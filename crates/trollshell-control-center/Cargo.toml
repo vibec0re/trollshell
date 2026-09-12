@@ -78,4 +78,10 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 # reaches the socket through `hytte-plugin-agents`' client on the shared
 # `hytte-reactive` runtime and needs none of these features of its own.
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "time",
+] }

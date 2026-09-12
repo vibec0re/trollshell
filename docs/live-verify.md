@@ -792,24 +792,40 @@ opens what it claims.
       precedence and this tab deliberately does not.
 - [ ] **(#947 P4)** **The agent-page link opens the companion window.** With
       `trollshell-agent-window` on `PATH`, click **Agent page** and confirm the
-      companion window opens for that agent — and that closing the
-      control-center afterwards leaves the window running (it is spawned
-      detached through `gio::Subprocess`, not parented).
+      companion window opens for that agent — **including on an agent whose row
+      shows `Agent page —`**, since the launch carries only the agent's name.
+      Then confirm it is genuinely detached: `systemctl --user list-units 'run-*'`
+      shows a transient unit for it, and stopping the control-center's own
+      scope (or closing the window) leaves the companion window running. If
+      `systemd-run` is unavailable the launch falls back to a plain child,
+      which survives the parent exiting but **not** the parent's scope being
+      stopped — check which path the journal logged.
 - [ ] **(#947 P4)** **…and the browser when it is not.** Start the
       control-center from a shell with `trollshell-agent-window` removed from
       `PATH` and confirm the same click opens the agent's URL in the browser
       instead, with exactly **one** "not on this plugin's PATH" warning in the
-      log however many times it is clicked.
+      log however many times it is clicked. On a hive that reports no `url`
+      the row is then **insensitive** — that is the one dead click, and the
+      only one.
+- [ ] **(#947 P4)** **A failed launch is visible.** With
+      `trollshell-agent-window` on `PATH` at startup, remove it, then click
+      **Agent page**: a toast must say the window could not be opened, and the
+      *next* click must take the browser route (the probe re-resolves after a
+      failure).
 - [ ] **(#947 P4)** **The config-repo link goes to the forge.** Confirm the
       **Config repo** row carries the hive's `HiveUrls.forge` verbatim and
       opens it. On a hive with no public forge URL the row must read `—` and
       be **insensitive** — never a dead click, and never a guessed
       `forge.<domain>`.
-- [ ] **(#947 P4)** **`HiveUrls.forge` is really there.** This PR is the first
-      thing in the tree to read that key. Capture a live `Urls` answer and
-      confirm `forge` is present and spelled as
-      `crates/hytte-plugin-agents/tests/fixtures/urls.json` records it — if it
-      is absent on the real hive, the row will silently never appear.
+- [ ] **(#947 P4)** **The four per-agent keys this tab reads are really
+      there.** `HiveUrls.forge` is settled (`hive-host-sock/src/lib.rs` declares
+      it, `hive-c0re/src/server.rs` fills it from `HIVE_FORGE_PUBLIC_URL`), but
+      the `AgentStatus` rows on the hyperhive revision in the tree carry **no**
+      `url`, `status_text`, `status_set_at` or `active_model` at all
+      (`hive-sh4re/src/container.rs`'s struct has no such fields). Capture a
+      live `AgentStatus` answer and record which of the four the deployed hive
+      actually sends: each absent one renders `—` by design, but four dashes on
+      a live hive is a finding about the mirror, not about this tab.
 - [ ] **(#947 P4)** **An unreachable hive says which socket.** Stop
       `hive-c0re` and confirm the tab shows one row titled _"Hive unreachable"_
       whose subtitle carries both the client's reason and the socket path, plus

@@ -58,6 +58,33 @@
 //!   refuses to guess at — all send the operator somewhere different and all
 //!   start with "which socket did you mean".
 //!
+//! # Nothing off the wire is ever parsed as markup
+//!
+//! **The rule for this whole file: a string that came from the hive reaches a
+//! label as text, never as Pango markup.** `status_text` is written by the
+//! *agent itself*, `active_model` / `parent` / `deployed_sha` by the hive, and
+//! the client's `reason` strings quote whatever the daemon said — a bare `&`
+//! ("R&D", a URL with a query string) makes Pango fail the whole label and
+//! render it **blank**, and a well-formed `<span …>` would be an injection
+//! channel from agent-controlled text into the settings app's chrome (#1147
+//! review, HIGH 1).
+//!
+//! Two mechanisms, because libadwaita offers two:
+//!
+//! - Every row built here is an `AdwPreferencesRow` subclass, whose title and
+//!   subtitle labels bind `use-markup` from the row itself
+//!   (`adw-action-row.ui`) — so every one of them is built with
+//!   **`use_markup(false)`**, and that one flag covers both lines.
+//! - `AdwStatusPage:description` has no such switch (its label is
+//!   `use-markup: True` in `adw-status-page.ui`, unlike its title label, which
+//!   is plain), so the one wire string that reaches it — the placeholder's
+//!   reason — is **escaped** with [`glib::markup_escape_text`] instead. That is
+//!   `places_tab`'s remedy, applied at the one place the other one cannot
+//!   reach.
+//!
+//! `AdwNavigationPage:title` needs neither: it renders through `AdwWindowTitle`,
+//! whose labels declare no `use-markup` and so are plain text.
+//!
 //! # Why the poll is a `glib` timer and not a task
 //!
 //! The tab has no runtime of its own: [`crate::spawn_on_runtime`] puts one
@@ -65,6 +92,16 @@
 //! to the GTK thread over a oneshot. That is the same seam the Plugins tab's
 //! `Control` calls use, so the window's existing "drop the timer on close"
 //! bookkeeping (#542) covers this tab with no new machinery.
+//!
+//! **One round trip at a time.** `client::REQUEST_TIMEOUT` is 5 s and the
+//! default cadence is 2 s, so an unguarded poll would have two or three
+//! `AgentStatus` requests in flight against a slow hive, resolving in
+//! completion order rather than issue order — a 5 s timeout issued at t=0
+//! landing *after* a good answer issued at t=4 s, flipping the roster to
+//! "Hive unreachable" and back. [`AgentsState::claim`] is `ShellStatusUi`'s
+//! one-slot guard (`main.rs`, #989's LOW 3) applied here for the same reason:
+//! a tick with a request outstanding is skipped, so an older answer can never
+//! land after a newer one (#1147 review, HIGH 2).
 //!
 //! # Testing without a hive
 //!
@@ -279,8 +316,11 @@ pub(crate) struct DetailModel {
     /// wire did not report renders [`ABSENT`] rather than being dropped — the
     /// row is a statement that the hive was asked.
     pub(crate) facts: Vec<(&'static str, String)>,
-    /// The agent's own page, as the hive states it. `None` when the hive's
-    /// domain is unconfigured, which is exactly when the link would be dead.
+    /// The agent's own page, as the hive states it — the **browser** route's
+    /// destination, and the row's subtitle. `None` when the hive reports no
+    /// `url` for this agent (every agent, on the hyperhive revision in the
+    /// tree). That does **not** make the row dead: the companion window is
+    /// launched by name and needs none of this — see [`route_for`].
     pub(crate) agent_page: Option<String>,
     /// The hive's forge, where the agent's config repo lives. `None` until a
     /// `Urls` answer has landed, and on a hive whose gateway publishes none.
@@ -473,6 +513,9 @@ struct AgentsState {
     split: adw::NavigationSplitView,
     list: gtk::ListBox,
     detail: AgentDetail,
+    /// The tab's own toast overlay, between the bin and the split view — what
+    /// a failed launch surfaces on (#1147 review, MEDIUM 7).
+    toasts: adw::ToastOverlay,
     /// `agents.toml`, read once at build. A change wants a restart, the same
     /// contract the plugin has.
     cfg: Rc<AgentsConfig>,
@@ -501,6 +544,25 @@ struct AgentsState {
     /// The companion window's resolve-once probe. **Resolved before an action
     /// is taken, never after** — see [`open_agent_page`].
     probe: Rc<RefCell<agent_window::Probe>>,
+    /// Whether an `AgentStatus` round trip is outstanding — the one-slot guard
+    /// that keeps a slow hive from stacking connections, and so keeps a stale
+    /// answer from landing after a newer one. See [`AgentsState::claim`].
+    in_flight: Rc<Cell<bool>>,
+    /// How a click reaches the outside world, injected for the tests. An
+    /// `Rc<RefCell<…>>` rather than a plain field because the handlers hold a
+    /// `WeakAgentsState` cloned at connect time, so a test that swaps the
+    /// actions after `build_tab` has to swap them through shared ownership.
+    actions: Rc<RefCell<Actions>>,
+}
+
+/// The single in-flight slot's guard: releases it on drop, wherever that
+/// happens.
+struct InFlightSlot(Rc<Cell<bool>>);
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 /// The selection a placeholder set aside, for the next good poll to restore.
@@ -528,6 +590,7 @@ struct WeakAgentsState {
     split: glib::WeakRef<adw::NavigationSplitView>,
     list: glib::WeakRef<gtk::ListBox>,
     detail: WeakAgentDetail,
+    toasts: glib::WeakRef<adw::ToastOverlay>,
     cfg: Rc<AgentsConfig>,
     rows: Rc<RefCell<Vec<gtk::Widget>>>,
     by_name: Rc<RefCell<HashMap<String, AgentRow>>>,
@@ -539,6 +602,8 @@ struct WeakAgentsState {
     selecting: Rc<Cell<bool>>,
     urls_wanted: Rc<Cell<bool>>,
     probe: Rc<RefCell<agent_window::Probe>>,
+    in_flight: Rc<Cell<bool>>,
+    actions: Rc<RefCell<Actions>>,
 }
 
 /// [`FlagRow`], weakly — see [`WeakAgentsState`].
@@ -561,11 +626,27 @@ struct WeakAgentDetail {
 }
 
 impl AgentsState {
+    /// Claim the single in-flight slot for this tick, or `None` because a
+    /// round trip is still outstanding. The returned guard releases the slot
+    /// when it drops.
+    ///
+    /// `ShellStatusUi::claim` in this crate's `main.rs`, for the same reason
+    /// it exists there (#989's LOW 3) and one more: with at most one request
+    /// in flight, answers arrive in issue order, so a 5 s timeout cannot land
+    /// after the good answer that followed it.
+    fn claim(&self) -> Option<InFlightSlot> {
+        if self.in_flight.replace(true) {
+            return None;
+        }
+        Some(InFlightSlot(self.in_flight.clone()))
+    }
+
     /// The handler-side view of this state.
     fn downgrade(&self) -> WeakAgentsState {
         WeakAgentsState {
             split: self.split.downgrade(),
             list: self.list.downgrade(),
+            toasts: self.toasts.downgrade(),
             detail: WeakAgentDetail {
                 page: self.detail.page.downgrade(),
                 stack: self.detail.stack.downgrade(),
@@ -594,6 +675,8 @@ impl AgentsState {
             selecting: self.selecting.clone(),
             urls_wanted: self.urls_wanted.clone(),
             probe: self.probe.clone(),
+            in_flight: self.in_flight.clone(),
+            actions: self.actions.clone(),
         }
     }
 }
@@ -606,6 +689,7 @@ impl WeakAgentsState {
         Some(AgentsState {
             split: self.split.upgrade()?,
             list: self.list.upgrade()?,
+            toasts: self.toasts.upgrade()?,
             detail: AgentDetail {
                 page: self.detail.page.upgrade()?,
                 stack: self.detail.stack.upgrade()?,
@@ -641,6 +725,8 @@ impl WeakAgentsState {
             selecting: self.selecting.clone(),
             urls_wanted: self.urls_wanted.clone(),
             probe: self.probe.clone(),
+            in_flight: self.in_flight.clone(),
+            actions: self.actions.clone(),
         })
     }
 }
@@ -657,14 +743,23 @@ pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
     let (bin, state) = build_tab(hytte_plugin_agents::config::load());
     let interval = state.cfg.poll_interval();
     refresh(&state);
-    let poll = {
-        let state = state.clone();
-        glib::timeout_add_local(interval, move || {
-            refresh(&state);
-            glib::ControlFlow::Continue
-        })
-    };
-    (bin, poll)
+    (bin, start_poll(&state, interval))
+}
+
+/// Start the tab's poll on `interval` and hand back its `SourceId`.
+///
+/// Split out of [`build_page`] so a test can start a real timer against a
+/// scripted socket without [`build_page`]'s `config::load()` reading the real
+/// `$XDG_CONFIG_HOME` (#1101) — which is what makes the `ControlFlow` below
+/// testable at all. Before #1147's review, turning it into
+/// [`glib::ControlFlow::Break`] — a tab that polls exactly once and then never
+/// again — passed the whole suite (its MEDIUM 4).
+fn start_poll(state: &AgentsState, interval: std::time::Duration) -> glib::SourceId {
+    let state = state.clone();
+    glib::timeout_add_local(interval, move || {
+        refresh(&state);
+        glib::ControlFlow::Continue
+    })
 }
 
 /// The widget tree and its state, with no socket traffic and no timer.
@@ -704,9 +799,15 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
     split.set_max_sidebar_width(SIDEBAR_MAX_PX);
     split.set_sidebar_width_fraction(SIDEBAR_FRACTION);
 
+    // The overlay sits between the bin and the split view so a toast floats
+    // over the whole tab — `places_tab`'s arrangement, one level lower because
+    // this tab's root is the breakpoint bin.
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&split));
+
     let bin = adw::BreakpointBin::new();
     bin.set_size_request(BIN_MIN_WIDTH_PX, BIN_MIN_HEIGHT_PX);
-    bin.set_child(Some(&split));
+    bin.set_child(Some(&toasts));
 
     let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
@@ -720,6 +821,7 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
         split,
         list,
         detail,
+        toasts,
         cfg: Rc::new(cfg),
         rows: Rc::new(RefCell::new(Vec::new())),
         by_name: Rc::new(RefCell::new(HashMap::new())),
@@ -731,6 +833,8 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
         selecting: Rc::new(Cell::new(false)),
         urls_wanted: Rc::new(Cell::new(true)),
         probe: Rc::new(RefCell::new(agent_window::Probe::path())),
+        in_flight: Rc::new(Cell::new(false)),
+        actions: Rc::new(RefCell::new(Actions::default())),
     };
 
     connect_selection(&state);
@@ -762,7 +866,14 @@ fn build_detail() -> AgentDetail {
     let flags: Vec<FlagRow> = flags_of_labels()
         .iter()
         .map(|label| {
-            let row = adw::ActionRow::builder().title(*label).build();
+            // `use_markup(false)`: the module doc's rule. This row's own text
+            // is a constant, but the flag is set at *every* row this file
+            // builds so a later value swap cannot quietly reintroduce a markup
+            // parser.
+            let row = adw::ActionRow::builder()
+                .title(*label)
+                .use_markup(false)
+                .build();
             let value = flag_value_label();
             row.add_suffix(&value);
             flags_group.add(&row);
@@ -780,6 +891,9 @@ fn build_detail() -> AgentDetail {
             let row = adw::ActionRow::builder()
                 .title(*label)
                 .subtitle(ABSENT)
+                // Every subtitle this row ever carries is the hive's own
+                // string — see the module doc's rule.
+                .use_markup(false)
                 .build();
             // The harness's status text and a full model id both overrun a
             // 500 px pane; wrapping them is what keeps the pane a pane.
@@ -860,6 +974,9 @@ fn link_row(title: &str, icon: &str) -> adw::ActionRow {
         .subtitle(ABSENT)
         .activatable(true)
         .sensitive(false)
+        // The subtitle is a URL the hive published; a query string's `&` is
+        // enough to blank the row. See the module doc's rule.
+        .use_markup(false)
         .build();
     let chevron = gtk::Image::from_icon_name(icon);
     chevron.set_valign(gtk::Align::Center);
@@ -926,24 +1043,80 @@ fn connect_links(state: &AgentsState) {
                 .map(|u| u.trim().to_owned())
                 .filter(|u| !u.is_empty());
             if let Some(uri) = uri {
-                open_uri(&uri);
+                let open = state.actions.borrow().open_uri.clone();
+                open(&uri);
             }
         });
     }
 }
 
-/// Open the selected agent's surface: the companion window when it resolves on
-/// `PATH`, the browser otherwise.
+/// Where a click on **Agent page** goes.
+///
+/// Split out as a value, and computed by a pure function, because the route
+/// *choice* is the part worth pinning: before #1147's review the branch could
+/// be inverted wholesale without a single test noticing (its MEDIUM 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// Launch the companion window with this argv.
+    Window(Vec<String>),
+    /// Hand this URL to the desktop's default handler.
+    Browser(String),
+    /// Nothing to open.
+    Nothing,
+}
+
+/// Pick the route for one agent: the companion window whenever it is
+/// installed, the browser only as the fallback when it is not.
+///
+/// **The window route depends on the agent's *name* and nothing else** — the
+/// launch is `--agent <name>` and the window reads `host.sock` itself, exactly
+/// as `hytte_plugin_agents::window`'s doc states for the plugin ("The launch
+/// carries **only** the agent's name"). Gating it on the hive publishing a
+/// per-agent `url` would couple it to the *browser* route's precondition, and
+/// on the hyperhive revision in the tree (`hive-c0re/src/server.rs`'s
+/// `AgentStatus` rows carry no `url` at all) that would leave the companion
+/// window with no entry point whatsoever (#1147 review, HIGH 3).
 ///
 /// **The route is chosen before anything is launched**, by resolving the
-/// binary — the same rule `hytte_plugin_agents::window` documents for the
-/// plugin, and it holds here for a related reason: a `gio::Subprocess` spawn
-/// does report `ENOENT`, but by then the browser fallback would be a *second*
-/// action taken after a visible failure rather than the only one taken. One
-/// click, one destination.
+/// binary — the same rule the plugin follows, and for the same reason: a
+/// detached launch cannot report a missing program, because `systemd-run`
+/// answers as soon as the user manager takes the start job.
+#[must_use]
+pub(crate) fn route_for(name: Option<&str>, window_installed: bool, url: Option<&str>) -> Route {
+    let Some(name) = name else {
+        return Route::Nothing;
+    };
+    if window_installed {
+        return Route::Window(agent_window::argv(name, agent_window::Tab::Agent));
+    }
+    match url {
+        Some(url) => Route::Browser(url.to_owned()),
+        None => Route::Nothing,
+    }
+}
+
+/// Whether **Agent page** is a live row at all: either destination will do.
+///
+/// The row is sensitive when the window is installed *or* the hive published a
+/// URL, and insensitive only when neither exists — which is the one case where
+/// a click genuinely has nowhere to go.
+#[must_use]
+pub(crate) fn agent_page_is_live(window_installed: bool, url: Option<&str>) -> bool {
+    window_installed || url.is_some()
+}
+
+/// Open the selected agent's surface along [`route_for`]'s choice.
 ///
 /// The probe caches, and complains exactly once, so a desktop without the
 /// window does not log a line per click.
+///
+/// A launch that *does* fail is the one case where "one click, one
+/// destination" is already broken — the probe promised the binary was there —
+/// so the failure is surfaced three ways rather than swallowed into a `warn!`
+/// (#1147 review, MEDIUM 7): a toast, the probe cache dropped so the next
+/// click re-resolves `PATH` rather than repeating a decision made against a
+/// binary that has since gone, and the browser as a late fallback where the
+/// hive published a URL.
 fn open_agent_page(state: &AgentsState) {
     let Some(name) = state.selected.borrow().clone() else {
         return;
@@ -955,28 +1128,141 @@ fn open_agent_page(state: &AgentsState) {
     let url = agent_url(agent).map(str::to_owned);
     drop(snapshot);
 
-    if state.probe.borrow_mut().available() {
-        let argv = agent_window::argv(&name, agent_window::Tab::Agent);
-        launch(&argv);
-        return;
-    }
-    if let Some(url) = url {
-        open_uri(&url);
+    let installed = state.probe.borrow_mut().available();
+    // Cloned out, so no borrow of `actions` is live while the action runs.
+    let (launch, open) = {
+        let actions = state.actions.borrow();
+        (actions.launch.clone(), actions.open_uri.clone())
+    };
+    match route_for(Some(&name), installed, url.as_deref()) {
+        Route::Window(argv) => {
+            if let Err(e) = launch(&argv) {
+                tracing::warn!(?argv, error = %e, "could not launch the agent companion window");
+                // The probe resolved `PATH` once, possibly hours ago. A launch
+                // that failed is evidence that answer is stale, so drop it.
+                *state.probe.borrow_mut() = agent_window::Probe::path();
+                toast(state, &format!("Could not open the agent window: {e}"));
+                if let Some(url) = url {
+                    open(&url);
+                }
+            }
+        }
+        Route::Browser(url) => open(&url),
+        Route::Nothing => {}
     }
 }
 
-/// Launch `argv` detached from this process.
+/// Raise one toast on the tab's own overlay.
+///
+/// The tab carries its own [`adw::ToastOverlay`] rather than reaching for the
+/// window's, the way `places_tab` does: a toast about a failed launch belongs
+/// over the tab that launched it, and the tab is built (and tested) without a
+/// window at all.
+fn toast(state: &AgentsState, text: &str) {
+    state.toasts.add_toast(adw::Toast::new(text));
+}
+
+/// How the tab reaches the world outside this process — injected so a GTK test
+/// can record the route taken instead of spawning a window or handing a URL to
+/// the operator's browser.
+///
+/// Two `Rc<dyn Fn>`s rather than a trait object with two methods: the default
+/// is two free functions, and the tests replace one or both with a recorder.
+#[derive(Clone)]
+struct Actions {
+    /// Start the companion window. `Err` carries an operator-facing reason.
+    launch: Rc<dyn Fn(&[String]) -> Result<(), String>>,
+    /// Hand a URL to the desktop.
+    open_uri: Rc<dyn Fn(&str)>,
+}
+
+impl Default for Actions {
+    fn default() -> Self {
+        Self {
+            launch: Rc::new(|argv| launch_detached(argv)),
+            open_uri: Rc::new(open_uri),
+        }
+    }
+}
+
+/// `systemd-run`, as the shell's own detached launcher names it
+/// (`trollshell/src/launch.rs`) — resolved on `PATH`, never by absolute path,
+/// because a NixOS profile and an FHS distro put it in different places.
+const SYSTEMD_RUN: &str = "systemd-run";
+
+/// The argv that starts `inner` as a **transient user unit**.
+///
+/// No `--unit=`: systemd allocates `run-u<N>.service` itself, so a second
+/// launch for the same agent never collides with the first one's unit (the
+/// window is single-instance per agent through GApplication, and that second
+/// launch is what forwards `--tab` to the running window — a fixed unit name
+/// would have systemd refuse it instead). `--collect` reaps a unit that failed
+/// at exec so a run of misses does not accumulate failed units; `--quiet`
+/// keeps the "Running as unit" line out of the control-center's own stderr.
+#[must_use]
+pub(crate) fn systemd_run_argv(inner: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        SYSTEMD_RUN.to_owned(),
+        "--user".to_owned(),
+        "--collect".to_owned(),
+        "--quiet".to_owned(),
+        "--".to_owned(),
+    ];
+    argv.extend_from_slice(inner);
+    argv
+}
+
+/// Launch `argv` **detached from this process**, the way the plugin's own
+/// effect does (#953's detached mode).
+///
+/// `systemd-run --user` first, because that is the property the plugin's
+/// `window` module documents and the only one that actually holds: a plain
+/// child shares this process's cgroup, so a scope teardown of the
+/// control-center takes the companion window with it. A transient unit is the
+/// user manager's child, not ours.
+///
+/// The direct `gio::Subprocess` spawn stays as the **fallback** for a session
+/// with no user manager (or no `systemd-run` on `PATH`) — it still outlives
+/// this process, GIO reaps it rather than leaving a zombie, and it is the same
+/// fallback shape `trollshell/src/plugins/effects.rs`'s `start_detached` takes
+/// for the same case. `Err` is returned only when *neither* worked, and it is
+/// what raises the toast.
+fn launch_detached(argv: &[String]) -> Result<(), String> {
+    let unit = systemd_run_argv(argv);
+    match spawn(&unit) {
+        Ok(()) => {
+            tracing::info!(?argv, "launched the agent companion window as a transient user unit");
+            Ok(())
+        }
+        Err(e) => {
+            // `systemd-run` itself is missing or not executable. A session
+            // without a user manager fails later than this (the unit start
+            // fails, not the spawn), which this side deliberately does not
+            // wait around for — see the module doc on why a launch verdict is
+            // not evidence the program exists.
+            tracing::warn!(error = %e, "no usable systemd-run; spawning the companion window directly");
+            spawn(argv).map(|()| {
+                tracing::info!(?argv, "launched the agent companion window directly");
+            })
+        }
+    }
+}
+
+/// Spawn one argv through GIO, silencing the child's stdio so a chatty
+/// companion window does not write into the settings app's journal stream.
 ///
 /// `gio::Subprocess` rather than `std::process::Command` because GIO reaps the
-/// child itself — a companion window the operator closes must not leave a
-/// zombie parented to a settings app that may outlive it by hours — and
-/// because it does not kill the child when this window goes away.
-fn launch(argv: &[String]) {
+/// child itself — a window the operator closes must not leave a zombie
+/// parented to a settings app that may outlive it by hours — and because it
+/// does not kill the child when this window goes away.
+fn spawn(argv: &[String]) -> Result<(), String> {
     let as_os: Vec<&std::ffi::OsStr> = argv.iter().map(AsRef::as_ref).collect();
-    match gtk::gio::Subprocess::newv(&as_os, gtk::gio::SubprocessFlags::NONE) {
-        Ok(_child) => tracing::info!(?argv, "launched the agent companion window"),
-        Err(e) => tracing::warn!(?argv, error = %e, "could not launch the agent companion window"),
-    }
+    gtk::gio::Subprocess::newv(
+        &as_os,
+        gtk::gio::SubprocessFlags::STDOUT_SILENCE | gtk::gio::SubprocessFlags::STDERR_SILENCE,
+    )
+    .map(|_child| ())
+    .map_err(|e| e.message().to_owned())
 }
 
 /// Hand a URI to the desktop's default handler.
@@ -1008,41 +1294,53 @@ fn name_for_row(state: &AgentsState, row: &gtk::ListBoxRow) -> Option<String> {
 
 // ── The poll ─────────────────────────────────────────────────────────────────
 
-/// One tick: ask for the roster, and — while the hive is up and has not
-/// answered yet — for its URLs.
+/// One tick: ask for the roster — **unless the last ask is still
+/// outstanding**, in which case this tick is skipped.
+///
+/// The `Urls` fetch is not issued here but from [`on_status`], so it only ever
+/// rides a roster answer that actually arrived (see [`refresh_urls`]).
+///
+/// The slot guard is **moved into the completion closure**, so the slot is
+/// released whether that closure runs or is dropped unrun — [`spawn_on_runtime`]
+/// calls its callback only `if let Ok(v) = rx.await`, so a sender dropped
+/// without sending would otherwise wedge `in_flight` at `true` and freeze the
+/// tab on its last snapshot forever. That is `ShellStatusUi::poll`'s own note
+/// in this crate, and it applies here unchanged.
 fn refresh(state: &AgentsState) {
+    let Some(slot) = state.claim() else {
+        tracing::debug!("an AgentStatus round trip is still in flight — skipping this tick");
+        return;
+    };
     let socket = PathBuf::from(&state.cfg.socket);
-    {
-        let weak = state.downgrade();
-        spawn_on_runtime(
-            async move { client::request(&socket, &Request::AgentStatus).await },
-            move |answer| {
-                if let Some(state) = weak.upgrade() {
-                    on_status(&state, &answer);
-                }
-            },
-        );
-    }
-    refresh_urls(state);
+    let weak = state.downgrade();
+    spawn_on_runtime(
+        async move { client::request(&socket, &Request::AgentStatus).await },
+        move |answer| {
+            drop(slot);
+            if let Some(state) = weak.upgrade() {
+                on_status(&state, &answer);
+            }
+        },
+    );
 }
 
-/// Ask for the hive's URLs, at most once successfully, and **only while the
-/// roster poll is succeeding**.
+/// Ask for the hive's URLs — **once**, riding a roster answer that arrived.
 ///
-/// The gate is what keeps a down hive from doubling its own failed traffic:
-/// the `Urls` answer never changes under a running window, so the only thing a
-/// retry-while-down buys is a second timeout per tick. Riding the roster's own
-/// success instead means the fetch resumes the moment the hive comes back,
-/// with no backoff machinery of its own — the seed `Connecting` state counts
-/// as "worth one attempt", so a hive that is up at open answers on tick one.
+/// Called from [`on_status`] with an `Up` snapshot, never from the tick: the
+/// `Urls` answer does not change under a running window, so the only thing a
+/// retry buys is a second round trip per tick. Three rules make "once" true
+/// (#1147 review, LOW 8):
+///
+/// - The want is **claimed** (taken, not read) before the request is issued,
+///   so two ticks cannot both dial.
+/// - A hive that **answered** — with a `urls` block or without one, or by
+///   refusing the verb outright — is never asked again. The earlier shape
+///   cleared the want only inside `Some(urls)`, so a hive answering
+///   `ok: true, urls: null` re-dialled every tick for the life of the window.
+/// - Only a transport failure puts the want back, so the fetch resumes when
+///   the hive comes back, with no backoff machinery of its own.
 fn refresh_urls(state: &AgentsState) {
-    if !state.urls_wanted.get() {
-        return;
-    }
-    if matches!(
-        &*state.snapshot.borrow(),
-        Hive::Unreachable { .. } | Hive::Error { .. } | Hive::Incompatible(_)
-    ) {
+    if !state.urls_wanted.replace(false) {
         return;
     }
     let socket = PathBuf::from(&state.cfg.socket);
@@ -1053,12 +1351,20 @@ fn refresh_urls(state: &AgentsState) {
             let Some(state) = weak.upgrade() else {
                 return;
             };
-            if let Ok(urls) = answer
-                && let Some(urls) = urls.urls
-            {
-                state.urls_wanted.set(false);
-                *state.urls.borrow_mut() = Some(urls);
-                refresh_detail(&state);
+            match answer {
+                Ok(resp) => {
+                    if let Some(urls) = resp.urls {
+                        *state.urls.borrow_mut() = Some(urls);
+                        refresh_detail(&state);
+                    }
+                }
+                // The hive answered, just not with URLs — that is an answer,
+                // and asking again would get the same one.
+                Err(HiveError::Refused { .. } | HiveError::Protocol { .. }) => {}
+                // A version this build refuses to guess at is not going to
+                // change under a running window either.
+                Err(HiveError::Version(_)) => {}
+                Err(HiveError::Unreachable { .. }) => state.urls_wanted.set(true),
             }
         },
     );
@@ -1068,9 +1374,19 @@ fn refresh_urls(state: &AgentsState) {
 ///
 /// Public to the crate's tests rather than private, so the GTK tests drive the
 /// exact path a real poll does instead of a lookalike.
+///
+/// The `Urls` fetch hangs off **this** rather than off the tick, so it is
+/// issued against a hive that has just answered rather than against the
+/// *previous* tick's snapshot — the seed `Connecting` state used to spend one
+/// request on a hive already known to be unreachable.
 fn on_status(state: &AgentsState, answer: &Result<Response, HiveError>) {
-    *state.snapshot.borrow_mut() = hive_of(answer);
+    let hive = hive_of(answer);
+    let up = matches!(hive, Hive::Up { .. });
+    *state.snapshot.borrow_mut() = hive;
     apply(state);
+    if up {
+        refresh_urls(state);
+    }
 }
 
 // ── Applying a snapshot ──────────────────────────────────────────────────────
@@ -1098,6 +1414,7 @@ fn apply(state: &AgentsState) {
                 update_agent_row(&row, model);
             }
         }
+        reorder_rows(state, &listed);
         refresh_detail(state);
         return;
     }
@@ -1149,6 +1466,80 @@ fn apply(state: &AgentsState) {
     refresh_detail(state);
 }
 
+/// Put the sidebar's rows in `listed`'s order **without rebuilding any of
+/// them**.
+///
+/// [`same_agent_set`] is set equality by design — a reorder must not tear the
+/// rows down — but the in-place branch used to key by name and never touch the
+/// list's child order, so the sidebar kept the order of the poll that last
+/// changed *membership*, forever. The card re-sorts on every poll because it
+/// re-renders; this tab does not, so "the same list as the sidebar, in the same
+/// order" was true only until hyperhive shuffled its answer (#1147 review,
+/// MEDIUM 5).
+///
+/// A no-op when the order already matches, which is every poll but the rare
+/// one: the walk compares first and only moves the rows that are out of place.
+///
+/// Removing a row from a `GtkListBox` drops the selection and emits
+/// `row-selected(None)`, so the whole walk runs under the `selecting` latch
+/// and the selection is put back silently at the end — the navigation state
+/// (a pushed page, collapsed) is never touched.
+fn reorder_rows(state: &AgentsState, listed: &[String]) {
+    if on_screen_order(state) == listed {
+        return;
+    }
+    let selected = state.selected.borrow().clone();
+    state.selecting.set(true);
+    for (index, name) in listed.iter().enumerate() {
+        let position = i32::try_from(index).unwrap_or(i32::MAX);
+        let Some(row) = state.by_name.borrow().get(name).map(|r| r.row.clone()) else {
+            continue;
+        };
+        let at = state.list.row_at_index(position);
+        if at.is_some_and(|at| &at == row.upcast_ref::<gtk::ListBoxRow>()) {
+            continue;
+        }
+        state.list.remove(&row);
+        state.list.insert(&row, position);
+    }
+    // The teardown bookkeeping follows the screen, so a later rebuild removes
+    // the rows that are actually mounted.
+    let ordered_widgets: Vec<gtk::Widget> = listed
+        .iter()
+        .filter_map(|name| {
+            state
+                .by_name
+                .borrow()
+                .get(name)
+                .map(|r| r.row.clone().upcast())
+        })
+        .collect();
+    *state.rows.borrow_mut() = ordered_widgets;
+    state.selecting.set(false);
+    if let Some(name) = selected {
+        select_silently(state, &name);
+    }
+}
+
+/// The agent names of the rows the sidebar is showing, top to bottom.
+///
+/// Read off the `GtkListBox` itself rather than off `rows`, because the screen
+/// is the thing [`reorder_rows`] is asserting about.
+fn on_screen_order(state: &AgentsState) -> Vec<String> {
+    let by_name = state.by_name.borrow();
+    let mut out = Vec::with_capacity(by_name.len());
+    let mut child = state.list.first_child();
+    while let Some(widget) = child {
+        if let Some(row) = widget.downcast_ref::<adw::ActionRow>()
+            && let Some((name, _)) = by_name.iter().find(|(_, arow)| &arow.row == row)
+        {
+            out.push(name.clone());
+        }
+        child = widget.next_sibling();
+    }
+    out
+}
+
 /// The rows for an `Up` hive, or `None` after rendering a placeholder for
 /// every other state — including an `Up` hive with an empty roster, which gets
 /// its own wording because "the hive has none" and "we could not ask" are
@@ -1183,8 +1574,17 @@ fn set_placeholder(state: &AgentsState, title: &str, detail: &str) {
     // Wording can change while the view does not (one client reason replacing
     // another), so the status page is refreshed unconditionally and only the
     // *row* rebuild is gated.
+    //
+    // The title is a fixed vocabulary from [`placeholder`] and its label is
+    // plain text either way; the **description** carries the client's reason,
+    // which quotes the daemon, and its label is the one surface in this file
+    // with `use-markup: True` and no switch to turn it off — so it is escaped.
+    // See the module doc's rule.
     state.detail.empty.set_title(title);
-    state.detail.empty.set_description(Some(detail));
+    state
+        .detail
+        .empty
+        .set_description(Some(&glib::markup_escape_text(detail)));
 
     if state.view.get() == AgentsView::Placeholder {
         // The one row is already there; keep its text current.
@@ -1210,6 +1610,9 @@ fn set_placeholder(state: &AgentsState, title: &str, detail: &str) {
         .subtitle(detail)
         .activatable(false)
         .selectable(false)
+        // The subtitle is the client's reason plus the socket path. See the
+        // module doc's rule.
+        .use_markup(false)
         .build();
     row.set_subtitle_lines(3);
     state.list.append(&row);
@@ -1293,8 +1696,20 @@ fn refresh_detail(state: &AgentsState) {
     for (row, (_, value)) in state.detail.facts.iter().zip(&model.facts) {
         row.set_subtitle(value);
     }
-    set_link_row(&state.detail.agent_page, model.agent_page.as_deref());
-    set_link_row(&state.detail.config_repo, model.config_repo.as_deref());
+    // **Agent page** is live whenever *either* destination exists: the
+    // companion window needs only the agent's name, so a hive that publishes
+    // no per-agent `url` still has one (#1147 review, HIGH 3). The subtitle
+    // stays the hive's own URL, or `—` where there is none — the row is a
+    // statement that the hive was asked, and it says nothing about which of
+    // the two routes the click will take.
+    let window_installed = state.probe.borrow_mut().available();
+    set_link_row(
+        &state.detail.agent_page,
+        model.agent_page.as_deref(),
+        agent_page_is_live(window_installed, model.agent_page.as_deref()),
+    );
+    let forge = model.config_repo.as_deref();
+    set_link_row(&state.detail.config_repo, forge, forge.is_some());
     state.detail.stack.set_visible_child_name("agent");
 }
 
@@ -1314,15 +1729,21 @@ fn set_flag_row(flag: &FlagRow, set: bool) {
         .add_css_class(if set { "accent" } else { "dim-label" });
 }
 
-/// Drive one link row: the destination as its subtitle, insensitive when there
-/// is none.
+/// Drive one link row: what the hive reported as its subtitle, and whether the
+/// row can be clicked at all.
+///
+/// `uri` and `live` are **separate** arguments on purpose. For the config repo
+/// they say the same thing, but **Agent page** has two destinations and only
+/// one of them is a URL: an agent with no reported `url` still opens in the
+/// companion window, so the row reads `—` and stays live. Collapsing the two
+/// is exactly the coupling HIGH 3 found.
 ///
 /// Insensitive rather than hidden, for the reason a fact row shows [`ABSENT`]
 /// rather than disappearing: "the hive publishes no forge" is an answer, and a
 /// row that vanishes only raises the question again.
-fn set_link_row(row: &adw::ActionRow, uri: Option<&str>) {
+fn set_link_row(row: &adw::ActionRow, uri: Option<&str>, live: bool) {
     row.set_subtitle(uri.unwrap_or(ABSENT));
-    row.set_sensitive(uri.is_some());
+    row.set_sensitive(live);
 }
 
 /// Build one sidebar row from its model.
@@ -1330,7 +1751,13 @@ fn set_link_row(row: &adw::ActionRow, uri: Option<&str>) {
 /// No per-row handler — drill-down is the list's `row-selected` /
 /// `row-activated`, so a row is a display of one agent and nothing else.
 fn build_agent_row(model: &RowModel) -> AgentRow {
-    let row = adw::ActionRow::builder().activatable(true).build();
+    // `use_markup(false)`: the title is `agents.toml`'s label or the hive's
+    // own name, and the subtitle is the harness's status line — the agent
+    // writes that one itself. See the module doc's rule.
+    let row = adw::ActionRow::builder()
+        .activatable(true)
+        .use_markup(false)
+        .build();
 
     let icon = gtk::Image::new();
     icon.set_valign(gtk::Align::Center);
@@ -1382,8 +1809,9 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ABSENT, DetailModel, FACT_LABELS, RowModel, detail_of, flags_of, flags_of_labels, hive_of,
-        ordered, placeholder, rows_of, same_agent_set, status_set,
+        ABSENT, DetailModel, FACT_LABELS, Route, RowModel, agent_page_is_live, detail_of, flags_of,
+        flags_of_labels, hive_of, ordered, placeholder, route_for, rows_of, same_agent_set,
+        status_set, systemd_run_argv,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
@@ -1829,6 +2257,95 @@ mod tests {
         assert!(!same_agent_set(&known, &["a".to_owned(), "c".to_owned()]));
     }
 
+    // ── which surface a click opens ─────────────────────────────────────────
+
+    /// **The companion window needs only the agent's name.** A hive that
+    /// publishes no per-agent `url` — every agent on the hyperhive revision in
+    /// the tree, whose `AgentStatus` rows carry no such field at all — must
+    /// still open the window, because the launch is `--agent <name>` and the
+    /// window dials `host.sock` itself.
+    ///
+    /// Mutation (run, verified red): require a `url` for the `Window` arm
+    /// (`if window_installed && url.is_some()`) and the first assertion reds.
+    #[test]
+    fn the_window_route_needs_only_the_agents_name() {
+        assert_eq!(
+            route_for(Some("argus"), true, None),
+            Route::Window(vec![
+                "trollshell-agent-window".to_owned(),
+                "--agent".to_owned(),
+                "argus".to_owned(),
+            ]),
+            "a hive that publishes no url still opens the companion window"
+        );
+        // …and the window wins over the browser when both are possible: one
+        // click, one destination.
+        assert!(matches!(
+            route_for(Some("argus"), true, Some("https://hive/a/argus")),
+            Route::Window(_)
+        ));
+    }
+
+    /// The browser is the **fallback**, taken only when the window is not
+    /// installed, and only where the hive named a destination.
+    ///
+    /// Mutation (run, verified red): invert the `window_installed` branch and
+    /// both arms red — the exact mutation that passed the whole suite before
+    /// this test existed (#1147 review, MEDIUM 4).
+    #[test]
+    fn the_browser_is_the_fallback_and_only_with_a_url() {
+        assert_eq!(
+            route_for(Some("argus"), false, Some("https://hive/a/argus")),
+            Route::Browser("https://hive/a/argus".to_owned())
+        );
+        assert_eq!(route_for(Some("argus"), false, None), Route::Nothing);
+        assert_eq!(route_for(None, true, Some("https://hive/a/x")), Route::Nothing);
+    }
+
+    /// The **Agent page** row is live whenever either destination exists, and
+    /// dead only when neither does — the coupling HIGH 3 found was this
+    /// predicate being `url.is_some()` alone.
+    #[test]
+    fn the_agent_page_row_is_live_for_either_destination() {
+        assert!(agent_page_is_live(true, None), "the window alone is enough");
+        assert!(agent_page_is_live(false, Some("https://hive/a/argus")));
+        assert!(agent_page_is_live(true, Some("https://hive/a/argus")));
+        assert!(
+            !agent_page_is_live(false, None),
+            "no window and no url is the one dead click"
+        );
+    }
+
+    /// The launch goes through a **transient user unit**, so the window is the
+    /// user manager's child and survives a scope teardown of the
+    /// control-center — the property `hytte_plugin_agents::window`'s doc
+    /// claims for the plugin's own launch (#1147 review, MEDIUM 6).
+    ///
+    /// The absence of `--unit=` is asserted, not incidental: the window is
+    /// single-instance per agent, and a second launch (what forwards `--tab`
+    /// to the running window) would collide with the first one's unit name.
+    #[test]
+    fn the_detached_launch_is_a_transient_user_unit() {
+        let inner = vec![
+            "trollshell-agent-window".to_owned(),
+            "--agent".to_owned(),
+            "argus".to_owned(),
+        ];
+        let argv = systemd_run_argv(&inner);
+        assert_eq!(argv[0], "systemd-run");
+        assert!(argv.contains(&"--user".to_owned()), "{argv:?}");
+        assert!(argv.contains(&"--collect".to_owned()), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--unit")),
+            "a fixed unit name would refuse the second launch: {argv:?}"
+        );
+        let sep = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("the argv is terminated before the program");
+        assert_eq!(&argv[sep + 1..], inner.as_slice());
+    }
+
     // ── the socket itself ───────────────────────────────────────────────────
     //
     // Deliberately **not** `system-tests`-gated, for the reason
@@ -1920,17 +2437,155 @@ mod gtk_tests {
     use adw::prelude::*;
     use gtk::glib;
 
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
     use super::{
-        ABSENT, AgentsState, AgentsView, FACT_LABELS, build_tab, flags_of_labels, on_status,
+        ABSENT, Actions, AgentsState, AgentsView, FACT_LABELS, build_tab, flags_of_labels,
+        on_status, refresh, start_poll,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
     use hytte_plugin_agents::hive::wire::{AgentStatusRow, HOST_SOCK_VERSION, Response};
+    use hytte_plugin_agents::window as agent_window;
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a
     /// queued resize/allocation actually happens.
     fn pump() {
         while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Pump until `done` or until `secs` have passed — for the tests that
+    /// drive a **real** socket, where the answer arrives on the shared
+    /// `hytte-reactive` runtime and comes back through
+    /// [`crate::spawn_on_runtime`]'s oneshot.
+    ///
+    /// Deliberately a non-blocking iteration plus a short sleep rather than
+    /// `iteration(true)`: a blocking iteration with nothing pending would park
+    /// the test forever if the mechanism under test never fires, which is the
+    /// failure a falsification run is *supposed* to produce as a red, not as a
+    /// hang.
+    fn pump_until(done: impl Fn() -> bool, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !done() && Instant::now() < deadline {
+            pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pump();
+    }
+
+    /// A scripted `host.sock` in a tempdir — the shape `tests::scripted` uses,
+    /// lifted here because these tests drive the tab's own poll rather than
+    /// the client directly.
+    ///
+    /// Each connection is served on its own task (so a slow answer does not
+    /// stop the next request from being *read*, which is exactly what the
+    /// in-flight guard has to be measured against), answered with the reply
+    /// the script picks for that request line, after that reply's delay.
+    struct Scripted {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Scripted {
+        /// The request lines the daemon has actually read, in arrival order.
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().expect("the script mutex").clone()
+        }
+
+        /// A config naming this socket. Built by hand — nothing here reads the
+        /// real `$XDG_CONFIG_HOME` (#1101).
+        fn cfg(&self) -> AgentsConfig {
+            AgentsConfig {
+                socket: self.path.to_string_lossy().into_owned(),
+                ..AgentsConfig::default()
+            }
+        }
+    }
+
+    /// Bind a scripted socket whose answer to the *n*-th request is
+    /// `reply(n, request_line)` — `None` to hang up without answering.
+    fn scripted(
+        reply: impl Fn(usize, &str) -> Option<(Duration, String)> + Send + Sync + 'static,
+    ) -> Scripted {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let path = dir.path().join("host.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let reply = Arc::new(reply);
+        let served = seen.clone();
+        hytte_reactive::runtime::handle().spawn(async move {
+            let mut n = 0usize;
+            while let Ok((stream, _)) = listener.accept().await {
+                let reply = reply.clone();
+                let served = served.clone();
+                let index = n;
+                n += 1;
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut reader = tokio::io::BufReader::new(read);
+                    let mut line = String::new();
+                    if tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    served.lock().expect("the script mutex").push(line.clone());
+                    if let Some((delay, answer)) = reply(index, line.trim()) {
+                        tokio::time::sleep(delay).await;
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut write, answer.as_bytes())
+                            .await;
+                    }
+                });
+            }
+        });
+
+        Scripted {
+            _dir: dir,
+            path,
+            seen,
+        }
+    }
+
+    /// One `AgentStatus` answer line carrying exactly these agents.
+    fn roster_line(names: &[&str]) -> String {
+        let rows: Vec<String> = names
+            .iter()
+            .map(|n| format!("{{\"name\":\"{n}\",\"running\":true}}"))
+            .collect();
+        format!(
+            "{{\"version\":1,\"ok\":true,\"agent_statuses\":[{}]}}\n",
+            rows.join(",")
+        )
+    }
+
+    /// Install a recording pair of [`Actions`] and hand back what they saw.
+    ///
+    /// `launch_result` is what the recorded launcher returns, so one helper
+    /// covers both the happy route tests and the failed-launch one.
+    fn record(state: &AgentsState, launch_result: Result<(), String>) -> Recorded {
+        let launched: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
+        let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let (l, o) = (launched.clone(), opened.clone());
+        *state.actions.borrow_mut() = Actions {
+            launch: Rc::new(move |argv| {
+                l.borrow_mut().push(argv.to_vec());
+                launch_result.clone()
+            }),
+            open_uri: Rc::new(move |uri| o.borrow_mut().push(uri.to_owned())),
+        };
+        Recorded { launched, opened }
+    }
+
+    /// What a recording [`Actions`] saw.
+    struct Recorded {
+        launched: Rc<RefCell<Vec<Vec<String>>>>,
+        opened: Rc<RefCell<Vec<String>>>,
     }
 
     /// A config naming this tab's socket, built by hand — nothing here reads
@@ -2311,6 +2966,472 @@ mod gtk_tests {
         pump();
         assert!(state.split.is_collapsed(), "narrow is one pane at a time");
         dismiss(&narrow);
+    }
+
+    // ── the hive's own strings are text, never markup ───────────────────────
+
+    /// **Nothing off the wire is parsed as Pango markup.** A bare `&` — "R&D",
+    /// any URL with a query string — makes Pango fail the whole label and
+    /// render it blank, and a well-formed `<span …>` would be an injection
+    /// channel from text the *agent itself* writes into the settings app's
+    /// chrome (#1147 review, HIGH 1).
+    ///
+    /// Both halves of the rule are asserted: the mechanism (`use-markup` is
+    /// off on every row this file builds, which is what stops the parse) and
+    /// the outcome (the string on the row is the hive's, verbatim). The
+    /// mechanism assertion is the load-bearing one — the getters return what
+    /// was set either way, so only `uses_markup` can tell a rendered label
+    /// from a blank one.
+    ///
+    /// Mutations (run, verified red): drop `.use_markup(false)` from
+    /// `build_agent_row` (the sidebar assertion reds), from the fact rows (the
+    /// fact assertion reds), from `link_row` (the link assertion reds), from
+    /// the placeholder row (its assertion reds), and drop the
+    /// `markup_escape_text` in `set_placeholder` (the status-page assertion
+    /// reds).
+    #[gtk::test]
+    fn wire_text_is_never_parsed_as_markup() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        let hostile = "R&D <b>done</b>";
+        on_status(
+            &state,
+            &Ok(Response {
+                version: HOST_SOCK_VERSION,
+                ok: true,
+                agent_statuses: Some(vec![AgentStatusRow {
+                    status_text: Some(hostile.to_owned()),
+                    url: Some("https://hive.example/a/argus?tab=turns&full=1".to_owned()),
+                    ..row("argus")
+                }]),
+                ..Response::default()
+            }),
+        );
+        pump();
+
+        let sidebar = state.by_name.borrow()["argus"].row.clone();
+        assert!(
+            !sidebar.uses_markup(),
+            "the sidebar row parses the hive's text as markup"
+        );
+        assert_eq!(sidebar.subtitle().as_deref(), Some(hostile));
+
+        assert!(
+            !state.detail.facts[0].uses_markup(),
+            "the fact rows parse the hive's text as markup"
+        );
+        assert_eq!(fact_values(&state)[0], hostile);
+
+        assert!(
+            !state.detail.agent_page.uses_markup(),
+            "the link rows parse the hive's URL as markup"
+        );
+        assert!(!state.detail.config_repo.uses_markup());
+        assert_eq!(
+            state.detail.agent_page.subtitle().as_deref(),
+            Some("https://hive.example/a/argus?tab=turns&full=1"),
+            "the query string's & survived"
+        );
+
+        // …and the one surface with no `use-markup` switch: escaped instead.
+        on_status(
+            &state,
+            &Err(HiveError::Unreachable {
+                reason: hostile.to_owned(),
+            }),
+        );
+        pump();
+        let expected = format!("{hostile} (/run/test/host.sock)");
+        assert_eq!(
+            state.detail.empty.description().unwrap_or_default().as_str(),
+            glib::markup_escape_text(&expected).as_str(),
+            "the status page's description is not escaped"
+        );
+        let placeholder = state.rows.borrow()[0]
+            .clone()
+            .downcast::<adw::ActionRow>()
+            .expect("the placeholder is an ActionRow");
+        assert!(!placeholder.uses_markup());
+        assert_eq!(placeholder.subtitle().as_deref(), Some(expected.as_str()));
+        dismiss(&window);
+    }
+
+    // ── a reorder reaches the screen ────────────────────────────────────────
+
+    /// A poll whose roster is the **same set in a different order** must
+    /// reorder the rows on screen — without rebuilding them and without moving
+    /// the selection.
+    ///
+    /// [`super::same_agent_set`] is set equality by design, so the in-place
+    /// branch runs; before #1147's review (its MEDIUM 5) that branch rewrote
+    /// each row's text by name and never touched the list's child order, so
+    /// the sidebar kept the order of the poll that last changed *membership*
+    /// — and the card, which re-renders, would disagree the moment hyperhive
+    /// shuffled its answer.
+    ///
+    /// Mutation (run, verified red): delete the `reorder_rows` call from
+    /// `apply`'s same-set branch and the second `row_titles` assertion reds
+    /// with the reviewer's own left/right (`["abe","mid","zed"]` on screen vs.
+    /// `["zed","abe","mid"]` asked for).
+    #[gtk::test]
+    fn a_reorder_reaches_the_screen_without_rebuilding_a_row() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        apply(&state, &["abe", "mid", "zed"]);
+        assert_eq!(row_titles(&state), ["abe", "mid", "zed"]);
+
+        // Select the middle one, so the reorder has a selection to preserve.
+        let mid = state.by_name.borrow()["mid"].row.clone();
+        state
+            .list
+            .select_row(Some(mid.upcast_ref::<gtk::ListBoxRow>()));
+        pump();
+        let abe = state.by_name.borrow()["abe"].row.clone();
+
+        apply(&state, &["zed", "abe", "mid"]);
+        assert_eq!(
+            row_titles(&state),
+            ["zed", "abe", "mid"],
+            "the sidebar kept the previous poll's order"
+        );
+        assert!(
+            state.by_name.borrow()["abe"].row == abe,
+            "a reorder rebuilt a row instead of moving it"
+        );
+        assert_eq!(
+            state.selected.borrow().as_deref(),
+            Some("mid"),
+            "the reorder moved the selection"
+        );
+        assert!(
+            state
+                .list
+                .selected_row()
+                .is_some_and(|r| &r == mid.upcast_ref::<gtk::ListBoxRow>()),
+            "the selected row on screen is not the selected agent"
+        );
+        dismiss(&window);
+    }
+
+    // ── which surface a click opens ─────────────────────────────────────────
+
+    /// The route, end to end through the row the operator actually clicks:
+    /// the companion window when it is installed — **with no `url` on the
+    /// wire**, which is every agent on the hyperhive revision in the tree —
+    /// and the browser only when it is not.
+    ///
+    /// Mutations (run, verified red): invert `open_agent_page`'s
+    /// `installed` branch (both halves red); gate `route_for`'s `Window` arm
+    /// on `url.is_some()` (the first half reds, and so does the sensitivity
+    /// assertion — HIGH 3's own case).
+    #[gtk::test]
+    fn the_probe_decides_which_surface_a_click_opens() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        let seen = record(&state, Ok(()));
+
+        *state.probe.borrow_mut() = agent_window::Probe::fixed(true);
+        apply(&state, &["argus"]);
+        assert!(
+            state.detail.agent_page.is_sensitive(),
+            "the companion window cannot be opened when the hive publishes no url"
+        );
+        assert_eq!(
+            state.detail.agent_page.subtitle().as_deref(),
+            Some(ABSENT),
+            "an absent url still reads as absent"
+        );
+        adw::prelude::ActionRowExt::activate(&state.detail.agent_page);
+        pump();
+        assert_eq!(
+            seen.launched.borrow().as_slice(),
+            [vec![
+                "trollshell-agent-window".to_owned(),
+                "--agent".to_owned(),
+                "argus".to_owned(),
+            ]]
+        );
+        assert!(seen.opened.borrow().is_empty(), "the browser was opened too");
+
+        // No window on this desktop: the browser, and only where the hive
+        // named a destination.
+        *state.probe.borrow_mut() = agent_window::Probe::fixed(false);
+        on_status(
+            &state,
+            &Ok(Response {
+                version: HOST_SOCK_VERSION,
+                ok: true,
+                agent_statuses: Some(vec![AgentStatusRow {
+                    url: Some("https://hive.example/a/argus".to_owned()),
+                    ..row("argus")
+                }]),
+                ..Response::default()
+            }),
+        );
+        pump();
+        adw::prelude::ActionRowExt::activate(&state.detail.agent_page);
+        pump();
+        assert_eq!(
+            seen.opened.borrow().as_slice(),
+            ["https://hive.example/a/argus".to_owned()]
+        );
+        assert_eq!(seen.launched.borrow().len(), 1, "no second launch");
+        dismiss(&window);
+    }
+
+    /// A launch that **fails** is not silent: it toasts, it re-resolves the
+    /// probe (whose answer may be hours old, and is now known wrong), and it
+    /// falls back to the browser where the hive named one — the single case
+    /// where "one click, one destination" is already broken, because the probe
+    /// promised the binary was there (#1147 review, MEDIUM 7).
+    ///
+    /// Mutations (run, verified red): drop the `add_toast` (the overlay-child
+    /// assertion reds); drop the `open(&url)` fallback (the browser assertion
+    /// reds); drop the `*probe = Probe::path()` line (the probe assertion reds
+    /// wherever `trollshell-agent-window` is **not** on `PATH`, which is every
+    /// CI environment and this devShell — a machine with the window installed
+    /// would make that one assertion vacuous, which is why it is stated as an
+    /// equality against [`agent_window::on_path`] rather than a bare `false`).
+    #[gtk::test]
+    fn a_failed_launch_toasts_falls_back_and_reresolves_the_probe() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+        let seen = record(&state, Err("no such file or directory".to_owned()));
+        *state.probe.borrow_mut() = agent_window::Probe::fixed(true);
+
+        on_status(
+            &state,
+            &Ok(Response {
+                version: HOST_SOCK_VERSION,
+                ok: true,
+                agent_statuses: Some(vec![AgentStatusRow {
+                    url: Some("https://hive.example/a/argus".to_owned()),
+                    ..row("argus")
+                }]),
+                ..Response::default()
+            }),
+        );
+        pump();
+
+        let before = overlay_children(&state);
+        adw::prelude::ActionRowExt::activate(&state.detail.agent_page);
+        pump();
+
+        assert_eq!(seen.launched.borrow().len(), 1, "the launch was attempted");
+        assert!(
+            overlay_children(&state) > before,
+            "a failed launch raised no toast"
+        );
+        assert_eq!(
+            seen.opened.borrow().as_slice(),
+            ["https://hive.example/a/argus".to_owned()],
+            "a failed launch did not fall back to the URL the hive named"
+        );
+        assert_eq!(
+            state.probe.borrow_mut().available(),
+            agent_window::on_path(),
+            "the pinned probe survived a launch that proved it wrong"
+        );
+        dismiss(&window);
+    }
+
+    /// Every widget the overlay holds, including the toasts it is showing —
+    /// `AdwToastOverlay` exposes no accessor for its queue, so the count of
+    /// its children is the observable.
+    fn overlay_children(state: &AgentsState) -> usize {
+        let mut n = 0;
+        let mut child = state.toasts.first_child();
+        while let Some(c) = child {
+            n += 1;
+            child = c.next_sibling();
+        }
+        n
+    }
+
+    // ── the socket, driven through the tab's own poll ───────────────────────
+
+    /// The `Urls` fetch's whole **runtime** path: a real round trip lands, the
+    /// answer reaches `state.urls`, and the **Config repo** row goes live with
+    /// the hive's own forge URL.
+    ///
+    /// Before #1147's review only `detail_of`'s pure mapping was covered —
+    /// making `refresh_urls` return early immediately passed the entire suite
+    /// (its MEDIUM 4).
+    ///
+    /// Mutation (run, verified red): `return` at the top of `refresh_urls`, or
+    /// drop the `refresh_urls` call from `on_status`, and both assertions red.
+    #[gtk::test]
+    fn the_urls_answer_lights_the_config_repo_row() {
+        let forge = "https://forge.example/hive?ref=main&x=1";
+        let hive = scripted(move |_, line| {
+            let answer = if line.contains("urls") {
+                format!("{{\"version\":1,\"ok\":true,\"urls\":{{\"forge\":\"{forge}\"}}}}\n")
+            } else {
+                roster_line(&["argus"])
+            };
+            Some((Duration::ZERO, answer))
+        });
+        let (bin, state) = build_tab(hive.cfg());
+        let window = present(&bin, 900);
+
+        // One roster answer, applied the way a real poll applies it — that is
+        // what issues the `Urls` request.
+        apply(&state, &["argus"]);
+        pump_until(|| state.urls.borrow().is_some(), 10);
+
+        assert!(
+            state.urls.borrow().is_some(),
+            "the Urls answer never landed: {:?}",
+            hive.seen()
+        );
+        assert!(state.detail.config_repo.is_sensitive());
+        assert_eq!(state.detail.config_repo.subtitle().as_deref(), Some(forge));
+
+        // …and it is asked exactly once, however many good polls follow —
+        // including one that answers with no `urls` block at all would be
+        // enough to stop it (#1147 review, LOW 8).
+        let asked = hive
+            .seen()
+            .iter()
+            .filter(|l| l.contains("urls"))
+            .count();
+        apply(&state, &["argus"]);
+        apply(&state, &["argus"]);
+        pump_until(|| false, 1);
+        assert_eq!(
+            hive.seen().iter().filter(|l| l.contains("urls")).count(),
+            asked,
+            "the Urls request is repeated on later polls"
+        );
+        dismiss(&window);
+    }
+
+    /// **A slow hive must not stack round trips.** With the default 2 s
+    /// cadence against a 5 s client timeout, an unguarded poll has two or
+    /// three `AgentStatus` requests outstanding at once and they resolve in
+    /// completion order — so a timeout issued at t=0 lands after a good answer
+    /// issued at t=4 s and the roster flips to "unreachable" and back (#1147
+    /// review, HIGH 2).
+    ///
+    /// The guard makes that unrepresentable rather than merely unlikely: a
+    /// tick with a request outstanding is skipped, so there is never a second
+    /// answer to arrive out of order. Measured on the daemon's side — the
+    /// script serves each connection on its own task, so a second dial would
+    /// be *read* immediately and show up in `seen()`.
+    ///
+    /// Mutation (run, verified red): drop the `claim()` guard from `refresh`
+    /// and the request-count assertion reds (three dials, not one).
+    #[gtk::test]
+    fn a_slow_hive_never_stacks_round_trips() {
+        let hive = scripted(|n, _| {
+            if n == 0 {
+                Some((Duration::from_millis(300), roster_line(&["stale"])))
+            } else {
+                Some((Duration::ZERO, roster_line(&["fresh"])))
+            }
+        });
+        let (bin, state) = build_tab(hive.cfg());
+        let window = present(&bin, 900);
+
+        refresh(&state); // issues the slow one
+        refresh(&state); // must be skipped…
+        refresh(&state); // …and so must this
+        pump_until(|| row_titles(&state) == ["stale"], 10);
+
+        assert_eq!(
+            hive.seen().len(),
+            1,
+            "a slow hive stacked round trips: {:?}",
+            hive.seen()
+        );
+        assert_eq!(row_titles(&state), ["stale"]);
+
+        // The slot is released with the answer, so the next tick does dial —
+        // and its newer answer is the one that lands.
+        refresh(&state);
+        pump_until(|| row_titles(&state) == ["fresh"], 10);
+        assert_eq!(row_titles(&state), ["fresh"]);
+        assert_eq!(hive.seen().len(), 2);
+        dismiss(&window);
+    }
+
+    /// The poll **keeps** polling. `build_page`'s timer returns
+    /// `glib::ControlFlow::Continue`; turning that into `Break` — a tab that
+    /// asks once and then never again for the life of the window — passed the
+    /// whole suite before this test existed (#1147 review, MEDIUM 4).
+    ///
+    /// Driven against a real socket rather than a counter, because the thing
+    /// worth asserting is that the hive is *asked* again.
+    ///
+    /// Mutation (run, verified red): `glib::ControlFlow::Break` in
+    /// [`start_poll`] and this reds at one request.
+    #[gtk::test]
+    fn the_poll_keeps_asking_the_hive() {
+        let hive = scripted(|_, _| Some((Duration::ZERO, roster_line(&["argus"]))));
+        let (bin, state) = build_tab(hive.cfg());
+        let window = present(&bin, 900);
+
+        let poll = start_poll(&state, Duration::from_millis(20));
+        pump_until(|| hive.seen().len() >= 3, 10);
+        poll.remove();
+
+        assert!(
+            hive.seen().len() >= 3,
+            "the timer stopped after {} request(s)",
+            hive.seen().len()
+        );
+        dismiss(&window);
+    }
+
+    // ── geometry (#851) ─────────────────────────────────────────────────────
+
+    /// Every sidebar row is allocated **inside** the scroller that owns it, at
+    /// the bin's own 360 px floor.
+    ///
+    /// Property assertions cannot see this class of bug: #851 shipped a chip
+    /// drawn 250 px outside its `OVERFLOW_HIDDEN` bin with both of its
+    /// geometry tests green, because both asserted state rather than
+    /// allocation. This asserts the allocation.
+    ///
+    /// Mutation (run, verified red): give the sidebar a
+    /// `set_margin_start(400)` — the rows are then allocated past the
+    /// scroller's right edge and the containment assertion reds.
+    #[gtk::test]
+    fn the_sidebar_rows_are_allocated_inside_their_scroller() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 360);
+        apply(&state, &["argus", "beta", "gamma"]);
+        pump();
+
+        let scroller = state
+            .list
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .expect("the sidebar list lives in a scroller");
+        assert!(scroller.width() > 0, "the scroller was never allocated");
+
+        for name in ["argus", "beta", "gamma"] {
+            let row = state.by_name.borrow()[name].row.clone();
+            let bounds = row
+                .compute_bounds(&scroller)
+                .unwrap_or_else(|| panic!("{name}'s row has no bounds in the scroller"));
+            assert!(
+                bounds.width() > 0.0 && bounds.height() > 0.0,
+                "{name}'s row is allocated empty: {bounds:?}"
+            );
+            // The allocation is in pixels and fits an f32 exactly at any size
+            // a window has; the cast is the only way to compare it with a
+            // `graphene::Rect`.
+            #[allow(clippy::cast_precision_loss)]
+            let (w, h) = (scroller.width() as f32, scroller.height() as f32);
+            assert!(
+                bounds.x() >= -0.5
+                    && bounds.y() >= -0.5
+                    && bounds.x() + bounds.width() <= w + 0.5
+                    && bounds.y() + bounds.height() <= h + 0.5,
+                "{name}'s row is drawn outside its scroller: {bounds:?} in {w}×{h}"
+            );
+        }
+        dismiss(&window);
     }
 
     /// The tab draws no window controls of its own: it is mounted inside the

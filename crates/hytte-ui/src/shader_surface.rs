@@ -35,14 +35,17 @@
 //! synchronously, inside the render callback: there is no window in which the
 //! widget is "compiling", so nothing has to hold a previous frame across one.
 //!
-//! Both of those bounds are per **source**, and the journal one remembers the
-//! last [`WARNED_SOURCES`] of them (a one-entry latch let two broken sources
-//! alternating write a line every frame — #968's second review). The case
-//! neither bounds is a plugin that *generates* its body wrongly, producing a
-//! fresh key every frame: that writes a line and pays a compile per frame, by
-//! construction, and no cache keyed on the source can help it. Stated rather
-//! than left as "one line for as long as it keeps sending it", which stopped
-//! being the whole truth when the latch grew a bound.
+//! Both of those bounds are per **source**, and each remembers the last
+//! [`WARNED_SOURCES`]/[`FAILED_SOURCES`] of them — the same number, fed in the
+//! same order, so a source that leaves one leaves the other. A one-entry latch
+//! let two broken sources alternating write a line every frame (#968's second
+//! review) and — until #1180 item 2, which is the same defect one field over —
+//! recompile every frame too. The case neither bounds is a plugin that
+//! *generates* its body wrongly, producing a fresh key every frame: that writes
+//! a line and pays a compile per frame, by construction, and no cache keyed on
+//! the source can help it. Stated rather than left as "one line for as long as
+//! it keeps sending it", which stopped being the whole truth when the latch
+//! grew a bound.
 //!
 //! # When it repaints
 //!
@@ -425,9 +428,19 @@ struct ProgramCache<P> {
     /// The linked program, its key, and the source it was linked from. The
     /// source is kept so the hash is a fast path rather than the whole answer.
     held: Option<(u64, Arc<str>, P)>,
-    /// The key **and source** of a source that failed to build. A repeat of that
-    /// exact source is refused without touching the driver, so a broken shader
-    /// costs one compile rather than one per frame.
+    /// The keys **and sources** of the last [`FAILED_SOURCES`] sources that
+    /// failed to build, oldest first. A repeat of any of them is refused
+    /// without touching the driver, so a broken shader costs one compile
+    /// rather than one per frame.
+    ///
+    /// **A `VecDeque`, not an `Option`** (#1180 item 2). One slot bounded the
+    /// compiles only while at most one broken source was in play: two of them
+    /// alternating — a plugin cycling two views, or one whose body carries a
+    /// counter that flips — each evicted the other, so *every frame*
+    /// recompiled inside the render callback. Measured at 10 compiles for 10
+    /// alternating frames, which is the exact shape [`WARNED_SOURCES`] was
+    /// already grown from one slot to fix for the *log* (#968 second review);
+    /// the same defect was still live one field over, for the driver.
     ///
     /// The source rides along for the same reason it does in `held`: a hash is a
     /// fast path, not the whole answer. Keyed on the hash alone, a *different*
@@ -437,17 +450,33 @@ struct ProgramCache<P> {
     /// over two sources in one widget's lifetime makes that astronomically
     /// unlikely, which is why it is a one-word guard rather than a redesign, but
     /// "unlikely" is not what the doc above claims.
-    failed: Option<(u64, Arc<str>)>,
+    failed: std::collections::VecDeque<(u64, Arc<str>)>,
 }
 
 impl<P> Default for ProgramCache<P> {
     fn default() -> Self {
         Self {
             held: None,
-            failed: None,
+            failed: std::collections::VecDeque::new(),
         }
     }
 }
+
+/// How many distinct failed sources a [`ProgramCache`] refuses without asking
+/// the driver.
+///
+/// Deliberately the same number as [`WARNED_SOURCES`], and deliberately fed
+/// in the same order: a source evicted from one is evicted from the other, so
+/// "a recompile is reported" stays true — a key that leaves this latch and is
+/// therefore handed back to the driver has also left the journal latch and
+/// gets its line. Two different bounds would let a source be silently
+/// recompiled forever, or reported without being retried.
+///
+/// Not unbounded, for [`WARNED_SOURCES`]' reason: a plugin that *generates* a
+/// broken body produces a fresh key every frame, and remembering them all
+/// would be a leak keyed by the plugin's own bug. Such a plugin recompiles
+/// per frame by construction, which no source-keyed cache can help.
+const FAILED_SOURCES: usize = WARNED_SOURCES;
 
 impl<P> ProgramCache<P> {
     /// The program for `fragment`, building it with `build` if this is a source
@@ -485,8 +514,8 @@ impl<P> ProgramCache<P> {
         }
         if self
             .failed
-            .as_ref()
-            .is_some_and(|(failed_key, source)| same(failed_key, source))
+            .iter()
+            .any(|(failed_key, source)| same(failed_key, source))
         {
             return Ok(None);
         }
@@ -495,12 +524,23 @@ impl<P> ProgramCache<P> {
         self.held = None;
         match build(fragment) {
             Ok(program) => {
-                self.failed = None;
+                // **A good build does not forget the bad ones** (#1180 item
+                // 2). It used to clear the whole latch, which is what made a
+                // plugin alternating a working view with a broken one
+                // recompile the broken one every time it came back. Compiling
+                // the same assembled source in the same context is
+                // deterministic, so a remembered refusal can only fail the
+                // same way; [`FAILED_SOURCES`] eviction is what gives one a
+                // second chance, and it applies to the journal latch at the
+                // same moment.
                 let held = self.held.insert((key, Arc::clone(fragment), program));
                 Ok(Some(&held.2))
             }
             Err(error) => {
-                self.failed = Some((key, Arc::clone(fragment)));
+                if self.failed.len() >= FAILED_SOURCES {
+                    self.failed.pop_front();
+                }
+                self.failed.push_back((key, Arc::clone(fragment)));
                 Err(Failure { error, key })
             }
         }
@@ -1469,8 +1509,10 @@ mod tests {
     ///
     /// **A → good B → A stays silent**, and that is the stated rule rather than
     /// an accident: a successful compile never reaches the latch, so A is still
-    /// remembered when it comes back. It was already reported, and the *compile*
-    /// is retried either way (`ensure` clears `failed` on the good build).
+    /// remembered when it comes back. It was already reported — and since
+    /// #1180 item 2 it is not recompiled either, because a good build no
+    /// longer clears `failed` (it used to, which is precisely what made the
+    /// alternating case pay a compile per frame).
     ///
     /// **Falsified** by making [`WarnLatch::claim`] a one-way bool (`if
     /// !self.said.is_empty() { return false }`): the "SECOND broken source"
@@ -1513,18 +1555,26 @@ mod tests {
         );
     }
 
-    /// **M2 residual (#968 second review).** Two broken sources **alternating**
-    /// cost two journal lines in total, not one per frame.
+    /// **M2 residual (#968 second review), and #1180 item 2.** Two broken
+    /// sources **alternating** cost two journal lines *and two compiles* in
+    /// total, not one of each per frame.
     ///
     /// A one-entry MRU bounded the log only while at most one broken source was
     /// in play: alternation evicted the other key every frame, so every frame
     /// wrote a line — measured at 10 for 10 frames. The bound is what the latch
     /// is *for*, so it has to hold under the case a one-slot cache breaks on.
     ///
-    /// **Falsified** by shrinking [`WARNED_SOURCES`] to `1`: the first count is
-    /// 10.
+    /// The **compile** count is #1180's one-line addition, and it failed on
+    /// the day it was written: #968 fixed the log's one-slot latch and left
+    /// `ProgramCache::failed` a one-slot `Option`, so the same alternation
+    /// that used to write 10 lines still handed the driver 10 compiles,
+    /// synchronously, inside the render callback. Both numbers now come from
+    /// the same bound ([`FAILED_SOURCES`] is [`WARNED_SOURCES`]).
+    ///
+    /// **Falsified** by shrinking [`WARNED_SOURCES`] to `1`: the line count is
+    /// 10 and so is the compile count.
     #[test]
-    fn two_broken_sources_alternating_cost_two_lines() {
+    fn two_broken_sources_alternating_cost_two_lines_and_two_compiles() {
         const A: &str = "void main() { fragColourA = u_fg; }";
         const B: &str = "void main() { fragColourB = u_fg; }";
 
@@ -1540,6 +1590,12 @@ mod tests {
             }
         }
         assert_eq!(lines, 2, "two distinct broken sources, two lines");
+        assert_eq!(
+            builder.builds.get(),
+            2,
+            "…and two compiles: a source the cache knows is broken must not be handed back to \
+             the driver just because another broken source arrived in between (#1180 item 2)",
+        );
 
         // The bound holds, and it is the right way round: `WARNED_SOURCES` more
         // distinct broken sources evict A, so A is reported a *second* time
@@ -1586,7 +1642,9 @@ mod tests {
         let good: Arc<str> = Arc::from("void main() { fragColor = u_fg; }");
 
         // The state a collision would leave: same key, different source.
-        cache.failed = Some((source_key(&good), Arc::from("a different source")));
+        cache
+            .failed
+            .push_back((source_key(&good), Arc::from("a different source")));
 
         assert_eq!(
             cache.ensure(&good, |s| builder.build(s)).unwrap().copied(),

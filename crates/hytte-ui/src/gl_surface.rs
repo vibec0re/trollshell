@@ -461,6 +461,73 @@ fn resources_reusable(
     built_grid == grid && built_program == program
 }
 
+/// The identity of one pipeline build: what `Resources::build` was asked for.
+///
+/// The whole input to that call, so "this exact build was already refused" is
+/// a value comparison rather than a judgement call. Compared by value rather
+/// than hashed (unlike `shader_surface`'s source key, which stands in for a
+/// megabyte of GLSL) because it is two `u32`s and a `&'static str`: there is
+/// no collision question to close.
+type BuildKey = ((u32, u32), GlProgram);
+
+/// How many distinct refused build keys a [`RefusedBuilds`] remembers.
+///
+/// Sized and argued exactly like [`WARNED_LENGTHS`] and
+/// `shader_surface::WARNED_SOURCES`, and for the same measured reason: a
+/// one-slot latch is not a bound at all when two keys alternate, since each
+/// evicts the other and every frame goes back to the driver. Eight covers
+/// alternation and any realistic set of grids one chip cycles through, in 128
+/// bytes.
+const REFUSED_BUILDS: usize = 8;
+
+/// The pipeline builds this surface has already asked the driver for and been
+/// refused (#1180 item 2).
+///
+/// **This latches the failure, not the warning.** Before it, a refused build
+/// set a one-shot `warned_build` bool: the journal went quiet, `resources`
+/// was left `None`, and `ensure_resources` therefore recompiled every pass of
+/// the pipeline — five shader pairs for the `Scope` — inside the render
+/// callback, on the GTK main thread, on every frame, for the life of the
+/// surface. Silenced, not stopped.
+///
+/// A key is retried only when it leaves the latch, which is what
+/// [`REFUSED_BUILDS`] eviction is for: a build refused, eight distinct other
+/// builds refused after it, and the first is worth asking about again (a
+/// driver that was out of memory may not be). A *successful* build does not
+/// clear it, deliberately — compiling the same GLSL for the same grid in the
+/// same context is deterministic, so retrying a remembered refusal can only
+/// fail the same way, and clearing on success is exactly what would make an
+/// alternating good/bad pair recompile per frame again.
+#[derive(Debug, Default)]
+struct RefusedBuilds {
+    /// The refused keys, oldest first. At most [`REFUSED_BUILDS`].
+    keys: std::collections::VecDeque<BuildKey>,
+}
+
+impl RefusedBuilds {
+    /// Whether `key` is a build this surface already knows will not build.
+    fn refused(&self, key: BuildKey) -> bool {
+        self.keys.contains(&key)
+    }
+
+    /// Remember `key` as refused, returning whether it is news — which is
+    /// also whether to write the journal line, so the log is bounded by the
+    /// same latch that bounds the compiles rather than by a second one that
+    /// could disagree with it.
+    fn remember(&mut self, key: BuildKey) -> bool {
+        if self.keys.contains(&key) {
+            return false;
+        }
+        // `>=` for the reason `WarnLatch::claim` spells out: `==` reads as
+        // "unbounded" the moment the bound is ever set to zero.
+        if self.keys.len() >= REFUSED_BUILDS {
+            self.keys.pop_front();
+        }
+        self.keys.push_back(key);
+        true
+    }
+}
+
 /// How many distinct refused data-strip lengths a [`WarnLatch`] remembers.
 ///
 /// Mirrors `shader_surface::WARNED_SOURCES` and its rationale: a one-entry
@@ -626,16 +693,22 @@ const PROGRAM_UNREGISTERED_REFUSED: &str = "no GL pipeline registered under that
 ///
 /// Same reasoning as [`PROGRAM_UNREGISTERED_REFUSED`]: `ensure_resources`
 /// returns `false`, `draw` gives up on that, and neither reaches a clear.
+///
+/// Says the build is **not retried**, not merely that further lines are
+/// silenced (#1180 item 2): silence was the whole bug. The old wording was
+/// accurate about the journal and wrong about the machine — the pipeline was
+/// recompiled on every frame behind it.
 const PIPELINE_BUILD_REFUSED: &str = "a GL pipeline could not be built; the surface keeps \
-    whatever it last successfully drew (nothing, before the first successful frame) (further \
-    occurrences are silenced)";
+    whatever it last successfully drew (nothing, before the first successful frame) and does \
+    not rebuild this pipeline again until its program or grid changes";
 
 mod imp {
     use super::{
-        DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
-        GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
-        PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        refuse_data_strip, resources_reusable, steps_owed,
+        BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
+        GlProgram, GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED,
+        PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, SAMPLER_NAMES, RefusedBuilds, WarnLatch,
+        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, refuse_data_strip, resources_reusable,
+        steps_owed,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -694,9 +767,12 @@ mod imp {
         last_drawn: Cell<u64>,
         /// One-shot latch for "this program is not registered".
         warned_unregistered: Cell<bool>,
-        /// One-shot latch for "a pass would not compile", so a broken shader
-        /// costs one journal line and not one per frame.
-        warned_build: Cell<bool>,
+        /// The builds this surface has been refused, keyed by `(grid,
+        /// program)` — so a broken shader costs **one compile** and one
+        /// journal line, not one of each per frame (#1180 item 2). This
+        /// replaced a bare `warned_build: Cell<bool>`, which silenced the
+        /// line and left the recompile running; see [`RefusedBuilds`].
+        refused_builds: RefCell<RefusedBuilds>,
         /// Journal latch for "the data strip's texture could not be
         /// (re)allocated" (#1023 item 3), keyed **by the refused length** via
         /// [`WarnLatch`] — not a bare bool, so a second, differently sized
@@ -893,6 +969,17 @@ mod imp {
             {
                 return true;
             }
+            // **The failure is latched, not just its warning** (#1180 item
+            // 2): a build this surface has already been refused is not
+            // handed to the driver a second time. Without this the arm
+            // below silenced the journal line and nothing else — `resources`
+            // stayed `None`, so every frame recompiled every pass of the
+            // pipeline inside the render callback, forever. See
+            // [`RefusedBuilds`] for what un-latches a key.
+            let key: BuildKey = (grid, program);
+            if self.refused_builds.borrow().refused(key) {
+                return false;
+            }
             // A grid change **or** a program change means new textures /
             // freshly compiled shaders, which means a cleared accumulator —
             // so the step count restarts with it, at `fresh_last_drawn`
@@ -905,14 +992,38 @@ mod imp {
                     true
                 }
                 Err(error) => {
-                    if !self.warned_build.replace(true) {
-                        tracing::warn!(%error, "{}", PIPELINE_BUILD_REFUSED);
+                    if self.refused_builds.borrow_mut().remember(key) {
+                        tracing::warn!(
+                            %error,
+                            program = program.0,
+                            grid = format!("{}x{}", grid.0, grid.1),
+                            "{}",
+                            PIPELINE_BUILD_REFUSED
+                        );
                     }
                     self.resources.replace(None);
                     false
                 }
             }
         }
+    }
+
+    #[cfg(all(test, feature = "system-tests"))]
+    thread_local! {
+        /// How many times [`Resources::build`] has asked the driver, on this
+        /// thread — the seam
+        /// `a_refused_pipeline_is_built_once_not_once_per_frame` reads
+        /// (#1180 item 2).
+        ///
+        /// A counter rather than a builder seam: "the compile did not
+        /// happen" has no observable trace otherwise (a refused compile
+        /// raises no `glGetError` and leaves no object), and unlike
+        /// `shader_surface`'s `ProgramCache` this call is not generic over
+        /// its builder — it allocates textures and an FBO against a live
+        /// context, so a counting stand-in would be a parallel probe
+        /// agreeing with itself. Compiled **only** into the gated test
+        /// build: nothing it touches exists in a shipped binary.
+        static BUILD_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
     }
 
     impl Resources {
@@ -923,6 +1034,8 @@ mod imp {
             program: GlProgram,
             grid: (u32, u32),
         ) -> Result<Self, hgl::Error> {
+            #[cfg(all(test, feature = "system-tests"))]
+            BUILD_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let (cols, rows) = (grid.0.max(1), grid.1.max(1));
             let mut programs = Vec::new();
             let mut compile = |pass: &GlPass| -> Result<usize, hgl::Error> {
@@ -1204,8 +1317,8 @@ mod imp {
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
         use super::{
-            Arc, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, GlUniforms,
-            PROGRAMS, RefCell, Resources, WarnLatch, gdk, hgl,
+            Arc, BUILD_ATTEMPTS, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface,
+            GlTarget, GlUniforms, PROGRAMS, RefCell, Resources, WarnLatch, gdk, hgl,
         };
         use gtk::prelude::*;
 
@@ -1489,6 +1602,82 @@ mod imp {
                  warned_data latch",
             );
         }
+
+        /// **#1180 item 2.** A pipeline the driver will not build is asked
+        /// for **once**, not once per frame.
+        ///
+        /// The shipped code latched the *warning* (`warned_build:
+        /// Cell<bool>`) and nothing else: `resources` stayed `None`, so
+        /// `ensure_resources` handed the same broken GLSL back to the driver
+        /// on every single render — five shader pairs per frame for the
+        /// `Scope`, synchronously, on the GTK main thread — with the journal
+        /// silent about it after the first line. Silenced, not stopped.
+        ///
+        /// Counting the driver asks is the only way to see this: a refused
+        /// compile raises no `glGetError` and leaves no GL object behind, so
+        /// the *absence* of a second compile has no other trace. Hence
+        /// [`BUILD_ATTEMPTS`], which exists only in this gated test build.
+        ///
+        /// The eviction half of the bound is covered hermetically by
+        /// `RefusedBuilds`' own tests in the outer module; this is the one
+        /// place the decision is wired to a real driver refusal.
+        ///
+        /// **Falsified** by deleting the `refused_builds.borrow().refused(key)`
+        /// early return in `ensure_resources`: the count goes to 10.
+        #[gtk::test]
+        fn a_refused_pipeline_is_built_once_not_once_per_frame() {
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("a_refused_pipeline_is_built_once_not_once_per_frame")
+            else {
+                return;
+            };
+
+            // A fragment stage no driver will compile.
+            const BROKEN: GlPass = GlPass {
+                vertex: VERTEX,
+                fragment: "void main() { this is not GLSL }",
+                target: GlTarget::Screen,
+                inputs: &[],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            };
+            const BROKEN_PASS: [GlPass; 1] = [BROKEN];
+
+            let pipeline = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &BROKEN_PASS,
+            };
+            let program = GlProgram("gl_surface_test.will_not_build");
+
+            let surface = GlSurface::default();
+            BUILD_ATTEMPTS.set(0);
+            for frame in 0..10 {
+                assert!(
+                    !surface.ensure_resources(&gl, &pipeline, program, (4, 4), frame),
+                    "a pipeline that will not build can never report resources ready",
+                );
+            }
+
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                1,
+                "a refused pipeline must be handed to the driver once, not once per frame \
+                 (#1180 item 2)",
+            );
+            assert!(
+                surface.refused_builds.borrow().refused(((4, 4), program)),
+                "…because the refusal itself is latched, keyed by (grid, program)",
+            );
+
+            // The key really is the whole input: the same broken program at a
+            // *different* grid is a build this surface has not been refused
+            // yet, so it is asked once more and then latched too.
+            assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 0));
+            assert_eq!(BUILD_ATTEMPTS.get(), 2, "a new grid is a new question");
+            assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 1));
+            assert_eq!(BUILD_ATTEMPTS.get(), 2, "…asked exactly once, like the first");
+        }
     }
 }
 
@@ -1556,13 +1745,72 @@ impl Default for GlSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER,
-        PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, WARNED_LENGTHS, WarnLatch,
-        abandon_gl, fit_rect, fresh_last_drawn, gl_abandoned, hgl, refuse_data_strip,
-        resources_reusable, steps_owed, warn_on_data_failure,
+        BuildKey, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue,
+        MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
+        REFUSED_BUILDS, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
+        fresh_last_drawn, gl_abandoned, hgl, refuse_data_strip, resources_reusable, steps_owed,
+        warn_on_data_failure,
     };
     use std::cell::RefCell;
     use std::sync::Arc;
+
+    /// **#1180 item 2.** The refusal latch is keyed by the **whole** build
+    /// input, and bounded — the two properties `ensure_resources` rests on.
+    ///
+    /// A one-slot latch would be no bound at all: two refused keys
+    /// alternating (a chip flapping between two grids with a shader that
+    /// will not compile at either) would each evict the other, and every
+    /// frame would go back to the driver — the same measured shape as
+    /// `shader_surface`'s `WARNED_SOURCES` residual (#968 second review).
+    ///
+    /// **Falsified** by shrinking [`REFUSED_BUILDS`] to `1`: the alternating
+    /// pair below reports both keys as news on every round, so `asked` ends
+    /// at 10 instead of 2.
+    #[test]
+    fn a_refused_build_is_remembered_by_grid_and_program_and_the_latch_is_bounded() {
+        let scope = GlProgram("preem.scope");
+        let gauge = GlProgram("preem.gauge");
+        let mut refused = RefusedBuilds::default();
+
+        assert!(!refused.refused(((4, 4), scope)), "nothing is refused yet");
+        assert!(refused.remember(((4, 4), scope)), "the first refusal is news");
+        assert!(!refused.remember(((4, 4), scope)), "…and only once");
+        assert!(refused.refused(((4, 4), scope)));
+
+        // Both halves of the key matter: a different grid and a different
+        // program are each a build this latch has not seen.
+        assert!(!refused.refused(((8, 4), scope)), "a different grid");
+        assert!(!refused.refused(((4, 4), gauge)), "a different program");
+
+        // Two keys alternating cost two driver asks in total, not one per
+        // round — the thing a one-slot latch gets wrong.
+        let mut refused = RefusedBuilds::default();
+        let mut asked = 0_u32;
+        for round in 0..10 {
+            let key: BuildKey = if round % 2 == 0 {
+                ((4, 4), scope)
+            } else {
+                ((8, 4), scope)
+            };
+            if !refused.refused(key) {
+                asked += 1;
+                refused.remember(key);
+            }
+        }
+        assert_eq!(asked, 2, "two distinct refused builds, two driver asks");
+
+        // The bound holds, and the right way round: REFUSED_BUILDS further
+        // distinct refusals evict the first, so it is asked again rather
+        // than being refused forever on a driver that may have moved on.
+        for n in 0..REFUSED_BUILDS {
+            let grid = (u32::try_from(n).unwrap_or(0) + 16, 4);
+            refused.remember((grid, scope));
+        }
+        assert!(
+            !refused.refused(((4, 4), scope)),
+            "an evicted key is asked again — the cost of a bound, and the safe direction",
+        );
+    }
 
     /// **The idempotence rule** (#893's "the draw must be idempotent"), which
     /// is otherwise untestable: CI has no GL, and a repeat render draws exactly
@@ -1968,8 +2216,8 @@ mod tests {
     /// makes eviction possible at all — with no clear-on-success anywhere in
     /// this module, eviction is the *only* path back to a second line for a
     /// length already reported. A port of
-    /// `shader_surface::two_broken_sources_alternating_cost_two_lines`, the
-    /// twin this bound shipped without a test for.
+    /// `shader_surface::two_broken_sources_alternating_cost_two_lines_and_two_compiles`,
+    /// the twin this bound shipped without a test for.
     ///
     /// `a_second_differently_sized_refused_data_strip_still_gets_its_own_line`
     /// looks like it would cover this and does not: it claims the same key

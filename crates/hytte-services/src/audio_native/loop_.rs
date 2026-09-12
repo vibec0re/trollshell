@@ -51,10 +51,19 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// on a capped ramp so a daemon restart heals automatically.
 ///
 /// Creates the command channel up front and publishes the [`Sender`] into
-/// [`COMMAND_TX`] before the thread starts running the loop. That way any
+/// [`COMMAND_TX`] before the thread starts running the loop, **parking its
+/// [`Receiver`] in the slot the first session takes from**. That way any
 /// `set_*` call from the tokio side that lands before the loop has fully
 /// connected to pipewire goes through the channel and is buffered until
 /// the receiver attaches — never silently dropped.
+///
+/// Seeding the slot is the load-bearing half, not a tidy-up. `publish_channel`
+/// hands its receiver back for a reason: dropping it here would leave the slot
+/// `None`, so the first [`session_receiver`] would publish a *second* channel
+/// and everything sent on the first would be stranded — and stranded
+/// **silently**, because `pw::channel::Sender::send` never checks for a live
+/// receiver (it writes the wakeup byte, pushes onto the queue and returns
+/// `Ok(())`), so not even `send_command`'s receiver-dropped warning could fire.
 ///
 /// **Supervised** since #1170 (the residual of #430): the reconnect loop below
 /// only ever covered `run_once` returning, and `run_once` is where every
@@ -77,20 +86,28 @@ pub(super) fn spawn_mainloop(handles: PipewireHandles) {
         tracing::warn!("audio_native: spawn_mainloop called twice; ignoring second start");
         return;
     }
-    publish_channel();
-
-    // The `pw::channel::Receiver` is `!Sync`, and `spawn_supervised_blocking`
-    // wants an `Fn() + Send + Sync` it can re-run from a fresh blocking thread,
-    // so it rides in a mutex. It must outlive any one `run_once`: a mainloop
-    // that exits (no daemon, dbus glitch) restarts, and commands queued
-    // meanwhile have to survive. `pipewire::channel::Receiver` detaches cleanly
-    // when `AttachedReceiver` is dropped, so the next `run_once` just attaches
-    // again.
-    let rx: Mutex<Option<pw::channel::Receiver<Command>>> = Mutex::new(None);
+    let rx = initial_slot();
     spawn_supervised_blocking("pipewire", move || {
         PW_INIT.call_once(pw::init);
         run_sessions(&rx, &handles);
     });
+}
+
+/// The receiver slot a fresh [`spawn_mainloop`] starts from: a published
+/// channel whose `Receiver` is already parked for the first session to take.
+///
+/// The `pw::channel::Receiver` is `!Sync`, and `spawn_supervised_blocking`
+/// wants an `Fn() + Send + Sync` it can re-run from a fresh blocking thread, so
+/// it rides in a mutex. It must outlive any one `run_once`: a mainloop that
+/// exits (no daemon, dbus glitch) restarts, and commands queued meanwhile have
+/// to survive. `pipewire::channel::Receiver` detaches cleanly when
+/// `AttachedReceiver` is dropped, so the next `run_once` just attaches again.
+///
+/// Its own function rather than an expression inside `spawn_mainloop` so the
+/// tests can start from the state production actually starts from — the
+/// `STARTED` latch makes `spawn_mainloop` itself a once-per-process call.
+fn initial_slot() -> Mutex<Option<pw::channel::Receiver<Command>>> {
+    Mutex::new(Some(publish_channel()))
 }
 
 /// `pw_init` is process-global and refcounted; the supervisor may re-enter the
@@ -107,8 +124,9 @@ fn publish_channel() -> pw::channel::Receiver<Command> {
 /// The receiver for the next mainloop session.
 ///
 /// Normally the previous session's, parked in `slot` — that is what makes a
-/// command issued while the daemon is down arrive once it is back. It is `None`
-/// in exactly two cases: the very first session, and after a session that
+/// command issued while the daemon is down arrive once it is back. The first
+/// session's is parked there too, by [`initial_slot`], so the startup window is
+/// not a hole. It is `None` in exactly one case: after a session that
 /// **panicked**, which unwinds holding the receiver. Re-creating the channel
 /// there is what keeps a restart a real recovery rather than a mainloop whose
 /// command path is permanently dead; the commands queued on the lost channel
@@ -1058,8 +1076,14 @@ pub(super) fn send_command(cmd: Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMAND_TX, Command, SessionEnd, pw, reconnect_after, session_receiver};
+    use super::{
+        COMMAND_TX, Command, PW_INIT, SessionEnd, initial_slot, pw, reconnect_after,
+        send_command, session_receiver,
+    };
     use crate::retry;
+    use hytte_reactive::test_lock::TEST_LOCK;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
@@ -1227,5 +1251,62 @@ mod tests {
             "after a lost receiver the command path is dead for the session"
         );
         drop(rx);
+    }
+
+    /// The startup window: a command issued **before** the first session takes
+    /// its receiver must arrive on that session, not vanish into a channel
+    /// nobody holds. That is the guarantee `spawn_mainloop`'s doc makes, and it
+    /// is the one a bare `publish_channel();` there breaks — the slot would
+    /// start `None`, the first `session_receiver` would publish a *second*
+    /// channel, and everything sent in between would sit in the first one's
+    /// queue for the life of the process.
+    ///
+    /// It fails **silently** without this, which is why the assertion has to be
+    /// about delivery rather than about an error: `pw::channel::Sender::send`
+    /// never checks for a live receiver — it writes the wakeup byte, pushes onto
+    /// the queue and returns `Ok(())` — so `send_command`'s receiver-dropped
+    /// `warn!` cannot fire for this window, and a test that only asserted
+    /// `send(...).is_ok()` would stay green with the bug in place. (The two
+    /// tests above do exactly that, deliberately: they assert the channel is
+    /// *published*, which is a weaker property.)
+    ///
+    /// Attaching to a real `MainLoopRc` and iterating it once is the only way to
+    /// read a `pw::channel::Receiver`'s queue, and it needs no daemon: the
+    /// mainloop is an epoll loop and the channel is a pipe. Nothing here
+    /// connects to pipewire.
+    ///
+    /// Falsify by giving `initial_slot` the pre-fix shape — `publish_channel();`
+    /// then `Mutex::new(None)`: nothing is delivered.
+    #[test]
+    fn a_command_sent_before_the_first_session_is_delivered() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        PW_INIT.call_once(pw::init);
+
+        // Production's starting state, then the tokio side setting mute while
+        // the blocking thread is still on its way up.
+        let slot = initial_slot();
+        send_command(Command::SetSinkMute {
+            name: "probe".into(),
+            mute: true,
+        });
+
+        let rx = session_receiver(&slot);
+        let mainloop = pw::main_loop::MainLoopRc::new(None).expect("a mainloop needs no daemon");
+        let seen: Rc<RefCell<Vec<Command>>> = Rc::new(RefCell::new(Vec::new()));
+        let attached = rx.attach(mainloop.loop_(), {
+            let seen = Rc::clone(&seen);
+            move |cmd| seen.borrow_mut().push(cmd)
+        });
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(500)));
+
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "a command issued before the first session was lost: {:?}",
+            seen.borrow()
+        );
+        drop(attached);
     }
 }

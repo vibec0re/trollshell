@@ -4986,6 +4986,263 @@ fn gauge_renders_at_parity_with_the_kit_before_and_after_a_swing() {
     );
 }
 
+// ── the `DotMatrix` GL arm (#1144) ───────────────────────────────────────────
+//
+// The third kind on the seam, and the last until Annika says otherwise (#865:
+// "lets pause after those"). The same shell-side contracts the `Scope` and the
+// `Gauge` have above: which arm a build takes, what node it emits, what a
+// failed context does about it — plus one of its own, since it is the first GL
+// arm whose per-instance GPU state is a *buffer* rather than a number.
+
+/// A `DotMatrix` widget at a known geometry, for the tests below.
+fn gl_dot_matrix_widget(text: &str) -> vocab::PreemWidget {
+    vocab::PreemWidget::DotMatrix {
+        config: vocab::DotMatrixConfig {
+            style: vocab::StyleRef::new(vocab::StyleName::Crt),
+            dot_px: 4,
+        },
+        state: vocab::DotMatrixState {
+            text: text.to_owned(),
+        },
+    }
+}
+
+/// **The kill switch reaches the dot matrix too**, and it restores the kit's
+/// own bytes exactly — the mirror of
+/// `the_cpu_arm_still_emits_the_kits_own_gauge_bytes_as_a_pixels_node`.
+///
+/// The whole preem suite runs on the CPU arm by default (`preem_gl`'s
+/// `TEST_ARM`), which is why every other dot-matrix parity assertion in this
+/// file keeps measuring the kit; this one pins the *node kind* as well.
+///
+/// **Falsified** by dropping the `preem_gl::arm() == Arm::Gl` guard from
+/// `build`'s dot-matrix arm: the first assertion reports a `GlSurface`.
+#[test]
+fn the_cpu_arm_still_emits_the_kits_own_dot_matrix_bytes_as_a_pixels_node() {
+    let _ink = preem_ink_lock();
+    let key = Scope::detached("dot-matrix-kill-switch-cpu");
+    let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
+
+    assert!(
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::Pixels { .. }
+        ),
+        "with the kill switch on, a DotMatrix is a raster surface",
+    );
+    assert_eq!(
+        mapped_pixels(&key, &node),
+        kit_pixels(
+            &kit::DotMatrix::new(kit::DisplayStyle::Crt)
+                .dot_px(4)
+                .render("PREEM")
+        ),
+        "the CPU arm is the kit, byte for byte",
+    );
+}
+
+/// The GL arm emits a `GlSurface` the CPU arm would have sized **identically**,
+/// naming the dot matrix's own pipeline, carrying the glyph strip, and counting
+/// no steps.
+///
+/// The size agreement is the layout argument the other two kinds make: a
+/// kill-switch flip is a node-kind change, so it rebuilds the widget, and a
+/// rebuild that also resized would reflow the whole card.
+///
+/// Unlike the gauge, the grid here is trivially native — there is no `scale` on
+/// this widget, the dot pitch is its size knob (#1091) — so what this pins
+/// instead is the **strip**: five texels per character, which is what the
+/// shader indexes by, and `None` would draw an empty display.
+///
+/// **Falsified** by handing `dot_matrix_surface` an unencoded line (the strip
+/// length assertion), or by pointing the grid at anything but the buffer.
+#[test]
+fn the_gl_dot_matrix_emits_its_own_pipeline_with_the_glyph_strip() {
+    let _ink = preem_ink_lock();
+    let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
+
+    let cpu = Scope::detached("dot-matrix-gl-size-cpu");
+    let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
+
+    super::preem_gl::with_gl_arm(|| {
+        let gl = Scope::detached("dot-matrix-gl-size-gl");
+        let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::DOT_MATRIX);
+        assert_eq!(
+            (gl_w, gl_h),
+            (cpu_w, cpu_h),
+            "same natural size on both arms",
+        );
+        // `2*pad + n*6*dot - dot` by `9*dot`, at five characters and pitch 4.
+        assert_eq!((gl_w, gl_h), (124, 36));
+        assert_eq!(
+            uniforms.grid,
+            (124, 36),
+            "the offscreen passes run at the buffer the kit would have filled",
+        );
+        assert_eq!(
+            uniforms.step_seq, 0,
+            "a dot matrix carries no cross-frame GPU state at all",
+        );
+        assert_eq!(
+            uniforms.data.as_ref().map(|strip| strip.len()),
+            Some(5 * 5),
+            "one texel per glyph column of every character",
+        );
+    });
+}
+
+/// **The glyph strip survives a cache drop** — a re-tint re-runs the mapping,
+/// and the line is not walked again.
+///
+/// This is the property the `Glyphs` field exists for and the only one that can
+/// distinguish it from encoding inside `gl_surface`: `invalidate_cached_frames`
+/// drops every cached surface (that is what #885's live re-tint does), so the
+/// uniform bag is genuinely rebuilt — and the strip inside it must be the same
+/// allocation, not an equal one.
+///
+/// **Falsified** by calling `preem_gl::encode_glyphs` from
+/// `Renderer::gl_surface` instead of cloning the field: the `ptr_eq` goes red
+/// while every other assertion in this file stays green.
+#[test]
+fn the_glyph_strip_is_shared_across_mapping_passes() {
+    let _ink = preem_ink_lock();
+    let node = preem_node(Some("dm"), gl_dot_matrix_widget("88:88"));
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("dot-matrix-strip-sharing");
+        let (_, _, first) = mapped_gl_for(&key, &node, super::preem_gl::DOT_MATRIX);
+        preem_render::invalidate_cached_frames();
+        let (_, _, second) = mapped_gl_for(&key, &node, super::preem_gl::DOT_MATRIX);
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the premise: the cache really was dropped, so this is a fresh bag",
+        );
+        let (Some(before), Some(after)) = (first.data.as_ref(), second.data.as_ref()) else {
+            panic!("both passes carry a strip");
+        };
+        assert!(
+            Arc::ptr_eq(before, after),
+            "the line is encoded on a state change, not on a mapping pass",
+        );
+    });
+}
+
+/// …and a **state change** does re-encode it, to the new line.
+///
+/// The other half of the contract above: sharing that outlived a text change
+/// would freeze the display on its first message.
+///
+/// **Falsified** by dropping the `DotMatrixGl` arm from `Renderer::update`,
+/// which the catch-all would then swallow silently.
+#[test]
+fn a_new_line_re_encodes_the_glyph_strip() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("dot-matrix-strip-update");
+        let (_, _, first) = mapped_gl_for(
+            &key,
+            &preem_node(Some("dm"), gl_dot_matrix_widget("AA")),
+            super::preem_gl::DOT_MATRIX,
+        );
+        let (_, _, second) = mapped_gl_for(
+            &key,
+            &preem_node(Some("dm"), gl_dot_matrix_widget("AB")),
+            super::preem_gl::DOT_MATRIX,
+        );
+        let (Some(before), Some(after)) = (first.data.as_ref(), second.data.as_ref()) else {
+            panic!("both passes carry a strip");
+        };
+        assert_ne!(
+            before.as_ref(),
+            after.as_ref(),
+            "a new message reaches the shader",
+        );
+        assert_eq!(
+            after.as_ref(),
+            super::preem_gl::encode_glyphs("AB")
+                .strip
+                .expect("a non-empty line carries a strip")
+                .as_ref(),
+            "…and it is the new line, encoded the one way",
+        );
+        // Both builds went through `update`, not a rebuild: the config never
+        // moved, so the instance is the same one.
+        assert_eq!(
+            preem_render::probe(&key, Some("dm")).expect("the instance exists"),
+            (1, 2),
+            "one build, two applies",
+        );
+    });
+}
+
+/// A `DotMatrix` whose GL context fails is rebuilt onto the kit **by the hook**,
+/// without waiting for a mapping pass.
+///
+/// This kind is the strongest case for the hook of the three: a gauge at least
+/// animates while its needle swings, and a scope while its trail fades, but a
+/// dot matrix **never** animates — `animates()` is a constant `false` — so the
+/// clock is parked from the moment it is built and `apply`'s `gl_lost` rebuild
+/// is never re-entered. Without the hook the chip stays blank until the plugin
+/// sends a new line, which a static readout may never do.
+///
+/// **Falsified** by making `Renderer::is_gl` answer `false` for `DotMatrixGl`
+/// (the `builds` assertion goes red — the hook walks past the instance), or by
+/// dropping the `rebuild_gl_renderers_on_cpu()` call from `preem_gl::install`'s
+/// hook.
+#[test]
+fn a_gl_dot_matrix_falls_back_without_waiting_for_a_frame_that_never_comes() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::install();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("dot-matrix-context-lost");
+        let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
+
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
+            "the GL arm is chosen while a context is still possible",
+        );
+        // The premise, and it is stronger here than on either other kind.
+        assert!(
+            !preem_render::any_animating_in(std::slice::from_ref(&key)),
+            "a dot matrix never animates, so nothing will ever re-map it",
+        );
+        let before = preem_render::probe(&key, Some("dm")).expect("the instance exists");
+
+        hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+        let after = preem_render::probe(&key, Some("dm")).expect("the instance survives");
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "the failure hook rebuilt the renderer itself, not the next re-map",
+        );
+        assert_eq!(
+            after.1, before.1,
+            "…and did it without an apply, so no widget state was touched",
+        );
+
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
+            "a lost context drops the display to the raster arm",
+        );
+        assert_eq!(
+            mapped_pixels(&key, &node),
+            kit_pixels(
+                &kit::DotMatrix::new(kit::DisplayStyle::Crt)
+                    .dot_px(4)
+                    .render("PREEM")
+            ),
+            "and what it draws is the kit's own frame, byte for byte",
+        );
+    });
+}
+
 /// Visual parity, `FlipBoard`, at the text's arrival and after one advance.
 #[test]
 fn flip_board_renders_at_parity_with_the_kit_before_and_after_a_flip() {

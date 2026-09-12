@@ -213,21 +213,56 @@ pub(crate) enum Kind {
     /// `preem.gauge` (#1143) — pinned bit-exact too, since #1148's review; no
     /// peak-row check, which is a beam statistic.
     Gauge,
+    /// `preem.dot_matrix` (#1144) — **pinned bit-exact**, like the scope, and
+    /// for the scope's reason rather than in spite of Annika's.
+    ///
+    /// Her word on #865 is about **glass**, and the ceiling is what carries it:
+    /// a real driver only ever has to clear mean 2 / p99 8 / max 32, and
+    /// nothing here tightens that. `TROLLSHELL_PARITY_EXACT=1` is exported in
+    /// exactly one place — `nix/checks/system-tests.nix`, inside a sandbox with
+    /// Mesa llvmpipe — so what it pins is a *CI regression detector* against
+    /// one known driver, not a design target.
+    ///
+    /// All sixteen dot-matrix cases measured **max |Δ| 0** of 255 on every
+    /// channel there, which makes the pin available; and it is worth taking
+    /// precisely because this arm's improvement is a coordinate change. At 1:1
+    /// the shader snaps its sample to the pixel centre so the continuous
+    /// falloff collapses onto the kit's integer table — a collapse that is
+    /// exact by construction and would stop being exact silently. Zero is the
+    /// only value that can say so.
+    DotMatrix,
 }
 
 impl Kind {
+    /// Every kind, for the tests that have to reason about all of them at once.
+    ///
+    /// It has to be extended by hand when a kind lands — but forgetting to is a
+    /// **compile** error rather than a silent gap, because
+    /// `every_kind_states_its_pin_and_its_beam_check` pairs this list with an
+    /// exhaustive `match` over the enum: a variant missing from here still has
+    /// to be named there, and a variant named there still has to be here for
+    /// the loop to reach it.
+    ///
+    /// `cfg(test)` because the tests are its only consumer: the shell mounts
+    /// this whole module under `cfg(test)` anyway, and the parity harness
+    /// `#[path]`-includes it *without* that gate, where an unused constant is a
+    /// `dead_code` warning rather than a signal.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Scope, Self::Gauge, Self::DotMatrix];
+
     /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
     ///
-    /// **Only what has been measured at zero** — which, since #1148's review,
-    /// is both of them. See the type docs.
+    /// **Only what has been measured at zero** — which, since #1148's review
+    /// and #1144, is all three. See the type docs.
     ///
-    /// An exhaustive `match` rather than a `matches!`, deliberately: a third
-    /// kind (#1144) must not inherit an answer by falling off the end of a
-    /// pattern. Whoever adds it has to look at their own llvmpipe numbers and
-    /// say which of the two this is, and the compiler makes them.
+    /// An exhaustive `match` rather than a `matches!`, deliberately: a fourth
+    /// kind must not inherit an answer by falling off the end of a pattern.
+    /// Whoever adds it has to look at their own llvmpipe numbers and say
+    /// whether zero is a value their arm has actually measured, and the
+    /// compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
         match self {
-            Self::Scope | Self::Gauge => true,
+            Self::Scope | Self::Gauge | Self::DotMatrix => true,
         }
     }
 
@@ -251,6 +286,7 @@ impl Kind {
         match self {
             Self::Scope => "scope",
             Self::Gauge => "gauge",
+            Self::DotMatrix => "dot_matrix",
         }
     }
 }
@@ -576,6 +612,10 @@ pub(crate) struct Stats {
     /// all three `GLArea::error()` is `None`, `context()` is `Some` and
     /// `glGetError` is clean. A `Scope` always paints a graticule, so a real
     /// frame is never uniform.
+    ///
+    /// On its own this is a statement about the GL side only. It becomes a
+    /// *verdict* in [`verdict_for`](Self::verdict_for), and only against a
+    /// reference that is not itself flat — see [`Self::reference_uniform`].
     pub(crate) uniform: bool,
     /// Every compared GL pixel is `0, 0, 0` — see [`Verdict::RendersNothing`].
     ///
@@ -584,6 +624,27 @@ pub(crate) struct Stats {
     /// nothing" is a different bug report from "the GL arm drew a flat
     /// colour", and #1070's M2 is specifically the first.
     pub(crate) all_zero: bool,
+    /// The same two questions, asked of the **kit's own frame** (#1144).
+    ///
+    /// The two guards above were written when every case's reference was
+    /// guaranteed to have structure — a `Scope` always paints a graticule, a
+    /// `Gauge` always paints an arc. #1144's dot matrix broke that assumption
+    /// honestly: an **empty** display is a bezel and nothing else, so the kit's
+    /// own frame is one flat colour, and on the OLED (whose field is `0, 0, 0`)
+    /// it is flat *black*. Measured, all four blank cases reported
+    /// `FAIL(blank)`/`FAIL(nothing)` at max |Δ| **0** — the guards firing on a
+    /// correct render.
+    ///
+    /// So the question the verdict asks is the one it always meant: *is the GL
+    /// side flat where the kit's is not*. That can only remove false positives
+    /// — a GL arm that drew nothing against a reference with any structure at
+    /// all still trips, unchanged. What it cannot detect, and now says so out
+    /// loud, is a GL arm that drew nothing for a state whose reference is
+    /// *also* flat black; there the two are indistinguishable by pixels, and
+    /// the case's siblings are what carry the detection.
+    pub(crate) reference_uniform: bool,
+    /// …and the black half of it — see [`Self::reference_uniform`].
+    pub(crate) reference_all_zero: bool,
     /// The single worst compared pixel, for the transcript: where it is, which
     /// channel, and what each arm put there.
     ///
@@ -639,10 +700,16 @@ impl Stats {
         // "Drew nothing at all" first, then "drew one flat colour": the second
         // is the general case of the first, and the first is the one #1070's
         // M2 says must never be reported as anything else.
-        if self.all_zero {
+        //
+        // Each is asked **against the reference** (#1144): the question these
+        // guards exist to answer is "is the GL side flat where the kit's is
+        // not", and a state whose kit frame is genuinely one colour — an empty
+        // dot matrix is a bezel and nothing else — is not evidence of an
+        // undrawn framebuffer. See `Stats::reference_uniform`.
+        if self.all_zero && !self.reference_all_zero {
             return Verdict::RendersNothing;
         }
-        if self.uniform {
+        if self.uniform && !self.reference_uniform {
             return Verdict::UndrawnFramebuffer;
         }
         if !self
@@ -718,6 +785,9 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
     let mut first_gl: Option<[u8; 3]> = None;
     let mut uniform = true;
     let mut all_zero = true;
+    let mut first_ref: Option<[u8; 3]> = None;
+    let mut reference_uniform = true;
+    let mut reference_all_zero = true;
     let mut worst: Option<WorstPixel> = None;
 
     let luma = |px: [u8; 3]| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]);
@@ -736,6 +806,14 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
                 Some(_) => {}
             }
             all_zero &= g == [0, 0, 0];
+            // The same two questions of the kit's own frame — see
+            // `Stats::reference_uniform`.
+            match first_ref {
+                None => first_ref = Some(c),
+                Some(seen) if seen != c => reference_uniform = false,
+                Some(_) => {}
+            }
+            reference_all_zero &= c == [0, 0, 0];
             for (channel, bucket) in deltas.iter_mut().enumerate() {
                 let delta = g[channel].abs_diff(c[channel]);
                 bucket.push(delta);
@@ -788,6 +866,15 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
         // which is the same report as one that arrived full of them: in both
         // the GL arm put no pixels in front of the comparison.
         all_zero,
+        // The reference's own flatness, and `&& !empty` on both because these
+        // two only ever **excuse** the guards above. An empty comparison has no
+        // reference to be flat: left to the loop's initialisers it would come
+        // out `true` on both and excuse the `uniform || empty` right above it,
+        // turning "nothing at all was compared" into a `Pass`. That is the one
+        // way this change could have loosened a guard, so it is spelled out
+        // here and pinned by `an_empty_comparison_is_not_excused_by_a_flat_reference`.
+        reference_uniform: reference_uniform && !empty,
+        reference_all_zero: reference_all_zero && !empty,
         worst,
     }
 }
@@ -905,6 +992,11 @@ mod tests {
             peak_row_mismatches: 0,
             uniform: false,
             all_zero: false,
+            // A reference with structure, which is what every kind but an empty
+            // dot matrix has — so the two guards keep meaning what they meant
+            // before #1144 in every test that builds on this.
+            reference_uniform: false,
+            reference_all_zero: false,
             worst: None,
         }
     }
@@ -1062,6 +1154,60 @@ mod tests {
             "…and the numbers llvmpipe actually measures pass, over #893's mean of 2 \
              on the worst-channel statistic and clean everywhere but the edges",
         );
+        assert_eq!(
+            case_verdict(&inside_by(1.0), Kind::DotMatrix, true),
+            Verdict::NotBitExact,
+            "#1144's dot matrix measured zero under llvmpipe too, so CI pins it \
+             the same way — the ceiling is still what a real driver answers to",
+        );
+        assert_eq!(
+            case_verdict(&inside_by(5.0), Kind::DotMatrix, false),
+            Verdict::Pass,
+            "…and without the env, the ceiling alone, on every kind",
+        );
+    }
+
+    /// **Every kind states its pin and its beam check, and the compiler makes
+    /// sure a new one has to** (#1144).
+    ///
+    /// The two per-kind decisions are one-line `matches!`es, which is the
+    /// cheapest possible thing to get wrong by omission: a fourth kind added to
+    /// the enum inherits "not pinned, not a beam" silently, and if that is the
+    /// wrong answer for it nothing says so. The exhaustive `match` below is
+    /// what turns that omission into a build failure — it cannot compile
+    /// against a variant it does not name, and [`Kind::ALL`] cannot loop over a
+    /// variant it does not carry.
+    ///
+    /// **Falsified** by flipping either arm of either `matches!`, and — the
+    /// point of it — by adding a variant to [`Kind`], which stops this file
+    /// compiling until the new kind's two answers are written down.
+    #[test]
+    fn every_kind_states_its_pin_and_its_beam_check() {
+        for kind in Kind::ALL {
+            let (pinned, beam) = match kind {
+                // Measured at zero under llvmpipe since #1078, and a trace with
+                // exactly one bright row per column.
+                Kind::Scope => (true, true),
+                // Measured at zero too (#1144, all sixteen cases), so CI pins
+                // it — but not a beam: a dot's brightest row in a column is
+                // whichever dot row wins, and they tie constantly.
+                Kind::DotMatrix => (true, false),
+                // Not a beam either, and not yet measured at zero.
+                Kind::Gauge => (false, false),
+            };
+            assert_eq!(
+                kind.pinned_exact(),
+                pinned,
+                "{}: the exact pin",
+                kind.label(),
+            );
+            assert_eq!(
+                kind.checks_peak_rows(),
+                beam,
+                "{}: the peak-row check",
+                kind.label(),
+            );
+        }
     }
 
     /// Every guard fires **ahead** of both standards: a breach is reported as a
@@ -1070,7 +1216,7 @@ mod tests {
     #[test]
     fn the_ceiling_and_the_blank_guards_come_before_the_pin() {
         let over = inside_by(CEILING_MAX + 1.0);
-        for kind in [Kind::Scope, Kind::Gauge] {
+        for kind in Kind::ALL {
             assert_eq!(
                 case_verdict(&over, &clean_regions(), kind, Sampling::OneToOne, true),
                 Verdict::OverCeiling,
@@ -1091,6 +1237,85 @@ mod tests {
                  standard behind it",
             );
         }
+    }
+
+    /// **A flat GL frame is only suspicious where the kit's frame is not**
+    /// (#1144).
+    ///
+    /// Both guards were written against kinds whose reference always has
+    /// structure. An empty dot matrix is a bezel and nothing else, so its
+    /// reference *is* one flat colour — and on the OLED, whose field is
+    /// `0, 0, 0`, flat black. Measured, all four blank cases reported
+    /// `FAIL(blank)`/`FAIL(nothing)` at max |Δ| 0: the guards firing on a
+    /// correct render.
+    ///
+    /// The four assertions below are the whole truth table, and the second and
+    /// fourth are the ones that say the change did not loosen anything: a GL
+    /// arm that drew nothing against a reference with any structure at all
+    /// still trips, exactly as it did before.
+    ///
+    /// **Falsified** by dropping either `&& !self.reference_*` from
+    /// [`Stats::verdict_for`] (the first and third go red), or by widening
+    /// either to excuse a structured reference (the second and fourth).
+    #[test]
+    fn a_flat_gl_frame_is_excused_only_by_a_flat_reference() {
+        let flat = |gl_flat: bool, gl_black: bool, ref_flat: bool, ref_black: bool| Stats {
+            uniform: gl_flat,
+            all_zero: gl_black,
+            reference_uniform: ref_flat,
+            reference_all_zero: ref_black,
+            ..inside_by(0.0)
+        };
+        assert_eq!(
+            flat(true, false, true, false).verdict_for(Kind::DotMatrix),
+            Verdict::Pass,
+            "an empty display: one flat colour on both sides, and they agree",
+        );
+        assert_eq!(
+            flat(true, false, false, false).verdict_for(Kind::DotMatrix),
+            Verdict::UndrawnFramebuffer,
+            "…but a flat GL frame against a reference with structure still trips",
+        );
+        assert_eq!(
+            flat(true, true, true, true).verdict_for(Kind::DotMatrix),
+            Verdict::Pass,
+            "an empty OLED display, whose field is literally black",
+        );
+        assert_eq!(
+            flat(true, true, false, false).verdict_for(Kind::DotMatrix),
+            Verdict::RendersNothing,
+            "…and a GL arm that drew nothing at all still trips, unchanged",
+        );
+    }
+
+    /// An **empty** comparison is not excused by the flat-reference rule
+    /// (#1144).
+    ///
+    /// A comparison with no pixels in it reads flat *and* black on the GL side
+    /// (`uniform || empty`, and an `all_zero` no loop ever falsified), and it
+    /// has always failed as `RendersNothing`. The reference's own flatness is
+    /// initialised the same way, so left alone it would have excused both
+    /// guards and turned "nothing was compared" into a `Pass` — which is the
+    /// one way #1144's change could have loosened something.
+    ///
+    /// **Falsified** by dropping either `&& !empty` in `compare`: the verdict
+    /// becomes `Pass`.
+    #[test]
+    fn an_empty_comparison_is_not_excused_by_a_flat_reference() {
+        let stats = compare(&[], &[], Layout::for_capture((0, 0), (0, 0), 1, 1));
+        assert!(
+            stats.uniform && stats.all_zero,
+            "the premise: an empty comparison reads flat and black",
+        );
+        assert!(
+            !stats.reference_uniform && !stats.reference_all_zero,
+            "…and has no flat reference to be excused by",
+        );
+        assert_eq!(
+            stats.verdict_for(Kind::DotMatrix),
+            Verdict::RendersNothing,
+            "nothing compared is still a failure, and the same one as before",
+        );
     }
 
     /// The **peak-row** check is the scope's alone (#1143): it is a statement

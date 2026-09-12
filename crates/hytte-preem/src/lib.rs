@@ -135,6 +135,7 @@
 //! exactly as the pet already does.
 
 pub mod font;
+pub mod text;
 
 mod color_map;
 mod contrast;

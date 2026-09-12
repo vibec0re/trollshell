@@ -45,6 +45,12 @@ pub use unix::{
     bridge_socket_path_in,
 };
 
+/// The plain-fetch `ureq::Agent` builder (#1168) — see the module docs for why
+/// it is not [`chat`]'s agent.
+pub mod http;
+/// Resolving a plugin's chat [`Provider`] from its env inputs (#1168).
+pub mod provider;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

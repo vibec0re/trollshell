@@ -223,31 +223,16 @@ pub const PLUGIN_ID: &str = "pet";
 /// explicit `$PET_LLM_URL` selects a local/self-hosted backend (e.g. a
 /// `llama-server`, which needs no key) as the base, with any `key`/`model`
 /// layered on.
+///
+/// Hoisted to [`hytte_ai_providers::provider::resolve`] (#1168) — caw had the
+/// exact same logic under the same name; this is a thin wrapper supplying the
+/// pet's own [`PLUGIN_ID`].
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
     model: Option<String>,
 ) -> Option<Provider> {
-    match url_env {
-        // Explicitly empty `$PET_LLM_URL` → model disabled (canned-only pet).
-        Some("") => None,
-        // An explicit URL is a local/self-hosted backend that needs no key —
-        // keep it even keyless.
-        Some(url) => Some(Provider {
-            base_url: url.to_owned(),
-            api_key: key,
-            model,
-            user: Some(PLUGIN_ID.to_owned()),
-        }),
-        // No URL → the OpenRouter cloud default, but ONLY with a key. Keyless →
-        // `None` (canned-only): the call would just 401, so skip it (#438).
-        None => key.map(|key| Provider {
-            base_url: "https://openrouter.ai/api".to_owned(),
-            api_key: Some(key),
-            model,
-            user: Some(PLUGIN_ID.to_owned()),
-        }),
-    }
+    hytte_ai_providers::provider::resolve(url_env, key, model, PLUGIN_ID)
 }
 
 /// The brain task. Every request gets exactly one [`PetMsg::Thought`] reply;
@@ -435,7 +420,13 @@ fn event(name: &str, owner: &str, req: ThinkReq) -> String {
 /// non-empty line, quotes stripped, the model's "{name}:" self-naming tic
 /// removed, emoji dropped (tiny models ignore "no emoji"), clamped to
 /// [`MAX_LINE`] chars.
+///
+/// The codepoint tables (combining marks, dropped noise) are
+/// [`hytte_plugin::preem::text`] (#1168) — caw's paragraph-shaped `sanitize`
+/// used the exact same tables under a "kept in sync by hand" comment.
 fn sanitize(raw: &str, name: &str) -> String {
+    use hytte_plugin::preem::text::{is_bubble_noise, is_combining_mark};
+
     let line = raw
         .lines()
         .map(str::trim)
@@ -448,41 +439,17 @@ fn sanitize(raw: &str, name: &str) -> String {
         Some((head, tail)) if head.trim().to_lowercase() == name.to_lowercase() => tail.trim(),
         _ => line,
     };
-    let cleaned: String = line.chars().filter(|&c| !is_dropped(c)).collect();
+    let cleaned: String = line.chars().filter(|&c| !is_bubble_noise(c)).collect();
     let cleaned = cleaned.trim();
     let mut out: String = cleaned.chars().take(MAX_LINE).collect();
     if cleaned.chars().count() > MAX_LINE {
         // Don't strand combining marks on the cut edge.
-        while out.chars().last().is_some_and(is_combining) {
+        while out.chars().last().is_some_and(is_combining_mark) {
             out.pop();
         }
         out.push('…');
     }
     out
-}
-
-/// Common combining-mark ranges (a full grapheme segmenter would be a dep;
-/// this covers what a chat model realistically emits).
-fn is_combining(c: char) -> bool {
-    matches!(c, '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{20D0}'..='\u{20FF}')
-}
-
-/// Codepoints to drop from bubbles: emoji blocks (kaomoji glyphs sit far
-/// below them and survive) plus every double-quote lookalike — a tiny model
-/// loves opening a quote it never closes, which end-trimming can't catch.
-fn is_dropped(c: char) -> bool {
-    matches!(
-        c,
-        '\u{1F000}'..='\u{1FAFF}'
-            | '\u{2600}'..='\u{27BF}'
-            | '\u{FE0F}'
-            | '\u{200D}'
-            | '"'
-            | '\u{201c}'
-            | '\u{201d}'
-            | '\u{201e}'
-            | '\u{ff02}'
-    )
 }
 
 // ── The canned path ──────────────────────────────────────────────────────────

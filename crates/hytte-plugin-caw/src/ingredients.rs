@@ -133,12 +133,12 @@ pub(crate) fn gather() -> Ingredients {
     }
 }
 
+// Hoisted to `hytte_ai_providers::http::agent` (#1168) — this builder was
+// byte-for-byte identical to the weather/usage/departures copies bar these
+// two `Duration`s, which stay local: they're this endpoint's own patience
+// budget (see the comment above), not a spelling difference.
 fn http_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
-        .timeout_global(Some(HTTP_READ_TIMEOUT))
-        .build();
-    config.into()
+    hytte_ai_providers::http::agent(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
 }
 
 // ── The home place (shared `places.toml` subset) ─────────────────────────────

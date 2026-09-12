@@ -789,10 +789,10 @@ async fn a_burst_of_presentation_edges_inside_one_cadence_costs_one_poll() {
     .await;
 }
 
-/// **Unmapping again re-parks the poll**, and remapping resumes cleanly — not
-/// just the first map/unmap edge the test above covers.
+/// **Parking again re-parks the poll**, and resuming works cleanly — not just
+/// the first edge the test above covers.
 ///
-/// The unmap is confirmed with a **probe command** before any cadence is
+/// The park is confirmed with a **probe command** before any cadence is
 /// advanced, rather than a bare `advance` after a few `yield_now`s: under
 /// `start_paused`, `tokio::time::advance` does not guarantee that a task
 /// parked on a plain (non-timer) wakeup — here, the just-sent `false` — has
@@ -801,13 +801,25 @@ async fn a_burst_of_presentation_edges_inside_one_cadence_costs_one_poll() {
 /// exact test). `cmds.recv()` carries no `if mapped` guard, so sending a
 /// harmless command always reaches the loop and forces a reconciling poll;
 /// biased selection checks the visibility branch ahead of it every iteration,
-/// so by the time that poll lands, `mapped` is provably `false` — and with it
-/// false, `ticker.tick()` is never even polled, so nothing short of the
-/// production code being wrong could make the cadences below fire.
+/// so by the time that poll lands, `mapped` is provably `false`.
 ///
-/// Mutation (verified red): make the unmap arm a no-op (drop the `mapped =
-/// now` assignment on the `false` branch) and the "parked" assertion reds —
-/// the ticker keeps firing after the window is hidden.
+/// **A second probe closes the absence**, and this is the review's own fix
+/// (MEDIUM 1): the first shape asserted "no polls" straight after a bare
+/// `for … advance(CADENCE)` loop with nothing after it, which is five yields —
+/// nowhere near enough for a stray tick's connect/write/read round trip to
+/// reach `FakeHive::seen()`. That assertion measured scheduling latency, not
+/// parking, and it stayed **green** with the `if mapped` guard deleted from
+/// the ticker arm. The second probe forces the loop through again, so a
+/// would-be stray tick has somewhere to land before the count is read. The
+/// 50-yield settle before `after_probe` matters for the same family of
+/// reasons: the urls retry's backoff sleep auto-advances the paused clock, so
+/// an extra scheduled poll can otherwise land between the `until` and the
+/// read.
+///
+/// Mutation (verified red, this round): delete the `if mapped` guard on the
+/// ticker arm and the "parked" assertion reds with the stray
+/// `agent_status`/`pending` pairs in the message. Making the park arm a no-op
+/// (dropping `mapped = now`) reds it too.
 #[tokio::test(start_paused = true)]
 async fn unmapping_again_re_parks_the_poll_and_remapping_resumes_it() {
     let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
@@ -830,17 +842,29 @@ async fn unmapping_again_re_parks_the_poll_and_remapping_resumes_it() {
         .send(feed::set_paused(&name("stray"), false))
         .expect("the loop is listening");
     until("the probe's reconciling poll", || polls(&hive) > after_seed).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await; // let the first probe's poll settle
+    }
     let after_probe = polls(&hive);
 
     for _ in 0..5 {
         tokio::time::advance(CADENCE).await;
     }
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), false))
+        .expect("the loop is listening");
+    until("the second probe's poll", || polls(&hive) > after_probe).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(
         polls(&hive),
-        after_probe,
-        "parked: no polls while unmapped, however many cadences pass: {:?}",
+        after_probe + 1,
+        "parked: no polls of its own while suspended, however many cadences pass — only the \
+         second probe's: {:?}",
         hive.seen()
     );
+    let after_probe = after_probe + 1;
 
     visible_tx.send(true).expect("the loop is listening");
     until("the resume poll after remapping", || {

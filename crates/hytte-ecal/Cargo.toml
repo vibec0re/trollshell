@@ -27,23 +27,34 @@ tempfile.workspace = true
 # `[workspace.lints]` (see the tripwire comment there) with `unsafe_code`
 # flipped and a few FFI-only allows layered on top. Keep the `rust`/`clippy`
 # tables' shared entries (`all`, `pedantic`, `disallowed_methods`,
-# `module_name_repetitions`, `missing_errors_doc`, `missing_panics_doc`) in
+# `undocumented_unsafe_blocks`, `module_name_repetitions`,
+# `missing_errors_doc`, `missing_panics_doc`) in
 # sync with root when either changes — `checks.lints-tables` (#1179,
 # `nix/lint-lints-tables.py`) fails if they drift, and the five FFI-only allows
 # below are declared in its `EXTRA_ALLOWS`, so adding a sixth means editing
-# that script too.
+# that script too. `undocumented_unsafe_blocks` is the one entry root carries
+# that only an island can ever violate (#1195); it is mirrored here rather than
+# declared as an extra so that *deleting* it is what the check catches.
 [lints.rust]
 # Crate-level FFI requires `unsafe`; this is one of the two crates in the
 # workspace that override the global `forbid` (with `hytte-gl`). Safe
 # wrappers in `lib.rs` confine the unsafety; downstream crates stay safe.
-# Every `unsafe` block here carries a `// SAFETY:` line (#1179); the three
-# recurring premises they cite are stated once in `lib.rs`'s module doc.
+# Every `unsafe` block here carries a `// SAFETY:` line (#1179), which
+# `clippy::undocumented_unsafe_blocks` below enforces rather than trusts
+# (#1195); the three recurring premises they cite are stated once in `lib.rs`'s
+# module doc.
 unsafe_code = "allow"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 disallowed_methods = "deny"
+# Mirrored from root (#1195): an `unsafe` block with no `// SAFETY:` line above
+# it fails `cargo clippy` here (a restriction-group lint rustc itself never
+# sees — measured, `cargo check` alone stays green), so the 129 lines #1179
+# wrote are a rule the `nix flake check` clippy row enforces rather than a
+# convention a future block can quietly skip.
+undocumented_unsafe_blocks = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

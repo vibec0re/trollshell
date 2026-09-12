@@ -6,7 +6,7 @@
 //! aliases use opaque `c_void` for GObject pointers — we don't need
 //! field access, only pointer identity + the methods listed here.
 
-use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+use std::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void};
 
 /// `time_t` — POSIX calendar seconds since the Unix epoch. On every target
 /// we build for (Linux x86_64/aarch64, glibc/musl) this is a signed 64-bit
@@ -126,6 +126,20 @@ pub const I_CAL_EXDATE_PROPERTY: c_int = 35;
 /// property (value 62 in `icalderivedproperty.h`). As with EXDATE, libical
 /// surfaces one property per RDATE value, iterated the same way.
 pub const I_CAL_RDATE_PROPERTY: c_int = 62;
+
+/// `ICalRecurrenceFrequency` discriminants for the three sub-day frequencies
+/// (`icalrecurrencetype_frequency` in `icalrecur.h`, mirrored 1:1 as
+/// `ICalRecurrenceFrequency` in `i-cal-recurrence.h`: `SECONDLY = 0`,
+/// `MINUTELY = 1`, `HOURLY = 2`, then `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY`/
+/// `NO_RECURRENCE` up to 7 — these enums index an array, so libical documents
+/// the order as fixed). [`i_cal_recurrence_get_freq`]'s return compares
+/// against these to decide whether an `INTERVAL > 1` skip is safe (#1206
+/// HIGH-1): libical recovers the post-skip phase for these three from a
+/// single calendar field (`istart.hour`/`minute`/`second` — `icalrecur.c`'s
+/// `__iterator_set_start`), which is only correct when `INTERVAL == 1`.
+pub const I_CAL_SECONDLY_RECURRENCE: c_int = 0;
+pub const I_CAL_MINUTELY_RECURRENCE: c_int = 1;
+pub const I_CAL_HOURLY_RECURRENCE: c_int = 2;
 
 /// `GError *` — out-param for fallible operations. We always init it to
 /// `null` and free it via [`g_error_free`] if a call sets it.
@@ -428,6 +442,16 @@ unsafe extern "C" {
     /// [`ICalRecurrence`] (owned — unref).
     pub fn i_cal_property_get_rrule(prop: *mut ICalProperty) -> *mut ICalRecurrence;
 
+    /// The RRULE's `FREQ` as an `ICalRecurrenceFrequency` (`gint`-sized C
+    /// enum — see the [`I_CAL_HOURLY_RECURRENCE`] family). Borrows `recur`;
+    /// allocates nothing (#1206 HIGH-1).
+    pub fn i_cal_recurrence_get_freq(recur: *mut ICalRecurrence) -> c_int;
+
+    /// The RRULE's `INTERVAL` (`gshort`; libical's own default is `1` for an
+    /// RRULE that omits it — never `0`). Borrows `recur`; allocates nothing
+    /// (#1206 HIGH-1).
+    pub fn i_cal_recurrence_get_interval(recur: *mut ICalRecurrence) -> c_short;
+
     /// The EXDATE value of an EXDATE [`ICalProperty`] as a new [`ICalTime`]
     /// (owned — unref). DATE vs DATE-TIME is reflected by
     /// [`i_cal_time_is_date`] on the result, matching the component's
@@ -465,6 +489,46 @@ unsafe extern "C" {
     /// [`ICalTime`] (owned — unref). Returns a null-time
     /// ([`i_cal_time_is_null_time`]) when the series is exhausted.
     pub fn i_cal_recur_iterator_next(iter: *mut ICalRecurIterator) -> *mut ICalTime;
+
+    /// Re-anchor a freshly-created iterator so its next step yields the first
+    /// occurrence at or after `start`, without emitting the ones before it
+    /// (#1195). This is how an hourly series whose `DTSTART` is years in the
+    /// past is expanded over a 43-day window in ~1 000 steps instead of
+    /// ~100 000.
+    ///
+    /// Borrows both arguments (the iterator keeps no reference to `start`, so
+    /// the caller may release it straight after). **Returns zero on failure.**
+    /// libical's own doc string names one case ("1 if succeeded, 0 if failed,
+    /// like when the recurrence type is unsupported") but leaves the rest
+    /// open-ended; reading `icalrecur.c` directly, three things return zero:
+    /// an RRULE carrying `COUNT` (skipping would change which occurrences the
+    /// count selects — the only one of the three that returns *before*
+    /// touching the iterator's internal state); a `FREQ=YEARLY` rule whose
+    /// day-of-year expansion errors (an unsupported `BY*` combination); and a
+    /// first re-anchored instance whose year exceeds libical's compiled
+    /// `MAX_TIME_T_YEAR`. The latter two mutate the iterator's internal state
+    /// (`istart`, `occurrence_no`, the Gregorian fields `set_datetime`
+    /// writes) before answering zero, so "zero ⇒ iterate from `DTSTART` as
+    /// before" is not literally true of the iterator libical hands back for
+    /// them (#1206 MEDIUM-2) — `lib.rs`'s `skip_iterator_to_window` rebuilds a
+    /// fresh iterator on any zero return rather than trust the one it was
+    /// given.
+    ///
+    /// Separately: for the three sub-day frequencies (HOURLY/MINUTELY/
+    /// SECONDLY), a **non-zero** return is not safe to trust either once
+    /// `INTERVAL > 1` — libical recovers the post-skip phase from a single
+    /// calendar field (`istart.hour`/`minute`/`second` modulo `INTERVAL`)
+    /// rather than the elapsed interval count, which re-anchors the series
+    /// onto the wrong grid (#1206 HIGH-1). `skip_iterator_to_window` declines
+    /// to call this function at all in that case — see
+    /// [`i_cal_recurrence_get_freq`] / [`i_cal_recurrence_get_interval`].
+    ///
+    /// libical spells `start` as "a value between DTSTART and UNTIL"; a value
+    /// before `DTSTART` is outside that contract, so the caller checks.
+    pub fn i_cal_recur_iterator_set_start(
+        iter: *mut ICalRecurIterator,
+        start: *mut ICalTime,
+    ) -> c_int;
 
     /// Free a recurrence iterator created by [`i_cal_recur_iterator_new`].
     pub fn i_cal_recur_iterator_free(iter: *mut ICalRecurIterator);

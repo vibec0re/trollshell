@@ -671,11 +671,19 @@ impl Approvals {
     }
 
     /// The rows this group **tracks**, for the tests that ask the container
-    /// what became of them (#1146's review, M2). See
-    /// [`Settings::tracked_rows`] for the argument.
+    /// what became of them (#1146's review, M2). Chains the refusal row too
+    /// (#1146 re-verify, L-NEW-1) — `row_text` already reads it back, and a
+    /// tracker that only mirrored `rows` was blind to a mutation that drops
+    /// the refusal row from its own bookkeeping without removing it from the
+    /// container. See [`Settings::tracked_rows`] for the argument.
     #[cfg(all(test, feature = "system-tests"))]
     fn tracked_rows(&self) -> Vec<adw::ActionRow> {
-        self.rows.borrow().iter().map(|w| w.row.clone()).collect()
+        self.refusal
+            .borrow()
+            .iter()
+            .cloned()
+            .chain(self.rows.borrow().iter().map(|w| w.row.clone()))
+            .collect()
     }
 
     /// The button `which` names for `id`, **cloned out of the borrow**.

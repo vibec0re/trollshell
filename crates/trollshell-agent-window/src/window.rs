@@ -330,7 +330,16 @@ impl Window {
                 // does not say *which* decision failed once more than one is
                 // queued.
                 Request::Approve { id } | Request::Deny { id } => {
-                    self.approval_refusals.borrow_mut().insert(*id, reason);
+                    // Only record the reason if the row is still pending —
+                    // a refusal that arrives after the row already left the
+                    // queue (the poll pruned it first) has nothing left to
+                    // decorate, and inserting anyway would plant an orphan
+                    // entry that a later poll bringing the same id back would
+                    // read as "the decision just sent for you failed"
+                    // (#1146 re-verify, M-NEW-1).
+                    if self.pending.borrow().iter().any(|a| a.id == *id) {
+                        self.approval_refusals.borrow_mut().insert(*id, reason);
+                    }
                     // The round trip ended in a no, so the row is answerable
                     // again — that is the whole reason a refusal keeps it
                     // (#1146's review, H1).
@@ -945,6 +954,83 @@ mod gtk_tests {
         );
     }
 
+    /// **The poll that takes the row out of the queue opens the latch.**
+    ///
+    /// `in_flight`'s doc says the latch empties two ways: the id leaves the
+    /// polled queue, or a refusal arrives. Only the second used to be
+    /// tested. #1146 re-verify, M-NEW-1.
+    ///
+    /// Mutation (verified red): delete the
+    /// `in_flight.borrow_mut().retain(|id| live.contains(id))` line in the
+    /// `Update::Approvals(Ok(_))` arm and the last `assert!` reds — the
+    /// latch never reopens, so the row stays permanently unanswerable.
+    #[gtk::test]
+    fn the_latch_opens_when_the_poll_takes_the_row_out_of_the_queue() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![approval(7, "stray")])));
+        assert!(w.settings.try_press_approve_for_test(7));
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 7 })));
+
+        w.update(Update::Approvals(Ok(Vec::new()))); // it landed
+        w.update(Update::Approvals(Ok(vec![approval(7, "stray")]))); // and comes back
+
+        assert!(
+            w.settings.try_press_approve_for_test(7),
+            "the poll that took the row out of the queue must open the latch"
+        );
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 7 })));
+    }
+
+    /// **A refusal arriving after its row already left the queue leaves
+    /// nothing behind.**
+    ///
+    /// The `Update::Refused` arm used to insert into `approval_refusals`
+    /// unconditionally, never asking whether the id was still in `pending`.
+    /// The prune at `Update::Approvals` only runs on that update and only
+    /// keeps ids the fresh queue carries, so an orphan inserted after the
+    /// row left was not pruned on the empty tick (it did not exist yet) and
+    /// was kept by the tick that brought the id back — decorating a row
+    /// with a reason about a decision that was never sent for it. #1146
+    /// re-verify, M-NEW-1.
+    ///
+    /// **Fails on HEAD before the guard**; passes with the `pending`-still-
+    /// contains-the-id guard on the insert.
+    #[gtk::test]
+    fn a_refusal_that_arrives_after_its_row_left_the_queue_leaves_nothing_behind() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![approval(8, "stray")])));
+        assert!(w.settings.try_press_approve_for_test(8));
+        assert!(matches!(rx.try_recv(), Ok(Request::Approve { id: 8 })));
+
+        w.update(Update::Approvals(Ok(Vec::new()))); // the row leaves first…
+        w.update(Update::Refused {
+            // …and the "no" arrives after
+            request: Request::Approve { id: 8 },
+            reason: "agent busy".to_owned(),
+        });
+        assert!(
+            w.settings.approval_row_text().is_empty(),
+            "a refusal cannot resurrect a row: {:?}",
+            w.settings.approval_row_text()
+        );
+
+        w.update(Update::Approvals(Ok(vec![approval(8, "stray")])));
+        assert!(
+            !w.settings
+                .approval_row_text()
+                .iter()
+                .any(|r| r.contains("agent busy")),
+            "an orphaned reason must not decorate the row that comes back: {:?}",
+            w.settings.approval_row_text()
+        );
+        assert!(
+            w.settings.try_press_approve_for_test(8),
+            "the row that comes back must be answerable"
+        );
+    }
+
     /// **A rebuild takes the old approval rows out of the group**, not just
     /// out of the bookkeeping — the reviewer's test (#1146's review, M2),
     /// taken as supplied.
@@ -1021,6 +1107,52 @@ mod gtk_tests {
         assert!(
             !text[0].contains("permission denied"),
             "a queue that answers again drops the refusal state: {text:?}"
+        );
+    }
+
+    /// **A flapping hive leaves exactly one warning row in the container**,
+    /// not one per flap (#1146 re-verify, L-NEW-1).
+    ///
+    /// `Approvals::apply` removes the *previous* refusal row from `self.root`
+    /// before this call's rows go in — asserted here against the container
+    /// (`tracked_approval_rows`, which since L-NEW-1 chains the refusal row
+    /// too), not the bookkeeping alone, the same #851 shape
+    /// `Settings::tracked_rows`'s doc is written about: a snapshot taken
+    /// *before* the rebuild still holds the old row's `GObject`, so its
+    /// `parent()` answers whether the widget itself left, independent of
+    /// whatever the bookkeeping was overwritten with.
+    ///
+    /// Mutation (verified red): drop the `self.root.remove(&row)` call on the
+    /// old refusal row in `Approvals::apply` (keeping the `refusal.take()`)
+    /// and the first assertion below reds — the old row is still parented.
+    #[gtk::test]
+    fn a_flapping_hive_leaves_exactly_one_warning_row_in_the_container() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+
+        // refused…
+        w.update(Update::Approvals(Err("permission denied".to_owned())));
+        let first_refusal = w.settings.tracked_approval_rows();
+        assert_eq!(first_refusal.len(), 1);
+
+        // …ok…
+        w.update(Update::Approvals(Ok(vec![approval(1, "stray")])));
+        assert!(
+            first_refusal.iter().all(|r| r.parent().is_none()),
+            "the old warning row must leave the container when the hive answers again"
+        );
+
+        // …refused again.
+        w.update(Update::Approvals(Err("permission denied again".to_owned())));
+        let rows = w.settings.tracked_approval_rows();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a flapping hive must leave exactly one warning row tracked, not one per flap"
+        );
+        assert!(
+            rows.iter().all(|r| r.parent().is_some()),
+            "the current warning row must be in the container"
         );
     }
 

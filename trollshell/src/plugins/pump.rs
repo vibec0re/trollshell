@@ -207,9 +207,11 @@ pub(super) fn to_now_playing(player: Option<&Player>) -> NowPlaying {
 }
 
 /// Resolve libadwaita's `@accent_color` to an opaque RGBA byte quad on the GTK
-/// thread (#376). Mirrors what the shell's CSS already does for the sparkline
-/// (`.ts-sparkline { color: @accent_color; }`), but materialized in Rust so the
-/// value can be handed to out-of-process plugins that can't read GTK themselves.
+/// thread (#376). Mirrors what the CSS already does for the sparkline
+/// (`.hytte-sparkline { color: @accent_color; }` — the class moved out of the
+/// shell's `ts-*` namespace into the library's in #1180 item 7, since
+/// `hytte-ui` is what stamps it), but materialized in Rust so the value can be
+/// handed to out-of-process plugins that can't read GTK themselves.
 ///
 /// libadwaita registers `@accent_color` as a display-scope named color, so a
 /// throwaway, unrealized widget resolves it. The style-context color lookup is

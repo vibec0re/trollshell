@@ -1099,16 +1099,30 @@ mod tests {
     // a *change* of (which link, is it routable) that lands on routable.
 
     /// Carrier without a route is not the network coming up. DHCP has not
-    /// answered yet, so a resolve here reaches nothing — and, under the old
-    /// `Option::is_some` rule, this was the *only* edge the watcher ever saw on
-    /// a cold boot, with no second one when the link actually became usable.
+    /// answered yet, so a resolve here reaches nothing — and under the old
+    /// `Option::is_some` rule the appearance of that link was the *only* edge
+    /// the watcher ever saw on a cold boot, with no second one when the link
+    /// actually became usable.
+    ///
+    /// Both steps matter and only the first falsifies the old rule: a link
+    /// **appearing** at `Dormant` (`None` → `Some`) is what `is_some` fired on,
+    /// and `Dormant` → `Carrier` is what a naive "operational changed" rule
+    /// would fire on instead. Neither is the host coming online.
     #[tokio::test]
     async fn a_link_that_only_gains_carrier_is_not_an_edge() {
-        let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Dormant)));
+        let primary: Mutable<Option<Link>> = Mutable::new(None);
         let waiter = wait_for_link_edge(&primary);
         tokio::pin!(waiter);
         assert!(!fired_within(&mut waiter, SETTLE).await, "the replayed value");
 
+        // The interface shows up with carrier pending — `is_some` fired here.
+        primary.set(Some(link_in(1, "wlan0", OperationalState::Dormant)));
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "a link merely existing reported the host online"
+        );
+
+        // Carrier, still no address and no route.
         primary.set(Some(link_in(1, "wlan0", OperationalState::Carrier)));
         assert!(
             !fired_within(&mut waiter, SETTLE).await,

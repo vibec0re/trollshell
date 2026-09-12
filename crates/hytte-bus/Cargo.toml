@@ -30,9 +30,15 @@ zbus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` is what lets `call.rs`'s retry tests run under `start_paused`:
+# the loop's own sleeps walk a 250 ms → 30 s ramp, so a counting test that
+# waited them out for real would cost minutes. It resolves no new package
+# (tokio's `test-util = ["rt", "sync", "time"]`, all already on) and it is a
+# dev-dependency, so nothing shipped carries it.
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
   "time",
   "process",
+  "test-util",
 ] }

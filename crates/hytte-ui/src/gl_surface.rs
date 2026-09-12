@@ -675,6 +675,62 @@ const DATA_STRIP_REFUSED: &str = "a GL surface's data strip could not be (re)all
     frame's data upload is skipped and the strip reads as empty (u_data_len = 0) until a length \
     this driver will take arrives (further occurrences of this length are silenced)";
 
+/// Claim `latch` for `error`'s framebuffer status and log it once — the whole
+/// reporting half of a refused render target (#1180 item 3), in one function
+/// a test can drive with no GL context.
+///
+/// Sibling of [`warn_on_data_failure`], down to taking the latch as a
+/// parameter for the same reason: the only thing left at the call site is
+/// *which* latch is passed, and passing anything but the widget's own
+/// `warned_target` makes that field unread — `dead_code`, which is a
+/// `-D warnings` gate.
+fn warn_on_target_failure(latch: &RefCell<WarnLatch>, error: &hgl::Error) {
+    if latch.borrow_mut().claim(framebuffer_status_key(error)) {
+        tracing::warn!(%error, "{}", RENDER_TARGET_REFUSED);
+    }
+}
+
+/// The [`WarnLatch`] key for a refused render target: the raw
+/// `GL_FRAMEBUFFER_*` status.
+///
+/// `Framebuffer::draw_to` returns [`hgl::Error::Framebuffer`] and nothing
+/// else, so the fallback arm is unreachable today — it is `0` rather than a
+/// panic because widening that function's error type must cost a shared
+/// journal line, not a crashed shell.
+fn framebuffer_status_key(error: &hgl::Error) -> u64 {
+    match error {
+        hgl::Error::Framebuffer { status } => u64::from(*status),
+        _ => 0,
+    }
+}
+
+/// How far `last_drawn` may advance when a step replay stops early (#1180
+/// item 3).
+///
+/// `owed` is what [`steps_owed`] asked for and `done` is how many of those
+/// replays actually ran, so the surface lands on the step it really reached:
+/// all of them is `step_seq`, none of them leaves `last_drawn` where the
+/// clamp put it, and a partial replay keeps the remainder owed for the next
+/// render.
+///
+/// Pure, and separate from `draw`, for [`steps_owed`]'s reason: the arithmetic
+/// is the whole contract and CI cannot reach the arm that exercises it (a
+/// driver has to refuse a framebuffer first).
+fn last_drawn_after(step_seq: u64, owed: u64, done: u64) -> u64 {
+    step_seq.saturating_sub(owed.saturating_sub(done))
+}
+
+/// The line a refused render target writes to the journal.
+///
+/// Says what is **held**, not just what failed: the pass did not run, so the
+/// step it belongs to is not counted as drawn and the next render owes it
+/// again. Listed alongside the two early-return messages below in
+/// `neither_early_return_message_claims_the_surface_draws_nothing`, since it
+/// makes the same promise.
+const RENDER_TARGET_REFUSED: &str = "a GL pass's render target would not attach; that pass did \
+    not run, the step it belongs to is not counted as drawn, and the surface keeps whatever it \
+    last successfully drew (further occurrences of this framebuffer status are silenced)";
+
 /// The line an unregistered program name writes to the journal.
 ///
 /// Says the surface **keeps whatever it last successfully drew**, not that it
@@ -707,8 +763,8 @@ mod imp {
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED,
         PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, SAMPLER_NAMES, RefusedBuilds, WarnLatch,
-        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, refuse_data_strip, resources_reusable,
-        steps_owed,
+        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, last_drawn_after, refuse_data_strip,
+        resources_reusable, steps_owed, warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -773,6 +829,15 @@ mod imp {
         /// replaced a bare `warned_build: Cell<bool>`, which silenced the
         /// line and left the recompile running; see [`RefusedBuilds`].
         refused_builds: RefCell<RefusedBuilds>,
+        /// Journal latch for "a pass's render target would not attach"
+        /// (#1180 item 3), keyed by the raw `GL_FRAMEBUFFER_*` status the
+        /// driver reported — for [`WarnLatch`]'s usual reason: an
+        /// `INCOMPLETE_ATTACHMENT` and an `UNSUPPORTED` are different triage,
+        /// and a bare bool would let the first one silence the second for the
+        /// life of the surface. This failure used to be dropped on the floor
+        /// entirely: no log, no latch, and the accumulator's step count
+        /// advanced over the pass that never ran.
+        warned_target: RefCell<WarnLatch>,
         /// Journal latch for "the data strip's texture could not be
         /// (re)allocated" (#1023 item 3), keyed **by the refused length** via
         /// [`WarnLatch`] — not a bare bool, so a second, differently sized
@@ -933,24 +998,59 @@ mod imp {
 
             // The idempotence rule, decided by `steps_owed` — see there.
             let (steps, reset) = steps_owed(self.last_drawn.get(), state.step_seq);
-            if reset {
-                resources.clear_accumulator(&gl);
+            if reset
+                && let Err(error) = resources.clear_accumulator(&gl)
+            {
+                // Nothing was wiped, so nothing may be replayed onto it:
+                // `last_drawn` stays ahead of `step_seq` and the next render
+                // tries the wipe again. See `RENDER_TARGET_REFUSED`.
+                warn_on_target_failure(&self.warned_target, &error);
+                return;
             }
             // The steps replayed are always the **newest** `steps` of them, so
             // a surface that fell far enough behind to hit the clamp catches up
             // on what is current rather than on ancient history.
-            for back in (0..steps).rev() {
+            //
+            // **A step that did not run is not counted as drawn** (#1180 item
+            // 3). `Framebuffer::draw_to` can refuse — an incomplete
+            // framebuffer is a real, if rare, driver answer — and its `Err`
+            // used to be dropped inside `run` with no log and no latch while
+            // the ping-pong pair flipped and `last_drawn` jumped to
+            // `step_seq` regardless. The accumulator then carried a hole the
+            // surface believed it had filled, permanently: `steps_owed` never
+            // asks for a step twice. Now the replay stops at the first
+            // refusal, the pair does not flip on the step that failed, and
+            // `last_drawn` lands on the last step that really ran
+            // (`last_drawn_after`), so the next render owes the rest.
+            let mut drawn = 0_u64;
+            'steps: for back in (0..steps).rev() {
                 for (slot, pass) in pipeline.step.iter().enumerate() {
                     let program = resources.step_programs.get(slot).copied();
-                    resources.run(&gl, pass, program, &state, self.obj().as_ref(), true, back);
+                    if let Err(error) =
+                        resources.run(&gl, pass, program, &state, self.obj().as_ref(), true, back)
+                    {
+                        warn_on_target_failure(&self.warned_target, &error);
+                        break 'steps;
+                    }
                 }
                 resources.front = 1 - resources.front;
+                drawn += 1;
             }
-            self.last_drawn.set(state.step_seq);
+            self.last_drawn
+                .set(last_drawn_after(state.step_seq, steps, drawn));
 
             for (slot, pass) in pipeline.frame.iter().enumerate() {
                 let program = resources.frame_programs.get(slot).copied();
-                resources.run(&gl, pass, program, &state, self.obj().as_ref(), false, 0);
+                // A frame pass advances nothing, so there is no state to hold
+                // — but the passes are ordered (a blur reads what the pass
+                // before it wrote), so the rest of the frame is abandoned
+                // rather than drawn over a target that was never written.
+                if let Err(error) =
+                    resources.run(&gl, pass, program, &state, self.obj().as_ref(), false, 0)
+                {
+                    warn_on_target_failure(&self.warned_target, &error);
+                    break;
+                }
             }
         }
 
@@ -1080,18 +1180,30 @@ mod imp {
                 grid: (cols, rows),
                 program,
             };
-            resources.clear_accumulator(gl);
+            resources.clear_accumulator(gl)?;
             Ok(resources)
         }
 
         /// Zero both halves of the ping-pong pair — a fresh screen.
-        fn clear_accumulator(&self, gl: &hgl::Gl) {
+        ///
+        /// # Errors
+        ///
+        /// The driver's, if either half cannot be attached as a render
+        /// target. **Propagated rather than skipped** (#1180 item 3): this
+        /// used to be `if draw_to(…).is_ok()`, so a refusal left whatever
+        /// `glTexStorage2D` had put in the texture — undefined contents, not
+        /// zeroes — and every caller carried on as though the screen were
+        /// fresh. `Resources::build`'s `?` turns that into a refused build
+        /// (which is latched, so it is asked once), and `draw`'s reset arm
+        /// holds `last_drawn` so the wipe is retried instead of being
+        /// replayed onto.
+        fn clear_accumulator(&self, gl: &hgl::Gl) -> Result<(), hgl::Error> {
             for texture in &self.accumulator {
-                if self.framebuffer.draw_to(gl, texture).is_ok() {
-                    hgl::set_blend(gl, hgl::Blend::Replace);
-                    hgl::clear(gl, [0.0, 0.0, 0.0, 0.0]);
-                }
+                self.framebuffer.draw_to(gl, texture)?;
+                hgl::set_blend(gl, hgl::Blend::Replace);
+                hgl::clear(gl, [0.0, 0.0, 0.0, 0.0]);
             }
+            Ok(())
         }
 
         /// Re-upload the data strip if it is not the allocation we already
@@ -1168,6 +1280,17 @@ mod imp {
         /// decayed, say) can tell them apart. Counted **backwards** so it never
         /// grows: an absolute step index would outrun the `int` a uniform
         /// carries after a few years of continuous animation.
+        ///
+        /// # Errors
+        ///
+        /// The driver's, when the pass's offscreen target cannot be attached
+        /// to the FBO (#1180 item 3). **Only** that: every other way this
+        /// returns early — a pass with no compiled program, an undeclared aux
+        /// slot, a zero-sized fit rect — is `Ok(())`, because each of those is
+        /// "there was nothing to draw", not "the draw was refused". The
+        /// caller's state machine turns on that distinction: an `Err` is what
+        /// stops the accumulator's step count from advancing over a step that
+        /// never ran.
         #[allow(clippy::too_many_arguments)]
         fn run(
             &self,
@@ -1178,15 +1301,15 @@ mod imp {
             area: &super::GlSurface,
             stepping: bool,
             step_back: u64,
-        ) {
+        ) -> Result<(), hgl::Error> {
             let Some(program) = program.and_then(|slot| self.programs.get(slot)) else {
-                return;
+                return Ok(());
             };
             let target = match pass.target {
                 GlTarget::Accumulator => {
                     debug_assert!(stepping, "a frame pass may not target the accumulator");
                     if !stepping {
-                        return;
+                        return Ok(());
                     }
                     Some(&self.accumulator[1 - self.front])
                 }
@@ -1201,9 +1324,10 @@ mod imp {
                 GlTarget::Screen => None,
             };
             let viewport = if let Some(texture) = target {
-                if self.framebuffer.draw_to(gl, texture).is_err() {
-                    return;
-                }
+                // The one refusal that is a refusal: propagated, so the caller
+                // can hold the state this pass was supposed to advance
+                // (#1180 item 3). It used to be `if …is_err() { return; }`.
+                self.framebuffer.draw_to(gl, texture)?;
                 texture.size()
             } else {
                 // GTK renders into its own FBO so GSK can import the result, so
@@ -1230,7 +1354,8 @@ mod imp {
                 hgl::clear(gl, [0.0, 0.0, 0.0, 0.0]);
                 let (x, y, w, h) = fit_rect(alloc_w, alloc_h, self.grid.0, self.grid.1);
                 if w == 0 || h == 0 {
-                    return;
+                    // Nothing to draw into, which is not a refusal.
+                    return Ok(());
                 }
                 hgl::viewport(gl, x, y, w, h);
                 (w, h)
@@ -1281,6 +1406,7 @@ mod imp {
                 GlDraw::PerColumn => hgl::draw_quads(gl, self.grid.0),
             }
             hgl::set_blend(gl, hgl::Blend::Replace);
+            Ok(())
         }
 
         /// Bind each declared input to its `u_texN` unit.
@@ -1747,12 +1873,88 @@ mod tests {
     use super::{
         BuildKey, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue,
         MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
-        REFUSED_BUILDS, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
-        fresh_last_drawn, gl_abandoned, hgl, refuse_data_strip, resources_reusable, steps_owed,
-        warn_on_data_failure,
+        REFUSED_BUILDS, RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch,
+        abandon_gl, fit_rect, framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl,
+        last_drawn_after, refuse_data_strip, resources_reusable, steps_owed,
+        warn_on_data_failure, warn_on_target_failure,
     };
     use std::cell::RefCell;
     use std::sync::Arc;
+
+    /// **#1180 item 3.** A replay that stops early leaves the steps it did
+    /// not run still owed.
+    ///
+    /// This is the arithmetic that makes "hold the state" true. `draw` used
+    /// to set `last_drawn` to `step_seq` unconditionally, right after a loop
+    /// whose passes could each have been refused and dropped in silence — so
+    /// a step that never ran was permanently counted as drawn, because
+    /// `steps_owed` never asks for a step twice.
+    ///
+    /// **Falsified** by returning `step_seq` unconditionally (the shipped
+    /// behaviour): every assertion but the first goes red.
+    #[test]
+    fn a_step_replay_that_stops_early_still_owes_the_rest() {
+        assert_eq!(
+            last_drawn_after(10, 3, 3),
+            10,
+            "a complete replay lands on the newest step"
+        );
+        assert_eq!(
+            last_drawn_after(10, 3, 0),
+            7,
+            "a replay that ran nothing advances nothing: the three are still owed"
+        );
+        assert_eq!(
+            last_drawn_after(10, 3, 2),
+            9,
+            "…and a partial one owes exactly the remainder"
+        );
+        assert_eq!(
+            last_drawn_after(0, 0, 0),
+            0,
+            "a surface at rest owes nothing and advances nothing"
+        );
+        // The clamp case: `steps_owed` caps a surface that fell far behind, so
+        // `owed` can be smaller than `step_seq - last_drawn`. Nothing here may
+        // underflow on it.
+        assert_eq!(
+            last_drawn_after(2, MAX_STEPS_PER_RENDER, 0),
+            0,
+            "saturating, so a clamped replay cannot wrap the step count",
+        );
+    }
+
+    /// **#1180 item 3.** The refused-target latch is keyed by the framebuffer
+    /// status, so a second, *different* refusal is not swallowed by the
+    /// first — the shape #1020's MEDIUM 1 and #1023 item 1 each settled for
+    /// the latch next door.
+    ///
+    /// **Falsified** by keying [`framebuffer_status_key`] on a constant: the
+    /// second claim returns `false` and the `UNSUPPORTED` refusal is never
+    /// reported.
+    #[test]
+    fn a_second_differently_refused_render_target_still_gets_its_own_line() {
+        let latch = RefCell::new(WarnLatch::default());
+        let incomplete = hgl::Error::Framebuffer { status: 0x8CD6 };
+        let unsupported = hgl::Error::Framebuffer { status: 0x8CDD };
+
+        assert_ne!(
+            framebuffer_status_key(&incomplete),
+            framebuffer_status_key(&unsupported),
+            "two different GL_FRAMEBUFFER_* statuses are two different facts",
+        );
+
+        warn_on_target_failure(&latch, &incomplete);
+        assert_eq!(latch.borrow().said.len(), 1, "the first refusal is reported");
+        warn_on_target_failure(&latch, &incomplete);
+        assert_eq!(latch.borrow().said.len(), 1, "…once");
+        warn_on_target_failure(&latch, &unsupported);
+        assert_eq!(
+            latch.borrow().said.len(),
+            2,
+            "a different framebuffer status must get its own line, not be silenced by the first",
+        );
+    }
 
     /// **#1180 item 2.** The refusal latch is keyed by the **whole** build
     /// input, and bounded — the two properties `ensure_resources` rests on.
@@ -2175,7 +2377,11 @@ mod tests {
     /// **Falsified** by reverting either const to #1020's wording.
     #[test]
     fn neither_early_return_message_claims_the_surface_draws_nothing() {
-        for msg in [PROGRAM_UNREGISTERED_REFUSED, PIPELINE_BUILD_REFUSED] {
+        for msg in [
+            PROGRAM_UNREGISTERED_REFUSED,
+            PIPELINE_BUILD_REFUSED,
+            RENDER_TARGET_REFUSED,
+        ] {
             assert!(
                 !msg.contains("draws nothing"),
                 "an early return out of draw() leaves the last frame up, so no such message may \

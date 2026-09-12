@@ -765,6 +765,13 @@ impl Layout {
     /// monitor) while two comments described a different number again. The
     /// tests below drive this function, not a literal, which is what would have
     /// caught that.
+    ///
+    /// There is deliberately **no** supersample factor here: a supersampled
+    /// case is box-averaged onto the reference grid by [`box_downsample`]
+    /// *before* a `Layout` is built for it, so everything below this point
+    /// compares one pair of buffers of one shape, whatever the case (#1148
+    /// review, HIGH-2). #1144's first cut averaged inside [`gl_pixel`] instead
+    /// and carried its own factor here; one seam is the whole point.
     pub(crate) fn for_capture(
         alloc: (u32, u32),
         reference: (usize, usize),

@@ -279,12 +279,12 @@ craneLib.mkCargoDerivation (
       # alone. Assert the evidence instead of trusting the exit
       # code: the case list is 4 skins × (3 scope fade depths + 3
       # gauge needle positions + 1 gauge at the shipping upscale + 4
-      # dot-matrix displays), so exactly 44 cases means exactly 44
-      # `.gl.ppm` files. It was 12 until #1143 added the gauge arm,
-      # 24 until #1148's review added the `scale = 2` gauge case and
-      # 28 until #1144 added the dot matrix; bump it with the case
-      # list, in the same commit, for the reason the number is
-      # asserted at all.
+      # dot-matrix displays + 1 stretched dot matrix), so exactly 48
+      # cases means exactly 48 `.gl.ppm` files. It was 12 until #1143
+      # added the gauge arm, 24 until #1148's review added the
+      # `scale = 2` gauge case and 28 until #1144 added the dot
+      # matrix; bump it with the case list, in the same commit, for
+      # the reason the number is asserted at all.
       #
       # Nothing here needs a per-kind knob: `TROLLSHELL_PARITY_EXACT=1`
       # still means "pin what has been measured at zero", and *which*
@@ -292,12 +292,14 @@ craneLib.mkCargoDerivation (
       # (`preem_gl::parity`'s `Kind` and `Sampling`) rather than this
       # file's. All three kinds are pinned bit-exact where the two arms
       # rasterise at the same resolution; a box-averaged supersampled
-      # case is held to the supersampled standard instead — every pixel
-      # off an edge bit-identical plus a per-kind edge budget — which is
-      # the only kind of statement a supersampled comparison can meet.
+      # case — four gauge, four dot matrix — is held to the
+      # supersampled standard instead: every pixel off an edge
+      # bit-identical plus a per-kind edge budget, which is the only
+      # kind of statement such a comparison can meet. The blank-frame
+      # guards bind on every case either way.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-      if [ "$gl_ppm_count" -ne 44 ]; then
-        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 44 — a case-count regression, not a parity failure." >&2
+      if [ "$gl_ppm_count" -ne 48 ]; then
+        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 48 — a case-count regression, not a parity failure." >&2
         exit 1
       fi
     '';

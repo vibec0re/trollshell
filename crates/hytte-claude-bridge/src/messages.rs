@@ -500,9 +500,16 @@ fn api_error_message(body: &str) -> String {
 /// Deliberately the **same** shape `hytte_ai_providers::load_key("anthropic")`
 /// would produce — `$XDG_CONFIG_HOME/trollshell/anthropic.key` (falling back to
 /// `$HOME/.config/trollshell/anthropic.key`), trimmed, empty-is-unset, with an
-/// `ANTHROPIC_API_KEY` env override for testing. Mirrored rather than called
-/// because this crate deliberately links nothing else in the tree (see the
-/// crate docs); the conventions are the contract, not the linkage.
+/// `ANTHROPIC_API_KEY` env override for testing, and (#1169) the same
+/// group/other permission refusal `hytte_ai_providers::load_key` applies to
+/// every other key file. The path/env-precedence logic stays mirrored rather
+/// than called through — this crate's own load order (env override, then a
+/// path this crate resolves itself) doesn't line up with `load_key`'s
+/// `name`-keyed signature — but the permission check is the one piece with
+/// nothing crate-specific about it, so it's called, not re-derived:
+/// `hytte-ai-providers` is already a dependency (#993, for the bridge socket
+/// path constants), and stating the predicate twice is exactly how the two
+/// copies drift.
 ///
 /// One consequence worth stating: `ANTHROPIC_API_KEY` is the variable
 /// [`crate::envguard`] refuses to start on — because it would silently move the
@@ -533,6 +540,13 @@ fn config_dir() -> Option<PathBuf> {
 /// Core of [`load_key`] with the override and config dir injected, so it is
 /// unit-testable without mutating the process environment (which is `unsafe`
 /// under edition 2024, and this workspace forbids `unsafe`).
+///
+/// #1169: a key file readable or writable by group or other is refused
+/// exactly the way `hytte_ai_providers::load_key`'s twin loader refuses one,
+/// via the same [`hytte_ai_providers::check_key_file_permissions`] — before
+/// this, `anthropic.key` was the one key file in the tree the check did not
+/// reach, so a `0644` copy loaded silently while its `openrouter.key` sibling
+/// was already refused.
 fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> Option<String> {
     if let Some(v) = env_override {
         let trimmed = v.trim();
@@ -541,6 +555,14 @@ fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> O
         }
     }
     let path = config_dir?.join("trollshell").join("anthropic.key");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = hytte_ai_providers::check_key_file_permissions(&path, meta.permissions().mode())
+        {
+            eprintln!("hytte-claude-bridge: {e}");
+            return None;
+        }
+    }
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -950,9 +972,19 @@ mod tests {
 
     // ── the key ──────────────────────────────────────────────────────────
 
+    /// A tiny `chmod` wrapper so the tests below read as intent, not
+    /// `PermissionsExt` boilerplate at every call site — same helper as
+    /// `hytte-ai-providers`' own key-permission tests.
+    fn chmod(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
     /// The loader must behave exactly like `hytte_ai_providers::load_key` — env
     /// override first, then the trimmed key file, empty is unset — or the
-    /// workspace grows a third key-loading style.
+    /// workspace grows a third key-loading style. `0600` throughout: this test
+    /// is about precedence and trimming, not permissions (see
+    /// `anthropic_key_honours_the_same_permission_refusal` for that).
     #[test]
     fn key_loading_matches_the_workspace_convention() {
         let dir =
@@ -960,6 +992,7 @@ mod tests {
         let ts = dir.join("trollshell");
         std::fs::create_dir_all(&ts).expect("mkdir");
         std::fs::write(ts.join("anthropic.key"), "  sk-ant-file\n").expect("write key");
+        chmod(&ts.join("anthropic.key"), 0o600);
 
         assert_eq!(
             load_key_from(None, Some(dir.clone())).as_deref(),
@@ -977,6 +1010,7 @@ mod tests {
             "a blank override falls through to the file",
         );
         std::fs::write(ts.join("anthropic.key"), "  \n").expect("blank the key");
+        chmod(&ts.join("anthropic.key"), 0o600);
         assert!(
             load_key_from(None, Some(dir.clone())).is_none(),
             "an empty key file is unset",
@@ -986,6 +1020,44 @@ mod tests {
             load_key_from(None, Some(dir)).is_none(),
             "a missing key file is unset, not a panic",
         );
+    }
+
+    /// **The gap #1169's review found**: before this, `openrouter.key` and
+    /// `anthropic.key` were the same file shape read by two different
+    /// loaders, and only one of them checked its mode — a `0644`
+    /// `openrouter.key` was refused while an identically-loose
+    /// `anthropic.key` loaded without a word. Both must now refuse a
+    /// group/other-readable file and load a `0600` one.
+    ///
+    /// Falsification: delete the `check_key_file_permissions` call out of
+    /// `load_key_from` and the first assertion goes red — `sk-loose` loads
+    /// clean.
+    #[test]
+    fn anthropic_key_honours_the_same_permission_refusal() {
+        let dir = std::env::temp_dir().join(format!(
+            "hytte-claude-bridge-key-perm-{}",
+            std::process::id()
+        ));
+        let ts = dir.join("trollshell");
+        std::fs::create_dir_all(&ts).expect("mkdir");
+        let path = ts.join("anthropic.key");
+
+        std::fs::write(&path, "sk-loose").expect("write key");
+        chmod(&path, 0o644);
+        assert!(
+            load_key_from(None, Some(dir.clone())).is_none(),
+            "a world-readable anthropic.key must be refused, not loaded",
+        );
+
+        std::fs::write(&path, "sk-tight").expect("rewrite key");
+        chmod(&path, 0o600);
+        assert_eq!(
+            load_key_from(None, Some(dir.clone())).as_deref(),
+            Some("sk-tight"),
+            "a 0600 anthropic.key must still load",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The key must never reach a log line: `main.rs` logs the settings and

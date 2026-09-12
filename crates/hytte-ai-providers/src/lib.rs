@@ -343,7 +343,12 @@ fn config_dir() -> Option<PathBuf> {
 /// group/other read, write, *or* execute in one test, which is the same bit
 /// group `ssh-keygen`/`sshd` check. Pure and path-injected so it's testable
 /// against a real tempfile without touching the loader's I/O.
-fn check_key_file_permissions(path: &Path, mode: u32) -> Result<(), String> {
+///
+/// `pub` since #1169's review: `hytte-claude-bridge`'s own key loader
+/// (`messages.rs`'s `load_key_from`, for `anthropic.key`) already depends on
+/// this crate and calls this directly rather than re-deriving the same
+/// predicate — one rule, not two copies that can drift.
+pub fn check_key_file_permissions(path: &Path, mode: u32) -> Result<(), String> {
     let mode = mode & 0o777;
     if mode & 0o077 != 0 {
         return Err(format!(

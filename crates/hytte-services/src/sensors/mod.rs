@@ -1138,3 +1138,480 @@ pub(crate) struct MountSpec {
     /// fstype (right-half token 1) — diagnostic only.
     pub(crate) fstype: String,
 }
+
+// ── Publisher tests (#1172) ──────────────────────────────────────────────────
+//
+// The leaf parsers under `sensors/*.rs` (`compute_cpu_load`, `compute_disk_io`,
+// …) are well covered by their own modules' tests. The `apply_*` functions
+// that fold each tick's sample into a `Mutable` — the glue `poll_loop` calls —
+// had none: whether a `None` sample is silently skipped vs. warned-once,
+// whether a "tick-gated" publisher (`apply_gpu`/`apply_disk`/
+// `apply_conn_counts`) actually leaves the writer untouched off-tick, and
+// `apply_network`'s inline rate computation (the one rate calculation in this
+// module that is *not* behind an already-tested leaf function) were all
+// unexercised.
+#[cfg(test)]
+mod tests {
+    use super::{
+        CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuState, GpuVendor,
+        NetConnections, NetIo, PollState, apply_conn_counts, apply_cpu_freq, apply_cpu_load,
+        apply_cpu_temp, apply_disk, apply_disk_io, apply_gpu, apply_memory, apply_network,
+    };
+    use futures_signals::signal::Mutable;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    // ── apply_cpu_load: table test (input sample → published value) ─────────
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_cpu_load_table() {
+        struct Case {
+            name: &'static str,
+            prev: Vec<(u64, u64)>,
+            sample: Option<Vec<(u64, u64)>>,
+            want_overall: Option<f64>,
+            want_prev_after: Vec<(u64, u64)>,
+        }
+        let cases = [
+            Case {
+                name: "first sample: no prior, load reads 0",
+                prev: Vec::new(),
+                sample: Some(vec![(50, 200)]),
+                want_overall: Some(0.0),
+                want_prev_after: vec![(50, 200)],
+            },
+            Case {
+                name: "second sample: half the total delta was active",
+                prev: vec![(50, 200)],
+                sample: Some(vec![(150, 400)]),
+                // d_active=100, d_total=200 → 0.5
+                want_overall: Some(0.5),
+                want_prev_after: vec![(150, 400)],
+            },
+            Case {
+                // Two identical `/proc/stat` samples: the jiffy total did not
+                // move, so there is no interval to divide by. The leaf guards
+                // this (`proc_stat.rs`'s `d_total == 0 → 0.0`); the table is
+                // the place that *says* a stalled counter reads 0 rather than
+                // NaN or a panic.
+                name: "identical samples: d_total == 0 reads 0, not NaN",
+                prev: vec![(50, 200)],
+                sample: Some(vec![(50, 200)]),
+                want_overall: Some(0.0),
+                want_prev_after: vec![(50, 200)],
+            },
+            Case {
+                name: "read failure: writer untouched, prev untouched",
+                prev: vec![(50, 200)],
+                sample: None,
+                want_overall: None,
+                want_prev_after: vec![(50, 200)],
+            },
+        ];
+
+        for c in cases {
+            let mut state = PollState::new();
+            state.cpu_prev = c.prev;
+            let writer = Mutable::new(CpuLoad {
+                overall: -1.0,
+                per_core: Vec::new(),
+            });
+            apply_cpu_load(&mut state, c.sample, &writer, Instant::now());
+
+            if let Some(want) = c.want_overall {
+                assert_eq!(writer.get_cloned().overall, want, "{}", c.name);
+            } else {
+                assert_eq!(
+                    writer.get_cloned().overall,
+                    -1.0,
+                    "{}: a failed sample must not publish",
+                    c.name
+                );
+            }
+            assert_eq!(state.cpu_prev, c.want_prev_after, "{}", c.name);
+        }
+    }
+
+    // ── apply_cpu_freq: unconditional passthrough ────────────────────────────
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_cpu_freq_publishes_verbatim() {
+        let writer = Mutable::new(CpuFreq::default());
+        let sample = CpuFreq {
+            max_hz: 3_200_000_000.0,
+            per_core: vec![3_200_000_000.0, 1_800_000_000.0],
+            max_ceiling_hz: 4_000_000_000.0,
+        };
+        apply_cpu_freq(sample.clone(), &writer);
+        let got = writer.get_cloned();
+        assert_eq!(got.max_hz, sample.max_hz);
+        assert_eq!(got.per_core, sample.per_core);
+        assert_eq!(got.max_ceiling_hz, sample.max_ceiling_hz);
+    }
+
+    // ── apply_memory: table test ──────────────────────────────────────────────
+
+    #[test]
+    fn apply_memory_table() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(super::Memory {
+            total: 999,
+            ..Default::default()
+        });
+
+        // A successful read publishes verbatim.
+        apply_memory(
+            &mut state,
+            Some(super::Memory {
+                total: 16_000_000_000,
+                free: 4_000_000_000,
+                available: 8_000_000_000,
+                used: 8_000_000_000,
+                swap_used: 0,
+                swap_total: 2_000_000_000,
+            }),
+            &writer,
+            Instant::now(),
+        );
+        assert_eq!(writer.get_cloned().total, 16_000_000_000);
+
+        // A failed read leaves the last published value in place.
+        apply_memory(&mut state, None, &writer, Instant::now());
+        assert_eq!(
+            writer.get_cloned().total,
+            16_000_000_000,
+            "a failed read must not clobber the last-known value"
+        );
+    }
+
+    // ── apply_network: table test + the net-rate cache across two ticks ──────
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_network_table() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(NetIo::default());
+
+        // First sample for an interface: no prior entry, so the rate reads 0
+        // even though the counters are non-zero (nothing to diff against).
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 1_000, 2_000)]),
+            Instant::now(),
+            &writer,
+        );
+        let first = writer.get_cloned();
+        assert_eq!(first.interfaces.len(), 1);
+        assert_eq!(first.interfaces[0].rx_bytes_total, 1_000);
+        assert_eq!(first.interfaces[0].tx_bytes_total, 2_000);
+        assert_eq!(first.interfaces[0].rx_rate_bps, 0.0, "no prior sample yet");
+
+        // A read failure leaves the last-known snapshot in place.
+        apply_network(&mut state, None, Instant::now(), &writer);
+        assert_eq!(
+            writer.get_cloned().interfaces.len(),
+            1,
+            "unchanged on failure"
+        );
+    }
+
+    /// **The net-rate cache across two ticks, with a counter wrap.** A second
+    /// tick whose byte counter is *lower* than the first — an interface reset
+    /// or a wrapped 32-bit counter surfaced through `/proc/net/dev` — must not
+    /// underflow into a huge bogus rate (`u64::MAX`-scale). The rate
+    /// computation saturates the delta to 0 instead.
+    ///
+    /// Falsification: swap `saturating_sub` for plain `-` in `apply_network`
+    /// and this either panics (debug) or reds with an astronomical rate
+    /// (release).
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_network_counter_wrap_saturates_the_rate_to_zero() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(NetIo::default());
+        let t0 = Instant::now();
+
+        // Tick 1: establish a baseline.
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 10_000, 20_000)]),
+            t0,
+            &writer,
+        );
+
+        // Tick 2, 1 s later: the counter is now *lower* than tick 1's (a
+        // reset/wrap), not higher.
+        let t1 = t0 + Duration::from_secs(1);
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 500, 900)]),
+            t1,
+            &writer,
+        );
+
+        let got = writer.get_cloned();
+        assert_eq!(got.interfaces.len(), 1);
+        assert_eq!(
+            got.interfaces[0].rx_rate_bps, 0.0,
+            "a counter that went backwards must saturate to a 0 rate, not underflow"
+        );
+        assert_eq!(
+            got.interfaces[0].tx_rate_bps, 0.0,
+            "a counter that went backwards must saturate to a 0 rate, not underflow"
+        );
+        // The raw totals still reflect exactly what this tick read, wrap and
+        // all — only the *rate* is protected, not the counter itself.
+        assert_eq!(got.interfaces[0].rx_bytes_total, 500);
+        assert_eq!(got.interfaces[0].tx_bytes_total, 900);
+    }
+
+    /// **The rate formula itself, pinned to literals.** The two tests above
+    /// only ever assert a *zero* rate (no prior sample; a wrapped counter), so
+    /// neither exercises the divisor, the unit, or which delta lands in which
+    /// field. A rate whose unit is asserted nowhere is exactly the #1026
+    /// shape: `rx_rate_bps`/`tx_rate_bps` are documented **bytes/sec** at the
+    /// `NetInterface` declaration, and nothing else in the tree says so.
+    ///
+    /// 20 000 rx bytes and 40 000 tx bytes over a 2 s gap ⇒ 10 000 B/s and
+    /// 20 000 B/s. The two numbers are deliberately different so a rx/tx swap
+    /// cannot pass, and the gap is deliberately not 1 s so the `/ dt` divisor
+    /// is load-bearing.
+    ///
+    /// Falsification: `… / dt * 8.0` (a bytes→bits unit error) reds both rate
+    /// assertions; swapping the `rx_r`/`tx_r` assignment reds them too.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_network_rate_is_bytes_per_second_over_the_elapsed_gap() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(NetIo::default());
+        let t0 = Instant::now();
+
+        // Tick 1: the baseline. No prior sample, so no rate yet.
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 10_000, 20_000)]),
+            t0,
+            &writer,
+        );
+
+        // Tick 2, exactly 2 s later: +20 000 rx, +40 000 tx.
+        let t1 = t0 + Duration::from_secs(2);
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 30_000, 60_000)]),
+            t1,
+            &writer,
+        );
+
+        let got = writer.get_cloned();
+        assert_eq!(got.interfaces.len(), 1);
+        assert_eq!(
+            got.interfaces[0].rx_rate_bps, 10_000.0,
+            "20000 rx bytes over 2 s is 10000 bytes/sec"
+        );
+        assert_eq!(
+            got.interfaces[0].tx_rate_bps, 20_000.0,
+            "40000 tx bytes over 2 s is 20000 bytes/sec"
+        );
+        // The totals are the raw counters, not the deltas.
+        assert_eq!(got.interfaces[0].rx_bytes_total, 30_000);
+        assert_eq!(got.interfaces[0].tx_bytes_total, 60_000);
+    }
+
+    /// **A vanished interface is pruned from the rate cache.** `apply_network`
+    /// rebuilds `net_prev` from scratch every tick rather than `insert`ing into
+    /// the existing map, which is the only thing that drops an interface that
+    /// went away (a USB tether unplugged, a VPN `tun0` torn down). Nothing
+    /// asserted that, so swapping the rebuild for an in-place `insert` — a
+    /// plausible "avoid the allocation" optimisation — would leak an entry per
+    /// vanished interface for the life of the process and red nothing.
+    ///
+    /// Falsification: replace `state.net_prev = next_net_prev;` with a loop
+    /// that inserts into `state.net_prev` and this reds on `len() == 1`.
+    #[test]
+    fn apply_network_prunes_an_interface_that_disappeared() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(NetIo::default());
+        let t0 = Instant::now();
+
+        // Tick 1: two interfaces.
+        apply_network(
+            &mut state,
+            Some(vec![
+                ("eth0".to_string(), 1_000, 2_000),
+                ("tun0".to_string(), 10, 20),
+            ]),
+            t0,
+            &writer,
+        );
+        assert_eq!(state.net_prev.len(), 2, "both interfaces cached");
+        assert_eq!(writer.get_cloned().interfaces.len(), 2);
+
+        // Tick 2: `tun0` is gone from /proc/net/dev.
+        let t1 = t0 + Duration::from_secs(1);
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 2_000, 4_000)]),
+            t1,
+            &writer,
+        );
+        assert_eq!(
+            state.net_prev.len(),
+            1,
+            "an interface absent from this tick must be pruned from the cache"
+        );
+        assert!(state.net_prev.contains_key("eth0"));
+        assert!(!state.net_prev.contains_key("tun0"));
+        assert_eq!(writer.get_cloned().interfaces.len(), 1);
+    }
+
+    // ── apply_disk_io: table test ─────────────────────────────────────────────
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_disk_io_table() {
+        let mut prev: HashMap<String, (u64, u64, Instant)> = HashMap::new();
+        let writer = Mutable::new(DiskIo::default());
+        let t0 = Instant::now();
+
+        apply_disk_io(
+            &mut prev,
+            Some(vec![("sda".to_string(), 1_000, 500)]),
+            t0,
+            &writer,
+        );
+        let got = writer.get_cloned();
+        assert_eq!(got.total_read_bytes, 1_000);
+        assert_eq!(got.total_write_bytes, 500);
+        assert_eq!(got.read_bps, 0.0, "no prior sample yet");
+        assert!(prev.contains_key("sda"));
+
+        // A read failure warns (not asserted here) and leaves `prev` and the
+        // writer untouched — both halves asserted, not just the writer.
+        apply_disk_io(&mut prev, None, t0, &writer);
+        assert_eq!(writer.get_cloned().total_read_bytes, 1_000);
+        assert_eq!(
+            prev.len(),
+            1,
+            "a failed read must not clear the rolling rate cache"
+        );
+        assert!(prev.contains_key("sda"), "the cached device survives");
+    }
+
+    // ── apply_cpu_temp: unconditional passthrough ────────────────────────────
+
+    #[test]
+    fn apply_cpu_temp_publishes_verbatim() {
+        let writer = Mutable::new(CpuTemp::default());
+        apply_cpu_temp(
+            CpuTemp {
+                package_celsius: Some(55.5),
+            },
+            &writer,
+        );
+        assert_eq!(writer.get_cloned().package_celsius, Some(55.5));
+    }
+
+    // ── Tick-gated publishers: apply_gpu / apply_disk / apply_conn_counts ────
+    //
+    // Each of these only publishes on its own tick cadence (`poll_loop` calls
+    // them every tick, but with `None`/`gpu_tick: false` off-cadence) — the
+    // one behaviour all three share and the one a table test alone would miss
+    // if the "off-tick" row were left out.
+
+    #[test]
+    fn apply_gpu_table() {
+        let writer = Mutable::new(Some(GpuState {
+            vendor: GpuVendor::Nvidia,
+            name: "sentinel".to_string(),
+            ..Default::default()
+        }));
+
+        // Off-tick: the writer is left exactly as it was.
+        apply_gpu(
+            false,
+            Some(GpuState {
+                vendor: GpuVendor::Amd,
+                ..Default::default()
+            }),
+            &writer,
+        );
+        assert_eq!(writer.get_cloned().unwrap().name, "sentinel");
+
+        // On-tick with hardware found: publishes it.
+        apply_gpu(
+            true,
+            Some(GpuState {
+                vendor: GpuVendor::Amd,
+                name: "found".to_string(),
+                ..Default::default()
+            }),
+            &writer,
+        );
+        assert_eq!(writer.get_cloned().unwrap().name, "found");
+
+        // On-tick with no hardware found: publishes `None` (clears it) —
+        // distinct from "not this tick".
+        apply_gpu(true, None, &writer);
+        assert!(writer.get_cloned().is_none());
+    }
+
+    #[test]
+    fn apply_disk_table() {
+        let writer = Mutable::new(DiskUsage {
+            mounts: vec![DiskMount {
+                path: "/sentinel".to_string(),
+                total_bytes: 1,
+                used_bytes: 1,
+                free_bytes: 0,
+                usage: 1.0,
+            }],
+        });
+
+        // Off-tick (`None`): untouched.
+        apply_disk(None, &writer);
+        assert_eq!(writer.get_cloned().mounts[0].path, "/sentinel");
+
+        // On-tick: publishes the fresh snapshot.
+        apply_disk(
+            Some(DiskUsage {
+                mounts: vec![DiskMount {
+                    path: "/".to_string(),
+                    total_bytes: 100,
+                    used_bytes: 50,
+                    free_bytes: 50,
+                    usage: 0.5,
+                }],
+            }),
+            &writer,
+        );
+        assert_eq!(writer.get_cloned().mounts[0].path, "/");
+    }
+
+    #[test]
+    fn apply_conn_counts_table() {
+        let writer = Mutable::new(NetConnections {
+            tcp_established: 999,
+            ..Default::default()
+        });
+
+        // Off-tick (`None`): untouched.
+        apply_conn_counts(None, &writer);
+        assert_eq!(writer.get_cloned().tcp_established, 999);
+
+        // On-tick: publishes the fresh snapshot.
+        apply_conn_counts(
+            Some(NetConnections {
+                tcp_established: 7,
+                tcp_listen: 3,
+                ..Default::default()
+            }),
+            &writer,
+        );
+        let got = writer.get_cloned();
+        assert_eq!(got.tcp_established, 7);
+        assert_eq!(got.tcp_listen, 3);
+    }
+}

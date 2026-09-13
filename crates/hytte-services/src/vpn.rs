@@ -20,7 +20,7 @@
 //! listed, just with empty peers / no summary.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use hytte_reactive::{Service, gated_poll, registry, spawn_supervised};
 use std::time::{Duration, SystemTime};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -233,15 +233,21 @@ impl Service for VpnService {
 }
 
 async fn poll_loop(writer: Mutable<Vec<Tunnel>>) {
-    loop {
-        let next = collect_tunnels().await;
-        // Avoid no-op re-emissions: the signal would still emit because
-        // `set` always notifies, so compare and skip when unchanged.
-        if writer.lock_ref().clone() != next {
-            writer.set(next);
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
+    // `vpn` has no drawer-visibility concept to park on (tunnels matter
+    // whether or not a panel is open), so the gate is a permanently-`true`
+    // `Mutable<bool>` purely to reuse `gated_poll`'s dedup/select-bail
+    // scaffolding (#1172) — the park branch never engages because nothing
+    // ever sets it `false`. This also drops the old dedup's `.clone()` of the
+    // whole `Vec<Tunnel>` just to compare — `gated_poll` compares by
+    // reference against `writer.lock_ref()` instead.
+    let always_active = Mutable::new(true);
+    gated_poll(
+        always_active,
+        || Duration::from_secs(5),
+        writer,
+        || async { Some(collect_tunnels().await) },
+    )
+    .await;
 }
 
 async fn collect_tunnels() -> Vec<Tunnel> {

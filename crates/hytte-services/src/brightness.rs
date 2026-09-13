@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, registry, runtime, spawn_supervised};
+use hytte_reactive::{Service, gated_poll, registry, runtime, spawn_supervised};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -114,30 +114,40 @@ async fn do_set(level: f64) -> Result<()> {
 }
 
 async fn poll_loop(writer: Mutable<Option<Brightness>>) {
-    // Last-snapshot dedupe so identical readings don't re-emit at 1 Hz to
-    // every consumer (OSD, power-page slider, brightness chip). Mirrors the
-    // pipewire service's gated-emit pattern.
-    let mut last: Option<Brightness> = None;
-    loop {
-        // `read_state` is synchronous `std::fs` I/O (a sysfs directory walk
-        // plus two file reads per candidate device); run it on tokio's
-        // blocking pool rather than the async worker thread it used to
-        // block (#1171) — the same fix `app_usage`/`sensors` already apply
-        // to their own sysfs/procfs walks (see #434's app_usage fix for the
-        // precedent). Cadence and values are unchanged: still one read per
-        // second, still dedupe-gated on the result.
-        let cur = tokio::task::spawn_blocking(read_state)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "brightness: sysfs read task panicked");
-                None
-            });
-        if cur != last {
-            writer.set(cur);
-            last = cur;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    // Dedupe so identical readings don't re-emit at 1 Hz to every consumer
+    // (OSD, power-page slider, brightness chip) — now `gated_poll`'s
+    // reference-compare against `writer` itself (#1172) rather than a
+    // hand-kept `last` local, which tracked the exact same value. No
+    // drawer-visibility concept to park on, so the gate is a permanently
+    // `true` `Mutable<bool>` purely to reuse the scaffolding; the park
+    // branch never engages.
+    let always_active = Mutable::new(true);
+    gated_poll(
+        always_active,
+        || Duration::from_secs(1),
+        writer,
+        || async {
+            // `read_state` is synchronous `std::fs` I/O (a sysfs directory walk
+            // plus two file reads per candidate device); run it on tokio's
+            // blocking pool rather than the async worker thread it used to
+            // block (#1171) — the same fix `app_usage`/`sensors` already apply
+            // to their own sysfs/procfs walks (see #434's app_usage fix for the
+            // precedent). Cadence and values are unchanged: still one read per
+            // second. The outer `Some` is unconditional (mirrors the pre-#1172
+            // loop, which always considered writing) — the *inner* `Option`,
+            // Some(device) vs None(no backlight), is the real value `gated_poll`
+            // dedupes against.
+            Some(
+                tokio::task::spawn_blocking(read_state)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "brightness: sysfs read task panicked");
+                        None
+                    }),
+            )
+        },
+    )
+    .await;
 }
 
 fn read_state() -> Option<Brightness> {

@@ -279,8 +279,19 @@ impl Service for PlacesService {
             let places = places.clone();
             move || watch_config(places.clone())
         });
+        // The wake-up `Notify` and its three forwarders are created **here**,
+        // outside the supervised factory below, so a `places` restart re-reads
+        // them rather than spawning another generation — see
+        // [`spawn_resolve_forwarders`].
+        let notify = Arc::new(Notify::new());
+        spawn_resolve_forwarders(&notify, &places);
         spawn_supervised("places", move || {
-            resolve_loop(place.clone(), location.clone(), places.clone())
+            resolve_loop(
+                place.clone(),
+                location.clone(),
+                places.clone(),
+                notify.clone(),
+            )
         });
         handles
     }
@@ -495,56 +506,90 @@ fn place_transition<'a>(
     if transitioned { place } else { None }
 }
 
-async fn resolve_loop(
-    place_out: Mutable<Option<ResolvedPlace>>,
-    location_out: Mutable<LocationState>,
-    places: Mutable<Arc<Vec<Place>>>,
+/// Forward every change on `handle`'s signal into `notify.notify_one()`,
+/// supervised under `name` (#1172) rather than a bare `tokio::spawn`.
+///
+/// [`resolve_loop`] used to spawn its three signal-forwarders (Wi-Fi scan,
+/// geoclue, config-reload) as raw `tokio::spawn`s: an unsupervised child of a
+/// supervised parent. A panic in one — say, inside a future combinator this
+/// pulls in — killed just that `tokio::spawn`ed task; `resolve_loop` itself
+/// kept running, healthy in the supervisor's eyes, but that one input froze
+/// for the rest of the session with nothing surfacing it. Naming and
+/// supervising each forwarder independently means a panic there is (a) its
+/// own [`hytte_reactive::health`] row, observable, and (b) restarted with
+/// backoff on its own — an outage in the Wi-Fi forwarder doesn't cost the
+/// geoclue or config-reload ones their live subscriptions too.
+fn forward_changes<T: Send + Sync + 'static>(
+    name: &'static str,
+    handle: Mutable<T>,
+    on_change: impl Fn() + Clone + Send + Sync + 'static,
 ) {
-    let aps = wifiscan::shared_aps();
-    let geo = geoclue::shared_location();
-
-    // Re-resolve whenever either sensor changes. Each `signal_ref` also emits
-    // its current value immediately, so this fires at boot.
-    let notify = Arc::new(Notify::new());
-    if let Some(m) = aps.clone() {
-        let n = notify.clone();
-        tokio::spawn(async move {
-            m.signal_ref(|_| ())
+    spawn_supervised(name, move || {
+        let handle = handle.clone();
+        let on_change = on_change.clone();
+        async move {
+            handle
+                .signal_ref(|_| ())
                 .for_each(move |()| {
-                    n.notify_one();
+                    on_change();
                     std::future::ready(())
                 })
                 .await;
-        });
+        }
+    });
+}
+
+/// Spawn the three supervised signal-forwarders that wake [`resolve_loop`] —
+/// Wi-Fi scan, geoclue, config reload — each notifying the shared `notify`.
+/// Each `signal_ref` also emits its current value immediately, so the resolver
+/// fires once at boot without anything having to change.
+///
+/// Called from [`PlacesService::start`], **outside** the `spawn_supervised`
+/// factory that runs [`resolve_loop`] — which is the entire point. These
+/// forwarders are perpetual and their futures never end (the factory holds the
+/// `Mutable`, so the signal cannot terminate), so spawning them from inside
+/// `resolve_loop` — as this did until the #1172 review — meant every restart of
+/// the supervised parent left the previous generation alive, forwarding into a
+/// `Notify` nobody awaited any more, and added three more supervised tasks plus
+/// three more [`hytte_reactive::health`] rows under the same three names,
+/// unbounded in the number of parent restarts. Hoisting them here makes it
+/// exactly one set per process, and makes the `Notify` something a restarted
+/// parent re-reads rather than replaces — so a wake-up that arrives while the
+/// parent is between runs is still waiting for it.
+fn spawn_resolve_forwarders(notify: &Arc<Notify>, places: &Mutable<Arc<Vec<Place>>>) {
+    if let Some(m) = wifiscan::shared_aps() {
+        let n = notify.clone();
+        forward_changes("places-wifi-forward", m, move || n.notify_one());
     } else {
         tracing::warn!("places: wifiscan not registered; Wi-Fi fingerprinting disabled");
     }
-    if let Some(m) = geo.clone() {
+    if let Some(m) = geoclue::shared_location() {
         let n = notify.clone();
-        tokio::spawn(async move {
-            m.signal_ref(|_| ())
-                .for_each(move |()| {
-                    n.notify_one();
-                    std::future::ready(())
-                })
-                .await;
-        });
+        forward_changes("places-geoclue-forward", m, move || n.notify_one());
     } else {
         tracing::warn!("places: geoclue not registered; location fallback disabled");
     }
     // Re-resolve whenever the config is reloaded (watch_config swaps the list).
-    {
-        let n = notify.clone();
-        let p = places.clone();
-        tokio::spawn(async move {
-            p.signal_ref(|_| ())
-                .for_each(move |()| {
-                    n.notify_one();
-                    std::future::ready(())
-                })
-                .await;
-        });
-    }
+    let n = notify.clone();
+    forward_changes("places-config-forward", places.clone(), move || {
+        n.notify_one();
+    });
+}
+
+/// Resolve "where am I" on every wake-up from `notify`, publishing into
+/// `place_out`/`location_out`.
+///
+/// The supervised body of `spawn_supervised("places", …)`. `notify` and the
+/// forwarders that ring it are owned by [`PlacesService::start`], not created
+/// here — see [`spawn_resolve_forwarders`] for why.
+async fn resolve_loop(
+    place_out: Mutable<Option<ResolvedPlace>>,
+    location_out: Mutable<LocationState>,
+    places: Mutable<Arc<Vec<Place>>>,
+    notify: Arc<Notify>,
+) {
+    let aps = wifiscan::shared_aps();
+    let geo = geoclue::shared_location();
 
     let mut place_hook_resolved_once = false;
     let mut place_hook_last_fired: Option<String> = None;
@@ -595,6 +640,8 @@ async fn resolve_loop(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use hytte_config::places::{DEFAULT_CONFIG, builtin_default, load_places, parse_places};
@@ -1217,6 +1264,183 @@ mine = true
         assert_eq!(
             add_place(Place::new("Home", 1.0, 2.0)),
             Err(PlacesError::NotRunning)
+        );
+    }
+
+    // ── forward_changes: scope-add, lens 9 of #1172 ──────────────────────────
+
+    /// Poll `cond` until it holds or `within` elapses; returns whether it held.
+    /// Mirrors `eds_retry`/`niri`'s own copies — there is no seam to shorten
+    /// the supervisor's real backoff sleep from outside `hytte-reactive`.
+    fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// The health row a supervisor keeps for `name`, if it is still live.
+    fn health_of(name: &str) -> Option<hytte_reactive::TaskHealth> {
+        hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == name)
+    }
+
+    /// How many live health rows carry `name`. Rows key on `TaskId`, not name,
+    /// so duplicates are representable — which is exactly what
+    /// `a_resolve_loop_restart_does_not_multiply_the_forwarders` looks for.
+    fn rows_named(name: &str) -> usize {
+        hytte_reactive::health::snapshot()
+            .into_iter()
+            .filter(|h| h.name == name)
+            .count()
+    }
+
+    /// `resolve_loop`'s three signal-forwarders used to be raw `tokio::spawn`s
+    /// — an unsupervised child of a supervised parent. A panic in the
+    /// forwarded callback used to kill just that `tokio::spawn`ed task while
+    /// the parent stayed healthy, silently freezing that one resolve input for
+    /// the session. `forward_changes` is now `spawn_supervised` under a name:
+    /// a panic is a first-class health row, and the forwarder restarts and
+    /// keeps forwarding subsequent changes.
+    ///
+    /// Falsification: revert `forward_changes` to a bare `tokio::spawn` (no
+    /// supervisor, no restart) and this times out — the second `handle.set`
+    /// is never observed, and no health row exists under `NAME` at all.
+    /// Second falsification (the one the `baseline` assertion at the bottom
+    /// exists for): comment out `handle.set(2)` and it reds. The earlier
+    /// `seen >= 1` wait alone cannot red that way — `signal_ref` replays the
+    /// current value on subscribe, so the restarted run's first callback
+    /// satisfies it whether or not anything changed since.
+    #[test]
+    fn forward_changes_survives_a_panicking_callback() {
+        const NAME: &str = "test-places-forward-restart";
+
+        let handle: Mutable<u32> = Mutable::new(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        forward_changes(NAME, handle.clone(), {
+            let calls = Arc::clone(&calls);
+            let seen = Arc::clone(&seen);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                // `signal_ref` replays the current value immediately on
+                // subscribe, so this is the very first thing the forwarder
+                // does — deliberately panic there.
+                assert!(n != 0, "{NAME}: first callback panics, deliberately");
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(15), || calls.load(Ordering::SeqCst)
+                >= 1),
+            "the forwarder never ran at all"
+        );
+
+        // Nudge the handle so a restarted forwarder has something to see even
+        // if it resubscribes late; the replay makes this alone insufficient
+        // evidence, which the `baseline` round below is what closes.
+        handle.set(1);
+
+        assert!(
+            wait_until(Duration::from_secs(15), || seen.load(Ordering::SeqCst) >= 1),
+            "no change was observed after the panic: calls={}, health={:?}",
+            calls.load(Ordering::SeqCst),
+            health_of(NAME)
+        );
+
+        // The wait above is satisfied by `signal_ref`'s replay-on-subscribe:
+        // the restarted run's *first* callback counts, whether or not anything
+        // actually changed. So it shows "restarted" but not "still
+        // forwarding". Take a baseline from the settled state and then make a
+        // genuinely new change — only a live subscription can carry that one.
+        let baseline = seen.load(Ordering::SeqCst);
+        handle.set(2);
+
+        assert!(
+            wait_until(Duration::from_secs(15), || seen.load(Ordering::SeqCst)
+                > baseline),
+            "a change after the restart was NOT forwarded: baseline={baseline}, seen={}",
+            seen.load(Ordering::SeqCst)
+        );
+
+        let health = health_of(NAME).expect("the supervisor publishes a live health row");
+        assert!(
+            health.panics >= 1,
+            "the panic is not on the health record: {health:?}"
+        );
+    }
+
+    /// **A parent restart must not multiply the forwarders.** The three
+    /// signal-forwarders used to be spawned from inside `resolve_loop` — which
+    /// *is* `spawn_supervised("places", …)`'s body — so every restart of the
+    /// parent added another generation: still alive, still subscribed, ringing
+    /// a `Notify` nobody awaited any more, plus three more health rows under
+    /// the same three names, unbounded in the number of restarts. They now live
+    /// in [`PlacesService::start`] via [`spawn_resolve_forwarders`], outside
+    /// the factory, so re-running the factory (which is all a restart is) adds
+    /// none.
+    ///
+    /// Only `places-config-forward` is observable here, and that is correct:
+    /// `wifiscan`/`geoclue` publish no shared handles in a unit test, so
+    /// `shared_aps()`/`shared_location()` are `None` and those two forwarders
+    /// are legitimately never spawned. One name is enough — all three are
+    /// spawned by the same call.
+    ///
+    /// Falsification: move the `spawn_resolve_forwarders` call back inside
+    /// `resolve_loop` and this reds with 3 rows (start's one plus one per run)
+    /// instead of 1.
+    #[test]
+    fn a_resolve_loop_restart_does_not_multiply_the_forwarders() {
+        const FORWARD: &str = "places-config-forward";
+
+        let places: Mutable<Arc<Vec<Place>>> = Mutable::new(Arc::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+
+        // What `PlacesService::start` does, exactly once.
+        spawn_resolve_forwarders(&notify, &places);
+        assert!(
+            wait_until(Duration::from_secs(10), || rows_named(FORWARD) == 1),
+            "the config forwarder never registered its health row: {} rows",
+            rows_named(FORWARD)
+        );
+
+        // Two runs of the supervised body: the parent having restarted once.
+        // An empty place set with no geo fix resolves to `(None, Unavailable)`,
+        // so neither run writes anything or fires the `place-changed` hook —
+        // each just parks on `notify.notified()`.
+        let place_out: Mutable<Option<ResolvedPlace>> = Mutable::new(None);
+        let location_out = Mutable::new(LocationState::Unavailable);
+        let runs: Vec<_> = (0..2)
+            .map(|_| {
+                hytte_reactive::runtime::handle().spawn(resolve_loop(
+                    place_out.clone(),
+                    location_out.clone(),
+                    places.clone(),
+                    notify.clone(),
+                ))
+            })
+            .collect();
+
+        // Long enough for both runs to be polled to their first park. A
+        // forwarder spawned from inside the body would have published its row
+        // by then — `spawn_supervised` registers before the first poll of the
+        // factory's future.
+        std::thread::sleep(Duration::from_millis(750));
+        let rows = rows_named(FORWARD);
+        for r in runs {
+            r.abort();
+        }
+
+        assert_eq!(
+            rows, 1,
+            "a parent restart must not spawn another forwarder: {rows} rows named {FORWARD}"
         );
     }
 }

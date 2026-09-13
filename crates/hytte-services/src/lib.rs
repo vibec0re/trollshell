@@ -24,6 +24,7 @@ pub mod departures;
 pub mod display_config;
 pub mod displays;
 pub mod dnd;
+mod eds_labels;
 mod eds_retry;
 pub mod fullscreen_inhibit;
 pub mod geoclue;

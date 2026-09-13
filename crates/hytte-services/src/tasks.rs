@@ -49,7 +49,7 @@ use std::sync::mpsc;
 use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Local, NaiveTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_ecal::sys::ECalClientSourceType;
 use hytte_ecal::{CalClient, CalClientView, MainContext, Registry, Source, Waker};
@@ -58,8 +58,10 @@ use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus,
 };
 
+use crate::eds_labels::short_date as day_label;
 use crate::eds_retry::{
-    INIT_BACKOFF_START, SourceFailureStreak, next_backoff, spawn_eds_worker, wait_backoff,
+    INIT_BACKOFF_START, SourceFailureStreak, maybe_rebuild_session, next_backoff,
+    spawn_eds_worker, wait_backoff, with_client, with_client_retry,
 };
 
 // ── Public data types ────────────────────────────────────────────────────────
@@ -397,47 +399,44 @@ impl Worker {
         }
     }
 
-    /// Open the [`CalClient`] for `list_uid` (lazily) and return a borrow.
-    /// 5 s connect budget — bumped for CalDAV/EWS at the cost of slower
+    /// Look up and connect `list_uid`'s client fresh — the `open` half of
+    /// [`Worker::with_client`]/[`Worker::with_client_retry`] below. 5 s
+    /// connect budget — bumped for CalDAV/EWS at the cost of slower
     /// initial-open feedback on broken networks.
-    fn client(&mut self, list_uid: &str) -> anyhow::Result<&CalClient> {
-        if !self.clients.contains_key(list_uid) {
-            let src = self.lookup_source(list_uid)?;
-            let client = CalClient::connect(&src, ECalClientSourceType::Tasks, 5)?;
-            self.clients.insert(list_uid.to_string(), client);
-        }
-        Ok(self
-            .clients
-            .get(list_uid)
-            .expect("just inserted; lookup can't miss"))
-    }
-
-    /// Drop `list_uid`'s cached connection state — the client **and** its
-    /// live view. The view holds the (possibly dead) client's proxy: keeping
-    /// it would both stop push delivery for good and block
-    /// [`Worker::ensure_watch`] from ever re-subscribing (#432).
-    fn evict(&mut self, list_uid: &str) {
-        if self.clients.remove(list_uid).is_some() {
-            tracing::debug!(list = %list_uid, "tasks: evicted cached EDS client");
-        }
-        self.views.remove(list_uid);
+    fn connect(registry: &Registry, list_uid: &str) -> anyhow::Result<CalClient> {
+        let Some(src) = registry.ref_source(list_uid)? else {
+            anyhow::bail!("EDS source '{list_uid}' not found");
+        };
+        CalClient::connect(&src, ECalClientSourceType::Tasks, 5)
     }
 
     /// Run `op` against `list_uid`'s (lazily opened) client, evicting the
-    /// cached connection state on failure so the next use reconnects instead
-    /// of being served a dead handle forever (#432). No automatic retry —
-    /// the safe default for writes, where a timed-out-but-applied call must
-    /// not be replayed.
+    /// cached connection state — the client **and** its live view — on
+    /// failure so the next use reconnects instead of being served a dead
+    /// handle forever (#432; #1172: the policy itself now lives in
+    /// [`with_client`], shared with `calendar.rs`, this just supplies the
+    /// `open`/`on_evict` halves). The view holds the (possibly dead)
+    /// client's proxy: keeping it would both stop push delivery for good and
+    /// block [`Worker::ensure_watch`] from ever re-subscribing. No automatic
+    /// retry — the safe default for writes, where a timed-out-but-applied
+    /// call must not be replayed.
     fn with_client<T>(
         &mut self,
         list_uid: &str,
         op: impl FnOnce(&CalClient) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let res = op(self.client(list_uid)?);
-        if res.is_err() {
-            self.evict(list_uid);
-        }
-        res
+        let registry = &self.registry;
+        let views = &mut self.views;
+        with_client(
+            &mut self.clients,
+            list_uid,
+            || Self::connect(registry, list_uid),
+            op,
+            || {
+                tracing::debug!(list = %list_uid, "tasks: evicted cached EDS client");
+                views.remove(list_uid);
+            },
+        )
     }
 
     /// Like [`Worker::with_client`], but when the failure hit a *previously
@@ -449,18 +448,19 @@ impl Worker {
         list_uid: &str,
         op: impl Fn(&CalClient) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let cached = self.clients.contains_key(list_uid);
-        match self.with_client(list_uid, &op) {
-            Err(e) if cached => {
-                tracing::info!(
-                    list = %list_uid,
-                    error = %e,
-                    "tasks: cached EDS client failed; reconnecting"
-                );
-                self.with_client(list_uid, &op)
-            }
-            r => r,
-        }
+        let registry = &self.registry;
+        let views = &mut self.views;
+        with_client_retry(
+            "tasks",
+            &mut self.clients,
+            list_uid,
+            || Self::connect(registry, list_uid),
+            op,
+            || {
+                tracing::debug!(list = %list_uid, "tasks: evicted cached EDS client");
+                views.remove(list_uid);
+            },
+        )
     }
 
     /// Open a live [`CalClientView`] over `list_uid`'s client (once) so EDS
@@ -487,36 +487,23 @@ impl Worker {
         }
     }
 
-    fn lookup_source(&self, list_uid: &str) -> anyhow::Result<Source> {
-        match self.registry.ref_source(list_uid)? {
-            Some(s) => Ok(s),
-            None => anyhow::bail!("EDS source '{list_uid}' not found"),
-        }
-    }
-
     /// If the last scan tripped the all-lists-failed streak, tear down and
-    /// rebuild the whole EDS session (fresh [`Registry`] + empty client and
-    /// view caches) — the per-client evict path can't help when the registry
-    /// connection itself died. Returns `true` when a rebuild happened (the
-    /// caller should rescan immediately on the fresh session).
+    /// rebuild the whole EDS session (#1172: shared with `calendar.rs` via
+    /// [`maybe_rebuild_session`]) — the per-client evict path above can't
+    /// help when the registry connection itself died. Returns `true` when a
+    /// rebuild happened (the caller should rescan immediately on the fresh
+    /// session).
     fn maybe_rebuild(&mut self) -> bool {
-        if !self.rebuild_pending {
-            return false;
-        }
-        self.rebuild_pending = false;
-        match Registry::new() {
-            Ok(r) => {
-                tracing::info!("tasks: rebuilt EDS session after repeated scan failures");
-                self.registry = r;
+        maybe_rebuild_session(
+            "tasks",
+            &mut self.rebuild_pending,
+            &mut self.registry,
+            Registry::new,
+            || {
                 self.clients.clear();
                 self.views.clear();
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "tasks: EDS session rebuild failed; keeping current one");
-                false
-            }
-        }
+            },
+        )
     }
 
     /// Re-scan every task list and emit fresh signals if either the
@@ -1005,49 +992,10 @@ fn overdue_label(delta_days: i64, day_label_str: &str) -> String {
     }
 }
 
-fn day_label(d: NaiveDate, today: NaiveDate) -> String {
-    let delta = d.signed_duration_since(today).num_days();
-    match delta {
-        0 => "Today".to_string(),
-        1 => "Tomorrow".to_string(),
-        _ => format!(
-            "{} {} {}",
-            weekday_short(d.weekday()),
-            d.day(),
-            month_short(d.month()),
-        ),
-    }
-}
-
-fn weekday_short(w: chrono::Weekday) -> &'static str {
-    match w {
-        chrono::Weekday::Mon => "Mon",
-        chrono::Weekday::Tue => "Tue",
-        chrono::Weekday::Wed => "Wed",
-        chrono::Weekday::Thu => "Thu",
-        chrono::Weekday::Fri => "Fri",
-        chrono::Weekday::Sat => "Sat",
-        chrono::Weekday::Sun => "Sun",
-    }
-}
-
-fn month_short(m: u32) -> &'static str {
-    match m {
-        1 => "Jan",
-        2 => "Feb",
-        3 => "Mar",
-        4 => "Apr",
-        5 => "May",
-        6 => "Jun",
-        7 => "Jul",
-        8 => "Aug",
-        9 => "Sep",
-        10 => "Oct",
-        11 => "Nov",
-        12 => "Dec",
-        _ => "?",
-    }
-}
+// `day_label` (the "Today"/"Tomorrow"/"Mon 14 Apr" formatter) now lives in
+// `crate::eds_labels` as `short_date` (#1172) — this was a byte-identical
+// copy of that same body, imported under its old name at the top of this
+// file so every call site below is unchanged.
 
 #[cfg(test)]
 mod tests {

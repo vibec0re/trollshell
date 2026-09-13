@@ -185,6 +185,118 @@ impl SourceFailureStreak {
     }
 }
 
+// ── Per-client evict-and-retry, and session rebuild (#1172) ─────────────────
+//
+// `calendar.rs` and `tasks.rs` each cache `CalClient`s by source UID and each
+// hand-rolled the rest of #432's policy on top of `SourceFailureStreak`
+// above: a lazily-opened, cached client; evict the cached entry on any
+// operation failure so the next use reconnects instead of being served a
+// dead handle forever; for **idempotent** (read) operations, retry once
+// immediately on a fresh connection when the failure hit a client that was
+// already cached (the EDS-restart signature: the daemon died under a handle
+// we were holding); and, when the streak above trips, tear down and rebuild
+// the whole session. `tasks.rs`'s versions were already fully generic over
+// the operation closure — this promotes that shape here rather than
+// reinventing it, and points `calendar.rs`'s narrower hand-rolled copy at it
+// too.
+
+/// Run `op` against `uid`'s cached client, lazily opening one via `open` if
+/// none is cached yet. Any failure — including `open`'s own — evicts `uid`
+/// from `clients` and runs `on_evict` (a no-op `|| {}` for a caller with
+/// nothing else tied to the client — `tasks.rs`'s live [`CalClientView`]
+/// cache is the one that needs this: it must drop the view alongside the
+/// client, or `Worker::ensure_watch` can never re-subscribe, per #432). No
+/// retry: the safe default for writes, where a timed-out-but-applied call
+/// replayed becomes a duplicate write or a confusing not-found.
+///
+/// Generic over the cached client type `C` (in practice
+/// [`hytte_ecal::CalClient`]) rather than naming it directly, so this — like
+/// everything else in the module — stays testable with a bare `i32` stand-in
+/// and no EDS.
+pub(crate) fn with_client<C, T>(
+    clients: &mut std::collections::HashMap<String, C>,
+    uid: &str,
+    open: impl FnOnce() -> anyhow::Result<C>,
+    op: impl FnOnce(&C) -> anyhow::Result<T>,
+    mut on_evict: impl FnMut(),
+) -> anyhow::Result<T> {
+    if !clients.contains_key(uid) {
+        clients.insert(uid.to_string(), open()?);
+    }
+    let client = clients.get(uid).expect("just inserted; lookup can't miss");
+    let res = op(client);
+    if res.is_err() {
+        clients.remove(uid);
+        on_evict();
+    }
+    res
+}
+
+/// Like [`with_client`], but when the failure hit a client that was already
+/// cached *before* this call — the EDS-restart signature — reconnect and
+/// retry once immediately on a fresh connection. Only for idempotent (read)
+/// operations; `service` names the caller in the retry's log line. `on_evict`
+/// is `FnMut` rather than `FnOnce` because an evict-then-retry-then-evict-
+/// again double failure runs it twice.
+pub(crate) fn with_client_retry<C, T>(
+    service: &'static str,
+    clients: &mut std::collections::HashMap<String, C>,
+    uid: &str,
+    open: impl Fn() -> anyhow::Result<C>,
+    op: impl Fn(&C) -> anyhow::Result<T>,
+    mut on_evict: impl FnMut(),
+) -> anyhow::Result<T> {
+    let cached = clients.contains_key(uid);
+    match with_client(clients, uid, &open, &op, &mut on_evict) {
+        Err(e) if cached => {
+            tracing::info!(service, uid, error = %e, "eds: cached client failed; reconnecting");
+            with_client(clients, uid, &open, &op, &mut on_evict)
+        }
+        r => r,
+    }
+}
+
+/// If `*rebuild_pending`, tear down and reopen the whole EDS session (a fresh
+/// registry via `open_registry` — in practice [`hytte_ecal::Registry::new`]),
+/// then run `on_rebuilt` so the caller can drop whatever per-source caches it
+/// keeps — a fresh registry invalidates every cached client, and the
+/// per-client evict path above can't help when the registry connection
+/// itself died. Returns `true` when a rebuild happened (the caller should
+/// rescan immediately on the fresh session). `service` names the caller in
+/// the log lines, mirroring [`with_client_retry`].
+///
+/// Generic over the registry type `R` and takes `open_registry` rather than
+/// naming [`hytte_ecal::Registry`] directly, for the same hermetic-testing
+/// reason as [`with_client`].
+pub(crate) fn maybe_rebuild_session<R>(
+    service: &'static str,
+    rebuild_pending: &mut bool,
+    registry: &mut R,
+    open_registry: impl FnOnce() -> anyhow::Result<R>,
+    on_rebuilt: impl FnOnce(),
+) -> bool {
+    if !*rebuild_pending {
+        return false;
+    }
+    *rebuild_pending = false;
+    match open_registry() {
+        Ok(r) => {
+            tracing::info!(service, "eds: rebuilt EDS session after repeated scan failures");
+            *registry = r;
+            on_rebuilt();
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                service,
+                error = %e,
+                "eds: EDS session rebuild failed; keeping current one"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +523,257 @@ mod tests {
         assert!(!s.record(1, 1));
         assert!(!s.record(1, 1));
         assert!(s.record(1, 1));
+    }
+
+    // ── with_client / with_client_retry / maybe_rebuild_session (#1172) ─────
+    //
+    // Stand-ins for `hytte_ecal::CalClient`/`Registry` — plain `i32`s tagged
+    // with a generation counter, so a test can tell "the client that was
+    // inserted on open #2" apart from "#1" without any EDS.
+
+    use std::collections::HashMap;
+
+    /// Opens a client whose value is the call count, failing (and counting
+    /// the attempt) while `fail_until_call` hasn't been reached yet.
+    struct FakeOpen {
+        calls: std::cell::Cell<u32>,
+        fail_until_call: u32,
+    }
+
+    impl FakeOpen {
+        fn new(fail_until_call: u32) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                fail_until_call,
+            }
+        }
+
+        fn open(&self) -> anyhow::Result<u32> {
+            let n = self.calls.get() + 1;
+            self.calls.set(n);
+            if n <= self.fail_until_call {
+                anyhow::bail!("open failed on call {n}");
+            }
+            Ok(n)
+        }
+    }
+
+    /// A failing `op` evicts the cached client, so the next `with_client`
+    /// call reconnects instead of reusing the dead entry.
+    ///
+    /// Falsification: drop the `clients.remove(uid)` in `with_client` and
+    /// this reds — the second call sees the stale cached `1` instead of a
+    /// freshly-opened `2`.
+    #[test]
+    fn with_client_evicts_on_op_failure() {
+        let mut clients: HashMap<String, u32> = HashMap::new();
+        let opener = FakeOpen::new(0);
+
+        let r1 = with_client(
+            &mut clients,
+            "a",
+            || opener.open(),
+            |c| {
+                anyhow::ensure!(*c != 1, "boom");
+                Ok(*c)
+            },
+            || {},
+        );
+        assert!(r1.is_err(), "the op itself failed");
+        assert!(
+            !clients.contains_key("a"),
+            "a failing op must evict the client it ran against"
+        );
+
+        let r2 = with_client(&mut clients, "a", || opener.open(), |c| Ok(*c), || {});
+        assert_eq!(r2.unwrap(), 2, "the second call reconnected fresh");
+    }
+
+    /// The `on_evict` hook (`tasks.rs`'s "also drop the live view") runs
+    /// exactly when the client is actually evicted — not on a successful op,
+    /// and not when `open` itself fails (there is no cached entry to evict).
+    ///
+    /// Falsification: move the `on_evict()` call outside the `if
+    /// res.is_err()` branch and the first assertion below reds.
+    #[test]
+    fn with_client_runs_on_evict_only_when_it_actually_evicts() {
+        let mut clients: HashMap<String, u32> = HashMap::new();
+        let evictions = std::cell::Cell::new(0u32);
+        let bump = || evictions.set(evictions.get() + 1);
+
+        // A successful op: no eviction.
+        with_client(&mut clients, "a", || Ok(1), |c| Ok(*c), bump).unwrap();
+        assert_eq!(evictions.get(), 0, "a successful op must not evict");
+
+        // A failing op against the now-cached client: one eviction.
+        let _: anyhow::Result<()> =
+            with_client(&mut clients, "a", || Ok(1), |_c| anyhow::bail!("boom"), bump);
+        assert_eq!(evictions.get(), 1, "a failing op must evict exactly once");
+
+        // `open` itself failing: nothing was ever cached, so nothing evicts.
+        let _: anyhow::Result<()> = with_client(
+            &mut clients,
+            "b",
+            || anyhow::bail!("open failed"),
+            |_c| Ok(()),
+            bump,
+        );
+        assert_eq!(
+            evictions.get(),
+            1,
+            "an open failure has nothing cached to evict"
+        );
+    }
+
+    /// A successful op leaves the client cached — the whole point of the
+    /// cache — and does not reopen on a subsequent call.
+    #[test]
+    fn with_client_keeps_a_successful_client_cached() {
+        let mut clients: HashMap<String, u32> = HashMap::new();
+        let opener = FakeOpen::new(0);
+
+        assert_eq!(
+            with_client(&mut clients, "a", || opener.open(), |c| Ok(*c), || {}).unwrap(),
+            1
+        );
+        assert_eq!(
+            with_client(&mut clients, "a", || opener.open(), |c| Ok(*c), || {}).unwrap(),
+            1,
+            "a successful op must not reopen an already-cached client"
+        );
+        assert_eq!(opener.calls.get(), 1, "open ran exactly once");
+    }
+
+    /// **The EDS-restart signature.** When the failing client was already
+    /// cached before this call, `with_client_retry` reconnects and retries
+    /// once, so the caller's read succeeds against the fresh connection
+    /// instead of surfacing the stale one's error.
+    ///
+    /// Falsification: change the `Err(e) if cached` guard to an unconditional
+    /// retry (or drop it and never retry) and one of the two assertions here
+    /// goes red — see the sibling test below for the "never cached" half.
+    #[test]
+    fn with_client_retry_reconnects_a_previously_cached_failure() {
+        let mut clients: HashMap<String, u32> = HashMap::new();
+        clients.insert("a".to_string(), 999); // pre-seed a "stale" cached client
+        let opener = FakeOpen::new(0);
+
+        // The op fails against whatever is cached (999), succeeds against
+        // anything freshly opened.
+        let result = with_client_retry(
+            "test",
+            &mut clients,
+            "a",
+            || opener.open(),
+            |c| {
+                anyhow::ensure!(*c != 999, "stale client");
+                Ok(*c)
+            },
+            || {},
+        );
+        assert!(
+            result.is_ok(),
+            "a previously-cached failure must be retried on a fresh connection"
+        );
+        assert_eq!(opener.calls.get(), 1, "exactly one reconnect attempt");
+    }
+
+    /// The retry is conditioned on the client having been cached *before*
+    /// this call — a failure on a client that was *just* opened (never
+    /// cached previously) is not retried, since retrying it would just
+    /// reopen the same failing source forever.
+    #[test]
+    fn with_client_retry_does_not_retry_a_fresh_open_failure() {
+        let mut clients: HashMap<String, u32> = HashMap::new();
+        let opener = FakeOpen::new(0);
+
+        let result: anyhow::Result<()> = with_client_retry(
+            "test",
+            &mut clients,
+            "a",
+            || opener.open(),
+            |_c| anyhow::bail!("always fails"),
+            || {},
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            opener.calls.get(),
+            1,
+            "no cached entry existed, so there is nothing to retry"
+        );
+    }
+
+    /// **The no-op path.** `maybe_rebuild_session` does nothing (and does not
+    /// call `open_registry`) while no rebuild is pending.
+    #[test]
+    fn maybe_rebuild_session_is_a_no_op_when_nothing_is_pending() {
+        let mut pending = false;
+        let mut registry = 1;
+        let opened = std::cell::Cell::new(false);
+        let rebuilt = std::cell::Cell::new(false);
+
+        let did = maybe_rebuild_session(
+            "test",
+            &mut pending,
+            &mut registry,
+            || {
+                opened.set(true);
+                Ok(2)
+            },
+            || rebuilt.set(true),
+        );
+
+        assert!(!did);
+        assert!(!opened.get(), "open_registry must not run when nothing is pending");
+        assert!(!rebuilt.get());
+        assert_eq!(registry, 1, "the registry is untouched");
+    }
+
+    /// A pending rebuild that succeeds swaps in the fresh registry, runs
+    /// `on_rebuilt` (the caller's cache-clear), clears the pending flag, and
+    /// reports `true`.
+    #[test]
+    fn maybe_rebuild_session_swaps_in_a_successful_rebuild() {
+        let mut pending = true;
+        let mut registry = 1;
+        let rebuilt = std::cell::Cell::new(false);
+
+        let did = maybe_rebuild_session(
+            "test",
+            &mut pending,
+            &mut registry,
+            || Ok(2),
+            || rebuilt.set(true),
+        );
+
+        assert!(did);
+        assert!(!pending, "the pending flag is cleared");
+        assert_eq!(registry, 2, "the registry is swapped for the fresh one");
+        assert!(rebuilt.get(), "on_rebuilt ran so the caller can drop its caches");
+    }
+
+    /// A pending rebuild whose `open_registry` fails clears the pending flag
+    /// anyway (so a permanently-broken registry doesn't retry every poll
+    /// forever — it re-paces to the next `SourceFailureStreak` trip instead),
+    /// keeps the old registry, and does not run `on_rebuilt` (there is
+    /// nothing fresh to point the caller's caches at).
+    #[test]
+    fn maybe_rebuild_session_keeps_the_old_registry_on_a_failed_rebuild() {
+        let mut pending = true;
+        let mut registry = 1;
+        let rebuilt = std::cell::Cell::new(false);
+
+        let did = maybe_rebuild_session::<i32>(
+            "test",
+            &mut pending,
+            &mut registry,
+            || anyhow::bail!("registry still down"),
+            || rebuilt.set(true),
+        );
+
+        assert!(!did);
+        assert!(!pending, "cleared even on failure, so it re-paces via the streak");
+        assert_eq!(registry, 1, "the old registry is kept");
+        assert!(!rebuilt.get());
     }
 }

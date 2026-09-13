@@ -78,8 +78,10 @@ use hytte_ecal::{CalClient, EventInstance, Registry, Source};
 use hytte_reactive::{Service, registry, spawn_supervised};
 use icalendar::{Calendar, CalendarComponent, Component, EventLike, EventStatus};
 
+use crate::eds_labels::short_date;
 use crate::eds_retry::{
-    INIT_BACKOFF_START, SourceFailureStreak, next_backoff, spawn_eds_worker, wait_backoff,
+    INIT_BACKOFF_START, SourceFailureStreak, maybe_rebuild_session, next_backoff,
+    spawn_eds_worker, wait_backoff, with_client_retry,
 };
 
 // ── Public data types ────────────────────────────────────────────────────────
@@ -284,94 +286,57 @@ impl Worker {
         })
     }
 
-    /// Open (lazily, cached) the Events [`CalClient`] for `source_uid`.
-    /// 5 s connect budget — same as the task service; bumped above the
-    /// libecal default so CalDAV/Google backends have time to come online.
-    fn client(&mut self, source_uid: &str) -> anyhow::Result<&CalClient> {
-        if !self.clients.contains_key(source_uid) {
-            let src = self.lookup_source(source_uid)?;
-            let client = CalClient::connect(&src, ECalClientSourceType::Events, 5)?;
-            self.clients.insert(source_uid.to_string(), client);
-        }
-        Ok(self
-            .clients
-            .get(source_uid)
-            .expect("just inserted; lookup can't miss"))
-    }
-
-    fn lookup_source(&self, source_uid: &str) -> anyhow::Result<Source> {
-        match self.registry.ref_source(source_uid)? {
-            Some(s) => Ok(s),
-            None => anyhow::bail!("EDS source '{source_uid}' not found"),
-        }
-    }
-
-    /// Query expanded instances for one source, reconnecting once on
-    /// failure: a cached [`CalClient`] whose backing daemon restarted (or
-    /// whose calendar was removed) errors on use — a failure on a
-    /// *previously cached* client is the EDS-restart signature, so evict it
-    /// and retry immediately on a fresh connection. One EDS restart then
-    /// costs one poll cycle, not the rest of the session (#432).
+    /// Query expanded instances for one source (#1172: the evict-and-retry
+    /// policy now lives in [`with_client_retry`], shared with `tasks.rs`
+    /// rather than hand-rolled here) — a cached [`CalClient`] whose backing
+    /// daemon restarted (or whose calendar was removed) errors on use, and a
+    /// failure on a *previously cached* client is the EDS-restart signature,
+    /// so the shared helper evicts it and retries immediately on a fresh
+    /// connection. One EDS restart then costs one poll cycle, not the rest of
+    /// the session (#432).
     fn instances(
         &mut self,
         source_uid: &str,
         start_unix: i64,
         end_unix: i64,
     ) -> anyhow::Result<Vec<EventInstance>> {
-        let cached = self.clients.contains_key(source_uid);
-        match self.try_instances(source_uid, start_unix, end_unix) {
-            Err(e) if cached => {
-                tracing::info!(
-                    source = %source_uid,
-                    error = %e,
-                    "calendar: cached EDS client failed; reconnecting"
-                );
-                self.try_instances(source_uid, start_unix, end_unix)
-            }
-            r => r,
-        }
+        // Bound separately from `self.clients` so the two are disjoint
+        // borrows across the call below (the `open` closure only touches
+        // `registry`, never `self` as a whole).
+        let registry = &self.registry;
+        // 5 s connect budget — same as the task service; bumped above the
+        // libecal default so CalDAV/Google backends have time to come online.
+        with_client_retry(
+            "calendar",
+            &mut self.clients,
+            source_uid,
+            || {
+                let Some(src) = registry.ref_source(source_uid)? else {
+                    anyhow::bail!("EDS source '{source_uid}' not found");
+                };
+                CalClient::connect(&src, ECalClientSourceType::Events, 5)
+            },
+            |c| c.generate_instances(start_unix, end_unix),
+            // Nothing else is tied to a source UID here — `calendar.rs` keeps
+            // no per-source view cache the way `tasks.rs` does.
+            || {},
+        )
     }
 
-    /// One expansion attempt against `source_uid`'s (lazily opened) client.
-    /// Any failure evicts the cached client so the next use reconnects
-    /// instead of being served a dead handle forever.
-    fn try_instances(
-        &mut self,
-        source_uid: &str,
-        start_unix: i64,
-        end_unix: i64,
-    ) -> anyhow::Result<Vec<EventInstance>> {
-        let res = self
-            .client(source_uid)?
-            .generate_instances(start_unix, end_unix);
-        if res.is_err() {
-            self.clients.remove(source_uid);
-        }
-        res
-    }
-
-    /// If the last scan tripped the all-sources-failed streak, tear down
-    /// and rebuild the whole EDS session (fresh [`Registry`] + empty client
-    /// cache) — the per-client evict path can't help when the registry
-    /// connection itself died. Returns `true` when a rebuild happened (the
-    /// caller should rescan immediately on the fresh session).
+    /// If the last scan tripped the all-sources-failed streak, tear down and
+    /// rebuild the whole EDS session (#1172: shared with `tasks.rs` via
+    /// [`maybe_rebuild_session`]) — the per-client evict path above can't
+    /// help when the registry connection itself died. Returns `true` when a
+    /// rebuild happened (the caller should rescan immediately on the fresh
+    /// session).
     fn maybe_rebuild(&mut self) -> bool {
-        if !self.rebuild_pending {
-            return false;
-        }
-        self.rebuild_pending = false;
-        match Registry::new() {
-            Ok(r) => {
-                tracing::info!("calendar: rebuilt EDS session after repeated scan failures");
-                self.registry = r;
-                self.clients.clear();
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "calendar: EDS session rebuild failed; keeping current one");
-                false
-            }
-        }
+        maybe_rebuild_session(
+            "calendar",
+            &mut self.rebuild_pending,
+            &mut self.registry,
+            Registry::new,
+            || self.clients.clear(),
+        )
     }
 
     /// Re-scan every calendar source and publish a fresh `Vec` on **every**
@@ -712,51 +677,9 @@ pub fn format_when(event: &CalendarEvent) -> String {
     format!("{start_label} {start_hm} \u{2192} {end_label} {end_hm}")
 }
 
-/// Render a date as one of "Today", "Tomorrow", or `"Mon 14 Apr"` relative
-/// to `today`. Used for both all-day and timed events.
-fn short_date(d: NaiveDate, today: NaiveDate) -> String {
-    let delta = d.signed_duration_since(today).num_days();
-    match delta {
-        0 => "Today".to_string(),
-        1 => "Tomorrow".to_string(),
-        _ => format!(
-            "{} {} {}",
-            weekday_short(d.weekday()),
-            d.day(),
-            month_short(d.month()),
-        ),
-    }
-}
-
-fn weekday_short(w: chrono::Weekday) -> &'static str {
-    match w {
-        chrono::Weekday::Mon => "Mon",
-        chrono::Weekday::Tue => "Tue",
-        chrono::Weekday::Wed => "Wed",
-        chrono::Weekday::Thu => "Thu",
-        chrono::Weekday::Fri => "Fri",
-        chrono::Weekday::Sat => "Sat",
-        chrono::Weekday::Sun => "Sun",
-    }
-}
-
-fn month_short(m: u32) -> &'static str {
-    match m {
-        1 => "Jan",
-        2 => "Feb",
-        3 => "Mar",
-        4 => "Apr",
-        5 => "May",
-        6 => "Jun",
-        7 => "Jul",
-        8 => "Aug",
-        9 => "Sep",
-        10 => "Oct",
-        11 => "Nov",
-        12 => "Dec",
-        _ => "?",
-    }
-}
+// `short_date` (the "Today"/"Tomorrow"/"Mon 14 Apr" formatter) now lives in
+// `crate::eds_labels` (#1172) — `tasks.rs`'s `day_label` was a byte-identical
+// copy of this same body, imported at the top of this file.
 
 #[cfg(test)]
 mod tests {

@@ -1998,7 +1998,7 @@ systemd-run --user --unit=trollshell-plugin-stats-side \
       With the sidebar instance running, launch a **second** copy with no
       `HYTTE_PLUGIN_ID` (just `HYTTE_PLUGIN_MOUNT=BarRight`): the host must
       reject it with `plugin id already has a live connection; rejecting the
-  duplicate` and nothing must appear in the bar. Add
+duplicate` and nothing must appear in the bar. Add
       `--setenv=HYTTE_PLUGIN_ID=stats-bar` and relaunch: both connections live
       at once, both cards on screen, each journal stream prefixed with its own
       id. Finally set a **bad** id (`--setenv=HYTTE_PLUGIN_ID=stats.bar`): the

@@ -937,11 +937,37 @@ fn request_preem_repaint(moved: &[Scope]) {
 ///   reconcile widgets — creating and destroying them — in the middle of GTK
 ///   rendering one.
 pub(super) fn request_preem_repaint_all_when_live() {
+    #[cfg(test)]
+    REPAINT_REQUESTS.with(|c| c.set(c.get() + 1));
     let live = registry::with(|r| r.get::<PluginHandles>().is_some());
     if !live {
         return;
     }
     glib::idle_add_local_once(request_preem_repaint_all);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times [`request_preem_repaint_all_when_live`] has been called on this
+    /// thread (#1253; PR #1243 review, NEW LOW B).
+    ///
+    /// This is the **shared callee** two `preem_gl` hooks call for the
+    /// re-map — the pre-existing context-failure hook and #1232's
+    /// build-refusal hook (`on_build_refused`) — so counting calls here pins
+    /// the nudge for both at once, without needing a call-site-shaped seam
+    /// for a hook that has two call sites (the PR's own objection to pinning
+    /// just one of them). It counts the *call*, not the mailbox write the
+    /// deferred `glib::idle_add_local_once` performs: what a deletion here
+    /// removes is the request, and a hermetic test has no main loop pumping
+    /// the idle queue to observe the write anyway.
+    static REPAINT_REQUESTS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// How many times [`request_preem_repaint_all_when_live`] has been called on
+/// this thread. `#[cfg(test)]` only — nothing shipped reads it.
+#[cfg(test)]
+pub(super) fn repaint_requests() -> u32 {
+    REPAINT_REQUESTS.with(Cell::get)
 }
 
 /// Re-map every mount mailbox, whoever is in it — the accent path.

@@ -3663,6 +3663,20 @@ mod tests {
     ///   because `build` answers with the same `GaugeGl` (`arm_for(GAUGE)`
     ///   still says `Gl`) after restarting its needle's spring mid-swing
     ///   (#1143). Asserting only the node kind would have missed it.
+    ///
+    /// **Also pins the re-map nudge** (#1253; PR #1243 review, NEW LOW B),
+    /// beside the builds probe: `pump::request_preem_repaint_all_when_live`
+    /// is the callee both this hook and the pre-existing context-failure hook
+    /// call to put an already-rebuilt renderer on screen, and until now
+    /// nothing in the tree asserted the call happened at all — deleting it
+    /// from either hook left the whole suite green. The counter lives in the
+    /// shared callee rather than at either call site (`pump.rs`,
+    /// `#[cfg(test)]`-only), which is what pins both hooks at once instead of
+    /// giving the new one a bespoke seam its older twin does not share.
+    /// **Falsified** by deleting the
+    /// `super::pump::request_preem_repaint_all_when_live();` line from
+    /// `on_build_refused`: the counter assertion below reds at
+    /// `left: 0, right: 1`.
     #[test]
     fn a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl() {
         let _ink = crate::plugins::tests::preem_ink_lock();
@@ -3710,6 +3724,7 @@ mod tests {
             let gauge_builds = probe(&key, Some("ga"))
                 .expect("the gauge instance exists")
                 .0;
+            let repaints_before = crate::plugins::pump::repaint_requests();
 
             // The driver refuses the scope's pipeline, once, exactly as a
             // realised `GlSurface` reports it.
@@ -3730,9 +3745,23 @@ mod tests {
                 "the refusal hook rebuilt the renderer itself, not the next re-map — the half a \
                  parked clock would otherwise withhold for ever",
             );
+            // A forward guard, not the `gl_lost` discriminator a fix-round
+            // comment once credited it with being: taken at a probe before
+            // any mapping pass, `apply` cannot have run yet on this path, so
+            // `scope_after_hook.1` is `scope_before_counts.1` by construction
+            // of the code path — `x == x` — and the `builds` assertion above
+            // is the one doing all the discriminating here (#1253).
             assert_eq!(
                 scope_after_hook.1, scope_before_counts.1,
                 "…and did it without an apply, so no widget state was touched",
+            );
+            // The re-map nudge (PR #1243 review, NEW LOW B): the hook asks
+            // for exactly one re-map per refused program, through the same
+            // shared callee the context-failure hook uses.
+            assert_eq!(
+                crate::plugins::pump::repaint_requests(),
+                repaints_before + 1,
+                "the hook asked for one re-map, so the rebuilt kit renderer reaches the screen",
             );
 
             begin_pass(&key);

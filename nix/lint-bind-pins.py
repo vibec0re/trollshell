@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fail if a `bind*` call site pins its widget with a captured strong clone.
+"""Fail if a `bind*` call site — or a `connect_*`/connect-helper call (#1176,
+#1259) — pins its widget with a captured strong clone.
 
 THE DEFECT
 ----------
@@ -283,6 +284,82 @@ One site on the tree (`panels/media.rs`, fixed in the same PR); the fix is
 #834's, move the field out of the holder and take it from the closure's own
 argument.
 
+THE DELEGATED-CONNECT SHAPE (#1259) — rule (c)
+-----------------------------------------------
+Rule (a) reads `<local>.connect_<signal>(` — a receiver-call. #1244's review
+found a defect in the same family reached through a shape with no receiver
+call in it at all:
+
+    fn on_map_or_now(window: &gtk::Window, apply: impl Fn(&gtk::Window) + 'static) {
+        let window_for_apply = window.clone();       // a *strong* ref
+        hytte::ui::on_surface_ready(window, move |_surface| {
+            apply(&window_for_apply);                // ... clone used instead
+        });
+    }
+
+`hytte::ui::on_surface_ready` wires `connect_map` on the widget it is
+*handed*, not on a widget it owns — `window` is its own parameter, not a
+receiver anyone writes `.connect_` on. So the call is `on_surface_ready(window,
+closure)`, structurally a free-function call with the widget as a plain
+argument, and rule (a)'s `CONNECT_RE` — which only ever matches
+`<ident>.connect_<signal>(` — cannot see it at all. This is exactly why
+`nix/lint-bind-pins.py` reported `0 pin(s)` on both the pre-fix and fixed
+sidebar.rs (#1259): the bug is real (the re-verifier measured
+`wired_alive_after_destroy=true`), and every existing rule is blind to its
+shape.
+
+The mechanism is a **discovery pass before the scan**, not a hand-maintained
+name list. `discover_connector_fns` (run once, over every scanned file
+together, before any pin scan) finds every function name that — called as
+`name(widget, .., (move)? |params| ..)` — wires `widget` to a persistent
+handler:
+
+  * **Directly**: the function's own body calls `.connect_<signal>(` on one of
+    its own parameters. This is how `on_surface_ready` itself joins the set,
+    with nothing about its name hardcoded anywhere in this file — the very
+    same fixed point would find the next one of these hytte-ui grows.
+  * **By forwarding**: the function hands one of its own parameters to an
+    *already-known* connector, immediately followed by the closure argument —
+    the identical `<ident>, (move)? |params|` adjacency `SITE_RE` requires of
+    a `bind*` call. This is how `on_map_or_now` joins the set on the strength
+    of `on_surface_ready` already being in it: its body is
+    `hytte::ui::on_surface_ready(window, move |_surface| { .. })`, and
+    `window` is `on_map_or_now`'s own parameter. Iterated to a fixed point
+    (like `clone_aliases`) because discovery order is not guaranteed — the
+    two functions live in different files (`crates/hytte-ui/src/layer_window.rs`
+    and `trollshell/src/overlays/sidebar.rs`), and a third link in the chain
+    would need a second iteration to join.
+
+Once a name is in the set, `scan_helper_connect_pins` scans every call to it
+exactly the way `scan_file` scans a `bind*` call: the widget argument
+immediately before the closure, the closure's own parameter discard-gated
+(`_`-prefixed), and a strong `clone_aliases` hit inside the closure body is
+the pin. The carve-out is the same one bind's rule relies on, and it needs no
+extra code to hold: `<widget>.downgrade()` matches neither `CLONE_ALIAS_RE`
+nor `MOVE_ALIAS_RE` (a `WeakRef` is not a clone, and `.downgrade()` is not a
+bare move), so it never enters the alias set the pin check searches — which
+is exactly what makes the *fixed* `on_map_or_now` (capturing `weak =
+window.downgrade()`) report clean.
+
+Measured on the tree at this rule's own base (`2d4f48a9`, #1244 merged): **15**
+connect-helper functions discovered (`on_surface_ready` and `on_map_or_now`
+among them — `attach_slider`, `attach_hover_pause`, `wire_recenter_on_map`,
+and eleven more, all real `wire_*`/`attach_*`/`install_*` widget helpers, none
+a coincidental same-name match), **49** calls to them across the three roots,
+**0** pins. Reintroducing #1244's exact pre-fix `on_map_or_now` body and
+re-running the scanner reports the single pin at its real line and reverts to
+`0 pin(s)` the moment the fix is restored — the same live probe "THE PROBE"
+below describes for the original rule.
+
+Name-only, like every other resolution in this file: there is no type
+information here to confirm two identically-named functions in different
+files are the *same* function, so a coincidentally-shaped unrelated function
+sharing a discovered connector's name would join the call-site scan too.
+Measured cost on the tree: zero. The mitigation is the same one the rest of
+this file leans on — membership in the connector set is necessary but not
+sufficient for a hit; the adjacency, the discard gate and the alias match all
+still have to align.
+
 THE PROBE
 ---------
 The regression this file exists to prevent is checked on every run by
@@ -343,9 +420,10 @@ USAGE
     python3 nix/lint-bind-pins.py [ROOT ...]      # from the repo root
 
 Exits 0 when clean, 1 when a pin is found (naming every site), 2 when the scan
-itself is untrustworthy — a root has gone missing, too few call sites were seen
-to believe the result, or `self_test()` (which runs first, on every invocation,
-against the fixtures at the bottom of this file) disagrees with the scanner.
+itself is untrustworthy — a root has gone missing, too few call sites (or too
+few #1259 connect-helper functions) were seen to believe the result, or
+`self_test()` (which runs first, on every invocation, against the fixtures at
+the bottom of this file) disagrees with the scanner.
 """
 
 import os
@@ -391,6 +469,17 @@ MIN_CALL_SITES = 100
 # far enough below 211 that ordinary churn never trips it and far enough above
 # zero that a broken scan cannot pass.
 MIN_CONNECT_SITES = 150
+
+# Anti-vacuity floor for #1259's connect-helper discovery: at least
+# `on_surface_ready` itself (`crates/hytte-ui/src/layer_window.rs`) must be
+# found on every run, or the fixed point in `discover_connector_fns` broke —
+# a renamed `connect_map` call, a changed parameter name, or a roots change
+# that drops `hytte-ui/src` would all silently zero this out and make the
+# whole rule permanently vacuous, the same failure shape #973 warns about
+# above. Deliberately not a count of *call sites*: there are only a handful
+# of those on the tree today, too few for a floor on that number to survive
+# ordinary churn.
+MIN_CONNECTOR_FNS = 1
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 
@@ -584,27 +673,113 @@ NAMED_CLOSURE_RE = re.compile(rf"let\s+({IDENT})\s*(?::[^=;]*)?=\s*(?:move\s+)?\
 # one function body: unlike the `bind` scan (which walks the whole file prefix
 # for `.clone()`s and cannot be widened now without changing what it reports),
 # an ancestry claim assembled from two unrelated functions' plumbing would be
-# a fabrication.
+# a fabrication. The name is captured too — #1259's connect-helper discovery
+# (below) keys its fixed point on it.
 FN_RE = re.compile(
     rf"(?m)^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?"
-    rf"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+{IDENT}"
+    rf"(?:unsafe\s+)?(?:extern\s+\"[^\"]*\"\s+)?fn\s+({IDENT})"
 )
 
 
-def iter_function_bodies(clean: str):
-    """Yield `(start, end)` spans of every function body in `clean`."""
+def skip_generics(clean: str, pos: int) -> int:
+    """If `clean[pos]` opens a `<...>` generic parameter list, return the
+    index just past its matching top-level `>`; otherwise return `pos`
+    unchanged.
+
+    Needed so `fn on_surface_ready<F>(window: &gtk::Window, apply: F)` doesn't
+    make the *next* step's `str.find("(", ...)` stop early — `<F>` carries no
+    paren, but a bound like `<F: Fn(&T)>` would, and that inner paren must not
+    be mistaken for the parameter list's opening one.
+    """
+    if pos >= len(clean) or clean[pos] != "<":
+        return pos
+    depth = 0
+    for i in range(pos, len(clean)):
+        if clean[i] == "<":
+            depth += 1
+        elif clean[i] == ">":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return pos
+
+
+def parse_params(param_text: str) -> list[str]:
+    """Ordered parameter names out of a function's parameter-list text.
+
+    Depth is tracked over `([{` / `)]}` only, not `<>` — angle brackets are
+    ambiguous with `->` and comparison operators, and unnecessary here: a bare
+    generic type argument (`Mutable<bool>`) carries no top-level comma of its
+    own, and a closure-typed parameter's own parens (`impl Fn(&gtk::Window) +
+    'static`) balance before any comma that matters. Good enough for the
+    widget-taking signatures this scan reasons about; under-splitting a
+    parameter list this scan doesn't need to understand is the safe direction,
+    same as `first_ident_arg`'s `None`.
+    """
+    names: list[str] = []
+    depth = 0
+    start = 0
+
+    def flush(chunk: str) -> None:
+        chunk = chunk.strip()
+        if not chunk or re.match(r"^(&\s*)?(mut\s+)?self\b", chunk):
+            return
+        chunk = chunk.lstrip("&").strip()
+        if chunk.startswith("mut "):
+            chunk = chunk[4:].strip()
+        m = re.match(rf"({IDENT})\s*:", chunk)
+        if m:
+            names.append(m.group(1))
+
+    for i, ch in enumerate(param_text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            flush(param_text[start:i])
+            start = i + 1
+    flush(param_text[start:])
+    return names
+
+
+def iter_function_defs(clean: str):
+    """Yield `(name, params, body_start, body_end)` for every function in
+    `clean`. `params` is `name`'s own parameter names, read with the same
+    paren-depth counting `match_delim` uses elsewhere (`self`-shaped
+    parameters excluded) — #1259's connect-helper discovery is "does this
+    function's body connect one of *its own* parameters", and that question
+    needs the parameter list, not just the body span `iter_function_bodies`
+    (kept below) used to hand out on its own.
+    """
     for m in FN_RE.finditer(clean):
-        brace = clean.find("{", m.end())
+        j = m.end()
+        while j < len(clean) and clean[j] in " \t":
+            j += 1
+        j = skip_generics(clean, j)
+        paren = clean.find("(", j)
+        if paren < 0:
+            continue
+        pend = match_delim(clean, paren, "(", ")")
+        if pend < 0:
+            continue
+        brace = clean.find("{", pend)
         if brace < 0:
             continue
         # A declaration without a body (`fn f(&self);` in a trait) would
         # otherwise borrow the *next* function's brace.
-        if ";" in clean[m.end() : brace]:
+        if ";" in clean[pend:brace]:
             continue
         end = match_delim(clean, brace, "{", "}")
         if end < 0:
             continue
-        yield brace + 1, end - 1
+        yield m.group(1), parse_params(clean[paren + 1 : pend - 1]), brace + 1, end - 1
+
+
+def iter_function_bodies(clean: str):
+    """Yield `(start, end)` spans of every function body in `clean`."""
+    for _name, _params, start, end in iter_function_defs(clean):
+        yield start, end
 
 
 def first_ident_arg(args: str) -> str | None:
@@ -773,6 +948,157 @@ def scan_connect_pins(path: str, src: str, hits: list) -> int:
                     ),
                 )
             )
+
+    return sites
+
+
+# ── Rule (c): the delegated-connect shape (#1259) ────────────────────────────
+#
+# See "THE DELEGATED-CONNECT SHAPE" in the header. `on_surface_ready` wires
+# `connect_map` on the widget it is *handed*, not on a widget it owns — so no
+# `.connect_*(` receiver ever names it at a call site, and rule (a) above,
+# which only reads `<local>.connect_<signal>(`, is structurally blind to it.
+
+
+def is_direct_connector(params: list[str], body: str) -> bool:
+    """True if `body` calls `.connect_<signal>(` on one of `params`."""
+    pset = set(params)
+    return any(m.group(1) in pset for m in CONNECT_RE.finditer(body))
+
+
+def forwards_to_connector(params: list[str], body: str, connectors: set[str]) -> bool:
+    """True if `body` hands one of `params` to an already-known connector,
+    immediately followed by the closure argument — the same `<ident>, (move)?
+    |params|` adjacency `SITE_RE` requires of a `bind*` call. This is what
+    lets `on_map_or_now` (forwarding `window` into `on_surface_ready`) join
+    the connector set on the strength of `on_surface_ready` already being in
+    it, without either name being hardcoded anywhere in this file.
+    """
+    if not connectors:
+        return False
+    pset = set(params)
+    alt = "|".join(re.escape(c) for c in sorted(connectors, key=len, reverse=True))
+    for m in re.finditer(rf"(?<![.\w])(?:{alt})\s*\(", body):
+        open_paren = m.end() - 1
+        end = match_delim(body, open_paren, "(", ")")
+        if end < 0:
+            continue
+        args = body[open_paren + 1 : end - 1]
+        if any(am.group(2) in pset for am in re.finditer(SITE_RE, args)):
+            return True
+    return False
+
+
+def discover_connector_fns(sources: dict[str, str]) -> set[str]:
+    """Function names that, called as `name(widget, .., (move)? |params| ..)`,
+    wire `widget` to a persistent handler — directly (`is_direct_connector`)
+    or by forwarding it into another such function
+    (`forwards_to_connector`). A fixed point over every scanned file at once
+    (not per-file, and not per-function): `on_surface_ready` lives in
+    `crates/hytte-ui/src/layer_window.rs`, the helper that forwards to it can
+    live anywhere under `trollshell/src`, and discovery order between the two
+    is not guaranteed by file-walk order.
+
+    Deliberately name-only, like every other alias/ancestor resolution in
+    this file — there is no type information to disambiguate two unrelated
+    functions sharing a name, so a same-named non-connector coincidentally
+    shaped like one would join the set too. Measured cost on the tree: zero
+    (see the header); the mitigation is the same one `first_ident_arg` and
+    `containment_edges` already rely on — every condition downstream (the
+    adjacency, the discard gate, the alias match) has to align for a hit, not
+    just membership in this set.
+    """
+    defs: list[tuple[str, list[str], str]] = []
+    for src in sources.values():
+        clean = blank_noise(src)
+        for name, params, bstart, bend in iter_function_defs(clean):
+            defs.append((name, params, clean[bstart:bend]))
+
+    connectors: set[str] = set()
+    while True:
+        grew = False
+        for name, params, body in defs:
+            if name in connectors:
+                continue
+            if is_direct_connector(params, body) or forwards_to_connector(
+                params, body, connectors
+            ):
+                connectors.add(name)
+                grew = True
+        if not grew:
+            return connectors
+
+
+def scan_helper_connect_pins(path: str, src: str, hits: list, connectors: set[str]) -> int:
+    """Append delegated-connect pin hits; return the number of connector call
+    sites seen.
+
+    Mirrors `scan_file`'s `bind*` loop rather than `scan_connect_pins`'s
+    ancestor walk, deliberately: a connector call is `name(widget, ..,
+    closure)`, the exact same `<ident>, (move)? |params| ..` shape a `bind*`
+    call site is, just under a discovered name instead of a hardcoded one in
+    `BIND_FNS`. Scoped to the whole file's text before the call (like
+    `scan_file`, not like the per-function ancestor scan) because the widget
+    handed to a connector is routinely the caller's own parameter, built
+    nowhere near the call — `wire_input_region`'s `window` is `#1259`'s own
+    example of that.
+    """
+    if not connectors:
+        return 0
+    clean = blank_noise(src)
+    sites = 0
+    alt = "|".join(re.escape(c) for c in sorted(connectors, key=len, reverse=True))
+    call_re = re.compile(rf"(?<![.\w])({alt})\s*\(")
+
+    for m in call_re.finditer(clean):
+        open_paren = m.end() - 1
+        end = match_delim(clean, open_paren, "(", ")")
+        if end < 0:
+            continue
+        sites += 1
+        args = clean[open_paren + 1 : end - 1]
+        base = open_paren + 1
+
+        for am in re.finditer(SITE_RE, args):
+            sigil = "&" if am.group(1) else ""
+            target = am.group(2)
+            first_param = (am.group(4).split(",") or [""])[0].strip()
+            pm = re.match(rf"^(?:mut\s+)?({IDENT})", first_param)
+            param_name = pm.group(1) if pm else ""
+
+            # Same discard gate as the `bind` rule: a closure that takes its
+            # own widget/surface parameter is correct by construction, and
+            # `<widget>.downgrade()` (upgraded inside the closure) is the
+            # documented fix, not a second-widget carve-out to lose.
+            if not param_name.startswith("_"):
+                continue
+
+            after = args[am.end() :]
+            lead = after.lstrip()
+            if lead.startswith("{"):
+                bstart = am.end() + (len(after) - len(lead))
+                bend = match_delim(args, bstart, "{", "}")
+                body = args[bstart : bend if bend > 0 else len(args)]
+            else:
+                body = after
+
+            prefix = clean[: base + am.start()]
+            used = sorted(
+                a
+                for a in clone_aliases(prefix, target)
+                if a != target and re.search(rf"\b{re.escape(a)}\b", body)
+            )
+            if used:
+                line = src[: base + am.start()].count("\n") + 1
+                hits.append(
+                    (
+                        "helper",
+                        path,
+                        line,
+                        f"{m.group(1)}(.., {sigil}{target}, move |{param_name}, ..|)"
+                        "  captures: " + ", ".join(used),
+                    )
+                )
 
     return sites
 
@@ -1164,12 +1490,143 @@ SELF_TEST_CASES: tuple[tuple[str, int, str], ...] = (
         }
         """,
     ),
+    # ── rule (c), #1259: the delegated-connect shape ──────────────────────
+    #
+    # Every fixture below carries its own `on_surface_ready`-shaped seed
+    # definition (calling `.connect_map(` on its own `window` parameter) so
+    # `discover_connector_fns` has something to find *within the fixture
+    # alone* — exactly the two-function shape #1259 reports (`on_map_or_now`
+    # forwarding into `on_surface_ready`), extracted to the minimum that still
+    # exercises discovery rather than a mock.
+    (
+        "delegated-connect pin (#1259/#1244 pre-fix `on_map_or_now` shape)",
+        1,
+        """
+        fn on_surface_ready<F: Fn(&gdk::Surface) + 'static>(window: &gtk::Window, apply: F) {
+            window.connect_map(move |w| {
+                if let Some(surface) = w.surface() {
+                    apply(&surface);
+                }
+            });
+        }
+
+        fn on_map_or_now(window: &gtk::Window, apply: impl Fn(&gtk::Window) + 'static) {
+            let window_for_apply = window.clone();
+            hytte::ui::on_surface_ready(window, move |_surface| apply(&window_for_apply));
+        }
+        """,
+    ),
+    (
+        "delegated-connect FIXED — a `.downgrade()` capture must stay clean",
+        0,
+        """
+        fn on_surface_ready<F: Fn(&gdk::Surface) + 'static>(window: &gtk::Window, apply: F) {
+            window.connect_map(move |w| {
+                if let Some(surface) = w.surface() {
+                    apply(&surface);
+                }
+            });
+        }
+
+        fn on_map_or_now(window: &gtk::Window, apply: impl Fn(&gtk::Window) + 'static) {
+            let weak = window.downgrade();
+            hytte::ui::on_surface_ready(window, move |_surface| {
+                if let Some(window) = weak.upgrade() {
+                    apply(&window);
+                }
+            });
+        }
+        """,
+    ),
+    (
+        "delegated-connect — the closure's own surface param must stay clean (osd.rs shape)",
+        0,
+        """
+        fn on_surface_ready<F: Fn(&gdk::Surface) + 'static>(window: &gtk::Window, apply: F) {
+            window.connect_map(move |w| {
+                if let Some(surface) = w.surface() {
+                    apply(&surface);
+                }
+            });
+        }
+
+        fn install_click_through(window: &gtk::Window) {
+            hytte::ui::on_surface_ready(window, |surface| {
+                surface.set_input_region(Some(&Region::create()));
+            });
+        }
+        """,
+    ),
+    (
+        "delegated-connect — a handler using its own surface param stays clean (modal.rs shape)",
+        0,
+        """
+        fn on_surface_ready<F: Fn(&gdk::Surface) + 'static>(window: &gtk::Window, apply: F) {
+            window.connect_map(move |w| {
+                if let Some(surface) = w.surface() {
+                    apply(&surface);
+                }
+            });
+        }
+
+        fn wire_recenter_on_bar_geometry(bar_window: &gtk::Window, key: String) {
+            let wired = Cell::new(false);
+            on_surface_ready(bar_window, move |surface| {
+                if wired.replace(true) {
+                    return;
+                }
+                surface.connect_layout(move |_, width, height| {
+                    let _ = (width, height);
+                });
+            });
+        }
+        """,
+    ),
+    (
+        "delegated-connect — a plain `connect_realize` handler using its own param (frame.rs shape)",
+        0,
+        """
+        fn install_click_through(window: &gtk::Window) {
+            window.connect_realize(|w| {
+                if let Some(surface) = w.surface() {
+                    let empty = Region::create();
+                    surface.set_input_region(Some(&empty));
+                }
+            });
+        }
+        """,
+    ),
+    (
+        "delegated-connect — a DIFFERENT widget's clone is the carve-out, must stay clean",
+        0,
+        """
+        fn on_surface_ready<F: Fn(&gdk::Surface) + 'static>(window: &gtk::Window, apply: F) {
+            window.connect_map(move |w| {
+                if let Some(surface) = w.surface() {
+                    apply(&surface);
+                }
+            });
+        }
+
+        fn wire_badge(window: &gtk::Window, badge: &gtk::Label) {
+            let badge_for_apply = badge.clone();
+            hytte::ui::on_surface_ready(window, move |_surface| {
+                badge_for_apply.set_visible(true);
+            });
+        }
+        """,
+    ),
 )
 
 
-def scan_source(path: str, src: str, hits: list) -> tuple[int, int]:
-    """Both scans over one source. Returns `(bind* sites, connect_* sites)`."""
-    return scan_file(path, src, hits), scan_connect_pins(path, src, hits)
+def scan_source(path: str, src: str, hits: list, connectors: set[str]) -> tuple[int, int, int]:
+    """All three scans over one source. Returns `(bind* sites, connect_*
+    sites, connect-helper call sites)`."""
+    return (
+        scan_file(path, src, hits),
+        scan_connect_pins(path, src, hits),
+        scan_helper_connect_pins(path, src, hits, connectors),
+    )
 
 
 def self_test() -> list[str]:
@@ -1177,7 +1634,12 @@ def self_test() -> list[str]:
     failures = []
     for name, expected, src in SELF_TEST_CASES:
         hits: list = []
-        scan_source("<self-test>", src, hits)
+        # Each fixture is self-contained: one that exercises the #1259
+        # connect-helper rule carries its own `on_surface_ready`-shaped seed
+        # definition, so discovery has something to find within the fixture
+        # alone — exactly as it would across the real tree's many files.
+        connectors = discover_connector_fns({"<self-test>": src})
+        scan_source("<self-test>", src, hits, connectors)
         if len(hits) != expected:
             found = ", ".join(f"{kind}: {detail}" for kind, _, _, detail in hits) or "nothing"
             failures.append(f"  {name}: expected {expected} pin(s), found {len(hits)} ({found})")
@@ -1211,10 +1673,12 @@ def main(argv: list[str]) -> int:
         print("  (run from the repository root, or pass roots explicitly)", file=sys.stderr)
         return 2
 
-    hits: list = []
-    call_sites = 0
-    connect_sites = 0
-    files = 0
+    # Every file is read once, up front — #1259's connector discovery is a
+    # fixed point over *all* scanned files at once (a delegating helper in
+    # `trollshell/src` can forward into a connector defined in
+    # `crates/hytte-ui/src`), so it has to see every source before the
+    # per-file pin scan below can use its result.
+    sources: dict[str, str] = {}
     for root in roots:
         for dirpath, _, names in os.walk(root):
             for name in sorted(names):
@@ -1222,23 +1686,38 @@ def main(argv: list[str]) -> int:
                     continue
                 path = os.path.join(dirpath, name)
                 with open(path, encoding="utf-8") as fh:
-                    src = fh.read()
-                files += 1
-                binds, connects = scan_source(path, src, hits)
-                call_sites += binds
-                connect_sites += connects
+                    sources[path] = fh.read()
+
+    connectors = discover_connector_fns(sources)
+
+    hits: list = []
+    call_sites = 0
+    connect_sites = 0
+    helper_sites = 0
+    for path, src in sources.items():
+        binds, connects, helpers = scan_source(path, src, hits, connectors)
+        call_sites += binds
+        connect_sites += connects
+        helper_sites += helpers
 
     # Flushed so the summary lands *before* the stderr report below when both
     # are funnelled into one build log.
     print(
-        f"bind-pin scan: {files} files, {call_sites} bind* call sites, "
-        f"{connect_sites} connect_* handlers, {len(hits)} pin(s)",
+        f"bind-pin scan: {len(sources)} files, {call_sites} bind* call sites, "
+        f"{connect_sites} connect_* handlers, {len(connectors)} connect-helper "
+        f"fn(s), {helper_sites} connect-helper call sites, {len(hits)} pin(s)",
         flush=True,
     )
 
     for seen, floor, what, knobs in (
         (call_sites, MIN_CALL_SITES, "bind*", "BIND_FNS / MIN_CALL_SITES"),
         (connect_sites, MIN_CONNECT_SITES, "connect_*", "CONNECT_RE / MIN_CONNECT_SITES"),
+        (
+            len(connectors),
+            MIN_CONNECTOR_FNS,
+            "connect-helper fn",
+            "discover_connector_fns / MIN_CONNECTOR_FNS",
+        ),
     ):
         if seen < floor:
             print(
@@ -1292,6 +1771,18 @@ def main(argv: list[str]) -> int:
             "breaks and the whole subtree outlives its container.\n"
             "  Fix: capture `<widget>.downgrade()` and `upgrade()` inside the handler, or\n"
             "  take the handler's own widget argument when it is the same widget.\n",
+            file=sys.stderr,
+        )
+    if "helper" in kinds:
+        print(
+            "connect-helper pin: a widget was handed to a function that connects it to a\n"
+            "handler on the caller's behalf (`hytte::ui::on_surface_ready`, or a local\n"
+            "helper like `on_map_or_now` that itself forwards into one), and a strong\n"
+            "clone of that same widget was captured into the closure instead of using the\n"
+            "closure's own parameter — the widget ends up owning a handler that owns the\n"
+            "widget (#1259, the #1244 sidebar shape).\n"
+            "  Fix: capture `<widget>.downgrade()` and `upgrade()` inside the closure, the\n"
+            "  way the fixed `on_map_or_now` does — never a captured strong clone.\n",
             file=sys.stderr,
         )
     print(

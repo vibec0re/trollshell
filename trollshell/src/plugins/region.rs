@@ -4359,7 +4359,6 @@ pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
 /// There is deliberately no left-hand twin: the left sidebar is always mounted
 /// (it carries the built-in calendar/tasks cards, which are never empty), and
 /// #1160 leaves its behaviour untouched.
-#[must_use]
 pub fn sidebar_right_non_empty(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
     let connector = monitor.connector();
     map_ref! {

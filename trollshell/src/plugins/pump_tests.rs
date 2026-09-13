@@ -533,6 +533,82 @@ fn every_render_mailbox_slot_contributes_to_the_live_ids_union() {
     }
 }
 
+// ── The two slot-visibility aggregates (#1158/#1160) ────────────────────────
+
+/// The GTK-side half of the #1221 review's LOW 5: the left and right sidebars
+/// keep **separate** per-monitor maps and publish on **separate** watch
+/// channels, so an edge on one side cannot move the other's aggregate.
+///
+/// `session::visibility_source` is what turns that into "only right-mounted
+/// plugins park when the right sidebar closes"; this pins the other half — that
+/// there are two aggregates at all and that each publisher writes exactly one of
+/// them. Before #1160 there was one map and one channel, and a right-mounted
+/// card was told it was on screen whenever the *left* sidebar opened.
+///
+/// **Falsifications:**
+/// * pointing `publish_right_visibility` at `visibility_tx` → red on
+///   "the left aggregate must not move".
+/// * having `set_sidebar_right_visibility` write `SLOT_VISIBILITY_BY_MONITOR`
+///   → red the same way.
+/// * dropping `publish_right_visibility`'s deliberate *non*-write of
+///   `SLOT_VISIBLE` (folding the right side into the binary's own #840 gate)
+///   → red on the `slot_visible_mutable` assertion.
+#[test]
+fn the_two_sidebars_publish_to_separate_aggregates() {
+    registry::reset_for_tests();
+
+    let handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    let mut left = handles.visibility_tx.subscribe();
+    let mut right = handles.visibility_right_tx.subscribe();
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+
+    assert!(!*left.borrow_and_update(), "test setup: both start closed");
+    assert!(!*right.borrow_and_update());
+
+    // Open only the RIGHT sidebar on one output.
+    super::set_sidebar_right_visibility("DP-1", true);
+    assert!(
+        *right.borrow_and_update(),
+        "a right-sidebar open edge must reach the right aggregate"
+    );
+    assert!(
+        !*left.borrow_and_update(),
+        "the left aggregate must not move when only the right sidebar opened — that is the whole \
+         of LOW 5: a left-mounted card is not on screen because the right sidebar opened"
+    );
+    assert!(
+        !super::slot_visible_mutable().get(),
+        "the binary's own #840 gate mirrors the LEFT aggregate only; its consumers are \
+         left-sidebar cards, and folding the right side in would unpark them for a card they \
+         cannot see"
+    );
+
+    // …and the mirror direction.
+    super::set_sidebar_visibility("DP-1", true);
+    assert!(*left.borrow_and_update());
+    super::set_sidebar_right_visibility("DP-1", false);
+    assert!(
+        !*right.borrow_and_update(),
+        "closing the right sidebar must close the right aggregate"
+    );
+    assert!(
+        *left.borrow_and_update(),
+        "…and must leave an open left sidebar reporting visible"
+    );
+
+    // Hot-unplug drops the monitor from the side it is forgotten on, only.
+    super::forget_sidebar_right_visibility("DP-1");
+    assert!(!*right.borrow_and_update());
+    assert!(*left.borrow_and_update());
+    super::forget_sidebar_visibility("DP-1");
+    assert!(!*left.borrow_and_update());
+
+    registry::reset_for_tests();
+}
+
 /// A `wire::Node::Shader` with a real buffer, for the release tests.
 fn shader_node(id: &str) -> wire::Node {
     wire::Node::Shader {

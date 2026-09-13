@@ -336,7 +336,23 @@ mod tests {
             };
             let settings = settings_from(DEFAULT_MOUNT, &lookup, &stats);
             assert_eq!(settings.family, Family::of(mount), "{}", mount.wire_name());
-            assert_eq!(settings.card, stats.for_family(settings.family));
+            // Against the table **by name**, never against
+            // `stats.for_family(settings.family)` — that would assert the
+            // selection against itself and stay green with the whole mechanism
+            // deleted (measured: neutering `for_family` to `self.sidebar`
+            // leaves this row passing, which is why the expectation is spelled
+            // out here).
+            assert_eq!(
+                settings.card,
+                if mount.is_bar() {
+                    stats.bar
+                } else {
+                    stats.sidebar
+                },
+                "{} must read the [{}] table",
+                mount.wire_name(),
+                settings.family.table(),
+            );
         }
     }
 

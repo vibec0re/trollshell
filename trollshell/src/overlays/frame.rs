@@ -26,15 +26,16 @@
 //! Both horizontal insets follow a sidebar: the left edge the left sidebar's
 //! visible width, the right edge the right one's (#1158/#1160). Each side is
 //! read from its own surface through `sidebar::current_visible_width(side, …)`
-//! and both are redrawn from **one** tick loop, armed by a `map_ref!` over the
-//! two open signals **and** the right sidebar's content flag
-//! (`plugins::sidebar_right_non_empty`, `.dedupe()`d) and broken only when
-//! [`all_settled`] says neither revealer is still moving. The content flag is
-//! its own input rather than folded into a rewritten `open_signal_on` because
-//! on the right it is a `Mutable` independent of the raw open intent — a card
-//! arriving or leaving moves the revealer, the exclusive zone and
-//! `current_visible_width` without the intent ever changing, so the two open
-//! signals alone would arm nothing for it (#1247 review finding 1). A side
+//! and both are redrawn from **one** tick loop, armed by [`redraw_arming_signal`]
+//! — a `map_ref!` over the two open signals **and** the right sidebar's
+//! content flag (`plugins::sidebar_right_non_empty`, `.dedupe()`d) — and
+//! broken only when [`all_settled`] says neither revealer is still moving.
+//! The content flag is its own input rather than folded into a rewritten
+//! `open_signal_on` because on the right it is a `Mutable` independent of the
+//! raw open intent — a card arriving or leaving moves the revealer, the
+//! exclusive zone and `current_visible_width` without the intent ever
+//! changing, so the two open signals alone would arm nothing for it (#1247
+//! review finding 1). A side
 //! that is closed, empty or never installed reports [`FRAME_THICKNESS_I32`],
 //! which is the plain strut — so a shell with no right-mounted plugin draws
 //! exactly the frame it drew before this existed.
@@ -43,6 +44,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hytte::futures_signals::map_ref;
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
@@ -170,31 +172,24 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
     // one armed — and would need its own `JoinHandle` in `FrameView` and its own
     // `abort()` in `close_all` to avoid the leak documented on that field.
     //
-    // A third input, the right sidebar's content flag (#1247 review finding 1):
-    // `open_signal_on` is the raw open *intent*, and on the right that is a
-    // Mutable independent of `plugins::sidebar_right_non_empty` — the card
-    // going away (or arriving) moves the revealer, the exclusive zone and
-    // `current_visible_width` by a whole sidebar width without ever touching
-    // `open_state`. Without this input a quiet plugin's tree going empty (or a
-    // fresh one arriving) leaves the cutout stale until something unrelated
-    // (a left toggle, hot-plug, fullscreen) queues the next draw. `.dedupe()`
-    // is load-bearing, not tidiness: `sidebar_right_non_empty` is itself a
-    // `map_ref!` over the right sidebar's three render-list signals
-    // (`plugins/region.rs`), which re-emit **per plugin frame** — an animated
-    // chip would otherwise arm this tick 60×/s for the life of the session.
-    // The left needs no such input: its `non_empty` is the constant `true`.
+    // The arming signal itself is [`redraw_arming_signal`] — a plain function
+    // over the three input signals (both sides' open intent, plus the right
+    // sidebar's content flag) rather than inlined here, so a test can
+    // subscribe to the exact function this call site drives instead of a
+    // stand-in that merely has the same shape (#1247 review finding 1, fix
+    // round 2). See that function's doc for why the third input exists at
+    // all and why `.dedupe()` on it is load-bearing.
     //
     // Spawned raw (not a `bind`), so it has no WeakRef safety net and won't
     // stop when the window drops — the `JoinHandle` is stored in `FrameView`
     // and aborted in `close_all` on hot-plug.
     let area_for_sidebar = area.clone();
     let monitor_for_sidebar = monitor.clone();
-    let both_sides = map_ref! {
-        let left = sidebar::open_signal_on(Side::Left, monitor),
-        let right = sidebar::open_signal_on(Side::Right, monitor),
-        let right_has_card = crate::plugins::sidebar_right_non_empty(monitor).dedupe() =>
-            (*left, *right, *right_has_card)
-    };
+    let both_sides = redraw_arming_signal(
+        sidebar::open_signal_on(Side::Left, monitor),
+        sidebar::open_signal_on(Side::Right, monitor),
+        crate::plugins::sidebar_right_non_empty(monitor),
+    );
     let sidebar_sub =
         glib::MainContext::default().spawn_local(both_sides.for_each(move |_opens| {
             let area = area_for_sidebar.clone();
@@ -389,12 +384,55 @@ fn sidebar_insets(width_of: impl Fn(Side) -> f64) -> (f64, f64) {
     (width_of(Side::Left), width_of(Side::Right))
 }
 
+/// The signal that arms [`install`]'s redraw tick: both sides' raw open
+/// *intent*, plus the right sidebar's content flag (#1247 review finding 1).
+///
+/// A plain function over three input **signals**, not a `&Monitor` — `install`
+/// is the only production caller and wires the real
+/// `sidebar::open_signal_on`/`crate::plugins::sidebar_right_non_empty`
+/// signals into it, but this function has no idea where its inputs come
+/// from. That is what lets `sidebar.rs`'s regression test subscribe to this
+/// exact function (not a re-implementation with the same shape) with
+/// substitute `Mutable`s standing in for a monitor's real signals — the same
+/// seam `wire_non_empty` already uses, and for the same reason: the review's
+/// #754 false-coupling concern is that a test built from a copy of a
+/// `map_ref!` stays green when the *production* one is broken, because
+/// nothing ties the two together. Routing both through this one function
+/// removes that gap — mutate this body (the thing [`install`] actually
+/// calls) and the test reds too.
+///
+/// Before #1247 only the left sidebar existed, whose `non_empty` is the
+/// constant `true`, so its open intent alone always tracked its visible-width
+/// transitions and there was nothing for a third input to catch. On the
+/// right, `open_state` and `non_empty` are independent `Mutable`s: a card
+/// arriving or leaving moves the revealer, the exclusive zone and
+/// `current_visible_width` by a whole sidebar width without the open intent
+/// ever changing, so `left_open`/`right_open` alone arm nothing for it.
+///
+/// `.dedupe()` on `right_has_card` is load-bearing, not tidiness:
+/// `plugins::sidebar_right_non_empty` is itself a `map_ref!` over the right
+/// sidebar's three render-list signals (`plugins/region.rs`), which re-emit
+/// **per plugin frame** — an animated chip would otherwise arm the tick 60×/s
+/// for the life of the session.
+pub(crate) fn redraw_arming_signal(
+    left_open: impl Signal<Item = bool> + 'static,
+    right_open: impl Signal<Item = bool> + 'static,
+    right_has_card: impl Signal<Item = bool> + 'static,
+) -> impl Signal<Item = (bool, bool, bool)> + 'static {
+    map_ref! {
+        let left = left_open,
+        let right = right_open,
+        let right_has_card = right_has_card.dedupe() =>
+            (*left, *right, *right_has_card)
+    }
+}
+
 /// Whether the frame's redraw tick can stop: **both** sidebars are at rest.
 ///
 /// A conjunction rather than either side's own flag, because one tick callback
-/// serves both edges (see `install`'s single `map_ref!` subscription): breaking
-/// as soon as the left has settled would freeze the cutout mid-way through a
-/// right slide.
+/// serves both edges (see [`redraw_arming_signal`], `install`'s single
+/// subscription): breaking as soon as the left has settled would freeze the
+/// cutout mid-way through a right slide.
 fn all_settled(left: bool, right: bool) -> bool {
     left && right
 }

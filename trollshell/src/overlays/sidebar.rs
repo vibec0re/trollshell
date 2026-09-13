@@ -2614,22 +2614,27 @@ mod gtk_tests {
     /// and [`current_visible_width_for_key`] by a whole sidebar width without
     /// `open_state` ever changing.
     ///
-    /// `frame.rs`'s arming subscription is spawned inline against a real
-    /// layer-shell window, so this pins its *shape* instead: it builds the
-    /// same three inputs by hand — [`sidebar_open_state`] for both sides, plus
-    /// the right panel's `non_empty` `Mutable` (the same one [`wire_non_empty`]
-    /// drives from `plugins::sidebar_right_non_empty` in production) — and
-    /// polls the combined signal directly rather than pumping a main loop.
+    /// This subscribes to [`frame::redraw_arming_signal`] itself — the exact
+    /// function `frame::install`'s tick loop calls — rather than a
+    /// re-implementation of its shape (fix round 2 / #754's false-coupling
+    /// class: a test built from a *copy* of a `map_ref!` stays green when the
+    /// real one breaks, because nothing ties the two together). It feeds that
+    /// function substitute `Mutable`s standing in for a real `Monitor`'s
+    /// [`sidebar_open_state`]/`plugins::sidebar_right_non_empty` signals — the
+    /// same seam [`wire_non_empty`] already uses, for the same reason: this
+    /// test has no `Monitor` to drive those through.
     ///
-    /// **Falsification (run):** dropping the third `map_ref!` input — i.e.
-    /// arming on `open_state` alone, which is what #1247 shipped before this
-    /// review — reproduces the finding exactly: the signal stays `Pending`
-    /// across the `non_empty` flip even though the visible width moves by a
-    /// full sidebar width in the same step.
+    /// **Falsification (run):** editing [`frame::redraw_arming_signal`]'s body
+    /// to ignore its `right_has_card` parameter (arming on the two open
+    /// signals alone, which is what #1247 shipped before this review)
+    /// reproduces the finding exactly: the signal stays `Pending` across the
+    /// `non_empty` flip even though the visible width moves by a full sidebar
+    /// width in the same step. Because this test calls that function directly
+    /// rather than its own copy, the mutation has to land in the function
+    /// `install` actually uses.
     #[gtk::test]
     fn a_right_non_empty_change_arms_the_frames_redraw_signal() {
-        use hytte::futures_signals::map_ref;
-        use hytte::futures_signals::signal::{Signal, SignalExt};
+        use hytte::futures_signals::signal::Signal;
         use std::task::{Context, Poll, Waker};
 
         adw::init().expect("libadwaita init");
@@ -2647,22 +2652,20 @@ mod gtk_tests {
             });
             sidebar_open_state(Side::Right, "DP-ARM").set(true);
 
-            // The same three inputs as `frame.rs`'s `both_sides`, `.dedupe()`d
-            // the same way — built from `sidebar_open_state`/`non_empty`
-            // directly since this test has no `Monitor` to call
-            // `open_signal_on`/`plugins::sidebar_right_non_empty` through.
-            let arming = map_ref! {
-                let _left = sidebar_open_state(Side::Left, "DP-ARM").signal(),
-                let _right = sidebar_open_state(Side::Right, "DP-ARM").signal(),
-                let has_card = non_empty.signal().dedupe() => *has_card
-            };
+            let arming = frame::redraw_arming_signal(
+                sidebar_open_state(Side::Left, "DP-ARM").signal(),
+                sidebar_open_state(Side::Right, "DP-ARM").signal(),
+                non_empty.signal(),
+            );
             let mut sig = std::pin::pin!(arming);
             let mut cx = Context::from_waker(Waker::noop());
 
-            // Drain the signal's initial value before measuring.
+            // Drain the signal's initial value before measuring: left is
+            // still closed, right was just latched open, and the card hasn't
+            // arrived yet.
             assert!(matches!(
                 sig.as_mut().poll_change(&mut cx),
-                Poll::Ready(Some(false))
+                Poll::Ready(Some((false, true, false)))
             ));
             assert!(matches!(sig.as_mut().poll_change(&mut cx), Poll::Pending));
 
@@ -2680,7 +2683,10 @@ mod gtk_tests {
                 "the inset the frame draws from must move: {before} -> {after}"
             );
             assert!(
-                matches!(sig.as_mut().poll_change(&mut cx), Poll::Ready(Some(true))),
+                matches!(
+                    sig.as_mut().poll_change(&mut cx),
+                    Poll::Ready(Some((false, true, true)))
+                ),
                 "the inset moved by {} px and the arming signal did not emit",
                 after - before
             );

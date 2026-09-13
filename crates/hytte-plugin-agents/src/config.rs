@@ -395,8 +395,8 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agents-nix-rendered.toml");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("missing fixture {} ({e})", path.display()));
-        let loaded = assemble::<AgentsConfig>(&[(path, body)])
-            .expect("the nix-rendered fixture assembles");
+        let loaded =
+            assemble::<AgentsConfig>(&[(path, body)]).expect("the nix-rendered fixture assembles");
         assert!(loaded.unknown_keys.is_empty(), "{:?}", loaded.unknown_keys);
         loaded.config.validate().expect("the fixture validates");
 

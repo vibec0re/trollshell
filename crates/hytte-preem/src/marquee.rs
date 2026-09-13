@@ -86,6 +86,17 @@ const DEFAULT_WINDOW_PX: usize = 192;
 /// **dots** — one glyph cell of clear space before the message restarts.
 const DEFAULT_GAP_DOTS: usize = font::GLYPH_W + font::SPACING;
 
+/// Largest accepted [`Marquee::window_px`]. Matches the wire's
+/// `MAX_BUFFER_DIM`: `window_px` is already the *final* buffer width (the
+/// marquee carries no separate `scale`), so capping it directly is the whole
+/// bound on this axis, and `2048 * 2048 * 4 B` is a single `Node::Pixels`
+/// frame's worth of RGBA8.
+const MAX_WINDOW_PX: usize = 2048;
+
+/// Largest accepted [`Marquee::gap_dots`]. Matches the wire's `MAX_GAP_DOTS`:
+/// the gap extends the rasterised strip, so it is bounded like a dimension.
+const MAX_GAP_DOTS: usize = 1024;
+
 /// One column of the font-space bitmap: bit `row` is the dot at that row, top
 /// row = bit 0. One bit per virtual pixel, which is the whole storage — the
 /// bitmap knows nothing about buffer pixels.
@@ -184,7 +195,8 @@ impl Marquee {
     /// The visible window width in **final** buffer pixels — the width of the
     /// [`Frame`] each [`window`](MarqueeStrip::window) hands back, so size it
     /// to the surface (the `Pixels` node's natural size *is* the buffer, per
-    /// the kit's sizing docs).
+    /// the kit's sizing docs). Capped at [`MAX_WINDOW_PX`] (`0` is left
+    /// alone — it resolves to a zero-width but still valid buffer).
     ///
     /// The dot grid inside is as many whole dot cells as fit between the
     /// one-cell bezels, centered in the window; a width that isn't a whole
@@ -192,17 +204,18 @@ impl Marquee {
     /// only knob in buffer pixels — everything that *moves* is in dots.
     #[must_use]
     pub fn window_px(mut self, px: usize) -> Self {
-        self.window_px = px;
+        self.window_px = px.min(MAX_WINDOW_PX);
         self
     }
 
     /// The blank gap appended after the message before it loops, in **dots** —
     /// the seam that separates the end of the message from its restart. In
     /// dots, not pixels, so the seam is a whole number of grid columns like
-    /// everything else the offset can reach (#839).
+    /// everything else the offset can reach (#839). Capped at
+    /// [`MAX_GAP_DOTS`] (`0` is left alone — no gap at all is valid).
     #[must_use]
     pub fn gap_dots(mut self, dots: usize) -> Self {
-        self.gap_dots = dots;
+        self.gap_dots = dots.min(MAX_GAP_DOTS);
         self
     }
 
@@ -414,7 +427,7 @@ impl MarqueeStrip {
 mod tests {
     use super::super::DisplayStyle;
     use super::super::dot_matrix::{DEFAULT_DOT_PX, DotMatrix, MAX_DOT_PX, MIN_DOT_PX, dot_matrix};
-    use super::{Frame, Marquee, MarqueeStrip, font, rasterize};
+    use super::{Frame, MAX_GAP_DOTS, MAX_WINDOW_PX, Marquee, MarqueeStrip, font, rasterize};
 
     /// The pitch and bezel the marquee shipped with before #1091 made them a
     /// knob. Every test below that does not *name* a pitch is asserting the
@@ -1023,5 +1036,50 @@ mod tests {
                 assert_eq!(strip.dot_px(), px);
             }
         }
+    }
+
+    /// The `window_px` knob has a ceiling: anything past `MAX_WINDOW_PX`
+    /// clamps down to exactly the bound (#1181). `0` is left alone — a
+    /// zero-width buffer is a valid degenerate case, not an error.
+    #[test]
+    fn window_px_knob_has_a_ceiling() {
+        let width_of = |px: usize| {
+            Marquee::new(DisplayStyle::Vfd)
+                .window_px(px)
+                .render("")
+                .width()
+        };
+        assert_eq!(width_of(0), 0, "0 is left alone");
+        assert_eq!(width_of(MAX_WINDOW_PX), MAX_WINDOW_PX);
+        assert_eq!(
+            width_of(MAX_WINDOW_PX + 1),
+            MAX_WINDOW_PX,
+            "one past the ceiling clamps down to exactly MAX_WINDOW_PX"
+        );
+        assert_eq!(
+            width_of(usize::MAX),
+            MAX_WINDOW_PX,
+            "usize::MAX clamps down to exactly MAX_WINDOW_PX"
+        );
+    }
+
+    /// The `gap_dots` knob has a ceiling: anything past `MAX_GAP_DOTS` clamps
+    /// down to exactly the bound (#1181). `0` is left alone — no gap at all
+    /// is valid.
+    #[test]
+    fn gap_dots_knob_has_a_ceiling() {
+        let gap_of = |dots: usize| Marquee::new(DisplayStyle::Vfd).gap_dots(dots).gap_dots;
+        assert_eq!(gap_of(0), 0, "0 is left alone");
+        assert_eq!(gap_of(MAX_GAP_DOTS), MAX_GAP_DOTS);
+        assert_eq!(
+            gap_of(MAX_GAP_DOTS + 1),
+            MAX_GAP_DOTS,
+            "one past the ceiling clamps down to exactly MAX_GAP_DOTS"
+        );
+        assert_eq!(
+            gap_of(usize::MAX),
+            MAX_GAP_DOTS,
+            "usize::MAX clamps down to exactly MAX_GAP_DOTS"
+        );
     }
 }

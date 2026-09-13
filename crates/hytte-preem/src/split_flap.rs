@@ -140,8 +140,29 @@ const MIN_GLYPH_PX: usize = 2;
 const MAX_GLYPH_PX: usize = 16;
 /// Default integer upscale baked into the output ([`Frame::upscale`]).
 const DEFAULT_SCALE: usize = 2;
+/// Largest accepted integer upscale (see [`FlipBoard::scale`]). Matches the
+/// wire's `MAX_SCALE`, mirrored the same way [`MAX_CELLS`] mirrors `MAX_CELLS`
+/// below — the kit's own defaults are 1x/2x, and 8x is already a chunkier
+/// pixel than any skin reads well at.
+const MAX_SCALE: usize = 8;
 /// Cells in a default board: `HH:MM:SS`.
 const DEFAULT_CELLS: usize = 8;
+/// The most cells a board will hold (see [`FlipBoard::cells`]).
+///
+/// A board's width grows linearly with the cell count *times*
+/// [`glyph_px`](FlipBoard::glyph_px) times [`scale`](FlipBoard::scale). Kit
+/// default 8 (`HH:MM:SS`); 64 is past a departure board's longest row.
+pub const MAX_CELLS: usize = 64;
+
+/// The wire's mirror of [`MAX_CELLS`] must agree with the kit's.
+///
+/// Pinned from **this** side, on the [`dot_matrix`](super::dot_matrix)
+/// precedent: `hytte-preem` depends on `hytte-plugin-proto` (for
+/// `Frame::into_node`), while the proto is the language-neutral schema anchor
+/// and can never see the kit, so `clamp_in_place`'s `MAX_CELLS` used to be an
+/// independent re-derivation of this same geometry rather than a checked copy
+/// of it (#1181). This assertion is what makes it a copy instead.
+const _: () = assert!(MAX_CELLS == hytte_plugin_proto::MAX_CELLS as usize);
 
 /// Card padding around the glyph, in **font pixels** — so it scales with
 /// [`glyph_px`](FlipBoard::glyph_px) and a bigger board stays in proportion.
@@ -328,11 +349,13 @@ impl FlipBoard {
 
     /// Set the number of character cells — the board's *physical* width, which
     /// never changes afterwards: [`set_text`](Self::set_text) pads a short
-    /// string with blanks and ignores anything past the last cell. A consuming
-    /// builder; call it at construction (it rebuilds the row blank).
+    /// string with blanks and ignores anything past the last cell. Clamped to
+    /// at most [`MAX_CELLS`] (`0` is left alone — an empty board is a valid,
+    /// total degenerate case, not an error). A consuming builder; call it at
+    /// construction (it rebuilds the row blank).
     #[must_use]
     pub fn cells(mut self, count: usize) -> Self {
-        self.cells = vec![blank_cell(); count];
+        self.cells = vec![blank_cell(); count.min(MAX_CELLS)];
         self
     }
 
@@ -351,12 +374,13 @@ impl FlipBoard {
         self
     }
 
-    /// Set the integer upscale baked into the output (clamped to at least 1) —
-    /// the kit bakes chunkiness into the buffer rather than leaning on shell
-    /// CSS (the `.caw-lcd` lesson, #313). A consuming builder.
+    /// Set the integer upscale baked into the output, clamped to
+    /// `1..=`[`MAX_SCALE`] — the kit bakes chunkiness into the buffer rather
+    /// than leaning on shell CSS (the `.caw-lcd` lesson, #313). A consuming
+    /// builder.
     #[must_use]
     pub fn scale(mut self, factor: usize) -> Self {
-        self.scale = factor.max(1);
+        self.scale = factor.clamp(1, MAX_SCALE);
         self
     }
 
@@ -965,9 +989,9 @@ fn level(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_PAD_FX, CHARSET, DEFAULT_FLIP_SECS, DisplayStyle, FlipBoard, Frame, Mechanism,
-        NOTDEF_CARD, PI, afterglow, cathode_stack, drum, flap_theta, font, fx, ignite, mix,
-        rows_of,
+        CARD_PAD_FX, CHARSET, DEFAULT_FLIP_SECS, DisplayStyle, FlipBoard, Frame, MAX_CELLS,
+        MAX_SCALE, Mechanism, NOTDEF_CARD, PI, afterglow, cathode_stack, drum, flap_theta, font,
+        fx, ignite, mix, rows_of,
     };
 
     /// A settled board of `n` cells showing `text` — the reference every
@@ -1828,5 +1852,52 @@ mod tests {
         assert!(board.glyph_coverage(dash, 0, lo, lo + 1.0).abs() < f32::EPSILON);
         assert!(board.glyph_coverage(dash, x, 0.0, 0.0).abs() < f32::EPSILON);
         assert!(board.glyph_coverage(dash, x, 5.0, 1.0).abs() < f32::EPSILON);
+    }
+
+    /// The `cells` knob has a ceiling: `MAX_CELLS` renders as many cells as
+    /// asked, and anything past it clamps down to exactly the bound rather
+    /// than growing the board without limit (#1181). `0` is left alone — an
+    /// empty board is a valid degenerate case, not something to floor to 1.
+    #[test]
+    fn cells_knob_has_a_ceiling() {
+        let empty = resting(Mechanism::SplitFlap, 0, "");
+        assert_eq!(empty.cells.len(), 0, "an empty board stays empty");
+
+        let at_ceiling = resting(Mechanism::SplitFlap, MAX_CELLS, "");
+        let over_ceiling = resting(Mechanism::SplitFlap, MAX_CELLS + 1, "");
+        let way_over = resting(Mechanism::SplitFlap, usize::MAX, "");
+        assert_eq!(at_ceiling.cells.len(), MAX_CELLS);
+        assert_eq!(
+            at_ceiling.render(DisplayStyle::Vfd),
+            over_ceiling.render(DisplayStyle::Vfd),
+            "one past the ceiling clamps down to exactly MAX_CELLS"
+        );
+        assert_eq!(
+            at_ceiling.render(DisplayStyle::Vfd),
+            way_over.render(DisplayStyle::Vfd),
+            "usize::MAX clamps down to exactly MAX_CELLS"
+        );
+    }
+
+    /// The `scale` knob has both a floor and a ceiling: `0` clamps up to `1`,
+    /// and anything past `MAX_SCALE` clamps down to exactly the bound (#1181).
+    #[test]
+    fn scale_knob_has_both_bounds() {
+        let board = || FlipBoard::new(Mechanism::SplitFlap).cells(1);
+        let floor = board().scale(0).render(DisplayStyle::Vfd);
+        let one = board().scale(1).render(DisplayStyle::Vfd);
+        assert_eq!(floor, one, "0 clamps up to exactly 1x");
+
+        let at_ceiling = board().scale(MAX_SCALE).render(DisplayStyle::Vfd);
+        let over_ceiling = board().scale(MAX_SCALE + 1).render(DisplayStyle::Vfd);
+        let way_over = board().scale(usize::MAX).render(DisplayStyle::Vfd);
+        assert_eq!(
+            at_ceiling, over_ceiling,
+            "one past the ceiling clamps down to exactly MAX_SCALE"
+        );
+        assert_eq!(
+            at_ceiling, way_over,
+            "usize::MAX clamps down to exactly MAX_SCALE"
+        );
     }
 }

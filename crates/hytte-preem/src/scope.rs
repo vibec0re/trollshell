@@ -64,6 +64,16 @@ const DEFAULT_ROWS: usize = 48;
 /// Default integer upscale baked into the output ([`Frame::upscale`]): chunky,
 /// nearest-neighbor pixels, the kit's house look.
 const DEFAULT_SCALE: usize = 2;
+/// Largest accepted integer upscale (see [`Scope::scale`]). Matches the
+/// wire's `MAX_SCALE`: the kit's own default is 2x, and 8x is already a
+/// chunkier pixel than any skin reads well at.
+const MAX_SCALE: usize = 8;
+
+/// Largest accepted logical buffer dimension (see [`Scope::with_size`]).
+/// Matches the wire's `MAX_BUFFER_DIM`: `2048 * 2048 * 4 B` is a single
+/// `Node::Pixels` frame's worth of RGBA8, so nothing built at or under this
+/// bound can outgrow what one frame could always have carried.
+const MAX_BUFFER_DIM: usize = 2048;
 
 /// Default phosphor persistence: 256ths of intensity **retained** each tick.
 /// `184/256 ≈ 0.72`, so a full-intensity beam pixel fades `255 → 183 → 131 →
@@ -131,13 +141,14 @@ impl Scope {
         Self::with_size(DEFAULT_COLS, DEFAULT_ROWS)
     }
 
-    /// A scope with an explicit **logical** buffer size (pre-upscale), clamped
-    /// to at least 1×1. The rendered frame is `width`×`scale` by `height`×`scale`
-    /// px — keep it within the ~296 px sidebar card (the default is 288 px wide).
+    /// A scope with an explicit **logical** buffer size (pre-upscale), each
+    /// dimension clamped to `1..=`[`MAX_BUFFER_DIM`]. The rendered frame is
+    /// `width`×`scale` by `height`×`scale` px — keep it within the ~296 px
+    /// sidebar card (the default is 288 px wide).
     #[must_use]
     pub fn with_size(width: usize, height: usize) -> Self {
-        let cols = width.max(1);
-        let rows = height.max(1);
+        let cols = width.clamp(1, MAX_BUFFER_DIM);
+        let rows = height.clamp(1, MAX_BUFFER_DIM);
         Self {
             cols,
             rows,
@@ -147,12 +158,13 @@ impl Scope {
         }
     }
 
-    /// Set the integer upscale baked into the output (clamped to at least 1) —
-    /// the kit bakes chunkiness into the buffer rather than leaning on shell CSS
-    /// (the `.caw-lcd` lesson). A consuming builder; call it at construction.
+    /// Set the integer upscale baked into the output, clamped to
+    /// `1..=`[`MAX_SCALE`] — the kit bakes chunkiness into the buffer rather
+    /// than leaning on shell CSS (the `.caw-lcd` lesson). A consuming builder;
+    /// call it at construction.
     #[must_use]
     pub fn scale(mut self, factor: usize) -> Self {
-        self.scale = factor.max(1);
+        self.scale = factor.clamp(1, MAX_SCALE);
         self
     }
 
@@ -427,8 +439,8 @@ fn row_for(value: f32, height: usize) -> usize {
 mod tests {
     use super::super::DisplayStyle;
     use super::{
-        CORE, DEFAULT_PERSISTENCE, GLOW_INNER, GLOW_OUTER, GLOW_SPAN, Scope, decayed, row_for,
-        sample_at,
+        CORE, DEFAULT_PERSISTENCE, GLOW_INNER, GLOW_OUTER, GLOW_SPAN, MAX_BUFFER_DIM,
+        MAX_PERSISTENCE, MAX_SCALE, Scope, decayed, row_for, sample_at,
     };
 
     /// The intensity at logical pixel (`x`, `y`) in a scope's phosphor buffer.
@@ -788,5 +800,80 @@ mod tests {
         assert_ne!(vfd, lcd);
         assert_ne!(vfd, oled);
         assert_ne!(lcd, oled);
+    }
+
+    /// The `with_size` knob has both a floor and a ceiling on each axis: `0`
+    /// clamps up to `1`, and anything past `MAX_BUFFER_DIM` clamps down to
+    /// exactly the bound (#1181). Checked via `width`/`height` rather than a
+    /// full render: a `MAX_BUFFER_DIM` phosphor buffer is real memory, and the
+    /// buffer's *dimensions* are exactly what this knob controls.
+    #[test]
+    fn with_size_knob_has_both_bounds_on_each_axis() {
+        let floor = Scope::with_size(0, 0);
+        assert_eq!(
+            (floor.width(), floor.height()),
+            (2, 2),
+            "0 clamps up to 1x1 at 2x scale"
+        );
+
+        let dim = |s: &Scope| (s.cols, s.rows);
+        let at_ceiling = Scope::with_size(MAX_BUFFER_DIM, MAX_BUFFER_DIM);
+        let over_ceiling = Scope::with_size(MAX_BUFFER_DIM + 1, MAX_BUFFER_DIM + 1);
+        let way_over = Scope::with_size(usize::MAX, usize::MAX);
+        assert_eq!(dim(&at_ceiling), (MAX_BUFFER_DIM, MAX_BUFFER_DIM));
+        assert_eq!(
+            dim(&over_ceiling),
+            dim(&at_ceiling),
+            "one past the ceiling clamps down to exactly MAX_BUFFER_DIM"
+        );
+        assert_eq!(
+            dim(&way_over),
+            dim(&at_ceiling),
+            "usize::MAX clamps down to exactly MAX_BUFFER_DIM"
+        );
+    }
+
+    /// The `scale` knob has both a floor and a ceiling: `0` clamps up to `1`,
+    /// and anything past `MAX_SCALE` clamps down to exactly the bound (#1181).
+    #[test]
+    fn scale_knob_has_both_bounds() {
+        let scope = || Scope::with_size(4, 4);
+        let floor = scope().scale(0).render(DisplayStyle::Vfd);
+        let one = scope().scale(1).render(DisplayStyle::Vfd);
+        assert_eq!(floor, one, "0 clamps up to exactly 1x");
+
+        let at_ceiling = scope().scale(MAX_SCALE).render(DisplayStyle::Vfd);
+        let over_ceiling = scope().scale(MAX_SCALE + 1).render(DisplayStyle::Vfd);
+        let way_over = scope().scale(usize::MAX).render(DisplayStyle::Vfd);
+        assert_eq!(
+            at_ceiling, over_ceiling,
+            "one past the ceiling clamps down to exactly MAX_SCALE"
+        );
+        assert_eq!(
+            at_ceiling, way_over,
+            "usize::MAX clamps down to exactly MAX_SCALE"
+        );
+    }
+
+    /// `persistence`'s clamp is the only guard on that field end to end
+    /// (#1181), and clamped vs. unclamped is otherwise indistinguishable: an
+    /// out-of-range `retained_256ths` must rasterise **exactly** the frame the
+    /// bound itself would, because `decayed` is `(v * retained) >> 8` — a
+    /// `retained` above 256 would *grow* the phosphor every tick instead of
+    /// decaying it, the runaway this clamp exists to prevent.
+    #[test]
+    fn persistence_clamps_out_of_range_to_the_ceiling() {
+        let samples = [0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0];
+        let mut over = Scope::with_size(16, 8).persistence(u16::MAX);
+        let mut at_bound = Scope::with_size(16, 8).persistence(MAX_PERSISTENCE);
+        for _ in 0..5 {
+            over.advance(&samples);
+            at_bound.advance(&samples);
+        }
+        assert_eq!(
+            over.render(DisplayStyle::Vfd),
+            at_bound.render(DisplayStyle::Vfd),
+            "an out-of-range persistence clamps to exactly the ceiling"
+        );
     }
 }

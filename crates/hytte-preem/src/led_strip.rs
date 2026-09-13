@@ -35,6 +35,24 @@ use super::style::{DisplayStyle, Emission, mix};
 /// ~296 px sidebar card (see the module docs on sizing).
 pub const DEFAULT_LEDS: usize = 24;
 
+/// The most LEDs a strip will render (see [`LedStrip::leds`]).
+///
+/// The strip's rendered width grows linearly with the segment count
+/// (`2*PAD + n*CELL_W + (n-1)*GAP`), and the default is 24 across a ~296 px
+/// card. 128 segments is a 1413 px strip — over 5x the default, and still
+/// comfortably inside a sane buffer.
+pub const MAX_LEDS: usize = 128;
+
+/// The wire's mirror of [`MAX_LEDS`] must agree with the kit's.
+///
+/// Pinned from **this** side, on the [`dot_matrix`](super::dot_matrix)
+/// precedent: `hytte-preem` depends on `hytte-plugin-proto` (for
+/// `Frame::into_node`), while the proto is the language-neutral schema anchor
+/// and can never see the kit, so `clamp_in_place`'s `MAX_LEDS` used to be an
+/// independent re-derivation of this same geometry rather than a checked copy
+/// of it (#1181). This assertion is what makes it a copy instead.
+const _: () = assert!(MAX_LEDS == hytte_plugin_proto::MAX_LEDS as usize);
+
 /// One LED cell's width in buffer pixels.
 const CELL_W: usize = 8;
 /// One LED cell's height in buffer pixels (a single chunky row).
@@ -168,12 +186,13 @@ impl LedStrip {
         }
     }
 
-    /// Set the segment count (clamped to at least 1). The rendered width is
-    /// `2*PAD + n*CELL_W + (n-1)*GAP` px — keep it within the ~296 px sidebar
-    /// card (the default [`DEFAULT_LEDS`] is [`DEFAULT_WIDTH`] px).
+    /// Set the segment count, clamped to `1..=`[`MAX_LEDS`]. The rendered
+    /// width is `2*PAD + n*CELL_W + (n-1)*GAP` px — keep it within the
+    /// ~296 px sidebar card (the default [`DEFAULT_LEDS`] is [`DEFAULT_WIDTH`]
+    /// px).
     #[must_use]
     pub fn leds(mut self, n: usize) -> Self {
-        self.leds = n.max(1);
+        self.leds = n.clamp(1, MAX_LEDS);
         self
     }
 
@@ -263,8 +282,8 @@ fn stamp_cell(lit: &mut Emission, i: usize) {
 mod tests {
     use super::super::{DisplayStyle, Frame};
     use super::{
-        CELL_W, DEFAULT_LEDS, DEFAULT_WIDTH, GAP, LedStrip, PAD, PeakHold, led_strip, lit_count,
-        peak_led,
+        CELL_W, DEFAULT_LEDS, DEFAULT_WIDTH, GAP, LedStrip, MAX_LEDS, PAD, PeakHold, led_strip,
+        lit_count, peak_led,
     };
 
     // ── LED mapping math ─────────────────────────────────────────────────────
@@ -472,6 +491,38 @@ mod tests {
         // A zero count clamps to one LED rather than a degenerate buffer.
         let zero = LedStrip::new(DisplayStyle::Vfd).leds(0).render(1.0, 1.0);
         assert_eq!(zero.width(), 2 * PAD + CELL_W);
+    }
+
+    /// The `leds` knob has both a floor and a ceiling: `0` clamps up to `1`,
+    /// and anything past [`MAX_LEDS`] clamps down to exactly the bound rather
+    /// than growing the buffer without limit (#1181).
+    #[test]
+    fn leds_knob_has_both_bounds() {
+        let floor = LedStrip::new(DisplayStyle::Vfd).leds(0).render(1.0, 1.0);
+        let one = LedStrip::new(DisplayStyle::Vfd).leds(1).render(1.0, 1.0);
+        assert_eq!(floor, one, "0 clamps up to exactly 1 LED");
+
+        let at_ceiling = LedStrip::new(DisplayStyle::Vfd)
+            .leds(MAX_LEDS)
+            .render(1.0, 1.0);
+        let over_ceiling = LedStrip::new(DisplayStyle::Vfd)
+            .leds(MAX_LEDS + 1)
+            .render(1.0, 1.0);
+        let way_over = LedStrip::new(DisplayStyle::Vfd)
+            .leds(usize::MAX)
+            .render(1.0, 1.0);
+        assert_eq!(
+            at_ceiling, over_ceiling,
+            "one past the ceiling clamps down to exactly MAX_LEDS"
+        );
+        assert_eq!(
+            at_ceiling, way_over,
+            "usize::MAX clamps down to exactly MAX_LEDS, not the ceiling minus one"
+        );
+        assert_eq!(
+            at_ceiling.width(),
+            2 * PAD + MAX_LEDS * CELL_W + (MAX_LEDS - 1) * GAP
+        );
     }
 
     /// A louder level lights more of the strip: more non-background pixels.

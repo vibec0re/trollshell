@@ -335,12 +335,17 @@ pub(super) fn arm_for(program: GlProgram) -> Arm {
 /// second call finds the program recorded and returns — one sweep and one
 /// journal line instead of four of each.
 ///
-/// What the suite pins of that is the **record** not growing
-/// ([`tests::a_refused_pipeline_takes_only_its_own_kinds_arm`]); the duplicate
-/// journal line is argued rather than asserted. Deleting the guard leaves
-/// every test green, because a second sweep finds no instance still on that
-/// program and so changes nothing observable but the log (PR #1243 review,
-/// LOW 2).
+/// **What the suite pins of that is the record being a set**, not the early
+/// return (PR #1243 review, LOW 2, measured both ways):
+/// [`tests::a_refused_pipeline_takes_only_its_own_kinds_arm`] reds if the
+/// `contains` check below is dropped so [`REFUSED`] grows an entry per
+/// surface, and stays **green** if `if !first { return; }` is deleted
+/// outright. That is honest rather than a gap to close: with the program
+/// already recorded, a second sweep finds no instance still on that pipeline
+/// and changes nothing at all, so the early return's whole effect is one
+/// duplicate journal line and one redundant re-map request — neither of which
+/// this suite can observe. It is kept because a bar with four chips of one
+/// kind would otherwise write four identical lines about one driver refusal.
 ///
 /// A kind registered under **two** names is two refusals by construction and
 /// that is correct, not a bug to read into a doubled journal line: the
@@ -672,18 +677,27 @@ mod tests {
                 "…which is exactly what the session-wide answer still says",
             );
 
-            // The idempotence guard, as far as it is observable at all (PR
-            // #1243 review, LOW 2). The hook fires once per *surface*, so a
-            // bar with four scope chips calls this four times in one frame;
-            // the record must not grow a duplicate entry per call, and the
-            // sweep behind it must not run again. The second journal line the
-            // guard also suppresses is not assertable here — see
-            // `on_build_refused`'s doc, which says so rather than claiming it.
+            // The record is a **set**, which is the observable half of the
+            // idempotence guard (PR #1243 review, LOW 2). The hook fires once
+            // per *surface* — `hytte-ui`'s latch is per instance — so a bar
+            // with four scope chips calls this four times in one frame, and a
+            // record that appended per call would grow for the life of the
+            // session and lengthen every `arm_for` scan with it.
+            //
+            // Measured: dropping the `contains` check reds this (`left: 2`);
+            // deleting `if !first { return; }` does **not** red anything, and
+            // `on_build_refused`'s doc says so rather than claiming coverage
+            // it has not got.
             on_build_refused(SCOPE, (96, 32), "the same driver, a second chip");
             assert_eq!(
                 REFUSED.with_borrow(Vec::len),
                 1,
                 "a program already known refused is recorded once, not once per surface",
+            );
+            assert_eq!(
+                arm_for(SCOPE),
+                Arm::Cpu,
+                "…and a second refusal of the same pipeline does not un-refuse it",
             );
         });
     }

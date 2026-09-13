@@ -1238,6 +1238,68 @@ pub const MAX_SHADER_DATA_BYTES: usize = 4 * 1024 * 1024;
 /// no [`VOCAB`](crate::VOCAB) or `PROTO_VERSION` bump.
 pub const MAX_SHADER_DATA_EXTENT: u32 = 4096;
 
+// ── display-string caps (#1165) ──────────────────────────────────────────────
+//
+// The tree-shape caps below bound how *many* nodes a frame may carry. These two
+// bound how much **text** one of them may carry, which is a different hazard on
+// a different thread: every string here becomes a `pango` layout on the **GTK
+// main thread**, and pango shapes the whole run before it can measure it. A
+// single 8 MiB `Node::Label` is inside `MAX_FRAME_LEN`, inside every tree-shape
+// cap, and stalls the main loop — the bar, the drawer, the notification daemon
+// and the effect drain with it.
+//
+// Like the tree-shape caps the proto cannot enforce these (it decodes a frame,
+// it never renders one); they are stated here so a plugin author reads them in
+// the same crate as everything else on the wire, and the host enforces them
+// where the string reaches a widget (`trollshell/src/plugins/wire_map.rs`) or an
+// overlay (`trollshell/src/plugins/session.rs`).
+
+/// The longest **single-line** display string the host will render from a
+/// plugin, in bytes — a label, an icon name, a tooltip, an entry's text or
+/// placeholder, and the human-facing strings of
+/// [`Effect::RaiseOsd`](crate::Effect::RaiseOsd) /
+/// [`Effect::Notify`](crate::Effect::Notify) /
+/// [`Effect::RequestConsent`](crate::Effect::RequestConsent).
+///
+/// **4 KiB.** A chip label is a handful of characters and the longest thing in
+/// this class that is still a *line* — a tooltip — is a sentence or two; 4096
+/// bytes is three orders of magnitude above that and still small enough that
+/// shaping it costs nothing measurable. It is deliberately the same number as
+/// the host's `MAX_URI_BYTES`, which bounds the other plugin-supplied string
+/// that ends up in front of a human.
+///
+/// **Past the cap the host truncates on a char boundary and renders the
+/// prefix**, with one warning per plugin tree — the `wire_map` posture that the
+/// node/depth caps and the malformed-`Pixels` seam already take (degrade to
+/// something that still renders and say so, never blank the plugin). Truncation
+/// is not silent data loss the plugin cannot see: the journal line names the
+/// length that arrived and the cap it was cut to.
+///
+/// Enforced **host-side only**, unlike the shader caps: the SDK builds display
+/// strings from a plugin's own formatting, so a cap in the builder would turn a
+/// long line into a construction-time refusal rather than a rendered prefix. The
+/// host is the layer that owns the GTK thread, so the host is the layer that
+/// defends it.
+pub const MAX_DISPLAY_TEXT_BYTES: usize = 4 * 1024;
+
+/// The longest **body** string the host will render from a plugin, in bytes —
+/// [`Node::Text`]'s wrapping paragraph body and the multi-line detail lines of
+/// [`Effect::RaiseOsd`](crate::Effect::RaiseOsd) /
+/// [`Effect::Notify`](crate::Effect::Notify) /
+/// [`Effect::RequestConsent`](crate::Effect::RequestConsent).
+///
+/// **16 KiB**, four times [`MAX_DISPLAY_TEXT_BYTES`], and kept a distinct
+/// constant because the two bound genuinely different things: a label is a line
+/// and a [`Node::Text`] is a paragraph — a log excerpt, a commit message, a
+/// model's answer — which legitimately runs to pages. 16 KiB is ~4000 words,
+/// past anything a sidebar card shows and equal to
+/// [`MAX_SHADER_SOURCE_BYTES`], this vocabulary's other "a large but finite
+/// blob of text" number.
+///
+/// Same degradation as [`MAX_DISPLAY_TEXT_BYTES`]: truncate on a char boundary,
+/// one warning per plugin tree, never a dropped node or a dropped frame.
+pub const MAX_BODY_TEXT_BYTES: usize = 16 * 1024;
+
 // ── tree-shape caps (#901) ───────────────────────────────────────────────────
 //
 // The caps in [`preem`](crate::preem) bound one widget's *geometry*, and the
@@ -1356,6 +1418,90 @@ pub const MAX_TREE_DEPTH: usize = 64;
 /// stays and a later in-cap frame updates it in place), with one warning per
 /// plugin tree for the life of the shell process.
 pub const MAX_PREEM_NODES_PER_TREE: usize = 64;
+
+// ── plugin id cap (#1165 review round 2) ─────────────────────────────────────
+//
+// Round 1 checked [`Manifest::id`](crate::manifest::Manifest::id) for
+// emptiness only (`trollshell/src/plugins/session.rs`'s `plugin_id.is_empty()`
+// gate, #436), so an id is otherwise unbounded — up to
+// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN) itself, since it rides the same
+// `Register` frame. Every cap this file states elsewhere bounds a *node* or an
+// *effect*; none of them look at the identifier the connection registers
+// under, so an oversized id sailed past all of them. The round-2 review found
+// two consequences: the id rides `Effect::Notify` verbatim as the
+// notification's app name and reaches `gtk::Label::new` on the GTK main thread
+// uncapped (measured: an 8 MiB id costs 1.57 s there — the #1165 headline
+// freeze, reached through the very effect this vocabulary's caps exist to
+// bound), and it keys two host tables (`EffectBuckets`,
+// `trollshell::plugins::effects`' `LAUNCH_BUDGETS`) that deliberately outlive
+// the connection — bounded in *entries* by
+// `MAX_TRACKED_EFFECT_BUCKETS`, but not in the bytes an entry's key can cost.
+
+/// The longest [`Manifest::id`](crate::manifest::Manifest::id) the host will
+/// accept, in bytes.
+///
+/// **64** — the same "generous, and still a small number" this vocabulary
+/// already uses for [`MAX_TREE_DEPTH`] and [`MAX_PREEM_NODES_PER_TREE`]. A
+/// plugin id is an *identifier* (`departures`, `caw`, `agents`, `pet`), not a
+/// sentence: every bundled plugin's is under 16 bytes, so 64 is four times the
+/// longest plausible hand-picked name — headroom for a reverse-DNS-flavoured
+/// or per-agent id, not a budget for prose.
+///
+/// **Refused at the `Register` handshake, never truncated** — unlike
+/// [`MAX_DISPLAY_TEXT_BYTES`]. An id is a *key*: it names the region mailbox,
+/// the live-connection guard (`IdGuard`), the audit log, and (since this cap)
+/// the two per-id host tables above, so a truncated id would silently become a
+/// *different* plugin colliding with (or shadowing) whatever already holds
+/// that prefix — the same argument [`MAX_DISPLAY_TEXT_BYTES`]'s doc makes for
+/// refusing an over-long `provider`/`scope` rather than cutting it. The host
+/// drops the connection with one warning and mounts nothing, on the same terms
+/// as the existing empty-id refusal.
+///
+/// Bounding this is also what bounds the two per-id tables' worst-case memory:
+/// each holds at most `MAX_TRACKED_EFFECT_BUCKETS` entries, and now no entry's
+/// key can exceed this many bytes.
+pub const MAX_PLUGIN_ID_BYTES: usize = 64;
+
+// ── node `classes` caps (#1165 review round 2) ───────────────────────────────
+//
+// The display-string caps above bound *text* pango shapes; they deliberately
+// left `classes` alone on the theory that a CSS class is not a layout. True,
+// but it answers the wrong hazard: `hytte_ui::widget_tree`'s `reconcile_classes`
+// diffs a node's old and new class lists with `Vec::contains`, i.e.
+// **O(old × new)**, once per node per monitor per frame, on the GTK main
+// thread. Measured: 20 000 class tokens on one `Node::Label` cost 5.70 s on the
+// *second* frame (the reconcile, not the first render) — three and a half
+// times longer than the 8 MiB label the display-text caps exist to stop, on a
+// wire payload two orders of magnitude smaller. Neither the token count nor a
+// token's length was capped anywhere in the proto, `hytte-ui`, or the host.
+
+/// How many CSS classes one [`Node`] may carry.
+///
+/// **32** — comfortably above any real stylesheet's per-widget class list (the
+/// bundled plugins use one to three), and small enough that
+/// `reconcile_classes`'s per-node diff cost is bounded to a constant this
+/// vocabulary is willing to pay every frame regardless of the diff algorithm
+/// used, rather than relying on that algorithm alone to save a pathological
+/// list.
+///
+/// **Past the cap the host keeps the first `MAX_NODE_CLASSES` tokens and drops
+/// the rest**, the same "keep the mapped prefix" posture
+/// [`MAX_NODES_PER_TREE`] takes, with one warning per plugin tree.
+pub const MAX_NODE_CLASSES: usize = 32;
+
+/// The longest single CSS class token the host will map from a [`Node`], in
+/// bytes.
+///
+/// **64** — an order of magnitude past the longest class name anywhere in this
+/// tree's own stylesheets (`hytte-ts-notification-summary-label` and friends
+/// top out in the 30s), and the same number [`MAX_PLUGIN_ID_BYTES`] settles on
+/// for "an identifier, not a sentence": a CSS class is exactly that.
+///
+/// **Truncated on a char boundary**, like [`MAX_DISPLAY_TEXT_BYTES`] — a class
+/// token that GTK never matches because it was cut a few bytes short costs a
+/// missing style rule, not a different plugin's identity, so this one
+/// degrades the same way the text caps do rather than the way the id cap does.
+pub const MAX_CLASS_BYTES: usize = 64;
 
 // ── float sanitisation (#904) ───────────────────────────────────────────────
 

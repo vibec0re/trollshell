@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::launch::Launch;
 
 use super::datasource::DatasourceRouter;
+use super::session::TokenBucket;
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer), [`Effect::Niri`] (→ niri's IPC actions), [`Effect::Media`]
@@ -109,6 +110,13 @@ pub(super) fn broker_effect(
     outbound: &mpsc::Sender<HostMsg>,
     datasource: &DatasourceRouter,
 ) {
+    // #1165 item 8: the detached-launch budget, checked FIRST — before the unit
+    // name is allocated and before the audit line is written, so a refused
+    // launch never names a unit nobody started (the #964 M-2 defect, applied to
+    // the new refusal path).
+    if over_launch_budget(plugin_id, effect, outbound) {
+        return;
+    }
     // #953 M1 / #964 item 2: allocated *here*, before the audit record, and
     // handed to the launcher unchanged — see `detached_launch_unit_for_audit`'s
     // doc for why, and for the rejected-id case.
@@ -495,6 +503,33 @@ const RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// host truncate [`EffectOutcome::output`]; keep a single reply frame small.
 const RUN_COMMAND_MAX_OUTPUT: usize = 4096;
 
+/// Cap on what the host **reads** off each of a plugin-spawned command's pipes
+/// before it stops the program (bytes, #1165).
+///
+/// [`RUN_COMMAND_MAX_OUTPUT`] is the *reply* cap and was, until #1165, the only
+/// one: `cmd.output()` buffered the child's entire stdout **and** stderr in
+/// memory and the 4 KiB truncation happened afterwards, on the way into the
+/// reply frame. So `sh -c 'yes'` — an ordinary shell one-liner, inside a
+/// 10-second timeout — grew the shell's heap by whatever a `yes` can write in
+/// ten seconds. The plugin was fine; the shell was OOM-killed.
+///
+/// The two caps bound different things and so are two numbers. The reply cap is
+/// what the plugin *sees*; this is what the host is willing to *read* before it
+/// concludes nobody will ever use the rest. **64 KiB**, 16× the reply cap, so
+/// every command whose output a plugin could plausibly act on still runs to
+/// completion and reports a real exit status — only a program streaming past
+/// sixteen times what can be returned to it is treated as runaway.
+///
+/// Past it the child is **killed** rather than drained: the host has stopped
+/// reading that pipe, so the program is about to block on a full pipe nobody
+/// will empty, and waiting out [`RUN_COMMAND_TIMEOUT`] for that would burn ten
+/// seconds of CPU to reach the same answer. The outcome is then
+/// `ok: false` with the truncated capture — honest, because the program did not
+/// finish and the host never learns an exit status — plus a `warn` naming the
+/// budget. Memory is bounded at `2 × (this + 1)` per in-flight `RunCommand`,
+/// and the effect rate cap bounds how many of those there can be.
+const RUN_COMMAND_MAX_CAPTURE: usize = 64 * 1024;
+
 /// Spawn a plugin-requested `argv` on the tokio runtime and route the
 /// [`EffectOutcome`] back to the originating plugin as [`HostMsg::EffectResult`]
 /// keyed by `id` (#510). Capability-gated upstream
@@ -522,8 +557,116 @@ fn run_command(plugin_id: &str, id: u64, argv: Vec<String>, outbound: mpsc::Send
     });
 }
 
-/// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`]) and map it
-/// onto an [`EffectOutcome`]. stdin is `/dev/null`; stdout/stderr are captured.
+/// What [`capture_bounded`] got out of one plugin-spawned command (#1165).
+struct Captured {
+    /// The program's exit status, or `None` when it blew
+    /// [`RUN_COMMAND_MAX_CAPTURE`] and was killed — the host never learns a
+    /// status in that case, and saying so is the point of the `Option`.
+    status: Option<std::process::ExitStatus>,
+    /// stdout, at most `RUN_COMMAND_MAX_CAPTURE + 1` bytes.
+    stdout: Vec<u8>,
+    /// stderr, same bound. Captured (rather than left to fill its pipe) because
+    /// a program that blocks writing stderr never exits, which is the deadlock
+    /// `Command::output` exists to avoid.
+    stderr: Vec<u8>,
+}
+
+/// Spawn `cmd` and read **at most** [`RUN_COMMAND_MAX_CAPTURE`] bytes off each
+/// of its pipes, killing it if it produces more (#1165).
+///
+/// Three things make this not a re-spelling of `Command::output`:
+///
+/// - each pipe is read through `take(budget + 1)`, so the host's heap is
+///   bounded by the budget and not by what the child decides to write (the
+///   extra byte is what makes "at the budget" distinguishable from "over it");
+/// - both pipes are drained **concurrently**, because a program that fills
+///   stderr while the host reads stdout blocks forever on a pipe nobody empties
+///   — the deadlock `output()` was avoiding for us;
+/// - past the budget the child is **killed** instead of waited on. The host has
+///   stopped reading, so the program is about to block on a full pipe; waiting
+///   out [`RUN_COMMAND_TIMEOUT`] would spend ten seconds to reach the same
+///   answer.
+async fn capture_bounded(cmd: &mut tokio::process::Command) -> std::io::Result<Captured> {
+    let mut child = cmd.spawn()?;
+    // Both are `Stdio::piped()` at every call site (the caller sets them one
+    // statement above), so `take()` always yields the handle.
+    let out_pipe = child.stdout.take().expect("RunCommand stdout is piped");
+    let err_pipe = child.stderr.take().expect("RunCommand stderr is piped");
+    // Scoped, so both futures — and with them both read ends — are dropped
+    // before the kill/wait below: a still-running child's next write then gets
+    // EPIPE as well as the signal.
+    let (over, out, err) = {
+        let read_out = read_capped(out_pipe, RUN_COMMAND_MAX_CAPTURE);
+        let read_err = read_capped(err_pipe, RUN_COMMAND_MAX_CAPTURE);
+        tokio::pin!(read_out, read_err);
+        let mut out: Option<Vec<u8>> = None;
+        let mut err: Option<Vec<u8>> = None;
+        let mut over = false;
+        // **Not `join!`.** `join!` waits for *both*, and the pipe that is not
+        // the runaway never EOFs while the child is alive — so a program that
+        // floods stdout and never writes stderr would park here until the
+        // 10 s timeout, which is the exact behaviour this function exists to
+        // remove. Stopping at the first over-budget pipe is what makes the
+        // kill below prompt.
+        while !over && (out.is_none() || err.is_none()) {
+            tokio::select! {
+                read = &mut read_out, if out.is_none() => {
+                    let (bytes, cut) = read?;
+                    over |= cut;
+                    out = Some(bytes);
+                }
+                read = &mut read_err, if err.is_none() => {
+                    let (bytes, cut) = read?;
+                    over |= cut;
+                    err = Some(bytes);
+                }
+            }
+        }
+        (over, out, err)
+    };
+    let status = if over {
+        child.kill().await?;
+        None
+    } else {
+        Some(child.wait().await?)
+    };
+    Ok(Captured {
+        status,
+        // `None` only on the over-budget path, where the sibling read was
+        // abandoned mid-stream. Its partial bytes are dropped with it: the
+        // capture of a program the host is about to kill is a diagnostic, and
+        // an honest empty one beats a torn one.
+        stdout: out.unwrap_or_default(),
+        stderr: err.unwrap_or_default(),
+    })
+}
+
+/// Read at most `budget` bytes from `src`, returning them and whether the source
+/// had more (#1165).
+///
+/// Owns its reader and its buffer so two of these can be `select!`ed over — a
+/// `read_to_end(&mut buf)` borrows the buffer for the future's whole life, which
+/// leaves nothing to inspect while it is still running.
+///
+/// It reads `budget + 1`: the extra byte is what distinguishes "exactly at the
+/// budget" (fine) from "over it" (kill), with no second syscall to ask.
+async fn read_capped<R>(src: R, budget: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut buf = Vec::new();
+    let mut capped = src.take(budget as u64 + 1);
+    capped.read_to_end(&mut buf).await?;
+    let over = buf.len() > budget;
+    buf.truncate(budget);
+    Ok((buf, over))
+}
+
+/// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`], and by
+/// [`RUN_COMMAND_MAX_CAPTURE`] per pipe) and map it onto an [`EffectOutcome`].
+/// stdin is `/dev/null`; stdout/stderr are captured.
 pub(super) async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOutcome {
     let Some((program, tail)) = argv.split_first() else {
         tracing::warn!(plugin = %plugin_id, id, "RunCommand with empty argv; nothing to spawn");
@@ -538,18 +681,41 @@ pub(super) async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    match tokio::time::timeout(RUN_COMMAND_TIMEOUT, cmd.output()).await {
-        Ok(Ok(output)) => {
-            if output.status.success() {
-                tracing::info!(plugin = %plugin_id, id, program = %program, "plugin RunCommand finished");
-            } else {
-                tracing::warn!(
-                    plugin = %plugin_id, id, status = ?output.status,
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "plugin RunCommand exited non-zero",
-                );
+    match tokio::time::timeout(RUN_COMMAND_TIMEOUT, capture_bounded(&mut cmd)).await {
+        Ok(Ok(captured)) => {
+            let success = captured.status.is_some_and(|status| status.success());
+            match captured.status {
+                Some(status) if status.success() => {
+                    tracing::info!(plugin = %plugin_id, id, program = %program, "plugin RunCommand finished");
+                }
+                Some(status) => {
+                    tracing::warn!(
+                        plugin = %plugin_id, id, status = ?status,
+                        // Bounded twice over: `capture_bounded` stopped at the
+                        // capture cap, and the journal gets only the reply cap
+                        // of it — a 64 KiB `tracing` line is its own problem.
+                        stderr = %truncate_on_char_boundary(
+                            &String::from_utf8_lossy(&captured.stderr),
+                            RUN_COMMAND_MAX_OUTPUT,
+                        ),
+                        "plugin RunCommand exited non-zero",
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        plugin = %plugin_id, id, program = %program,
+                        cap = RUN_COMMAND_MAX_CAPTURE,
+                        "plugin RunCommand wrote more than the host will read; killed. The \
+                         captured prefix is returned and the outcome is a failure — the program \
+                         did not finish, so there is no exit status to report. If the cap was \
+                         hit on stdout, the reply's stderr may read empty even though the \
+                         program wrote some: `capture_bounded` discards whichever pipe was NOT \
+                         the one that tripped the cap, on the same 'an honest empty one beats a \
+                         torn one' posture as the returned stdout/stderr split",
+                    );
+                }
             }
-            command_outcome(output.status.success(), &output.stdout)
+            command_outcome(success, &captured.stdout)
         }
         Ok(Err(e)) => {
             tracing::warn!(plugin = %plugin_id, id, program = %program, error = %e, "plugin RunCommand failed to spawn");
@@ -1076,6 +1242,162 @@ fn reply_effect_result(
 // It is also the exact groove `plugin_launcher.rs` already runs plugins in, and
 // it gives the program a name in `systemctl --user`, which is what #953 asked
 // for.
+
+// ── Detached-launch budget (#1165 item 8) ────────────────────────────────────
+//
+// A detached launch has a *visibility* bound (`LAUNCH_SLICE`, so every surviving
+// unit lands in one subtree the user can stop with a single command) and had no
+// *count* bound at all. `detached_launch` passes no resource limits either — no
+// `MemoryMax=`, no `TasksMax=` — so each launch is an unbounded program the
+// shell explicitly hands to the user manager and then forgets. Nothing here
+// reclaims them: `--collect` retires a unit that *exits*, and a launch that does
+// not exit is the case that matters.
+//
+// The effect rate cap does not stand in for this. It is 8 back-to-back then one
+// a second, which is right for drawer-opens and toasts and is three orders of
+// magnitude too loose for "start a program that outlives the shell": a plugin
+// inside its effect budget can accumulate a process a second, forever, and each
+// one survives the restart that would otherwise clear them.
+
+/// Detached launches a plugin may fire back-to-back (#1165 item 8).
+///
+/// Four covers every real burst: the motivating consumer is #950's agent
+/// window, where a user clicking through a few agents at once is four launches
+/// in a second and anything beyond that is not a hand on a mouse.
+const LAUNCH_BURST: u32 = 4;
+
+/// The sustained detached-launch budget, per minute (#1165 item 8) — stated in
+/// minutes because that is the unit it is *argued* in, and converted for the
+/// bucket below.
+///
+/// Deliberately far slower than the effect cap's 1/s. A launched program is the
+/// most expensive thing a plugin can ask the host for and the only one the host
+/// cannot take back, so the budget is sized for a human's clicking rather than
+/// for a render loop.
+const LAUNCH_PER_MINUTE: f64 = 4.0;
+
+/// [`LAUNCH_PER_MINUTE`] as the per-second rate [`TokenBucket`] wants.
+const LAUNCH_REFILL_PER_SEC: f64 = LAUNCH_PER_MINUTE / 60.0;
+
+thread_local! {
+    /// Per-plugin detached-launch buckets (#1165 item 8).
+    ///
+    /// A `thread_local` rather than a field on the `ListenerCtx`, because
+    /// unlike the effect buckets this is only ever touched from the **GTK main
+    /// thread**: `broker_effect` is the single place a detached launch can
+    /// start, and it runs there by construction. That also gives the hermetic
+    /// tests isolation for free — a `#[test]` body runs start-to-finish on one
+    /// thread, so no two tests share a table.
+    ///
+    /// Swept on every launch (retiring the buckets that have refilled, exactly
+    /// the ones whose removal changes no decision — see
+    /// [`TokenBucket::is_full`]), so it holds only ids that launched something
+    /// inside the last budget window. No separate size cap is needed the way
+    /// the effect table needs one: a launch *is* an effect, so reaching this at
+    /// all is already inside the effect rate cap.
+    ///
+    /// The **key**, though, is bounded the same way `EffectBuckets`' is (#1165
+    /// review round 2): `serve_conn` refuses a `Register` whose id is over
+    /// [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES) before
+    /// a connection's id can reach either table, so this map's worst case is
+    /// as many entries as the effect rate cap allows, each keyed by at most
+    /// that many bytes — not the unbounded-key shape a round-1 id cap would
+    /// have left it in.
+    static LAUNCH_BUDGETS: std::cell::RefCell<std::collections::HashMap<String, TokenBucket>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The effect `id` of a **detached** [`Effect::RunCommand`], or `None` for
+/// anything else — including the attached mode, which is bounded by
+/// [`RUN_COMMAND_TIMEOUT`] and dies with the shell and so needs no budget of its
+/// own.
+pub(super) fn detached_launch_id(effect: &Effect) -> Option<u64> {
+    match effect {
+        Effect::RunCommand {
+            id, detached: true, ..
+        } => Some(*id),
+        _ => None,
+    }
+}
+
+/// Spend one token from `plugin_id`'s detached-launch budget: `true` to go
+/// ahead, `false` to refuse (#1165 item 8).
+fn launch_budget_allows(plugin_id: &str, now: std::time::Instant) -> bool {
+    LAUNCH_BUDGETS.with_borrow_mut(|budgets| {
+        budgets.retain(|_, bucket| !bucket.is_full(now));
+        if !budgets.contains_key(plugin_id) {
+            budgets.insert(
+                plugin_id.to_owned(),
+                TokenBucket::new_at(now, LAUNCH_BURST, LAUNCH_REFILL_PER_SEC),
+            );
+        }
+        budgets
+            .get_mut(plugin_id)
+            .expect("present, or inserted just above")
+            .allow(now)
+    })
+}
+
+/// The detached-launch budget gate (#1165 item 8): `true` when `effect` is a
+/// detached launch this plugin may not make right now, in which case the
+/// refusal has already been audited, logged and sent back — the caller returns
+/// without brokering it.
+///
+/// Pulled out of [`broker_effect`] only to keep that function under clippy's
+/// line cap, the same reason [`dispatch_detached_run_command`] is a separate
+/// function; the reasoning lives with the constants above.
+///
+/// **Spends the token before anything else can reject the launch.** This runs
+/// first in `broker_effect`, ahead of `detached_launch_unit_for_audit`'s
+/// rejected-id check and `execute_command`'s empty-argv guard, so a plugin
+/// that sends four malformed detached launches (an empty argv, say) burns its
+/// whole [`LAUNCH_BURST`] on requests that were never going to launch anything.
+/// Harmless — a plugin doing that is already misbehaving, and the cost lands
+/// only on itself — but worth knowing before "fix the ordering" looks like a
+/// free improvement: checking argv/unit-id validity first would need those
+/// checks pulled out of `execute_command` and `detached_launch_unit_for_audit`
+/// and duplicated here, for a plugin that is malfunctioning either way.
+fn over_launch_budget(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) -> bool {
+    let Some(id) = detached_launch_id(effect) else {
+        return false;
+    };
+    if launch_budget_allows(plugin_id, std::time::Instant::now()) {
+        return false;
+    }
+    record_audit(plugin_id, effect, AuditDecision::DroppedRateCap, None);
+    tracing::warn!(
+        plugin = %plugin_id, id,
+        burst = LAUNCH_BURST,
+        per_minute = LAUNCH_PER_MINUTE,
+        "plugin exceeded the host's detached-launch budget; refused",
+    );
+    refuse_detached_launch(plugin_id, id, outbound);
+    true
+}
+
+/// Tell the plugin its detached launch was refused (#1165 item 8), as the
+/// **same** `ok: false` [`EffectOutcome`] shape a `systemd-run` refusal
+/// produces — `launch_outcome(&Err(…))` — so a plugin needs no new arm to
+/// handle it, and so a refusal can never be mistaken for a launch.
+///
+/// `try_send` rather than the `send().await` the success path uses: this runs on
+/// the GTK main thread, the frame is a few dozen bytes onto a
+/// [`OUTBOUND_CAPACITY`](super::session::OUTBOUND_CAPACITY)-deep queue, and a
+/// queue that full means the plugin has stopped reading — in which case the
+/// liveness ping is already reaping it and a parked task would only be one more
+/// thing waiting on a dead connection.
+fn refuse_detached_launch(plugin_id: &str, id: u64, outbound: &mpsc::Sender<HostMsg>) {
+    let outcome = launch_outcome(&Err(format!(
+        "refused: over the host's detached-launch budget ({LAUNCH_BURST} back-to-back, then \
+         {LAUNCH_PER_MINUTE} a minute)"
+    )));
+    if outbound
+        .try_send(HostMsg::EffectResult { id, outcome })
+        .is_err()
+    {
+        tracing::debug!(plugin = %plugin_id, id, "plugin gone or backed up before the launch refusal; dropped");
+    }
+}
 
 /// Bounds the `systemd-run` **launch call** — the short D-Bus round-trip that
 /// asks the user manager to start the transient unit — and *nothing else*
@@ -1712,7 +2034,11 @@ fn launch_detached(
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 code point.
-fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+///
+/// `pub(super)` since #1165: `wire_map` truncates plugin display strings with
+/// the same helper, so the node seam and the effect seam cut on one
+/// implementation rather than two that could disagree about what a boundary is.
+pub(super) fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
     }
@@ -1793,7 +2119,11 @@ impl AuditDecision {
 /// is a program the shell handed to the user manager and will *not* clean up,
 /// so it is the one an after-the-fact review has to reconcile against
 /// `systemctl --user list-units 'trollshell-launch-*'`.
-fn effect_kind(effect: &Effect) -> &'static str {
+///
+/// `pub(super)` since #1165: the two drop-warn sites in `session` name the
+/// kind with it instead of `Debug`-formatting the whole effect, so one
+/// vocabulary of kind names serves the audit log and the journal.
+pub(super) fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::OpenPage(_) => "OpenPage",
         Effect::Niri(_) => "Niri",

@@ -295,8 +295,9 @@ pub use state::{
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{
     Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
-    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB,
-    ShaderData, SliderFloats, sane_fraction, sane_slider_floats,
+    MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
+    MAX_PLUGIN_ID_BYTES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, NodeId,
+    SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats, sane_fraction, sane_slider_floats,
 };
 
 #[cfg(feature = "tokio")]

@@ -1,6 +1,6 @@
 //! tokio-side: per-connection lifecycle.
 //!
-//! [`handle_conn`] drives one plugin connection — handshake, the four opt-in
+//! [`serve_conn`] drives one plugin connection — handshake, the four opt-in
 //! host→plugin push tasks (clock / visibility / accent / spectrum), the reader
 //! loop feeding renders into the mount mailboxes, and the shared teardown. It
 //! also carries the containment (#435) and registration-hygiene (#436) guards:
@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
-    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Manifest, Mount, NowPlaying,
-    PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
+    AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
+    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_PLUGIN_ID_BYTES, Manifest, Mount,
+    NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame,
+    write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -118,7 +120,7 @@ impl Drop for SpectrumDemand {
 /// effects onto the global non-lossy broker channel, park (or clear) its optional
 /// drawer panel in the dedicated `panels` mailbox, and upsert its chip/card
 /// `tree` into the mount's region mailbox (latest-wins per plugin id). Factored
-/// out of [`handle_conn`] so that reader loop stays within the line budget.
+/// out of [`serve_conn`] so that reader loop stays within the line budget.
 fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Vec<Effect>) {
     // The mount picks which region mailbox (and thus per-monitor container) the
     // tree lands in: sidebar regions render as cards, bar regions as chips
@@ -182,10 +184,44 @@ const MAX_MISSED_PONGS: u32 = 2;
 /// reading its socket backs it up to this cap, at which point new frames are
 /// dropped (see [`push_state`]) rather than buffered without limit. Comfortably
 /// above any real burst, so the happy path never fills it.
+///
+/// **It bounds frames, not bytes**, which is why it is not the whole story
+/// (#1165 item 7). Every other `HostMsg` is a small, host-built value — a clock
+/// tick, an accent colour, a spectrum frame — but the two datasource legs carry
+/// *plugin*-supplied opaque payloads, bounded on the wire only by
+/// `MAX_FRAME_LEN`. 256 × 16 MiB is four gigabytes of queue behind one plugin
+/// that stopped reading, so those payloads carry their own byte cap:
+/// [`MAX_DATASOURCE_PAYLOAD_BYTES`].
 pub(super) const OUTBOUND_CAPACITY: usize = 256;
 
-/// Max effect tokens a connection may hold — the burst of [`Effect`]s it can emit
+/// The largest opaque datasource payload the host will forward, in bytes
+/// (#1165 item 7) — [`Effect::DatasourceQuery`]'s `params` and
+/// [`Effect::DatasourceResult`]'s `Ready` body.
+///
+/// These are the only plugin-supplied blobs that ride the host→plugin outbound
+/// queue, and [`OUTBOUND_CAPACITY`] counts frames rather than bytes, so without
+/// this a stalled provider's queue is bounded at 256 × `MAX_FRAME_LEN` = 4 GiB.
+/// With it, 64 MiB — the same order as every other buffer the host holds.
+///
+/// **256 KiB** is generous for a query answer: a departures board, a weather
+/// digest or an agent roster is single-digit kilobytes of JSON, so this is two
+/// orders of magnitude of headroom. A datasource that genuinely needs to move
+/// more than this is asking for a file path or a socket, not a reply frame.
+///
+/// **Refused, not truncated** — the opposite of the display-string caps, and
+/// for a stated reason: these payloads are opaque JSON, and a JSON document cut
+/// at 256 KiB is not a smaller document, it is a parse error at the far end. A
+/// refusal the requester can see beats a corruption it cannot.
+pub(super) const MAX_DATASOURCE_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Max effect tokens a **plugin** may hold — the burst of [`Effect`]s it can emit
 /// back-to-back before the sustained cap ([`EFFECT_REFILL_PER_SEC`]) applies.
+///
+/// Per plugin id since #1165, not per connection: the bucket used to live in
+/// `handle_conn`'s stack frame, so a crash-looping plugin got a **fresh burst
+/// on every reconnect** — and the SDK backs off from 100 ms, which makes the
+/// sustained cap a ~10× multiple of its stated value for exactly the plugin the
+/// cap exists for. See [`EffectBuckets`].
 pub(super) const EFFECT_BURST: u32 = 8;
 
 /// Sustained effect budget refilled per second (a token-bucket rate). Together
@@ -276,6 +312,265 @@ pub(super) fn capped_hidden_on(
     (hidden_on, None)
 }
 
+/// Per-connection latch for the effect-level payload caps (#1165), keyed by
+/// effect **kind**.
+///
+/// `std::mem::Discriminant<Effect>` rather than the effect itself: an effect
+/// carries the very strings being capped, so keying on the value would make the
+/// latch a per-payload memo — unbounded, and useless (a plugin that raises a
+/// counter in an over-cap OSD title would get a fresh line every frame). The
+/// kind is what an author fixes, so the kind is what is latched.
+///
+/// Per connection, like [`EffectRateLimiter`]'s own scope and
+/// `capped_hidden_on`'s `violated` set: a reconnect re-arms it, so the same
+/// mistake is named once per connection rather than once per frame or once for
+/// the life of the shell.
+pub(super) type EffectWarnLatch = HashSet<std::mem::Discriminant<Effect>>;
+
+/// Cap the human-facing strings a plugin puts in front of the user through an
+/// effect (#1165) — the non-node half of the display-text cap that
+/// `wire_map::map_node` applies to a render tree.
+///
+/// The three effects here are the ones whose payload becomes a widget on the
+/// **GTK main thread** without passing through `wire_map` at all:
+/// [`Effect::RaiseOsd`] sets a `gtk::Label` in the OSD overlay,
+/// [`Effect::Notify`] goes through the shell's own notification daemon, and
+/// [`Effect::RequestConsent`] renders four fields into the consent card. Each is
+/// bounded only by `MAX_FRAME_LEN` on the wire, so an 8 MiB
+/// `RaiseOsd { title }` is a legal frame that stalls the main loop exactly as an
+/// 8 MiB `Node::Label` does.
+///
+/// Single-line fields (a title, a summary, an icon name, the consent card's
+/// agent/datasource/scope) take
+/// [`MAX_DISPLAY_TEXT_BYTES`](hytte_plugin_proto::MAX_DISPLAY_TEXT_BYTES);
+/// bodies and the consent detail take
+/// [`MAX_BODY_TEXT_BYTES`](hytte_plugin_proto::MAX_BODY_TEXT_BYTES). **Truncate,
+/// never refuse**: an OSD nudge whose title is cut still tells the user
+/// something, and dropping the effect would make a plugin bug look like a dead
+/// click.
+///
+/// Exhaustive over the effect vocabulary, like
+/// [`Effect::required_capability`](hytte_plugin_proto::Effect::required_capability)
+/// and `effects::effect_kind`, so an effect variant that grows a human-facing
+/// string is a compile error here rather than a silent hole. The no-op arms say
+/// why they are no-ops.
+///
+/// Pure, like [`capped_hidden_on`]: it returns the capped effect plus at most
+/// one message for the caller to warn with, and `warned` is the caller's
+/// per-connection latch.
+pub(super) fn capped_effect_strings(
+    mut effect: Effect,
+    warned: &mut EffectWarnLatch,
+) -> (Effect, Option<String>) {
+    let mut longest = 0usize;
+    let mut cut = |s: &mut String, max: usize| {
+        if s.len() > max {
+            longest = longest.max(s.len());
+            *s = super::effects::truncate_on_char_boundary(s, max);
+        }
+    };
+    match &mut effect {
+        Effect::RaiseOsd { title, body, icon } => {
+            cut(title, MAX_DISPLAY_TEXT_BYTES);
+            cut(body, MAX_BODY_TEXT_BYTES);
+            if let Some(icon) = icon.as_mut() {
+                cut(icon, MAX_DISPLAY_TEXT_BYTES);
+            }
+        }
+        Effect::Notify { summary, body } => {
+            cut(summary, MAX_DISPLAY_TEXT_BYTES);
+            cut(body, MAX_BODY_TEXT_BYTES);
+        }
+        Effect::RequestConsent {
+            agent,
+            datasource,
+            scope,
+            detail,
+            ..
+        } => {
+            cut(agent, MAX_DISPLAY_TEXT_BYTES);
+            cut(datasource, MAX_DISPLAY_TEXT_BYTES);
+            cut(scope, MAX_DISPLAY_TEXT_BYTES);
+            cut(detail, MAX_BODY_TEXT_BYTES);
+        }
+        // The rest carry nothing this cap applies to. Listed rather than
+        // caught by `_`, so an effect variant that grows a human-facing string
+        // is a compile error here — one arm because clippy reads identical
+        // bodies as a mistake, with the per-variant reasons written out:
+        //
+        // - `OpenPage`/`Niri`/`Media`/`Audio` carry enum payloads the host maps
+        //   onto its own actions; there is no plugin string at all.
+        // - `RunCommand`'s `argv` is a program invocation, not a display
+        //   string: nothing renders it, and `execve`'s own `ARG_MAX` is the
+        //   bound that actually applies.
+        // - `OpenUri` is capped in the broker by `MAX_URI_BYTES` (#1045), which
+        //   *refuses* rather than truncates — a cut URI is a different
+        //   destination, so truncating would be the wrong degradation.
+        // - The datasource legs carry opaque JSON and identifiers; their bound
+        //   is `MAX_DATASOURCE_PAYLOAD_BYTES` in `capped_effect_payload`, and
+        //   it refuses for the same reason as a URI (#1165 item 7).
+        Effect::OpenPage(_)
+        | Effect::Niri(_)
+        | Effect::Media(_)
+        | Effect::Audio(_)
+        | Effect::RunCommand { .. }
+        | Effect::OpenUri { .. }
+        | Effect::DatasourceQuery { .. }
+        | Effect::DatasourceResult { .. } => {}
+    }
+    let message = (longest > 0 && warned.insert(std::mem::discriminant(&effect))).then(|| {
+        format!(
+            "plugin effect carries a display string {longest} B long, over the host's \
+             {MAX_DISPLAY_TEXT_BYTES} B line / {MAX_BODY_TEXT_BYTES} B body cap; the prefix is \
+             shown. Every one of these becomes a pango layout on the GTK main thread, which \
+             shapes the whole run before it can measure it (further occurrences of this effect \
+             kind are silenced for the rest of this connection)"
+        )
+    });
+    (effect, message)
+}
+
+/// Enforce [`MAX_DATASOURCE_PAYLOAD_BYTES`] on the two datasource legs (#1165
+/// item 7) — the only plugin-supplied blobs that ride a host→plugin outbound
+/// queue whose bound counts frames rather than bytes.
+///
+/// `None` means the effect is refused outright. The two legs degrade
+/// differently, because the host can answer one of them and not the other:
+///
+/// - **`DatasourceResult`** (a provider's answer to a parked query) is rewritten
+///   to `Failed { error: Provider, … }`. The requester still gets its reply, on
+///   the correlation it is waiting on, saying the provider's answer was
+///   unusable — which is true, and is exactly what `DatasourceError::Provider`
+///   is for.
+/// - **`DatasourceQuery`** is refused with an immediate
+///   `HostMsg::DatasourceResult { outcome: Failed { error: Provider, … }, .. }`
+///   on `out_tx` — the requester's own connection, since the refusal happens
+///   *before* the router ever parks the query and so has no correlation to
+///   route a reply back through. This is the same reply shape
+///   `super::datasource`'s `fail` helper sends on a real query timeout (#1165
+///   review round 2 MEDIUM): the vocabulary already had a host-sourced
+///   "your request was too large" — `DatasourceOutcome::Failed` — so a
+///   plugin's pending query resolves instead of hanging forever with no
+///   timer of its own to notice.
+///
+/// `provider` and `scope` are bounded too: they are identifiers, so an
+/// over-long one is refused rather than cut (a truncated name is a *different*
+/// datasource), and they are formatted into the failure messages the router
+/// sends back, which would otherwise be a second way onto the same queue.
+///
+/// Latched like [`capped_effect_strings`], and a separate function from it
+/// because the two answer different questions: that one bounds what a human
+/// will look at, this one bounds what a queue will hold. No longer pure since
+/// the round-2 fix above — the `DatasourceQuery` refusal now has a side
+/// effect (`out_tx.try_send`), non-blocking like every other outbound push in
+/// this reader loop (`push_state`'s posture): the GTK broker thread must
+/// never block on a plugin that stopped reading its socket, and the liveness
+/// ping is what reaps that connection either way.
+pub(super) fn capped_effect_payload(
+    mut effect: Effect,
+    out_tx: &mpsc::Sender<HostMsg>,
+    warned: &mut EffectWarnLatch,
+) -> (Option<Effect>, Option<String>) {
+    let kind = std::mem::discriminant(&effect);
+    let refuse = |what: &str, bytes: usize, request_id: u64, warned: &mut EffectWarnLatch| {
+        let message = warned.insert(kind).then(|| {
+            format!(
+                "plugin {what} is {bytes} B, over the host's {MAX_DATASOURCE_PAYLOAD_BYTES} B \
+                 datasource payload cap; refused. The host→plugin queue bounds frames, not \
+                 bytes, so an unbounded payload is an unbounded queue (further occurrences of \
+                 this effect kind are silenced for the rest of this connection)"
+            )
+        });
+        let _ = out_tx.try_send(HostMsg::DatasourceResult {
+            request_id,
+            outcome: DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: format!(
+                    "plugin {what} is {bytes} B, over the host's \
+                     {MAX_DATASOURCE_PAYLOAD_BYTES} B cap"
+                ),
+            },
+        });
+        (None, message)
+    };
+    match &mut effect {
+        Effect::DatasourceQuery {
+            request_id,
+            provider,
+            scope,
+            params,
+        } => {
+            let request_id = *request_id;
+            if params.len() > MAX_DATASOURCE_PAYLOAD_BYTES {
+                return refuse("DatasourceQuery params", params.len(), request_id, warned);
+            }
+            if provider.len() > MAX_DISPLAY_TEXT_BYTES {
+                return refuse(
+                    "DatasourceQuery provider name",
+                    provider.len(),
+                    request_id,
+                    warned,
+                );
+            }
+            if scope.len() > MAX_DISPLAY_TEXT_BYTES {
+                return refuse(
+                    "DatasourceQuery scope name",
+                    scope.len(),
+                    request_id,
+                    warned,
+                );
+            }
+        }
+        Effect::DatasourceResult { outcome, .. } => {
+            let over = match outcome {
+                DatasourceOutcome::Ready(payload) => {
+                    (payload.len() > MAX_DATASOURCE_PAYLOAD_BYTES).then_some(payload.len())
+                }
+                // A failure's `message` is a human line, so it is cut rather
+                // than refused — the requester learning *that* it failed
+                // matters more than the tail of why.
+                DatasourceOutcome::Failed { message, .. } => {
+                    if message.len() > MAX_BODY_TEXT_BYTES {
+                        *message =
+                            super::effects::truncate_on_char_boundary(message, MAX_BODY_TEXT_BYTES);
+                    }
+                    None
+                }
+            };
+            if let Some(bytes) = over {
+                let message = warned.insert(kind).then(|| {
+                    format!(
+                        "plugin DatasourceResult payload is {bytes} B, over the host's \
+                         {MAX_DATASOURCE_PAYLOAD_BYTES} B cap; the requester gets a Failed \
+                         outcome instead of an unbounded frame (further occurrences of this \
+                         effect kind are silenced for the rest of this connection)"
+                    )
+                });
+                *outcome = DatasourceOutcome::Failed {
+                    error: DatasourceError::Provider,
+                    message: format!(
+                        "provider payload is {bytes} B, over the host's \
+                         {MAX_DATASOURCE_PAYLOAD_BYTES} B cap"
+                    ),
+                };
+                return (Some(effect), message);
+            }
+        }
+        // Everything else carries no opaque payload; the display-string caps in
+        // `capped_effect_strings` are what bound their strings.
+        Effect::OpenPage(_)
+        | Effect::Niri(_)
+        | Effect::Media(_)
+        | Effect::Audio(_)
+        | Effect::RunCommand { .. }
+        | Effect::RaiseOsd { .. }
+        | Effect::Notify { .. }
+        | Effect::RequestConsent { .. }
+        | Effect::OpenUri { .. } => {}
+    }
+    (Some(effect), None)
+}
+
 /// Whether a non-blocking outbound push should keep its producer task running.
 enum Push {
     /// The frame was sent, or dropped because the queue was momentarily full —
@@ -297,34 +592,42 @@ fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
     }
 }
 
-/// Per-connection effect rate cap (#435): a token bucket over [`Effect`]
-/// emissions. A plugin may fire up to [`EFFECT_BURST`] effects back-to-back;
-/// beyond that it's limited to [`EFFECT_REFILL_PER_SEC`], so a buggy plugin
-/// emitting an effect per render can't flood the (deliberately non-lossy #277)
-/// effect broker with drawer-opens / OSD nudges / toasts.
-pub(super) struct EffectRateLimiter {
+/// A token bucket: `burst` tokens to spend back-to-back, refilled at
+/// `refill_per_sec`.
+///
+/// Extracted from [`EffectRateLimiter`] in #1165 because the effect cap is no
+/// longer the only thing the host rate-limits — [`LogGate`] bounds
+/// [`PluginMsg::Log`] and the broker bounds detached launches — and three
+/// hand-copied `tokens/last` pairs would be three places for the refill
+/// arithmetic to drift.
+pub(super) struct TokenBucket {
     tokens: f64,
     last: Instant,
+    burst: f64,
+    refill_per_sec: f64,
 }
 
-impl EffectRateLimiter {
-    fn new() -> Self {
-        Self::new_at(Instant::now())
+impl TokenBucket {
+    pub(super) fn new_at(now: Instant, burst: u32, refill_per_sec: f64) -> Self {
+        Self {
+            tokens: f64::from(burst),
+            last: now,
+            burst: f64::from(burst),
+            refill_per_sec,
+        }
     }
 
-    pub(super) fn new_at(now: Instant) -> Self {
-        Self {
-            tokens: f64::from(EFFECT_BURST),
-            last: now,
-        }
+    /// What this bucket holds as of `now`, without spending anything.
+    fn refilled(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        (self.tokens + elapsed * self.refill_per_sec).min(self.burst)
     }
 
     /// Refill by the time elapsed since the last call (capped at the burst), then
     /// try to spend one token. `true` = allowed, `false` = over budget (drop).
     pub(super) fn allow(&mut self, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = self.refilled(now);
         self.last = now;
-        self.tokens = (self.tokens + elapsed * EFFECT_REFILL_PER_SEC).min(f64::from(EFFECT_BURST));
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -332,26 +635,286 @@ impl EffectRateLimiter {
             false
         }
     }
+
+    /// Whether this bucket has refilled to its full burst as of `now`, i.e.
+    /// whether it still remembers anything about what was spent.
+    ///
+    /// This is what makes a *keyed* bucket table sweepable (#1165 item 4): a
+    /// full bucket is indistinguishable from a fresh one, so forgetting it
+    /// changes no decision, while forgetting a partly-spent one would hand its
+    /// owner a free burst.
+    pub(super) fn is_full(&self, now: Instant) -> bool {
+        self.refilled(now) >= self.burst
+    }
 }
 
-/// Filter a render frame's effects through the connection's rate limiter,
+/// Per-plugin effect rate cap (#435): a token bucket over [`Effect`]
+/// emissions. A plugin may fire up to [`EFFECT_BURST`] effects back-to-back;
+/// beyond that it's limited to [`EFFECT_REFILL_PER_SEC`], so a buggy plugin
+/// emitting an effect per render can't flood the (deliberately non-lossy #277)
+/// effect broker with drawer-opens / OSD nudges / toasts.
+///
+/// A thin newtype over [`TokenBucket`] so the two knobs live with the cap they
+/// describe and callers cannot accidentally build an effect limiter with some
+/// other plugin's budget.
+pub(super) struct EffectRateLimiter(TokenBucket);
+
+impl EffectRateLimiter {
+    pub(super) fn new_at(now: Instant) -> Self {
+        Self(TokenBucket::new_at(
+            now,
+            EFFECT_BURST,
+            EFFECT_REFILL_PER_SEC,
+        ))
+    }
+
+    /// Refill by the time elapsed since the last call (capped at the burst), then
+    /// try to spend one token. `true` = allowed, `false` = over budget (drop).
+    pub(super) fn allow(&mut self, now: Instant) -> bool {
+        self.0.allow(now)
+    }
+
+    /// Whether this plugin's bucket has refilled completely — see
+    /// [`TokenBucket::is_full`]. The predicate [`sweep_effect_buckets`] retires
+    /// an entry on.
+    fn is_full(&self, now: Instant) -> bool {
+        self.0.is_full(now)
+    }
+}
+
+/// Max [`PluginMsg::Log`] frames a connection may emit back-to-back before the
+/// sustained cap ([`LOG_REFILL_PER_SEC`]) applies (#1165).
+///
+/// 32 is deliberately looser than [`EFFECT_BURST`]: a plugin's startup is
+/// legitimately chatty (a handful of `debug!` lines per subsystem), and a log
+/// line costs the host a journal write, not a drawer-open.
+pub(super) const LOG_BURST: u32 = 32;
+
+/// Sustained [`PluginMsg::Log`] budget refilled per second (#1165). Five lines a
+/// second, forever, is well above what any bundled plugin emits and well below
+/// what fills a journal.
+const LOG_REFILL_PER_SEC: f64 = 5.0;
+
+/// Max bytes in one [`PluginMsg::Log`] message (#1165).
+///
+/// The frame was bounded only by `MAX_FRAME_LEN`, so a plugin could push 16 MiB
+/// into a single `tracing` event — and a journal line is not a widget, so this
+/// costs disk and `journalctl` rather than the GTK thread. 4 KiB matches
+/// [`MAX_DISPLAY_TEXT_BYTES`] and is far past any line worth reading;
+/// `systemd-journald` has its own field limit above it, so the host cuts first
+/// and says so rather than letting the journal silently do it.
+pub(super) const MAX_LOG_MSG_BYTES: usize = 4 * 1024;
+
+/// What the host should do with one inbound [`PluginMsg::Log`] frame (#1165).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LogAdmission {
+    /// Surface this message at the frame's level.
+    Emit {
+        /// The message, cut to [`MAX_LOG_MSG_BYTES`] on a char boundary.
+        msg: String,
+        /// `Some(original_len)` the **first** time this connection sent an
+        /// over-cap message, so the truncation is named once rather than on
+        /// every line.
+        over_cap: Option<usize>,
+    },
+    /// Over the rate cap: drop the line.
+    Drop {
+        /// `true` the **first** time this connection is over budget — the one
+        /// journal line that says logs are being dropped. Latched, because an
+        /// unlatched "dropped" line is itself the flood.
+        warn: bool,
+    },
+}
+
+/// Per-connection [`PluginMsg::Log`] gate (#1165): the rate bucket plus the two
+/// one-shot latches, kept as one value so the policy is unit-testable without a
+/// socket.
+pub(super) struct LogGate {
+    bucket: TokenBucket,
+    rate_warned: bool,
+    len_warned: bool,
+}
+
+impl LogGate {
+    pub(super) fn new_at(now: Instant) -> Self {
+        Self {
+            bucket: TokenBucket::new_at(now, LOG_BURST, LOG_REFILL_PER_SEC),
+            rate_warned: false,
+            len_warned: false,
+        }
+    }
+
+    /// Decide one log frame's fate. The rate cap is checked **first**: an
+    /// over-budget line is dropped whole, so a flood costs no truncation work.
+    pub(super) fn admit(&mut self, msg: &str, now: Instant) -> LogAdmission {
+        if !self.bucket.allow(now) {
+            let warn = !self.rate_warned;
+            self.rate_warned = true;
+            return LogAdmission::Drop { warn };
+        }
+        if msg.len() > MAX_LOG_MSG_BYTES {
+            let over_cap = (!self.len_warned).then_some(msg.len());
+            self.len_warned = true;
+            return LogAdmission::Emit {
+                msg: super::effects::truncate_on_char_boundary(msg, MAX_LOG_MSG_BYTES),
+                over_cap,
+            };
+        }
+        LogAdmission::Emit {
+            msg: msg.to_owned(),
+            over_cap: None,
+        }
+    }
+}
+
+/// The host's effect rate buckets, keyed by **plugin id** and shared across its
+/// connections (#1165 item 4).
+///
+/// Before this the bucket was a local in `handle_conn`, so it died with the
+/// connection: a plugin that crash-loops — or one written to reconnect on
+/// purpose — got a fresh [`EFFECT_BURST`] every time it dialled back in, and
+/// the SDK's backoff starts at 100 ms. The cap that reads as "8 then 1/s" was
+/// therefore "8 per reconnect" for exactly the plugin it exists to bound.
+/// Keyed by id and held on the [`ListenerCtx`], it survives the reconnect.
+///
+/// Host-scoped (not process-global) for the reason `live_ids` is: the
+/// per-connection tests stay isolated from one another.
+///
+/// **Bounded by construction, in both dimensions, since #1165 review round
+/// 2:** at most [`MAX_TRACKED_EFFECT_BUCKETS`] entries
+/// ([`spend_effect_tokens`]'s refusal past that count), each keyed by a
+/// `String` no longer than [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES)
+/// bytes — `serve_conn` refuses a `Register` over that cap before a
+/// connection's id can ever reach this map. Before the id cap, the entry count
+/// was bounded but an entry's own key was not, so the worst case was
+/// `MAX_TRACKED_EFFECT_BUCKETS` × an unbounded id — "bounds entries, not
+/// bytes", the same shape the outbound queue's own #1165 fix closed one file
+/// over. [`super::effects`]'s `LAUNCH_BUDGETS` is the sibling table with the
+/// same shape and the same fix.
+pub(super) type EffectBuckets = Arc<Mutex<std::collections::HashMap<String, EffectRateLimiter>>>;
+
+/// How many plugin ids the host will keep a bucket for at once (#1165 item 4).
+///
+/// The table is swept at every registration ([`sweep_effect_buckets`]), and a
+/// *full* bucket is forgotten there because it is indistinguishable from a
+/// fresh one — so what the table actually holds is "ids that spent an effect
+/// token within the last refill window", a handful in any real session. This
+/// cap is the backstop against a synthetic flood of distinct ids registering
+/// faster than the sweep retires them: past it, an unknown id's effects are
+/// **refused** rather than tracked. Refusing is the safe direction — reaching
+/// this at all takes a thousand plugin ids actively spending effects, which is
+/// the abuse, not a deployment.
+///
+/// With [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES)
+/// bounding every key, this table's worst-case retained memory is
+/// `MAX_TRACKED_EFFECT_BUCKETS × MAX_PLUGIN_ID_BYTES` bytes of keys — 64 KiB —
+/// plus one fixed-size [`EffectRateLimiter`] per entry, not the unbounded
+/// figure a round-1 id cap would have left this at.
+///
+/// **What this table does and does not defend against** (#1165 review round
+/// 2, judge item 3, answered explicitly rather than left for the next
+/// reviewer to re-derive). A peer that re-registers under a fresh id every
+/// time gets a fresh [`EFFECT_BURST`] (and a fresh `LAUNCH_BURST` in
+/// `super::effects`'s sibling table) each time, and — worse — 1024 non-full
+/// buckets from a cycling peer can deny a *new* legitimate plugin its own
+/// bucket. This is moot rather than a gap: the plugin socket is `0600` in a
+/// `0700` directory (`listener.rs`'s `take_socket`/`listen`), so route 0 is
+/// same-uid by construction. A peer that can cycle plugin ids fast enough to
+/// matter can already fork processes, read the keyring and replace the
+/// binaries under this uid — it is strictly above what the plugin API is
+/// meant to contain, not something these buckets are positioned to stop. What
+/// this table genuinely fixes is the case #1165 item 4 names: a
+/// **crash-looping plugin that keeps its id**, which is the ordinary
+/// reconnect this eviction policy (evict full buckets first, never touch a
+/// partly-spent one, refuse rather than evict a victim once the table is
+/// full) protects correctly.
+pub(super) const MAX_TRACKED_EFFECT_BUCKETS: usize = 1024;
+
+/// Forget every bucket that has refilled to its full burst as of `now` (#1165
+/// item 4).
+///
+/// Called once per registration — the moment a new id may be about to add an
+/// entry — rather than on a timer, so the table has no background cost at all.
+/// Dropping a *full* bucket changes no decision (it is exactly a fresh one);
+/// dropping a partly-spent one would hand its owner the free burst this whole
+/// change exists to close, which is why the predicate is `is_full` and not an
+/// age.
+pub(super) fn sweep_effect_buckets(buckets: &EffectBuckets, now: Instant) {
+    buckets
+        .lock()
+        .expect("plugin effect buckets poisoned")
+        .retain(|_, bucket| !bucket.is_full(now));
+}
+
+/// Spend up to `count` tokens from `plugin_id`'s persistent bucket, returning
+/// one verdict per effect **in order** (#1165 item 4).
+///
+/// The lock is held for pure arithmetic only — the warn and the audit write for
+/// a refused effect happen after it is released, in [`throttle_effects`] — so a
+/// slow `tracing` subscriber can never stall another connection's reader.
+fn spend_effect_tokens(
+    buckets: &EffectBuckets,
+    plugin_id: &str,
+    count: usize,
+    now: Instant,
+) -> Vec<bool> {
+    let mut guard = buckets.lock().expect("plugin effect buckets poisoned");
+    if !guard.contains_key(plugin_id) {
+        // Borrow-first: the `to_owned()` is paid only on the insert that
+        // actually adds an id, not on every frame of every connection.
+        if guard.len() >= MAX_TRACKED_EFFECT_BUCKETS {
+            guard.retain(|_, bucket| !bucket.is_full(now));
+        }
+        if guard.len() >= MAX_TRACKED_EFFECT_BUCKETS {
+            return vec![false; count];
+        }
+        guard.insert(plugin_id.to_owned(), EffectRateLimiter::new_at(now));
+    }
+    let bucket = guard
+        .get_mut(plugin_id)
+        .expect("present, or inserted just above");
+    (0..count).map(|_| bucket.allow(now)).collect()
+}
+
+/// Filter a render frame's effects through the plugin's rate limiter,
 /// dropping (with a warn) any that exceed the cap. All effects in one frame share
 /// a single `now`, so a burst frame depletes the bucket in order.
 fn throttle_effects(
-    rl: &mut EffectRateLimiter,
+    buckets: &EffectBuckets,
     plugin_id: &str,
     effects: Vec<Effect>,
+    warned: &mut EffectWarnLatch,
 ) -> Vec<Effect> {
     if effects.is_empty() {
         return effects;
     }
     let now = Instant::now();
+    let verdicts = spend_effect_tokens(buckets, plugin_id, effects.len(), now);
     let mut kept = Vec::with_capacity(effects.len());
-    for effect in effects {
-        if rl.allow(now) {
+    for (effect, allowed) in effects.into_iter().zip(verdicts) {
+        if allowed {
             kept.push(effect);
         } else {
-            tracing::warn!(plugin = %plugin_id, ?effect, "plugin effect rate cap exceeded; dropped");
+            // #1165 item 5: latched per connection per effect *kind*, and
+            // naming the kind rather than `Debug`-formatting the whole effect.
+            // A plugin over the rate cap is over it on every frame, and the
+            // effect it is over with carries the very payloads the other caps
+            // in this file exist to bound — so the unlatched `?effect` line was
+            // a per-frame journal write of arbitrary plugin-supplied bytes,
+            // which is the flood it was reporting. The audit log below still
+            // records every dropped effect: that is the per-occurrence record,
+            // and it is rotated and bounded.
+            if warned.insert(std::mem::discriminant(&effect)) {
+                tracing::warn!(
+                    plugin = %plugin_id,
+                    effect = super::effects::effect_kind(&effect),
+                    burst = EFFECT_BURST,
+                    per_sec = EFFECT_REFILL_PER_SEC,
+                    "plugin effect rate cap exceeded; dropped (further drops of this effect \
+                     kind on this connection are silenced — the audit log still records each \
+                     one)",
+                );
+            }
             super::effects::record_audit(
                 plugin_id,
                 &effect,
@@ -486,6 +1049,7 @@ pub(super) fn enforce_capabilities(
     granted: &[Capability],
     plugin_id: &str,
     effects: Vec<Effect>,
+    warned: &mut EffectWarnLatch,
 ) -> Vec<Effect> {
     effects
         .into_iter()
@@ -496,12 +1060,23 @@ pub(super) fn enforce_capabilities(
             if granted.contains(&cap) {
                 true
             } else {
-                tracing::warn!(
-                    plugin = %plugin_id,
-                    ?effect,
-                    ?cap,
-                    "plugin effect requires a capability it didn't declare; dropped",
-                );
+                // #1165 item 5: one line per effect kind per connection, naming
+                // the kind rather than `Debug`-formatting the effect. A missing
+                // capability is a *manifest* mistake, so it is wrong on every
+                // frame for the life of the connection — the unlatched form
+                // wrote the plugin's whole (arbitrary-length, plugin-supplied)
+                // effect payload to the journal at the plugin's frame rate. The
+                // audit log keeps the per-occurrence record.
+                if warned.insert(std::mem::discriminant(effect)) {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        effect = super::effects::effect_kind(effect),
+                        ?cap,
+                        "plugin effect requires a capability it didn't declare; dropped. Add it \
+                         to the manifest's capabilities (further drops of this effect kind on \
+                         this connection are silenced — the audit log still records each one)",
+                    );
+                }
                 super::effects::record_audit(
                     plugin_id,
                     effect,
@@ -516,14 +1091,37 @@ pub(super) fn enforce_capabilities(
         .collect()
 }
 
+/// [`serve_conn`] with no unregistered-connection permit — one connection driven
+/// on its own, which is what the per-connection tests do: a socketpair, no
+/// listener, so there is no gate to hold a permit from.
+///
+/// `#[cfg(test)]` because production reaches a connection only through
+/// [`listener::accept_loop`](super::listener::accept_loop), which always has a
+/// permit to hand over. Keeping it as a test-only shim is what let the gate be
+/// added without rewriting twenty-odd call sites that are about something else
+/// entirely.
+#[cfg(test)]
+pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
+    serve_conn(stream, ctx, None).await;
+}
+
 /// Drive one plugin connection: handshake, then read frames until the peer
 /// disconnects, feeding renders into the mount mailbox and pushing state
 /// snapshots + events back out.
+///
+/// `unregistered` is the listener's gate permit (#1165 item 6), released the
+/// moment this connection is registered — see the `drop` after the [`IdGuard`]
+/// claim. It is an `Option` because the gate belongs to the accept loop: a test
+/// driving one socketpair has no listener and passes `None`.
 // One cohesive per-connection lifecycle (handshake → the four opt-in push tasks
 // → reader loop → teardown); splitting it would scatter the paired setup/abort
 // of each task across helpers for no readability gain.
 #[allow(clippy::too_many_lines)]
-pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
+pub(super) async fn serve_conn(
+    stream: UnixStream,
+    ctx: &ListenerCtx,
+    unregistered: Option<tokio::sync::OwnedSemaphorePermit>,
+) {
     let (mut rd, wr) = stream.into_split();
 
     // Handshake: the first frame MUST be `Register`, and its proto must match
@@ -581,6 +1179,24 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         tracing::warn!("plugin Register carried an empty id; dropping the connection");
         return;
     }
+    // #1165 review round 2 HIGH-1: an id is a *key* (it names the region
+    // mailbox, `live_ids`, the audit log, and — since this same round —
+    // `EffectBuckets`/`LAUNCH_BUDGETS`), so an over-cap one is refused
+    // outright here, on the same terms as the empty-id check above, rather
+    // than truncated like a display string. A truncated id would silently
+    // become a *different* plugin colliding with (or shadowing) whatever
+    // already holds that prefix. This is also what stops an unbounded id from
+    // ever reaching `gtk::Label::new` as a notification's app name
+    // (`effects.rs`'s `Effect::Notify` arm) or costing the two per-id host
+    // tables an unbounded key.
+    if plugin_id.len() > MAX_PLUGIN_ID_BYTES {
+        tracing::warn!(
+            bytes = plugin_id.len(),
+            cap = MAX_PLUGIN_ID_BYTES,
+            "plugin Register carried an id over the host's cap; dropping the connection",
+        );
+        return;
+    }
     // #436: one live connection per plugin id on this host. A second Register
     // for an id already connected (e.g. a dev binary dialing the same socket as
     // the systemd-launched unit) would otherwise have both connections
@@ -597,6 +1213,21 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         );
         return;
     };
+    // #1165 item 6: **registered**, so the listener's gate permit is released
+    // here rather than at teardown. What the gate bounds is *unregistered*
+    // connections — a peer that dials and says nothing — and a registered
+    // plugin is a long-lived, identified connection that should not count
+    // against the handshake budget. Held to exactly this point: the `IdGuard`
+    // above is the last thing that can reject a registration, so releasing
+    // before it would let a rejected duplicate free a permit it never earned.
+    // A connection that never gets here drops its permit when `REGISTER_TIMEOUT`
+    // (or a decode failure) returns from this function.
+    drop(unregistered);
+    // #1165 item 4: the one moment a new plugin id may be about to take a slot
+    // in the host's effect-bucket table, and therefore the moment to retire the
+    // entries that have refilled. This connection's own bucket is deliberately
+    // NOT reset here — surviving the reconnect is the whole point.
+    sweep_effect_buckets(&ctx.effect_buckets, Instant::now());
     let mount = manifest.mount;
     // Region sort key (advisory placement request); `None` sorts as `0` (#274).
     let order = manifest.order.unwrap_or(0);
@@ -798,13 +1429,28 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // `select!` only ever *abandons* on teardown — it is never resumed after a
     // cancel, so no partial read is lost mid-stream.
     let pong_seen = AtomicBool::new(false);
-    let mut effect_rl = EffectRateLimiter::new();
     // #1058 review MEDIUM-2: per-connection latch for `capped_hidden_on`'s two
-    // violation kinds, mirroring `effect_rl`'s per-connection scope (and the
-    // SDK's own `capability_warned`) — reset on every reconnect, so a
+    // violation kinds, mirroring the SDK's own `capability_warned` — reset on
+    // every reconnect, so a
     // long-lived misconfiguration is named once per connection, not once per
     // frame.
     let mut hidden_on_warned = HashSet::new();
+    // #1165: the per-connection latch for `capped_effect_strings`, on exactly
+    // the same terms as `hidden_on_warned` above — one line per effect kind per
+    // connection, not one per frame.
+    let mut effect_text_warned = EffectWarnLatch::new();
+    // #1165 item 7: the datasource payload cap's own latch, separate from the
+    // display-string one because an effect kind can trip both.
+    let mut effect_payload_warned = EffectWarnLatch::new();
+    // #1165 item 5: the two drop-warn latches. Kept apart rather than shared,
+    // because an effect kind can be dropped for *both* reasons over one
+    // connection's life and the two name different fixes — a manifest edit
+    // versus a slower emitter.
+    let mut ungranted_warned = EffectWarnLatch::new();
+    let mut rate_cap_warned = EffectWarnLatch::new();
+    // #1165: the `PluginMsg::Log` length + rate gate, per connection like the
+    // effect limiter beside it.
+    let mut log_gate = LogGate::new_at(Instant::now());
     let reader = async {
         loop {
             match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -820,10 +1466,36 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     // plugin may request anything; the host decides what runs.
                     let requested = effects.len();
                     let kept = throttle_effects(
-                        &mut effect_rl,
+                        &ctx.effect_buckets,
                         &plugin_id,
-                        enforce_capabilities(&capabilities, &plugin_id, effects),
+                        enforce_capabilities(
+                            &capabilities,
+                            &plugin_id,
+                            effects,
+                            &mut ungranted_warned,
+                        ),
+                        &mut rate_cap_warned,
                     );
+                    // #1165: the payload caps run LAST — after the two host
+                    // policies have decided which effects run at all, so a
+                    // dropped effect costs no capping work, and before the
+                    // broker, which is the GTK main thread.
+                    let kept = kept
+                        .into_iter()
+                        .filter_map(|effect| {
+                            let (effect, message) =
+                                capped_effect_strings(effect, &mut effect_text_warned);
+                            if let Some(message) = message {
+                                tracing::warn!(plugin = %plugin_id, "{message}");
+                            }
+                            let (effect, message) =
+                                capped_effect_payload(effect, &out_tx, &mut effect_payload_warned);
+                            if let Some(message) = message {
+                                tracing::warn!(plugin = %plugin_id, "{message}");
+                            }
+                            effect
+                        })
+                        .collect::<Vec<_>>();
                     // Runtime mirror (#423): this frame proves the plugin is
                     // rendering; the guards' drops feed its violation count.
                     let dropped =
@@ -867,7 +1539,37 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                 Ok(PluginMsg::Register { .. }) => {
                     tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
                 }
-                Ok(PluginMsg::Log { level, msg }) => log_plugin(&plugin_id, level, &msg),
+                // #1165: a `Log` frame was neither length- nor rate-capped —
+                // the one inbound message kind that reaches the journal
+                // directly, bounded only by the 16 MiB frame limit and by how
+                // fast the plugin can write.
+                Ok(PluginMsg::Log { level, msg }) => match log_gate.admit(&msg, Instant::now()) {
+                    LogAdmission::Emit { msg, over_cap } => {
+                        if let Some(bytes) = over_cap {
+                            tracing::warn!(
+                                plugin = %plugin_id,
+                                bytes,
+                                cap = MAX_LOG_MSG_BYTES,
+                                "plugin Log message is over the host's length cap; the \
+                                 prefix is logged (further occurrences on this connection \
+                                 are silenced)",
+                            );
+                        }
+                        log_plugin(&plugin_id, level, &msg);
+                    }
+                    LogAdmission::Drop { warn } => {
+                        if warn {
+                            tracing::warn!(
+                                plugin = %plugin_id,
+                                burst = LOG_BURST,
+                                per_sec = LOG_REFILL_PER_SEC,
+                                "plugin exceeded the host's log rate cap; lines are being \
+                                 dropped (further occurrences on this connection are \
+                                 silenced)",
+                            );
+                        }
+                    }
+                },
                 Ok(PluginMsg::Pong { seq }) => {
                     pong_seen.store(true, Ordering::Relaxed);
                     tracing::trace!(plugin = %plugin_id, seq, "plugin pong");
@@ -954,7 +1656,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     // Drop this connection from the runtime mirror (#423) — done here, still
     // inside the id's exclusive-ownership window (the `IdGuard` releases only
-    // when `handle_conn` returns), so it can't evict a fast-reconnect successor.
+    // when `serve_conn` returns), so it cannot evict a fast-reconnect successor.
     super::runtime_remove(&ctx.runtime, &plugin_id);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
@@ -1030,7 +1732,7 @@ async fn snapshot_task(
 /// [`snapshot_task`]; spawned **only** for a **sidebar** connection that
 /// subscribes [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never
 /// receives the frame, and a bar mount gets a constant `true` seed instead (its
-/// chip is always on-screen; see `handle_conn`, #438), never this change loop.
+/// chip is always on-screen; see `serve_conn`, #438), never this change loop.
 ///
 /// #542: when `now_playing_rx` is `Some` (a gated now-playing subscriber), the
 /// unpark rising edge (`false`→`true`) additionally re-seeds the current

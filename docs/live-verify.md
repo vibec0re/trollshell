@@ -427,6 +427,82 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       **again** (once) and the driver is asked once more — a second line after
       a hot-plug is correct, not a regression, and its _absence_ would be the
       bug.
+- [ ] **(#1165)** **The crasher, on glass.** Everything below is bounded by a
+      hermetic test, but only a real GTK main loop can show that the _shell
+      stays usable_, which is the thing the caps are for. Point a scratch plugin
+      at the live socket and have it render a `Node::Label` whose text is ~8 MiB
+      (`"a".repeat(8 << 20)`) — inside the 16 MiB frame cap, so the frame is
+      legal. Expect: the chip renders a 4 KiB prefix, **the bar keeps
+      ticking**, the drawer still opens, and `journalctl --user -u trollshell`
+      carries exactly **one** line per plugin tree —
+      _"plugin render tree carries a display string over the host's text cap"_ —
+      no matter how many frames the plugin sends. Before this, the same frame
+      froze the main loop for as long as pango took to shape 8 MiB. Repeat with
+      `Effect::RaiseOsd { title: <8 MiB> }`: the OSD shows a prefix, the shell
+      stays responsive, one warn.
+- [ ] **(#1165)** `RunCommand` memory. With a plugin holding
+      `Capability::RunCommand`, emit the **attached** (`detached: false`)
+      `Effect::run_command(1, ["sh", "-c", "yes"])`
+      and watch `systemctl --user status trollshell`'s `Memory:` line.
+      It must stay flat, the reply must come back within a second or so with
+      `ok: false`, and the journal must say _"wrote more than the host will
+      read; killed"_. Before this the host buffered the child's whole stdout for
+      the full 10 s timeout and was OOM-killed. Sanity leg: a normal
+      `["sh", "-c", "echo hi"]` still returns `ok: true` with `hi`.
+- [ ] **(#1165)** Reconnect does not refill the effect budget. Take a plugin
+      that emits an effect per frame, `systemctl --user restart` it in a loop
+      (or run a dev binary that exits after each render), and confirm the
+      drawer/OSD **stops** reacting after the first burst instead of firing
+      once per reconnect. The journal should carry one
+      _"plugin effect rate cap exceeded"_ line per effect kind per connection —
+      not one per dropped effect, and not the plugin's whole `Debug`-formatted
+      effect payload.
+- [ ] **(#1165)** Unregistered-dial gate. With the shell up, saturate the
+      socket with peers that connect and say nothing:
+      `for i in $(seq 70); do (exec 3<>/run/user/$UID/trollshell/plugin.sock; sleep 30) & done`.
+      Then `systemctl --user restart trollshell-plugin-pet`. The pet plugin must
+      mount **within the handshake timeout** (10 s) once the silent peers start
+      timing out, the shell must stay responsive throughout, and `ls /proc/$(systemctl --user show -p MainPID --value trollshell)/fd | wc -l`
+      must not climb past the gate. Kill the background dials afterwards.
+- [ ] **(#1165)** Detached-launch budget. From the agents card, click through
+      more than four agent-window launches inside a minute (or hold a key on
+      the `edit` button). The first four open windows; the fifth comes back to
+      the plugin as `ok: false` with _"refused: over the host's detached-launch
+      budget"_ and the journal logs the refusal. Confirm
+      `systemctl --user list-units 'trollshell-launch-*'` shows exactly the
+      launches that were allowed, and that after a minute a further click works
+      again — this is a rate cap, not a lockout.
+- [ ] **(#1165 review round 2, HIGH-1)** **The id crasher, on glass.** Round 1
+      capped every display string the vocabulary carries, but not the plugin
+      `id` itself. Register a scratch plugin with `id: "a".repeat(65)` (one
+      byte over `MAX_PLUGIN_ID_BYTES`, 64): the connection must be dropped at
+      the handshake with no card mounted, and the journal carries one
+      _"plugin Register carried an id over the host's cap; dropping the
+      connection"_ line. Before this fix, an id up to ~16 MiB was a legal
+      `Register`, and one that then sent a single `Effect::Notify` rode the id
+      into `gtk::Label::new` as the notification's app name, unbounded — this
+      was the #1165 headline freeze reached through the very effect round 1
+      capped two of three arguments of.
+- [ ] **(#1165 review round 2, HIGH-2)** **`classes` freeze, on glass.** Point
+      a scratch plugin at the live socket and have it render a `Node::Label`
+      with 20 000 CSS classes on one frame, then a second frame with 20 000
+      _different_ class names (a full replace, the reconciler's worst case).
+      Expect: the mapped node carries at most `MAX_NODE_CLASSES` (32) of them,
+      the bar keeps ticking across both frames, and the journal carries one
+      _"plugin render tree carries a node with more CSS classes than the
+      host's count cap…"_ line. Before this fix, `classes` was unbounded and
+      `reconcile_classes`'s `Vec::contains` diff was quadratic — the review
+      measured 5.70 s for this exact case, over three times the 8 MiB label
+      the round-1 crasher fix exists to stop.
+- [ ] **(#1165 review round 2, MEDIUM)** An over-cap `DatasourceQuery` resolves
+      instead of hanging. From a plugin with `Capability::DatasourceQuery`,
+      emit one with `params` over `MAX_DATASOURCE_PAYLOAD_BYTES`. Before this
+      fix the request vanished with no reply and a card watching for
+      `Input::DatasourceResult` waited forever with nothing in its own
+      journal to explain why; now the plugin's pending query resolves with a
+      `Failed` outcome naming the cap, on the same correlation, within the
+      same frame — no different from a routing failure (unknown provider,
+      denied scope) the plugin already has to handle.
 
 ## Agents (hyperhive)
 

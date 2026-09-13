@@ -40,9 +40,9 @@ use super::pump::{
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
-    EFFECT_BURST, EffectRateLimiter, HiddenOnViolation, IdGuard, MAX_HIDDEN_ON_ENTRIES,
-    MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT, capped_hidden_on,
-    enforce_capabilities, handle_conn, push_gate, state_key_capability,
+    EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
+    MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
+    capped_hidden_on, enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -1093,6 +1093,9 @@ fn ctx_with(
         now_playing_rx,
         locked_rx,
         live_ids: Arc::new(Mutex::new(HashSet::new())),
+        // #1165 item 4: the host-scoped effect bucket table, per-ctx like
+        // `live_ids` so the per-connection tests stay isolated.
+        effect_buckets: EffectBuckets::default(),
         // Host-scoped runtime mirror (#423); like `live_ids`, kept per-ctx so the
         // per-connection tests stay isolated and never publish `PLUGIN_RUNTIME`.
         runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -1999,12 +2002,18 @@ fn enforce_capabilities_drops_an_uncapped_open_uri() {
     let open = Effect::open_uri(3, "https://pr1ma.darkest.space/agents/argus");
 
     assert!(
-        enforce_capabilities(&[], "p", vec![open.clone()]).is_empty(),
+        enforce_capabilities(&[], "p", vec![open.clone()], &mut EffectWarnLatch::new()).is_empty(),
         "a plugin that declared no caps cannot open a link",
     );
     // Holding the highest-trust cap does not imply the narrow one…
     assert!(
-        enforce_capabilities(&[Capability::RunCommand], "p", vec![open.clone()]).is_empty(),
+        enforce_capabilities(
+            &[Capability::RunCommand],
+            "p",
+            vec![open.clone()],
+            &mut EffectWarnLatch::new(),
+        )
+        .is_empty(),
         "RunCommand does not stand in for OpenUri",
     );
     // …and holding the narrow one emphatically does not imply the other.
@@ -2013,12 +2022,18 @@ fn enforce_capabilities_drops_an_uncapped_open_uri() {
             &[Capability::OpenUri],
             "p",
             vec![Effect::run_command(4, vec!["true".into()])],
+            &mut EffectWarnLatch::new(),
         )
         .is_empty(),
         "OpenUri does not stand in for RunCommand",
     );
 
-    let kept = enforce_capabilities(&[Capability::Notify, Capability::OpenUri], "p", vec![open]);
+    let kept = enforce_capabilities(
+        &[Capability::Notify, Capability::OpenUri],
+        "p",
+        vec![open],
+        &mut EffectWarnLatch::new(),
+    );
     assert_eq!(kept.len(), 1, "the declared cap lets it through");
     assert!(matches!(kept[0], Effect::OpenUri { id: 3, .. }));
 }
@@ -2044,14 +2059,20 @@ fn enforce_capabilities_drops_ungranted_effects() {
         Effect::Niri(NiriAction::FocusWindow { id: 7 }), // NOT granted
     ];
 
-    let kept = enforce_capabilities(&granted, "p", effects);
+    let kept = enforce_capabilities(&granted, "p", effects, &mut EffectWarnLatch::new());
     assert_eq!(kept.len(), 2, "only the two granted effects survive");
     assert!(matches!(kept[0], Effect::OpenPage(Page::Media)));
     assert!(matches!(kept[1], Effect::Notify { .. }));
 
     // A plugin that declared no caps has every effect dropped.
     assert!(
-        enforce_capabilities(&[], "p", vec![Effect::OpenPage(Page::Power)]).is_empty(),
+        enforce_capabilities(
+            &[],
+            "p",
+            vec![Effect::OpenPage(Page::Power)],
+            &mut EffectWarnLatch::new(),
+        )
+        .is_empty(),
         "a plugin that declared no caps gets every effect dropped",
     );
 }
@@ -2684,7 +2705,13 @@ fn enforce_capabilities_gates_datasource_effects() {
     };
     // No caps → both dropped.
     assert!(
-        enforce_capabilities(&[], "p", vec![query.clone(), result.clone()]).is_empty(),
+        enforce_capabilities(
+            &[],
+            "p",
+            vec![query.clone(), result.clone()],
+            &mut EffectWarnLatch::new(),
+        )
+        .is_empty(),
         "ungranted datasource effects are dropped",
     );
     // The requester cap keeps only the query.
@@ -2692,11 +2719,17 @@ fn enforce_capabilities_gates_datasource_effects() {
         &[Capability::DatasourceQuery],
         "p",
         vec![query.clone(), result.clone()],
+        &mut EffectWarnLatch::new(),
     );
     assert_eq!(kept.len(), 1);
     assert!(matches!(kept[0], Effect::DatasourceQuery { .. }));
     // The provider cap keeps only the result.
-    let kept = enforce_capabilities(&[Capability::DatasourceProvider], "p", vec![query, result]);
+    let kept = enforce_capabilities(
+        &[Capability::DatasourceProvider],
+        "p",
+        vec![query, result],
+        &mut EffectWarnLatch::new(),
+    );
     assert_eq!(kept.len(), 1);
     assert!(matches!(kept[0], Effect::DatasourceResult { .. }));
 }
@@ -3209,6 +3242,9 @@ fn ctx_now_playing_lane() -> (ListenerCtx, watch::Sender<bool>, watch::Sender<No
         now_playing_rx,
         locked_rx,
         live_ids: Arc::new(Mutex::new(HashSet::new())),
+        // #1165 item 4: the host-scoped effect bucket table, per-ctx like
+        // `live_ids` so the per-connection tests stay isolated.
+        effect_buckets: EffectBuckets::default(),
         runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         effects_tx,
         datasource: DatasourceRouter::default(),
@@ -10239,6 +10275,1067 @@ mod text_kinds_gl {
                     "…and the GL arm, on the same predicate",
                 );
             });
+        }
+    }
+}
+// ── #1165: plugin-host containment, round 2 ──────────────────────────────────
+//
+// One module rather than tests interleaved into the sections above, because
+// every one of these is about a *bound* the host enforces on plugin-supplied
+// input — the same subject `capped_hidden_on`'s tests have, one round later.
+//
+// Each test names what deleting its guard does, because that is the only thing
+// that makes a containment test worth having: the suite passing with the cap
+// removed is the failure mode these exist to rule out.
+mod containment_r2 {
+    use super::super::listener::{MAX_UNREGISTERED_CONNECTIONS, accept_loop};
+    use super::super::session::{
+        LOG_BURST, LogAdmission, LogGate, MAX_DATASOURCE_PAYLOAD_BYTES, MAX_LOG_MSG_BYTES,
+        capped_effect_payload, capped_effect_strings,
+    };
+    use super::*;
+    #[cfg(feature = "system-tests")]
+    use hytte::gtk;
+    use hytte_plugin_proto::{
+        MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
+        MAX_PLUGIN_ID_BYTES,
+    };
+
+    /// Every WARN line the capture holds that carries `field`.
+    fn warns_with(captured: &hytte_config::test_support::Captured, field: &str) -> usize {
+        captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key(field))
+            .count()
+    }
+
+    // ── Item 1: display strings never reach pango unbounded ──────────────────
+
+    /// The crasher. A `Node::Label` (and its tooltip) over
+    /// [`MAX_DISPLAY_TEXT_BYTES`] must reach the reconciler **truncated**, not
+    /// whole: `gtk::Label::new` shapes the string on the GTK main thread before
+    /// it can measure it, so an 8 MiB label inside the 16 MiB frame cap is a
+    /// one-frame freeze of the bar, the drawer and the effect drain.
+    ///
+    /// **Falsified** by putting `text.clone()` back in `wire_map`'s `Label` arm:
+    /// this reds, and nothing else in `cargo test -p trollshell` notices.
+    #[test]
+    fn an_over_cap_label_maps_to_a_truncated_node() {
+        let scope = Scope::detached("r2-label-cap");
+        let text = "a".repeat(MAX_DISPLAY_TEXT_BYTES + 1);
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text: text.clone(),
+            classes: vec![],
+            tooltip: Some(text),
+        };
+        match to_ui_node(&scope, Grants::all(), &node) {
+            UiNode::Label { text, tooltip, .. } => {
+                assert_eq!(
+                    text.len(),
+                    MAX_DISPLAY_TEXT_BYTES,
+                    "an over-cap label reaches the reconciler cut to the cap",
+                );
+                assert!(text.bytes().all(|b| b == b'a'), "and it is the prefix");
+                assert_eq!(
+                    tooltip.expect("the tooltip survives, capped").len(),
+                    MAX_DISPLAY_TEXT_BYTES,
+                    "a tooltip is a pango layout too, and is capped the same way",
+                );
+            }
+            other => panic!("a Label must map to a Label, got {other:?}"),
+        }
+    }
+
+    /// The cut lands on a **char** boundary, not a byte one. `MAX_DISPLAY_TEXT_BYTES`
+    /// is 4096 and `€` is 3 bytes, so the cap falls mid-character — the case a
+    /// naive `&s[..max]` panics on, taking down the reader task with it.
+    #[test]
+    fn the_text_cap_cuts_on_a_char_boundary() {
+        let scope = Scope::detached("r2-label-boundary");
+        // 4200 bytes, and 4096 is not a multiple of 3.
+        let text = "€".repeat(1400);
+        assert!(
+            !text.is_char_boundary(MAX_DISPLAY_TEXT_BYTES),
+            "the fixture must actually straddle the cap, or this proves nothing",
+        );
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text,
+            classes: vec![],
+            tooltip: None,
+        };
+        match to_ui_node(&scope, Grants::all(), &node) {
+            UiNode::Label { text, .. } => {
+                assert!(text.len() <= MAX_DISPLAY_TEXT_BYTES, "never over the cap");
+                assert_eq!(
+                    text.len(),
+                    MAX_DISPLAY_TEXT_BYTES - 1,
+                    "and it backs up to the boundary rather than splitting a code point",
+                );
+                assert!(text.chars().all(|c| c == '€'), "every character is intact");
+            }
+            other => panic!("a Label must map to a Label, got {other:?}"),
+        }
+    }
+
+    /// A `Node::Text` is a wrapping **paragraph**, so it gets
+    /// [`MAX_BODY_TEXT_BYTES`] and not the line cap — a length over the line cap
+    /// passes through untouched, and only the body cap cuts it.
+    ///
+    /// **Falsified** by swapping the `Text` arm's `MAX_BODY_TEXT_BYTES` for
+    /// `MAX_DISPLAY_TEXT_BYTES`: the first assertion reds.
+    #[test]
+    fn a_text_body_gets_the_larger_cap() {
+        let scope = Scope::detached("r2-text-cap");
+        let text_node = |text: String| wire::Node::Text {
+            id: Some("t".into()),
+            text,
+            max_width_chars: None,
+            ellipsize: false,
+            classes: vec![],
+            tooltip: None,
+        };
+        let long = "b".repeat(MAX_DISPLAY_TEXT_BYTES + 1);
+        match to_ui_node(&scope, Grants::all(), &text_node(long.clone())) {
+            UiNode::Text { text, .. } => assert_eq!(
+                text.len(),
+                long.len(),
+                "a paragraph over the LINE cap is left alone",
+            ),
+            other => panic!("a Text must map to a Text, got {other:?}"),
+        }
+        let huge = "b".repeat(MAX_BODY_TEXT_BYTES + 1);
+        match to_ui_node(&scope, Grants::all(), &text_node(huge)) {
+            UiNode::Text { text, .. } => assert_eq!(
+                text.len(),
+                MAX_BODY_TEXT_BYTES,
+                "and the body cap is what cuts it",
+            ),
+            other => panic!("a Text must map to a Text, got {other:?}"),
+        }
+    }
+
+    /// The node-seam warning is latched **per plugin tree for the life of the
+    /// shell**, like the node/depth caps: an over-cap string is over-cap on
+    /// every frame, at the SDK's ~30 Hz view rate, on every monitor.
+    ///
+    /// **Falsified** by dropping the `&& warn_once_text_cap(scope)` conjunct in
+    /// `to_ui_node`: five passes produce five lines and this reds.
+    #[test]
+    fn the_display_text_warn_latches_across_frames() {
+        let scope = Scope::detached("r2-label-latch");
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text: "a".repeat(MAX_DISPLAY_TEXT_BYTES + 1),
+            classes: vec![],
+            tooltip: None,
+        };
+        let (captured, _guard) = hytte_config::test_support::capture();
+        for _ in 0..5 {
+            let _ = to_ui_node(&scope, Grants::all(), &node);
+        }
+        assert_eq!(
+            warns_with(&captured, "line_cap"),
+            1,
+            "five over-cap frames get one journal line, not five",
+        );
+    }
+
+    /// The effect seam: an over-cap `RaiseOsd` is truncated **and** named once.
+    /// The OSD overlay sets a `gtk::Label` straight from these strings without
+    /// passing through `wire_map` at all, so it needs its own cap.
+    ///
+    /// **Falsified** by deleting the `RaiseOsd` arm of `capped_effect_strings`:
+    /// the lengths come back whole and both length assertions red.
+    #[test]
+    fn an_over_cap_raise_osd_is_truncated_and_warns_once() {
+        let mut warned = EffectWarnLatch::new();
+        let osd = || Effect::RaiseOsd {
+            title: "t".repeat(MAX_DISPLAY_TEXT_BYTES + 1),
+            body: "b".repeat(MAX_BODY_TEXT_BYTES + 1),
+            icon: Some("i".repeat(MAX_DISPLAY_TEXT_BYTES + 1)),
+        };
+        let (effect, message) = capped_effect_strings(osd(), &mut warned);
+        assert!(
+            message.is_some(),
+            "the first over-cap effect of a kind is named",
+        );
+        match effect {
+            Effect::RaiseOsd { title, body, icon } => {
+                assert_eq!(title.len(), MAX_DISPLAY_TEXT_BYTES, "the title is a line");
+                assert_eq!(body.len(), MAX_BODY_TEXT_BYTES, "the body is a paragraph");
+                assert_eq!(
+                    icon.expect("icon").len(),
+                    MAX_DISPLAY_TEXT_BYTES,
+                    "an icon name is a line",
+                );
+            }
+            other => panic!("RaiseOsd must stay RaiseOsd, got {other:?}"),
+        }
+        // …and the SECOND one is still capped, just silently.
+        let (effect, message) = capped_effect_strings(osd(), &mut warned);
+        assert!(
+            message.is_none(),
+            "the warn latches per effect kind per connection",
+        );
+        match effect {
+            Effect::RaiseOsd { title, .. } => assert_eq!(
+                title.len(),
+                MAX_DISPLAY_TEXT_BYTES,
+                "latching the WARNING must not latch the CAP",
+            ),
+            other => panic!("RaiseOsd must stay RaiseOsd, got {other:?}"),
+        }
+        // A different kind gets its own line: the latch is keyed by kind.
+        let (_, message) = capped_effect_strings(
+            Effect::Notify {
+                summary: "s".repeat(MAX_DISPLAY_TEXT_BYTES + 1),
+                body: String::new(),
+            },
+            &mut warned,
+        );
+        assert!(
+            message.is_some(),
+            "a different effect kind is named on its own first occurrence",
+        );
+    }
+
+    /// An under-cap effect is returned byte-identical and silent — the guard
+    /// must be invisible on the happy path, which is every real frame.
+    #[test]
+    fn an_under_cap_effect_is_untouched() {
+        let mut warned = EffectWarnLatch::new();
+        let (effect, message) = capped_effect_strings(
+            Effect::Notify {
+                summary: "timer done".into(),
+                body: "05:00 elapsed".into(),
+            },
+            &mut warned,
+        );
+        assert!(message.is_none());
+        assert_eq!(
+            effect,
+            Effect::Notify {
+                summary: "timer done".into(),
+                body: "05:00 elapsed".into(),
+            },
+        );
+    }
+
+    // ── Item 3: Log is bounded by length and by rate ─────────────────────────
+
+    /// An over-length `Log` message is cut to [`MAX_LOG_MSG_BYTES`] and the
+    /// truncation is named **once** per connection.
+    ///
+    /// **Falsified** by having `LogGate::admit` return `msg.to_owned()`
+    /// unconditionally: the length assertion reds.
+    #[test]
+    fn the_log_gate_truncates_and_names_it_once() {
+        let now = Instant::now();
+        let mut gate = LogGate::new_at(now);
+        let huge = "x".repeat(MAX_LOG_MSG_BYTES * 4);
+        match gate.admit(&huge, now) {
+            LogAdmission::Emit { msg, over_cap } => {
+                assert_eq!(msg.len(), MAX_LOG_MSG_BYTES, "cut to the cap");
+                assert_eq!(over_cap, Some(huge.len()), "…and the real length is named");
+            }
+            LogAdmission::Drop { .. } => panic!("the first line is inside the burst"),
+        }
+        match gate.admit(&huge, now) {
+            LogAdmission::Emit { msg, over_cap } => {
+                assert_eq!(msg.len(), MAX_LOG_MSG_BYTES, "still cut");
+                assert_eq!(over_cap, None, "…but no longer named");
+            }
+            LogAdmission::Drop { .. } => panic!("the second line is inside the burst too"),
+        }
+    }
+
+    /// Past [`LOG_BURST`] back-to-back lines the gate drops them, and says so
+    /// exactly once — an unlatched "I am dropping your logs" line is itself the
+    /// flood it reports.
+    ///
+    /// **Falsified** by deleting the `!self.bucket.allow(now)` early return:
+    /// every line comes back `Emit` and the first assertion reds.
+    #[test]
+    fn the_log_gate_drops_past_the_burst_and_warns_once() {
+        let now = Instant::now();
+        let mut gate = LogGate::new_at(now);
+        // The whole burst is admitted, at one instant (no refill).
+        for i in 0..LOG_BURST {
+            assert!(
+                matches!(gate.admit("hello", now), LogAdmission::Emit { .. }),
+                "line {i} is inside the burst",
+            );
+        }
+        assert_eq!(
+            gate.admit("hello", now),
+            LogAdmission::Drop { warn: true },
+            "the first line past the burst is dropped, and named",
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                gate.admit("hello", now),
+                LogAdmission::Drop { warn: false },
+                "every line after that is dropped silently",
+            );
+        }
+        // Time refills it: a plugin that slows down is logged again.
+        assert!(
+            matches!(
+                gate.admit("hello", now + Duration::from_secs(5)),
+                LogAdmission::Emit { .. }
+            ),
+            "the bucket refills — this is a rate cap, not a permanent mute",
+        );
+    }
+
+    // ── Item 4: the effect bucket is keyed by plugin id ──────────────────────
+
+    /// Register, burn the whole effect burst, disconnect, reconnect under the
+    /// **same id** — the bucket must still be empty.
+    ///
+    /// Before #1165 the limiter was a local in the connection's own stack frame,
+    /// so this second connection got a fresh `EFFECT_BURST`; with the SDK
+    /// backing off from 100 ms, "8 then 1/s" was really "8 per reconnect" for
+    /// precisely the crash-looping plugin the cap exists for.
+    ///
+    /// **Falsified** by moving the bucket back into `serve_conn` (an
+    /// `EffectRateLimiter::new_at(Instant::now())` local): the second
+    /// connection's effects arrive and this reds.
+    #[tokio::test]
+    async fn the_effect_bucket_survives_a_reconnect() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, mut effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        // One connection that asks for many more effects than the burst allows.
+        let burn = |ctx: ListenerCtx| async move {
+            let (host, plugin) = UnixStream::pair().expect("socketpair");
+            let conn = tokio::spawn(async move { handle_conn(host, &ctx).await });
+            let (_prd, mut pwr) = plugin.into_split();
+            let mut manifest = Manifest::new("flooder", Mount::BarCenter);
+            manifest.capabilities = vec![Capability::OpenPage];
+            write_frame(&mut pwr, &PluginMsg::Register { manifest })
+                .await
+                .expect("Register");
+            write_frame(
+                &mut pwr,
+                &PluginMsg::Render {
+                    tree: wire::Node::Label {
+                        id: Some("t".into()),
+                        text: "chip".into(),
+                        classes: vec![],
+                        tooltip: None,
+                    },
+                    panel: None,
+                    hidden_on: Vec::new(),
+                    effects: (0..EFFECT_BURST * 4)
+                        .map(|_| Effect::OpenPage(Page::PowerMenu))
+                        .collect(),
+                },
+            )
+            .await
+            .expect("Render with an effect flood");
+            // Drop the plugin end so the connection tears down, and wait for it
+            // — otherwise the reconnect below races the `IdGuard` release.
+            drop(pwr);
+            let _ = conn.await;
+        };
+
+        burn(ctx.clone()).await;
+        let mut first = 0;
+        while effects_rx.try_recv().is_ok() {
+            first += 1;
+        }
+        assert_eq!(
+            first, EFFECT_BURST as usize,
+            "the first connection gets exactly the burst",
+        );
+
+        burn(ctx.clone()).await;
+        assert!(
+            effects_rx.try_recv().is_err(),
+            "a reconnect under the same id does NOT refill the burst",
+        );
+    }
+
+    // ── Item 5: the drop-warns are latched, and name a kind ──────────────────
+
+    /// `enforce_capabilities` drops every ungranted effect but names the kind
+    /// **once** per connection — the condition is a manifest mistake, so it is
+    /// wrong on every frame for the connection's whole life, and the line used
+    /// to `Debug`-format the plugin's whole (unbounded) effect payload into the
+    /// journal at the plugin's frame rate.
+    ///
+    /// **Falsified** by deleting the `if warned.insert(…)` guard: eight lines
+    /// instead of one, and this reds.
+    #[test]
+    fn the_ungranted_drop_warn_latches_per_effect_kind() {
+        let mut warned = EffectWarnLatch::new();
+        let (captured, _guard) = hytte_config::test_support::capture();
+        for _ in 0..4 {
+            let dropped = enforce_capabilities(
+                &[],
+                "p",
+                vec![
+                    Effect::OpenPage(Page::PowerMenu),
+                    Effect::Niri(NiriAction::FocusWindow { id: 1 }),
+                ],
+                &mut warned,
+            );
+            assert!(dropped.is_empty(), "an ungranted effect is always dropped");
+        }
+        let lines: Vec<String> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .filter(|e| e.fields.contains_key("cap"))
+            .map(|e| e.fields.get("effect").cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per effect KIND, not one per dropped effect: {lines:?}",
+        );
+        assert!(
+            lines.iter().any(|k| k.contains("OpenPage"))
+                && lines.iter().any(|k| k.contains("Niri")),
+            "and each names its kind rather than Debug-printing the effect: {lines:?}",
+        );
+    }
+
+    // ── Item 6: unregistered dials cannot starve the listener ────────────────
+
+    /// Saturate the gate with connections that dial and say nothing, then dial a
+    /// **registering** plugin: it must not be served while the gate is full, and
+    /// must be served the moment one of the silent peers goes away.
+    ///
+    /// This is the bound stated end to end. `REGISTER_TIMEOUT` bounds how long
+    /// one silent peer lives; before #1165 nothing bounded how *many*, so any
+    /// same-uid process could hold a task and an fd per dial and walk the shell
+    /// into its fd limit.
+    ///
+    /// **Falsified** by removing the gate — pass `serve_conn` a `None` permit
+    /// and drop the `acquire_owned`: all 65 dials are accepted, the plugin
+    /// mounts immediately, and the middle assertion reds.
+    ///
+    /// **What it does not distinguish**, stated because the falsification pass
+    /// measured it rather than assumed it: taking the permit immediately *after*
+    /// `accept(2)` instead of before leaves this green. The accept loop is
+    /// sequential, so that arrangement parks on the permit with exactly one
+    /// accepted connection in hand — a one-descriptor difference this test has
+    /// no way to see. The arrangement that would leak is acquiring inside the
+    /// spawned task, and distinguishing *that* needs an fd count, which is the
+    /// live-verify leg (`docs/live-verify.md`, #1165) rather than this.
+    #[tokio::test]
+    async fn an_unregistered_dial_flood_cannot_starve_a_registering_plugin() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin.sock");
+        let SocketClaim::Bound(socket) = take_socket(&path).await.expect("binds") else {
+            panic!("a fresh tempdir must bind");
+        };
+        let loop_ctx = ctx.clone();
+        let listener = tokio::spawn(async move {
+            let _ = accept_loop(&socket, &loop_ctx).await;
+        });
+
+        // Fill every permit with peers that never Register. Each is held by the
+        // `Vec`, so none of them EOFs and frees its permit.
+        let mut silent = Vec::new();
+        for _ in 0..MAX_UNREGISTERED_CONNECTIONS {
+            silent.push(UnixStream::connect(&path).await.expect("dial"));
+        }
+        // Let the accept loop drain the backlog it can drain.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The (MAX+1)-th peer is a well-behaved plugin. It connects — the kernel
+        // backlog takes it — but must not be *accepted* while the gate is full.
+        let plugin = UnixStream::connect(&path).await.expect("dial");
+        let (_prd, mut pwr) = plugin.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("late", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register");
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "chip".into(),
+                    classes: vec![],
+                    tooltip: None,
+                },
+                panel: None,
+                hidden_on: Vec::new(),
+                effects: Vec::new(),
+            },
+        )
+        .await
+        .expect("Render");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            bar_center.lock_ref().is_empty(),
+            "the host must not accept past its unregistered-connection gate",
+        );
+
+        // Free one permit; the waiting plugin is accepted and mounts.
+        silent.pop();
+        let cards = wait_for_region(&bar_center).await;
+        assert_eq!(
+            cards[0].plugin_id, "late",
+            "and it is served the moment a slot frees",
+        );
+        listener.abort();
+    }
+
+    /// The other half of the gate's contract: a permit is released at
+    /// **registration**, not at teardown. Without that, 64 long-lived plugins —
+    /// an ordinary session — would wedge the socket shut forever.
+    ///
+    /// Driven through `serve_conn` with a one-permit semaphore, so the assertion
+    /// is on the permit itself rather than on a symptom.
+    #[tokio::test]
+    async fn a_registered_connection_releases_its_permit() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = std::sync::Arc::clone(&gate)
+            .acquire_owned()
+            .await
+            .expect("the only permit");
+        assert_eq!(gate.available_permits(), 0, "the gate starts saturated");
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        let conn_ctx = ctx.clone();
+        let conn = tokio::spawn(async move {
+            super::super::session::serve_conn(host, &conn_ctx, Some(permit)).await;
+        });
+        let (_prd, mut pwr) = plugin.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("registers", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register");
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "chip".into(),
+                    classes: vec![],
+                    tooltip: None,
+                },
+                panel: None,
+                hidden_on: Vec::new(),
+                effects: Vec::new(),
+            },
+        )
+        .await
+        .expect("Render");
+        // The card proves the connection is registered AND still live.
+        wait_for_region(&bar_center).await;
+        assert_eq!(
+            gate.available_permits(),
+            1,
+            "a registered connection gives its permit back while it is still serving",
+        );
+        conn.abort();
+    }
+
+    // ── Item 7: the outbound queue's payloads are bounded in bytes ────────────
+
+    /// An over-cap `DatasourceQuery` is refused outright: the payload is opaque
+    /// JSON, so cutting it would hand the provider a parse error rather than a
+    /// smaller request.
+    ///
+    /// **Falsified** by deleting the `params.len() >` branch: the effect comes
+    /// back `Some` and this reds.
+    #[test]
+    fn an_over_cap_datasource_query_is_refused() {
+        let mut warned = EffectWarnLatch::new();
+        let (out_tx, _out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+        let query = |params: String| Effect::DatasourceQuery {
+            request_id: 1,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params,
+        };
+        let (effect, message) = capped_effect_payload(
+            query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
+            &out_tx,
+            &mut warned,
+        );
+        assert!(
+            effect.is_none(),
+            "an over-cap query is refused, not forwarded"
+        );
+        assert!(message.is_some(), "and named once");
+        let (effect, message) = capped_effect_payload(
+            query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
+            &out_tx,
+            &mut warned,
+        );
+        assert!(effect.is_none(), "still refused");
+        assert!(message.is_none(), "…silently, from the second one on");
+        // An at-cap query is fine: the boundary is pinned on both sides so it
+        // cannot drift by one silently.
+        let (effect, _) = capped_effect_payload(
+            query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES)),
+            &out_tx,
+            &mut warned,
+        );
+        assert!(effect.is_some(), "exactly at the cap is forwarded");
+    }
+
+    /// An over-cap `DatasourceResult` becomes a `Failed { Provider, … }`, so the
+    /// requester still gets its reply on the correlation it is parked on — it
+    /// just gets told the provider's answer was unusable, which is true.
+    ///
+    /// **Falsified** by deleting the `Ready` branch: the outcome stays `Ready`
+    /// with the whole payload and the `matches!` reds.
+    #[test]
+    fn an_over_cap_datasource_result_fails_instead_of_queueing() {
+        let mut warned = EffectWarnLatch::new();
+        let (out_tx, _out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+        let (effect, message) = capped_effect_payload(
+            Effect::DatasourceResult {
+                request_id: 7,
+                outcome: DatasourceOutcome::Ready("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
+            },
+            &out_tx,
+            &mut warned,
+        );
+        assert!(message.is_some(), "the refusal is named");
+        match effect.expect("the result still goes back to the requester") {
+            Effect::DatasourceResult {
+                request_id,
+                outcome,
+            } => {
+                assert_eq!(request_id, 7, "on the same correlation");
+                assert!(
+                    matches!(
+                        outcome,
+                        DatasourceOutcome::Failed {
+                            error: DatasourceError::Provider,
+                            ..
+                        }
+                    ),
+                    "as a provider-sourced failure, not an unbounded frame: {outcome:?}",
+                );
+            }
+            other => panic!("a DatasourceResult must stay one, got {other:?}"),
+        }
+    }
+
+    // ── Item 8: detached launches are budgeted ───────────────────────────────
+
+    /// Past [`LAUNCH_BURST`](super::super::effects) back-to-back detached
+    /// launches the broker refuses, and the refusal reaches the plugin as the
+    /// **same** `ok: false` outcome a `systemd-run` refusal produces — so a
+    /// plugin needs no new arm, and a refusal can never read as a launch.
+    ///
+    /// Under `#[cfg(test)]` `launch_detached` only records the unit it would
+    /// have used, so this drives the real broker path with no systemd and no
+    /// process.
+    ///
+    /// **Falsified** by deleting the `launch_budget_allows` guard in
+    /// `broker_effect`: every launch is dispatched, the outbound queue stays
+    /// empty, and the refusal assertion reds.
+    #[test]
+    fn the_detached_launch_budget_refuses_past_the_burst() {
+        let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(16);
+        let router = DatasourceRouter::default();
+        // A distinct plugin id per test: the budget table is a thread_local, and
+        // a `#[test]` body runs start-to-finish on one thread.
+        let plugin = "r2-launch-budget";
+        let launch = |id: u64| Effect::RunCommand {
+            id,
+            argv: vec!["true".into()],
+            detached: true,
+        };
+        // The burst is dispatched (no reply frame: the launch itself answers).
+        for id in 0..4 {
+            broker_effect(plugin, &launch(id), &out_tx, &router);
+        }
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a launch inside the budget is dispatched, not answered here",
+        );
+        // The next one is refused, with a reply the plugin can read.
+        broker_effect(plugin, &launch(99), &out_tx, &router);
+        match out_rx.try_recv().expect("the refusal reaches the plugin") {
+            HostMsg::EffectResult { id, outcome } => {
+                assert_eq!(id, 99, "keyed by the effect the plugin asked about");
+                assert!(!outcome.ok, "a refused launch is not a launch");
+                let text = outcome.output.expect("the refusal says why");
+                assert!(
+                    text.contains("refused"),
+                    "and names itself a refusal: {text}",
+                );
+            }
+            other => panic!("expected an EffectResult, got {other:?}"),
+        }
+        // An *attached* RunCommand is not budgeted — it is bounded by
+        // RUN_COMMAND_TIMEOUT and dies with the shell, so it needs no budget of
+        // its own and must not be refused by this one.
+        //
+        // Not driven through `broker_effect` (that would spawn a real process on
+        // the shell's runtime); the discrimination is `detached_launch_id`'s, and
+        // that is what is asserted.
+        assert_eq!(
+            super::super::effects::detached_launch_id(&Effect::RunCommand {
+                id: 1,
+                argv: vec!["true".into()],
+                detached: false,
+            }),
+            None,
+            "the attached mode is outside the launch budget",
+        );
+    }
+
+    // ── Item 2: RunCommand's capture is bounded (needs a real /bin/sh) ────────
+
+    /// A command that writes 50 MB must be captured at the host's budget and
+    /// **killed**, not buffered for the whole `RUN_COMMAND_TIMEOUT`.
+    ///
+    /// Three assertions carry it, and each was **measured** to fail against a
+    /// different wrong implementation — which is the only reason to keep all
+    /// three:
+    ///
+    /// - `!outcome.ok` reds against the pre-#1165 `cmd.output()`: `head` exits
+    ///   cleanly, so the old code reports success in about a second and the
+    ///   *size* assertion below stays green while the heap grew by 50 MB. This
+    ///   is the proxy for "the host stopped reading", since a test cannot
+    ///   assert on the host's own RSS.
+    /// - The elapsed bound reds against the first #1165 attempt, which read
+    ///   both pipes under `join!`: the pipe that is not the runaway never EOFs
+    ///   while the child lives, so the capture parked for the whole
+    ///   `RUN_COMMAND_TIMEOUT` — measured at 10.001 s. It is what makes "the
+    ///   child is killed" mean something rather than "the child is ignored".
+    /// - The size bound reds if the reply cap is ever widened by accident.
+    ///
+    /// The memory claim itself is the live-verify leg (`docs/live-verify.md`),
+    /// because only a running shell has an RSS to watch.
+    #[cfg(feature = "system-tests")]
+    #[tokio::test]
+    async fn run_command_capture_is_bounded_and_the_child_is_killed() {
+        let started = Instant::now();
+        let outcome = execute_command(
+            "p",
+            1,
+            &["sh".into(), "-c".into(), "yes | head -c 50000000".into()],
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let output = outcome.output.unwrap_or_default();
+        assert!(
+            output.len() <= 4096,
+            "the reply carries at most the reply cap, got {} B",
+            output.len(),
+        );
+        assert!(
+            !outcome.ok,
+            "a program stopped for blowing the capture budget did not finish",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the child is killed at the budget, not waited out: took {elapsed:?} \
+             (RUN_COMMAND_TIMEOUT is 10 s)",
+        );
+    }
+
+    /// The sibling case, so the budget is not doing its job by breaking
+    /// everything: a short command still runs to completion, reports its real
+    /// exit status, and comes back with its output.
+    #[cfg(feature = "system-tests")]
+    #[tokio::test]
+    async fn a_short_command_still_completes_normally() {
+        let outcome = execute_command("p", 2, &["sh".into(), "-c".into(), "echo hi".into()]).await;
+        assert!(outcome.ok, "a normal command still reports success");
+        assert_eq!(outcome.output.as_deref(), Some("hi"));
+
+        let failing = execute_command("p", 3, &["sh".into(), "-c".into(), "exit 3".into()]).await;
+        assert!(!failing.ok, "…and a real non-zero exit is still reported");
+    }
+
+    // ── Adversarial review round 2, HIGH-1: `Manifest.id` is a bounded key ──
+
+    /// An id over [`MAX_PLUGIN_ID_BYTES`] is refused at the `Register`
+    /// handshake, on the same "refuse, don't truncate" posture the empty-id
+    /// check already takes and for the same reason: an id is a *key* (the
+    /// region mailbox, `live_ids`, the audit log, and the two per-id
+    /// effect-budget tables), so a truncated one would silently become a
+    /// different plugin colliding with whatever already holds that prefix.
+    ///
+    /// This is also what closes the crasher the round-2 review found: an
+    /// uncapped id rides `Effect::Notify` as the notification app name and
+    /// reaches `gtk::Label::new` on the GTK main thread (measured there:
+    /// 1.57 s for an 8 MiB id) — the very effect this PR's item 1 caps two of
+    /// three arguments of.
+    ///
+    /// **Falsified** by deleting the `plugin_id.len() > MAX_PLUGIN_ID_BYTES`
+    /// branch in `serve_conn`: the connection is accepted and the middle
+    /// assertion reds.
+    #[tokio::test]
+    async fn an_over_cap_plugin_id_is_rejected() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (mut prd, mut pwr) = plugin.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("a".repeat(MAX_PLUGIN_ID_BYTES + 1), Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register with an over-cap id");
+
+        let dropped =
+            tokio::time::timeout(Duration::from_secs(5), read_frame::<HostMsg, _>(&mut prd))
+                .await
+                .expect("the over-cap-id connection is dropped within 5s");
+        assert!(
+            dropped.is_err(),
+            "an over-cap id Register is rejected (EOF)",
+        );
+        assert!(
+            bar_center.lock_ref().is_empty(),
+            "no card is parked for an over-cap id",
+        );
+    }
+
+    /// The boundary is pinned on both sides, mirroring the display-text and
+    /// datasource-payload cap tests: exactly [`MAX_PLUGIN_ID_BYTES`] is
+    /// accepted and mounts normally.
+    #[tokio::test]
+    async fn an_at_cap_plugin_id_is_accepted() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (_prd, mut pwr) = plugin.into_split();
+        let id = "a".repeat(MAX_PLUGIN_ID_BYTES);
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new(id.clone(), Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register at exactly the cap");
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "chip".into(),
+                    classes: vec![],
+                    tooltip: None,
+                },
+                panel: None,
+                hidden_on: Vec::new(),
+                effects: Vec::new(),
+            },
+        )
+        .await
+        .expect("Render");
+        let cards = wait_for_region(&bar_center).await;
+        assert_eq!(cards[0].plugin_id, id, "an at-cap id registers normally");
+    }
+
+    // ── Adversarial review round 2, HIGH-2: `classes` is bounded too ────────
+
+    /// A [`wire::Node`]'s `classes` list is capped to [`MAX_NODE_CLASSES`]
+    /// tokens, each cut to [`MAX_CLASS_BYTES`]: the mapped node never carries
+    /// more, and a token over the byte cap comes back truncated rather than
+    /// dropped whole.
+    ///
+    /// The hazard this closes is not pango (a class is not a layout) but
+    /// `hytte_ui::widget_tree::reconcile_classes`'s `Vec::contains` diff,
+    /// O(old × new) per node per frame — measured at 5.70 s for 20 000 tokens
+    /// on one label's second frame, over three times the 8 MiB label this PR's
+    /// item 1 exists to stop, on a wire payload two orders of magnitude
+    /// smaller.
+    ///
+    /// **Falsified** by mapping `classes: classes.clone()` (the round-1 code)
+    /// in `wire_map`'s `Label` arm: 33 classes come back as 33 and this reds.
+    #[test]
+    fn an_over_cap_classes_list_is_truncated() {
+        let scope = Scope::detached("r2-classes-count-cap");
+        let classes: Vec<String> = (0..=MAX_NODE_CLASSES).map(|i| format!("c{i}")).collect();
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text: "hi".into(),
+            classes,
+            tooltip: None,
+        };
+        match to_ui_node(&scope, Grants::all(), &node) {
+            UiNode::Label { classes, .. } => {
+                assert_eq!(
+                    classes.len(),
+                    MAX_NODE_CLASSES,
+                    "the mapped node carries at most the cap, not the {} the plugin sent",
+                    MAX_NODE_CLASSES + 1,
+                );
+                assert_eq!(
+                    classes, // kept prefix, same posture as the node/depth caps
+                    (0..MAX_NODE_CLASSES)
+                        .map(|i| format!("c{i}"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            other => panic!("mapped to {other:?}"),
+        }
+    }
+
+    /// A single over-cap class token is truncated on a char boundary, not
+    /// dropped — the [`MAX_DISPLAY_TEXT_BYTES`] posture, not
+    /// [`MAX_PLUGIN_ID_BYTES`]'s: a class is CSS, not a key, so a cut token
+    /// costs a missing style rule rather than a different identity.
+    #[test]
+    fn an_over_cap_class_token_is_truncated_on_a_char_boundary() {
+        let scope = Scope::detached("r2-classes-token-cap");
+        // A multi-byte char straddling the cut point, exactly like
+        // `the_text_cap_cuts_on_a_char_boundary` above.
+        let long_class = format!("{}é", "a".repeat(MAX_CLASS_BYTES - 1));
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text: "hi".into(),
+            classes: vec![long_class.clone()],
+            tooltip: None,
+        };
+        match to_ui_node(&scope, Grants::all(), &node) {
+            UiNode::Label { classes, .. } => {
+                assert_eq!(classes.len(), 1, "the token is kept, just shortened");
+                assert!(
+                    classes[0].len() <= MAX_CLASS_BYTES,
+                    "cut to the cap: {} bytes",
+                    classes[0].len(),
+                );
+                assert!(
+                    long_class.as_bytes().starts_with(classes[0].as_bytes()),
+                    "the kept bytes are a genuine prefix, not something else",
+                );
+                assert!(
+                    std::str::from_utf8(classes[0].as_bytes()).is_ok(),
+                    "cut on a char boundary, not mid-codepoint",
+                );
+            }
+            other => panic!("mapped to {other:?}"),
+        }
+    }
+
+    /// `reconcile_classes` (in `hytte_ui::widget_tree`, not this crate — see
+    /// its own `gtk_tests` module for the algorithmic falsification, since the
+    /// function is private to that crate) must stay linear. This is the
+    /// host-side half of the same claim: driving the real `Reconciler` at
+    /// exactly the new cap (32 classes, replaced wholesale so every token is
+    /// both an insertion and a removal — the worst case for a diff) must cost
+    /// well under a millisecond, not the seconds the round-2 review measured
+    /// at 20 000 uncapped tokens.
+    ///
+    /// Needs a display — hermetic under `xvfb-run`, same as the rest of
+    /// `--features system-tests`.
+    #[cfg(feature = "system-tests")]
+    #[gtk::test]
+    fn reconciling_the_max_classes_list_is_fast() {
+        use hytte::ui::{NodeId, Reconciler};
+
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let mut rec = Reconciler::new(&root, |_: NodeId, _: UiEventKind| {});
+        let label = |classes: Vec<String>| UiNode::Label {
+            id: Some("l".into()),
+            text: "hi".into(),
+            classes,
+            tooltip: None,
+        };
+        rec.render(&label(
+            (0..MAX_NODE_CLASSES).map(|i| format!("a{i}")).collect(),
+        ));
+        let start = Instant::now();
+        rec.render(&label(
+            (0..MAX_NODE_CLASSES).map(|i| format!("b{i}")).collect(),
+        ));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "reconciling {MAX_NODE_CLASSES} classes against {MAX_NODE_CLASSES} entirely \
+             different ones took {elapsed:?}, over the 50 ms regression bound",
+        );
+    }
+
+    // ── Adversarial review round 2, MEDIUM: an over-cap query gets a reply ──
+
+    /// An over-cap `DatasourceQuery` no longer vanishes: the requester's
+    /// pending correlation resolves with a `Failed` outcome naming the cap,
+    /// the same reply shape [`arm_query_timeout`](super::super::datasource)
+    /// sends on a real timeout — not a hang the plugin's own state machine has
+    /// no timer for.
+    ///
+    /// **Falsified** by reverting the refusal to `(None, message)` with no
+    /// outbound send: `out_rx` never yields anything and the `timeout(...)`
+    /// below reds.
+    #[tokio::test]
+    async fn an_over_cap_datasource_query_replies_with_failed_not_silence() {
+        let mut warned = EffectWarnLatch::new();
+        let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+        let query = Effect::DatasourceQuery {
+            request_id: 42,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params: "j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1),
+        };
+        let (effect, message) = capped_effect_payload(query, &out_tx, &mut warned);
+        assert!(
+            effect.is_none(),
+            "the query itself is still refused, not forwarded",
+        );
+        assert!(message.is_some(), "and named once, for the journal");
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("a reply must be sent within 5s, not left hanging")
+            .expect("the outbound channel is still open");
+        match sent {
+            HostMsg::DatasourceResult {
+                request_id,
+                outcome,
+            } => {
+                assert_eq!(
+                    request_id, 42,
+                    "on the requester's own correlation, not a fresh one",
+                );
+                assert!(
+                    matches!(outcome, DatasourceOutcome::Failed { .. }),
+                    "a Failed outcome, exactly what the timeout leg sends: {outcome:?}",
+                );
+            }
+            other => panic!("expected a DatasourceResult reply, got {other:?}"),
         }
     }
 }

@@ -1,5 +1,5 @@
 //! tokio-side: the UDS listener that binds the host socket and accepts plugin
-//! connections, handing each to [`super::session::handle_conn`].
+//! connections, handing each to [`super::session::serve_conn`].
 //!
 //! **No accept error is fatal** — the socket stays valid, so a live listener is
 //! always worth another `accept()` (#426). The bind path itself takes an
@@ -9,12 +9,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hytte_plugin_proto::socket_path;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 use super::ListenerCtx;
-use super::session::handle_conn;
+use super::session::serve_conn;
 
 /// A short backoff applied after a resource-pressure `accept(2)` error, so a
 /// *persistent* one (sustained fd/memory exhaustion) degrades gracefully
@@ -236,16 +238,73 @@ pub(super) async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
         }
     };
     tracing::info!(socket = %path.display(), "plugin host listening");
+    accept_loop(&socket, ctx).await
+}
 
+/// How many **accepted but not yet registered** connections the host will hold
+/// at once (#1165 item 6).
+///
+/// `REGISTER_TIMEOUT` bounds how long *one* such connection lives, but nothing
+/// bounded how many there could be: the accept loop spawned a task per
+/// connection unconditionally, so any same-uid process could dial the socket in
+/// a loop and hold a task, a file descriptor and a read buffer per dial for ten
+/// seconds each — the shell hits its fd limit long before the timeouts start
+/// retiring them, and an fd-exhausted GTK process cannot open a window, a font
+/// file, or a D-Bus connection.
+///
+/// **64** is generous against every real deployment: a connection occupies a
+/// permit only from `accept(2)` until its `Register` frame is read (a
+/// round-trip on a Unix socket, microseconds), so even a session that starts
+/// twenty plugins at once holds a handful of permits for an instant. Reaching
+/// it means 64 peers are simultaneously mid-handshake, which is not a
+/// deployment shape.
+pub(super) const MAX_UNREGISTERED_CONNECTIONS: usize = 64;
+
+/// Accept plugin connections forever, at most [`MAX_UNREGISTERED_CONNECTIONS`]
+/// of them un-registered at a time.
+///
+/// The permit is taken **before** `accept(2)`: past the cap the host stops
+/// accepting at all, and the kernel's listen backlog — not this process — holds
+/// the waiting dials.
+///
+/// What the position buys, measured rather than asserted (#1165's own
+/// falsification pass): since this loop is sequential, acquiring immediately
+/// *after* `accept(2)` instead differs by exactly **one** descriptor, and the
+/// hermetic test below cannot tell the two apart. The arrangement that does
+/// leak is acquiring the permit **inside the spawned task**: the loop would then
+/// accept without limit and every parked task would hold its fd, which is the
+/// resource that actually runs out. So the rule is "the gate is upstream of the
+/// spawn", and taking it before the accept is the cheapest spelling of that
+/// rather than a difference in kind.
+///
+/// The permit is handed to [`serve_conn`], which releases it the moment the
+/// connection registers (see there). A connection that never registers holds it
+/// until `REGISTER_TIMEOUT` drops it, which is the pressure this is for.
+///
+/// Split out of [`listen`] so the bound is testable: a test can bind its own
+/// socket with [`take_socket`] and drive this against it, which `listen` —
+/// which reads the path out of the environment — cannot offer.
+pub(super) async fn accept_loop(socket: &HostSocket, ctx: &ListenerCtx) -> std::io::Result<()> {
+    let gate = Arc::new(Semaphore::new(MAX_UNREGISTERED_CONNECTIONS));
     loop {
+        // Never closed, so this cannot fail; `expect` rather than `?` keeps the
+        // error type about I/O.
+        let permit = Arc::clone(&gate)
+            .acquire_owned()
+            .await
+            .expect("the plugin host's unregistered-connection gate is never closed");
         match socket.accept().await {
             Ok((stream, _addr)) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    handle_conn(stream, &ctx).await;
+                    serve_conn(stream, &ctx, Some(permit)).await;
                 });
             }
             Err(e) => {
+                // Nothing was accepted, so the permit belongs back in the gate
+                // immediately — otherwise a run of `accept(2)` errors would
+                // wedge the listener shut with no connections to blame.
+                drop(permit);
                 // Keep the listener alive: a transient `accept(2)` error must
                 // NOT kill the loop, or one syscall hiccup strands every plugin
                 // against a dead socket until restart (#426). Warn and retry;

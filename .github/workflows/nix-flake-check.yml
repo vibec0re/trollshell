@@ -17,9 +17,14 @@ jobs:
     # silent after its last derivation finished — every check green, then
     # nothing — and the third time nobody cancelled it, so GitHub's default
     # 360-minute limit did, six hours later, leaving main without a verdict
-    # for two days. The measured band for a full run is 35-52 min, so 90 is
+    # for two days. The measured band for a full run was 35-52 min when this
+    # was written; on 2026-09-13 it is 51-86 min (three full workspace
+    # compiles — release, workspace-tests, system-tests — run concurrently on
+    # the 4-core runner from the same deps closure, and the doctest tail of
+    # workspace-tests now lands after the 75-minute mark on a slow VM), so
+    # 120 is
     # headroom, not a squeeze.
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
@@ -35,12 +40,12 @@ jobs:
       # step from *inside* the job, where we can still print the process tree:
       # the open question in #1011 is whether the survivor is nix itself or a
       # VM-test child holding the log pipe, and only a listing taken during
-      # the hang can answer it. 75 min leaves the job-level bound as the
+      # the hang can answer it. 105 min leaves the job-level bound as the
       # backstop for everything else.
       - run: |
-          timeout 75m nix flake check -L || rc=$?
+          timeout 105m nix flake check -L || rc=$?
           if [ "${rc:-0}" = 124 ]; then
-            echo '::error::nix flake check did not exit within 75 min (#1011); process tree follows'
+            echo '::error::nix flake check did not exit within 105 min (#1011); process tree follows'
             ps auxf
             exit 1
           fi

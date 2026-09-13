@@ -4425,10 +4425,7 @@ mod tests {
     #[test]
     fn a_painting_card_shows_here() {
         let (tx, _rx) = mpsc::channel(4);
-        assert!(any_card_shows_here(
-            &[render("p", &tx, &[])],
-            Some("DP-1")
-        ));
+        assert!(any_card_shows_here(&[render("p", &tx, &[])], Some("DP-1")));
     }
 
     /// The #1050 half: a card hidden on **this** connector leaves this

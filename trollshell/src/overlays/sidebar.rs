@@ -614,13 +614,7 @@ fn install_side(monitor: &Monitor, side: Side) {
     let effective = Mutable::new(effective_open(open_state.get(), non_empty.get()));
 
     let subscription = wire_open_subscription(
-        &window,
-        &revealer,
-        &card,
-        &effective,
-        &zone_tick,
-        &last_zone,
-        &key,
+        &window, &revealer, &card, &effective, &zone_tick, &last_zone, &key,
     );
     wire_escape(&window, monitor.clone(), side);
 

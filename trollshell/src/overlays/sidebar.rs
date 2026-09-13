@@ -2592,7 +2592,14 @@ mod gtk_tests {
 
     /// Set the parked panel's revealer reveal flag, for the settle assertions.
     fn parked_revealer_reveal(side: Side, key: &str, reveal: bool) {
-        let revealer = PANELS.with(|panels| panels.borrow()[&(side, key.to_owned())].revealer.clone());
+        let revealer = PANELS.with(|panels| {
+            panels
+                .borrow()
+                .get(&(side, key.to_owned()))
+                .expect("test setup: the panel was just parked")
+                .revealer
+                .clone()
+        });
         revealer.set_reveal_child(reveal);
     }
 

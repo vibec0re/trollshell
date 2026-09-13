@@ -1663,21 +1663,42 @@ systemd-run --user --unit=trollshell-plugin-departures \
       A zone-0 surface should be placed inside the non-exclusive area, so this
       should be fine; if the card paints over the bar's right end, say so on
       #1160 — the fix is a top margin of the bar's height on that window.
-- [ ] **(#1160 → #1247)** **The frame's cutout is right-blind — confirm the
-      known answer, don't discover it.** The frame overlay tracks the _left_
-      sidebar's width only (`frame.rs:253` reads `current_visible_width`, which
-      is hardcoded to `Side::Left`), and `cutout_rect` always puts the cutout's
-      right edge at `width - FRAME_THICKNESS`. So with the right sidebar open
-      the prediction is: the frame's 8 px right strut paints **on top of** the
-      sidebar's outer edge (the frame is `Layer::Overlay`, above the sidebar's
-      `Layer::Top`), the rounded right corners sit ~312 px _underneath_ the
-      sidebar instead of against it, the tiles niri has just reflowed to
-      `width - 320` get no frame border on their right edge at all, and the
-      frame does not even redraw during the right slide (`is_settled` is
-      left-keyed too). Check it looks like that rather than like something else
-      — a _different_ artefact is new information. The fix is **#1247**;
-      `frame.rs` is outside #1160's lane and this is not a regression of the
-      left behaviour.
+- [ ] **(#1247)** **The frame's right edge tucks in behind the right
+      sidebar.** The mirror of the left inset, and the artefact #1160's own
+      live-verify item predicted: before #1247 the frame's 8 px right strut
+      painted **on top of** the open right sidebar (the frame is
+      `Layer::Overlay`, above the sidebar's `Layer::Top`), the rounded right
+      corners sat ~312 px _underneath_ it, and the tiles niri had reflowed to
+      `width - 320` got no border on their right edge at all. Open the right
+      sidebar and confirm: the dark frame stops at the sidebar's inner edge with
+      **no** strut drawn over the card, the cutout's two right corners round off
+      against that edge, and the tile beside it has a frame border there just
+      like the left one does. Watch the slide itself — the cutout's right edge
+      must track the card the whole way in and out, not jump at the end or
+      freeze part-way (one tick loop now serves both edges and breaks only once
+      **both** revealers are at rest).
+- [ ] **(#1247)** **Both sidebars, both insets.** Open the left and the right
+      together: the frame should be inset on both sides at once, the tiles
+      framed between them, and toggling one must not move the other's edge.
+      Then close the right one only — its edge goes back to the plain 8 px strut
+      while the left inset stays exactly where it was.
+- [ ] **(#1247)** **An empty right sidebar costs the frame nothing.** On a
+      shell with no right-mounted plugin (every shell until you run the
+      `systemd-run` line above), the frame must be pixel-identical to what it
+      was before #1247 — plain 8 px struts on both sides. Then the harder case,
+      which is #1160's "open sidebar whose last card left": with the right
+      sidebar **open**, stop the plugin. The card goes, the strip is released,
+      and the frame's right edge must return to the screen edge rather than
+      staying inset by 320 px over nothing — and the frame must not keep
+      redrawing every frame afterwards (check with `RUST_LOG` or just that the
+      shell is not burning a core on an idle desktop).
+- [ ] **(#1247)** **Blur / overlap, both surfaces.** With the right sidebar
+      open, look along the boundary between the card and the frame: no seam, no
+      double-dark band, and no sliver of frame gradient bleeding over the card's
+      rounded corners. If you run a niri `layer-rule` with blur, confirm the
+      right card's backdrop still looks like the left's now that the frame no
+      longer paints over it — a blur difference here is the `layer-rule`
+      namespace item above (`hytte-sidebar-right-<connector>`), not a frame bug.
 - [ ] **(#1160)** **Pollers park per side.** With a `SlotVisible`-subscribing
       plugin on the right (departures declares it) and another on the left,
       open only the **right** sidebar and confirm from

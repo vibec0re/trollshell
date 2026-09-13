@@ -590,7 +590,10 @@ mod tests {
             Side::Right => OPEN_W_2,
         });
         assert_eq!(left, OPEN_W, "the left inset must come from Side::Left");
-        assert_eq!(right, OPEN_W_2, "the right inset must come from Side::Right");
+        assert_eq!(
+            right, OPEN_W_2,
+            "the right inset must come from Side::Right"
+        );
     }
 
     // ── The paint rect (`outer_span`) ────────────────────────────────────────

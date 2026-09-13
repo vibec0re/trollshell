@@ -37,58 +37,81 @@
 //!
 //! [`enabled`] / [`set_enabled`] back the "Keep awake when fullscreen" switch
 //! next to caffeine in the Power panel. **On by default.** The choice is
-//! persisted to `~/.config/trollshell/fullscreen-inhibit.toml` (flat
-//! `enabled = true|false`, mirroring `dnd`), so turning the policy off sticks
-//! across restarts.
+//! persisted to `$XDG_STATE_HOME/trollshell/fullscreen-inhibit.toml` (#1226,
+//! flat `enabled = true|false`, mirroring `dnd`), so turning the policy off
+//! sticks across restarts. One-time read-migration from the legacy
+//! `~/.config/trollshell/fullscreen-inhibit.toml`: if state is absent and
+//! that file exists, its value is adopted into state and the old file is
+//! left untouched; once state exists it is authoritative and the old file is
+//! never read again.
 
 use crate::config_file;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::FdLease;
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ── Persistence ────────────────────────────────────────────────────────────
 
-/// Config file under `~/.config/trollshell/`.
-const CONFIG_FILE: &str = "fullscreen-inhibit.toml";
+/// The state subsystem name —
+/// `$XDG_STATE_HOME/trollshell/fullscreen-inhibit.toml`.
+const SUBSYSTEM: &str = "fullscreen-inhibit";
+
+/// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
+const LEGACY_CONFIG_FILE: &str = "fullscreen-inhibit.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FullscreenInhibitState {
+    #[serde(default)]
+    enabled: bool,
+}
+
+/// Default ON — the whole point is to keep the box awake during fullscreen
+/// out of the box.
+impl Default for FullscreenInhibitState {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
 
 /// Load the policy flag. **Default `true`** (unlike `dnd`) — the whole point is
 /// to keep the box awake during fullscreen out of the box; a missing or
 /// malformed file leaves the policy on.
 fn load_enabled_from_disk() -> bool {
-    let Some(text) = config_file::read(CONFIG_FILE) else {
-        return true;
-    };
-    parse_enabled(&text)
+    let old = config_file::path(LEGACY_CONFIG_FILE);
+    let loaded: FullscreenInhibitState =
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
+    loaded.enabled
 }
 
-/// Parse the flat `enabled = true|false` config body. Permissive: an explicit
-/// `enabled = false` turns the policy off; anything else — a missing key, a
-/// malformed value, an empty file — leaves the **default-on** policy. Split out
-/// as a pure fn so it's unit-testable without touching `$HOME`.
-fn parse_enabled(text: &str) -> bool {
+/// Parse the flat `enabled = true|false` legacy config body. Permissive: an
+/// explicit `enabled = false` turns the policy off; anything else — a
+/// missing key, a malformed value, an empty file — leaves the
+/// **default-on** policy. Only used for the one-time migration — always
+/// succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`; split out as a pure fn so
+/// it's unit-testable without touching `$HOME`.
+fn parse_legacy(text: &str) -> FullscreenInhibitState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("false") {
-                return false;
+                return FullscreenInhibitState { enabled: false };
             }
             if rhs.eq_ignore_ascii_case("true") {
-                return true;
+                return FullscreenInhibitState { enabled: true };
             }
         }
     }
-    true
+    FullscreenInhibitState::default()
 }
 
 fn save_enabled_to_disk(enabled: bool) {
-    config_file::write(
-        "fullscreen-inhibit",
-        CONFIG_FILE,
-        &format!("enabled = {enabled}\n"),
-    );
+    state::store(SUBSYSTEM, &FullscreenInhibitState { enabled });
 }
 
 // ── Screensaver visibility inhibitor identity ──────────────────────────────
@@ -350,97 +373,135 @@ mod tests {
     }
 
     #[test]
-    fn parse_enabled_defaults_on() {
+    fn parse_legacy_defaults_on() {
         // Empty / keyless / malformed bodies all keep the default-on policy —
         // the papercut this feature fixes is only worth having on by default.
-        assert!(parse_enabled(""));
-        assert!(parse_enabled("# just a comment\n"));
-        assert!(parse_enabled("something = else\n"));
-        assert!(parse_enabled("enabled = maybe\n"));
+        assert!(parse_legacy("").enabled);
+        assert!(parse_legacy("# just a comment\n").enabled);
+        assert!(parse_legacy("something = else\n").enabled);
+        assert!(parse_legacy("enabled = maybe\n").enabled);
     }
 
     #[test]
-    fn parse_enabled_explicit_off_and_on() {
-        assert!(!parse_enabled("enabled = false\n"));
-        assert!(parse_enabled("enabled = true\n"));
+    fn parse_legacy_explicit_off_and_on() {
+        assert!(!parse_legacy("enabled = false\n").enabled);
+        assert!(parse_legacy("enabled = true\n").enabled);
         // Tolerant of spacing / case, like the dnd parser it mirrors.
-        assert!(!parse_enabled("enabled=FALSE"));
-        assert!(parse_enabled("  enabled  =  True  "));
+        assert!(!parse_legacy("enabled=FALSE").enabled);
+        assert!(parse_legacy("  enabled  =  True  ").enabled);
     }
 
-    // ── Disk round-trip (#769) ──────────────────────────────────────────────
+    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
+                ("XDG_STATE_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+            ],
+            || body(&home),
+        )
+    }
+
+    fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell/fullscreen-inhibit.toml")
+    }
+
+    // ── Disk round-trip (#769, moved onto state by #1226) ───────────────────
     //
     // These drive `save_enabled_to_disk`/`load_enabled_from_disk` — i.e. that
-    // this module's calls land on / read back the right file — not
-    // `config_file::write`'s atomicity mechanics (temp file + fsync +
-    // rename), which are already exhaustively covered where that mechanism
-    // actually lives (`config_file::tests::{a_reader_never_observes_a_partial_file,
-    // concurrent_writers_do_not_corrupt_each_other, overwrites_an_existing_file_exactly}`,
-    // all exercised against the same `write_path` core `config_file::write`
-    // delegates to). A single-line payload written synchronously by one
-    // writer with no crash can't demonstrate a tear either way — see the
-    // note on `save_replaces_a_longer_pre_existing_file_exactly` below for
-    // the falsification that confirms this.
+    // this module's calls land on / read back the right subsystem — not
+    // `state::store`'s atomicity mechanics (temp file + fsync + rename),
+    // which are already exhaustively covered where that mechanism actually
+    // lives (`hytte_config::state::tests` and `hytte_config::file::tests`,
+    // which `state::store_at` shares the atomic writer with).
 
     #[test]
     fn save_and_load_round_trip() {
-        let root = std::env::temp_dir().join(format!(
-            "hytte-fullscreen-inhibit-roundtrip-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-
-        // `temp_env` serializes $HOME mutation across tests and restores it
-        // after (mirrors `places`'s config-watcher tests).
-        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+        with_scratch_home(|_home| {
             save_enabled_to_disk(false);
             assert!(!load_enabled_from_disk(), "false must round-trip as false");
 
             save_enabled_to_disk(true);
             assert!(load_enabled_from_disk(), "true must round-trip as true");
         });
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn save_replaces_a_longer_pre_existing_file_exactly() {
-        // Seed a stale file bigger than any real payload, then confirm the
-        // replacement is exact, not just "starts with the right bytes".
-        //
-        // NOTE this does NOT falsify the non-atomic defect #769 fixes: verified
-        // by hand (reverted `save_enabled_to_disk` to the old bare
-        // `std::fs::write(&path, body)`, reran this test, restored) that it
-        // passes unchanged either way. `std::fs::write` opens with `O_TRUNC`,
-        // so in a synchronous, single-writer, no-crash run the file is already
-        // zero-length before the new bytes land — no tail survives regardless
-        // of which implementation writes them. The actual defect (a reader or
-        // a crash observing a torn/zero-length file mid-write) is only
-        // observable via a concurrent reader or an injected crash, and is
-        // already covered where the atomicity mechanism lives:
-        // `config_file::tests::{a_reader_never_observes_a_partial_file,
-        // concurrent_writers_do_not_corrupt_each_other}`. This test is kept as
-        // a plain correctness regression guard, not an atomicity proof.
-        let root = std::env::temp_dir().join(format!(
-            "hytte-fullscreen-inhibit-replace-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
-        let cfg = root.join(".config/trollshell/fullscreen-inhibit.toml");
-        std::fs::write(&cfg, "x".repeat(4096)).unwrap();
+    fn save_replaces_a_longer_pre_existing_state_file_exactly() {
+        // Seed a stale state file bigger than any real payload, then confirm
+        // the replacement is exact, not just "starts with the right bytes".
+        with_scratch_home(|_home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "x".repeat(4096)).unwrap();
 
-        temp_env::with_var("HOME", Some(root.as_os_str()), || {
             save_enabled_to_disk(false);
             assert_eq!(
-                std::fs::read_to_string(&cfg).unwrap(),
+                std::fs::read_to_string(&state_path).unwrap(),
                 "enabled = false\n",
                 "no tail of the old, longer content may survive the replace"
             );
             assert!(!load_enabled_from_disk());
         });
+    }
 
-        std::fs::remove_dir_all(&root).unwrap();
+    // ── State migration (#1226) ─────────────────────────────────────────────
+
+    #[test]
+    fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
+        with_scratch_home(|home| {
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = false\n").unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "the legacy off-value must be adopted into state"
+            );
+
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                "enabled = false\n",
+                "the legacy file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
+        with_scratch_home(|home| {
+            state::store(SUBSYSTEM, &FullscreenInhibitState { enabled: false });
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "not even valid toml {{{").unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "state's off-value must win over the legacy file (which would default ON)"
+            );
+        });
+    }
+
+    #[test]
+    fn neither_file_present_defaults_to_on() {
+        with_scratch_home(|_home| {
+            assert!(load_enabled_from_disk(), "fullscreen-inhibit defaults ON");
+        });
     }
 }

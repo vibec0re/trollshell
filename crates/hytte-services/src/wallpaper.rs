@@ -22,11 +22,11 @@
 //! # Rendering
 //!
 //! The structured state ([`WallpaperState`]) is the source of truth, persisted
-//! to `~/.config/trollshell/wallpaper.json`. From it the service derives the
-//! swaybg argument vector and writes it, one arg per line, to
-//! `~/.config/trollshell/swaybg.args`; the bundled swaybg unit's `ExecStart`
-//! reads that file (see `etc/systemd/user/swaybg.service`). A representative
-//! single image (the "primary") is also written to the legacy
+//! to `$XDG_STATE_HOME/trollshell/wallpaper.toml` (#1226). From it the
+//! service derives the swaybg argument vector and writes it, one arg per
+//! line, to `~/.config/trollshell/swaybg.args`; the bundled swaybg unit's
+//! `ExecStart` reads that file (see `etc/systemd/user/swaybg.service`). A
+//! representative single image (the "primary") is also written to the legacy
 //! `~/.config/trollshell/wallpaper.path` — for any not-yet-redeployed old unit
 //! and for the custom-reload-command path — and handed to a configured reload
 //! command.
@@ -41,16 +41,31 @@
 //!
 //! # Persistence & backward compat
 //!
-//! - `wallpaper.json` — structured [`WallpaperState`], the source of truth.
-//! - `swaybg.args` — derived render spec (one swaybg arg per line); the unit's
-//!   `ExecStart` reads it. Absent ⇒ no wallpaper (the unit stays inactive).
-//! - `wallpaper.path` — legacy single-line path, kept written for
-//!   graceful-degradation of an old unit and read once on first launch to
-//!   **migrate** a pre-#546 install (its single path becomes the new default).
+//! - **`wallpaper.toml`** under `$XDG_STATE_HOME/trollshell/` — structured
+//!   [`WallpaperState`], the source of truth (#1226). One-time
+//!   read-migration: if state is absent and a legacy
+//!   `~/.config/trollshell/wallpaper.json` exists, it's parsed and adopted
+//!   into state (the JSON file is left untouched); if that's *also* absent,
+//!   falls through one layer further to the pre-#546 single-path
+//!   `wallpaper.path` (see below). Once state exists it is authoritative and
+//!   neither legacy file is read again.
+//! - **`swaybg.args`** and **`wallpaper.path`** stay under
+//!   `~/.config/trollshell/` — deliberately **not** moved to state, unlike
+//!   `wallpaper.toml`: `etc/systemd/user/swaybg.service`'s `ExecStart` /
+//!   `ConditionPathExists`, and the home-manager/NixOS-rendered mirrors of
+//!   that unit (`nix/hm-module.nix`, `nix/nixos-module.nix`), all hardcode
+//!   `%h/.config/trollshell/swaybg.args`; `wallpaper.path` is the documented
+//!   hand-off point for a custom `reloadCommand`
+//!   (`nix/module-common.nix`). Moving either would silently break an
+//!   external consumer this crate doesn't control. `swaybg.args` is the
+//!   derived render spec (one swaybg arg per line; absent ⇒ no wallpaper, the
+//!   unit stays inactive); `wallpaper.path` is the legacy single-line primary
+//!   path, kept written for graceful degradation and read once (see above)
+//!   to migrate a pre-#546 install.
 //!
-//! On init `wallpaper.json` is preferred; if it's absent (or unparseable) and a
-//! legacy `wallpaper.path` exists, that single path is adopted as the default
-//! image for all outputs.
+//! On init, state wins if present; otherwise `wallpaper.json` is preferred; if
+//! that's absent (or unparseable) and a legacy `wallpaper.path` exists, that
+//! single path is adopted as the default image for all outputs.
 //!
 //! # Validation
 //!
@@ -62,6 +77,7 @@ use crate::config_file;
 use chrono::{Local, Timelike};
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use gtk::glib;
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -71,11 +87,18 @@ use std::time::Duration;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Structured state file under `~/.config/trollshell/` — the source of truth.
-const STATE_FILE: &str = "wallpaper.json";
+/// The state subsystem name — `$XDG_STATE_HOME/trollshell/wallpaper.toml`
+/// (#1226).
+const SUBSYSTEM: &str = "wallpaper";
 
-/// Legacy single-line path file. Kept written (primary image) for old units and
-/// read once on init to migrate a pre-#546 install.
+/// Legacy structured state file under `~/.config/trollshell/`, migrated once
+/// onto state (#1226).
+const LEGACY_JSON_FILE: &str = "wallpaper.json";
+
+/// Legacy single-line path file. Kept written (primary image) for old units,
+/// AND — never moved to state, see the module doc — read once on init to
+/// migrate a pre-#546 install if neither state nor [`LEGACY_JSON_FILE`]
+/// exists yet.
 const LEGACY_PATH_FILE: &str = "wallpaper.path";
 
 /// Derived swaybg argument file (one arg per line) read by the swaybg unit's
@@ -297,28 +320,29 @@ fn primary_image(state: &WallpaperState, hour: u32) -> Option<String> {
         .or_else(|| state.outputs.values().next().cloned())
 }
 
-/// Build the initial state from the on-disk file contents. Prefers the
-/// structured `wallpaper.json`; on its absence (or a parse error) migrates a
-/// legacy single-line `wallpaper.path` into [`WallpaperState::default`].
-fn state_from_disk(json: Option<&str>, legacy: Option<&str>) -> WallpaperState {
+/// Build the initial state from a legacy `wallpaper.json`'s contents, or from
+/// the even-older single-line `wallpaper.path`'s if the JSON is absent (or
+/// unparseable). Only ever consulted by [`load_state`] when no state file
+/// exists yet — see the module doc's migration chain.
+fn state_from_disk(json: Option<&str>, legacy: Option<&str>) -> Option<WallpaperState> {
     if let Some(text) = json {
         match serde_json::from_str::<WallpaperState>(text) {
-            Ok(state) => return state,
+            Ok(state) => return Some(state),
             Err(e) => {
-                tracing::warn!(error = %e, "wallpaper: state file parse failed; falling back");
+                tracing::warn!(error = %e, "wallpaper: legacy state file parse failed; falling back");
             }
         }
     }
     if let Some(text) = legacy {
         let trimmed = text.trim();
         if !trimmed.is_empty() {
-            return WallpaperState {
+            return Some(WallpaperState {
                 default: Some(trimmed.to_string()),
                 ..WallpaperState::default()
-            };
+            });
         }
     }
-    WallpaperState::default()
+    None
 }
 
 /// Serialize the swaybg argument vector to the newline-delimited `swaybg.args`
@@ -332,10 +356,40 @@ fn args_file_body(args: &[String]) -> String {
 
 // ── Disk I/O (off the GTK main thread) ───────────────────────────────────────
 
+/// Load the initial state (#1226): state wins if it already exists; otherwise
+/// migrate once from whichever legacy file resolves — `wallpaper.json`, else
+/// the older single-path `wallpaper.path` — write the result to state, and
+/// leave both legacy files untouched. Neither resolving is the ordinary
+/// zero-state.
 fn load_state() -> WallpaperState {
-    let json = config_file::read(STATE_FILE);
+    if state::path(SUBSYSTEM).is_some_and(|p| p.exists()) {
+        return state::load(SUBSYSTEM).unwrap_or_default();
+    }
+    let json = config_file::read(LEGACY_JSON_FILE);
     let legacy = config_file::read(LEGACY_PATH_FILE);
-    state_from_disk(json.as_deref(), legacy.as_deref())
+    let Some(migrated) = state_from_disk(json.as_deref(), legacy.as_deref()) else {
+        return WallpaperState::default();
+    };
+    // Name whichever legacy file's value actually won — mirrors
+    // `state_from_disk`'s own precedence (JSON first, else the older
+    // single-path file) so the log never claims a source that was actually
+    // unparseable and fell through.
+    let json_parsed = json
+        .as_deref()
+        .is_some_and(|text| serde_json::from_str::<WallpaperState>(text).is_ok());
+    let old = if json_parsed {
+        config_file::path(LEGACY_JSON_FILE)
+    } else {
+        config_file::path(LEGACY_PATH_FILE)
+    };
+    if let Some(old) = old {
+        tracing::info!(
+            old = %old.display(),
+            "wallpaper: migrating a shell-written toggle file from the config directory to state (#1226)"
+        );
+    }
+    state::store(SUBSYSTEM, &migrated);
+    migrated
 }
 
 /// The swaybg args already on disk (one per line), used to seed the render dedup
@@ -345,13 +399,10 @@ fn read_existing_args() -> Option<Vec<String>> {
     config_file::read(ARGS_FILE).map(|text| text.lines().map(String::from).collect())
 }
 
-fn persist_state(state: &WallpaperState) {
-    let state = state.clone();
-    runtime::handle().spawn_blocking(move || match serde_json::to_string_pretty(&state) {
-        Ok(json) => {
-            config_file::write("wallpaper", STATE_FILE, &format!("{json}\n"));
-        }
-        Err(e) => tracing::warn!(error = %e, "wallpaper: failed to serialize state"),
+fn persist_state(wallpaper_state: &WallpaperState) {
+    let value = wallpaper_state.clone();
+    runtime::handle().spawn_blocking(move || {
+        state::store(SUBSYSTEM, &value);
     });
 }
 
@@ -645,8 +696,9 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::{
-        PATH_PLACEHOLDER, Rotation, Slot, WallpaperState, args_file_body, primary_image,
-        shell_single_quote, state_from_disk, swaybg_args,
+        LEGACY_JSON_FILE, LEGACY_PATH_FILE, PATH_PLACEHOLDER, Rotation, SUBSYSTEM, Slot,
+        WallpaperState, args_file_body, load_state, primary_image, shell_single_quote, state,
+        state_from_disk, swaybg_args,
     };
     use std::collections::BTreeMap;
 
@@ -708,7 +760,7 @@ mod tests {
 
     #[test]
     fn migrates_legacy_single_path() {
-        let state = state_from_disk(None, Some("  /home/a/wall.png\n"));
+        let state = state_from_disk(None, Some("  /home/a/wall.png\n")).expect("migrates");
         assert_eq!(state.default.as_deref(), Some("/home/a/wall.png"));
         assert!(state.outputs.is_empty());
         assert!(!state.rotation.enabled);
@@ -716,23 +768,20 @@ mod tests {
 
     #[test]
     fn legacy_blank_is_no_wallpaper() {
-        assert_eq!(
-            state_from_disk(None, Some("   \n")),
-            WallpaperState::default()
-        );
-        assert_eq!(state_from_disk(None, None), WallpaperState::default());
+        assert_eq!(state_from_disk(None, Some("   \n")), None);
+        assert_eq!(state_from_disk(None, None), None);
     }
 
     #[test]
     fn json_wins_over_legacy() {
         let json = r#"{"default":"/j.png"}"#;
-        let state = state_from_disk(Some(json), Some("/legacy.png"));
+        let state = state_from_disk(Some(json), Some("/legacy.png")).expect("json parses");
         assert_eq!(state.default.as_deref(), Some("/j.png"));
     }
 
     #[test]
     fn unparseable_json_falls_back_to_legacy() {
-        let state = state_from_disk(Some("{ not json"), Some("/legacy.png"));
+        let state = state_from_disk(Some("{ not json"), Some("/legacy.png")).expect("falls back");
         assert_eq!(state.default.as_deref(), Some("/legacy.png"));
     }
 
@@ -950,5 +999,120 @@ mod tests {
         };
         assert!(swaybg_args(&state, 3).is_empty());
         assert_eq!(primary_image(&state, 3), None);
+    }
+
+    // ── State migration (#1226) ─────────────────────────────────────────────
+
+    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
+                ("XDG_STATE_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+            ],
+            || body(&home),
+        )
+    }
+
+    fn legacy_json_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell").join(LEGACY_JSON_FILE)
+    }
+
+    fn legacy_single_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell").join(LEGACY_PATH_FILE)
+    }
+
+    #[test]
+    fn migrates_the_legacy_json_file_once_and_leaves_it_untouched() {
+        with_scratch_home(|home| {
+            let legacy = legacy_json_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, r#"{"default":"/j.png"}"#).unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            let got = load_state();
+            assert_eq!(got.default.as_deref(), Some("/j.png"));
+
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
+            assert_eq!(
+                state::load::<WallpaperState>(SUBSYSTEM).as_ref(),
+                Some(&got),
+                "the written state must read back as the migrated value"
+            );
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                r#"{"default":"/j.png"}"#,
+                "the legacy JSON file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy JSON file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_neither_legacy_file_is_read_again() {
+        with_scratch_home(|home| {
+            state::store(
+                SUBSYSTEM,
+                &WallpaperState {
+                    default: Some("/state.png".into()),
+                    ..WallpaperState::default()
+                },
+            );
+
+            let json = legacy_json_path(home);
+            std::fs::create_dir_all(json.parent().unwrap()).unwrap();
+            std::fs::write(&json, "not even valid json {{{").unwrap();
+            let single = legacy_single_path(home);
+            std::fs::write(&single, "/single.png\n").unwrap();
+
+            let got = load_state();
+            assert_eq!(
+                got.default.as_deref(),
+                Some("/state.png"),
+                "state's value must win over either legacy file"
+            );
+        });
+    }
+
+    #[test]
+    fn neither_legacy_file_present_defaults_to_empty() {
+        with_scratch_home(|_home| {
+            assert_eq!(load_state(), WallpaperState::default());
+        });
+    }
+
+    #[test]
+    fn falls_through_to_the_single_path_legacy_when_json_is_absent() {
+        // The pre-#546 migration chain, preserved through #1226: no state,
+        // no wallpaper.json, but the even-older wallpaper.path exists.
+        with_scratch_home(|home| {
+            let single = legacy_single_path(home);
+            std::fs::create_dir_all(single.parent().unwrap()).unwrap();
+            std::fs::write(&single, "/single.png\n").unwrap();
+            let before = std::fs::metadata(&single).unwrap();
+
+            let got = load_state();
+            assert_eq!(got.default.as_deref(), Some("/single.png"));
+
+            let after = std::fs::metadata(&single).unwrap();
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "wallpaper.path must survive the migration untouched — it is still \
+                 written by the render side and read by external units"
+            );
+        });
     }
 }

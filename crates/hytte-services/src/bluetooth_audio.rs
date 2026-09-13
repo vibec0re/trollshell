@@ -47,16 +47,21 @@
 //!
 //! # Persistence
 //!
-//! User toggle persisted to `~/.config/trollshell/bluetooth-audio.toml` as a
-//! single-line `enabled = true|false` flag. Default ON. The file is parsed
-//! permissively — any value other than `false` keeps the feature ON. Writes
-//! are best-effort; failure is logged and the in-memory state is the source
-//! of truth for the running process.
+//! User toggle persisted to `$XDG_STATE_HOME/trollshell/bluetooth-audio.toml`
+//! (#1226) as `enabled = true|false`. Default ON. One-time read-migration
+//! from the legacy `~/.config/trollshell/bluetooth-audio.toml`: if state is
+//! absent and that file exists, its value (parsed permissively — any value
+//! other than `false` keeps the feature ON) is adopted into state and the
+//! old file is left untouched; once state exists it is authoritative and the
+//! old file is never read again. Writes are best-effort; failure is logged
+//! and the in-memory state is the source of truth for the running process.
 
 use crate::config_file;
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,35 +71,56 @@ use crate::pipewire::{self, Sink};
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-/// Config file under `~/.config/trollshell/`.
-const CONFIG_FILE: &str = "bluetooth-audio.toml";
+/// The state subsystem name —
+/// `$XDG_STATE_HOME/trollshell/bluetooth-audio.toml`.
+const SUBSYSTEM: &str = "bluetooth-audio";
 
-fn load_enabled_from_disk() -> bool {
-    let Some(text) = config_file::read(CONFIG_FILE) else {
-        return true;
-    };
-    // Permissive: look for `enabled = false` anywhere; otherwise default ON.
+/// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
+const LEGACY_CONFIG_FILE: &str = "bluetooth-audio.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct BluetoothAudioState {
+    #[serde(default)]
+    enabled: bool,
+}
+
+/// Default ON — unlike `dnd`/`keep-awake`, a fresh install auto-switches.
+impl Default for BluetoothAudioState {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Permissive legacy parser: looks for `enabled = false` anywhere in the old
+/// config file's text; anything else (missing key, malformed value, garbage)
+/// keeps the historical default ON. Only used for the one-time migration —
+/// always succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`.
+fn parse_legacy(text: &str) -> BluetoothAudioState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("false") {
-                return false;
+                return BluetoothAudioState { enabled: false };
             }
             if rhs.eq_ignore_ascii_case("true") {
-                return true;
+                return BluetoothAudioState { enabled: true };
             }
         }
     }
-    true
+    BluetoothAudioState::default()
+}
+
+fn load_enabled_from_disk() -> bool {
+    let old = config_file::path(LEGACY_CONFIG_FILE);
+    let loaded: BluetoothAudioState =
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
+    loaded.enabled
 }
 
 fn save_enabled_to_disk(enabled: bool) {
-    config_file::write(
-        "bluetooth-audio",
-        CONFIG_FILE,
-        &format!("enabled = {enabled}\n"),
-    );
+    state::store(SUBSYSTEM, &BluetoothAudioState { enabled });
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -687,5 +713,80 @@ mod tests {
             "bluez_output.DE_AD_BE_EF_00_00.1",
             &dev,
         ));
+    }
+
+    // ── State migration (#1226) ─────────────────────────────────────────────
+
+    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
+                ("XDG_STATE_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+            ],
+            || body(&home),
+        )
+    }
+
+    fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell/bluetooth-audio.toml")
+    }
+
+    #[test]
+    fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
+        with_scratch_home(|home| {
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = false\n").unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "the legacy off-value must be adopted into state"
+            );
+
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                "enabled = false\n",
+                "the legacy file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
+        with_scratch_home(|home| {
+            state::store(SUBSYSTEM, &BluetoothAudioState { enabled: false });
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "not even valid toml {{{").unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "state's off-value must win over the legacy file (which would default ON)"
+            );
+        });
+    }
+
+    #[test]
+    fn neither_file_present_defaults_to_on() {
+        with_scratch_home(|_home| {
+            assert!(load_enabled_from_disk(), "bluetooth-audio defaults ON");
+        });
     }
 }

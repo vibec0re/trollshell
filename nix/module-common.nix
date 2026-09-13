@@ -860,7 +860,7 @@ self:
                   session-wide via `programs.trollshell.weather.fallbackCity`
                   instead of per-plugin here).
 
-                The full inventory — swept from source, all 13 bundled
+                The full inventory — swept from source, all 14 bundled
                 plugins including the ones with zero knobs — is published at
                 <https://vibec0re.github.io/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`). An absolute URL rather than a

@@ -325,6 +325,13 @@
 .ts-cpu-temp,
 .ts-gpu-temp {
     font-size: 0.846em;
+}
+/* Scoped to labels: both native users are GtkLabels (widgets/cpu.rs,
+   widgets/gpu.rs), and an unscoped rule also dims a plugin's preem drawing
+   surface carrying the same class — hytte-plugin-stats' seven-segment readout
+   rendered 15 % darker than the rest of its card (#1277 TRIVIAL 11). */
+label.ts-cpu-temp,
+label.ts-gpu-temp {
     opacity: 0.85;
 }
 .ts-clock {

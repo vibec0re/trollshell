@@ -4472,6 +4472,39 @@ mod tests {
         );
     }
 
+    /// **The length half of the launcher mirror, in literals** — the charset
+    /// half already is, and that asymmetry was the finding (#1277 LOW 6).
+    ///
+    /// `hytte_services::systemd::is_valid_plugin_id` hard-codes `id.len() <= 64`
+    /// and this SDK takes its cap from [`MAX_PLUGIN_ID_BYTES`], so the two agree
+    /// only as long as that constant *is* 64. Measured: changing it to 32 left
+    /// `hytte-plugin-proto` (11), `hytte-plugin` (116) and `hytte-services`
+    /// (856) all green, because every assertion on either side derives from
+    /// whichever value it can see. The launcher would then render a unit for a
+    /// 40-byte id whose plugin refuses to start under it.
+    ///
+    /// The rows below are therefore spelled as literals: 64 bytes accepted, 65
+    /// refused, and the constant itself pinned with the reason it cannot move
+    /// alone.
+    #[test]
+    fn the_id_cap_is_the_sixty_four_the_launcher_hard_codes() {
+        assert_eq!(
+            MAX_PLUGIN_ID_BYTES, 64,
+            "hytte_services::systemd::is_valid_plugin_id hard-codes `id.len() <= 64`; \
+             moving this constant alone silently splits the mirror",
+        );
+        let at_cap = "a".repeat(64);
+        assert_eq!(
+            id_override(Some(&at_cap)),
+            Ok(Some(at_cap.clone())),
+            "a 64-byte id is what the launcher accepts, so the SDK must too",
+        );
+        assert!(
+            id_override(Some(&"a".repeat(65))).is_err(),
+            "a 65-byte id is what the launcher refuses, so the SDK must too",
+        );
+    }
+
     /// An unusable value is **refused**, and the refusal states the rule — the
     /// one thing that makes this recoverable for whoever set it. A silent
     /// fallback to the manifest's id is the outcome this test exists to forbid:

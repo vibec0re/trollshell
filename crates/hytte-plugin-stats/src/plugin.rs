@@ -97,7 +97,8 @@ pub struct Stats {
     /// This instance's resolved `stats.toml` table.
     cfg: config::Card,
     /// The latest sample. Defaults to the "nothing measured yet" state, which
-    /// the seed render draws as dashes.
+    /// the seed render draws as dashes — every reading of it, headline
+    /// included (#1277 LOW 5).
     snapshot: Snapshot,
     /// The overall-load history the scope sweeps, newest last, capped at the
     /// scope's own column count.
@@ -117,19 +118,27 @@ impl Stats {
     /// a `Snapshot` literal — which is also the only way they can, since the
     /// real sampler is on the other side of a `spawn_blocking`.
     pub fn apply(&mut self, snapshot: Snapshot) {
-        self.widgets.fit_cores(snapshot.per_core.len().max(1));
+        // The loads, never a core *count*: the pitch is fitted to the widest
+        // row the wrap produces, which `card::row_cells` is the one definition
+        // of (#1277 MEDIUM 1).
+        self.widgets.fit_cores(&snapshot.per_core);
         self.widgets
             .set_gpu(snapshot.gpu.as_ref().and_then(|g| g.load), self.dt());
 
-        self.ring.push_back(card::trace_sample(snapshot.cpu));
-        while self.ring.len() > card::HISTORY_COLS as usize {
-            self.ring.pop_front();
+        // A withheld reading is not a sample: a cold tick (or one whose
+        // `/proc/stat` read failed) must not push a fake rest value onto the
+        // trace, and must not restate the scope's batch either.
+        if let Some(cpu) = snapshot.cpu {
+            self.ring.push_back(card::trace_sample(cpu));
+            while self.ring.len() > card::HISTORY_COLS as usize {
+                self.ring.pop_front();
+            }
+            // `make_contiguous` is why the ring is a `VecDeque` and not a `Vec`
+            // with a rotating index: the scope wants one slice, and this is the
+            // cheap way to hand it one without copying on every render.
+            let ring: Vec<f32> = self.ring.iter().copied().collect();
+            self.widgets.push_history(&ring);
         }
-        // `make_contiguous` is why the ring is a `VecDeque` and not a `Vec` with
-        // a rotating index: the scope wants one slice, and this is the cheap
-        // way to hand it one without copying on every render.
-        let ring: Vec<f32> = self.ring.iter().copied().collect();
-        self.widgets.push_history(&ring);
 
         self.snapshot = snapshot;
     }
@@ -244,7 +253,7 @@ mod tests {
 
     fn sample(cpu: f32) -> Input<Msg> {
         Input::App(Msg::Sampled(Box::new(Snapshot {
-            cpu,
+            cpu: Some(cpu),
             per_core: vec![cpu; 4],
             cpu_temp_c: Some(50.0),
             gpu: Some(Gpu {
@@ -395,6 +404,40 @@ mod tests {
             let _ = model.update(sample(load));
         }
         assert_eq!(model.ring.len(), HISTORY_COLS as usize);
+    }
+
+    /// **A withheld reading is not a sample**: the cold tick, whose `cpu` is
+    /// `None` and whose `per_core` is empty, leaves the trace alone rather than
+    /// stamping a fake rest value on it — and the card still reads as dashes
+    /// afterwards, exactly as the seed render did (#1277 MEDIUM 3 / LOW 5).
+    ///
+    /// **Falsified** by pushing `trace_sample(cpu.unwrap_or(0.0))`
+    /// unconditionally: the ring grows and the scope's first sweep starts from
+    /// a bottom-rail point nothing measured.
+    #[test]
+    fn a_withheld_reading_leaves_the_trace_alone() {
+        let mut model = fresh(Card::sidebar_default());
+        let seed = model.view();
+
+        let cold = Input::App(Msg::Sampled(Box::new(Snapshot {
+            cpu: None,
+            per_core: Vec::new(),
+            cpu_temp_c: Some(44.0),
+            gpu: None,
+        })));
+        assert!(model.update(cold).is_empty());
+        assert!(
+            model.ring.is_empty(),
+            "a tick with no delta contributes no history point",
+        );
+
+        // The temperature it *did* read is a real reading and does move the
+        // card, so this is not "the update was dropped".
+        assert_ne!(model.view(), seed, "the temperature it did read still lands");
+
+        // …and the first real sample is the ring's first point.
+        let _ = model.update(sample(0.5));
+        assert_eq!(model.ring.len(), 1);
     }
 
     /// A visibility push is forwarded to the sampler and changes nothing on

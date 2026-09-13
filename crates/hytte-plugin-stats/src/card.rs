@@ -123,8 +123,30 @@ pub fn lamp_rows(loads: &[f32]) -> Vec<String> {
         .collect()
 }
 
+/// How many glyph cells the **widest row** of a set of per-core loads holds —
+/// which is the number the dot pitch must be fitted to, and the only number
+/// [`dot_px_for`] will give a useful answer for.
+///
+/// [`lamp_rows`] wraps at [`CORES_PER_ROW`], so no row is ever wider than that:
+/// feeding the *total* core count to `dot_px_for` computes the width of a row
+/// that does not exist, and past sixteen threads the division underflows and
+/// the clamp lifts it to the floor. A 32-thread desktop then draws its two tight
+/// rows at two-thirds of the pitch the card admits — the exact machine the
+/// module doc's worked example names (#1277 MEDIUM 1).
+#[must_use]
+pub fn row_cells(loads: &[f32]) -> usize {
+    if loads.is_empty() {
+        DASH_CELLS
+    } else {
+        loads.len().min(CORES_PER_ROW)
+    }
+}
+
 /// The chunkiest dot pitch at which a row of `cells` glyphs still fits
 /// [`CARD_PX`], floored at the kit's own [`MIN_DOT_PX`].
+///
+/// `cells` means **cells in one row** — see [`row_cells`], which is the only
+/// thing that should be computing it.
 ///
 /// `DotMatrix::render`'s width is `2*pad + n*advance - SPACING*dot`, and the
 /// bezel is one dot cell on each side, which collapses to `dot_px * (6n + 1)`.
@@ -250,16 +272,24 @@ impl Default for Widgets {
 }
 
 impl Widgets {
-    /// Re-fit the lamp row to a new core count, if it changed.
+    /// Re-fit the lamp row to a fresh set of per-core loads, if the row it
+    /// produces is a different width than the last one.
+    ///
+    /// Takes the **loads**, not a count, so the one number that matters here
+    /// can only be computed one way: [`row_cells`] of the slice the row is
+    /// actually drawn from. Handing this a core *total* is what #1277's MEDIUM 1
+    /// was, and there is now no argument to hand it one with.
     ///
     /// Rebuilding the wrapper restates the widget's **config** on the wire, so
     /// the shell drops its renderer instance and builds a fresh one. That is
     /// free here and nowhere else on this card: `DotMatrix` is the one kind with
     /// no animation state to lose ("the static matrix has no animation of its
     /// own, so *animate toward the target* degenerates to an immediate redraw").
-    /// The count changes at most twice in a session — once when the first delta
-    /// arrives, and again only if the kernel hotplugs a CPU.
-    pub fn fit_cores(&mut self, cells: usize) {
+    /// The width changes at most twice in a session — once when the first delta
+    /// arrives, and again only if the kernel hotplugs a CPU across the wrap
+    /// boundary.
+    pub fn fit_cores(&mut self, loads: &[f32]) {
+        let cells = row_cells(loads);
         if cells != self.fitted_cells {
             self.cores = DotMatrix::new(SKIN).dot_px(dot_px_for(cells));
             self.fitted_cells = cells;
@@ -317,12 +347,10 @@ pub fn card(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) ->
     let mut children = Vec::new();
 
     if cfg.cpu {
-        children.push(header(
-            "CPU",
-            percent_text(Some(snapshot.cpu)),
-            "ts-cpu",
-            None,
-        ));
+        // `snapshot.cpu` is an `Option`, so the headline dashes on the seed
+        // frame exactly like the lamp row does — two answers to "do we know
+        // yet?" in one frame was #1277's LOW 5.
+        children.push(header("CPU", percent_text(snapshot.cpu), "ts-cpu", None));
         if cfg.per_core {
             children.extend(widgets.core_nodes(&snapshot.per_core));
         }
@@ -382,8 +410,8 @@ pub fn card(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_PX, CORES_PER_ROW, LAMPS, Widgets, card, dot_px_for, lamp, lamp_rows, percent_text,
-        temp_text, trace_sample,
+        CARD_PX, CORES_PER_ROW, DASH_CELLS, LAMPS, Widgets, card, dot_px_for, lamp, lamp_rows,
+        percent_text, row_cells, temp_text, trace_sample,
     };
     use crate::config::Card;
     use crate::sample::{Gpu, Snapshot};
@@ -504,10 +532,71 @@ mod tests {
             );
         }
         // Past the card's width the pitch bottoms out rather than going to zero.
+        // `dot_px_for` is a *row* width, so nothing on this card ever asks it
+        // these — but it is total over them, which is what keeps `row_cells`
+        // the only clamp and not a second one.
         assert_eq!(dot_px_for(1_000), MIN_DOT_PX);
         assert_eq!(dot_px_for(usize::MAX), MIN_DOT_PX);
         // And a degenerate count is still a legal pitch.
         assert_eq!(dot_px_for(0), dot_px_for(1));
+    }
+
+    /// **The pitch is fitted to the widest ROW, not to the core count** —
+    /// extended past the wrap boundary, which is where the loop above stops and
+    /// where #1277's MEDIUM 1 lived.
+    ///
+    /// Below seventeen threads the two numbers coincide, so every count the old
+    /// loop covered passed either way; from seventeen up, `6 * cells + 1` is
+    /// computed for a row `lamp_rows` never emits, the division underflows, and
+    /// the clamp hands back `MIN_DOT_PX`. A 32-thread desktop then drew its
+    /// lamps at 2 px instead of the 3 px the card admits, filling 194 px of 296.
+    ///
+    /// **Falsified** by making `row_cells` answer `loads.len().max(1)` — every
+    /// row from 17 up then reds, at the pitch and again at the width.
+    #[test]
+    fn the_lamp_pitch_is_fitted_to_the_widest_row_past_the_wrap_boundary() {
+        for cores in [1_usize, 4, 8, 12, 16, 17, 20, 24, 32, 64, 128] {
+            let loads = vec![0.5_f32; cores];
+            let rows = lamp_rows(&loads);
+            let widest = rows
+                .iter()
+                .map(|r| r.chars().count())
+                .max()
+                .expect("lamp_rows never returns nothing");
+            assert_eq!(
+                row_cells(&loads),
+                widest,
+                "{cores} cores wrap into rows at most {widest} wide",
+            );
+
+            let px = dot_px_for(row_cells(&loads));
+            assert_eq!(
+                px,
+                dot_px_for(widest),
+                "{cores} cores must be drawn at the pitch its widest row admits",
+            );
+            let width = px * (6 * u32::try_from(widest).unwrap() + 1);
+            assert!(
+                width <= CARD_PX,
+                "{cores} cores: a {widest}-lamp row at pitch {px} is {width}px, \
+                 past the {CARD_PX}px card",
+            );
+        }
+
+        // Every count from the wrap boundary up is the *same* pitch — the 16-wide
+        // row's — rather than sliding down to the floor.
+        let sixteen = dot_px_for(CORES_PER_ROW);
+        for cores in [16_usize, 17, 32, 64, 128, 1_024] {
+            assert_eq!(
+                dot_px_for(row_cells(&vec![0.5_f32; cores])),
+                sixteen,
+                "{cores} cores still draws a 16-wide row",
+            );
+        }
+        assert!(sixteen > MIN_DOT_PX, "…and that is not the floor");
+
+        // An empty reading is the dash row's width, not one cell.
+        assert_eq!(row_cells(&[]), DASH_CELLS);
     }
 
     /// The temperature readout uses only glyphs the kit's seven-segment cells
@@ -585,7 +674,7 @@ mod tests {
 
     fn busy_snapshot() -> Snapshot {
         Snapshot {
-            cpu: 0.42,
+            cpu: Some(0.42),
             per_core: vec![0.1, 0.9, 0.5, 0.0],
             cpu_temp_c: Some(57.0),
             gpu: Some(Gpu {
@@ -687,7 +776,16 @@ mod tests {
 
     /// An all-default snapshot — what the seed render carries, before the first
     /// sample can possibly have landed — renders without panicking and shows
-    /// dashes rather than zeros it did not measure.
+    /// dashes rather than numbers it did not measure.
+    ///
+    /// **Every** reading dashes, which is the whole point: before #1277 the
+    /// headline read `CPU 0%` beside a `----` lamp row, two different answers
+    /// to "do we know yet?" in one frame, and this test asserted the wrong one
+    /// of them (`texts.contains("0%")`, with a message about a number it did
+    /// not measure).
+    ///
+    /// **Falsified** by making `Snapshot.cpu` an `f32` again: the headline
+    /// reads `0%` and the first assertion below reds.
     #[test]
     fn the_seed_render_is_dashes_not_invented_numbers() {
         let widgets = Widgets::default();
@@ -699,14 +797,52 @@ mod tests {
             "the header is there: {texts:?}",
         );
         assert!(
-            texts.iter().any(|t| t == "0%"),
-            "and the load reads zero rather than a number it did not measure: {texts:?}",
+            texts.iter().any(|t| t == "—"),
+            "and the load reads a dash rather than a number it did not measure: {texts:?}",
+        );
+        assert!(
+            !texts.iter().any(|t| t == "0%"),
+            "…and in particular not zero, which is a measurement: {texts:?}",
         );
         assert!(
             preem_ids(Card::sidebar_default(), &Snapshot::default(), &widgets)
                 .contains(&"stats-cores-0".to_owned()),
             "and the lamp row holds its slot",
         );
+    }
+
+    /// The headline and the lamp row agree, frame by frame, about whether the
+    /// card knows anything yet — the invariant LOW 5 was a violation of.
+    #[test]
+    fn the_headline_and_the_lamp_row_never_disagree_about_what_is_known() {
+        let widgets = Widgets::default();
+        for (snapshot, known) in [
+            (Snapshot::default(), false),
+            (
+                Snapshot {
+                    cpu: None,
+                    per_core: Vec::new(),
+                    cpu_temp_c: Some(50.0),
+                    gpu: None,
+                },
+                false,
+            ),
+            (busy_snapshot(), true),
+        ] {
+            let tree = card(Card::sidebar_default(), &snapshot, &widgets);
+            let mut texts = Vec::new();
+            collect_text(&tree, &mut texts);
+            // `header` emits [name, reading], and the CPU header is first — so
+            // this is the CPU reading and not a GPU gauge that happens to be
+            // dashed for a reason of its own.
+            assert_eq!(texts.first().map(String::as_str), Some("CPU"));
+            let headline_dashes = texts.get(1).map(String::as_str) == Some("—");
+            let row_dashes = lamp_rows(&snapshot.per_core) == vec!["----".to_owned()];
+            assert_eq!(
+                headline_dashes, row_dashes,
+                "known={known}: headline and row must make the same claim ({texts:?})",
+            );
+        }
     }
 
     /// **The compat arm**: against a host that never advertised the preem
@@ -777,14 +913,22 @@ mod tests {
     fn the_lamp_row_is_refitted_once_per_core_count() {
         let mut widgets = Widgets::default();
         let before = format!("{:?}", widgets.cores);
-        widgets.fit_cores(16);
+        widgets.fit_cores(&[0.5; 16]);
         let after = format!("{:?}", widgets.cores);
         assert_ne!(before, after, "16 cores is a different pitch than 4 dashes");
-        widgets.fit_cores(16);
+        widgets.fit_cores(&[0.5; 16]);
         assert_eq!(
             format!("{:?}", widgets.cores),
             after,
             "re-fitting to the same count must not rebuild the widget",
+        );
+        // …and a 32-thread box is the same 16-wide row, so it is the same
+        // widget: no rebuild, and above all no narrower pitch (#1277 MEDIUM 1).
+        widgets.fit_cores(&[0.5; 32]);
+        assert_eq!(
+            format!("{:?}", widgets.cores),
+            after,
+            "past the wrap boundary the row is still 16 wide — same pitch, same widget",
         );
     }
 }

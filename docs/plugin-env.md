@@ -269,7 +269,7 @@ programs.trollshell.plugins = {
   stats-bar = {
     package = trollshell.packages.${system}.hytte-plugin-stats;
     env.HYTTE_PLUGIN_ID = "stats-bar"; # must equal the attribute name
-    env.HYTTE_PLUGIN_MOUNT = "BarRight";
+    mount = "BarRight"; # renders HYTTE_PLUGIN_MOUNT (#1161)
   };
 };
 ```

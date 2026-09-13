@@ -1116,6 +1116,48 @@ mod tests {
         });
     }
 
+    /// The JSON→TOML hop is the one place #1226 changes a serialization
+    /// format, and the only test crossing it seeded a `default`-only document
+    /// — so neither the `outputs` map nor the `rotation` block ever crossed it
+    /// (#1233 NIT 8). `store`'s `bool` is discarded at both call sites, so a
+    /// render that failed (TOML requires values before tables) would be a
+    /// `warn!` nobody reads and a wallpaper that quietly stops persisting.
+    #[test]
+    fn a_fully_populated_legacy_json_survives_the_hop_to_toml() {
+        scratch_home(|home| {
+            let want = WallpaperState {
+                default: Some("/pics/all displays.png".into()),
+                outputs: BTreeMap::from([
+                    ("DP-1".to_string(), "/pics/left & right.png".to_string()),
+                    ("DP-2".to_string(), "/pics/o'clock.png".to_string()),
+                    ("eDP-1".to_string(), "/pics/laptop.png".to_string()),
+                ]),
+                rotation: Rotation {
+                    enabled: true,
+                    morning: Some("/pics/dawn.png".into()),
+                    day: Some("/pics/noon.png".into()),
+                    evening: Some("/pics/dusk.png".into()),
+                    night: Some("/pics/night.png".into()),
+                },
+            };
+
+            let legacy = legacy_json_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, serde_json::to_string(&want).unwrap()).unwrap();
+
+            assert_eq!(
+                load_state(),
+                want,
+                "the migration must not drop a field on the format hop"
+            );
+            assert_eq!(
+                state::load::<WallpaperState>(SUBSYSTEM).as_ref(),
+                Some(&want),
+                "and what actually landed in state must read back identically"
+            );
+        });
+    }
+
     #[test]
     fn neither_legacy_file_present_defaults_to_empty() {
         scratch_home(|_home| {

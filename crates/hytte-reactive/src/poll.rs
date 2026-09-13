@@ -322,15 +322,20 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let c = calls.clone();
 
-            let poll = gated_poll(active, || Duration::ZERO, writer, move || {
-                let n = c.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if n + 1 >= BUDGET {
-                        std::future::pending::<()>().await;
+            let poll = gated_poll(
+                active,
+                || Duration::ZERO,
+                writer,
+                move || {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n + 1 >= BUDGET {
+                            std::future::pending::<()>().await;
+                        }
+                        None::<u32>
                     }
-                    None::<u32>
-                }
-            });
+                },
+            );
             let _ = tokio::time::timeout(Duration::from_secs(1), poll).await;
 
             let n = calls.load(Ordering::SeqCst);

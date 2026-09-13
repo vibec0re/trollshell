@@ -319,7 +319,10 @@ mod tests {
                 "exactly one migration line, got {migrations:?}"
             );
             let fields = &migrations[0].fields;
-            assert_eq!(fields.get("subsystem").map(String::as_str), Some("migrate-a"));
+            assert_eq!(
+                fields.get("subsystem").map(String::as_str),
+                Some("migrate-a")
+            );
             assert_eq!(
                 fields.get("old").map(String::as_str),
                 Some(old.display().to_string()).as_deref()

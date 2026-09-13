@@ -1124,6 +1124,16 @@ mod tests {
     /// cannot swallow it, so both writers run and the order is the lane's
     /// rather than the pool's. Injected writers record their order, so a swap
     /// is visible as more than just the final content.
+    ///
+    /// #1265: each marker is pushed *after* its own `write_atomic` returns,
+    /// not before — `write_atomic`'s last step is the rename, so a marker
+    /// recorded post-write means the write is really on disk, not merely
+    /// "the writer closure started running". `order.len() == 2` is then a
+    /// true completion signal, but the on-disk read that follows still polls
+    /// its own content against a deadline rather than trusting that and
+    /// reading once: a fixed settle can't tell "the write already landed"
+    /// from "the write is about to land", and on a loaded runner the second
+    /// is exactly what a fixed sleep loses to (the original bug here).
     #[tokio::test]
     async fn two_uncoalesced_saves_are_written_in_order() {
         use std::sync::{Arc, Mutex};
@@ -1143,8 +1153,9 @@ mod tests {
         store.save_with(move |p, t| {
             started_tx.send(()).expect("the test outlives this writer");
             std::thread::sleep(std::time::Duration::from_millis(200));
+            let result = write_atomic(p, t);
             first.lock().expect("order lock").push("first");
-            write_atomic(p, t)
+            result
         });
         // Wait for job 1 to be *out of the channel and running*, so the
         // coalescing loop cannot reach it — no fixed sleep to race under load.
@@ -1161,12 +1172,14 @@ mod tests {
         store.grants.clear();
         let second = Arc::clone(&order);
         store.save_with(move |p, t| {
+            let result = write_atomic(p, t);
             second.lock().expect("order lock").push("second");
-            write_atomic(p, t)
+            result
         });
 
-        // Both writers must run; poll rather than sleep a fixed window, then
-        // settle briefly so a *third* (impossible) run would still be seen.
+        // Both writers must run; poll rather than sleep a fixed window. Each
+        // marker lands only once its own write has returned, so len() == 2
+        // means both writes are already on disk.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while order.lock().expect("order lock").len() < 2 {
             assert!(
@@ -1177,17 +1190,110 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Read the disk by polling its content against its own deadline
+        // rather than trusting a fixed settle and reading once — belt and
+        // braces alongside the marker reordering above, so a slow
+        // `write_atomic` (tmp write, fsync, rename) can never be mistaken
+        // for a finished one. The 10s window also leaves room for an
+        // impossible third run to surface before the order-vector check
+        // below: any stray marker would land well within it.
+        let disk_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut on_disk;
+        loop {
+            on_disk = parse_grants(&std::fs::read_to_string(&path).expect("reads")).expect("toml");
+            if on_disk.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < disk_deadline,
+                "the newer (revoke) snapshot never landed on disk within 10s, got {on_disk:?}",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(
             *order.lock().expect("order lock"),
             vec!["first", "second"],
             "both queued writes must run, in submission order — a coalesced or \
              reordered lane shows up here before it shows up on disk",
         );
-        let on_disk = parse_grants(&std::fs::read_to_string(&path).expect("reads")).expect("toml");
-        assert!(
-            on_disk.is_empty(),
-            "the newer (revoke) snapshot must be the one left on disk, got {on_disk:?}",
+    }
+
+    /// Regression pin for #1265: even if a future writer went back to
+    /// recording its marker *before* the write lands (the exact shape that
+    /// raced above — see the doc on the test before this one), the on-disk
+    /// read must still be correct, because it polls disk content against its
+    /// own deadline instead of trusting the order-vector timing at all. This
+    /// is deliberately the adversarial shape, with an exaggerated 300ms gap
+    /// between "marker pushed" and "write actually lands" — comfortably
+    /// longer than the fixed 100ms settle the original bug shipped with, so
+    /// a regression back to a fixed-settle read would flake here too.
+    #[tokio::test]
+    async fn two_uncoalesced_saves_survive_a_marker_recorded_before_the_write_lands() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        std::fs::write(&path, "").expect("seed empty file");
+        let mut store = GrantStore::load(&path).expect("loads the empty seed");
+
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        store.grants.push(Grant::always("claude", "departures"));
+        let first = Arc::clone(&order);
+        store.save_with(move |p, t| {
+            started_tx.send(()).expect("the test outlives this writer");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            first.lock().expect("order lock").push("first");
+            write_atomic(p, t)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while started_rx.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first write never started — the drain task was never polled",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        store.grants.clear();
+        let second = Arc::clone(&order);
+        store.save_with(move |p, t| {
+            // The exact race from #1265: the marker lands well before the
+            // write does.
+            second.lock().expect("order lock").push("second");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            write_atomic(p, t)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while order.lock().expect("order lock").len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {:?} ran within 10s — a queued job was coalesced away after the \
+                 drain task had already taken the one before it",
+                *order.lock().expect("order lock"),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let disk_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut on_disk;
+        loop {
+            on_disk = parse_grants(&std::fs::read_to_string(&path).expect("reads")).expect("toml");
+            if on_disk.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < disk_deadline,
+                "the newer (revoke) snapshot never landed on disk within 10s, got {on_disk:?}",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            *order.lock().expect("order lock"),
+            vec!["first", "second"],
+            "both queued writes must run, in submission order — a coalesced or \
+             reordered lane shows up here before it shows up on disk",
         );
     }
 

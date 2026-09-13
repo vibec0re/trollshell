@@ -10,10 +10,19 @@
 //!
 //! Three plugins already keep state in the right place (`caw`'s
 //! `expression.json`, `infobroker`'s `grants.toml`, the claude bridge's
-//! session map); the six misplaced ones are all shell-side toggle files still
-//! sitting in `~/.config/trollshell/`. Moving them is Phase 2 and deliberately
-//! **not** part of #868 — this module is the destination they will move to,
-//! and nothing is migrated onto it yet.
+//! session map); #1226 moved the seven shell-side toggle files here too —
+//! `crates/hytte-services/src/{dnd,notifications_mute,bluetooth_audio,
+//! fullscreen_inhibit,screensaver,wallpaper}.rs` each read/write their state
+//! through [`load_or_migrate_from`]/[`store`] now (`dnd.toml`,
+//! `muted-apps.toml`, `bluetooth-audio.toml`, `fullscreen-inhibit.toml`,
+//! `keep-awake.toml`, `wallpaper.toml`). `nightlight.rs`'s `wlsunset.args` is
+//! the one file #1226 left behind: `nix/hm-module.nix`'s `wlsunset.service`
+//! `ExecStart` hardcodes `%h/.config/trollshell/wlsunset.args`, so moving it
+//! would break that unit for anyone who hasn't (and, being a nix-rendered
+//! unit, can't on their own) picked up a state-aware version — the same
+//! reason `wallpaper.rs`'s `swaybg.args` and `wallpaper.path` stay in the
+//! config dir while only its structured `wallpaper.json` moved (now
+//! `wallpaper.toml`, since a state file is always TOML — see [`store`]).
 //!
 //! # Why this is not the format-preserving writer
 //!
@@ -96,6 +105,54 @@ pub fn store_at<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<
     file::write_atomic(path, &body, Durability::FileOnly)
 }
 
+/// Load `subsystem`'s state, migrating a legacy `~/.config/trollshell/*` file
+/// the first time the state file doesn't exist yet (#1226).
+///
+/// **State wins once it exists.** If the state file is already there, `old`
+/// is never consulted, even if the state file fails to parse — exactly
+/// [`load`]'s own warn-and-fall-back-to-`T::default()` behaviour, unchanged
+/// by having a migration source available. That is the second half of
+/// #1226's contract: once migrated, a hand-edited or corrupted legacy file
+/// has no effect, ever again.
+///
+/// **Migrate once, non-destructively.** If the state file is absent, `old`
+/// names a path, that path is readable, and `parse_old` accepts its
+/// contents, the parsed value is written to state — best-effort, like
+/// [`store`] — and returned. `old` itself is left completely alone: never
+/// deleted, never renamed. A file a person's own daemon unit might still be
+/// reading (or that they just haven't looked at in months) is not this
+/// shell's to remove. Logs once at `info`, naming both paths.
+///
+/// **Otherwise, the zero state.** No state file and either no `old` path, no
+/// file there, or a `parse_old` that returns `None` all fall back to
+/// `T::default()` — the same outcome a bare [`load`] gives a caller with
+/// nothing to migrate.
+pub fn load_or_migrate_from<T, F>(subsystem: &str, old: Option<&Path>, parse_old: F) -> T
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Default,
+    F: FnOnce(&str) -> Option<T>,
+{
+    if path(subsystem).is_some_and(|p| p.exists()) {
+        return load(subsystem).unwrap_or_default();
+    }
+    let Some(old) = old else {
+        return T::default();
+    };
+    let Some(text) = std::fs::read_to_string(old).ok() else {
+        return T::default();
+    };
+    let Some(value) = parse_old(&text) else {
+        return T::default();
+    };
+    tracing::info!(
+        subsystem,
+        old = %old.display(),
+        "migrating a shell-written toggle file from the config directory to state (#1226)"
+    );
+    store(subsystem, &value);
+    value
+}
+
 /// Delete the state file if it exists, returning a subsystem to its zero
 /// state. Best-effort; a missing file is success.
 pub fn remove(subsystem: &str) {
@@ -171,5 +228,104 @@ mod tests {
         );
         assert!(!text.contains("hand-written"));
         assert_eq!(text, "enabled = false\napps = []\n");
+    }
+
+    // ── `load_or_migrate_from` (#1226) ──────────────────────────────────────
+
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Flag {
+        #[serde(default)]
+        enabled: bool,
+    }
+
+    /// Clears `$XDG_STATE_HOME`/`$XDG_CONFIG_HOME` and points `$HOME` at a
+    /// tempdir before running `body`, so `path()`'s process-environment read
+    /// can never resolve into a real, ambient state or config directory —
+    /// the #1101 rule this whole feature is built to respect.
+    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
+                ("XDG_STATE_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+            ],
+            || body(&home),
+        )
+    }
+
+    #[test]
+    fn load_or_migrate_from_migrates_once_and_leaves_the_old_file_alone() {
+        with_scratch_home(|home| {
+            let old = home.join("old.toml");
+            std::fs::write(&old, "enabled = true\n").expect("seed old");
+            let before = std::fs::metadata(&old).expect("meta");
+
+            let value: Flag = load_or_migrate_from("migrate-a", Some(&old), |text| {
+                Some(Flag {
+                    enabled: text.contains("true"),
+                })
+            });
+            assert_eq!(value, Flag { enabled: true });
+
+            let state_path = path("migrate-a").expect("state path resolves");
+            assert!(state_path.exists(), "the migrated value must land in state");
+            assert_eq!(
+                load::<Flag>("migrate-a"),
+                Some(Flag { enabled: true }),
+                "the written state must read back as the migrated value"
+            );
+
+            let after = std::fs::metadata(&old).expect("meta");
+            assert_eq!(
+                std::fs::read_to_string(&old).expect("old survives"),
+                "enabled = true\n",
+                "the old file's bytes must be untouched"
+            );
+            assert_eq!(
+                before.modified().expect("mtime"),
+                after.modified().expect("mtime"),
+                "the old file's mtime must be untouched — it is never written"
+            );
+        });
+    }
+
+    #[test]
+    fn load_or_migrate_from_prefers_state_and_never_reads_old_again() {
+        with_scratch_home(|_home| {
+            let state_path = path("migrate-b").expect("state path resolves");
+            store_at(&state_path, &Flag { enabled: false }).expect("seed state");
+
+            let old = state_path.with_file_name("old-b.toml");
+            // Deliberately unparseable — if `parse_old` is ever called, the
+            // closure panics, which is the falsification for "old is never
+            // read again once state exists".
+            std::fs::write(&old, "not valid toml {{{").expect("seed unparseable old");
+
+            let value: Flag = load_or_migrate_from("migrate-b", Some(&old), |_text| {
+                panic!("old must not be read once a state file exists")
+            });
+            assert_eq!(
+                value,
+                Flag { enabled: false },
+                "state's value must win over the (unreadable) old file"
+            );
+        });
+    }
+
+    #[test]
+    fn load_or_migrate_from_defaults_when_neither_file_exists() {
+        with_scratch_home(|home| {
+            let old = home.join("never-existed.toml");
+            let value: Flag = load_or_migrate_from("migrate-c", Some(&old), |_text| {
+                panic!("old does not exist; parse_old must not run")
+            });
+            assert_eq!(value, Flag::default());
+            assert!(
+                path("migrate-c").is_some_and(|p| !p.exists()),
+                "no state file should be created when there was nothing to migrate"
+            );
+        });
     }
 }

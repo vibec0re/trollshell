@@ -25,6 +25,15 @@
 //! round dots at the screen's resolution instead of a magnified 4×4 block. See
 //! `dot_matrix.frag`'s header.
 //!
+//! The halo is the exception, and since #1186 it is read rather than recomputed
+//! at that resolution: a box blur of the lit layer is a grid-resolution quantity
+//! by construction, so `blur.frag` can only produce it at `u_grid` and the blit
+//! takes a bilinear tap out of it (`halo_at`) on the same branch the lattice
+//! takes its continuous position on. Before that the stretched frame had round
+//! dots with a blocky bloom around them — see
+//! [`tests::the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap`]
+//! for why nothing but a source read can hold that in place.
+//!
 //! At the natural size — what the reconciler requests and what the parity
 //! harness measures — the shader snaps that position to the pixel centre
 //! (`u_viewport == u_grid`), where the law's arguments are exactly the integers
@@ -75,8 +84,9 @@
 //! 2. **blur H** and 3. **blur V** — the kit's separable truncating box blur,
 //!    the *same* `blur.frag` the scope and the gauge use;
 //! 4. **blit** — the field, the unlit ghost matrix, the lit layer recomputed at
-//!    the fragment's own resolution with the halo max-combined under it, the
-//!    CRT pass and the composite.
+//!    the fragment's own resolution with the halo — read bilinearly at that
+//!    same resolution off the snap, #1186 — max-combined under it, the CRT pass
+//!    and the composite.
 //!
 //! The blur runs on a glow-free skin too, for the reason
 //! [`program`](super::program) gives: at radius `0` it is the identity and at
@@ -356,25 +366,25 @@ mod tests {
     const SEG2_BASE: usize = 955;
     const SEG2_SLOPE: usize = 760;
 
-    /// The plateau value of the falloff, and the four fixed-point constants of
-    /// the CRT pass — the five the shader declared and nothing on this side
-    /// stated (#1150 review, MEDIUM-2).
+    /// The plateau value of the falloff — one of the five the shader declared
+    /// and nothing on this side stated (#1150 review, MEDIUM-2).
     ///
-    /// `CORE` is `intensity`'s `s <= 1/2` return; the other four are
-    /// `hytte-preem/src/style.rs`'s own (private) `MASK_ONE`, `COORD_ONE`,
-    /// `BAND_DIV` and `CORNER_DIV`, verbatim. They are a **copy**, like the
-    /// knots above, for the same reason: those items are private to the kit and
-    /// this crate cannot read them. What the tests buy is that a change to one
-    /// side alone goes red — and, for the two divisors, that the *behaviour*
-    /// they decide is measured against the kit's at a pitch where the two
-    /// candidate values actually differ. See
+    /// `CORE` is `intensity`'s `s <= 1/2` return, and it stays a **copy** for
+    /// the reason the knots above are: `intensity` is private to the kit and
+    /// this crate cannot read it. What the test buys is that a change to one
+    /// side alone goes red.
+    ///
+    /// The other four of those five — the CRT pass's `MASK_ONE`, `COORD_ONE`,
+    /// `BAND_DIV` and `CORNER_DIV` — were copies here too until #1186 made the
+    /// kit's own items `pub`. They are now read out of `hytte_preem` directly,
+    /// by `program::assert_crt_constants`, so the shader's literal is held
+    /// against the value the kit actually renders with instead of against a
+    /// second copy of the number sitting beside the test. See
     /// [`tests::the_shader_and_the_mapping_agree_about_the_crt_mask_constants`]
-    /// and the `DisplayAt::Coarse` harness case.
+    /// and — for the half that catches the kit and the shader moving *together*
+    /// — the `DisplayAt::Coarse` harness case, which renders at a pitch where
+    /// the two candidate `BAND_DIV` values actually differ.
     const CORE: usize = 255;
-    const MASK_ONE: usize = 256;
-    const COORD_ONE: usize = 1024;
-    const BAND_DIV: usize = 9;
-    const CORNER_DIV: usize = 6;
 
     /// `round(num / denom)`, half away from zero — the kit's `round_div`.
     fn round_div(num: usize, denom: usize) -> u16 {
@@ -553,9 +563,19 @@ mod tests {
     /// `band = shortSide / BAND_DIV` and every case's short side was `9 * dot`
     /// for `dot` in `{2, 4}`, where `36/9 == 36/8` and `18/9 == 18/8`.
     ///
-    /// **Falsified** by changing any of the five on either side alone. Note
-    /// what this test does *not* do: it cannot see the shader and the kit
-    /// drifting together, because the kit's copies are private. The
+    /// **The four CRT constants are now the kit's own items** (#1186), not a
+    /// second Rust copy of the same numbers declared beside this test: the
+    /// counterpart they carry is `hytte_preem::{MASK_ONE, COORD_ONE, BAND_DIV,
+    /// CORNER_DIV}`, read through the shared
+    /// `program::assert_crt_constants` that `scope_blit.frag` and
+    /// `gauge.frag` call too. That closes half of the hole below — a change to
+    /// the *kit's* value alone now reddens here, where before it moved neither
+    /// mirror. `CORE` stays a local copy because `intensity` is still private.
+    ///
+    /// **Falsified** by changing `CORE` on either side, by editing one of the
+    /// four literals in `dot_matrix.frag`, or by moving one constant in
+    /// `hytte-preem/src/style.rs`. Note what this test still does *not* do: it
+    /// cannot see the shader and the kit drifting **together**. The
     /// `dot_matrix.*.coarse` harness case is the half that can — at
     /// `MAX_DOT_PX` the short side is 72, where `72/9 == 8` and `72/8 == 9`,
     /// so the CRT vignette's ramp is a different width and the comparison
@@ -567,18 +587,7 @@ mod tests {
             BODY.contains(&wanted),
             "dot_matrix.frag must declare `{wanted}`",
         );
-        for (name, value) in [
-            ("MASK_ONE", MASK_ONE),
-            ("COORD_ONE", COORD_ONE),
-            ("BAND_DIV", BAND_DIV),
-            ("CORNER_DIV", CORNER_DIV),
-        ] {
-            let wanted = format!("const int {name} = {value};");
-            assert!(
-                BODY.contains(&wanted),
-                "dot_matrix.frag must declare `{wanted}`",
-            );
-        }
+        super::super::program::assert_crt_constants("dot_matrix.frag", BODY);
     }
 
     /// …and the same for the font metrics, which this side reads out of
@@ -599,6 +608,59 @@ mod tests {
                 "dot_matrix.frag must declare `{wanted}`",
             );
         }
+    }
+
+    /// The blit reads the **halo** at the fragment's resolution on the
+    /// continuous branch, and with one `texelFetch` on the snapped one (#1186).
+    ///
+    /// A source read for the `the_shader_and_the_mapping_agree_about_*` reason —
+    /// nothing in the tree compiles the GLSL until a driver does — but it is
+    /// protecting a shape rather than a number, and it is here because **no
+    /// comparison against the CPU oracle** can protect this one. Measured: the
+    /// grid-resolution `texelFetch(u_tex1, ivec2(col, row))` this replaced
+    /// leaves every oracle-facing check green (it moves only the four stretched
+    /// dot-matrix and four stretched marquee cases, and only by ~1 on an edge
+    /// mean against a budget of 16). It could not be otherwise: the kit's own
+    /// halo *is* grid-resolution, so replicating it agrees with the oracle
+    /// slightly **better** than resolving it per fragment does, and an
+    /// oracle-based gate could only ever penalise this change. The two halves
+    /// asserted below are the two ways that revert can be spelled: deleting
+    /// `halo_at`, or keeping it and dropping the `snapped ?` fan-out at the
+    /// call site.
+    ///
+    /// **The harness does hold it, since #1238's review — just not by
+    /// comparing.** `parity::flat_block_fraction` asks the *native*
+    /// supersampled readback whether it is actually denser than the kit's grid,
+    /// and a replicated halo answers no: the fraction of internally-constant
+    /// `n × n` blocks jumps from 33.3 %/49.3 % to 79.8 %/79.7 % on the
+    /// dot matrix's crt and oled cases under the revert, against a ceiling of
+    /// 60 % (`parity::Kind::flat_block_ceiling`). So this test is the cheap
+    /// guard that needs no driver, not the only one — and the two disagree
+    /// about which skins they cover, which is why both are here: the gate is
+    /// blind to the vfd (whose replicated frame measures exactly what the
+    /// bloomless lcd control does) and to every 1:1 case, and this test is
+    /// blind to whether `halo_at` interpolates *correctly*.
+    ///
+    /// What it cannot see, stated for the same reason
+    /// `parity::case_verdict`'s doc states its own hole: it says nothing about
+    /// whether `halo_at` computes a *correct* bilinear tap. The harness is what
+    /// says that, via the edge budget — a wrong interpolation moves those eight
+    /// cases much further than the ~1 a resolution change does.
+    ///
+    /// **Falsified** by reverting either half — by putting
+    /// `texel(u_tex1, ivec2(col, row))` back on both branches, or by deleting
+    /// `halo_at`'s declaration.
+    #[test]
+    fn the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap() {
+        assert!(
+            BODY.contains("int halo_at(vec2 p) {"),
+            "dot_matrix.frag must declare the bilinear halo reader `halo_at`",
+        );
+        assert!(
+            BODY.contains("int glow = snapped ? texel(u_tex1, ivec2(col, row)) : halo_at(pc);"),
+            "the blit's halo read must be gated on the snap exactly as the \
+             lattice's sample point is — `texelFetch` at 1:1, `halo_at` above it",
+        );
     }
 
     /// The two layers are the **same body** with one line in front of it.

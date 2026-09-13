@@ -866,9 +866,18 @@ mod tests {
     /// `hytte-preem`'s `gauge.rs` too and this test is what says so.
     ///
     /// Declared as a list rather than derived, so a constant the shader grows
-    /// on its own (a purely GL quantity like `F32_EPSILON` or the CRT's
-    /// `MASK_ONE`) does not have to be given a Rust counterpart it has no
-    /// meaning for. What the list covers is every value that is *shared*.
+    /// on its own (a purely GL quantity like `F32_EPSILON`) does not have to be
+    /// given a Rust counterpart it has no meaning for. What the list covers is
+    /// every value that is *shared*.
+    ///
+    /// The CRT pass's four — `MASK_ONE`, `COORD_ONE`, `BAND_DIV`,
+    /// `CORNER_DIV` — sat on the wrong side of that line until #1186. This doc
+    /// called them "a purely GL quantity"; they are `hytte-preem`'s own, copied
+    /// into this shader out of `scope_blit.frag` along with the rest of the
+    /// composite, and they were merely *unreadable* (private to the kit) rather
+    /// than unshared. #1186 made them `pub`, so they are checked here too now,
+    /// through the shared `program::assert_crt_constants` the other two shaders
+    /// in that lineage call.
     ///
     /// **Falsified** by changing any entry on either side of the seam.
     #[test]
@@ -909,6 +918,8 @@ mod tests {
                 "gauge.frag's {name} is not the kit's {kit_value}",
             );
         }
+
+        super::super::program::assert_crt_constants("gauge.frag", LIT_FRAG);
     }
 
     /// The shader's motion-blur intensities are the kit's `TRAIL_T`, **element

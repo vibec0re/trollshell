@@ -223,3 +223,22 @@ pub use style::{Ink, Pins, with_ink, with_pins};
 /// [`Emission::composite`](self)'s loop, and must agree with the CPU kit byte
 /// for byte to stay inside the parity ceiling.
 pub use style::{BloomSnapshot, MaskSnapshot, PaletteSnapshot, palette_snapshot};
+
+/// The CRT pass's four fixed-point constants (#1186), for the **one** kind of
+/// consumer that has to restate them: a renderer outside this crate that
+/// re-implements [`DisplayStyle::Crt`]'s mask in a language which cannot read a
+/// Rust `const` at all.
+///
+/// That is the shell's GPU arm, where `scope_blit.frag`, `dot_matrix.frag` and
+/// `gauge.frag` each declare `MASK_ONE`/`COORD_ONE`/`BAND_DIV`/`CORNER_DIV` as
+/// GLSL literals. The copy is unavoidable, so what these exports buy is that it
+/// can be *checked*: each of those shaders has a test on the far side that
+/// parses the shipped GLSL and holds its literal against the item here. Before
+/// this, the GL side compared its literal against a second Rust copy of the
+/// number sitting beside the test — a mirror agreeing with a mirror, which
+/// stays green when the kit moves under both. The #1148 MEDIUM-3 shape, which
+/// the gauge's own [`ARC_HW`]-and-friends already had.
+///
+/// Additive and visibility-only: no kit render path changed, and nothing here
+/// is author-facing — a plugin drawing a widget never names one.
+pub use style::{BAND_DIV, COORD_ONE, CORNER_DIV, MASK_ONE};

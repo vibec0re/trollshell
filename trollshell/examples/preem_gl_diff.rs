@@ -995,11 +995,22 @@ impl Runner {
                 .iter()
                 .filter(|case| case.sampling() != parity::Sampling::OneToOne)
                 .count();
+            // The flatness ceiling (`parity::with_native_flatness`) only ever
+            // *asserts* under `TROLLSHELL_PARITY_EXACT=1` — without it, the
+            // per-case verdict above still prints the measured fraction but
+            // never fails on it (#1238's review, LOW). Saying "inside their
+            // ceiling" regardless would claim a plain run checked something it
+            // only ever printed.
+            let flatness = if self.exact {
+                "inside their native-frame flatness ceiling where their kind states one"
+            } else {
+                "with their native-frame flatness printed, not asserted, since \
+                 TROLLSHELL_PARITY_EXACT=1 was not set"
+            };
             println!(
                 "PASS all {} case(s) — {} 1:1 ones inside the proposed ceiling on every \
                  channel, {supersampled} box-averaged ones bit-identical off every edge, \
-                 inside their edge budget and inside their native-frame flatness ceiling \
-                 where their kind states one",
+                 inside their edge budget and {flatness}",
                 self.cases.len(),
                 self.cases.len() - supersampled,
             );

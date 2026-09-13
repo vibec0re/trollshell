@@ -800,7 +800,9 @@ mod tests {
     }
 
     /// **Every logical length the shader draws with is multiplied by the
-    /// upscale**, and the factor it is multiplied by is the upscale uniform.
+    /// upscale, and by nothing else** — the factor it is multiplied by is
+    /// exactly the upscale uniform, with no leading or trailing extra term and
+    /// no literal hiding in place of the named constant.
     ///
     /// The fourth of the arm's scale-only decisions, and the one no other gate
     /// can see (#1148 review, HIGH-2). The pivot offset is pinned by
@@ -813,43 +815,64 @@ mod tests {
     /// inside the budget. Measured: with `s` pinned to `1.0`, all 28 harness
     /// cases pass and the whole unit suite is green.
     ///
-    /// So it is pinned here, in the source, in the two ways it can break:
-    /// `s` stopping being the upscale, and a use of a length losing its `* s`.
-    /// A source scan is a weak instrument and this is the case that earns one —
-    /// the alternative is no check at all on a change that halves every tick on
-    /// every dial on the glass.
+    /// **#1164 re-verify note**: this used to check only that a line mentioning
+    /// a name also mentioned `* s`/`* u_upscale` *somewhere* — which is what it
+    /// is multiplied **by**, not what it is multiplied **into**. A #1238
+    /// re-verification widened every tick and the flat-arc band by 50 % at the
+    /// shipping scale (`NAME * 1.5 * s` and `NAME * s * 1.5` both still contain
+    /// `NAME` and `* s` on the same line) and every gate — this one, the `glsl`
+    /// lint, and the rendered parity harness at `scale == 1` — stayed green.
+    /// It now delegates to `parity::assert_scaled_lengths`, which anchors on
+    /// the exact text from each constant through its multiply, immediately
+    /// followed by the statement's own terminator: a leading extra factor
+    /// breaks the match before the constant even starts, a trailing one breaks
+    /// it right after the multiply, and a literal standing in for the constant
+    /// (hiding the extra factor as a rewritten "kit" value rather than a second
+    /// multiplicand) fails simply because the constant's name is no longer in
+    /// the source at all.
+    ///
+    /// So it is pinned here, in the source, in the two ways it can break: `s`
+    /// stopping being the upscale, and a use of a length losing its exact,
+    /// untampered `* s` (or `* u_upscale`). A source scan is a weak instrument
+    /// and this is the case that earns one — the alternative is no check at
+    /// all on a change that widens every tick and every arc on every dial on
+    /// the glass.
     ///
     /// **Falsified** by `float s = u_upscale;` -> `float s = 1.0;` (the first
-    /// assertion), or by dropping the `* s` from any of the half-widths (the
-    /// second).
+    /// assertion); by a leading extra factor (`ARC_HW * s` -> `ARC_HW * 1.5 *
+    /// s`); by a trailing one (`MAJOR_HW * s` -> `MAJOR_HW * s * 1.5`); or by a
+    /// literal standing in for the named constant (`(ARC_HW + VALUE_HW_BONUS)`
+    /// -> `(ARC_HW + 0.5)`).
     #[test]
     fn the_shader_scales_every_logical_length_it_draws_with() {
+        use super::super::parity::assert_scaled_lengths;
+
         assert!(
             LIT_FRAG.contains("float s = u_upscale;"),
             "gauge.frag's face resolves its half-widths against `s`; `s` must be the \
              upscale uniform, or every tick and arc is drawn at its logical width on a \
              native-resolution grid",
         );
-        // The declaration block is where these are *defined* in logical px; it
-        // is every line after it that has to carry them into native ones.
-        let body = LIT_FRAG
-            .split_once("const float F32_EPSILON")
-            .map_or(LIT_FRAG, |(_, rest)| rest);
-        for name in [
-            "ARC_HW",
-            "VALUE_HW_BONUS",
-            "MAJOR_HW",
-            "MINOR_HW",
-            "BLADE_TIP",
-        ] {
-            for line in body.lines().filter(|line| line.contains(name)) {
-                assert!(
-                    line.contains("* s") || line.contains("* u_upscale"),
-                    "gauge.frag draws with {name} without scaling it into native pixels: \
-                     {line}",
-                );
-            }
-        }
+        assert_scaled_lengths(
+            "gauge.frag",
+            LIT_FRAG,
+            &[
+                // The flat scale arc's half-width, in `face_intensity`.
+                ("ARC_HW", "ARC_HW * s", ','),
+                // The major/mid tick half-width — same text at both of its two
+                // call sites (the mid tick's own clause and the major one's).
+                ("MAJOR_HW", "MAJOR_HW * s", ';'),
+                // The minor tick half-width.
+                ("MINOR_HW", "MINOR_HW * s", ';'),
+                // The needle blade's tip half-width, in `blade_shade`.
+                ("BLADE_TIP", "BLADE_TIP * u_upscale", ','),
+                // The value arc's extra fattening over `ARC_HW`, folded into
+                // one sum before the multiply — pinning the text from the
+                // sum's close paren through the multiply is what catches the
+                // constant being swapped for a bare literal.
+                ("VALUE_HW_BONUS", "VALUE_HW_BONUS) * u_upscale", ','),
+            ],
+        );
     }
 
     /// **Every constant `gauge.frag` shares with the kit is the kit's value**,

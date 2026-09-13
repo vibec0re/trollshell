@@ -32,7 +32,7 @@
 
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
-use hytte_bus::BusKind;
+use hytte_bus::{BusKind, SignalItem};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::time::Duration;
@@ -458,19 +458,48 @@ async fn pump_device_props(path: String, wake_tx: mpsc::Sender<()>) {
         .signal("PropertiesChanged")
         .start();
 
-    let mut events = sub.events();
-    while events.next().await.is_some() {
+    drive_device_pump(&path, sub.items(), &wake_tx).await;
+
+    tracing::debug!(path, "networkd_nm: per-device signal stream ended");
+}
+
+/// The body of [`pump_device_props`], over an injected item stream.
+///
+/// Both an ordinary emission and a `Resubscribed`/`Lagged` marker (#1201) wake
+/// the watcher loop the same way: the wakeup just asks for a fresh
+/// `GetDevices`-driven refresh, and re-reading everything is exactly the repair
+/// a missed `PropertiesChanged` needs too. Before #1201 this was `events()`,
+/// which cannot represent either marker, so a subscription that quietly
+/// rebuilt mid-gap left this device's state stale until the 5 s poll happened
+/// to catch up.
+///
+/// Split out so that choice is actually guarded (#1201 review L5). Measured:
+/// reverting the loop to `sub.events()` compiled clean and left the whole
+/// suite green, because nothing else in this file looks at the item type.
+/// With the stream injected it is guarded twice — by this signature (an
+/// `events()` stream yields `SignalEvent`, which does not fit) and by a test
+/// that pushes a marker through and expects a wake, which cannot even be
+/// written against `events()`.
+async fn drive_device_pump<S>(path: &str, mut items: S, wake_tx: &mpsc::Sender<()>)
+where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+{
+    while let Some(item) = items.next().await {
+        if matches!(item, SignalItem::Resubscribed | SignalItem::Lagged { .. }) {
+            tracing::info!(
+                path,
+                "networkd_nm: per-device PropertiesChanged resubscribed; waking watcher"
+            );
+        }
         // A `Full` queue is not backpressure to wait on: a wakeup is already
         // pending and the refresh it triggers re-reads NM, so it will observe
         // this change too. Dropping the duplicate also keeps the pump from
         // blocking behind a slow multi-round-trip refresh. Only `Closed` — the
         // watcher loop is gone — ends the pump.
         if let Err(mpsc::error::TrySendError::Closed(())) = wake_tx.try_send(()) {
-            break;
+            return;
         }
     }
-
-    tracing::debug!(path, "networkd_nm: per-device signal stream ended");
 }
 
 // ── Main watcher task ──────────────────────────────────────────────────────────
@@ -486,6 +515,34 @@ async fn refresh_and_reconcile(
     if let Some(devices) = refresh(links_out, primary_out, source_out).await {
         watches.reconcile(&devices);
     }
+}
+
+/// Handle one item from `DeviceAdded`/`DeviceRemoved`/manager
+/// `PropertiesChanged`: run `refresh` for both an ordinary emission and a
+/// `Resubscribed`/`Lagged` marker (#1201) — before #1201 these three
+/// subscriptions were read via `events()`, which cannot represent either
+/// marker, so a subscription that silently rebuilt mid-gap left the link
+/// list stale until the 5 s poll happened to catch up.
+///
+/// `refresh` is `FnOnce`, not `FnMut`: each call site below builds a fresh
+/// closure per loop iteration and this is called at most once, so the
+/// closure can soundly return a future that holds `&mut watches` across the
+/// `.await` — an `FnMut`/`AsyncFnMut` bound here would hit the same rustc
+/// limitation `bluetooth::devices::bluetooth_marker_or_event`'s doc
+/// describes (`Send` is "not general enough" once this loop is spawned via
+/// `spawn_supervised`). Injectable so a test can stand in for the real
+/// `GetDevices`-driven [`refresh_and_reconcile`] round trip with a counter.
+async fn handle_nm_item<Refresh, Fut>(item: SignalItem, what: &'static str, refresh: Refresh)
+where
+    Refresh: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if matches!(item, SignalItem::Resubscribed | SignalItem::Lagged { .. }) {
+        tracing::info!(what, "networkd_nm: resubscribed; refreshing links");
+    } else {
+        tracing::debug!(what, "networkd_nm: refreshing links");
+    }
+    refresh().await;
 }
 
 /// NM link watcher loop. Reads the initial device list, then refreshes on:
@@ -534,9 +591,9 @@ pub(crate) async fn run_nm_links_watcher(
         .signal("PropertiesChanged")
         .start();
 
-    let mut added_events = device_added.events();
-    let mut removed_events = device_removed.events();
-    let mut manager_events = manager_props.events();
+    let mut added_items = device_added.items();
+    let mut removed_items = device_removed.items();
+    let mut manager_items = manager_props.items();
 
     // Per-device `PropertiesChanged` wakeups arrive here. `watches` owns the
     // sender, so the receiver never closes while this loop lives — and dropping
@@ -555,16 +612,20 @@ pub(crate) async fn run_nm_links_watcher(
 
     loop {
         tokio::select! {
-            Some(_) = added_events.next() => {
-                tracing::debug!("networkd_nm: DeviceAdded; refreshing links");
-                refresh_and_reconcile(&mut watches, &links_out, &primary_out, &source_out).await;
+            Some(item) = added_items.next() => {
+                handle_nm_item(item, "DeviceAdded", || {
+                    refresh_and_reconcile(&mut watches, &links_out, &primary_out, &source_out)
+                }).await;
             }
-            Some(_) = removed_events.next() => {
-                tracing::debug!("networkd_nm: DeviceRemoved; refreshing links");
-                refresh_and_reconcile(&mut watches, &links_out, &primary_out, &source_out).await;
+            Some(item) = removed_items.next() => {
+                handle_nm_item(item, "DeviceRemoved", || {
+                    refresh_and_reconcile(&mut watches, &links_out, &primary_out, &source_out)
+                }).await;
             }
-            Some(_) = manager_events.next() => {
-                refresh_and_reconcile(&mut watches, &links_out, &primary_out, &source_out).await;
+            Some(item) = manager_items.next() => {
+                handle_nm_item(item, "manager PropertiesChanged", || {
+                    refresh_and_reconcile(&mut watches, &links_out, &primary_out, &source_out)
+                }).await;
             }
             Some(()) = wake_rx.recv() => {
                 // Collapse a burst into one read. NM walks a device through
@@ -887,5 +948,91 @@ mod tests {
             "a pump whose stream ended must be re-created"
         );
         assert_eq!(w.watched(), watched(&[WIFI]));
+    }
+
+    // ── #1201: DeviceAdded/DeviceRemoved/manager PropertiesChanged and the
+    //    per-device pump refresh on Resubscribed/Lagged, not just on an
+    //    ordinary emission ────────────────────────────────────────────────
+
+    /// Before #1201 these three subscriptions were read via `events()`,
+    /// which cannot represent either marker, so a subscription that
+    /// silently rebuilt mid-gap left the link list stale until the 5 s poll
+    /// happened to catch up. Pushing one marker through `handle_nm_item`
+    /// must call `refresh` exactly once — for both `Resubscribed` and a
+    /// broadcast `Lagged`.
+    ///
+    /// Falsifiable: reverting to an `events()`-shaped filter (only
+    /// refreshing on `SignalItem::Event`) drops both counts to 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nm_item_refreshes_exactly_once_per_marker() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            handle_nm_item(SignalItem::Resubscribed, "test", || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Resubscribed must refresh exactly once"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            handle_nm_item(SignalItem::Lagged { skipped: 4 }, "test", || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Lagged must refresh exactly once"
+        );
+    }
+
+    /// The per-device pump's own guard (#1201 review L5). The three arms above
+    /// are type-enforced — `handle_nm_item` takes a `SignalItem` — but the pump
+    /// consumed its stream inline, so reverting it to `sub.events()` compiled
+    /// clean and left the suite green at 815/815. A marker must wake the
+    /// watcher exactly like an emission does.
+    ///
+    /// Falsifiable two ways: the `events()` revert no longer type-checks
+    /// against `drive_device_pump`, and deleting the `try_send` leaves the
+    /// queue empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_device_pump_wakes_the_watcher_for_a_marker() {
+        for item in [SignalItem::Resubscribed, SignalItem::Lagged { skipped: 4 }] {
+            let (tx, mut rx) = mpsc::channel::<()>(DEVICE_WAKE_QUEUE);
+            drive_device_pump(WIFI, futures_util::stream::iter(vec![item]), &tx).await;
+            assert!(rx.try_recv().is_ok(), "a marker must wake the watcher");
+            assert!(rx.try_recv().is_err(), "exactly one wake, not two");
+        }
+    }
+
+    /// And the pump gives up when the watcher loop is gone, rather than
+    /// spinning on a dead channel for the rest of the session.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_device_pump_stops_when_the_watcher_is_gone() {
+        let (tx, rx) = mpsc::channel::<()>(DEVICE_WAKE_QUEUE);
+        drop(rx);
+        // An endless stream: only the closed channel can end this.
+        let pump = drive_device_pump(
+            WIFI,
+            futures_util::stream::repeat(SignalItem::Resubscribed),
+            &tx,
+        );
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("a pump nobody listens to must stop");
     }
 }

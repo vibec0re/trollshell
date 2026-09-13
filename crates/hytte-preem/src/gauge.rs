@@ -379,6 +379,16 @@ const DEFAULT_ROWS: usize = 64;
 /// Default integer upscale baked into the output ([`Frame::upscale`]): chunky,
 /// nearest-neighbor pixels, the kit's house look.
 const DEFAULT_SCALE: usize = 2;
+/// Largest accepted integer upscale (see [`Gauge::scale`]). Matches the
+/// wire's `MAX_SCALE`: the kit's own default is 2x, and 8x is already a
+/// chunkier pixel than any skin reads well at.
+const MAX_SCALE: usize = 8;
+
+/// Largest accepted logical buffer dimension (see [`Gauge::with_size`]).
+/// Matches the wire's `MAX_BUFFER_DIM`: `2048 * 2048 * 4 B` is a single
+/// `Node::Pixels` frame's worth of RGBA8, so nothing built at or under this
+/// bound can outgrow what one frame could always have carried.
+const MAX_BUFFER_DIM: usize = 2048;
 
 /// Default total sweep, in degrees — the classic panel/automotive dial arc.
 const DEFAULT_SWEEP_DEG: f32 = 150.0;
@@ -391,8 +401,16 @@ const MAX_SWEEP_DEG: f32 = 180.0;
 
 /// Default major divisions (intervals between long ticks).
 const DEFAULT_DIVISIONS: usize = 4;
+/// Largest accepted major-division count (see [`Gauge::ticks`]). Matches the
+/// wire's `MAX_DIVISIONS`.
+const MAX_DIVISIONS: usize = 64;
 /// Default minor ticks per major division.
 const DEFAULT_SUBDIVISIONS: usize = 5;
+/// Largest accepted minor-tick count (see [`Gauge::ticks`]). Matches the
+/// wire's `MAX_SUBDIVISIONS`: the gauge rasterises `divisions * subdivisions`
+/// tick marks every frame, so this is capped tighter than [`MAX_DIVISIONS`] to
+/// keep the worst-case product cheap.
+const MAX_SUBDIVISIONS: usize = 32;
 
 /// Clear logical pixels kept between the scale arc and the buffer edge, so the
 /// arc's soft edge never clips.
@@ -779,14 +797,15 @@ impl Gauge {
         Self::with_size(DEFAULT_COLS, DEFAULT_ROWS)
     }
 
-    /// A gauge with an explicit **logical** buffer size (pre-upscale), clamped
-    /// to at least 1×1. The rendered frame is `width`×`scale` by `height`×`scale`
-    /// px — keep it within the ~296 px sidebar card (the default is 288 px wide).
+    /// A gauge with an explicit **logical** buffer size (pre-upscale), each
+    /// dimension clamped to `1..=`[`MAX_BUFFER_DIM`]. The rendered frame is
+    /// `width`×`scale` by `height`×`scale` px — keep it within the ~296 px
+    /// sidebar card (the default is 288 px wide).
     #[must_use]
     pub fn with_size(width: usize, height: usize) -> Self {
         Self {
-            cols: width.max(1),
-            rows: height.max(1),
+            cols: width.clamp(1, MAX_BUFFER_DIM),
+            rows: height.clamp(1, MAX_BUFFER_DIM),
             scale: DEFAULT_SCALE,
             sweep: DEFAULT_SWEEP_DEG.to_radians(),
             divisions: DEFAULT_DIVISIONS,
@@ -795,12 +814,13 @@ impl Gauge {
         }
     }
 
-    /// Set the integer upscale baked into the output (clamped to at least 1) —
-    /// the kit bakes chunkiness into the buffer rather than leaning on shell CSS
-    /// (the `.caw-lcd` lesson). A consuming builder; call it at construction.
+    /// Set the integer upscale baked into the output, clamped to
+    /// `1..=`[`MAX_SCALE`] — the kit bakes chunkiness into the buffer rather
+    /// than leaning on shell CSS (the `.caw-lcd` lesson). A consuming
+    /// builder; call it at construction.
     #[must_use]
     pub fn scale(mut self, factor: usize) -> Self {
-        self.scale = factor.max(1);
+        self.scale = factor.clamp(1, MAX_SCALE);
         self
     }
 
@@ -815,13 +835,14 @@ impl Gauge {
         self
     }
 
-    /// Set the tick layout: `divisions` major intervals, each cut into
-    /// `subdivisions` minor steps (both clamped to at least 1). Defaults:
-    /// [`DEFAULT_DIVISIONS`] and [`DEFAULT_SUBDIVISIONS`]. A consuming builder.
+    /// Set the tick layout: `divisions` major intervals (clamped to
+    /// `1..=`[`MAX_DIVISIONS`]), each cut into `subdivisions` minor steps
+    /// (clamped to `1..=`[`MAX_SUBDIVISIONS`]). Defaults: [`DEFAULT_DIVISIONS`]
+    /// and [`DEFAULT_SUBDIVISIONS`]. A consuming builder.
     #[must_use]
     pub fn ticks(mut self, divisions: usize, subdivisions: usize) -> Self {
-        self.divisions = divisions.max(1);
-        self.subdivisions = subdivisions.max(1);
+        self.divisions = divisions.clamp(1, MAX_DIVISIONS);
+        self.subdivisions = subdivisions.clamp(1, MAX_SUBDIVISIONS);
         self
     }
 
@@ -1457,9 +1478,9 @@ pub fn trail_fraction(fraction: f32, velocity: f32, back: f32) -> f32 {
 mod tests {
     use super::{
         ARC_HW, BLADE_TIP, DEFAULT_DAMPING, DEFAULT_FREQ_HZ, DisplayStyle, FEATHER, Gauge, Grid,
-        MAJOR_HW, MAX_DAMPING, MAX_FREQ_HZ, MID_LEN_BONUS, MIN_DAMPING, MIN_FREQ_HZ, Needle,
-        OVERTRAVEL, Tick, VALUE_HW_BONUS, coverage, fx, on_dial, polar, shade, span,
-        trail_fraction,
+        MAJOR_HW, MAX_BUFFER_DIM, MAX_DAMPING, MAX_DIVISIONS, MAX_FREQ_HZ, MAX_SCALE,
+        MAX_SUBDIVISIONS, MID_LEN_BONUS, MIN_DAMPING, MIN_FREQ_HZ, Needle, OVERTRAVEL, Tick,
+        VALUE_HW_BONUS, coverage, fx, on_dial, polar, shade, span, trail_fraction,
     };
     use std::f32::consts::PI;
 
@@ -2162,6 +2183,83 @@ mod tests {
         let bare_gauge = Gauge::new().ticks(0, 0);
         let bare: Vec<(f32, Tick)> = bare_gauge.tick_marks(bare_gauge.dial()).collect();
         assert_eq!(bare.len(), 2, "the two ends");
+    }
+
+    /// The `ticks` knob has a ceiling on each axis: `MAX_DIVISIONS`/
+    /// `MAX_SUBDIVISIONS` are accepted as configured, and anything past either
+    /// clamps down to exactly the bound (#1181).
+    ///
+    /// Checked against the raw configured counts rather than the resolved
+    /// [`Dial`] — a small-dial face separately *thins* `subdivisions` (see
+    /// [`Gauge::dial`]'s docs on [`tick_budget`]), which would mask whether
+    /// this knob's own ceiling ever fired.
+    #[test]
+    fn ticks_knob_has_ceilings_on_both_axes() {
+        let at_ceiling = Gauge::new().ticks(MAX_DIVISIONS, MAX_SUBDIVISIONS);
+        assert_eq!(at_ceiling.divisions, MAX_DIVISIONS);
+        assert_eq!(at_ceiling.subdivisions, MAX_SUBDIVISIONS);
+
+        let over_ceiling = Gauge::new().ticks(MAX_DIVISIONS + 1, MAX_SUBDIVISIONS + 1);
+        assert_eq!(
+            over_ceiling.divisions, MAX_DIVISIONS,
+            "one past the ceiling clamps down to exactly MAX_DIVISIONS"
+        );
+        assert_eq!(
+            over_ceiling.subdivisions, MAX_SUBDIVISIONS,
+            "one past the ceiling clamps down to exactly MAX_SUBDIVISIONS"
+        );
+
+        let way_over = Gauge::new().ticks(usize::MAX, usize::MAX);
+        assert_eq!(way_over.divisions, MAX_DIVISIONS, "usize::MAX clamps down too");
+        assert_eq!(way_over.subdivisions, MAX_SUBDIVISIONS, "usize::MAX clamps down too");
+    }
+
+    /// The `with_size` knob has both a floor and a ceiling on each axis: `0`
+    /// clamps up to `1`, and anything past `MAX_BUFFER_DIM` clamps down to
+    /// exactly the bound (#1181). Checked via the private `cols`/`rows`
+    /// fields rather than a full render — a `MAX_BUFFER_DIM` buffer is real
+    /// memory and this knob's contract is about the dimensions, not the ink.
+    #[test]
+    fn with_size_knob_has_both_bounds_on_each_axis() {
+        let floor = Gauge::with_size(0, 0);
+        assert_eq!((floor.cols, floor.rows), (1, 1), "0 clamps up to 1x1");
+
+        let at_ceiling = Gauge::with_size(MAX_BUFFER_DIM, MAX_BUFFER_DIM);
+        let over_ceiling = Gauge::with_size(MAX_BUFFER_DIM + 1, MAX_BUFFER_DIM + 1);
+        let way_over = Gauge::with_size(usize::MAX, usize::MAX);
+        assert_eq!((at_ceiling.cols, at_ceiling.rows), (MAX_BUFFER_DIM, MAX_BUFFER_DIM));
+        assert_eq!(
+            (over_ceiling.cols, over_ceiling.rows),
+            (at_ceiling.cols, at_ceiling.rows),
+            "one past the ceiling clamps down to exactly MAX_BUFFER_DIM"
+        );
+        assert_eq!(
+            (way_over.cols, way_over.rows),
+            (at_ceiling.cols, at_ceiling.rows),
+            "usize::MAX clamps down to exactly MAX_BUFFER_DIM"
+        );
+    }
+
+    /// The `scale` knob has both a floor and a ceiling: `0` clamps up to `1`,
+    /// and anything past `MAX_SCALE` clamps down to exactly the bound (#1181).
+    #[test]
+    fn scale_knob_has_both_bounds() {
+        let gauge = || Gauge::with_size(4, 4);
+        let floor = gauge().scale(0).render(DisplayStyle::Vfd);
+        let one = gauge().scale(1).render(DisplayStyle::Vfd);
+        assert_eq!(floor, one, "0 clamps up to exactly 1x");
+
+        let at_ceiling = gauge().scale(MAX_SCALE).render(DisplayStyle::Vfd);
+        let over_ceiling = gauge().scale(MAX_SCALE + 1).render(DisplayStyle::Vfd);
+        let way_over = gauge().scale(usize::MAX).render(DisplayStyle::Vfd);
+        assert_eq!(
+            at_ceiling, over_ceiling,
+            "one past the ceiling clamps down to exactly MAX_SCALE"
+        );
+        assert_eq!(
+            at_ceiling, way_over,
+            "usize::MAX clamps down to exactly MAX_SCALE"
+        );
     }
 
     // ── Sizing / host invariant ──────────────────────────────────────────────

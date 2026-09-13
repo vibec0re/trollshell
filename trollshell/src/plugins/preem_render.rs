@@ -3540,6 +3540,47 @@ mod tests {
         }
     }
 
+    /// Assert `got` is a raster node carrying exactly `want`'s pixels.
+    ///
+    /// Both halves matter and neither is enough alone: the node **kind** is
+    /// what a blank `GlSurface` would fail, and the **bytes** are what a
+    /// fallback that produced an empty or differently-sized buffer would fail.
+    /// The non-empty check is there so the comparison cannot be satisfied by
+    /// two placeholders agreeing with each other.
+    fn assert_same_raster(got: &UiNode, want: &UiNode) {
+        let (
+            UiNode::Pixels {
+                width,
+                height,
+                data,
+                ..
+            },
+            UiNode::Pixels {
+                width: want_w,
+                height: want_h,
+                data: want,
+                ..
+            },
+        ) = (got, want)
+        else {
+            panic!("expected two raster chips, got a GL one — the fallback did not engage");
+        };
+        assert_eq!(
+            (width, height),
+            (want_w, want_h),
+            "the fallback chip is the size the kit arm would have produced",
+        );
+        assert_eq!(
+            data.as_ref(),
+            want.as_ref(),
+            "…and it is the kit's raster, byte for byte — not a blank buffer",
+        );
+        assert!(
+            !data.is_empty(),
+            "…which is not empty, so this cannot pass vacuously",
+        );
+    }
+
     /// One widget per kind that **has** a GL arm, at its vocabulary defaults.
     ///
     /// Length-checked against [`preem_gl::Kind::ALL`], the #1211 enumeration
@@ -3699,38 +3740,7 @@ mod tests {
             let gauge_after = map_widget(&key, Some("ga"), &[], &gauge);
             end_pass(&key);
 
-            match (&scope_after, &oracle) {
-                (
-                    UiNode::Pixels {
-                        width,
-                        height,
-                        data,
-                        ..
-                    },
-                    UiNode::Pixels {
-                        width: want_w,
-                        height: want_h,
-                        data: want,
-                        ..
-                    },
-                ) => {
-                    assert_eq!(
-                        (width, height),
-                        (want_w, want_h),
-                        "the fallback chip is the size the kit arm would have produced",
-                    );
-                    assert_eq!(
-                        data.as_ref(),
-                        want.as_ref(),
-                        "…and it is the kit's raster, byte for byte — not a blank buffer",
-                    );
-                    assert!(
-                        !data.is_empty(),
-                        "…which is not empty, so this cannot pass vacuously",
-                    );
-                }
-                _ => panic!("a refused pipeline must leave a raster chip behind, not a GL one"),
-            }
+            assert_same_raster(&scope_after, &oracle);
 
             assert!(
                 matches!(gauge_after, UiNode::GlSurface { .. }),

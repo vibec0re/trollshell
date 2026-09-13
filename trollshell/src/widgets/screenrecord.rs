@@ -16,7 +16,12 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::recorder;
 
-pub fn widget(_monitor: &Monitor) -> gtk::Widget {
+/// The button + row + elapsed-time label, with no click or reactive binding
+/// wired in yet — those need `recorder::state()`, which `.expect()`s a
+/// registered `Registry` (#831). Split out so #1177's CSS-class snapshot test
+/// can build this much without one, the same split `disk.rs`'s
+/// `bind_disk_mounts` makes for the same reason.
+fn build_button() -> (gtk::Button, gtk::Label) {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-recording");
@@ -28,6 +33,12 @@ pub fn widget(_monitor: &Monitor) -> gtk::Widget {
     row.append(&dot);
     row.append(&time);
     btn.set_child(Some(&row));
+
+    (btn, time)
+}
+
+pub fn widget(_monitor: &Monitor) -> gtk::Widget {
+    let (btn, time) = build_button();
 
     btn.connect_clicked(|_| recorder::toggle());
 
@@ -50,4 +61,23 @@ pub fn widget(_monitor: &Monitor) -> gtk::Widget {
     });
 
     btn.upcast()
+}
+
+/// #1177: pins this chip's CSS class set as a snapshot, taken **before** the
+/// hand-rolled scaffold in [`build_button`] is replaced with
+/// `components::chip::action_indicator` — the two `add_css_class` calls there
+/// must survive that refactor unchanged. Falsified by adding/removing/renaming
+/// either class.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use hytte::gtk::{self, prelude::*};
+
+    use super::build_button;
+
+    #[gtk::test]
+    fn css_classes_are_ts_indicator_and_ts_recording() {
+        let (btn, _time) = build_button();
+        assert!(btn.has_css_class("ts-indicator"));
+        assert!(btn.has_css_class("ts-recording"));
+    }
 }

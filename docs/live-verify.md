@@ -744,29 +744,61 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
       certificate.** Stop nginx on the hive (leave `host.sock` up, so the
       header still populates and the window still gets a URL). The card must
       say `That is a connection problem rather than a certificate one`.
-- [ ] **(#1234)** **The freeze is bounded, and only the deadline bounds it.**
-      The probe runs on the GTK main thread, so while it runs nothing
-      repaints. Two constants, and only one of them is a bound:
+- [ ] **(#1246)** **A slow or dead hive does not freeze the window — it opens
+      instantly, on the verifying state.** This is the one to do on glass,
+      because it is the half CI cannot reach: stop nginx on the hive and put a
+      peer that accepts TCP and says nothing on the gateway's port
+      (`nc -l -p 443`), leaving `host.sock` up so the window still gets a URL.
+      Open the window from the sidebar card.
+
+      Expected, in this order and with a stopwatch on none of it:
+
+      1. The window appears **at once**, with the header already live (icon,
+         name, model, status — that half never touched TLS) and the Agent tab
+         showing a spinner over _"Verifying the hive's certificate…"_.
+      2. It is a **normal window the whole time**: grab it and drag it, switch
+         to the Settings tab and back, resize it. Nothing may stall. That is
+         the check — before #1246 all of this was dead for the whole bound.
+      3. After `verify::PROBE_DEADLINE` (8 s) the verifying state is replaced
+         by the failure card, whose first paragraph reads
+         `…the probe was cancelled after 8.0s`.
+
+      Then do it again with the hive **up** and confirm the verifying state is
+      a blink rather than a state you can read (the probe is a loopback round
+      trip — 3.6 ms measured, #1242's re-verification), and with the gateway's
+      host unroutable (point the URL at a blackholed address) to confirm the
+      same 8 s bound covers a name that never resolves, which is the arm only
+      the worker makes true.
+
+      **Also confirm one probe, not five.** The hive is polled every 2 s and
+      the poll is what mounts the page, so a probe that takes 8 s used to have
+      four more starting behind it. With the dead gateway up, watch
+      `journalctl --user -f` while the window sits verifying: there must be
+      exactly one `loading the agent's page` line, and `ss -tn state all
+      '( dport = :443 )'` must show one connection, not a growing pile. Then
+      run `trollshell-agent-window --agent <name> --tab settings` **while the
+      first window is still verifying**: it must move the running window's tab
+      and start nothing new.
+
+- [ ] **(#1234/#1246)** **The bound is the deadline, and it is the only bound.**
+      Two constants, and only one of them is a bound:
       `verify::PROBE_IO_TIMEOUT_SECS` (5 s) is GIO's **per-read** socket
       timeout, which every arriving byte resets — measured against a peer
-      dribbling one byte per 1.5 s, it let the window sit for **21.01 s**
+      dribbling one byte per 1.5 s, it let the probe run for **21.01 s**
       (#1242 review). `verify::PROBE_DEADLINE` (8 s) is the real one: a
       watchdog thread cancels the whole probe — connect, handshake, and the
       name resolution `connect_to_host` does inside itself — when it expires,
-      and the card then says `the probe was cancelled after 8.0s`. The same
-      dribbling peer now returns in ~2 s against a 2 s budget in
-      `tls_tests::a_dribbling_peer_cannot_hold_the_probe_past_its_deadline`.
+      and the card then says `the probe was cancelled after 8.0s`. Since
+      #1246 that watchdog cancels a **worker**, so what the deadline bounds is
+      how long the card can say "verifying" before it says why not.
       Two things sit outside it: the anchors file's own read and parse
       (`TlsFileDatabase::new` takes no cancellable — a local file read), and a
       `getaddrinfo` already in flight, which GIO abandons rather than aborts
       (the call returns on time; the pool thread finishes and discards).
-      To check it by hand, point the hive's URL at a host that accepts TCP and
-      says nothing (`nc -l` on the gateway's port with nginx stopped), open
-      the window, and time it: **grab the window and drag it** — it should
-      become responsive within ~8 s, not 20+. Moving the probe off the main
-      thread entirely, with a "verifying…" state on the card, is
-      [#1246](https://github.com/vibec0re/trollshell/issues/1246); until that
-      lands, a bounded freeze is what this is.
+      In CI the mechanism is pinned by
+      `tls_tests::a_dribbling_peer_cannot_hold_the_probe_past_its_deadline`
+      and, through the window's own worker,
+      `window::gtk_tests::the_deadline_bounds_a_probe_that_never_finishes_on_the_worker`.
 - [ ] **(#950/#1234)** **TLS — the inline error state names the way out.**
       With every automatic route removed (e.g.
       `TROLLSHELL_AGENT_WINDOW_TLS_DIR=/nonexistent`), **expect the window to

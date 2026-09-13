@@ -45,7 +45,9 @@ let
   #
   # `mount` (#1161): see `nix/hm-module.nix`'s matching comment — `null` (the
   # default) adds nothing to `env`, so the strictly-additive/byte-identical
-  # claim holds here too.
+  # claim holds here too, and the same `//` merge order makes `mount` beat a
+  # hand-set `env.HYTTE_PLUGIN_MOUNT` (asserted against in
+  # `nix/module-common.nix` rather than resolved silently, #1260 review F5).
   pluginsState = builtins.toJSON {
     version = 1;
     plugins = lib.mapAttrs (_: plugin: {

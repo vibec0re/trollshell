@@ -46,6 +46,12 @@ let
   # `HYTTE_PLUGIN_MOUNT`, which the launcher already turns into
   # `--setenv=HYTTE_PLUGIN_MOUNT=<name>` with no launcher change at all — the
   # override rides the same `env` path #392's key injection already uses.
+  #
+  # Note the merge order: `mount` is on the RIGHT of `//`, so it beats a
+  # hand-set `env.HYTTE_PLUGIN_MOUNT`. That is the right precedence (the
+  # typed option is the checked one) but would be a silent discard, so
+  # `nix/module-common.nix` asserts the two never disagree (#1260 review
+  # F5); agreeing values are merely redundant.
   pluginsState = builtins.toJSON (
     {
       version = 1;

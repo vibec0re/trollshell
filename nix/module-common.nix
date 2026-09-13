@@ -875,6 +875,26 @@ self:
                 where *this deployment* puts it — reinstalling the same
                 plugin elsewhere with `mount` unset goes right back to the
                 author's own choice.
+
+                **This option and `env.HYTTE_PLUGIN_MOUNT` are the same
+                knob, and this one wins.** Setting the variable by hand still
+                works (it is how the override was reached before this option
+                existed, and `docs/plugin-env.md` documents the variable
+                itself), but a non-null `mount` is merged over `env` when
+                `plugins.json` is rendered, so the two disagreeing would
+                silently discard the hand-written value. Rather than let that
+                happen quietly, setting **both** to different values is an
+                eval error naming the plugin; setting both to the same value
+                is merely redundant. Prefer this option: it is checked against
+                the nine wire names at eval time, while a hand-set variable is
+                only checked when the plugin tries to start.
+
+                **Mounting into the right sidebar needs the right sidebar.**
+                The three `SidebarRight*` values are accepted and rendered
+                today, and the host already routes a render to their
+                mailboxes — but no window mounts those mailboxes until
+                #1160/#1244 ships, so until then a card sent there simply does
+                not appear. The left-sidebar and bar values work now.
               '';
             };
           };
@@ -1277,6 +1297,40 @@ self:
   # flake.nix's `nixos-module-nightlight` for the same shape used for a
   # different removed knob.
   config.assertions = [
+    # `mount` and `env.HYTTE_PLUGIN_MOUNT` are the same knob (#1161; #1260
+    # review F5). Both platform modules render `plugin.env // (optionalAttrs
+    # (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })`, so the
+    # typed option wins — which is the right precedence (it is the checked
+    # one) but a *silent* discard of whatever the user wrote by hand. Refuse
+    # the disagreement instead; agreeing values are merely redundant and pass.
+    # Unconditional, like the `usage` assertion below, so both modules'
+    # `nix flake check` fixtures see it.
+    (
+      let
+        conflicting = lib.attrNames (
+          lib.filterAttrs (
+            _: plugin: plugin.mount != null && (plugin.env.HYTTE_PLUGIN_MOUNT or plugin.mount) != plugin.mount
+          ) config.programs.trollshell.plugins
+        );
+      in
+      {
+        assertion = conflicting == [ ];
+        # Lazy, as every assertion message is: only forced when the predicate
+        # above is false, so naming the offenders costs nothing on a clean
+        # config.
+        message = ''
+          These programs.trollshell.plugins entries set both `mount` and
+          `env.HYTTE_PLUGIN_MOUNT`, to different values: ${lib.concatStringsSep ", " conflicting}.
+
+          They are the same knob. `mount` is merged over `env` when
+          plugins.json is rendered, so `mount` wins and the hand-set
+          HYTTE_PLUGIN_MOUNT would be discarded with no warning. Drop one —
+          prefer `mount`, which nix type-checks against the nine wire names
+          at eval time, while a hand-set variable is only checked when the
+          plugin tries to start (and then only by failing to).
+        '';
+      }
+    )
     {
       assertion = !(config.programs.trollshell.plugins ? usage);
       message = ''

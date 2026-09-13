@@ -945,7 +945,10 @@ fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
     let declared = {
         let probe = probe_plugins_json(&hytte_config::xdg::Env::from_process());
-        state.declared.borrow_mut().get(probe, read_declared_mounts_at)
+        state
+            .declared
+            .borrow_mut()
+            .get(probe, read_declared_mounts_at)
     };
     let state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
@@ -2388,7 +2391,10 @@ mod tests {
             one_override()
         });
         assert_eq!(reads, 2, "a changed stamp must re-read");
-        assert_eq!(map.get("agents").map(String::as_str), Some("SidebarRightTop"));
+        assert_eq!(
+            map.get("agents").map(String::as_str),
+            Some("SidebarRightTop")
+        );
     }
 
     #[test]
@@ -2405,9 +2411,16 @@ mod tests {
     #[test]
     fn a_file_appearing_later_is_picked_up() {
         let mut cache = DeclaredMounts::default();
-        assert!(cache.get(None, |_| panic!("there is no file yet")).is_empty());
+        assert!(
+            cache
+                .get(None, |_| panic!("there is no file yet"))
+                .is_empty()
+        );
         let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| one_override());
-        assert_eq!(map.get("agents").map(String::as_str), Some("SidebarRightTop"));
+        assert_eq!(
+            map.get("agents").map(String::as_str),
+            Some("SidebarRightTop")
+        );
     }
 
     // ── The XDG search path (#1260 review F8) ────────────────────────────────

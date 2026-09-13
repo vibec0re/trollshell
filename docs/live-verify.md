@@ -1326,15 +1326,15 @@ opens what it claims.
       the card really is in the left sidebar while that line is up: the
       "rendering in" slot must never name the mount that did not take.
 - [ ] **(#1161/#1260)** The Plugins tab reads `plugins.json` once, not on
-      every 2 s poll. With the control-center open on **any** tab, run
-      `strace -f -e trace=openat -p $(pidof trollshell-control-center) 2>&1 |
-      grep plugins.json` for ~20 s: there should be **no** `openat` of
-      `plugins.json` at all once the tab has built (the poll only `stat`s it).
-      Then `nixos-rebuild switch` / `home-manager switch` with a changed
-      `mount` **while the window stays open** and confirm the row's note
-      follows the new value within a poll or two — the stamp
-      (`link target`, else `(mtime, len)`) is what makes a rebuild visible
-      without re-reading every tick.
+      every 2 s poll. With the control-center open on **any** tab, attach
+      `strace -f -e trace=openat -p "$(pidof trollshell-control-center)"` and
+      watch for `plugins.json` for ~20 s: there should be **no** `openat` of
+      it at all once the tab has built (the poll only `stat`s it). Then
+      `nixos-rebuild switch` / `home-manager switch` with a changed `mount`
+      **while the window stays open** and confirm the row's note follows the
+      new value within a poll or two — the stamp (the symlink's target, else
+      `(mtime, len)`) is what makes a rebuild visible without re-reading
+      every tick.
 
 ## Infobroker
 

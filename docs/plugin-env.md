@@ -279,11 +279,17 @@ a plugin-author idiom on top of the runtime, not part of it.
 | -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `HYTTE_PLUGIN_MOUNT` | unset   | **Where the plugin's card or chip mounts**, overriding the mount its own `manifest()` asked for (#1159). One of the nine wire mount names: `SidebarLead`, `SidebarTop`, `SidebarBottom`, `SidebarRightLead`, `SidebarRightTop`, `SidebarRightBottom`, `BarLeft`, `BarCenter`, `BarRight`. Read once in `run()` before the first dial and applied to every `Register` frame the process sends, reconnects included; the plugin's own code never sees it. An unknown or empty value is a **startup failure** naming all nine spellings — never a silent fallback to the manifest, which would put the card on the other sidebar and leave the plugin looking healthy. Surrounding whitespace is trimmed; the match is otherwise exact, case included. |
 
-Set it per plugin like any other var — `programs.trollshell.plugins.<id>.env.HYTTE_PLUGIN_MOUNT = "SidebarRightTop";`
-works today, and #1161 adds a checked `plugins.<id>.mount` option that renders
-the same variable from an enum of the nine names. It is the one knob here that is
-a _deployment_ decision rather than a plugin-author one, which is why it lives on
-the launch instead of in a config file (settled on #866; see epic #1158).
+**Set it with `programs.trollshell.plugins.<id>.mount`, not by hand** (#1161) —
+a checked enum of the nine names that renders this variable into that plugin's
+`env` in `plugins.json`. Nix rejects a misspelling at eval time; a hand-set
+`env.HYTTE_PLUGIN_MOUNT = "SidebarRightTop";` is only checked when the plugin
+tries to start, and then only by failing to. The hand-set route still works,
+but the two are **one knob and `mount` wins**: it is merged over `env` when
+`plugins.json` is rendered, so setting both to different values is an eval
+error rather than a silently discarded string (both platform modules assert
+this). It is the one knob here that is a _deployment_ decision rather than a
+plugin-author one, which is why it lives on the launch instead of in a config
+file (settled on #866; see epic #1158).
 
 **Prefer an override _within_ a family — bar↔sidebar changes a plugin's
 visibility semantics and it cannot adapt.** The nine names are not

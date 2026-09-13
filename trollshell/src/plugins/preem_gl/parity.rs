@@ -965,6 +965,17 @@ pub(crate) fn with_native_flatness(
 /// carries: it is only as strong as the `term` text each caller writes down,
 /// which is why every call site is expected to name the constant it means to
 /// pin rather than a fragment generic enough to match by accident.
+///
+/// `#[cfg(test)]` for `program::assert_crt_constants`'s own reason: unlike
+/// the rest of this file, this module (`parity`) is `#[path]`-included by the
+/// harness example **without** a `cfg(test)` gate on the `mod` declaration
+/// itself, so a plain `cargo build --example preem_gl_diff` compiles this
+/// function too — and its only caller lives in `gauge.rs`'s `#[cfg(test)] mod
+/// tests`, absent from that same build. Without this attribute the function
+/// is unreachable there and `dead_code` fires; with it, the function itself
+/// is absent from that build and there is nothing to warn about — exactly
+/// `assert_crt_constants`'s situation in `program.rs`.
+#[cfg(test)]
 pub(crate) fn assert_scaled_lengths(
     shader: &str,
     source: &str,

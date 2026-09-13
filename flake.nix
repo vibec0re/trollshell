@@ -217,6 +217,11 @@
           # The single whole-workspace compile (#572), mirroring the `packages`
           # output above.
           workspace = trollshell.passthru.workspace;
+          # The checks-universe probe-examples compile (#1257) — see
+          # nix/package.nix's `probes` binding. `probe`/`wifiProbe` below take
+          # BOTH this and `workspace`: the binary from here, the GApps wrap's
+          # `buildInputs` from `workspace.passthru.devInputs`.
+          probes = trollshell.passthru.probes;
 
           # The control-center companion app (#411), mirroring the `packages`
           # output above — a slice of `workspace`, no cargo of its own (#572).
@@ -305,15 +310,17 @@
 
           # The hytte-ecal `probe` example binary + fixture sources (a
           # task-list and a calendar), for the eds-nixos-test below. Since #588
-          # this is a slice of `workspace` — a `cp` + a GApps wrap, no cargo and
-          # no crane — exactly like the plugin packages above. Before #588 it
-          # was its own `buildDepsOnly` + `buildPackage` pair with its own `src`
-          # filter, i.e. a second full dependency compile per cold flake check.
-          probe = pkgs.callPackage ./nix/probe.nix { inherit workspace; };
+          # this is a slice — a `cp` + a GApps wrap, no cargo and no crane —
+          # exactly like the plugin packages above; since #1257 the binary it
+          # copies is `probes`' (the checks-universe compile), not
+          # `workspace`'s. Before #588 it was its own `buildDepsOnly` +
+          # `buildPackage` pair with its own `src` filter, i.e. a second full
+          # dependency compile per cold flake check.
+          probe = pkgs.callPackage ./nix/probe.nix { inherit workspace probes; };
           # The hytte-services `wifi_probe` example binary, for the
-          # wifi-nm-nixos-test below. Same slice treatment (#588) — it was the
-          # third full dependency compile.
-          wifiProbe = pkgs.callPackage ./nix/wifi-probe.nix { inherit workspace; };
+          # wifi-nm-nixos-test below. Same slice treatment (#588/#1257) — it
+          # was the third full dependency compile.
+          wifiProbe = pkgs.callPackage ./nix/wifi-probe.nix { inherit workspace probes; };
           taskSource = pkgs.writeText "test-tasks.source" ''
             [Data Source]
             DisplayName=Test Tasks
@@ -374,6 +381,14 @@
           # including why it names the ABI.
           shell-has-no-web-engine = pkgs.callPackage ./nix/checks/shell-has-no-web-engine.nix {
             inherit trollshell trollshell-control-center;
+          };
+
+          # The two nixosTest probe examples (`probe`, `wifi_probe`) must
+          # never creep back into the `workspace` compile every package
+          # output slices from (#1257) — see nix/checks/workspace-ships-no-
+          # probes.nix for the full mechanism and how to falsify it.
+          workspace-ships-no-probes = pkgs.callPackage ./nix/checks/workspace-ships-no-probes.nix {
+            inherit workspace;
           };
 
           # Lint the entire workspace with pedantic-clean Clippy. Reuses

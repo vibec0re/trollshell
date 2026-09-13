@@ -10,10 +10,19 @@
 # cold `nix flake check` paid a third full dependency compile just for this one
 # binary.
 #
-# `workspace` (nix/package.nix) is the single derivation that compiles the whole
-# workspace, and its `doCheck` test phase builds the example targets too (cargo
-# builds every example during `cargo test` "to ensure they compile"), so
-# `$out/bin/wifi_probe` already exists there.
+# `workspace` (nix/package.nix) is the single derivation that compiles the
+# whole workspace's default feature set — the shell, the control center,
+# every plugin. Until #1257 the two probe examples rode along inside IT (a
+# `postInstall` after the workspace build), which meant every one of those
+# consumers recompiled hytte-ecal's and hytte-services' dev-dependency
+# closures too, on a cache (`cargoArtifactsBinOnly`) that holds none. Since
+# #1257 the examples are `probes` (nix/package.nix's `passthru.probes`), a
+# SEPARATE crane compile in the checks universe, on `cargoArtifacts` — the
+# same dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
+# share, so this is genuinely zero extra dependency compilation for a
+# checkout that already runs `nix flake check`. `$out/bin/wifi_probe` comes
+# from `${probes}` now, not `${workspace}` — `workspace` is still taken here,
+# but only for `passthru.devInputs`, the GApps wrap's `buildInputs`.
 #
 # The wrap is preserved from the pre-#588 shape for the same reason as
 # nix/probe.nix: the old derivation had `wrapGAppsHook4` in `nativeBuildInputs`
@@ -28,8 +37,14 @@
   lib,
   stdenv,
   wrapGAppsHook4,
-  # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
+  # The single whole-workspace compile (nix/package.nix's `passthru.workspace`)
+  # — taken here ONLY for `passthru.devInputs.buildInputs`, the GApps wrap
+  # env; the binary itself comes from `probes` (#1257).
   workspace,
+  # The checks-universe probe-examples compile (nix/package.nix's
+  # `passthru.probes`) — the actual source of `$out/bin/wifi_probe` since
+  # #1257.
+  probes,
 }:
 stdenv.mkDerivation {
   pname = "hytte-services-wifi-probe";
@@ -44,7 +59,7 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 ${workspace}/bin/wifi_probe "$out/bin/wifi_probe"
+    install -Dm755 ${probes}/bin/wifi_probe "$out/bin/wifi_probe"
     runHook postInstall
   '';
 

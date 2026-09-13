@@ -9,12 +9,20 @@
 # a second full dependency compile (~470 crates) purely to produce this one
 # example binary. `nix/wifi-probe.nix` paid a third.
 #
-# `workspace` (nix/package.nix) is the single derivation that compiles the whole
-# workspace, and since #588 its `$out/bin` carries the two probe examples too:
-# cargo's default `cargo test` target selection builds every example "to ensure
-# they compile", so the workspace build's `doCheck` phase already produces them
-# and a postInstall hook copies them out of the target dir. Packaging one here
-# is a `cp` + a wrap.
+# `workspace` (nix/package.nix) is the single derivation that compiles the
+# whole workspace's default feature set — the shell, the control center,
+# every plugin. Until #1257 the two probe examples rode along inside IT (a
+# `postInstall` after the workspace build), which meant every one of those
+# consumers recompiled hytte-ecal's and hytte-services' dev-dependency
+# closures too, on a cache (`cargoArtifactsBinOnly`) that holds none. Since
+# #1257 the examples are `probes` (nix/package.nix's `passthru.probes`), a
+# SEPARATE crane compile in the checks universe, on `cargoArtifacts` — the
+# same dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
+# share, so this is genuinely zero extra dependency compilation for a
+# checkout that already runs `nix flake check`. Packaging one here is still
+# just a `cp` + a wrap, now out of `${probes}/bin/probe` instead of
+# `${workspace}/bin/probe` — `workspace` is still taken here, but only for
+# `passthru.devInputs`, the GApps wrap's `buildInputs`.
 #
 # The wrap is load-bearing and preserved verbatim from the pre-#588 shape. The
 # old derivation had `wrapGAppsHook4` in `nativeBuildInputs` and did *not* set
@@ -30,8 +38,13 @@
   lib,
   stdenv,
   wrapGAppsHook4,
-  # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
+  # The single whole-workspace compile (nix/package.nix's `passthru.workspace`)
+  # — taken here ONLY for `passthru.devInputs.buildInputs`, the GApps wrap
+  # env; the binary itself comes from `probes` (#1257).
   workspace,
+  # The checks-universe probe-examples compile (nix/package.nix's
+  # `passthru.probes`) — the actual source of `$out/bin/probe` since #1257.
+  probes,
 }:
 stdenv.mkDerivation {
   pname = "hytte-ecal-probe";
@@ -46,7 +59,7 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 ${workspace}/bin/probe "$out/bin/probe"
+    install -Dm755 ${probes}/bin/probe "$out/bin/probe"
     runHook postInstall
   '';
 

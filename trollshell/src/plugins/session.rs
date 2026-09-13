@@ -184,10 +184,16 @@ pub(super) const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// plugin answers each with a [`PluginMsg::Pong`]; a hung one is dropped after
 /// [`MAX_MISSED_PONGS`] go unanswered (~`PING_INTERVAL * (MAX_MISSED_PONGS + 1)`
 /// worst case), freeing its region slot instead of leaving a frozen card.
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// `pub(super)`, like [`OUTBOUND_CAPACITY`]/[`EFFECT_BURST`]/[`REGISTER_TIMEOUT`]
+/// above: exposed so `tests.rs` can pin the liveness bound against these exact
+/// values rather than copied literals (#1166 finding 3).
+pub(super) const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How many consecutive unanswered pings mark a plugin as hung (drop it).
-const MAX_MISSED_PONGS: u32 = 2;
+///
+/// `pub(super)` for the same reason as [`PING_INTERVAL`] above (#1166 finding 3).
+pub(super) const MAX_MISSED_PONGS: u32 = 2;
 
 /// Bound on the per-connection outbound (host→plugin) queue. A well-behaved
 /// plugin drains it immediately so it sits near-empty; a plugin that stops
@@ -582,7 +588,10 @@ pub(super) fn capped_effect_payload(
 }
 
 /// Whether a non-blocking outbound push should keep its producer task running.
-enum Push {
+///
+/// `pub(super)`, like [`OUTBOUND_CAPACITY`]/[`EFFECT_BURST`]/[`REGISTER_TIMEOUT`]
+/// above: exposed so `tests.rs` can pin the bounded-queue guarantee (#1166).
+pub(super) enum Push {
     /// The frame was sent, or dropped because the queue was momentarily full —
     /// either way keep going (the next change re-sends the latest value).
     Continue,
@@ -595,7 +604,9 @@ enum Push {
 /// reading) drops the frame rather than growing memory without bound — the stuck
 /// plugin is separately reaped by the liveness ping (it can't answer pings while
 /// not reading). `Closed` means the writer task exited; the producer stops.
-fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
+///
+/// `pub(super)` for the same reason as [`Push`] above (#1166).
+pub(super) fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
     match out.try_send(msg) {
         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Push::Continue,
         Err(mpsc::error::TrySendError::Closed(_)) => Push::Stop,

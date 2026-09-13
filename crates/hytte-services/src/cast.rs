@@ -8,6 +8,15 @@
 //!
 //! **Do not add helpers here for casts that are semantically dangerous.**
 //! Each helper must carry a comment explaining why the loss is acceptable.
+//!
+//! #1249 moved this module's sensor-only helpers (`u64_to_f64_count`,
+//! `millicelsius_to_celsius`, `khz_to_hz`, `percent_u64_to_ratio`,
+//! `octal_byte_from_u32`) to `hytte-sensors`' own private `cast` module along
+//! with their only callers (`sensors/{proc_stat,disk,hwmon,cpufreq,gpu}.rs`).
+//! What's left here still serves `audio_native` (`usize_to_f64`,
+//! `f64_to_f32_gain`) and `sensors/mod.rs`'s own tick-loop glue
+//! (`u64_to_f64_bytes`, called directly by `apply_network` and the memory
+//! history extractor — not by anything that moved).
 
 /// Convert a `usize` count to `f64` for arithmetic (e.g. dividing by channel
 /// count to compute an average).
@@ -48,82 +57,6 @@ pub(crate) fn f64_to_f32_gain(v: f64) -> f32 {
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn u64_to_f64_bytes(n: u64) -> f64 {
     n as f64
-}
-
-/// Convert a `u64` counter (jiffies, disk blocks, …) to `f64` for ratio
-/// computation.
-///
-/// # Precision contract
-///
-/// Used where two `u64` counters form a ratio (e.g. `d_active / d_total` for
-/// CPU load, `used / total` for disk usage). Both operands are realistic
-/// kernel counters: jiffy totals are bounded by uptime × CPU count (never
-/// near 2^53 in practice), and disk block counts on consumer hardware are
-/// likewise well below 2^53. The resulting `f64` is immediately divided to
-/// produce a fraction in `0.0..=1.0`; sub-ulp precision loss in the
-/// numerator or denominator is irrelevant at display resolution.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn u64_to_f64_count(n: u64) -> f64 {
-    n as f64
-}
-
-/// Convert a milli-Celsius reading from sysfs (`u64`, e.g. from
-/// `/sys/class/hwmon/.../temp*_input`) to degrees Celsius (`f64`).
-///
-/// # Precision contract
-///
-/// sysfs reports temperatures in thousandths of a degree. A realistic CPU or
-/// GPU temperature is 20 000 – 110 000 milli-°C. Dividing by 1 000.0 gives a
-/// value in the tens-to-hundreds range — exactly representable in `f64` to
-/// well beyond display precision. The `u64 → f64` cast could theoretically
-/// lose precision for values near 2^53, but no real sensor produces values
-/// anywhere near 9 × 10^12 °C.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn millicelsius_to_celsius(milli: u64) -> f64 {
-    milli as f64 / 1_000.0
-}
-
-/// Convert a kHz frequency reading from sysfs (`u64`, e.g. from
-/// `/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq`) to Hz (`f64`).
-///
-/// # Precision contract
-///
-/// sysfs reports CPU frequencies in kHz. A realistic current or ceiling
-/// frequency is ~800 000 – 6 000 000 kHz; multiplying by 1 000.0 gives a value
-/// of order 10^9 — far below `f64`'s 2^53 exact-integer range, so the `u64 →
-/// f64` cast is exact and no precision is lost for this use case.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn khz_to_hz(khz: u64) -> f64 {
-    khz as f64 * 1_000.0
-}
-
-/// Convert a whole-number percent in `u64` (e.g. GPU busy percent from
-/// `/sys/class/drm/.../gpu_busy_percent`) to a `0.0..=1.0` ratio.
-///
-/// # Precision contract
-///
-/// The source is an integer in `0..=100`, so the cast to `f64` is exact for
-/// every possible input value (all fit in the 53-bit mantissa). Dividing by
-/// 100.0 gives a fraction accurate to the nearest hundredth — sufficient for
-/// display.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn percent_u64_to_ratio(v: u64) -> f64 {
-    v as f64 / 100.0
-}
-
-/// Extract the low 8 bits of a `u32` octal byte value decoded from
-/// `/proc/self/mountinfo` path escapes (`\NNN`, where NNN ∈ `000`–`377` octal).
-///
-/// # Truncation contract
-///
-/// `mountinfo` octal escapes are `\000`–`\377`, encoding byte values 0–255.
-/// The caller (in `sensors`) already verifies each digit is in `'0'..='7'`
-/// before calling this, and `proc(5)` guarantees only valid byte escapes are
-/// emitted, so the value is always ≤ 255 and the low-byte truncation is safe
-/// by construction.
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn octal_byte_from_u32(v: u32) -> u8 {
-    v as u8
 }
 
 #[cfg(test)]
@@ -206,85 +139,5 @@ mod tests {
         let hundred_mib: u64 = 100 * 1024 * 1024;
         let result = u64_to_f64_bytes(hundred_mib);
         assert!((result - 104_857_600.0_f64).abs() < f64::EPSILON);
-    }
-
-    // ── u64_to_f64_count ─────────────────────────────────────────────────────
-
-    #[test]
-    fn u64_to_f64_count_zero() {
-        assert!(u64_to_f64_count(0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn u64_to_f64_count_small_exact() {
-        assert!((u64_to_f64_count(1000) - 1000.0).abs() < f64::EPSILON);
-    }
-
-    // ── millicelsius_to_celsius ───────────────────────────────────────────────
-
-    #[test]
-    fn millicelsius_to_celsius_typical() {
-        // 45 000 milli-°C = 45.0 °C exactly.
-        assert!((millicelsius_to_celsius(45_000) - 45.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn millicelsius_to_celsius_zero() {
-        assert!(millicelsius_to_celsius(0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn millicelsius_to_celsius_precision() {
-        // 52 125 milli-°C = 52.125 °C (exactly representable in f64).
-        assert!((millicelsius_to_celsius(52_125) - 52.125).abs() < f64::EPSILON);
-    }
-
-    // ── khz_to_hz ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn khz_to_hz_zero() {
-        assert!(khz_to_hz(0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn khz_to_hz_typical() {
-        // 2 400 000 kHz = 2.4 GHz exactly.
-        assert!((khz_to_hz(2_400_000) - 2.4e9).abs() < f64::EPSILON);
-    }
-
-    // ── percent_u64_to_ratio ──────────────────────────────────────────────────
-
-    #[test]
-    fn percent_u64_to_ratio_zero() {
-        assert!(percent_u64_to_ratio(0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn percent_u64_to_ratio_hundred() {
-        assert!((percent_u64_to_ratio(100) - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn percent_u64_to_ratio_fifty() {
-        assert!((percent_u64_to_ratio(50) - 0.5).abs() < f64::EPSILON);
-    }
-
-    // ── octal_byte_from_u32 ───────────────────────────────────────────────────
-
-    #[test]
-    fn octal_byte_from_u32_zero() {
-        assert_eq!(octal_byte_from_u32(0), 0u8);
-    }
-
-    #[test]
-    fn octal_byte_from_u32_space() {
-        // \040 octal = 32 decimal = ASCII space.
-        assert_eq!(octal_byte_from_u32(32), b' ');
-    }
-
-    #[test]
-    fn octal_byte_from_u32_max_byte() {
-        // \377 octal = 255 decimal — the largest valid mountinfo escape.
-        assert_eq!(octal_byte_from_u32(255), 255u8);
     }
 }

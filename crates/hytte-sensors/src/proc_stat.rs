@@ -6,7 +6,7 @@ use super::CpuLoad;
 
 /// Returns one entry per `cpu*` line: `(active_jiffies, total_jiffies)`.
 /// Index 0 = aggregate `cpu` line, 1+ = `cpu0`, `cpu1`, …
-pub(super) fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
+pub fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
     let text = std::fs::read_to_string("/proc/stat")?;
     let mut entries = Vec::new();
 
@@ -32,7 +32,8 @@ pub(super) fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
     Ok(entries)
 }
 
-pub(super) fn compute_cpu_load(prev: &[(u64, u64)], now: &[(u64, u64)]) -> CpuLoad {
+#[must_use]
+pub fn compute_cpu_load(prev: &[(u64, u64)], now: &[(u64, u64)]) -> CpuLoad {
     if prev.is_empty() || now.is_empty() {
         // First sample — no delta yet.
         return CpuLoad {

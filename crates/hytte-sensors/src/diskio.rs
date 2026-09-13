@@ -23,7 +23,7 @@ const SECTOR_BYTES: u64 = 512;
 /// cumulative-since-boot byte counters — for every **physical whole-disk**
 /// block device. Partitions, loop/ram/zram/device-mapper and other virtual
 /// devices are filtered out (see [`is_physical_disk`]).
-pub(super) fn read_proc_diskstats() -> Result<Vec<(String, u64, u64)>, std::io::Error> {
+pub fn read_proc_diskstats() -> Result<Vec<(String, u64, u64)>, std::io::Error> {
     let text = std::fs::read_to_string("/proc/diskstats")?;
     Ok(parse_diskstats(&text))
 }
@@ -114,7 +114,14 @@ fn is_nvme_namespace(rest: &str) -> bool {
 /// across physical disks (the aggregate default — one combined series, like the
 /// network row's rx+tx). Totals-since-boot are the summed raw cumulative
 /// counters. Returns the snapshot plus the next prev-map to store.
-pub(super) fn compute_disk_io(
+///
+/// Not generalized over `BuildHasher` (`clippy::implicit_hasher`'s suggested
+/// fix): the one caller (`hytte-services`' `poll_loop`) always threads a
+/// plain `std::collections::HashMap` cache through this every tick, and this
+/// crate has no consumer that would ever plug in a different hasher.
+#[allow(clippy::implicit_hasher)]
+#[must_use]
+pub fn compute_disk_io(
     prev: &HashMap<String, (u64, u64, Instant)>,
     devices: Vec<(String, u64, u64)>,
     now: Instant,

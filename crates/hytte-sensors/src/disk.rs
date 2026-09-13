@@ -152,7 +152,8 @@ pub(super) fn parse_mountinfo(text: &str) -> Vec<MountSpec> {
 ///
 /// Returns an empty list on read failure (e.g. sandboxed runtime); the
 /// caller's only failure mode in that case is reporting zero mounts.
-pub(super) fn read_mountlist() -> Vec<MountSpec> {
+#[must_use]
+pub fn read_mountlist() -> Vec<MountSpec> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .map(|t| parse_mountinfo(&t))
         .unwrap_or_default()
@@ -160,7 +161,8 @@ pub(super) fn read_mountlist() -> Vec<MountSpec> {
 
 // ── Disk usage ────────────────────────────────────────────────────────────────
 
-pub(super) fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
+#[must_use]
+pub fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
     use nix::sys::statvfs::statvfs;
     let mut mounts = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -189,7 +191,8 @@ pub(super) fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
 
 // ── Process count ─────────────────────────────────────────────────────────────
 
-pub(super) fn read_process_count() -> u32 {
+#[must_use]
+pub fn read_process_count() -> u32 {
     std::fs::read_dir("/proc").map_or(0, |iter| {
         let count: usize = iter
             .filter_map(std::result::Result::ok)

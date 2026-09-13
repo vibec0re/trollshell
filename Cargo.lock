@@ -1459,6 +1459,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-sensors"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hytte-services"
 version = "0.1.0"
 dependencies = [
@@ -1473,6 +1482,7 @@ dependencies = [
  "hytte-config",
  "hytte-ecal",
  "hytte-reactive",
+ "hytte-sensors",
  "icalendar",
  "niri-ipc",
  "nix",

@@ -835,12 +835,20 @@ mod gtk_tests {
             .build()
     }
 
+    /// A window for the tests that are **not** about TLS, with a trust
+    /// resolver that reads nothing and dials nothing.
+    ///
+    /// Not [`Window::assemble`]'s real [`tls::resolve`]: that one reads the
+    /// machine's `/var/lib/hive-tls` (and the `TROLLSHELL_AGENT_WINDOW_*`
+    /// variables), so on a developer's own box — the one machine where this
+    /// crate's hive material exists — a test about a banner would open a TLS
+    /// connection to their real gateway and take however long that took. The
+    /// answer it stands in for is exactly what a machine with no hive material
+    /// produces (`TlsPolicy::SystemStore`, nothing tried), so nothing below
+    /// changes shape; it just stops depending on whose laptop it runs on.
+    /// #1246's own tests pick their route through [`scripted_trust`].
     fn window() -> (Rc<Window>, mpsc::UnboundedReceiver<Request>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            Window::assemble(&app(), &name("stray"), AgentsConfig::default(), tx),
-            rx,
-        )
+        window_with_trust(Arc::new(|_| tls::Resolved::default()))
     }
 
     fn up(row: AgentStatusRow) -> AgentState {
@@ -970,6 +978,13 @@ mod gtk_tests {
     /// *same widget* in the slot — not a fresh `WebView` that threw away the
     /// scroll position and the half-typed message.
     ///
+    /// Since #1246 the mount is two steps with a worker between them, so this
+    /// pumps the main context until the probe answers before it takes the
+    /// widget to compare. The identity assertion is against the **view**, not
+    /// merely "not the hint": without that, the verifying state would satisfy
+    /// it and the test would compare that with itself — the #1130 N6 vacuity,
+    /// one state later.
+    ///
     /// Mutation (re-run this round, red): the reviewer's **M13** — delete the
     /// `page_loaded` early return in `load_page` — and the pointer comparison
     /// reds.
@@ -982,13 +997,18 @@ mod gtk_tests {
         };
 
         w.update(Update::State(up(with_url.clone())));
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
         let first = w.page_child().expect("the page went into the slot");
         // **Not vacuously** (#1130 N6): `assemble`'s first `apply` puts the
-        // `NO_PAGE` label in the slot, so without this the test would compare
-        // that label with itself and stay green with `Window::update` mutated
-        // to a no-op — measured by the re-verification.
+        // `NO_PAGE` label in the slot and #1246's `begin_probe` puts the
+        // verifying state there, so without this the test would compare one of
+        // those with itself and stay green with `Window::update` mutated to a
+        // no-op — measured by #1242's re-verification.
         assert!(
-            first.downcast_ref::<gtk::Label>().is_none(),
+            webview::view_of(&first).is_some(),
             "the update must have replaced the no-page hint with the view, or what follows \
              compares the hint with itself"
         );
@@ -1010,6 +1030,10 @@ mod gtk_tests {
 
     /// With no URL from the hive, the slot carries the explanation and **not**
     /// a view pointed at nothing — and it is still replaced once a URL lands.
+    ///
+    /// Since #1246 that replacement is in two steps, and both are asserted:
+    /// the verifying state goes in synchronously, the view when the worker
+    /// answers.
     #[gtk::test]
     fn no_url_shows_the_hint_until_one_arrives() {
         let (w, _rx) = window();
@@ -1025,10 +1049,21 @@ mod gtk_tests {
             url: Some("https://hive.local/agent/stray/".to_owned()),
             ..row()
         })));
-        let page = w.page_child().expect("the page replaced the hint");
+        let verifying = w.page_child().expect("the verifying state replaced the hint");
         assert!(
-            page.downcast_ref::<gtk::Label>().is_none(),
-            "once the hive names a URL the slot holds the page, not the hint"
+            webview::is_verifying(&verifying),
+            "the hint goes the moment a URL lands, and what takes its place says why there is no \
+             page yet"
+        );
+
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
+        let page = w.page_child().expect("the page replaced the verifying state");
+        assert!(
+            webview::view_of(&page).is_some(),
+            "once the hive names a URL and its certificate checks out, the slot holds the page"
         );
     }
 
@@ -1957,9 +1992,22 @@ mod gtk_tests {
     /// each connection on its own thread, so a second probe would hang exactly
     /// like the first rather than be answered quickly and hide the fault.
     ///
+    /// # The count is read while the probe is the only thing dialling
+    ///
+    /// Measured, and worth recording because it corrects a standing note in
+    /// this crate: once the view is mounted the accept count reaches **2**
+    /// within ~300 ms. That second connection is not a second probe — the
+    /// resolver ran exactly once, asserted below — it is the embedded view's
+    /// own `load_uri` reaching `WebKitGTK`'s **network** process, which is a
+    /// different process from the web process that dies under xvfb (see
+    /// `webview.rs`'s `gtk_tests` module doc). So the socket assertion is
+    /// taken at the instant the probe answers, before the mount, and the
+    /// resolver count carries the rest of the way.
+    ///
     /// Mutation (run this round, red): drop `|| self.probe.borrow().is_some()`
     /// from `load_page`'s early return — the poll behind the activation starts
-    /// a second probe and the accept count reaches 2.
+    /// a second probe, both are in flight when the pump waits on `probing()`,
+    /// and the accept count is 2 before either mounts anything.
     #[gtk::test]
     fn a_second_activation_during_the_probe_opens_no_second_connection() {
         let (port, accepted) = serve_counting_dribbler(Duration::from_millis(200));
@@ -1981,16 +2029,17 @@ mod gtk_tests {
             pump_until(Duration::from_secs(20), || !w.probing()),
             "the probe never answered"
         );
-        // …and give anything a second probe would have queued a chance to run.
-        let a_second = pump_until(Duration::from_millis(300), || {
-            accepted.load(Ordering::SeqCst) > 1
-        });
 
-        assert!(!a_second, "a second connection was opened to the gateway");
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             1,
-            "one window, one launch-time probe, one connection"
+            "one window, one launch-time probe, one connection — the activation and the poll \
+             behind it must not each open their own"
+        );
+        // …and let anything a second probe would have queued actually run.
+        assert!(
+            !pump_until(Duration::from_millis(300), || runs_so_far(&runs) > 1),
+            "a second probe was queued behind the first"
         );
         assert_eq!(runs_so_far(&runs), 1, "…and the resolver ran exactly once");
         assert_eq!(

@@ -66,7 +66,7 @@ pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
     let session = webkit::NetworkSession::new_ephemeral();
     session.set_tls_errors_policy(policy.errors_policy());
 
-    if let TlsPolicy::AllowCertificateForHost { cert, host } = policy {
+    if let Some((cert, host)) = pin_for(policy) {
         // `from_file` takes the FIRST PEM block as the certificate and the rest
         // as its issuer chain — which is exactly hyperhive's `gateway.pem`
         // (`cat leaf-only ca.pem`) and exactly why a `trust-bundle.pem`, which
@@ -147,6 +147,50 @@ pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
 
     view.load_uri(url);
     stack.upcast()
+}
+
+/// What to pin and **under which spelling of the host**, or `None` when the
+/// policy pins nothing.
+///
+/// # `WebKit` strips the brackets before it looks the pin up
+///
+/// This function exists because the obvious call — passing
+/// [`crate::tls::host_of`]'s host straight through — silently produces a dead
+/// pin for an IPv6 hive, on every route. `webkitgtk` 2.52.6 stores the
+/// exception under the host **verbatim**
+/// (`WebKitNetworkSession.cpp:477-486` → `WebsiteDataStore.cpp:1789-1792` →
+/// `NetworkSessionSoup.cpp:128-131` → `SoupNetworkSession.cpp:341-344`), but
+/// looks it up through `hostForComparison`
+/// (`SoupNetworkSession.cpp:314-327`), whose own comment says why:
+///
+/// ```text
+/// // If the host component of the URL is an IPv6 address, it will be
+/// // surrounded by [ ] brackets. We have to remove them because they're part
+/// // of the WTF::URL's host component … but not part of the host passed to
+/// // allowSpecificHTTPSCertificateForHost.
+/// ```
+///
+/// So `[::1]` goes in and `::1` is asked for, and the pin never applies. The
+/// **bare** spelling is the one to store — the same one `GNetworkAddress`
+/// wants, which is why this is [`crate::tls::identity_host`] and not a third
+/// helper. The bracketed spelling stays for the card, where a human reads it.
+///
+/// # What the comparison actually is (#1242 review)
+///
+/// `HostTLSCertificateSet` (`SoupNetworkSession.cpp:68-97`) hashes the
+/// certificate's **own DER** — the `"certificate"` property — with SHA-256,
+/// not the chain. So route 2's leaf-only `VerifiedPem` and route 3's
+/// leaf-plus-CA `gateway.pem` both match a gateway presenting a full chain,
+/// and chain length is irrelevant to whether a pin takes. That is the one
+/// thing that could have made the launch-time verify decorative, and it does
+/// not.
+fn pin_for(policy: &TlsPolicy) -> Option<(&Pinned, &str)> {
+    match policy {
+        TlsPolicy::SystemStore => None,
+        TlsPolicy::AllowCertificateForHost { cert, host } => {
+            Some((cert, crate::tls::identity_host(host)))
+        }
+    }
 }
 
 /// The [`webkit::WebView`] inside a widget [`page`] returned.
@@ -311,7 +355,46 @@ fn elsewhere(uri: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::elsewhere;
+    use super::{elsewhere, pin_for};
+    use crate::tls::{Pinned, TlsPolicy};
+    use std::path::PathBuf;
+
+    /// **An IPv6 pin is stored under the spelling `WebKit` looks it up by** —
+    /// the bare literal, not the bracketed one (#1242 review, finding 3;
+    /// `SoupNetworkSession.cpp`'s `hostForComparison`, quoted in
+    /// [`pin_for`]'s docs).
+    ///
+    /// Before this, `[::1]` went in and `::1` was asked for, so the pin was
+    /// dead on **every** route for an IPv6 hive and the failure card was all
+    /// such a hive ever got — silently, since nothing in `WebKit` reports an
+    /// exception that is never consulted.
+    ///
+    /// Mutation (re-run this round, red): drop `identity_host` from
+    /// [`pin_for`] and hand the host through unchanged — the spelling this
+    /// PR shipped at first — and the two literal rows red.
+    ///
+    /// [`pin_for`]: super::pin_for
+    #[test]
+    fn an_ipv6_pin_is_stored_under_the_spelling_webkit_looks_it_up_by() {
+        let policy = |host: &str| TlsPolicy::AllowCertificateForHost {
+            cert: Pinned::File(PathBuf::from("/tmp/hive-gateway.pem")),
+            host: host.to_owned(),
+        };
+        for (stored, expected) in [
+            ("[::1]", "::1"),
+            ("[fd00::1]", "fd00::1"),
+            ("hive.local", "hive.local"),
+            ("127.0.0.1", "127.0.0.1"),
+        ] {
+            let p = policy(stored);
+            let (_, pinned_under) = pin_for(&p).expect("this policy pins something");
+            assert_eq!(pinned_under, expected, "stored as {stored}");
+        }
+        assert!(
+            pin_for(&TlsPolicy::SystemStore).is_none(),
+            "the system store pins nothing, so there is no host to spell"
+        );
+    }
 
     /// A non-http(s) scheme never reaches a launcher.
     ///

@@ -353,7 +353,8 @@ mod tests {
         AgentsConfig, DEFAULT_RUNTIME_ICON, Display, Invalid, MAX_POLL_SECONDS, MIN_POLL_SECONDS,
     };
     use hytte_config::subsystem::{Subsystem as _, assemble};
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     fn from_toml(body: &str) -> AgentsConfig {
         assemble::<AgentsConfig>(&[(PathBuf::from("overlay.toml"), body.to_owned())])
@@ -370,6 +371,60 @@ mod tests {
         assert_eq!(loaded.config, AgentsConfig::default());
         assert!(loaded.unknown_keys.is_empty(), "{:?}", loaded.unknown_keys);
         loaded.config.validate().expect("the default validates");
+    }
+
+    /// #1227 item 1: the exact bytes `programs.trollshell.config.agents`
+    /// renders (checked in at `tests/fixtures/agents-nix-rendered.toml`,
+    /// pinned byte-for-byte against the live nix module by `flake.nix`'s
+    /// `nixos-module-agents-fixture` check) parse through this crate's real
+    /// [`Subsystem`] reader — as a single base layer with an empty overlay,
+    /// [`assemble`] with the fixture as the one layer beyond
+    /// [`AgentsConfig::DEFAULT_TOML`] — and produce exactly the typed values
+    /// the nix example set. This never touches the real
+    /// `$XDG_CONFIG_HOME`/`$XDG_CONFIG_DIRS`: [`assemble`] takes layer
+    /// bodies as plain strings, the same seam every other test in this file
+    /// uses.
+    ///
+    /// Falsification: change one key in the fixture without changing the
+    /// nix example that produced it (or vice versa), and either this test
+    /// or `nix build .#checks.x86_64-linux.nixos-module-agents-fixture`
+    /// goes red — never both silently drifting the same way.
+    #[test]
+    fn nix_rendered_fixture_round_trips_through_the_real_reader() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agents-nix-rendered.toml");
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("missing fixture {} ({e})", path.display()));
+        let loaded = assemble::<AgentsConfig>(&[(path, body)])
+            .expect("the nix-rendered fixture assembles");
+        assert!(loaded.unknown_keys.is_empty(), "{:?}", loaded.unknown_keys);
+        loaded.config.validate().expect("the fixture validates");
+
+        let mut display = BTreeMap::new();
+        display.insert(
+            "argus".to_owned(),
+            Display {
+                label: None,
+                icon: Some("starred-symbolic".to_owned()),
+                project: None,
+            },
+        );
+        display.insert(
+            "trollshell-choom".to_owned(),
+            Display {
+                label: Some("choom".to_owned()),
+                icon: None,
+                project: Some("viberoot".to_owned()),
+            },
+        );
+        assert_eq!(
+            loaded.config,
+            AgentsConfig {
+                socket: "/run/hyperhive/host.sock".to_owned(),
+                poll_seconds: 5,
+                display,
+            }
+        );
     }
 
     /// P2's keys (`terminal`, `session_title`, `[chat]`) are unknown to this

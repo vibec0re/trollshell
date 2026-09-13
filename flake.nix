@@ -1442,6 +1442,66 @@
               touch $out
             '';
 
+          # #1227 item 1: `programs.trollshell.config.agents` renders
+          # `agents.toml` the same way `core-leds` does — this uses the
+          # NixOS module (straight into `/etc/xdg`, same as
+          # `nixos-module-core-leds` above) rather than home-manager's
+          # `XDG_CONFIG_DIRS`-splicing path, since there is nothing
+          # `agents`-specific about *which* platform module renders it.
+          #
+          # Unlike the two `core-leds` checks above, which parse the
+          # rendered TOML back with `tomllib` and compare the resulting
+          # dict (order- and formatting-insensitive), this asserts the
+          # rendered file's BYTES against a checked-in fixture
+          # (`crates/hytte-plugin-agents/tests/fixtures/agents-nix-rendered.toml`).
+          # That fixture is also fed straight through `AgentsConfig`'s real
+          # `Subsystem` reader by a Rust test in the same crate
+          # (`config.rs`'s
+          # `nix_rendered_fixture_round_trips_through_the_real_reader`), so
+          # a renderer change and a fixture change must land in the same
+          # commit, or one of the two checks goes red.
+          nixos-module-agents-fixture =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      config.agents = {
+                        socket = "/run/hyperhive/host.sock";
+                        poll_seconds = 5;
+                        display."trollshell-choom" = {
+                          label = "choom";
+                          project = "viberoot";
+                        };
+                        display.argus.icon = "starred-symbolic";
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              renderedFile = cfg.environment.etc."xdg/trollshell/agents.toml".source;
+              fixture = ./crates/hytte-plugin-agents/tests/fixtures/agents-nix-rendered.toml;
+            in
+            pkgs.runCommand "trollshell-nixos-module-agents-fixture-check" { } ''
+              if ! diff -u ${fixture} ${renderedFile}; then
+                echo "rendered agents.toml drifted from the checked-in fixture (${fixture})" >&2
+                exit 1
+              fi
+              touch $out
+            '';
+
           # The "lean heavy on nix" counterpart to the Rust ephemeral-EDS
           # harness (#49). Split out to nix/checks/eds-nixos-test.nix
           # (#1102), mirroring how `packages` already lives under

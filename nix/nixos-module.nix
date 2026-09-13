@@ -62,11 +62,16 @@ let
   # `XDG_CONFIG_DIRS`: `/etc/xdg` is already the default base entry
   # `crates/hytte-config/src/xdg.rs` falls back to when the variable is
   # unset, and this module (unlike home-manager) actually owns `/etc`.
+  #
+  # The inner filter is `filterAttrsRecursive`, not a flat `filterAttrs` —
+  # see the matching comment in `nix/hm-module.nix` for why (`agents`'
+  # `display` field nests a submodule's own unset fields one level below
+  # `value`, and `core-leds` has no nested field so this is a no-op there).
   configFiles = lib.filterAttrs (_: v: v != null) (
     lib.mapAttrs (
       name: value:
       let
-        filtered = lib.filterAttrs (_: v: v != null) value;
+        filtered = lib.filterAttrsRecursive (_: v: v != null) value;
       in
       if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
     ) cfg.config

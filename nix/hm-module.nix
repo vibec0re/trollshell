@@ -58,14 +58,24 @@ let
   # `<subsystem>.toml` — one store-path file per subsystem that declares at
   # least one non-null field, `null`s filtered out first (TOML has no null,
   # and an omitted key here just means "no opinion", left to the layer below).
-  # `cfg.config` is a fixed attrset of typed submodules (`core-leds` today),
-  # not an `attrsOf`, so this stays a plain `mapAttrs` over its known keys
-  # rather than the `attrsOf`-keyed-by-id shape `pluginsState` above uses.
+  # `cfg.config` is a fixed attrset of typed submodules (`core-leds`,
+  # `agents`), not an `attrsOf`, so this stays a plain `mapAttrs` over its
+  # known keys rather than the `attrsOf`-keyed-by-id shape `pluginsState`
+  # above uses.
+  #
+  # The inner filter is `filterAttrsRecursive` (#1227 item 1), not a flat
+  # `filterAttrs`: `agents`' `display` field is an `attrsOf` submodule, so an
+  # entry's own unset fields (`icon`/`project` left `null`) sit one level
+  # *below* `value` and a flat filter would leave them in as a literal
+  # `null` TOML cannot represent — `json2x` (what `pkgs.formats.toml`'s
+  # `generate` shells out to) fails on that, it does not silently drop it.
+  # `core-leds` has no nested field, so this is a no-op there — recursive
+  # filtering strictly subsumes the flat filter it replaces.
   configFiles = lib.filterAttrs (_: v: v != null) (
     lib.mapAttrs (
       name: value:
       let
-        filtered = lib.filterAttrs (_: v: v != null) value;
+        filtered = lib.filterAttrsRecursive (_: v: v != null) value;
       in
       if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
     ) cfg.config

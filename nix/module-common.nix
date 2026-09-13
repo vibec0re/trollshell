@@ -914,10 +914,13 @@ self:
         to turn a declared entry off again without deleting it.)
 
         `agents` (#947) is worth two extra notes. It reads
-        `~/.config/trollshell/agents.toml` — socket path, poll cadence,
-        per-agent display and grouping — and takes no `env` beyond `RUST_LOG`
-        and no `secrets` at all. Reaching the hive is the desktop user's
-        membership of the `hive-admin` group
+        `agents.toml` — socket path, poll cadence, per-agent display and
+        grouping — through the #866/#868 base+overlay layering: nix's own
+        side of that is `programs.trollshell.config.agents` below (#1227
+        item 1), and `~/.config/trollshell/agents.toml` is still there as
+        your hand-edited overlay on top of it. This plugin takes no `env`
+        beyond `RUST_LOG` and no `secrets` at all. Reaching the hive is the
+        desktop user's membership of the `hive-admin` group
         (`services.hyperhive.adminUsers`) against hyperhive's
         `0660 root:hive-admin` socket: no root, no polkit, nothing this module
         grants. Outside that group the card renders one "no hive — permission
@@ -942,9 +945,9 @@ self:
     #
     # The option shape every later subsystem family copies (decided once,
     # #1041): one attrset per subsystem name under `config.<subsystem>`,
-    # renders to `<base>/trollshell/<subsystem>.toml`. `core-leds` is the
-    # first and, for now, only one — a new family adds a sibling attrset here
-    # with its own typed fields (mirroring
+    # renders to `<base>/trollshell/<subsystem>.toml`. `core-leds` was the
+    # first; `agents` (#1227 item 1) is the second — a new family adds a
+    # sibling attrset here with its own typed fields (mirroring
     # `trollshell/src/config/<subsystem>.rs`'s `Knob` vocabulary), not a
     # generic free-form passthrough: a typed submodule (no `freeformType`)
     # means an unknown key is a **module-eval** error naming the bad option
@@ -1042,6 +1045,143 @@ self:
         or the built-in default says. A value here is still the *lowest*
         of the two nix-writable precedence layers: your own hand-edited
         `~/.config/trollshell/core-leds.toml` always wins over it, and a
+        rebuild that changes this option never touches that file.
+      '';
+    };
+
+    # `agents.toml` (#947), the second family (#1227 item 1) — typed after
+    # `crates/hytte-plugin-agents/src/config.rs`'s `AgentsConfig`/`Display`
+    # schema exactly the way `core-leds` above is typed after
+    # `core_leds.rs`'s: every field nullable/optional (an unset field is
+    # absent from the rendered file, never a copy of the plugin's own
+    # default), the plugin's own `DEFAULT_TOML` stays the one documented
+    # source of truth (cited in the descriptions below rather than
+    # duplicated), and `display` — the one nested field this schema has that
+    # `core-leds` doesn't — is an `attrsOf` submodule so a per-agent entry's
+    # own unset fields (e.g. `icon` left `null`) are stripped the same way,
+    # not rendered as a literal `null` TOML cannot represent (see
+    # `configFiles`'s `lib.filterAttrsRecursive` in the two platform
+    # modules).
+    config.agents = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          socket = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "/run/hyperhive/host.sock";
+            description = ''
+              The hive's host admin socket — an absolute path
+              (`AgentsConfig::validate` in `config.rs` rejects anything
+              else, at file-load time; this option does not re-check the
+              shape at eval time, the same "open string, the file schema
+              judges it" precedent as `core-leds.color` above). `null`
+              (the default) sets no `socket` key at all, leaving the
+              overlay or the plugin's built-in default
+              (`config.rs`'s `DEFAULT_TOML`,
+              `/run/hyperhive/host.sock`) to decide.
+            '';
+          };
+
+          poll_seconds = lib.mkOption {
+            type = lib.types.nullOr (lib.types.ints.between 1 3600);
+            default = null;
+            example = 5;
+            description = ''
+              Seconds between `AgentStatus` polls while the agents sidebar
+              is open — `config.rs`'s `MIN_POLL_SECONDS`/`MAX_POLL_SECONDS`
+              bound it to 1..=3600. `null` (the default) sets no
+              `poll_seconds` key at all, leaving the overlay or the
+              plugin's built-in default (`DEFAULT_POLL_SECONDS`, 2) to
+              decide.
+            '';
+          };
+
+          display = lib.mkOption {
+            type = lib.types.attrsOf (
+              lib.types.submodule {
+                options = {
+                  label = lib.mkOption {
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                    example = "choom";
+                    description = ''
+                      What the sidebar row calls this agent. `null` (the
+                      default) sets no `label` key, so the row shows the
+                      hive's own agent name instead.
+                    '';
+                  };
+
+                  icon = lib.mkOption {
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                    example = "starred-symbolic";
+                    description = ''
+                      The row's leading symbolic icon name. `null` (the
+                      default) sets no `icon` key, so the row falls back
+                      to `config.rs`'s `DEFAULT_RUNTIME_ICON`
+                      (`system-run-symbolic`).
+                    '';
+                  };
+
+                  project = lib.mkOption {
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                    example = "viberoot";
+                    description = ''
+                      The group header this agent's row sits under. `null`
+                      (the default) leaves the agent in the ungrouped
+                      bucket.
+                    '';
+                  };
+                };
+              }
+            );
+            default = { };
+            example = lib.literalExpression ''
+              {
+                trollshell-choom = {
+                  label = "choom";
+                  project = "viberoot";
+                };
+              }
+            '';
+            description = ''
+              Per-agent display overrides — `[display.<name>]` in
+              `agents.toml` — keyed EXACTLY as the hive reports the
+              agent's name; a key naming an agent the hive doesn't have
+              decorates nothing (`config.rs`: "the roster is the hive's,
+              not the file's"). Every field of an entry defaults to
+              `null` ("no opinion"); an entry holding only `null`s renders
+              as an empty `[display.<name>]` table, which
+              `AgentsConfig`'s own schema reads back as absent — the same
+              no-op-by-construction the Rust side documents on
+              `AgentsConfig::display`.
+            '';
+          };
+        };
+      };
+      default = { };
+      example = lib.literalExpression ''
+        {
+          socket = "/run/hyperhive/host.sock";
+          poll_seconds = 5;
+          display.trollshell-choom = {
+            label = "choom";
+            project = "viberoot";
+          };
+        }
+      '';
+      description = ''
+        The hyperhive agents sidebar's (#947) base-layer config, rendered
+        to `agents.toml` under nix's `$XDG_CONFIG_DIRS` base layer (never
+        your own `$XDG_CONFIG_HOME` overlay — see the note above `config`).
+        Every field defaults to `null`/`{ }` ("no opinion"), so setting
+        only `socket` here leaves `poll_seconds`/`display` to whatever the
+        overlay or the plugin's own built-in default
+        (`crates/hytte-plugin-agents/src/config.rs`'s `DEFAULT_TOML`)
+        says. A value here is still the *lowest* of the two nix-writable
+        precedence layers: your own hand-edited
+        `~/.config/trollshell/agents.toml` always wins over it, and a
         rebuild that changes this option never touches that file.
       '';
     };

@@ -1,0 +1,9 @@
+poll_seconds = 5
+socket = "/run/hyperhive/host.sock"
+
+[display.argus]
+icon = "starred-symbolic"
+
+[display.trollshell-choom]
+label = "choom"
+project = "viberoot"

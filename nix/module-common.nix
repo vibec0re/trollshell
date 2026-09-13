@@ -828,6 +828,55 @@ self:
                 control-center relaunches the running plugins that declare it.
               '';
             };
+
+            mount = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.enum [
+                  "SidebarLead"
+                  "SidebarTop"
+                  "SidebarBottom"
+                  "SidebarRightLead"
+                  "SidebarRightTop"
+                  "SidebarRightBottom"
+                  "BarLeft"
+                  "BarCenter"
+                  "BarRight"
+                ]
+              );
+              default = null;
+              example = "SidebarRightTop";
+              description = ''
+                Override where this plugin's card mounts (#1158/#1159/#1161),
+                as a launch-time deployment decision rather than something the
+                plugin author bakes into its manifest. `null` (the default)
+                leaves the plugin's own `Mount` in force — nothing is rendered
+                and the manifest's choice wins, exactly as before this option
+                existed.
+
+                The nine values are the wire names
+                [`hytte_plugin_proto::manifest::Mount`] carries, in two
+                families: the **left** sidebar (`SidebarLead` — the very top,
+                above the built-in weather/calendar/tasks cards;
+                `SidebarTop` — after those cards, above the flex gap;
+                `SidebarBottom` — below everything, by the departures board),
+                its mirror the **right** sidebar (`SidebarRightLead` /
+                `SidebarRightTop` / `SidebarRightBottom`, #1158 — hidden
+                entirely while no plugin occupies one of its three regions),
+                and the **bar** (`BarLeft` / `BarCenter` / `BarRight`, a slim
+                inline chip rather than a sidebar card). A non-null value
+                renders as `HYTTE_PLUGIN_MOUNT = "<name>";` in this plugin's
+                `env` (above) in `plugins.json`; the SDK's `hytte_plugin::run`
+                reads it before `Register` and refuses to start on a name
+                outside these nine, so a rename here and on the wire cannot
+                silently drift apart — a stale spelling is a launch failure,
+                not a misplaced card.
+
+                Setting this does not change the plugin's own manifest, only
+                where *this deployment* puts it — reinstalling the same
+                plugin elsewhere with `mount` unset goes right back to the
+                author's own choice.
+              '';
+            };
           };
         }
       );
@@ -1060,8 +1109,7 @@ self:
     # `core-leds` doesn't — is an `attrsOf` submodule so a per-agent entry's
     # own unset fields (e.g. `icon` left `null`) are stripped the same way,
     # not rendered as a literal `null` TOML cannot represent (see
-    # `configFiles`'s `lib.filterAttrsRecursive` in the two platform
-    # modules).
+    # `configFiles`'s `prune` in the two platform modules).
     config.agents = lib.mkOption {
       type = lib.types.submodule {
         options = {

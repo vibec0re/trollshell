@@ -989,6 +989,70 @@
               touch $out
             '';
 
+          # #1161: `programs.trollshell.plugins.<id>.mount` must be strictly
+          # additive — a plugin that never sets it renders the exact same
+          # `plugins.json` entry as before this option existed. Two plugins,
+          # one covering each half: `right` sets `mount` and must carry
+          # `HYTTE_PLUGIN_MOUNT` in its rendered `env`; `left` doesn't, and
+          # its ENTIRE rendered entry is asserted against `expectedLeft` —
+          # every field `nix/hm-module.nix`'s `pluginsState` puts on a
+          # plugin, spelled out here rather than sourced from a captured
+          # historical eval (a rename or a stray extra key fails this the
+          # same way an accidental `HYTTE_PLUGIN_MOUNT` leak would). Nix
+          # attrset equality after `fromJSON` is used rather than a raw
+          # `diff` — unlike `hm-module-agents-fixture` above, there is no
+          # TOML formatting to pin here, and comparing parsed values catches
+          # a real regression the way a byte diff would while staying
+          # insensitive to JSON key order (`builtins.toJSON` already sorts
+          # keys, so the two coincide in practice, but the parsed comparison
+          # is the one that says what it means).
+          hm-module-plugin-mount =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      plugins = {
+                        left.package = stubPlugin;
+                        right = {
+                          package = stubPlugin;
+                          mount = "SidebarRightTop";
+                        };
+                      };
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+              );
+              expectedLeft = {
+                exec = pkgs.lib.getExe stubPlugin;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
+              probe =
+                assert pluginsState.plugins.right.env.HYTTE_PLUGIN_MOUNT == "SidebarRightTop";
+                assert pluginsState.plugins.left == expectedLeft;
+                builtins.deepSeq { inherit pluginsState; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-plugin-mount-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
           # Evaluate nixosModules.default the same way. Forces the module's own
           # config contributions — the swaybg/polkit user units, the session
           # vars, and the assertions — rather than system.build.toplevel, to keep
@@ -1204,6 +1268,61 @@
                 builtins.deepSeq { inherit falsePredicates; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-plugin-removed-1200-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # The NixOS twin of `hm-module-plugin-mount` above (#1161) — same
+          # fixture shape, read back through `environment.etc` instead of
+          # `xdg.configFile` (see `nixos-module` above for why). `mount` is
+          # declared once, in the shared `plugins` submodule
+          # (`nix/module-common.nix`), so setting it under THIS module has to
+          # render too, or the option would silently do nothing on a
+          # NixOS-only install — this is what would catch that.
+          nixos-module-plugin-mount =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      plugins = {
+                        left.package = stubPlugin;
+                        right = {
+                          package = stubPlugin;
+                          mount = "SidebarRightTop";
+                        };
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
+              );
+              expectedLeft = {
+                exec = pkgs.lib.getExe stubPlugin;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
+              probe =
+                assert pluginsState.plugins.right.env.HYTTE_PLUGIN_MOUNT == "SidebarRightTop";
+                assert pluginsState.plugins.left == expectedLeft;
+                builtins.deepSeq { inherit pluginsState; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-mount-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

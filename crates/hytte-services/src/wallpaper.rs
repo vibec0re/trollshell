@@ -233,7 +233,10 @@ impl Rotation {
     }
 }
 
-/// The complete wallpaper selection. Serialized to `wallpaper.json`.
+/// The complete wallpaper selection. Serialized to
+/// `$XDG_STATE_HOME/trollshell/wallpaper.toml`, and migrated once out of the
+/// legacy `~/.config/trollshell/wallpaper.json` (#1226 — a state file is
+/// always TOML; the JSON shape was never an external contract).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WallpaperState {
     /// Image applied to every output without a specific override. This is the

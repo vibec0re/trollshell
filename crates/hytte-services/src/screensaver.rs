@@ -194,7 +194,7 @@ type OwnersMap = Arc<Mutex<HashMap<u32, String>>>;
 //
 // The held fd is owned by *this* process, so it closes on exit — the hold does
 // not survive a shell restart on its own. The desire is therefore persisted to
-// `~/.config/trollshell/keep-awake.toml` and re-acquired on the next
+// `$XDG_STATE_HOME/trollshell/keep-awake.toml` (#1226) and re-acquired on the next
 // `Service::start` (#534), so "Keep awake" stays on across a restart/upgrade
 // instead of silently lapsing while the box quietly goes back to idle-locking.
 
@@ -392,8 +392,8 @@ pub fn other_inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
 /// binding) can never thrash the logind fd. Safe to call from any thread; the
 /// async fd acquire runs on the shared runtime.
 ///
-/// The desire is persisted to `~/.config/trollshell/keep-awake.toml` so the
-/// hold is re-acquired on the next shell start (#534) — the logind fd is
+/// The desire is persisted to `$XDG_STATE_HOME/trollshell/keep-awake.toml`
+/// (#1226) so the hold is re-acquired on the next shell start (#534) — the logind fd is
 /// process-owned and would otherwise be silently dropped on restart. Persisting
 /// the user's *intent* (rather than only a confirmed hold) means a transiently
 /// failed acquire is simply retried next launch.

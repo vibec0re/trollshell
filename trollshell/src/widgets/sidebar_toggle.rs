@@ -7,9 +7,10 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-sidebar-toggle");
+    let monitor_for_click = monitor.clone();
+    let btn = crate::components::chip::action_indicator("ts-sidebar-toggle", move || {
+        crate::overlays::sidebar::toggle(&monitor_for_click);
+    });
 
     // Bundled Material icon: modern Adwaita dropped `view-sidebar-symbolic`
     // (it lives at `sidebar-show-symbolic` now, but Material's view_sidebar
@@ -18,18 +19,14 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     icon.set_pixel_size(crate::scale::scale(16));
     btn.set_child(Some(&icon));
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |_| {
-        crate::overlays::sidebar::toggle(&monitor_for_click);
-    });
-
     btn.upcast()
 }
 
-/// #1177: pins this chip's CSS class set as a snapshot, taken **before** the
-/// hand-rolled scaffold above is replaced with `components::chip::action_indicator`
-/// — the two `add_css_class` calls in [`widget`] must survive that refactor
-/// unchanged. Falsified by adding/removing/renaming either class.
+/// #1177: pins this chip's CSS class set as a snapshot, taken before the
+/// hand-rolled scaffold above was replaced with `components::chip::action_indicator`
+/// — the two classes `action_indicator` stamps (`"ts-indicator"` + the
+/// caller's `class`) must reproduce what the scaffold set here unchanged.
+/// Falsified by adding/removing/renaming either class.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use std::cell::RefCell;

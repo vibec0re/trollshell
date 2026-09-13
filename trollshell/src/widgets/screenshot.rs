@@ -21,23 +21,20 @@ use hytte::prelude::*;
 use hytte::services::niri;
 
 pub fn widget(_monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-screenshot");
+    let btn = crate::components::chip::action_indicator("ts-screenshot", niri::screenshot);
     btn.set_tooltip_text(Some("Take a screenshot"));
 
     let icon = gtk::Image::from_icon_name("camera-photo-symbolic");
     btn.set_child(Some(&icon));
 
-    btn.connect_clicked(|_| niri::screenshot());
-
     btn.upcast()
 }
 
-/// #1177: pins this chip's CSS class set as a snapshot, taken **before** the
-/// hand-rolled scaffold above is replaced with `components::chip::action_indicator`
-/// — the two `add_css_class` calls in [`widget`] must survive that refactor
-/// unchanged. Falsified by adding/removing/renaming either class.
+/// #1177: pins this chip's CSS class set as a snapshot, taken before the
+/// hand-rolled scaffold above was replaced with `components::chip::action_indicator`
+/// — the two classes `action_indicator` stamps (`"ts-indicator"` + the
+/// caller's `class`) must reproduce what the scaffold set here unchanged.
+/// Falsified by adding/removing/renaming either class.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use std::cell::RefCell;

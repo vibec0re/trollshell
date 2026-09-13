@@ -355,15 +355,31 @@ pub const MAX_MARQUEE_SPEED_DPS: f32 = 1000.0;
 
 /// Cap on [`LedStripConfig::leds`].
 ///
-/// The strip's rendered width grows linearly with the segment count
-/// (`2*PAD + n*CELL_W + (n-1)*GAP` = `8 + 11n - 3` px), and the kit's default
-/// is 24 across a ~296 px card. 128 segments is a 1413 px strip — over 5× the
-/// default and still inside [`MAX_BUFFER_DIM`].
+/// **Mirrors the kit's own ceiling**, not an independent guess: before #1181
+/// the kit's `LedStrip::leds` floored its input (`n.max(1)`) but never
+/// ceilinged it, so this value used to be this crate's own re-derivation of
+/// the strip's geometry (`2*PAD + n*CELL_W + (n-1)*GAP`, private kit
+/// constants this crate cannot see) rather than a checked copy of a real kit
+/// bound. #1181 gave the kit its own `hytte_preem::led_strip::MAX_LEDS`,
+/// pinned there against this value the way `hytte-preem`'s `dot_matrix.rs`
+/// already pins `MIN_DOT_PX`/`MAX_DOT_PX` against this crate's — the assert
+/// lives on the kit's side of the arrow (`hytte-preem` depends on this crate,
+/// never the reverse), so this doc comment is the only place the connection
+/// can be *stated*, but the values can no longer silently drift apart. 128
+/// segments is a 1413 px strip at the kit's own pitch — over 5× the default
+/// 24 and still inside [`MAX_BUFFER_DIM`].
 pub const MAX_LEDS: u32 = 128;
 
 /// Cap on [`FlipBoardConfig::cells`].
 ///
-/// A board's width grows linearly with the cell count *times*
+/// **Mirrors the kit's own ceiling**, not an independent guess: before #1181
+/// the kit's `FlipBoard::cells` had no bound of its own at all, so this value
+/// used to be this crate's own re-derivation of the board's geometry (the
+/// card pitch and bezel, private kit constants this crate cannot see) rather
+/// than a checked copy of a real kit bound. #1181 gave the kit its own
+/// `hytte_preem::split_flap::MAX_CELLS`, pinned there against this value on
+/// the same `dot_matrix.rs`-precedent const-assert [`MAX_LEDS`] now uses. A
+/// board's width grows linearly with the cell count *times*
 /// [`FlipBoardConfig::glyph_px`] times `scale`, which is why
 /// [`PreemWidget::clamped`] pulls those two multipliers down when a wide board
 /// would otherwise overflow [`MAX_BUFFER_DIM`]. Kit default 8 (`HH:MM:SS`); 64

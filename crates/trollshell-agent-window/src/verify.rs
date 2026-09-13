@@ -358,7 +358,14 @@ pub enum Presented {
     /// It is also what a launch with **no GIO TLS backend at all** takes, which
     /// is what that wrong sentence would have been permanently, had
     /// `nix/agent-window.nix` not learned to put `glib-networking` on
-    /// `GIO_EXTRA_MODULES` in this same PR.
+    /// `GIO_EXTRA_MODULES` in this same PR. `probe` detects that case
+    /// explicitly (`gio::TlsError::Unavailable` on the database arm) rather
+    /// than letting it fall through as an ordinary parse failure, because
+    /// `TlsFileDatabase::new` needs the same backend `TlsClientConnection::new`
+    /// does and fails first — so without the explicit check, the sentence
+    /// naming `GIO_EXTRA_MODULES` was unreachable and every bare-session
+    /// operator read "it could not be loaded as a certificate database" about
+    /// a file that parses fine (#1242's re-verification, N2).
     UnusableAnchors(String),
 }
 
@@ -493,6 +500,20 @@ pub fn probe(
 ) -> Presented {
     let database = match gio::TlsFileDatabase::new(bundle) {
         Ok(db) => db,
+        // No GIO TLS backend is loaded at all (`GIO_EXTRA_MODULES` pointing
+        // nowhere, or glib-networking simply not installed): every GIO TLS
+        // call fails on the same grounds, and `TlsFileDatabase::new` just
+        // gets there first — before this check existed, that meant the
+        // sentence below (naming the actual cause) was unreachable, because
+        // this arm always won first and blamed a file that parses fine
+        // (#1242's re-verification, N2). Checked before the generic parse
+        // failure below rather than after, so nothing is contacted either way.
+        Err(e) if e.kind::<gio::TlsError>() == Some(gio::TlsError::Unavailable) => {
+            return Presented::UnusableAnchors(format!(
+                "there is no GIO TLS backend to check {host} with ({e}) — glib-networking must \
+                 be on GIO_EXTRA_MODULES"
+            ));
+        }
         Err(e) => {
             // NOT `Unreachable`: nothing has been contacted yet, and saying
             // "the gateway may be down" about a file that will not parse sends
@@ -542,6 +563,11 @@ pub fn probe(
     let identity = gio::NetworkAddress::new(host, port);
     let tls = match gio::TlsClientConnection::new(&connection, Some(&identity)) {
         Ok(t) => t,
+        // A backstop, not the primary path: with no backend at all the
+        // database arm above already caught it before a connection was ever
+        // opened (N2). This stays for the (untested) case where a backend
+        // exists — `TlsFileDatabase::new` succeeded — but this particular
+        // constructor still fails; the sentence is the same either way.
         Err(e) => {
             return Presented::UnusableAnchors(format!(
                 "there is no GIO TLS backend to check {host} with ({e}) — glib-networking must be \
@@ -1172,6 +1198,85 @@ mod tls_tests {
             !tried.contains("gateway may be down"),
             "…which is the sentence this test exists to keep out of this arm: {tried}"
         );
+    }
+
+    /// **No GIO TLS backend at all is not an anchors-file problem either** —
+    /// #1242's re-verification, N2. `GIO_EXTRA_MODULES` is a process-wide
+    /// loader setting GIO reads once and caches for the life of the process
+    /// (the devShell and `checks.system-tests` both put glib-networking on it,
+    /// #1234 ask 3), so proving the *other* case — nowhere to load a backend
+    /// from — needs a genuinely separate OS process with it pointed at
+    /// nothing, on the `detached_launch_falls_back_without_a_user_manager`
+    /// shape (`trollshell/src/plugins/tests.rs`): `std::env::set_var` is
+    /// `unsafe` in edition 2024 (forbidden workspace-wide) and unsound under a
+    /// multi-threaded harness regardless.
+    ///
+    /// Mutation (drop the `gio::TlsError::Unavailable` arm in `probe`): the
+    /// child still passes as a process, but its own assertions red — the
+    /// sentence goes back to naming only the anchors file, which is exactly
+    /// the shape N2 measured against a bare niri session.
+    #[test]
+    fn no_gio_tls_backend_names_gio_extra_modules_not_the_file() {
+        let exe = std::env::current_exe().expect("this test binary's own path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "verify::tls_tests::no_gio_tls_backend_names_gio_extra_modules_not_the_file_inner",
+            ])
+            .env("GIO_EXTRA_MODULES", "/nonexistent")
+            .env("AGENT_WINDOW_TEST_NO_GIO_BACKEND", "1")
+            .output()
+            .expect("re-exec this test binary with GIO_EXTRA_MODULES pointed nowhere");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the no-backend child must pass, not panic.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+        assert!(
+            stdout.contains("NO_GIO_BACKEND_NAMES_GIO_EXTRA_MODULES"),
+            "the child must report that the card actually names GIO_EXTRA_MODULES.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The child half of the test above. Runs its assertions only when
+    /// re-executed with `GIO_EXTRA_MODULES` pointed nowhere; an ordinary
+    /// devShell/CI run has a working backend (#1234 ask 3), so there would be
+    /// nothing to assert.
+    #[test]
+    fn no_gio_tls_backend_names_gio_extra_modules_not_the_file_inner() {
+        if std::env::var_os("AGENT_WINDOW_TEST_NO_GIO_BACKEND").is_none() {
+            return;
+        }
+        let verdict = probe(&anchors(), "127.0.0.1", closed_port(), 5, TEST_BUDGET);
+        let Presented::UnusableAnchors(why) = verdict else {
+            panic!("with no GIO TLS backend the anchors cannot even be opened: {verdict:?}")
+        };
+        assert!(
+            why.contains("GIO_EXTRA_MODULES"),
+            "the card must name the actual cause instead of leaving the operator staring at a \
+             file that is fine: {why}"
+        );
+
+        let resolved = resolve_route(
+            &Route::VerifyAgainstBundle {
+                bundle: anchors(),
+                source: Source::Env(super::CA_ENV),
+            },
+            "https://hive.local/agent/stray/",
+        );
+        assert_eq!(resolved.policy, TlsPolicy::SystemStore);
+        let tried = resolved
+            .tried
+            .expect("the card names what this launch tried");
+        assert!(
+            tried.contains("GIO_EXTRA_MODULES"),
+            "the composed card must carry the real cause too, not just `probe`'s own verdict: \
+             {tried}"
+        );
+        println!("NO_GIO_BACKEND_NAMES_GIO_EXTRA_MODULES");
     }
 
     /// **The identity check is real, and it is the stated reason for probing

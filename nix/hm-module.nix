@@ -508,10 +508,6 @@ in
         home.packages = [ cfg.controlCenter.package ];
       })
 
-      # The per-agent companion window (#950): the hyperhive agents card's two
-      # destinations. On by default exactly when `plugins.agents` is declared —
-      # the plugin resolves this binary on the *user manager's* PATH, which is
-      # what the user profile feeds, and degrades to the browser without it.
       (lib.mkIf (cfg.agentWindow.enable && cfg.agentWindow.hiveTlsStateDir != null) {
         # #1234: the hive's TLS directory, so the window trusts a same-host
         # self-signed gateway with nothing set by hand. Written to BOTH
@@ -533,6 +529,10 @@ in
         systemd.user.sessionVariables.TROLLSHELL_AGENT_WINDOW_TLS_DIR = cfg.agentWindow.hiveTlsStateDir;
       })
 
+      # The per-agent companion window (#950): the hyperhive agents card's two
+      # destinations. On by default exactly when `plugins.agents` is declared —
+      # the plugin resolves this binary on the *user manager's* PATH, which is
+      # what the user profile feeds, and degrades to the browser without it.
       (lib.mkIf cfg.agentWindow.enable {
         home.packages = [ cfg.agentWindow.package ];
       })

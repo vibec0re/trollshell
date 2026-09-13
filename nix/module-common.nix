@@ -192,9 +192,9 @@ self:
 
           Neither is read unless it is readable, and neither changes the
           machine's trust store or the session's TLS-error policy (which stays
-          `Fail` on every path). `TROLLSHELL_AGENT_WINDOW_CA` and
-          `TROLLSHELL_AGENT_WINDOW_CERT` override, in that order, for a hive on
-          another host.
+          `Fail` on every path). For a hive on another host,
+          `TROLLSHELL_AGENT_WINDOW_CERT` overrides both well-known files, and
+          `TROLLSHELL_AGENT_WINDOW_CA` overrides the well-known bundle.
 
           The default reads hyperhive's own `tls.stateDir` option when that
           module is on this host, so the two sides cannot drift when it moves —

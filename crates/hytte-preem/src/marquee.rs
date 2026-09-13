@@ -1043,8 +1043,12 @@ mod tests {
     /// zero-width buffer is a valid degenerate case, not an error.
     #[test]
     fn window_px_knob_has_a_ceiling() {
-        let width_of =
-            |px: usize| Marquee::new(DisplayStyle::Vfd).window_px(px).render("").width();
+        let width_of = |px: usize| {
+            Marquee::new(DisplayStyle::Vfd)
+                .window_px(px)
+                .render("")
+                .width()
+        };
         assert_eq!(width_of(0), 0, "0 is left alone");
         assert_eq!(width_of(MAX_WINDOW_PX), MAX_WINDOW_PX);
         assert_eq!(

@@ -2210,8 +2210,14 @@ mod tests {
         );
 
         let way_over = Gauge::new().ticks(usize::MAX, usize::MAX);
-        assert_eq!(way_over.divisions, MAX_DIVISIONS, "usize::MAX clamps down too");
-        assert_eq!(way_over.subdivisions, MAX_SUBDIVISIONS, "usize::MAX clamps down too");
+        assert_eq!(
+            way_over.divisions, MAX_DIVISIONS,
+            "usize::MAX clamps down too"
+        );
+        assert_eq!(
+            way_over.subdivisions, MAX_SUBDIVISIONS,
+            "usize::MAX clamps down too"
+        );
     }
 
     /// The `with_size` knob has both a floor and a ceiling on each axis: `0`
@@ -2227,7 +2233,10 @@ mod tests {
         let at_ceiling = Gauge::with_size(MAX_BUFFER_DIM, MAX_BUFFER_DIM);
         let over_ceiling = Gauge::with_size(MAX_BUFFER_DIM + 1, MAX_BUFFER_DIM + 1);
         let way_over = Gauge::with_size(usize::MAX, usize::MAX);
-        assert_eq!((at_ceiling.cols, at_ceiling.rows), (MAX_BUFFER_DIM, MAX_BUFFER_DIM));
+        assert_eq!(
+            (at_ceiling.cols, at_ceiling.rows),
+            (MAX_BUFFER_DIM, MAX_BUFFER_DIM)
+        );
         assert_eq!(
             (over_ceiling.cols, over_ceiling.rows),
             (at_ceiling.cols, at_ceiling.rows),

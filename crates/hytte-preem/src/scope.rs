@@ -810,7 +810,11 @@ mod tests {
     #[test]
     fn with_size_knob_has_both_bounds_on_each_axis() {
         let floor = Scope::with_size(0, 0);
-        assert_eq!((floor.width(), floor.height()), (2, 2), "0 clamps up to 1x1 at 2x scale");
+        assert_eq!(
+            (floor.width(), floor.height()),
+            (2, 2),
+            "0 clamps up to 1x1 at 2x scale"
+        );
 
         let dim = |s: &Scope| (s.cols, s.rows);
         let at_ceiling = Scope::with_size(MAX_BUFFER_DIM, MAX_BUFFER_DIM);

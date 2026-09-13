@@ -391,3 +391,202 @@ async fn change_during_initial_get_window_is_not_lost() {
          tracker did not converge to Loaded(99)"
     );
 }
+
+// ── #1222 item 1: the daemon dies while the cold Get is in flight ────────────
+//
+// `cold_get` wraps the initial `Get` in `with_conn` (property.rs's `cold_get`,
+// this file's neighbour), which is the reconnect seam: a transient failure on
+// that call is what clears the cached connection and wakes the supervisor
+// (`connection.rs`'s `with_conn` tail). Nothing in this crate pinned the case
+// where the daemon dies WHILE that specific Get is still outstanding —
+// `reconnect_emits_stale_then_loaded` (above, :149) disconnects only *after*
+// observing `Loaded(42)`; `change_during_initial_get_window_is_not_lost`
+// (above, :310) races a `PropertiesChanged` signal against the Get, not a
+// connection drop; `killed_and_restarted_daemon_is_detected_by_with_conn_itself`
+// (`connection_reconnect.rs`:170) kills the daemon only after draining to the
+// initial `Loaded(42)`. This test kills it *during* the first, still-pending
+// Get.
+//
+// `WithholdingCounter::value` notifies `get_started` the instant the Get
+// lands on the peer, then parks forever (`std::future::pending`) — there is
+// nothing to "release" it to: once the daemon that would route its reply is
+// dead, that reply can never reach the client on any connection, old or new,
+// so there is no point modelling a release path that cannot deliver.
+//
+// The contract this pins (`PropState`'s own doc plus `cold_get`'s comment):
+// once the daemon is restarted, the subscriber must converge to `Loaded` on
+// the value the FRESH connection's Get answers with, and must never observe
+// `Loaded`/`Stale` on 42 — the value the dead connection's Get would have
+// answered with, had it ever gotten to reply. A `Stale` marking in between is
+// allowed by the state machine but not required here: since the first Get
+// never completes, `run_property`'s `last` never becomes `Some`, so the one
+// `needs_mark` write already spent before this test starts touching the
+// daemon (the initial `Loading`) is the only mark until recovery — there is
+// no `last` value for an in-between `Stale` to carry.
+//
+// ── Why this uses two independent ephemeral buses, not `restart_on_same_
+// address` ───────────────────────────────────────────────────────────────
+//
+// Recovery here has to go through a real `spawn_supervisor_for_test` +
+// `arm_reconnect_for_test`, exactly like `tests/resubscribe.rs`'s
+// `a_lone_property_subscription_detects_a_dead_daemon_and_recovers`, and for
+// the same reason that test gives for not using
+// `simulate_disconnect_for_test`: that helper clears the cache and wakes the
+// supervisor *itself*, which would make this test pass even if `with_conn`'s
+// own detection were deleted.
+//
+// But an in-flight `Get` is the *fastest possible* detector in this crate —
+// it is already registered as a receiver on the connection's broadcast
+// channel, so it observes the socket-reader's error directly, with no extra
+// "resubscribe, discover the stream ended, and re-issue a fresh call" lap
+// like every other reconnect test's detection path takes. Measured against
+// `restart_on_same_address` (kill, wait for reap, spawn a new daemon on the
+// same path, wait for its startup line, dial it) that speed is a liability:
+// the supervisor can wake and lose the race to a real, unrelated session bus
+// before this test ever reaches its own `arm_reconnect_for_test` call —
+// `connection_reconnect.rs`'s neighbouring comment calls exactly this race
+// out as "a trap this test has no reason to walk into", and it is not
+// hypothetical here — a `nix develop` shell has a real, reachable
+// `$DBUS_SESSION_BUS_ADDRESS`, and an earlier draft of this test lost that
+// race reliably (the retried `Get` came back `ServiceUnknown` from that real
+// bus instead of `Ok` from the intended replacement).
+//
+// So the replacement bus (server included) is stood up and armed BEFORE bus
+// A's daemon is killed, which closes the race window by construction rather
+// than by hoping the arm wins it: `arm_reconnect_for_test` only populates a
+// side table the supervisor consults on its *next* wake, and nothing wakes
+// the supervisor until the in-flight Get on bus A actually fails — which
+// cannot happen before bus A's daemon dies, several lines below the arm.
+struct WithholdingCounter {
+    value: u32,
+    get_started: Arc<Notify>,
+}
+
+#[zbus::interface(name = "mov.vibec0re.test.WithholdingCounter")]
+impl WithholdingCounter {
+    #[zbus(property)]
+    async fn value(&self) -> u32 {
+        // Prove the Get actually landed on the peer, then park forever: the
+        // reply this would eventually send can never reach the client once
+        // the daemon that routes it is dead, so nothing ever needs to release
+        // this — see the module comment above.
+        self.get_started.notify_one();
+        std::future::pending::<()>().await;
+        self.value
+    }
+}
+
+/// Non-withholding counter for the replacement bus: answers immediately with
+/// a value distinct from [`WithholdingCounter`]'s withheld 42, so reaching it
+/// requires a fresh Get on the fresh connection rather than a replay of the
+/// dead epoch's (never-sent) answer.
+struct FreshCounter {
+    value: u32,
+}
+
+#[zbus::interface(name = "mov.vibec0re.test.WithholdingCounter")]
+impl FreshCounter {
+    #[zbus(property)]
+    fn value(&self) -> u32 {
+        self.value
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_in_flight_when_the_daemon_dies_recovers_to_loaded_after_restart() {
+    const IFACE: &str = "mov.vibec0re.test.WithholdingCounter";
+    const PATH: &str = "/mov/vibec0re/test/WithholdingCounter";
+    /// The dead epoch's withheld answer. Never sent, and must never be
+    /// observed by the subscriber under test.
+    const WITHHELD: u32 = 42;
+    /// The replacement bus's answer. Distinct from `WITHHELD` on purpose —
+    /// see the module comment.
+    const FRESH: u32 = 43;
+
+    // ── Bus A: where the Get will be genuinely outstanding when its daemon
+    // dies ────────────────────────────────────────────────────────────────
+    let (conn_a, guard_a) = ephemeral_bus().await;
+    let address_a = guard_a.address.clone();
+
+    let get_started = Arc::new(Notify::new());
+    let _server_a = zbus::connection::Builder::address(address_a.as_str())
+        .unwrap()
+        .name(IFACE)
+        .unwrap()
+        .serve_at(
+            PATH,
+            WithholdingCounter {
+                value: WITHHELD,
+                get_started: get_started.clone(),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let shared = SharedConnection::for_test_session(conn_a);
+    shared.spawn_supervisor_for_test();
+
+    let prop = property_with::<u32>(&shared, IFACE)
+        .at_path(PATH)
+        .iface(IFACE)
+        .name("Value")
+        .start();
+    let mut stream = prop.signal().to_stream();
+
+    // Wait (bounded) for the cold Get to actually land on the peer before
+    // touching bus A — otherwise "kill it while the Get is outstanding"
+    // could race a Get that hasn't been sent yet.
+    tokio::time::timeout(Duration::from_secs(5), get_started.notified())
+        .await
+        .expect("the initial Get never reached the peer — is the tracker parked elsewhere?");
+
+    // ── Bus B: the replacement, stood up and armed BEFORE bus A dies — see
+    // the module comment for why this order is load-bearing ───────────────
+    let (conn_b, guard_b) = ephemeral_bus().await;
+    let address_b = guard_b.address.clone();
+    let _server_b = zbus::connection::Builder::address(address_b.as_str())
+        .unwrap()
+        .name(IFACE)
+        .unwrap()
+        .serve_at(PATH, FreshCounter { value: FRESH })
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    shared.arm_reconnect_for_test(conn_b);
+
+    // Now kill bus A's daemon, with the Get from above still outstanding,
+    // parked and unanswered, on it.
+    drop(guard_a);
+
+    let mut saw_loading = false;
+    let mut recovered = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    while tokio::time::Instant::now() < deadline && !recovered {
+        let next = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
+        if let Ok(Some(state)) = next {
+            match state {
+                PropState::Loading => saw_loading = true,
+                PropState::Loaded(WITHHELD) | PropState::Stale(WITHHELD) => panic!(
+                    "observed the dead epoch's withheld answer ({WITHHELD}) after the daemon \
+                     was killed with its Get still outstanding — a recovered subscription must \
+                     only ever surface a fresh Get's answer, never a replay of the dead one"
+                ),
+                PropState::Loaded(FRESH) => recovered = true,
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        saw_loading,
+        "expected the initial Loading state to have been observed before the daemon died"
+    );
+    assert!(
+        recovered,
+        "property subscription never reached Loaded({FRESH}) after the daemon was killed with \
+         its initial Get outstanding and a replacement bus armed"
+    );
+}

@@ -1921,13 +1921,13 @@ mod tests {
         // Every block-row is a uniform field except the one straddling row 5,
         // whose two rows disagree — the correct row-major stride finds that
         // one block, and only that one, not-flat.
-        let frame = native_frame(2, 16, |_, y| {
-            if y == 5 {
-                [1, 2, 3, 4]
-            } else {
-                [9, 9, 9, 255]
-            }
-        });
+        let frame = native_frame(
+            2,
+            16,
+            |_, y| {
+                if y == 5 { [1, 2, 3, 4] } else { [9, 9, 9, 255] }
+            },
+        );
         assert_eq!(
             flat_block_fraction(&frame, (2, 16), two, 1),
             Some(7.0 / 8.0),

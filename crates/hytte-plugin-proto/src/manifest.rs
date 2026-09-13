@@ -268,11 +268,54 @@ pub enum Capability {
 /// - [`SidebarBottom`](Mount::SidebarBottom) — below everything (the departures
 ///   board).
 ///
-/// Appending [`SidebarLead`](Mount::SidebarLead) is additive under the crate's
-/// compat rules (see the crate root): `Mount` is an externally-tagged **unit**
-/// enum, so every variant rides the wire as its bare *name* (`"SidebarTop"`, …).
-/// A new name-tagged variant leaves every existing variant's encoding untouched,
-/// so [`PROTO_VERSION`](crate::PROTO_VERSION) stays the same.
+/// The sidebar variants come in a **left** and a **right** family
+/// (`Sidebar*` / `SidebarRight*`, #1158/#1159), one per sidebar surface, and the
+/// host treats the families identically: same three regions, same reconciler,
+/// same card class — only the surface the region is mounted on differs. A plugin
+/// names its family in its manifest, and the launch can override the whole mount
+/// through `HYTTE_PLUGIN_MOUNT` (see `hytte_plugin::run`), so where a card sits
+/// is a deployment decision rather than a plugin-author one.
+///
+/// Appending [`SidebarLead`](Mount::SidebarLead) — and later the right family —
+/// is additive under the crate's compat rules (see the crate root): `Mount` is
+/// an externally-tagged **unit** enum, so every variant rides the wire as its
+/// bare *name* (`"SidebarTop"`, …). A new name-tagged variant leaves every
+/// existing variant's encoding untouched, so
+/// [`PROTO_VERSION`](crate::PROTO_VERSION) stays the same.
+///
+/// It does bump the census ([`SIDEBAR_RIGHT_VOCAB`], generation 6) — but note
+/// what the counter can and cannot do for *this* enum. A `Mount` rides inside
+/// the [`Register`](crate::msg::PluginMsg::Register) frame, which is the very
+/// frame that carries [`vocab`](Manifest::vocab): an older host fails to decode
+/// `"SidebarRightTop"` and drops the connection *before*
+/// [`check_vocab`](Manifest::check_vocab) ever runs, so the loud failure here is
+/// the decode error, not the handshake check. That is the trade #1158 chose over
+/// a `{ region, side }` struct, which would have re-shaped a frame every plugin
+/// already sends.
+///
+/// # This enum is **append only**
+///
+/// A new variant goes at the **end** of the declaration, never between two
+/// existing ones — the readable left/right grouping lives in
+/// [`ALL`](Mount::ALL), which is order-free, not here.
+///
+/// The reason is that the variant's *integer index* is wire-visible even though
+/// nothing in this workspace ever sends one: rmp-serde's `Deserialize` for a unit
+/// enum accepts a bare integer as well as the name it encodes, so declaration
+/// order is part of the decoder's accepted vocabulary. #1159's first cut inserted
+/// the three `SidebarRight*` variants between `SidebarBottom` and `BarLeft`, and
+/// the review measured the silent remap that bought: index 3/4/5 stopped decoding
+/// as `BarLeft`/`BarCenter`/`BarRight` and started decoding as the three new
+/// sidebar-right mounts — i.e. a non-Rust client written against this crate as the
+/// "language-neutral schema anchor" the crate root advertises would have had three
+/// of its mounts silently re-pointed at the other sidebar, with nothing in either
+/// end's logs. Every previous generation here appended at the tail
+/// ([`Capability`]'s `OpenUri` is last, and `manifest_full_v1` pins that order in
+/// bytes); this stays that way.
+///
+/// `the_mount_integer_indices_are_frozen` in `tests/proto.rs` is the guard: it
+/// pins all nine indices to their variants as a literal table, so a mid-enum
+/// insertion is a failing test rather than a wire break.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mount {
     /// The leading sidebar region — the very top, above the built-in cards.
@@ -282,9 +325,86 @@ pub enum Mount {
     BarLeft,
     BarCenter,
     BarRight,
+    /// The leading region of the **right** sidebar (#1158) — the mirror of
+    /// [`SidebarLead`](Mount::SidebarLead) on the other surface.
+    ///
+    /// Appended after the bar family rather than beside its left-hand twin, for
+    /// the append-only reason on the enum's own doc above; [`ALL`](Mount::ALL)
+    /// carries the readable grouping instead.
+    SidebarRightLead,
+    /// The right sidebar's middle region — the mirror of
+    /// [`SidebarTop`](Mount::SidebarTop).
+    SidebarRightTop,
+    /// The right sidebar's trailing region — the mirror of
+    /// [`SidebarBottom`](Mount::SidebarBottom).
+    SidebarRightBottom,
 }
 
 impl Mount {
+    /// Every mount — the vocabulary a launch-time override is parsed against
+    /// ([`from_wire_name`](Mount::from_wire_name)) and the list an SDK error names
+    /// when it refuses one (#1159).
+    ///
+    /// Ordered by **family** (left sidebar, right sidebar, bar), deliberately
+    /// *not* in the enum's declaration order: the enum is append-only because its
+    /// integer indices are wire-visible (see the type's own doc), while this array
+    /// is read only by humans and by loops that do not care, so it is free to read
+    /// the way the two sidebars actually relate. Nothing may derive a wire value
+    /// from a position in here.
+    ///
+    /// Appending a variant to the enum means adding it here too. Two things catch
+    /// a half-done append: [`wire_name`](Mount::wire_name)'s match is exhaustive
+    /// (so a new variant does not compile until it is named), and
+    /// `every_mount_variant_names_itself_and_is_listed` in `tests/proto.rs` pins
+    /// this array's length and contents against that name table.
+    pub const ALL: [Mount; 9] = [
+        Mount::SidebarLead,
+        Mount::SidebarTop,
+        Mount::SidebarBottom,
+        Mount::SidebarRightLead,
+        Mount::SidebarRightTop,
+        Mount::SidebarRightBottom,
+        Mount::BarLeft,
+        Mount::BarCenter,
+        Mount::BarRight,
+    ];
+
+    /// This mount's **wire name** — the bare variant name serde's external
+    /// tagging puts on the wire (`"SidebarRightTop"`, …).
+    ///
+    /// The one place that string is spelled. `trollshell`'s `mount_name` (the
+    /// control-center's runtime overlay, #423) and the SDK's `HYTTE_PLUGIN_MOUNT`
+    /// parser both read it here rather than carrying their own table, so a rename
+    /// cannot leave two of the three disagreeing. `tests/proto.rs` pins each name
+    /// against the bytes `encode_body` actually produces, so this table cannot
+    /// drift from serde's tag either.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Mount::SidebarLead => "SidebarLead",
+            Mount::SidebarTop => "SidebarTop",
+            Mount::SidebarBottom => "SidebarBottom",
+            Mount::SidebarRightLead => "SidebarRightLead",
+            Mount::SidebarRightTop => "SidebarRightTop",
+            Mount::SidebarRightBottom => "SidebarRightBottom",
+            Mount::BarLeft => "BarLeft",
+            Mount::BarCenter => "BarCenter",
+            Mount::BarRight => "BarRight",
+        }
+    }
+
+    /// The mount a wire name spells, or `None` for a name outside
+    /// [`ALL`](Mount::ALL).
+    ///
+    /// The inverse of [`wire_name`](Mount::wire_name), exact-matched: this is how
+    /// a launch-time `HYTTE_PLUGIN_MOUNT` value becomes a `Mount`, and an unknown
+    /// name must stay `None` so the SDK can refuse it loudly rather than fall
+    /// back to the manifest and misplace a card (#1159).
+    #[must_use]
+    pub fn from_wire_name(name: &str) -> Option<Mount> {
+        Mount::ALL.into_iter().find(|m| m.wire_name() == name)
+    }
+
     /// Whether this is one of the three **bar** regions (a slim inline chip),
     /// as opposed to a sidebar card. A bar chip is effectively always on-screen,
     /// so the host reports a constant [`SlotVisible`](StateKey::SlotVisible) of
@@ -295,6 +415,33 @@ impl Mount {
         matches!(self, Mount::BarLeft | Mount::BarCenter | Mount::BarRight)
     }
 }
+
+/// The [`VOCAB`](crate::VOCAB) generation that appended the **right sidebar's**
+/// three mounts ([`Mount::SidebarRightLead`] / [`SidebarRightTop`](Mount::SidebarRightTop) /
+/// [`SidebarRightBottom`](Mount::SidebarRightBottom), #1158/#1159).
+///
+/// Census-only, like the four generations before it: it does **not** move
+/// [`VOCAB_UNCONDITIONAL`], so a plugin rebuilt on this SDK still stamps the
+/// generation every older shell accepts and is not refused at the handshake —
+/// the trade #882/#893/#966/#1045 each declined to make, for the same reason.
+///
+/// Unlike those four, the argument here is not "the plugin waits for a `Hello`"
+/// (#882) nor "the gating capability is itself undecodable" (#1045). It is that
+/// the counter **structurally cannot** gate this variant: a `Mount` rides inside
+/// the `Register` frame that carries [`Manifest::vocab`], so a pre-#1159 host
+/// fails `rmp-serde` decoding of the frame and drops the connection before
+/// [`Manifest::check_vocab`] is reached. Refusing at the handshake is therefore
+/// not on the table, and bumping the unconditional ceiling would buy nothing but
+/// a refusal for every plugin that never leaves the left sidebar. What an owner
+/// sees on an older shell is a plugin that will not register — loud, and named
+/// by the host's own decode error — which is exactly the outcome #1158 weighed a
+/// `{ region, side }` struct against.
+///
+/// The generation exists as a const rather than a bare `VOCAB` bump so both the
+/// census and the "newest appended variant" pin in `tests/proto.rs` compare
+/// against one number (the [`OPEN_URI_VOCAB`](crate::effect::OPEN_URI_VOCAB)
+/// shape).
+pub const SIDEBAR_RIGHT_VOCAB: u16 = 6;
 
 /// A datasource a plugin serves (#509), declared in
 /// [`Manifest::provides`]. `id` is the datasource name a requester queries

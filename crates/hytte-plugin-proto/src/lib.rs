@@ -228,7 +228,21 @@ pub const PROTO_VERSION: u16 = 1;
 /// undeclared emit is a plugin bug with a named residual). It is also the first
 /// appended [`Effect`](effect::Effect) variant since this counter existed. See
 /// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB).
-pub const VOCAB: u16 = 5;
+///
+/// Generation `6` is #1158's right sidebar — the three
+/// [`Mount`](manifest::Mount) variants `SidebarRightLead` / `SidebarRightTop` /
+/// `SidebarRightBottom`, marked by
+/// [`SIDEBAR_RIGHT_VOCAB`](manifest::SIDEBAR_RIGHT_VOCAB). Census-only like the
+/// four before it, and the first appended [`Mount`](manifest::Mount) variant
+/// since this counter existed — which is also the one case where the counter's
+/// *mechanism* cannot fire: a `Mount` rides inside the `Register` frame that
+/// carries [`vocab`](manifest::Manifest::vocab), so an older host fails the frame
+/// decode and drops the connection before
+/// [`check_vocab`](manifest::Manifest::check_vocab) is reached. The census is
+/// bumped anyway — it is a census — and
+/// [`SIDEBAR_RIGHT_VOCAB`](manifest::SIDEBAR_RIGHT_VOCAB) carries the full
+/// argument for why the *unconditional* ceiling still must not move.
+pub const VOCAB: u16 = 6;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -243,7 +257,11 @@ pub const VOCAB: u16 = 5;
 /// widget ([`SHADER_VOCAB`](wire::SHADER_VOCAB)) is the second and #966's bounded
 /// viewport ([`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB)) the third. (#1045's
 /// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB) is the fourth to leave this const
-/// alone, on a capability argument rather than a `Hello` one. Read the rule
+/// alone, on a capability argument rather than a `Hello` one, and #1158's
+/// [`SIDEBAR_RIGHT_VOCAB`](manifest::SIDEBAR_RIGHT_VOCAB) the fifth, on a third
+/// argument again: a [`Mount`](manifest::Mount) rides inside the `Register` frame
+/// that carries the counter, so a handshake refusal is not reachable and bumping
+/// this would only refuse every plugin that never leaves the left sidebar. Read the rule
 /// below against it before appending the next `Effect`: a plugin *may* emit
 /// `OpenUri` with no advertisement — what stops an old host seeing one is the
 /// plugin having declared the gating capability, which nothing enforces. #1045
@@ -274,7 +292,9 @@ pub use effect::{
     ConsentDecision, DatasourceError, DatasourceOutcome, Effect, EffectOutcome, MediaAction,
     NiriAction, OPEN_URI_VOCAB, Page,
 };
-pub use manifest::{Capability, Manifest, Mount, ProvidedDatasource, StateKey};
+pub use manifest::{
+    Capability, Manifest, Mount, ProvidedDatasource, SIDEBAR_RIGHT_VOCAB, StateKey,
+};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
 pub use preem::{
     AccentRole, DEFAULT_DOT_PX, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState,

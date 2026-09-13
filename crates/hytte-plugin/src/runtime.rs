@@ -7,8 +7,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use hytte_plugin_proto::{
-    Capability, Effect, HostMsg, LogLevel, PluginMsg, ProtoError, StateKey, VOCAB_UNCONDITIONAL,
-    read_frame, socket_path, write_frame,
+    Capability, Effect, HostMsg, LogLevel, Mount, PluginMsg, ProtoError, StateKey,
+    VOCAB_UNCONDITIONAL, read_frame, socket_path, write_frame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -49,6 +49,90 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// is nothing left to check.
 async fn shutdown_fired(shutdown: &mut watch::Receiver<bool>) -> Option<()> {
     shutdown.changed().await.ok()
+}
+
+/// The launch-time mount override (#1159, epic #1158): a wire
+/// [`Mount`](hytte_plugin_proto::Mount) name that replaces whatever the plugin's
+/// own [`manifest`](Plugin::manifest) asked for.
+///
+/// An **environment variable** rather than an argv flag, settled on #866: two
+/// bundled plugins parse their own argv with `clap` for a CLI hat
+/// (`hytte-infobroker`, `hytte-plugin-niri-layouts`, #1116) and would reject an
+/// SDK-owned `--mount`, while an env var rides the launcher's existing
+/// `env` → `--setenv=K=V` path (`trollshell/src/plugin_launcher.rs`) with no
+/// launcher change at all — which is exactly what "nix renders the placement onto
+/// the launch" already means for every other knob.
+///
+/// Read once, in [`run`], before the first dial; applied to the manifest inside
+/// every [`session`] so a reconnect carries it too. The plugin's own
+/// `manifest()` is never called differently and never sees the override.
+const MOUNT_ENV: &str = "HYTTE_PLUGIN_MOUNT";
+
+/// A [`MOUNT_ENV`] value that is not a wire mount name.
+///
+/// A refusal, never a fallback: silently keeping the manifest's mount would put
+/// the card on the *other* sidebar from the one the deployment asked for, with
+/// nothing on screen to say so — the single worst outcome available, since the
+/// plugin looks healthy. So this is fatal at startup, and its message names every
+/// spelling that would have worked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountOverrideError {
+    /// The value exactly as the environment carried it (untrimmed, and
+    /// lossy-converted if it was not UTF-8), so the message shows the typo rather
+    /// than a cleaned-up version of it.
+    value: String,
+}
+
+impl std::fmt::Display for MountOverrideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The spellings come from `Mount::ALL`, not a list written out here: a
+        // tenth mount must not be able to exist without this message naming it.
+        let names = Mount::ALL.map(Mount::wire_name).join(", ");
+        write!(
+            f,
+            "{MOUNT_ENV}={:?} is not a mount name; expected one of: {names}",
+            self.value,
+        )
+    }
+}
+
+impl std::error::Error for MountOverrideError {}
+
+/// Parse one raw [`MOUNT_ENV`] value. The whole decision, with no environment in
+/// it, so the nine accepted spellings and the refusal are testable without
+/// mutating process state (`unsafe` is forbidden workspace-wide, so
+/// `std::env::set_var` is not available to a test anyway).
+///
+/// `None` in → `Ok(None)`: the variable is unset and the manifest wins.
+/// Surrounding whitespace is trimmed before the lookup — a trimmed name still
+/// resolves to exactly one mount, so this cannot misplace anything — but the
+/// match is otherwise **exact**, case included, because the value has to be a
+/// name the wire itself can carry (`Mount::from_wire_name`). An empty or
+/// whitespace-only value is therefore a refusal, not "unset": the launcher can
+/// render `--setenv=HYTTE_PLUGIN_MOUNT=` from an empty Nix string, and treating
+/// that as "no override" would hide a misconfiguration.
+fn mount_override(raw: Option<&str>) -> Result<Option<Mount>, MountOverrideError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    Mount::from_wire_name(raw.trim())
+        .map(Some)
+        .ok_or_else(|| MountOverrideError {
+            value: raw.to_owned(),
+        })
+}
+
+/// [`mount_override`] against the real environment — the only place this SDK
+/// reads one. A non-UTF-8 value is refused like any other unparseable one rather
+/// than ignored.
+fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
+    match std::env::var(MOUNT_ENV) {
+        Ok(raw) => mount_override(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(MountOverrideError {
+            value: raw.to_string_lossy().into_owned(),
+        }),
+    }
 }
 
 /// Reconnect backoff bounds: start small, cap so we never hammer the socket.
@@ -268,6 +352,16 @@ enum Step<M> {
 ///
 /// Generic over the I/O halves (not `UnixStream`) so the whole loop is
 /// hermetically testable over `tokio::io::duplex`.
+///
+/// `mount_override` is the launch-time placement [`run`] resolved out of
+/// [`MOUNT_ENV`] (#1159), applied to the manifest here rather than in `run` so a
+/// **reconnect** carries it too — the manifest is rebuilt from
+/// [`P::manifest`](Plugin::manifest) on every session. It arrives as a value
+/// rather than being re-read from the environment for two reasons: the refusal
+/// has to be fatal at *startup*, before the first dial, where whoever started the
+/// unit is watching; and a test can then drive all nine placements in one process
+/// without touching process state (`unsafe` is forbidden workspace-wide, so
+/// `std::env::set_var` is not available to one anyway).
 // One cohesive session lifecycle (handshake → seed render → the select loop over
 // every host frame → dedup); the length is the host-frame vocabulary, not
 // branching complexity — splitting it would scatter the loop for no gain.
@@ -276,6 +370,7 @@ async fn session<P, R, W>(
     rd: R,
     mut wr: W,
     mut shutdown: watch::Receiver<bool>,
+    mount_override: Option<Mount>,
 ) -> Result<(), ProtoError>
 where
     P: Plugin,
@@ -304,6 +399,13 @@ where
     // Handshake: `Register` MUST be the first frame (else the host drops us),
     // then a greeting through the host log (exercises the `Log` frame path).
     let mut manifest = P::manifest();
+    // The launch-time placement (#1159) replaces whatever the plugin asked for,
+    // here rather than in `run`, so a *reconnect* carries it too — the manifest is
+    // rebuilt from `P::manifest()` on every session. Applied before the `Register`
+    // frame below, which is the only place the mount is ever read.
+    if let Some(mount) = mount_override {
+        manifest.mount = mount;
+    }
     // Auto-opt-in to the desktop-accent push (#376): the SDK knows how to
     // consume `HostMsg::Accent` (it feeds the `preem` kit's default tint), so it
     // declares the subscription on every plugin's behalf — accent tracking is
@@ -711,6 +813,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
     plugin_id: &str,
     mut shutdown: watch::Receiver<bool>,
     mut connect: C,
+    mount_override: Option<Mount>,
 ) where
     P: Plugin,
     R: AsyncRead + Send + Unpin + 'static,
@@ -732,7 +835,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
         match connected {
             Ok((rd, wr)) => {
                 let started = Instant::now();
-                let outcome = session::<P, _, _>(rd, wr, shutdown.clone()).await;
+                let outcome = session::<P, _, _>(rd, wr, shutdown.clone(), mount_override).await;
                 let lived = started.elapsed();
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
@@ -782,8 +885,19 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// target — or a host restart is a transient we ride out here rather than
 /// exiting into systemd's start-limit), and drives one session per
 /// connection. Exits the process (status 1) only on unrecoverable setup:
-/// `XDG_RUNTIME_DIR` unset (then there is nothing to dial, ever) or the
-/// tokio runtime failing to build.
+/// `XDG_RUNTIME_DIR` unset (then there is nothing to dial, ever), the
+/// tokio runtime failing to build, or a [`MOUNT_ENV`] value that is not a wire
+/// mount name.
+///
+/// **Placement is a launch argument** (#1159, epic #1158). Before the first dial,
+/// `run` reads [`MOUNT_ENV`] (`HYTTE_PLUGIN_MOUNT`); a value naming one of the
+/// nine wire [`Mount`](hytte_plugin_proto::Mount)s replaces
+/// [`Plugin::manifest`]'s own `mount` in every `Register` this process sends,
+/// including after a reconnect. An unknown or empty value is a **startup
+/// failure** whose message names all nine spellings — never a silent fallback to
+/// the manifest, which would put the card on the wrong sidebar and look healthy
+/// doing it. The plugin's own code is not consulted and never sees the override:
+/// `manifest()` is called exactly as before.
 ///
 /// Also installs the `SIGTERM`/`SIGINT` listener for the shutdown lifecycle
 /// (#1079, crate docs' "Process shutdown" section): on either signal a
@@ -801,7 +915,32 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// `fork`/`exec` gap, not anything this function does), and not otherwise
 /// fixable short of blocking `SIGTERM` before the runtime exists.
 pub fn run<P: Plugin>() -> ! {
-    let plugin_id = P::manifest().id;
+    let manifest = P::manifest();
+    let plugin_id = manifest.id.clone();
+    // The launch-time placement (#1159), resolved once and before the first dial:
+    // an unparseable value is a startup failure, not something a plugin limps on
+    // with its manifest's mount (see `MountOverrideError`). `eprintln!` rather
+    // than `tracing::error!` for the reason the crate docs give — no plugin
+    // process installs a `tracing` subscriber, so a `tracing` line here would
+    // reach nobody, while the journal captures stderr for the transient unit.
+    let mount_override = match mount_override_from_env() {
+        Ok(mount) => mount,
+        Err(e) => {
+            eprintln!("[{plugin_id}] {e}");
+            std::process::exit(1);
+        }
+    };
+    // One line, only when the override actually changes something — a deployment
+    // that pins a plugin to the mount it already asked for is not worth a line,
+    // and a silent move to the other sidebar is exactly what a reader of this
+    // journal would otherwise have to guess at.
+    if let Some(mount) = mount_override.filter(|m| *m != manifest.mount) {
+        eprintln!(
+            "[{plugin_id}] {MOUNT_ENV}={} overrides the manifest's {}",
+            mount.wire_name(),
+            manifest.mount.wire_name(),
+        );
+    }
     let Some(path) = socket_path() else {
         eprintln!("[{plugin_id}] XDG_RUNTIME_DIR unset; no host socket to dial");
         std::process::exit(1);
@@ -861,6 +1000,7 @@ pub fn run<P: Plugin>() -> ! {
                 Ok(stream.into_split())
             }
         },
+        mount_override,
     ));
     std::process::exit(0);
 }
@@ -868,16 +1008,16 @@ pub fn run<P: Plugin>() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, Redial, SHUTDOWN_GRACE,
-        SKEW_WARN_AFTER, reconnect_loop, session,
+        BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, MOUNT_ENV, MountOverrideError,
+        Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, mount_override, reconnect_loop,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
     use hytte_plugin_proto::preem::PREEM_VOCAB;
     use hytte_plugin_proto::{
         AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
-        HostMsg, LogLevel, Manifest, Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey,
-        StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
+        HostMsg, LogLevel, Manifest, Mount, Node, Page, PluginMsg, ProtoError, SPECTRUM_BINS,
+        StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -893,6 +1033,28 @@ mod tests {
     /// isn't itself about the #1079 shutdown lifecycle.
     fn never_shuts_down() -> watch::Receiver<bool> {
         watch::channel(false).1
+    }
+
+    /// [`super::session`] with **no** launch-time mount override — what every
+    /// test here wants except the #1159 placement ones, which call
+    /// `super::session` directly with a `Some`.
+    ///
+    /// A shim in the test module rather than a second entry point in the shipped
+    /// lib: the override is not optional in production (it is threaded from
+    /// [`run`] on every path), so a `None`-defaulting wrapper there would be dead
+    /// code, while here it keeps thirty-odd call sites that have nothing to do
+    /// with placement reading exactly as they did.
+    async fn session<P, R, W>(
+        rd: R,
+        wr: W,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<(), ProtoError>
+    where
+        P: Plugin,
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Unpin,
+    {
+        super::session::<P, R, W>(rd, wr, shutdown, None).await
     }
 
     // ── Test plugins ─────────────────────────────────────────────────────────
@@ -2625,8 +2787,10 @@ mod tests {
         // any further attempt parks forever.
         let mut pending = vec![p2, p1];
 
-        let dial_loop =
-            reconnect_loop::<Echo, _, _, _, _>("echo-test", never_shuts_down(), move || {
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
+            "echo-test",
+            never_shuts_down(),
+            move || {
                 let next = pending.pop();
                 async move {
                     match next {
@@ -2634,7 +2798,9 @@ mod tests {
                         None => std::future::pending().await,
                     }
                 }
-            });
+            },
+            None,
+        );
 
         let host = async move {
             let (mut hrd1, mut hwr1) = tokio::io::split(h1);
@@ -2676,19 +2842,24 @@ mod tests {
         let calls = connect_calls.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let dial_loop = reconnect_loop::<Echo, _, _, _, _>("echo-test", shutdown_rx, move || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            let next = first.take();
-            async move {
-                match next {
-                    Some(end) => Ok(tokio::io::split(end)),
-                    // A second connect attempt (a redial) parks here forever;
-                    // the outer timeout below turns that into a failure
-                    // instead of a hang.
-                    None => std::future::pending().await,
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
+            "echo-test",
+            shutdown_rx,
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let next = first.take();
+                async move {
+                    match next {
+                        Some(end) => Ok(tokio::io::split(end)),
+                        // A second connect attempt (a redial) parks here forever;
+                        // the outer timeout below turns that into a failure
+                        // instead of a hang.
+                        None => std::future::pending().await,
+                    }
                 }
-            }
-        });
+            },
+            None,
+        );
 
         let host = async move {
             let (mut hrd, _hwr) = tokio::io::split(h1);
@@ -2949,14 +3120,19 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            reconnect_loop::<NeverConnects, _, _, _, _>("never-connects-test", shutdown_rx, || {
-                std::future::pending::<
-                    std::io::Result<(
-                        tokio::io::ReadHalf<tokio::io::DuplexStream>,
-                        tokio::io::WriteHalf<tokio::io::DuplexStream>,
-                    )>,
-                >()
-            }),
+            reconnect_loop::<NeverConnects, _, _, _, _>(
+                "never-connects-test",
+                shutdown_rx,
+                || {
+                    std::future::pending::<
+                        std::io::Result<(
+                            tokio::io::ReadHalf<tokio::io::DuplexStream>,
+                            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+                        )>,
+                    >()
+                },
+                None,
+            ),
         )
         .await
         .expect(
@@ -3475,5 +3651,229 @@ mod tests {
             host
         );
         assert!(result.is_ok());
+    }
+
+    // ── Launch-time mount override (#1159, epic #1158) ──────────────────────
+
+    /// Drive the handshake half of a session with `override_mount` in force and
+    /// return the mount that actually went out in `Register`.
+    ///
+    /// Reads only the first frame, then drops both host halves: the plugin's
+    /// following `Log`/`Render` writes fail, the session returns `Err`, and that
+    /// is fine — the claim under test is entirely about the frame already read.
+    async fn registered_mount(override_mount: Option<Mount>) -> Mount {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            drop(hwr);
+            drop(hrd);
+            manifest.mount
+        };
+
+        let (_ended, mount) = tokio::join!(
+            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), override_mount),
+            host
+        );
+        mount
+    }
+
+    /// No override → the plugin's own manifest wins, unchanged. The baseline
+    /// every deployed plugin is on today, and the one case where a regression
+    /// would move every existing card at once.
+    #[tokio::test]
+    async fn without_an_override_the_manifest_mount_registers() {
+        assert_eq!(
+            Echo::manifest().mount,
+            Mount::SidebarTop,
+            "precondition: the test plugin asks for SidebarTop",
+        );
+        assert_eq!(
+            registered_mount(None).await,
+            Mount::SidebarTop,
+            "an unset HYTTE_PLUGIN_MOUNT leaves the manifest's mount alone",
+        );
+    }
+
+    /// Each of the nine mounts, set as the override, is the mount that goes out
+    /// in `Register` — including `SidebarTop`, which is the one the manifest
+    /// already asked for (so "the override is applied" is not confused with "the
+    /// manifest happened to agree").
+    ///
+    /// This is the whole feature: `plugins.<id>.mount` in nix (#1161) becomes
+    /// `HYTTE_PLUGIN_MOUNT` on the launch, and the only thing that has to be true
+    /// is that the frame the host reads says so.
+    ///
+    /// **Falsified** by deleting the `if let Some(mount) = mount_override` arm in
+    /// `session` (eight of the nine rows red), or by applying it *after* the
+    /// `Register` write (all nine).
+    #[tokio::test]
+    async fn every_mount_override_reaches_the_register_frame() {
+        for mount in Mount::ALL {
+            assert_eq!(
+                registered_mount(Some(mount)).await,
+                mount,
+                "HYTTE_PLUGIN_MOUNT={} must be the mount in Register",
+                mount.wire_name(),
+            );
+        }
+    }
+
+    /// An override survives a **reconnect**: the manifest is rebuilt from
+    /// `P::manifest()` once per session, so an override applied only on the first
+    /// pass would silently move the card back to the left sidebar the first time
+    /// the shell restarted.
+    ///
+    /// Two prepared connections, the host sending `Shutdown` on the first; both
+    /// handshakes must name the override. This is why the override lives on
+    /// `session` (which runs per connection) rather than being applied once in
+    /// `run`.
+    ///
+    /// **Falsified** by moving the override onto `run`'s own `P::manifest()` copy
+    /// instead of threading it into `session` — the second handshake then reports
+    /// `SidebarTop`.
+    #[tokio::test]
+    async fn a_mount_override_survives_a_reconnect() {
+        let (p1, h1) = duplex(64 * 1024);
+        let (p2, h2) = duplex(64 * 1024);
+        let mut pending = vec![p2, p1];
+
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
+            "echo-test",
+            never_shuts_down(),
+            move || {
+                let next = pending.pop();
+                async move {
+                    match next {
+                        Some(end) => Ok(tokio::io::split(end)),
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            Some(Mount::SidebarRightBottom),
+        );
+
+        let host = async move {
+            let (mut hrd1, mut hwr1) = tokio::io::split(h1);
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd1).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(
+                manifest.mount,
+                Mount::SidebarRightBottom,
+                "the first session registers on the overridden mount",
+            );
+            send(&mut hwr1, &HostMsg::Shutdown).await;
+
+            let (mut hrd2, _hwr2) = tokio::io::split(h2);
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd2).await else {
+                panic!("the redial's first frame must be Register");
+            };
+            assert_eq!(
+                manifest.mount,
+                Mount::SidebarRightBottom,
+                "…and so does the session after the reconnect",
+            );
+        };
+
+        tokio::select! {
+            () = host => {}
+            () = dial_loop => unreachable!("reconnect_loop never returns with a shutdown notice that never fires"),
+        }
+    }
+
+    /// The parser, with no environment in it: unset is "no override", and every
+    /// wire name resolves to its own mount.
+    #[test]
+    fn the_mount_override_parser_accepts_exactly_the_nine_wire_names() {
+        assert_eq!(
+            mount_override(None),
+            Ok(None),
+            "an unset variable is not an error — the manifest simply wins",
+        );
+        for mount in Mount::ALL {
+            assert_eq!(
+                mount_override(Some(mount.wire_name())),
+                Ok(Some(mount)),
+                "{} parses as itself",
+                mount.wire_name(),
+            );
+        }
+        // Surrounding whitespace is tolerated because a trimmed name still names
+        // exactly one mount (so this can never misplace a card), and a stray space
+        // in a Nix string is otherwise a launch failure with a baffling message.
+        assert_eq!(
+            mount_override(Some("  SidebarRightLead\t")),
+            Ok(Some(Mount::SidebarRightLead)),
+            "surrounding whitespace is trimmed before the lookup",
+        );
+    }
+
+    /// An unparseable value is **refused**, and the refusal names all nine
+    /// spellings — the one thing that makes this recoverable for whoever set it.
+    /// A silent fallback to the manifest is the outcome this test exists to
+    /// forbid: it would put the card on the other sidebar and leave the plugin
+    /// looking perfectly healthy.
+    ///
+    /// The empty and whitespace-only cases are here on purpose: `--setenv=K=` from
+    /// an empty Nix string is a plausible mistake, and reading it as "unset" would
+    /// swallow it.
+    ///
+    /// **Falsified** by having `mount_override` return `Ok(None)` on a bad value
+    /// (every row reds), by a case-insensitive lookup (the `sidebarrightlead` row),
+    /// or by writing the nine names out in `Display` instead of reading
+    /// `Mount::ALL` (the message stops listing a tenth mount the day one lands —
+    /// which is why the loop below reads `ALL` too).
+    #[test]
+    fn an_unparseable_mount_override_is_refused_and_names_every_spelling() {
+        for bad in [
+            "",
+            "   ",
+            "SidebarRight",
+            "sidebarrightlead",
+            "SidebarRightMiddle",
+            "BarTop",
+            "right",
+        ] {
+            let err = mount_override(Some(bad))
+                .expect_err("an unparseable override must be refused, never ignored");
+            assert_eq!(
+                err.value, bad,
+                "the message quotes the value verbatim, untrimmed",
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(MOUNT_ENV),
+                "the message names the variable: {msg}",
+            );
+            for mount in Mount::ALL {
+                assert!(
+                    msg.contains(mount.wire_name()),
+                    "the message must name {} as a valid spelling: {msg}",
+                    mount.wire_name(),
+                );
+            }
+        }
+    }
+
+    /// A non-UTF-8 value is refused like any other unparseable one rather than
+    /// quietly ignored — the `VarError::NotUnicode` arm of
+    /// `mount_override_from_env`, reached here through `MountOverrideError`
+    /// directly because constructing the process environment from a test would
+    /// need `unsafe`.
+    #[test]
+    fn a_non_utf8_mount_override_still_names_the_spellings() {
+        let err = MountOverrideError {
+            value: String::from_utf8_lossy(b"Sidebar\xffRight").into_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(MOUNT_ENV), "{msg}");
+        for mount in Mount::ALL {
+            assert!(msg.contains(mount.wire_name()), "{msg}");
+        }
     }
 }

@@ -31,6 +31,14 @@
 //! schedule, the log line, and the restart/stop rules with the async variant —
 //! there is deliberately only *one* supervision policy in this crate.
 //!
+//! [`spawn_supervised_blocking_bounded`] (#1196) is [`spawn_supervised_blocking`]
+//! crossed with [`spawn_supervised_bounded`]'s declaration, for the blocking
+//! bodies whose clean return is likewise the expected end of their work:
+//! `idle-notify-observer` (`hytte-services::idle_notify`) returning when the
+//! compositor has no `ext_idle_notifier_v1`, and both EDS workers
+//! (`calendar-eds`, `tasks-eds`, through `hytte-services::eds_retry`'s
+//! `spawn_eds_worker` seam) returning once every sender has disconnected.
+//!
 //! [`spawn_supervised_handle`] is [`spawn_supervised`] plus a way to stop it:
 //! it returns a [`SupervisorHandle`] whose [`cancel`](SupervisorHandle::cancel)
 //! aborts the run in flight and ends the restart loop. Reach for it only when
@@ -56,8 +64,8 @@
 //! current backoff — to [`crate::health`], which is where a diagnostics view
 //! reads "the niri connection has panicked four times in the last minute" from.
 //! The bookkeeping lives in [`supervise_runs`], the one loop every spawn
-//! function funnels through, so it covers all four variants and any future
-//! entry point that reuses that loop (#238, #690, #691).
+//! function funnels through, so it covers all five variants and any future
+//! entry point that reuses that loop (#238, #690, #691, #1196).
 //!
 //! # Restart policy: why a return is not a panic (#1174)
 //!
@@ -113,7 +121,7 @@
 //! points could one day hand back the same type without a single call site
 //! changing meaning. Do not add either property to it.
 //!
-//! All four funnel through [`supervise_runs`], which is how the cancellable
+//! All five funnel through [`supervise_runs`], which is how the cancellable
 //! variant inherits [`crate::health`] tracking for free — including releasing
 //! its row via [`crate::health::stopped`] when a cancelled supervisor unwinds,
 //! without which every backend switch would leak one.
@@ -257,14 +265,15 @@ where
 /// [`spawn_supervised`] is what turns a silent fall-out into a log line and a
 /// visible row.
 ///
-/// # No blocking twin
+/// # The blocking twin
 ///
-/// There is no `spawn_supervised_bounded_blocking`, for the same reason
-/// [`spawn_supervised_handle`] has no blocking twin: nothing needs one. Every
-/// body that returns by design in this tree is async, and the sole
-/// [`spawn_supervised_blocking`] call site (niri's IPC socket) is an infinite
-/// reconnect loop. Adding the twin is a five-line copy of this function the day
-/// a blocking body earns it.
+/// [`spawn_supervised_blocking_bounded`] is this same declaration for a
+/// blocking body. It did not exist before #1196, for the reason this doc used
+/// to give: every body that returned by design in this tree was async, and the
+/// sole [`spawn_supervised_blocking`] call site (niri's IPC socket) was an
+/// infinite reconnect loop with nothing to declare. #1194 gave three blocking
+/// bodies a designed return (`idle-notify-observer`, `calendar-eds`,
+/// `tasks-eds`), which is what earned the twin.
 pub fn spawn_supervised_bounded<F, Fut>(name: &'static str, factory: F)
 where
     F: Fn() -> Fut + Send + 'static,
@@ -291,6 +300,11 @@ where
 /// a cancellation likewise stops the supervisor, but drops its row. Same
 /// policy, same log lines, same stop conditions as the async variant: there is
 /// one supervision idiom here, not two.
+///
+/// If the body you are spawning *is* supposed to end — a stand-down that is
+/// the point rather than a symptom — reach for
+/// [`spawn_supervised_blocking_bounded`] instead, this function's own bounded
+/// twin.
 ///
 /// # What supervision *means* for a blocking task
 ///
@@ -333,9 +347,47 @@ pub fn spawn_supervised_blocking<F>(name: &'static str, task: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
-    // Always `Intent::Perpetual` (inside `supervise_blocking`) — see
-    // `spawn_supervised_bounded`'s "No blocking twin".
-    runtime::handle().spawn(supervise_blocking(name, Arc::new(task), Backoff::default()));
+    runtime::handle().spawn(supervise_blocking(
+        name,
+        Arc::new(task),
+        Backoff::default(),
+        Intent::Perpetual,
+    ));
+}
+
+/// [`spawn_supervised_blocking`] for a blocking task whose clean return is the
+/// **expected** end of its work — the blocking twin of
+/// [`spawn_supervised_bounded`], added by #1196 for the blocking bodies #1194
+/// gave a designed return: `idle-notify-observer` (no `ext_idle_notifier_v1`
+/// on this compositor) and the two EDS workers, `calendar-eds` and
+/// `tasks-eds`, through `hytte-services::eds_retry`'s `spawn_eds_worker` seam
+/// (every sender disconnected — the service tearing down).
+///
+/// Identical to [`spawn_supervised_blocking`] in every other respect — same
+/// restart-safety precondition, same capped exponential backoff, same
+/// restart-on-panic, same [`crate::health`] publishing, because it is the same
+/// loop. What differs is only what a clean return *means*, exactly as
+/// [`spawn_supervised_bounded`] differs from [`spawn_supervised`] — see that
+/// function's doc comment for the comparison table and the reasoning behind
+/// it; it applies here unchanged, with "task" in place of "factory" and
+/// "blocking thread" in place of "future".
+///
+/// Reach for this **only** when the body's return is genuinely expected. A
+/// blocking body written to run for the life of the process belongs on the
+/// plain [`spawn_supervised_blocking`], whose `warn!` is what turns a silent
+/// fall-out into a log line and a visible row.
+///
+/// `name` is a stable, human-readable label used only for log lines.
+pub fn spawn_supervised_blocking_bounded<F>(name: &'static str, task: F)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    runtime::handle().spawn(supervise_blocking(
+        name,
+        Arc::new(task),
+        Backoff::default(),
+        Intent::Bounded,
+    ));
 }
 
 // ── Cancellable supervision ──────────────────────────────────────────────────
@@ -584,7 +636,7 @@ async fn supervise<F, Fut>(
 
 /// The blocking supervision loop — [`supervise`]'s twin, likewise split out so
 /// tests can inject a zero-delay `Backoff`.
-async fn supervise_blocking<F>(name: &'static str, task: Arc<F>, cfg: Backoff)
+async fn supervise_blocking<F>(name: &'static str, task: Arc<F>, cfg: Backoff, intent: Intent)
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -599,14 +651,12 @@ where
         // thread has picked it up, so there is no cancellable blocking entry
         // point to pass a `Stop` in from. See [`spawn_supervised_handle`].
         None,
-        // Always perpetual: there is no bounded blocking entry point either.
-        // See [`spawn_supervised_bounded`]'s "No blocking twin".
-        Intent::Perpetual,
+        intent,
     )
     .await;
 }
 
-/// The one supervision loop all four entry points run.
+/// The one supervision loop all five entry points run.
 ///
 /// `spawn_run` starts a single run and hands back its `JoinHandle`; everything
 /// above it — restart policy, backoff schedule, log lines, [`crate::health`]
@@ -938,6 +988,10 @@ mod tests {
         // tag is never counted, so a `logged_warnings(…) == 0` on one would
         // pass whatever the supervisor logged.
         "test-bounded-quiet",
+        // The `service` name `a_bounded_blocking_task_ends_quietly_and_releases_its_row`
+        // supervises under (#1196) — the blocking twin of the tag above, and
+        // listed for the same absence.
+        "test-blocking-bounded-quiet",
     ];
 
     /// Per-tag counts of `ERROR` events from this module.
@@ -1118,6 +1172,7 @@ mod tests {
                 assert!(n >= 3, "panic on the first three runs");
             }),
             ZERO_BACKOFF,
+            Intent::Perpetual,
         ));
 
         assert_eq!(calls.load(Ordering::SeqCst), 4);
@@ -1151,6 +1206,7 @@ mod tests {
                 assert!(n >= 1, "panic on the first run only");
             }),
             ZERO_BACKOFF,
+            Intent::Perpetual,
         ));
 
         assert_eq!(
@@ -1260,6 +1316,61 @@ mod tests {
         );
     }
 
+    /// [`a_bounded_task_ends_quietly_and_releases_its_row`]'s blocking twin
+    /// (#1196): [`spawn_supervised_blocking_bounded`]'s declared-expected
+    /// return must not `warn!`, must release the health row, and — like its
+    /// async sibling — must still restart on a panic.
+    ///
+    /// This is the shape the real migration falsifies against: revert
+    /// `idle_notify::supervise_observer` or `eds_retry::spawn_eds_worker` from
+    /// `spawn_supervised_blocking_bounded` back to `spawn_supervised_blocking`
+    /// and each crate's own regression test times out waiting for the row to
+    /// disappear — see `hytte-services`' `idle_notify` and `eds_retry` test
+    /// modules.
+    #[test]
+    fn a_bounded_blocking_task_ends_quietly_and_releases_its_row() {
+        const NAME: &str = "test-blocking-bounded-quiet";
+
+        install_error_counter();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_task = Arc::clone(&calls);
+
+        runtime::handle().block_on(supervise_blocking(
+            NAME,
+            Arc::new(move || {
+                let n = calls_task.fetch_add(1, Ordering::SeqCst);
+                assert!(n >= 1, "panic on the first run only");
+            }),
+            ZERO_BACKOFF,
+            Intent::Bounded,
+        ));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a bounded blocking task is still restarted after a panic — only the meaning of a \
+             clean return changes"
+        );
+        assert_eq!(
+            logged_errors(NAME),
+            1,
+            "the panic is still reported at error level"
+        );
+        assert_eq!(
+            logged_warnings(NAME),
+            0,
+            "the declared-expected return must not warn; this is the log line that would \
+             otherwise fire on every idle-notify-observer boot with no protocol, and on every \
+             EDS worker shutdown"
+        );
+        assert!(
+            !health::snapshot().iter().any(|task| task.name == NAME),
+            "a bounded blocking task's row is released on its return, exactly as its async \
+             sibling's is"
+        );
+    }
+
     /// A task that flaps and *then* returns must not stay on the shell's
     /// "something is wrong right now" surfaces forever.
     ///
@@ -1358,6 +1469,7 @@ mod tests {
                 assert!(mine.runs >= 3, "panic on the first two runs");
             }),
             NEVER_RESET,
+            Intent::Perpetual,
         ));
 
         let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();

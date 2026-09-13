@@ -22,10 +22,16 @@
 //! froze the service for the session with no log line — the residual #430 left
 //! behind. [`spawn_eds_worker`] is the one place that supervision lives.
 //!
+//! Both `run_worker`s (`calendar.rs`, `tasks.rs`) also **return** on purpose
+//! once every sender has disconnected — the service tearing down — which
+//! #1196 declares through [`spawn_supervised_blocking_bounded`] rather than
+//! the plain `spawn_supervised_blocking`: a `debug!` and a released health row
+//! instead of a `warn!` and a permanent `Returned` one.
+//!
 //! Everything here is pure logic + std channels — hermetically testable,
 //! no EDS required.
 
-use hytte_reactive::spawn_supervised_blocking;
+use hytte_reactive::spawn_supervised_blocking_bounded;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -41,15 +47,26 @@ use std::time::{Duration, Instant};
 /// is the crate's answer to exactly that (`niri.rs` states the argument
 /// verbatim), and this is the EDS-shaped wrapper over it.
 ///
+/// Spawned via [`spawn_supervised_blocking_bounded`], not the plain
+/// `spawn_supervised_blocking` (#1196): both `run_worker`s return on purpose
+/// once their `Receiver` reports every sender gone — `for _ in rx {}` /
+/// `while rx.recv().is_ok() {}` falling through, or the equivalent
+/// `TryRecvError::Disconnected` arm in `tasks`' event loop — which is this
+/// worker shutting down, not a bug that fell out of a loop. The bounded
+/// variant is what turns that into a `debug!` and a released health row
+/// instead of a `warn!` and a permanent `Returned` one for the rest of the
+/// session.
+///
 /// # Why the receiver is behind a mutex
 ///
 /// The `Receiver` must outlive any one run — a restart that lost it would drop
 /// every queued op and could never get another, since `SENDER` is a `OnceLock`
 /// set once at registration. It cannot simply be *captured*, because
-/// `spawn_supervised_blocking` takes an `Fn() + Send + Sync` (it re-runs the
-/// closure from a fresh blocking thread per run) and `mpsc::Receiver` is `Send`
-/// but not `Sync`. A `Mutex` makes it `Sync` and hands the run exclusive use;
-/// only one run exists at a time, so the lock is never contended.
+/// `spawn_supervised_blocking_bounded` takes an `Fn() + Send + Sync` (it
+/// re-runs the closure from a fresh blocking thread per run) and
+/// `mpsc::Receiver` is `Send` but not `Sync`. A `Mutex` makes it `Sync` and
+/// hands the run exclusive use; only one run exists at a time, so the lock is
+/// never contended.
 ///
 /// **The poison tolerance is load-bearing, not boilerplate.** A panicking run
 /// unwinds while this guard is held, which poisons the mutex; a plain
@@ -86,7 +103,7 @@ where
     F: Fn(&mpsc::Receiver<T>) + Send + Sync + 'static,
 {
     let rx = Arc::new(Mutex::new(rx));
-    spawn_supervised_blocking(name, move || {
+    spawn_supervised_blocking_bounded(name, move || {
         let rx = rx.lock().unwrap_or_else(PoisonError::into_inner);
         body(&rx);
     });
@@ -208,8 +225,8 @@ mod tests {
     ///
     /// Three mechanisms hang on this, and deleting any of them reddens it:
     ///
-    /// * the `spawn_supervised_blocking` call — without it the panic ends the
-    ///   thread and there is no second run at all;
+    /// * the `spawn_supervised_blocking_bounded` call — without it the panic
+    ///   ends the thread and there is no second run at all;
     /// * the shared `Arc<Mutex<Receiver>>` — capture a fresh receiver per run
     ///   and the queued op is gone (and, with `SENDER` set once, unrecoverable);
     /// * `unwrap_or_else(PoisonError::into_inner)` — the panic unwinds holding
@@ -266,6 +283,55 @@ mod tests {
         // Let the second run end so its blocking thread is not held for the
         // rest of the binary.
         drop(tx);
+    }
+
+    /// #1196: an EDS worker's clean return — every sender gone, i.e. the
+    /// service tearing down — is designed, not a bug that fell out of a loop.
+    /// `spawn_eds_worker` must go through `spawn_supervised_blocking_bounded`,
+    /// not the plain `spawn_supervised_blocking`, so that shutdown costs a
+    /// `debug!` and a released row instead of a `warn!` and a permanent
+    /// `Returned` one — both `calendar-eds` and `tasks-eds` return exactly
+    /// this way when their channel's last sender drops.
+    ///
+    /// Falsify by swapping `spawn_eds_worker`'s
+    /// `spawn_supervised_blocking_bounded` back to `spawn_supervised_blocking`:
+    /// the row then survives forever in `Returned` and the second wait below
+    /// times out.
+    ///
+    /// Waits for the row to **appear** before waiting for it to disappear.
+    /// Without that first wait, a body that returns as fast as this one does
+    /// (the receiver is already disconnected before the worker even starts)
+    /// can race the tokio scheduler: checking only for absence would read "no
+    /// row" while supervision simply hadn't started yet, and pass even against
+    /// the plain `spawn_supervised_blocking` this test exists to catch —
+    /// measured, not hypothetical (it did, until this fix).
+    #[test]
+    fn a_returning_eds_worker_releases_its_row_instead_of_sticking() {
+        const NAME: &str = "test-eds-worker-bounded-return";
+
+        let (tx, rx) = mpsc::channel::<u32>();
+        drop(tx); // every sender gone before the worker even starts
+
+        spawn_eds_worker(NAME, rx, |rx| {
+            // A brief pause before draining widens the window in which the
+            // row is observably present, so the first wait below is not
+            // itself a race against an instant return.
+            std::thread::sleep(Duration::from_millis(50));
+            // Mirror the shutdown shape both real workers use: drain until
+            // disconnected, then return.
+            for _ in rx {}
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(5), || health_of(NAME).is_some()),
+            "the supervisor never published a health row for {NAME}"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || health_of(NAME).is_none()),
+            "a designed return from an EDS worker must release its health row, not leave it \
+             Returned forever: health={:?}",
+            health_of(NAME)
+        );
     }
 
     #[test]

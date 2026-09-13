@@ -211,11 +211,8 @@ mod textbox;
 // `NeedleAt`) there too; their `impl`s (`.name()`/`.line()`/`.spec()`) stay
 // below, since an inherent impl only has to share a crate with its type, not
 // a file.
-use cases::{
-    Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, STRETCH, TICKER_ORIGIN_WINDOW_PX, TICKER_SEAM_PHASE,
-    TICKER_WINDOW_PX, cases_for,
-};
 use cases::{BubbleAt, DisplayAt, NeedleAt, TickerAt};
+use cases::{Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, STRETCH, TICKER_WINDOW_PX, cases_for};
 
 /// Logical grid the **scope** cases run at. Small enough to keep the whole
 /// comparison on screen at 1× and wide enough that the graticule's 12-column
@@ -808,13 +805,13 @@ fn out_dir() -> std::path::PathBuf {
 }
 
 fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
-    // The same registration `plugins::install` does in the shell, with the same
-    // pipeline constant — the harness drives the shipping pipeline, not a copy.
-    hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
-    hytte::ui::gl_surface::register(gauge::GAUGE, gauge::GAUGE_PIPELINE);
-    hytte::ui::gl_surface::register(dot_matrix::DOT_MATRIX, dot_matrix::DOT_MATRIX_PIPELINE);
-    hytte::ui::gl_surface::register(marquee::MARQUEE, marquee::MARQUEE_PIPELINE);
-    hytte::ui::gl_surface::register(textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE);
+    // The same registration `preem_gl::install` does in the shell — since
+    // #1211, both loop over `kind::Kind::ALL`, so this is the same code
+    // rather than a second hand-kept copy of it.
+    for kind in kind::Kind::ALL {
+        let (program, pipeline) = kind.gl_seam();
+        hytte::ui::gl_surface::register(program, pipeline);
+    }
 
     let cases = cases_for(skins);
 

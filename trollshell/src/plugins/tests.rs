@@ -11481,8 +11481,8 @@ mod kind_enumeration {
     fn the_nix_case_count_matches_the_harness() {
         let harness_count = cases_for(&kit::DisplayStyle::ALL).len();
 
-        let nix_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../nix/checks/system-tests.nix");
+        let nix_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../nix/checks/system-tests.nix");
         let nix_src = std::fs::read_to_string(&nix_path)
             .unwrap_or_else(|error| panic!("couldn't read {}: {error}", nix_path.display()));
         let nix_count: usize = nix_src

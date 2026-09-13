@@ -35,6 +35,15 @@ use hytte_preem as kit;
 /// One comparison: a kit widget, a skin, and the state to drive it into.
 ///
 /// Moved out of `examples/preem_gl_diff.rs` for #1211 — see the module docs.
+///
+/// `#[allow(dead_code)]`: every field but `style` (read by [`Case::kind`]'s
+/// sibling match in `plugins::tests`) is read only by the harness's own
+/// `label`/`drive`/`geometry`/`measure` functions, which stayed in the
+/// example (its `impl Case` block, not moved here) and so live in a
+/// *different* crate compilation of this same source file — `cargo test`'s
+/// dead-code pass over the lib/bin never sees them read, even though the
+/// harness genuinely reads every one.
+#[allow(dead_code)]
 pub(crate) enum Case {
     /// A `Scope` after its debut batch plus `idle_steps` idle ones.
     Scope {
@@ -98,7 +107,6 @@ impl Case {
             Self::TextBox { .. } => Kind::TextBox,
         }
     }
-
 }
 
 /// What a marquee case is showing, and where the message has scrolled to.
@@ -109,7 +117,11 @@ impl Case {
 /// shader has no offset uniform at all (#839 made a sub-dot position
 /// inexpressible, so a step is a different set of lit columns) — and because
 /// the three chosen below are the three shapes the wrap can take.
+///
+/// `#[allow(dead_code)]`: `Scrolled`'s offset is read only by the harness's
+/// `TickerAt::line` (stayed in the example, [`Case`]'s doc explains why).
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum TickerAt {
     /// The empty string: the bezel and the **fixed** ghost grid, with nothing
     /// lit. `u_data_len` is the grid's width and every texel is `0`, which is

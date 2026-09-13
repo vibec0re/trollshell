@@ -115,17 +115,17 @@ mod parity;
 #[cfg(test)]
 mod cases;
 
-pub(super) use dot_matrix::{
-    DOT_MATRIX, DOT_MATRIX_PIPELINE, Glyphs, dot_matrix_surface, glyphs as encode_glyphs,
-};
-pub(super) use gauge::{GAUGE, GAUGE_PIPELINE, gauge_surface};
-pub(super) use marquee::{
-    MARQUEE, MARQUEE_PIPELINE, Window, marquee_surface, window as encode_window,
-};
-pub(super) use program::{KitSurface, SCOPE, SCOPE_PIPELINE, scope_surface};
-pub(super) use textbox::{
-    Block, TEXTBOX, TEXTBOX_PIPELINE, block as encode_block, textbox_surface,
-};
+// The `_PIPELINE` constant each kind is registered with is no longer named
+// here (#1211): `install` and the harness's own registration both loop over
+// `kind::Kind::ALL` and reach each pipeline through `Kind::gl_seam` instead,
+// which resolves it via `super::{program, gauge, dot_matrix, marquee,
+// textbox}` directly. The plain program name stays re-exported — used to
+// build a `UiNode::GlSurface` at every mapping call site.
+pub(super) use dot_matrix::{DOT_MATRIX, Glyphs, dot_matrix_surface, glyphs as encode_glyphs};
+pub(super) use gauge::{GAUGE, gauge_surface};
+pub(super) use marquee::{MARQUEE, Window, marquee_surface, window as encode_window};
+pub(super) use program::{KitSurface, SCOPE, scope_surface};
+pub(super) use textbox::{Block, TEXTBOX, block as encode_block, textbox_surface};
 
 /// Re-exported for `plugins::tests`' `kind_enumeration` module (#1211): both
 /// `parity` and `cases` are private to this module (test-only, so a stray

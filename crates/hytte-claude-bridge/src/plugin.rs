@@ -90,7 +90,10 @@
 //! the percent, the reset time as both an absolute UTC stamp and a "in 2 h
 //! 15 min", and the account's extra-usage allowance when it is enabled. The
 //! header carries the last-fetched time, or the failure sentence when the last
-//! poll produced nothing.
+//! poll produced nothing **and there is nothing left over from a previous
+//! one** — since #1283, a failed poll that still has [`usage::Report::last_ok`]
+//! numbers renders that same list, with the failure sentence appended as a
+//! footer rather than replacing it (see [`failure_footer`]).
 //!
 //! This is why the manifest now requests
 //! [`Capability::OpenPage`](hytte_plugin::proto::Capability::OpenPage) — the one
@@ -404,12 +407,16 @@ fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
         }
     };
     let second_line = match report {
-        // A stale *successful* report is the case with nothing else to say
-        // it: no error was ever recorded, so without this the chip would keep
-        // painting last week's meters as if they were current.
+        // A stale report — whether the *latest* poll succeeded or is still
+        // failing on top of old-enough `last_ok` numbers (#1283) — is the
+        // case with nothing more specific to say: once the numbers
+        // themselves are this old, that is the more urgent fact than
+        // whichever error the last attempt hit. `numbers_at` names when
+        // those numbers were actually fetched, which on a stale failure is
+        // `last_ok`'s clock, not this attempt's own `at`.
         Some(report) if report.usage().is_some() && report.is_stale(now) => Some(format!(
             "usage stale since {}",
-            usage::format_utc(report.at)
+            usage::format_utc(report.numbers_at().unwrap_or(report.at))
         )),
         Some(report) => usage_failure_sentence(status, report),
         None => None,
@@ -705,36 +712,45 @@ fn extra_row(extra: &ExtraUsage) -> Node {
     }
 }
 
+/// The failure line, when the *latest* poll failed — [`usage_failure_sentence`]'s
+/// mode adjustment, the same one the chip hover applies, so the panel can
+/// never contradict it (#1254's review, N2). Used both as [`panel`]'s only
+/// content when there are no numbers at all, and as its footer under a list
+/// still drawn from [`Report::last_ok`] (#1283) — a failure names itself
+/// without ever blanking numbers that are still within [`Report::is_stale`]'s
+/// window.
+fn failure_footer(status: &Status, report: &Report) -> Option<Node> {
+    let Outcome::Failed(error) = &report.outcome else {
+        return None;
+    };
+    let sentence = usage_failure_sentence(status, report).unwrap_or_else(|| error.sentence());
+    Some(label(&sentence, &["warning"]))
+}
+
 /// The drawer page: the header, then **every** row the server sent, then the
 /// extra-usage allowance when it is on.
 ///
-/// Three states other than a list, each of which says what it knows rather than
-/// showing an empty page: nothing polled yet, the poll failed (the sentence,
-/// which is the only actionable thing there is), or the account genuinely
-/// reported no limits.
+/// States other than a list, each of which says what it knows rather than
+/// showing an empty page: nothing polled yet; the poll failed with no
+/// last-known-good numbers to fall back on (the sentence, the only
+/// actionable thing there is); or the account genuinely reported no limits.
+/// Since #1283 a **failed** poll that still has [`Report::last_ok`] numbers
+/// is a fourth state, not a variant of the second: the rows render exactly as
+/// a success's would (from [`Report::usage`], which already resolves to
+/// `last_ok` on a failure), with [`failure_footer`] appended below them
+/// rather than replacing them.
 ///
-/// The failure sentence is routed through [`usage_failure_sentence`] — the
-/// same mode adjustment the chip's [`tooltip`] applies — rather than reading
-/// [`UsageError::sentence`] directly, so on the *failure* arm the panel one
-/// click beneath the chip can never contradict it (#1254's review, N2: an
-/// API-key bridge's hover said "usage limits are a subscription feature"
-/// while the panel still told the same reader to `run claude once to sign
-/// in`). The staleness arm is the one place they can still disagree — the
-/// chip drops its meters and names when the numbers stopped being current,
-/// while this function paints every bar at its old value under an "updated
-/// … ago" header with no staleness call at all — and that gap is
-/// pre-existing (#1254 N4/N5), not something this routing touches.
+/// The staleness arm is the one place the chip and panel can still disagree —
+/// the chip drops its meters and names when the numbers stopped being
+/// current, while this function paints every bar at its old value under an
+/// "updated … ago" header with no staleness call at all — and that gap is
+/// pre-existing (#1254 N4/N5), not something #1283 touches.
 fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
     let mut children = vec![header(report, now)];
     match report {
         None => children.push(label("fetching usage…", &["dim-label"])),
-        Some(report) => match &report.outcome {
-            Outcome::Failed(error) => {
-                let sentence =
-                    usage_failure_sentence(status, report).unwrap_or_else(|| error.sentence());
-                children.push(label(&sentence, &["warning"]));
-            }
-            Outcome::Ok(usage) => {
+        Some(report) => match report.usage() {
+            Some(usage) => {
                 if usage.limits.is_empty() {
                     children.push(label("this account reported no limits", &["dim-label"]));
                 }
@@ -744,7 +760,9 @@ fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
                 if let Some(extra) = usage.extra_usage.as_ref().filter(|extra| extra.is_enabled) {
                     children.push(extra_row(extra));
                 }
+                children.extend(failure_footer(status, report));
             }
+            None => children.extend(failure_footer(status, report)),
         },
     }
     Node::Box {
@@ -787,6 +805,7 @@ mod tests {
         self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError, parse_rfc3339,
     };
     use hytte_plugin::display::{AccentRole, RenderMode};
+    use std::time::Duration;
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Manifest, Mount, Node, Page, PluginMsg, decode, encode,
         preem::PreemWidget,
@@ -827,36 +846,42 @@ mod tests {
         }
     }
 
-    /// The captured three-row response, as a published report.
+    /// The captured three-row response.
+    fn captured_usage() -> Usage {
+        Usage {
+            limits: vec![
+                limit(
+                    "session",
+                    80.0,
+                    "warning",
+                    true,
+                    "2026-09-13T13:50:00.101848+00:00",
+                ),
+                limit(
+                    "weekly_all",
+                    40.0,
+                    "normal",
+                    true,
+                    "2026-09-17T15:00:00.101872+00:00",
+                ),
+                limit(
+                    "weekly_scoped",
+                    25.0,
+                    "normal",
+                    false,
+                    "2026-09-17T15:00:00.102097+00:00",
+                ),
+            ],
+            extra_usage: Some(ExtraUsage::default()),
+        }
+    }
+
+    /// The captured response, as a published report.
     fn captured_report() -> Report {
         Report {
             at: now() - 120,
-            outcome: Outcome::Ok(Usage {
-                limits: vec![
-                    limit(
-                        "session",
-                        80.0,
-                        "warning",
-                        true,
-                        "2026-09-13T13:50:00.101848+00:00",
-                    ),
-                    limit(
-                        "weekly_all",
-                        40.0,
-                        "normal",
-                        true,
-                        "2026-09-17T15:00:00.101872+00:00",
-                    ),
-                    limit(
-                        "weekly_scoped",
-                        25.0,
-                        "normal",
-                        false,
-                        "2026-09-17T15:00:00.102097+00:00",
-                    ),
-                ],
-                extra_usage: Some(ExtraUsage::default()),
-            }),
+            outcome: Outcome::Ok(captured_usage()),
+            last_ok: None,
         }
     }
 
@@ -1072,6 +1097,7 @@ mod tests {
             let report = Report {
                 at: now(),
                 outcome: Outcome::Ok(usage.clone()),
+                last_ok: None,
             };
             assert_eq!(
                 chip_limits(&usage).len(),
@@ -1143,6 +1169,7 @@ mod tests {
         let report = Report {
             at: now() - 120,
             outcome: Outcome::Ok(usage),
+            last_ok: None,
         };
         let board = status(Mode::Subscription, false, 4, 0, Last::Ok);
         let meters = preems(&chip_state(&board, Some(&report)));
@@ -1262,6 +1289,7 @@ mod tests {
             let report = Report {
                 at: now() - 30,
                 outcome: Outcome::Failed(error.clone()),
+                last_ok: None,
             };
             let tree = chip_state(&board, Some(&report));
             assert!(preems(&tree).is_empty(), "{error:?} ⇒ no meters");
@@ -1329,6 +1357,89 @@ mod tests {
         );
     }
 
+    // ── #1283: a failure keeps the last good numbers on the meters ──────────
+
+    /// **Item 1(a): a failed poll after a success keeps the meters up**, drawn
+    /// from `Report::last_ok`, with the failure's own sentence on the hover —
+    /// the numbers and the explanation are not the same job.
+    ///
+    /// Falsify by reverting `Report::usage`'s `Failed` arm to ignore
+    /// `last_ok` (`Outcome::Failed(_) => None`, the pre-#1283 shape): the
+    /// meters assertion goes red.
+    #[test]
+    fn a_failed_poll_after_a_success_keeps_the_meters_and_still_names_the_failure() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let base = "Claude bridge · subscription · 18 served, 0 failed";
+        let report = Report {
+            at: now() - 30,
+            outcome: Outcome::Failed(UsageError::RateLimited(Duration::from_mins(10))),
+            last_ok: Some((now() - 150, captured_usage())),
+        };
+
+        let tree = chip_state(&board, Some(&report));
+        assert!(!preems(&tree).is_empty(), "the last-good meters stay up");
+        assert_eq!(
+            root_tooltip(&tree),
+            Some(format!(
+                "{base}\nusage rate-limited — next try in 10 min"
+            )),
+            "the hover still names the failure, on its own line"
+        );
+
+        let panel_text = texts(&panel(&board, Some(&report), now()));
+        assert!(
+            panel_text.contains(&"Session (5 h)".to_owned()),
+            "the panel also keeps the last-good rows: {panel_text:?}"
+        );
+        assert!(
+            panel_text.contains(&"usage rate-limited — next try in 10 min".to_owned()),
+            "…with the failure as a footer, not a replacement: {panel_text:?}"
+        );
+    }
+
+    /// **Item 1(b): once `last_ok` itself is past [`usage::STALE_AFTER`], the
+    /// chip drops the meters — the same as any other stale report — even
+    /// though the failure that produced this `Report` is fresh.**
+    #[test]
+    fn a_last_ok_older_than_the_ceiling_still_drops_the_meters() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let ceiling = i64::try_from(usage::STALE_AFTER.as_secs()).expect("fits");
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::Http(429)),
+            last_ok: Some((now() - ceiling - 1, captured_usage())),
+        };
+        let tree = chip_state(&board, Some(&report));
+        assert!(
+            preems(&tree).is_empty(),
+            "last_ok is one second past the ceiling, even though `at` is now"
+        );
+    }
+
+    /// **Item 1(c): a first poll that fails has no `last_ok`, and renders
+    /// exactly as it always has** — this is the pre-existing
+    /// `a_failed_poll_costs_the_meters_and_never_the_chip` case, named here
+    /// once more so the #1283 build issue's three test items are each
+    /// findable by name.
+    #[test]
+    fn a_first_poll_failure_has_no_last_ok_and_is_unchanged() {
+        let board = status(Mode::Subscription, false, 0, 0, Last::None);
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::Unauthorized),
+            last_ok: None,
+        };
+        assert!(preems(&chip_state(&board, Some(&report))).is_empty());
+        assert!(
+            bars(&panel(&board, Some(&report), now())).is_empty(),
+            "no rows at all — nothing to fall back on"
+        );
+        assert!(
+            texts(&panel(&board, Some(&report), now()))
+                .contains(&"usage stale — run `claude` once to refresh the login".to_owned())
+        );
+    }
+
     /// **API-key mode has no login to sign in to.** `NoCredentials` in every
     /// other mode reads its own sentence — "run `claude` once to sign in" —
     /// but `api` mode never spawns `claude`, so that is advice for a login
@@ -1341,6 +1452,7 @@ mod tests {
         let report = Report {
             at: now() - 30,
             outcome: Outcome::Failed(error.clone()),
+            last_ok: None,
         };
 
         let api = status(Mode::Api, true, 9, 0, Last::Ok);
@@ -1386,6 +1498,7 @@ mod tests {
         let report = Report {
             at: now() - 30,
             outcome: Outcome::Failed(error.clone()),
+            last_ok: None,
         };
         let board = status(mode, keyed, 9, 0, Last::Ok);
 
@@ -1452,6 +1565,7 @@ mod tests {
         let report = Report {
             at: now(),
             outcome: Outcome::Failed(UsageError::Io("<redacted> refused".to_owned())),
+            last_ok: None,
         };
         let tree = chip_state(&status(Mode::Api, true, 1, 0, Last::Ok), Some(&report));
         let rendered = format!("{:?}{:?}", texts(&tree), tooltips(&tree));
@@ -1514,6 +1628,7 @@ mod tests {
         let failed = Report {
             at: now() - 90,
             outcome: Outcome::Failed(UsageError::Unauthorized),
+            last_ok: None,
         };
         let text = texts(&panel(&board, Some(&failed), now()));
         assert!(text.contains(&"updated 1 min ago".to_owned()), "{text:?}");
@@ -1526,6 +1641,7 @@ mod tests {
         let empty = Report {
             at: now(),
             outcome: Outcome::Ok(Usage::default()),
+            last_ok: None,
         };
         let text = texts(&panel(&board, Some(&empty), now()));
         assert!(
@@ -1557,6 +1673,7 @@ mod tests {
                     currency: Some("USD".to_owned()),
                 }),
             }),
+            last_ok: None,
         };
         let text = texts(&panel(&board, Some(&on), now()));
         assert!(text.contains(&"Extra usage".to_owned()), "{text:?}");

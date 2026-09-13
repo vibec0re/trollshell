@@ -114,9 +114,16 @@
 //!
 //! The frame overlay (`Layer::Overlay`, above the bar) reads
 //! [`current_visible_width`] each animation tick and shifts its cutout's
-//! left edge to match — the sidebar surface (below the frame) shows
-//! through the cutout. [`open_width`] is the authority on both sides, so the
-//! cutout's left edge can't disagree with the strip niri reserved.
+//! left **and right** edges to match — the sidebar surface (below the frame)
+//! shows through the cutout. [`open_width`] is the authority on both sides, so
+//! neither cutout edge can disagree with the strip niri reserved.
+//!
+//! Since #1247 every frame-facing accessor here — [`current_visible_width`],
+//! [`is_settled`], [`open_signal_on`] — takes a [`Side`], because the frame has
+//! two insets to compute and each follows its own surface. The left's answers
+//! are unchanged: [`effective_open`] is the identity on a side whose `non_empty`
+//! is the constant `true`, so a left-only shell reads exactly what it read
+//! before.
 //!
 //! State is per-connector, mirroring `modal::DRAWER_OPEN`. Subscribers (the
 //! sidebar surface, the frame draw, future bar-CSS bindings) read
@@ -332,11 +339,30 @@ fn effective_open(open: bool, non_empty: bool) -> bool {
     open && non_empty
 }
 
-/// Signal that emits the sidebar open/closed state for `monitor`. Backed by
-/// [`SIDEBAR_OPEN`] so callers can subscribe before `install` has run for
-/// this monitor (e.g., the frame wires up during early bootstrap).
+/// Signal that emits the **left** sidebar's open/closed state for `monitor` —
+/// the one the bar chip drives and `components::open_refresh` re-runs on.
+/// Backed by [`SIDEBAR_OPEN`] so callers can subscribe before `install` has run
+/// for this monitor.
 pub fn open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
-    sidebar_open_state(Side::Left, &monitor_key(monitor)).signal()
+    open_signal_on(Side::Left, monitor)
+}
+
+/// [`open_signal`] for either side (#1247). The frame subscribes to **both**,
+/// because either slide moves one of its two insets.
+///
+/// This is the raw open *intent*, not [`effective_open`]. On the left that is
+/// the whole story: `non_empty` there is the constant `true`, so intent and
+/// effective state never diverge. On the right it is **not** enough by itself
+/// — a card arriving or leaving flips `non_empty` independently of this
+/// signal, which moves the revealer, the exclusive zone and
+/// [`current_visible_width`] by a whole sidebar width without this emitting at
+/// all. The frame's redraw tick learned this the hard way (#1247 review
+/// finding 1): it now arms on this signal for **both** sides *and* on
+/// `plugins::sidebar_right_non_empty` separately, rather than trying to make
+/// one function answer both "did the user ask to open/close" and "did the
+/// content change" — see `frame.rs`'s module doc for the arming signal.
+pub fn open_signal_on(side: Side, monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
+    sidebar_open_state(side, &monitor_key(monitor)).signal()
 }
 
 /// Flip the **left** sidebar's open state for `monitor`. Bar chip calls this on
@@ -497,55 +523,71 @@ fn open_width_from_natural(natural: i32) -> i32 {
     natural.max(scale(SIDEBAR_WIDTH))
 }
 
-/// Currently visible width of the sidebar card on `monitor`, in CSS px — the
-/// measured [`open_width`] while open. Returns `frame::FRAME_THICKNESS_I32` when
-/// the sidebar is closed, hasn't been installed yet, or the per-monitor panel is
-/// missing. The frame uses this to compute its cutout's left edge each animation
-/// tick.
-pub fn current_visible_width(monitor: &Monitor) -> i32 {
-    current_visible_width_for_key(&monitor_key(monitor))
+/// Currently visible width of `side`'s sidebar card on `monitor`, in CSS px —
+/// the measured [`open_width`] while that side is showing. Returns
+/// `frame::FRAME_THICKNESS_I32` when the sidebar is closed, empty, hasn't been
+/// installed yet, or the per-`(side, monitor)` panel is missing. The frame calls
+/// it **once per side** each animation tick to compute its two cutout edges
+/// (#1247).
+///
+/// "Showing" is [`effective_open`], not the raw open flag: a right sidebar whose
+/// last card left is latched `open` with a collapsed revealer and a released
+/// exclusive zone, and the frame must draw its right strut against the screen
+/// edge for it, not against a 320 px strip nothing is painting. The left's
+/// `non_empty` is the constant `true`, so this is the same filter it had before.
+pub fn current_visible_width(side: Side, monitor: &Monitor) -> i32 {
+    current_visible_width_for_key(side, &monitor_key(monitor))
 }
 
 /// Internal: keyed lookup used by both the public API and tests.
-fn current_visible_width_for_key(key: &str) -> i32 {
+fn current_visible_width_for_key(side: Side, key: &str) -> i32 {
     // Copy the revealer out and measure with no `PANELS` borrow live (#643) —
     // same shape, and the same reason, as `is_settled_for_key` just below:
     // `open_width` walks a whole widget subtree's measure vfuncs, and this runs
     // from `frame.rs`'s per-frame draw while `install`/`close_all` hold the
-    // `borrow_mut()` counterparties. (The `open_state.get()` filter reads a
-    // `Mutable`, not GTK, so it is fine inside the borrow.)
+    // `borrow_mut()` counterparties. (The `effective_open` filter reads two
+    // `Mutable`s, not GTK, so it is fine inside the borrow.)
     let revealer = PANELS.with(|panels| {
         panels
             .borrow()
-            .get(&(Side::Left, key.to_owned()))
-            .filter(|p| p.open_state.get())
+            .get(&(side, key.to_owned()))
+            .filter(|p| effective_open(p.open_state.get(), p.non_empty.get()))
             .map(|p| p.revealer.clone())
     });
     revealer.map_or(frame::FRAME_THICKNESS_I32, |r| open_width(&r))
 }
 
-/// True when the sidebar's revealer animation is at rest on `monitor`
-/// (fully open or fully closed). The frame's tick callback uses this to
-/// know when to stop redrawing after the slide finishes.
-pub fn is_settled(monitor: &Monitor) -> bool {
-    is_settled_for_key(&monitor_key(monitor))
+/// True when `side`'s revealer animation is at rest on `monitor` (fully open or
+/// fully closed). The frame's tick callback uses this — for **both** sides since
+/// #1247 — to know when to stop redrawing after a slide finishes.
+pub fn is_settled(side: Side, monitor: &Monitor) -> bool {
+    is_settled_for_key(side, &monitor_key(monitor))
 }
 
 /// Internal: keyed lookup used by both the public API and tests.
-fn is_settled_for_key(key: &str) -> bool {
+fn is_settled_for_key(side: Side, key: &str) -> bool {
     // Copy the two handles out and read them with no `PANELS` borrow live
     // (#643). `is_child_revealed()` is only a property *getter*, so it cannot
     // emit — but the sweep's definition is "any borrow across a GTK call" and
     // deliberately does not carve out getters, and this runs from `frame.rs`'s
     // per-frame tick callback while `install`/`close_all` hold the `borrow_mut()`
     // counterparties. Cheaper to settle it than to keep the exemption as
-    // folklore. (`current_visible_width_for_key` just above reads
-    // `open_state.get()` — a `Mutable`, not GTK — so it needs nothing.)
+    // folklore. (`current_visible_width_for_key` just above reads two
+    // `Mutable`s, not GTK, so it needs nothing.)
+    //
+    // Compared against [`effective_open`], not the raw intent: the revealer is
+    // driven by the effective value, so a right sidebar latched `open` with no
+    // card would otherwise never compare equal — and the frame's tick loop,
+    // which breaks on this, would spin for the rest of the session redrawing a
+    // cutout that is not moving. The left's `non_empty` is the constant `true`,
+    // so this is the same comparison it had before.
     let handles = PANELS.with(|panels| {
-        panels
-            .borrow()
-            .get(&(Side::Left, key.to_owned()))
-            .map(|p| (p.revealer.clone(), p.open_state.get()))
+        panels.borrow().get(&(side, key.to_owned())).map(|p| {
+            (
+                p.revealer.clone(),
+                effective_open(p.open_state.get(), p.non_empty.get()),
+            )
+        })
     });
     handles.is_none_or(|(revealer, open)| revealer.is_child_revealed() == open)
 }
@@ -1656,22 +1698,34 @@ mod tests {
 
     /// When no sidebar surface has been installed yet (or the connector is
     /// unknown), `current_visible_width` must return `frame::FRAME_THICKNESS_I32`
-    /// so the frame's cutout draws at its default left edge.
+    /// so the frame's cutout draws that side's edge at its default inset.
+    ///
+    /// Asserted for **both** sides since #1247: the right sidebar is the side
+    /// that is genuinely absent on every shell with no right-mounted plugin, so
+    /// this is its steady state rather than a bootstrap window.
     #[test]
     fn current_visible_width_defaults_to_frame_thickness_when_no_panel() {
         // No PANELS map yet, no install() call — the frame might query us
         // during early bootstrap. Use a fake monitor key directly via the
         // private fallback path.
-        assert_eq!(
-            current_visible_width_for_key("nonexistent"),
-            frame::FRAME_THICKNESS_I32
-        );
+        for side in [Side::Left, Side::Right] {
+            assert_eq!(
+                current_visible_width_for_key(side, "nonexistent"),
+                frame::FRAME_THICKNESS_I32,
+                "{side:?}"
+            );
+        }
     }
 
     #[test]
     fn is_settled_defaults_to_true_when_no_panel() {
         // Same situation: no panel installed → nothing animating → settled.
-        assert!(is_settled_for_key("nonexistent"));
+        // Both sides, for the same reason as above — and because the frame's
+        // tick loop breaks on the *conjunction*, so a never-installed right
+        // sidebar answering `false` here would keep it spinning forever.
+        for side in [Side::Left, Side::Right] {
+            assert!(is_settled_for_key(side, "nonexistent"), "{side:?}");
+        }
     }
 
     // ── Post-close niri reflow (#1129) ───────────────────────────────────────
@@ -1712,9 +1766,10 @@ mod gtk_tests {
 
     use super::{
         PANELS, SIDEBAR_WIDTH, Side, SidebarPanel, build_clamped_scroller, build_revealer,
-        effective_open, on_map_or_now, open_width, sidebar_open_state, toggle_right_on_focused,
-        wire_non_empty,
+        current_visible_width_for_key, effective_open, is_settled_for_key, on_map_or_now,
+        open_width, sidebar_open_state, toggle_right_on_focused, wire_non_empty,
     };
+    use crate::overlays::frame;
     use crate::scale::scale;
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
@@ -2380,6 +2435,262 @@ mod gtk_tests {
         PANELS.with(|panels| panels.borrow_mut().clear());
         sidebar_open_state(Side::Left, key).set(false);
         sidebar_open_state(Side::Right, key).set(false);
+    }
+
+    /// [`panel`], with the shipped `AdwClamp → scroller → card` nesting mounted
+    /// in its revealer so [`open_width`] has something to measure.
+    ///
+    /// `content_min` is the stand-in card's content minimum, exactly as in
+    /// [`tree`] — which is what lets the two sides of one connector report
+    /// *different* widths, the only shape in which "each inset comes from its
+    /// own side" is falsifiable at all.
+    fn sized_panel(side: Side, key: &str, content_min: i32) -> SidebarPanel {
+        let parked = panel(side, key, true);
+        parked
+            .revealer
+            .set_child(Some(&build_clamped_scroller(&card(content_min, 0))));
+        // The revealer has to be *revealed* for `is_child_revealed()` to agree
+        // with an open state, and `set_reveal_child` at build time (before any
+        // frame clock) lands immediately rather than animating.
+        parked.revealer.set_reveal_child(true);
+        parked
+    }
+
+    /// [`with_panels`], but with a card of a given content minimum on each side.
+    fn with_sized_panels(key: &str, left_min: i32, right_min: i32, body: impl FnOnce()) {
+        PANELS.with(|panels| {
+            let mut panels = panels.borrow_mut();
+            panels.insert(
+                (Side::Left, key.to_owned()),
+                sized_panel(Side::Left, key, left_min),
+            );
+            panels.insert(
+                (Side::Right, key.to_owned()),
+                sized_panel(Side::Right, key, right_min),
+            );
+        });
+        body();
+        PANELS.with(|panels| panels.borrow_mut().clear());
+        sidebar_open_state(Side::Left, key).set(false);
+        sidebar_open_state(Side::Right, key).set(false);
+    }
+
+    /// #1247, the accessor half: each side's visible width is measured on
+    /// **that side's** surface.
+    ///
+    /// The two panels are deliberately given cards of different minimum widths,
+    /// because the bug this guards is a *keying* bug, not an arithmetic one —
+    /// with both sides measuring the same baseline every wrong answer is also
+    /// the right one. The left is the bare baseline; the right is authored
+    /// relative to it so the case stays meaningful whatever font the harness
+    /// runs with.
+    ///
+    /// **Falsification (run):** pinning `current_visible_width_for_key`'s lookup
+    /// back to `Side::Left` (the pre-#1247 spelling) turns the right assertion
+    /// red; so does dropping the `side` parameter and reading `Side::Right`.
+    #[gtk::test]
+    fn each_sides_visible_width_is_measured_on_its_own_surface() {
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 160;
+        with_sized_panels("DP-WIDTH", 0, wide, || {
+            sidebar_open_state(Side::Left, "DP-WIDTH").set(true);
+            sidebar_open_state(Side::Right, "DP-WIDTH").set(true);
+
+            let left = current_visible_width_for_key(Side::Left, "DP-WIDTH");
+            let right = current_visible_width_for_key(Side::Right, "DP-WIDTH");
+            assert_eq!(
+                left,
+                scale(SIDEBAR_WIDTH),
+                "the left inset must come from the left surface's baseline card"
+            );
+            assert!(
+                right >= wide,
+                "the right inset must come from the RIGHT surface (a {wide} px card), not from \
+                 the left one ({left} px) — got {right}"
+            );
+            assert_ne!(
+                left, right,
+                "test setup: the two sides must measure differently, or this asserts nothing"
+            );
+        });
+    }
+
+    /// …and closing one side does not move the other's inset (#1247).
+    ///
+    /// The frame draws both edges from one tick, so a shared filter — reading
+    /// one side's `open_state` for both lookups — would show up here as the
+    /// left strut jumping to the screen edge when the *right* sidebar closes.
+    #[gtk::test]
+    fn closing_one_side_leaves_the_other_sides_inset_alone() {
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 160;
+        with_sized_panels("DP-ONESIDE", 0, wide, || {
+            sidebar_open_state(Side::Left, "DP-ONESIDE").set(true);
+            sidebar_open_state(Side::Right, "DP-ONESIDE").set(true);
+            let left_with_both_open = current_visible_width_for_key(Side::Left, "DP-ONESIDE");
+
+            sidebar_open_state(Side::Right, "DP-ONESIDE").set(false);
+            assert_eq!(
+                current_visible_width_for_key(Side::Right, "DP-ONESIDE"),
+                frame::FRAME_THICKNESS_I32,
+                "a closed right sidebar reserves nothing, so the frame's right strut goes back to \
+                 the screen edge"
+            );
+            assert_eq!(
+                current_visible_width_for_key(Side::Left, "DP-ONESIDE"),
+                left_with_both_open,
+                "closing the RIGHT sidebar must not move the left inset"
+            );
+        });
+    }
+
+    /// An **open but empty** right sidebar reserves nothing and is at rest
+    /// (#1247, riding #1160's `effective_open`).
+    ///
+    /// Both halves matter to the frame and they fail differently: reading the
+    /// raw open flag for the width would inset the frame's right strut by 320 px
+    /// with nothing painting there, and reading it for the settle check would
+    /// leave the frame's tick loop redrawing every frame for the rest of the
+    /// session — the revealer is driven by the effective value, so it can never
+    /// catch up to an intent that stayed `true`.
+    ///
+    /// **Falsification (run):** swapping either `effective_open(p.open_state
+    /// .get(), p.non_empty.get())` back to the bare `p.open_state.get()` turns
+    /// the matching assertion red.
+    #[gtk::test]
+    fn an_open_but_empty_right_sidebar_reserves_nothing_and_is_settled() {
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 160;
+        with_sized_panels("DP-EMPTYOPEN", 0, wide, || {
+            // The card went away while the sidebar was open (#1244 finding 1's
+            // sequence): intent stays latched, content does not.
+            PANELS.with(|panels| {
+                panels
+                    .borrow()
+                    .get(&(Side::Right, "DP-EMPTYOPEN".to_owned()))
+                    .expect("test setup: the right panel was just parked")
+                    .non_empty
+                    .set(false);
+            });
+            sidebar_open_state(Side::Right, "DP-EMPTYOPEN").set(true);
+
+            assert!(
+                !effective_open(true, false),
+                "test setup: this is the open-but-empty case"
+            );
+            assert_eq!(
+                current_visible_width_for_key(Side::Right, "DP-EMPTYOPEN"),
+                frame::FRAME_THICKNESS_I32,
+                "an empty right sidebar paints nothing, so the frame must not inset for it"
+            );
+            // `sized_panel` leaves the revealer revealed; the effective state is
+            // closed, so a raw-intent settle check would answer `false` forever.
+            parked_revealer_reveal(Side::Right, "DP-EMPTYOPEN", false);
+            assert!(
+                is_settled_for_key(Side::Right, "DP-EMPTYOPEN"),
+                "a collapsed revealer under an open-but-empty intent is at rest — otherwise the \
+                 frame's tick loop never breaks"
+            );
+        });
+    }
+
+    /// Set the parked panel's revealer reveal flag, for the settle assertions.
+    fn parked_revealer_reveal(side: Side, key: &str, reveal: bool) {
+        let revealer = PANELS.with(|panels| {
+            panels
+                .borrow()
+                .get(&(side, key.to_owned()))
+                .expect("test setup: the panel was just parked")
+                .revealer
+                .clone()
+        });
+        revealer.set_reveal_child(reveal);
+    }
+
+    /// The frame's redraw tick must be armed by a right sidebar's **content**
+    /// change too, not only its raw open intent (#1247 review finding 1): on
+    /// the right, `open_state` and `non_empty` are two independent `Mutable`s,
+    /// and a card arriving or leaving moves the revealer, the exclusive zone
+    /// and [`current_visible_width_for_key`] by a whole sidebar width without
+    /// `open_state` ever changing.
+    ///
+    /// This subscribes to [`frame::redraw_arming_signal`] itself — the exact
+    /// function `frame::install`'s tick loop calls — rather than a
+    /// re-implementation of its shape (fix round 2 / #754's false-coupling
+    /// class: a test built from a *copy* of a `map_ref!` stays green when the
+    /// real one breaks, because nothing ties the two together). It feeds that
+    /// function substitute `Mutable`s standing in for a real `Monitor`'s
+    /// [`sidebar_open_state`]/`plugins::sidebar_right_non_empty` signals — the
+    /// same seam [`wire_non_empty`] already uses, for the same reason: this
+    /// test has no `Monitor` to drive those through.
+    ///
+    /// **Falsification (run):** editing [`frame::redraw_arming_signal`]'s body
+    /// to ignore its `right_has_card` parameter (arming on the two open
+    /// signals alone, which is what #1247 shipped before this review)
+    /// reproduces the finding exactly: the signal stays `Pending` across the
+    /// `non_empty` flip even though the visible width moves by a full sidebar
+    /// width in the same step. Because this test calls that function directly
+    /// rather than its own copy, the mutation has to land in the function
+    /// `install` actually uses.
+    #[gtk::test]
+    fn a_right_non_empty_change_arms_the_frames_redraw_signal() {
+        use hytte::futures_signals::signal::Signal;
+        use std::task::{Context, Poll, Waker};
+
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 160;
+        with_sized_panels("DP-ARM", 0, wide, || {
+            // Latch the right sidebar open with no card yet, mirroring #1244
+            // finding 1's sequence: intent arrives before content does.
+            let non_empty = PANELS.with(|panels| {
+                let panels = panels.borrow();
+                let panel = panels
+                    .get(&(Side::Right, "DP-ARM".to_owned()))
+                    .expect("test setup: the right panel was just parked");
+                panel.non_empty.set(false);
+                panel.non_empty.clone()
+            });
+            sidebar_open_state(Side::Right, "DP-ARM").set(true);
+
+            let arming = frame::redraw_arming_signal(
+                sidebar_open_state(Side::Left, "DP-ARM").signal(),
+                sidebar_open_state(Side::Right, "DP-ARM").signal(),
+                non_empty.signal(),
+            );
+            let mut sig = std::pin::pin!(arming);
+            let mut cx = Context::from_waker(Waker::noop());
+
+            // Drain the signal's initial value before measuring: left is
+            // still closed, right was just latched open, and the card hasn't
+            // arrived yet.
+            assert!(matches!(
+                sig.as_mut().poll_change(&mut cx),
+                Poll::Ready(Some((false, true, false)))
+            ));
+            assert!(matches!(sig.as_mut().poll_change(&mut cx), Poll::Pending));
+
+            let before = current_visible_width_for_key(Side::Right, "DP-ARM");
+            assert_eq!(
+                before,
+                frame::FRAME_THICKNESS_I32,
+                "test setup: starts empty"
+            );
+
+            non_empty.set(true); // a card dials in — #1247's own artefact sequence
+            let after = current_visible_width_for_key(Side::Right, "DP-ARM");
+            assert!(
+                after >= wide,
+                "the inset the frame draws from must move: {before} -> {after}"
+            );
+            assert!(
+                matches!(
+                    sig.as_mut().poll_change(&mut cx),
+                    Poll::Ready(Some((false, true, true)))
+                ),
+                "the inset moved by {} px and the arming signal did not emit",
+                after - before
+            );
+        });
     }
 
     /// A toggle aimed at an empty right sidebar does **nothing** — it does not

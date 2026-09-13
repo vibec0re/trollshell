@@ -110,7 +110,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
-use trollshell::overlays::sidebar;
+use trollshell::overlays::sidebar::{self, Side};
 
 thread_local! {
     /// The `Monitor` the reentrant `wake()` callback below reads the sidebar
@@ -144,14 +144,19 @@ impl Wake for ReentrantSidebarReader {
 /// The reentrant action: read the sidebar's live geometry the way
 /// `overlays::frame`'s tick callback does.
 ///
-/// `frame.rs`'s `install_draw` tick calls exactly this pair every frame
-/// while the sidebar slides, and `sidebar::close_all` is the `borrow_mut()`
-/// counterparty on the `PANELS` cell both of them read — so this is the real
-/// pairing the sweep was about, not a contrived one. Both take a shared
+/// `frame.rs`'s `install_draw` tick calls exactly these four reads every frame
+/// while a sidebar slides — since #1247 the width and the settle check are made
+/// **once per side** — and `sidebar::close_all` is the `borrow_mut()`
+/// counterparty on the `PANELS` cell all of them read, so this is the real
+/// pairing the sweep was about, not a contrived one. Each takes a shared
 /// `PANELS.borrow()`; a `BorrowMutError` here unwinds through
 /// `Mutable::set`'s `notify` and out through the glib `activate` trampoline
 /// this whole closure runs under, which aborts the process rather than
 /// failing one test — the failure mode #663 hit for real.
+///
+/// Both sides are read rather than just the left because `close_all` tears the
+/// two down in one `take()` loop: a read that lands between the left panel's
+/// drop and the right's is a state only a two-sided reader can reach.
 fn reentrant_sidebar_read() {
     REENTRY_MONITOR.with(|cell| {
         let borrowed = cell.borrow();
@@ -161,8 +166,10 @@ fn reentrant_sidebar_read() {
         // Results deliberately unused: what is under test is that these calls
         // can *run at all* from inside `close_all`'s loop, not what they
         // return (post-teardown they necessarily report "closed").
-        let _ = sidebar::current_visible_width(monitor);
-        let _ = sidebar::is_settled(monitor);
+        for side in [Side::Left, Side::Right] {
+            let _ = sidebar::current_visible_width(side, monitor);
+            let _ = sidebar::is_settled(side, monitor);
+        }
     });
 }
 
@@ -218,8 +225,14 @@ fn sidebar_close_all_tolerates_a_reentrant_panels_read_from_the_open_state_wake(
 
             // Mount the sidebar for real: `PANELS` is private and `install` is
             // the only thing that populates it, so there is no shortcut to the
-            // state `close_all` iterates.
+            // state `close_all` iterates. Both sides — `install_right` parks a
+            // panel without mapping the surface, and without it `close_all`'s
+            // `take()` loop has exactly one entry, so "a read landing between
+            // the two panels" (the module doc above, and this test's own
+            // reasoning for reading both sides) is not actually reachable
+            // (#1269 review finding 3).
             sidebar::install(&monitor);
+            sidebar::install_right(&monitor);
 
             // Open it before tearing it down. Not strictly required to make
             // `close_all`'s `open_state.set(false)` notify (`Mutable::set`

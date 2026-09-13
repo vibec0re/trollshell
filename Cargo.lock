@@ -1412,6 +1412,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-stats"
+version = "0.1.0"
+dependencies = [
+ "hytte-config",
+ "hytte-plugin",
+ "hytte-sensors",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hytte-plugin-terminal"
 version = "0.1.0"
 dependencies = [

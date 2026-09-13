@@ -179,6 +179,14 @@ impl Family {
 }
 
 /// One instance's resolved settings — what the card actually consults.
+///
+/// Five booleans, and `clippy::struct_excessive_bools` is allowed rather than
+/// worked around: they are five **independent** switches over a file whose
+/// whole job is to say which parts of a card to draw, and the usual remedy —
+/// collapsing them into a bitflag or an enum — would make `[sidebar] gpu =
+/// false` unspellable as one TOML key, which is the thing this type exists to
+/// be.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Card {
     /// Draw the CPU half.
@@ -299,10 +307,14 @@ impl CardFile {
     /// and `the_shipped_default_parses_and_matches_the_rust_default` pins the
     /// result against [`DEFAULT_TOML`]'s own parse.
     fn of(card: Card) -> Self {
-        // `as_secs` is a `u64` and TOML integers are `i64`; the cast is exact
-        // for any value this schema will accept (`1..=60`) and for the
-        // built-in defaults, which is all this constructor is ever handed.
-        let secs = i64::try_from(card.poll.as_secs()).unwrap_or(DEFAULT_POLL_SECONDS as i64);
+        // `as_secs` is a `u64` and TOML integers are `i64`. The conversion
+        // cannot fail for anything this schema accepts (`1..=60`), which is all
+        // the two `…_default` constructors ever hand it; the fallback is the
+        // ceiling, spelled as a literal because the `const` assertion beside
+        // `MAX_POLL_SECONDS` is what keeps them in step without a second cast.
+        const CEILING: i64 = 60;
+        const _: () = assert!(MAX_POLL_SECONDS == 60, "CEILING mirrors MAX_POLL_SECONDS");
+        let secs = i64::try_from(card.poll.as_secs()).unwrap_or(CEILING);
         Self {
             cpu: card.cpu.into(),
             per_core: card.per_core.into(),
@@ -322,7 +334,8 @@ impl CardFile {
         // serde message about an integer where a boolean was expected.
         Card {
             cpu: keep(
-                parse_bool(&spelling(&self.cpu)).map_err(|()| InvalidValue::of(&knobs.cpu, &self.cpu)),
+                parse_bool(&spelling(&self.cpu))
+                    .map_err(|()| InvalidValue::of(&knobs.cpu, &self.cpu)),
                 fallback.cpu,
                 rejected,
             ),
@@ -345,7 +358,8 @@ impl CardFile {
                 rejected,
             ),
             gpu: keep(
-                parse_bool(&spelling(&self.gpu)).map_err(|()| InvalidValue::of(&knobs.gpu, &self.gpu)),
+                parse_bool(&spelling(&self.gpu))
+                    .map_err(|()| InvalidValue::of(&knobs.gpu, &self.gpu)),
                 fallback.gpu,
                 rejected,
             ),
@@ -540,10 +554,7 @@ mod tests {
     fn resolved(body: &str) -> (Stats, Vec<String>) {
         let config = from_toml(body);
         let (stats, rejected) = config.parsed();
-        (
-            stats,
-            rejected.into_iter().map(|r| r.to_string()).collect(),
-        )
+        (stats, rejected.into_iter().map(|r| r.to_string()).collect())
     }
 
     /// The shipped default parses, validates, and produces exactly the values
@@ -584,7 +595,10 @@ mod tests {
             "a bar chip has room for neither",
         );
         assert_eq!(stats.bar.poll, Duration::from_secs(DEFAULT_POLL_SECONDS));
-        assert_eq!(stats.sidebar.poll, Duration::from_secs(DEFAULT_POLL_SECONDS));
+        assert_eq!(
+            stats.sidebar.poll,
+            Duration::from_secs(DEFAULT_POLL_SECONDS)
+        );
     }
 
     /// **The mechanism**: which table each of the nine mounts reads.
@@ -656,9 +670,8 @@ mod tests {
     /// rejecting it (the rejection list comes back empty).
     #[test]
     fn one_bad_value_costs_its_own_key_and_nothing_else() {
-        let (stats, rejected) = resolved(
-            "[sidebar]\npoll_seconds = 6000\nper_core = false\n[bar]\ncpu = \"maybe\"\n",
-        );
+        let (stats, rejected) =
+            resolved("[sidebar]\npoll_seconds = 6000\nper_core = false\n[bar]\ncpu = \"maybe\"\n");
         assert_eq!(
             stats.sidebar.poll,
             Card::sidebar_default().poll,
@@ -667,7 +680,11 @@ mod tests {
         assert!(!stats.sidebar.per_core, "its sibling still applies");
         assert_eq!(stats.bar.cpu, Card::bar_default().cpu);
         assert!(stats.bar.temperature, "and the bar table's siblings too");
-        assert_eq!(rejected.len(), 2, "exactly two keys were rejected: {rejected:?}");
+        assert_eq!(
+            rejected.len(),
+            2,
+            "exactly two keys were rejected: {rejected:?}"
+        );
         assert!(
             rejected
                 .iter()
@@ -808,7 +825,8 @@ mod tests {
     #[test]
     fn the_file_and_resolved_defaults_are_one_value() {
         let mut rejected = Vec::new();
-        let bar = CardFile::bar_default().parsed(&super::BAR_KNOBS, Card::bar_default(), &mut rejected);
+        let bar =
+            CardFile::bar_default().parsed(&super::BAR_KNOBS, Card::bar_default(), &mut rejected);
         let sidebar = CardFile::sidebar_default().parsed(
             &super::SIDEBAR_KNOBS,
             Card::sidebar_default(),

@@ -48,13 +48,16 @@ pub fn effective(manifest: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> Mo
         .unwrap_or(manifest)
 }
 
-/// [`effective`] against the real environment — the one place this crate reads
-/// one. A non-UTF-8 value comes back `None` from `var` and so falls to the
-/// manifest, which is unreachable for the reason the module doc gives: the SDK
-/// refuses such a launch before this runs.
+/// The real process environment — the **one** place this crate reads one, so
+/// "what does this launch say?" has a single answer and every other function
+/// here takes it as a parameter.
+///
+/// A non-UTF-8 value comes back `None` and so falls to the manifest, which is
+/// unreachable for the reason the module doc gives: the SDK refuses such a
+/// launch before this runs.
 #[must_use]
-pub fn effective_from_env(manifest: Mount) -> Mount {
-    effective(manifest, &|key| std::env::var(key).ok())
+pub fn env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
 #[cfg(test)]

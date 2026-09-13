@@ -25,7 +25,7 @@
 //! `fork`/`exec` per tick. `hytte_plugin::run` drives the whole session on a
 //! **current-thread** runtime, so a blocking read here is a blocking read of
 //! the socket loop — the card would stop answering the host for as long as the
-//! probe took. `hytte-services`' own `sensors` service spawn_blocking's the
+//! probe took. `hytte-services`' own `sensors` service `spawn_blocking`s the
 //! same reads for the same reason.
 
 use std::path::PathBuf;
@@ -130,7 +130,7 @@ impl Sampler {
         Snapshot {
             cpu: as_unit(load.overall),
             per_core: load.per_core.iter().copied().map(as_unit).collect(),
-            cpu_temp_c: temp.package_celsius.map(|c| c as f32),
+            cpu_temp_c: temp.package_celsius.map(celsius),
             gpu: gpu.map(|g| Gpu {
                 name: g.name,
                 load: g.load.map(as_unit),
@@ -152,6 +152,17 @@ impl Sampler {
 fn as_unit(load: f64) -> f32 {
     let v = load as f32;
     if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) }
+}
+
+/// A `f64` temperature as an `f32`. Unlike [`as_unit`] this one is **not**
+/// clamped or sanitised: there is no defensible range for a temperature, and a
+/// non-finite reading is rendered as a dash by `card::temp_text` rather than
+/// substituted with a number nothing measured. The cast loses precision the
+/// sensor never had (hwmon reports millidegrees, and the readout is whole
+/// degrees).
+#[allow(clippy::cast_possible_truncation)]
+fn celsius(c: f64) -> f32 {
+    c as f32
 }
 
 /// The sampler task: park while the card is off screen, sample on the cadence
@@ -219,6 +230,13 @@ mod tests {
 
     /// The one normalisation the sampler does, including the `NaN` case that
     /// would otherwise defeat the runtime's render dedup forever.
+    ///
+    /// `float_cmp` is allowed here because every value asserted is an **exact**
+    /// output of a clamp or a literal round-trip — `0.0`, `1.0`, and the `0.5`
+    /// that is exactly representable — not the result of arithmetic. An
+    /// epsilon comparison would weaken the `NaN` row in particular, which is
+    /// the whole point of this test.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn a_load_is_clamped_into_the_unit_range_and_a_nan_reads_as_rest() {
         assert!((as_unit(0.5) - 0.5).abs() < 1e-6);
@@ -236,6 +254,9 @@ mod tests {
     /// A default [`Snapshot`] is the "nothing measured yet" state the card
     /// renders dashes for — pinned because the seed render goes out before the
     /// first sample can possibly have landed.
+    ///
+    /// `float_cmp`: `0.0` here is `f32::default()`, an exact literal.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn the_default_snapshot_is_the_nothing_yet_state() {
         let s = Snapshot::default();
@@ -251,7 +272,7 @@ mod tests {
     #[test]
     fn a_fresh_sampler_has_cold_caches() {
         let s = Sampler::new();
-        assert_eq!(format!("{s:?}").contains("prev_cpu: []"), true);
+        assert!(format!("{s:?}").contains("prev_cpu: []"));
     }
 
     /// **The gate**: while the surface is hidden, nothing is sampled at all.

@@ -1,9 +1,11 @@
 //! The card's geometry and its one piece of real translation: **per-core load
 //! as dot-matrix lamps**.
 //!
-//! # Why the lamp row is a `DotMatrix` and not an `LedMatrix`
+//! # Why the lamp row is a `DotMatrix` and not an [`LedMatrix`]
 //!
-//! The native Stats page draws its per-core BlinkenLichten with
+//! [`LedMatrix`]: hytte_plugin::preem::LedMatrix
+//!
+//! The native Stats page draws its per-core `BlinkenLichten` with
 //! `hytte_preem::LedMatrix` (#857) — a grid of independently-lit lamps, each at
 //! its own core's intensity — rasterised in-process into a `PixelSurface`. That
 //! type is **not on the wire**: `PreemWidget` has eight variants and a lamp grid
@@ -57,6 +59,15 @@ use crate::sample::Snapshot;
 /// and an idle core is very much still there.
 pub const LAMPS: [char; 5] = ['.', ':', 'o', 'O', '0'];
 
+/// The index of the brightest lamp, as a float — the multiplier [`lamp`] scales
+/// a `0.0..=1.0` load by.
+///
+/// A literal rather than `(LAMPS.len() - 1) as f32`, which is a
+/// precision-losing cast the workspace's pedantic lints refuse; the
+/// `const` assertion below is what keeps the two in step, at compile time.
+const TOP_LAMP: f32 = 4.0;
+const _: () = assert!(LAMPS.len() == 5, "TOP_LAMP is LAMPS.len() - 1");
+
 /// Lamps per row before wrapping. Sixteen both fits the card at a legible pitch
 /// (see the module doc) and is the bank size real lamp panels come in.
 pub const CORES_PER_ROW: usize = 16;
@@ -91,10 +102,10 @@ const SKIN: StyleName = StyleName::Vfd;
 /// second belt, because `view` must never be the thing that panics.
 #[must_use]
 pub fn lamp(load: f32) -> char {
-    // `LAMPS` is five elements, the product is `0.0..=4.0`, and the cast
-    // saturates — so the index cannot be out of bounds for any input at all.
+    // The product is `0.0..=TOP_LAMP` and the cast saturates — so the index
+    // cannot be out of bounds for any input at all, `NaN` included.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let idx = (load.clamp(0.0, 1.0) * (LAMPS.len() - 1) as f32).round() as usize;
+    let idx = (load.clamp(0.0, 1.0) * TOP_LAMP).round() as usize;
     LAMPS[idx.min(LAMPS.len() - 1)]
 }
 
@@ -262,7 +273,8 @@ impl Widgets {
     /// keeps one code path serving both a preem host and an older one, where it
     /// is exactly the per-heartbeat tick a rasterising plugin writes today.
     pub fn set_gpu(&mut self, load: Option<f32>, dt: f32) {
-        self.gpu.set_target(load.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0);
+        self.gpu
+            .set_target(load.unwrap_or(0.0).clamp(0.0, 1.0) * 100.0);
         self.gpu.advance(dt);
     }
 
@@ -327,9 +339,11 @@ pub fn card(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) ->
                 classes: Vec::new(),
                 spacing: 4,
                 children: vec![
-                    widgets
-                        .temp
-                        .node_classed("stats-cpu-temp", cls("ts-cpu-temp")),
+                    widgets.temp.node_classed(
+                        "stats-cpu-temp",
+                        cls("ts-cpu-temp"),
+                        &temp_text(snapshot.cpu_temp_c),
+                    ),
                     label("°C", &["dim-label", "ts-cpu-temp"]),
                     Node::Spacer,
                 ],
@@ -373,16 +387,18 @@ mod tests {
     };
     use crate::config::Card;
     use crate::sample::{Gpu, Snapshot};
+    use hytte_plugin::display::RenderMode;
+    use hytte_plugin::display::testing::with_render_mode;
     use hytte_plugin::preem::font;
-    use hytte_plugin::proto::preem::{MAX_DOT_PX, MIN_DOT_PX};
     use hytte_plugin::proto::Node;
+    use hytte_plugin::proto::preem::{MAX_DOT_PX, MIN_DOT_PX};
 
     /// How many dots the kit's font lights for one glyph.
     fn lit_dots(c: char) -> u32 {
         font::glyph(c)
             .unwrap_or_else(|| panic!("the kit's 5x7 font must cover the lamp glyph {c:?}"))
             .iter()
-            .map(|row| u32::from(row.count_ones()))
+            .map(|row| row.count_ones())
             .sum()
     }
 
@@ -441,7 +457,7 @@ mod tests {
     /// One cell per core, in the kernel's order, wrapped at `CORES_PER_ROW`.
     #[test]
     fn there_is_one_lamp_per_core_wrapped_into_banks() {
-        let loads: Vec<f32> = (0..20).map(|i| i as f32 / 19.0).collect();
+        let loads: Vec<f32> = (0..20_u8).map(|i| f32::from(i) / 19.0).collect();
         let rows = lamp_rows(&loads);
         assert_eq!(rows.len(), 2, "20 cores wrap onto two banks");
         assert_eq!(rows[0].chars().count(), CORES_PER_ROW);
@@ -505,7 +521,8 @@ mod tests {
         assert_eq!(temp_text(Some(f32::INFINITY)), "--");
         for text in [temp_text(Some(58.4)), temp_text(None)] {
             assert!(
-                text.chars().all(|c| c.is_ascii_digit() || c == '-' || c == ':' || c == ' '),
+                text.chars()
+                    .all(|c| c.is_ascii_digit() || c == '-' || c == ':' || c == ' '),
                 "{text:?} must be drawable on a seven-segment cell",
             );
         }
@@ -532,16 +549,31 @@ mod tests {
         assert!((trace_sample(9.0) - 1.0).abs() < 1e-6);
     }
 
-    /// Collect every `Node::Preem` id in a tree, in order.
-    fn preem_ids(node: &Node) -> Vec<String> {
-        let mut out = Vec::new();
-        walk(node, &mut out);
-        out
+    /// The ids of every preem widget the card rendered, in tree order, built
+    /// with the host **speaking preem** — which is what a `Node::Preem` id list
+    /// requires.
+    ///
+    /// Without the forced mode this would come back empty and every assertion
+    /// below would be vacuous: the SDK's wrappers default to
+    /// [`RenderMode::Raster`] until a real host `Hello` raises the negotiated
+    /// generation, and a unit test has no session to receive one. That is the
+    /// whole reason `display::testing` exists.
+    fn preem_ids(cfg: Card, snapshot: &Snapshot, widgets: &Widgets) -> Vec<String> {
+        with_render_mode(RenderMode::State, || {
+            let tree = card(cfg, snapshot, widgets);
+            let mut out = Vec::new();
+            walk(&tree, &mut out);
+            out
+        })
     }
 
+    /// Every widget node's id, whichever shape it went out as — so the raster
+    /// arm can be asserted with the same helper.
     fn walk(node: &Node, out: &mut Vec<String>) {
         match node {
-            Node::Preem { id, .. } => out.push(id.clone().unwrap_or_default()),
+            Node::Preem { id, .. } | Node::Pixels { id, .. } => {
+                out.push(id.clone().unwrap_or_default());
+            }
             Node::Box { children, .. } | Node::Row { children, .. } => {
                 for child in children {
                     walk(child, out);
@@ -569,8 +601,7 @@ mod tests {
     #[test]
     fn the_sidebar_card_renders_every_widget_with_a_unique_stable_id() {
         let widgets = Widgets::default();
-        let tree = card(Card::sidebar_default(), &busy_snapshot(), &widgets);
-        let ids = preem_ids(&tree);
+        let ids = preem_ids(Card::sidebar_default(), &busy_snapshot(), &widgets);
         assert_eq!(
             ids,
             vec![
@@ -603,7 +634,7 @@ mod tests {
             gpu: None,
             ..busy_snapshot()
         };
-        let ids = preem_ids(&card(Card::sidebar_default(), &snapshot, &widgets));
+        let ids = preem_ids(Card::sidebar_default(), &snapshot, &widgets);
         assert!(
             !ids.iter().any(|id| id.starts_with("stats-gpu")),
             "no GPU, no gauge: {ids:?}",
@@ -625,10 +656,14 @@ mod tests {
         let off = |f: fn(&mut Card)| {
             let mut cfg = all;
             f(&mut cfg);
-            preem_ids(&card(cfg, &snapshot, &widgets))
+            preem_ids(cfg, &snapshot, &widgets)
         };
 
-        assert!(!off(|c| c.per_core = false).iter().any(|i| i.starts_with("stats-cores")));
+        assert!(
+            !off(|c| c.per_core = false)
+                .iter()
+                .any(|i| i.starts_with("stats-cores"))
+        );
         assert!(!off(|c| c.history = false).contains(&"stats-cpu-history".to_owned()));
         assert!(!off(|c| c.temperature = false).contains(&"stats-cpu-temp".to_owned()));
         assert!(!off(|c| c.gpu = false).contains(&"stats-gpu-load".to_owned()));
@@ -644,8 +679,8 @@ mod tests {
     fn the_bar_table_renders_a_smaller_tree() {
         let widgets = Widgets::default();
         let snapshot = busy_snapshot();
-        let bar = preem_ids(&card(Card::bar_default(), &snapshot, &widgets));
-        let sidebar = preem_ids(&card(Card::sidebar_default(), &snapshot, &widgets));
+        let bar = preem_ids(Card::bar_default(), &snapshot, &widgets);
+        let sidebar = preem_ids(Card::sidebar_default(), &snapshot, &widgets);
         assert!(bar.len() < sidebar.len(), "{bar:?} vs {sidebar:?}");
         assert!(!bar.iter().any(|i| i.starts_with("stats-cores")));
     }
@@ -664,9 +699,63 @@ mod tests {
             "the header is there: {texts:?}",
         );
         assert!(
-            preem_ids(&tree).contains(&"stats-cores-0".to_owned()),
+            texts.iter().any(|t| t == "0%"),
+            "and the load reads zero rather than a number it did not measure: {texts:?}",
+        );
+        assert!(
+            preem_ids(Card::sidebar_default(), &Snapshot::default(), &widgets)
+                .contains(&"stats-cores-0".to_owned()),
             "and the lamp row holds its slot",
         );
+    }
+
+    /// **The compat arm**: against a host that never advertised the preem
+    /// vocabulary the very same card comes out as CPU-rasterised
+    /// `Node::Pixels`, with the same ids in the same order — the promise the
+    /// SDK's `display` wrappers make, exercised here because this plugin has
+    /// no `view` of its own for that case.
+    ///
+    /// **Falsified** by reaching past the wrappers and building `Node::Preem`
+    /// by hand, which would emit a frame an older shell cannot decode and put
+    /// the plugin in the #437 redial crash-loop.
+    #[test]
+    fn an_unadvertised_host_gets_the_same_card_as_pixels() {
+        let widgets = Widgets::default();
+        let snapshot = busy_snapshot();
+
+        let state_ids = preem_ids(Card::sidebar_default(), &snapshot, &widgets);
+        let (raster_ids, kinds) = with_render_mode(RenderMode::Raster, || {
+            let tree = card(Card::sidebar_default(), &snapshot, &widgets);
+            let mut ids = Vec::new();
+            walk(&tree, &mut ids);
+            let mut kinds = Vec::new();
+            kind_names(&tree, &mut kinds);
+            (ids, kinds)
+        });
+
+        assert_eq!(
+            state_ids, raster_ids,
+            "the same widgets, keyed the same way"
+        );
+        assert!(
+            kinds.iter().all(|k| *k == "Pixels"),
+            "an unadvertised host must receive pixels, never state: {kinds:?}",
+        );
+        assert!(!kinds.is_empty(), "…and the card is not simply empty");
+    }
+
+    /// The wire kind of every widget node in a tree, in order.
+    fn kind_names(node: &Node, out: &mut Vec<&'static str>) {
+        match node {
+            Node::Preem { .. } => out.push("Preem"),
+            Node::Pixels { .. } => out.push("Pixels"),
+            Node::Box { children, .. } | Node::Row { children, .. } => {
+                for child in children {
+                    kind_names(child, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn collect_text(node: &Node, out: &mut Vec<String>) {

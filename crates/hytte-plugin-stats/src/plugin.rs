@@ -80,7 +80,7 @@ fn settings() -> Settings {
     static SETTINGS: OnceLock<Settings> = OnceLock::new();
     *SETTINGS.get_or_init(|| {
         let stats = config::load();
-        let resolved = settings_from(DEFAULT_MOUNT, &|key| std::env::var(key).ok(), &stats);
+        let resolved = settings_from(DEFAULT_MOUNT, &mount::env_lookup, &stats);
         tracing::info!(
             table = resolved.family.table(),
             poll_secs = resolved.card.poll.as_secs(),
@@ -288,13 +288,17 @@ mod tests {
     /// unconditionally — the bar row then reports the sidebar card.
     #[test]
     fn the_launch_mount_decides_which_table_this_instance_reads() {
-        let stats = config::Stats::default();
-        let env = |value: Option<&str>| {
-            move |key: &str| {
+        /// A lookup that answers `value` for the placement variable and nothing
+        /// for anything else, asserting which variable was asked for from a
+        /// **literal** — so a renamed const cannot pass by agreeing with itself.
+        fn env(value: Option<&str>) -> impl Fn(&str) -> Option<String> + use<'_> {
+            move |key| {
                 assert_eq!(key, "HYTTE_PLUGIN_MOUNT");
                 value.map(str::to_owned)
             }
-        };
+        }
+
+        let stats = config::Stats::default();
 
         // No override: the manifest's own mount, which is a sidebar one.
         assert_eq!(
@@ -346,7 +350,10 @@ mod tests {
         let mut model = fresh(Card::sidebar_default());
         let seed = model.view();
 
-        assert!(model.update(sample(0.5)).is_empty(), "no effects are emitted");
+        assert!(
+            model.update(sample(0.5)).is_empty(),
+            "no effects are emitted"
+        );
         let after = model.view();
         assert_ne!(after, seed, "the first sample must change the card");
 
@@ -411,7 +418,7 @@ mod tests {
     #[test]
     fn a_machine_with_no_sensors_at_all_still_renders() {
         let mut model = fresh(Card::sidebar_default());
-        let _ = model.update(Input::App(Msg::Sampled(Box::new(Snapshot::default()))));
+        let _ = model.update(Input::App(Msg::Sampled(Box::default())));
         let view = model.view();
         assert!(view.panel.is_none(), "P1 ships no drawer panel");
         // …and the frame it produces is valid on the wire.

@@ -1035,9 +1035,14 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 // `id_override` is cloned per session rather than moved: the
                 // manifest is rebuilt on every reconnect, so every session needs
                 // its own copy of the identity this launch registers under.
-                let outcome =
-                    session::<P, _, _>(rd, wr, shutdown.clone(), mount_override, id_override.clone())
-                        .await;
+                let outcome = session::<P, _, _>(
+                    rd,
+                    wr,
+                    shutdown.clone(),
+                    mount_override,
+                    id_override.clone(),
+                )
+                .await;
                 let lived = started.elapsed();
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
@@ -1262,7 +1267,8 @@ mod tests {
     use hytte_plugin_proto::{
         AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
         HostMsg, LogLevel, MAX_PLUGIN_ID_BYTES, Manifest, Mount, Node, Page, PluginMsg, ProtoError,
-        SPECTRUM_BINS, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
+        SPECTRUM_BINS, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame,
+        write_frame,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -4501,7 +4507,10 @@ mod tests {
                 "the message quotes the value verbatim, untrimmed",
             );
             let msg = err.to_string();
-            assert!(msg.contains(ID_ENV), "the message names the variable: {msg}");
+            assert!(
+                msg.contains(ID_ENV),
+                "the message names the variable: {msg}"
+            );
             assert!(
                 msg.contains(&MAX_PLUGIN_ID_BYTES.to_string()),
                 "the message states the length bound: {msg}",

@@ -12073,14 +12073,12 @@ async fn a_connection_that_always_pongs_survives_past_the_drop_bound() {
     // longer than the window the sibling test proves a silent peer dies in.
     for _ in 0..(MAX_MISSED_PONGS + 2) {
         advance_one_ping_interval().await;
-        let seq = match tokio::time::timeout(Duration::from_secs(5), recv(&mut prd)).await {
-            Ok(HostMsg::Ping { seq }) => seq,
-            Ok(other) => panic!("expected a Ping, got {other:?}"),
-            Err(_) => panic!(
-                "a Ping must arrive every PING_INTERVAL — if it doesn't, the \
-                 host stopped sending them rather than the plugin failing to \
-                 answer",
-            ),
+        // `recv` already times out and panics ("a host frame within 5s") on
+        // its own if nothing arrives — exactly the case if the host stopped
+        // sending pings rather than the plugin failing to answer one.
+        let seq = match recv(&mut prd).await {
+            HostMsg::Ping { seq } => seq,
+            other => panic!("expected a Ping, got {other:?}"),
         };
         write_frame(&mut pwr, &PluginMsg::Pong { seq })
             .await

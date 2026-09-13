@@ -24,7 +24,7 @@ use futures_signals::signal::{Mutable, Signal};
 use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
@@ -37,20 +37,36 @@ const LEGACY_CONFIG_FILE: &str = "muted-apps.toml";
 /// `#[serde(default)]` on the **container** (#1233 F4) — see `dnd::DndState`
 /// for why the rule is uniform rather than applied only where the two forms
 /// differ.
+///
+/// `apps` is a `BTreeSet`, not the `HashSet` the in-memory handle carries, and
+/// that is the whole of what keeps the rendered file sorted: serde walks the
+/// set in iteration order, and a `HashSet`'s is `RandomState`-seeded per
+/// instance — the review measured **172 distinct renders of one six-element
+/// logical set across 200 builds** (#1233 F5). The pre-#1226 hand-rolled
+/// writer sorted explicitly; losing that made the file churn byte-wise on
+/// every unrelated toggle, stop being diffable or greppable by a human, and
+/// pre-broke any future dedup-on-content. [`state_for`] is the one conversion
+/// seam, so the test can render through the same path `save_to_disk` does.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct MutedAppsState {
-    apps: HashSet<String>,
+    apps: BTreeSet<String>,
+}
+
+/// The on-disk shape of `apps` — the one place the unordered in-memory set
+/// becomes the ordered on-disk one. See [`MutedAppsState`].
+fn state_for(apps: &HashSet<String>) -> MutedAppsState {
+    MutedAppsState {
+        apps: apps.iter().cloned().collect(),
+    }
 }
 
 fn load_from_disk() -> HashSet<String> {
     let old = config_file::path(LEGACY_CONFIG_FILE);
     let loaded: MutedAppsState = state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| {
-        Some(MutedAppsState {
-            apps: parse_apps_line(text),
-        })
+        Some(state_for(&parse_apps_line(text)))
     });
-    loaded.apps
+    loaded.apps.into_iter().collect()
 }
 
 /// Parse a single `apps = ["X", "Y", ...]` line out of the TOML body.
@@ -79,7 +95,7 @@ fn parse_apps_line(text: &str) -> HashSet<String> {
 }
 
 fn save_to_disk(apps: &HashSet<String>) {
-    state::store(SUBSYSTEM, &MutedAppsState { apps: apps.clone() });
+    state::store(SUBSYSTEM, &state_for(apps));
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -235,9 +251,7 @@ mod tests {
         scratch_home(|home| {
             state::store(
                 SUBSYSTEM,
-                &MutedAppsState {
-                    apps: HashSet::from(["Slack".to_string()]),
-                },
+                &state_for(&HashSet::from(["Slack".to_string()])),
             );
 
             let legacy = legacy_path(home);
@@ -272,6 +286,51 @@ mod tests {
                 "not valid toml {{{",
                 "the read path must not rewrite the corrupt state file"
             );
+        });
+    }
+
+    /// The rendered file is sorted, and two renders of the same logical set
+    /// are byte-identical (#1233 F5).
+    ///
+    /// Six independently-seeded `HashSet`s — `RandomState` is per-instance —
+    /// all render to the same sorted line. Under a `HashSet` serialized field
+    /// the chance of all six landing in sorted order is (1/720)^6, so this
+    /// falsifies the `BTreeSet` rather than merely coexisting with it.
+    /// Rendered through `state::store_at` into a tempdir because this crate
+    /// deliberately has no `toml` dependency of its own (see its Cargo.toml).
+    #[test]
+    fn the_rendered_file_is_sorted_and_independent_of_insertion_order() {
+        const APPS: [&str; 6] = ["Zed", "Discord", "Element", "Firefox", "Slack", "Thunderbird"];
+        const WANT: &str =
+            "apps = [\"Discord\", \"Element\", \"Firefox\", \"Slack\", \"Thunderbird\", \"Zed\"]\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for rotation in 0..APPS.len() {
+            let apps: HashSet<String> = APPS
+                .iter()
+                .cycle()
+                .skip(rotation)
+                .take(APPS.len())
+                .map(|s| (*s).to_string())
+                .collect();
+            let path = dir.path().join(format!("muted-apps-{rotation}.toml"));
+            state::store_at(&path, &state_for(&apps)).expect("renders");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read back"),
+                WANT,
+                "insertion order {rotation} must render the same sorted bytes"
+            );
+        }
+    }
+
+    /// The bug the new writer fixed, kept pinned: the pre-#1226 hand-rolled
+    /// writer silently `filter`ed out any app name containing `\"`.
+    #[test]
+    fn an_app_name_with_a_quote_round_trips() {
+        scratch_home(|_home| {
+            let apps = HashSet::from(["He said \"hi\"".to_string()]);
+            save_to_disk(&apps);
+            assert_eq!(load_from_disk(), apps);
         });
     }
 

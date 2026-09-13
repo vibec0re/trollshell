@@ -148,7 +148,12 @@ inline in `flake.nix` as one-liners.
   `command not found`, which a script run for its side effects can swallow. The
   script's header documents the deliberate carve-out (capturing a _different_
   widget is correct) and why it paren/brace-matches instead of using a regex —
-  read it before changing it.
+  read it before changing it. Since #1259 (the #1244 sidebar leak this scan
+  reported `0 pin(s)` on both sides of) it also discovers connect-helper
+  functions like `hytte::ui::on_surface_ready`/`on_map_or_now` — ones that
+  wire a widget to a handler on the caller's behalf rather than through a
+  `connect_*` receiver call — and flags the same strong-clone-into-a-discarded-
+  closure-parameter shape at a call to one of them.
 - `lints-tables` (#1179): the same shape for the three hand-mirrored `[lints]`
   tables — `nix/lint-lints-tables.py` parses the root `[workspace.lints]` and
   both `unsafe` islands' copies (`crates/hytte-ecal/Cargo.toml`,

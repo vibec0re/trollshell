@@ -553,6 +553,27 @@ in
         home.packages = [ cfg.controlCenter.package ];
       })
 
+      (lib.mkIf (cfg.agentWindow.enable && cfg.agentWindow.hiveTlsStateDir != null) {
+        # #1234: the hive's TLS directory, so the window trusts a same-host
+        # self-signed gateway with nothing set by hand. Written to BOTH
+        # delivery paths for the #568 reason `trollshellSessionEnv`'s own doc
+        # states, and it matters more here than anywhere else: the agents
+        # plugin launches this binary detached through `systemd-run --user`
+        # (#953), so what it inherits is the **user manager's** environment,
+        # which never sources `hm-session-vars.sh`.
+        # `systemd.user.sessionVariables` is the one that reaches it
+        # (home-manager renders `environment.d/10-home-manager.conf`, which the
+        # manager imports for every unit it starts); `home.sessionVariables` is
+        # for a launch from a terminal.
+        #
+        # Under home-manager the NixOS option tree is out of scope, so this
+        # option has no automatic default here — an operator on a same-host
+        # deploy sets it, or leaves it null and the window falls back to
+        # hyperhive's own `/var/lib/hive-tls`.
+        home.sessionVariables.TROLLSHELL_AGENT_WINDOW_TLS_DIR = cfg.agentWindow.hiveTlsStateDir;
+        systemd.user.sessionVariables.TROLLSHELL_AGENT_WINDOW_TLS_DIR = cfg.agentWindow.hiveTlsStateDir;
+      })
+
       # The per-agent companion window (#950): the hyperhive agents card's two
       # destinations. On by default exactly when `plugins.agents` is declared —
       # the plugin resolves this binary on the *user manager's* PATH, which is

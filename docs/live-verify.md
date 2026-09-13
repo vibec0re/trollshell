@@ -691,38 +691,141 @@ whole point of the window.
       and check `hivectl list-agents` before and after that nothing else moved
       — the §11 rule-one footgun again, and this is a second writer on the same
       socket.
-- [ ] **(#950)** **TLS — the inline error state names the way out.** A default
-      hyperhive gateway serves a self-signed leaf under a host-held CA and this
-      machine's trust store does not carry it, so **expect the window to open
-      on an error state** rather than the page. Confirm that state names the
-      failing host and all three routes (not WebKit's bare "load failed"), then
-      take the first one that applies. Check this by eye, not by reading the
-      source: confirm the description text — the three bullets and the
-      `openssl s_client` one-liner — actually **renders** under the title, not
-      just the padlock icon and an empty card (#1224 was exactly that: the
-      text was there in code but Pango markup-escaping was missing, so GTK
-      silently dropped the whole description).
-  1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
-     Reference hyperhive's own option rather than typing the path (Mara's ask
-     on #948), so the two sides cannot drift if that directory moves:
+- [ ] **(#1234)** **TLS — the page loads on a same-host hive with nothing set.**
+      This is the real test of #1234, and it is Mara's case: `trollshell` and
+      hyperhive on one machine, no `TROLLSHELL_AGENT_WINDOW_*` variable
+      anywhere, nothing added to `security.pki.certificateFiles`. Open the
+      window. **The agent's page must render.** Then check the journal for one
+      of the two lines that say why:
 
-     ```nix
-     security.pki.certificateFiles = [
-       "${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem"
-     ];
+      - `the hive's anchors signed what the gateway presented; pinning that
+        leaf for this launch` — route 2, the `trust-bundle.pem` probe;
+      - `pinned the certificate in this file for this host` with
+        `pem=…/gateway.pem` — route 3, the leaf straight off disk.
+
+      Route 2 is the expected one when both files exist. If you see neither,
+      check that `TROLLSHELL_AGENT_WINDOW_TLS_DIR` actually reached the
+      process (`systemctl --user show-environment | grep AGENT_WINDOW`, or
+      `tr '\0' '\n' < /proc/<pid>/environ`): the window is launched detached
+      through `systemd-run --user`, so it inherits the **user manager's**
+      environment, and a variable that only landed in `hm-session-vars.sh` is
+      invisible to it (#568's lesson).
+
+      **When each path takes effect differs, and it is the likeliest reason
+      this looks broken right after a rebuild.** The NixOS module's
+      `environment.sessionVariables` reaches the user manager through pam_env
+      on the `systemd-user` PAM service (`security.pam.services.systemd-user.setEnvironment`,
+      default true), i.e. when `user@<uid>.service` starts — so on a NixOS
+      deploy it is there **from the next login**, not from `nixos-rebuild
+      switch`. The home-manager path has no such wait: activation runs
+      `systemctl --user daemon-reload`, and environment generators re-run on
+      reload, so `environment.d/10-home-manager.conf` is live for anything
+      started afterwards. The shipped niri session imports only
+      `WAYLAND_DISPLAY XDG_CURRENT_DESKTOP` (`etc/niri/session.kdl`), so there
+      is no third route that would paper over this. Log out and back in before
+      concluding the option does not work.
+
+- [ ] **(#1234)** **Rotation.** Force the hive to re-sign
+      (`systemctl restart hive-tls-ca.service`, or wait out the weekly timer),
+      then **close and reopen** the window. It must still load: route 2 pins
+      what the gateway presents _this launch_, so a new leaf under the same
+      anchor needs nothing. A window that was already open keeps its old pin —
+      that is by design, and reopening is the fix.
+- [ ] **(#1234)** **A wrong anchor is refused, and the card says which check
+      failed.** Launch with
+      `TROLLSHELL_AGENT_WINDOW_CA=/etc/ssl/certs/ca-bundle.crt` (any bundle
+      that does not carry the hive CA). The page must **not** load, and the
+      card's first paragraph must read `This launch checked <host>'s
+certificate against the anchors in /etc/ssl/… and they refused it:
+nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
+      sentence is the half #1234 added — a card that only said "could not
+      verify" is what sent #1224 round in circles.
+- [ ] **(#1234)** **A gateway that is down does not read as a bad
+      certificate.** Stop nginx on the hive (leave `host.sock` up, so the
+      header still populates and the window still gets a URL). The card must
+      say `That is a connection problem rather than a certificate one`.
+- [ ] **(#1234)** **The freeze is bounded, and only the deadline bounds it.**
+      The probe runs on the GTK main thread, so while it runs nothing
+      repaints. Two constants, and only one of them is a bound:
+      `verify::PROBE_IO_TIMEOUT_SECS` (5 s) is GIO's **per-read** socket
+      timeout, which every arriving byte resets — measured against a peer
+      dribbling one byte per 1.5 s, it let the window sit for **21.01 s**
+      (#1242 review). `verify::PROBE_DEADLINE` (8 s) is the real one: a
+      watchdog thread cancels the whole probe — connect, handshake, and the
+      name resolution `connect_to_host` does inside itself — when it expires,
+      and the card then says `the probe was cancelled after 8.0s`. The same
+      dribbling peer now returns in ~2 s against a 2 s budget in
+      `tls_tests::a_dribbling_peer_cannot_hold_the_probe_past_its_deadline`.
+      Two things sit outside it: the anchors file's own read and parse
+      (`TlsFileDatabase::new` takes no cancellable — a local file read), and a
+      `getaddrinfo` already in flight, which GIO abandons rather than aborts
+      (the call returns on time; the pool thread finishes and discards).
+      To check it by hand, point the hive's URL at a host that accepts TCP and
+      says nothing (`nc -l` on the gateway's port with nginx stopped), open
+      the window, and time it: **grab the window and drag it** — it should
+      become responsive within ~8 s, not 20+. Moving the probe off the main
+      thread entirely, with a "verifying…" state on the card, is
+      [#1246](https://github.com/vibec0re/trollshell/issues/1246); until that
+      lands, a bounded freeze is what this is.
+- [ ] **(#950/#1234)** **TLS — the inline error state names the way out.**
+      With every automatic route removed (e.g.
+      `TROLLSHELL_AGENT_WINDOW_TLS_DIR=/nonexistent`), **expect the window to
+      open on an error state** rather than the page. Confirm that state names
+      the failing host and every route (not WebKit's bare "load failed").
+      Check this by eye, not by reading the source: confirm the description
+      text — all four bullets and the `openssl s_client` one-liner — actually
+      **renders** under the title, not just the padlock icon and an empty card
+      (#1224 was exactly that: the text was there in code but Pango
+      markup-escaping was missing, so GTK silently dropped the whole
+      description).
+  1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
+     **Nothing to do**: `programs.trollshell.agentWindow.hiveTlsStateDir`
+     already defaults to hyperhive's own `tls.stateDir` when that module is on
+     this host, and the window reads `trust-bundle.pem` and `gateway.pem` out
+     of it itself. Set the option by hand only under home-manager, where the
+     NixOS option tree is not in scope to default from.
+  2. **A remote hive, or a host you do not configure.** Copy that hive's
+     `trust-bundle.pem` over and name it:
+     `TROLLSHELL_AGENT_WINDOW_CA=/etc/ssl/hive/trust-bundle.pem`. The window
+     verifies what the gateway presents against those anchors and pins the
+     leaf, so this survives the hive re-signing.
+  3. **Machine-wide** (every browser too), and **the route #1234 had to
+     fix**: copy the bundle into your NixOS flake's git tree and reference the
+     copy.
+
+     ```sh
+     cp /var/lib/hive-tls/trust-bundle.pem <your-flake>/hive-ca.pem
      ```
 
-  2. **A remote hive, or a host you do not configure.** Copy that file over and
-     name it literally — `/var/lib/hive-tls` is only that option's default, so
-     spelling it out is the fallback, not the example to copy.
-  3. **Last resort**, when neither is available: launch with
-     `TROLLSHELL_AGENT_WINDOW_CERT=<pem>`, which pins one certificate for the
-     agent's host only. ⚠️ It must be the certificate the gateway **presents**
-     — its leaf, **not** the bundle — because
+     ```nix
+     security.pki.certificateFiles = [ ./hive-ca.pem ];
+     ```
+
+     ⚠️ **Do not** write
+     `[ "${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem" ]`
+     — what this document said until #1234. That value is a plain string
+     spliced into the `cacert` derivation, which opens it **inside the build
+     sandbox**, where `/var/lib/hive-tls` does not exist: `nixos-rebuild`
+     fails at build on a stock host. With the sandbox off it is worse — the
+     derivation hashes the path string, never the bytes, so the bundle is
+     pinned at first build and silently goes stale when the hive rotates its
+     CA. hyperhive's own agents do it the sound way (`hive_c0re::meta` copies
+     the runtime bundle into the flake's tree), which is what the `cp` above
+     is. Re-run it after a CA rotation.
+
+  4. **Last resort**, for a hive you can read a certificate from but not
+     configure: launch with `TROLLSHELL_AGENT_WINDOW_CERT=<pem>`, which pins
+     one certificate for the agent's host only. ⚠️ It must be the certificate
+     the gateway **presents** — its leaf, **not** the bundle — because
      `allow_tls_certificate_for_host` pins a certificate rather than adding an
-     anchor. `openssl s_client -connect <host>:443 -showcerts </dev/null |
-openssl x509` produces it. Pointing it at `trust-bundle.pem` gets you an
-     INFO line saying it worked and an error page anyway (#1130 M3).
+     anchor. On the hive's own machine that file already exists as
+     `/var/lib/hive-tls/gateway.pem` (leaf first, CA appended;
+     @the-sword-above on #1224); elsewhere,
+     `openssl s_client -connect <host>:443 -showcerts </dev/null |
+openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
+     card now tells you so by name — "it does not name `<host>` … this is
+     probably a CA where a leaf was expected" — rather than an INFO line
+     claiming it worked (#1130 M3, #1234).
 
   Whichever you use, confirm the page then loads _and_ that an unrelated https
   host with a bad certificate still fails in the same window — this window

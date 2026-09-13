@@ -29,18 +29,24 @@ use adw::prelude::*;
 use webkit::prelude::*;
 
 use crate::page::navigable_in_place;
-use crate::tls::{CERT_ENV, TlsPolicy, failure_description};
+use crate::tls::{CERT_ENV, Pinned, Resolved, TlsPolicy, failure_description};
 
 /// The `Stack` child names — the page, and the TLS failure state that replaces
 /// it.
 const PAGE: &str = "page";
 const TLS_FAILED: &str = "tls-failed";
 
-/// Build the page widget for `url`, under `policy`.
+/// Build the page widget for `url`, under the policy
+/// [`crate::tls::resolve`] settled on.
 ///
 /// The returned widget is a `gtk::Stack`: the [`webkit::WebView`] itself, plus
 /// the inline error state [`failure_description`] fills in when verification
 /// fails. [`view_of`] gets the view back out of it.
+///
+/// `trust.tried` — the sentence naming the file this launch read and what came
+/// of it — is carried here rather than recomputed, because by the time
+/// `load-failed-with-tls-errors` runs the probe is long over and its verdict
+/// is the single most useful thing the card can say (#1234).
 ///
 /// The network session is configured **before** the first load: the
 /// TLS-errors policy is set explicitly (always
@@ -48,7 +54,8 @@ const TLS_FAILED: &str = "tls-failed";
 /// left at the default, so a reader of this file can see that nothing here
 /// turns verification off.
 #[must_use]
-pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
+pub fn page(url: &str, trust: &Resolved) -> gtk::Widget {
+    let policy = &trust.policy;
     // **Ephemeral**, not `NetworkSession::default()`: the default is the
     // persistent one, which accumulates cookies, cache and `IndexedDB` under
     // `$XDG_{DATA,CACHE}_HOME` per app-id for ever, with nothing in this
@@ -59,22 +66,32 @@ pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
     let session = webkit::NetworkSession::new_ephemeral();
     session.set_tls_errors_policy(policy.errors_policy());
 
-    if let TlsPolicy::AllowCertificateForHost { pem, host } = policy {
-        match gtk::gio::TlsCertificate::from_file(pem) {
+    if let Some((cert, host)) = pin_for(policy) {
+        // `from_file` takes the FIRST PEM block as the certificate and the rest
+        // as its issuer chain — which is exactly hyperhive's `gateway.pem`
+        // (`cat leaf-only ca.pem`) and exactly why a `trust-bundle.pem`, which
+        // leads with the CA, can never match. `from_pem` is the route-2 arm:
+        // the leaf the gateway itself presented, already verified against the
+        // hive's anchors before it got here.
+        let loaded = match cert {
+            Pinned::File(pem) => gtk::gio::TlsCertificate::from_file(pem)
+                .map_err(|e| format!("{} could not be read ({e})", pem.display())),
+            Pinned::VerifiedPem(pem) => gtk::gio::TlsCertificate::from_pem(pem)
+                .map_err(|e| format!("the verified leaf could not be re-parsed ({e})")),
+        };
+        match loaded {
             Ok(cert) => {
                 session.allow_tls_certificate_for_host(&cert, host);
                 tracing::info!(
-                    pem = %pem.display(),
                     host,
-                    "pinning the certificate {CERT_ENV} names for this host — it must be the one \
-                     the gateway PRESENTS (its leaf); a CA bundle will not match and the load \
-                     will still fail"
+                    "pinning one certificate for this host — it must be the one the gateway \
+                     PRESENTS (its leaf); a CA bundle will not match and the load will still \
+                     fail, which is why {CERT_ENV} is documented as the leaf"
                 );
             }
-            Err(e) => tracing::warn!(
-                pem = %pem.display(),
-                error = %e,
-                "{CERT_ENV} does not name a readable certificate; using the system trust store"
+            Err(why) => tracing::warn!(
+                %why,
+                "no certificate to pin for this host; using the system trust store"
             ),
         }
     }
@@ -103,30 +120,77 @@ pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
     // address bar and `WebKit`'s own text says only that the load failed.
     let sink = stack.clone();
     let error = failed.clone();
+    let tried = trust.tried.clone();
     view.connect_load_failed_with_tls_errors(move |_, failing_uri, _cert, errors| {
         let host = crate::tls::host_of(failing_uri).unwrap_or(failing_uri);
         tracing::warn!(
             uri = failing_uri,
             ?errors,
-            "TLS verification failed for the hive; add its trust-bundle.pem to the system store \
-             (security.pki.certificateFiles, referencing \
-             services.hyperhive.deploy.hive-controller.tls.stateDir when the hive is on this \
-             machine), or as a last resort point {CERT_ENV} at the certificate the gateway \
-             PRESENTS — its leaf, never the bundle. The window's own error state spells all \
-             three out"
+            tried = tried
+                .as_deref()
+                .unwrap_or("nothing — the system trust store decided"),
+            "TLS verification failed for the hive. On a same-host deploy the window reads \
+             hyperhive's own trust-bundle.pem / gateway.pem and needs no setting; otherwise \
+             point TROLLSHELL_AGENT_WINDOW_CA at a copy of that bundle, or as a last resort \
+             {CERT_ENV} at the certificate the gateway PRESENTS — its leaf, never the bundle. \
+             The window's own error state spells them all out"
         );
         // `AdwStatusPage:description` is parsed as Pango markup, and
         // `failure_message` is not valid markup on its own (its `openssl …
         // </dev/null` reads as an unopened closing tag) — escape at this
         // sink, the one place this text becomes a description. See
         // `tls::failure_message`'s docs (#1224).
-        error.set_description(Some(&failure_description(host)));
+        error.set_description(Some(&failure_description(host, tried.as_deref())));
         sink.set_visible_child_name(TLS_FAILED);
         false
     });
 
     view.load_uri(url);
     stack.upcast()
+}
+
+/// What to pin and **under which spelling of the host**, or `None` when the
+/// policy pins nothing.
+///
+/// # `WebKit` strips the brackets before it looks the pin up
+///
+/// This function exists because the obvious call — passing
+/// [`crate::tls::host_of`]'s host straight through — silently produces a dead
+/// pin for an IPv6 hive, on every route. `webkitgtk` 2.52.6 stores the
+/// exception under the host **verbatim**
+/// (`WebKitNetworkSession.cpp:477-486` → `WebsiteDataStore.cpp:1789-1792` →
+/// `NetworkSessionSoup.cpp:128-131` → `SoupNetworkSession.cpp:341-344`), but
+/// looks it up through `hostForComparison`
+/// (`SoupNetworkSession.cpp:314-327`), whose own comment says why:
+///
+/// ```text
+/// // If the host component of the URL is an IPv6 address, it will be
+/// // surrounded by [ ] brackets. We have to remove them because they're part
+/// // of the WTF::URL's host component … but not part of the host passed to
+/// // allowSpecificHTTPSCertificateForHost.
+/// ```
+///
+/// So `[::1]` goes in and `::1` is asked for, and the pin never applies. The
+/// **bare** spelling is the one to store — the same one `GNetworkAddress`
+/// wants, which is why this is [`crate::tls::identity_host`] and not a third
+/// helper. The bracketed spelling stays for the card, where a human reads it.
+///
+/// # What the comparison actually is (#1242 review)
+///
+/// `HostTLSCertificateSet` (`SoupNetworkSession.cpp:68-97`) hashes the
+/// certificate's **own DER** — the `"certificate"` property — with SHA-256,
+/// not the chain. So route 2's leaf-only `VerifiedPem` and route 3's
+/// leaf-plus-CA `gateway.pem` both match a gateway presenting a full chain,
+/// and chain length is irrelevant to whether a pin takes. That is the one
+/// thing that could have made the launch-time verify decorative, and it does
+/// not.
+fn pin_for(policy: &TlsPolicy) -> Option<(&Pinned, &str)> {
+    match policy {
+        TlsPolicy::SystemStore => None,
+        TlsPolicy::AllowCertificateForHost { cert, host } => {
+            Some((cert, crate::tls::identity_host(host)))
+        }
+    }
 }
 
 /// The [`webkit::WebView`] inside a widget [`page`] returned.
@@ -291,7 +355,46 @@ fn elsewhere(uri: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::elsewhere;
+    use super::{elsewhere, pin_for};
+    use crate::tls::{Pinned, TlsPolicy};
+    use std::path::PathBuf;
+
+    /// **An IPv6 pin is stored under the spelling `WebKit` looks it up by** —
+    /// the bare literal, not the bracketed one (#1242 review, finding 3;
+    /// `SoupNetworkSession.cpp`'s `hostForComparison`, quoted in
+    /// [`pin_for`]'s docs).
+    ///
+    /// Before this, `[::1]` went in and `::1` was asked for, so the pin was
+    /// dead on **every** route for an IPv6 hive and the failure card was all
+    /// such a hive ever got — silently, since nothing in `WebKit` reports an
+    /// exception that is never consulted.
+    ///
+    /// Mutation (re-run this round, red): drop `identity_host` from
+    /// [`pin_for`] and hand the host through unchanged — the spelling this
+    /// PR shipped at first — and the two literal rows red.
+    ///
+    /// [`pin_for`]: super::pin_for
+    #[test]
+    fn an_ipv6_pin_is_stored_under_the_spelling_webkit_looks_it_up_by() {
+        let policy = |host: &str| TlsPolicy::AllowCertificateForHost {
+            cert: Pinned::File(PathBuf::from("/tmp/hive-gateway.pem")),
+            host: host.to_owned(),
+        };
+        for (stored, expected) in [
+            ("[::1]", "::1"),
+            ("[fd00::1]", "fd00::1"),
+            ("hive.local", "hive.local"),
+            ("127.0.0.1", "127.0.0.1"),
+        ] {
+            let p = policy(stored);
+            let (_, pinned_under) = pin_for(&p).expect("this policy pins something");
+            assert_eq!(pinned_under, expected, "stored as {stored}");
+        }
+        assert!(
+            pin_for(&TlsPolicy::SystemStore).is_none(),
+            "the system store pins nothing, so there is no host to spell"
+        );
+    }
 
     /// A non-http(s) scheme never reaches a launcher.
     ///
@@ -311,7 +414,7 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{PAGE, TLS_FAILED, page, settings, view_of};
-    use crate::tls::TlsPolicy;
+    use crate::tls::Resolved;
     use webkit::prelude::*;
 
     /// # Why there is no end-to-end "the view refused it" test here
@@ -411,7 +514,7 @@ mod gtk_tests {
     #[gtk::test]
     fn the_view_carries_those_settings() {
         use gtk::glib::object::ObjectExt as _;
-        let w = page("https://hive.local/agent/stray/", &TlsPolicy::SystemStore);
+        let w = page("https://hive.local/agent/stray/", &Resolved::default());
         let view = view_of(&w).expect("the page widget carries the view");
         let s =
             webkit::prelude::WebViewExt::settings(&view).expect("the view was built with settings");
@@ -425,7 +528,7 @@ mod gtk_tests {
     /// on a normal open.
     #[gtk::test]
     fn the_page_starts_on_the_view_not_on_the_error_state() {
-        let w = page("https://hive.local/agent/stray/", &TlsPolicy::SystemStore);
+        let w = page("https://hive.local/agent/stray/", &Resolved::default());
         let stack = w
             .downcast_ref::<gtk::Stack>()
             .expect("the page widget is a stack");
@@ -443,7 +546,7 @@ mod gtk_tests {
     /// `NetworkSession::default()` — the persistent one — and this reds.
     #[gtk::test]
     fn the_network_session_is_ephemeral() {
-        let w = page("https://hive.local/agent/stray/", &TlsPolicy::SystemStore);
+        let w = page("https://hive.local/agent/stray/", &Resolved::default());
         let view = view_of(&w).expect("the page widget carries the view");
         assert!(
             view.network_session()

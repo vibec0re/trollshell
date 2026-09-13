@@ -45,6 +45,14 @@ pkgs.mkShell {
     # check supplies it in `nativeBuildInputs`, and listing it here lets the
     # identical `python3 nix/lint-glsl.py` run from the devShell.
     glslang
+
+    # GIO's TLS backend (#1234 ask 3). It is a **loadable module**, not part
+    # of libgio, so without it every `gio::TlsCertificate::from_file`,
+    # `TlsFileDatabase::new` and `TlsClientConnection::new` in the tree
+    # answers "TLS support is not available" — which is exactly what
+    # `tls.rs`'s #1130 note recorded, and why the window's whole trust path
+    # was live-verify-only until now. See `GIO_EXTRA_MODULES` below.
+    glib-networking
   ];
 
   # Fixed (non-prepending) values live as env attrs; only the two vars that
@@ -82,6 +90,27 @@ pkgs.mkShell {
     # the raw schema dirs ourselves so org.gnome.desktop.interface (and
     # therefore the active GTK icon theme name) reads cleanly.
     GSETTINGS_SCHEMA_DIR = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}/glib-2.0/schemas:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}/glib-2.0/schemas";
+
+    # #1234 ask 3 — **GIO has no TLS without this.** `glib-networking` ships
+    # `libgiognutls.so` as a GIO *module*, which a normal application picks up
+    # because `wrapGAppsHook4` sets this variable; nothing wraps a `cargo test`
+    # or a `cargo run`, so the devShell sets it by hand the same way
+    # `nix/probe.nix` relies on a GApps wrap for dconf's GSettings backend.
+    #
+    # Without it `gio::TlsCertificate::from_file` returns
+    # `"TLS support is not available"` — measured, and recorded as a
+    # live-verify caveat in `tls.rs` for the whole of #1130 — so the agent
+    # window's launch-time verify (`verify.rs`) could neither run nor be
+    # tested. `nix/checks/system-tests.nix` exports the identical value, for
+    # the reason `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS` is in both: the
+    # local and CI buckets must agree about what `cargo test --features
+    # system-tests` does.
+    #
+    # It is **not** a runtime concern for the shipped binaries: every package
+    # output that needs GIO TLS is `wrapGAppsHook4`-wrapped
+    # (nix/agent-window.nix), and that hook injects this path itself from the
+    # closure.
+    GIO_EXTRA_MODULES = "${pkgs.glib-networking}/lib/gio/modules";
 
     # #1130 N1 — **the local `system-tests` bucket aborts without this.**
     #

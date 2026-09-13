@@ -43,5 +43,6 @@ pub mod feed;
 pub mod page;
 pub mod tls;
 pub mod ui;
+pub mod verify;
 pub mod webview;
 pub mod window;

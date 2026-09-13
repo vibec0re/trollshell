@@ -343,9 +343,15 @@ pub(super) fn arm_for(program: GlProgram) -> Arm {
 /// outright. That is honest rather than a gap to close: with the program
 /// already recorded, a second sweep finds no instance still on that pipeline
 /// and changes nothing at all, so the early return's whole effect is one
-/// duplicate journal line and one redundant re-map request — neither of which
-/// this suite can observe. It is kept because a bar with four chips of one
-/// kind would otherwise write four identical lines about one driver refusal.
+/// duplicate journal line and one redundant re-map request. The re-map
+/// request is unobservable in this suite (#1253; PR #1243 review, LOW 1 /
+/// NEW LOW B — pinned instead at the shared callee,
+/// `pump::request_preem_repaint_all_when_live`). The journal line **is**
+/// observable, and is pinned right here:
+/// [`tests::one_journal_line_per_program`] reds (`left: 2, right: 1`) if the
+/// same `contains` check is dropped. It is kept because a bar with four chips
+/// of one kind would otherwise write four identical lines about one driver
+/// refusal.
 ///
 /// A kind registered under **two** names is two refusals by construction and
 /// that is correct, not a bug to read into a doubled journal line: the
@@ -384,15 +390,17 @@ pub(super) fn on_build_refused(program: GlProgram, grid: (u32, u32), reason: &st
     // the screen. Guarded and deferred to idle there; both matter here too,
     // since this runs inside a `GtkGLArea` render callback.
     //
-    // **Not pinned by any test**, here or for the context hook above: deleting
-    // either call leaves the whole suite green (PR #1243 review, LOW 1). What
-    // it would take is a live `PluginHandles` in the registry (the guard
-    // `request_preem_repaint_all_when_live` reads) plus an idle turn, i.e. a
-    // host fixture no test in this tree stands up. The *rebuild* half is
-    // pinned — `preem_render`'s
+    // Whether the *mailbox write* this eventually performs reaches the
+    // screen is still unpinned — that would take a live `PluginHandles` in
+    // the registry (the guard this function reads) plus a pumped idle turn,
+    // i.e. a host fixture no test in this tree stands up (PR #1243 review,
+    // LOW 1). But whether the *call* happens at all is pinned since #1253,
+    // in the shared callee both this hook and the context hook above call:
+    // `pump::request_preem_repaint_all_when_live`'s `#[cfg(test)]` counter,
+    // asserted alongside the builds probe in `preem_render`'s
     // `a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl`
-    // probes it before any mapping pass — so what is unasserted is the nudge
-    // that puts an already-correct renderer on screen.
+    // (PR #1243 review, NEW LOW B) — which is also where the *rebuild* half
+    // is pinned, so what is unasserted narrows to the mailbox write alone.
     super::pump::request_preem_repaint_all_when_live();
 }
 
@@ -700,5 +708,41 @@ mod tests {
                 "…and a second refusal of the same pipeline does not un-refuse it",
             );
         });
+    }
+
+    /// **#1253** (PR #1243 review, NEW LOW A). The idempotence guard's
+    /// doc used to say the early return's duplicate-journal-line effect is
+    /// "unobservable" — that was wrong, and this is the pin that says so.
+    ///
+    /// [`on_build_refused`] is driven directly, with no chip in `STORE` to
+    /// rebuild — the journal line fires whether or not there is anything to
+    /// sweep, and a bare double-refusal is the narrowest fixture that
+    /// exercises the `contains` check. `hytte_config::test_support::capture`
+    /// is the same WARN-counting harness `plugins::tests::warns_with` already
+    /// uses (`plugins/tests.rs`), reached here without that helper since this
+    /// module has no `warns_with` of its own and one field filter is not
+    /// worth importing across a module boundary for.
+    ///
+    /// **Falsified** by dropping the `contains` check in [`on_build_refused`]
+    /// (the same M7 mutation LOW 2's test above pins from the other side, the
+    /// record growing to two entries): `REFUSED` no longer short-circuits the
+    /// second call, so the hook's `tracing::warn!` fires twice and this reds
+    /// at `left: 2, right: 1`.
+    #[test]
+    fn one_journal_line_per_program() {
+        let (captured, _guard) = hytte_config::test_support::capture();
+
+        on_build_refused(SCOPE, (48, 24), "the first chip");
+        on_build_refused(SCOPE, (96, 32), "the second chip, same driver");
+
+        let lines = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key("program"))
+            .count();
+        assert_eq!(
+            lines, 1,
+            "one journal line per refused program, not one per refused surface",
+        );
     }
 }

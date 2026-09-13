@@ -11338,6 +11338,7 @@ mod containment_r2 {
             other => panic!("expected a DatasourceResult reply, got {other:?}"),
         }
     }
+}
 
 // ── #1211: one enumeration for the six per-kind GL lists ────────────────────
 

@@ -1049,7 +1049,9 @@ mod gtk_tests {
             url: Some("https://hive.local/agent/stray/".to_owned()),
             ..row()
         })));
-        let verifying = w.page_child().expect("the verifying state replaced the hint");
+        let verifying = w
+            .page_child()
+            .expect("the verifying state replaced the hint");
         assert!(
             webview::is_verifying(&verifying),
             "the hint goes the moment a URL lands, and what takes its place says why there is no \
@@ -1060,7 +1062,9 @@ mod gtk_tests {
             pump_until(Duration::from_secs(10), || !w.probing()),
             "the probe never answered"
         );
-        let page = w.page_child().expect("the page replaced the verifying state");
+        let page = w
+            .page_child()
+            .expect("the page replaced the verifying state");
         assert!(
             webview::view_of(&page).is_some(),
             "once the hive names a URL and its certificate checks out, the slot holds the page"
@@ -1970,7 +1974,10 @@ mod gtk_tests {
             tls::TlsPolicy::SystemStore,
             "a probe that ran out of time pins nothing"
         );
-        let tried = resolved.tried.as_deref().expect("the card says what happened");
+        let tried = resolved
+            .tried
+            .as_deref()
+            .expect("the card says what happened");
         assert!(tried.contains("the probe was cancelled after"), "{tried}");
         assert!(
             webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),

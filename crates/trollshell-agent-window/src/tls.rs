@@ -223,11 +223,7 @@ pub fn resolve_route(route: &Route, url: &str) -> Resolved {
 /// [`PROBE_DEADLINE`] through [`resolve_route`]; nothing outside `cfg(test)`
 /// passes anything else.
 #[must_use]
-pub fn resolve_route_within(
-    route: &Route,
-    url: &str,
-    budget: std::time::Duration,
-) -> Resolved {
+pub fn resolve_route_within(route: &Route, url: &str, budget: std::time::Duration) -> Resolved {
     if matches!(route, Route::SystemStore) {
         return Resolved::system_store(None);
     }

@@ -11,7 +11,7 @@ use super::CpuTemp;
 /// cached in `chip`; subsequent ticks re-read only the cached chip's
 /// `temp*_input` files. If the cached chip stops yielding a reading (module
 /// reload / hotplug) the cache is dropped and re-resolved next call.
-pub(super) fn read_cpu_temp(chip: &mut Option<PathBuf>) -> CpuTemp {
+pub fn read_cpu_temp(chip: &mut Option<PathBuf>) -> CpuTemp {
     // Fast path: the chip directory is already known.
     if let Some(dir) = chip.as_deref() {
         if let Some(celsius) = read_chip_temp(dir) {

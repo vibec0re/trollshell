@@ -36,6 +36,11 @@ hytte-bus = { path = "../hytte-bus" }
 hytte-config = { path = "../hytte-config" }
 hytte-ecal = { path = "../hytte-ecal" }
 hytte-reactive = { path = "../hytte-reactive" }
+# The procfs/sysfs sampler leaf (#1249): `sensors/mod.rs` keeps the
+# `Service`/`SensorsHandles` wrapper, the tick loop and the mount-table
+# watcher, and calls into this crate's `read_*`/`compute_*` functions for the
+# actual `/proc` and `/sys` reads. See the crate's own doc comment.
+hytte-sensors = { workspace = true }
 niri-ipc.workspace = true
 # Native PipeWire client. libpipewire-sys / libspa-sys discover the C
 # libs via pkg-config; flake.nix supplies `pipewire` in buildInputs so

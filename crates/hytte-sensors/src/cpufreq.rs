@@ -41,7 +41,7 @@ pub(super) struct CoreFreqKhz {
 ///
 /// Returns an empty [`CpuFreq`] (per-core empty, zeros) when the base cpufreq
 /// directory is absent (no governor — typical of VMs) or unreadable.
-pub(super) fn read_cpu_freq() -> CpuFreq {
+pub fn read_cpu_freq() -> CpuFreq {
     let base = Path::new(CPU_BASE);
 
     // Graceful degrade: no cpufreq on cpu0 means no governor is driving the

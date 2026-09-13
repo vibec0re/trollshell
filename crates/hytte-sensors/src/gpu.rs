@@ -250,7 +250,7 @@ fn read_nvidia_gpu() -> Option<GpuState> {
 ///
 /// Carried alongside each GPU tick so readers never need `Mutex` or `Arc`.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct GpuCache {
+pub struct GpuCache {
     /// Whether `nvidia-smi` is available.
     ///
     /// - `None`        — not yet probed; probe on the next GPU tick.
@@ -274,7 +274,7 @@ pub(super) struct GpuCache {
 ///
 /// Returns `(gpu_state, updated_cache)`. The caller stores the returned cache
 /// back into `PollState`.
-pub(super) fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCache) {
+pub fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCache) {
     // AMD sysfs reads don't need caching — `read_amd_gpu` only walks
     // `/sys/class/drm` and exits on the first AMD card it finds.
     if let Some(state) = read_amd_gpu() {

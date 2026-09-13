@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/hytte-reactive",
   "crates/hytte-ui",
+  "crates/hytte-sensors",
   "crates/hytte-services",
   "crates/hytte",
   "crates/hytte-bus",
@@ -150,6 +151,16 @@ hive-claude = "0.1.1"
 # which is precisely why the bridge hand-rolls its one HTTP route instead of
 # pulling in axum/hyper/tower.
 httparse = "1.10"
+# The GTK-free procfs/sysfs sampler leaf (#1249, P0 of the #1248 epic),
+# extracted out of `hytte-services::sensors` on the `hytte-preem` precedent
+# (#859). A workspace-dependency `path` entry rather than each consumer
+# hand-repinning — unlike most internal `hytte-*` crates, which stay plain
+# per-consumer `{ path = "../hytte-…" }` lines because their feature sets
+# diverge per consumer (see `hytte-config`) — because this one is meant to
+# gain a second consumer with an identical, feature-less dependency: a future
+# `hytte-plugin-stats` (#1250) reusing the same samplers without linking GTK,
+# D-Bus, or a reactive registry.
+hytte-sensors = { path = "crates/hytte-sensors" }
 # niri's IPC types + its blocking socket helper. Two consumers since #1019 —
 # `hytte-services`' shell-side client and `hytte-plugin-niri-layouts`, which
 # dials `$NIRI_SOCKET` in its own process so the same binary works as a niri

@@ -2,7 +2,7 @@
 
 use super::Memory;
 
-pub(super) fn read_proc_meminfo() -> Result<Memory, std::io::Error> {
+pub fn read_proc_meminfo() -> Result<Memory, std::io::Error> {
     let text = std::fs::read_to_string("/proc/meminfo")?;
     Ok(parse_meminfo(&text))
 }

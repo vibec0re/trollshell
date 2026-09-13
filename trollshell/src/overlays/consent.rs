@@ -246,7 +246,10 @@ thread_local! {
 /// lives in the shared [`crate::components::focused_output`] cache (#496/#440/#517),
 /// so this only maintains the connector→`Monitor` map [`request`] resolves against.
 pub fn install(monitor: &Monitor) {
-    let Some(connector) = monitor.connector().filter(|c| !c.is_empty()) else {
+    // No `.filter(|c| !c.is_empty())` needed here any more (#1177):
+    // `Monitor::connector()` itself folds `Some("")` to `None` since #1180
+    // item 6, so this `let-else` already can't see the empty string.
+    let Some(connector) = monitor.connector() else {
         tracing::debug!("consent::install: monitor has no connector name; skipping");
         return;
     };

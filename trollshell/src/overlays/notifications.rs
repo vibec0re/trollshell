@@ -137,12 +137,12 @@ thread_local! {
 /// calls register additional per-monitor surfaces; subscriptions wire
 /// exactly once.
 pub fn install(monitor: &Monitor) {
-    let connector = match monitor.connector() {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            tracing::debug!("notifications::install: monitor has no connector; skipping");
-            return;
-        }
+    // No `Some(c) if !c.is_empty()` guard needed any more (#1177):
+    // `Monitor::connector()` itself folds `Some("")` to `None` since #1180
+    // item 6, so this `let-else` already can't see the empty string.
+    let Some(connector) = monitor.connector() else {
+        tracing::debug!("notifications::install: monitor has no connector; skipping");
+        return;
     };
 
     let view = build_toast_view(monitor);

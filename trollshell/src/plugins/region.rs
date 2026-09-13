@@ -103,38 +103,26 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     })
 }
 
-/// `Monitor::connector()`'s value, with an empty name folded to `None` (#1068
-/// review, LOW-3). Takes the already-read `Option<String>` rather than
-/// `&Monitor` so this stays a pure fold, testable without a live display.
-///
-/// `hytte_ui::Monitor::connector` documents that the name "may be empty on
-/// some drivers", but every consumer of a region's `connector` — this module's
-/// own doc on [`build_region`], and [`HostMsg::Event::output`]'s wire doc in
-/// `hytte-plugin-proto` — promises plugins a clean `None` for an unnamed
-/// monitor, the same "never hidden by name, no output on events" degrade a
-/// `None` from GDK itself gets. Passing `monitor.connector()` straight through
-/// would let `Some("")` slip past that contract: a plugin matching on
-/// `Some(name) => …, None => …` would take the `Some` branch for a name no
-/// compositor ever answers to, instead of falling back. `fullscreen::install`
-/// and `overlays::consent::install` already carry this exact filter for the
-/// same reason; this is the one helper the six [`build_region`] call sites
-/// below share instead of repeating it.
-fn named_connector(connector: Option<String>) -> Option<String> {
-    connector.filter(|c| !c.is_empty())
-}
-
 /// The [`Mount::SidebarLead`](hytte_plugin_proto::Mount::SidebarLead) **region** —
 /// a vertical container of N plugin cards. Built per monitor from
 /// `overlays::sidebar::build_card` and mounted at the very **top** of the sidebar,
 /// above the built-in weather/calendar/tasks cards, so a plugin here leads the
 /// sidebar (#301).
+///
+/// Every [`build_region`] call site here passes `monitor.connector()`
+/// straight through (no more `named_connector` fold, #1177):
+/// `hytte_ui::Monitor::connector` itself folds an empty connector name to
+/// `None` since #1180 item 6, so a region can no longer see `Some("")` — the
+/// exact case this module's own doc on [`build_region`] and
+/// [`HostMsg::Event::output`]'s wire doc in `hytte-plugin-proto` promise
+/// plugins a clean `None` for.
 #[must_use]
 pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         lead_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -147,7 +135,7 @@ pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
         top_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -159,7 +147,7 @@ pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
         bottom_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -174,7 +162,7 @@ pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
         bar_left_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -186,7 +174,7 @@ pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
         bar_center_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -198,7 +186,7 @@ pub fn bar_right_slot(monitor: &Monitor) -> gtk::Widget {
         bar_right_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -1285,8 +1273,8 @@ mod gtk_tests {
 
     use super::{
         Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
-        drive_panel_child, forget_previous_panel_scope, named_connector, preem_render,
-        reconcile_region, render_active_panel, unknown_connectors,
+        drive_panel_child, forget_previous_panel_scope, preem_render, reconcile_region,
+        render_active_panel, unknown_connectors,
     };
     // The #921 releaser lives in `pump` (beside the animation driver whose
     // "still animating" predicate a leaked scope corrupts), but the mounts it has
@@ -2098,44 +2086,24 @@ mod gtk_tests {
         );
     }
 
-    /// [`named_connector`] folds `Some("")` to `None`, the same way
-    /// `fullscreen::install`/`overlays::consent::install` already do for the
-    /// unnamed-monitor case some drivers hand GDK (#1068 review, LOW-3).
+    /// End to end: a card on the `None` connector an unnamed monitor produces
+    /// is never hidden by `hidden_on: [""]` — the exact wire shape a plugin
+    /// would have to send to name that monitor if `Some("")` ever leaked
+    /// through as a real connector value.
     ///
-    /// Pure, so it stands in for a real unnamed `Monitor` — `hytte_ui::Monitor`
-    /// has no test constructor reachable from this crate, and Xvfb's own
-    /// monitor always reports a real connector name, so there is no way to
-    /// exercise the empty-string case through an actual `Monitor` here. The
-    /// fold itself is the whole fix, so testing it directly is not a downgrade
-    /// from an end-to-end check — nothing downstream of `build_region`'s
-    /// `connector: Option<String>` parameter can tell `named_connector`'s
-    /// `None` apart from a genuine `None` from GDK.
-    ///
-    /// **Deletion check:** dropping the `.filter(|c| !c.is_empty())` turns the
-    /// first assertion red (`left: Some(""), right: None`).
-    #[test]
-    fn named_connector_folds_an_empty_name_to_none() {
-        assert_eq!(named_connector(Some(String::new())), None);
-        assert_eq!(named_connector(None), None);
-        assert_eq!(
-            named_connector(Some("DP-2".to_owned())),
-            Some("DP-2".to_owned()),
-            "a real connector name must pass through unchanged",
-        );
-    }
-
-    /// End to end: a card on the `None` connector [`named_connector`] produces
-    /// for an unnamed monitor is never hidden by `hidden_on: [""]` — the exact
-    /// wire shape a plugin would have to send to name that monitor if the fold
-    /// above did not happen and `""` leaked through as a real connector value.
-    ///
-    /// Without the fold, an unnamed monitor's region would reconcile with
+    /// Before #1180 item 6, the fold that prevents this lived in this
+    /// module's own `named_connector` helper, which every [`build_region`]
+    /// call site had to remember to wrap `monitor.connector()` in; since then
+    /// `hytte_ui::Monitor::connector` folds `Some("")` to `None` itself (that
+    /// fold has its own test at its source, `hytte-ui`'s `monitor.rs`), so
+    /// #1177 deleted the now-redundant local copy and every call site's wrap.
+    /// Without either fold, an unnamed monitor's region would reconcile with
     /// `connector = Some("")`, and [`hidden_on_this_output`] would match it
     /// against a `hidden_on` entry of `""` — which is exactly the failure mode
-    /// LOW-3 named: a plugin sending `hidden_on: [""]` (however unlikely) would
-    /// hide on every unnamed screen, contradicting the documented "`None` is
-    /// never hidden by name" contract this same test pins from the other
-    /// side.
+    /// #1068's LOW-3 named: a plugin sending `hidden_on: [""]` (however
+    /// unlikely) would hide on every unnamed screen, contradicting the
+    /// documented "`None` is never hidden by name" contract this same test
+    /// pins from the other side.
     #[gtk::test]
     fn an_unnamed_monitors_region_is_never_hidden_by_an_empty_hidden_on_entry() {
         adw::init().expect("libadwaita init");
@@ -2143,13 +2111,10 @@ mod gtk_tests {
         let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
-        // What `sidebar_lead_slot`/`bar_left_slot`/etc. would pass in for a
-        // monitor GDK reports an empty connector for.
-        let connector = named_connector(Some(String::new()));
-        assert_eq!(
-            connector, None,
-            "test setup: the unnamed monitor's connector"
-        );
+        // What `sidebar_lead_slot`/`bar_left_slot`/etc. now get straight out
+        // of `monitor.connector()` for a monitor GDK reports an empty
+        // connector for — no local fold left to stand in for it.
+        let connector: Option<String> = None;
 
         reconcile_region(
             &container,

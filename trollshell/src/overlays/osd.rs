@@ -136,12 +136,12 @@ struct OsdView {
 /// first call. Subsequent calls only insert into the per-monitor map;
 /// subscriptions stay singletons.
 pub fn install(monitor: &Monitor) {
-    let connector = match monitor.connector() {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            tracing::debug!("osd::install: monitor has no connector name; skipping");
-            return;
-        }
+    // No `Some(c) if !c.is_empty()` guard needed any more (#1177):
+    // `Monitor::connector()` itself folds `Some("")` to `None` since #1180
+    // item 6, so this `let-else` already can't see the empty string.
+    let Some(connector) = monitor.connector() else {
+        tracing::debug!("osd::install: monitor has no connector name; skipping");
+        return;
     };
 
     let view = build_osd_view(monitor);

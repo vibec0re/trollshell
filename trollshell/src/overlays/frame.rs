@@ -84,12 +84,12 @@ const CUTOUT_RADIUS: f64 = 10.0;
 /// monitor (built just before this in `main.rs`'s per-monitor loop); its
 /// window is read live for the frame's top inset (#441) — see [`bar_height`].
 pub fn install(monitor: &Monitor, bar: &BarHandle) {
-    let connector = match monitor.connector() {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            tracing::debug!("frame::install: monitor has no connector; skipping");
-            return;
-        }
+    // No `Some(c) if !c.is_empty()` guard needed any more (#1177):
+    // `Monitor::connector()` itself folds `Some("")` to `None` since #1180
+    // item 6, so this `let-else` already can't see the empty string.
+    let Some(connector) = monitor.connector() else {
+        tracing::debug!("frame::install: monitor has no connector; skipping");
+        return;
     };
     let window = layer_window(monitor)
         .layer(Layer::Overlay)

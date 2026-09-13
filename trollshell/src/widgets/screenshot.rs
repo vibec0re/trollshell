@@ -21,15 +21,65 @@ use hytte::prelude::*;
 use hytte::services::niri;
 
 pub fn widget(_monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-screenshot");
+    let btn = crate::components::chip::action_indicator("ts-screenshot", niri::screenshot);
     btn.set_tooltip_text(Some("Take a screenshot"));
 
     let icon = gtk::Image::from_icon_name("camera-photo-symbolic");
     btn.set_child(Some(&icon));
 
-    btn.connect_clicked(|_| niri::screenshot());
-
     btn.upcast()
+}
+
+/// #1177: pins this chip's CSS class set as a snapshot, taken before the
+/// hand-rolled scaffold above was replaced with `components::chip::action_indicator`
+/// — the two classes `action_indicator` stamps (`"ts-indicator"` + the
+/// caller's `class`) must reproduce what the scaffold set here unchanged.
+/// Falsified by adding/removing/renaming either class.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use hytte::gtk::{self, prelude::*};
+    use hytte::prelude::*;
+
+    use super::widget;
+
+    /// A real `Monitor`, captured from a one-shot `App::run` — the only way to
+    /// get one (`hytte_ui::monitor::Monitor::new` is `pub(crate)` to
+    /// `hytte-ui`). Cached in a thread-local: `#[gtk::test]` funnels every test
+    /// in this binary onto one shared worker thread, mirroring
+    /// `widgets::tray`'s `test_monitor`.
+    fn test_monitor() -> Monitor {
+        thread_local! {
+            static CACHED: RefCell<Option<Monitor>> = const { RefCell::new(None) };
+        }
+        if let Some(m) = CACHED.with(|c| c.borrow().clone()) {
+            return m;
+        }
+        let captured: Rc<RefCell<Option<Monitor>>> = Rc::new(RefCell::new(None));
+        let captured_for_body = Rc::clone(&captured);
+        App::new("mov.vibec0re.trollshell.test.screenshot-chip")
+            .run(move |app| {
+                *captured_for_body.borrow_mut() = app.monitors().into_iter().next();
+                app.quit();
+            })
+            .expect("App::run");
+        let monitor = captured.borrow_mut().take().expect(
+            "no output under this display server — not expected under xvfb-run, which provides one",
+        );
+        CACHED.with(|c| *c.borrow_mut() = Some(monitor.clone()));
+        monitor
+    }
+
+    #[gtk::test]
+    fn css_classes_are_ts_indicator_and_ts_screenshot() {
+        let w = widget(&test_monitor());
+        // Not an exact-set comparison: an icon-only `GtkButton` also carries
+        // GTK's own internal `image-button` class (added synchronously off
+        // `set_child`), which is no part of this chip's contract — only the
+        // two explicit `add_css_class` calls in `widget()` are.
+        assert!(w.has_css_class("ts-indicator"));
+        assert!(w.has_css_class("ts-screenshot"));
+    }
 }

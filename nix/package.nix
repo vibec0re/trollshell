@@ -343,12 +343,14 @@ let
   # THE workspace compile — the single cargo invocation that produces every
   # binary this flake ships (#572, implementing kaesaecracker's plan).
   #
-  # Everything downstream (the shell, the control center, the 14 bundled widget
-  # plugins, the hytte-infobroker CLI, and since #588 the two nixosTest probe
-  # *examples*) is a *slice* of this one output: a `cp` of one binary out of
-  # `$out/bin`, optionally wrapped. There is no second crane invocation anywhere
-  # in the tree that compiles the default feature set, so there is no second
-  # cargo fingerprint universe that can drift out of sync with this one. The
+  # Everything downstream (the shell, the control center, the bundled widget
+  # plugins — the count drifts, so trust `ls crates/hytte-plugin-*` over any
+  # number written here — the hytte-infobroker CLI, and since #588 the two
+  # nixosTest probe *examples*) is a *slice* of this one output: a `cp` of
+  # one binary out of `$out/bin`, optionally wrapped. There is no second
+  # crane invocation anywhere in the tree that compiles the default feature
+  # set, so there is no second cargo fingerprint universe that can drift out
+  # of sync with this one. The
   # only other crane calls are `checks.{clippy,system-tests}`, which compile
   # `--features system-tests` — a genuinely different feature union that by
   # construction cannot be a slice of this build — and, since #1115,

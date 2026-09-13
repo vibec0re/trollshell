@@ -63,7 +63,16 @@ impl MultiSparkline {
         assert!(capacity > 0, "MultiSparkline capacity must be > 0");
 
         let inner = gtk::DrawingArea::new();
-        inner.add_css_class("ts-multi-sparkline");
+        // `hytte-`, not `ts-` (#1177, the #1180 item 7 precedent `sparkline.rs`
+        // set for its own `hytte-sparkline`). The widget is built here, in the
+        // library, so the library's own stylesheet has to be able to give it
+        // a default — a bare `GtkDrawingArea`'s minimum height is 0, and this
+        // one carries no theme color of its own (the per-series colors are
+        // generated in Rust), but it still needs *some* height default or a
+        // second shell built on `hytte` gets a collapsed strip. It used to be
+        // stamped `ts-multi-sparkline`, a name only `trollshell`'s stylesheet
+        // defines, which is a namespace `hytte-ui` does not own.
+        inner.add_css_class("hytte-multi-sparkline");
 
         let series: Rc<RefCell<Vec<VecDeque<f64>>>> = Rc::new(RefCell::new(Vec::new()));
         let domain_max: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
@@ -536,5 +545,29 @@ mod widget_tests {
         assert_eq!(g.domain_max.get(), Some(1.0));
         g.set_domain_max(None);
         assert_eq!(g.domain_max.get(), None);
+    }
+
+    /// **#1177**, the #1180 item 7 precedent `sparkline.rs`'s
+    /// `the_sparkline_wears_the_library_class_not_the_shells` set for
+    /// `Sparkline`. The widget wears the library's own namespace, so the
+    /// library's stylesheet is what styles it.
+    ///
+    /// The negative half is the load-bearing one: it is what fails if the old
+    /// class is re-added "for compatibility", which would put the library
+    /// back in a namespace (`ts-*`) it does not own.
+    ///
+    /// **Falsified** by restoring `add_css_class("ts-multi-sparkline")`.
+    #[gtk::test]
+    fn the_multi_sparkline_wears_the_library_class_not_the_shells() {
+        let g = MultiSparkline::new(8);
+        assert!(
+            g.widget().has_css_class("hytte-multi-sparkline"),
+            "the library styles its own widget through its own namespace",
+        );
+        assert!(
+            !g.widget().has_css_class("ts-multi-sparkline"),
+            "and not through a shell's: `ts-*` is trollshell's stylesheet, which a second \
+             shell built on hytte does not load",
+        );
     }
 }

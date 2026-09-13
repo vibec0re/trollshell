@@ -118,8 +118,28 @@ pub(crate) fn watch_presentation(
     rx
 }
 
+/// How a window turns its agent's URL into a trust decision — always
+/// [`tls::resolve`] on a launch.
+///
+/// `Send + Sync` because the call is made on a worker thread (#1246): the
+/// resolver is moved into the probe thread by value, so the window's copy has
+/// to be shareable. It is a field rather than a hard-coded call for the reason
+/// [`tls::resolve_route`] is a public seam — a display test drives the real
+/// probe against a scripted gateway on a budget it can wait out, through the
+/// same threading a launch uses. Nothing outside `cfg(test)` constructs one
+/// that is not `tls::resolve` (see [`Window::assemble`]).
+type TrustResolver = std::sync::Arc<dyn Fn(&str) -> tls::Resolved + Send + Sync>;
+
 /// One agent's window.
 pub struct Window {
+    /// This window, weakly — the handle the probe's continuation upgrades
+    /// through when it lands back on the main thread (#1246).
+    ///
+    /// Weak and not strong: a `spawn_future_local` holding an `Rc<Self>` would
+    /// keep the window alive for the rest of the probe's budget after it was
+    /// closed, and a probe's answer for a window nobody is looking at has
+    /// nowhere to go. `Rc::new_cyclic` is what fills it.
+    me: std::rc::Weak<Self>,
     toplevel: adw::ApplicationWindow,
     stack: adw::ViewStack,
     header: ui::Header,
@@ -129,6 +149,25 @@ pub struct Window {
     /// row carries it (hyperhive#4073) and a fresh hive may not have one yet.
     page_slot: gtk::Box,
     page_loaded: RefCell<bool>,
+    /// The URL a launch-time TLS probe is running for, while one is — #1246's
+    /// **single in-flight** rule.
+    ///
+    /// An `Option`, not a queue and not a map, and for #963's reason on the
+    /// consent window: there is exactly one page slot, so there is exactly one
+    /// thing a probe's answer can be *for*. It is what stops a second probe
+    /// from starting — and the second probe is not a hypothetical: the hive is
+    /// polled every 2 s by default and [`Window::apply`] ends in
+    /// [`Window::load_page`], so an 8 s probe would otherwise have four more
+    /// started behind it, each opening its own connection to a gateway that is
+    /// already not answering. A second activation (`--tab` on the running
+    /// instance, `HANDLES_COMMAND_LINE`) is the same story through a different
+    /// door.
+    ///
+    /// [`Window::page_loaded`] latches *after* the answer lands; between the
+    /// two, this is the latch.
+    probe: RefCell<Option<String>>,
+    /// What the probe runs — see [`TrustResolver`].
+    trust: TrustResolver,
     cfg: AgentsConfig,
     name: AgentName,
     urls: RefCell<Option<HiveUrls>>,
@@ -223,12 +262,36 @@ impl Window {
     /// The test seam. A display test drives this with a command lane it holds
     /// the other end of, so it can assert both what the window shows and what
     /// the buttons put on the wire, with no socket and no runtime.
+    ///
+    /// The trust decision is always [`tls::resolve`] here — the only spelling
+    /// anything outside `cfg(test)` can produce, since
+    /// [`Window::assemble_with_trust`] is private to this module.
     #[must_use]
     pub fn assemble(
         app: &adw::Application,
         name: &AgentName,
         cfg: AgentsConfig,
         cmds: tokio::sync::mpsc::UnboundedSender<Request>,
+    ) -> Rc<Self> {
+        Self::assemble_with_trust(app, name, cfg, cmds, std::sync::Arc::new(tls::resolve))
+    }
+
+    /// [`Window::assemble`] with the trust decision named.
+    ///
+    /// Private, and the reason [`TrustResolver`] is: a display test drives the
+    /// real probe against a fixture gateway on a budget it can wait out, and
+    /// through the same worker thread a launch uses, without needing to set a
+    /// `TROLLSHELL_AGENT_WINDOW_*` variable — which this crate cannot do at
+    /// all (`std::env::set_var` is `unsafe` in edition 2024 and the workspace
+    /// `forbid`s `unsafe_code`, and it would be process-wide across a test
+    /// binary that runs its GTK tests on one thread anyway).
+    #[must_use]
+    fn assemble_with_trust(
+        app: &adw::Application,
+        name: &AgentName,
+        cfg: AgentsConfig,
+        cmds: tokio::sync::mpsc::UnboundedSender<Request>,
+        trust: TrustResolver,
     ) -> Rc<Self> {
         let header = ui::Header::new();
         let settings = ui::Settings::new();
@@ -273,7 +336,12 @@ impl Window {
             .content(&body)
             .build();
 
-        let this = Rc::new(Self {
+        // `new_cyclic` only so the window can hold a `Weak` of itself: the
+        // probe's continuation runs on the main context after the worker
+        // answers, and the handle it upgrades through must not be what keeps
+        // this window alive (see `Window::me`).
+        let this = Rc::new_cyclic(|me| Self {
+            me: me.clone(),
             toplevel,
             stack,
             header,
@@ -281,6 +349,8 @@ impl Window {
             banner,
             page_slot,
             page_loaded: RefCell::new(false),
+            probe: RefCell::new(None),
+            trust,
             cfg,
             name: name.clone(),
             urls: RefCell::new(None),
@@ -505,8 +575,13 @@ impl Window {
     /// position and any half-typed message on the page, twice a second. That
     /// latch is #1130's M13 and is now pinned by
     /// [`gtk_tests::the_page_is_built_once_and_not_on_every_poll`].
+    ///
+    /// Since #1246 the latch is two things, because mounting the page is two
+    /// steps with a worker thread between them: [`Window::probe`] holds the
+    /// window from the moment a probe starts, [`Window::page_loaded`] from the
+    /// moment its answer lands. Either one means "do not start another".
     fn load_page(&self, state: &AgentState) {
-        if *self.page_loaded.borrow() {
+        if *self.page_loaded.borrow() || self.probe.borrow().is_some() {
             return;
         }
         let Some(url) = state.agent().and_then(agent_url) else {
@@ -526,34 +601,121 @@ impl Window {
             return;
         };
 
-        let embedded = page::embed_url(url);
-        // #1234: this reads the hive's own TLS material and, on the bundle
-        // route, opens one TLS connection to the gateway to verify the chain it
-        // presents before pinning the leaf. It is affordable here precisely
-        // because of *when* "here" is — `host.sock` has already answered with
-        // this agent's URL, so the hive daemon is up and the handshake is
-        // normally a loopback round trip.
-        //
-        // It is **synchronous on this thread**, which is the GTK main thread,
-        // so the case where it is not a loopback round trip is a freeze. What
-        // bounds that freeze is `verify::PROBE_DEADLINE` and not
-        // `verify::PROBE_IO_TIMEOUT_SECS` — the latter is GIO's per-read knob,
-        // which a dribbling peer resets on every byte (measured at 21.01 s
-        // against a documented 5 s, #1242 review). Removing the freeze rather
-        // than bounding it is #1246.
-        let trust = tls::resolve(&embedded);
+        self.begin_probe(page::embed_url(url));
+    }
+
+    /// Paint the verifying state, then check the hive's certificate **on a
+    /// worker thread** — #1246.
+    ///
+    /// # Who runs where
+    ///
+    /// Everything here except the [`tls::resolve`] call is on the GTK main
+    /// thread. The resolve is the part that blocks: #1234 reads the hive's own
+    /// TLS material and, on the bundle route, opens a TLS connection to the
+    /// gateway to verify the chain it presents before pinning the leaf.
+    /// #1242's [`PROBE_DEADLINE`](crate::verify::PROBE_DEADLINE) made that a
+    /// real wall-clock bound (8 s, DNS included) and said so in those words —
+    /// *it bounds the freeze, it does not remove it*. This is the removal: the
+    /// window paints the verifying state and returns to the main loop
+    /// immediately, and the answer crosses back over a `tokio::sync::oneshot`
+    /// that `glib::spawn_future_local` awaits on the main context. Nothing the
+    /// worker touches is a widget, and nothing the continuation touches is a
+    /// socket.
+    ///
+    /// A `oneshot` and a plain `std::thread` rather than [`gio::spawn_blocking`]:
+    /// `tokio::sync`'s channels are executor-agnostic, which is already how
+    /// this window gets its `host.sock` updates onto the main context
+    /// ([`Window::build`]), so the crossing costs no new dependency and no new
+    /// idiom — while `gio`'s task pool is shared with GIO's own async I/O
+    /// (including the threaded resolver this probe calls into) and is
+    /// documented as rate-limiting what it is handed, which is not where a
+    /// call that may hold a thread for the whole budget belongs.
+    ///
+    /// [`gio::spawn_blocking`]: gtk::gio::spawn_blocking
+    ///
+    /// # The deadline still bounds it
+    ///
+    /// It moves with the probe rather than being replaced by it: the watchdog
+    /// is armed inside [`crate::verify::probe`], so it now cancels a worker
+    /// instead of the main thread. On expiry the card says the probe was
+    /// cancelled and names every route, exactly as before — what changed is
+    /// that the window was usable the whole time it ran.
+    fn begin_probe(&self, embedded: String) {
+        let host = tls::host_of(&embedded).unwrap_or("the hive").to_owned();
+        self.fill_page_slot(&webview::verifying(&host));
+        *self.probe.borrow_mut() = Some(embedded.clone());
+
+        let (answer, wait) = tokio::sync::oneshot::channel();
+        let resolver = std::sync::Arc::clone(&self.trust);
+        let asked = embedded.clone();
+        let worker = std::thread::Builder::new()
+            .name("agent-window-tls-probe".to_owned())
+            .spawn(move || {
+                // The receiver is gone if the window closed while this ran —
+                // there is nobody to tell, which is the whole of the cleanup.
+                drop(answer.send(resolver(&asked)));
+            });
+
+        match worker {
+            Ok(_detached) => {
+                let me = std::rc::Weak::clone(&self.me);
+                glib::spawn_future_local(async move {
+                    let Ok(trust) = wait.await else {
+                        // The worker panicked, so no verdict exists. The slot
+                        // keeps the verifying state rather than pretending a
+                        // trust decision was made — `tls::resolve` is total,
+                        // so this is unreachable short of an abort.
+                        tracing::error!(
+                            "the TLS probe thread died without a verdict; the page was not loaded"
+                        );
+                        return;
+                    };
+                    let Some(window) = me.upgrade() else {
+                        return;
+                    };
+                    window.finish_probe(&embedded, &trust);
+                });
+            }
+            Err(e) => {
+                // No thread to be had. The old shape — resolve here, on this
+                // thread — is strictly better than never loading the page, so
+                // it is what a machine out of threads gets, with the freeze
+                // said out loud.
+                tracing::warn!(
+                    error = %e,
+                    "no thread for the TLS probe; checking the hive's certificate on the GTK main \
+                     thread instead, which blocks the window for up to the probe's deadline"
+                );
+                let trust = (self.trust)(&embedded);
+                self.finish_probe(&embedded, &trust);
+            }
+        }
+    }
+
+    /// The probe's answer, back on the GTK main thread: mount the page under
+    /// the policy it settled on and close the in-flight slot.
+    fn finish_probe(&self, embedded: &str, trust: &tls::Resolved) {
+        self.probe.borrow_mut().take();
         tracing::info!(
             url = %embedded,
             tls_host = ?trust.policy.scoped_host(),
             tls_tried = trust.tried.as_deref().unwrap_or("nothing — the system trust store"),
             "loading the agent's page"
         );
-
-        while let Some(child) = self.page_slot.first_child() {
-            self.page_slot.remove(&child);
-        }
-        self.page_slot.append(&webview::page(&embedded, &trust));
+        self.fill_page_slot(&webview::page(embedded, trust));
         *self.page_loaded.borrow_mut() = true;
+    }
+
+    /// Put `child` in the page slot, replacing whatever was there.
+    ///
+    /// One function because the slot now holds three different things over a
+    /// launch — the no-page hint, the verifying state, the page — and each
+    /// swap has to remove the last one or the box stacks them.
+    fn fill_page_slot(&self, child: &gtk::Widget) {
+        while let Some(old) = self.page_slot.first_child() {
+            self.page_slot.remove(&old);
+        }
+        self.page_slot.append(child);
     }
 
     /// Whether the banner is showing, and what it says — the display tests'
@@ -569,6 +731,13 @@ impl Window {
     #[cfg(all(test, feature = "system-tests"))]
     fn page_child(&self) -> Option<gtk::Widget> {
         self.page_slot.first_child()
+    }
+
+    /// Whether a launch-time TLS probe is in flight — the display tests' way
+    /// to know the worker has not answered yet (#1246).
+    #[cfg(all(test, feature = "system-tests"))]
+    fn probing(&self) -> bool {
+        self.probe.borrow().is_some()
     }
 
     /// The header, for the tests that assert what it shows.
@@ -621,17 +790,24 @@ mod tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use super::{NO_PAGE, Window};
+    use super::{NO_PAGE, TrustResolver, Window};
     use crate::cli::Tab;
     use crate::feed::{AgentState, Update};
     use crate::ui::Decision;
+    use crate::verify::tls_tests::{anchors, serve, serve_counting_dribbler, serve_dribbling};
+    use crate::verify::{Route, Source};
+    use crate::{tls, webview};
     use gtk::prelude::*;
     use hytte_plugin_agents::config::AgentsConfig;
     use hytte_plugin_agents::hive::wire::{
         AgentStatusRow, Approval, ApprovalStatus, HiveUrls, Request, Scope,
     };
     use hytte_plugin_agents::model::{Agent, AgentName};
+    use std::cell::Cell;
     use std::rc::Rc;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
     fn name(s: &str) -> AgentName {
@@ -659,12 +835,20 @@ mod gtk_tests {
             .build()
     }
 
+    /// A window for the tests that are **not** about TLS, with a trust
+    /// resolver that reads nothing and dials nothing.
+    ///
+    /// Not [`Window::assemble`]'s real [`tls::resolve`]: that one reads the
+    /// machine's `/var/lib/hive-tls` (and the `TROLLSHELL_AGENT_WINDOW_*`
+    /// variables), so on a developer's own box — the one machine where this
+    /// crate's hive material exists — a test about a banner would open a TLS
+    /// connection to their real gateway and take however long that took. The
+    /// answer it stands in for is exactly what a machine with no hive material
+    /// produces (`TlsPolicy::SystemStore`, nothing tried), so nothing below
+    /// changes shape; it just stops depending on whose laptop it runs on.
+    /// #1246's own tests pick their route through [`scripted_trust`].
     fn window() -> (Rc<Window>, mpsc::UnboundedReceiver<Request>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            Window::assemble(&app(), &name("stray"), AgentsConfig::default(), tx),
-            rx,
-        )
+        window_with_trust(Arc::new(|_| tls::Resolved::default()))
     }
 
     fn up(row: AgentStatusRow) -> AgentState {
@@ -684,9 +868,122 @@ mod gtk_tests {
         }
     }
 
+    /// [`row`] whose page URL points at a fixture gateway on `port` — what
+    /// makes the window's probe dial something a test controls.
+    fn row_at(port: u16) -> AgentStatusRow {
+        AgentStatusRow {
+            url: Some(format!("https://localhost:{port}/agent/stray/")),
+            ..row()
+        }
+    }
+
+    /// Every probe a window ran under [`scripted_trust`]: the verdict, and how
+    /// long the worker took to reach it.
+    type Runs = Arc<Mutex<Vec<(tls::Resolved, Duration)>>>;
+
+    /// A [`TrustResolver`] that runs the **real** route-2 probe — the same
+    /// `verify::probe`, the same fixture anchors, the same `Deadline` — on a
+    /// budget a test can wait out, and records each run.
+    ///
+    /// Not a canned `Resolved`: the point of #1246's tests is the *threading*,
+    /// and a resolver that returns instantly cannot show that the main loop
+    /// kept running while a slow one did not. Not the process environment
+    /// either — `std::env::set_var` is `unsafe` in edition 2024 and this
+    /// workspace `forbid`s `unsafe_code`, so a window's route can only be
+    /// chosen through this seam.
+    fn scripted_trust(budget: Duration) -> (TrustResolver, Runs) {
+        let runs: Runs = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&runs);
+        let route = Route::VerifyAgainstBundle {
+            bundle: anchors(),
+            source: Source::HiveDir,
+        };
+        let resolver: TrustResolver = Arc::new(move |url: &str| {
+            let started = Instant::now();
+            let resolved = tls::resolve_route_within(&route, url, budget);
+            log.lock()
+                .expect("the run log is not poisoned")
+                .push((resolved.clone(), started.elapsed()));
+            resolved
+        });
+        (resolver, runs)
+    }
+
+    fn window_with_trust(trust: TrustResolver) -> (Rc<Window>, mpsc::UnboundedReceiver<Request>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Window::assemble_with_trust(&app(), &name("stray"), AgentsConfig::default(), tx, trust),
+            rx,
+        )
+    }
+
+    /// The first (and, in these tests, only) probe a window ran.
+    fn first_run(runs: &Runs) -> (tls::Resolved, Duration) {
+        runs.lock()
+            .expect("the run log is not poisoned")
+            .first()
+            .cloned()
+            .expect("exactly one probe ran")
+    }
+
+    fn runs_so_far(runs: &Runs) -> usize {
+        runs.lock().expect("the run log is not poisoned").len()
+    }
+
+    /// Iterate the GTK main context until `done`, or give up after `limit`.
+    ///
+    /// **Non-blocking iterations.** A test about the main loop still running
+    /// must not itself be the thing that parks it: `iteration(true)` would
+    /// sleep in `poll()` until a source is ready, so a probe that answers
+    /// through a `oneshot` — which wakes the context — would be measured
+    /// through a loop that was asleep for most of the probe. This spins and
+    /// yields instead, so the tick counter below is counting dispatches the
+    /// window's own main loop performed.
+    fn pump_until(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let ctx = gtk::glib::MainContext::default();
+        let give_up = Instant::now() + limit;
+        while !done() {
+            if Instant::now() >= give_up {
+                return false;
+            }
+            if !ctx.iteration(false) {
+                std::thread::yield_now();
+            }
+        }
+        true
+    }
+
+    /// A heartbeat on the main context, and the switch that stops it.
+    ///
+    /// It has to stop: `#[gtk::test]` bodies share one `MainContext`, so a
+    /// source left `Continue`ing would keep firing inside every test that runs
+    /// after this one.
+    fn heartbeat(every: Duration) -> (Rc<Cell<u32>>, Rc<Cell<bool>>) {
+        let ticks = Rc::new(Cell::new(0_u32));
+        let stop = Rc::new(Cell::new(false));
+        let counter = Rc::clone(&ticks);
+        let halt = Rc::clone(&stop);
+        gtk::glib::timeout_add_local(every, move || {
+            counter.set(counter.get() + 1);
+            if halt.get() {
+                gtk::glib::ControlFlow::Break
+            } else {
+                gtk::glib::ControlFlow::Continue
+            }
+        });
+        (ticks, stop)
+    }
+
     /// **The page is built once.** Two states carrying the same URL leave the
     /// *same widget* in the slot — not a fresh `WebView` that threw away the
     /// scroll position and the half-typed message.
+    ///
+    /// Since #1246 the mount is two steps with a worker between them, so this
+    /// pumps the main context until the probe answers before it takes the
+    /// widget to compare. The identity assertion is against the **view**, not
+    /// merely "not the hint": without that, the verifying state would satisfy
+    /// it and the test would compare that with itself — the #1130 N6 vacuity,
+    /// one state later.
     ///
     /// Mutation (re-run this round, red): the reviewer's **M13** — delete the
     /// `page_loaded` early return in `load_page` — and the pointer comparison
@@ -700,13 +997,18 @@ mod gtk_tests {
         };
 
         w.update(Update::State(up(with_url.clone())));
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
         let first = w.page_child().expect("the page went into the slot");
         // **Not vacuously** (#1130 N6): `assemble`'s first `apply` puts the
-        // `NO_PAGE` label in the slot, so without this the test would compare
-        // that label with itself and stay green with `Window::update` mutated
-        // to a no-op — measured by the re-verification.
+        // `NO_PAGE` label in the slot and #1246's `begin_probe` puts the
+        // verifying state there, so without this the test would compare one of
+        // those with itself and stay green with `Window::update` mutated to a
+        // no-op — measured by #1242's re-verification.
         assert!(
-            first.downcast_ref::<gtk::Label>().is_none(),
+            webview::view_of(&first).is_some(),
             "the update must have replaced the no-page hint with the view, or what follows \
              compares the hint with itself"
         );
@@ -728,6 +1030,10 @@ mod gtk_tests {
 
     /// With no URL from the hive, the slot carries the explanation and **not**
     /// a view pointed at nothing — and it is still replaced once a URL lands.
+    ///
+    /// Since #1246 that replacement is in two steps, and both are asserted:
+    /// the verifying state goes in synchronously, the view when the worker
+    /// answers.
     #[gtk::test]
     fn no_url_shows_the_hint_until_one_arrives() {
         let (w, _rx) = window();
@@ -743,10 +1049,25 @@ mod gtk_tests {
             url: Some("https://hive.local/agent/stray/".to_owned()),
             ..row()
         })));
-        let page = w.page_child().expect("the page replaced the hint");
+        let verifying = w
+            .page_child()
+            .expect("the verifying state replaced the hint");
         assert!(
-            page.downcast_ref::<gtk::Label>().is_none(),
-            "once the hive names a URL the slot holds the page, not the hint"
+            webview::is_verifying(&verifying),
+            "the hint goes the moment a URL lands, and what takes its place says why there is no \
+             page yet"
+        );
+
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe never answered"
+        );
+        let page = w
+            .page_child()
+            .expect("the page replaced the verifying state");
+        assert!(
+            webview::view_of(&page).is_some(),
+            "once the hive names a URL and its certificate checks out, the slot holds the page"
         );
     }
 
@@ -1546,5 +1867,242 @@ mod gtk_tests {
             !*rx.borrow(),
             "the unmap edge (teardown, and a hide on a compositor that allows one) must park"
         );
+    }
+
+    /// **A slow hive does not freeze the window** — #1246, the whole of it.
+    ///
+    /// The peer is #1242's review fixture: a legal TLS record header
+    /// announcing 0x0400 bytes, then one byte every 1.5 s. Every byte resets
+    /// GIO's per-I/O timeout, so nothing but the deadline ends it — which on
+    /// the old shape meant the GTK main thread sat in `connect_to_host` +
+    /// `handshake` for the whole budget, painting nothing.
+    ///
+    /// Two observables, and the second is the one that matters: the page slot
+    /// carries the verifying state **synchronously**, before a single main-loop
+    /// iteration; and a 20 ms heartbeat on that same main context advances
+    /// while the probe is in flight.
+    ///
+    /// Mutation (run this round, red): put the probe back inline — replace
+    /// `self.begin_probe(page::embed_url(url))` in `load_page` with
+    /// `self.finish_probe(&embedded, &(self.trust)(&embedded))`. `update`
+    /// then blocks for the whole budget with the loop stopped, `probing()` is
+    /// already false when `pump_until` is reached, so **no iteration happens
+    /// at all**: the tick count stays at 0 and the verifying assertion reds
+    /// too (the slot holds the page, never the state).
+    #[gtk::test]
+    fn a_slow_hive_paints_the_verifying_state_and_the_main_loop_keeps_running() {
+        let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(1500));
+        let (trust, runs) = scripted_trust(Duration::from_millis(900));
+        let (w, _rx) = window_with_trust(trust);
+        let (ticks, stop) = heartbeat(Duration::from_millis(20));
+
+        w.update(Update::State(up(row_at(port))));
+
+        assert!(
+            w.probing(),
+            "the probe must be in flight the moment the hive names a URL"
+        );
+        let shown = w.page_child().expect("the slot is filled");
+        assert!(
+            webview::is_verifying(&shown),
+            "…and the slot must explain itself rather than sit blank or hold a page that is not \
+             verified yet"
+        );
+        assert_eq!(
+            ticks.get(),
+            0,
+            "nothing has been dispatched yet — everything below is what the probe let through"
+        );
+
+        let answered = pump_until(Duration::from_secs(20), || !w.probing());
+        stop.set(true);
+        assert!(answered, "the probe never answered");
+
+        let (_, on_worker) = first_run(&runs);
+        assert!(
+            ticks.get() >= 10,
+            "the main loop dispatched {} times during a {on_worker:.1?} probe — a window that \
+             cannot paint is the freeze #1246 exists to remove",
+            ticks.get()
+        );
+        assert!(
+            webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),
+            "the worker's answer mounts the page"
+        );
+    }
+
+    /// **The deadline still bounds the probe, now on the worker** — it moved
+    /// with it rather than being replaced by it.
+    ///
+    /// The peer dribbles for 30 s; the budget is 700 ms. The assertion is
+    /// generous (5 s) so it measures the mechanism and not CI's scheduler, and
+    /// it still sits far below what an un-deadlined probe against this peer
+    /// produces. Both halves are asserted: what the *worker* took, and what
+    /// the *window* waited — a deadline that bounded the worker while the main
+    /// thread waited on the `oneshot` anyway would pass the first and fail the
+    /// second.
+    ///
+    /// Mutation (run this round, red): make `Deadline::arm`'s watchdog never
+    /// `cancel()`, and both elapsed assertions red at ~30 s.
+    #[gtk::test]
+    fn the_deadline_bounds_a_probe_that_never_finishes_on_the_worker() {
+        let port = serve_dribbling(Duration::from_secs(30), Duration::from_millis(200));
+        let budget = Duration::from_millis(700);
+        let (trust, runs) = scripted_trust(budget);
+        let (w, _rx) = window_with_trust(trust);
+
+        let started = Instant::now();
+        w.update(Update::State(up(row_at(port))));
+        assert!(
+            pump_until(Duration::from_secs(20), || !w.probing()),
+            "the probe never answered"
+        );
+        let waited = started.elapsed();
+        let (resolved, on_worker) = first_run(&runs);
+
+        assert!(
+            on_worker < Duration::from_secs(5),
+            "a peer that keeps talking must not hold the worker: {on_worker:.1?} against a \
+             {budget:.1?} budget"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "…and the window must learn about it just as soon: {waited:.1?}"
+        );
+        assert_eq!(
+            resolved.policy,
+            tls::TlsPolicy::SystemStore,
+            "a probe that ran out of time pins nothing"
+        );
+        let tried = resolved
+            .tried
+            .as_deref()
+            .expect("the card says what happened");
+        assert!(tried.contains("the probe was cancelled after"), "{tried}");
+        assert!(
+            webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),
+            "a failed probe still mounts the view, so WebKit's own load can fail into the card"
+        );
+    }
+
+    /// **One activation, one probe, one connection** — #1246's single
+    /// in-flight rule, asked of the peer rather than of the window.
+    ///
+    /// The second activation is what `main.rs` does on a running instance
+    /// (`HANDLES_COMMAND_LINE`: parse, `show_tab`, `present`) with the 2 s
+    /// poll still arriving behind it. Both routes reach
+    /// [`Window::load_page`], and without the in-flight slot each would open
+    /// its own TLS connection to a gateway that is already not answering.
+    ///
+    /// The listener counts accepts, so the claim is about sockets and not
+    /// about what the window believes it did. It keeps accepting and dribbles
+    /// each connection on its own thread, so a second probe would hang exactly
+    /// like the first rather than be answered quickly and hide the fault.
+    ///
+    /// # The count is read while the probe is the only thing dialling
+    ///
+    /// Measured, and worth recording because it corrects a standing note in
+    /// this crate: once the view is mounted the accept count reaches **2**
+    /// within ~300 ms. That second connection is not a second probe — the
+    /// resolver ran exactly once, asserted below — it is the embedded view's
+    /// own `load_uri` reaching `WebKitGTK`'s **network** process, which is a
+    /// different process from the web process that dies under xvfb (see
+    /// `webview.rs`'s `gtk_tests` module doc). So the socket assertion is
+    /// taken at the instant the probe answers, before the mount, and the
+    /// resolver count carries the rest of the way.
+    ///
+    /// Mutation (run this round, red): drop `|| self.probe.borrow().is_some()`
+    /// from `load_page`'s early return — the poll behind the activation starts
+    /// a second probe, both are in flight when the pump waits on `probing()`,
+    /// and the accept count is 2 before either mounts anything.
+    #[gtk::test]
+    fn a_second_activation_during_the_probe_opens_no_second_connection() {
+        let (port, accepted) = serve_counting_dribbler(Duration::from_millis(200));
+        let (trust, runs) = scripted_trust(Duration::from_millis(900));
+        let (w, _rx) = window_with_trust(trust);
+
+        w.update(Update::State(up(row_at(port))));
+        assert!(w.probing(), "the first probe is in flight");
+
+        // The pen's `--tab settings` on the live instance, and the poll that
+        // arrives while the probe runs.
+        w.show_tab(Tab::Settings);
+        w.update(Update::State(up(AgentStatusRow {
+            status_text: Some("still working".to_owned()),
+            ..row_at(port)
+        })));
+
+        assert!(
+            pump_until(Duration::from_secs(20), || !w.probing()),
+            "the probe never answered"
+        );
+
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "one window, one launch-time probe, one connection — the activation and the poll \
+             behind it must not each open their own"
+        );
+        // …and let anything a second probe would have queued actually run.
+        assert!(
+            !pump_until(Duration::from_millis(300), || runs_so_far(&runs) > 1),
+            "a second probe was queued behind the first"
+        );
+        assert_eq!(runs_so_far(&runs), 1, "…and the resolver ran exactly once");
+        assert_eq!(
+            w.visible_tab().as_deref(),
+            Some(Tab::Settings.as_str()),
+            "the later activation's --tab survives the probe it did not restart"
+        );
+        assert!(
+            webview::view_of(&w.page_child().expect("the slot is filled")).is_some(),
+            "and the page still mounts when the one probe answers"
+        );
+    }
+
+    /// **The happy path is what it was** — route 2 verifies the chain the
+    /// gateway presents, pins the leaf it accepted, and the page mounts under
+    /// that policy. The only thing #1246 changed is which thread found out.
+    ///
+    /// It also re-pins #1130's M13 latch across the new two-step mount: a poll
+    /// arriving after the answer must not rebuild the view, and must not
+    /// re-probe. The fixture server accepts exactly **one** connection, so a
+    /// second probe would hang rather than quietly succeed.
+    #[gtk::test]
+    fn the_verified_leaf_is_pinned_and_the_page_mounts_once() {
+        let port = serve("server-leaf.pem", "server-leaf-key.pem");
+        let (trust, runs) = scripted_trust(Duration::from_secs(30));
+        let (w, _rx) = window_with_trust(trust);
+
+        w.update(Update::State(up(row_at(port))));
+        assert!(
+            pump_until(Duration::from_secs(30), || !w.probing()),
+            "the probe never answered"
+        );
+
+        let (resolved, _) = first_run(&runs);
+        let tls::TlsPolicy::AllowCertificateForHost {
+            cert: tls::Pinned::VerifiedPem(pem),
+            host,
+        } = &resolved.policy
+        else {
+            panic!("route 2 pins what it verified: {:?}", resolved.policy);
+        };
+        assert_eq!(host, "localhost");
+        assert!(pem.contains("BEGIN CERTIFICATE"), "{pem}");
+
+        let mounted = w.page_child().expect("the slot is filled");
+        assert!(
+            webview::view_of(&mounted).is_some(),
+            "the page mounts under the policy the worker settled on"
+        );
+
+        w.update(Update::State(up(row_at(port))));
+        assert_eq!(
+            mounted,
+            w.page_child().expect("the slot is still filled"),
+            "the embedded page must survive a poll — the latch is the same one #1130 added"
+        );
+        assert_eq!(runs_so_far(&runs), 1, "…and no second probe ran");
     }
 }

@@ -495,6 +495,39 @@ fn place_transition<'a>(
     if transitioned { place } else { None }
 }
 
+/// Forward every change on `handle`'s signal into `notify.notify_one()`,
+/// supervised under `name` (#1172) rather than a bare `tokio::spawn`.
+///
+/// [`resolve_loop`] used to spawn its three signal-forwarders (Wi-Fi scan,
+/// geoclue, config-reload) as raw `tokio::spawn`s: an unsupervised child of a
+/// supervised parent. A panic in one — say, inside a future combinator this
+/// pulls in — killed just that `tokio::spawn`ed task; `resolve_loop` itself
+/// kept running, healthy in the supervisor's eyes, but that one input froze
+/// for the rest of the session with nothing surfacing it. Naming and
+/// supervising each forwarder independently means a panic there is (a) its
+/// own [`hytte_reactive::health`] row, observable, and (b) restarted with
+/// backoff on its own — an outage in the Wi-Fi forwarder doesn't cost the
+/// geoclue or config-reload ones their live subscriptions too.
+fn forward_changes<T: Send + Sync + 'static>(
+    name: &'static str,
+    handle: Mutable<T>,
+    on_change: impl Fn() + Clone + Send + Sync + 'static,
+) {
+    spawn_supervised(name, move || {
+        let handle = handle.clone();
+        let on_change = on_change.clone();
+        async move {
+            handle
+                .signal_ref(|_| ())
+                .for_each(move |()| {
+                    on_change();
+                    std::future::ready(())
+                })
+                .await;
+        }
+    });
+}
+
 async fn resolve_loop(
     place_out: Mutable<Option<ResolvedPlace>>,
     location_out: Mutable<LocationState>,
@@ -508,41 +541,21 @@ async fn resolve_loop(
     let notify = Arc::new(Notify::new());
     if let Some(m) = aps.clone() {
         let n = notify.clone();
-        tokio::spawn(async move {
-            m.signal_ref(|_| ())
-                .for_each(move |()| {
-                    n.notify_one();
-                    std::future::ready(())
-                })
-                .await;
-        });
+        forward_changes("places-wifi-forward", m, move || n.notify_one());
     } else {
         tracing::warn!("places: wifiscan not registered; Wi-Fi fingerprinting disabled");
     }
     if let Some(m) = geo.clone() {
         let n = notify.clone();
-        tokio::spawn(async move {
-            m.signal_ref(|_| ())
-                .for_each(move |()| {
-                    n.notify_one();
-                    std::future::ready(())
-                })
-                .await;
-        });
+        forward_changes("places-geoclue-forward", m, move || n.notify_one());
     } else {
         tracing::warn!("places: geoclue not registered; location fallback disabled");
     }
     // Re-resolve whenever the config is reloaded (watch_config swaps the list).
     {
         let n = notify.clone();
-        let p = places.clone();
-        tokio::spawn(async move {
-            p.signal_ref(|_| ())
-                .for_each(move |()| {
-                    n.notify_one();
-                    std::future::ready(())
-                })
-                .await;
+        forward_changes("places-config-forward", places.clone(), move || {
+            n.notify_one();
         });
     }
 
@@ -595,6 +608,8 @@ async fn resolve_loop(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use hytte_config::places::{DEFAULT_CONFIG, builtin_default, load_places, parse_places};
@@ -1217,6 +1232,84 @@ mine = true
         assert_eq!(
             add_place(Place::new("Home", 1.0, 2.0)),
             Err(PlacesError::NotRunning)
+        );
+    }
+
+    // ── forward_changes: scope-add, lens 9 of #1172 ──────────────────────────
+
+    /// Poll `cond` until it holds or `within` elapses; returns whether it held.
+    /// Mirrors `eds_retry`/`niri`'s own copies — there is no seam to shorten
+    /// the supervisor's real backoff sleep from outside `hytte-reactive`.
+    fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// The health row a supervisor keeps for `name`, if it is still live.
+    fn health_of(name: &str) -> Option<hytte_reactive::TaskHealth> {
+        hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == name)
+    }
+
+    /// `resolve_loop`'s three signal-forwarders used to be raw `tokio::spawn`s
+    /// — an unsupervised child of a supervised parent. A panic in the
+    /// forwarded callback used to kill just that `tokio::spawn`ed task while
+    /// the parent stayed healthy, silently freezing that one resolve input for
+    /// the session. `forward_changes` is now `spawn_supervised` under a name:
+    /// a panic is a first-class health row, and the forwarder restarts and
+    /// keeps forwarding subsequent changes.
+    ///
+    /// Falsification: revert `forward_changes` to a bare `tokio::spawn` (no
+    /// supervisor, no restart) and this times out — the second `handle.set`
+    /// is never observed, and no health row exists under `NAME` at all.
+    #[test]
+    fn forward_changes_survives_a_panicking_callback() {
+        const NAME: &str = "test-places-forward-restart";
+
+        let handle: Mutable<u32> = Mutable::new(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        forward_changes(NAME, handle.clone(), {
+            let calls = Arc::clone(&calls);
+            let seen = Arc::clone(&seen);
+            move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                // `signal_ref` replays the current value immediately on
+                // subscribe, so this is the very first thing the forwarder
+                // does — deliberately panic there.
+                assert!(n != 0, "{NAME}: first callback panics, deliberately");
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(15), || calls.load(Ordering::SeqCst) >= 1),
+            "the forwarder never ran at all"
+        );
+
+        // Only a *restarted* forwarder — a fresh `signal_ref` subscription —
+        // can still observe a change made after the panic.
+        handle.set(1);
+
+        assert!(
+            wait_until(Duration::from_secs(15), || seen.load(Ordering::SeqCst) >= 1),
+            "no change was observed after the panic: calls={}, health={:?}",
+            calls.load(Ordering::SeqCst),
+            health_of(NAME)
+        );
+
+        let health = health_of(NAME).expect("the supervisor publishes a live health row");
+        assert!(
+            health.panics >= 1,
+            "the panic is not on the health record: {health:?}"
         );
     }
 }

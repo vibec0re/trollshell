@@ -570,46 +570,82 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     };
 
     // Subscribe to the four update signals via bus::signals.
+    //
+    // Each forwarder is a named, supervised task rather than a bare
+    // `tokio::spawn` (#1172): an unsupervised child of `watch_item` (itself
+    // supervised, `spawn_supervised_bounded("tray-item", …)` above) — a panic
+    // in one silently killed just that forwarder while `watch_item` stayed
+    // healthy in the supervisor's eyes, freezing that one property (icon,
+    // title, status or tooltip) for the item's whole session with nothing
+    // surfacing it. `Bounded`, mirroring `tray-item` itself: the stream
+    // ending (item disconnected) is this forwarder's normal, expected
+    // completion, not a return worth a `warn!`. The subscription is
+    // (re-)established *inside* the factory so a restart after a panic gets
+    // a fresh one rather than reusing whatever the first, now-dead run built.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
 
-    for sig_name in ["NewIcon", "NewTitle", "NewStatus", "NewToolTip"] {
+    for (sig_name, task_name) in [
+        ("NewIcon", "tray-item-signal-new-icon"),
+        ("NewTitle", "tray-item-signal-new-title"),
+        ("NewStatus", "tray-item-signal-new-status"),
+        ("NewToolTip", "tray-item-signal-new-tooltip"),
+    ] {
         let tx2 = tx.clone();
         let bus2 = bus_name.clone();
         let path2 = object_path.clone();
         let sig = sig_name.to_string();
-        let sub = signals(BusKind::Session, bus2.as_str())
-            .at_path(path2)
-            .iface(SNI_IFACE)
-            .signal(sig.clone())
-            .start();
-        tokio::spawn(async move {
-            let mut events = sub.events();
-            while events.next().await.is_some() {
-                if tx2.send(()).await.is_err() {
-                    break;
+        spawn_supervised_bounded(task_name, move || {
+            let tx2 = tx2.clone();
+            let bus2 = bus2.clone();
+            let path2 = path2.clone();
+            let sig = sig.clone();
+            async move {
+                let sub = signals(BusKind::Session, bus2.as_str())
+                    .at_path(path2)
+                    .iface(SNI_IFACE)
+                    .signal(sig.clone())
+                    .start();
+                let mut events = sub.events();
+                while events.next().await.is_some() {
+                    if tx2.send(()).await.is_err() {
+                        break;
+                    }
                 }
+                tracing::debug!(signal = sig, bus_name = bus2, "signal stream ended");
             }
-            tracing::debug!(signal = sig, bus_name = bus2, "signal stream ended");
         });
     }
     drop(tx); // close sender side so channel closes when all sub-tasks end
 
-    // Spawn liveness watcher for PeerGone.
+    // Liveness watcher for PeerGone — same rationale as the signal
+    // forwarders above: a panic here used to silently stop PeerGone
+    // detection for this item, leaving a disconnected item's row in the
+    // published list forever with no observable cause.
     {
         let state2 = state.clone();
         let bus2 = bus_name.clone();
         let path2 = object_path.clone();
         let proxy2 = item_proxy.clone();
-        tokio::spawn(async move {
-            let mut liveness = proxy2.liveness().to_stream();
-            while let Some(s) = liveness.next().await {
-                if s == ProxyState::PeerGone {
-                    tracing::debug!(bus_name = bus2, object_path = path2, "item proxy: PeerGone");
-                    let key = format!("{bus2}{path2}");
-                    state2.registered.lock().await.remove(&key);
-                    state2.rebuild_published_list().await;
-                    state2.emit_unregistered(key).await;
-                    return;
+        spawn_supervised_bounded("tray-item-liveness", move || {
+            let state2 = state2.clone();
+            let bus2 = bus2.clone();
+            let path2 = path2.clone();
+            let proxy2 = proxy2.clone();
+            async move {
+                let mut liveness = proxy2.liveness().to_stream();
+                while let Some(s) = liveness.next().await {
+                    if s == ProxyState::PeerGone {
+                        tracing::debug!(
+                            bus_name = bus2,
+                            object_path = path2,
+                            "item proxy: PeerGone"
+                        );
+                        let key = format!("{bus2}{path2}");
+                        state2.registered.lock().await.remove(&key);
+                        state2.rebuild_published_list().await;
+                        state2.emit_unregistered(key).await;
+                        return;
+                    }
                 }
             }
         });

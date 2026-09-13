@@ -104,9 +104,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -199,9 +199,15 @@ struct PluginRuntime {
     /// This plugin's declared `HYTTE_PLUGIN_MOUNT` override, read straight out
     /// of `plugins.json` (#1161) — `None` when the file declares no override
     /// for this id, in which case [`mount`](Self::mount) alone is the whole
-    /// story. When `Some` and it disagrees with [`mount`](Self::mount), the
-    /// override didn't take (an older plugin build that predates
-    /// `HYTTE_PLUGIN_MOUNT`, most likely) and the UI shows both.
+    /// story.
+    ///
+    /// **`Some` is the interesting bit, not `Some` + disagreement.** The SDK
+    /// applies `HYTTE_PLUGIN_MOUNT` before `Register`, so an override that
+    /// *works* makes this equal [`mount`](Self::mount) — which means
+    /// comparing the two can only ever detect the **failure** case, while
+    /// #1161 asked to make an override *in force* visible. So
+    /// [`mount_display`] keys the "set by nix" note off `is_some()` and uses
+    /// the disagreement only to add "(not applied)" (#1260 review F1/F2).
     declared_mount: Option<String>,
     /// Seconds since the host last saw a frame (or its `Register`).
     last_seen_secs: u64,
@@ -422,6 +428,10 @@ struct PluginsState {
     /// of identical outcomes logs once, not once per poll — see
     /// [`on_poll_result_with_declared`].
     last_failing: Rc<Cell<Option<bool>>>,
+    /// `plugins.json`'s declared `HYTTE_PLUGIN_MOUNT` overrides (#1161),
+    /// parsed at most once per change to the file — see [`DeclaredMounts`]
+    /// for why the 2 s poll must not re-read it (#1260 review F7).
+    declared: Rc<RefCell<DeclaredMounts>>,
 }
 
 /// [`PluginsState`] with its widget handles held **weakly** — what the
@@ -459,6 +469,7 @@ struct WeakPluginsState {
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
+    declared: Rc<RefCell<DeclaredMounts>>,
 }
 
 /// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
@@ -497,6 +508,7 @@ impl PluginsState {
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
+            declared: self.declared.clone(),
         }
     }
 }
@@ -530,6 +542,7 @@ impl WeakPluginsState {
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
+            declared: self.declared.clone(),
         })
     }
 }
@@ -639,6 +652,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
+        declared: Rc::new(RefCell::new(DeclaredMounts::default())),
     };
 
     connect_selection(&state);
@@ -917,16 +931,22 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// applied, so a slow poll completing after a faster later one is dropped
 /// rather than rewriting the tab with its stale answer (#983).
 ///
-/// [`read_declared_mounts`] runs here, once per tick, on the GTK main thread
-/// (the same idiom [`hytte_config::places::load_places`] uses — a small local
-/// file read, not worth a round trip through the tokio runtime) and the
-/// result is threaded through to [`on_poll_result_with_declared`] rather than
-/// read from inside it, so the many existing `on_poll_result` tests stay
-/// hermetic (#1161) — none of them touch the real filesystem, and none of
-/// them should start to by accident.
+/// The declared-mount map comes from [`PluginsState::declared`] here, and is
+/// threaded through to [`on_poll_result_with_declared`] rather than read from
+/// inside it, so the many existing `on_poll_result` tests stay hermetic
+/// (#1161) — none of them touch the real filesystem, and none of them should
+/// start to by accident.
+///
+/// What this tick costs is one [`probe_plugins_json`] stat, not a read and a
+/// `serde_json` parse: the parse happens on the first tick and then only when
+/// the file's stamp changes (#1260 review F7 — see [`DeclaredMounts`] for why
+/// a stat-shaped stamp is enough for a nix-rendered store symlink).
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
-    let declared = read_declared_mounts();
+    let declared = {
+        let probe = probe_plugins_json(&hytte_config::xdg::Env::from_process());
+        state.declared.borrow_mut().get(probe, read_declared_mounts_at)
+    };
     let state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
         on_poll_result_with_declared(&state, generation, res, &declared);
@@ -972,7 +992,7 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
 
 /// `on_poll_result`'s real logic, parameterised by the plugin-id →
 /// declared-mount map
-/// [`read_declared_mounts`] reads out of `plugins.json` (#1161). Split out so
+/// [`read_declared_mounts_at`] reads out of `plugins.json` (#1161). Split out so
 /// that real filesystem read is injectable rather than baked into the
 /// function every existing poll-ordering test already drives — see
 /// `tests-must-not-touch-real-xdg` in the project's own house rules for why
@@ -1024,7 +1044,7 @@ fn on_poll_result_with_declared(
 }
 
 /// Zip a `ListPluginStates` reply with the declared-mount map
-/// [`read_declared_mounts`] read into `PluginRuntime`s, keyed by id (#1161).
+/// [`read_declared_mounts_at`] read into `PluginRuntime`s, keyed by id (#1161).
 ///
 /// Split out of [`on_poll_result_with_declared`] purely so the
 /// declared-mount attachment is unit-testable on its own: it takes no
@@ -1053,22 +1073,24 @@ fn runtime_states(
         .collect()
 }
 
-/// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` straight out of
-/// `plugins.json` (#1161) — the same file `nix/hm-module.nix` /
-/// `nix/nixos-module.nix` render, found by the same first-existing-wins
-/// search `trollshell::plugin_launcher::candidate_paths` uses: `$XDG_CONFIG_HOME`
-/// (else `$HOME/.config`) first, then each `$XDG_CONFIG_DIRS` entry (else
-/// `/etc/xdg`). Rebuilt here via [`hytte_config::xdg::Env`] rather than
-/// imported — `trollshell` is a binary crate, not a library another crate can
-/// link, which is the #640 argument for `hytte-config` existing as a
-/// GTK-free leaf in the first place.
+/// Every place a `plugins.json` could be, **most important first** — the same
+/// first-existing-wins search `trollshell::plugin_launcher::candidate_paths`
+/// walks: `$XDG_CONFIG_HOME` (else `$HOME/.config`) first, then each
+/// `$XDG_CONFIG_DIRS` entry (else `/etc/xdg`).
 ///
-/// Best-effort, the same failure mode [`hytte_config::places::load_places`]
-/// gives this tab's Places sibling: a missing, unreadable or unparsable file
-/// yields an empty map rather than an error — the row simply shows no
-/// override note, same as an unreachable shell showing no runtime overlay.
-fn read_declared_mounts() -> HashMap<String, String> {
-    let env = hytte_config::xdg::Env::from_process();
+/// That second half is not decoration: a home-manager install renders
+/// `~/.config/trollshell/plugins.json` and a NixOS one renders
+/// `/etc/xdg/trollshell/plugins.json`, so the `config_dirs` leg is the only
+/// one a NixOS user ever hits (#1260 review F8 — it had no test).
+///
+/// Rebuilt here over [`hytte_config::xdg::Env`] rather than imported —
+/// `trollshell` is a binary crate, not a library another crate can link,
+/// which is the #640 argument for `hytte-config` existing as a GTK-free leaf
+/// in the first place. Taking the `Env` as a parameter rather than reading
+/// the process environment inside is what lets a test drive both legs from a
+/// `tempfile` dir without touching the real XDG config (the project's own
+/// `tests-must-not-touch-real-xdg` rule).
+fn plugins_json_candidates(env: &hytte_config::xdg::Env) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = env.config_home() {
         candidates.push(home.join("trollshell").join("plugins.json"));
@@ -1079,14 +1101,140 @@ fn read_declared_mounts() -> HashMap<String, String> {
             .map(|dir| dir.join("trollshell").join("plugins.json")),
     );
     candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .and_then(|path| std::fs::read_to_string(path).ok())
+}
+
+/// The `plugins.json` the search path settled on, plus the cheap identity
+/// [`DeclaredMounts`] keys its cached parse on (#1260 review F7).
+///
+/// Everything here comes from one `stat` (plus one `readlink`) per candidate
+/// — no read, no parse — which is the whole point: the tab's 2 s poll runs
+/// this on the GTK main thread and must not do the blocking read it used to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PluginsJson {
+    /// The file the search found, i.e. the first candidate that exists.
+    path: PathBuf,
+    /// `readlink(path)`, or `None` when the path is a regular file.
+    ///
+    /// This is the discriminator that matters in practice. Both platform
+    /// modules render `plugins.json` as a **symlink into the nix store**, and
+    /// every store path carries the frozen mtime `1970-01-01 00:00:01` —
+    /// measured and documented in `hytte_config::subsystem::watch`'s module
+    /// doc, which is why *that* poller stamps `(mtime, content hash)` rather
+    /// than `(mtime, len)`. A hash would mean reading the file every tick,
+    /// the cost this cache exists to avoid; the link target carries the
+    /// content hash in its own name, so for the nix-rendered case it is
+    /// exactly as sharp and costs one `readlink`.
+    link: Option<PathBuf>,
+    /// `(mtime, len)` — [`hytte_config::subsystem::watch`]'s original stamp,
+    /// and what actually discriminates a **hand-written** `plugins.json`
+    /// (which has no link target and a real mtime).
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+/// Probe the search path: the first existing `plugins.json` and its stamp, or
+/// `None` when no file exists anywhere on it.
+fn probe_plugins_json(env: &hytte_config::xdg::Env) -> Option<PluginsJson> {
+    plugins_json_candidates(env).into_iter().find_map(|path| {
+        let meta = std::fs::metadata(&path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(PluginsJson {
+            link: std::fs::read_link(&path).ok(),
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            path,
+        })
+    })
+}
+
+/// The declared `HYTTE_PLUGIN_MOUNT` overrides in `plugins.json`, parsed **at
+/// most once per change to the file** (#1260 review F7).
+///
+/// Before this, [`refresh_plugins`] did a full read + `serde_json` parse on
+/// the GTK main thread on every 2 s tick, for the window's whole life and
+/// regardless of which tab was showing — for a file that is a nix-rendered
+/// store symlink and changes only on a rebuild. The cache keeps the parse and
+/// leaves only the [`probe_plugins_json`] stat behind, which is the shape
+/// `hytte_config::subsystem::watch` already polls config layers with.
+///
+/// Caching "there is no file" is deliberate too: that is the common case on a
+/// box whose plugins were installed by hand, and it should not re-walk the
+/// search path's every candidate any more often than a hit does.
+#[derive(Default)]
+struct DeclaredMounts {
+    /// What the last [`probe_plugins_json`] found — see [`Seen`].
+    seen: Seen,
+    /// The last parse. Handed out by `Rc` so a poll's completion closure can
+    /// hold it without re-cloning the map.
+    map: Rc<HashMap<String, String>>,
+}
+
+/// The state [`DeclaredMounts`] compares tick to tick.
+///
+/// Three states, not `Option<Option<…>>`: [`Unprobed`](Self::Unprobed) — the
+/// cache has never run, so the first tick must read — is a genuinely
+/// different thing from [`Missing`](Self::Missing), "the search path has no
+/// `plugins.json`", which is a cacheable answer like any other.
+#[derive(Default, PartialEq, Eq)]
+enum Seen {
+    #[default]
+    Unprobed,
+    Missing,
+    Found(PluginsJson),
+}
+
+impl DeclaredMounts {
+    /// The cached map, re-reading through `read` **only** when `probe`
+    /// differs from the one the cache last parsed.
+    ///
+    /// `read` is a parameter rather than a hard-wired call so a test can
+    /// count how often the blocking half actually runs — which is the
+    /// property this type exists for, and the one a stamp comparison that
+    /// stopped working would break silently.
+    fn get<F>(&mut self, probe: Option<PluginsJson>, read: F) -> Rc<HashMap<String, String>>
+    where
+        F: FnOnce(&Path) -> HashMap<String, String>,
+    {
+        let seen = probe.map_or(Seen::Missing, Seen::Found);
+        if self.seen != seen {
+            self.map = Rc::new(match &seen {
+                Seen::Found(found) => read(&found.path),
+                Seen::Unprobed | Seen::Missing => HashMap::new(),
+            });
+            self.seen = seen;
+        }
+        Rc::clone(&self.map)
+    }
+}
+
+/// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` out of the
+/// `plugins.json` at `path` (#1161) — the same file `nix/hm-module.nix` /
+/// `nix/nixos-module.nix` render.
+///
+/// Best-effort, the same failure mode [`hytte_config::places::load_places`]
+/// gives this tab's Places sibling: an unreadable or unparsable file yields
+/// an empty map rather than an error — the row simply shows no override note,
+/// same as an unreachable shell showing no runtime overlay.
+///
+/// **Two id namespaces meet in the map this returns** (#1260 review F9, and
+/// inherited from #423 rather than new here): its keys are `plugins.json`
+/// attribute names — i.e. `programs.trollshell.plugins.<id>`, a nix option
+/// name — while the ids they are looked up by in [`runtime_states`] come from
+/// `ListPluginStates`, i.e. the **manifest** id the plugin registered with.
+/// Nothing enforces that the two agree; they coincide by convention, and
+/// `apply_plugins`' own `rt.get(id)` has zipped the same two namespaces since
+/// #423. A plugin whose manifest id differs from its nix attribute name
+/// simply shows no override note.
+fn read_declared_mounts_at(path: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
         .map(|text| declared_mounts_from_json(&text))
         .unwrap_or_default()
 }
 
-/// The pure half of [`read_declared_mounts`]: `{"plugins": {"<id>": {"env":
+/// The pure half of [`read_declared_mounts_at`]: `{"plugins": {"<id>": {"env":
 /// {"HYTTE_PLUGIN_MOUNT": "<name>"}}}}` → `{id: name}`, dropping any entry
 /// that is missing the key or shaped unexpectedly rather than erroring — the
 /// same tolerance the rest of this best-effort read has. Split out so a test
@@ -1667,23 +1815,44 @@ fn mount_or_unknown(mount: &str) -> &str {
     }
 }
 
-/// The mount line for display (#1161): the effective (host-registered) mount
-/// alone, or — when a declared override in `plugins.json` disagrees with it —
-/// both, `"<declared> · manifest: <effective>"`. The two only diverge when the
-/// override didn't take: the SDK applies `HYTTE_PLUGIN_MOUNT` before
-/// `Register` (`hytte_plugin::run`), so an override that took hold is exactly
-/// what `mount` already reports and there is nothing worth saying twice. Pure
-/// → unit-tested.
+/// The mount line for display (#1161). Pure → unit-tested.
+///
+/// `mount` is the **effective**, host-registered mount and is always what
+/// goes first, because the line it feeds reads `"rendering in …"` and that
+/// is a claim about where the card actually is. `declared` is what
+/// `plugins.json` asked for, and it only ever *annotates*:
+///
+/// | `declared`         | line                                          |
+/// |--------------------|-----------------------------------------------|
+/// | `None`             | `Sidebar (middle)`                            |
+/// | `Some(== mount)`   | `Sidebar, right (middle) · set by nix`        |
+/// | `Some(!= mount)`   | `Sidebar (middle) · nix asked for Sidebar, right (middle) (not applied)` |
+///
+/// The middle row is the case #1161 asked to make visible ("so an operator
+/// can see an override is in force") and it is also the **common** one: the
+/// SDK applies `HYTTE_PLUGIN_MOUNT` before `Register` (`hytte_plugin::run`),
+/// so an override that works makes the two values equal. Keying the note off
+/// the *disagreement* instead — what this function did until #1260's review
+/// F1 — therefore said nothing at all whenever the feature worked, and spoke
+/// up only for a plugin binary that ignores the variable.
+///
+/// The bottom row is that failure case, and the reason the effective mount
+/// leads rather than the declared one (#1260 review F2): the declared value
+/// is precisely the one that did **not** take, so putting it in the
+/// "rendering in" slot asserted the card was somewhere it is not.
 fn mount_display(mount: &str, declared: Option<&str>) -> String {
+    let effective = mount_or_unknown(mount);
     match declared {
+        // The override was declared and did not take: say where it *is*, first.
         Some(declared) if declared != mount => {
             format!(
-                "{} · manifest: {}",
-                mount_or_unknown(declared),
-                mount_or_unknown(mount)
+                "{effective} · nix asked for {} (not applied)",
+                mount_or_unknown(declared)
             )
         }
-        _ => mount_or_unknown(mount).to_owned(),
+        // The override took — this is the case #1161 wants visible.
+        Some(_) => format!("{effective} · set by nix"),
+        None => effective.to_owned(),
     }
 }
 
@@ -1797,10 +1966,12 @@ async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::Bu
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        PluginRuntime, PollGenerations, PollStates, declared_mounts_from_json, is_running,
-        mount_display, mount_or_unknown, plugin_subtitle, runtime_overlay, runtime_states,
+        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates,
+        declared_mounts_from_json, is_running, mount_display, mount_or_unknown, plugin_subtitle,
+        probe_plugins_json, read_declared_mounts_at, runtime_overlay, runtime_states,
         same_plugin_set, seen_suffix, status_cell, violations_suffix,
     };
 
@@ -1924,11 +2095,40 @@ mod tests {
         assert_eq!(status, "Connected · rendering in Sidebar (middle)");
     }
 
-    /// The override note (#1161): a declared mount that disagrees with the
-    /// effective (host-registered) one shows both, in the detail pane's own
-    /// status line — the surface this note actually reaches.
+    /// The case #1161 asked for, in the surface the note actually reaches:
+    /// an override that **took**. The host reports the overridden mount (the
+    /// SDK applied `HYTTE_PLUGIN_MOUNT` before `Register`), and the row says
+    /// so — "an operator can see an override is in force".
+    ///
+    /// Red before #1260's review F1: the old `mount_display` keyed its note
+    /// off `declared != mount`, so this — the working, common case — showed
+    /// nothing at all.
     #[test]
-    fn overlay_notes_a_differing_declared_mount() {
+    fn overlay_says_an_override_that_took_is_in_force() {
+        let (_, _, status) = runtime_overlay(
+            "active",
+            Some(&rt_with_declared(
+                true,
+                "SidebarRightTop",
+                "SidebarRightTop",
+                1,
+                0,
+            )),
+        );
+        assert_eq!(
+            status,
+            "Connected · rendering in Sidebar, right (middle) · set by nix"
+        );
+    }
+
+    /// The failure case: a declared mount the plugin ignored. The row must
+    /// keep the **effective** mount in the "rendering in" slot — it is the
+    /// place the card actually is — and name the declared one as the thing
+    /// that did not take (#1260 review F2; the old wording put the
+    /// non-effective value first and so asserted the card was on the other
+    /// sidebar).
+    #[test]
+    fn overlay_notes_a_declared_mount_that_did_not_take() {
         let (_, _, status) = runtime_overlay(
             "active",
             Some(&rt_with_declared(
@@ -1941,7 +2141,8 @@ mod tests {
         );
         assert_eq!(
             status,
-            "Connected · rendering in Sidebar, right (middle) · manifest: Sidebar (middle)"
+            "Connected · rendering in Sidebar (middle) \
+             · nix asked for Sidebar, right (middle) (not applied)"
         );
     }
 
@@ -2002,6 +2203,30 @@ mod tests {
         assert_eq!(mount_or_unknown("BarRight"), "Bar (right)");
     }
 
+    /// The **wire** half of the same claim, and the half nine string
+    /// literals structurally cannot make (#1260 review F4): every entry of
+    /// `Mount::ALL` must reach a human label, so a rename on the wire — or a
+    /// tenth variant — reds here instead of leaking the raw wire string onto
+    /// the screen through `mount_or_unknown`'s `other => other` arm, which is
+    /// the one thing #1161 said not to do.
+    ///
+    /// `hytte-plugin-proto` is a **dev**-dependency for exactly this: its
+    /// rlib is already linked into this binary through `hytte-plugin-agents`,
+    /// so naming it costs no new `Cargo.lock` package and nothing at
+    /// runtime — but the shipped binary has no use for `Mount`, only this
+    /// assertion does.
+    #[test]
+    fn every_wire_mount_has_a_human_label() {
+        for mount in hytte_plugin_proto::manifest::Mount::ALL {
+            let wire = mount.wire_name();
+            assert_ne!(
+                mount_or_unknown(wire),
+                wire,
+                "{wire} has no human label in mount_or_unknown"
+            );
+        }
+    }
+
     #[test]
     fn mount_falls_back_when_unknown() {
         assert_eq!(mount_or_unknown(""), "an unknown region");
@@ -2014,21 +2239,27 @@ mod tests {
         assert_eq!(mount_display("SidebarTop", None), "Sidebar (middle)");
     }
 
+    /// An override that took is the **common** case (the SDK applies
+    /// `HYTTE_PLUGIN_MOUNT` before `Register`, so the host reports it back)
+    /// and it is the one #1161 asked to make visible. Keying the note off
+    /// `declared != mount` — what this did before #1260's review F1 — made
+    /// this exact case say nothing.
     #[test]
-    fn mount_display_omits_the_note_when_declared_matches_effective() {
-        // The common case: the override took, so `mount` already reports it —
-        // nothing is worth saying twice.
+    fn mount_display_says_an_override_in_force_is_set_by_nix() {
         assert_eq!(
             mount_display("SidebarRightTop", Some("SidebarRightTop")),
-            "Sidebar, right (middle)"
+            "Sidebar, right (middle) · set by nix"
         );
     }
 
+    /// The effective mount leads even when the declared one disagrees: the
+    /// line it feeds says "rendering in", and the declared value is precisely
+    /// the one that did not take (#1260 review F2).
     #[test]
-    fn mount_display_notes_a_differing_declared_mount() {
+    fn mount_display_keeps_the_effective_mount_first_when_the_override_failed() {
         assert_eq!(
             mount_display("SidebarTop", Some("SidebarRightTop")),
-            "Sidebar, right (middle) · manifest: Sidebar (middle)"
+            "Sidebar (middle) · nix asked for Sidebar, right (middle) (not applied)"
         );
     }
 
@@ -2095,6 +2326,174 @@ mod tests {
             rt.get("clock").expect("an entry for clock").declared_mount,
             None
         );
+    }
+
+    // ── The declared-mount cache (#1260 review F7) ───────────────────────────
+    //
+    // The property: the 2 s poll costs one `stat`, and the blocking read +
+    // `serde_json` parse runs only when `plugins.json` actually changed.
+    // Drive the cache with a counting `read` — nothing else can tell a cache
+    // that works from one that re-reads every time, since both return the
+    // right map.
+
+    /// A stamp for a file that is not there to be stat'd — the cache never
+    /// dereferences the path, only compares the stamp.
+    fn stamp(path: &str, len: u64) -> PluginsJson {
+        PluginsJson {
+            path: PathBuf::from(path),
+            link: None,
+            modified: None,
+            len,
+        }
+    }
+
+    fn one_override() -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        map.insert("agents".to_owned(), "SidebarRightTop".to_owned());
+        map
+    }
+
+    #[test]
+    fn the_declared_mount_file_is_parsed_once_while_its_stamp_holds() {
+        let mut cache = DeclaredMounts::default();
+        let mut reads = 0;
+        for _ in 0..5 {
+            let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| {
+                reads += 1;
+                one_override()
+            });
+            assert_eq!(
+                map.get("agents").map(String::as_str),
+                Some("SidebarRightTop"),
+                "every tick must still see the overrides"
+            );
+        }
+        assert_eq!(
+            reads, 1,
+            "five polls over an unchanged file must parse it once, not {reads} times"
+        );
+    }
+
+    #[test]
+    fn a_changed_stamp_reparses() {
+        let mut cache = DeclaredMounts::default();
+        let mut reads = 0;
+        cache.get(Some(stamp("/x/plugins.json", 42)), |_| {
+            reads += 1;
+            HashMap::new()
+        });
+        // Same path, different content: a rebuild.
+        let map = cache.get(Some(stamp("/x/plugins.json", 43)), |_| {
+            reads += 1;
+            one_override()
+        });
+        assert_eq!(reads, 2, "a changed stamp must re-read");
+        assert_eq!(map.get("agents").map(String::as_str), Some("SidebarRightTop"));
+    }
+
+    #[test]
+    fn no_plugins_json_is_cached_too_and_never_read() {
+        let mut cache = DeclaredMounts::default();
+        for _ in 0..3 {
+            let map = cache.get(None, |_| panic!("there is no file to read"));
+            assert!(map.is_empty());
+        }
+    }
+
+    /// The other direction of the same door: a file appearing where there was
+    /// none must be picked up, not swallowed by the cached "no file".
+    #[test]
+    fn a_file_appearing_later_is_picked_up() {
+        let mut cache = DeclaredMounts::default();
+        assert!(cache.get(None, |_| panic!("there is no file yet")).is_empty());
+        let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| one_override());
+        assert_eq!(map.get("agents").map(String::as_str), Some("SidebarRightTop"));
+    }
+
+    // ── The XDG search path (#1260 review F8) ────────────────────────────────
+    //
+    // `probe_plugins_json`'s `$XDG_CONFIG_HOME` → `$XDG_CONFIG_DIRS` walk is
+    // exactly what differs between a home-manager install
+    // (`~/.config/trollshell/plugins.json`) and a NixOS one
+    // (`/etc/xdg/trollshell/plugins.json`), and the `dirs` leg — the only one
+    // a NixOS user ever hits — had no test at all. `Env`'s four fields are
+    // `pub`, so these drive two `tempfile` dirs and never touch the real XDG
+    // config (`tests-must-not-touch-real-xdg`).
+
+    /// An `Env` naming `home` as the overlay and `dirs` as the single base.
+    fn env_of(home: &Path, dirs: &Path) -> hytte_config::xdg::Env {
+        hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(home.to_string_lossy().into_owned()),
+            config_dirs: Some(dirs.to_string_lossy().into_owned()),
+            state_home: None,
+        }
+    }
+
+    /// Write a `plugins.json` declaring one override under `base`.
+    fn write_plugins_json(base: &Path, mount: &str) -> PathBuf {
+        let dir = base.join("trollshell");
+        std::fs::create_dir_all(&dir).expect("create the trollshell config dir");
+        let path = dir.join("plugins.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"plugins":{{"agents":{{"exec":"x","env":{{"HYTTE_PLUGIN_MOUNT":"{mount}"}},"secrets":[],"enabled":true}}}}}}"#
+            ),
+        )
+        .expect("write plugins.json");
+        path
+    }
+
+    #[test]
+    fn the_search_path_finds_a_dirs_only_plugins_json() {
+        let home = tempfile::tempdir().expect("a temp XDG_CONFIG_HOME");
+        let dirs = tempfile::tempdir().expect("a temp XDG_CONFIG_DIRS entry");
+        // The NixOS shape: nothing in the overlay, the file in the base.
+        let written = write_plugins_json(dirs.path(), "SidebarRightBottom");
+        let env = env_of(home.path(), dirs.path());
+
+        let found = probe_plugins_json(&env).expect("the dirs entry must be found");
+        assert_eq!(found.path, written);
+        assert_eq!(
+            read_declared_mounts_at(&found.path)
+                .get("agents")
+                .map(String::as_str),
+            Some("SidebarRightBottom"),
+            "a NixOS install's override must reach the tab"
+        );
+    }
+
+    #[test]
+    fn the_overlay_wins_over_the_dirs_entry() {
+        let home = tempfile::tempdir().expect("a temp XDG_CONFIG_HOME");
+        let dirs = tempfile::tempdir().expect("a temp XDG_CONFIG_DIRS entry");
+        let overlay = write_plugins_json(home.path(), "BarRight");
+        write_plugins_json(dirs.path(), "SidebarRightBottom");
+        let env = env_of(home.path(), dirs.path());
+
+        let found = probe_plugins_json(&env).expect("the overlay must be found");
+        assert_eq!(found.path, overlay, "first existing wins, overlay first");
+        assert_eq!(
+            read_declared_mounts_at(&found.path)
+                .get("agents")
+                .map(String::as_str),
+            Some("BarRight")
+        );
+    }
+
+    #[test]
+    fn no_plugins_json_anywhere_probes_to_none() {
+        let home = tempfile::tempdir().expect("a temp XDG_CONFIG_HOME");
+        let dirs = tempfile::tempdir().expect("a temp XDG_CONFIG_DIRS entry");
+        assert!(probe_plugins_json(&env_of(home.path(), dirs.path())).is_none());
+    }
+
+    /// An unreadable (here: nonexistent) file is best-effort, the same as an
+    /// unparsable one — no override note, never a panic.
+    #[test]
+    fn reading_a_missing_file_yields_an_empty_map() {
+        assert!(read_declared_mounts_at(Path::new("/nonexistent/plugins.json")).is_empty());
     }
 
     #[test]

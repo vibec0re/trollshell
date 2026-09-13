@@ -79,11 +79,25 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 ] }
 
 [dev-dependencies]
+# The Plugins tab's nine human mount labels are a hand-mirror of
+# `Mount::wire_name`'s table, and nine string literals in a test cannot see
+# the wire they mirror (#1260 review F4) — `every_wire_mount_has_a_human_label`
+# iterates `Mount::ALL` instead, so a rename or a tenth variant reds here
+# rather than leaking a raw wire string onto the screen.
+#
+# A **dev**-dependency, not a dependency: the proto rlib is already compiled
+# into this binary through `hytte-plugin-agents` (see its entry above), so
+# this adds no `Cargo.lock` package and no closure — but only the test names
+# `Mount`, so only the test target needs the edge.
+hytte-plugin-proto = { path = "../hytte-plugin-proto" }
 # The Agents tab's scripted `host.sock` (#947 P4): a real `UnixListener` in a
 # `TempDir` answering one recorded JSON line, the shape
 # `hytte-plugin-agents/tests/fake_socket.rs` uses. Dev-only — the app itself
 # reaches the socket through `hytte-plugin-agents`' client on the shared
-# `hytte-reactive` runtime and needs none of these features of its own.
+# `hytte-reactive` runtime and needs none of these features of its own. Since
+# #1260 it also backs the Plugins tab's XDG search-path tests (review F8):
+# two temp dirs standing in for `$XDG_CONFIG_HOME` and an `$XDG_CONFIG_DIRS`
+# entry, so those never touch the real config.
 tempfile.workspace = true
 tokio = { workspace = true, features = [
   "io-util",

@@ -6,6 +6,34 @@ use super::font;
 use super::frame::{Frame, Rgba};
 use super::style::{DisplayStyle, mix};
 
+/// Largest accepted wrap width, in glyph cells (see [`TextBox::cols`]).
+/// Matches the wire's `MAX_TEXT_COLS`: the kit's default is 16 cells and the
+/// widest real use is the pet's ~268 px bubble (~44 cells), so 256 cells is
+/// generous while keeping the scaled width inside [`MAX_BUFFER_DIM`].
+const MAX_TEXT_COLS: usize = 256;
+/// Largest accepted wrapped-line count (see [`TextBox::max_lines`]). Matches
+/// the wire's `MAX_TEXT_LINES`: the kit's default is 3 lines, and 64 is far
+/// past anything a sidebar card shows.
+const MAX_TEXT_LINES: usize = 64;
+/// Largest accepted field padding, in pre-scale pixels (see
+/// [`TextBox::pad`]). Matches the wire's `MAX_PAD`: padding is added to
+/// **both** dimensions, so an uncapped pad inflates the buffer quadratically
+/// all on its own. The kit's default is 3.
+const MAX_PAD: usize = 64;
+/// Largest accepted rounded-corner cut radius, in pre-scale pixels (see
+/// [`TextBox::corner`]). Matches the wire's `MAX_CORNER`, bounded for the same
+/// reason as [`MAX_PAD`] (a per-pixel corner test). The kit's default is 2.
+const MAX_CORNER: usize = 64;
+/// Largest accepted integer upscale (see [`TextBox::scale`]). Matches the
+/// wire's `MAX_SCALE`: the kit's own default is 1x, and 8x is already a
+/// chunkier pixel than any skin reads well at.
+const MAX_SCALE: usize = 8;
+/// Largest accepted `fit_px` pixel budget (see [`TextBox::fit_px`]). Matches
+/// the wire's `MAX_BUFFER_DIM`: `2048 * 2048 * 4 B` is a single `Node::Pixels`
+/// frame's worth of RGBA8, so nothing built at or under this bound can outgrow
+/// what one frame could always have carried.
+const MAX_BUFFER_DIM: usize = 2048;
+
 /// How the box picks its wrap width.
 #[derive(Debug, Clone, Copy)]
 enum WidthSpec {
@@ -76,50 +104,55 @@ impl TextBox {
         Self::new().colors(p.bg, p.ink, notdef)
     }
 
-    /// Wrap width in glyph cells (clamped to at least 1).
+    /// Wrap width in glyph cells, clamped to `1..=`[`MAX_TEXT_COLS`].
     #[must_use]
     pub fn cols(mut self, cols: usize) -> Self {
-        self.width = WidthSpec::Cols(cols.max(1));
+        self.width = WidthSpec::Cols(cols.clamp(1, MAX_TEXT_COLS));
         self
     }
 
     /// Pick the widest wrap width whose rendered box — padding included —
     /// still fits `px` **final** pixels, i.e. after [`scale`](Self::scale)
-    /// (order-independent: the budget is resolved at render time).
+    /// (order-independent: the budget is resolved at render time). Capped at
+    /// [`MAX_BUFFER_DIM`] (`0` is left alone — it resolves to the narrowest
+    /// wrap, not an error).
     #[must_use]
     pub fn fit_px(mut self, px: usize) -> Self {
-        self.width = WidthSpec::FitPx(px);
+        self.width = WidthSpec::FitPx(px.min(MAX_BUFFER_DIM));
         self
     }
 
-    /// Hard cap on wrapped lines (clamped to at least 1); overflow is
-    /// truncated with a trailing `…`.
+    /// Hard cap on wrapped lines, clamped to `1..=`[`MAX_TEXT_LINES`];
+    /// overflow is truncated with a trailing `…`.
     #[must_use]
     pub fn max_lines(mut self, lines: usize) -> Self {
-        self.max_lines = lines.max(1);
+        self.max_lines = lines.clamp(1, MAX_TEXT_LINES);
         self
     }
 
-    /// Field padding around the text block, in pre-scale pixels.
+    /// Field padding around the text block, in pre-scale pixels, capped at
+    /// [`MAX_PAD`] (`0` is left alone — it is added to **both** dimensions, so
+    /// an uncapped pad would inflate the buffer quadratically all on its own).
     #[must_use]
     pub fn pad(mut self, pad: usize) -> Self {
-        self.pad = pad;
+        self.pad = pad.min(MAX_PAD);
         self
     }
 
     /// Radius of the rounded-corner cut (to transparent), in pre-scale
-    /// pixels; `0` keeps the box fully opaque to its square corners.
+    /// pixels, capped at [`MAX_CORNER`]; `0` keeps the box fully opaque to its
+    /// square corners.
     #[must_use]
     pub fn corner(mut self, corner: usize) -> Self {
-        self.corner = corner;
+        self.corner = corner.min(MAX_CORNER);
         self
     }
 
-    /// Integer upscale baked into the buffer (chunkier pixels; see the
-    /// `preem` docs on sizing). `0`/`1` render at native 1×.
+    /// Integer upscale baked into the buffer, clamped to `1..=`[`MAX_SCALE`]
+    /// (chunkier pixels; see the `preem` docs on sizing).
     #[must_use]
     pub fn scale(mut self, scale: usize) -> Self {
-        self.scale = scale.max(1);
+        self.scale = scale.clamp(1, MAX_SCALE);
         self
     }
 
@@ -382,7 +415,10 @@ impl TextBoxLayout {
 #[cfg(test)]
 mod tests {
     use super::super::DisplayStyle;
-    use super::TextBox;
+    use super::{
+        MAX_BUFFER_DIM, MAX_CORNER, MAX_PAD, MAX_SCALE, MAX_TEXT_COLS, MAX_TEXT_LINES, TextBox,
+        WidthSpec,
+    };
 
     /// The host invariant, across pathological inputs, styles, and scales.
     #[test]
@@ -587,5 +623,126 @@ mod tests {
             && col < layout.content_cols()
             && gy % (GLYPH_H + LINE_GAP) < GLYPH_H
             && gx % (GLYPH_W + SPACING) < GLYPH_W
+    }
+
+    /// The `cols` knob has both a floor and a ceiling: `0` clamps up to `1`,
+    /// and anything past `MAX_TEXT_COLS` clamps down to exactly the bound
+    /// (#1181).
+    #[test]
+    fn cols_knob_has_both_bounds() {
+        fn cols_of(tb: &TextBox) -> usize {
+            match tb.width {
+                WidthSpec::Cols(n) => n,
+                WidthSpec::FitPx(_) => unreachable!("built with .cols()"),
+            }
+        }
+        assert_eq!(
+            cols_of(&TextBox::new().cols(0)),
+            1,
+            "0 clamps up to exactly 1"
+        );
+        assert_eq!(cols_of(&TextBox::new().cols(MAX_TEXT_COLS)), MAX_TEXT_COLS);
+        assert_eq!(
+            cols_of(&TextBox::new().cols(MAX_TEXT_COLS + 1)),
+            MAX_TEXT_COLS,
+            "one past the ceiling clamps down to exactly MAX_TEXT_COLS"
+        );
+        assert_eq!(
+            cols_of(&TextBox::new().cols(usize::MAX)),
+            MAX_TEXT_COLS,
+            "usize::MAX clamps down to exactly MAX_TEXT_COLS"
+        );
+    }
+
+    /// The `fit_px` knob has a ceiling: anything past `MAX_BUFFER_DIM` clamps
+    /// down to exactly the bound (#1181). `0` is left alone — it resolves to
+    /// the narrowest wrap, not an error.
+    #[test]
+    fn fit_px_knob_has_a_ceiling() {
+        fn px_of(tb: &TextBox) -> usize {
+            match tb.width {
+                WidthSpec::FitPx(px) => px,
+                WidthSpec::Cols(_) => unreachable!("built with .fit_px()"),
+            }
+        }
+        assert_eq!(px_of(&TextBox::new().fit_px(0)), 0, "0 is left alone");
+        assert_eq!(
+            px_of(&TextBox::new().fit_px(MAX_BUFFER_DIM)),
+            MAX_BUFFER_DIM
+        );
+        assert_eq!(
+            px_of(&TextBox::new().fit_px(MAX_BUFFER_DIM + 1)),
+            MAX_BUFFER_DIM,
+            "one past the ceiling clamps down to exactly MAX_BUFFER_DIM"
+        );
+        assert_eq!(
+            px_of(&TextBox::new().fit_px(usize::MAX)),
+            MAX_BUFFER_DIM,
+            "usize::MAX clamps down to exactly MAX_BUFFER_DIM"
+        );
+    }
+
+    /// The `max_lines`/`pad`/`corner`/`scale` knobs each have the bound their
+    /// doc claims (#1181): `max_lines` and `scale` floor at 1 and ceiling at
+    /// their bound; `pad` and `corner` have no floor (`0` is a valid,
+    /// unchanged degenerate value) but do ceiling.
+    #[test]
+    fn the_remaining_knobs_have_their_bounds() {
+        let tb = TextBox::new();
+
+        assert_eq!(tb.clone().max_lines(0).max_lines, 1, "0 clamps up to 1");
+        assert_eq!(
+            tb.clone().max_lines(MAX_TEXT_LINES).max_lines,
+            MAX_TEXT_LINES
+        );
+        assert_eq!(
+            tb.clone().max_lines(MAX_TEXT_LINES + 1).max_lines,
+            MAX_TEXT_LINES,
+            "one past the ceiling clamps down to exactly MAX_TEXT_LINES"
+        );
+        assert_eq!(
+            tb.clone().max_lines(usize::MAX).max_lines,
+            MAX_TEXT_LINES,
+            "usize::MAX clamps down to exactly MAX_TEXT_LINES"
+        );
+
+        assert_eq!(tb.clone().pad(0).pad, 0, "0 is left alone");
+        assert_eq!(tb.clone().pad(MAX_PAD).pad, MAX_PAD);
+        assert_eq!(
+            tb.clone().pad(MAX_PAD + 1).pad,
+            MAX_PAD,
+            "one past the ceiling clamps down to exactly MAX_PAD"
+        );
+        assert_eq!(
+            tb.clone().pad(usize::MAX).pad,
+            MAX_PAD,
+            "usize::MAX clamps down to exactly MAX_PAD"
+        );
+
+        assert_eq!(tb.clone().corner(0).corner, 0, "0 is left alone");
+        assert_eq!(tb.clone().corner(MAX_CORNER).corner, MAX_CORNER);
+        assert_eq!(
+            tb.clone().corner(MAX_CORNER + 1).corner,
+            MAX_CORNER,
+            "one past the ceiling clamps down to exactly MAX_CORNER"
+        );
+        assert_eq!(
+            tb.clone().corner(usize::MAX).corner,
+            MAX_CORNER,
+            "usize::MAX clamps down to exactly MAX_CORNER"
+        );
+
+        assert_eq!(tb.clone().scale(0).scale, 1, "0 clamps up to 1");
+        assert_eq!(tb.clone().scale(MAX_SCALE).scale, MAX_SCALE);
+        assert_eq!(
+            tb.clone().scale(MAX_SCALE + 1).scale,
+            MAX_SCALE,
+            "one past the ceiling clamps down to exactly MAX_SCALE"
+        );
+        assert_eq!(
+            tb.scale(usize::MAX).scale,
+            MAX_SCALE,
+            "usize::MAX clamps down to exactly MAX_SCALE"
+        );
     }
 }

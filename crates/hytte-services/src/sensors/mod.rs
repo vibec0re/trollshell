@@ -39,12 +39,22 @@ use std::time::{Duration, Instant};
 
 use crate::cast::u64_to_f64_bytes;
 
+// The data shapes moved to `hytte-sensors` byte-for-byte (#1249) as plain
+// `pub struct`/`pub enum` items directly in that crate's root, exactly where
+// they used to live in this module — so re-exporting them with `pub use`
+// here keeps `hytte_services::sensors::CpuLoad` (etc.) resolving to the same
+// path every existing caller (this crate's own tests, `trollshell`'s
+// widgets/panels) already uses. `MountSpec` stays a plain (non-`pub`) import:
+// it was `pub(crate)` before the move and nothing outside this module ever
+// names it.
+pub use hytte_sensors::{
+    CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskUsage, DiskMount, GpuState, GpuVendor, Memory,
+    NetConnections, NetIo, NetInterface,
+};
 use hytte_sensors::{
-    CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuCache, GpuState, GpuVendor,
-    Memory, MountSpec, NetConnections, NetIo, NetInterface, compute_cpu_load, compute_disk_io,
-    read_cpu_freq, read_cpu_temp, read_disk_for_specs, read_gpu_with_cache, read_mountlist,
-    read_net_connections, read_process_count, read_proc_diskstats, read_proc_meminfo,
-    read_proc_net_dev, read_proc_stat,
+    GpuCache, MountSpec, compute_cpu_load, compute_disk_io, read_cpu_freq, read_cpu_temp,
+    read_disk_for_specs, read_gpu_with_cache, read_mountlist, read_net_connections,
+    read_process_count, read_proc_diskstats, read_proc_meminfo, read_proc_net_dev, read_proc_stat,
 };
 use warn_latch::{WARN_COOLDOWN, WarnLatch};
 

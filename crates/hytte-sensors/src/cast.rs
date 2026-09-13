@@ -107,3 +107,96 @@ pub(crate) fn percent_u64_to_ratio(v: u64) -> f64 {
 pub(crate) fn octal_byte_from_u32(v: u32) -> u8 {
     v as u8
 }
+
+#[cfg(test)]
+mod tests {
+    // `u64_to_f64_bytes` carries no dedicated unit test in this module: it is
+    // exercised indirectly through `diskio::tests` (`compute_disk_io`'s rate
+    // math calls it), and it is unit-tested directly where it also still
+    // lives — `hytte-services`' own `cast.rs`, whose `apply_network` and
+    // memory-history extractor are its other caller. Duplicating those two
+    // tests here as well would double-count coverage without moving anything
+    // (the function has two independent callers on two sides of the crate
+    // boundary; see `lib.rs`'s and `hytte-services::cast`'s doc comments).
+    use super::*;
+
+    // ── u64_to_f64_count ─────────────────────────────────────────────────────
+
+    #[test]
+    fn u64_to_f64_count_zero() {
+        assert!(u64_to_f64_count(0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn u64_to_f64_count_small_exact() {
+        assert!((u64_to_f64_count(1000) - 1000.0).abs() < f64::EPSILON);
+    }
+
+    // ── millicelsius_to_celsius ───────────────────────────────────────────────
+
+    #[test]
+    fn millicelsius_to_celsius_typical() {
+        // 45 000 milli-°C = 45.0 °C exactly.
+        assert!((millicelsius_to_celsius(45_000) - 45.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn millicelsius_to_celsius_zero() {
+        assert!(millicelsius_to_celsius(0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn millicelsius_to_celsius_precision() {
+        // 52 125 milli-°C = 52.125 °C (exactly representable in f64).
+        assert!((millicelsius_to_celsius(52_125) - 52.125).abs() < f64::EPSILON);
+    }
+
+    // ── khz_to_hz ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn khz_to_hz_zero() {
+        assert!(khz_to_hz(0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn khz_to_hz_typical() {
+        // 2 400 000 kHz = 2.4 GHz exactly.
+        assert!((khz_to_hz(2_400_000) - 2.4e9).abs() < f64::EPSILON);
+    }
+
+    // ── percent_u64_to_ratio ──────────────────────────────────────────────────
+
+    #[test]
+    fn percent_u64_to_ratio_zero() {
+        assert!(percent_u64_to_ratio(0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn percent_u64_to_ratio_hundred() {
+        assert!((percent_u64_to_ratio(100) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn percent_u64_to_ratio_fifty() {
+        assert!((percent_u64_to_ratio(50) - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ── octal_byte_from_u32 ───────────────────────────────────────────────────
+
+    #[test]
+    fn octal_byte_from_u32_zero() {
+        assert_eq!(octal_byte_from_u32(0), 0u8);
+    }
+
+    #[test]
+    fn octal_byte_from_u32_space() {
+        // \040 octal = 32 decimal = ASCII space.
+        assert_eq!(octal_byte_from_u32(32), b' ');
+    }
+
+    #[test]
+    fn octal_byte_from_u32_max_byte() {
+        // \377 octal = 255 decimal — the largest valid mountinfo escape.
+        assert_eq!(octal_byte_from_u32(255), 255u8);
+    }
+}

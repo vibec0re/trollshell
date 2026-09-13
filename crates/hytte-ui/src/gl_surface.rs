@@ -942,7 +942,11 @@ const PIPELINE_BUILD_REFUSED: &str = "a GL pipeline could not be built; the surf
 /// read, and the reason this is a free function rather than four lines inside
 /// `imp::GlSurface::ensure_resources`: that one needs a live `hgl::Gl` and a
 /// default `cargo test` has no driver at all.
-fn report_build_refusal(refused: &RefCell<RefusedBuilds>, key: BuildKey, error: &hgl::Error) -> bool {
+fn report_build_refusal(
+    refused: &RefCell<RefusedBuilds>,
+    key: BuildKey,
+    error: &hgl::Error,
+) -> bool {
     let (grid, program) = key;
     if !refused.borrow_mut().remember(key) {
         return false;
@@ -962,9 +966,9 @@ mod imp {
     use super::{
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PROGRAM_UNREGISTERED_REFUSED, PROGRAMS,
-        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk,
-        glib, last_drawn_after, program_key, refuse_data_strip, report_build_refusal,
-        resources_reusable, steps_owed, warn_on_target_failure,
+        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
+        last_drawn_after, program_key, refuse_data_strip, report_build_refusal, resources_reusable,
+        steps_owed, warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -1689,6 +1693,11 @@ mod imp {
         use gtk::prelude::*;
         use gtk::subclass::prelude::ObjectSubclassIsExt;
 
+        /// What `a_refused_pipeline_calls_the_hosts_fallback_hook_once`'s
+        /// `set_build_refusal_handler` hook records, per call: the program,
+        /// the grid, and the driver's own reason.
+        type Refusals = std::rc::Rc<RefCell<Vec<(&'static str, (u32, u32), String)>>>;
+
         // This test never calls `run` — only `ensure_resources` /
         // `Resources::build` — so the two pipelines below only need to differ
         // in how many programs they compile; their passes are never drawn.
@@ -2220,13 +2229,12 @@ mod imp {
             };
             const BROKEN_PASS: [GlPass; 1] = [BROKEN];
 
-            let Some((window, surface, _gl)) = realised_surface_or_skip(
-                "a_refused_pipeline_calls_the_hosts_fallback_hook_once",
-            ) else {
+            let Some((window, surface, _gl)) =
+                realised_surface_or_skip("a_refused_pipeline_calls_the_hosts_fallback_hook_once")
+            else {
                 return;
             };
 
-            type Refusals = std::rc::Rc<RefCell<Vec<(&'static str, (u32, u32), String)>>>;
             let seen: Refusals = std::rc::Rc::new(RefCell::new(Vec::new()));
             let sink = std::rc::Rc::clone(&seen);
             super::super::set_build_refusal_handler(move |program, grid, reason| {
@@ -2535,7 +2543,6 @@ impl GlSurface {
     pub fn has_error(&self) -> bool {
         self.error().is_some()
     }
-
 }
 
 impl Default for GlSurface {
@@ -2845,7 +2852,11 @@ mod tests {
             sink.borrow_mut().push((program.0, grid, reason.to_owned()));
             // The re-entry: a host rebuilding widgets can reach any of this
             // module's entry points, and this is the sharpest of them.
-            refuse_build(GlProgram("gl_surface_test.reentrant.inner"), (1, 1), "inner");
+            refuse_build(
+                GlProgram("gl_surface_test.reentrant.inner"),
+                (1, 1),
+                "inner",
+            );
         });
 
         refuse_build(GlProgram("gl_surface_test.reentrant"), (2, 2), "outer");
@@ -2860,7 +2871,11 @@ mod tests {
         // …and the handler is back in its slot afterwards, so the *next*
         // refusal is still reported. A `take` that forgot to put it back
         // would leave the host deaf after its first fallback.
-        refuse_build(GlProgram("gl_surface_test.reentrant.again"), (3, 3), "again");
+        refuse_build(
+            GlProgram("gl_surface_test.reentrant.again"),
+            (3, 3),
+            "again",
+        );
         assert_eq!(
             seen.borrow().len(),
             2,

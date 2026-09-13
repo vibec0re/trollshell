@@ -3634,8 +3634,12 @@ mod tests {
                 "the premise: both chips start on the GPU",
             );
             assert!(matches!(gauge_before, UiNode::GlSurface { .. }));
-            let scope_builds = probe(&key, Some("sc")).expect("the scope instance exists").0;
-            let gauge_builds = probe(&key, Some("ga")).expect("the gauge instance exists").0;
+            let scope_builds = probe(&key, Some("sc"))
+                .expect("the scope instance exists")
+                .0;
+            let gauge_builds = probe(&key, Some("ga"))
+                .expect("the gauge instance exists")
+                .0;
 
             // The driver refuses the scope's pipeline, once, exactly as a
             // realised `GlSurface` reports it.
@@ -3689,13 +3693,17 @@ mod tests {
                  pipeline, not per session",
             );
             assert_eq!(
-                probe(&key, Some("sc")).expect("the scope instance exists").0,
+                probe(&key, Some("sc"))
+                    .expect("the scope instance exists")
+                    .0,
                 scope_builds + 1,
                 "the refused chip is rebuilt exactly once — by the sweep, not again by the \
                  mapping pass that follows it",
             );
             assert_eq!(
-                probe(&key, Some("ga")).expect("the gauge instance exists").0,
+                probe(&key, Some("ga"))
+                    .expect("the gauge instance exists")
+                    .0,
                 gauge_builds,
                 "…and the gauge is not rebuilt at all. A sweep over every GL instance would \
                  answer with the same `GaugeGl` it already had and restart the needle's spring \

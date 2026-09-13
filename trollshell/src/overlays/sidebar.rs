@@ -784,9 +784,22 @@ fn wire_input_region(window: &gtk::Window, open: &Mutable<bool>, non_empty: &Mut
 /// assertion on the input region itself could do: **GDK exposes no getter for a
 /// surface's input region**, so what it applied stays a code-path argument plus
 /// a live-verify item. That the wiring is deferred at all is now held by a test.
+///
+/// Captures a [`glib::WeakRef`] of `window`, deliberately, not a strong clone
+/// (#1244 review round 2): `hytte::ui::on_surface_ready` connects `map` on
+/// `window` itself, so a strong clone in the closure it hands back is a
+/// reference cycle — the window owns a handler that owns the window — and
+/// `destroy()` (`close_all`) never breaks it, leaking the whole card subtree
+/// (and every live `bind()` inside it) on each monitor hot-plug. Same contract
+/// as `bind*`'s own `WeakRef` (`crates/hytte-reactive/src/bind.rs`, #224), one
+/// layer over. Don't "simplify" this back to a captured clone.
 fn on_map_or_now(window: &gtk::Window, apply: impl Fn(&gtk::Window) + 'static) {
-    let window_for_apply = window.clone();
-    hytte::ui::on_surface_ready(window, move |_surface| apply(&window_for_apply));
+    let weak = window.downgrade();
+    hytte::ui::on_surface_ready(window, move |_surface| {
+        if let Some(window) = weak.upgrade() {
+            apply(&window);
+        }
+    });
 }
 
 /// Mirror `source` ("does this side have a card on this connector?") into
@@ -2273,6 +2286,66 @@ mod gtk_tests {
         );
     }
 
+    /// [`on_map_or_now`] used to capture a **strong** clone of the very window
+    /// its closure is connected to (`hytte::ui::on_surface_ready`'s
+    /// `connect_map`), so the window owned a handler that owned the window — a
+    /// reference cycle (#1244 review round 2). `close_all`'s `window.destroy()`
+    /// drops GTK's own teardown references but cannot break a Rust-side
+    /// strong-ref cycle, so the whole card subtree — and every live `bind()`
+    /// inside it — leaked on each `monitors_changed` hot-plug: the #224 outcome
+    /// `nix/lint-bind-pins.py` exists to prevent, reached through `connect_map`
+    /// rather than a `bind*` call the lint actually scans.
+    ///
+    /// Carries a **control** — an identical window `on_map_or_now` never
+    /// touches — so "still alive after destroy" is attributable to the wiring
+    /// and not to some unrelated deferred-finalization artefact of the test
+    /// harness: without it, a `false` reading on the wired window alone would
+    /// not distinguish "no cycle" from "this harness never frees anything, and
+    /// the assertion is vacuous."
+    ///
+    /// The cycle exists the moment `connect_map` is connected, not only once
+    /// the window is mapped, so neither window is ever `set_visible`.
+    ///
+    /// **Falsification (run):** restoring the strong `window.clone()` capture
+    /// in [`on_map_or_now`] reddens `wired_alive` back to `true`; the `WeakRef`
+    /// fix reads `false`, with `the_input_region_is_wired_before_the_first_map`
+    /// (the deferral contract finding 2 pins) still green.
+    #[gtk::test]
+    fn on_map_or_now_does_not_pin_the_window_it_is_wired_to() {
+        adw::init().expect("libadwaita init");
+
+        // Control: same construction, same teardown, no `on_map_or_now` call —
+        // must free promptly on its own.
+        let control = surface();
+        let control_weak = control.downgrade();
+        control.destroy();
+        drop(control);
+        pump();
+        let control_alive = control_weak.upgrade().is_some();
+        assert!(
+            !control_alive,
+            "PROBE control_alive_after_destroy={control_alive} — the un-wired control must free \
+             on destroy(), or this test measures the test harness rather than the cycle"
+        );
+
+        // Wired: on_map_or_now connects `map` without ever presenting the
+        // window, matching install_side's own call shape.
+        let wired = surface();
+        let wired_weak = wired.downgrade();
+        on_map_or_now(&wired, |_| {});
+        wired.destroy();
+        drop(wired);
+        pump();
+        let wired_alive = wired_weak.upgrade().is_some();
+        assert!(
+            !wired_alive,
+            "PROBE wired_alive_after_destroy={wired_alive} — on_map_or_now's closure must not \
+             hold a strong reference to the window it is connected to via connect_map, or the \
+             window (and every bind() inside its subtree) outlives destroy() forever, leaking \
+             one sidebar per monitor per hot-plug (#1244 review round 2)"
+        );
+    }
+
     /// A `SidebarPanel` with no live subscriptions, for the [`PANELS`]-driven
     /// toggle tests. The two `JoinHandle`s are inert futures: nothing here
     /// exercises the zone/visibility machinery, only the toggle's own decision.
@@ -2313,8 +2386,8 @@ mod gtk_tests {
     /// flip the open state, so the surface cannot "open by itself" later when an
     /// unrelated plugin dials in.
     ///
-    /// **Falsification (run):** deleting the `if !non_empty { … return; }` guard
-    /// in [`toggle_right_on_focused`] turns this red.
+    /// **Falsification (run):** deleting the `if !non_empty && !state.get() { …
+    /// return; }` guard in [`toggle_right_on_focused`] turns this red.
     #[gtk::test]
     fn a_toggle_on_an_empty_right_sidebar_is_a_no_op() {
         adw::init().expect("libadwaita init");

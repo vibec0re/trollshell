@@ -582,7 +582,10 @@ pub(super) fn capped_effect_payload(
 }
 
 /// Whether a non-blocking outbound push should keep its producer task running.
-enum Push {
+///
+/// `pub(super)`, like [`OUTBOUND_CAPACITY`]/[`EFFECT_BURST`]/[`REGISTER_TIMEOUT`]
+/// above: exposed so `tests.rs` can pin the bounded-queue guarantee (#1166).
+pub(super) enum Push {
     /// The frame was sent, or dropped because the queue was momentarily full —
     /// either way keep going (the next change re-sends the latest value).
     Continue,
@@ -595,7 +598,9 @@ enum Push {
 /// reading) drops the frame rather than growing memory without bound — the stuck
 /// plugin is separately reaped by the liveness ping (it can't answer pings while
 /// not reading). `Closed` means the writer task exited; the producer stops.
-fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
+///
+/// `pub(super)` for the same reason as [`Push`] above (#1166).
+pub(super) fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
     match out.try_send(msg) {
         Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Push::Continue,
         Err(mpsc::error::TrySendError::Closed(_)) => Push::Stop,

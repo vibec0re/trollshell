@@ -41,8 +41,9 @@ use super::pump::{
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
-    MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
-    capped_hidden_on, enforce_capabilities, handle_conn, push_gate, state_key_capability,
+    MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, Push, REGISTER_TIMEOUT,
+    capped_hidden_on, enforce_capabilities, handle_conn, push_gate, push_state,
+    state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -12112,5 +12113,91 @@ async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
         matches!(brokered.effect, Effect::RaiseOsd { .. }),
         "expected the granted RaiseOsd to reach the broker, got {:?}",
         brokered.effect,
+    );
+}
+
+/// #435 measure 2, direct: [`push_state`]'s bounded outbound queue. A
+/// receiver that never drains sees the queue stop at [`OUTBOUND_CAPACITY`]
+/// with the producer still running — every push past capacity returns
+/// [`Push::Continue`] (the same "keep going" answer a successful send
+/// returns, per `push_state`'s own doc: a `Full` queue is *dropped*, not
+/// blocked or panicked on) rather than growing the queue or halting the
+/// caller — and a push made after the receiver drains one frame is actually
+/// enqueued, not just reported as `Continue`.
+///
+/// Unlike the wire-level tests above, this calls `push_state` directly on a
+/// bare, undrained `mpsc::Receiver` — the only way to pin this deterministically
+/// and fast. Driving it through a real `handle_conn` connection would need the
+/// *kernel's* Unix-socket buffer (tens of thousands of small frames on typical
+/// Linux defaults) to fill before the writer task's own `out_rx` ever
+/// backs up, since the writer drains this channel into that buffer near
+/// instantly regardless of whether the peer reads it — not a hermetic or
+/// fast unit test.
+///
+/// **Falsified** by the issue's named deletion: changing `push_state`'s
+/// `Err(TrySendError::Full(_))` arm from `Push::Continue` to `Push::Stop` (or
+/// making the channel unbounded so it's never reached at all). With the
+/// `Full` arm mapped to `Stop`, the first push past capacity below no longer
+/// matches `Push::Continue` and this test reds there.
+#[tokio::test]
+async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+
+    // Fill the queue exactly to capacity — every one of these is a plain
+    // successful send (the `Ok(())` arm of `try_send`, also `Push::Continue`).
+    for seq in 0..OUTBOUND_CAPACITY {
+        let result = push_state(&out_tx, HostMsg::Ping { seq: seq as u64 });
+        assert!(
+            matches!(result, Push::Continue),
+            "filling the queue to its own capacity must never report Stop",
+        );
+    }
+    assert_eq!(
+        out_rx.len(),
+        OUTBOUND_CAPACITY,
+        "the queue holds exactly its capacity after being filled",
+    );
+
+    // Past capacity: the queue must stop growing, and the producer must
+    // neither block (this is a plain sync call, so a hang would deadlock the
+    // test) nor panic — it just keeps reporting Continue.
+    const OVERFLOW: usize = 5;
+    for seq in 0..OVERFLOW {
+        let result = push_state(
+            &out_tx,
+            HostMsg::Ping {
+                seq: (OUTBOUND_CAPACITY + seq) as u64,
+            },
+        );
+        assert!(
+            matches!(result, Push::Continue),
+            "a push past capacity must still report Continue (dropped, not \
+             fatal) — the producer keeps running",
+        );
+    }
+    assert_eq!(
+        out_rx.len(),
+        OUTBOUND_CAPACITY,
+        "the queue must stop at OUTBOUND_CAPACITY: none of the {OVERFLOW} \
+         overflow pushes grew it",
+    );
+
+    // Draining one frame frees exactly one slot...
+    out_rx.recv().await.expect("a frame is queued to receive");
+    assert_eq!(out_rx.len(), OUTBOUND_CAPACITY - 1);
+
+    // ...and a further push is genuinely *enqueued* this time, not merely
+    // reported as Continue (which an overflow drop also reports) — the
+    // queue length is the only observable proof it wasn't dropped.
+    let result = push_state(&out_tx, HostMsg::Ping { seq: u64::MAX });
+    assert!(
+        matches!(result, Push::Continue),
+        "a push after a drain must report Continue",
+    );
+    assert_eq!(
+        out_rx.len(),
+        OUTBOUND_CAPACITY,
+        "a push made after a drain must actually be enqueued, back to full \
+         capacity — not silently dropped like an overflow push",
     );
 }

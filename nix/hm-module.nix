@@ -68,8 +68,13 @@ let
   #
   # `!lib.isDerivation` guards both halves: a derivation is an attrset too,
   # and while no `config.*` leaf is package-typed today, this helper is the
-  # one every later subsystem family (#1041) rides — recursing into a
-  # derivation's attrs is never what a TOML render wants.
+  # one every later subsystem family (#1041) rides. It is not cosmetic —
+  # measured, an unguarded recursion into `pkgs.hello` does not merely walk
+  # a big attrset, it **stack-overflows the evaluator** (`max-call-depth
+  # exceeded`), because a derivation's own attrs are cyclic (`all`, `out`,
+  # `drvAttrs`). With the guard the value is passed through untouched
+  # (`prune { p = pkgs.hello; } == { p = pkgs.hello; }`), which is what a
+  # `pkgs.formats.toml` render wants anyway.
   #
   # Pruning an all-`null` `display.<name>` away entirely is the right answer
   # rather than merely a side effect: the Rust reader already drops an empty

@@ -86,6 +86,8 @@
 //! `advance` and `animates` arms outright and differ only in what they hand
 //! the reconciler.
 
+use hytte::ui::gl_surface::GlProgram;
+
 mod dot_matrix;
 mod gauge;
 mod kind;
@@ -238,11 +240,160 @@ pub(super) fn with_gl_arm<T>(body: impl FnOnce() -> T) -> T {
 /// [`hytte::ui::gl_surface::gl_abandoned`] wins over the env: once a context
 /// has failed there is nothing to fall back *to*, and a `ScopeGl` that can
 /// never draw would leave a blank chip where the kit would have drawn a trace.
+///
+/// **The session-wide half of the answer**, and the whole of it only for a
+/// caller with no pipeline in hand: [`arm_for`] is what `preem_render::build`
+/// asks, because a driver that refuses one pipeline (#1232) may build every
+/// other one.
 pub(super) fn arm() -> Arm {
     if hytte::ui::gl_surface::gl_abandoned() {
         return Arm::Cpu;
     }
     configured_arm()
+}
+
+thread_local! {
+    /// The pipelines this session's driver has **refused to build** (#1232).
+    ///
+    /// A `Vec` and a linear scan rather than a set: there are five registered
+    /// programs in the whole shell, the list is empty on every healthy
+    /// session, and [`arm_for`] runs once per renderer *build* — hashing to
+    /// save at most four comparisons that never happen would be the wrong
+    /// trade in both directions.
+    ///
+    /// **Sticky for the session**, like [`hytte::ui::gl_surface::gl_abandoned`]
+    /// and deliberately unlike the per-surface latch it is fed from. That one
+    /// is per `GdkGLContext` and clears on unrealize, because "the same GLSL
+    /// compiles the same way" is an argument about one context; this one is a
+    /// decision about which *renderer* to build, and re-offering a pipeline
+    /// the driver has already refused — on every re-parent, each time
+    /// restarting the phosphor from black to find out — is worse on the desk
+    /// than a kit chip that stays a kit chip. The journal line names the
+    /// program, so the restart that undoes it is an informed one.
+    ///
+    /// **Keyed by program, although the refusal arrives keyed by
+    /// `(grid, program)`** — `hytte-ui`'s per-surface latch remembers the
+    /// grid too, and this deliberately drops it (PR #1243 review, LOW 3). A
+    /// compile or link refusal is a fact about the *source*, and the grid
+    /// reaches a shader as a uniform rather than as a splice, so a driver
+    /// that will not build `preem.scope` at 48×24 will not build it at 96×32
+    /// either: condemning the program is the honest generalisation, and the
+    /// alternative leaves every other-grid chip on GL to go blank one by one
+    /// as each surface asks for itself. The one case it over-reaches is a
+    /// genuinely grid-dependent refusal (an allocation the driver will not
+    /// make at a large grid), where a small chip loses the GPU for a refusal
+    /// that was not about it — and a kit chip is a far better outcome there
+    /// than a blank one.
+    ///
+    /// Thread-local, like every other latch this module and `hytte-ui` keep:
+    /// the GTK main thread is the only one that builds renderers, and a
+    /// `#[test]`'s own thread is then the blast radius of anything it refuses.
+    static REFUSED: std::cell::RefCell<Vec<GlProgram>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The arm a kit widget drawn by `program` should take: [`arm`], plus the one
+/// thing that is per pipeline rather than per session (#1232).
+///
+/// A `GtkGLArea` can come up with a perfectly good context and still be
+/// refused *one* pipeline — a compile or link failure, which `hytte-ui`
+/// latches per surface (#1180 item 2) so the driver is asked exactly once.
+/// Before this, nothing in the shell heard about that: the chip drew nothing
+/// at all for the life of the context while `arm()` kept answering `Gl`,
+/// because neither of the two failures it folds in had happened.
+///
+/// Narrower than a second `gl_abandoned`, deliberately: a refused
+/// `preem.scope` says nothing about `preem.gauge`, and a session that loses
+/// one pipeline keeps the GPU arm for every other kind on the bar.
+pub(super) fn arm_for(program: GlProgram) -> Arm {
+    if REFUSED.with_borrow(|refused| refused.contains(&program)) {
+        return Arm::Cpu;
+    }
+    arm()
+}
+
+/// The host's half of `hytte-ui`'s build-refusal hook (#1232): record the
+/// pipeline as refused, rebuild the chips that were drawing with it onto the
+/// CPU kit, say so once, and ask for one re-map.
+///
+/// Registered by [`install`]; also the function a test drives, through
+/// `hytte::ui::gl_surface::refuse_build` — the same entry point `GlSurface`
+/// itself calls, so a test exercises the production wire rather than a
+/// stand-in for it.
+///
+/// **Ordering, load-bearing, and it is `abandon_gl`'s lesson restated:**
+/// the program is recorded *before* the rebuild, because the rebuild resolves
+/// its arm through [`arm_for`], which reads that record. Reverse the two
+/// statements and every rebuilt chip lands back on the GL arm — the function
+/// silently accomplishes nothing, which is exactly the shape
+/// `preem_render::rebuild_gl_renderers_on_cpu` documents for the context
+/// hook.
+///
+/// **Idempotent per program**, which matters because the hook fires once per
+/// *surface*, not once per program: `hytte-ui`'s latch is per instance, so
+/// four chips of one kind refused in one frame call this four times. The
+/// second call finds the program recorded and returns — one sweep and one
+/// journal line instead of four of each.
+///
+/// **What the suite pins of that is the record being a set**, not the early
+/// return (PR #1243 review, LOW 2, measured both ways):
+/// [`tests::a_refused_pipeline_takes_only_its_own_kinds_arm`] reds if the
+/// `contains` check below is dropped so [`REFUSED`] grows an entry per
+/// surface, and stays **green** if `if !first { return; }` is deleted
+/// outright. That is honest rather than a gap to close: with the program
+/// already recorded, a second sweep finds no instance still on that pipeline
+/// and changes nothing at all, so the early return's whole effect is one
+/// duplicate journal line and one redundant re-map request — neither of which
+/// this suite can observe. It is kept because a bar with four chips of one
+/// kind would otherwise write four identical lines about one driver refusal.
+///
+/// A kind registered under **two** names is two refusals by construction and
+/// that is correct, not a bug to read into a doubled journal line: the
+/// `Marquee` runs the dot matrix's pipeline under its own name (see
+/// [`marquee`]), so a driver that will not build that source refuses it once
+/// per name, sweeps once per name, and each kind's chips recover on their own
+/// refusal.
+pub(super) fn on_build_refused(program: GlProgram, grid: (u32, u32), reason: &str) {
+    let first = REFUSED.with_borrow_mut(|refused| {
+        if refused.contains(&program) {
+            return false;
+        }
+        refused.push(program);
+        true
+    });
+    if !first {
+        return;
+    }
+    // Only the instances actually drawing with this pipeline, unlike the
+    // context hook's wholesale sweep: a gauge rebuilt for a scope's refusal
+    // would answer with the same `GaugeGl` it already had and restart its
+    // needle's spring for nothing.
+    let chips = super::preem_render::rebuild_refused_gl_renderers_on_cpu(program);
+    tracing::warn!(
+        program = program.0,
+        grid = format!("{}x{}", grid.0, grid.1),
+        reason,
+        chips,
+        "this driver will not build that preem GL pipeline; its chips fall back to the CPU kit \
+         for the rest of this session (restart the shell to offer it GL again)",
+    );
+    // The re-map is the other half, for the context hook's reason: a chip
+    // whose plugin has gone quiet gets no mapping pass of its own — a
+    // `persistence: 256` scope answers `animates()` with `false` from birth,
+    // #926's clock parks it, and the rebuilt kit renderer would never reach
+    // the screen. Guarded and deferred to idle there; both matter here too,
+    // since this runs inside a `GtkGLArea` render callback.
+    //
+    // **Not pinned by any test**, here or for the context hook above: deleting
+    // either call leaves the whole suite green (PR #1243 review, LOW 1). What
+    // it would take is a live `PluginHandles` in the registry (the guard
+    // `request_preem_repaint_all_when_live` reads) plus an idle turn, i.e. a
+    // host fixture no test in this tree stands up. The *rebuild* half is
+    // pinned — `preem_render`'s
+    // `a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl`
+    // probes it before any mapping pass — so what is unasserted is the nudge
+    // that puts an already-correct renderer on screen.
+    super::pump::request_preem_repaint_all_when_live();
 }
 
 /// The arm the **shader widget** takes — the kill switch, and only the kill
@@ -349,12 +500,19 @@ pub(super) fn install() {
         //    destroy widgets mid-render).
         super::pump::request_preem_repaint_all_when_live();
     });
+    // The third failure (#1232), and the only one of the three that is per
+    // *pipeline*: a context that came up fine and a driver that will not build
+    // one of the programs registered above. See [`on_build_refused`], which is
+    // the same two steps this hook takes, narrowed to the chips drawing with
+    // that one pipeline.
+    hytte::ui::gl_surface::set_build_refusal_handler(on_build_refused);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Arm, RENDERER_ENV, arm, arm_from_env, shader_arm, with_cpu_kill_switch, with_gl_arm,
+        Arm, GAUGE, REFUSED, RENDERER_ENV, SCOPE, arm, arm_for, arm_from_env, on_build_refused,
+        shader_arm, with_cpu_kill_switch, with_gl_arm,
     };
 
     /// **A failed GL context beats the switch, and keeps beating it** — the one
@@ -473,5 +631,74 @@ mod tests {
                 "{value:?} does not name the kill switch"
             );
         }
+    }
+
+    /// **#1232.** A refused pipeline takes **its own** kind's arm to the kit
+    /// and nobody else's.
+    ///
+    /// The third failure, and the first one that is not session-wide: the two
+    /// [`arm`] folds in — the kill switch and the context-failure latch — are
+    /// each an answer about the whole process, so before this the shell had
+    /// no way to say "this driver builds four of my five pipelines". It said
+    /// nothing at all instead, and the fifth kind's chips stayed blank.
+    ///
+    /// Driven through [`on_build_refused`] rather than by poking the latch,
+    /// because the record and the rebuild sweep are one decision: a version
+    /// that recorded the program *after* rebuilding would leave every chip on
+    /// the pipeline that will not build, and the assertions below would still
+    /// pass if this only checked the record.
+    ///
+    /// **Falsified** by having [`arm_for`] ignore its argument and return
+    /// [`arm`]: the second assertion reports `Gl` — which is the shipped
+    /// behaviour, i.e. #1232.
+    #[test]
+    fn a_refused_pipeline_takes_only_its_own_kinds_arm() {
+        let _ink = crate::plugins::tests::preem_ink_lock();
+        with_gl_arm(|| {
+            assert_eq!(arm_for(SCOPE), Arm::Gl, "the premise: the switch says GL");
+            assert_eq!(arm_for(GAUGE), Arm::Gl);
+
+            on_build_refused(SCOPE, (48, 24), "fragment shader failed to compile");
+
+            assert_eq!(
+                arm_for(SCOPE),
+                Arm::Cpu,
+                "a pipeline this driver refused is not offered to it again",
+            );
+            assert_eq!(
+                arm_for(GAUGE),
+                Arm::Gl,
+                "…and every other pipeline keeps the GPU: the refusal is per program, not a \
+                 second `gl_abandoned`",
+            );
+            assert_eq!(
+                arm(),
+                Arm::Gl,
+                "…which is exactly what the session-wide answer still says",
+            );
+
+            // The record is a **set**, which is the observable half of the
+            // idempotence guard (PR #1243 review, LOW 2). The hook fires once
+            // per *surface* — `hytte-ui`'s latch is per instance — so a bar
+            // with four scope chips calls this four times in one frame, and a
+            // record that appended per call would grow for the life of the
+            // session and lengthen every `arm_for` scan with it.
+            //
+            // Measured: dropping the `contains` check reds this (`left: 2`);
+            // deleting `if !first { return; }` does **not** red anything, and
+            // `on_build_refused`'s doc says so rather than claiming coverage
+            // it has not got.
+            on_build_refused(SCOPE, (96, 32), "the same driver, a second chip");
+            assert_eq!(
+                REFUSED.with_borrow(Vec::len),
+                1,
+                "a program already known refused is recorded once, not once per surface",
+            );
+            assert_eq!(
+                arm_for(SCOPE),
+                Arm::Cpu,
+                "…and a second refusal of the same pipeline does not un-refuse it",
+            );
+        });
     }
 }

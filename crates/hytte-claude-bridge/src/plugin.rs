@@ -715,18 +715,23 @@ fn extra_row(extra: &ExtraUsage) -> Node {
 ///
 /// The failure sentence is routed through [`usage_failure_sentence`] — the
 /// same mode adjustment the chip's [`tooltip`] applies — rather than reading
-/// [`UsageError::sentence`] directly, so the panel one click beneath the chip
-/// can never contradict it (#1254's review, N2: an API-key bridge's hover said
-/// "usage limits are a subscription feature" while the panel still told the
-/// same reader to `run claude once to sign in`).
+/// [`UsageError::sentence`] directly, so on the *failure* arm the panel one
+/// click beneath the chip can never contradict it (#1254's review, N2: an
+/// API-key bridge's hover said "usage limits are a subscription feature"
+/// while the panel still told the same reader to `run claude once to sign
+/// in`). The staleness arm is the one place they can still disagree — the
+/// chip drops its meters and names when the numbers stopped being current,
+/// while this function paints every bar at its old value under an "updated
+/// … ago" header with no staleness call at all — and that gap is
+/// pre-existing (#1254 N4/N5), not something this routing touches.
 fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
     let mut children = vec![header(report, now)];
     match report {
         None => children.push(label("fetching usage…", &["dim-label"])),
         Some(report) => match &report.outcome {
-            Outcome::Failed(_) => {
-                let sentence = usage_failure_sentence(status, report)
-                    .unwrap_or_else(|| report.error().unwrap_or_default());
+            Outcome::Failed(error) => {
+                let sentence =
+                    usage_failure_sentence(status, report).unwrap_or_else(|| error.sentence());
                 children.push(label(&sentence, &["warning"]));
             }
             Outcome::Ok(usage) => {
@@ -774,7 +779,7 @@ mod tests {
     use super::{
         BridgeChip, CHIP_BTN, CLAUDE_ICON, MAX_CHIP_METERS, PANEL_ROOT_ID, Tick, capped, chip,
         chip_limits, counts_label, health_icon, meter_tooltip, mode_label, mode_name, panel,
-        severity_class, severity_role, tooltip, usage_failure_sentence,
+        severity_class, severity_role, tooltip,
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
@@ -1366,41 +1371,66 @@ mod tests {
     /// limits are a subscription feature" while the panel one click beneath
     /// it still said "run `claude` once to sign in").
     ///
-    /// One test per mode so a regression names which mode broke. Only the API
-    /// arm below can actually go red on today's one special case, but the
-    /// other two pin that "agree" does not silently mean "the panel forgot
-    /// the sentence entirely".
-    fn assert_panel_agrees_with_chip_hover(mode: Mode, keyed: bool) {
+    /// One test per mode, each against the LITERAL wording for its mode —
+    /// not `usage_failure_sentence`'s own answer. Deriving `expected` from
+    /// that function (both surfaces under test call it) made the assertion
+    /// `f(x) == f(x)`: it agreed with itself under a mutation that swapped
+    /// the mode adjustment onto the wrong modes, so no test named which mode
+    /// broke, contrary to what this doc claimed (#1278's review, F1).
+    fn assert_panel_agrees_with_chip_hover(
+        mode: Mode,
+        keyed: bool,
+        expect_subscription_note: bool,
+    ) {
         let error = UsageError::NoCredentials("/home/a/.claude/.credentials.json".into());
         let report = Report {
             at: now() - 30,
-            outcome: Outcome::Failed(error),
+            outcome: Outcome::Failed(error.clone()),
         };
         let board = status(mode, keyed, 9, 0, Last::Ok);
-        let expected =
-            usage_failure_sentence(&board, &report).expect("a failed report has a sentence");
 
         let hover = root_tooltip(&chip_state(&board, Some(&report))).expect("a hover");
-        assert!(
-            hover.ends_with(&expected),
-            "{mode:?} hover does not carry the failure sentence: {hover:?}"
-        );
-
         let panel_text = texts(&panel(&board, Some(&report), now()));
-        assert!(
-            panel_text.contains(&expected),
-            "{mode:?} panel does not carry the failure sentence: {panel_text:?}"
-        );
+
+        if expect_subscription_note {
+            assert!(
+                hover.contains("usage limits are a subscription feature"),
+                "{mode:?} hover: {hover:?}"
+            );
+            assert!(
+                !hover.contains("run `claude` once"),
+                "{mode:?} hover: api mode never spawns claude: {hover:?}"
+            );
+            assert!(
+                panel_text
+                    .iter()
+                    .any(|t| t.contains("usage limits are a subscription feature")),
+                "{mode:?} panel: {panel_text:?}"
+            );
+            assert!(
+                !panel_text.iter().any(|t| t.contains("run `claude` once")),
+                "{mode:?} panel: api mode never spawns claude: {panel_text:?}"
+            );
+        } else {
+            assert!(
+                hover.ends_with(&error.sentence()),
+                "{mode:?} hover does not carry the failure sentence: {hover:?}"
+            );
+            assert!(
+                panel_text.contains(&error.sentence()),
+                "{mode:?} panel does not carry the failure sentence: {panel_text:?}"
+            );
+        }
     }
 
     #[test]
     fn the_panel_agrees_with_the_chip_hover_in_subscription_mode() {
-        assert_panel_agrees_with_chip_hover(Mode::Subscription, false);
+        assert_panel_agrees_with_chip_hover(Mode::Subscription, false, false);
     }
 
     #[test]
     fn the_panel_agrees_with_the_chip_hover_in_reprompt_mode() {
-        assert_panel_agrees_with_chip_hover(Mode::Reprompt, false);
+        assert_panel_agrees_with_chip_hover(Mode::Reprompt, false, false);
     }
 
     /// The mode that actually differs: falsify by reverting `panel`'s
@@ -1410,7 +1440,7 @@ mod tests {
     /// subscription-feature note the hover gives in `api` mode.
     #[test]
     fn the_panel_agrees_with_the_chip_hover_in_api_mode() {
-        assert_panel_agrees_with_chip_hover(Mode::Api, true);
+        assert_panel_agrees_with_chip_hover(Mode::Api, true, true);
     }
 
     /// No error text anywhere in the chip may carry a bearer token. The arms

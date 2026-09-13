@@ -172,14 +172,23 @@ self:
 
           The window reads two well-known names under it, in this order:
 
-          - `trust-bundle.pem` — the hive's anchors. It opens one bounded TLS
+          - `trust-bundle.pem` — the hive's anchors. It opens one TLS
             connection to the agent's gateway, verifies the chain that gateway
             presents against these anchors, and then pins that leaf for that
             host only. Rotation-safe, because what it pins is what the gateway
-            presented *this launch*.
+            presented *this launch*. That connection happens on the window's
+            main thread before the page mounts, so it is bounded in wall clock
+            (`verify::PROBE_DEADLINE`, 8 s) and the window does not repaint
+            while it runs; moving it off that thread is #1246.
           - `gateway.pem` — the file nginx serves verbatim, written leaf-first
             with the CA appended and re-signed weekly. Pinned directly, with no
             probe.
+
+          Pinning only the **leaf** is enough for a gateway that presents a
+          whole chain: WebKit's per-host exception compares a SHA-256 over the
+          certificate's own DER, not over the chain
+          (`SoupNetworkSession.cpp`'s `HostTLSCertificateSet`), so neither
+          route has to reconstruct what the server will send.
 
           Neither is read unless it is readable, and neither changes the
           machine's trust store or the session's TLS-error policy (which stays

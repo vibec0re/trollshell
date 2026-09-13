@@ -706,6 +706,20 @@ whole point of the window.
       environment, and a variable that only landed in `hm-session-vars.sh` is
       invisible to it (#568's lesson).
 
+      **When each path takes effect differs, and it is the likeliest reason
+      this looks broken right after a rebuild.** The NixOS module's
+      `environment.sessionVariables` reaches the user manager through pam_env
+      on the `systemd-user` PAM service (`security.pam.services.systemd-user.setEnvironment`,
+      default true), i.e. when `user@<uid>.service` starts — so on a NixOS
+      deploy it is there **from the next login**, not from `nixos-rebuild
+      switch`. The home-manager path has no such wait: activation runs
+      `systemctl --user daemon-reload`, and environment generators re-run on
+      reload, so `environment.d/10-home-manager.conf` is live for anything
+      started afterwards. The shipped niri session imports only
+      `WAYLAND_DISPLAY XDG_CURRENT_DESKTOP` (`etc/niri/session.kdl`), so there
+      is no third route that would paper over this. Log out and back in before
+      concluding the option does not work.
+
 - [ ] **(#1234)** **Rotation.** Force the hive to re-sign
       (`systemctl restart hive-tls-ca.service`, or wait out the weekly timer),
       then **close and reopen** the window. It must still load: route 2 pins
@@ -724,9 +738,30 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
 - [ ] **(#1234)** **A gateway that is down does not read as a bad
       certificate.** Stop nginx on the hive (leave `host.sock` up, so the
       header still populates and the window still gets a URL). The card must
-      say `That is a connection problem rather than a certificate one`, and
-      the window must not freeze for more than `verify::PROBE_TIMEOUT_SECS`
-      (5 s) while it finds out.
+      say `That is a connection problem rather than a certificate one`.
+- [ ] **(#1234)** **The freeze is bounded, and only the deadline bounds it.**
+      The probe runs on the GTK main thread, so while it runs nothing
+      repaints. Two constants, and only one of them is a bound:
+      `verify::PROBE_IO_TIMEOUT_SECS` (5 s) is GIO's **per-read** socket
+      timeout, which every arriving byte resets — measured against a peer
+      dribbling one byte per 1.5 s, it let the window sit for **21.01 s**
+      (#1242 review). `verify::PROBE_DEADLINE` (8 s) is the real one: a
+      watchdog thread cancels the whole probe — connect, handshake, and the
+      name resolution `connect_to_host` does inside itself — when it expires,
+      and the card then says `the probe was cancelled after 8.0s`. The same
+      dribbling peer now returns in ~2 s against a 2 s budget in
+      `tls_tests::a_dribbling_peer_cannot_hold_the_probe_past_its_deadline`.
+      Two things sit outside it: the anchors file's own read and parse
+      (`TlsFileDatabase::new` takes no cancellable — a local file read), and a
+      `getaddrinfo` already in flight, which GIO abandons rather than aborts
+      (the call returns on time; the pool thread finishes and discards).
+      To check it by hand, point the hive's URL at a host that accepts TCP and
+      says nothing (`nc -l` on the gateway's port with nginx stopped), open
+      the window, and time it: **grab the window and drag it** — it should
+      become responsive within ~8 s, not 20+. Moving the probe off the main
+      thread entirely, with a "verifying…" state on the card, is
+      [#1246](https://github.com/vibec0re/trollshell/issues/1246); until that
+      lands, a bounded freeze is what this is.
 - [ ] **(#950/#1234)** **TLS — the inline error state names the way out.**
       With every automatic route removed (e.g.
       `TROLLSHELL_AGENT_WINDOW_TLS_DIR=/nonexistent`), **expect the window to
@@ -739,10 +774,11 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
       markup-escaping was missing, so GTK silently dropped the whole
       description).
   1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
-     Nothing to do: set
-     `programs.trollshell.agentWindow.hiveTlsStateDir` (it already defaults to
-     hyperhive's own `tls.stateDir` when that module is on this host) and the
-     window reads `trust-bundle.pem` and `gateway.pem` itself.
+     **Nothing to do**: `programs.trollshell.agentWindow.hiveTlsStateDir`
+     already defaults to hyperhive's own `tls.stateDir` when that module is on
+     this host, and the window reads `trust-bundle.pem` and `gateway.pem` out
+     of it itself. Set the option by hand only under home-manager, where the
+     NixOS option tree is not in scope to default from.
   2. **A remote hive, or a host you do not configure.** Copy that hive's
      `trust-bundle.pem` over and name it:
      `TROLLSHELL_AGENT_WINDOW_CA=/etc/ssl/hive/trust-bundle.pem`. The window

@@ -84,7 +84,9 @@ use gtk::gio;
 use gtk::gio::prelude::*;
 use gtk::glib;
 
-use crate::verify::{self, Env, EnvOwned, PROBE_TIMEOUT_SECS, Presented, Route, describe_flags};
+use crate::verify::{
+    self, Env, EnvOwned, PROBE_DEADLINE, PROBE_IO_TIMEOUT_SECS, Presented, Route, describe_flags,
+};
 
 /// Points the window at the certificate to accept for the agent's host.
 ///
@@ -289,7 +291,13 @@ fn pin_from_file(pem: &Path, source: &str, host: &str, port: u16) -> Resolved {
 /// Route 2: verify what `host` presents against `bundle`, then pin it.
 fn verify_then_pin(bundle: &Path, source: &str, host: &str, port: u16) -> Resolved {
     let shown = bundle.display();
-    match verify::probe(bundle, identity_host(host), port, PROBE_TIMEOUT_SECS) {
+    match verify::probe(
+        bundle,
+        identity_host(host),
+        port,
+        PROBE_IO_TIMEOUT_SECS,
+        PROBE_DEADLINE,
+    ) {
         Presented::Trusted(pem) => {
             tracing::info!(
                 bundle = %shown,
@@ -334,6 +342,23 @@ fn verify_then_pin(bundle: &Path, source: &str, host: &str, port: u16) -> Resolv
                 "could not check {host} against the anchors in {shown} ({source}): {why}. That is \
                  a connection problem rather than a certificate one — the hive's gateway may be \
                  down while its host.sock is up"
+            )))
+        }
+        // **No connection was attempted**, so the sentence above would be a
+        // lie: it is the anchors file itself that is unusable, and naming it
+        // plus the parse error is the whole of what an operator with a typo
+        // needs (#1242 review, finding 2).
+        Presented::UnusableAnchors(why) => {
+            tracing::warn!(
+                bundle = %shown,
+                host,
+                %why,
+                "the anchors file could not be used, so nothing was contacted — this says nothing \
+                 about the hive"
+            );
+            Resolved::system_store(Some(format!(
+                "could not use the anchors in {shown} ({source}): {why}. Nothing was contacted, \
+                 so this says nothing about whether the hive is up — fix or re-point that file"
             )))
         }
     }
@@ -417,8 +442,16 @@ pub fn failure_description(host: &str, tried: Option<&str>) -> String {
     glib::markup_escape_text(&failure_message(host, tried)).to_string()
 }
 
-/// The host part of an `http(s)` URL — no port, no userinfo, IPv6 literal kept
-/// with its brackets (which is the form `WebKit`'s host matching uses).
+/// The host part of an `http(s)` URL — no port, no userinfo, IPv6 literal
+/// **kept in its brackets**, which is the form a URL spells it in and the form
+/// to show a human.
+///
+/// It is **not** the form to hand any API: `GNetworkAddress` and
+/// `WebKit`'s per-host certificate exception both want the bare literal
+/// ([`identity_host`]), and `g_socket_client_connect_to_host` wants the
+/// bracketed one *with* the port ([`crate::verify::connect_target`]). This
+/// function is the single source all three derive from; none of them takes its
+/// output unchanged.
 ///
 /// Hand-rolled rather than a `url` crate dependency: this is the only URL
 /// parsing in the window, it runs on one string the hive produced, and a
@@ -444,12 +477,31 @@ pub fn host_of(url: &str) -> Option<&str> {
     if host.is_empty() { None } else { Some(host) }
 }
 
-/// The same host **without** its brackets, which is what GIO's resolver and
-/// `GNetworkAddress` want.
+/// The same host **without** its brackets — what `GNetworkAddress` wants, and
+/// what `WebKit`'s per-host certificate exception wants **too**.
 ///
-/// `WebKit`'s per-host exception keys on the bracketed form, GIO's on the bare
-/// literal; both spellings come from one [`host_of`] call, so the difference
-/// lives here rather than at two call sites.
+/// # Both, not one each (#1242 review, finding 3)
+///
+/// This function's docs used to say `WebKit` keyed that exception on the
+/// *bracketed* form. It does not, and the mistake was load-bearing: the pin
+/// was stored under `[::1]` and looked up as `::1`, so an IPv6 hive got a dead
+/// pin on every route and nothing anywhere reported it.
+/// `SoupNetworkSession.cpp:314-327` (webkitgtk 2.52.6) carries a comment
+/// written for exactly this error —
+///
+/// ```text
+/// // If the host component of the URL is an IPv6 address, it will be
+/// // surrounded by [ ] brackets. We have to remove them because they're part
+/// // of the WTF::URL's host component … but not part of the host passed to
+/// // allowSpecificHTTPSCertificateForHost.
+/// ```
+///
+/// — while `allowSpecificHTTPSCertificateForHost` (`:341-344`) stores under
+/// whatever string it is handed, verbatim. So this spelling is the one to
+/// store; see [`crate::webview`]'s `pin_for`, which is where that happens.
+///
+/// The bracketed [`host_of`] spelling is for the **card**, where a human reads
+/// it; [`crate::verify::connect_target`] is the third form.
 #[must_use]
 pub fn identity_host(host: &str) -> &str {
     host.strip_prefix('[')
@@ -587,7 +639,7 @@ mod tests {
     ///
     /// The reviewer wrote it as `gio::TlsCertificate::from_file(…).is_same(…)`.
     /// That shape now exists, as
-    /// `verify::gtk_tests::gateway_pem_pins_the_leaf_and_a_ca_first_file_does_not`
+    /// `verify::tls_tests::gateway_pem_pins_the_leaf_and_a_ca_first_file_does_not`
     /// — #1234 put `glib-networking` in both the devShell and the
     /// `system-tests` closure, so `from_file` finally has a backend. This one
     /// stays as the **hermetic** half: it asserts the same fact one layer
@@ -807,7 +859,8 @@ mod tests {
     }
 
     /// The probe connects to the port the URL names, or the scheme's default —
-    /// and `WebKit`'s bracketed IPv6 host becomes GIO's bare literal.
+    /// and the URL's bracketed IPv6 host becomes the bare literal both
+    /// `GNetworkAddress` and `WebKit`'s pin lookup want.
     ///
     /// Mutation (re-run this round, red): take the **first** colon in the
     /// authority as the port separator and the `[::1]` rows red with a parse

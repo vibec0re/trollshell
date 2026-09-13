@@ -48,6 +48,16 @@
 //! stale under an already-open window simply fails to match — the pin is per
 //! launch, so reopening fixes it, and the card names the path it tried.
 //!
+//! # What the pin actually compares (and why chain length does not matter)
+//!
+//! Verified for #1242's review, because it is the one fact that could have
+//! made route 2 decorative: `HostTLSCertificateSet`
+//! (`SoupNetworkSession.cpp:68-97`, webkitgtk 2.52.6) keys on a **SHA-256 of
+//! the certificate's own DER** — the `"certificate"` property — and not on the
+//! chain. So route 2's leaf-only [`Presented::Trusted`] PEM and route 3's
+//! leaf-plus-CA `gateway.pem` both match a gateway presenting a full chain,
+//! and neither has to reconstruct what the server will send.
+//!
 //! An **explicitly set** env variable always takes its route, readable or not:
 //! a variable someone typed is a statement of intent, and falling through it
 //! silently is how an operator ends up debugging the wrong file. The
@@ -96,16 +106,69 @@ pub const BUNDLE_NAME: &str = "trust-bundle.pem";
 /// first with the CA appended**, re-signed weekly by `hive-tls-ca.service`.
 pub const GATEWAY_NAME: &str = "gateway.pem";
 
-/// How long the route-2 probe may spend reaching the gateway, in seconds.
+/// The probe's **per-I/O** socket timeout, in seconds
+/// (`g_socket_client_set_timeout`).
 ///
-/// It is a blocking handshake on the GTK main thread, so the bound is what
-/// keeps a gateway that is down from freezing the window. It is affordable
-/// because of *when* it runs: the window only resolves a policy after
-/// `host.sock` has answered with this agent's URL, so the hive daemon is up
-/// and the connection is normally a loopback handshake measured in
-/// milliseconds. The timeout covers the one case left — the daemon up and the
-/// gateway not.
-pub const PROBE_TIMEOUT_SECS: u32 = 5;
+/// This is what it says on the tin and no more: it fires when a single read or
+/// write blocks this long, and **every byte that arrives resets it**. It is not
+/// a bound on how long the probe takes — see [`PROBE_DEADLINE`], which is.
+///
+/// Measured through [`probe`] on `77b3e84f`, when this was the only limit
+/// (#1242 review, finding 1):
+///
+/// | peer | elapsed |
+/// | --- | --- |
+/// | accepts TCP, never speaks | 5.16 s — this timeout, honoured |
+/// | a TLS record header then one byte every 1.5 s | **21.01 s** |
+///
+/// A dribbling peer is not only a hostile story: a slow or lossy link to a
+/// remote hive behaves exactly like that, and the remote hive is the case
+/// route 2 is *recommended* for.
+pub const PROBE_IO_TIMEOUT_SECS: u32 = 5;
+
+/// The **total** wall-clock the probe may take, after which it is cancelled
+/// and reported as unreachable.
+///
+/// Unlike [`PROBE_IO_TIMEOUT_SECS`] this one is a real bound, because it is
+/// enforced by a watchdog thread holding a [`gio::Cancellable`] that every
+/// blocking call here is given.
+///
+/// **Measured** (`tls_tests::a_dribbling_peer_cannot_hold_the_probe_past_its_deadline`):
+/// the peer that held `77b3e84f` for 21.01 s returns in ~2.0 s against a 2 s
+/// budget, and the card says the probe was cancelled rather than blaming the
+/// peer for a verdict it never gave.
+///
+/// What it covers:
+///
+/// - the TCP connect, and the whole TLS handshake — byte-dribbling peer
+///   included. This is the measured half.
+/// - **name resolution**, by construction rather than by measurement. It
+///   happens *inside* `g_socket_client_connect_to_host`, before the socket the
+///   I/O timeout is set on exists, which is why that timeout never bounded DNS
+///   at all; the cancellable goes into that same call, and GIO's threaded
+///   resolver runs its blocking lookup under a `GTask` with return-on-cancel,
+///   so cancelling makes *this* call return while the `getaddrinfo` behind it
+///   runs to completion in GIO's thread pool and throws its answer away. That
+///   is GIO's contract, not a number taken here — a resolver slow enough to
+///   matter needs a stalled nameserver, which these tests have no hermetic way
+///   to stand up. [#1246] resolves on a worker and retires the question.
+///
+/// What it does **not** cover: [`gio::TlsFileDatabase::new`], the local read
+/// and parse of the anchors file, which takes no cancellable. That is a
+/// `read()` of a file the caller already opened once
+/// ([`is_readable`]), so it is bounded by the filesystem and nothing else.
+///
+/// [#1246]: https://github.com/vibec0re/trollshell/issues/1246
+///
+/// # It bounds the freeze, it does not remove it
+///
+/// The probe still runs **on the GTK main thread** (`window.rs`'s `load_page`
+/// ← `apply` ← the `glib::spawn_future_local` pump), so for up to this long
+/// nothing repaints and no button responds. Moving it to a worker with a
+/// "verifying…" state on the card is
+/// [#1246](https://github.com/vibec0re/trollshell/issues/1246); this constant
+/// is the honest bound until then, not a substitute for it.
+pub const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Where a route's file came from, for the sentence the card shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,13 +337,108 @@ pub enum Presented {
         /// Which checks failed — [`describe_flags`] turns it into words.
         flags: gio::TlsCertificateFlags,
     },
-    /// No chain was ever judged: no route to the host, no TLS on the port, the
-    /// timeout, or an anchors file that could not be opened as a database.
+    /// No chain was ever judged: no route to the host, no TLS on the port, or
+    /// the deadline.
     ///
     /// **This is not a trust failure** and the card says so — it is the
     /// difference between "the hive's certificate is wrong" and "the hive's
     /// gateway did not answer".
     Unreachable(String),
+    /// The anchors file itself could not be loaded — **nothing was
+    /// contacted**.
+    ///
+    /// Split out of [`Presented::Unreachable`] by #1242's review (finding 2):
+    /// a `TROLLSHELL_AGENT_WINDOW_CA` naming a file that is not a PEM produced
+    /// *"That is a connection problem rather than a certificate one — the
+    /// hive's gateway may be down"*, about a gateway no socket had been opened
+    /// to. It is a third category — **your anchors file is unusable** — and it
+    /// is the one an operator with a typo actually hits, so it gets its own
+    /// sentence naming the file and the parse error.
+    ///
+    /// It is also what a launch with **no GIO TLS backend at all** takes, which
+    /// is what that wrong sentence would have been permanently, had
+    /// `nix/agent-window.nix` not learned to put `glib-networking` on
+    /// `GIO_EXTRA_MODULES` in this same PR.
+    UnusableAnchors(String),
+}
+
+/// A wall-clock bound on a run of blocking GIO calls, enforced by a watchdog
+/// thread that cancels them.
+///
+/// GIO's own knob — `g_socket_client_set_timeout` — is per-I/O and resets on
+/// every byte, so it cannot bound anything against a peer that keeps sending
+/// (#1242 review, finding 1: 21.01 s measured against a documented 5 s). A
+/// [`gio::Cancellable`] can, because `g_cancellable_cancel` is thread-safe —
+/// gio-rs marks the type `Send + Sync` for exactly that reason — and every
+/// blocking call in [`probe`] takes one.
+///
+/// The watchdog parks on a channel rather than sleeping the whole budget, so a
+/// probe that finishes in 3 ms takes the thread down with it instead of
+/// leaving one parked for the remaining seconds: dropping this value drops the
+/// sender, the `recv_timeout` returns `Disconnected`, and [`Drop`] joins.
+struct Deadline {
+    /// Dropped on the way out, which is what wakes the watchdog early.
+    done: Option<std::sync::mpsc::Sender<()>>,
+    /// `None` only if the thread could not be spawned, in which case there is
+    /// no deadline and [`Deadline::expired`] is always false — the per-I/O
+    /// timeout is then the only limit, as it was before #1242.
+    watchdog: Option<std::thread::JoinHandle<()>>,
+    /// Handed to every blocking call; cancelled when the budget runs out.
+    cancellable: gio::Cancellable,
+}
+
+impl Deadline {
+    /// Arm a watchdog for `budget`.
+    fn arm(budget: std::time::Duration) -> Self {
+        let cancellable = gio::Cancellable::new();
+        let (done, idle) = std::sync::mpsc::channel::<()>();
+        let alarm = cancellable.clone();
+        let watchdog = std::thread::Builder::new()
+            .name("agent-window-probe-deadline".to_owned())
+            .spawn(move || {
+                if matches!(
+                    idle.recv_timeout(budget),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    alarm.cancel();
+                }
+            })
+            .map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "no thread for the TLS probe's deadline; the per-I/O timeout is the only \
+                     limit this launch has"
+                );
+            })
+            .ok();
+        Self {
+            done: Some(done),
+            watchdog,
+            cancellable,
+        }
+    }
+
+    /// The cancellable to hand every blocking call.
+    fn cancellable(&self) -> &gio::Cancellable {
+        &self.cancellable
+    }
+
+    /// Whether the budget ran out — i.e. whether the error that just came back
+    /// is this deadline's doing rather than the peer's.
+    fn expired(&self) -> bool {
+        self.cancellable.is_cancelled()
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        // Wake the watchdog with `Disconnected` before joining it, or the join
+        // waits out the whole budget on every successful probe.
+        drop(self.done.take());
+        if let Some(watchdog) = self.watchdog.take() {
+            drop(watchdog.join());
+        }
+    }
 }
 
 /// Open a TLS connection to `host:port`, verify the chain it presents against
@@ -306,33 +464,78 @@ pub enum Presented {
 /// a human, and a probe that could say yes to a certificate the anchors
 /// refused would be trust on first use with the human taken out.
 ///
+/// The identity argument to `TlsClientConnection::new` is load-bearing in both
+/// directions, measured: glib-networking treats a **missing** server identity
+/// as a *failed* identity check, not a skipped one, so dropping it does not
+/// quietly widen anything — it sets `BAD_IDENTITY` on every connection and
+/// three of this module's tests go red. See
+/// `tls_tests::a_certificate_that_does_not_name_the_host_is_refused_for_that_reason`,
+/// which records that measurement against the #1242 review's contrary claim.
+///
 /// The connection is closed either way; nothing is sent over it and nothing is
 /// read from it.
+///
+/// # What bounds it
+///
+/// `io_timeout_secs` is GIO's own per-read knob and bounds nothing on its own
+/// (see [`PROBE_IO_TIMEOUT_SECS`]). `budget` is the real one: a [`Deadline`]
+/// is armed before the first blocking call and its cancellable is handed to
+/// every one of them, so name resolution, the connect and the whole handshake
+/// together cannot exceed it. Only [`gio::TlsFileDatabase::new`] sits outside,
+/// because it takes no cancellable.
 #[must_use]
-pub fn probe(bundle: &Path, host: &str, port: u16, timeout_secs: u32) -> Presented {
+pub fn probe(
+    bundle: &Path,
+    host: &str,
+    port: u16,
+    io_timeout_secs: u32,
+    budget: std::time::Duration,
+) -> Presented {
     let database = match gio::TlsFileDatabase::new(bundle) {
         Ok(db) => db,
         Err(e) => {
-            return Presented::Unreachable(format!(
-                "the anchors in {} could not be loaded ({e})",
-                bundle.display()
+            // NOT `Unreachable`: nothing has been contacted yet, and saying
+            // "the gateway may be down" about a file that will not parse sends
+            // the operator after the wrong thing (#1242 review, finding 2).
+            //
+            // The path is deliberately *not* repeated here: the caller's
+            // sentence opens with it and GIO's own message carries it, so
+            // spelling it a third time is how a card ends up printing one long
+            // path three times to say one thing.
+            return Presented::UnusableAnchors(format!(
+                "it could not be loaded as a certificate database ({e})"
             ));
         }
     };
 
+    // Armed before the first blocking call, so it covers DNS too — which the
+    // per-I/O timeout never did, since `connect_to_host` resolves before the
+    // socket that timeout applies to exists.
+    let deadline = Deadline::arm(budget);
+    let unreachable = |why: String| {
+        if deadline.expired() {
+            Presented::Unreachable(format!(
+                "{why}; the probe was cancelled after {budget:.1?} — the window blocks while it \
+                 runs, so it is bounded rather than allowed to finish"
+            ))
+        } else {
+            Presented::Unreachable(why)
+        }
+    };
+
     let client = gio::SocketClient::new();
-    // Covers the connect *and* the handshake reads: `g_socket_client_set_timeout`
-    // sets the I/O timeout on the sockets it creates, which the TLS connection
-    // then wraps.
-    client.set_timeout(timeout_secs);
+    // GIO's per-read timeout. It is **not** the bound — every byte resets it,
+    // which is how a dribbling peer held the main thread for 21 s before
+    // #1242's review measured it. `deadline` is what bounds this function.
+    client.set_timeout(io_timeout_secs);
     let connection = match client.connect_to_host(
         &connect_target(host, port),
         port,
-        None::<&gio::Cancellable>,
+        Some(deadline.cancellable()),
     ) {
         Ok(c) => c,
         Err(e) => {
-            return Presented::Unreachable(format!("could not reach {host}:{port} ({e})"));
+            return unreachable(format!("could not reach {host}:{port} ({e})"));
         }
     };
 
@@ -340,7 +543,10 @@ pub fn probe(bundle: &Path, host: &str, port: u16, timeout_secs: u32) -> Present
     let tls = match gio::TlsClientConnection::new(&connection, Some(&identity)) {
         Ok(t) => t,
         Err(e) => {
-            return Presented::Unreachable(format!("no TLS backend to check {host} with ({e})"));
+            return Presented::UnusableAnchors(format!(
+                "there is no GIO TLS backend to check {host} with ({e}) — glib-networking must be \
+                 on GIO_EXTRA_MODULES"
+            ));
         }
     };
     tls.set_database(Some(&database));
@@ -357,36 +563,41 @@ pub fn probe(bundle: &Path, host: &str, port: u16, timeout_secs: u32) -> Present
         false
     });
 
-    let verdict = match tls.handshake(None::<&gio::Cancellable>) {
+    let verdict = match tls.handshake(Some(deadline.cancellable())) {
         Ok(()) => match tls.peer_certificate() {
             Some(leaf) => match leaf.certificate_pem() {
                 Some(pem) => Presented::Trusted(pem.to_string()),
-                None => Presented::Unreachable(format!(
+                None => unreachable(format!(
                     "{host} was verified but its certificate could not be re-encoded"
                 )),
             },
-            None => {
-                Presented::Unreachable(format!("{host} completed a handshake with no certificate"))
-            }
+            None => unreachable(format!("{host} completed a handshake with no certificate")),
         },
+        // The flags take precedence over the deadline: an `accept-certificate`
+        // that already fired is a **judgement**, and reporting it as "the
+        // probe ran out of time" would lose the one thing worth saying.
         Err(e) => match refused.get() {
             Some(flags) => Presented::Refused { flags },
-            None => Presented::Unreachable(format!("the handshake with {host} failed ({e})")),
+            None => unreachable(format!("the handshake with {host} failed ({e})")),
         },
     };
 
-    // Best effort: the verdict is already in hand, and a close error on a
-    // connection nothing was written to says nothing worth reporting.
-    drop(tls.close(None::<&gio::Cancellable>));
+    // Best effort, and still under the deadline: the verdict is already in
+    // hand, and a close error on a connection nothing was written to says
+    // nothing worth reporting — but a close that blocked past the budget would
+    // undo the bound this function just promised.
+    drop(tls.close(Some(deadline.cancellable())));
     verdict
 }
 
 /// The `host:port` string `g_socket_client_connect_to_host` parses, with an
 /// **IPv6 literal put back in its brackets**.
 ///
-/// [`crate::tls::host_of`] hands `WebKit`'s bracketed spelling, and
-/// [`crate::tls::identity_host`] strips the brackets for `GNetworkAddress`,
-/// which wants a bare hostname. This is the third spelling: `connect_to_host`
+/// [`crate::tls::host_of`] hands the URL's bracketed spelling (which is what a
+/// human reads on the card), and [`crate::tls::identity_host`] strips the
+/// brackets for `GNetworkAddress` — and for `WebKit`'s per-host pin, which
+/// strips them itself before the lookup and so must be *given* the bare form.
+/// This is the third spelling: `connect_to_host`
 /// parses a *host-and-port*, so `::1:8443` is ambiguous and
 /// `g_network_address_parse` resolves it wrong — the brackets are what make
 /// the last colon the port separator.
@@ -810,6 +1021,219 @@ mod tls_tests {
         port
     }
 
+    /// The deadline the tests that are *not* about the deadline run under:
+    /// generous, so a slow CI box never turns a trust assertion into a timeout
+    /// assertion.
+    const TEST_BUDGET: Duration = Duration::from_mins(1);
+
+    /// A peer that accepts TCP, claims a long TLS record, and then **dribbles**
+    /// — one byte at a time, slowly, for `dribble` in total.
+    ///
+    /// This is the shape #1242's review measured at 21.01 s against a
+    /// documented 5 s bound: every byte resets GIO's per-I/O timeout, so that
+    /// timeout can never fire while the peer keeps talking. Only
+    /// [`Deadline`](super::Deadline) stops it.
+    ///
+    /// Plain `std::net`, not GIO: nothing here needs a GIO object, and a
+    /// `TcpListener` is `Send`, so the listener can be moved into the thread
+    /// after the port is read off it.
+    fn serve_dribbling(dribble: Duration, step: Duration) -> u16 {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to dribble on");
+        let port = listener.local_addr().expect("…with an address").port();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // A handshake record header announcing 0x0400 bytes to follow, so
+            // the client keeps waiting for a body that never completes.
+            if stream.write_all(&[0x16, 0x03, 0x03, 0x04, 0x00]).is_err() {
+                return;
+            }
+            let until = std::time::Instant::now() + dribble;
+            while std::time::Instant::now() < until {
+                if stream.write_all(&[0x01]).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(step);
+            }
+        });
+        port
+    }
+
+    /// **The probe is bounded in wall clock, not per read** — #1242's review
+    /// finding 1, which measured 21.01 s against a documented 5 s.
+    ///
+    /// The peer here dribbles for 12 s with a 5 s per-I/O timeout, so without
+    /// a deadline the probe takes ~12 s (then the timeout, ~17 s). With a 2 s
+    /// budget it takes ~2 s, and the verdict says the probe was cancelled
+    /// rather than blaming the peer for something it did not do.
+    ///
+    /// The assertion is generous (under 8 s) so it is measuring the
+    /// *mechanism*, not CI's scheduler — it still sits far below what the
+    /// un-deadlined shape produces.
+    ///
+    /// Mutation (re-run this round, red): hand `None::<&gio::Cancellable>` to
+    /// `connect_to_host`/`handshake` again, or make `Deadline::arm` a no-op,
+    /// and this reds on the elapsed bound.
+    #[test]
+    fn a_dribbling_peer_cannot_hold_the_probe_past_its_deadline() {
+        let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(300));
+        let budget = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let verdict = probe(&anchors(), "127.0.0.1", port, 5, budget);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the probe took {elapsed:.2?} against a {budget:.1?} budget — the per-I/O timeout is \
+             not a bound, which is the whole of #1242's finding 1"
+        );
+        assert!(
+            elapsed >= budget,
+            "…and it did not give up early either: {elapsed:.2?}"
+        );
+        let Presented::Unreachable(why) = verdict else {
+            panic!(
+                "a peer that never completes a handshake is unreachable, not judged: {verdict:?}"
+            )
+        };
+        assert!(
+            why.contains("cancelled after"),
+            "the card must say the probe was cut short rather than blame the peer: {why}"
+        );
+    }
+
+    /// …and the deadline does not cost anything on the happy path: a local
+    /// handshake still finishes in milliseconds, and the watchdog thread goes
+    /// down with it rather than parking for the rest of the budget.
+    #[test]
+    fn the_deadline_does_not_slow_a_gateway_that_answers() {
+        let port = serve("server-leaf.pem", "server-leaf-key.pem");
+        let started = std::time::Instant::now();
+        let verdict = probe(&anchors(), "localhost", port, 5, Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(verdict, Presented::Trusted(_)),
+            "{verdict:?} — the fixture CA signs the fixture leaf"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "a 30 s budget must not become a 30 s wait: {elapsed:.2?} (if this reds, `Deadline`'s \
+             Drop is sleeping out the budget instead of waking the watchdog)"
+        );
+    }
+
+    /// **An anchors file that will not load is not a network problem** —
+    /// #1242's review finding 2. No socket is opened, and the card must not
+    /// say the gateway may be down.
+    ///
+    /// The fixture is this directory's own README: a real file, readable,
+    /// and not a PEM — which is exactly the shape a typo'd
+    /// `TROLLSHELL_AGENT_WINDOW_CA` has.
+    ///
+    /// Mutation (re-run this round, red): fold `UnusableAnchors` back into
+    /// `Unreachable` and both halves red — the verdict here and the card
+    /// sentence below.
+    #[test]
+    fn an_anchors_file_that_will_not_load_is_not_reported_as_the_gateway_being_down() {
+        let verdict = probe(
+            &fixture("README.md"),
+            "127.0.0.1",
+            closed_port(),
+            5,
+            TEST_BUDGET,
+        );
+        let Presented::UnusableAnchors(why) = verdict else {
+            panic!("a file that is not a PEM is an anchors problem, not a network one: {verdict:?}")
+        };
+        // This half asserts *our* wording, not GIO's: the path belongs to the
+        // caller's sentence (below), and a test that pinned GIO's message text
+        // would red on a glib-networking bump saying nothing.
+        assert!(why.contains("certificate database"), "{why}");
+
+        let resolved = resolve_route(
+            &Route::VerifyAgainstBundle {
+                bundle: fixture("README.md"),
+                source: Source::Env(super::CA_ENV),
+            },
+            "https://hive.local/agent/stray/",
+        );
+        assert_eq!(resolved.policy, TlsPolicy::SystemStore);
+        let tried = resolved.tried.expect("the card names the file");
+        assert!(tried.contains("README.md"), "{tried}");
+        assert!(tried.contains(super::CA_ENV), "{tried}");
+        assert!(
+            tried.contains("Nothing was contacted"),
+            "the operator must not be sent after a gateway nobody called: {tried}"
+        );
+        assert!(
+            !tried.contains("gateway may be down"),
+            "…which is the sentence this test exists to keep out of this arm: {tried}"
+        );
+    }
+
+    /// **The identity check is real, and it is the stated reason for probing
+    /// at all** rather than calling `TlsCertificateExt::verify` on a chain.
+    ///
+    /// `127.0.0.2` is a loopback address the fixture leaf's SANs do not carry
+    /// (they carry `127.0.0.1`, `::1`, `hive.local`, `localhost`), and the
+    /// listener binds any-inet, so the connection succeeds and only the name
+    /// is wrong.
+    ///
+    /// # What this pins, and what was already pinned — measured
+    ///
+    /// #1242's review asked for this test on the premise that dropping
+    /// `Some(&identity)` from `TlsClientConnection::new` "reds **nothing** in
+    /// the 117-test suite". **That premise is false on this tree**, and the
+    /// measurement is worth keeping rather than the claim: dropping it reds
+    /// three tests —
+    /// [`the_hives_anchors_verify_the_gateway_and_the_leaf_is_what_gets_pinned`],
+    /// [`resolving_the_bundle_route_pins_the_verified_leaf_and_says_which_file_did_it`]
+    /// and [`the_deadline_does_not_slow_a_gateway_that_answers`] — because
+    /// glib-networking treats *no identity to check* as a **failed** identity
+    /// check rather than a skipped one, so `BAD_IDENTITY` becomes
+    /// unconditional and the happy path stops being happy. The argument was
+    /// never unpinned; it was pinned from the other side.
+    ///
+    /// So this test does **not** pin that argument (nothing it asserts changes
+    /// when the argument goes), and saying so is the point — the alternative
+    /// is a doc comment claiming a falsification it does not have, which is
+    /// the habit `webview.rs`'s settings tests already document.
+    ///
+    /// What it *does* pin is the half the module doc is written against and
+    /// the two refusal siblings are not: that a certificate the anchors
+    /// **did** sign, failing only on the name, comes back as `BAD_IDENTITY`
+    /// **and not** `UNKNOWN_CA`, and reaches the card in those words. Get that
+    /// wrong and the card sends the operator after the wrong file — which is
+    /// the whole of #1242's finding-2 complaint, applied to a different arm.
+    ///
+    /// [`the_hives_anchors_verify_the_gateway_and_the_leaf_is_what_gets_pinned`]: tls_tests::the_hives_anchors_verify_the_gateway_and_the_leaf_is_what_gets_pinned
+    /// [`resolving_the_bundle_route_pins_the_verified_leaf_and_says_which_file_did_it`]: tls_tests::resolving_the_bundle_route_pins_the_verified_leaf_and_says_which_file_did_it
+    /// [`the_deadline_does_not_slow_a_gateway_that_answers`]: tls_tests::the_deadline_does_not_slow_a_gateway_that_answers
+    #[test]
+    fn a_certificate_that_does_not_name_the_host_is_refused_for_that_reason() {
+        let port = serve("server-leaf.pem", "server-leaf-key.pem");
+        let verdict = probe(&anchors(), "127.0.0.2", port, 10, TEST_BUDGET);
+        let Presented::Refused { flags } = verdict else {
+            panic!("the fixture leaf does not name 127.0.0.2: {verdict:?}")
+        };
+        assert!(
+            flags.contains(gio::TlsCertificateFlags::BAD_IDENTITY),
+            "{flags:?}"
+        );
+        assert!(
+            !flags.contains(gio::TlsCertificateFlags::UNKNOWN_CA),
+            "the anchor DID sign it — only the name is wrong, and the card must say so: {flags:?}"
+        );
+        assert!(
+            super::describe_flags(flags).contains("does not name this host"),
+            "{}",
+            super::describe_flags(flags)
+        );
+    }
+
     /// **#1234 finding 2's note is now false, and that is the point of ask 3.**
     ///
     /// `gio::TlsCertificate::from_file` answered "TLS support is not
@@ -878,7 +1302,7 @@ mod tls_tests {
     #[test]
     fn the_hives_anchors_verify_the_gateway_and_the_leaf_is_what_gets_pinned() {
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
-        let Presented::Trusted(pem) = probe(&anchors(), "localhost", port, 30) else {
+        let Presented::Trusted(pem) = probe(&anchors(), "localhost", port, 30, TEST_BUDGET) else {
             panic!("the fixture CA signs the fixture leaf; this must verify");
         };
         let pinned =
@@ -904,7 +1328,8 @@ mod tls_tests {
     #[test]
     fn a_leaf_under_another_ca_is_refused_and_the_reason_is_named() {
         let port = serve("other-leaf.pem", "other-leaf-key.pem");
-        let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30) else {
+        let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30, TEST_BUDGET)
+        else {
             panic!("the fixture CA does not sign other-leaf; this must be refused");
         };
         assert!(
@@ -923,7 +1348,8 @@ mod tls_tests {
     #[test]
     fn an_expired_leaf_is_refused_and_named_as_expired() {
         let port = serve("expired-leaf.pem", "expired-leaf-key.pem");
-        let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30) else {
+        let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30, TEST_BUDGET)
+        else {
             panic!("an expired leaf must be refused");
         };
         assert!(
@@ -947,7 +1373,9 @@ mod tls_tests {
     /// `Refused { flags: empty }` and the second assertion reds.
     #[test]
     fn a_gateway_that_does_not_answer_is_a_reachability_failure_not_a_trust_one() {
-        let Presented::Unreachable(why) = probe(&anchors(), "127.0.0.1", closed_port(), 5) else {
+        let Presented::Unreachable(why) =
+            probe(&anchors(), "127.0.0.1", closed_port(), 5, TEST_BUDGET)
+        else {
             panic!("nothing is listening there");
         };
         assert!(why.contains("127.0.0.1"), "{why}");

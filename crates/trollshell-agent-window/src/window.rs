@@ -528,12 +528,19 @@ impl Window {
 
         let embedded = page::embed_url(url);
         // #1234: this reads the hive's own TLS material and, on the bundle
-        // route, opens one bounded TLS connection to the gateway to verify the
-        // chain it presents before pinning the leaf. It is affordable here
-        // precisely because of *when* "here" is — `host.sock` has already
-        // answered with this agent's URL, so the hive daemon is up and the
-        // handshake is normally a loopback round trip. See `verify`'s
-        // `PROBE_TIMEOUT_SECS` for the bound on the case where it is not.
+        // route, opens one TLS connection to the gateway to verify the chain it
+        // presents before pinning the leaf. It is affordable here precisely
+        // because of *when* "here" is — `host.sock` has already answered with
+        // this agent's URL, so the hive daemon is up and the handshake is
+        // normally a loopback round trip.
+        //
+        // It is **synchronous on this thread**, which is the GTK main thread,
+        // so the case where it is not a loopback round trip is a freeze. What
+        // bounds that freeze is `verify::PROBE_DEADLINE` and not
+        // `verify::PROBE_IO_TIMEOUT_SECS` — the latter is GIO's per-read knob,
+        // which a dribbling peer resets on every byte (measured at 21.01 s
+        // against a documented 5 s, #1242 review). Removing the freeze rather
+        // than bounding it is #1246.
         let trust = tls::resolve(&embedded);
         tracing::info!(
             url = %embedded,

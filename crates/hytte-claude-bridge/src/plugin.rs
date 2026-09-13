@@ -113,8 +113,8 @@ use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, N
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_stream};
 
 use crate::Mode;
-use crate::status::{self, Last, Status};
-use crate::usage::{self, ExtraUsage, Limit, Outcome, Report, Usage};
+use crate::status::{self, Last, Startup, Status};
+use crate::usage::{self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError};
 
 /// Stable plugin id — the host's mount-slot key, and the `<id>` in the
 /// `trollshell-plugin-<id>.service` transient unit the launcher spawns.
@@ -381,10 +381,15 @@ pub fn chip_limits(usage: &Usage) -> Vec<&Limit> {
 /// ones: the cap exists to stop the chip widening on the bar, and a tooltip has
 /// no width to defend.
 ///
-/// A **failed** usage poll appends its sentence on a second line. A successful
-/// one appends nothing — the meters carry their own hovers, and repeating them
-/// here would put the same numbers in two places that can disagree by a tick.
-fn tooltip(status: &Status, report: Option<&Report>) -> String {
+/// A second line is appended for whichever of three things is true, in order:
+/// the last report is too old to trust ([`Report::is_stale`], which only a
+/// wedged poll ever reaches — see [`usage::STALE_AFTER`]), the last poll
+/// failed (its own [`sentence`](UsageError::sentence), adjusted by
+/// [`usage_failure_sentence`] for the mode), or neither, in which case nothing
+/// is appended — the meters carry their own hovers, and repeating their
+/// numbers here would put the same numbers in two places that can disagree by
+/// a tick.
+fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
     let head = match status.startup {
         // Same honesty as the `…` label: no mode has been settled yet, so name
         // none.
@@ -398,10 +403,49 @@ fn tooltip(status: &Status, report: Option<&Report>) -> String {
             format!("Claude bridge · {} · {traffic}", mode_name(startup.mode))
         }
     };
-    match report.and_then(Report::error) {
-        Some(sentence) => format!("{head}\n{sentence}"),
+    let second_line = match report {
+        // A stale *successful* report is the case with nothing else to say
+        // it: no error was ever recorded, so without this the chip would keep
+        // painting last week's meters as if they were current.
+        Some(report) if report.usage().is_some() && report.is_stale(now) => {
+            Some(format!("usage stale since {}", usage::format_utc(report.at)))
+        }
+        Some(report) => usage_failure_sentence(status, report),
+        None => None,
+    };
+    match second_line {
+        Some(line) => format!("{head}\n{line}"),
         None => head,
     }
+}
+
+/// The failure line for the tooltip, one mode adjustment applied.
+///
+/// Every arm but one reads [`UsageError::sentence`] verbatim. The exception:
+/// [`UsageError::NoCredentials`] in [`Mode::Api`], where "run `claude` once to
+/// sign in" is advice for a login this mode never needs — it never spawns
+/// `claude` (module docs, `Mode::spawns_claude`) and may have no Claude Code
+/// login on the box at all. The usage limits are a subscription-account
+/// feature regardless of which backend is answering, so say that instead.
+fn usage_failure_sentence(status: &Status, report: &Report) -> Option<String> {
+    let Outcome::Failed(error) = &report.outcome else {
+        return None;
+    };
+    let is_api = matches!(
+        status.startup,
+        Some(Startup {
+            mode: Mode::Api,
+            ..
+        })
+    );
+    if is_api && matches!(error, UsageError::NoCredentials(_)) {
+        return Some(
+            "usage limits are a subscription feature — no Claude Code login is expected in \
+             API-key mode"
+                .to_owned(),
+        );
+    }
+    report.error()
 }
 
 /// One meter's hover: `Session (5 h): 80% — resets in 2 h 15 min`.
@@ -517,7 +561,14 @@ fn chip(status: &Status, report: Option<&Report>, now: i64) -> Node {
             }
         }
     }
-    if let Some(usage) = report.and_then(Report::usage) {
+    // A stale report's meters are dropped, not just its tooltip line: a level
+    // strip with no words on it is the one part of the chip that could read as
+    // current when it is not (`tooltip` is where the "since <time>" text
+    // lives).
+    if let Some(usage) = report
+        .filter(|report| !report.is_stale(now))
+        .and_then(Report::usage)
+    {
         for (index, limit) in chip_limits(usage).into_iter().enumerate() {
             children.push(meter(index, limit, now));
         }
@@ -532,7 +583,7 @@ fn chip(status: &Status, report: Option<&Report>, now: i64) -> Node {
         // On the inner box, so hovering anywhere on the pill that isn't a meter
         // answers the question — the glyphs are 16 px wide and nobody should
         // have to find the right one.
-        tooltip: Some(tooltip(status, report)),
+        tooltip: Some(tooltip(status, report, now)),
     };
     Node::Button {
         id: CHIP_BTN.to_owned(),
@@ -713,7 +764,7 @@ mod tests {
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
-    use crate::usage::{ExtraUsage, Limit, Outcome, Report, Usage, UsageError, parse_rfc3339};
+    use crate::usage::{self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError, parse_rfc3339};
     use hytte_plugin::display::{AccentRole, RenderMode};
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Manifest, Mount, Node, Page, PluginMsg, decode, encode,
@@ -975,11 +1026,50 @@ mod tests {
         }
     }
 
-    /// An **inactive** limit keeps its panel row and never takes a chip meter —
-    /// the captured response's third row is exactly this case.
+    /// An **inactive** limit keeps its panel row and never takes a chip meter
+    /// — with the inactive row placed **first**, the shape the real endpoint
+    /// has actually sent on this account (the PR's own live-verify record:
+    /// three rows on 2026-09-13, only one `is_active`).
+    ///
+    /// This is deliberately not the captured response's own order (inactive
+    /// third): `.take(MAX_CHIP_METERS)` alone would remove that row too, so a
+    /// mutation that deletes `chip_limits`'s `.filter(|limit| limit.active())`
+    /// is invisible against that fixture — the meters come out identical
+    /// either way. Leading with the inactive row makes the two lists differ:
+    /// without the filter the first meter would be `weekly_scoped`, not
+    /// `session`. Falsify by deleting that filter: red, on the id list below.
     #[test]
     fn an_inactive_limit_is_a_panel_row_but_never_a_chip_meter() {
-        let report = captured_report();
+        let usage = Usage {
+            limits: vec![
+                limit(
+                    "weekly_scoped",
+                    25.0,
+                    "normal",
+                    false,
+                    "2026-09-17T15:00:00.102097+00:00",
+                ),
+                limit(
+                    "session",
+                    80.0,
+                    "warning",
+                    true,
+                    "2026-09-13T13:50:00.101848+00:00",
+                ),
+                limit(
+                    "weekly_all",
+                    40.0,
+                    "normal",
+                    true,
+                    "2026-09-17T15:00:00.101872+00:00",
+                ),
+            ],
+            extra_usage: Some(ExtraUsage::default()),
+        };
+        let report = Report {
+            at: now() - 120,
+            outcome: Outcome::Ok(usage),
+        };
         let meters = preems(&chip_state(
             &status(Mode::Subscription, false, 4, 0, Last::Ok),
             Some(&report),
@@ -992,7 +1082,9 @@ mod tests {
                 "claude-bridge-led-0-session",
                 "claude-bridge-led-1-weekly_all"
             ],
-            "ids are indexed AND named, so two rows of one kind cannot collide"
+            "the leading, inactive row is skipped rather than masked by \
+             `.take` — ids are indexed AND named, so two rows of one kind \
+             cannot collide"
         );
 
         let rows = bars(&panel(Some(&report), now()));
@@ -1118,6 +1210,78 @@ mod tests {
         let tree = chip_state(&board, None);
         assert!(preems(&tree).is_empty());
         assert_eq!(root_tooltip(&tree), Some(base.to_owned()));
+    }
+
+    /// **A wedged poll goes visibly stale, past [`usage::STALE_AFTER`].**
+    ///
+    /// The report is a *successful* one — the case with no error to already
+    /// say so — and old enough that only a poll task that stopped publishing
+    /// entirely explains it (an ordinary failure would have republished a
+    /// fresh `at` on its own five-minute cadence). The chip drops the meters
+    /// and the hover says since when, rather than keeping last hour's numbers
+    /// on the bar looking current.
+    #[test]
+    fn a_wedged_poll_drops_its_meters_past_the_staleness_ceiling() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let base = "Claude bridge · subscription · 18 served, 0 failed";
+        let ceiling = i64::try_from(usage::STALE_AFTER.as_secs()).expect("fits");
+
+        let fresh = Report {
+            at: now() - ceiling,
+            ..captured_report()
+        };
+        let tree = chip_state(&board, Some(&fresh));
+        assert!(!preems(&tree).is_empty(), "still inside the ceiling");
+        assert_eq!(root_tooltip(&tree), Some(base.to_owned()), "nothing extra yet");
+
+        let stale = Report {
+            at: now() - ceiling - 1,
+            ..captured_report()
+        };
+        let tree = chip_state(&board, Some(&stale));
+        assert!(preems(&tree).is_empty(), "one second past the ceiling ⇒ no meters");
+        assert_eq!(
+            root_tooltip(&tree),
+            Some(format!(
+                "{base}\nusage stale since {}",
+                usage::format_utc(stale.at)
+            )),
+            "the hover names when the numbers stopped being current"
+        );
+    }
+
+    /// **API-key mode has no login to sign in to.** `NoCredentials` in every
+    /// other mode reads its own sentence — "run `claude` once to sign in" —
+    /// but `api` mode never spawns `claude`, so that is advice for a login
+    /// this bridge does not need. The usage limits belong to the box's Claude
+    /// Code login regardless of which backend answers, so the hover says
+    /// that instead.
+    #[test]
+    fn an_api_mode_bridge_gets_a_subscription_note_not_a_sign_in_prompt() {
+        let error = UsageError::NoCredentials("/home/a/.claude/.credentials.json".into());
+        let report = Report {
+            at: now() - 30,
+            outcome: Outcome::Failed(error.clone()),
+        };
+
+        let api = status(Mode::Api, true, 9, 0, Last::Ok);
+        let hover = root_tooltip(&chip_state(&api, Some(&report))).expect("a hover");
+        assert!(
+            hover.contains("usage limits are a subscription feature"),
+            "{hover:?}"
+        );
+        assert!(
+            !hover.contains("run `claude` once"),
+            "api mode never spawns claude: {hover:?}"
+        );
+
+        // Every claude-spawning mode is unaffected — the sign-in prompt is
+        // exactly right there.
+        for mode in [Mode::Subscription, Mode::Reprompt] {
+            let board = status(mode, false, 9, 0, Last::Ok);
+            let hover = root_tooltip(&chip_state(&board, Some(&report))).expect("a hover");
+            assert!(hover.contains(&error.sentence()), "{mode:?}: {hover:?}");
+        }
     }
 
     /// No error text anywhere in the chip may carry a bearer token. The arms
@@ -1370,7 +1534,7 @@ mod tests {
     #[test]
     fn the_tooltip_says_nothing_served_yet_before_the_first_request() {
         assert_eq!(
-            tooltip(&status(Mode::Api, true, 0, 0, Last::None), None),
+            tooltip(&status(Mode::Api, true, 0, 0, Last::None), None, now()),
             "Claude bridge · API key · nothing served yet"
         );
     }
@@ -1385,10 +1549,10 @@ mod tests {
             errors: 0,
             last: Last::None,
         };
-        assert_eq!(tooltip(&board, None), "Claude bridge · starting up");
+        assert_eq!(tooltip(&board, None, now()), "Claude bridge · starting up");
         assert_eq!(
             root_tooltip(&chip_state(&board, None)).as_deref(),
-            Some(tooltip(&board, None).as_str())
+            Some(tooltip(&board, None, now()).as_str())
         );
     }
 
@@ -1407,7 +1571,7 @@ mod tests {
             .for_each(|w| assert_ne!(w[0], w[1], "names must not collide"));
         for (mode, name) in modes.into_iter().zip(names) {
             let board = status(mode, false, 1, 0, Last::Ok);
-            let hover = tooltip(&board, None);
+            let hover = tooltip(&board, None, now());
             assert!(hover.contains(name), "{hover:?} must name {name}");
             // …and the chip is still printing the short form of that same mode.
             assert_eq!(texts(&chip_state(&board, None))[2], mode_label(mode));
@@ -1421,6 +1585,7 @@ mod tests {
         let hover = tooltip(
             &status(Mode::Reprompt, false, 86_400, 12_345, Last::Error),
             None,
+            now(),
         );
         assert_eq!(
             hover,
@@ -1491,10 +1656,17 @@ mod tests {
         let back: PluginMsg = decode(&encode(&reg)).expect("register frame decodes");
         assert_eq!(reg, back);
 
+        // `.view()` reads the *real* clock (`usage::now_unix()`), unlike
+        // `chip_state`'s fixed `now()` — so the report has to be fresh against
+        // real time, not the fixed narrative time the other tests use, or the
+        // #1236 staleness ceiling drops the meters this test is asserting on.
         let view = hytte_plugin::display::testing::with_render_mode(RenderMode::State, || {
             BridgeChip {
                 status: status(Mode::Api, true, 1, 0, Last::Ok),
-                usage: Some(captured_report()),
+                usage: Some(Report {
+                    at: usage::now_unix(),
+                    ..captured_report()
+                }),
                 usage_version: 1,
             }
             .view()

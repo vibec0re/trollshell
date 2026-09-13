@@ -1467,6 +1467,24 @@ title` in the stderr tail — worth a deliberate look on first run, since
   4. **Nothing leaks.** `journalctl --user -u trollshell-plugin-claude-bridge | grep -c 'sk-ant'`
      → `0`, including after forcing a failure (step 3) with
      `RUST_LOG=hytte_claude_bridge=debug`.
+  5. **(FIX ROUND, #1254) `api` mode gets a subscription note, not a sign-in
+     prompt.** With `CLAUDE_BRIDGE_MODE=api` on a box with no
+     `~/.claude/.credentials.json`, hover the chip: the second line reads
+     "usage limits are a subscription feature — no Claude Code login is
+     expected in API-key mode", never the claude-modes' "run `claude` once to
+     sign in" — `api` mode never spawns `claude`, so that instruction is for a
+     login this mode does not need.
+  6. **(FIX ROUND, #1254) The staleness ceiling is hermetic-only.**
+     `poll_forever` republishes a fresh `at` on every attempt, success or
+     failure, so an ordinary network hiccup or an expired token never goes
+     stale — only a poll task that stopped publishing entirely (a panic, since
+     it is deliberately unsupervised) would reach `usage::STALE_AFTER` (three
+     poll periods, 15 min). Nothing short of killing that one tokio task from
+     outside the process reproduces that live; the unit tests
+     (`usage::tests::a_report_is_stale_only_past_the_ceiling`,
+     `plugin::tests::a_wedged_poll_drops_its_meters_past_the_staleness_ceiling`)
+     cover the ceiling directly with an injected `at`. There is no live step
+     for it.
 
 ## Caw (morning briefing)
 

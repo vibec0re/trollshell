@@ -59,6 +59,15 @@
 //! [`Report`] off the process-global board below, the same
 //! two-runtimes-meet-at-a-static shape [`crate::status`] documents. A poll is a
 //! blocking `ureq` call on `spawn_blocking`, exactly like [`crate::messages`].
+//!
+//! # A proxy is honoured, by ureq's own default
+//!
+//! `ureq::Config::default()` resolves `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`
+//! (`NO_PROXY` respected) the same way every other `ureq` call in this crate
+//! does — [`fetch`] sets no proxy of its own and does nothing to opt out. TLS
+//! to `api.anthropic.com` stays end-to-end under rustls, so a configured proxy
+//! sees a `CONNECT` and never the bearer: the same position
+//! [`crate::envguard`] already takes for `HTTPS_PROXY` on the `claude` child.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,6 +107,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// login token: five minutes is frequent enough that the chip is never
 /// meaningfully behind and infrequent enough to be invisible.
 pub const POLL_EVERY: Duration = Duration::from_mins(5);
+
+/// How old a [`Report`] may be before the chip stops trusting its numbers.
+///
+/// Three poll periods: a single slow round-trip (the fetch's own [`TIMEOUT`]
+/// plus whatever the next tick catches up on) never trips it, but a
+/// `poll_forever` that has stopped publishing at all — it is deliberately
+/// **unsupervised** (`main`'s doc comment) — goes visibly stale within one
+/// dial-backoff window instead of leaving confidently-wrong meters on the bar
+/// forever. Every poll attempt, success *or* failure, republishes a fresh
+/// [`Report::at`], so an ordinary network hiccup never reaches this ceiling —
+/// only a genuinely wedged or panicked poll task does.
+pub const STALE_AFTER: Duration = Duration::from_secs(POLL_EVERY.as_secs() * 3);
 
 /// Longest borrowed error text kept in a [`UsageError`]. A transport error can
 /// be a paragraph; a chip tooltip cannot.
@@ -300,9 +321,11 @@ fn scrub(text: &str, token: &str) -> String {
 /// The credential file Claude Code keeps its OAuth login in.
 ///
 /// Resolved the way the CLI resolves it: `$CLAUDE_CONFIG_DIR` replaces the whole
-/// `~/.claude` directory when it is set (the same variable
-/// [`crate::envguard`] refuses for the `claude` child, because it moves where
-/// the login credential is read from), otherwise `$HOME/.claude`.
+/// `~/.claude` directory when it is set — the same variable
+/// [`crate::envguard`] deliberately **allows** through for the `claude` child,
+/// because it only moves where the login credential is *read from*, which is
+/// itself a legitimate setting the child may need in order to find a login at
+/// all — otherwise `$HOME/.claude`.
 #[must_use]
 pub fn credentials_path() -> PathBuf {
     credentials_path_in(
@@ -372,6 +395,16 @@ pub fn fetch(base_url: &str, credentials_path: &Path) -> Result<Usage, UsageErro
         // Read the endpoint's own body on a non-2xx rather than collapsing it
         // into a transport error: the status is what decides the arm below.
         .http_status_as_error(false)
+        // This is a single constant URL with no business redirecting. Without
+        // this, the bearer's only protection on a cross-host redirect is
+        // `ureq::Config::default()`'s `RedirectAuthHeaders::Never` — a
+        // dependency default this crate does not pin — and a redirect target
+        // that happens to answer `200 {}` would read as "this account has no
+        // limits" instead of an error. With `max_redirects(0)` the redirect is
+        // never followed at all (no second connection, so no header can ever
+        // reach it) and its own status falls through to the `other` arm below
+        // as `UsageError::Http`.
+        .max_redirects(0)
         .build()
         .into();
 
@@ -434,6 +467,13 @@ impl Report {
             Outcome::Ok(_) => None,
             Outcome::Failed(e) => Some(e.sentence()),
         }
+    }
+
+    /// Whether this report is too old to trust — see [`STALE_AFTER`].
+    #[must_use]
+    pub fn is_stale(&self, now: i64) -> bool {
+        let ceiling = i64::try_from(STALE_AFTER.as_secs()).unwrap_or(i64::MAX);
+        now.saturating_sub(self.at) > ceiling
     }
 }
 
@@ -756,9 +796,9 @@ pub fn percent_label(percent: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BASE_URL, ExtraUsage, Limit, Outcome, Report, SEVERITY_NORMAL, Usage, UsageError,
-        credentials_path_in, fetch, format_utc, humanise_kind, humanise_since, humanise_until,
-        parse_rfc3339, percent_label, reset_phrase, reset_short, scrub, truncate,
+        DEFAULT_BASE_URL, ExtraUsage, Limit, Outcome, Report, SEVERITY_NORMAL, STALE_AFTER, Usage,
+        UsageError, credentials_path_in, fetch, format_utc, humanise_kind, humanise_since,
+        humanise_until, parse_rfc3339, percent_label, reset_phrase, reset_short, scrub, truncate,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1104,6 +1144,88 @@ mod tests {
         assert_eq!(usage.limits.len(), 3);
         assert_eq!(usage.limits[0].kind, "session");
         drop(handle.join());
+    }
+
+    /// **A redirect is never followed, and the bearer never reaches its
+    /// target.** Two real listeners: the first answers every request with a
+    /// `302` pointing at the second; the second must never see a connection at
+    /// all, so it cannot see the `Authorization` header either. `fetch` is a
+    /// single blocking call, so by the time it returns, any redirect it was
+    /// going to follow would already have reached the second listener —
+    /// checking immediately after is not a race.
+    ///
+    /// Falsify by deleting `.max_redirects(0)` in `fetch`: the redirect is
+    /// followed, the second listener's `200 {}` parses as an empty (but
+    /// `Ok`) `Usage`, and this goes red on both the returned `Err` and the
+    /// "never contacted" assertion.
+    #[test]
+    fn a_redirect_is_never_followed_and_the_bearer_never_reaches_it() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = creds(dir.path(), FAKE_TOKEN);
+
+        // The redirect target. Bound, so a follow would have somewhere to
+        // land — and so this test can prove nothing ever lands there.
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second");
+        let second_addr = second.local_addr().expect("addr");
+
+        // The endpoint the poll actually calls: a 302 to `second` on every
+        // request, carrying a real (small) JSON body a follow would parse as
+        // a legitimate, empty readout.
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first");
+        let first_addr = first.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = first.accept().expect("accept");
+            let raw = capture_request(&mut sock);
+            let body = "{}";
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://{second_addr}/api/oauth/usage\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            sock.write_all(resp.as_bytes()).expect("write response");
+            raw
+        });
+
+        let err =
+            fetch(&format!("http://{first_addr}"), &path).expect_err("a redirect is an error");
+        assert_eq!(
+            err,
+            UsageError::Http(302),
+            "the first listener's own status, not a followed 200"
+        );
+
+        let raw = handle.join().expect("server thread");
+        assert!(raw.contains("GET /api/oauth/usage "), "{raw}");
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains(&format!("bearer {FAKE_TOKEN}").to_ascii_lowercase()),
+            "the first hop must still authenticate normally: {raw}"
+        );
+
+        // The redirect target must never have been contacted — not by this
+        // fetch, and not by anything else this process does concurrently
+        // with the tests in this file (`TEST_SOCKETS` serialises them).
+        second.set_nonblocking(true).expect("nonblocking");
+        match second.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the redirect target was contacted: {other:?}"),
+        }
+    }
+
+    /// **The staleness ceiling**, at its boundary — a report inside
+    /// [`STALE_AFTER`] is trusted, one past it is not. `now == at` is the
+    /// freshest a report can be relative to itself.
+    #[test]
+    fn a_report_is_stale_only_past_the_ceiling() {
+        let ceiling = i64::try_from(STALE_AFTER.as_secs()).expect("fits");
+        let fresh = Report {
+            at: 1_000,
+            outcome: Outcome::Ok(Usage::default()),
+        };
+        assert!(!fresh.is_stale(1_000), "zero age");
+        assert!(!fresh.is_stale(1_000 + ceiling), "exactly the ceiling");
+        assert!(fresh.is_stale(1_000 + ceiling + 1), "one past it");
+        assert!(!fresh.is_stale(500), "a clock that moved backward is not stale");
     }
 
     // ── (d) No credentials ───────────────────────────────────────────────────

@@ -29,7 +29,7 @@ use adw::prelude::*;
 use webkit::prelude::*;
 
 use crate::page::navigable_in_place;
-use crate::tls::{CERT_ENV, TlsPolicy, failure_message};
+use crate::tls::{CERT_ENV, TlsPolicy, failure_description};
 
 /// The `Stack` child names — the page, and the TLS failure state that replaces
 /// it.
@@ -39,7 +39,7 @@ const TLS_FAILED: &str = "tls-failed";
 /// Build the page widget for `url`, under `policy`.
 ///
 /// The returned widget is a `gtk::Stack`: the [`webkit::WebView`] itself, plus
-/// the inline error state [`failure_message`] fills in when verification
+/// the inline error state [`failure_description`] fills in when verification
 /// fails. [`view_of`] gets the view back out of it.
 ///
 /// The network session is configured **before** the first load: the
@@ -115,7 +115,12 @@ pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
              PRESENTS — its leaf, never the bundle. The window's own error state spells all \
              three out"
         );
-        error.set_description(Some(&failure_message(host)));
+        // `AdwStatusPage:description` is parsed as Pango markup, and
+        // `failure_message` is not valid markup on its own (its `openssl …
+        // </dev/null` reads as an unopened closing tag) — escape at this
+        // sink, the one place this text becomes a description. See
+        // `tls::failure_message`'s docs (#1224).
+        error.set_description(Some(&failure_description(host)));
         sink.set_visible_child_name(TLS_FAILED);
         false
     });
@@ -181,7 +186,8 @@ fn settings() -> webkit::Settings {
     s
 }
 
-/// The TLS failure state — filled in by [`failure_message`] when it fires.
+/// The TLS failure state — filled in by [`failure_description`] when it
+/// fires.
 fn failure_state() -> adw::StatusPage {
     let page = adw::StatusPage::builder()
         .icon_name("channel-insecure-symbolic")

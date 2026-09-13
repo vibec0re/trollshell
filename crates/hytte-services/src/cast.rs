@@ -140,5 +140,4 @@ mod tests {
         let result = u64_to_f64_bytes(hundred_mib);
         assert!((result - 104_857_600.0_f64).abs() < f64::EPSILON);
     }
-
 }

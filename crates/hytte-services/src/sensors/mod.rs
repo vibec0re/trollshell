@@ -48,13 +48,13 @@ use crate::cast::u64_to_f64_bytes;
 // it was `pub(crate)` before the move and nothing outside this module ever
 // names it.
 pub use hytte_sensors::{
-    CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskUsage, DiskMount, GpuState, GpuVendor, Memory,
-    NetConnections, NetIo, NetInterface,
+    CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuState, GpuVendor, Memory,
+    NetConnections, NetInterface, NetIo,
 };
 use hytte_sensors::{
     GpuCache, MountSpec, compute_cpu_load, compute_disk_io, read_cpu_freq, read_cpu_temp,
     read_disk_for_specs, read_gpu_with_cache, read_mountlist, read_net_connections,
-    read_process_count, read_proc_diskstats, read_proc_meminfo, read_proc_net_dev, read_proc_stat,
+    read_proc_diskstats, read_proc_meminfo, read_proc_net_dev, read_proc_stat, read_process_count,
 };
 use warn_latch::{WARN_COOLDOWN, WarnLatch};
 

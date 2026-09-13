@@ -894,6 +894,75 @@ self:
                 control-center relaunches the running plugins that declare it.
               '';
             };
+
+            mount = lib.mkOption {
+              type = lib.types.nullOr (
+                lib.types.enum [
+                  "SidebarLead"
+                  "SidebarTop"
+                  "SidebarBottom"
+                  "SidebarRightLead"
+                  "SidebarRightTop"
+                  "SidebarRightBottom"
+                  "BarLeft"
+                  "BarCenter"
+                  "BarRight"
+                ]
+              );
+              default = null;
+              example = "SidebarRightTop";
+              description = ''
+                Override where this plugin's card mounts (#1158/#1159/#1161),
+                as a launch-time deployment decision rather than something the
+                plugin author bakes into its manifest. `null` (the default)
+                leaves the plugin's own `Mount` in force — nothing is rendered
+                and the manifest's choice wins, exactly as before this option
+                existed.
+
+                The nine values are the wire names
+                `hytte_plugin_proto::manifest::Mount` carries, in two
+                families: the **left** sidebar (`SidebarLead` — the very top,
+                above the built-in weather/calendar/tasks cards;
+                `SidebarTop` — after those cards, above the flex gap;
+                `SidebarBottom` — below everything, by the departures board),
+                its mirror the **right** sidebar (`SidebarRightLead` /
+                `SidebarRightTop` / `SidebarRightBottom`, #1158 — hidden
+                entirely while no plugin occupies one of its three regions),
+                and the **bar** (`BarLeft` / `BarCenter` / `BarRight`, a slim
+                inline chip rather than a sidebar card). A non-null value
+                renders as `HYTTE_PLUGIN_MOUNT = "<name>";` in this plugin's
+                `env` (above) in `plugins.json`; the SDK's `hytte_plugin::run`
+                reads it before `Register` and refuses to start on a name
+                outside these nine, so a rename here and on the wire cannot
+                silently drift apart — a stale spelling is a launch failure,
+                not a misplaced card.
+
+                Setting this does not change the plugin's own manifest, only
+                where *this deployment* puts it — reinstalling the same
+                plugin elsewhere with `mount` unset goes right back to the
+                author's own choice.
+
+                **This option and `env.HYTTE_PLUGIN_MOUNT` are the same
+                knob, and this one wins.** Setting the variable by hand still
+                works (it is how the override was reached before this option
+                existed, and `docs/plugin-env.md` documents the variable
+                itself), but a non-null `mount` is merged over `env` when
+                `plugins.json` is rendered, so the two disagreeing would
+                silently discard the hand-written value. Rather than let that
+                happen quietly, setting **both** to different values is an
+                eval error naming the plugin; setting both to the same value
+                is merely redundant. Prefer this option: it is checked against
+                the nine wire names at eval time, while a hand-set variable is
+                only checked when the plugin tries to start.
+
+                **Mounting into the right sidebar needs the right sidebar.**
+                The three `SidebarRight*` values are accepted and rendered
+                today, and the host already routes a render to their
+                mailboxes — but no window mounts those mailboxes until
+                #1160/#1244 ships, so until then a card sent there simply does
+                not appear. The left-sidebar and bar values work now.
+              '';
+            };
           };
         }
       );
@@ -1126,8 +1195,7 @@ self:
     # `core-leds` doesn't — is an `attrsOf` submodule so a per-agent entry's
     # own unset fields (e.g. `icon` left `null`) are stripped the same way,
     # not rendered as a literal `null` TOML cannot represent (see
-    # `configFiles`'s `lib.filterAttrsRecursive` in the two platform
-    # modules).
+    # `configFiles`'s `prune` in the two platform modules).
     config.agents = lib.mkOption {
       type = lib.types.submodule {
         options = {
@@ -1295,6 +1363,40 @@ self:
   # flake.nix's `nixos-module-nightlight` for the same shape used for a
   # different removed knob.
   config.assertions = [
+    # `mount` and `env.HYTTE_PLUGIN_MOUNT` are the same knob (#1161; #1260
+    # review F5). Both platform modules render `plugin.env // (optionalAttrs
+    # (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })`, so the
+    # typed option wins — which is the right precedence (it is the checked
+    # one) but a *silent* discard of whatever the user wrote by hand. Refuse
+    # the disagreement instead; agreeing values are merely redundant and pass.
+    # Unconditional, like the `usage` assertion below, so both modules'
+    # `nix flake check` fixtures see it.
+    (
+      let
+        conflicting = lib.attrNames (
+          lib.filterAttrs (
+            _: plugin: plugin.mount != null && (plugin.env.HYTTE_PLUGIN_MOUNT or plugin.mount) != plugin.mount
+          ) config.programs.trollshell.plugins
+        );
+      in
+      {
+        assertion = conflicting == [ ];
+        # Lazy, as every assertion message is: only forced when the predicate
+        # above is false, so naming the offenders costs nothing on a clean
+        # config.
+        message = ''
+          These programs.trollshell.plugins entries set both `mount` and
+          `env.HYTTE_PLUGIN_MOUNT`, to different values: ${lib.concatStringsSep ", " conflicting}.
+
+          They are the same knob. `mount` is merged over `env` when
+          plugins.json is rendered, so `mount` wins and the hand-set
+          HYTTE_PLUGIN_MOUNT would be discarded with no warning. Drop one —
+          prefer `mount`, which nix type-checks against the nine wire names
+          at eval time, while a hand-set variable is only checked when the
+          plugin tries to start (and then only by failing to).
+        '';
+      }
+    )
     {
       assertion = !(config.programs.trollshell.plugins ? usage);
       message = ''

@@ -989,6 +989,86 @@
               touch $out
             '';
 
+          # #1161: `programs.trollshell.plugins.<id>.mount` must be strictly
+          # additive — a plugin that never sets it renders the exact same
+          # `plugins.json` entry as before this option existed. Two plugins,
+          # one covering each half: `right` sets `mount` and must carry
+          # `HYTTE_PLUGIN_MOUNT` in its rendered `env`; `left` doesn't, and
+          # its ENTIRE rendered entry is asserted against `expectedLeft` —
+          # every field `nix/hm-module.nix`'s `pluginsState` puts on a
+          # plugin, spelled out here rather than sourced from a captured
+          # historical eval (a rename or a stray extra key fails this the
+          # same way an accidental `HYTTE_PLUGIN_MOUNT` leak would). Nix
+          # attrset equality after `fromJSON` is used rather than a raw
+          # `diff` — unlike `hm-module-agents-fixture` above, there is no
+          # TOML formatting to pin here, and comparing parsed values catches
+          # a real regression the way a byte diff would while staying
+          # insensitive to JSON key order (`builtins.toJSON` already sorts
+          # keys, so the two coincide in practice, but the parsed comparison
+          # is the one that says what it means).
+          hm-module-plugin-mount =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      plugins = {
+                        left.package = stubPlugin;
+                        right = {
+                          package = stubPlugin;
+                          mount = "SidebarRightTop";
+                        };
+                        # #1260 review F5: `mount` and `env.HYTTE_PLUGIN_MOUNT`
+                        # are one knob and `mount` wins, which
+                        # `nix/module-common.nix` now asserts on rather than
+                        # discarding the hand-set value silently. This is the
+                        # *agreeing* half — redundant, not a conflict — and it
+                        # must still evaluate, with every predicate true. The
+                        # disagreeing half is `hm-module-plugin-mount-conflict`
+                        # below, which pins that the assertion actually fires.
+                        agreeing = {
+                          package = stubPlugin;
+                          mount = "BarRight";
+                          env.HYTTE_PLUGIN_MOUNT = "BarRight";
+                        };
+                      };
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+              );
+              expectedLeft = {
+                exec = pkgs.lib.getExe stubPlugin;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
+              assertionPredicates = map (a: a.assertion) cfg.assertions;
+              probe =
+                assert pluginsState.plugins.right.env.HYTTE_PLUGIN_MOUNT == "SidebarRightTop";
+                assert pluginsState.plugins.left == expectedLeft;
+                assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_MOUNT == "BarRight";
+                assert builtins.all (p: p) assertionPredicates;
+                builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-plugin-mount-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
           # Evaluate nixosModules.default the same way. Forces the module's own
           # config contributions — the swaybg/polkit user units, the session
           # vars, and the assertions — rather than system.build.toplevel, to keep
@@ -1204,6 +1284,136 @@
                 builtins.deepSeq { inherit falsePredicates; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-plugin-removed-1200-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # The NixOS twin of `hm-module-plugin-mount` above (#1161) — same
+          # fixture shape, read back through `environment.etc` instead of
+          # `xdg.configFile` (see `nixos-module` above for why). `mount` is
+          # declared once, in the shared `plugins` submodule
+          # (`nix/module-common.nix`), so setting it under THIS module has to
+          # render too, or the option would silently do nothing on a
+          # NixOS-only install — this is what would catch that.
+          nixos-module-plugin-mount =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      plugins = {
+                        left.package = stubPlugin;
+                        right = {
+                          package = stubPlugin;
+                          mount = "SidebarRightTop";
+                        };
+                        # See the home-manager twin: the agreeing half of
+                        # #1260 review F5's precedence assertion, which must
+                        # keep evaluating.
+                        agreeing = {
+                          package = stubPlugin;
+                          mount = "BarRight";
+                          env.HYTTE_PLUGIN_MOUNT = "BarRight";
+                        };
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
+              );
+              expectedLeft = {
+                exec = pkgs.lib.getExe stubPlugin;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
+              # The `plugins.<id>.mount` precedence assertion lives in the
+              # shared `nix/module-common.nix`, so it has to hold on this
+              # platform too — and this is what proves the agreeing fixture
+              # above does not trip it. Predicates only, never `.message`:
+              # NixOS ships assertions whose message is lazy and only
+              # well-defined when the assertion fails, so filtering or
+              # deepSeq'ing by message content would trip an unrelated
+              # internal one (see `nixos-module`'s own comment).
+              assertionPredicates = map (a: a.assertion) cfg.assertions;
+              probe =
+                assert pluginsState.plugins.right.env.HYTTE_PLUGIN_MOUNT == "SidebarRightTop";
+                assert pluginsState.plugins.left == expectedLeft;
+                assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_MOUNT == "BarRight";
+                assert builtins.all (p: p) assertionPredicates;
+                builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-mount-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # The other half of #1260 review F5: `mount` and
+          # `env.HYTTE_PLUGIN_MOUNT` set to **different** values must be
+          # refused, not silently resolved — both platform modules render
+          # `plugin.env // (optionalAttrs … { HYTTE_PLUGIN_MOUNT = …; })`, so
+          # `mount` wins with no warning and the hand-written string is
+          # discarded.
+          #
+          # Mirror image of `nixos-module-plugin-mount` above, and the same
+          # `falsePredicates` idiom `nixos-module-nightlight` uses: exactly
+          # one predicate must be false, and it must be *this* one (matched
+          # by message content, which is narrower and far more stable than a
+          # count of NixOS's own ~1400 predicates). The assertion itself is
+          # declared once, in the shared `nix/module-common.nix`, so pinning
+          # it here pins it for the home-manager module too — and it is
+          # deliberately pinned on THIS platform because home-manager
+          # evaluates `config.assertions` eagerly while building `hm.config`,
+          # which throws rather than handing back an inspectable false
+          # predicate (measured while writing this check).
+          nixos-module-plugin-mount-conflict =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      plugins.conflicting = {
+                        package = stubPlugin;
+                        mount = "SidebarRightTop";
+                        env.HYTTE_PLUGIN_MOUNT = "BarLeft";
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
+              probe =
+                assert builtins.length falsePredicates == 1;
+                assert pkgs.lib.hasInfix "HYTTE_PLUGIN_MOUNT" (builtins.head falsePredicates).message;
+                builtins.deepSeq { inherit falsePredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-mount-conflict-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

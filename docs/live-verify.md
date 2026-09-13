@@ -1400,6 +1400,44 @@ opens what it claims.
       the same as with the plugin absent entirely, not the ~30 Hz/monitor a
       still-armed tick callback would cost. Re-show it (drop the `hidden_on`
       call) and confirm the animation resumes on that screen.
+- [ ] **(#1161)** `plugins.<id>.mount` override, end to end (needs #1160's
+      right sidebar on `PATH`; nothing here can be exercised in CI). Pick a
+      bundled plugin whose manifest mounts on the **left** sidebar (e.g.
+      `pet`, `SidebarTop`) and set
+      `programs.trollshell.plugins.pet.mount = "SidebarRightTop";`, then
+      rebuild/switch. The card should move to the **right** sidebar's middle
+      region — not the left one it shipped in — and
+      `cat ~/.config/trollshell/plugins.json` (or `/etc/xdg/…` under the
+      NixOS module) should show `"HYTTE_PLUGIN_MOUNT": "SidebarRightTop"` in
+      that plugin's `env`. Open the control-center's Plugins tab and select
+      it: the connection line should read "Connected · rendering in Sidebar,
+      right (middle) **· set by nix**" — the "set by nix" half is the point of
+      the override note (#1161's own wording: "so an operator can see an
+      override is in force"), and it is the **normal** case, since the SDK
+      applies `HYTTE_PLUGIN_MOUNT` before `Register` and the host therefore
+      reports the overridden mount back. Now unset `mount` (delete the line)
+      and rebuild: the card returns to the **left** sidebar's own region, the
+      `HYTTE_PLUGIN_MOUNT` key disappears from `plugins.json` entirely (not
+      merely blanked), and the connection line drops the "· set by nix" half,
+      leaving just the mount. **The disagreement case**: point `mount` at a
+      plugin binary old enough to predate `HYTTE_PLUGIN_MOUNT` (or one that
+      never reads env at all) — `plugins.json` still declares the override,
+      but the plugin registers with its own compiled-in manifest mount
+      regardless. The row should keep reporting **where the card actually
+      is** and name the declared value as the one that failed, e.g. "Sidebar
+      (middle) · nix asked for Sidebar, right (middle) (not applied)". Check
+      the card really is in the left sidebar while that line is up: the
+      "rendering in" slot must never name the mount that did not take.
+- [ ] **(#1161/#1260)** The Plugins tab reads `plugins.json` once, not on
+      every 2 s poll. With the control-center open on **any** tab, attach
+      `strace -f -e trace=openat -p "$(pidof trollshell-control-center)"` and
+      watch for `plugins.json` for ~20 s: there should be **no** `openat` of
+      it at all once the tab has built (the poll only `stat`s it). Then
+      `nixos-rebuild switch` / `home-manager switch` with a changed `mount`
+      **while the window stays open** and confirm the row's note follows the
+      new value within a poll or two — the stamp (the symlink's target, else
+      `(mtime, len)`) is what makes a rebuild visible without re-reading
+      every tick.
 
 ## Infobroker
 

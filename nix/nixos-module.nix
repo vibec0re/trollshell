@@ -42,11 +42,19 @@ let
   # bind plugins to. The key is optional on the shell side and its absence means
   # graphical-session.target, which is exactly what this module wants. Keep the
   # rest of the two in sync.
+  #
+  # `mount` (#1161): see `nix/hm-module.nix`'s matching comment — `null` (the
+  # default) adds nothing to `env`, so the strictly-additive/byte-identical
+  # claim holds here too, and the same `//` merge order makes `mount` beat a
+  # hand-set `env.HYTTE_PLUGIN_MOUNT` (asserted against in
+  # `nix/module-common.nix` rather than resolved silently, #1260 review F5).
   pluginsState = builtins.toJSON {
     version = 1;
     plugins = lib.mapAttrs (_: plugin: {
       exec = lib.getExe plugin.package;
-      inherit (plugin) env secrets;
+      env =
+        plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
+      inherit (plugin) secrets;
       enabled = plugin.enable;
     }) cfg.plugins;
   };
@@ -56,8 +64,10 @@ let
   # `nix/hm-module.nix`'s `prune` exactly; see there for why
   # `lib.filterAttrsRecursive` cannot do the second half, why an
   # attrset-valued knob with a `default = { }` (`agents`' `display`) breaks
-  # the `filtered == { }` guard without it, and what `!lib.isDerivation`
-  # is for.
+  # the `filtered == { }` guard without it, what `!lib.isDerivation`
+  # is for, and why it does not descend into lists (#1241 item 3) — a
+  # `listOf submodule` leaf holding a `null` fails loudly at `generate`
+  # rather than being silently pruned, which is the accepted trade.
   prune =
     set:
     lib.filterAttrs (_: v: !(v == null || (lib.isAttrs v && !lib.isDerivation v && v == { }))) (

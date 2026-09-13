@@ -9,3 +9,9 @@ Cargo.lock.bak
 # stack-overflow logs etc.). Never check these in.
 *.log
 result
+
+# Byte-compiled Python from the `nix/lint-*.py` flake checks when they are run
+# in-tree by hand (`nix shell nixpkgs#python3 --command python3 nix/…`). The
+# sandboxed `runCommand` that runs them in CI writes nowhere near the
+# checkout; a local run leaves `nix/__pycache__/`.
+__pycache__/

@@ -39,12 +39,27 @@ let
   # therefore stays byte-identical to the pre-#707 one, so upgrading recycles
   # no already-running plugin (#813 item 2 fixed this key being emitted
   # unconditionally, which silently defeated that invariant).
+  #
+  # `mount` (#1161) is the same shape again: `null` (the default) adds
+  # nothing to `env`, so a config that never sets it renders byte-identical
+  # `plugins.json` to before this option existed; a non-null value merges in
+  # `HYTTE_PLUGIN_MOUNT`, which the launcher already turns into
+  # `--setenv=HYTTE_PLUGIN_MOUNT=<name>` with no launcher change at all — the
+  # override rides the same `env` path #392's key injection already uses.
+  #
+  # Note the merge order: `mount` is on the RIGHT of `//`, so it beats a
+  # hand-set `env.HYTTE_PLUGIN_MOUNT`. That is the right precedence (the
+  # typed option is the checked one) but would be a silent discard, so
+  # `nix/module-common.nix` asserts the two never disagree (#1260 review
+  # F5); agreeing values are merely redundant.
   pluginsState = builtins.toJSON (
     {
       version = 1;
       plugins = lib.mapAttrs (_: plugin: {
         exec = lib.getExe plugin.package;
-        inherit (plugin) env secrets;
+        env =
+          plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
+        inherit (plugin) secrets;
         enabled = plugin.enable;
       }) cfg.plugins;
     }
@@ -82,6 +97,15 @@ let
   # `an_empty_display_entry_is_dropped_and_a_populated_one_is_not`), so the
   # rendered file and the schema that reads it agree about what an empty
   # entry means instead of round-tripping a heading that changes nothing.
+  #
+  # This does NOT descend into lists (#1241 item 3): `mapAttrs` only recurses
+  # through attrsets, so a `null` sitting inside a `listOf submodule` leaf
+  # rides through untouched. No subsystem has one today, so nothing is
+  # silently mispruned — but the day one does, a `null` element fails loudly
+  # at `pkgs.formats.toml`'s `generate` ("Cannot convert data to TOML (null
+  # values are not supported)") rather than being dropped the way an all-null
+  # attrset is. That loud failure is the acceptable outcome; staying silent
+  # about the gap was not, which is why this paragraph exists.
   prune =
     set:
     lib.filterAttrs (_: v: !(v == null || (lib.isAttrs v && !lib.isDerivation v && v == { }))) (

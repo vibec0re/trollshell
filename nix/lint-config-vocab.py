@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Fail if `nix/module-common.nix`'s `config.*` vocabulary drifts from Rust.
+"""Fail if `nix/module-common.nix`'s hand-mirrored vocabulary drifts from Rust.
 
-Two subsystem families today — `core-leds` (#1041) and `agents` (#1227
-item 1). The file was `lint-core-leds-vocab.py` while there was only one;
-the rename came with the second (#1237 review MEDIUM-3), because the thing
-it guards is the `programs.trollshell.config.<subsystem>` mirror as such and
-a name that says `core-leds` would be wrong nine more times.
+Two `config.*` subsystem families today — `core-leds` (#1041) and `agents`
+(#1227 item 1) — plus one option that is not a `config.*` subsystem at all:
+`programs.trollshell.plugins.<id>.mount` (#1161). The file was
+`lint-core-leds-vocab.py` while there was only one family; the rename came
+with the second (#1237 review MEDIUM-3), because the thing it guards is a
+*hand-mirrored vocabulary* as such and a name that says `core-leds` would be
+wrong nine more times.
 
 THE DEFECT
 ----------
@@ -46,6 +48,27 @@ three things from `core-leds.toml`'s Rust schema:
     keys are a strict subset), and `DEFAULT_TOML` is already pinned against
     the struct by `the_shipped_default_parses_and_matches_the_rust_default`
     in that crate's own tests.
+
+`programs.trollshell.plugins.<id>.mount` (#1161) hand-mirrors a third,
+non-`config.*` vocabulary from `crates/hytte-plugin-proto/src/manifest.rs`:
+
+  - the `types.enum` of nine wire names — must list exactly `Mount::ALL`, in
+    `wire_name()`'s spelling and `ALL`'s order. Structurally the same rule as
+    `style` above, and read with the same two functions (`bracket_list_after`
+    nix-side, an `ALL` + name-table compose Rust-side); it is here because
+    the mirror is here, not because the option is a config subsystem.
+
+    Measured on #1260's own branch: renaming `"SidebarLead"` to
+    `"SidebarHead"` and inserting a tenth value left **all seven** gates that
+    could plausibly see it green — `hm-module-plugin-mount`,
+    `nixos-module-plugin-mount`, `config-vocab`, `options-doc`, `hm-module`,
+    `nixos-module` and this script. (The two mount eval checks look like a
+    guard but only catch a rename of the one value their fixture happens to
+    set.) The consequence on a user's box is worse than the `config.*`
+    families': `mount = "SidebarHead"` passes nix eval, renders
+    `HYTTE_PLUGIN_MOUNT=SidebarHead`, and the SDK then **refuses to start**
+    the plugin — every boot, on every machine. The reverse direction (a
+    rename in `wire_name` with the nix enum left stale) is the same outage.
 
 Nothing fails if the two drift: a fifth `DisplayStyle` variant added Rust-side
 renders a base file the nix option would reject at eval before anyone ever
@@ -121,6 +144,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STYLE_RS = os.path.join(REPO_ROOT, "crates", "hytte-preem", "src", "style.rs")
 CORE_LEDS_RS = os.path.join(REPO_ROOT, "trollshell", "src", "config", "core_leds.rs")
 AGENTS_RS = os.path.join(REPO_ROOT, "crates", "hytte-plugin-agents", "src", "config.rs")
+MANIFEST_RS = os.path.join(REPO_ROOT, "crates", "hytte-plugin-proto", "src", "manifest.rs")
 MODULE_COMMON_NIX = os.path.join(REPO_ROOT, "nix", "module-common.nix")
 
 # `config.agents`' nix option leaves, paired with the Rust struct whose serde
@@ -200,35 +224,65 @@ def ints_between_after(src: str, anchor: str) -> tuple[int, int]:
     return (as_int(tokens[0], "lower"), as_int(tokens[1], "upper"))
 
 
-def display_style_all(src: str) -> list[str]:
-    """`DisplayStyle`'s canonical spelling, in `ALL`'s order.
+def _enum_all_names(src: str, ty: str, fn: str, where: str) -> list[str]:
+    """`<ty>::ALL`'s variants mapped through `fn <fn>(self) -> &'static str`.
 
-    Reads `pub const ALL: [Self; N] = [Self::Vfd, Self::Lcd, …];` for the
-    variant *order*, then `fn name(self) -> &'static str { … }`'s match arms
-    for the variant -> string mapping, and composes the two — this is exactly
-    what `DisplayStyle::ALL.iter().map(|s| s.name())` computes at runtime, so
-    the nix side is checked against the same sequence the Rust schema itself
-    would resolve.
+    Reads `pub const ALL: [Self; N] = [Self::Vfd, Self::Lcd, …];` (or the
+    `[Mount; N] = [Mount::…]` spelling — both appear in the tree) for the
+    variant *order*, then that function's match arms for the
+    variant -> string mapping, and composes the two. This is exactly what
+    `<ty>::ALL.iter().map(|v| v.<fn>())` computes at runtime, so the nix side
+    is checked against the same sequence the Rust schema itself would
+    resolve.
+
+    Two enums go through this: `DisplayStyle::ALL`/`name` in
+    `crates/hytte-preem/src/style.rs` and `Mount::ALL`/`wire_name` in
+    `crates/hytte-plugin-proto/src/manifest.rs`. One function rather than two
+    near-copies because the only differences are the type's spelling and the
+    method's name — and a second copy would be a second thing to fix when
+    either enum grows a shape this scan cannot follow.
     """
-    m = re.search(r"pub const ALL:\s*\[Self;\s*\d+\]\s*=\s*\[([^\]]*)\];", src)
+    qualified = rf"(?:Self|{ty})"
+    m = re.search(rf"pub const ALL:\s*\[{qualified};\s*\d+\]\s*=\s*\[([^\]]*)\];", src)
     if not m:
-        raise LookupError("DisplayStyle::ALL not found in style.rs")
-    variants = [v.strip().removeprefix("Self::") for v in m.group(1).split(",") if v.strip()]
+        raise LookupError(f"{ty}::ALL not found in {where}")
+    variants = [
+        v.strip().removeprefix("Self::").removeprefix(f"{ty}::")
+        for v in m.group(1).split(",")
+        if v.strip()
+    ]
 
-    fn = re.search(r"fn name\(self\)\s*->\s*&'static str\s*\{", src)
-    if not fn:
-        raise LookupError("DisplayStyle::name() not found in style.rs")
-    body_start = fn.end() - 1
+    sig = re.search(rf"fn {fn}\(self\)\s*->\s*&'static str\s*\{{", src)
+    if not sig:
+        raise LookupError(f"{ty}::{fn}() not found in {where}")
+    body_start = sig.end() - 1
     body_end = match_delim(src, body_start, "{", "}")
     if body_end < 0:
-        raise LookupError("DisplayStyle::name()'s body brace never closes")
+        raise LookupError(f"{ty}::{fn}()'s body brace never closes")
     body = src[body_start:body_end]
 
-    name_of = dict(re.findall(r"Self::(\w+)\s*=>\s*\"([^\"]+)\"", body))
+    name_of = dict(re.findall(rf"{qualified}::(\w+)\s*=>\s*\"([^\"]+)\"", body))
     missing = [v for v in variants if v not in name_of]
     if missing:
-        raise LookupError(f"name() has no arm for ALL variant(s): {missing}")
+        raise LookupError(f"{fn}() has no arm for ALL variant(s): {missing}")
     return [name_of[v] for v in variants]
+
+
+def display_style_all(src: str) -> list[str]:
+    """`DisplayStyle`'s canonical spelling, in `ALL`'s order."""
+    return _enum_all_names(src, "DisplayStyle", "name", "style.rs")
+
+
+def mount_wire_names(src: str) -> list[str]:
+    """`Mount`'s wire names, in `ALL`'s order (#1161, #1260 review F3).
+
+    The vocabulary `programs.trollshell.plugins.<id>.mount`'s `types.enum`
+    hand-mirrors, and the one the SDK matches `HYTTE_PLUGIN_MOUNT` against at
+    plugin startup — `Mount::from_wire_name` is `wire_name`'s exact inverse,
+    so a value outside this list is a launch failure rather than a card in
+    the wrong place.
+    """
+    return _enum_all_names(src, "Mount", "wire_name", "crates/hytte-plugin-proto/src/manifest.rs")
 
 
 def fill_parser_vocab(src: str) -> list[str]:
@@ -291,6 +345,23 @@ def agents_option_levels(nix_src: str) -> dict[str, list[str]]:
     return {"AgentsConfig": option_leaves(outer), "Display": option_leaves(display_body)}
 
 
+def _serde_attr_lists(text: str) -> list[str]:
+    """Every `#[serde(...)]` attribute's inner content found in `text`."""
+    return re.findall(r"#\[serde\(([^)]*)\)\]", text)
+
+
+def _serde_has(text: str, pattern: str) -> bool:
+    """Whether `pattern` matches ANYWHERE inside any `#[serde(...)]`
+    attribute list in `text` — scanned as a whole list rather than by
+    position (#1241). The idiom `Display` itself uses,
+    `#[serde(default, skip_serializing_if = "…", rename = "glyph")]`, puts
+    `rename` third; a scan that only checked the first entry or two (the old
+    `"serde(rename" in body` / `"serde(default, rename" in body` prefixes)
+    scanned that green.
+    """
+    return any(re.search(pattern, attrs) for attrs in _serde_attr_lists(text))
+
+
 def struct_serde_fields(src: str, struct: str) -> list[str]:
     """The serde-visible field names of `pub struct <struct>`, in source order.
 
@@ -307,17 +378,24 @@ def struct_serde_fields(src: str, struct: str) -> list[str]:
     # Container attributes sit between the doc comment and the struct keyword;
     # 500 characters back covers the derive list and any `#[serde(...)]` line.
     head = src[max(0, m.start() - 500) : m.start()]
-    if "rename_all" in head:
+    if _serde_has(head, r"rename_all"):
         raise LookupError(f"`{struct}` carries a serde `rename_all` this scan cannot follow")
     body_start = m.end() - 1
     body_end = match_delim(src, body_start, "{", "}")
     if body_end < 0:
         raise LookupError(f"`pub struct {struct}`'s body brace never closes")
     body = src[body_start:body_end]
-    for spelling in ("rename", "flatten"):
-        if f"serde({spelling}" in body or f"serde(default, {spelling}" in body:
-            raise LookupError(f"`{struct}` uses serde `{spelling}`, which this scan cannot follow")
-    fields = re.findall(r"pub (\w+):", body)
+    if _serde_has(body, r"rename\s*="):
+        raise LookupError(f"`{struct}` uses serde `rename`, which this scan cannot follow")
+    if _serde_has(body, r"\bflatten\b"):
+        raise LookupError(f"`{struct}` uses serde `flatten`, which this scan cannot follow")
+    # `pub(crate)`/`pub(super)` is still a `pub` field as far as serde and
+    # TOML are concerned — only a Rust-side visibility restriction, which
+    # this scan must not confuse with "not a field at all" (#1241): the old
+    # `pub (\w+):` pattern had a literal space and so never matched a
+    # visibility qualifier, silently dropping the field from the comparison
+    # instead of comparing it.
+    fields = re.findall(r"pub(?:\([^)]*\))?\s+(\w+):", body)
     if not fields:
         raise LookupError(f"`pub struct {struct}` has no `pub` fields")
     return fields
@@ -379,6 +457,46 @@ def self_test() -> list[str]:
     if "other" in got:
         failures.append("fill_parser_vocab: the catch-all arm must never be captured")
 
+    # #1161/#1260 F3: `Mount::ALL` is spelled `[Mount; N] = [Mount::…]`, not
+    # `[Self; N] = [Self::…]` the way `DisplayStyle::ALL` is, and its name
+    # table is `wire_name` rather than `name`. Both spellings must read.
+    mount_src = """
+    pub const ALL: [Mount; 3] = [Mount::SidebarLead, Mount::BarLeft, Mount::BarRight];
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Mount::SidebarLead => "SidebarLead",
+            Mount::BarLeft => "BarLeft",
+            Mount::BarRight => "BarRight",
+        }
+    }
+    """
+    got = mount_wire_names(mount_src)
+    if got != ["SidebarLead", "BarLeft", "BarRight"]:
+        failures.append(f"mount_wire_names: expected the three in ALL's order, got {got}")
+    # A half-done append — a variant in `ALL` with no arm in the name table —
+    # must refuse rather than silently drop it from the comparison, which
+    # would let the nix enum go one value short and stay green.
+    half_done = mount_src.replace('Mount::BarRight => "BarRight",', "")
+    try:
+        mount_wire_names(half_done)
+        failures.append("mount_wire_names: a variant with no wire_name arm was not refused")
+    except LookupError:
+        pass
+    # The two enums must not read each other's tables: `name`/`wire_name` and
+    # `DisplayStyle`/`Mount` are both parameters, so a mix-up would show up
+    # as one of them silently reading the other's arms out of a file that
+    # holds both. Neither function may find anything in the other's source.
+    for fn_name, fn, other_src in (
+        ("display_style_all", display_style_all, mount_src),
+        ("mount_wire_names", mount_wire_names, style_src),
+    ):
+        try:
+            fn(other_src)
+            failures.append(f"{fn_name}: read the other enum's table instead of refusing")
+        except LookupError:
+            pass
+
     if max_rows("const MAX_ROWS: usize = 64;") != 64:
         failures.append("max_rows: did not read the literal back")
     # A number sharing digits with a nearby, differently-named constant must
@@ -406,6 +524,25 @@ def self_test() -> list[str]:
     got = bracket_list_after(nix_src, "style = lib.mkOption {")
     if got != ["vfd", "lcd", "oled", "crt"]:
         failures.append(f"bracket_list_after: expected the four nix-side, got {got}")
+
+    # #1161's `mount` enum is nested one level deeper than `style`'s
+    # (`nullOr (enum [ … ])` either way, but written across more lines), so
+    # read a fixture shaped like the real option rather than assuming.
+    mount_nix_src = """
+    mount = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.enum [
+          "SidebarLead"
+          "BarLeft"
+          "BarRight"
+        ]
+      );
+      default = null;
+    };
+    """
+    got = bracket_list_after(mount_nix_src, "mount = lib.mkOption {")
+    if got != ["SidebarLead", "BarLeft", "BarRight"]:
+        failures.append(f"bracket_list_after: expected the three mount names, got {got}")
     got_bounds = ints_between_after(nix_src, "ints.between ")
     if got_bounds != (0, 64):
         failures.append(f"ints_between_after: expected (0, 64), got {got_bounds}")
@@ -484,6 +621,42 @@ def self_test() -> list[str]:
     except LookupError:
         pass
 
+    # #1241: `rename` inside a MULTI-attribute serde list, not just as the
+    # sole or leading entry — the `Display` idiom itself,
+    # `#[serde(default, skip_serializing_if = "…", rename = "glyph")]`,
+    # scanned green before this fix (the old check only looked at the
+    # attribute's first one or two entries).
+    multi_attr_renamed = '''
+    #[derive(Deserialize)]
+    pub struct MultiAttrRenamed {
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "glyph")]
+        pub icon: Option<String>,
+    }
+    '''
+    try:
+        struct_serde_fields(multi_attr_renamed, "MultiAttrRenamed")
+        failures.append("struct_serde_fields: a multi-attribute serde rename was not refused")
+    except LookupError:
+        pass
+
+    # #1241: `pub(crate)`/`pub(super)` is still a field as far as serde and
+    # TOML are concerned — the old `pub (\\w+):` pattern (note the literal
+    # space) never matched a visibility qualifier at all, silently dropping
+    # the field from the comparison instead of comparing it.
+    scoped_visibility = '''
+    #[derive(Deserialize)]
+    pub struct ScopedVisibility {
+        pub(crate) glyph: String,
+        pub(super) label: String,
+        pub plain: String,
+    }
+    '''
+    got = struct_serde_fields(scoped_visibility, "ScopedVisibility")
+    if got != ["glyph", "label", "plain"]:
+        failures.append(
+            f"struct_serde_fields: pub(crate)/pub(super) fields dropped, got {got}"
+        )
+
     agents_nix_src = '''
     config.agents = lib.mkOption {
       type = lib.types.submodule {
@@ -541,7 +714,9 @@ def main() -> int:
         return 2
 
     missing = [
-        p for p in (STYLE_RS, CORE_LEDS_RS, AGENTS_RS, MODULE_COMMON_NIX) if not os.path.isfile(p)
+        p
+        for p in (STYLE_RS, CORE_LEDS_RS, AGENTS_RS, MANIFEST_RS, MODULE_COMMON_NIX)
+        if not os.path.isfile(p)
     ]
     if missing:
         print(f"config-vocab scan: file(s) not found: {', '.join(missing)}", file=sys.stderr)
@@ -551,6 +726,7 @@ def main() -> int:
     style_src = read(STYLE_RS)
     core_leds_src = read(CORE_LEDS_RS)
     agents_src = read(AGENTS_RS)
+    manifest_src = read(MANIFEST_RS)
     nix_src = read(MODULE_COMMON_NIX)
 
     try:
@@ -562,6 +738,8 @@ def main() -> int:
         nix_rows_lo, nix_rows_hi = ints_between_after(nix_src, "rows = lib.mkOption {")
         rust_poll_lo, rust_poll_hi = poll_seconds_bounds(agents_src)
         nix_poll_lo, nix_poll_hi = ints_between_after(nix_src, "poll_seconds = lib.mkOption {")
+        rust_mount = mount_wire_names(manifest_src)
+        nix_mount = bracket_list_after(nix_src, "mount = lib.mkOption {")
         nix_agents_levels = agents_option_levels(nix_src)
         rust_agents_levels = {
             struct: struct_serde_fields(agents_src, struct)
@@ -597,6 +775,13 @@ def main() -> int:
             f"rows: nix/module-common.nix's upper bound is {nix_rows_hi}, "
             f"but MAX_ROWS is {rust_max_rows}"
         )
+    if nix_mount != rust_mount:
+        mismatches.append(
+            f"mount: nix/module-common.nix has {nix_mount}, "
+            f"but Mount::ALL is {rust_mount} "
+            "(crates/hytte-plugin-proto/src/manifest.rs) — a value only one side "
+            "knows renders a HYTTE_PLUGIN_MOUNT the SDK refuses at plugin startup"
+        )
     if (nix_poll_lo, nix_poll_hi) != (rust_poll_lo, rust_poll_hi):
         mismatches.append(
             f"poll_seconds: nix/module-common.nix bounds it {nix_poll_lo}..{nix_poll_hi}, "
@@ -630,10 +815,10 @@ def main() -> int:
         for line in mismatches:
             print(f"  - {line}", file=sys.stderr)
         print(
-            "\nnix/module-common.nix's `programs.trollshell.config.{core-leds,agents}` "
-            "hand-mirror\nthis vocabulary (see those options' own descriptions) — update "
-            "whichever side fell\nbehind so a base-layer render and the shell's own parser "
-            "agree.",
+            "\nnix/module-common.nix's `programs.trollshell.config.{core-leds,agents}` and "
+            "`plugins.<id>.mount`\nhand-mirror this vocabulary (see those options' own "
+            "descriptions) — update whichever side\nfell behind so a base-layer render and "
+            "the shell's own parser agree.",
             file=sys.stderr,
         )
         return 1
@@ -642,7 +827,8 @@ def main() -> int:
         f"config-vocab scan: core-leds style {rust_style}, fill {rust_fill}, "
         f"rows 0-{rust_max_rows}; agents poll_seconds {rust_poll_lo}-{rust_poll_hi}, "
         f"keys {rust_agents_levels['AgentsConfig']} + display "
-        f"{rust_agents_levels['Display']} — nix and Rust agree",
+        f"{rust_agents_levels['Display']}; plugins.<id>.mount {rust_mount} "
+        "— nix and Rust agree",
         flush=True,
     )
     return 0

@@ -46,6 +46,29 @@
 //! workspace's index; the column order itself stays a property of the
 //! connected outputs, not of the cards in it.
 //!
+//! ## How wide the page is
+//!
+//! The columns box is **homogeneous**, so the page's width divided by the number
+//! of columns *is* a column. Since #1219 the page therefore sizes itself from that
+//! count — [`crate::components::layout::workspaces_page_width`], 680 for one
+//! column, 732 for two, 1080 from three — rather than sitting at the widest
+//! supported layout whatever it renders, which drew a single 1080-px column around
+//! ~340 px of card on a one-monitor box.
+//!
+//! The count is the number of columns this page *renders* (one per connected
+//! output, plus at most one "not connected" one), which comes out of the same
+//! model everything else on the page does. It is deliberately **not**
+//! `displays::outputs().len()`: that snapshot is read only for the columns' `(x, y)`
+//! sort order (#1110) and can lag or be empty while niri already reports
+//! workspaces on two screens.
+//!
+//! [`bind_columns`] publishes the width into [`PAGE_WIDTH`] and applies it to this
+//! page's own clamp on every model revision — so a monitor hot-plugged while the
+//! drawer is open resizes it — and `modal.rs`'s two on-show caps plus
+//! [`crate::panels::workspace_edit`]'s form read that one number, which is what
+//! keeps the Edit sub-page measuring exactly the same as the page it replaces
+//! (#1108).
+//!
 //! ## Dragging a card (§5/§3.6)
 //!
 //! A card's screen is set by **dragging it into another monitor's column** —
@@ -73,10 +96,11 @@
 //! page be driven from a bare `#[gtk::test]` with plain `Mutable`s — the same
 //! seam `widgets::workspaces::bind_workspace_pills` and
 //! `panels::bluetooth::bind_device_groups` carve for the same reason.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
+use hytte::adw;
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gdk, glib, pango, prelude::*};
@@ -86,11 +110,65 @@ use hytte::services::niri::{self, Window, Workspace};
 
 use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
 use crate::components::layout::{
-    DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page_box, toggle_class,
+    WORKSPACES_COLUMN_SPACING, finish_page_clamped, page_box, set_page_width, toggle_class,
+    workspaces_page_width,
 };
 use crate::config::workspaces::{self as config_workspaces, Layout, Workspaces};
 use crate::panels::workspace_edit;
 use crate::workspace_stacks::{self, StackState, state_of};
+
+thread_local! {
+    /// The width this page currently asks for — [`workspaces_page_width`] of the
+    /// number of columns the last model revision rendered (#1219), republished on
+    /// every revision by [`bind_columns`].
+    ///
+    /// ## Why a cell rather than each site deciding for itself
+    ///
+    /// Three places have to agree on one number, and #1108's whole point is that
+    /// they must never disagree — the Workspaces page and its Edit sub-page have
+    /// to measure the same or the drawer visibly jumps the moment ✎ is pressed:
+    ///
+    /// * this page's own `AdwClamp`, which [`bind_columns`] resizes as the column
+    ///   count changes (so a monitor hot-plug while the drawer is open resizes the
+    ///   page rather than waiting for the next open),
+    /// * `modal::apply_workspaces_width_cap`, which re-pushes the same width on
+    ///   every show, and
+    /// * `panels::workspace_edit`'s form, which reads it when it builds — both for
+    ///   its own clamp and for whether it lays out in one column or two.
+    ///
+    /// Only the first of those three can see the model, so it publishes and the
+    /// other two read. The alternative — handing every one of them the outputs
+    /// signal — would give three independent subscriptions that can be one
+    /// revision apart, which is exactly the jump #1108 fixed.
+    ///
+    /// Thread-local, on the GTK main thread, like every other UI-side cell here.
+    /// The count is global (it is the same set of monitors whichever drawer is
+    /// open), so the per-monitor pages all publish the same value and the last
+    /// writer is not a race, just a repeat.
+    static PAGE_WIDTH: Cell<i32> = const { Cell::new(workspaces_page_width(0)) };
+}
+
+/// The width the Workspaces page and its Edit sub-page should measure right now,
+/// in CSS px before [`crate::scale::scale`] — see [`PAGE_WIDTH`].
+///
+/// Reads the no-outputs width ([`workspaces_page_width`] of 0, i.e. the ordinary
+/// drawer width) until the page has been built once and its first model revision
+/// has landed, which is also the honest answer before anything is known.
+pub(crate) fn current_page_width() -> i32 {
+    PAGE_WIDTH.with(Cell::get)
+}
+
+/// Publish a page width without a model, so a `#[gtk::test]` outside this module
+/// can drive `modal.rs`'s caps and `workspace_edit`'s layout choice.
+///
+/// Test-only on purpose: in production [`bind_columns`] is the only writer.
+/// Every `#[gtk::test]` in the binary runs on one thread and therefore shares
+/// [`PAGE_WIDTH`], so a test that asserts on a width must **set** it rather than
+/// inherit whatever the previous test left behind.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn set_current_page_width_for_test(width: i32) {
+    PAGE_WIDTH.with(|cell| cell.set(width));
+}
 
 /// CSS class on an app icon whose app has at least one window open on the
 /// card's workspace.
@@ -617,7 +695,7 @@ where
     T: Signal<Item = BTreeSet<String>> + 'static,
     O: Signal<Item = Vec<DisplayOutput>> + 'static,
 {
-    let columns_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let columns_box = gtk::Box::new(gtk::Orientation::Horizontal, WORKSPACES_COLUMN_SPACING);
     columns_box.add_css_class("ts-ws-columns");
     columns_box.set_homogeneous(true);
     columns_box.set_valign(gtk::Align::Fill);
@@ -642,17 +720,28 @@ where
     // is not rebound to any of this; see `panels::workspace_edit`'s module doc.)
     .dedupe_cloned();
 
-    bind_columns(&columns_box, combined);
-
     let column = page_box();
     column.add_css_class("ts-popup-column");
     column.add_css_class("ts-ws-page");
     column.append(&columns_box);
 
-    // One column per monitor inside the 680px default clamp would squeeze a
-    // two-screen setup to ~330px a column — the same measurement that put the
-    // Stats multicolumn page on the wide clamp (#508).
-    finish_page_clamped(&column, DRAWER_MAX_WIDTH_WIDE)
+    // The starting width is the no-outputs one; [`bind_columns`] moves the clamp
+    // to `workspaces_page_width(columns)` on the first model revision and on
+    // every one after it (#1219). Before that this page was pinned to
+    // `DRAWER_MAX_WIDTH_WIDE` from construction *and* floored there by
+    // `modal::apply_workspaces_width_cap`, so a one-monitor box drew a single
+    // 1080-px column around ~340 px of card.
+    //
+    // **Bound after the tree is assembled**, deliberately: the apply closure
+    // reaches this clamp through `columns_box.ancestor(…)` (see `bind_columns`),
+    // so the clamp has to exist and be an ancestor by the time the binding first
+    // applies. It would be, even bound earlier — `bind` applies on the next
+    // `MainContext` iteration, by which point `build_panel` has returned — but
+    // relying on that ordering to make a widget lookup succeed is a trap, and the
+    // two statements cost nothing to keep in this order.
+    let page = finish_page_clamped(&column, workspaces_page_width(0));
+    bind_columns(&columns_box, combined);
+    page
 }
 
 /// Rebuild the per-monitor columns from `model` into `columns_box`.
@@ -670,6 +759,30 @@ where
     // `AppInfo::all()` scan, not one per card. Lives as long as the binding.
     let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
     bind(model, columns_box, move |columns_box, page| {
+        // #1219: the page's width follows the number of columns it is about to
+        // render, so one monitor gets the ordinary drawer width instead of a
+        // 1080-px column. Published for `modal.rs`'s on-show re-push and for
+        // `panels::workspace_edit`'s form, then applied to this page's own clamp
+        // so a monitor hot-plug resizes the drawer while it is open.
+        //
+        // The clamp is reached by walking **up** from the container `bind` handed
+        // us rather than by capturing it: a strong clone of an ancestor inside a
+        // binding owned by its own descendant is a reference cycle (clamp → page
+        // box → columns box → binding → clamp), which would leak the whole page
+        // for the life of the process, and a `WeakRef` would be one more thing to
+        // keep correct for no gain. `build_panel` is the only builder and always
+        // wraps this box in that clamp; a test that drives `bind_columns` with a
+        // bare box (`the_columns_binding_does_not_pin_its_container`) simply finds
+        // nothing here, which is the right answer for a box with no page.
+        let width = workspaces_page_width(page.columns.len());
+        PAGE_WIDTH.with(|cell| cell.set(width));
+        if let Some(clamp) = columns_box
+            .ancestor(adw::Clamp::static_type())
+            .and_then(|w| w.downcast::<adw::Clamp>().ok())
+        {
+            set_page_width(&clamp, width);
+        }
+
         while let Some(child) = columns_box.first_child() {
             columns_box.remove(&child);
         }
@@ -1401,6 +1514,9 @@ mod fixtures {
 
     pub(super) const LEFT: &str = "DP-1";
     pub(super) const RIGHT: &str = "HDMI-A-1";
+    /// A third connector, for the cases that need three columns (#1219's
+    /// three-screen width).
+    pub(super) const THIRD: &str = "DP-2";
 
     /// A [`DisplayOutput`] at logical position `(x, y)` — #1110's column
     /// order. Only `name`/`x`/`y` matter to the model; the rest are neutral
@@ -2461,12 +2577,17 @@ mod model_tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 pub(in crate::panels) mod tests {
-    use super::fixtures::{LEFT, RIGHT, no_stacks, output_at, saved, stack, win, ws, ws_focused};
+    use super::fixtures::{
+        LEFT, RIGHT, THIRD, no_stacks, output_at, saved, stack, win, ws, ws_focused,
+    };
     use super::{
         APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_HEADER_CLASS, CARD_INACTIVE_CLASS, DisplayOutput,
         EMPTY_COLUMN_HINT, NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
+        current_page_width,
     };
+    use crate::components::layout::workspaces_page_width;
     use crate::config::workspaces::Workspaces;
+    use crate::scale::scale;
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, graphene, prelude::*};
@@ -2485,7 +2606,11 @@ pub(in crate::panels) mod tests {
     /// appending a child queues an allocation on its parent, and the queue is
     /// drained by the frame clock rather than by an idle. Same helper, same
     /// reason, as `overlays::sidebar`'s scroll tests.
-    fn pump_until(ms: u64, done: impl Fn() -> bool) {
+    ///
+    /// Shared with `panels::workspace_edit`'s tests, like
+    /// [`assert_inside_and_hittable`] below and for the same reason (review
+    /// MEDIUM 5): one definition of how this tree is waited on.
+    pub(in crate::panels) fn pump_until(ms: u64, done: impl Fn() -> bool) {
         let expired = std::rc::Rc::new(std::cell::Cell::new(false));
         let flag = expired.clone();
         gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
@@ -2668,6 +2793,106 @@ pub(in crate::panels) mod tests {
                 .is_some_and(|w| w == *inner || w.is_ancestor(inner)),
             "a click at the centre of {what} does not reach it"
         );
+    }
+
+    /// The page's clamp, as [`build_panel`] returns it — `finish_page_clamped`
+    /// upcasts the `AdwClamp` itself, with nothing wrapped around it, which is
+    /// also what lets `modal::apply_workspaces_width_cap` downcast it back.
+    fn page_clamp(page: &gtk::Widget) -> adw::Clamp {
+        page.clone()
+            .downcast::<adw::Clamp>()
+            .expect("the Workspaces page is its own AdwClamp")
+    }
+
+    /// The page measures exactly `workspaces_page_width(columns)`, and has
+    /// published that number for `modal.rs` and `panels::workspace_edit` to read.
+    ///
+    /// All three clamp properties, because any one of them alone is not the
+    /// guarantee: the two ceilings without the floor leave the page shrinking to
+    /// its content's natural width (the #1108 bug), and the floor without the
+    /// ceilings lets a wide child push past it.
+    fn assert_page_width(page: &gtk::Widget, count: usize) {
+        assert_eq!(
+            columns(page).len(),
+            count,
+            "this assertion is about a {count}-column page, so the page has to have \
+             rendered that many columns first"
+        );
+        let clamp = page_clamp(page);
+        let want = scale(workspaces_page_width(count));
+        assert_eq!(
+            clamp.maximum_size(),
+            want,
+            "{count} columns: the clamp's ceiling"
+        );
+        assert_eq!(
+            clamp.tightening_threshold(),
+            want,
+            "{count} columns: the clamp's tightening threshold, which must equal \
+             the ceiling or the clamp over-requests (#134)"
+        );
+        assert_eq!(
+            clamp.width_request(),
+            want,
+            "{count} columns: the minimum that makes the page *fill* its cap (#1108)"
+        );
+        assert_eq!(
+            current_page_width(),
+            workspaces_page_width(count),
+            "{count} columns: the width published for modal.rs's on-show re-push \
+             and for the Edit form"
+        );
+    }
+
+    /// #1219: the page's width follows the number of columns it renders — one
+    /// monitor gets the ordinary 680-px drawer, two get 732, three the 1080-px
+    /// wide page — and it **re-sizes while the drawer is open**, which is what
+    /// makes a monitor hot-plug land rather than wait for the next open.
+    ///
+    /// Driven through the injected workspaces signal, because that is where the
+    /// column set comes from: `model` derives the connected outputs from niri's
+    /// own snapshot, and takes `displays::outputs()` only for the columns' `(x, y)`
+    /// sort order (#1110). So the number that decides the width is the number of
+    /// columns rendered, which is why `workspaces_page_width` takes that rather
+    /// than `outputs.len()` — the latter is empty here and would size a
+    /// two-column page at 680.
+    ///
+    /// **The mutation**: deleting the `PAGE_WIDTH`/`set_page_width` block at the
+    /// top of `bind_columns`' apply closure reds this — the clamp stays at
+    /// `workspaces_page_width(0)` from construction, so the two- and
+    /// three-column cases fail.
+    #[gtk::test]
+    fn the_page_width_follows_the_number_of_columns() {
+        let f = fixture();
+        f.workspaces.set(vec![ws(1, 1, LEFT, Some("one"))]);
+        pump();
+        let window = present(&f.page);
+
+        assert_page_width(&f.page, 1);
+
+        // A second screen appears while the drawer is open.
+        f.workspaces.set(vec![
+            ws(1, 1, LEFT, Some("one")),
+            ws(2, 1, RIGHT, Some("two")),
+        ]);
+        pump();
+        assert_page_width(&f.page, 2);
+
+        // …and a third.
+        f.workspaces.set(vec![
+            ws(1, 1, LEFT, Some("one")),
+            ws(2, 1, RIGHT, Some("two")),
+            ws(3, 1, THIRD, Some("three")),
+        ]);
+        pump();
+        assert_page_width(&f.page, 3);
+
+        // Unplugging two of them takes it back down — the floor is not sticky.
+        f.workspaces.set(vec![ws(1, 1, LEFT, Some("one"))]);
+        pump();
+        assert_page_width(&f.page, 1);
+
+        window.destroy();
     }
 
     /// §7: **one column per monitor**, side by side — and each column is
@@ -3533,10 +3758,20 @@ pub(in crate::panels) mod tests {
     /// #1119: the double-size icons wrap onto a second row instead of
     /// clipping past the card's edge or shrinking to squeeze in.
     ///
-    /// 330 px is the width `build_column`'s own doc comment measures for a
+    /// ~330 px is the width `build_column`'s own doc comment measures for a
     /// two-screen drawer column ("would squeeze a two-screen setup to ~330px
     /// a column") — comfortably narrower than twelve 32 px icons plus their
     /// spacing need in one row, so the wrap is not a near thing.
+    ///
+    /// **Two screens** is how that width is reached, since #1219: the page now
+    /// carries a width request of its own (`workspaces_page_width` of the column
+    /// count), so a `set_default_size(330, …)` on a one-column page no longer
+    /// squeezes anything — GTK cannot allocate below a child's minimum, and one
+    /// column would be a whole 680-px page wide, where twelve icons fit on one row
+    /// with room to spare. Taking the column count seriously instead is also the
+    /// honest geometry: a ~330-px column is what *two* screens produce
+    /// (732 / 2 − gutter), so this now measures the case the doc comment names
+    /// rather than an allocation no drawer ever has.
     ///
     /// **The mutation**: building `.ts-ws-apps` as a plain `gtk::Box` instead
     /// of a `gtk::FlowBox` reds this — the twelfth icon renders past the
@@ -3546,7 +3781,8 @@ pub(in crate::panels) mod tests {
     #[gtk::test]
     fn a_crowded_stack_wraps_its_icons_onto_a_second_row() {
         let f = fixture();
-        f.workspaces.set(vec![ws_focused(1, 1, LEFT, None)]);
+        f.workspaces
+            .set(vec![ws_focused(1, 1, LEFT, None), ws(2, 1, RIGHT, None)]);
         f.saved.set(saved(&[(
             "chat",
             stack(
@@ -3558,9 +3794,15 @@ pub(in crate::panels) mod tests {
 
         let window = gtk::Window::new();
         window.set_child(Some(&f.page));
-        window.set_default_size(330, 600);
+        window.set_default_size(scale(workspaces_page_width(2)), 600);
         window.present();
         pump();
+
+        assert_eq!(
+            columns(&f.page).len(),
+            2,
+            "the ~330 px column this test is about is a two-screen one"
+        );
 
         let column = &columns(&f.page)[0];
         let card = &cards(column)[0];

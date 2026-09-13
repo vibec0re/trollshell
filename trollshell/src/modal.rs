@@ -11,7 +11,7 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window, on_surface_ready};
 
-use crate::components::layout::DRAWER_MAX_WIDTH_WIDE;
+use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, set_page_width};
 use crate::components::monitor_key::{is_fallback_key, monitor_key};
 use crate::components::visibility_gate::GateRegistry;
 use crate::scale::scale;
@@ -2088,22 +2088,29 @@ fn apply_stats_max_height(panel: &ModalPanel) {
     }
 }
 
-/// Make the Workspaces page's own `AdwClamp` *fill* the shared wide cap
-/// (#1108, Annika on the issue 15:01Z: "680 cap sounds fine if used" — the
-/// page was shrinking to its content's natural width instead of reaching the
-/// existing `DRAWER_MAX_WIDTH_WIDE` ceiling it's already clamped to, so with
-/// one or two monitors the drawer read noticeably narrower than the Stats
-/// multicolumn page even though both share the same `finish_page_clamped`
-/// call). `maximum_size`/`tightening_threshold` already sit at
-/// `DRAWER_MAX_WIDTH_WIDE` from construction — a ceiling, not a floor — so
-/// this pushes a matching **minimum** width request onto the same clamp,
-/// the same seam [`build_positioner`] already uses to floor the drawer at
-/// its narrow-page minimum. Re-applied on every show (not only first build)
-/// — a no-op if the page was never opened on this monitor yet, exactly like
-/// [`apply_stats_max_height`].
+/// Make the Workspaces page's own `AdwClamp` *fill* its cap (#1108, Annika on
+/// the issue 15:01Z: "680 cap sounds fine if used" — the page was shrinking to
+/// its content's natural width instead of reaching the ceiling it's already
+/// clamped to, so the drawer read noticeably narrower than the Stats multicolumn
+/// page even though both share the same `finish_page_clamped` call).
+/// [`crate::components::layout::set_page_width`] pushes a **minimum** width
+/// request matching the ceiling onto the clamp — the same seam
+/// [`build_positioner`] already uses to floor the drawer at its narrow-page
+/// minimum — and moves the ceiling with it. Re-applied on every show (not only
+/// first build) — a no-op if the page was never opened on this monitor yet,
+/// exactly like [`apply_stats_max_height`].
 ///
-/// Needs no action-group cooperation from `panels::workspaces` (that file is
-/// phase 4's lane while this ships, so it can't gain one):
+/// **Which width** is `panels::workspaces::current_page_width()`, not a constant
+/// (#1219): the page's own binding publishes `workspaces_page_width(columns)` on
+/// every model revision, so one monitor asks for the ordinary 680-px drawer and
+/// three for the 1080-px wide one. Reading the same published number here is what
+/// keeps this cap and [`apply_workspace_edit_width_cap`] equal at all times,
+/// which is #1108's actual contract — the Edit sub-page must measure the same as
+/// the page it replaces or the drawer jumps on ✎. Pushing
+/// `DRAWER_MAX_WIDTH_WIDE` here instead would silently undo #1219 on every show,
+/// since the floor wins over the page's own narrower request.
+///
+/// Needs no action-group cooperation from `panels::workspaces`:
 /// `panels::panel_workspaces` returns the `AdwClamp` itself —
 /// `finish_page_clamped`'s `clamp.upcast()`, with nothing wrapped around it —
 /// so the widget `ensure_page` stashed in `panel.stack` under
@@ -2117,7 +2124,7 @@ fn apply_workspaces_width_cap(panel: &ModalPanel) {
         tracing::debug!("modal: workspaces page child is not an AdwClamp");
         return;
     };
-    clamp.set_size_request(scale(DRAWER_MAX_WIDTH_WIDE), -1);
+    set_page_width(&clamp, crate::panels::workspaces::current_page_width());
 }
 
 /// The same cap for the Workspaces **Edit** sub-page (#1108 × #1071 phase 4).
@@ -2131,12 +2138,16 @@ fn apply_workspaces_width_cap(panel: &ModalPanel) {
 /// That one's child is `finish_page_clamped`'s `adw::Clamp` directly; this one's
 /// is `panels::workspace_edit::edit_slot`'s bind container — a `gtk::Box` whose
 /// child is rebuilt per selection — so there is no clamp to downcast to at this
-/// level, and the request goes on the box that holds it.
+/// level, and the request goes on the box that holds it. What keeps the two equal
+/// is that both read the *same* published number
+/// (`panels::workspaces::current_page_width()`, #1219) rather than each carrying
+/// its own constant; the form inside the slot reads it a third time, for its own
+/// clamp and for whether it stacks its columns (#1220).
 fn apply_workspace_edit_width_cap(panel: &ModalPanel) {
     let Some(widget) = panel.stack.child_by_name(WORKSPACE_EDIT_STACK_CHILD) else {
         return;
     };
-    widget.set_size_request(scale(DRAWER_MAX_WIDTH_WIDE), -1);
+    widget.set_size_request(scale(crate::panels::workspaces::current_page_width()), -1);
 }
 
 #[cfg(test)]
@@ -2842,9 +2853,11 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{
-        Active, BarGeometry, DRAWER_MAX_WIDTH_WIDE, ModalPanel, PANELS, Page, drawer_open_state,
-        monitor_key, on_page_show, recompute_gates, toggle,
+        Active, BarGeometry, ModalPanel, PANELS, Page, drawer_open_state, monitor_key,
+        on_page_show, recompute_gates, toggle,
     };
+    use crate::components::layout::workspaces_page_width;
+    use crate::panels::workspaces::set_current_page_width_for_test;
     use crate::scale::scale;
     use hytte::adw;
     use hytte::gtk::{self, prelude::*};
@@ -2898,12 +2911,17 @@ mod gtk_tests {
     }
 
     /// #1108's core mutation target: `on_page_show`'s `Page::Workspaces` arm
-    /// must push a **minimum** width request matching `DRAWER_MAX_WIDTH_WIDE`
-    /// onto the page's own `AdwClamp` on *every* show, not only at first
-    /// build — filling the existing cap instead of shrinking to content.
-    /// Deleting `apply_workspaces_width_cap(panel)` from that arm leaves the
-    /// clamp's width request at its `adw::Clamp::new()` default (`-1`,
-    /// meaning "no minimum, size to content") — red.
+    /// must push a **minimum** width request matching the page's cap onto the
+    /// page's own `AdwClamp` on *every* show, not only at first build — filling
+    /// the cap instead of shrinking to content. Deleting
+    /// `apply_workspaces_width_cap(panel)` from that arm leaves the clamp's width
+    /// request at its `adw::Clamp::new()` default (`-1`, meaning "no minimum, size
+    /// to content") — red.
+    ///
+    /// The width is seeded explicitly (#1219 made it a published number rather
+    /// than a constant): every `#[gtk::test]` in this binary shares the
+    /// thread-local it lives in, so a test that asserts on it must set it rather
+    /// than inherit whatever ran before.
     #[gtk::test]
     fn on_page_show_fills_the_workspaces_clamp_to_the_cap() {
         let monitor = test_monitor();
@@ -2912,10 +2930,71 @@ mod gtk_tests {
         panel
             .stack
             .add_named(&clamp, Some(Page::Workspaces.stack_name()));
+        set_current_page_width_for_test(workspaces_page_width(3));
 
         on_page_show(&panel, Page::Workspaces);
 
-        assert_eq!(clamp.width_request(), scale(DRAWER_MAX_WIDTH_WIDE));
+        assert_eq!(clamp.width_request(), scale(workspaces_page_width(3)));
+    }
+
+    /// #1219: the cap that arm pushes is the width `panels::workspaces` published
+    /// for the column count it is rendering — so a one-monitor box gets the
+    /// ordinary 680-px drawer, not the 1080-px three-column one. All three clamp
+    /// properties move, because the floor alone would fight the page's own
+    /// narrower ceiling and the ceilings alone would let it shrink to content
+    /// again.
+    ///
+    /// And the two caps must be the **same number at every width** — that is
+    /// #1108's actual contract, not the constant it happened to use: the Edit
+    /// sub-page is a different stack child, so if the two disagree the drawer
+    /// jumps the moment ✎ is pressed and back on Save/Cancel.
+    ///
+    /// **The mutation**: either `apply_workspaces_width_cap` or
+    /// `apply_workspace_edit_width_cap` reading `DRAWER_MAX_WIDTH_WIDE` again
+    /// instead of `panels::workspaces::current_page_width()` reds the one- and
+    /// two-column rounds here.
+    #[gtk::test]
+    fn both_workspaces_caps_follow_the_published_width_and_stay_equal() {
+        let monitor = test_monitor();
+        let panel = harness_panel(&monitor);
+        let clamp = adw::Clamp::new();
+        panel
+            .stack
+            .add_named(&clamp, Some(Page::Workspaces.stack_name()));
+        let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panel
+            .stack
+            .add_named(&slot, Some(super::WORKSPACE_EDIT_STACK_CHILD));
+
+        for columns in [1usize, 2, 3, 4] {
+            let want = scale(workspaces_page_width(columns));
+            set_current_page_width_for_test(workspaces_page_width(columns));
+
+            on_page_show(&panel, Page::Workspaces);
+            super::on_active_show(&panel, &Active::WorkspaceEdit("chat".to_owned()));
+
+            assert_eq!(
+                clamp.width_request(),
+                want,
+                "{columns} columns: the Workspaces page's floor"
+            );
+            assert_eq!(
+                clamp.maximum_size(),
+                want,
+                "{columns} columns: the Workspaces page's ceiling"
+            );
+            assert_eq!(
+                clamp.tightening_threshold(),
+                want,
+                "{columns} columns: the ceiling and the threshold must stay equal (#134)"
+            );
+            assert_eq!(
+                slot.width_request(),
+                clamp.width_request(),
+                "{columns} columns: the Edit sub-page must measure the same as the \
+                 page it replaces, or the drawer jumps on ✎ (#1108)"
+            );
+        }
     }
 
     /// The companion guarantee: every *other* page must keep its natural-width
@@ -2956,10 +3035,11 @@ mod gtk_tests {
         panel
             .stack
             .add_named(&slot, Some(super::WORKSPACE_EDIT_STACK_CHILD));
+        set_current_page_width_for_test(workspaces_page_width(3));
 
         super::on_active_show(&panel, &Active::WorkspaceEdit("chat".to_owned()));
 
-        assert_eq!(slot.width_request(), scale(DRAWER_MAX_WIDTH_WIDE));
+        assert_eq!(slot.width_request(), scale(workspaces_page_width(3)));
     }
 
     /// The generic drawer-opening path end to end (#1108 follow-up: the
@@ -2981,6 +3061,7 @@ mod gtk_tests {
         panel
             .stack
             .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+        set_current_page_width_for_test(workspaces_page_width(3));
         PANELS.with(|panels| {
             panels.borrow_mut().insert(key.clone(), panel.clone());
         });
@@ -3000,7 +3081,7 @@ mod gtk_tests {
             .child_by_name(Page::Workspaces.stack_name())
             .and_then(|w| w.downcast::<adw::Clamp>().ok())
             .expect("the stand-in clamp is still the visible child");
-        assert_eq!(clamp.width_request(), scale(DRAWER_MAX_WIDTH_WIDE));
+        assert_eq!(clamp.width_request(), scale(workspaces_page_width(3)));
 
         // `PANELS`/`GATES`/`DRAWER_OPEN` are process-wide thread-locals
         // shared by every `#[gtk::test]` in this binary (they all run on one

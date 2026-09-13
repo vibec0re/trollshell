@@ -215,8 +215,22 @@ impl Kind {
     /// picture moved. The ceiling and the blank-framebuffer guards do the work
     /// for a gauge; inventing a second structural check for it without a
     /// failure to calibrate against would be inventing a flake.
+    ///
+    /// An exhaustive `match` rather than a `matches!` (#1216 fix round,
+    /// LOW-1): the PR body's table claimed this function was "already
+    /// exhaustive … pre-dating this PR", which was true of `pinned_exact`
+    /// and `edge_budget` but not of this one — a `matches!(self,
+    /// Self::Scope)` gives every kind but `Scope` `false` by falling off the
+    /// end of the pattern, the same silent-inheritance shape `pinned_exact`'s
+    /// own doc warns against. `every_kind_states_its_pin_and_its_beam_check`
+    /// already cross-checks this answer against its own hand-written match,
+    /// so the guarantee held either way — this just makes the function keep
+    /// it on its own terms too.
     pub(crate) fn checks_peak_rows(self) -> bool {
-        matches!(self, Self::Scope)
+        match self {
+            Self::Scope => true,
+            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => false,
+        }
     }
 
     /// What this kind's **supersampled** cases may drift by in the edge region

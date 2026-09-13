@@ -37,6 +37,28 @@
   commonArgs,
   cargoArtifacts,
 }:
+let
+  # The one place the parity-harness case count lives on the nix side
+  # (#1216 fix round, HIGH-1): read by both the `-ne` assertion at the
+  # bottom of `checkPhaseCargoCommand` and by `TROLLSHELL_PARITY_CASES`
+  # below, so the two never drift apart the way a hand-kept literal in
+  # each could. `trollshell/src/plugins/tests.rs`'s
+  # `the_nix_case_count_matches_the_harness` prefers that env var over
+  # reading this file directly, because this check and
+  # `checks.workspace-tests` share the same crane-filtered source
+  # (`trollshell.passthru.commonArgs.src`), and `nix/` is not in it
+  # (`nix/package.nix`'s `keepEntry`) — a test that unconditionally
+  # opened this file would panic there rather than skip. See that
+  # test's doc comment for the three-arm resolution this binding feeds.
+  #
+  # It was 12 until #1143 added the gauge arm, 24 until #1148's review
+  # added the `scale = 2` gauge case, 28 until #1144 added the dot
+  # matrix, 52 until #1152 added the two text kinds and 96 until
+  # #1209's review (MEDIUM-1) added the odd-origin marquee case, one
+  # per skin; bump it with the case list, in the same commit, for the
+  # reason the number is asserted at all.
+  parityCases = 100;
+in
 craneLib.mkCargoDerivation (
   commonArgs
   // {
@@ -141,6 +163,14 @@ craneLib.mkCargoDerivation (
       # this build means the three tests to run for real, so a
       # missing/refused GL context must fail the check, not skip it.
       export TROLLSHELL_REQUIRE_GL=1
+      # #1216 fix round (HIGH-1): hands the `let`-bound `parityCases`
+      # above to `trollshell/src/plugins/tests.rs`'s
+      # `the_nix_case_count_matches_the_harness`, which cannot read
+      # this file itself here — `nix/` is not in the crane source a
+      # `cargo test` under `nix flake check` sees (`nix/package.nix`'s
+      # `keepEntry`) — so the nix-side value has to cross as an env
+      # var instead, the same way `TROLLSHELL_REQUIRE_GL` above does.
+      export TROLLSHELL_PARITY_CASES=${toString parityCases}
       # #1082, on the same precedent: `pkgs.systemd` above puts
       # `systemd-run` on `$PATH`, so
       # `detached_launch_falls_back_without_a_user_manager`'s own
@@ -306,8 +336,8 @@ craneLib.mkCargoDerivation (
       # kind of statement such a comparison can meet. The blank-frame
       # guards bind on every case either way.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-      if [ "$gl_ppm_count" -ne 100 ]; then
-        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 100 — a case-count regression, not a parity failure." >&2
+      if [ "$gl_ppm_count" -ne ${toString parityCases} ]; then
+        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected ${toString parityCases} — a case-count regression, not a parity failure." >&2
         exit 1
       fi
     '';

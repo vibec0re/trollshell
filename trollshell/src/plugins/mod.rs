@@ -447,7 +447,7 @@ pub struct PluginHandles {
     /// (a plugin has one panel regardless of where its chip/card mounts).
     /// Written by the reader task; read by the per-monitor plugin drawer child.
     /// Routing it through the same `upsert_region`/`clear_region_if_owned` as the
-    /// six regions inherits the #278 generation guard for free.
+    /// nine regions inherits the #278 generation guard for free.
     panels: Mutable<Vec<SlotRender>>,
     /// The plugin id whose panel is currently shown in a drawer (any monitor),
     /// or `None`. GTK-thread-only: set by [`set_active_panel`] on drawer

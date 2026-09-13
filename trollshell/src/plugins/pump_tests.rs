@@ -247,20 +247,26 @@ fn step(releaser: &mut std::pin::Pin<&mut impl Future<Output = ()>>) {
 /// (#921).
 ///
 /// This is the mechanism the production wiring rests on, isolated from GTK: the
-/// releaser's only input is the union of the seven mailboxes' plugin ids, and
+/// releaser's only input is the union of all ten mailboxes' plugin ids, and
 /// its only output is a `forget_scope` per departed id. `region::gtk_tests`'
 /// `a_plugin_leaving_with_no_live_region_still_releases_its_card_scope` covers
 /// the same fix in its production shape (a real region mounted, then destroyed,
 /// then the plugin exiting); this one covers the part that shape cannot show —
-/// that the departure is read off *all seven* mailboxes, so the id has to leave
-/// the panel list as well as its region before anything is forgotten, which is
-/// exactly the order `session.rs:815-824`'s teardown writes them in.
+/// that the departure is read off *every* mailbox, so the id has to leave the
+/// panel list as well as its region before anything is forgotten, which is
+/// exactly the order `handle_conn`'s teardown (`session.rs`) writes them in.
+///
+/// It shows that for the **one** pairing it mounts (`bar_left` + `panels`);
+/// `every_render_mailbox_slot_contributes_to_the_live_ids_union` is what covers
+/// the other eight slots, and is the test whose absence let #1159's 7 → 10 union
+/// bump ship unpinned.
 ///
 /// **Deletion check:** dropping the `forget_scope` loop from
 /// [`drive_scope_releaser`] turns the **final** card assertion red with
-/// `left: 1, right: 0`. Narrowing the union to the six region mailboxes turns
-/// the **middle** one red instead, with `left: 0, right: 1` — the scopes would
-/// be released while the plugin is still in the panel list.
+/// `left: 1, right: 0`. Narrowing the union to the nine region mailboxes (i.e.
+/// dropping `panels`) turns the **middle** one red instead, with
+/// `left: 0, right: 1` — the scopes would be released while the plugin is still
+/// in the panel list.
 #[test]
 fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
     let (tx, _rx) = mpsc::channel::<HostMsg>(4);
@@ -298,7 +304,7 @@ fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
     step(&mut releaser);
     assert_eq!(preem_render::instance_count(&card), 1);
 
-    // Teardown's order (`session.rs:815-824`): the six regions first…
+    // Teardown's order (`handle_conn`, `session.rs`): all nine regions first…
     bar_left.set(Vec::new());
     step(&mut releaser);
     assert_eq!(
@@ -447,6 +453,81 @@ fn a_departing_plugin_releases_its_shader_states_with_no_region_alive() {
             0,
             "round {round}: a departed plugin's shader states must be released \
              by the releaser — with no monitor there is no retain loop to do it",
+        );
+    }
+}
+
+/// The union in [`live_plugin_ids_signal`] covers **every** slot — a plugin
+/// present only in slot `i`, then removed from slot `i`, must have its scopes
+/// released, for every `i` in `0..RENDER_MAILBOXES` (#1159 review, finding 2).
+///
+/// This is the test whose absence made the 7 → 10 union bump unpinned. The two
+/// existing releaser tests populate slots **3** (`bar_left`) and **6**
+/// (`panels`) only, and `region::gtk_tests`' `spawn_releaser_over` is called
+/// with nothing else, so dropping all three of #1158's right-sidebar mailboxes
+/// straight back out of the `for ids in [...]` union left
+/// `cargo test -p trollshell --lib` at **821 passed, 0 failed** and the
+/// `system-tests` bucket at **402 passed, 0 failed** — a right-mounted plugin
+/// silently not counted as live at all.
+///
+/// The #921 exhaustive `PluginHandles` destructure in `install_scope_releaser`
+/// forces a *decision* about a new mailbox (it is what caught #1158's three), but
+/// it cannot force the decision to be **correct** — nothing downstream of it
+/// checks that the field reached the array at all. This does, positionally, and it
+/// covers the next mount the day its slot exists rather than needing a new case
+/// written for it.
+///
+/// One plugin id per slot, so the ten sub-cases cannot mask each other through
+/// `preem_render`'s thread-local store (one shared id would let an earlier slot's
+/// release satisfy a later slot's assertion).
+///
+/// **Falsified** by dropping any single mailbox from [`live_plugin_ids_signal`]'s
+/// `for ids in [...]` union — verified for `r_top` (slot 8), which reds on
+/// *"slot 8 must contribute to the live-ids union"* with `left: 1, right: 0`.
+#[test]
+fn every_render_mailbox_slot_contributes_to_the_live_ids_union() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+
+    for i in 0..RENDER_MAILBOXES {
+        let id = format!("t1159-slot-{i}");
+        let card = Scope::card(&id);
+
+        // The renderer instance a real mount in that slot would have built.
+        let _ = to_ui_node(&card, Grants::none(), &marquee_node("chip"));
+        assert_eq!(
+            preem_render::instance_count(&card),
+            1,
+            "test setup: slot {i}'s plugin has a live renderer instance",
+        );
+
+        let mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] = std::array::from_fn(|s| {
+            if s == i {
+                Mutable::new(vec![slot(&id, marquee_node("chip"), &tx)])
+            } else {
+                Mutable::new(Vec::new())
+            }
+        });
+        let occupied = mailboxes[i].clone();
+
+        let mut releaser = pin!(drive_scope_releaser(live_plugin_ids_signal(mailboxes)));
+        // The first emission only seeds "who is here". That seeding is also what
+        // makes the final assertion mean something: a slot missing from the union
+        // never makes the id resident, so nothing can be observed to leave it.
+        step(&mut releaser);
+        assert_eq!(
+            preem_render::instance_count(&card),
+            1,
+            "slot {i}'s plugin is still here after the seeding emission",
+        );
+
+        occupied.set(Vec::new());
+        step(&mut releaser);
+        assert_eq!(
+            preem_render::instance_count(&card),
+            0,
+            "slot {i} must contribute to the live-ids union: a plugin that was \
+             only ever in this mailbox has now left every mailbox, so its card \
+             scope must be released (#921/#1159)",
         );
     }
 }

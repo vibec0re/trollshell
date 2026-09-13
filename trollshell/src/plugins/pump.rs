@@ -581,14 +581,22 @@ pub(super) fn live_animators() -> Vec<Rc<Animator>> {
 /// new mailboxes are what it caught first, exactly as designed — the right
 /// sidebar's cards animate preem widgets like any other, so leaving them out of
 /// this union would have leaked a departed plugin's renderer instances.
+///
+/// What the destructure *cannot* do is force that decision to be **correct**: it
+/// fires at the pattern, and nothing downstream of it checked that the field
+/// actually reached [`live_plugin_ids_signal`]'s array. #1159's review measured
+/// that gap — dropping all three right mailboxes back out of the union left both
+/// test buckets green (821 and 402 passed). `pump_tests`'
+/// `every_render_mailbox_slot_contributes_to_the_live_ids_union` closes it by
+/// walking all `RENDER_MAILBOXES` slots, so the field-to-slot hop is pinned too.
 pub(super) const RENDER_MAILBOXES: usize = 10;
 
 /// The set of plugin ids **any** render mailbox currently holds.
 ///
 /// This is the host's answer to "which plugins are still here", and it is the
 /// one [`drive_scope_releaser`] watches. A connection's teardown clears its
-/// entry from all ten mailboxes (`session.rs:815-824`), so an id leaving this
-/// union is exactly "the plugin left" — the same event
+/// entry from all ten mailboxes (`handle_conn`'s teardown, `session.rs`), so an
+/// id leaving this union is exactly "the plugin left" — the same event
 /// `region::reconcile_region`'s retain loop reacts to, read from a place that
 /// does not need a region (or a monitor, or any widget) to exist.
 ///
@@ -774,7 +782,7 @@ pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String
 /// leaked animating scope corrupts is still the one [`Animator`] parks on.
 ///
 /// The authoritative "plugin left" site is the connection teardown in
-/// `session.rs:815-824`, which runs on a **tokio** task — `preem_render`'s
+/// `handle_conn` (`session.rs`), which runs on a **tokio** task — `preem_render`'s
 /// `STORE` is a GTK-thread `thread_local!`, so it cannot forget anything from
 /// there. Riding the render mailboxes instead is the marshalling: the teardown
 /// already writes them (that is how the regions learn), and this loop reads them

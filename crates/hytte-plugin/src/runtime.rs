@@ -122,17 +122,43 @@ fn mount_override(raw: Option<&str>) -> Result<Option<Mount>, MountOverrideError
         })
 }
 
-/// [`mount_override`] against the real environment — the only place this SDK
-/// reads one. A non-UTF-8 value is refused like any other unparseable one rather
-/// than ignored.
-fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
-    match std::env::var(MOUNT_ENV) {
+/// [`mount_override`] over an arbitrary environment lookup — the three
+/// [`std::env::VarError`] arms, with no process state in them.
+///
+/// Split out from [`mount_override_from_env`] so the `NotUnicode` arm is
+/// reachable from a test (it was previously only reachable by hand-constructing a
+/// [`MountOverrideError`], which pins the *message* and not the arm that produces
+/// it). The `lookup` closure is handed [`MOUNT_ENV`], so a test can also assert
+/// which variable was asked for rather than trusting a const it read from the
+/// same place.
+fn mount_override_from(
+    lookup: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<Mount>, MountOverrideError> {
+    match lookup(MOUNT_ENV) {
         Ok(raw) => mount_override(Some(&raw)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(raw)) => Err(MountOverrideError {
             value: raw.to_string_lossy().into_owned(),
         }),
     }
+}
+
+/// [`mount_override_from`] against the real environment — the only place this SDK
+/// reads one. A non-UTF-8 value is refused like any other unparseable one rather
+/// than ignored.
+///
+/// This one line is what ties [`MOUNT_ENV`] to an actual `getenv`, and it is
+/// pinned by a **real second process**: `the_mount_env_var_reaches_the_register_frame`
+/// re-execs this test binary with `HYTTE_PLUGIN_MOUNT` set (spelled as a literal
+/// there, never via the const) and asserts the overridden mount comes back out of
+/// the `Register` frame. Before that test, neutering this function to `Ok(None)`
+/// — or typo'ing `MOUNT_ENV` — left the whole SDK suite green at 110 passed with
+/// the feature shipping inert (#1159 review, finding 4).
+fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
+    // A closure rather than `std::env::var` by name: that function is generic over
+    // `AsRef<OsStr>`, so passing it directly makes the higher-ranked bound on
+    // `lookup` unsatisfiable ("implementation of `FnOnce` is not general enough").
+    mount_override_from(|key| std::env::var(key))
 }
 
 /// Reconnect backoff bounds: start small, cap so we never hammer the socket.
@@ -1009,7 +1035,8 @@ pub fn run<P: Plugin>() -> ! {
 mod tests {
     use super::{
         BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, MOUNT_ENV, MountOverrideError,
-        Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, mount_override, reconnect_loop,
+        Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, mount_override, mount_override_from,
+        mount_override_from_env, reconnect_loop,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -3861,10 +3888,10 @@ mod tests {
     }
 
     /// A non-UTF-8 value is refused like any other unparseable one rather than
-    /// quietly ignored — the `VarError::NotUnicode` arm of
-    /// `mount_override_from_env`, reached here through `MountOverrideError`
-    /// directly because constructing the process environment from a test would
-    /// need `unsafe`.
+    /// quietly ignored — the message half, pinned straight off
+    /// `MountOverrideError`. The **arm** that builds it lives in
+    /// `every_environment_arm_of_the_mount_override_is_reachable` below, which
+    /// drives `mount_override_from` with a real `VarError::NotUnicode`.
     #[test]
     fn a_non_utf8_mount_override_still_names_the_spellings() {
         let err = MountOverrideError {
@@ -3875,5 +3902,169 @@ mod tests {
         for mount in Mount::ALL {
             assert!(msg.contains(mount.wire_name()), "{msg}");
         }
+    }
+
+    /// The variable's **name**, pinned as a literal (#1159 review, finding 4b).
+    ///
+    /// Every other assertion about the override's message is `msg.contains(
+    /// MOUNT_ENV)`, i.e. self-referential: the review typo'd this const to
+    /// `"HYTTE_PLUGN_MOUNT"` and the whole SDK suite stayed green at 110 passed,
+    /// shipping a feature nothing could switch on. The string is a contract with
+    /// something outside this crate — #1161 renders it from a checked
+    /// `plugins.<id>.mount` nix option, `docs/plugin-env.md` documents it, and a
+    /// deployment can set it by hand — and this const is the only thing tying
+    /// that spelling to a reader.
+    #[test]
+    fn the_mount_override_variable_is_named_hytte_plugin_mount() {
+        assert_eq!(MOUNT_ENV, "HYTTE_PLUGIN_MOUNT");
+    }
+
+    /// All three `std::env::VarError` arms of the environment read, driven
+    /// through `mount_override_from` with the lookup as a closure — including
+    /// `NotUnicode`, which had no test at all before (only the message it
+    /// produces did).
+    ///
+    /// The closure also asserts **which** variable was asked for, from a literal
+    /// rather than from `MOUNT_ENV`, so a renamed const cannot pass here by
+    /// agreeing with itself.
+    #[test]
+    fn every_environment_arm_of_the_mount_override_is_reachable() {
+        use std::env::VarError;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let checked = |result: Result<String, VarError>| {
+            mount_override_from(|key| {
+                assert_eq!(
+                    key, "HYTTE_PLUGIN_MOUNT",
+                    "the reader must look up the documented variable",
+                );
+                result
+            })
+        };
+
+        assert_eq!(
+            checked(Err(VarError::NotPresent)),
+            Ok(None),
+            "an unset variable is not an error — the manifest simply wins",
+        );
+        assert_eq!(
+            checked(Ok("SidebarRightTop".to_owned())),
+            Ok(Some(Mount::SidebarRightTop)),
+            "a set variable names the mount",
+        );
+        let not_unicode = std::ffi::OsString::from_vec(b"Sidebar\xffRight".to_vec());
+        let err = checked(Err(VarError::NotUnicode(not_unicode)))
+            .expect_err("a non-UTF-8 value is refused, never ignored");
+        assert_eq!(
+            err.value,
+            String::from_utf8_lossy(b"Sidebar\xffRight"),
+            "the lossy conversion is what the message shows",
+        );
+    }
+
+    /// Set (to any value) only on the re-exec'd child that actually runs
+    /// [`the_mount_env_var_reaches_the_register_frame_inner`]; see that test's
+    /// doc.
+    const MOUNT_ENV_CHILD: &str = "HYTTE_PLUGIN_MOUNT_TEST_CHILD";
+
+    /// The value the parent sets and the child expects back out of `Register`.
+    /// Deliberately **not** `Echo::manifest()`'s own mount, so "the override was
+    /// applied" cannot be confused with "the manifest happened to agree".
+    const MOUNT_ENV_CHILD_VALUE: &str = "SidebarRightTop";
+
+    /// Printed by the child only once its whole body has run, so the parent can
+    /// tell "the scenario passed" from "`--exact` matched no test and libtest
+    /// reported `0 passed`, exit 0" — the failure mode a renamed inner test
+    /// produces (the `serve_socket_handover` harness's #1024 review M1).
+    const MOUNT_ENV_CHILD_OK: &str = "mount-env-child-reached-the-end";
+
+    /// **The real variable, in a real process, all the way to the wire.**
+    ///
+    /// `mount_override_from_env` is one line — `mount_override_from(std::env::var)`
+    /// — and nothing in-process can pin it: `std::env::set_var` is `unsafe` in
+    /// edition 2024 and this workspace forbids `unsafe_code` outright, so a test
+    /// cannot set the variable for itself. The review measured what that costs:
+    /// neutering the whole function to `Ok(None)` left `cargo test -p hytte-plugin`
+    /// at **110 passed, 0 failed**, and so did typo'ing `MOUNT_ENV`. The feature
+    /// could ship doing nothing at all with CI green.
+    ///
+    /// So this re-execs the test binary (`std::env::current_exe`) filtered to
+    /// exactly one inner test, with `HYTTE_PLUGIN_MOUNT` set on the **child** via
+    /// `Command::env` — a safe builder method; controlling a child's environment
+    /// needs no `unsafe`. Same shape as
+    /// `hytte-plugin-infobroker`'s `tests/serve_socket_handover.rs` and
+    /// `trollshell`'s `detached_launch_falls_back_without_a_user_manager`.
+    ///
+    /// The variable is spelled as a **literal** here, never through `MOUNT_ENV`:
+    /// setting it from the same const the reader reads would agree with a typo in
+    /// it. (`the_mount_override_variable_is_named_hytte_plugin_mount` pins the two
+    /// together from the other side.)
+    ///
+    /// **Falsified** two ways, both red on the child's own assertion, surfaced
+    /// here as a failed child: `mount_override_from_env() -> Ok(None)`, and
+    /// `MOUNT_ENV = "HYTTE_PLUGN_MOUNT"`.
+    #[test]
+    fn the_mount_env_var_reaches_the_register_frame() {
+        let inner = "runtime::tests::the_mount_env_var_reaches_the_register_frame_inner";
+        let args = ["--exact", "--nocapture", "--test-threads=1", inner];
+        assert!(
+            args.contains(&"--exact"),
+            "the re-exec must stay filtered to exactly one inner test",
+        );
+        let exe = std::env::current_exe().expect("this test binary's own path");
+        let out = std::process::Command::new(exe)
+            .args(args)
+            .env(MOUNT_ENV_CHILD, "1")
+            .env("HYTTE_PLUGIN_MOUNT", MOUNT_ENV_CHILD_VALUE)
+            .output()
+            .expect("re-exec this test binary with HYTTE_PLUGIN_MOUNT set");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child scenario failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status,
+        );
+        assert!(
+            stdout.contains(MOUNT_ENV_CHILD_OK),
+            "the child exited 0 without reaching the end of {inner} — a stale \
+             filter matches no test and libtest still reports success\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The scenario body of [`the_mount_env_var_reaches_the_register_frame`]. Does
+    /// nothing at all unless the parent's marker is set, so an ordinary
+    /// `cargo test` run — which discovers it like any other test — does not try to
+    /// run it with no `HYTTE_PLUGIN_MOUNT` in the environment.
+    #[tokio::test]
+    async fn the_mount_env_var_reaches_the_register_frame_inner() {
+        if std::env::var_os(MOUNT_ENV_CHILD).is_none() {
+            return;
+        }
+        let want = Mount::from_wire_name(MOUNT_ENV_CHILD_VALUE)
+            .expect("the parent sets a real wire mount name");
+        assert_ne!(
+            Echo::manifest().mount,
+            want,
+            "test setup: the override must differ from the manifest's own mount",
+        );
+
+        let resolved = mount_override_from_env()
+            .expect("the parent set a valid HYTTE_PLUGIN_MOUNT on this process");
+        assert_eq!(
+            resolved,
+            Some(want),
+            "`mount_override_from_env` must read the real {MOUNT_ENV_CHILD_VALUE:?} \
+             out of this process's environment",
+        );
+        // …and through the manifest-building path `run` uses, not just the
+        // resolver: the mount the *host* reads is the only thing that matters.
+        assert_eq!(
+            registered_mount(resolved).await,
+            want,
+            "the environment's mount must be the mount in the Register frame",
+        );
+        println!("{MOUNT_ENV_CHILD_OK}");
     }
 }

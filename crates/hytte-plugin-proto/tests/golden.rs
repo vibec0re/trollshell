@@ -42,14 +42,18 @@
 //! the wire break this suite exists to catch.
 //!
 //! A second explainable shape, from #1158: bumping [`VOCAB`] moves exactly one
-//! byte in each of **three** files, because three of them stamp the census —
-//! `manifest_full_v1` and `plugin_register_v1` through
-//! [`full_manifest`]'s `vocab_max`, and `host_msgs_v1` through
-//! [`HostMsg::Hello`]'s advertised `vocab`. Measured on #1158's own bump: one
-//! differing byte per file (`05` → `06`), each immediately after the `vocab_max`
-//! / `vocab` key, with the frame length and every other byte's position
-//! unchanged. That is what tells this diff apart from a real encoder change —
-//! the census is a `u16` whose *value* moved, not a field whose shape did.
+//! byte in **every fixture built from [`Manifest::new`] or [`full_manifest`]**,
+//! plus `host_msgs_v1` — because each of those stamps the census, the manifests
+//! through `vocab_max` and `host_msgs_v1` through [`HostMsg::Hello`]'s advertised
+//! `vocab`. That is **four** files today: `manifest_full_v1`,
+//! `plugin_register_v1`, `plugin_register_sidebar_right_v1` (added by #1159, and
+//! the reason this paragraph says "every fixture" rather than a count — the
+//! count moves whenever a fixture is added) and `host_msgs_v1`. Measured on
+//! #1158's own bump: one differing byte per file (`05` → `06`), each immediately
+//! after the `vocab_max` / `vocab` key, with the frame length and every other
+//! byte's position unchanged. That is what tells this diff apart from a real
+//! encoder change — the census is a `u16` whose *value* moved, not a field whose
+//! shape did.
 //!
 //! What did **not** move in those files is the `mount` tag, and that is the
 //! point: #1158 pinned its new mount in a **new** fixture

@@ -292,14 +292,45 @@ pub enum Capability {
 /// the decode error, not the handshake check. That is the trade #1158 chose over
 /// a `{ region, side }` struct, which would have re-shaped a frame every plugin
 /// already sends.
+///
+/// # This enum is **append only**
+///
+/// A new variant goes at the **end** of the declaration, never between two
+/// existing ones — the readable left/right grouping lives in
+/// [`ALL`](Mount::ALL), which is order-free, not here.
+///
+/// The reason is that the variant's *integer index* is wire-visible even though
+/// nothing in this workspace ever sends one: rmp-serde's `Deserialize` for a unit
+/// enum accepts a bare integer as well as the name it encodes, so declaration
+/// order is part of the decoder's accepted vocabulary. #1159's first cut inserted
+/// the three `SidebarRight*` variants between `SidebarBottom` and `BarLeft`, and
+/// the review measured the silent remap that bought: index 3/4/5 stopped decoding
+/// as `BarLeft`/`BarCenter`/`BarRight` and started decoding as the three new
+/// sidebar-right mounts — i.e. a non-Rust client written against this crate as the
+/// "language-neutral schema anchor" the crate root advertises would have had three
+/// of its mounts silently re-pointed at the other sidebar, with nothing in either
+/// end's logs. Every previous generation here appended at the tail
+/// ([`Capability`]'s `OpenUri` is last, and `manifest_full_v1` pins that order in
+/// bytes); this stays that way.
+///
+/// `the_mount_integer_indices_are_frozen` in `tests/proto.rs` is the guard: it
+/// pins all nine indices to their variants as a literal table, so a mid-enum
+/// insertion is a failing test rather than a wire break.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mount {
     /// The leading sidebar region — the very top, above the built-in cards.
     SidebarLead,
     SidebarTop,
     SidebarBottom,
+    BarLeft,
+    BarCenter,
+    BarRight,
     /// The leading region of the **right** sidebar (#1158) — the mirror of
     /// [`SidebarLead`](Mount::SidebarLead) on the other surface.
+    ///
+    /// Appended after the bar family rather than beside its left-hand twin, for
+    /// the append-only reason on the enum's own doc above; [`ALL`](Mount::ALL)
+    /// carries the readable grouping instead.
     SidebarRightLead,
     /// The right sidebar's middle region — the mirror of
     /// [`SidebarTop`](Mount::SidebarTop).
@@ -307,19 +338,23 @@ pub enum Mount {
     /// The right sidebar's trailing region — the mirror of
     /// [`SidebarBottom`](Mount::SidebarBottom).
     SidebarRightBottom,
-    BarLeft,
-    BarCenter,
-    BarRight,
 }
 
 impl Mount {
-    /// Every mount, in wire-declaration order — the vocabulary a launch-time
-    /// override is parsed against ([`from_wire_name`](Mount::from_wire_name)) and
-    /// the list an SDK error names when it refuses one (#1159).
+    /// Every mount — the vocabulary a launch-time override is parsed against
+    /// ([`from_wire_name`](Mount::from_wire_name)) and the list an SDK error names
+    /// when it refuses one (#1159).
     ///
-    /// Appending a variant to the enum means appending it here too. Two things
-    /// catch a half-done append: [`wire_name`](Mount::wire_name)'s match is
-    /// exhaustive (so a new variant does not compile until it is named), and
+    /// Ordered by **family** (left sidebar, right sidebar, bar), deliberately
+    /// *not* in the enum's declaration order: the enum is append-only because its
+    /// integer indices are wire-visible (see the type's own doc), while this array
+    /// is read only by humans and by loops that do not care, so it is free to read
+    /// the way the two sidebars actually relate. Nothing may derive a wire value
+    /// from a position in here.
+    ///
+    /// Appending a variant to the enum means adding it here too. Two things catch
+    /// a half-done append: [`wire_name`](Mount::wire_name)'s match is exhaustive
+    /// (so a new variant does not compile until it is named), and
     /// `every_mount_variant_names_itself_and_is_listed` in `tests/proto.rs` pins
     /// this array's length and contents against that name table.
     pub const ALL: [Mount; 9] = [

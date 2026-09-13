@@ -1242,9 +1242,15 @@ pub(super) fn upsert_region(region: &Mutable<Vec<SlotRender>>, render: SlotRende
 /// different id and never matched, so siblings are undisturbed.
 ///
 /// Probes with the read lock first so a teardown never spuriously notifies a
-/// region this plugin isn't even in (each teardown checks *all six* regions —
-/// three sidebar + three bar, #349); it re-finds under the write lock to stay
-/// correct against a concurrent mutation.
+/// region this plugin isn't even in (each teardown checks **every** region —
+/// three per sidebar since #1158, plus the three bar ones, #349 — plus the shared
+/// panel list); it re-finds under the write lock to stay correct against a
+/// concurrent mutation.
+///
+/// That "every" is the contract, not the current count:
+/// `every_mount_clears_its_mailbox_on_connection_teardown` (`plugins::tests`)
+/// drives `Mount::ALL` through a real connection and names any mount missing from
+/// `handle_conn`'s clear list, because #1159's first cut shipped three that were.
 pub(super) fn clear_region_if_owned(
     region: &Mutable<Vec<SlotRender>>,
     plugin_id: &str,
@@ -4008,6 +4014,14 @@ mod gtk_tests {
     /// literal, so the next mount arrives here as a count rather than as a type
     /// error.
     ///
+    /// Only slots 3 and 6 are reached from this module — the two the chip and
+    /// drawer fixtures here mount into. That is deliberately *not* what pins the
+    /// union's coverage: `pump_tests`'
+    /// `every_render_mailbox_slot_contributes_to_the_live_ids_union` walks all
+    /// `RENDER_MAILBOXES` slots for that, because #1159's review measured that
+    /// dropping any of the untouched ones from the union left both test buckets
+    /// green.
+    ///
     /// Returns the task handle so the test can abort it: `#[gtk::test]` funnels
     /// every test in this binary onto one main context, and a parked
     /// subscription would otherwise keep polling through later tests' `pump()`s.
@@ -4268,6 +4282,17 @@ mod gtk_tests {
 // control-center — it just has no surface to paint on. That is the intended
 // intermediate state, which is why the `allow(dead_code)` below is scoped to
 // these three items and names the issue that removes it.
+//
+// One deliberate difference from the six builders above: these three pass
+// `monitor.connector()` **straight through** rather than wrapping it in this
+// module's local `named_connector` fold. `hytte_ui::Monitor::connector` has done
+// that fold itself since #1180 item 6 (`monitor.rs`, with its own test at the
+// source), so the local copy is already redundant here — and #1177/#1218 deletes
+// it along with the six wraps above. Writing the new sites in the post-#1218
+// form is what keeps the two branches' *clean* merge compiling: a new call site
+// at this file's tail sits outside every hunk #1218 touches, so git would
+// reconcile them silently and main would go red on `E0425: cannot find function
+// named_connector` (#1159 review, finding 9).
 
 fn right_lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     registry::with(|r| {
@@ -4311,7 +4336,7 @@ pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
         right_lead_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -4329,7 +4354,7 @@ pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
         right_top_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }
 
@@ -4347,6 +4372,6 @@ pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
         right_bottom_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        named_connector(monitor.connector()),
+        monitor.connector(),
     )
 }

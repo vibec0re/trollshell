@@ -11799,4 +11799,120 @@ mod sidebar_right_routing {
             "the bar family did not grow with the sidebar one",
         );
     }
+
+    /// How long a mailbox gets to empty after its connection dies before this
+    /// test calls it a leak. The teardown is not synchronous with the socket
+    /// close — `handle_conn`'s reader has to observe EOF and run its clear list
+    /// on a tokio task — so this polls rather than asserting once.
+    const TEARDOWN_GIVE_UP: Duration = Duration::from_secs(1);
+
+    /// **Every** mount clears its mailbox when the connection that filled it goes
+    /// away — driven off [`Mount::ALL`], never a hand-written list.
+    ///
+    /// This is the test whose absence let #1159's first cut ship a leak. The three
+    /// `sidebar_right_*` mailboxes were added to `pump::live_plugin_ids_signal`'s
+    /// "who is live" union but *not* to `handle_conn`'s teardown clears, and the
+    /// whole suite stayed green: the routing test above only ever watches cards
+    /// **arrive**, so nothing observed that a right-mounted plugin's id could
+    /// never leave the union again. That is strictly worse than not tracking it —
+    /// `forget_scope` never fires for such a plugin, so its preem renderer
+    /// instances (and, since #893, its shader states) stay resident for the life
+    /// of the shell, and once #1160 mounts the surface its card stays on glass
+    /// after the process is gone.
+    ///
+    /// Written as "which mounts failed", not "assert on the first one": the
+    /// failure message carries the complete offender list, so a sweep that misses
+    /// three mounts reports three rather than one at a time. Iterating `ALL` is
+    /// what makes the *next* mount arrive here for free — the property being
+    /// pinned is "the clear list covers the enum", and a list is the only thing
+    /// that can drift from it.
+    ///
+    /// Each connection is driven to the point where its card has actually landed
+    /// **before** the sockets are dropped: a teardown that raced the render would
+    /// find nothing to clear and this test would pass for the wrong reason.
+    ///
+    /// **Falsified** by removing any one `clear_region_if_owned` call from
+    /// `handle_conn`'s teardown — verified for `sidebar_right_top`, which reds
+    /// with `["SidebarRightTop"]`.
+    #[tokio::test]
+    async fn every_mount_clears_its_mailbox_on_connection_teardown() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        // Captured before `ctx` is cloned into the connection tasks; `Mutable`
+        // shares its state, so these stay live after each connection ends.
+        let mailboxes: Vec<(Mount, Mutable<Vec<SlotRender>>)> = Mount::ALL
+            .into_iter()
+            .map(|mount| (mount, mailbox_for(&ctx, mount)))
+            .collect();
+
+        for (mount, mailbox) in &mailboxes {
+            let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+            let conn_ctx = ctx.clone();
+            tokio::spawn(async move { handle_conn(host_end, &conn_ctx).await });
+
+            let (prd, mut pwr) = plugin_end.into_split();
+            write_frame(
+                &mut pwr,
+                &PluginMsg::Register {
+                    manifest: Manifest::new(mount.wire_name(), *mount),
+                },
+            )
+            .await
+            .expect("send Register");
+            write_frame(
+                &mut pwr,
+                &PluginMsg::Render {
+                    tree: wire::Node::Label {
+                        id: Some("t".into()),
+                        text: mount.wire_name().to_owned(),
+                        classes: vec![],
+                        tooltip: None,
+                    },
+                    panel: None,
+                    effects: vec![],
+                    hidden_on: Vec::new(),
+                },
+            )
+            .await
+            .expect("send Render");
+
+            let cards = wait_for_region(mailbox).await;
+            assert_eq!(
+                cards[0].plugin_id,
+                mount.wire_name(),
+                "precondition: {}'s card is in its mailbox before the disconnect",
+                mount.wire_name(),
+            );
+
+            // The disconnect. Both halves — the host's reader sees EOF and runs
+            // its teardown clears.
+            drop(prd);
+            drop(pwr);
+        }
+
+        let mut never_cleared: Vec<&str> = Vec::new();
+        for (mount, mailbox) in &mailboxes {
+            let deadline = Instant::now() + TEARDOWN_GIVE_UP;
+            loop {
+                if mailbox.lock_ref().is_empty() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    never_cleared.push(mount.wire_name());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            never_cleared.is_empty(),
+            "these mounts NEVER clear their mailbox on connection teardown: \
+             {never_cleared:?} — `handle_conn`'s teardown must call \
+             `clear_region_if_owned` for every mount in `Mount::ALL`, or a \
+             departed plugin's id can never leave `pump`'s live-ids union and its \
+             preem scopes leak for the life of the shell",
+        );
+    }
 }

@@ -2206,6 +2206,55 @@ fn the_six_pre_1158_mount_names_still_decode() {
     }
 }
 
+/// Every [`Mount`]'s **integer index** decodes to the variant it decoded to
+/// before, frozen as a literal table (#1159 review, finding 3).
+///
+/// rmp-serde encodes a unit variant as its *name*, so nothing in this workspace
+/// ever puts an index on the wire — but the **decoder** accepts a bare integer
+/// too, which makes declaration order part of the accepted vocabulary of a crate
+/// the root doc advertises as a language-neutral schema anchor. #1159's first cut
+/// inserted the three `SidebarRight*` variants mid-enum, and the review measured
+/// the consequence: indices 3/4/5 stopped decoding as `BarLeft`/`BarCenter`/
+/// `BarRight` (their meaning on every release since #349) and started decoding as
+/// the three new sidebar-right mounts. A non-Rust client sending indices would
+/// have had three mounts silently re-pointed at the other sidebar.
+///
+/// The expected variants are **literals**, deliberately not `Mount::ALL[i]`:
+/// reading the table under test would make this agree with any future
+/// reordering, which is the whole break it exists to catch. `ALL`'s order is a
+/// separate, order-free thing (see its doc) and is not the index table.
+///
+/// **Falsified** by moving any variant within the enum — the row for its old
+/// index reds naming both spellings.
+#[test]
+fn the_mount_integer_indices_are_frozen() {
+    for (index, want) in [
+        (0_u32, Mount::SidebarLead),
+        (1, Mount::SidebarTop),
+        (2, Mount::SidebarBottom),
+        (3, Mount::BarLeft),
+        (4, Mount::BarCenter),
+        (5, Mount::BarRight),
+        (6, Mount::SidebarRightLead),
+        (7, Mount::SidebarRightTop),
+        (8, Mount::SidebarRightBottom),
+    ] {
+        let got: Mount = decode_body(&encode_body(&index))
+            .expect("rmp-serde decodes a unit variant from its integer index too");
+        assert_eq!(
+            got, want,
+            "Mount index {index} must still decode as {want:?} — this enum is \
+             append-only, because its indices are wire-visible",
+        );
+    }
+    let past_the_end: Result<Mount, _> = decode_body(&encode_body(&9_u32));
+    assert!(
+        past_the_end.is_err(),
+        "index 9 is past the end of a nine-variant enum and must not decode: \
+         {past_the_end:?}",
+    );
+}
+
 /// The three new mounts round-trip, ride the wire as their bare names, and are
 /// **not** bar regions (`is_bar` must keep answering `false` for a sidebar, or the
 /// host would report a constant `SlotVisible` of `true` for a right-sidebar card

@@ -41,6 +41,16 @@
 }:
 runCommand "workspace-ships-no-probes"
   {
+    # `unsafeDiscardOutputDependency`: we want `workspace`'s `.drv` FILE
+    # itself as a plain input source (always present, no build required to
+    # write it), not a dependency on any of its OUTPUTS — the plain
+    # `workspace.drvPath` string carries the latter kind of context, which is
+    # what a bare `${workspace.drvPath}` interpolation asks Nix to satisfy,
+    # and Nix has nothing built yet to satisfy it with under `nix flake check
+    # --no-build`/eval-only contexts. Discarding that context is the standard
+    # idiom for reading a sibling derivation's `.drv` without forcing it to
+    # build.
+    workspaceDrv = builtins.unsafeDiscardOutputDependency workspace.drvPath;
     meta.description = "the two nixosTest probe examples never creep back into the workspace compile (#1257)";
   }
   ''
@@ -53,7 +63,7 @@ runCommand "workspace-ships-no-probes"
       fi
     done
 
-    if grep -q -- '--example' "${workspace.drvPath}"; then
+    if grep -q -- '--example' "$workspaceDrv"; then
       echo "FAIL: workspace's own .drv references --example — see nix/package.nix's probes derivation (#1257)"
       fail=1
     fi

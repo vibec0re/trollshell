@@ -97,7 +97,7 @@ jobs:
               echo 'stack:'
               timeout 5 sudo -n cat "/proc/$pid/stack" 2>/dev/null || echo unreadable
               echo 'fd (first 60):'
-              timeout 5 sudo -n ls -l "/proc/$pid/fd" 2>/dev/null | head -60
+              timeout 5 sudo -n ls -l "/proc/$pid/fd" 2>/dev/null | head -60 || true
             done
           }
 
@@ -108,19 +108,19 @@ jobs:
           # memory pressure (PSI, disk, dmesg) at the time.
           dump_stuck_nix() {
             # shellcheck disable=SC2046  # word-splitting a newline pid list is the point
-            dump_pids $(collect_nix_daemon_pids)
+            dump_pids $(collect_nix_daemon_pids) || true
             echo '--- PSI / disk / memory / dmesg / load ---'
-            cat /proc/pressure/io /proc/pressure/memory 2>/dev/null
-            df -h /nix /home/runner /tmp 2>/dev/null
-            free -m
+            cat /proc/pressure/io /proc/pressure/memory 2>/dev/null || true
+            df -h /nix /home/runner /tmp 2>/dev/null || true
+            free -m || true
             sudo -n dmesg --ctime 2>/dev/null | tail -n 60 || true
-            cat /proc/loadavg
+            cat /proc/loadavg || true
           }
 
           timeout 105m nix flake check -L || rc=$?
           if [ "${rc:-0}" = 124 ]; then
             echo '::error::nix flake check did not exit within 105 min (#1011); process tree follows'
-            dump_stuck_nix
+            dump_stuck_nix || true
             ps auxf
             exit 1
           fi

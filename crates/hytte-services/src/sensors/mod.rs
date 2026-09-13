@@ -1190,6 +1190,18 @@ mod tests {
                 want_prev_after: vec![(150, 400)],
             },
             Case {
+                // Two identical `/proc/stat` samples: the jiffy total did not
+                // move, so there is no interval to divide by. The leaf guards
+                // this (`proc_stat.rs`'s `d_total == 0 → 0.0`); the table is
+                // the place that *says* a stalled counter reads 0 rather than
+                // NaN or a panic.
+                name: "identical samples: d_total == 0 reads 0, not NaN",
+                prev: vec![(50, 200)],
+                sample: Some(vec![(50, 200)]),
+                want_overall: Some(0.0),
+                want_prev_after: vec![(50, 200)],
+            },
+            Case {
                 name: "read failure: writer untouched, prev untouched",
                 prev: vec![(50, 200)],
                 sample: None,
@@ -1355,6 +1367,106 @@ mod tests {
         assert_eq!(got.interfaces[0].tx_bytes_total, 900);
     }
 
+    /// **The rate formula itself, pinned to literals.** The two tests above
+    /// only ever assert a *zero* rate (no prior sample; a wrapped counter), so
+    /// neither exercises the divisor, the unit, or which delta lands in which
+    /// field. A rate whose unit is asserted nowhere is exactly the #1026
+    /// shape: `rx_rate_bps`/`tx_rate_bps` are documented **bytes/sec** at the
+    /// `NetInterface` declaration, and nothing else in the tree says so.
+    ///
+    /// 20 000 rx bytes and 40 000 tx bytes over a 2 s gap ⇒ 10 000 B/s and
+    /// 20 000 B/s. The two numbers are deliberately different so a rx/tx swap
+    /// cannot pass, and the gap is deliberately not 1 s so the `/ dt` divisor
+    /// is load-bearing.
+    ///
+    /// Falsification: `… / dt * 8.0` (a bytes→bits unit error) reds both rate
+    /// assertions; swapping the `rx_r`/`tx_r` assignment reds them too.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn apply_network_rate_is_bytes_per_second_over_the_elapsed_gap() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(NetIo::default());
+        let t0 = Instant::now();
+
+        // Tick 1: the baseline. No prior sample, so no rate yet.
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 10_000, 20_000)]),
+            t0,
+            &writer,
+        );
+
+        // Tick 2, exactly 2 s later: +20 000 rx, +40 000 tx.
+        let t1 = t0 + Duration::from_secs(2);
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 30_000, 60_000)]),
+            t1,
+            &writer,
+        );
+
+        let got = writer.get_cloned();
+        assert_eq!(got.interfaces.len(), 1);
+        assert_eq!(
+            got.interfaces[0].rx_rate_bps, 10_000.0,
+            "20000 rx bytes over 2 s is 10000 bytes/sec"
+        );
+        assert_eq!(
+            got.interfaces[0].tx_rate_bps, 20_000.0,
+            "40000 tx bytes over 2 s is 20000 bytes/sec"
+        );
+        // The totals are the raw counters, not the deltas.
+        assert_eq!(got.interfaces[0].rx_bytes_total, 30_000);
+        assert_eq!(got.interfaces[0].tx_bytes_total, 60_000);
+    }
+
+    /// **A vanished interface is pruned from the rate cache.** `apply_network`
+    /// rebuilds `net_prev` from scratch every tick rather than `insert`ing into
+    /// the existing map, which is the only thing that drops an interface that
+    /// went away (a USB tether unplugged, a VPN `tun0` torn down). Nothing
+    /// asserted that, so swapping the rebuild for an in-place `insert` — a
+    /// plausible "avoid the allocation" optimisation — would leak an entry per
+    /// vanished interface for the life of the process and red nothing.
+    ///
+    /// Falsification: replace `state.net_prev = next_net_prev;` with a loop
+    /// that inserts into `state.net_prev` and this reds on `len() == 1`.
+    #[test]
+    fn apply_network_prunes_an_interface_that_disappeared() {
+        let mut state = PollState::new();
+        let writer = Mutable::new(NetIo::default());
+        let t0 = Instant::now();
+
+        // Tick 1: two interfaces.
+        apply_network(
+            &mut state,
+            Some(vec![
+                ("eth0".to_string(), 1_000, 2_000),
+                ("tun0".to_string(), 10, 20),
+            ]),
+            t0,
+            &writer,
+        );
+        assert_eq!(state.net_prev.len(), 2, "both interfaces cached");
+        assert_eq!(writer.get_cloned().interfaces.len(), 2);
+
+        // Tick 2: `tun0` is gone from /proc/net/dev.
+        let t1 = t0 + Duration::from_secs(1);
+        apply_network(
+            &mut state,
+            Some(vec![("eth0".to_string(), 2_000, 4_000)]),
+            t1,
+            &writer,
+        );
+        assert_eq!(
+            state.net_prev.len(),
+            1,
+            "an interface absent from this tick must be pruned from the cache"
+        );
+        assert!(state.net_prev.contains_key("eth0"));
+        assert!(!state.net_prev.contains_key("tun0"));
+        assert_eq!(writer.get_cloned().interfaces.len(), 1);
+    }
+
     // ── apply_disk_io: table test ─────────────────────────────────────────────
 
     #[allow(clippy::float_cmp)]
@@ -1377,9 +1489,15 @@ mod tests {
         assert!(prev.contains_key("sda"));
 
         // A read failure warns (not asserted here) and leaves `prev` and the
-        // writer untouched.
+        // writer untouched — both halves asserted, not just the writer.
         apply_disk_io(&mut prev, None, t0, &writer);
         assert_eq!(writer.get_cloned().total_read_bytes, 1_000);
+        assert_eq!(
+            prev.len(),
+            1,
+            "a failed read must not clear the rolling rate cache"
+        );
+        assert!(prev.contains_key("sda"), "the cached device survives");
     }
 
     // ── apply_cpu_temp: unconditional passthrough ────────────────────────────

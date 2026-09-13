@@ -249,10 +249,7 @@ mod tests {
     #[test]
     fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
         scratch_home(|home| {
-            state::store(
-                SUBSYSTEM,
-                &state_for(&HashSet::from(["Slack".to_string()])),
-            );
+            state::store(SUBSYSTEM, &state_for(&HashSet::from(["Slack".to_string()])));
 
             let legacy = legacy_path(home);
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
@@ -300,7 +297,14 @@ mod tests {
     /// deliberately has no `toml` dependency of its own (see its Cargo.toml).
     #[test]
     fn the_rendered_file_is_sorted_and_independent_of_insertion_order() {
-        const APPS: [&str; 6] = ["Zed", "Discord", "Element", "Firefox", "Slack", "Thunderbird"];
+        const APPS: [&str; 6] = [
+            "Zed",
+            "Discord",
+            "Element",
+            "Firefox",
+            "Slack",
+            "Thunderbird",
+        ];
         const WANT: &str =
             "apps = [\"Discord\", \"Element\", \"Firefox\", \"Slack\", \"Thunderbird\", \"Zed\"]\n";
 

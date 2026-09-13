@@ -53,7 +53,7 @@ night = "/home/you/Pictures/night.png"
 **Migrated once from `~/.config/trollshell/wallpaper.json`.** If the state
 file does not exist yet and that legacy JSON document does, it is read once,
 converted, and written here; the JSON file is left exactly as it was, never
-deleted or rewritten. If that is *also* absent, the even older single-line
+deleted or rewritten. If that is _also_ absent, the even older single-line
 `wallpaper.path` is used instead (see below). After the first launch the state
 file is authoritative **forever** — editing `wallpaper.json` afterwards does
 nothing at all, even with the shell running.

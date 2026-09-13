@@ -4392,7 +4392,7 @@ location.
 - [ ] **(#1226)** **The new file exists and the old one is untouched.** After
       that restart, `~/.local/state/trollshell/dnd.toml` (or
       `keep-awake.toml`) exists and holds the migrated value, **and**
-      `~/.config/trollshell/dnd.toml` still has its original bytes *and*
+      `~/.config/trollshell/dnd.toml` still has its original bytes _and_
       mtime — the migration reads it and never writes, renames or deletes it.
       `journalctl --user -u trollshell -g 1226` shows one `info` line per
       migrated file naming both paths.
@@ -4408,7 +4408,7 @@ location.
       `~/.local/state/trollshell/dnd.toml` in place, edit
       `~/.config/trollshell/dnd.toml` to the opposite value and restart the
       shell. The toggle must **not** change — once migrated, the legacy file
-      has no effect ever again. Then corrupt the *state* file
+      has no effect ever again. Then corrupt the _state_ file
       (`echo 'nonsense {{{' > ~/.local/state/trollshell/dnd.toml`) and restart:
       the toggle falls back to its **default** (DND off), still does not read
       the legacy file, and the next flip repairs the state file. This is the

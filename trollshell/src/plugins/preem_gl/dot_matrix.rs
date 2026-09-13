@@ -25,6 +25,15 @@
 //! round dots at the screen's resolution instead of a magnified 4×4 block. See
 //! `dot_matrix.frag`'s header.
 //!
+//! The halo is the exception, and since #1186 it is read rather than recomputed
+//! at that resolution: a box blur of the lit layer is a grid-resolution quantity
+//! by construction, so `blur.frag` can only produce it at `u_grid` and the blit
+//! takes a bilinear tap out of it (`halo_at`) on the same branch the lattice
+//! takes its continuous position on. Before that the stretched frame had round
+//! dots with a blocky bloom around them — see
+//! [`tests::the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap`]
+//! for why nothing but a source read can hold that in place.
+//!
 //! At the natural size — what the reconciler requests and what the parity
 //! harness measures — the shader snaps that position to the pixel centre
 //! (`u_viewport == u_grid`), where the law's arguments are exactly the integers
@@ -75,8 +84,9 @@
 //! 2. **blur H** and 3. **blur V** — the kit's separable truncating box blur,
 //!    the *same* `blur.frag` the scope and the gauge use;
 //! 4. **blit** — the field, the unlit ghost matrix, the lit layer recomputed at
-//!    the fragment's own resolution with the halo max-combined under it, the
-//!    CRT pass and the composite.
+//!    the fragment's own resolution with the halo — read bilinearly at that
+//!    same resolution off the snap, #1186 — max-combined under it, the CRT pass
+//!    and the composite.
 //!
 //! The blur runs on a glow-free skin too, for the reason
 //! [`program`](super::program) gives: at radius `0` it is the identity and at
@@ -599,6 +609,42 @@ mod tests {
                 "dot_matrix.frag must declare `{wanted}`",
             );
         }
+    }
+
+    /// The blit reads the **halo** at the fragment's resolution on the
+    /// continuous branch, and with one `texelFetch` on the snapped one (#1186).
+    ///
+    /// A source read for the `the_shader_and_the_mapping_agree_about_*` reason —
+    /// nothing in the tree compiles the GLSL until a driver does — but it is
+    /// protecting a shape rather than a number, and it is here because the
+    /// harness cannot protect this one. Measured: the grid-resolution
+    /// `texelFetch(u_tex1, ivec2(col, row))` this replaced leaves **all 100
+    /// cases green** (it moves only the four stretched dot-matrix and four
+    /// stretched marquee cases, and only by ~1 on an edge mean against a budget
+    /// of 16), so a revert to it ships silently. The two halves asserted below
+    /// are the two ways that revert can be spelled: deleting `halo_at`, or
+    /// keeping it and dropping the `snapped ?` fan-out at the call site.
+    ///
+    /// What it cannot see, stated for the same reason
+    /// `parity::case_verdict`'s doc states its own hole: it says nothing about
+    /// whether `halo_at` computes a *correct* bilinear tap. The harness is what
+    /// says that, via the edge budget — a wrong interpolation moves those eight
+    /// cases much further than the ~1 a resolution change does.
+    ///
+    /// **Falsified** by reverting either half — by putting
+    /// `texel(u_tex1, ivec2(col, row))` back on both branches, or by deleting
+    /// `halo_at`'s declaration.
+    #[test]
+    fn the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap() {
+        assert!(
+            BODY.contains("int halo_at(vec2 p) {"),
+            "dot_matrix.frag must declare the bilinear halo reader `halo_at`",
+        );
+        assert!(
+            BODY.contains("int glow = snapped ? texel(u_tex1, ivec2(col, row)) : halo_at(pc);"),
+            "the blit's halo read must be gated on the snap exactly as the \
+             lattice's sample point is — `texelFetch` at 1:1, `halo_at` above it",
+        );
     }
 
     /// The two layers are the **same body** with one line in front of it.

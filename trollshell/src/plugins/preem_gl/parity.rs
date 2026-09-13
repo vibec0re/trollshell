@@ -260,32 +260,65 @@ impl Kind {
                 mean: 16.0,
                 max: 128,
             },
-            // Four stretched cases, one per skin. Measured worst on llvmpipe:
-            // edge mean 10.641 (oled, the skin with the strongest bloom and no
-            // ghost lattice), edge max 39 (crt). Tighter on `max` than the
-            // gauge and deliberately so: a dot's rim is one or two pixels wide
-            // against a flat ground, so the largest *legitimate* disagreement
-            // here is one rim step, not a long ramp. 64 is ~1.6x the worst
-            // measured; 16 on the mean is ~1.5x. An all-black blit puts every
-            // one of the four at an edge mean of 51.7 to 65.0 and a max of 180
-            // to 255, so this catches the blank render on its own even where
-            // the field is black and the two blank guards cannot.
+            // Four stretched cases, one per skin. Measured worst on llvmpipe
+            // (Mesa 26.2.1, the flake's own): edge mean **11.626** (oled, the
+            // skin with the strongest bloom and no ghost lattice), edge max
+            // **40** (crt). Tighter on `max` than the gauge and deliberately so:
+            // a dot's rim is one or two pixels wide against a flat ground, so
+            // the largest *legitimate* disagreement here is one rim step, not a
+            // long ramp. An all-black blit puts every one of the four at an edge
+            // mean of 51.693 to 150.450 and a max of 180 to 255, so this catches
+            // the blank render on its own even where the field is black and the
+            // two blank guards cannot.
+            //
+            // **Re-measured in #1186**, which is the commit that gave the halo
+            // its bilinear read on the continuous branch: the four per-skin
+            // numbers moved 6.559/4.410/10.641/5.288 → 6.869/4.410/11.626/5.701
+            // on the mean and 36/19/38/39 → 37/19/38/40 on the max (the LCD is
+            // unchanged on both because its bloom radius is 0, so the blur is
+            // the identity and there is nothing to interpolate).
+            //
+            // **The pair did not move, and that is the decision rather than an
+            // omission.** `max` is still exactly ~1.6x the worst measured
+            // (64/40). `mean` is now ~1.38x rather than ~1.5x, and it is kept at
+            // 16.0 instead of being raised to ~18 to restore the old ratio,
+            // because the ratio was never the goal — detecting a drift is, and
+            // the measured cost of restoring it is most of the one drift this
+            // budget is known to catch. A scale-only dot radius +10 % (`denom`
+            // multiplied by 1.21 on the `u_viewport != u_grid` branch only) puts
+            // the oled at edge mean **19.182** here: against 16.0 that is a
+            // margin of 3.18 and `FAIL(edges)`, against 18.0 it would be 1.18.
+            // 37 % headroom on a mean taken over 5544–8463 pixels is ample, and
+            // it is not fragile across a Mesa bump either: the pre-#1186 numbers
+            // this comment used to carry were taken on 26.2.2 (the #1150 review
+            // states the version) and every one of them reproduced to the last
+            // digit on 26.2.1 before the shader hunk went in.
             Self::DotMatrix => EdgeBudget {
                 mean: 16.0,
                 max: 64,
             },
             // Four stretched cases, one per skin, at the mid-message scroll
-            // phase. Measured worst on llvmpipe: edge mean 10.781 (oled, the
-            // skin with the strongest bloom and no ghost lattice), edge max 40
-            // (crt). **The dot matrix's pair, and not by inheritance**: it is
-            // the same shader over the same falloff, so the same population of
+            // phase. Measured worst on llvmpipe: edge mean **11.747** (oled, the
+            // skin with the strongest bloom and no ghost lattice), edge max
+            // **40** (crt). **The dot matrix's pair, and not by inheritance**: it
+            // is the same shader over the same falloff, so the same population of
             // tiny round rims against a flat ground is what the budget bounds,
-            // and measured, the two kinds' worst numbers land within 0.2 and 1
+            // and measured, the two kinds' worst numbers land within 0.13 and 0
             // of each other. It is stated separately because a ticker's grid is
             // denser than a readout's — no spacing column, so ~20 % more dots
             // per row, and the edge bin is 2178–3070 px of 3456 against the
             // readout's 5544–8463 of 9648 — and a future divergence must be
             // able to move one without dragging the other.
+            //
+            // **Re-measured in #1186 on its own cases**, not carried over from
+            // the arm above: the four per-skin numbers moved
+            // 7.168/4.711/10.781/5.377 → 7.510/4.711/11.747/5.779 on the mean
+            // and 35/19/38/40 → 35/19/38/40 on the max, so the max did not move
+            // at all here. The pair is kept for the reason the dot matrix's is —
+            // `max` is ~1.6x the worst measured and `mean` is allowed to tighten
+            // from ~1.5x to ~1.36x rather than be raised toward the one drift it
+            // catches, which on this kind puts the oled at edge mean **19.379**
+            // (scale-only dot radius +10 %, `FAIL(edges)`).
             Self::Marquee => EdgeBudget {
                 mean: 16.0,
                 max: 64,
@@ -294,6 +327,12 @@ impl Kind {
             // edge mean 14.016, edge max 180, both on the LCD. **A different
             // shape from the other four kinds**, and the one place a budget had
             // to be reasoned about rather than scaled off a measurement.
+            //
+            // **Untouched by #1186**, and that is a measurement too: #1152 took
+            // both text kinds, but only the *marquee* runs `dot_matrix.frag` —
+            // the text box has its own `textbox.frag` and no emission at all, so
+            // there is no halo to read at any resolution. All four of its numbers
+            // come back to the digit after the halo hunk, which is what says so.
             //
             // This widget's edges are the rounded corner's arc and the 5×7
             // glyphs' own borders, and the kit anti-aliases **neither** — it
@@ -431,9 +470,14 @@ pub(crate) enum Sampling {
 ///   The residual hole, stated for all of them: a scale-only drift *inside* an
 ///   expression that still carries `* s` moves only edge pixels and clears the
 ///   budget — a tick or an arc 50 % wider on the gauge; a dot radius 5 %
-///   larger (caught on no skin; 10 % on one, oled) or a halo 25 % stronger
-///   (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64) on the
-///   dot matrix and, by construction, on the marquee.
+///   larger (caught on no skin) or a halo 25 % stronger on the dot matrix and
+///   the marquee. Re-measured against #1186's bilinear halo, since both of
+///   those numbers are statements about the bloom: a radius 10 % larger is now
+///   caught on the **oled** of both kinds (edge mean 19.182 / 19.379 against
+///   16.0, `FAIL(edges)`) where before the halo change it was one case of four;
+///   a halo 25 % stronger is still caught on **none** of the eight, at edge
+///   mean ≤ 13.379 and max ≤ 48 against 16 / 64 — closer to the mean ceiling
+///   than the ≤ 12.245 the grid-resolution halo measured, and still inside it.
 ///
 ///   **On the text box the hole has a direction, and it is worth knowing
 ///   which.** Measured: a corner arc one logical pixel **wider** on the

@@ -46,6 +46,15 @@
 // on the lattice, so a stretched chip draws round dots at the screen's
 // resolution rather than a magnified 4×4 block.
 //
+// The **halo** is the one thing that cannot be recomputed that way: it is a box
+// blur of the lit layer, i.e. a grid-resolution quantity by construction, and
+// `blur.frag` produces it at `u_grid`. So since #1186 it is *read* at the
+// fragment's resolution instead — `halo_at`'s bilinear tap, gated on
+// `u_viewport == u_grid` exactly the way the pixel-centre snap is, so the
+// stretched frame gets a smooth bloom under its round dots while the 1:1
+// comparison the parity harness pins bit-exact keeps taking a single
+// `texelFetch`.
+//
 // At 1:1 — the natural size, which is what the reconciler requests and what the
 // parity harness measures — the two are the **same arithmetic**: `site_at` is
 // then evaluated at the pixel centre, where its `q` values are exactly the
@@ -274,6 +283,43 @@ int texel(sampler2D tex, ivec2 p) {
     return int(texelFetch(tex, p, 0).r * 255.0 + 0.5);
 }
 
+// The blurred lit layer read at a **continuous** grid position: the four texels
+// around `p` mixed bilinearly (#1186).
+//
+// This is the halo's half of #1144's improvement. The lattice under it is
+// already evaluated at the fragment's own position, so before this the bloom
+// was the one grid-resolution thing left in a stretched frame: round dots drawn
+// at the screen's resolution with a halo replicated out of the kit's grid
+// around them. `blur.frag` writes the aux texture at `u_grid`, and a chip a
+// layout gave more room than its natural size — or any chip at all on a
+// `scale_factor >= 2` monitor — reads it at more fragments than it has texels.
+//
+// **Hand-written rather than a filtered `texture()` call, deliberately.**
+// `hytte-gl`'s `Texture` is `NEAREST`/`CLAMP_TO_EDGE` by construction ("a
+// filtered read of a phosphor cell is a wrong answer, not a smoother one"), and
+// that is load-bearing for every other reader of this same texture: `blur.frag`
+// takes exact `texelFetch` taps and the kit's truncating integer divisions
+// depend on them. So the filtering that belongs to *this* read lives at this
+// read, and `CLAMP_TO_EDGE`'s own border behaviour is spelled out below rather
+// than borrowed from sampler state nothing else here wants.
+//
+// Kit rows throughout, like every other index into `u_tex1`: row 0 is the top
+// of the image, and the blit's single flip has already happened in the caller.
+int halo_at(vec2 p) {
+    vec2 t = p - 0.5;                   // texel centres sit at integer + 0.5
+    vec2 base = floor(t);
+    vec2 f = t - base;
+    ivec2 lo = ivec2(0, 0);
+    ivec2 hi = u_grid - 1;
+    ivec2 a = clamp(ivec2(base), lo, hi);
+    ivec2 b = clamp(ivec2(base) + 1, lo, hi);
+    float v00 = float(texel(u_tex1, ivec2(a.x, a.y)));
+    float v10 = float(texel(u_tex1, ivec2(b.x, a.y)));
+    float v01 = float(texel(u_tex1, ivec2(a.x, b.y)));
+    float v11 = float(texel(u_tex1, ivec2(b.x, b.y)));
+    return int(mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y) + 0.5);
+}
+
 // `hytte-preem/src/style.rs`'s `mix`: `a` toward `b` by `t`/255, channel-wise,
 // with the same `+ 127` rounding.
 ivec4 mix_kit(ivec4 a, ivec4 b, int t) {
@@ -354,16 +400,18 @@ void main() {
     int cols = u_grid.x;
     int rows = u_grid.y;
     // Point sampling into the letterboxed fit rect, as `scope_blit.frag` does
-    // it — used for the halo and the CRT pass, which are grid-resolution
-    // quantities either way.
+    // it — used for the CRT pass, which is a grid-resolution quantity by
+    // definition (`MaskRow` is a row of the *buffer*), and for the snapped
+    // branch's lattice and halo below.
     int col = clamp(int(v_uv.x * float(cols)), 0, cols - 1);
     int row = clamp(int((1.0 - v_uv.y) * float(rows)), 0, rows - 1);
 
-    // The lattice, on the other hand, is evaluated at the **fragment's own**
-    // position — see the module header. At 1:1 that position is the pixel
-    // centre, and it is taken from `col`/`row` rather than from the `v_uv`
-    // product so no float round trip can move it off the centre the kit
-    // samples at.
+    // The lattice and its halo, on the other hand, are evaluated at the
+    // **fragment's own** position — see the module header. At 1:1 that position
+    // is the pixel centre, and it is taken from `col`/`row` rather than from the
+    // `v_uv` product so no float round trip can move it off the centre the kit
+    // samples at; the halo takes the single `texelFetch` it always took on that
+    // same branch, and the bilinear `halo_at` on the other (#1186).
     //
     // **Which branch a real screen takes.** `u_viewport` is the allocation in
     // *device* pixels (`GlSurface`'s `alloc` multiplies by `scale_factor`), so
@@ -381,8 +429,9 @@ void main() {
     // strength: the snap is pinned bit-exact, while on the continuous branch
     // every pixel of a falloff dot is an `edge` to the region split (the four
     // `readoutx2` cases report `lit[n=0]`), so a scale-only drift in the dot
-    // radius or the halo has only the edge budget to answer to (+5 % radius
-    // and +25 % halo both clear it; see `parity::case_verdict`'s doc).
+    // radius or the halo has only the edge budget to answer to (+5 % radius and
+    // +25 % halo both clear it, re-measured against the bilinear halo in #1186;
+    // see `parity::case_verdict`'s doc).
     //
     // **And nobody should believe the harness is protecting the snap itself**
     // (#1150 review, LOW-2). Deleting this `if` does not move a single pixel
@@ -393,11 +442,15 @@ void main() {
     // the kit's integer answer anyway. The snap is insurance against a driver
     // whose `v_uv` interpolation is *not* exact at a pixel centre — a real
     // risk on hardware this has never run on, and one no gate here can see.
-    // Keep it; do not read a green harness as evidence for it.
-    vec2 p = vec2(v_uv.x * float(cols), (1.0 - v_uv.y) * float(rows));
-    if (u_viewport == u_grid) {
-        p = vec2(float(col), float(row)) + 0.5;
-    }
+    // Keep it; do not read a green harness as evidence for it. The same
+    // sentence covers `halo_at`'s half of the gate below, and for the same
+    // reason: at a pixel centre its `f` is exactly zero and the bilinear mix
+    // collapses onto `v00`, i.e. onto the `texelFetch` the snapped branch
+    // takes, so the gate is arithmetically redundant under a driver whose
+    // `v_uv` interpolation is exact and is insurance against one whose is not.
+    vec2 pc = vec2(v_uv.x * float(cols), (1.0 - v_uv.y) * float(rows));
+    bool snapped = (u_viewport == u_grid);
+    vec2 p = snapped ? vec2(float(col), float(row)) + 0.5 : pc;
     Site s = site_at(p);
 
     ivec4 bg = ivec4(u_bg + 0.5);
@@ -417,8 +470,18 @@ void main() {
 
     // `Emission::bloom`: the blurred grid scaled by strength/256 and
     // max-combined under the original.
+    //
+    // The *read* of the blurred grid is gated exactly the way the lattice's
+    // sample point above is (#1186): the single `texelFetch` on the snapped
+    // branch, which is what keeps the 1:1 cases bit-exact, and `halo_at`'s
+    // bilinear tap on the continuous one, so a stretched chip's bloom is
+    // resolved at the screen's resolution rather than replicated out of the
+    // kit's grid. The scaling and the max-combine are untouched and stay
+    // integer, so a skin with `u_bloom_strength == 0` still reduces to `lit` on
+    // either branch.
     int lit = lit_intensity(s);
-    int halo = min(texel(u_tex1, ivec2(col, row)) * u_bloom_strength / 256, 255);
+    int glow = snapped ? texel(u_tex1, ivec2(col, row)) : halo_at(pc);
+    int halo = min(glow * u_bloom_strength / 256, 255);
     lit = min(max(lit, halo), 255);
 
     // `Emission::composite`: unlit pixels are skipped *before* the mask is

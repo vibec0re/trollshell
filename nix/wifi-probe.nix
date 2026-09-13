@@ -19,10 +19,16 @@
 # #1257 the examples are `probes` (nix/package.nix's `passthru.probes`), a
 # SEPARATE crane compile in the checks universe, on `cargoArtifacts` — the
 # same dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
-# share, so this is genuinely zero extra dependency compilation for a
-# checkout that already runs `nix flake check`. `$out/bin/wifi_probe` comes
-# from `${probes}` now, not `${workspace}` — `workspace` is still taken here,
-# but only for `passthru.devInputs`, the GApps wrap's `buildInputs`.
+# share. That does NOT make it free: measured (2026-09-13), `probes` still
+# runs ~101 `Compiling` lines in ~3m14s — roughly what the pre-#1257
+# `postInstall` cost (~106/~3m04s), because it's a `-p`-scoped build against
+# a `--workspace`-scoped cache (see `nix/package.nix`'s `probes` comment).
+# What changed is WHO pays it: no package build (this one included) reaches
+# `probes` any more, so the cost moves out of every consumer's `nix build`
+# and into one checks-universe derivation, once per Cargo.lock/source
+# change, instead of once per consumer. `$out/bin/wifi_probe` comes from
+# `${probes}` now, not `${workspace}` — `workspace` is still taken here, but
+# only for `passthru.devInputs`, the GApps wrap's `buildInputs`.
 #
 # The wrap is preserved from the pre-#588 shape for the same reason as
 # nix/probe.nix: the old derivation had `wrapGAppsHook4` in `nativeBuildInputs`

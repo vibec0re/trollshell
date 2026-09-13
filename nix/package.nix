@@ -361,13 +361,31 @@ let
   #
   # `cargoArtifacts` (NOT `cargoArtifactsBinOnly`) is the fix: it's the SAME
   # dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
-  # share (`buildDepsOnly commonArgs`, above), so the two examples link
-  # against dev-dependency artifacts a checks-universe cache already built,
-  # and no package build ever reaches this derivation. Scoped one crate at a
-  # time (`-p hytte-ecal --example probe`, then `-p hytte-services --example
-  # wifi_probe`) rather than `--workspace --examples`, for the same reason
-  # the old postInstall was: avoid pulling every OTHER workspace member's
-  # dev-deps into the union.
+  # share (`buildDepsOnly commonArgs`, above), and no package build ever
+  # reaches this derivation — that part is the actual win, confirmed by
+  # `checks.workspace-ships-no-probes`. It is NOT "zero extra compilation":
+  # measured (`nix build .#trollshell.passthru.probes --rebuild -L`,
+  # 2026-09-13), `probes` still runs **101 `Compiling` lines in ~3m14s**,
+  # against roughly the same cost the old `postInstall` paid on the wrong
+  # cache (~106 lines / ~3m04s) — barely a five-crate saving, because `-p
+  # hytte-ecal --example probe` / `-p hytte-services --example wifi_probe`
+  # fingerprint a different feature union than the `--workspace --locked`
+  # scope `cargoArtifacts` was built under (the exact `commonArgs` warning
+  # above, applied to this derivation: a `-p <crate>` stage and a
+  # `--workspace` stage disagree about shared deps and cannot fully reuse
+  # each other's target dir). The cost does not disappear; it moves out of
+  # every package build and into this one checks-universe derivation, paid
+  # once per Cargo.lock/source change rather than once per consumer.
+  # Scoped one crate at a time (`-p hytte-ecal --example probe`, then `-p
+  # hytte-services --example wifi_probe`) rather than `--workspace
+  # --examples`, for the same reason the old postInstall was: avoid pulling
+  # every OTHER workspace member's dev-deps into the union. UNMEASURED
+  # follow-up hypothesis (review, 2026-09-13): `buildDepsOnly`'s own
+  # `--all-targets` already unions every member's dev-deps into
+  # `cargoArtifacts`, so the narrower `-p` scope here may be paying a
+  # fingerprint mismatch for no matching benefit, and `--workspace
+  # --examples` — the actual union the cache was built for — could turn out
+  # cheaper. Not tried here; measure before switching.
   #
   # `doNotPostBuildInstallCargoBinaries = true`: `buildPackage`'s default
   # `buildPhaseCargoCommand` captures a JSON build log into `$cargoBuildLog`
@@ -579,14 +597,18 @@ stdenv.mkDerivation {
     )
   '';
 
-  # `workspace` is what nix/plugin.nix, nix/control-center.nix and (since #588)
-  # nix/{probe,wifi-probe}.nix slice their own binaries out of; `commonArgs` +
-  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests /
-  # since #1115 workspace-tests) reuse instead of `workspace` itself — clippy
-  # and system-tests because they compile a different feature set (`--features
-  # system-tests`) and so cannot be a slice of `workspace`, workspace-tests
-  # because `workspace` sits on `cargoArtifactsBinOnly` (no dev-dependency
-  # graph) rather than `cargoArtifacts` (which has one).
+  # `workspace` is what nix/plugin.nix and nix/control-center.nix slice their
+  # own binaries out of. `nix/probe.nix` and `nix/wifi-probe.nix` are the
+  # odd ones since #1257: they still take `workspace`, but only for
+  # `passthru.devInputs.buildInputs` (the GApps wrap env) — the binaries
+  # themselves now come from `probes` (above), not `${workspace}/bin`.
+  # `commonArgs` + `cargoArtifacts` are what the leaf flake checks (clippy /
+  # system-tests / since #1115 workspace-tests) reuse instead of `workspace`
+  # itself — clippy and system-tests because they compile a different
+  # feature set (`--features system-tests`) and so cannot be a slice of
+  # `workspace`, workspace-tests because `workspace` sits on
+  # `cargoArtifactsBinOnly` (no dev-dependency graph) rather than
+  # `cargoArtifacts` (which has one).
   passthru = workspace.passthru // {
     inherit workspace assets;
   };

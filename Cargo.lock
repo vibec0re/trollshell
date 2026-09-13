@@ -1463,6 +1463,7 @@ name = "hytte-sensors"
 version = "0.1.0"
 dependencies = [
  "nix",
+ "serde_json",
  "tempfile",
 ]
 

@@ -19,10 +19,10 @@ system-tests = []
 
 [dependencies]
 anyhow.workspace = true
-nix = { version = "0.29", default-features = false, features = [
-  "fs",
-  "signal",
-] }
+# "signal" is this crate's own addition (`recorder.rs`'s SIGINT) on top of
+# the workspace baseline's "fs" (#453 — shared version here, no
+# hand-repinning); `hytte-sensors` takes the baseline alone.
+nix = { workspace = true, features = ["signal"] }
 chrono.workspace = true
 futures-channel.workspace = true
 futures-signals.workspace = true

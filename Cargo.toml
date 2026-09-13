@@ -176,6 +176,14 @@ hytte-sensors = { path = "crates/hytte-sensors" }
 # practice before; this makes `cargo update` respect it too, which matters more
 # now that a second crate reads the same structs.
 niri-ipc = "=26.4.0"
+# `hytte-sensors`' `statvfs` call (disk usage) and `hytte-services`' own
+# `SIGINT` handling (`audio_native/recorder.rs`) — two consumers since #1249
+# moved the first one out of `hytte-services` into its own leaf. Feature sets
+# diverge (`hytte-services` also wants "signal"), so only the common "fs"
+# feature lives here and `hytte-services` adds "signal" locally, the same
+# shape as `futures-util` above (#453: shared version/baseline here, no
+# hand-repinning per consumer).
+nix = { version = "0.29", default-features = false, features = ["fs"] }
 # Secret Service (gnome-keyring/libsecret) client for the AI-key store (#392),
 # used only by the `trollshell` binary's `secrets.rs`. Pure-Rust (RustCrypto via
 # `native_crypto`, no native `libsecret` link → no nix buildInputs change) and

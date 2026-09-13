@@ -15,10 +15,16 @@ workspace = true
 # for free/used/total bytes per mount point. Same version + the same "fs"
 # feature `hytte-services` already resolves (its own `nix` dependency also
 # needs "signal", for `recorder.rs`'s SIGINT — unrelated to sensors, so it
-# stays there); pulling "fs" alone here adds no new resolved package.
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+# stays there); pulling "fs" alone here adds no new resolved package. Both
+# consumers now inherit the version from `[workspace.dependencies]` (#453)
+# rather than hand-repinning it.
+nix.workspace = true
 
 [dev-dependencies]
 # `cpufreq.rs` and `hwmon.rs` build fixture sysfs directories to exercise the
 # fast/slow-path chip resolution without touching the real `/sys`.
 tempfile.workspace = true
+# `tests/gtk_free.rs`'s GTK-free pin shells out to `cargo metadata` and
+# parses its JSON output — already resolved in `Cargo.lock` via half the
+# workspace, so this dev-only edge adds no new package.
+serde_json.workspace = true

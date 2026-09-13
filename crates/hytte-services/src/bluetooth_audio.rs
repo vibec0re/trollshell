@@ -93,27 +93,29 @@ impl Default for BluetoothAudioState {
 
 /// Permissive legacy parser: looks for `enabled = false` anywhere in the old
 /// config file's text; anything else (missing key, malformed value, garbage)
-/// keeps the historical default ON. Only used for the one-time migration.
-fn parse_legacy(text: &str) -> Option<BluetoothAudioState> {
+/// keeps the historical default ON. Only used for the one-time migration —
+/// always succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`.
+fn parse_legacy(text: &str) -> BluetoothAudioState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("false") {
-                return Some(BluetoothAudioState { enabled: false });
+                return BluetoothAudioState { enabled: false };
             }
             if rhs.eq_ignore_ascii_case("true") {
-                return Some(BluetoothAudioState { enabled: true });
+                return BluetoothAudioState { enabled: true };
             }
         }
     }
-    Some(BluetoothAudioState::default())
+    BluetoothAudioState::default()
 }
 
 fn load_enabled_from_disk() -> bool {
     let old = config_file::path(LEGACY_CONFIG_FILE);
     let loaded: BluetoothAudioState =
-        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), parse_legacy);
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
     loaded.enabled
 }
 

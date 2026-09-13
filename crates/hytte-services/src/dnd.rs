@@ -40,26 +40,29 @@ struct DndState {
 
 /// Permissive legacy parser: looks for `enabled = true` anywhere in the old
 /// config file's text; anything else (missing key, malformed value, garbage)
-/// keeps the historical default OFF. Only used for the one-time migration.
-fn parse_legacy(text: &str) -> Option<DndState> {
+/// keeps the historical default OFF. Only used for the one-time migration —
+/// always succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`.
+fn parse_legacy(text: &str) -> DndState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("true") {
-                return Some(DndState { enabled: true });
+                return DndState { enabled: true };
             }
             if rhs.eq_ignore_ascii_case("false") {
-                return Some(DndState { enabled: false });
+                return DndState { enabled: false };
             }
         }
     }
-    Some(DndState::default())
+    DndState::default()
 }
 
 fn load_enabled_from_disk() -> bool {
     let old = config_file::path(LEGACY_CONFIG_FILE);
-    let loaded: DndState = state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), parse_legacy);
+    let loaded: DndState =
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
     loaded.enabled
 }
 

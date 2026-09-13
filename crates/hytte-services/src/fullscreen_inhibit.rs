@@ -83,29 +83,31 @@ impl Default for FullscreenInhibitState {
 fn load_enabled_from_disk() -> bool {
     let old = config_file::path(LEGACY_CONFIG_FILE);
     let loaded: FullscreenInhibitState =
-        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), parse_legacy);
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
     loaded.enabled
 }
 
 /// Parse the flat `enabled = true|false` legacy config body. Permissive: an
 /// explicit `enabled = false` turns the policy off; anything else — a
 /// missing key, a malformed value, an empty file — leaves the
-/// **default-on** policy. Only used for the one-time migration; split out as
-/// a pure fn so it's unit-testable without touching `$HOME`.
-fn parse_legacy(text: &str) -> Option<FullscreenInhibitState> {
+/// **default-on** policy. Only used for the one-time migration — always
+/// succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`; split out as a pure fn so
+/// it's unit-testable without touching `$HOME`.
+fn parse_legacy(text: &str) -> FullscreenInhibitState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("false") {
-                return Some(FullscreenInhibitState { enabled: false });
+                return FullscreenInhibitState { enabled: false };
             }
             if rhs.eq_ignore_ascii_case("true") {
-                return Some(FullscreenInhibitState { enabled: true });
+                return FullscreenInhibitState { enabled: true };
             }
         }
     }
-    Some(FullscreenInhibitState::default())
+    FullscreenInhibitState::default()
 }
 
 fn save_enabled_to_disk(enabled: bool) {
@@ -374,19 +376,19 @@ mod tests {
     fn parse_legacy_defaults_on() {
         // Empty / keyless / malformed bodies all keep the default-on policy —
         // the papercut this feature fixes is only worth having on by default.
-        assert!(parse_legacy("").unwrap().enabled);
-        assert!(parse_legacy("# just a comment\n").unwrap().enabled);
-        assert!(parse_legacy("something = else\n").unwrap().enabled);
-        assert!(parse_legacy("enabled = maybe\n").unwrap().enabled);
+        assert!(parse_legacy("").enabled);
+        assert!(parse_legacy("# just a comment\n").enabled);
+        assert!(parse_legacy("something = else\n").enabled);
+        assert!(parse_legacy("enabled = maybe\n").enabled);
     }
 
     #[test]
     fn parse_legacy_explicit_off_and_on() {
-        assert!(!parse_legacy("enabled = false\n").unwrap().enabled);
-        assert!(parse_legacy("enabled = true\n").unwrap().enabled);
+        assert!(!parse_legacy("enabled = false\n").enabled);
+        assert!(parse_legacy("enabled = true\n").enabled);
         // Tolerant of spacing / case, like the dnd parser it mirrors.
-        assert!(!parse_legacy("enabled=FALSE").unwrap().enabled);
-        assert!(parse_legacy("  enabled  =  True  ").unwrap().enabled);
+        assert!(!parse_legacy("enabled=FALSE").enabled);
+        assert!(parse_legacy("  enabled  =  True  ").enabled);
     }
 
     fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {

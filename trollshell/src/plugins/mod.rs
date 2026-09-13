@@ -90,8 +90,15 @@
 //! ## v1 scope (see the PR body for the full deferred list)
 //!
 //! - **Mounts:** the three sidebar regions ([`Mount::SidebarLead`] /
-//!   [`Mount::SidebarTop`] / [`Mount::SidebarBottom`]) render as sidebar cards,
-//!   and the three bar regions ([`Mount::BarLeft`] / [`Mount::BarCenter`] /
+//!   [`Mount::SidebarTop`] / [`Mount::SidebarBottom`]) render as sidebar cards —
+//!   as do their three mirrors on the **right** sidebar
+//!   ([`Mount::SidebarRightLead`] / [`Mount::SidebarRightTop`] /
+//!   [`Mount::SidebarRightBottom`], #1158/#1159), which the host treats
+//!   identically: same mailbox shape, same reconciler, same `.ts-plugin-card`
+//!   class, only a different surface to mount the region on. (P1 routes them;
+//!   nothing mounts the right slots until #1160 builds the surface, so a plugin
+//!   placed right today registers and renders into a mailbox nobody reads.)
+//!   The three bar regions ([`Mount::BarLeft`] / [`Mount::BarCenter`] /
 //!   [`Mount::BarRight`]) render as bar **chips** (#349) — the plugin's `view()`
 //!   tree wrapped in a `.ts-plugin-chip` pill in the matching bar group. Both
 //!   sides share one reconciler path ([`build_region`](region)); a bar region
@@ -175,6 +182,17 @@ pub use region::{
     bar_center_slot, bar_left_slot, bar_right_slot, plugin_panel_slot, set_active_panel,
     sidebar_bottom_slot, sidebar_lead_slot, sidebar_top_slot,
 };
+// The right sidebar's three region builders (#1158/#1159). Re-exported now, used
+// by nobody until #1160 builds the surface that mounts them — the intended
+// intermediate state of P1: the wire, the routing and the mailboxes all work, and
+// a plugin placed right renders into a mailbox with no reader. A separate `use`
+// with a scoped `allow` rather than one over the whole list above, so the seven
+// slots that *are* mounted keep their unused-import cover.
+#[allow(
+    unused_imports,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub use region::{sidebar_right_bottom_slot, sidebar_right_lead_slot, sidebar_right_top_slot};
 
 /// Signal that emits `true` while **some** monitor's sidebar is open — the same
 /// aggregate the host pushes to plugins as
@@ -284,17 +302,16 @@ pub fn plugin_states() -> Vec<PluginState> {
 }
 
 /// The stable wire name for a mount region, for the runtime overlay (#423).
-/// `Mount` lives in `hytte-plugin-proto` and has no name accessor, so map it
-/// here.
+///
+/// Since #1159 this is [`Mount::wire_name`] and nothing else. It used to carry
+/// its own `match` — the proto had no name accessor when #423 needed one — and
+/// the names the control-center displays would have drifted from the names the
+/// SDK's `HYTTE_PLUGIN_MOUNT` parses the moment either table grew a row alone.
+/// Kept as a named function rather than inlined at the two call sites so the
+/// reason this is the wire spelling (and not a prettier label) stays written
+/// down.
 fn mount_name(mount: Mount) -> &'static str {
-    match mount {
-        Mount::SidebarLead => "SidebarLead",
-        Mount::SidebarTop => "SidebarTop",
-        Mount::SidebarBottom => "SidebarBottom",
-        Mount::BarLeft => "BarLeft",
-        Mount::BarCenter => "BarCenter",
-        Mount::BarRight => "BarRight",
-    }
+    mount.wire_name()
 }
 
 /// Record a newly-registered connection in the runtime mirror (#423): connected,
@@ -399,8 +416,9 @@ struct BrokeredEffect {
     outbound: mpsc::Sender<HostMsg>,
 }
 
-/// Registry handles for the plugin host. The six render mailboxes (three
-/// sidebar + three bar, #349) are written from tokio (a plugin's reader task)
+/// Registry handles for the plugin host. The nine render mailboxes (three
+/// sidebar regions per side since #1158, plus three bar, #349) are written from
+/// tokio (a plugin's reader task)
 /// and read on the GTK thread (the reconcilers). `clock_tx` is written on the
 /// GTK thread (the clock pump) and subscribed from tokio (per-conn snapshot
 /// tasks). `effects_rx` is the receive end of the non-lossy effect channel;
@@ -412,6 +430,14 @@ pub struct PluginHandles {
     sidebar_lead: Mutable<Vec<SlotRender>>,
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
+    /// The **right** sidebar's three regions (#1158/#1159) — the same shape as
+    /// the three above, because the host treats the two families identically.
+    /// Written by the reader task from P1 on; nothing reads them until #1160
+    /// builds the right sidebar surface and mounts
+    /// [`sidebar_right_lead_slot`](region::sidebar_right_lead_slot) & co.
+    sidebar_right_lead: Mutable<Vec<SlotRender>>,
+    sidebar_right_top: Mutable<Vec<SlotRender>>,
+    sidebar_right_bottom: Mutable<Vec<SlotRender>>,
     bar_left: Mutable<Vec<SlotRender>>,
     bar_center: Mutable<Vec<SlotRender>>,
     bar_right: Mutable<Vec<SlotRender>>,
@@ -477,6 +503,11 @@ struct ListenerCtx {
     sidebar_lead: Mutable<Vec<SlotRender>>,
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
+    /// The right sidebar's three regions (#1158/#1159); see
+    /// [`PluginHandles::sidebar_right_lead`].
+    sidebar_right_lead: Mutable<Vec<SlotRender>>,
+    sidebar_right_top: Mutable<Vec<SlotRender>>,
+    sidebar_right_bottom: Mutable<Vec<SlotRender>>,
     bar_left: Mutable<Vec<SlotRender>>,
     bar_center: Mutable<Vec<SlotRender>>,
     bar_right: Mutable<Vec<SlotRender>>,
@@ -558,6 +589,9 @@ impl Service for PluginsService {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
             sidebar_bottom: Mutable::new(Vec::new()),
+            sidebar_right_lead: Mutable::new(Vec::new()),
+            sidebar_right_top: Mutable::new(Vec::new()),
+            sidebar_right_bottom: Mutable::new(Vec::new()),
             bar_left: Mutable::new(Vec::new()),
             bar_center: Mutable::new(Vec::new()),
             bar_right: Mutable::new(Vec::new()),
@@ -577,6 +611,9 @@ impl Service for PluginsService {
             sidebar_lead: handles.sidebar_lead.clone(),
             sidebar_top: handles.sidebar_top.clone(),
             sidebar_bottom: handles.sidebar_bottom.clone(),
+            sidebar_right_lead: handles.sidebar_right_lead.clone(),
+            sidebar_right_top: handles.sidebar_right_top.clone(),
+            sidebar_right_bottom: handles.sidebar_right_bottom.clone(),
             bar_left: handles.bar_left.clone(),
             bar_center: handles.bar_center.clone(),
             bar_right: handles.bar_right.clone(),

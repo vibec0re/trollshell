@@ -565,26 +565,29 @@ pub(super) fn live_animators() -> Vec<Rc<Animator>> {
 
 // ── Monitor-independent preem scope release (#921) ───────────────────────────
 
-/// The number of render mailboxes a plugin id can appear in: the six mount
-/// regions (`sidebar_{lead,top,bottom}` + `bar_{left,center,right}`) plus the
-/// single shared `panels` list.
+/// The number of render mailboxes a plugin id can appear in: the nine mount
+/// regions (`sidebar_{lead,top,bottom}`, their `sidebar_right_*` mirrors since
+/// #1158, and `bar_{left,center,right}`) plus the single shared `panels` list.
 ///
 /// A fixed-size array rather than a slice so *changing the count* is a compile
 /// error at every call site. On its own that is **not** enough to stop a union
 /// that silently stops covering a mailbox — which would look exactly like the
-/// defect this module is fixing, and is M4's failure mode: an eighth
+/// defect this module is fixing, and is M4's failure mode: an eleventh
 /// `Mutable<Vec<SlotRender>>` field on [`PluginHandles`] leaves this const, the
 /// destructuring below and every `handles.<field>` compiling untouched. The
 /// guard that actually holds is the **exhaustive** `PluginHandles` pattern in
 /// [`install_scope_releaser`] (every field named, no `..`), which turns a new
-/// field into a compile error there and forces a decision about it.
-pub(super) const RENDER_MAILBOXES: usize = 7;
+/// field into a compile error there and forces a decision about it. #1158's three
+/// new mailboxes are what it caught first, exactly as designed — the right
+/// sidebar's cards animate preem widgets like any other, so leaving them out of
+/// this union would have leaked a departed plugin's renderer instances.
+pub(super) const RENDER_MAILBOXES: usize = 10;
 
 /// The set of plugin ids **any** render mailbox currently holds.
 ///
 /// This is the host's answer to "which plugins are still here", and it is the
 /// one [`drive_scope_releaser`] watches. A connection's teardown clears its
-/// entry from all seven mailboxes (`session.rs:815-824`), so an id leaving this
+/// entry from all ten mailboxes (`session.rs:815-824`), so an id leaving this
 /// union is exactly "the plugin left" — the same event
 /// `region::reconcile_region`'s retain loop reacts to, read from a place that
 /// does not need a region (or a monitor, or any widget) to exist.
@@ -601,17 +604,36 @@ pub(super) const RENDER_MAILBOXES: usize = 7;
 /// worth being precise about what still runs per nudge: the nudged mailbox's
 /// `signal_ref` (one `String` clone per plugin in it) plus `map_ref!`'s
 /// combine, which builds a fresh `HashSet<String>` cloning every id in **all
-/// seven** mailboxes before `dedupe_cloned` compares it against the last one
-/// and drops it. Measured (test profile, so an upper bound): **6.5 µs** per
-/// nudge for the realistic shape — 10 ids in one mailbox, six empty — which at
-/// a worst-case 140 nudges/s is 0.91 ms/s, ~0.09 % of a core. Negligible, but
-/// linear in total plugin count × nudge rate rather than free. What the dedupe
-/// buys is that the *release* pass — the set difference and the `forget_scope`
-/// calls — never runs on a nudge, only on a real membership change.
+/// ten** mailboxes before `dedupe_cloned` compares it against the last one
+/// and drops it. Measured at seven mailboxes (test profile, so an upper bound):
+/// **6.5 µs** per nudge for the realistic shape — 10 ids in one mailbox, the
+/// rest empty — which at a worst-case 140 nudges/s is 0.91 ms/s, ~0.09 % of a
+/// core. #1158 added three mailboxes without re-measuring, and the number above
+/// is left as it was taken: the per-nudge cost is dominated by the ids actually
+/// present (which did not change) rather than by the count of empty mailboxes
+/// the combine walks, so three more empties move it by a rounding error, not by
+/// 3/7. Negligible either way, but linear in total plugin count × nudge rate
+/// rather than free. What the dedupe buys is that the *release* pass — the set
+/// difference and the `forget_scope` calls — never runs on a nudge, only on a
+/// real membership change.
 pub(super) fn live_plugin_ids_signal(
     mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES],
 ) -> impl Signal<Item = HashSet<String>> {
-    let [lead, top, bottom, left, center, right, panels] = mailboxes;
+    // The array's *order* is arbitrary — this is a union, and membership does not
+    // care — so #1158's three go on the tail rather than beside their left-hand
+    // twins, which keeps the index-based call sites in `pump_tests.rs` valid.
+    let [
+        lead,
+        top,
+        bottom,
+        left,
+        center,
+        right,
+        panels,
+        r_lead,
+        r_top,
+        r_bottom,
+    ] = mailboxes;
     map_ref! {
         let lead = mailbox_ids(&lead),
         let top = mailbox_ids(&top),
@@ -619,9 +641,14 @@ pub(super) fn live_plugin_ids_signal(
         let left = mailbox_ids(&left),
         let center = mailbox_ids(&center),
         let right = mailbox_ids(&right),
-        let panels = mailbox_ids(&panels) => {
+        let panels = mailbox_ids(&panels),
+        let r_lead = mailbox_ids(&r_lead),
+        let r_top = mailbox_ids(&r_top),
+        let r_bottom = mailbox_ids(&r_bottom) => {
             let mut live: HashSet<String> = HashSet::new();
-            for ids in [lead, top, bottom, left, center, right, panels] {
+            for ids in [
+                lead, top, bottom, left, center, right, panels, r_lead, r_top, r_bottom,
+            ] {
                 live.extend(ids.iter().cloned());
             }
             live
@@ -768,6 +795,9 @@ pub(super) fn install_scope_releaser() {
             sidebar_lead,
             sidebar_top,
             sidebar_bottom,
+            sidebar_right_lead,
+            sidebar_right_top,
+            sidebar_right_bottom,
             bar_left,
             bar_center,
             bar_right,
@@ -793,6 +823,11 @@ pub(super) fn install_scope_releaser() {
             bar_center.clone(),
             bar_right.clone(),
             panels.clone(),
+            // #1158's three, on the tail — see `live_plugin_ids_signal`'s
+            // destructure for why the order is free.
+            sidebar_right_lead.clone(),
+            sidebar_right_top.clone(),
+            sidebar_right_bottom.clone(),
         ])
     });
     glib::MainContext::default().spawn_local(drive_scope_releaser(live));

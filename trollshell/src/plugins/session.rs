@@ -124,11 +124,21 @@ impl Drop for SpectrumDemand {
 fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Vec<Effect>) {
     // The mount picks which region mailbox (and thus per-monitor container) the
     // tree lands in: sidebar regions render as cards, bar regions as chips
-    // (#349); both share the reconciler path.
+    // (#349); both share the reconciler path. The right sidebar's three (#1158)
+    // are ordinary rows here — one mailbox each, no side-awareness anywhere in
+    // this function, which is what "the host treats the two families
+    // identically" means in practice.
+    //
+    // This match is the host's whole placement decision, and
+    // `plugins::tests::sidebar_right_routing` pins every one of its nine arms
+    // against a real `handle_conn` (#1159): swapping two of them reds it.
     let region = match mount {
         Mount::SidebarLead => &ctx.sidebar_lead,
         Mount::SidebarTop => &ctx.sidebar_top,
         Mount::SidebarBottom => &ctx.sidebar_bottom,
+        Mount::SidebarRightLead => &ctx.sidebar_right_lead,
+        Mount::SidebarRightTop => &ctx.sidebar_right_top,
+        Mount::SidebarRightBottom => &ctx.sidebar_right_bottom,
         Mount::BarLeft => &ctx.bar_left,
         Mount::BarCenter => &ctx.bar_center,
         Mount::BarRight => &ctx.bar_right,

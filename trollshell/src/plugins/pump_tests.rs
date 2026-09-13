@@ -115,6 +115,9 @@ fn fixture_handles(
         sidebar_lead: Mutable::new(Vec::new()),
         sidebar_top: Mutable::new(Vec::new()),
         sidebar_bottom: Mutable::new(Vec::new()),
+        sidebar_right_lead: Mutable::new(Vec::new()),
+        sidebar_right_top: Mutable::new(Vec::new()),
+        sidebar_right_bottom: Mutable::new(Vec::new()),
         bar_left,
         bar_center,
         bar_right: Mutable::new(Vec::new()),
@@ -271,7 +274,7 @@ fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
     assert_eq!(preem_render::instance_count(&card), 1);
     assert_eq!(preem_render::instance_count(&panel), 1);
 
-    // The seven mailboxes, with this plugin in one region (`bar_left`) and in
+    // The ten mailboxes, with this plugin in one region (`bar_left`) and in
     // the shared panel list — where a chip with a drawer panel really sits.
     let mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] = [
         Mutable::new(Vec::new()),
@@ -281,6 +284,11 @@ fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
         Mutable::new(Vec::new()),
         Mutable::new(Vec::new()),
         Mutable::new(vec![slot("t921-leaver", marquee_node("panel"), &tx)]),
+        // #1158's three right-sidebar mailboxes, on the tail of the array (see
+        // `live_plugin_ids_signal`) so the indices below keep their meaning.
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
     ];
     let bar_left = mailboxes[3].clone();
     let panels = mailboxes[6].clone();
@@ -338,6 +346,9 @@ fn a_repaint_nudge_does_not_wake_the_scope_releaser() {
         Mutable::new(Vec::new()),
         Mutable::new(Vec::new()),
         bar_left.clone(),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
         Mutable::new(Vec::new()),
         Mutable::new(Vec::new()),
         Mutable::new(Vec::new()),
@@ -416,6 +427,9 @@ fn a_departing_plugin_releases_its_shader_states_with_no_region_alive() {
             Mutable::new(Vec::new()),
             Mutable::new(Vec::new()),
             Mutable::new(vec![slot(&id, node.clone(), &tx)]),
+            Mutable::new(Vec::new()),
+            Mutable::new(Vec::new()),
+            Mutable::new(Vec::new()),
             Mutable::new(Vec::new()),
             Mutable::new(Vec::new()),
             Mutable::new(Vec::new()),

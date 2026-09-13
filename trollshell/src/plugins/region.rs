@@ -4245,3 +4245,105 @@ mod gtk_tests {
         );
     }
 }
+
+// ── The right sidebar's three regions (#1158/#1159, P1) ──────────────────────
+//
+// Deliberately at the end of the file rather than beside their left-hand twins:
+// P1 landed alongside another change to the middle of this module, and a new
+// block at the tail conflicts with nothing. #1160 is free to move them up.
+//
+// The three signal accessors and the three slot builders are *exactly* the left
+// family's, pointed at the right family's mailboxes — the whole content of "the
+// host treats the two families identically" (`Mount`'s own doc). The card class
+// is `ts-plugin-card` here too, so a plugin moved from one sidebar to the other
+// by `HYTTE_PLUGIN_MOUNT` looks the same on both.
+//
+// Nothing calls the three `_slot` functions yet. `sidebar.rs` builds one
+// `Left + Top + Bottom` surface today; #1160 parameterises it by side and mounts
+// these three into the right one. Until then a plugin placed right registers
+// fine, routes into its mailbox, and shows its runtime mount in the
+// control-center — it just has no surface to paint on. That is the intended
+// intermediate state, which is why the `allow(dead_code)` below is scoped to
+// these three items and names the issue that removes it.
+
+fn right_lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_right_lead
+            .signal_cloned()
+    })
+}
+
+fn right_top_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_right_top
+            .signal_cloned()
+    })
+}
+
+fn right_bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_right_bottom
+            .signal_cloned()
+    })
+}
+
+/// The [`Mount::SidebarRightLead`](hytte_plugin_proto::Mount::SidebarRightLead)
+/// **region** — the mirror of [`sidebar_lead_slot`] on the right sidebar: a
+/// vertical container of N plugin cards, mounted at the very top of that surface.
+///
+/// Unused until #1160 builds the right sidebar; see the section comment above.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
+    build_region(
+        right_lead_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+        named_connector(monitor.connector()),
+    )
+}
+
+/// The [`Mount::SidebarRightTop`](hytte_plugin_proto::Mount::SidebarRightTop)
+/// **region** — the mirror of [`sidebar_top_slot`] on the right sidebar.
+///
+/// Unused until #1160 builds the right sidebar; see the section comment above.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
+    build_region(
+        right_top_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+        named_connector(monitor.connector()),
+    )
+}
+
+/// The [`Mount::SidebarRightBottom`](hytte_plugin_proto::Mount::SidebarRightBottom)
+/// **region** — the mirror of [`sidebar_bottom_slot`] on the right sidebar.
+///
+/// Unused until #1160 builds the right sidebar; see the section comment above.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
+    build_region(
+        right_bottom_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+        named_connector(monitor.connector()),
+    )
+}

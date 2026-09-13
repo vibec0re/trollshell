@@ -32,9 +32,15 @@ const SUBSYSTEM: &str = "dnd";
 /// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
 const LEGACY_CONFIG_FILE: &str = "dnd.toml";
 
+/// `#[serde(default)]` on the **container** (#1233 F4). Here the two forms
+/// happen to coincide — the derived `Default` is the field type's — but the
+/// rule is "a state struct defaults through its `Default` impl", not "…except
+/// where the two happen to agree": on a field, serde consults the field type,
+/// which is how `bluetooth-audio` and `fullscreen-inhibit` ended up with a
+/// keyless state file reading the opposite of their documented default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct DndState {
-    #[serde(default)]
     enabled: bool,
 }
 
@@ -223,6 +229,22 @@ mod tests {
                 "not valid toml {{{",
                 "the read path must not rewrite the corrupt state file"
             );
+        });
+    }
+
+    /// The `bluetooth-audio`/`fullscreen-inhibit` assertion in the one place
+    /// it is *not* observable (this struct's `Default` and its field type's
+    /// coincide). Kept anyway so the rule is one rule: a keyless state file
+    /// reads this struct's `Default` (#1233 F4).
+    #[test]
+    fn a_keyless_state_file_reads_the_documented_default() {
+        scratch_home(|_home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "# nothing\n").unwrap();
+
+            assert_eq!(load_enabled_from_disk(), DndState::default().enabled);
+            assert!(!load_enabled_from_disk(), "dnd's documented default is OFF");
         });
     }
 

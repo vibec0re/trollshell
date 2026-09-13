@@ -34,9 +34,12 @@ const SUBSYSTEM: &str = "muted-apps";
 /// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
 const LEGACY_CONFIG_FILE: &str = "muted-apps.toml";
 
+/// `#[serde(default)]` on the **container** (#1233 F4) — see `dnd::DndState`
+/// for why the rule is uniform rather than applied only where the two forms
+/// differ.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct MutedAppsState {
-    #[serde(default)]
     apps: HashSet<String>,
 }
 

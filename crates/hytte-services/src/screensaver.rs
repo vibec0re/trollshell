@@ -86,9 +86,12 @@ const KEEP_AWAKE_SUBSYSTEM: &str = "keep-awake";
 /// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
 const LEGACY_KEEP_AWAKE_CONFIG_FILE: &str = "keep-awake.toml";
 
+/// `#[serde(default)]` on the **container** (#1233 F4) — see `dnd::DndState`
+/// for why the rule is uniform rather than applied only where the two forms
+/// differ.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct KeepAwakeState {
-    #[serde(default)]
     enabled: bool,
 }
 

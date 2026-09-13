@@ -63,9 +63,17 @@ const SUBSYSTEM: &str = "fullscreen-inhibit";
 /// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
 const LEGACY_CONFIG_FILE: &str = "fullscreen-inhibit.toml";
 
+/// `#[serde(default)]` sits on the **container**, not the field: on a field it
+/// resolves to the *field type*'s `Default` (`bool::default()` — `false`),
+/// which is the opposite of this struct's documented default and the opposite
+/// of what the unparsable path gives, so a keyless-but-valid state file and a
+/// corrupt one would disagree (#1233 F4). It also future-proofs the shape: the
+/// day a second field is added, every existing state file lacks it, and the
+/// container form is what makes those files inherit this `Default` impl rather
+/// than the new field type's zero value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 struct FullscreenInhibitState {
-    #[serde(default)]
     enabled: bool,
 }
 
@@ -509,6 +517,28 @@ mod tests {
                 std::fs::read_to_string(&state_path).unwrap(),
                 "not valid toml {{{",
                 "the read path must not rewrite the corrupt state file"
+            );
+        });
+    }
+
+    /// A state file that exists and parses as a TOML table but carries no
+    /// `enabled` key must read the **documented** default (ON), which is what
+    /// `#[serde(default)]` on the container buys and what the same attribute
+    /// on the field silently inverts to `bool::default()` (#1233 F4). Pinned
+    /// alongside the unparsable case above so the two "this file is unusable"
+    /// paths are asserted to agree — before this they did not, and the one
+    /// that disagreed was the silent one.
+    #[test]
+    fn a_keyless_state_file_reads_the_documented_default() {
+        scratch_home(|_home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "# nothing\n").unwrap();
+
+            assert!(
+                load_enabled_from_disk(),
+                "a state file with no `enabled` key must read the struct's documented \
+                 default (ON), not `bool::default()`"
             );
         });
     }

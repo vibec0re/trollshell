@@ -18,7 +18,11 @@
 //! out to remove — which is exactly why the harness is an example and why the
 //! shell links no GL crate outside its dev-dependencies.
 //!
-//! Like `program`, this module references nothing above it.
+//! Like `program`, this module touches no GL crate. Since #1211 it does
+//! reference one sibling, [`super::kind::Kind`] (`use`d back in under its own
+//! name below), because [`super::install`] needs that enum outside
+//! `cfg(test)` and a single type living in two places would be exactly the
+//! kind of drift #1211 exists to close.
 //!
 //! # The statistic is **per channel**
 //!
@@ -174,111 +178,16 @@ pub(crate) enum Verdict {
     EdgeOverBudget,
 }
 
-/// Which kit widget a case is measuring, because the two do **not** take the
-/// same structural checks (#1143).
-///
-/// The ceiling (mean ≤ 2 / p99 ≤ 8 / max ≤ 32 per channel) is #893's, and it
-/// is what Annika agreed to on that thread — it is what every real driver
-/// faces, and nothing here touches it. What `TROLLSHELL_PARITY_EXACT=1` adds
-/// on top is a *measurement*, not a design target: it is exported in exactly
-/// one place, `nix/checks/system-tests.nix`, inside the llvmpipe sandbox, so
-/// it is a regression detector for one pinned software rasteriser and costs
-/// nothing on hardware.
-///
-/// **Both kinds are pinned there** (#1148 review, HIGH-1). The gauge was not,
-/// on the argument that it is a different rasteriser — the kit walks a
-/// bounding box per shape accumulating `u16` coverage, the shader evaluates
-/// the same distance fields per fragment in `highp float` — and that Annika's
-/// "does not have to be pixel perfect identical" on #865 said so. Both halves
-/// were wrong about *this* variable. Annika's word was permission for the GL
-/// arm to look different on glass, which the ceiling already grants; and the
-/// twelve gauge cases have measured `max |Δ| 0` on every channel under
-/// llvmpipe since the day the arm landed, so the sensitivity is there to be
-/// had. Without the pin the review's 9 % widening of every minor tick
-/// (`gauge.frag`'s `MINOR_HW`, 0.55 → 0.60) reported worst-channel mean 0.044
-/// / p99 2 / max 3 and shipped green — ~45× inside a ceiling built for a GPU
-/// nobody has run this on.
-///
-/// A pin is only ever as good as the measurement under it, and the Mesa-bump
-/// risk is real: `nix flake update` can red this on a PR that touched no
-/// shader. That risk was accepted for the scope in #1080 and
-/// `nix/checks/system-tests.nix` already documents the response (re-measure on
-/// the new Mesa; never raise the ceiling).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
-    /// `preem.scope` — pinned bit-exact under `TROLLSHELL_PARITY_EXACT=1`, and
-    /// structurally checked with the per-column peak-row test.
-    Scope,
-    /// `preem.gauge` (#1143) — pinned bit-exact too, since #1148's review; no
-    /// peak-row check, which is a beam statistic.
-    Gauge,
-    /// `preem.dot_matrix` (#1144) — **pinned bit-exact**, like the scope, and
-    /// for the scope's reason rather than in spite of Annika's.
-    ///
-    /// Her word on #865 is about **glass**, and the ceiling is what carries it:
-    /// a real driver only ever has to clear mean 2 / p99 8 / max 32, and
-    /// nothing here tightens that. `TROLLSHELL_PARITY_EXACT=1` is exported in
-    /// exactly one place — `nix/checks/system-tests.nix`, inside a sandbox with
-    /// Mesa llvmpipe — so what it pins is a *CI regression detector* against
-    /// one known driver, not a design target.
-    ///
-    /// All sixteen dot-matrix cases measured **max |Δ| 0** of 255 on every
-    /// channel there, which makes the pin available; and it is worth taking
-    /// precisely because this arm's improvement is a coordinate change. At 1:1
-    /// the shader snaps its sample to the pixel centre so the continuous
-    /// falloff collapses onto the kit's integer table — a collapse that is
-    /// exact by construction and would stop being exact silently. Zero is the
-    /// only value that can say so.
-    DotMatrix,
-    /// `preem.marquee` (#1152) — **pinned bit-exact**, and it inherits nothing
-    /// to say so.
-    ///
-    /// It runs the dot matrix's shader, so the *reason* zero is available is
-    /// that one (the 1:1 snap collapses the continuous falloff onto the kit's
-    /// integer table by construction) — but the geometry it collapses onto is
-    /// this widget's own: a continuous ticker grid, centred in its window
-    /// rather than inset by the bezel, addressed through three uniforms the dot
-    /// matrix drives with different numbers. All twenty 1:1 marquee cases
-    /// measured **max |Δ| 0** of 255 on every channel under llvmpipe, at five
-    /// scroll phases across four skins, which is what makes the pin a
-    /// measurement rather than an inheritance.
-    Marquee,
-    /// `preem.textbox` (#1152) — **pinned bit-exact**, and the easiest of the
-    /// five to hold there.
-    ///
-    /// There is no falloff, no bloom and no CRT comb in this widget: the kit
-    /// `set`s flat bytes and never composites, so the shader has nothing to
-    /// round. The one place it could disagree is the rounded corner, where the
-    /// continuous `poke` is written with the ±0.5 shifts that turn it back into
-    /// the kit's integer `corner_delta` at a logical pixel centre — and that is
-    /// exactly the collapse a pin is worth taking to protect. All sixteen 1:1
-    /// cases measured max |Δ| 0 on every channel.
-    TextBox,
-}
+/// [`Kind`] itself, [`Kind::ALL`] and [`Kind::gl_seam`] moved to
+/// [`super::kind`] for #1211: `super::install` needs the enum and its
+/// registration answer outside `cfg(test)`, since it now loops over
+/// [`Kind::ALL`] to build its registration list instead of five hand-written
+/// `register` calls. What stays here is everything only the harness and its
+/// tests need — the pin/beam/edge-budget answers below, each still an
+/// exhaustive `match` over the same enum.
+pub(crate) use super::kind::Kind;
 
 impl Kind {
-    /// Every kind, for the tests that have to reason about all of them at once.
-    ///
-    /// It has to be extended by hand when a kind lands — but forgetting to is a
-    /// **compile** error rather than a silent gap, because
-    /// `every_kind_states_its_pin_and_its_beam_check` pairs this list with an
-    /// exhaustive `match` over the enum: a variant missing from here still has
-    /// to be named there, and a variant named there still has to be here for
-    /// the loop to reach it.
-    ///
-    /// `cfg(test)` because the tests are its only consumer: the shell mounts
-    /// this whole module under `cfg(test)` anyway, and the parity harness
-    /// `#[path]`-includes it *without* that gate, where an unused constant is a
-    /// `dead_code` warning rather than a signal.
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
-        Self::Scope,
-        Self::Gauge,
-        Self::DotMatrix,
-        Self::Marquee,
-        Self::TextBox,
-    ];
-
     /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
     ///
     /// **Only what has been measured at zero** — which, since #1148's review
@@ -306,8 +215,22 @@ impl Kind {
     /// picture moved. The ceiling and the blank-framebuffer guards do the work
     /// for a gauge; inventing a second structural check for it without a
     /// failure to calibrate against would be inventing a flake.
+    ///
+    /// An exhaustive `match` rather than a `matches!` (#1216 fix round,
+    /// LOW-1): the PR body's table claimed this function was "already
+    /// exhaustive … pre-dating this PR", which was true of `pinned_exact`
+    /// and `edge_budget` but not of this one — a `matches!(self,
+    /// Self::Scope)` gives every kind but `Scope` `false` by falling off the
+    /// end of the pattern, the same silent-inheritance shape `pinned_exact`'s
+    /// own doc warns against. `every_kind_states_its_pin_and_its_beam_check`
+    /// already cross-checks this answer against its own hand-written match,
+    /// so the guarantee held either way — this just makes the function keep
+    /// it on its own terms too.
     pub(crate) fn checks_peak_rows(self) -> bool {
-        matches!(self, Self::Scope)
+        match self {
+            Self::Scope => true,
+            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => false,
+        }
     }
 
     /// What this kind's **supersampled** cases may drift by in the edge region

@@ -11339,3 +11339,270 @@ mod containment_r2 {
         }
     }
 }
+
+// ── #1211: one enumeration for the six per-kind GL lists ────────────────────
+
+/// `Kind::ALL` ties together the six per-kind GL lists the #1209 review
+/// (LOW-1) found nothing enumerated: `preem_gl::install`'s registrations,
+/// `Renderer::matches_kind`, `Renderer::invalidate_cached_frames`,
+/// `preem_gl::parity::Kind` (+ `pinned_exact`/`checks_peak_rows`/
+/// `edge_budget`), the parity harness's case list, and the case count
+/// `nix/checks/system-tests.nix` asserts.
+///
+/// What each test here checks, and how it is tied:
+///
+/// - `install`'s register list is now *derived* from `Kind::ALL`
+///   (`preem_gl::mod::install` loops over it and `Kind::gl_seam`), so there is
+///   nothing left here to test — a variant missing from `Kind::gl_seam`'s
+///   `match` fails to compile.
+/// - `matches_kind`/`is_gl`/`invalidate_cached_frames` are now exhaustive
+///   `match`es over `Renderer` with no catch-all (`preem_render.rs`), so a
+///   Renderer variant added without an arm there fails to compile too —
+///   again nothing left to test here.
+/// - `every_gl_kind_widget_takes_the_gl_arm` below is what is left:
+///   `preem_gl::parity::Kind` and `preem_render::gl_kind_for` are two
+///   independent exhaustive matches (one over the five GL kinds, one over the
+///   eight wire kinds), and this is where they are cross-checked against the
+///   real renderer the GL arm builds.
+/// - `every_kind_has_a_harness_case_per_skin` and
+///   `the_nix_case_count_matches_the_harness` close the parity-coverage gap
+///   the review measured: a sixth kind shipping with zero `cases_for` cases,
+///   all green.
+mod kind_enumeration {
+    use hytte_preem as kit;
+
+    use super::super::preem_gl::{self, Case, Kind, cases_for};
+    use super::super::preem_render;
+    use super::{every_preem_widget, preem_ink_lock};
+
+    /// The style every [`Case`] variant carries — a small local mirror of
+    /// `cases_for`'s field shape, exhaustive so a sixth `Case` variant with no
+    /// `style` field fails to compile here rather than being silently
+    /// excluded from [`every_kind_has_a_harness_case_per_skin`].
+    fn case_style(case: &Case) -> kit::DisplayStyle {
+        match case {
+            Case::Scope { style, .. }
+            | Case::Gauge { style, .. }
+            | Case::DotMatrix { style, .. }
+            | Case::Marquee { style, .. }
+            | Case::TextBox { style, .. } => *style,
+        }
+    }
+
+    /// **Every wire kind's GL-arm answer agrees with `Kind::ALL`'s
+    /// membership**, in both directions.
+    ///
+    /// `every_preem_widget()`'s exhaustive `match` is the wire vocabulary's
+    /// forcing function; `gl_kind_for`'s is `Kind`'s. Together they say: a
+    /// widget kind has a GL arm if and only if it names a `Kind`, and that
+    /// kind's renderer, under the GL arm, both claims `is_gl()` and produces
+    /// a surface (the two halves `gl_seam_for` reports) — and every `Kind`
+    /// is reachable from some widget kind, so `gl_kind_for` cannot drop one
+    /// from its `Some` arms unnoticed.
+    ///
+    /// **Falsified** by adding a sixth `Kind` variant with no
+    /// `gl_kind_for` arm answering `Some` for it (`gl_kind_for` stops being
+    /// exhaustive and this file does not compile), or by pointing an
+    /// existing widget's `gl_kind_for` arm at the wrong `Kind` (`install`
+    /// registers that kind's pipeline under a different name than the one
+    /// `gl_surface` produces, so the first assertion reds — not because the
+    /// booleans disagree, but because `gl_seam_for` reads both off the *same*
+    /// renderer and neither answer can lie about the other independently;
+    /// what actually catches a swapped `Kind` is the second loop, since the
+    /// swapped-away `Kind` then reports no widget reaching it).
+    ///
+    /// **Also falsified** (#1216 fix round, MEDIUM-1) by removing a variant
+    /// from [`Kind::ALL`] — a variant a widget still reaches via
+    /// `gl_kind_for` but that `install()` no longer registers a pipeline
+    /// for, because `install()` derives its registrations from `ALL`. The
+    /// `Some(k)` arm's `Kind::ALL.contains(&k)` assertion below catches
+    /// that; without it the removal only dropped a test-side loop entry
+    /// before this fix round, and the whole suite stayed green while
+    /// `install()` silently stopped registering that kind's chip.
+    #[test]
+    fn every_gl_kind_widget_takes_the_gl_arm() {
+        let _ink = preem_ink_lock();
+        let widgets = every_preem_widget();
+
+        for widget in &widgets {
+            let kind = preem_render::gl_kind_for(widget);
+            let seam = preem_gl::with_gl_arm(|| preem_render::gl_seam_for(widget))
+                .expect("every vocabulary widget builds");
+            match kind {
+                Some(k) => {
+                    // #1216 fix round, MEDIUM-1: `gl_kind_for` is exhaustive
+                    // over the wire vocabulary, but nothing forced its
+                    // `Some` answers to be *members of `Kind::ALL`* — the
+                    // list `install()` actually derives its registrations
+                    // from. Before this assertion, removing a variant from
+                    // `ALL` (so `install()` stops registering its pipeline)
+                    // left this whole suite green, because `gl_seam_for`
+                    // reads `is_gl()`/`gl_surface()` off the *renderer*, not
+                    // off the registry `ALL` feeds.
+                    assert!(
+                        Kind::ALL.contains(&k),
+                        "{k:?} is reachable from a PreemWidget but missing \
+                         from Kind::ALL — install() never registers its \
+                         pipeline",
+                    );
+                    assert_eq!(
+                        seam,
+                        (true, true),
+                        "{k:?} is in Kind::ALL, so its widget must take the \
+                         GL arm and produce a surface",
+                    );
+                }
+                None => assert!(
+                    // #1216 fix round, NIT-1: was `!seam.0` alone, which
+                    // missed a renderer that answered `is_gl() == false` but
+                    // still produced a `gl_surface` — the other half of the
+                    // failure mode `is_gl`'s own doc names.
+                    !seam.0 && !seam.1,
+                    "a widget kind absent from Kind::ALL took the GL arm \
+                     anyway: {seam:?}",
+                ),
+            }
+        }
+
+        for kind in Kind::ALL {
+            let reached = widgets
+                .iter()
+                .any(|widget| preem_render::gl_kind_for(widget) == Some(kind));
+            assert!(reached, "no PreemWidget kind maps to {kind:?}");
+        }
+    }
+
+    /// **Every `Kind::ALL` member has at least one harness case per skin** —
+    /// the parity gap the #1209 review measured (LOW-1): a sixth kind could
+    /// ship with zero `cases_for` coverage and every other gate would stay
+    /// green.
+    ///
+    /// Calls the harness's *real* [`cases_for`] (moved to `preem_gl::cases`
+    /// for exactly this reason) rather than a hand-kept count, so a harness
+    /// change that quietly drops a kind's cases reds here instead of only in
+    /// `docs/live-verify.md`'s eyeballed transcript.
+    ///
+    /// **Falsified** by commenting out any one of `cases_for`'s per-kind
+    /// `.chain(...)` calls — the `assert!` for that `(kind, style)` pair
+    /// reds.
+    #[test]
+    fn every_kind_has_a_harness_case_per_skin() {
+        let cases = cases_for(&kit::DisplayStyle::ALL);
+        for kind in Kind::ALL {
+            for style in kit::DisplayStyle::ALL {
+                let has_case = cases
+                    .iter()
+                    .any(|case| case.kind() == kind && case_style(case) == style);
+                assert!(
+                    has_case,
+                    "{kind:?} has no harness case for the {style:?} skin",
+                );
+            }
+        }
+    }
+
+    /// **`nix/checks/system-tests.nix`'s parity-case count matches the
+    /// harness's own computed total** — the other half of #1211's ask: the
+    /// nix file's count is read here, not retyped, so a case-list change
+    /// that forgets to bump it reds in `cargo test` rather than only in CI's
+    /// much slower `system-tests` check.
+    ///
+    /// **#1216 fix round, HIGH-1:** the original version of this test always
+    /// read `../nix/checks/system-tests.nix` off disk, which panics rather
+    /// than skips when that file is absent — and it *is* absent from the
+    /// crane-filtered source both `checks.workspace-tests` and
+    /// `checks.system-tests` build from (`nix/package.nix`'s `keepEntry`
+    /// keeps no `.nix` files; CLAUDE.md's "Packaging" section says so). That
+    /// made `nix flake check` red on merge for a reason no local `cargo
+    /// test` run could show. This version resolves the count in three arms,
+    /// tried in order:
+    ///
+    /// (a) **`TROLLSHELL_PARITY_CASES` is set.** Parse it and compare
+    ///     directly — this is the path `checks.system-tests` takes: its
+    ///     `preCheck` exports this variable from the same `parityCases`
+    ///     nix binding the `-ne` assertion in `checkPhaseCargoCommand`
+    ///     uses, so the nix value is authoritative and this test never
+    ///     needs the file itself.
+    /// (b) **Else, `../nix/checks/system-tests.nix` (relative to
+    ///     `CARGO_MANIFEST_DIR`) is readable.** Parse its `parityCases =
+    ///     N;` binding and compare — the path a plain `cargo test` takes
+    ///     outside any nix sandbox, where the repo checkout has a `nix/`
+    ///     directory sitting right next to `trollshell/`.
+    /// (c) **Else, print one line and return.** Neither source is present.
+    ///     This is the path `checks.workspace-tests` takes *by design*: it
+    ///     is deliberately hermetic (no `system-tests` feature, so it
+    ///     never sets `TROLLSHELL_PARITY_CASES`) and its crane source has
+    ///     no `nix/` directory either — so this test is a no-op there
+    ///     rather than a red herring or a panic.
+    ///
+    /// **Falsified** three ways (verified in the #1216 fix round): (i) set
+    /// `TROLLSHELL_PARITY_CASES` to the wrong count → red via arm (a); (ii)
+    /// run with neither the env var nor a sibling `nix/` present → passes
+    /// (skips) via arm (c), does not panic; (iii) edit
+    /// `nix/checks/system-tests.nix`'s `parityCases` binding to the wrong
+    /// count with no env var set → red via arm (b).
+    #[test]
+    fn the_nix_case_count_matches_the_harness() {
+        let harness_count = cases_for(&kit::DisplayStyle::ALL).len();
+
+        // Arm (a): the CI path (`checks.system-tests`) — the nix side
+        // already resolved its own `parityCases` binding and handed it
+        // over as an env var, so trust that over re-parsing the file.
+        if let Ok(env_value) = std::env::var("TROLLSHELL_PARITY_CASES") {
+            let nix_count: usize = env_value.trim().parse().unwrap_or_else(|error| {
+                panic!(
+                    "TROLLSHELL_PARITY_CASES={env_value:?} did not parse as \
+                     an integer: {error}",
+                )
+            });
+            assert_eq!(
+                harness_count, nix_count,
+                "`cases_for` builds {harness_count} case(s) but \
+                 TROLLSHELL_PARITY_CASES={nix_count} — bump \
+                 nix/checks/system-tests.nix's `parityCases` binding (and \
+                 its history comment) in the same commit as a case-list \
+                 change",
+            );
+            return;
+        }
+
+        // Arm (b): a plain local `cargo test`, where `nix/` sits next to
+        // `trollshell/` in the checkout.
+        let nix_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../nix/checks/system-tests.nix");
+        let Ok(nix_src) = std::fs::read_to_string(&nix_path) else {
+            // Arm (c): neither source exists — `checks.workspace-tests`'s
+            // shape, by design (see the doc comment above). A skip, not a
+            // panic: nothing here to check this pin against.
+            eprintln!(
+                "skipping the_nix_case_count_matches_the_harness: neither \
+                 TROLLSHELL_PARITY_CASES nor {} is present",
+                nix_path.display(),
+            );
+            return;
+        };
+
+        let nix_count: usize = nix_src
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("parityCases = ")
+                    .and_then(|rest| rest.strip_suffix(';'))
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "couldn't find the `parityCases = N;` binding in {}",
+                    nix_path.display(),
+                )
+            });
+
+        assert_eq!(
+            harness_count, nix_count,
+            "`cases_for` builds {harness_count} case(s) but \
+             nix/checks/system-tests.nix's `parityCases` binding says \
+             {nix_count} — bump it (and its history comment) in the same \
+             commit as a case-list change",
+        );
+    }
+}

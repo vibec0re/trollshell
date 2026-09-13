@@ -88,6 +88,7 @@
 
 mod dot_matrix;
 mod gauge;
+mod kind;
 mod marquee;
 mod program;
 mod textbox;
@@ -103,17 +104,37 @@ mod textbox;
 #[cfg(test)]
 mod parity;
 
-pub(super) use dot_matrix::{
-    DOT_MATRIX, DOT_MATRIX_PIPELINE, Glyphs, dot_matrix_surface, glyphs as encode_glyphs,
-};
-pub(super) use gauge::{GAUGE, GAUGE_PIPELINE, gauge_surface};
-pub(super) use marquee::{
-    MARQUEE, MARQUEE_PIPELINE, Window, marquee_surface, window as encode_window,
-};
-pub(super) use program::{KitSurface, SCOPE, SCOPE_PIPELINE, scope_surface};
-pub(super) use textbox::{
-    Block, TEXTBOX, TEXTBOX_PIPELINE, block as encode_block, textbox_surface,
-};
+/// The parity harness's case list — see the module docs there.
+///
+/// `#[cfg(test)]`-mounted for [`parity`]'s reason, and `#[path]`-included by
+/// `examples/preem_gl_diff.rs` the same way. Split out of the example (#1211)
+/// because a hermetic test cannot import from one: `cases_for`'s real output
+/// is what `plugins::tests`' `kind_enumeration` checks against
+/// [`kind::Kind::ALL`], rather than a hand-kept mirror of the harness's case
+/// counts that could drift from it unnoticed.
+#[cfg(test)]
+mod cases;
+
+// The `_PIPELINE` constant each kind is registered with is no longer named
+// here (#1211): `install` and the harness's own registration both loop over
+// `kind::Kind::ALL` and reach each pipeline through `Kind::gl_seam` instead,
+// which resolves it via `super::{program, gauge, dot_matrix, marquee,
+// textbox}` directly. The plain program name stays re-exported — used to
+// build a `UiNode::GlSurface` at every mapping call site.
+pub(super) use dot_matrix::{DOT_MATRIX, Glyphs, dot_matrix_surface, glyphs as encode_glyphs};
+pub(super) use gauge::{GAUGE, gauge_surface};
+pub(super) use marquee::{MARQUEE, Window, marquee_surface, window as encode_window};
+pub(super) use program::{KitSurface, SCOPE, scope_surface};
+pub(super) use textbox::{Block, TEXTBOX, block as encode_block, textbox_surface};
+
+/// Re-exported for `plugins::tests`' `kind_enumeration` module (#1211): both
+/// `parity` and `cases` are private to this module (test-only, so a stray
+/// non-test reference should not compile), and a sibling under `plugins`
+/// cannot reach a private child of a private child without one of these.
+#[cfg(test)]
+pub(super) use cases::{Case, cases_for};
+#[cfg(test)]
+pub(super) use parity::Kind;
 
 /// The renderer switch. `cpu` forces the kit; unset, `gl`, or anything else
 /// takes the GL arm — see the module docs for the parity numbers behind that
@@ -290,16 +311,19 @@ fn configured_arm() -> Arm {
 /// plugin tree is reconciled. Cheap: registering a pipeline stores a `Copy`
 /// struct in a map — no GL is touched until a surface realizes — so a new
 /// kind's cost here is one line and no startup work.
+///
+/// Loops over [`kind::Kind::ALL`] rather than naming each pipeline by hand
+/// (#1211): a kind added to that array without a [`kind::Kind::gl_seam`] arm
+/// fails to compile, so this list cannot silently fall one kind behind it.
+/// The ticker's pipeline **is** the dot matrix's, under its own name so a
+/// journal line says which widget is on screen — see `marquee`'s module docs
+/// and [`kind::Kind::gl_seam`]. `hytte-ui` compiles programs per surface, so
+/// the second name costs one map entry and no extra compilation.
 pub(super) fn install() {
-    hytte::ui::gl_surface::register(SCOPE, SCOPE_PIPELINE);
-    hytte::ui::gl_surface::register(GAUGE, GAUGE_PIPELINE);
-    hytte::ui::gl_surface::register(DOT_MATRIX, DOT_MATRIX_PIPELINE);
-    // The ticker's pipeline **is** the dot matrix's, under its own name so a
-    // journal line says which widget is on screen — see `marquee`'s module
-    // docs. `hytte-ui` compiles programs per surface, so the second name costs
-    // one map entry and no extra compilation.
-    hytte::ui::gl_surface::register(MARQUEE, MARQUEE_PIPELINE);
-    hytte::ui::gl_surface::register(TEXTBOX, TEXTBOX_PIPELINE);
+    for kind in kind::Kind::ALL {
+        let (program, pipeline) = kind.gl_seam();
+        hytte::ui::gl_surface::register(program, pipeline);
+    }
     hytte::ui::gl_surface::set_context_failure_handler(|_reason| {
         // `hytte-ui` has already logged the reason once. What is left for the
         // host is to make the fallback actually reach the screen, and that is

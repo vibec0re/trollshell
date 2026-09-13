@@ -170,6 +170,11 @@ use hytte_preem as kit;
 // why this is a `#[path]` include and not a second copy.
 #[path = "../src/plugins/preem_gl/program.rs"]
 mod program;
+// Which kinds have a GL arm, and their registration (#1211). `parity` and
+// `cases` both `use super::kind::Kind`, which is what this module resolves to
+// from either of them here.
+#[path = "../src/plugins/preem_gl/kind.rs"]
+mod kind;
 // The delta statistics and the verdict. Also a `#[path]` include, and for a
 // second reason on top of the first: `cargo test` does not run `#[test]`s
 // inside an example (examples default to `test = false`), so the arithmetic
@@ -177,6 +182,12 @@ mod program;
 // mounted there — where `cargo test -p trollshell --lib` actually runs it.
 #[path = "../src/plugins/preem_gl/parity.rs"]
 mod parity;
+// The case list `cases_for` builds, `#[path]`-included the same way and for
+// the same reason (#1211): `plugins::tests`' `kind_enumeration` module reads
+// this exact function's output, so the harness has to run the same code
+// rather than a copy of it.
+#[path = "../src/plugins/preem_gl/cases.rs"]
+mod cases;
 // The gauge's pipeline and mapping (#1143), included the same way and for the
 // same reason. It is a sibling of `program` in the shell too, and reaches it
 // through `super::program::…`, which resolves here as well because both land
@@ -195,6 +206,14 @@ mod marquee;
 #[path = "../src/plugins/preem_gl/textbox.rs"]
 mod textbox;
 
+// The case list itself lives in `cases` (#1211) — see its module docs. `Case`
+// keeps its variants' field types (`DisplayAt`/`TickerAt`/`BubbleAt`/
+// `NeedleAt`) there too; their `impl`s (`.name()`/`.line()`/`.spec()`) stay
+// below, since an inherent impl only has to share a crate with its type, not
+// a file.
+use cases::{BubbleAt, DisplayAt, NeedleAt, TickerAt};
+use cases::{Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, STRETCH, TICKER_WINDOW_PX, cases_for};
+
 /// Logical grid the **scope** cases run at. Small enough to keep the whole
 /// comparison on screen at 1× and wide enough that the graticule's 12-column
 /// pitch repeats.
@@ -209,38 +228,14 @@ const PERSISTENCE: u16 = 184;
 /// one #931 tuned and #1090 was reported against.
 const GAUGE_COLS: u32 = 144;
 const GAUGE_ROWS: u32 = 64;
-/// The upscale the **1:1** gauge cases run at.
-///
-/// The GL gauge's offscreen grid is the *native* buffer (`cols * scale`), not
-/// the logical one, because drawing the dial at the size it is shown at is the
-/// point of the arm — see `preem_gl::gauge`. At `scale = 1` the two arms draw
-/// the same picture at the same resolution, which is the one place a *pixel
-/// against pixel* number means something, and it is where
-/// `TROLLSHELL_PARITY_EXACT=1` pins them both at zero.
-const GAUGE_SCALE: u32 = 1;
-
-/// The upscale the **supersampled** gauge cases run at — `GaugeConfig`'s own
-/// default, which is what every dial on the glass actually uses (#1148 review,
-/// HIGH-2).
-///
-/// Without these, nothing in CI ever rendered the gauge in the configuration it
-/// ships in: `Dial::scaled`'s half-pixel offset, the `u_upscale` on every
-/// length, the bloom radius's `* scale` and the CRT mask's logical-pitch
-/// division are all the identity at `scale = 1`, so four separate scale-only
-/// decisions went unrendered by every gate.
-///
-/// Comparing them naively would indeed measure the improvement rather than a
-/// regression — a sharper edge is *supposed* to differ from a smeared one — so
-/// the harness does not compare them naively. It renders GL at the native grid,
-/// box-averages each `GAUGE_SUPERSAMPLE`² block back down to the kit's logical
-/// frame (`parity::box_downsample`) and holds the result to the supersampled
-/// standard in `parity::case_verdict`: every pixel off a rasterisation edge
-/// bit-identical (`interior_max() == 0`) and the edge bin inside a measured
-/// budget — not #893's ceiling, which a dial's roughly one-quarter edge pixels
-/// would fail by construction. That is what a dropped `(scale - 1) / 2`, an
-/// unscaled length, a doubled mask pitch or a mis-scaled bloom breaks: they
-/// move the field, not only the edges.
-const GAUGE_SUPERSAMPLE: u32 = 2;
+// [`GAUGE_SCALE`] (the upscale the **1:1** gauge cases run at) and
+// [`GAUGE_SUPERSAMPLE`] (the upscale the **supersampled** ones run at,
+// box-averaged back down through `parity::box_downsample` and held to
+// `parity::case_verdict`'s supersampled standard) moved to `cases` (#1211)
+// along with the rest of the case list. `GAUGE_SUPERSAMPLE` is
+// `GaugeConfig`'s own default, what every dial on the glass actually uses
+// (#1148 review, HIGH-2); without it nothing in CI ever rendered the gauge
+// in the configuration it ships in.
 
 /// The dot pitch the **dot matrix** cases run at — the kit's `DEFAULT_DOT_PX`,
 /// which is what every caller written before #1091 renders at and what the
@@ -257,47 +252,22 @@ const DENSE_DOT_PX: u32 = 2;
 /// arithmetic the other four pitches cannot reach.
 const COARSE_DOT_PX: u32 = 8;
 
-/// How much bigger than the kit's buffer the **stretched** dot-matrix case
-/// sizes its area — the one case that measures the improvement rather than the
-/// agreement.
-///
-/// `GlSurface::measure` requests a minimum of `0` on both axes on purpose ("so
-/// CSS/layout can scale the surface above its grid size, which is the whole LCD
-/// look"), so this is a real configuration and not a contrived one: it is what
-/// a readout in a container wider than its natural size gets. At `2` the GL arm
-/// rasterises the dot lattice into four screen pixels per kit pixel; the
-/// readback is box-averaged back down to the kit's grid before the comparison,
-/// so what is measured is "the same picture, drawn with more samples".
-///
-/// It is deliberately **not** held to the bit-exact pin, nor to #893's
-/// ceiling: it is box-averaged onto the kit's grid and then held to a
-/// bit-identical interior plus an edge budget — see
-/// [`Case::sampling`] and `parity::case_verdict`.
-const STRETCH: u32 = 2;
-
-/// The window the **marquee** cases run at, in final buffer pixels — wide
-/// enough that a 22-cell grid fits at the default pitch (so a short message can
-/// hold and a long one must scroll) and narrow enough to keep the whole
-/// comparison on screen beside the other kinds.
-const TICKER_WINDOW_PX: u32 = 96;
-
-/// The window **one marquee case per skin** runs at instead of
-/// [`TICKER_WINDOW_PX`] — closing #1209's review MEDIUM-1.
-///
-/// `origin_x = pad + floor(r/2)` where `r = (window_px - 2*pad) mod dot`
-/// (`kit::MarqueeStrip::window_px`'s own arithmetic), and at 96 px with the
-/// default pitch that remainder is 0 — `origin_x` collides with `pad`, the
-/// bezel, for **every** marquee case in this file otherwise. That let the
-/// shader's `u_origin_x` uniform be quietly swapped back for the pre-#1152
-/// `p.x - pad` (or dropped outright) and leave every gate green: nothing here
-/// could tell the centred grid from the bezel apart. 98 keeps the same
-/// 22-cell grid (`(98 - 2*4) / 4` still floors to 22, the same premise
-/// `preem_gl::marquee`'s own `the_marquee_drives_the_lattice_as_a_continuous_grid`
-/// test uses 99 to establish) and moves `origin_x` to `5`, one
-/// pixel off the bezel — enough to red the mutation above while the case
-/// stays exact-pinned: the GL and CPU arms still rasterise at the same
-/// resolution, just at a width where the two candidate origins disagree.
-const TICKER_ORIGIN_WINDOW_PX: u32 = 98;
+// [`STRETCH`] (how much bigger than the kit's buffer the **stretched**
+// cases size their area — the one case shape that measures the
+// improvement rather than the agreement), [`TICKER_WINDOW_PX`] (the window
+// the **marquee** cases run at) and [`TICKER_ORIGIN_WINDOW_PX`] (the window
+// **one marquee case per skin** runs at instead, closing the #1209 review's
+// MEDIUM-1: `origin_x = pad + floor(r/2)` where `r = (window_px - 2*pad) mod
+// dot`, and at 96 px with the default pitch that remainder is 0 — `origin_x`
+// collides with the bezel for every other case, so nothing could tell the
+// centred grid from the bezel apart; 98 keeps the same 22-cell grid and
+// moves `origin_x` to `5`) all moved to `cases` (#1211), along with the rest
+// of the case list. `GlSurface::measure` requests a minimum of `0` on both
+// axes on purpose ("so CSS/layout can scale the surface above its grid
+// size, which is the whole LCD look"), so a stretched case is a real
+// configuration and not a contrived one — it is deliberately not held to
+// the bit-exact pin or #893's ceiling, only to a bit-identical interior plus
+// an edge budget (`parity::case_verdict`).
 
 /// The wrap width the **textbox** cases run at, in glyph cells — wide enough
 /// that a sentence wraps to three lines and narrow enough that the hugging
@@ -455,124 +425,11 @@ USAGE:
     Ok(skins)
 }
 
-/// One comparison: a kit widget, a skin, and the state to drive it into.
-enum Case {
-    /// A `Scope` after its debut batch plus `idle_steps` idle ones.
-    Scope {
-        style: kit::DisplayStyle,
-        /// Extra idle steps after the debut batch, so the phosphor trail — the
-        /// one thing the GL arm reimplements as a recurrence — is measured
-        /// mid-fade rather than only at full intensity.
-        idle_steps: u32,
-    },
-    /// A `Gauge` with its needle driven into one of three positions (#1143).
-    Gauge {
-        style: kit::DisplayStyle,
-        needle: NeedleAt,
-        /// The integer upscale the GL arm renders at. [`GAUGE_SCALE`] compares
-        /// pixel against pixel; [`GAUGE_SUPERSAMPLE`] compares a box-averaged
-        /// native frame against the kit's logical one.
-        scale: u32,
-    },
-    /// A `DotMatrix` showing one line at one pitch (#1144).
-    DotMatrix {
-        style: kit::DisplayStyle,
-        display: DisplayAt,
-        /// How many times the area's size request exceeds the kit's buffer —
-        /// see [`STRETCH`]. `1` for every case but the stretched one.
-        stretch: u32,
-    },
-    /// A `Marquee` at one scroll phase (#1152).
-    Marquee {
-        style: kit::DisplayStyle,
-        ticker: TickerAt,
-        /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
-        stretch: u32,
-        /// The window this case renders at, in final buffer pixels —
-        /// [`TICKER_WINDOW_PX`] for every case but one per skin, which runs at
-        /// [`TICKER_ORIGIN_WINDOW_PX`] instead (#1209 review, MEDIUM-1).
-        window_px: u32,
-    },
-    /// A `TextBox` in one configuration (#1152).
-    TextBox {
-        style: kit::DisplayStyle,
-        bubble: BubbleAt,
-        /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
-        stretch: u32,
-    },
-}
-
-/// What a marquee case is showing, and where the message has scrolled to.
-///
-/// Five, and the choice is the issue's: the degenerate display, the
-/// [hold rule](kit::MarqueeStrip::scrolls), and a scrolling message at **three**
-/// phases. Three rather than one because the whole widget is the phase — the
-/// shader has no offset uniform at all (#839 made a sub-dot position
-/// inexpressible, so a step is a different set of lit columns) — and because
-/// the three chosen below are the three shapes the wrap can take.
-#[derive(Clone, Copy)]
-enum TickerAt {
-    /// The empty string: the bezel and the **fixed** ghost grid, with nothing
-    /// lit. `u_data_len` is the grid's width and every texel is `0`, which is
-    /// the one case that separates "no strip" from "a blank strip" — the kit
-    /// paints the ghost lattice either way, so a shader that refused to draw on
-    /// an all-zero grid would go dark here and nowhere else.
-    Empty,
-    /// A message that fits the grid, so the kit **holds** it static and ignores
-    /// the offset entirely. Left-aligned on the grid, and the phase below can
-    /// never move it.
-    Held,
-    /// A message wider than the grid, at scroll phase `offset` **in dots**.
-    ///
-    /// The three the case list uses are `0` (the message's head at the grid's
-    /// first column), `7` (mid-message, so every visible column is a glyph
-    /// column of a *different* character than at `0`) and one that lands inside
-    /// the **loop seam** — the blank gap the kit appends after the message —
-    /// where the grid is part message and part nothing, which is the one phase
-    /// where `window_columns`' `bitmap.get` returns `None` for some columns and
-    /// not others.
-    Scrolled(usize),
-}
-
-/// What a textbox case is showing.
-///
-/// Four, the issue's list: the degenerate box, one line, a message wrapped to
-/// the last row it is allowed, and the pinned-palette configuration the pet's
-/// and caw's bubbles actually ship in.
-#[derive(Clone, Copy)]
-enum BubbleAt {
-    /// The empty string, hugging: the `max(1)`-wide degenerate buffer, no
-    /// cells at all (`u_cols == 0`, no strip), and one of the two cases at the
-    /// kit's native `scale = 1` — so `u_upscale == 1` is rendered somewhere
-    /// rather than only reasoned about.
-    ///
-    /// **On the OLED this case carries no information, and that is worth
-    /// knowing rather than hiding** — `DisplayAt::Blank`'s finding (#1150
-    /// review, MEDIUM-3) in this widget's shape. The OLED's field is
-    /// `0, 0, 0` and the corner cut is to transparent *black*, so an empty box
-    /// there is a frame of pure zeros: `verdict_for` excuses both blank guards
-    /// by design (a flat reference is not evidence of an undrawn framebuffer)
-    /// and every delta is 0 for any renderer that outputs black. Measured under
-    /// an all-black blit it is the one text-box case of twenty that still says
-    /// `PASS`. It is kept rather than special-cased because the other three
-    /// skins' empty cases *do* detect — `textbox.lcd.empty` reports mean 152.308
-    /// there — and a case list that varies by skin is a worse thing to reason
-    /// about than one case that is vacuously green on one skin.
-    Empty,
-    /// One short line at `scale = 2`, hugging — the pet's own bubble.
-    OneLine,
-    /// A sentence wrapped to exactly [`BUBBLE_LINES`] rows with the kit's
-    /// trailing `…`, in a **fixed-width** slot: three lines of different
-    /// lengths, so the block's blank padding cells are what keep every line
-    /// after the first at the right strip offset.
-    Wrapped,
-    /// A pinned ink, an explicit `.notdef` and an uncovered char, over a corner
-    /// cut wide enough to reach the glyph block — #884/#885's configuration
-    /// (see [`PINNED_INK`] for the one pin it deliberately leaves out), and the
-    /// one that renders the ink, the notdef box and the largest arc in one
-    /// frame.
-    Pinned,
-}
+// `Case` and its four supporting enums (`TickerAt`, `BubbleAt`, `DisplayAt`,
+// `NeedleAt`) moved to `cases` (#1211) — see that module's docs and the
+// `use cases::{…}` near the top of this file. Their `impl`s stay below, next
+// to the code that actually drives a kit widget from them: an inherent impl
+// only has to share a crate with its type, not a file.
 
 /// One textbox case's box, spelled out: the knobs each [`BubbleAt`] turns, and
 /// the text it shows.
@@ -590,61 +447,9 @@ struct Bubble {
     pinned: bool,
 }
 
-/// What a dot-matrix case puts on the display.
-///
-/// Five, chosen to cover what the shader has to get right: the degenerate
-/// buffer, the ordinary readout, the font's fallback path, and each end of the
-/// pitch clamp — the one where the CRT comb has to be **re-phased** or it stops
-/// being a raster (#1091), and the one where the vignette's band is a different
-/// number of pixels than any other case makes it. Each is the same lattice
-/// arithmetic at a different corner of it.
-#[derive(Clone, Copy)]
-enum DisplayAt {
-    /// The empty string: bezel only, no strip, no lit pixel — `2*pad` × `9*dot`.
-    /// The one case where `u_data_len` is `0` and the shader must draw the
-    /// field rather than sample an unbound texture.
-    ///
-    /// **On the OLED this case carries no information, and that is worth
-    /// knowing rather than hiding** (#1150 review, MEDIUM-3). The kit's frame
-    /// there is 8×72 of pure black (`style.rs`'s OLED `bg` is `0, 0, 0` with no
-    /// ghost), so both sides are flat *and* black: `verdict_for` excuses both
-    /// blank guards by design — a flat reference is not evidence of an undrawn
-    /// framebuffer — and every delta is 0 for any renderer that outputs black.
-    /// Measured: under an all-black blit it is the one dot-matrix case that
-    /// still says `PASS`. It is kept rather than special-cased because the
-    /// other three skins' blank cases *do* detect, and a case list that varies
-    /// by skin is a worse thing to reason about than one case that is
-    /// vacuously green on one skin.
-    Blank,
-    /// An ordinary readout at the default pitch: the ghost lattice, lit glyphs,
-    /// the skin's halo, and the comb where the kit's own golden digests have it.
-    Readout,
-    /// Accented glyphs, a space and an uncovered char — so the hollow `NOTDEF`
-    /// box reaches the strip encoder and the shader end to end.
-    Notdef,
-    /// The same readout at `MIN_DOT_PX`, where every pixel of a dot sits on the
-    /// falloff plateau (a solid block, no rim) **and** the CRT comb is re-phased
-    /// onto a 2-row grid. A fixed 4-row comb here is interference, not a raster.
-    Dense,
-    /// The same readout at `MAX_DOT_PX`, the other end of the clamp — and the
-    /// only case whose short side is **not** a multiple of both 8 and 9
-    /// (#1150 review, MEDIUM-2).
-    ///
-    /// It is here for the CRT vignette rather than for the dots. The mask's
-    /// edge ramp is `band = shortSide / BAND_DIV`, and `BAND_DIV` is one of the
-    /// five constants the shader declared with no Rust counterpart. The review
-    /// measured that `9 -> 8` shipped green across the whole tree, and the
-    /// reason was arithmetic rather than a loose detector: every case's short
-    /// side was `9 * dot` for `dot` in `{2, 4}`, and `36/9 == 36/8 == 4`,
-    /// `18/9 == 18/8 == 2`. At `dot = 8` the short side is 72, where
-    /// `72/9 == 8` and `72/8 == 9` — a one-pixel-wider ramp all the way round
-    /// the bezel, against the kit's own composite, on a case that is pinned
-    /// bit-exact. `3`, `5` and `7` do **not** work here and were checked:
-    /// `27/8`, `45/8` and `63/8` all floor back onto `k`.
-    ///
-    /// It also gets the upper clamp rendered at all, which nothing did before.
-    Coarse,
-}
+// `DisplayAt` moved to `cases` (#1211) too — see above. `impl DisplayAt`
+// stays here, next to the pitch constants (`DOT_PX`/`DENSE_DOT_PX`/
+// `COARSE_DOT_PX`) its `.line()` reads.
 
 impl DisplayAt {
     /// The word in the case label and on its evidence files.
@@ -678,10 +483,10 @@ impl DisplayAt {
 /// [`TickerAt::Scrolled`] phases land in different parts of it.
 const TICKER_LONG: &str = "PREEM RASTER KIT ~ SCROLLING TICKER ~ ";
 
-/// The phase that lands inside the loop seam. `TICKER_LONG` rasterises to 223
-/// bitmap columns and the kit appends a `GLYPH_W + SPACING` gap, so a 22-cell
-/// grid starting here straddles the message's tail and the blank seam.
-const TICKER_SEAM_PHASE: usize = 215;
+// [`TICKER_SEAM_PHASE`] — the phase that lands inside the loop seam —
+// moved to `cases` (#1211). `TICKER_LONG` rasterises to 223 bitmap columns
+// and the kit appends a `GLYPH_W + SPACING` gap, so a 22-cell grid starting
+// there straddles the message's tail and the blank seam.
 
 impl TickerAt {
     /// The word in the case label and on its evidence files.
@@ -819,21 +624,8 @@ fn ticker_strip(style: kit::DisplayStyle, ticker: TickerAt, window_px: u32) -> k
         .render(text)
 }
 
-/// Where a gauge case's needle is when the frame is taken.
-///
-/// Three positions, chosen to cover what the shader has to get right: the
-/// motion-blur fan **off** and **on** (it is the needle's own geometry
-/// max-combined, so at rest it must vanish exactly rather than fatten the
-/// blade), the lit value arc empty and full, and the overtravel stop.
-#[derive(Clone, Copy)]
-enum NeedleAt {
-    /// Settled at rest, low on the scale: no fan, a short value arc.
-    Rest,
-    /// Mid-sweep toward full scale: the fan is spread, the arc is partly lit.
-    Sweeping,
-    /// Slammed to full scale and overshooting into the mechanical stop.
-    Pegged,
-}
+// `NeedleAt` moved to `cases` (#1211) too — see above. `impl NeedleAt`
+// stays here, next to `gauge_state`, which is the only thing that reads it.
 
 impl NeedleAt {
     /// The word in the case label and on its evidence files.
@@ -863,16 +655,11 @@ impl NeedleAt {
 }
 
 impl Case {
-    /// Which per-kind ceiling this case is held to — see `parity::Kind`.
-    fn kind(&self) -> parity::Kind {
-        match self {
-            Self::Scope { .. } => parity::Kind::Scope,
-            Self::Gauge { .. } => parity::Kind::Gauge,
-            Self::DotMatrix { .. } => parity::Kind::DotMatrix,
-            Self::Marquee { .. } => parity::Kind::Marquee,
-            Self::TextBox { .. } => parity::Kind::TextBox,
-        }
-    }
+    // `Case::kind` — which per-kind ceiling a case is held to — moved to
+    // `cases` (#1211), next to the enum itself; `plugins::tests`'
+    // `kind_enumeration` module calls it directly. Every call site here
+    // (`case.kind()`) is unchanged: same method name, same return type
+    // (`cases`'s `Kind` and `parity`'s are the one type, re-exported).
 
     /// How the two buffers are brought to one grid — see `parity::Sampling`.
     ///
@@ -1018,13 +805,13 @@ fn out_dir() -> std::path::PathBuf {
 }
 
 fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
-    // The same registration `plugins::install` does in the shell, with the same
-    // pipeline constant — the harness drives the shipping pipeline, not a copy.
-    hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
-    hytte::ui::gl_surface::register(gauge::GAUGE, gauge::GAUGE_PIPELINE);
-    hytte::ui::gl_surface::register(dot_matrix::DOT_MATRIX, dot_matrix::DOT_MATRIX_PIPELINE);
-    hytte::ui::gl_surface::register(marquee::MARQUEE, marquee::MARQUEE_PIPELINE);
-    hytte::ui::gl_surface::register(textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE);
+    // The same registration `preem_gl::install` does in the shell — since
+    // #1211, both loop over `kind::Kind::ALL`, so this is the same code
+    // rather than a second hand-kept copy of it.
+    for kind in kind::Kind::ALL {
+        let (program, pipeline) = kind.gl_seam();
+        hytte::ui::gl_surface::register(program, pipeline);
+    }
 
     let cases = cases_for(skins);
 
@@ -1079,134 +866,11 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     });
 }
 
-/// Every case this run measures, in transcript order — four skins' worth of
-/// each kind's own state list.
-///
-/// Split out of [`activate`] so the **case list** is one findable thing rather
-/// than a third of a long function that also builds a window and arms a
-/// timeout. `nix/checks/system-tests.nix` asserts this list's length by
-/// counting evidence files; if you change it, change the number there in the
-/// same commit.
-fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
-    skins
-        .iter()
-        .flat_map(|style| {
-            let scopes = [0_u32, 1, 5]
-                .into_iter()
-                .map(move |idle_steps| Case::Scope {
-                    style: *style,
-                    idle_steps,
-                });
-            let gauges = [NeedleAt::Rest, NeedleAt::Sweeping, NeedleAt::Pegged]
-                .into_iter()
-                .map(move |needle| Case::Gauge {
-                    style: *style,
-                    needle,
-                    scale: GAUGE_SCALE,
-                });
-            // One supersampled case per skin, at the needle position that puts
-            // the most anti-aliased edge on the face: the blade is at an
-            // arbitrary angle, the fan is spread across four blades, and the
-            // value arc has both of its ends on screen. See
-            // [`GAUGE_SUPERSAMPLE`].
-            let shipping = std::iter::once(Case::Gauge {
-                style: *style,
-                needle: NeedleAt::Sweeping,
-                scale: GAUGE_SUPERSAMPLE,
-            });
-            let displays = [
-                DisplayAt::Blank,
-                DisplayAt::Readout,
-                DisplayAt::Notdef,
-                DisplayAt::Dense,
-                DisplayAt::Coarse,
-            ]
-            .into_iter()
-            .map(move |display| Case::DotMatrix {
-                style: *style,
-                display,
-                stretch: 1,
-            });
-            // …and the same readout given more room than its natural size,
-            // which is where the improvement actually lives (#1144).
-            let stretched = std::iter::once(Case::DotMatrix {
-                style: *style,
-                display: DisplayAt::Readout,
-                stretch: STRETCH,
-            });
-            // The ticker (#1152): the degenerate display, the hold rule, and a
-            // scrolling message at three phases — the head, mid-message, and
-            // one straddling the loop seam. See [`TickerAt`].
-            let tickers = [
-                TickerAt::Empty,
-                TickerAt::Held,
-                TickerAt::Scrolled(0),
-                TickerAt::Scrolled(7),
-                TickerAt::Scrolled(TICKER_SEAM_PHASE),
-            ]
-            .into_iter()
-            .map(move |ticker| Case::Marquee {
-                style: *style,
-                ticker,
-                stretch: 1,
-                window_px: TICKER_WINDOW_PX,
-            });
-            // …and the same mid-message phase given more room than its natural
-            // size, which is where this arm's improvement lives — the dot
-            // lattice at the screen's resolution rather than a magnified table.
-            let stretched_ticker = std::iter::once(Case::Marquee {
-                style: *style,
-                ticker: TickerAt::Scrolled(7),
-                stretch: STRETCH,
-                window_px: TICKER_WINDOW_PX,
-            });
-            // …and the same mid-message phase again, but through a window
-            // where the centred grid's origin does not coincide with the
-            // bezel (#1209 review, MEDIUM-1) — still 1:1 and exact-pinned,
-            // since the point is the uniform's *value*, not a new sampling
-            // standard. See [`TICKER_ORIGIN_WINDOW_PX`].
-            let ticker_origin = std::iter::once(Case::Marquee {
-                style: *style,
-                ticker: TickerAt::Scrolled(7),
-                stretch: 1,
-                window_px: TICKER_ORIGIN_WINDOW_PX,
-            });
-            // The bubble (#1152): the degenerate box, one line, a message
-            // wrapped to the last row, and the pinned-palette configuration.
-            let bubbles = [
-                BubbleAt::Empty,
-                BubbleAt::OneLine,
-                BubbleAt::Wrapped,
-                BubbleAt::Pinned,
-            ]
-            .into_iter()
-            .map(move |bubble| Case::TextBox {
-                style: *style,
-                bubble,
-                stretch: 1,
-            });
-            // …and the widest corner given more room than its natural size,
-            // which is where *this* arm's improvement lives: the cut is an arc
-            // at the screen's resolution rather than a replicated logical-pixel
-            // mask, and `Pinned`'s radius-5 corner is the one that shows it.
-            let stretched_bubble = std::iter::once(Case::TextBox {
-                style: *style,
-                bubble: BubbleAt::Pinned,
-                stretch: STRETCH,
-            });
-            scopes
-                .chain(gauges)
-                .chain(shipping)
-                .chain(displays)
-                .chain(stretched)
-                .chain(tickers)
-                .chain(stretched_ticker)
-                .chain(ticker_origin)
-                .chain(bubbles)
-                .chain(stretched_bubble)
-        })
-        .collect()
-}
+// `cases_for` itself moved to `preem_gl::cases` (#1211) — see that module's
+// docs. `plugins::tests`' `kind_enumeration` module calls the same function
+// this harness does, so the case count it checks against `Kind::ALL` and
+// `nix/checks/system-tests.nix` is never a hand-kept mirror of the real
+// list.
 
 /// The tick machine that walks the cases.
 struct Runner {

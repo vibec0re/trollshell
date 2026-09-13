@@ -151,7 +151,8 @@ pub const PROBE_IO_TIMEOUT_SECS: u32 = 5;
 ///   runs to completion in GIO's thread pool and throws its answer away. That
 ///   is GIO's contract, not a number taken here — a resolver slow enough to
 ///   matter needs a stalled nameserver, which these tests have no hermetic way
-///   to stand up. [#1246] resolves on a worker and retires the question.
+///   to stand up. Since [#1246] the lookup is also **off the GTK main
+///   thread**, which is the half that never needed GIO's contract to be true.
 ///
 /// What it does **not** cover: [`gio::TlsFileDatabase::new`], the local read
 /// and parse of the anchors file, which takes no cancellable. That is a
@@ -160,14 +161,17 @@ pub const PROBE_IO_TIMEOUT_SECS: u32 = 5;
 ///
 /// [#1246]: https://github.com/vibec0re/trollshell/issues/1246
 ///
-/// # It bounds the freeze, it does not remove it
+/// # It bounds the **probe**, and since #1246 that is no longer the window
 ///
-/// The probe still runs **on the GTK main thread** (`window.rs`'s `load_page`
-/// ← `apply` ← the `glib::spawn_future_local` pump), so for up to this long
-/// nothing repaints and no button responds. Moving it to a worker with a
-/// "verifying…" state on the card is
-/// [#1246](https://github.com/vibec0re/trollshell/issues/1246); this constant
-/// is the honest bound until then, not a substitute for it.
+/// This used to read *"it bounds the freeze, it does not remove it"*: the
+/// probe ran on the GTK main thread, so for up to this long nothing repainted
+/// and no button responded. [#1246] moved it to a worker
+/// (`window.rs`'s `begin_probe`), with the verifying state on the card while
+/// it runs and the answer crossing back over a `tokio::sync::oneshot` the main
+/// context awaits — so this constant now bounds how long the *card* can say
+/// "verifying" before it says why not, which is a thing a user can sit through.
+/// The watchdog moved with the probe and is unchanged: it cancels a worker
+/// instead of the main thread.
 pub const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Where a route's file came from, for the sentence the card shows.
@@ -536,8 +540,8 @@ pub fn probe(
     let unreachable = |why: String| {
         if deadline.expired() {
             Presented::Unreachable(format!(
-                "{why}; the probe was cancelled after {budget:.1?} — the window blocks while it \
-                 runs, so it is bounded rather than allowed to finish"
+                "{why}; the probe was cancelled after {budget:.1?} — the window shows its \
+                 verifying state while this runs, so it is bounded rather than allowed to finish"
             ))
         } else {
             Presented::Unreachable(why)
@@ -546,7 +550,8 @@ pub fn probe(
 
     let client = gio::SocketClient::new();
     // GIO's per-read timeout. It is **not** the bound — every byte resets it,
-    // which is how a dribbling peer held the main thread for 21 s before
+    // which is how a dribbling peer held this call for 21 s (and, before
+    // #1246 moved it off the GTK main thread, the whole window with it) before
     // #1242's review measured it. `deadline` is what bounds this function.
     client.set_timeout(io_timeout_secs);
     let connection = match client.connect_to_host(
@@ -937,7 +942,7 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "system-tests"))]
-mod tls_tests {
+pub(crate) mod tls_tests {
     //! The launch-time verify, run for real against a **local TLS server**.
     //!
     //! # Why these are gated, and what #1234 had to change to make them run
@@ -963,6 +968,14 @@ mod tls_tests {
     //! disabled). What is testable is everything *before* `WebKit` — which is
     //! where all of #1234's logic lives.
     //!
+    //! # The fixture gateways are `pub(crate)`
+    //!
+    //! [`serve`], [`serve_dribbling`] and [`serve_counting_dribbler`] — and
+    //! the PEMs behind them — are reached from `window.rs`'s `gtk_tests` too
+    //! since #1246, which drives the same probe through the window's worker
+    //! thread. A second copy of a loopback TLS server, in the module that is
+    //! *not* about TLS, is the thing that would drift.
+    //!
     //! [`probe`]: super::probe
 
     use super::{Presented, Route, Source, probe};
@@ -970,11 +983,13 @@ mod tls_tests {
     use gtk::gio;
     use gtk::gio::prelude::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// A PEM from `tests/fixtures/tls` — see that directory's README for what
     /// each one is and `generate.sh` for how they were minted.
-    fn fixture(name: &str) -> PathBuf {
+    pub(crate) fn fixture(name: &str) -> PathBuf {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls")
             .join(name);
@@ -985,7 +1000,7 @@ mod tls_tests {
     /// The anchors a launch would be pointed at: **the fixture CA alone**,
     /// which signs `server-leaf` and `expired-leaf` and does not sign
     /// `other-leaf`.
-    fn anchors() -> PathBuf {
+    pub(crate) fn anchors() -> PathBuf {
         fixture("fixture-ca.pem")
     }
 
@@ -1001,7 +1016,7 @@ mod tls_tests {
     /// every certificate it is not happy with (see [`probe`]'s docs), so for
     /// three of the four cases below a server-side error **is** the expected
     /// outcome.
-    fn serve(cert: &str, key: &str) -> u16 {
+    pub(crate) fn serve(cert: &str, key: &str) -> u16 {
         let (cert, key) = (fixture(cert), fixture(key));
         let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
         std::thread::spawn(move || {
@@ -1063,7 +1078,7 @@ mod tls_tests {
     /// Plain `std::net`, not GIO: nothing here needs a GIO object, and a
     /// `TcpListener` is `Send`, so the listener can be moved into the thread
     /// after the port is read off it.
-    fn serve_dribbling(dribble: Duration, step: Duration) -> u16 {
+    pub(crate) fn serve_dribbling(dribble: Duration, step: Duration) -> u16 {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to dribble on");
         let port = listener.local_addr().expect("…with an address").port();
@@ -1086,6 +1101,44 @@ mod tls_tests {
             }
         });
         port
+    }
+
+    /// [`serve_dribbling`] that keeps accepting, and **counts** every
+    /// connection it took.
+    ///
+    /// The counter is the observable #1246's single-in-flight rule needs: "no
+    /// second probe" is a claim about sockets, and the honest way to check it
+    /// is to ask the peer how many times it was dialled rather than to ask the
+    /// window how many times it thinks it dialled. (#1242's re-verification
+    /// used the same instrument to show that the `UnusableAnchors` arm
+    /// contacts nothing.)
+    ///
+    /// Each accepted connection is dribbled on its own thread and for as long
+    /// as the peer keeps it open, so a *second* probe would hang exactly like
+    /// the first instead of being answered quickly and hiding the fault.
+    pub(crate) fn serve_counting_dribbler(step: Duration) -> (u16, Arc<AtomicUsize>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to count on");
+        let port = listener.local_addr().expect("…with an address").port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    if stream.write_all(&[0x16, 0x03, 0x03, 0x04, 0x00]).is_err() {
+                        return;
+                    }
+                    // Until the peer goes away — the probe's own `close` after
+                    // its deadline fires is what ends this.
+                    while stream.write_all(&[0x01]).is_ok() && stream.flush().is_ok() {
+                        std::thread::sleep(step);
+                    }
+                });
+            }
+        });
+        (port, accepted)
     }
 
     /// **The probe is bounded in wall clock, not per read** — #1242's review

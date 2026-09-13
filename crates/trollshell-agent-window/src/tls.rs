@@ -189,6 +189,16 @@ impl Resolved {
 /// candidate path, and on route 2 a bounded TLS handshake to the gateway — so
 /// it is called once per window, from the point where `host.sock` has already
 /// handed over this agent's URL.
+///
+/// # It runs on a worker thread, not the GTK main thread (#1246)
+///
+/// Every call this makes blocks, and [`PROBE_DEADLINE`] bounds the worst of
+/// them rather than removing it. So `window.rs`'s `begin_probe` runs this on a
+/// thread of its own and hands the [`Resolved`] back over a
+/// `tokio::sync::oneshot` the main context awaits; nothing here touches a
+/// widget, which is what makes that legal. Call it from the main thread and
+/// the window freezes for as long as the hive takes — the shape #1246 exists
+/// to retire.
 #[must_use]
 pub fn resolve(url: &str) -> Resolved {
     let owned = EnvOwned::from_process();
@@ -201,6 +211,23 @@ pub fn resolve(url: &str) -> Resolved {
 /// runs rather than by a copy of it.
 #[must_use]
 pub fn resolve_route(route: &Route, url: &str) -> Resolved {
+    resolve_route_within(route, url, PROBE_DEADLINE)
+}
+
+/// [`resolve_route`] with the probe's wall-clock budget named too.
+///
+/// The same seam [`crate::verify::probe`] already carries one level down, and
+/// for the same reason: a test that is *about* the deadline has to be able to
+/// pick a budget it can wait out, and a test that is not about the deadline
+/// has to be able to pick one a slow CI box cannot trip. A launch always takes
+/// [`PROBE_DEADLINE`] through [`resolve_route`]; nothing outside `cfg(test)`
+/// passes anything else.
+#[must_use]
+pub fn resolve_route_within(
+    route: &Route,
+    url: &str,
+    budget: std::time::Duration,
+) -> Resolved {
     if matches!(route, Route::SystemStore) {
         return Resolved::system_store(None);
     }
@@ -221,7 +248,7 @@ pub fn resolve_route(route: &Route, url: &str) -> Resolved {
         Route::SystemStore => Resolved::system_store(None),
         Route::PinLeaf { pem, source } => pin_from_file(pem, &source.describe(), host, port),
         Route::VerifyAgainstBundle { bundle, source } => {
-            verify_then_pin(bundle, &source.describe(), host, port)
+            verify_then_pin(bundle, &source.describe(), host, port, budget)
         }
     }
 }
@@ -289,14 +316,20 @@ fn pin_from_file(pem: &Path, source: &str, host: &str, port: u16) -> Resolved {
 }
 
 /// Route 2: verify what `host` presents against `bundle`, then pin it.
-fn verify_then_pin(bundle: &Path, source: &str, host: &str, port: u16) -> Resolved {
+fn verify_then_pin(
+    bundle: &Path,
+    source: &str,
+    host: &str,
+    port: u16,
+    budget: std::time::Duration,
+) -> Resolved {
     let shown = bundle.display();
     match verify::probe(
         bundle,
         identity_host(host),
         port,
         PROBE_IO_TIMEOUT_SECS,
-        PROBE_DEADLINE,
+        budget,
     ) {
         Presented::Trusted(pem) => {
             tracing::info!(

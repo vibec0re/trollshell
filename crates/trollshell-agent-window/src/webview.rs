@@ -36,6 +36,15 @@ use crate::tls::{CERT_ENV, Pinned, Resolved, TlsPolicy, failure_description};
 const PAGE: &str = "page";
 const TLS_FAILED: &str = "tls-failed";
 
+/// The widget name [`verifying`] stamps on its state, and the whole of how
+/// [`is_verifying`] recognises it.
+///
+/// A name rather than a type test: the failure card is an `adw::StatusPage`
+/// too, so `downcast_ref::<adw::StatusPage>()` would answer yes to both, and
+/// the one thing a caller ever wants to know here is *which* of the two the
+/// page slot is showing.
+const VERIFYING: &str = "tls-verifying";
+
 /// Build the page widget for `url`, under the policy
 /// [`crate::tls::resolve`] settled on.
 ///
@@ -260,6 +269,56 @@ fn failure_state() -> adw::StatusPage {
     page.set_hexpand(true);
     page.set_vexpand(true);
     page
+}
+
+/// What the page slot shows **while the launch-time TLS probe runs** — #1246.
+///
+/// The same inline-state widget the failure card is ([`failure_state`], an
+/// `adw::StatusPage` in the same slot), so the window has one place where it
+/// explains itself instead of the page and a second, differently-shaped
+/// "loading" thing. Which one is showing is the whole difference between
+/// "this is taking a while" and "this will not work", and a probe against a
+/// dead hive ends at the second.
+///
+/// It deliberately names **no number**. The bound is
+/// [`PROBE_DEADLINE`](crate::verify::PROBE_DEADLINE) on a launch, but the
+/// budget is a parameter (`tls::resolve_route_within`), and a card that
+/// printed "8.0s" while a test ran a 700 ms probe would be stating something
+/// it does not know. What it can promise is what changed: the window is usable
+/// while this is up, and a probe that runs out of time is replaced by the card
+/// rather than by nothing.
+///
+/// `gtk::Spinner` rather than `adw::Spinner`: the latter is libadwaita 1.7 and
+/// this crate declares `v1_4`, so using it would link a symbol the declared
+/// floor does not have.
+#[must_use]
+pub fn verifying(host: &str) -> gtk::Widget {
+    let page = adw::StatusPage::builder()
+        .title("Verifying the hive's certificate…")
+        .description(gtk::glib::markup_escape_text(&format!(
+            "Checking {host} against the hive's own anchors before the page loads. The window \
+             stays usable while this runs, and if the hive does not answer in time this card says \
+             so instead."
+        )))
+        .build();
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    spinner.set_size_request(32, 32);
+    spinner.set_halign(gtk::Align::Center);
+    page.set_child(Some(&spinner));
+    page.set_widget_name(VERIFYING);
+    page.set_hexpand(true);
+    page.set_vexpand(true);
+    page.upcast()
+}
+
+/// Whether `widget` is the state [`verifying`] built.
+///
+/// `None`-free and total, like [`view_of`]: a caller asks the widget it has
+/// rather than remembering what it put there.
+#[must_use]
+pub fn is_verifying(widget: &gtk::Widget) -> bool {
+    widget.widget_name() == VERIFYING
 }
 
 /// Wire the navigation policy: in-place for the agent's own origin,

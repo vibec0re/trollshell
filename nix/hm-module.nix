@@ -53,6 +53,36 @@ let
     })
   );
 
+  # Bottom-up prune of one subsystem's option value (#1237 review MEDIUM-1):
+  # drop every `null` leaf, then every attrset the dropping emptied.
+  #
+  # `lib.filterAttrsRecursive` cannot do the second half — it tests the
+  # predicate BEFORE recursing, so an attrset that goes empty under it
+  # survives as `{ }`. That is the whole defect the moment a subsystem grows
+  # an attrset-valued knob whose own `default` is `{ }` (`agents`' `display`
+  # is the first, #1227 item 1): `{ }` is not `null`, so the
+  # `filtered == { }` guard below stops firing for that subsystem entirely
+  # and every install that merely *enables* the shell ships an
+  # `agents.toml` holding a bare `[display]` heading nobody asked for —
+  # contradicting this block's own "at least one non-null field" invariant.
+  #
+  # `!lib.isDerivation` guards both halves: a derivation is an attrset too,
+  # and while no `config.*` leaf is package-typed today, this helper is the
+  # one every later subsystem family (#1041) rides — recursing into a
+  # derivation's attrs is never what a TOML render wants.
+  #
+  # Pruning an all-`null` `display.<name>` away entirely is the right answer
+  # rather than merely a side effect: the Rust reader already drops an empty
+  # `[display.<name>]` table (`crates/hytte-plugin-agents/src/config.rs`'s
+  # `an_empty_display_entry_is_dropped_and_a_populated_one_is_not`), so the
+  # rendered file and the schema that reads it agree about what an empty
+  # entry means instead of round-tripping a heading that changes nothing.
+  prune =
+    set:
+    lib.filterAttrs (_: v: !(v == null || (lib.isAttrs v && !lib.isDerivation v && v == { }))) (
+      lib.mapAttrs (_: v: if lib.isAttrs v && !lib.isDerivation v then prune v else v) set
+    );
+
   # Base-layer config files (#866/#868, #1041): each
   # `programs.trollshell.config.<subsystem>` attrset renders to
   # `<subsystem>.toml` — one store-path file per subsystem that declares at
@@ -63,19 +93,19 @@ let
   # known keys rather than the `attrsOf`-keyed-by-id shape `pluginsState`
   # above uses.
   #
-  # The inner filter is `filterAttrsRecursive` (#1227 item 1), not a flat
+  # The inner filter is `prune` above (#1227 item 1), not a flat
   # `filterAttrs`: `agents`' `display` field is an `attrsOf` submodule, so an
   # entry's own unset fields (`icon`/`project` left `null`) sit one level
   # *below* `value` and a flat filter would leave them in as a literal
   # `null` TOML cannot represent — `json2x` (what `pkgs.formats.toml`'s
   # `generate` shells out to) fails on that, it does not silently drop it.
-  # `core-leds` has no nested field, so this is a no-op there — recursive
-  # filtering strictly subsumes the flat filter it replaces.
+  # `core-leds` has no nested field, so `prune` is a plain `filterAttrs`
+  # there — it strictly subsumes the flat filter it replaces.
   configFiles = lib.filterAttrs (_: v: v != null) (
     lib.mapAttrs (
       name: value:
       let
-        filtered = lib.filterAttrsRecursive (_: v: v != null) value;
+        filtered = prune value;
       in
       if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
     ) cfg.config

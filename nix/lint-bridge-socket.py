@@ -41,7 +41,7 @@ seam no compiler spans. A live session would notice — the daemon binds a
 path no plugin dials — but CI would not.
 
 This is a `runCommand` source scan on the `nix/lint-glsl.py` /
-`nix/lint-bind-pins.py` / `nix/lint-core-leds-vocab.py` precedent, wired as
+`nix/lint-bind-pins.py` / `nix/lint-config-vocab.py` precedent, wired as
 `checks.bridge-socket` in `flake.nix`.
 
 WHAT IT CHECKS
@@ -70,7 +70,7 @@ extraction functions below for the mechanics):
   - `nix/module-common.nix`'s `claudeBridge.baseUrl` `default` is read from
     inside that **specific option's own `{ … }` block**, brace-matched from
     `baseUrl = lib.mkOption {` to its closing `}` (the `lint-bind-pins.py`/
-    `lint-core-leds-vocab.py` `match_delim` shape) — not "the next `default =
+    `lint-config-vocab.py` `match_delim` shape) — not "the next `default =
     "…"` found anywhere after the word `baseUrl`". `module-common.nix`
     declares several string-valued options; an unbounded forward search
     would read a sibling option's default (e.g. `mode`'s, four options
@@ -128,11 +128,11 @@ crane source filter keeps only `.rs`/`.toml`/`Cargo.lock`,
 exists in that build's source tree at all (the same `include_str!`-of-
 `assets/` trap CLAUDE.md documents, reached here by `std::fs::read_to_string`
 instead). Widening the crane filter to keep `*.nix` was rejected for
-`core-leds-vocab` for the same reason it would be rejected here: every edit
+`config-vocab` for the same reason it would be rejected here: every edit
 to *any* `.nix` file would invalidate the `workspace` derivation's source
 hash and force a full recompile.
 
-A plain `pkgs.runCommand` (the `bind-pins`/`glsl`/`core-leds-vocab`
+A plain `pkgs.runCommand` (the `bind-pins`/`glsl`/`config-vocab`
 precedent) reads the real repository tree — there is no crane filter between
 a `runCommand`'s `src = ./.;`-shaped input and the checkout — needs no
 compile, and reds in seconds.
@@ -285,7 +285,7 @@ def nix_option_block(src: str, anchor: str) -> str:
     from `anchor` (which must end at the block's opening `{`) to its closing
     `}` — so a `default = "..."` sitting in a LATER option can never be
     picked up as this option's value (the `lint-bind-pins.py`/
-    `lint-core-leds-vocab.py` `match_delim` shape).
+    `lint-config-vocab.py` `match_delim` shape).
     """
     start = src.find(anchor)
     if start < 0:

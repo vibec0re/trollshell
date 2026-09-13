@@ -1066,17 +1066,44 @@ self:
       type = lib.types.submodule {
         options = {
           socket = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
+            # Checked HERE, unlike `core-leds.color` above — deliberately
+            # the opposite call, because the two keys fail differently
+            # (#1237 review MEDIUM-2). `color`'s bad value costs `color`
+            # and nothing else: `CoreLeds::validate` is unconditionally
+            # `Ok(())` and every word is judged per-key in
+            # `core_leds.rs`'s `CoreLedsConfig::parsed`, so an open string
+            # there is a typo an operator pays for once. `socket` is a
+            # WHOLE-FILE rule — `AgentsConfig::validate`
+            # (`crates/hytte-plugin-agents/src/config.rs`) rejects a
+            # relative path, `hytte_config::subsystem::assemble` turns that
+            # into `ConfigError::Invalid`, and `load_or_default` then
+            # discards the entire merged file back to `DEFAULT_TOML`. A
+            # relative `socket` set here would therefore silently revert
+            # `poll_seconds` and every `[display.*]` entry too — #1040 V1's
+            # named anti-pattern, reached from a surface where nix can
+            # simply refuse the value in front of the operator who typed
+            # it, at eval, naming the option path.
+            #
+            # `^/.+` is strictly STRICTER than `validate` (which would also
+            # accept a bare `/`), which is the safe direction for a mirror:
+            # every value this option accepts loads, and the one value it
+            # refuses that `validate` would take is not a socket path.
+            # Pinned by `flake.nix`'s
+            # `checks.nixos-module-agents-relative-socket`.
+            type = lib.types.nullOr (lib.types.strMatching "^/.+");
             default = null;
             example = "/run/hyperhive/host.sock";
             description = ''
-              The hive's host admin socket — an absolute path
-              (`AgentsConfig::validate` in `config.rs` rejects anything
-              else, at file-load time; this option does not re-check the
-              shape at eval time, the same "open string, the file schema
-              judges it" precedent as `core-leds.color` above). `null`
-              (the default) sets no `socket` key at all, leaving the
-              overlay or the plugin's built-in default
+              The hive's host admin socket — an **absolute** path, checked
+              at nix eval (`lib.types.strMatching "^/.+"`) rather than left
+              to the file schema the way `core-leds.color` above is: a bad
+              `color` fails per-key at load time, but a bad `socket` fails
+              `AgentsConfig::validate` for the file as a WHOLE, and
+              `hytte-config`'s `load_or_default` then discards the entire
+              merged `agents.toml` back to the plugin's built-in default —
+              reverting `poll_seconds` and every `[display.*]` entry with
+              it. `null` (the default) sets no `socket` key at all, leaving
+              the overlay or the plugin's built-in default
               (`config.rs`'s `DEFAULT_TOML`,
               `/run/hyperhive/host.sock`) to decide.
             '';

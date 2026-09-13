@@ -131,14 +131,25 @@ unprivileged outcome rather than a bug. `id -nG` shows what the running
 session actually has.
 
 No environment-variable knobs beyond `RUST_LOG`. The whole desktop-side
-surface is
-`~/.config/trollshell/agents.toml` (issue #947, spec §9): the hive's
+surface is one TOML schema, `agents.toml` (issue #947, spec §9): the hive's
 `host.sock` path, the poll cadence, and per-agent display overrides
 (`label` / `icon` / `project`, the last being the sidebar group header). It
 rides `hytte-config`'s layered `Subsystem`, so it merges
 `XDG_CONFIG_DIRS` → `XDG_CONFIG_HOME`, warns on an unknown key rather than
 failing, and is re-read on the next poll after an edit — no plugin restart,
 the same live-reload `places.toml` gets.
+
+That schema has **two** writable surfaces, not one (#1227 item 1). Your own
+`~/.config/trollshell/agents.toml` is the overlay and always wins; nix owns
+the layer below it through `programs.trollshell.config.agents`
+(`nix/module-common.nix`), a typed option rendering the same keys into
+`/etc/xdg/trollshell/agents.toml` (NixOS module) or a store path spliced onto
+the shell unit's `XDG_CONFIG_DIRS` (home-manager). The two are genuinely
+merged rather than shadowing each other, and a rebuild never touches the
+overlay — so declaring the fleet-wide `socket` and `[display.*]` roster in
+nix while keeping a hand edit for the one machine's quirk is the intended
+shape. An unset option leaf renders no key at all, which is not the same as
+rendering the default: it leaves the decision to the layer below.
 
 **Approvals have no knob either (#947 P3).** Pending hive approvals raise the
 shell's consent prompt, and that rides the same `host.sock` and the same

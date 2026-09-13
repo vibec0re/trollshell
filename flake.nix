@@ -483,12 +483,20 @@
           # `std::fs::read_to_string` instead). Widening the crane filter to
           # keep `*.nix` was rejected — every `.nix` edit would then
           # invalidate `workspace`'s source hash and force a full recompile.
-          # `nix/lint-core-leds-vocab.py`'s own header has the full story.
-          core-leds-vocab =
-            pkgs.runCommand "trollshell-core-leds-vocab-check" { nativeBuildInputs = [ pkgs.python3 ]; }
+          # `nix/lint-config-vocab.py`'s own header has the full story —
+          # including why it is `lint-config-vocab.py` and `config-vocab`
+          # rather than the `core-leds` spelling both carried until #1237:
+          # `agents` (#1227 item 1) is the second
+          # `programs.trollshell.config.<subsystem>` family to hand-mirror a
+          # Rust vocabulary here, of nine expected, and the check now covers
+          # its `poll_seconds` bounds and the *set of keys itself* on both
+          # sides (a Rust field with no nix option leaf is drift the byte
+          # fixture cannot see).
+          config-vocab =
+            pkgs.runCommand "trollshell-config-vocab-check" { nativeBuildInputs = [ pkgs.python3 ]; }
               ''
                 cd ${self}
-                python3 nix/lint-core-leds-vocab.py
+                python3 nix/lint-config-vocab.py
                 touch $out
               '';
 
@@ -511,7 +519,7 @@
           # defect no compile in this flake can see, so a script rather than a
           # test, with no cargoArtifacts so it goes red in seconds.
           # `nix/lint-bridge-socket.py`'s own header has the full story,
-          # including why this is not a `cargo test` (the `core-leds-vocab`
+          # including why this is not a `cargo test` (the `config-vocab`
           # crane-filter reasoning applies unchanged).
           bridge-socket =
             pkgs.runCommand "trollshell-bridge-socket-check" { nativeBuildInputs = [ pkgs.python3 ]; }
@@ -1499,6 +1507,232 @@
                 echo "rendered agents.toml drifted from the checked-in fixture (${fixture})" >&2
                 exit 1
               fi
+              touch $out
+            '';
+
+          # The home-manager twin of the check above (#1237 review LOW-5).
+          # `configFiles` is hand-mirrored in BOTH platform modules —
+          # `nix/nixos-module.nix` says so in as many words ("Mirrors
+          # `nix/hm-module.nix`'s `configFiles` exactly — keep the two in
+          # sync") — and #1227 item 1 changed the inner filter in both, yet
+          # only the NixOS render was pinned. Same example, same checked-in
+          # fixture, resolved through `configBase` on the trollshell unit's
+          # own `XDG_CONFIG_DIRS` (the #1081 review M1 surface) instead of
+          # `/etc/xdg`. The two renders are byte-identical today — measured —
+          # and that is precisely the property that has to keep holding:
+          # without this, a `prune`/`configFiles` edit applied to one module
+          # and fumbled in the other ships a home-manager base layer nothing
+          # in `checks` ever reads.
+          hm-module-agents-fixture =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      config.agents = {
+                        socket = "/run/hyperhive/host.sock";
+                        poll_seconds = 5;
+                        display."trollshell-choom" = {
+                          label = "choom";
+                          project = "viberoot";
+                        };
+                        display.argus.icon = "starred-symbolic";
+                      };
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              # Same unwrapping as `hm-module-core-leds` above — see there for
+              # why the trollshell UNIT's own `Service.Environment` is the
+              # surface to read rather than `home.sessionVariables`.
+              environment = cfg.systemd.user.services.trollshell.Service.Environment;
+              xdgEntry = pkgs.lib.findFirst (e: pkgs.lib.hasPrefix "\"XDG_CONFIG_DIRS=" e) null environment;
+              xdgValue =
+                assert xdgEntry != null;
+                pkgs.lib.removeSuffix "\"" (pkgs.lib.removePrefix "\"XDG_CONFIG_DIRS=" xdgEntry);
+              base = builtins.head (pkgs.lib.splitString ":" xdgValue);
+              renderedFile = "${base}/trollshell/agents.toml";
+              fixture = ./crates/hytte-plugin-agents/tests/fixtures/agents-nix-rendered.toml;
+            in
+            pkgs.runCommand "trollshell-hm-module-agents-fixture-check" { } ''
+              if ! diff -u ${fixture} ${renderedFile}; then
+                echo "home-manager's rendered agents.toml drifted from the checked-in fixture (${fixture}) — it must stay byte-identical to the NixOS module's render, see nixos-module-agents-fixture" >&2
+                exit 1
+              fi
+              touch $out
+            '';
+
+          # #1237 review MEDIUM-1: "one store-path file per subsystem that
+          # declares at least one non-null field" is the invariant BOTH
+          # platform modules state above their `configFiles` — and `agents`
+          # broke it, because `display`'s own `default` is `{ }` rather than
+          # `null` and `{ }` is not `null`, so the `filtered == { } -> null`
+          # guard could never fire again for that subsystem. Measured before
+          # the fix: `programs.trollshell.enable = true` with NO `config.agents`
+          # at all shipped `/etc/xdg/trollshell/agents.toml` containing a bare
+          # `[display]`, on every install. `nix/{hm,nixos}-module.nix`'s
+          # `prune` (bottom-up, unlike `lib.filterAttrsRecursive`) is the fix.
+          #
+          # Deliberately ONE derivation across BOTH modules rather than the
+          # `nixos-module-*` / `hm-module-*` pair the names above suggest: the
+          # defect lives in the block those two hand-mirror, so pinning it on
+          # one platform only is the same gap LOW-5 filed against the fixture
+          # check. Each arm carries its own control (the same fixture WITH a
+          # field set must still render), so a mutation that simply stopped
+          # rendering anything cannot pass.
+          modules-agents-absent-when-unset =
+            let
+              nixosEtc =
+                extra:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                    extra
+                  ];
+                }).config.environment.etc;
+              hmDirs =
+                extra:
+                (home-manager.lib.homeManagerConfiguration {
+                  inherit pkgs;
+                  modules = [
+                    self.homeModules.default
+                    {
+                      home = {
+                        username = "alice";
+                        homeDirectory = "/home/alice";
+                        stateVersion = "24.11";
+                        enableNixpkgsReleaseCheck = false;
+                      };
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                      };
+                    }
+                    extra
+                  ];
+                }).config.xdg.systemDirs.config;
+
+              untouchedEtc = nixosEtc { };
+              socketOnlyEtc = nixosEtc { programs.trollshell.config.agents.socket = "/x/y.sock"; };
+              socketOnlyFile = socketOnlyEtc."xdg/trollshell/agents.toml".source;
+
+              probe =
+                # The defect itself: nothing set, nothing rendered.
+                assert !(untouchedEtc ? "xdg/trollshell/agents.toml");
+                # `core-leds` was always correct here (every field `null`) and
+                # must stay so — the control that says this is about `agents`'
+                # `{ }`-defaulted attrset and not about the guard as a whole.
+                assert !(untouchedEtc ? "xdg/trollshell/core-leds.toml");
+                # …and the file still appears the moment one field is set, so
+                # "render nothing, ever" cannot pass this check.
+                assert socketOnlyEtc ? "xdg/trollshell/agents.toml";
+                # The home-manager arm reads the same `configFiles != { }`
+                # gate through `xdg.systemDirs.config` (`nix/hm-module.nix`),
+                # so an unpruned `{ display = { }; }` there splices a whole
+                # `configBase` onto the session's XDG search path for nothing.
+                assert (hmDirs { }) == [ ];
+                assert (hmDirs { programs.trollshell.config.agents.socket = "/x/y.sock"; }) != [ ];
+                # No `builtins.deepSeq` wrapper here, unlike the sibling
+                # checks above: these two bindings are whole `environment.etc`
+                # attrsets, and forcing one deeply overflows the evaluator's
+                # call stack (measured). The asserts above already force every
+                # value this check reads, and `inherit probe` in the
+                # derivation's env forces the chain itself.
+                "ok";
+            in
+            pkgs.runCommand "trollshell-modules-agents-absent-when-unset-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              # The other half of MEDIUM-1: a rendered file must not carry a
+              # `[display]` heading it was never given entries for. `prune`
+              # drops the emptied attrset, so a `socket`-only config renders
+              # exactly one line.
+              if ! grep -q 'socket = "/x/y.sock"' ${socketOnlyFile}; then
+                echo "a socket-only config.agents did not render its socket:" >&2
+                cat ${socketOnlyFile} >&2
+                exit 1
+              fi
+              if grep -q 'display' ${socketOnlyFile}; then
+                echo "a socket-only config.agents rendered a [display] heading (see #1237 review MEDIUM-1):" >&2
+                cat ${socketOnlyFile} >&2
+                exit 1
+              fi
+              touch $out
+            '';
+
+          # #1237 review MEDIUM-2: `socket` is judged by a WHOLE-FILE rule on
+          # the Rust side (`AgentsConfig::validate` -> `ConfigError::Invalid`
+          # -> `load_or_default` discards the entire merged file back to
+          # `DEFAULT_TOML`), so a relative path set from nix would silently
+          # revert `poll_seconds` and every `[display.*]` entry with it —
+          # #1040 V1's named anti-pattern. `nix/module-common.nix` therefore
+          # types it `strMatching "^/.+"` rather than an open `str`, and this
+          # is the pin.
+          #
+          # Same tryEval-plus-control shape as
+          # `nixos-module-core-leds-unknown-key` above, and for the same
+          # reason (#1081 review M4): `builtins.tryEval` reports only
+          # success/failure, never the message, so on its own the failing arm
+          # cannot tell "`socket` rejected a relative path" from "`socket` no
+          # longer exists". Only the control arm — the identical fixture with
+          # an absolute path, which must succeed — makes both hold at once.
+          nixos-module-agents-relative-socket =
+            let
+              fixture =
+                socket:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                        config.agents.socket = socket;
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                  ];
+                }).config.programs.trollshell.config.agents.socket;
+              result = builtins.tryEval (builtins.deepSeq (fixture "run/hyperhive/host.sock") "ok");
+              control = builtins.tryEval (builtins.deepSeq (fixture "/run/hyperhive/host.sock") "ok");
+              probe =
+                assert !result.success;
+                assert control.success;
+                builtins.deepSeq { inherit result control; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-agents-relative-socket-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
               touch $out
             '';
 

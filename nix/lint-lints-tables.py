@@ -66,13 +66,13 @@ which is exactly the review moment that would otherwise be missing.
 WHY THIS IS A NIX LINT AND NOT A `cargo test`
 ----------------------------------------------
 A `cargo test` *could* read `Cargo.toml` files (unlike the `.nix` files
-`nix/lint-core-leds-vocab.py` and `nix/lint-bridge-socket.py` need — the crane
+`nix/lint-config-vocab.py` and `nix/lint-bridge-socket.py` need — the crane
 source filter keeps `.toml`). It still should not: the natural home for such
 a test is one of the islands, which would make the crate that must not drift
 the crate that certifies it hasn't, and the test would have to be duplicated
 or given a home in a third crate that has no other reason to exist. It is
 also a *source-level* defect that no compile in this flake can see, which is
-precisely the `bind-pins` / `glsl` / `core-leds-vocab` / `bridge-socket`
+precisely the `bind-pins` / `glsl` / `config-vocab` / `bridge-socket`
 posture: a `pkgs.runCommand` with no `cargoArtifacts`, red in seconds.
 
 Run it by hand from the repo root with:

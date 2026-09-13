@@ -3116,6 +3116,50 @@ switch` repoints atomically to a new store path every rebuild; the running
     mathematically impossible, and a real inotify watch remains the eventual
     answer for that residue.
 
+- [ ] **(#1227 item 1)** **`agents.toml`'s nix base layer.** The second
+      `programs.trollshell.config.<subsystem>` family (#1041 was the first),
+      and the only thing here no automated check can assert: that the rendered
+      file actually reaches the running sidebar.
+  - **It renders, and the sidebar reads it.** Declare, in home-manager (or
+    the NixOS module — the option is shared):
+
+    ```nix
+    programs.trollshell.config.agents = {
+      poll_seconds = 5;
+      display.trollshell-choom = {
+        label = "choom";
+        project = "viberoot";
+      };
+    };
+    ```
+
+    Rebuild (`home-manager switch` then `systemctl --user restart trollshell`
+    — a home-manager base layer is baked into the unit's `Environment=` at
+    process start, exactly as the `core-leds` item above explains), open the
+    agents sidebar, and expect the `trollshell-choom` row to read **choom**
+    under a **viberoot** group header. With no
+    `~/.config/trollshell/agents.toml` at all, the base layer is the whole
+    config.
+
+  - **An overlay still wins, per key.** Write
+    `echo '[display.trollshell-choom]' > ~/.config/trollshell/agents.toml`
+    then `echo 'label = "mine"' >> ~/.config/trollshell/agents.toml`. The row
+    must read **mine** while `project` (set only in the nix layer) still
+    groups it under **viberoot** — a merge, not a shadow.
+  - **Unset means no file at all (#1237 review MEDIUM-1).** Remove the
+    `config.agents` block entirely and rebuild. Under the NixOS module,
+    `/etc/xdg/trollshell/agents.toml` must be **gone**, not present holding a
+    bare `[display]` heading (which is what shipped on every install before
+    the `prune` fix); under home-manager, `systemctl --user show trollshell
+-p Environment` must carry no `XDG_CONFIG_DIRS` entry of its own. The
+    sidebar keeps working off the plugin's built-in default either way.
+  - **A relative `socket` is refused at eval, not at load.** Set
+    `config.agents.socket = "run/hyperhive/host.sock";` and expect the
+    _rebuild_ to fail naming the option path. This is the one option leaf
+    whose bad value would otherwise cost the whole merged file (`validate` is
+    a whole-file rule there, unlike `core-leds.color`'s per-key one), so nix
+    refuses it in front of the person who typed it.
+
 - [ ] **(#862)** **Accent tracking for the shell's own preem surfaces** — the
       Stats drawer's per-core LED panel is rasterised in-process, and until
       #864 nothing called `hytte_preem::set_accent`, so it drew with the kit

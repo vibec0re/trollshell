@@ -330,6 +330,24 @@ in
       # the control center has one.
       (lib.mkIf cfg.agentWindow.enable {
         environment.systemPackages = [ cfg.agentWindow.package ];
+
+        # #1234: point the window at the hive's own TLS directory, so a
+        # same-host deploy trusts its self-signed gateway with nothing set by
+        # hand (Mara on #1224: "i dont want to run some cmd for manual setup
+        # tho"). The option's default reads
+        # `services.hyperhive.deploy.hive-controller.tls.stateDir` when that
+        # module is on this host and is null otherwise, so this line exports
+        # nothing on a machine with no hive — and the window then falls back to
+        # hyperhive's own `/var/lib/hive-tls` default, which is equally
+        # harmless when it does not exist.
+        #
+        # A session variable rather than a unit `Environment=`: nothing here
+        # declares a unit for this binary. The agents plugin launches it
+        # detached through `systemd-run --user` (#953), so what it inherits is
+        # the user manager's environment.
+        environment.sessionVariables.TROLLSHELL_AGENT_WINDOW_TLS_DIR = lib.mkIf (
+          cfg.agentWindow.hiveTlsStateDir != null
+        ) cfg.agentWindow.hiveTlsStateDir;
       })
 
       # The recommended-but-optional system daemons trollshell's chips lean

@@ -31,6 +31,8 @@
   lib,
   stdenv,
   wrapGAppsHook4,
+  # GIO's TLS backend, for the launch-time verify (#1234) — see `buildInputs`.
+  glib-networking,
   # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
   workspace,
   # Source revision string (#601), computed once in flake.nix from
@@ -49,7 +51,22 @@ stdenv.mkDerivation {
   nativeBuildInputs = [ wrapGAppsHook4 ];
   # `webInputs`, not `buildInputs`: this is the one slice that ships a web
   # engine, so its wrap is the one that may reference it (#1130 M1).
-  buildInputs = workspace.passthru.devInputs.webInputs;
+  #
+  # `glib-networking` is listed **explicitly** (#1234): GIO's TLS backend is a
+  # loadable module, and `wrapGAppsHook4` only puts a dependency's
+  # `lib/gio/modules` on `GIO_EXTRA_MODULES` when it is in *this* derivation's
+  # `buildInputs`. Measured on the pre-#1234 wrapper: the prefix carried dconf
+  # and nothing else, so `src/verify.rs`'s launch-time chain verification —
+  # `TlsFileDatabase::new`, `TlsClientConnection::new`,
+  # `TlsCertificate::from_file` — would have worked only where the *session*
+  # happened to export the variable (`services.gnome.glib-networking.enable`,
+  # off in a bare niri session), and silently degraded to the system trust
+  # store everywhere else.
+  #
+  # It adds **no** closure: measured with `nix-store -qR`, all 37 paths of
+  # glib-networking's closure were already in this package's 426, pulled in
+  # transitively. Only the wrapper's environment changes.
+  buildInputs = workspace.passthru.devInputs.webInputs ++ [ glib-networking ];
 
   installPhase = ''
     runHook preInstall

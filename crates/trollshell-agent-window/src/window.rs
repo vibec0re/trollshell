@@ -527,17 +527,25 @@ impl Window {
         };
 
         let embedded = page::embed_url(url);
-        let policy = tls::policy(std::env::var(tls::CERT_ENV).ok().as_deref(), &embedded);
+        // #1234: this reads the hive's own TLS material and, on the bundle
+        // route, opens one bounded TLS connection to the gateway to verify the
+        // chain it presents before pinning the leaf. It is affordable here
+        // precisely because of *when* "here" is — `host.sock` has already
+        // answered with this agent's URL, so the hive daemon is up and the
+        // handshake is normally a loopback round trip. See `verify`'s
+        // `PROBE_TIMEOUT_SECS` for the bound on the case where it is not.
+        let trust = tls::resolve(&embedded);
         tracing::info!(
             url = %embedded,
-            tls_host = ?policy.scoped_host(),
+            tls_host = ?trust.policy.scoped_host(),
+            tls_tried = trust.tried.as_deref().unwrap_or("nothing — the system trust store"),
             "loading the agent's page"
         );
 
         while let Some(child) = self.page_slot.first_child() {
             self.page_slot.remove(&child);
         }
-        self.page_slot.append(&webview::page(&embedded, &policy));
+        self.page_slot.append(&webview::page(&embedded, &trust));
         *self.page_loaded.borrow_mut() = true;
     }
 

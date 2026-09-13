@@ -119,23 +119,80 @@ self:
           without the plugin — it is launchable as
           `trollshell-agent-window --agent <name>`.
 
-          A hyperhive gateway is self-signed by default, so the window opens on
-          an error state until its anchor is in the machine's trust store. With
-          the hive on this machine, reference hyperhive's own option rather
-          than a literal path:
+          A hyperhive gateway is self-signed by default. Since #1234 the
+          window handles that itself when the hive is on this machine, and
+          `agentWindow.hiveTlsStateDir` below is the only knob — it defaults
+          to hyperhive's own `tls.stateDir` when `services.hyperhive` is
+          enabled here, so a same-host deploy needs **no** setting at all.
 
-              security.pki.certificateFiles = [
-                "''${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem"
-              ];
+          For a hive on another host, launch with
+          `TROLLSHELL_AGENT_WINDOW_CA` pointing at a copy of that hive's
+          `trust-bundle.pem`; the window verifies what the gateway presents
+          against those anchors and pins the leaf, per launch, so a re-signed
+          leaf keeps working. `TROLLSHELL_AGENT_WINDOW_CERT` is the last
+          resort and pins one certificate for one host — it must be the
+          **leaf** the gateway presents, never the bundle.
 
-          (`/var/lib/hive-tls` is only that option's default; spell it out only
-          for a remote hive.) The window's error state names that and the
-          `TROLLSHELL_AGENT_WINDOW_CERT` last resort, which pins one
-          certificate for one host and must be the **leaf** the gateway
-          presents, never the bundle.
+          To trust the hive machine-wide (every browser too), copy the bundle
+          into your flake's git tree and reference the copy:
+
+              # cp /var/lib/hive-tls/trust-bundle.pem ./hive-ca.pem
+              security.pki.certificateFiles = [ ./hive-ca.pem ];
+
+          Do **not** interpolate the runtime path into that option: its value
+          is spliced into the `cacert` derivation, which opens it inside the
+          build sandbox, so `"''${…tls.stateDir}/trust-bundle.pem"` fails
+          `nixos-rebuild` outright — and with the sandbox off it hashes only
+          the path string, pinning whatever bytes were there at first build
+          and never noticing a CA rotation (#1234 finding 1; hyperhive's own
+          agents copy the file into the tree for exactly this reason,
+          `hive_c0re::meta`).
 
           It is the one package in this flake that links WebKitGTK; the shell
           and every plugin stay free of a web engine.
+        '';
+      };
+
+      hiveTlsStateDir = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default =
+          if (config ? services.hyperhive) && (config.services.hyperhive.enable or false) then
+            (config.services.hyperhive.deploy.hive-controller.tls.stateDir or null)
+          else
+            null;
+        defaultText = lib.literalExpression ''
+          config.services.hyperhive.deploy.hive-controller.tls.stateDir
+          when services.hyperhive is enabled on this host, else null
+        '';
+        example = "/var/lib/hive-tls";
+        description = ''
+          Directory holding the hive's TLS material, exported to the session as
+          `TROLLSHELL_AGENT_WINDOW_TLS_DIR` so the agent window can trust a
+          self-signed hyperhive gateway with nothing else configured (#1234).
+
+          The window reads two well-known names under it, in this order:
+
+          - `trust-bundle.pem` — the hive's anchors. It opens one bounded TLS
+            connection to the agent's gateway, verifies the chain that gateway
+            presents against these anchors, and then pins that leaf for that
+            host only. Rotation-safe, because what it pins is what the gateway
+            presented *this launch*.
+          - `gateway.pem` — the file nginx serves verbatim, written leaf-first
+            with the CA appended and re-signed weekly. Pinned directly, with no
+            probe.
+
+          Neither is read unless it is readable, and neither changes the
+          machine's trust store or the session's TLS-error policy (which stays
+          `Fail` on every path). `TROLLSHELL_AGENT_WINDOW_CA` and
+          `TROLLSHELL_AGENT_WINDOW_CERT` override, in that order, for a hive on
+          another host.
+
+          The default reads hyperhive's own `tls.stateDir` option when that
+          module is on this host, so the two sides cannot drift when it moves —
+          guarded so this module still evaluates on a machine with no hyperhive.
+          Set it by hand under home-manager, where the NixOS option tree is not
+          in scope; null exports nothing and leaves the window on
+          `/var/lib/hive-tls`, hyperhive's own default.
         '';
       };
 

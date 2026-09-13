@@ -82,11 +82,23 @@ craneLib.mkCargoDerivation (
     # direct-spawn fallback (`FallbackReason::NoUserManager`) — see
     # the doc comments on `detached_launch_falls_back_without_a_user_manager`
     # and its two siblings for which shape each one exercises there.
+    #
+    # `glib-networking` since #1234: GIO's TLS backend is a loadable
+    # module, not part of libgio, so without it on `GIO_EXTRA_MODULES`
+    # (exported in `preCheck` below) every `TlsCertificate::from_file`
+    # / `TlsFileDatabase::new` / `TlsClientConnection::new` answers
+    # `"TLS support is not available"` — which is precisely what
+    # `crates/trollshell-agent-window/src/tls.rs` recorded as a
+    # live-verify caveat for the whole of #1130, and why the agent
+    # window's trust path had no tests. It buys
+    # `verify.rs`'s `tls_tests` module: a real `GTlsServerConnection`
+    # on loopback and the window's own `probe` against it.
     nativeCheckInputs = [
       pkgs.dbus
       pkgs.xvfb-run
       pkgs.mesa
       pkgs.systemd
+      pkgs.glib-networking
     ];
     doCheck = true;
     # Leaf/terminal check: nothing consumes its target dir. crane
@@ -143,6 +155,14 @@ craneLib.mkCargoDerivation (
       export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
       export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
       export TROLLSHELL_REQUIRE_ICON_THEME=1
+      # #1234 ask 3 — the line that makes GIO able to do TLS at all here.
+      # `wrapGAppsHook4` sets this for anything that ships; a `cargo test`
+      # is wrapped by nothing, so the check sets it by hand, and
+      # `nix/devshell.nix` exports the identical value so the local and CI
+      # buckets agree about what `--features system-tests` runs.
+      # `verify.rs`'s `gio_has_a_tls_backend_here_which_is_what_glib_networking_buys`
+      # is what goes red — naming the cause — if this line is dropped.
+      export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules"
       # llvmpipe (#1036): `__EGL_VENDOR_LIBRARY_FILENAMES` is the
       # load-bearing one — glvnd's default vendor dirs
       # (`/usr/share/glvnd/egl_vendor.d`,

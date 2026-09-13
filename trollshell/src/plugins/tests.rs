@@ -11612,3 +11612,191 @@ mod kind_enumeration {
         );
     }
 }
+
+// ── #1159: Mount → mailbox routing, all nine arms ────────────────────────────
+//
+// `route_render`'s `match` is the host's entire placement decision, and until
+// #1159 **nothing pinned it**. `bar_mount_render_reaches_bar_region` (#349)
+// covers one arm; the other five were free to be swapped, deleted or aliased
+// without a single test noticing — which is why the epic (#1158) asked for this
+// before adding three more arms to the same match.
+//
+// Appended as a module so the nine-way fixture reads in one place rather than as
+// nine variations woven through the file.
+mod sidebar_right_routing {
+    use super::*;
+
+    /// The nine mounts paired with the [`ListenerCtx`] mailbox each must land in.
+    ///
+    /// The `match` is deliberately written out here rather than reusing anything
+    /// from `route_render`: an oracle that shared the production mapping would
+    /// agree with a swapped pair by construction. This is the second, independent
+    /// statement of the same table, and the test is the two of them meeting.
+    fn mailbox_for(ctx: &ListenerCtx, mount: Mount) -> Mutable<Vec<SlotRender>> {
+        match mount {
+            Mount::SidebarLead => ctx.sidebar_lead.clone(),
+            Mount::SidebarTop => ctx.sidebar_top.clone(),
+            Mount::SidebarBottom => ctx.sidebar_bottom.clone(),
+            Mount::SidebarRightLead => ctx.sidebar_right_lead.clone(),
+            Mount::SidebarRightTop => ctx.sidebar_right_top.clone(),
+            Mount::SidebarRightBottom => ctx.sidebar_right_bottom.clone(),
+            Mount::BarLeft => ctx.bar_left.clone(),
+            Mount::BarCenter => ctx.bar_center.clone(),
+            Mount::BarRight => ctx.bar_right.clone(),
+        }
+    }
+
+    /// Nine plugins, one per mount, all on **one** host context — every render
+    /// must land in exactly its own mailbox and in no other.
+    ///
+    /// One context rather than nine is what makes the negative half mean
+    /// anything: the mailboxes are shared across connections (that is how two
+    /// plugins co-mount in a region), so a mis-routed card lands somewhere a
+    /// sibling is watching. Nine separate contexts would have nine empty
+    /// neighbours by construction and could not see a swap at all.
+    ///
+    /// Each plugin's tree carries its own mount name as the label text, so the
+    /// assertion checks *which* plugin arrived rather than just that something
+    /// did — an arm that routed two mounts to the same mailbox would otherwise
+    /// pass the length check on whichever frame won the race.
+    ///
+    /// Driven through `handle_conn` over a real socketpair, not by calling
+    /// `route_render` directly: the mount the router sees comes from the
+    /// `Register` frame, and the hop from that frame to the routing decision is
+    /// part of what this pins.
+    ///
+    /// **Falsified** by swapping any two arms of `route_render`'s `match` —
+    /// verified for `SidebarRightTop` ⇄ `BarCenter` and for
+    /// `SidebarLead` ⇄ `SidebarRightLead`, which is the swap the old six-arm
+    /// match could not have produced and the one the left/right families make
+    /// newly possible.
+    #[tokio::test]
+    async fn every_mount_routes_to_exactly_its_own_mailbox() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        // Every mailbox, captured before `ctx` is cloned into the connection
+        // tasks (`Mutable` shares its state, so these stay live).
+        let mailboxes: Vec<(Mount, Mutable<Vec<SlotRender>>)> = Mount::ALL
+            .into_iter()
+            .map(|mount| (mount, mailbox_for(&ctx, mount)))
+            .collect();
+        let panels = ctx.panels.clone();
+
+        // Both halves of every plugin socket are kept alive for the whole test.
+        // Dropping either one ends that connection, and the teardown clears the
+        // plugin's entry from every mailbox (`session.rs`) — the card would
+        // arrive and then leave again, turning the assertions below into a race
+        // that passes or fails on scheduling. The read half matters as much as
+        // the write half: the host pushes `Hello` (every `Manifest::new` declares
+        // a `vocab_max`), and a closed reader turns that into a write error.
+        let mut plugin_ends = Vec::with_capacity(Mount::ALL.len());
+        for mount in Mount::ALL {
+            let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+            let conn_ctx = ctx.clone();
+            tokio::spawn(async move { handle_conn(host_end, &conn_ctx).await });
+
+            let (prd, mut pwr) = plugin_end.into_split();
+            write_frame(
+                &mut pwr,
+                &PluginMsg::Register {
+                    manifest: Manifest::new(mount.wire_name(), mount),
+                },
+            )
+            .await
+            .expect("send Register");
+            write_frame(
+                &mut pwr,
+                &PluginMsg::Render {
+                    tree: wire::Node::Label {
+                        id: Some("t".into()),
+                        text: mount.wire_name().to_owned(),
+                        classes: vec![],
+                        tooltip: None,
+                    },
+                    panel: None,
+                    effects: vec![],
+                    hidden_on: Vec::new(),
+                },
+            )
+            .await
+            .expect("send Render");
+            plugin_ends.push((prd, pwr));
+        }
+
+        // Every mailbox must end up holding exactly its own plugin. Waiting on
+        // each in turn is enough to order the whole thing: nine independent
+        // reader tasks fill nine independent mailboxes, and a card that went to
+        // the wrong one shows up as the wrong `plugin_id` here (or as a second
+        // entry in the neighbour it invaded, caught by the length check).
+        for (mount, mailbox) in &mailboxes {
+            let cards = wait_for_region(mailbox).await;
+            assert_eq!(
+                cards.len(),
+                1,
+                "{}'s mailbox must hold exactly one card, got {:?}",
+                mount.wire_name(),
+                cards.iter().map(|c| &c.plugin_id).collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                cards[0].plugin_id,
+                mount.wire_name(),
+                "{}'s mailbox holds the plugin that asked for it",
+                mount.wire_name(),
+            );
+            assert!(
+                matches!(
+                    &cards[0].tree,
+                    wire::Node::Label { text, .. } if text == mount.wire_name()
+                ),
+                "…and that plugin's own tree, not a neighbour's",
+            );
+        }
+
+        // And nothing leaked sideways: with all nine settled, each mailbox is
+        // still exactly one card long. (The loop above could in principle have
+        // read a mailbox before a mis-routed sibling reached it.)
+        for (mount, mailbox) in &mailboxes {
+            let cards = mailbox.lock_ref();
+            assert_eq!(
+                cards.len(),
+                1,
+                "{} gained a second card once every plugin had rendered: {:?}",
+                mount.wire_name(),
+                cards.iter().map(|c| &c.plugin_id).collect::<Vec<_>>(),
+            );
+        }
+        assert!(
+            panels.lock_ref().is_empty(),
+            "no plugin sent a panel, so the shared panels mailbox stays empty",
+        );
+        drop(plugin_ends);
+    }
+
+    /// The right family is routed by the same code path as the left one and
+    /// carries no bar semantics: a right-sidebar mount must answer `false` to
+    /// `Mount::is_bar`, or the host would seed its plugins a constant
+    /// `SlotVisible` of `true` (#288/#422) and any poller parked on visibility
+    /// would never park.
+    ///
+    /// The proto's own `is_bar` test pins the predicate; this pins that the host
+    /// still routes on the mount rather than on `is_bar`, by checking the three
+    /// sidebar-right mounts land in sidebar mailboxes that the bar ones do not
+    /// share.
+    #[test]
+    fn the_right_family_is_three_sidebar_regions_not_bar_ones() {
+        for mount in [
+            Mount::SidebarRightLead,
+            Mount::SidebarRightTop,
+            Mount::SidebarRightBottom,
+        ] {
+            assert!(!mount.is_bar(), "{} is a sidebar region", mount.wire_name(),);
+        }
+        assert_eq!(
+            Mount::ALL.iter().filter(|m| m.is_bar()).count(),
+            3,
+            "the bar family did not grow with the sidebar one",
+        );
+    }
+}

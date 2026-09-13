@@ -309,11 +309,14 @@ impl Kind {
             // (64/40). `mean` is now ~1.38x rather than ~1.5x, and it is kept at
             // 16.0 instead of being raised to ~18 to restore the old ratio,
             // because the ratio was never the goal — detecting a drift is, and
-            // the measured cost of restoring it is most of the one drift this
-            // budget is known to catch. A scale-only dot radius +10 % (`denom`
-            // multiplied by 1.21 on the `u_viewport != u_grid` branch only) puts
-            // the oled at edge mean **19.182** here: against 16.0 that is a
-            // margin of 3.18 and `FAIL(edges)`, against 18.0 it would be 1.18.
+            // the measured cost of restoring it is most of the *margin* on the
+            // one drift this budget is known to catch. The margin, not the
+            // detection: 18.0 still catches it, and saying otherwise overstates
+            // the case for 16.0 (#1238's review, NIT-1).
+            // A scale-only dot radius +10 % (`denom` multiplied by 1.21 at both
+            // `falloff` call sites, on the `u_viewport != u_grid` branch only)
+            // puts the oled at edge mean **19.182** here: against 16.0 that is
+            // a margin of 3.18 and `FAIL(edges)`, against 18.0 it would be 1.18.
             // 37 % headroom on a mean taken over 5544–8463 pixels is ample, and
             // it is not fragile across a Mesa bump either: the pre-#1186 numbers
             // this comment used to carry were taken on 26.2.2 (the #1150 review
@@ -555,13 +558,13 @@ pub(crate) enum Sampling {
 ///   larger (caught on no skin) or a halo 25 % stronger on the dot matrix and
 ///   the marquee. Re-measured against #1186's bilinear halo, since both of
 ///   those numbers are statements about the bloom: a radius 10 % larger
-///   (`denom` multiplied by 1.21 on the `u_viewport != u_grid` branch only) is
-///   now caught on the **oled** of both kinds (edge mean 19.182 / 19.379
-///   against 16.0, `FAIL(edges)`) where before the halo change it was one case
-///   of four; a halo 25 % stronger is still caught on **none** of the eight, at
-///   edge mean ≤ 13.379 and max ≤ 48 against 16 / 64 — closer to the mean
-///   ceiling than the ≤ 12.245 the grid-resolution halo measured, and still
-///   inside it.
+///   (`denom` multiplied by 1.21 at both `falloff` call sites, on the
+///   `u_viewport != u_grid` branch only) is now caught on the **oled** of both
+///   kinds (edge mean 19.182 / 19.379 against 16.0, `FAIL(edges)`) where before
+///   the halo change it was one case of four; a halo 25 % stronger is still
+///   caught on **none** of the eight, at edge mean ≤ 13.379 and max ≤ 48
+///   against 16 / 64 — closer to the mean ceiling than the ≤ 12.245 the
+///   grid-resolution halo measured, and still inside it.
 ///
 ///   **Both probes are spelled out, because a number nobody can reproduce is
 ///   not a measurement** (#1238's review, LOW-1 — the radius probe stated its
@@ -1747,7 +1750,12 @@ mod tests {
              frame rendered at twice the grid's density",
         );
         assert_eq!(
-            flat_block_fraction(&native_frame(8, 8, |x, _| [byte(x), 0, 0, 255]), (8, 8), two, 1),
+            flat_block_fraction(
+                &native_frame(8, 8, |x, _| [byte(x), 0, 0, 255]),
+                (8, 8),
+                two,
+                1
+            ),
             Some(0.0),
             "…and a value that steps once per native pixel is flat nowhere",
         );
@@ -1926,6 +1934,7 @@ mod tests {
     ///
     /// **Falsified** by flipping an arm, or by adding a variant to [`Kind`].
     #[test]
+    #[allow(clippy::match_same_arms)]
     fn every_kind_states_whether_its_native_frame_has_a_flatness_ceiling() {
         for kind in Kind::ALL {
             let ceiling = match kind {

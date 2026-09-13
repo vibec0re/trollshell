@@ -997,8 +997,9 @@ impl Runner {
                 .count();
             println!(
                 "PASS all {} case(s) — {} 1:1 ones inside the proposed ceiling on every \
-                 channel, {supersampled} box-averaged ones bit-identical off every edge \
-                 and inside their edge budget",
+                 channel, {supersampled} box-averaged ones bit-identical off every edge, \
+                 inside their edge budget and inside their native-frame flatness ceiling \
+                 where their kind states one",
                 self.cases.len(),
                 self.cases.len() - supersampled,
             );

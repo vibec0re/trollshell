@@ -2425,8 +2425,8 @@ session.
       max 64 (`FAIL(edges)`), against a measured worst of 11.626 / 40 —
       re-measured in #1186, the commit that gave the halo its bilinear read on
       the stretched path; 10.641 / 39 before it, and the budget stayed put. The
-      two blank-frame guards bind on them too, which is what an all-black blit now
-      trips on all four. What that gate cannot see, stated: on a dot matrix
+      two blank-frame guards bind on them too, which is what an all-black blit
+      now trips on all four. What that gate cannot see, stated: on a dot matrix
       every pixel of a falloff dot is an `edge` by the region split's
       4-neighbour rule, so all four cases report `lit[n=0]` and the
       bit-identical clause is about the flat field only — the lattice, the
@@ -2437,12 +2437,13 @@ session.
       ≤ 13.379 over all eight stretched lattice cases, max ≤ 48). **Both probes
       are spelled out here because a number nobody can reproduce is not a
       measurement** (#1238 review): the radius one multiplies `falloff`'s
-      `denom` by 1.21 on the `u_viewport != u_grid` branch only, and the halo
-      one scales `u_bloom_strength` by 5/4 in the shader's own integer
-      arithmetic on that same branch only — `int halo = min(glow * (snapped ?
-      u_bloom_strength : u_bloom_strength * 5 / 4) / 256, 255);` at
-      `dot_matrix.frag`'s bloom composite, which measures 13.278 on
-      `dot_matrix.oled.readoutx2` and 13.379 on `marquee.oled.phase7x2`.
+      `denom` by 1.21 at both of its call sites on the `u_viewport != u_grid`
+      branch only, and the halo one scales `u_bloom_strength` by 5/4 in the
+      shader's own integer arithmetic on that same branch only —
+      `int halo = min(glow * (snapped ? u_bloom_strength : u_bloom_strength * 5
+      / 4) / 256, 255);` at `dot_matrix.frag`'s bloom composite, which
+      measures 13.278 on `dot_matrix.oled.readoutx2` and 13.379 on
+      `marquee.oled.phase7x2`.
 
       One gate on these eight is **not** a comparison against the kit at all
       (#1238 review): the harness also asks the *native* readback, before the
@@ -2559,8 +2560,8 @@ session.
       carry the native-flatness gate described in the dot-matrix row above, and
       the four text-box ones do not — a text box has no emission, so there is
       no grid-resolution texture read to protect and its frames measure 97.4 %
-      flat either way. The text box's budget is its own and a different *shape* of
-      number — mean 24 / max 192 against a measured worst of 14.016 / 180 —
+      flat either way. The text box's budget is its own and a different
+      *shape* of number — mean 24 / max 192 against a measured worst of 14.016 / 180 —
       because the kit anti-aliases none of this widget's edges, so every
       legitimate disagreement is the full field-to-transparent contrast (180 on
       the LCD, 0 on the OLED, whose field is black) and the mean is really a

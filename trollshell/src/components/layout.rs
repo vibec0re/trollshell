@@ -126,8 +126,10 @@ pub(crate) const EDIT_FORM_WIDTH: i32 = 960;
 /// `panels::workspaces`' module doc), so the two counts can legitimately
 /// disagree.
 ///
-/// `const fn` so `panels::workspaces` can seed its published-width cell with
-/// `workspaces_page_width(0)` in a `const` block rather than repeating 680.
+/// `const fn` because it is a pure table lookup with no side effects — nothing
+/// in the tree actually calls it from a `const` context. (It used to seed a
+/// published-width cell in `panels::workspaces`; #1225's review deleted that
+/// cell — see [`fill_page_to_its_cap`] — and nothing replaced the const use.)
 pub(crate) const fn workspaces_page_width(columns: usize) -> i32 {
     match columns {
         0 | 1 => DRAWER_MAX_WIDTH,
@@ -169,11 +171,20 @@ pub(crate) fn set_page_width(clamp: &adw::Clamp, width: i32) {
 /// width the page decided on — for the Workspaces page,
 /// `panels::workspaces`' binding sets all three properties from
 /// [`workspaces_page_width`] on every model revision — so reading it back here
-/// means the number lives in exactly one place and the on-show re-push can never
-/// be a revision behind the page it is flooring (#1225 review, MEDIUM 3: the
-/// published-number cell this replaces was still at its seed on the very first
-/// show, because `bind` applies a turn later than the synchronous
-/// build → show → present call stack).
+/// means the number lives in exactly one place, with no second copy for it to
+/// drift out of step with (#1225 review, MEDIUM 3: the published-number cell
+/// this replaces *was* that second copy, kept in sync by hand and free to go
+/// stale against the clamp it described).
+///
+/// That does not erase the timing gap underneath, only the class of bug where
+/// two copies disagree: on a fresh panel's very first show there has been no
+/// main-loop turn yet, so `bind` has not applied and `clamp.maximum_size()`
+/// still answers the page's *seed* width, not its settled one — measured
+/// straight out of `build_panel`, with no pump, as `max=618 tight=618 req=-1`;
+/// this function floors the page at that 618 for one turn, and `bind` widens it
+/// to 873 the moment the loop pumps. Invisible on glass: the idle that
+/// recenters the drawer under its anchor runs after `bind` applies, so nobody
+/// sees the 618-px frame.
 ///
 /// `tightening_threshold` is re-pushed alongside it for the reason
 /// [`finish_page`] documents — a threshold below the maximum makes the clamp

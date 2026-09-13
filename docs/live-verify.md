@@ -4045,7 +4045,12 @@ trollshell`. Expect the cards to come back Active and **no notification at
     whatever the page behind it measured, so **from a one- or two-screen page
     the drawer visibly widens on ✎ and narrows back on Save/Cancel**. That jump
     is expected and approved (Annika, #1219: _"Slight jump in edit form is
-    ok."_); what would be a regression is the form opening narrow.
+    ok."_); what would be a regression is the form opening narrow. Save/Cancel's
+    narrowing is the ordinary page-show path, not a special case for leaving
+    Edit — `switch_active` → `on_page_show` → `apply_workspaces_width_cap` —
+    and it works because the pages stack is `hhomogeneous(false)`, so the Edit
+    slot's leftover 960-px request cannot keep the drawer wide once that path
+    re-floors the page.
   - **The apps column is ~700 px, running or stopped.** This is #1220 itself.
     With a **stopped** stack, ✎ and check the Apps rows have room for the name
     plus the launch-command entry — not the ~150-px column in the issue's

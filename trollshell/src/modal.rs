@@ -2172,11 +2172,15 @@ fn apply_workspaces_width_cap(panel: &ModalPanel) {
 /// longer agree with is the page behind them, and that jump is accepted (Annika,
 /// #1219, 2026-09-13: *"Slight jump in edit form is ok."*).
 ///
-/// Reached from **two** routes and both must run it: [`show_panel_active`] (the
-/// `Active` re-show path) and [`switch_to_workspace_edit`] (the ✎ button, which
-/// is the only route a user ever takes). The second one is why this is worth
-/// spelling out — it called `set_stack_active` alone until #1225's review, so in
-/// production this cap never ran at all and the form sat at its minimum.
+/// Reached through **one** route: [`switch_to_workspace_edit`] — the ✎ button,
+/// the only place `Active::WorkspaceEdit` is ever constructed — which calls
+/// `on_active_show`, whose `Active::WorkspaceEdit` arm calls this. Worth
+/// spelling out because until #1225's review `switch_to_workspace_edit` called
+/// `set_stack_active` alone, so in production this cap never ran at all and the
+/// form sat at its minimum. [`show_panel_active`] also routes through
+/// `on_active_show`, but its own two call sites (`open_plugin_by_key`,
+/// `show_panel`) only ever pass `Active::Plugin`/`Active::Builtin`, so it never
+/// actually reaches this arm.
 fn apply_workspace_edit_width_cap(panel: &ModalPanel) {
     let Some(widget) = panel.stack.child_by_name(WORKSPACE_EDIT_STACK_CHILD) else {
         return;

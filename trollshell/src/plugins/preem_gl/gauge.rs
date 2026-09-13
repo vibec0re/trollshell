@@ -824,25 +824,29 @@ mod tests {
     /// lint, and the rendered parity harness at `scale == 1` — stayed green.
     /// It now delegates to `parity::assert_scaled_lengths`, which anchors on
     /// the exact text from each constant through its multiply, immediately
-    /// followed by the statement's own terminator: a leading extra factor
-    /// breaks the match before the constant even starts, a trailing one breaks
-    /// it right after the multiply, and a literal standing in for the constant
-    /// (hiding the extra factor as a rewritten "kit" value rather than a second
-    /// multiplicand) fails simply because the constant's name is no longer in
-    /// the source at all.
+    /// followed by the statement's own terminator, and counts how many sites
+    /// carry it: a leading extra factor breaks the match before the constant
+    /// even starts, a trailing one breaks it right after the multiply, a
+    /// literal standing in for the constant (hiding the extra factor as a
+    /// rewritten "kit" value rather than a second multiplicand) fails simply
+    /// because the constant's name is no longer in the source at all, and
+    /// widening only one of `MAJOR_HW`'s two identical call sites drops its
+    /// count from two to one rather than leaving the other, untouched site to
+    /// pass the check on the widened one's behalf.
     ///
     /// So it is pinned here, in the source, in the two ways it can break: `s`
     /// stopping being the upscale, and a use of a length losing its exact,
-    /// untampered `* s` (or `* u_upscale`). A source scan is a weak instrument
-    /// and this is the case that earns one — the alternative is no check at
-    /// all on a change that widens every tick and every arc on every dial on
-    /// the glass.
+    /// untampered `* s` (or `* u_upscale`) at every site it is drawn with. A
+    /// source scan is a weak instrument and this is the case that earns one —
+    /// the alternative is no check at all on a change that widens every tick
+    /// and every arc on every dial on the glass.
     ///
     /// **Falsified** by `float s = u_upscale;` -> `float s = 1.0;` (the first
     /// assertion); by a leading extra factor (`ARC_HW * s` -> `ARC_HW * 1.5 *
-    /// s`); by a trailing one (`MAJOR_HW * s` -> `MAJOR_HW * s * 1.5`); or by a
-    /// literal standing in for the named constant (`(ARC_HW + VALUE_HW_BONUS)`
-    /// -> `(ARC_HW + 0.5)`).
+    /// s`); by a trailing one at only one of `MAJOR_HW`'s two call sites
+    /// (`MAJOR_HW * s` -> `MAJOR_HW * s * 1.5` at just the major-tick clause,
+    /// leaving the mid-tick one untouched); or by a literal standing in for
+    /// the named constant (`(ARC_HW + VALUE_HW_BONUS)` -> `(ARC_HW + 0.5)`).
     #[test]
     fn the_shader_scales_every_logical_length_it_draws_with() {
         use super::super::parity::assert_scaled_lengths;
@@ -858,19 +862,21 @@ mod tests {
             LIT_FRAG,
             &[
                 // The flat scale arc's half-width, in `face_intensity`.
-                ("ARC_HW", "ARC_HW * s", ','),
-                // The major/mid tick half-width — same text at both of its two
-                // call sites (the mid tick's own clause and the major one's).
-                ("MAJOR_HW", "MAJOR_HW * s", ';'),
+                ("ARC_HW", "ARC_HW * s", ',', 1),
+                // The major/mid tick half-width — the identical text at both
+                // of its two call sites (the mid tick's own clause and the
+                // major one's), so a widened half-width at only one of them
+                // still drops the count from two.
+                ("MAJOR_HW", "MAJOR_HW * s", ';', 2),
                 // The minor tick half-width.
-                ("MINOR_HW", "MINOR_HW * s", ';'),
+                ("MINOR_HW", "MINOR_HW * s", ';', 1),
                 // The needle blade's tip half-width, in `blade_shade`.
-                ("BLADE_TIP", "BLADE_TIP * u_upscale", ','),
+                ("BLADE_TIP", "BLADE_TIP * u_upscale", ',', 1),
                 // The value arc's extra fattening over `ARC_HW`, folded into
                 // one sum before the multiply — pinning the text from the
                 // sum's close paren through the multiply is what catches the
                 // constant being swapped for a bare literal.
-                ("VALUE_HW_BONUS", "VALUE_HW_BONUS) * u_upscale", ','),
+                ("VALUE_HW_BONUS", "VALUE_HW_BONUS) * u_upscale", ',', 1),
             ],
         );
     }

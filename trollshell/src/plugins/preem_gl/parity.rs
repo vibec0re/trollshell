@@ -931,11 +931,12 @@ pub(crate) fn with_native_flatness(
     }
 }
 
-/// Assert that each `(name, term, terminator)` triple's `term` — the shader
-/// text from a kit constant through the `* <scale>` multiply that scales it
-/// into native pixels — appears in `source` **immediately followed by
-/// `terminator`**, with nothing between them (#1164; the same
-/// parse-the-shipped-GLSL shape `program::assert_crt_constants` uses).
+/// Assert that each `(name, term, terminator, sites)` quadruple's `term` — the
+/// shader text from a kit constant through the `* <scale>` multiply that
+/// scales it into native pixels — appears in `source` **exactly `sites`
+/// times, each immediately followed by `terminator`** with nothing between
+/// them (#1164; the same parse-the-shipped-GLSL shape
+/// `program::assert_crt_constants` uses).
 ///
 /// `terminator` is the single character the surrounding GLSL closes the
 /// expression on: `,` inside a call's argument list, `;` for a
@@ -953,18 +954,31 @@ pub(crate) fn with_native_flatness(
 /// into a sum) fails because `term` — which spells the constant's name — is
 /// no longer in the source at all.
 ///
+/// `sites` closes a second gap a plain "found at least once" check leaves
+/// open: `MAJOR_HW`'s half-width is drawn at **two** call sites carrying the
+/// identical text (the mid tick's clause and the major one's), so widening
+/// only one of them still leaves the other's untouched `MAJOR_HW * s;`
+/// findable — a bare `contains` would report that as a pass. Counting every
+/// occurrence closes it: one widened site drops the count from two to one.
+///
 /// A source scan, not a parser, same caveat `program::assert_crt_constants`
 /// carries: it is only as strong as the `term` text each caller writes down,
 /// which is why every call site is expected to name the constant it means to
 /// pin rather than a fragment generic enough to match by accident.
-pub(crate) fn assert_scaled_lengths(shader: &str, source: &str, lengths: &[(&str, &str, char)]) {
-    for (name, term, terminator) in lengths {
+pub(crate) fn assert_scaled_lengths(
+    shader: &str,
+    source: &str,
+    lengths: &[(&str, &str, char, usize)],
+) {
+    for (name, term, terminator, sites) in lengths {
         let wanted = format!("{term}{terminator}");
-        assert!(
-            source.contains(&wanted),
-            "{shader} does not scale {name} as `{wanted}` — a leading or trailing \
-             extra factor, or a literal standing in for the named constant, would \
-             all leave this exact text unfindable",
+        let found = source.matches(wanted.as_str()).count();
+        assert_eq!(
+            found, *sites,
+            "{shader} scales {name} as `{wanted}` at {found} site(s), wanted exactly \
+             {sites} — a leading or trailing extra factor, a literal standing in for \
+             the named constant, or a widened site among several would all move this \
+             count",
         );
     }
 }

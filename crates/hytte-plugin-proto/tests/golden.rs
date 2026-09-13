@@ -41,6 +41,23 @@
 //! committing — a diff you can't explain from the source change is exactly
 //! the wire break this suite exists to catch.
 //!
+//! A second explainable shape, from #1158: bumping [`VOCAB`] moves exactly one
+//! byte in each of **three** files, because three of them stamp the census —
+//! `manifest_full_v1` and `plugin_register_v1` through
+//! [`full_manifest`]'s `vocab_max`, and `host_msgs_v1` through
+//! [`HostMsg::Hello`]'s advertised `vocab`. Measured on #1158's own bump: one
+//! differing byte per file (`05` → `06`), each immediately after the `vocab_max`
+//! / `vocab` key, with the frame length and every other byte's position
+//! unchanged. That is what tells this diff apart from a real encoder change —
+//! the census is a `u16` whose *value* moved, not a field whose shape did.
+//!
+//! What did **not** move in those files is the `mount` tag, and that is the
+//! point: #1158 pinned its new mount in a **new** fixture
+//! (`plugin_register_sidebar_right_v1`) rather than re-pointing
+//! `plugin_register_v1`, so the bytes a left-mounted plugin has sent since #450
+//! stay committed evidence for the epic's "the wire grows three variants rather
+//! than a `side` field" decision.
+//!
 //! One diff shape *is* explainable and looks alarming: appending the **16th**
 //! [`Capability`] crosses `MessagePack`'s `fixarray` limit (15), so the capability
 //! array header in `manifest_full_v1` and `plugin_register_v1` goes from one
@@ -1028,6 +1045,24 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 node: "golden".into(),
                 kind: EventKind::Click,
                 output: Some("DP-2".into()),
+            }),
+        ),
+        // #1158's right-sidebar mount, on a **minimal** manifest and in its own
+        // file. Deliberately not folded into `plugin_register_v1`: that fixture's
+        // job is to pin the bytes a *left*-mounted plugin has been sending since
+        // #450, and moving its `mount` tag would retire exactly the evidence the
+        // epic's "the wire grows three variants rather than a `side` field"
+        // decision rests on. A new file adds the new tag's bytes without
+        // disturbing it.
+        //
+        // `Manifest::new` rather than `full_manifest()` on purpose — this fixture
+        // exists to pin one string (`"SidebarRightTop"`, the externally-tagged
+        // variant name) in a `Register` frame, so the rest of it is kept as small
+        // as the type allows and cannot drift for reasons unrelated to the mount.
+        (
+            "plugin_register_sidebar_right_v1",
+            Box::new(PluginMsg::Register {
+                manifest: Manifest::new("right-hand", Mount::SidebarRightTop),
             }),
         ),
     ]

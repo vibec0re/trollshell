@@ -361,9 +361,18 @@ fn args_file_body(args: &[String]) -> String {
 /// the older single-path `wallpaper.path` — write the result to state, and
 /// leave both legacy files untouched. Neither resolving is the ordinary
 /// zero-state.
+///
+/// The "state wins once it exists" half is [`state::load_if_present`], not a
+/// local re-statement of it: this subsystem cannot use
+/// [`state::load_or_migrate_from`] wholesale (that takes a single `old` path,
+/// and this chain is two deep with a per-file precedence the log line has to
+/// name), but the rule with the user-visible consequence — a corrupt state
+/// file falls to the default rather than re-opening the migration — must have
+/// exactly one implementation. #1233's review mutated both copies of it
+/// independently and nothing went red.
 fn load_state() -> WallpaperState {
-    if state::path(SUBSYSTEM).is_some_and(|p| p.exists()) {
-        return state::load(SUBSYSTEM).unwrap_or_default();
+    if let Some(value) = state::load_if_present(SUBSYSTEM) {
+        return value;
     }
     let json = config_file::read(LEGACY_JSON_FILE);
     let legacy = config_file::read(LEGACY_PATH_FILE);
@@ -1070,6 +1079,36 @@ mod tests {
                 got.default.as_deref(),
                 Some("/state.png"),
                 "state's value must win over either legacy file"
+            );
+        });
+    }
+
+    /// The other half of #1226's contract: state wins **even when it does not
+    /// parse**, so neither legacy file is re-read on a single bad byte. The
+    /// `state_wins_*` test above seeds a *valid* state file, which is the easy
+    /// half; this is the one with a user-visible cost (#1233 F1).
+    #[test]
+    fn a_corrupt_state_file_still_wins_over_both_legacy_files() {
+        scratch_home(|home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "not valid toml {{{").unwrap();
+
+            let json = legacy_json_path(home);
+            std::fs::create_dir_all(json.parent().unwrap()).unwrap();
+            std::fs::write(&json, r#"{"default":"/j.png"}"#).unwrap();
+            let single = legacy_single_path(home);
+            std::fs::write(&single, "/single.png\n").unwrap();
+
+            assert_eq!(
+                load_state(),
+                WallpaperState::default(),
+                "a corrupt state file falls to the zero state, never back to either legacy file"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(),
+                "not valid toml {{{",
+                "the read path must not rewrite the corrupt state file"
             );
         });
     }

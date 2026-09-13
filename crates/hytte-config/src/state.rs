@@ -105,6 +105,40 @@ pub fn store_at<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<
     file::write_atomic(path, &body, Durability::FileOnly)
 }
 
+/// The state file's value **if that file exists at all**, `None` if it does
+/// not — where "exists but does not parse" is `Some(T::default())`, not `None`.
+///
+/// This is #1226's lead contract in one function: **state wins once it
+/// exists**. It is `pub` and split out rather than inlined because there are
+/// two callers — [`load_or_migrate_from`] and `hytte-services`' `wallpaper`,
+/// whose two-deep legacy chain (`wallpaper.json`, then the pre-#546
+/// `wallpaper.path`) does not fit this module's single-`old` shape — and a
+/// rule with two implementations is a rule that can be half-changed. #1233's
+/// review found exactly that: both copies could be mutated to fall back to
+/// legacy on a corrupt state file with all 1079 tests still green.
+///
+/// # Why a corrupt state file does not re-open the migration
+///
+/// It is the one branch where a user loses a setting they can still see on
+/// disk, so the choice is deliberate rather than incidental. A state file is
+/// written by exactly one author — this shell — so "it does not parse" means
+/// the shell's own last write was truncated or the file was hand-edited into
+/// nonsense; neither makes a months-old config-directory file a better
+/// answer than the documented default, and the very next toggle repairs the
+/// state file. The alternative — re-reading legacy whenever state is
+/// unreadable — would make the migration permanently re-armed, so a legacy
+/// file a person edited long after migrating could silently resurrect itself
+/// on a single bad byte. Pinned by
+/// `a_corrupt_state_file_still_wins_over_the_legacy_file`, in this module and
+/// in all six adopters.
+#[must_use]
+pub fn load_if_present<T: serde::de::DeserializeOwned + Default>(subsystem: &str) -> Option<T> {
+    if !path(subsystem).is_some_and(|p| p.exists()) {
+        return None;
+    }
+    Some(load(subsystem).unwrap_or_default())
+}
+
 /// Load `subsystem`'s state, migrating a legacy `~/.config/trollshell/*` file
 /// the first time the state file doesn't exist yet (#1226).
 ///
@@ -113,7 +147,8 @@ pub fn store_at<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<
 /// [`load`]'s own warn-and-fall-back-to-`T::default()` behaviour, unchanged
 /// by having a migration source available. That is the second half of
 /// #1226's contract: once migrated, a hand-edited or corrupted legacy file
-/// has no effect, ever again.
+/// has no effect, ever again. [`load_if_present`] is that half, and it is
+/// where the argument for it is written down.
 ///
 /// **Migrate once, non-destructively.** If the state file is absent, `old`
 /// names a path, that path is readable, and `parse_old` accepts its
@@ -132,8 +167,8 @@ where
     T: serde::de::DeserializeOwned + serde::Serialize + Default,
     F: FnOnce(&str) -> Option<T>,
 {
-    if path(subsystem).is_some_and(|p| p.exists()) {
-        return load(subsystem).unwrap_or_default();
+    if let Some(value) = load_if_present(subsystem) {
+        return value;
     }
     let Some(old) = old else {
         return T::default();
@@ -294,6 +329,49 @@ mod tests {
                 value,
                 Flag { enabled: false },
                 "state's value must win over the (unreadable) old file"
+            );
+        });
+    }
+
+    /// The half of #1226's contract the module doc leads with, and the half
+    /// with a user-visible cost: **a state file that exists but does not
+    /// parse still wins**. The three `state_wins_*` tests in this tree all
+    /// seed a *valid* state file, so before #1233 both implementations of
+    /// this rule could be mutated into falling back to legacy with all 1079
+    /// tests green.
+    #[test]
+    fn a_corrupt_state_file_still_wins_over_the_legacy_file() {
+        scratch_home(|home| {
+            let state_path = path("migrate-d").expect("state path resolves");
+            std::fs::create_dir_all(state_path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&state_path, "not valid toml {{{").expect("seed corrupt state");
+
+            let old = home.join("old-d.toml");
+            std::fs::write(&old, "enabled = true\n").expect("seed old");
+
+            // Recorded rather than `panic!`ed so a regression fails with the
+            // message that explains it, instead of unwinding out through
+            // `temp_env`'s serialising lock.
+            let consulted = std::cell::Cell::new(false);
+            let value: Flag = load_or_migrate_from("migrate-d", Some(&old), |_text| {
+                consulted.set(true);
+                Some(Flag { enabled: true })
+            });
+
+            assert!(
+                !consulted.get(),
+                "a corrupt state file must not re-open the legacy migration"
+            );
+            assert_eq!(
+                value,
+                Flag::default(),
+                "a corrupt state file falls to the zero state, never back to legacy"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).expect("state file survives"),
+                "not valid toml {{{",
+                "the read path must not rewrite the corrupt state file — the next \
+                 write repairs it, a migration behind the user's back does not"
             );
         });
     }

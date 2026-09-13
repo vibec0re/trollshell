@@ -1036,6 +1036,33 @@ mod tests {
         });
     }
 
+    /// State wins **even when it does not parse** — the half of #1226's
+    /// contract with a user-visible cost, and the one the `state_wins_*` test
+    /// above cannot reach because it seeds a valid state file (#1233 F1).
+    #[test]
+    fn a_corrupt_state_file_still_wins_over_the_legacy_file() {
+        scratch_home(|home| {
+            let state_path = state::path(KEEP_AWAKE_SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "not valid toml {{{").unwrap();
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = true\n").unwrap();
+
+            assert!(
+                !load_keep_awake_from_disk(),
+                "a corrupt state file falls to the documented default (OFF), \
+                 never back to the legacy file's ON"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(),
+                "not valid toml {{{",
+                "the read path must not rewrite the corrupt state file"
+            );
+        });
+    }
+
     #[test]
     fn neither_file_present_defaults_to_off() {
         scratch_home(|_home| {

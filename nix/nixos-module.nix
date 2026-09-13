@@ -51,6 +51,19 @@ let
     }) cfg.plugins;
   };
 
+  # Bottom-up prune of one subsystem's option value (#1237 review MEDIUM-1) —
+  # drop every `null` leaf, then every attrset the dropping emptied. Mirrors
+  # `nix/hm-module.nix`'s `prune` exactly; see there for why
+  # `lib.filterAttrsRecursive` cannot do the second half, why an
+  # attrset-valued knob with a `default = { }` (`agents`' `display`) breaks
+  # the `filtered == { }` guard without it, and what `!lib.isDerivation`
+  # is for.
+  prune =
+    set:
+    lib.filterAttrs (_: v: !(v == null || (lib.isAttrs v && !lib.isDerivation v && v == { }))) (
+      lib.mapAttrs (_: v: if lib.isAttrs v && !lib.isDerivation v then prune v else v) set
+    );
+
   # Base-layer config files (#866/#868, #1041): each
   # `programs.trollshell.config.<subsystem>` attrset renders to
   # `<subsystem>.toml` — one store-path file per subsystem that declares at
@@ -62,11 +75,17 @@ let
   # `XDG_CONFIG_DIRS`: `/etc/xdg` is already the default base entry
   # `crates/hytte-config/src/xdg.rs` falls back to when the variable is
   # unset, and this module (unlike home-manager) actually owns `/etc`.
+  #
+  # The inner filter is `prune` above, not a flat `filterAttrs` — see the
+  # matching comment in `nix/hm-module.nix` for why (`agents`' `display`
+  # field nests a submodule's own unset fields one level below `value`, and
+  # `core-leds` has no nested field so `prune` is a plain `filterAttrs`
+  # there).
   configFiles = lib.filterAttrs (_: v: v != null) (
     lib.mapAttrs (
       name: value:
       let
-        filtered = lib.filterAttrs (_: v: v != null) value;
+        filtered = prune value;
       in
       if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
     ) cfg.config

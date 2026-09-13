@@ -395,8 +395,11 @@ fn load_state() -> WallpaperState {
         config_file::path(LEGACY_PATH_FILE)
     };
     if let Some(old) = old {
+        let new_path = state::path(SUBSYSTEM).unwrap_or_default();
         tracing::info!(
+            subsystem = SUBSYSTEM,
             old = %old.display(),
+            new = %new_path.display(),
             "wallpaper: migrating a shell-written toggle file from the config directory to state (#1226)"
         );
     }
@@ -712,7 +715,7 @@ mod tests {
         WallpaperState, args_file_body, load_state, primary_image, shell_single_quote, state,
         state_from_disk, swaybg_args,
     };
-    use hytte_config::test_support::scratch_home;
+    use hytte_config::test_support::{capture, scratch_home};
     use std::collections::BTreeMap;
 
     fn expand(cmd: &str, path: &str) -> String {
@@ -1032,6 +1035,7 @@ mod tests {
             std::fs::write(&legacy, r#"{"default":"/j.png"}"#).unwrap();
             let before = std::fs::metadata(&legacy).unwrap();
 
+            let (captured, _guard) = capture();
             let got = load_state();
             assert_eq!(got.default.as_deref(), Some("/j.png"));
 
@@ -1044,6 +1048,32 @@ mod tests {
                 state::load::<WallpaperState>(SUBSYSTEM).as_ref(),
                 Some(&got),
                 "the written state must read back as the migrated value"
+            );
+
+            // Pin (#1240 N1): this subsystem's own migration `info!` line
+            // shares the same three-field shape as `state::load_or_migrate_from`'s
+            // (`subsystem`, `old`, `new`) rather than the `old`-only shape it
+            // shipped with — drop the `new` field from the call site and this
+            // goes red.
+            let migrations: Vec<_> = captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::INFO)
+                .collect();
+            assert_eq!(
+                migrations.len(),
+                1,
+                "exactly one migration line, got {migrations:?}"
+            );
+            let fields = &migrations[0].fields;
+            assert_eq!(fields.get("subsystem").map(String::as_str), Some(SUBSYSTEM));
+            assert_eq!(
+                fields.get("old").map(String::as_str),
+                Some(legacy.display().to_string()).as_deref()
+            );
+            assert_eq!(
+                fields.get("new").map(String::as_str),
+                Some(state_path.display().to_string()).as_deref()
             );
 
             let after = std::fs::metadata(&legacy).unwrap();

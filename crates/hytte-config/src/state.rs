@@ -66,7 +66,11 @@ pub fn load<T: serde::de::DeserializeOwned>(subsystem: &str) -> Option<T> {
     match toml::from_str(&text) {
         Ok(value) => Some(value),
         Err(e) => {
-            tracing::warn!(subsystem, error = %e, "state file does not parse; ignoring it");
+            tracing::warn!(
+                subsystem,
+                error = %e,
+                "state file does not parse; the documented default is now in force, and the next write overwrites this file"
+            );
             None
         }
     }
@@ -156,7 +160,8 @@ pub fn load_if_present<T: serde::de::DeserializeOwned + Default>(subsystem: &str
 /// [`store`] — and returned. `old` itself is left completely alone: never
 /// deleted, never renamed. A file a person's own daemon unit might still be
 /// reading (or that they just haven't looked at in months) is not this
-/// shell's to remove. Logs once at `info`, naming both paths.
+/// shell's to remove. Logs once at `info`, naming both paths (`old` and
+/// `new`).
 ///
 /// **Otherwise, the zero state.** No state file and either no `old` path, no
 /// file there, or a `parse_old` that returns `None` all fall back to
@@ -179,9 +184,11 @@ where
     let Some(value) = parse_old(&text) else {
         return T::default();
     };
+    let new_path = path(subsystem).unwrap_or_default();
     tracing::info!(
         subsystem,
         old = %old.display(),
+        new = %new_path.display(),
         "migrating a shell-written toggle file from the config directory to state (#1226)"
     );
     store(subsystem, &value);
@@ -206,7 +213,7 @@ pub fn remove(subsystem: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scratch_home;
+    use crate::test_support::{capture, scratch_home};
 
     #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Toggle {
@@ -281,6 +288,7 @@ mod tests {
             std::fs::write(&old, "enabled = true\n").expect("seed old");
             let before = std::fs::metadata(&old).expect("meta");
 
+            let (captured, _guard) = capture();
             let value: Flag = load_or_migrate_from("migrate-a", Some(&old), |text| {
                 Some(Flag {
                     enabled: text.contains("true"),
@@ -294,6 +302,31 @@ mod tests {
                 load::<Flag>("migrate-a"),
                 Some(Flag { enabled: true }),
                 "the written state must read back as the migrated value"
+            );
+
+            // Pin (#1240 N1): the migration `info!` line names *both* paths,
+            // not just `old` with the destination merely implied by
+            // `subsystem` — drop the `new` field from the call site and this
+            // goes red.
+            let migrations: Vec<_> = captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::INFO)
+                .collect();
+            assert_eq!(
+                migrations.len(),
+                1,
+                "exactly one migration line, got {migrations:?}"
+            );
+            let fields = &migrations[0].fields;
+            assert_eq!(fields.get("subsystem").map(String::as_str), Some("migrate-a"));
+            assert_eq!(
+                fields.get("old").map(String::as_str),
+                Some(old.display().to_string()).as_deref()
+            );
+            assert_eq!(
+                fields.get("new").map(String::as_str),
+                Some(state_path.display().to_string()).as_deref()
             );
 
             let after = std::fs::metadata(&old).expect("meta");

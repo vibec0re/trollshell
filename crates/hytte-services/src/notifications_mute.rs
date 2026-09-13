@@ -69,10 +69,15 @@ fn load_from_disk() -> HashSet<String> {
     loaded.apps.into_iter().collect()
 }
 
-/// Parse a single `apps = ["X", "Y", ...]` line out of the TOML body.
-/// Permissive: ignores comments, anything after the last `]`, and entries with
-/// embedded `"` are not supported (we just emit raw strings on save). App
-/// names with double quotes are dropped on load.
+/// Parse a single `apps = ["X", "Y", ...]` line out of the **legacy**
+/// config file's body — used only by [`load_from_disk`]'s one-time migration,
+/// never by the state reader (that goes through [`state::load_or_migrate_from`]
+/// and its real TOML parser). Permissive: ignores comments and anything after
+/// the last `]`; an app name containing `"` cannot be represented in the
+/// legacy hand-rolled format this reads, so such an entry is dropped on load.
+/// `save_to_disk` no longer has this limitation — it renders through
+/// [`state::store`]'s TOML serializer, which escapes quotes correctly (see
+/// `an_app_name_with_a_quote_round_trips`).
 fn parse_apps_line(text: &str) -> HashSet<String> {
     for line in text.lines() {
         let trimmed = line.trim();

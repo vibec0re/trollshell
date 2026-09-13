@@ -4453,7 +4453,7 @@ location.
       `~/.config/trollshell/dnd.toml` still has its original bytes _and_
       mtime — the migration reads it and never writes, renames or deletes it.
       `journalctl --user -u trollshell -g 1226` shows one `info` line per
-      migrated file naming both paths.
+      migrated file naming both paths (`old` and `new`).
 - [ ] **(#1226)** **Only state moves after that.** Flip the toggle again;
       only the state file's mtime changes and the config-dir file is not
       touched a second time. Repeat for the other four:

@@ -1840,14 +1840,34 @@ pub(super) fn invalidate_cached_frames() {
         for state in store.values_mut() {
             for instance in state.instances.values_mut() {
                 instance.cached = None;
-                if matches!(
-                    instance.renderer,
+                // An exhaustive `match` on `Option<&Renderer>` rather than a
+                // `matches!` (#1211): every kind's arm is named on its own
+                // `false`, so a Renderer variant added without a decision here
+                // fails to compile instead of silently inheriting "no rebuild
+                // needed" — the answer that is right for every kind today but
+                // must be *stated*, not assumed, for the next one.
+                let needs_rebuild = match &instance.renderer {
                     // Both arms: the GL one holds the same baked builder, and
                     // its uniforms are mapped from the layout that builder
                     // resolved, so dropping bytes it does not have would leave
                     // the old palette on screen (#1152).
-                    Some(Renderer::TextBox { .. } | Renderer::TextBoxGl { .. })
-                ) {
+                    Some(Renderer::TextBox { .. } | Renderer::TextBoxGl { .. }) => true,
+                    Some(
+                        Renderer::DotMatrix { .. }
+                        | Renderer::DotMatrixGl { .. }
+                        | Renderer::SevenSeg { .. }
+                        | Renderer::LedStrip { .. }
+                        | Renderer::Marquee { .. }
+                        | Renderer::MarqueeGl { .. }
+                        | Renderer::Scope { .. }
+                        | Renderer::ScopeGl { .. }
+                        | Renderer::Gauge { .. }
+                        | Renderer::GaugeGl { .. }
+                        | Renderer::FlipBoard { .. },
+                    )
+                    | None => false,
+                };
+                if needs_rebuild {
                     instance.renderer = build(&instance.applied);
                 }
             }
@@ -2625,32 +2645,33 @@ impl Renderer {
     /// Whether this renderer was built for `widget`'s kind. A mismatch means the
     /// plugin swapped one widget for another under the same node key, which
     /// rebuilds.
+    ///
+    /// An exhaustive `match` on `self` alone, rather than a `matches!` over
+    /// `(self, widget)` pairs (#1211): the outer dispatch has no catch-all, so
+    /// a Renderer variant added without an arm here fails to *compile* instead
+    /// of silently taking a permanent `matches_kind() == false` (rebuild every
+    /// frame) — the failure mode a missing pair in the old list degraded to.
     fn matches_kind(&self, widget: &vocab::PreemWidget) -> bool {
         use vocab::PreemWidget as W;
-        matches!(
-            (self, widget),
-            (Self::DotMatrix { .. }, W::DotMatrix { .. })
-                // …and the same for the two `DotMatrix` arms (#1144).
-                | (Self::DotMatrixGl { .. }, W::DotMatrix { .. })
-                | (Self::SevenSeg { .. }, W::SevenSeg { .. })
-                | (Self::TextBox { .. }, W::TextBox { .. })
-                // …and the same for the two `TextBox` and `Marquee` arms
-                // (#1152).
-                | (Self::TextBoxGl { .. }, W::TextBox { .. })
-                | (Self::LedStrip { .. }, W::LedStrip { .. })
-                | (Self::Marquee { .. }, W::Marquee { .. })
-                | (Self::MarqueeGl { .. }, W::Marquee { .. })
-                | (Self::Scope { .. }, W::Scope { .. })
-                // Both `Scope` arms answer for the same wire kind: which one an
-                // instance holds is the host's choice (`preem_gl::arm`), not
-                // the plugin's, so a kind mismatch here would rebuild every
-                // frame rather than never.
-                | (Self::ScopeGl { .. }, W::Scope { .. })
-                | (Self::Gauge { .. }, W::Gauge { .. })
-                // …and the same for the two `Gauge` arms (#1143).
-                | (Self::GaugeGl { .. }, W::Gauge { .. })
-                | (Self::FlipBoard { .. }, W::FlipBoard { .. })
-        )
+        match self {
+            // …and the same for the two `DotMatrix` arms (#1144).
+            Self::DotMatrix { .. } | Self::DotMatrixGl { .. } => {
+                matches!(widget, W::DotMatrix { .. })
+            }
+            Self::SevenSeg { .. } => matches!(widget, W::SevenSeg { .. }),
+            // …and the same for the two `TextBox` and `Marquee` arms (#1152).
+            Self::TextBox { .. } | Self::TextBoxGl { .. } => matches!(widget, W::TextBox { .. }),
+            Self::LedStrip { .. } => matches!(widget, W::LedStrip { .. }),
+            Self::Marquee { .. } | Self::MarqueeGl { .. } => matches!(widget, W::Marquee { .. }),
+            // Both `Scope` arms answer for the same wire kind: which one an
+            // instance holds is the host's choice (`preem_gl::arm`), not
+            // the plugin's, so a kind mismatch here would rebuild every
+            // frame rather than never.
+            Self::Scope { .. } | Self::ScopeGl { .. } => matches!(widget, W::Scope { .. }),
+            // …and the same for the two `Gauge` arms (#1143).
+            Self::Gauge { .. } | Self::GaugeGl { .. } => matches!(widget, W::Gauge { .. }),
+            Self::FlipBoard { .. } => matches!(widget, W::FlipBoard { .. }),
+        }
     }
 
     /// Whether this renderer draws on the **GPU**, and so hands the reconciler
@@ -2668,15 +2689,27 @@ impl Renderer {
     /// `plugins::tests`: an arm that answers `true` here and `None` there would
     /// rasterise nothing and never be rebuilt onto the kit — a permanently
     /// blank chip.
+    ///
+    /// An exhaustive `match` rather than a `matches!` (#1211): every non-GL
+    /// arm is named on its own `false` arm, so a new Renderer variant has to
+    /// answer `true` or `false` here to compile at all, rather than falling
+    /// into an implicit `_ => false`.
     fn is_gl(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::ScopeGl { .. }
-                | Self::GaugeGl { .. }
-                | Self::DotMatrixGl { .. }
-                | Self::MarqueeGl { .. }
-                | Self::TextBoxGl { .. }
-        )
+            | Self::GaugeGl { .. }
+            | Self::DotMatrixGl { .. }
+            | Self::MarqueeGl { .. }
+            | Self::TextBoxGl { .. } => true,
+            Self::DotMatrix { .. }
+            | Self::SevenSeg { .. }
+            | Self::TextBox { .. }
+            | Self::LedStrip { .. }
+            | Self::Marquee { .. }
+            | Self::Scope { .. }
+            | Self::Gauge { .. }
+            | Self::FlipBoard { .. } => false,
+        }
     }
 
     /// Point the renderer at `widget`'s new **state**, keeping the animation it
@@ -3376,4 +3409,31 @@ pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
     let renderer = build(widget)?;
     let style = display_style(widget.style());
     Some((renderer.is_gl(), renderer.gl_surface(style).is_some()))
+}
+
+/// Which [`preem_gl::Kind`] `widget`'s wire kind takes a GL arm for, if any
+/// (#1211).
+///
+/// An exhaustive `match` over `vocab::PreemWidget` with no catch-all — the
+/// production-adjacent half of the enumeration `plugins::tests`'
+/// `kind_enumeration` module ties together: a widget kind added to the wire
+/// vocabulary does not compile here until it says whether it has a GL arm,
+/// which is exactly the question [`preem_gl::Kind::ALL`] answers for the five
+/// that do.
+///
+/// Test-only for [`gl_seam_for`]'s reason: [`preem_gl::Kind`] is itself
+/// `cfg(test)`-only, since nothing outside a test needs a widget's *kind* —
+/// only whether its renderer draws on the GPU, which [`Renderer::is_gl`]
+/// answers without naming one.
+#[cfg(test)]
+pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind> {
+    use vocab::PreemWidget as W;
+    match widget {
+        W::Scope { .. } => Some(preem_gl::Kind::Scope),
+        W::Gauge { .. } => Some(preem_gl::Kind::Gauge),
+        W::DotMatrix { .. } => Some(preem_gl::Kind::DotMatrix),
+        W::Marquee { .. } => Some(preem_gl::Kind::Marquee),
+        W::TextBox { .. } => Some(preem_gl::Kind::TextBox),
+        W::SevenSeg { .. } | W::LedStrip { .. } | W::FlipBoard { .. } => None,
+    }
 }

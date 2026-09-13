@@ -11338,4 +11338,174 @@ mod containment_r2 {
             other => panic!("expected a DatasourceResult reply, got {other:?}"),
         }
     }
+
+// ── #1211: one enumeration for the six per-kind GL lists ────────────────────
+
+/// `Kind::ALL` ties together the six per-kind GL lists the #1209 review
+/// (LOW-1) found nothing enumerated: `preem_gl::install`'s registrations,
+/// `Renderer::matches_kind`, `Renderer::invalidate_cached_frames`,
+/// `preem_gl::parity::Kind` (+ `pinned_exact`/`checks_peak_rows`/
+/// `edge_budget`), the parity harness's case list, and the case count
+/// `nix/checks/system-tests.nix` asserts.
+///
+/// What each test here checks, and how it is tied:
+///
+/// - `install`'s register list is now *derived* from `Kind::ALL`
+///   (`preem_gl::mod::install` loops over it and `Kind::gl_seam`), so there is
+///   nothing left here to test — a variant missing from `Kind::gl_seam`'s
+///   `match` fails to compile.
+/// - `matches_kind`/`is_gl`/`invalidate_cached_frames` are now exhaustive
+///   `match`es over `Renderer` with no catch-all (`preem_render.rs`), so a
+///   Renderer variant added without an arm there fails to compile too —
+///   again nothing left to test here.
+/// - `every_gl_kind_widget_takes_the_gl_arm` below is what is left:
+///   `preem_gl::parity::Kind` and `preem_render::gl_kind_for` are two
+///   independent exhaustive matches (one over the five GL kinds, one over the
+///   eight wire kinds), and this is where they are cross-checked against the
+///   real renderer the GL arm builds.
+/// - `every_kind_has_a_harness_case_per_skin` and
+///   `the_nix_case_count_matches_the_harness` close the parity-coverage gap
+///   the review measured: a sixth kind shipping with zero `cases_for` cases,
+///   all green.
+mod kind_enumeration {
+    use hytte_preem as kit;
+
+    use super::super::preem_gl::{self, Case, Kind, cases_for};
+    use super::super::preem_render;
+    use super::{every_preem_widget, preem_ink_lock};
+
+    /// The style every [`Case`] variant carries — a small local mirror of
+    /// `cases_for`'s field shape, exhaustive so a sixth `Case` variant with no
+    /// `style` field fails to compile here rather than being silently
+    /// excluded from [`every_kind_has_a_harness_case_per_skin`].
+    fn case_style(case: &Case) -> kit::DisplayStyle {
+        match case {
+            Case::Scope { style, .. }
+            | Case::Gauge { style, .. }
+            | Case::DotMatrix { style, .. }
+            | Case::Marquee { style, .. }
+            | Case::TextBox { style, .. } => *style,
+        }
+    }
+
+    /// **Every wire kind's GL-arm answer agrees with `Kind::ALL`'s
+    /// membership**, in both directions.
+    ///
+    /// `every_preem_widget()`'s exhaustive `match` is the wire vocabulary's
+    /// forcing function; `gl_kind_for`'s is `Kind`'s. Together they say: a
+    /// widget kind has a GL arm if and only if it names a `Kind`, and that
+    /// kind's renderer, under the GL arm, both claims `is_gl()` and produces
+    /// a surface (the two halves `gl_seam_for` reports) — and every `Kind`
+    /// is reachable from some widget kind, so `gl_kind_for` cannot drop one
+    /// from its `Some` arms unnoticed.
+    ///
+    /// **Falsified** by adding a sixth `Kind` variant with no
+    /// `gl_kind_for` arm answering `Some` for it (`gl_kind_for` stops being
+    /// exhaustive and this file does not compile), or by pointing an
+    /// existing widget's `gl_kind_for` arm at the wrong `Kind` (`install`
+    /// registers that kind's pipeline under a different name than the one
+    /// `gl_surface` produces, so the first assertion reds — not because the
+    /// booleans disagree, but because `gl_seam_for` reads both off the *same*
+    /// renderer and neither answer can lie about the other independently;
+    /// what actually catches a swapped `Kind` is the second loop, since the
+    /// swapped-away `Kind` then reports no widget reaching it).
+    #[test]
+    fn every_gl_kind_widget_takes_the_gl_arm() {
+        let _ink = preem_ink_lock();
+        let widgets = every_preem_widget();
+
+        for widget in &widgets {
+            let kind = preem_render::gl_kind_for(widget);
+            let seam = preem_gl::with_gl_arm(|| preem_render::gl_seam_for(widget))
+                .expect("every vocabulary widget builds");
+            match kind {
+                Some(k) => assert_eq!(
+                    seam,
+                    (true, true),
+                    "{k:?} is in Kind::ALL, so its widget must take the GL arm \
+                     and produce a surface",
+                ),
+                None => assert!(
+                    !seam.0,
+                    "a widget kind absent from Kind::ALL took the GL arm anyway",
+                ),
+            }
+        }
+
+        for kind in Kind::ALL {
+            let reached = widgets
+                .iter()
+                .any(|widget| preem_render::gl_kind_for(widget) == Some(kind));
+            assert!(reached, "no PreemWidget kind maps to {kind:?}");
+        }
+    }
+
+    /// **Every `Kind::ALL` member has at least one harness case per skin** —
+    /// the parity gap the #1209 review measured (LOW-1): a sixth kind could
+    /// ship with zero `cases_for` coverage and every other gate would stay
+    /// green.
+    ///
+    /// Calls the harness's *real* [`cases_for`] (moved to `preem_gl::cases`
+    /// for exactly this reason) rather than a hand-kept count, so a harness
+    /// change that quietly drops a kind's cases reds here instead of only in
+    /// `docs/live-verify.md`'s eyeballed transcript.
+    ///
+    /// **Falsified** by commenting out any one of `cases_for`'s per-kind
+    /// `.chain(...)` calls — the `assert!` for that `(kind, style)` pair
+    /// reds.
+    #[test]
+    fn every_kind_has_a_harness_case_per_skin() {
+        let cases = cases_for(&kit::DisplayStyle::ALL);
+        for kind in Kind::ALL {
+            for style in kit::DisplayStyle::ALL {
+                let has_case = cases
+                    .iter()
+                    .any(|case| case.kind() == kind && case_style(case) == style);
+                assert!(
+                    has_case,
+                    "{kind:?} has no harness case for the {style:?} skin",
+                );
+            }
+        }
+    }
+
+    /// **`nix/checks/system-tests.nix`'s hand-kept `-ne N` count matches the
+    /// harness's own computed total** — the other half of #1211's ask: the
+    /// nix file's literal is read here, not retyped, so a case-list change
+    /// that forgets to bump the nix comment reds in `cargo test` rather than
+    /// only in CI's much slower `system-tests` check.
+    ///
+    /// **Falsified** by adding or removing a case from `cases_for` without
+    /// updating `nix/checks/system-tests.nix`'s `-ne` literal.
+    #[test]
+    fn the_nix_case_count_matches_the_harness() {
+        let harness_count = cases_for(&kit::DisplayStyle::ALL).len();
+
+        let nix_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nix/checks/system-tests.nix");
+        let nix_src = std::fs::read_to_string(&nix_path)
+            .unwrap_or_else(|error| panic!("couldn't read {}: {error}", nix_path.display()));
+        let nix_count: usize = nix_src
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("if [ \"$gl_ppm_count\" -ne ")
+                    .and_then(|rest| rest.strip_suffix(" ]; then"))
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "couldn't find the `if [ \"$gl_ppm_count\" -ne N ]; then` line in {}",
+                    nix_path.display(),
+                )
+            });
+
+        assert_eq!(
+            harness_count, nix_count,
+            "`cases_for` builds {harness_count} case(s) but \
+             nix/checks/system-tests.nix asserts {nix_count} — bump the nix \
+             literal (and its history comment) in the same commit as a \
+             case-list change",
+        );
+    }
 }

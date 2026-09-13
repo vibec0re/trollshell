@@ -250,6 +250,15 @@ craneLib.mkCargoDerivation (
       # is held to its own standard instead (every pixel off an edge
       # bit-identical plus a per-kind edge budget,
       # `parity::case_verdict`), not to #893's ceiling.
+      #
+      # Since #1238 this variable arms a second, unrelated gate too:
+      # `parity::with_native_flatness` only ever asserts under
+      # `TROLLSHELL_PARITY_EXACT=1` (a plain run prints the fraction and
+      # fails on nothing), so a passing case here that regresses a
+      # halo read back to the kit's grid resolution now fails
+      # `FAIL(flat)` rather than merely printing a number nobody
+      # checks — for the two lattice kinds that state a ceiling
+      # (`Kind::flat_block_ceiling`: dot matrix, marquee) only.
       export TROLLSHELL_PARITY_EXACT=1
     '';
     checkPhaseCargoCommand = ''

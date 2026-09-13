@@ -931,6 +931,69 @@ pub(crate) fn with_native_flatness(
     }
 }
 
+/// Assert that each `(name, term, terminator, sites)` quadruple's `term` — the
+/// shader text from a kit constant through the `* <scale>` multiply that
+/// scales it into native pixels — appears in `source` **exactly `sites`
+/// times, each immediately followed by `terminator`** with nothing between
+/// them (#1164; the same parse-the-shipped-GLSL shape
+/// `program::assert_crt_constants` uses).
+///
+/// `terminator` is the single character the surrounding GLSL closes the
+/// expression on: `,` inside a call's argument list, `;` for a
+/// `half_width = …;` statement. Requiring it right after `term` is what makes
+/// this stronger than a bare "does the line mention the name and a multiply"
+/// scan: gauge.rs's `the_shader_scales_every_logical_length_it_draws_with`
+/// used exactly that looser scan until a #1238 re-verification found it
+/// passes a widened dial — `NAME * 1.5 * s` still contains `NAME` and `* s`
+/// *somewhere on the line*, and so does the trailing-factor shape
+/// `NAME * s * 1.5`. Anchoring on `term` immediately followed by `terminator`
+/// closes both directions at once: a **leading** extra factor breaks the
+/// match before `term` even starts, a **trailing** one breaks it right after
+/// `term` ends, and a factor hidden by dropping the named constant in favour
+/// of a literal (`(ARC_HW + 0.5) * u_upscale` for a `VALUE_HW_BONUS` folded
+/// into a sum) fails because `term` — which spells the constant's name — is
+/// no longer in the source at all.
+///
+/// `sites` closes a second gap a plain "found at least once" check leaves
+/// open: `MAJOR_HW`'s half-width is drawn at **two** call sites carrying the
+/// identical text (the mid tick's clause and the major one's), so widening
+/// only one of them still leaves the other's untouched `MAJOR_HW * s;`
+/// findable — a bare `contains` would report that as a pass. Counting every
+/// occurrence closes it: one widened site drops the count from two to one.
+///
+/// A source scan, not a parser, same caveat `program::assert_crt_constants`
+/// carries: it is only as strong as the `term` text each caller writes down,
+/// which is why every call site is expected to name the constant it means to
+/// pin rather than a fragment generic enough to match by accident.
+///
+/// `#[cfg(test)]` for `program::assert_crt_constants`'s own reason: unlike
+/// the rest of this file, this module (`parity`) is `#[path]`-included by the
+/// harness example **without** a `cfg(test)` gate on the `mod` declaration
+/// itself, so a plain `cargo build --example preem_gl_diff` compiles this
+/// function too — and its only caller lives in `gauge.rs`'s `#[cfg(test)] mod
+/// tests`, absent from that same build. Without this attribute the function
+/// is unreachable there and `dead_code` fires; with it, the function itself
+/// is absent from that build and there is nothing to warn about — exactly
+/// `assert_crt_constants`'s situation in `program.rs`.
+#[cfg(test)]
+pub(crate) fn assert_scaled_lengths(
+    shader: &str,
+    source: &str,
+    lengths: &[(&str, &str, char, usize)],
+) {
+    for (name, term, terminator, sites) in lengths {
+        let wanted = format!("{term}{terminator}");
+        let found = source.matches(wanted.as_str()).count();
+        assert_eq!(
+            found, *sites,
+            "{shader} scales {name} as `{wanted}` at {found} site(s), wanted exactly \
+             {sites} — a leading or trailing extra factor, a literal standing in for \
+             the named constant, or a widened site among several would all move this \
+             count",
+        );
+    }
+}
+
 impl Verdict {
     /// The word the transcript prints.
     pub(crate) fn label(self) -> &'static str {
@@ -1832,6 +1895,44 @@ mod tests {
             flat_block_fraction(&frame[..8], (4, 4), two, 1),
             None,
             "…and so is a buffer too short for the allocation it claims",
+        );
+    }
+
+    /// **The block index's row stride is the frame's width, not its
+    /// height** — the one bug every fixture above cannot see, because every
+    /// one of them is square (#1238's review, NIT). `flat_block_fraction`
+    /// indexes a pixel as `(row * w + col) * 4`; swap `w` for `h` there and a
+    /// wide-short or narrow-tall frame reads the wrong row entirely, while a
+    /// square one reads exactly the same bytes it always did.
+    ///
+    /// The frame is a narrow, tall `2 × 16`: one block column, eight block
+    /// rows. Picked to make the swap **loud** rather than merely wrong — at
+    /// `w = 2` the correct stride only ever advances an index by a handful of
+    /// bytes per row, while `h = 16` used as the stride instead overshoots the
+    /// buffer's actual `w * h * 4 = 128` bytes by the second block row
+    /// (`by = 1`), so the mutation panics on an out-of-range slice index
+    /// rather than quietly returning a different fraction.
+    ///
+    /// **Falsified** by changing either `* w` in [`flat_block_fraction`] to
+    /// `* h`.
+    #[test]
+    fn the_flat_block_statistic_strides_by_width_not_height() {
+        let two = Sampling::Supersampled(2);
+        // Every block-row is a uniform field except the one straddling row 5,
+        // whose two rows disagree — the correct row-major stride finds that
+        // one block, and only that one, not-flat.
+        let frame = native_frame(
+            2,
+            16,
+            |_, y| {
+                if y == 5 { [1, 2, 3, 4] } else { [9, 9, 9, 255] }
+            },
+        );
+        assert_eq!(
+            flat_block_fraction(&frame, (2, 16), two, 1),
+            Some(7.0 / 8.0),
+            "7 of the 8 block-rows are a uniform field; only the one straddling \
+             row 5 is not",
         );
     }
 

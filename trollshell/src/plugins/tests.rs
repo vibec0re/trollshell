@@ -11963,14 +11963,32 @@ async fn liveness_drops_a_connection_that_never_pongs() {
     .expect("send Register");
     // No Pong is ever sent for the rest of this test.
 
-    // Let the handshake land and the liveness ticker arm before advancing.
-    tokio::task::yield_now().await;
+    // Drain the executor (no time advanced yet) until the handshake has
+    // landed and the liveness ticker is parked on its first tick — with the
+    // clock still at 0, `interval_at(Instant::now() + PING_INTERVAL, ...)`
+    // is guaranteed to have been constructed against t=0, not against
+    // whatever `now` a later `advance` call would otherwise leave it built
+    // against.
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+    }
 
-    // One interval short of the drop bound (2 of the tolerated 2 misses have
-    // landed, but the connection is only dropped on the *next* miss): still
-    // alive.
-    tokio::time::advance(PING_INTERVAL * MAX_MISSED_PONGS).await;
-    tokio::task::yield_now().await;
+    // Advance **one ping interval at a time**, draining after each: the
+    // ticker uses `MissedTickBehavior::Skip`, which collapses any tick
+    // boundary a single bulk `advance` jumps clean over into the *next*
+    // scheduled one rather than firing it — advancing `PING_INTERVAL *
+    // MAX_MISSED_PONGS` in one call was measured to skip straight past the
+    // first missed ping and under-count by one, the exact reason this
+    // test's first version reds on the correct code. One `PING_INTERVAL` per
+    // `advance` never crosses more than the one boundary it targets.
+    for _ in 0..MAX_MISSED_PONGS {
+        tokio::time::advance(PING_INTERVAL).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+    }
+    // Two of the two tolerated misses have now landed, but the connection is
+    // only dropped on the *next* one: still alive.
     assert!(
         !conn.is_finished(),
         "a connection that has missed only {MAX_MISSED_PONGS} of the \
@@ -11981,13 +11999,20 @@ async fn liveness_drops_a_connection_that_never_pongs() {
 
     // The bound itself: one more interval and the hung connection is gone.
     tokio::time::advance(PING_INTERVAL).await;
-    tokio::time::timeout(Duration::from_secs(5), conn)
-        .await
-        .expect(
-            "a connection that never Pongs must be dropped within \
-             PING_INTERVAL * (MAX_MISSED_PONGS + 1)",
-        )
-        .expect("conn task joined cleanly");
+    let mut finished = false;
+    for _ in 0..10_000 {
+        if conn.is_finished() {
+            finished = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        finished,
+        "a connection that never Pongs must be dropped within \
+         PING_INTERVAL * (MAX_MISSED_PONGS + 1)",
+    );
+    conn.await.expect("conn task joined cleanly");
 }
 
 /// #435 measure 4 / #1165's composition guarantee: the reader drops any

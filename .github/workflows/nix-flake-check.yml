@@ -37,17 +37,91 @@ jobs:
       # so the first cold build of the GTK/crane closure is slow — add a Cachix
       # or FlakeHub cache step here to speed CI up if it becomes a bottleneck.
       # `timeout` (rather than only `timeout-minutes`) so a hang fails the
-      # step from *inside* the job, where we can still print the process tree:
-      # the open question in #1011 is whether the survivor is nix itself or a
-      # VM-test child holding the log pipe, and only a listing taken during
-      # the hang can answer it. 105 min leaves the job-level bound as the
-      # backstop for everything else.
+      # step from *inside* the job, where we can still print diagnostics: the
+      # fourth occurrence (2026-09-13, run 34760575142) showed every builder
+      # and both VM test drivers already gone at the 105-minute kill — the
+      # only live nix process was a per-client `nix-daemon` worker sitting in
+      # kernel state `Ds` (uninterruptible sleep) with barely a minute of CPU
+      # time over the whole run, blocked in some post-build syscall a bare
+      # `ps auxf` cannot name. So before the process tree, dump each
+      # `nix-daemon` pid's `/proc` state (stat/wchan/syscall/stack/fd) plus
+      # system pressure (PSI, disk, memory, dmesg) — the evidence that
+      # decides whether it is stuck on fsync of one output, a store-wide
+      # walk, or a sandbox-mount teardown, and thus what the actual fix is
+      # (#1011). 105 min leaves the job-level bound as the backstop for
+      # everything else.
       - run: |
+          # Baseline so the *next* hang has a before/after on disk and memory
+          # (#1011) — the runner starts this job carrying the GTK/WebKitGTK/
+          # Mesa/QEMU/toolchain closure plus dep caches, and the log has
+          # never recorded what that looked like before nix touched it.
+          df -h /nix / 2>/dev/null; free -m
+
+          # Pids of the nix-daemon proper plus its per-client worker
+          # processes (#1011 rec 2). Its own function, taking no arguments
+          # and touching nothing but /proc, so it can be pulled out and
+          # exercised on its own with a fake pid list.
+          collect_nix_daemon_pids() {
+            { pgrep -x nix-daemon; pgrep -f 'nix-daemon [0-9]+'; } 2>/dev/null | sort -un
+          }
+
+          # Dumps per-pid /proc state for each pid passed as an argument.
+          # Called with none, it says so and returns 0 — a kill with no
+          # nix-daemon left alive is itself evidence, not a bug in the
+          # dumper. Every /proc read is wrapped in `timeout 5` so a pid stuck
+          # in uninterruptible sleep (state D) cannot wedge the dump itself;
+          # `stack` and the `fd` listing need root, which the runner has
+          # passwordlessly.
+          dump_pids() {
+            if [ "$#" -eq 0 ]; then
+              echo 'no nix-daemon processes'
+              return 0
+            fi
+            local pid
+            for pid in "$@"; do
+              echo "--- pid $pid ---"
+              if [ ! -r "/proc/$pid/stat" ]; then
+                echo 'pid vanished (or unreadable) before it could be inspected'
+                continue
+              fi
+              printf 'cmdline: '
+              timeout 5 tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || echo unreadable
+              echo
+              echo 'stat:'
+              timeout 5 cat "/proc/$pid/stat" 2>/dev/null || echo unreadable
+              printf 'wchan: '
+              timeout 5 cat "/proc/$pid/wchan" 2>/dev/null || echo unreadable
+              echo
+              echo 'syscall:'
+              timeout 5 cat "/proc/$pid/syscall" 2>/dev/null || echo unreadable
+              echo 'stack:'
+              timeout 5 sudo -n cat "/proc/$pid/stack" 2>/dev/null || echo unreadable
+              echo 'fd (first 60):'
+              timeout 5 sudo -n ls -l "/proc/$pid/fd" 2>/dev/null | head -60
+            done
+          }
+
+          # What the fourth occurrence's forensics (#1011) said to look at
+          # once a nix-daemon worker is found sitting in D-state: which
+          # syscall it is blocked in (wchan/syscall/stack), which output it
+          # is holding open (fd), and whether the box itself was under I/O or
+          # memory pressure (PSI, disk, dmesg) at the time.
+          dump_stuck_nix() {
+            # shellcheck disable=SC2046  # word-splitting a newline pid list is the point
+            dump_pids $(collect_nix_daemon_pids)
+            echo '--- PSI / disk / memory / dmesg / load ---'
+            cat /proc/pressure/io /proc/pressure/memory 2>/dev/null
+            df -h /nix /home/runner /tmp 2>/dev/null
+            free -m
+            sudo -n dmesg --ctime 2>/dev/null | tail -n 60 || true
+            cat /proc/loadavg
+          }
+
           timeout 105m nix flake check -L || rc=$?
           if [ "${rc:-0}" = 124 ]; then
             echo '::error::nix flake check did not exit within 105 min (#1011); process tree follows'
+            dump_stuck_nix
             ps auxf
             exit 1
           fi
           exit "${rc:-0}"
-

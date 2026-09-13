@@ -12314,10 +12314,7 @@ async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
     // the channel from the other end, so the next push must report `Stop`.
     drop(out_rx);
     assert!(
-        matches!(
-            push_state(&out_tx, HostMsg::Ping { seq: 0 }),
-            Push::Stop
-        ),
+        matches!(push_state(&out_tx, HostMsg::Ping { seq: 0 }), Push::Stop),
         "a push to a closed queue must report Stop",
     );
 }

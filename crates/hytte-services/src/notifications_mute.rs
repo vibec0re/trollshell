@@ -11,27 +11,43 @@
 //!
 //! # Persistence
 //!
-//! Persisted to `~/.config/trollshell/muted-apps.toml` as a single-line
-//! `apps = ["Discord", "Slack"]` array. Mirrors the parser shape used by
-//! `dnd` / `bluetooth_audio` — a flat key=value parser, fallback empty on
-//! missing file or malformed contents. Writes are best-effort; failure is
-//! logged and the in-memory state is the source of truth for the running
-//! process.
+//! Persisted to `$XDG_STATE_HOME/trollshell/muted-apps.toml` (#1226) as
+//! `apps = ["Discord", "Slack"]`. One-time read-migration from the legacy
+//! `~/.config/trollshell/muted-apps.toml`: if state is absent and that file
+//! exists, its value is adopted into state and the old file is left
+//! untouched; once state exists it is authoritative and the old file is
+//! never read again. Writes are best-effort; failure is logged and the
+//! in-memory state is the source of truth for the running process.
 
 use crate::config_file;
 use futures_signals::signal::{Mutable, Signal};
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-/// Config file under `~/.config/trollshell/`.
-const CONFIG_FILE: &str = "muted-apps.toml";
+/// The state subsystem name — `$XDG_STATE_HOME/trollshell/muted-apps.toml`.
+const SUBSYSTEM: &str = "muted-apps";
+
+/// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
+const LEGACY_CONFIG_FILE: &str = "muted-apps.toml";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct MutedAppsState {
+    #[serde(default)]
+    apps: HashSet<String>,
+}
 
 fn load_from_disk() -> HashSet<String> {
-    config_file::read(CONFIG_FILE)
-        .map(|text| parse_apps_line(&text))
-        .unwrap_or_default()
+    let old = config_file::path(LEGACY_CONFIG_FILE);
+    let loaded: MutedAppsState = state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| {
+        Some(MutedAppsState {
+            apps: parse_apps_line(text),
+        })
+    });
+    loaded.apps
 }
 
 /// Parse a single `apps = ["X", "Y", ...]` line out of the TOML body.
@@ -60,15 +76,12 @@ fn parse_apps_line(text: &str) -> HashSet<String> {
 }
 
 fn save_to_disk(apps: &HashSet<String>) {
-    let mut sorted: Vec<&String> = apps.iter().collect();
-    sorted.sort();
-    let parts: Vec<String> = sorted
-        .iter()
-        .filter(|s| !s.contains('"'))
-        .map(|s| format!("\"{s}\""))
-        .collect();
-    let body = format!("apps = [{}]\n", parts.join(", "));
-    config_file::write("notifications_mute", CONFIG_FILE, &body);
+    state::store(
+        SUBSYSTEM,
+        &MutedAppsState {
+            apps: apps.clone(),
+        },
+    );
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -179,5 +192,77 @@ mod tests {
         let s = parse_apps_line(body);
         assert_eq!(s.len(), 1);
         assert!(s.contains("X"));
+    }
+
+    // ── State migration (#1226) ─────────────────────────────────────────────
+
+    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().to_path_buf();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
+                ("XDG_STATE_HOME", None::<&str>),
+                ("XDG_CONFIG_HOME", None::<&str>),
+            ],
+            || body(&home),
+        )
+    }
+
+    fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell/muted-apps.toml")
+    }
+
+    #[test]
+    fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
+        with_scratch_home(|home| {
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "apps = [\"Discord\"]\n").unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            let apps = load_from_disk();
+            assert_eq!(apps, HashSet::from(["Discord".to_string()]));
+
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            assert!(state_path.exists(), "state must now hold the migrated value");
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                "apps = [\"Discord\"]\n",
+                "the legacy file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
+        with_scratch_home(|home| {
+            state::store(
+                SUBSYSTEM,
+                &MutedAppsState {
+                    apps: HashSet::from(["Slack".to_string()]),
+                },
+            );
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "not even valid toml {{{").unwrap();
+
+            assert_eq!(load_from_disk(), HashSet::from(["Slack".to_string()]));
+        });
+    }
+
+    #[test]
+    fn neither_file_present_defaults_to_empty() {
+        with_scratch_home(|_home| {
+            assert!(load_from_disk().is_empty());
+        });
     }
 }

@@ -3512,7 +3512,7 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
 mod tests {
     use super::{
         Arm, Renderer, Scope, UiNode, begin_pass, build, display_style, end_pass, map_widget,
-        preem_gl, vocab,
+        preem_gl, probe, vocab,
     };
 
     /// The `Scope` the two arms are compared through — the same shape
@@ -3593,12 +3593,15 @@ mod tests {
     /// than as a node kind, and a fallback that produced an empty or
     /// differently sized buffer would fail here rather than look right.
     ///
-    /// **Falsified** two ways: dropping the `set_build_refusal_handler` line
-    /// from `preem_gl::install` (the chip is still a `GlSurface` afterwards —
-    /// the shipped behaviour, i.e. blank on glass), and widening
-    /// `rebuild_refused_gl_renderers_on_cpu` to every GL instance (the last
-    /// assertion goes red: the gauge loses its GPU arm for a refusal that was
-    /// never about it).
+    /// **Falsified** two ways, both measured: dropping the
+    /// `set_build_refusal_handler` line from `preem_gl::install` — the chip is
+    /// still a `GlSurface` afterwards, which is the shipped behaviour and so
+    /// #1232 itself — and widening `rebuild_refused_gl_renderers_on_cpu` to
+    /// every GL instance, which reds the **builds** assertion rather than the
+    /// node-kind one: the gauge is rebuilt (restarting its needle's spring
+    /// mid-swing, #1143) and then lands straight back on `GaugeGl`, because
+    /// `arm_for(GAUGE)` still says `Gl`. Asserting only the node kind would
+    /// have missed that entirely.
     #[test]
     fn a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl() {
         let _ink = crate::plugins::tests::preem_ink_lock();
@@ -3631,6 +3634,8 @@ mod tests {
                 "the premise: both chips start on the GPU",
             );
             assert!(matches!(gauge_before, UiNode::GlSurface { .. }));
+            let scope_builds = probe(&key, Some("sc")).expect("the scope instance exists").0;
+            let gauge_builds = probe(&key, Some("ga")).expect("the gauge instance exists").0;
 
             // The driver refuses the scope's pipeline, once, exactly as a
             // realised `GlSurface` reports it.
@@ -3682,6 +3687,19 @@ mod tests {
                 matches!(gauge_after, UiNode::GlSurface { .. }),
                 "a refused `preem.scope` says nothing about `preem.gauge`: the fallback is per \
                  pipeline, not per session",
+            );
+            assert_eq!(
+                probe(&key, Some("sc")).expect("the scope instance exists").0,
+                scope_builds + 1,
+                "the refused chip is rebuilt exactly once — by the sweep, not again by the \
+                 mapping pass that follows it",
+            );
+            assert_eq!(
+                probe(&key, Some("ga")).expect("the gauge instance exists").0,
+                gauge_builds,
+                "…and the gauge is not rebuilt at all. A sweep over every GL instance would \
+                 answer with the same `GaugeGl` it already had and restart the needle's spring \
+                 mid-swing for a refusal that was never about it (#1143)",
             );
         });
     }

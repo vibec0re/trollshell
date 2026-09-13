@@ -41,9 +41,9 @@ use super::pump::{
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
-    MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, Push, REGISTER_TIMEOUT,
-    capped_hidden_on, enforce_capabilities, handle_conn, push_gate, push_state,
-    state_key_capability,
+    MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, MAX_MISSED_PONGS, OUTBOUND_CAPACITY,
+    PING_INTERVAL, Push, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
+    push_gate, push_state, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -11921,6 +11921,30 @@ mod sidebar_right_routing {
 // ── #1166: two of #435's containment measures + one composition guarantee ──
 // had no test at all, so each survived being deleted with the suite green.
 
+/// Yield to the executor `n` times without advancing the paused clock — lets
+/// any already-woken task (or one whose deadline the clock has already
+/// reached) actually run before the next check.
+async fn drain_yields(n: usize) {
+    for _ in 0..n {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Advance the paused clock by exactly one [`PING_INTERVAL`], then drain.
+///
+/// One interval at a time, deliberately: the liveness ticker uses
+/// `MissedTickBehavior::Skip`, which collapses any tick boundary a *bulk*
+/// advance jumps clean over into the next scheduled one instead of firing
+/// it — advancing `PING_INTERVAL * MAX_MISSED_PONGS` in a single call was
+/// measured to skip straight past the first missed ping and under-count by
+/// one (the exact reason `liveness_drops_a_connection_that_never_pongs`'s
+/// first version reds on unmodified code). One `PING_INTERVAL` per `advance`
+/// never crosses more than the one boundary it targets.
+async fn advance_one_ping_interval() {
+    tokio::time::advance(PING_INTERVAL).await;
+    drain_yields(1000).await;
+}
+
 /// #435 measure 1, the liveness ping: a connection that never answers `Pong`
 /// must be dropped within `PING_INTERVAL * (MAX_MISSED_PONGS + 1)`, not left
 /// mounted forever (the exact symptom #435 filed). Paused time drives the
@@ -11928,21 +11952,22 @@ mod sidebar_right_routing {
 /// so the *liveness* arm of `serve_conn`'s `select!` — not an EOF — is what
 /// ends the connection.
 ///
-/// `PING_INTERVAL`/`MAX_MISSED_PONGS` are private to `session` (unlike
-/// `EFFECT_BURST`/`OUTBOUND_CAPACITY` above, neither is `pub(super)`), so
-/// this test pins their documented values (session.rs:187/190) as literals
-/// rather than reading them — the doc comment on `PING_INTERVAL` names the
-/// exact bound checked below.
+/// `PING_INTERVAL`/`MAX_MISSED_PONGS` are read from `session` (`pub(super)`,
+/// like `EFFECT_BURST`/`OUTBOUND_CAPACITY` above, since #1166 finding 3 —
+/// before that this test pinned copied literals, which a legitimate retune
+/// of either constant would silently desync from).
 ///
 /// **Falsified** by commenting out the `() = liveness => { … }` arm of the
 /// `select!` (session.rs ~1636-1641): the reader then never resolves either
 /// (this connection sends no more frames), so `handle_conn` never returns and
 /// the closing `timeout` reds.
+///
+/// This test alone does not prove the mechanism *answers* Pongs correctly —
+/// see its sibling, `a_connection_that_always_pongs_survives_past_the_drop_bound`,
+/// for the positive half (#1166 finding 2): together they pin "a hung plugin
+/// is reaped" and "a healthy one is never reaped" as two separate claims.
 #[tokio::test(start_paused = true)]
 async fn liveness_drops_a_connection_that_never_pongs() {
-    const PING_INTERVAL: Duration = Duration::from_secs(30);
-    const MAX_MISSED_PONGS: u32 = 2;
-
     let (_clock_tx, clock_rx) = watch::channel(None);
     let (_vis_tx, vis_rx) = watch::channel(false);
     let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
@@ -11970,23 +11995,12 @@ async fn liveness_drops_a_connection_that_never_pongs() {
     // is guaranteed to have been constructed against t=0, not against
     // whatever `now` a later `advance` call would otherwise leave it built
     // against.
-    for _ in 0..1000 {
-        tokio::task::yield_now().await;
-    }
+    drain_yields(1000).await;
 
-    // Advance **one ping interval at a time**, draining after each: the
-    // ticker uses `MissedTickBehavior::Skip`, which collapses any tick
-    // boundary a single bulk `advance` jumps clean over into the *next*
-    // scheduled one rather than firing it — advancing `PING_INTERVAL *
-    // MAX_MISSED_PONGS` in one call was measured to skip straight past the
-    // first missed ping and under-count by one, the exact reason this
-    // test's first version reds on the correct code. One `PING_INTERVAL` per
-    // `advance` never crosses more than the one boundary it targets.
+    // Advance one ping interval at a time (see `advance_one_ping_interval`'s
+    // doc for why not in bulk).
     for _ in 0..MAX_MISSED_PONGS {
-        tokio::time::advance(PING_INTERVAL).await;
-        for _ in 0..1000 {
-            tokio::task::yield_now().await;
-        }
+        advance_one_ping_interval().await;
     }
     // Two of the two tolerated misses have now landed, but the connection is
     // only dropped on the *next* one: still alive.
@@ -12016,6 +12030,73 @@ async fn liveness_drops_a_connection_that_never_pongs() {
     conn.await.expect("conn task joined cleanly");
 }
 
+/// #1166 finding 2 (review round on #1239): the sibling `never-Pongs` test
+/// above proves a silent peer is dropped on a timer, but nothing in the
+/// suite ever answered a `Ping` with a `Pong` — so the send half of the
+/// ping/pong protocol (session.rs ~1636, `if
+/// out_tx.try_send(HostMsg::Ping { seq }).is_err() { break; }`) could be
+/// replaced with a liveness-preserving no-op (`if out_tx.is_closed() {
+/// break; }`) and nothing would notice, even though that mutation turns
+/// "liveness" into a blind inactivity timer that would eventually reap
+/// *every* healthy plugin (nothing can `Pong` a ping it was never sent).
+///
+/// This is the positive half: a connection that answers every `Ping` it
+/// receives with a matching `Pong` must still be alive well past
+/// `PING_INTERVAL * (MAX_MISSED_PONGS + 1)` — the same bound the sibling
+/// test proves a silent peer is dropped at.
+///
+/// **Falsified** by the mutation described above (`out_tx.is_closed()`
+/// instead of sending): with no `Ping` ever sent, this test's `read_frame`
+/// on `_prd` for the first ping has nothing to read and times out.
+#[tokio::test(start_paused = true)]
+async fn a_connection_that_always_pongs_survives_past_the_drop_bound() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (mut prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("healthy", Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("send Register");
+    drain_yields(1000).await;
+
+    // Answer every Ping with a Pong, well past the drop bound — one more
+    // round than `MAX_MISSED_PONGS + 1` intervals, so this is strictly
+    // longer than the window the sibling test proves a silent peer dies in.
+    for _ in 0..(MAX_MISSED_PONGS + 2) {
+        advance_one_ping_interval().await;
+        let seq = match tokio::time::timeout(Duration::from_secs(5), recv(&mut prd)).await {
+            Ok(HostMsg::Ping { seq }) => seq,
+            Ok(other) => panic!("expected a Ping, got {other:?}"),
+            Err(_) => panic!(
+                "a Ping must arrive every PING_INTERVAL — if it doesn't, the \
+                 host stopped sending them rather than the plugin failing to \
+                 answer",
+            ),
+        };
+        write_frame(&mut pwr, &PluginMsg::Pong { seq })
+            .await
+            .expect("send Pong");
+        drain_yields(1000).await;
+    }
+
+    assert!(
+        !conn.is_finished(),
+        "a connection that answers every Ping with a Pong must still be \
+         alive past PING_INTERVAL * (MAX_MISSED_PONGS + 1) — a blind \
+         inactivity timer would have dropped it regardless",
+    );
+    conn.abort();
+}
+
 /// #435 measure 4 / #1165's composition guarantee: the reader drops any
 /// effect whose capability the plugin never declared **before** it reaches
 /// the [`EffectRateLimiter`] (`enforce_capabilities` is the inner call,
@@ -12032,6 +12113,12 @@ async fn liveness_drops_a_connection_that_never_pongs() {
 /// ~1478-1486): the flood then spends the whole burst on effects that are
 /// dropped for capability anyway, so the second frame's granted effect is
 /// throttled out and this test's final `recv` times out.
+///
+/// Also carries #1166 finding 1's `OUTBOUND_CAPACITY` pin (review round on
+/// #1239): rides this test's existing `wait_for_region` rather than adding a
+/// fourth test. **Falsified** by building `serve_conn`'s outbound queue at
+/// a different bound (session.rs ~1278, e.g. `mpsc::channel(1_000_000)`
+/// instead of `mpsc::channel(OUTBOUND_CAPACITY)`).
 #[tokio::test]
 async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
     let (_clock_tx, clock_rx) = watch::channel(None);
@@ -12078,7 +12165,21 @@ async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
     )
     .await
     .expect("Render with an ungranted flood");
-    wait_for_region(&bar_center).await;
+    let cards = wait_for_region(&bar_center).await;
+    // #1166 finding 1: `push_state`'s Full/Closed semantics are pinned
+    // directly by `push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain`
+    // below, but nothing pinned that `serve_conn` actually *builds* its
+    // outbound queue at `OUTBOUND_CAPACITY` — the issue names both halves of
+    // this deletion ("changed to `Err(Full(_)) => Push::Stop`, **or the
+    // channel made unbounded**"), and only the first half had a test.
+    // `SlotRender.outbound` (mod.rs) *is* the production sender, reached here
+    // through the harness this test already drives.
+    assert_eq!(
+        cards[0].outbound.max_capacity(),
+        OUTBOUND_CAPACITY,
+        "serve_conn must build its outbound queue at OUTBOUND_CAPACITY, not \
+         some other bound (or unbounded)",
+    );
     assert!(
         effects_rx.try_recv().is_err(),
         "every ungranted effect in the flood is dropped before the broker",
@@ -12139,6 +12240,13 @@ async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
 /// making the channel unbounded so it's never reached at all). With the
 /// `Full` arm mapped to `Stop`, the first push past capacity below no longer
 /// matches `Push::Continue` and this test reds there.
+///
+/// Also carries #1166 finding 4 (review round on #1239): `Err(Closed(_)) =>
+/// Push::Stop` is `push_state`'s *only* `Stop`-producing arm — the only thing
+/// that ever stops a producer task (`accent_task`/`calendar_task`/
+/// `locked_task`/`now_playing_task`/`visibility_task`/`snapshot_task` would
+/// each spin forever on a closed channel without it) — and was untested
+/// until now. **Falsified** by mapping that arm to `Push::Continue` too.
 #[tokio::test]
 async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
     const OVERFLOW: usize = 5;
@@ -12200,5 +12308,18 @@ async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
         OUTBOUND_CAPACITY,
         "a push made after a drain must actually be enqueued, back to full \
          capacity — not silently dropped like an overflow push",
+    );
+
+    // #1166 finding 4 (review round on #1239): `Err(Closed(_)) => Push::Stop`
+    // is the *only* arm that ever produces `Stop` — the only thing that ever
+    // stops a producer task — and was untested. Dropping the receiver closes
+    // the channel from the other end, so the next push must report `Stop`.
+    drop(out_rx);
+    assert!(
+        matches!(
+            push_state(&out_tx, HostMsg::Ping { seq: 0 }),
+            Push::Stop
+        ),
+        "a push to a closed queue must report Stop",
     );
 }

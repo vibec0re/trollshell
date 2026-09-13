@@ -517,6 +517,12 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
     const BAR_EDGE_OFFSET: i32 = 0;
 
     overlays::sidebar::install(monitor);
+    // The right sidebar (#1158/#1160): the same surface mirrored onto the right
+    // edge, holding the three `SidebarRight*` plugin regions and nothing else.
+    // Installed here, before the bar, for the same z-order reason as the left
+    // one — but it does not *map* until a plugin card shows on this connector,
+    // so a shell with nothing mounted right never puts a surface on screen.
+    overlays::sidebar::install_right(monitor);
     // Plugin bar-chip regions (#349): one per bar group (left/center/right),
     // built like the sidebar's plugin regions but laid out horizontally. Each is
     // a reconciler-backed container that stays empty (and hidden) until a

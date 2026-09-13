@@ -1371,6 +1371,11 @@ pub(super) async fn serve_conn(
     // the sidebar visibility task carries so it lands *after* the
     // `SlotVisibility(true)` frame (see `visibility_task`).
     let now_playing_gated = push_gate(&manifest, StateKey::NowPlaying);
+    // Which sidebar's aggregate this connection's card follows (#1160, the #1221
+    // review's LOW 5). Resolved once, here, and used for both the visibility task
+    // below and the spectrum task's on-screen demand further down, so the two can
+    // never disagree about whether this card is being looked at.
+    let visibility_rx = visibility_source(mount, ctx);
     let visibility = if manifest.subscribes.contains(&StateKey::SlotVisible) {
         if mount.is_bar() {
             let _ = out_tx.try_send(HostMsg::SlotVisibility { visible: true });
@@ -1383,7 +1388,7 @@ pub(super) async fn serve_conn(
             // so without the re-seed it resumes stale on reopen.
             let np_rx = now_playing_gated.then(|| ctx.now_playing_rx.clone());
             Some(tokio::spawn(visibility_task(
-                ctx.visibility_rx.clone(),
+                visibility_rx.clone(),
                 np_rx,
                 out_tx.clone(),
             )))
@@ -1421,7 +1426,7 @@ pub(super) async fn serve_conn(
         .then(|| {
             tokio::spawn(spectrum_task(
                 ctx.spectrum_rx.clone(),
-                ctx.visibility_rx.clone(),
+                visibility_rx.clone(),
                 mount.is_bar(),
                 out_tx.clone(),
             ))
@@ -1763,6 +1768,47 @@ async fn snapshot_task(
     }
 }
 
+/// Whether a mount's card lives on the **right** sidebar (#1158/#1160).
+///
+/// Written out here rather than added to `hytte-plugin-proto`'s [`Mount`] beside
+/// [`Mount::is_bar`] on purpose: `is_bar` is a *wire* fact (a bar chip is always
+/// on screen, which is why the host seeds it a constant `true`) and every
+/// consumer of the protocol shares it, while "which of this shell's two sidebar
+/// surfaces is that" is a `trollshell` fact about `overlays::sidebar`, which the
+/// proto knows nothing about. The match is exhaustive over the enum, so a tenth
+/// mount does not compile until it is classified here.
+fn is_right_sidebar(mount: Mount) -> bool {
+    match mount {
+        Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom => true,
+        Mount::SidebarLead
+        | Mount::SidebarTop
+        | Mount::SidebarBottom
+        | Mount::BarLeft
+        | Mount::BarCenter
+        | Mount::BarRight => false,
+    }
+}
+
+/// The slot-visibility aggregate this connection's card follows (#1160).
+///
+/// A plugin is told whether its card is on screen so it can park pollers while
+/// it is not; before the right sidebar existed there was one aggregate and every
+/// sidebar card read it. A right-mounted card is **not** on screen because the
+/// left sidebar opened, so it reads the right sidebar's aggregate instead.
+///
+/// A **bar** mount resolves to the left receiver and then never reads it: its
+/// `SlotVisibility` is seeded as a constant `true` (see `serve_conn`, #438) and
+/// its spectrum demand passes `always_visible`, so the receiver it is handed is
+/// inert. Resolving one anyway keeps this a total function of the mount with no
+/// `Option` for two call sites to unwrap differently.
+fn visibility_source(mount: Mount, ctx: &ListenerCtx) -> watch::Receiver<bool> {
+    if is_right_sidebar(mount) {
+        ctx.visibility_right_rx.clone()
+    } else {
+        ctx.visibility_rx.clone()
+    }
+}
+
 /// Push the aggregate slot visibility on the initial subscribe (the register
 /// seed, so a reconnecting plugin starts in the right state) and on every
 /// change, coalescing bursts latest-wins via `borrow_and_update` (#288). Mirrors
@@ -1962,5 +2008,132 @@ fn log_plugin(plugin_id: &str, level: LogLevel, msg: &str) {
         LogLevel::Info => tracing::info!(plugin = %plugin_id, "{msg}"),
         LogLevel::Debug => tracing::debug!(plugin = %plugin_id, "{msg}"),
         LogLevel::Trace => tracing::trace!(plugin = %plugin_id, "{msg}"),
+    }
+}
+
+// ── Which sidebar a mount's `SlotVisible` follows (#1158/#1160) ──────────────
+
+#[cfg(test)]
+mod visibility_source_tests {
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    use hytte::futures_signals::signal::Mutable;
+    use hytte_plugin_proto::{Mount, NowPlaying};
+    use tokio::sync::{mpsc, watch};
+
+    use super::super::{DatasourceRouter, ListenerCtx};
+    use super::{EffectBuckets, is_right_sidebar, visibility_source};
+
+    /// A `ListenerCtx` whose two visibility channels are the only thing these
+    /// tests read, with both senders handed back so each side can be driven
+    /// independently.
+    ///
+    /// Spelled out here rather than reused from `plugins::tests`: those fixtures
+    /// are shaped for `handle_conn` end-to-end runs, and what is under test is a
+    /// two-line selection whose whole risk is picking the wrong **field**. An
+    /// oracle that only checked the predicate could not see a swapped pair.
+    fn ctx() -> (ListenerCtx, watch::Sender<bool>, watch::Sender<bool>) {
+        let (visibility_tx, visibility_rx) = watch::channel(false);
+        let (visibility_right_tx, visibility_right_rx) = watch::channel(false);
+        let (effects_tx, _effects_rx) = mpsc::unbounded_channel();
+        let ctx = ListenerCtx {
+            sidebar_lead: Mutable::new(Vec::new()),
+            sidebar_top: Mutable::new(Vec::new()),
+            sidebar_bottom: Mutable::new(Vec::new()),
+            sidebar_right_lead: Mutable::new(Vec::new()),
+            sidebar_right_top: Mutable::new(Vec::new()),
+            sidebar_right_bottom: Mutable::new(Vec::new()),
+            bar_left: Mutable::new(Vec::new()),
+            bar_center: Mutable::new(Vec::new()),
+            bar_right: Mutable::new(Vec::new()),
+            panels: Mutable::new(Vec::new()),
+            clock_rx: watch::channel(None).1,
+            visibility_rx,
+            visibility_right_rx,
+            accent_rx: watch::channel(None).1,
+            spectrum_rx: watch::channel(None).1,
+            calendar_rx: watch::channel(Vec::new()).1,
+            now_playing_rx: watch::channel(NowPlaying::default()).1,
+            locked_rx: watch::channel(false).1,
+            live_ids: Arc::new(Mutex::new(HashSet::new())),
+            effect_buckets: EffectBuckets::default(),
+            runtime: Arc::new(Mutex::new(BTreeMap::new())),
+            effects_tx,
+            datasource: DatasourceRouter::default(),
+        };
+        (ctx, visibility_tx, visibility_right_tx)
+    }
+
+    /// The classification, over **every** mount the wire has. Exhaustive by
+    /// `Mount::ALL` rather than by a hand-written list, so a tenth mount arrives
+    /// here as a failing assertion (and, in [`is_right_sidebar`] itself, as a
+    /// non-exhaustive `match`) rather than silently defaulting to the left.
+    #[test]
+    fn exactly_the_three_right_mounts_are_right_sidebar_mounts() {
+        let right: Vec<&str> = Mount::ALL
+            .into_iter()
+            .filter(|m| is_right_sidebar(*m))
+            .map(Mount::wire_name)
+            .collect();
+        assert_eq!(
+            right,
+            vec!["SidebarRightLead", "SidebarRightTop", "SidebarRightBottom"],
+            "the right sidebar's family is exactly the three SidebarRight* mounts"
+        );
+        // The complement, stated rather than implied: a bar chip is never a
+        // right-sidebar mount (it gets its constant `true` seed instead).
+        assert!(
+            !Mount::ALL
+                .into_iter()
+                .any(|m| m.is_bar() && is_right_sidebar(m))
+        );
+    }
+
+    /// The wiring, through the two real channels: a right-mounted connection's
+    /// task reads the **right** aggregate and a left-mounted one reads the left,
+    /// so toggling one sidebar parks and unparks only the plugins mounted on it
+    /// (the #1221 review's LOW 5).
+    ///
+    /// Driving the senders is what makes this see a **swap**: a
+    /// `visibility_source` that handed the left receiver to a right mount — or
+    /// that crossed the two fields — reports the wrong value here, while an
+    /// assertion on [`is_right_sidebar`] alone stays green for both mutations.
+    ///
+    /// **Falsifications (run):**
+    /// * `visibility_source` always returning `ctx.visibility_rx` — feeding the
+    ///   left aggregate to the right family, i.e. the pre-#1160 behaviour LOW 5
+    ///   is about → red on the right-mount assertions.
+    /// * `visibility_source`'s two fields swapped → red on both families.
+    #[test]
+    fn a_right_toggle_moves_only_right_mounted_plugins() {
+        let (ctx, left_tx, right_tx) = ctx();
+
+        // Open only the RIGHT sidebar.
+        right_tx.send_replace(true);
+        for mount in Mount::ALL {
+            let visible = *visibility_source(mount, &ctx).borrow();
+            let expect = is_right_sidebar(mount);
+            assert_eq!(
+                visible,
+                expect,
+                "with only the right sidebar open, {} must read visible={expect}",
+                mount.wire_name()
+            );
+        }
+
+        // The mirror case: only the LEFT sidebar open.
+        right_tx.send_replace(false);
+        left_tx.send_replace(true);
+        for mount in Mount::ALL {
+            let visible = *visibility_source(mount, &ctx).borrow();
+            let expect = !is_right_sidebar(mount);
+            assert_eq!(
+                visible,
+                expect,
+                "with only the left sidebar open, {} must read visible={expect}",
+                mount.wire_name()
+            );
+        }
     }
 }

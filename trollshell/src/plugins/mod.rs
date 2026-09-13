@@ -177,34 +177,42 @@ use datasource::DatasourceRouter;
 #[cfg(test)]
 mod tests;
 
-pub use pump::{forget_sidebar_visibility, set_sidebar_visibility};
+pub use pump::{
+    forget_sidebar_right_visibility, forget_sidebar_visibility, set_sidebar_right_visibility,
+    set_sidebar_visibility,
+};
 pub use region::{
     bar_center_slot, bar_left_slot, bar_right_slot, plugin_panel_slot, set_active_panel,
     sidebar_bottom_slot, sidebar_lead_slot, sidebar_top_slot,
 };
-// The right sidebar's three region builders (#1158/#1159). Re-exported now, used
-// by nobody until #1160 builds the surface that mounts them — the intended
-// intermediate state of P1: the wire, the routing and the mailboxes all work, and
-// a plugin placed right renders into a mailbox with no reader. A separate `use`
-// with a scoped `allow` rather than one over the whole list above, so the seven
-// slots that *are* mounted keep their unused-import cover.
-#[allow(
-    unused_imports,
-    reason = "#1160 (P2) mounts the right sidebar's three slots"
-)]
-pub use region::{sidebar_right_bottom_slot, sidebar_right_lead_slot, sidebar_right_top_slot};
+// The right sidebar's three region builders (#1158/#1159) plus the "has this
+// output anything to show on that side?" signal #1160 hides the surface by.
+// `overlays::sidebar` mounts all four since #1160, so P1's scoped
+// `allow(unused_imports)` is gone with the intermediate state it named.
+pub use region::{
+    sidebar_right_bottom_slot, sidebar_right_lead_slot, sidebar_right_non_empty,
+    sidebar_right_top_slot,
+};
 
-/// Signal that emits `true` while **some** monitor's sidebar is open — the same
-/// aggregate the host pushes to plugins as
+/// Signal that emits `true` while **some** monitor's *left* sidebar is open —
+/// the same aggregate the host pushes to left-mounted plugins as
 /// [`HostMsg::SlotVisibility`](hytte_plugin_proto::HostMsg::SlotVisibility)
 /// (#288), surfaced to the binary so it can gate its own pollers on "a sidebar
 /// card can see this" (#840).
 ///
+/// **Left only since #1160**, and deliberately: the right sidebar keeps its own
+/// aggregate on [`PluginHandles::visibility_right_tx`], and
+/// `pump::publish_right_visibility` does not touch this mirror. Every consumer
+/// of this signal is a *left*-sidebar card — today's only one is the mpris
+/// position gate in `main.rs`, whose plugin-side consumer is the audio widget's
+/// transport readout — so folding the right side in would park nothing extra and
+/// would unpark those pollers whenever an unrelated right-hand card came on
+/// screen. A future consumer that wants the other side (or the OR of both)
+/// should say so with its own accessor rather than widening this one.
+///
 /// Sidebar-scoped on purpose: a *bar*-mounted plugin is always visible (see
 /// [`Mount::is_bar`](hytte_plugin_proto::Mount::is_bar)), so this would be a
-/// constant `true` for one and gate nothing. Today's only consumer is the mpris
-/// position gate in `main.rs`, whose plugin-side consumer (the audio widget's
-/// transport readout) is a sidebar card.
+/// constant `true` for one and gate nothing.
 pub fn slot_visible_signal() -> impl Signal<Item = bool> + 'static {
     pump::slot_visible_mutable().signal()
 }
@@ -460,6 +468,12 @@ pub struct PluginHandles {
     /// from tokio (per-conn visibility tasks). Starts `false` (nothing open at
     /// boot). See the module-level "Slot visibility" note (#288).
     visibility_tx: watch::Sender<bool>,
+    /// The same aggregate for the **right** sidebar (#1158/#1160). A plugin's
+    /// `SlotVisible` follows the aggregate of the sidebar **its own mount is
+    /// on** — see `session`'s `visibility_source` — because a right-mounted card
+    /// is not on screen just because the left sidebar opened. Written on the GTK
+    /// thread ([`set_sidebar_right_visibility`]); starts `false`.
+    visibility_right_tx: watch::Sender<bool>,
     /// The desktop accent (`@accent_color`) resolved on the GTK thread and
     /// handed to accent-subscribing plugins (#376). Written by [`install`]
     /// (via `pump::publish_accent`), subscribed from tokio (per-conn accent
@@ -515,6 +529,12 @@ struct ListenerCtx {
     panels: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
     visibility_rx: watch::Receiver<bool>,
+    /// Subscriber end of [`PluginHandles::visibility_right_tx`] (#1160). A
+    /// second receiver rather than a richer value on `visibility_rx`: the
+    /// per-connection task reads exactly one of the two, chosen once at register
+    /// from the connection's mount, so nothing downstream has to know there are
+    /// two sidebars.
+    visibility_right_rx: watch::Receiver<bool>,
     /// Subscriber end of [`PluginHandles::accent_tx`] (#376).
     accent_rx: watch::Receiver<Option<[u8; 4]>>,
     /// Subscriber end of [`PluginHandles::spectrum_tx`] (#405).
@@ -561,6 +581,10 @@ impl Service for PluginsService {
         // Slot visibility seeds `false`: no sidebar is open at boot, and each
         // monitor's `install` re-asserts `false` as it wires up (#288).
         let (visibility_tx, visibility_rx) = watch::channel(false);
+        // The right sidebar's own aggregate (#1160), seeded the same way: no
+        // sidebar is open at boot, and the right one additionally has nothing
+        // mounted on it until a plugin dials in.
+        let (visibility_right_tx, visibility_right_rx) = watch::channel(false);
         // Accent seeds `None` (unresolved): `install` resolves `@accent_color`
         // on the GTK thread and publishes it once the display's CSS is up (#376).
         let (accent_tx, accent_rx) = watch::channel(None);
@@ -599,6 +623,7 @@ impl Service for PluginsService {
             active_panel_id: Mutable::new(None),
             clock_tx,
             visibility_tx,
+            visibility_right_tx,
             accent_tx,
             spectrum_tx,
             calendar_tx,
@@ -620,6 +645,7 @@ impl Service for PluginsService {
             panels: handles.panels.clone(),
             clock_rx,
             visibility_rx,
+            visibility_right_rx,
             accent_rx,
             spectrum_rx,
             calendar_rx,

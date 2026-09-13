@@ -132,8 +132,9 @@ outright, drop them from the affected lines and re-load.
   shutdown). Those actions live on a drawer page (`panel_power_menu` in
   `trollshell/src/panels/power_menu.rs`); reaching it from a keybind no
   longer needs new IPC — `trollshell/src/commands.rs` already registers
-  `open-page`, `power-menu`, `toggle-sidebar`, and `toggle-recording` as
-  `org.gtk.Actions` on the shell's existing session-bus name (#219):
+  `open-page`, `power-menu`, `toggle-sidebar`, `toggle-sidebar-right`, and
+  `toggle-recording` as `org.gtk.Actions` on the shell's existing session-bus
+  name (#219):
 
   ```sh
   busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
@@ -143,6 +144,8 @@ outright, drop them from the affected lines and re-load.
   Whether/how to actually bind this in `binds.kdl` is left to the deployer —
   this file mirrors Annika's personal chords, and which key (if any) maps to
   which verb is a preference call, not something this doc should default.
+  `binds.kdl` carries a **commented-out** pair for the two sidebar verbs as a
+  starting point.
 
 - It does NOT bind the keyboard-backlight keys (`XF86KbdBrightnessUp/Down`).
   Those typically don't have a sysfs uniformity story; add them by hand if
@@ -152,6 +155,40 @@ outright, drop them from the affected lines and re-load.
 - It does NOT ship a complete niri `config.kdl`. Only the `binds { }`
   fragment relevant to media keys lives here; the rest of niri configuration
   (layout, output, input) is the user's call.
+
+## The two sidebars (#1158/#1160)
+
+`toggle-sidebar` flips the **left** sidebar (calendar, tasks, and the
+`SidebarLead` / `SidebarTop` / `SidebarBottom` plugin regions). It also has a
+bar chip, so the keybind is a convenience.
+
+`toggle-sidebar-right` flips the **right** one — the mirror added in #1158,
+anchored `Right + Top + Bottom` and holding nothing but the three
+`SidebarRight*` plugin regions. It has **no** bar chip, so this verb (or `Esc`
+once the surface has keyboard focus) is the only way to reach it:
+
+```sh
+busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
+    org.gtk.Actions Activate 'sava{sv}' toggle-sidebar-right 0 0
+```
+
+`binds.kdl` ships both as commented-out `Mod+A` / `Mod+Shift+A` lines; pick your
+own chords and uncomment. Two things are worth knowing before you bind it:
+
+- The right sidebar is **hidden entirely while empty**. Until a plugin is
+  launched with `HYTTE_PLUGIN_MOUNT=SidebarRightLead` (or `…RightTop` /
+  `…RightBottom` — #1161 turns that into a checked
+  `programs.trollshell.plugins.<id>.mount` option), its layer surface is never
+  mapped at all, and `toggle-sidebar-right` does nothing but write one `debug!`
+  line. That is the design, not a broken bind — check with
+  `RUST_LOG=trollshell=debug`.
+- Both verbs target **niri's focused output**, so on a multi-monitor setup the
+  chord opens the sidebar on the screen you are looking at and leaves the
+  others alone.
+
+Both surfaces take their own layer-shell namespace, so a niri `layer-rule` can
+address one without the other: `hytte-sidebar-<connector>` for the left and
+`hytte-sidebar-right-<connector>` for the right.
 
 ## Frame struts
 

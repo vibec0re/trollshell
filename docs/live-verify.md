@@ -1584,6 +1584,109 @@ title` in the stderr tail — worth a deliberate look on first run, since
       closed the sidebar should still have it afterward, not the column the
       nudge itself focused.
 
+### The right sidebar (#1158 P2 / #1160)
+
+The right sidebar is a mirror of the left, anchored `Right + Top + Bottom`,
+holding nothing but the three `SidebarRight*` plugin regions, and **not mapped
+at all** until a card shows there. CI can pin the anchor set, the map latch,
+the toggle's no-op and the per-side `SlotVisible` feed; everything below needs a
+live niri, because it is about where a layer surface actually lands and what
+niri does with the strip it reserves.
+
+The setup for every item: pick any bundled sidebar plugin and relaunch it with
+the placement env var #1159 added. #1161 turns this into a checked
+`programs.trollshell.plugins.<id>.mount` option; until then, by hand —
+
+```sh
+systemctl --user stop trollshell-plugin-departures.service
+systemd-run --user --unit=trollshell-plugin-departures \
+    --setenv=HYTTE_PLUGIN_MOUNT=SidebarRightTop \
+    "$(command -v hytte-plugin-departures)"
+```
+
+- [ ] **(#1160)** **An empty right sidebar is not there at all.** Before
+      launching anything right, run `toggle-sidebar-right` (the `busctl`
+      one-liner in `etc/niri/README.md`, or the commented-out keybind). Nothing
+      should appear — no strip, no dark slab, no reserved space on the right
+      edge, and windows must not shift. With `RUST_LOG=trollshell=debug` you
+      should see exactly one
+      `toggle-sidebar-right: no plugin card mounted on the right sidebar here`
+      line per press. Confirm with `niri msg outputs` / a compositor layer
+      listing that there is **no** `hytte-sidebar-right-<connector>` surface —
+      "invisible" is not the claim, "not mapped" is.
+- [ ] **(#1160)** **It appears on the first card, on the right.** Run the
+      `systemd-run` line above, then toggle. The card should slide in from the
+      **right** edge (a `SlideLeft` reveal), full height between the bar and
+      the bottom frame, at the same width the left sidebar uses, and niri
+      should reflow the tiles to the left by exactly that strip. Toggle again:
+      the strip is released and the columns reflow back — the same #1129 check
+      as the left one, mirrored.
+- [ ] **(#1160)** **Focused monitor only.** On a two-monitor setup, move focus
+      to one screen and toggle. The right sidebar must open on that screen and
+      not on the other, and the same press on the other screen must open only
+      there. (Same `focused_output` routing as `toggle-sidebar`; #496's item
+      above covers the left.)
+- [ ] **(#1160)** **The plugin is on the right and nowhere else.** With the
+      card showing on the right, open the **left** sidebar too: the plugin must
+      not appear there. The control-center's Plugins tab should report its
+      runtime mount as `SidebarRightTop`. Then restart it with no
+      `HYTTE_PLUGIN_MOUNT` and confirm it goes back to the left, and that the
+      right sidebar returns to showing nothing.
+- [ ] **(#1160 review)** **An open right sidebar survives its last card
+      leaving — and can still be dismissed.** With the right sidebar **open**,
+      stop the plugin (`systemctl --user stop trollshell-plugin-departures`) or
+      wait for one that renders an empty tree when it has nothing to say. The
+      card should disappear and the strip should be released. Now press
+      `toggle-sidebar-right`: it must **close** (the open latch clears — there
+      is no `ignoring` debug line for this press). Restart the plugin: the
+      sidebar must stay closed rather than sliding open by itself. Then press
+      the keybind again with the card present and confirm it opens normally.
+      Before the #1244 review this sequence left the sidebar latched open with
+      nothing on screen, and the returning card re-opened it unasked.
+- [ ] **(#1160)** **Both sidebars open at once.** Open the left and the right
+      together. Both should be revealed, both strips reserved, the tiles
+      squeezed between them, and neither toggle should disturb the other.
+      `Esc` while the right one has focus must close the **right** one and
+      leave the left open (and vice versa).
+- [ ] **(#1160)** **Blur / layer rules match the left.** The two surfaces take
+      **different** layer-shell namespaces (`hytte-sidebar-<connector>` and
+      `hytte-sidebar-right-<connector>`), so a niri `layer-rule` written for
+      the left does **not** cover the right one. Confirm the right card's
+      backdrop looks like the left's; if it does not, that is a `layer-rule`
+      to add in your niri config, not a shell bug — check what rules match with
+      `niri msg` and add the right namespace beside the left one.
+- [ ] **(#1160)** **Z-order against the bar.** Open the right sidebar and look
+      at the bar's rightmost chips. They must stay on top / uncovered. The
+      right surface maps _after_ the bar (its first card arrives once a plugin
+      dials in, which is post-startup), and `Layer::Top` orders by surface
+      creation — the left sidebar avoids this by being created before the bar.
+      A zone-0 surface should be placed inside the non-exclusive area, so this
+      should be fine; if the card paints over the bar's right end, say so on
+      #1160 — the fix is a top margin of the bar's height on that window.
+- [ ] **(#1160 → #1247)** **The frame's cutout is right-blind — confirm the
+      known answer, don't discover it.** The frame overlay tracks the _left_
+      sidebar's width only (`frame.rs:253` reads `current_visible_width`, which
+      is hardcoded to `Side::Left`), and `cutout_rect` always puts the cutout's
+      right edge at `width - FRAME_THICKNESS`. So with the right sidebar open
+      the prediction is: the frame's 8 px right strut paints **on top of** the
+      sidebar's outer edge (the frame is `Layer::Overlay`, above the sidebar's
+      `Layer::Top`), the rounded right corners sit ~312 px _underneath_ the
+      sidebar instead of against it, the tiles niri has just reflowed to
+      `width - 320` get no frame border on their right edge at all, and the
+      frame does not even redraw during the right slide (`is_settled` is
+      left-keyed too). Check it looks like that rather than like something else
+      — a _different_ artefact is new information. The fix is **#1247**;
+      `frame.rs` is outside #1160's lane and this is not a regression of the
+      left behaviour.
+- [ ] **(#1160)** **Pollers park per side.** With a `SlotVisible`-subscribing
+      plugin on the right (departures declares it) and another on the left,
+      open only the **right** sidebar and confirm from
+      `RUST_LOG=trollshell=debug,hytte_plugin=debug` that the right-mounted one
+      unparks and the left-mounted one stays parked — then the mirror. Before
+      #1160 both followed the left sidebar's state, so a right-mounted card
+      polled whenever the left sidebar opened and idled while it was being
+      looked at.
+
 ## Audio & media
 
 - [ ] **(#470)** Drag-safe seek slider: open the Media drawer on an active

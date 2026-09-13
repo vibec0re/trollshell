@@ -25,6 +25,8 @@ use hytte_plugin_proto::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, UpcomingEvent,
 };
 
+use tokio::sync::watch;
+
 use super::preem_render::{self, Role, Scope};
 use super::{PluginHandles, SlotRender};
 
@@ -813,6 +815,7 @@ pub(super) fn install_scope_releaser() {
             active_panel_id: _,
             clock_tx: _,
             visibility_tx: _,
+            visibility_right_tx: _,
             accent_tx: _,
             spectrum_tx: _,
             calendar_tx: _,
@@ -1005,13 +1008,26 @@ pub(super) fn request_remap(mailbox: &Mutable<Vec<SlotRender>>) {
 // ── Slot visibility (#288): OR of every monitor's sidebar open flag ───────────
 
 thread_local! {
-    /// GTK-thread-only per-monitor sidebar open flag, keyed by connector. The OR
-    /// across its values is the single `visible` bool pushed to every connected
-    /// plugin: a plugin's card mirrors onto **every** monitor's sidebar region,
-    /// so it is "visible" while any one sidebar is open. Fed by `sidebar.rs`
-    /// through [`set_sidebar_visibility`] (open/close) and
-    /// [`forget_sidebar_visibility`] (hot-unplug).
+    /// GTK-thread-only per-monitor **left** sidebar open flag, keyed by
+    /// connector. The OR across its values is the `visible` bool pushed to every
+    /// connected plugin mounted on the left sidebar: a plugin's card mirrors onto
+    /// **every** monitor's sidebar region, so it is "visible" while any one
+    /// sidebar is open. Fed by `sidebar.rs` through [`set_sidebar_visibility`]
+    /// (open/close) and [`forget_sidebar_visibility`] (hot-unplug).
     static SLOT_VISIBILITY_BY_MONITOR: RefCell<HashMap<String, bool>> =
+        RefCell::new(HashMap::new());
+
+    /// The same map for the **right** sidebar (#1158/#1160, closing the #1221
+    /// review's LOW 5). Deliberately a second map rather than a side-qualified
+    /// key in the one above: the two aggregates are consumed separately (a
+    /// right-mounted plugin's `SlotVisible` follows *this* one), and a shared map
+    /// would have to be filtered at every read anyway.
+    ///
+    /// Why a second aggregate at all: a plugin is told its card is on screen so
+    /// it can park pollers while it is not. A card mounted on the right sidebar
+    /// is not on screen because the *left* one opened, and before #1160 it was
+    /// told it was — the left aggregate was the only one there was.
+    static SLOT_VISIBILITY_RIGHT_BY_MONITOR: RefCell<HashMap<String, bool>> =
         RefCell::new(HashMap::new());
 
     /// The same aggregate as a GTK-side `Mutable`, so the *binary* can gate its
@@ -1072,6 +1088,23 @@ pub fn forget_sidebar_visibility(monitor_key: &str) {
     publish_visibility(visible);
 }
 
+/// [`set_sidebar_visibility`] for the **right** sidebar (#1160). Same
+/// aggregation, its own map and its own watch channel, so only right-mounted
+/// plugins see this edge. GTK-thread-only.
+pub fn set_sidebar_right_visibility(monitor_key: &str, open: bool) {
+    let visible = SLOT_VISIBILITY_RIGHT_BY_MONITOR
+        .with(|m| apply_open(&mut m.borrow_mut(), monitor_key, open));
+    publish_right_visibility(visible);
+}
+
+/// [`forget_sidebar_visibility`] for the **right** sidebar (#1160).
+/// GTK-thread-only.
+pub fn forget_sidebar_right_visibility(monitor_key: &str) {
+    let visible =
+        SLOT_VISIBILITY_RIGHT_BY_MONITOR.with(|m| apply_forget(&mut m.borrow_mut(), monitor_key));
+    publish_right_visibility(visible);
+}
+
 /// Push `visible` on the watch channel, but only when it differs from the last
 /// published value (`send_if_modified`) — so redundant open/close churn on one
 /// monitor while another stays open doesn't wake the per-conn tasks. Latest-wins
@@ -1086,17 +1119,45 @@ fn publish_visibility(visible: bool) {
         mirror.set(visible);
     }
     registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .visibility_tx
-            .send_if_modified(|current| {
-                if *current == visible {
-                    false
-                } else {
-                    *current = visible;
-                    true
-                }
-            });
+        send_if_changed(
+            &r.get::<PluginHandles>()
+                .expect("plugins::service() not registered")
+                .visibility_tx,
+            visible,
+        );
+    });
+}
+
+/// [`publish_visibility`] for the **right** sidebar's aggregate (#1160).
+///
+/// Deliberately does **not** touch [`SLOT_VISIBLE`]: that mirror exists so the
+/// *binary* can gate its own pollers on plugin-card visibility (#840), and every
+/// consumer of it — `main.rs`'s mpris position gate — is a left-sidebar card.
+/// Folding the right side into it would park nothing extra and unpark the
+/// left's pollers whenever an unrelated right-hand card came on screen.
+fn publish_right_visibility(visible: bool) {
+    registry::with(|r| {
+        send_if_changed(
+            &r.get::<PluginHandles>()
+                .expect("plugins::service() not registered")
+                .visibility_right_tx,
+            visible,
+        );
+    });
+}
+
+/// Publish on a watch channel only when the value actually changes, so
+/// redundant open/close churn on one monitor while another stays open doesn't
+/// wake the per-conn tasks. Shared by both sides' publishers so they cannot
+/// drift apart.
+fn send_if_changed(tx: &watch::Sender<bool>, visible: bool) {
+    tx.send_if_modified(|current| {
+        if *current == visible {
+            false
+        } else {
+            *current = visible;
+            true
+        }
     });
 }
 

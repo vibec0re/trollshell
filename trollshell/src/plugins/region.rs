@@ -498,6 +498,22 @@ fn card_shows_here(render: &SlotRender, connector: Option<&str>) -> bool {
     !root_renders_nothing(&render.tree) && !hidden_on_this_output(render, connector)
 }
 
+/// Whether **any** render in `renders` shows a card on `connector` — i.e.
+/// whether the region built over that mailbox would map itself rather than
+/// collapse.
+///
+/// The single-mailbox half of [`sidebar_right_non_empty`], and deliberately the
+/// *same* [`card_shows_here`] the region-collapse rule in [`reconcile_region`]
+/// reads (`container.set_visible(renders.iter().any(…))`) rather than a second
+/// spelling of "has cards" (#1160). A right sidebar hidden while empty and a
+/// region collapsed while empty have to agree about what empty means on this
+/// screen, or the surface maps around three collapsed regions — a 320 px strip
+/// of exclusive zone reserved for nothing, which is the right-hand twin of the
+/// #1042 HIGH-1 bug.
+fn any_card_shows_here(renders: &[SlotRender], connector: Option<&str>) -> bool {
+    renders.iter().any(|r| card_shows_here(r, connector))
+}
+
 /// The entries of `hidden_on` that name no monitor currently attached to
 /// `display` — a plugin author's typo (`"DP1"` for `"DP-1"`), or a screen that
 /// has since been unplugged.
@@ -4240,13 +4256,10 @@ mod gtk_tests {
 // is `ts-plugin-card` here too, so a plugin moved from one sidebar to the other
 // by `HYTTE_PLUGIN_MOUNT` looks the same on both.
 //
-// Nothing calls the three `_slot` functions yet. `sidebar.rs` builds one
-// `Left + Top + Bottom` surface today; #1160 parameterises it by side and mounts
-// these three into the right one. Until then a plugin placed right registers
-// fine, routes into its mailbox, and shows its runtime mount in the
-// control-center — it just has no surface to paint on. That is the intended
-// intermediate state, which is why the `allow(dead_code)` below is scoped to
-// these three items and names the issue that removes it.
+// Since #1160 all three are mounted: `sidebar.rs`'s `build_card` appends them
+// into the `Side::Right` surface at the same three places the left family's go
+// into the left one, so P1's scoped `allow(dead_code)` is gone with the
+// intermediate state it named.
 //
 // One deliberate difference from the six builders above: these three pass
 // `monitor.connector()` **straight through** rather than wrapping it in this
@@ -4289,13 +4302,7 @@ fn right_bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// The [`Mount::SidebarRightLead`](hytte_plugin_proto::Mount::SidebarRightLead)
 /// **region** — the mirror of [`sidebar_lead_slot`] on the right sidebar: a
 /// vertical container of N plugin cards, mounted at the very top of that surface.
-///
-/// Unused until #1160 builds the right sidebar; see the section comment above.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "#1160 (P2) mounts the right sidebar's three slots"
-)]
 pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         right_lead_render_signal(),
@@ -4307,13 +4314,7 @@ pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
 
 /// The [`Mount::SidebarRightTop`](hytte_plugin_proto::Mount::SidebarRightTop)
 /// **region** — the mirror of [`sidebar_top_slot`] on the right sidebar.
-///
-/// Unused until #1160 builds the right sidebar; see the section comment above.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "#1160 (P2) mounts the right sidebar's three slots"
-)]
 pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         right_top_render_signal(),
@@ -4325,13 +4326,7 @@ pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
 
 /// The [`Mount::SidebarRightBottom`](hytte_plugin_proto::Mount::SidebarRightBottom)
 /// **region** — the mirror of [`sidebar_bottom_slot`] on the right sidebar.
-///
-/// Unused until #1160 builds the right sidebar; see the section comment above.
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "#1160 (P2) mounts the right sidebar's three slots"
-)]
 pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         right_bottom_render_signal(),
@@ -4339,4 +4334,146 @@ pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
         "ts-plugin-card",
         monitor.connector(),
     )
+}
+
+/// Whether **any** card shows on the right sidebar **for this monitor** (#1160):
+/// the OR of [`any_card_shows_here`] across the three right mailboxes, evaluated
+/// with this monitor's connector.
+///
+/// The right sidebar is hidden entirely while its three regions are empty
+/// (#1158), and this is the signal that decides it. Three properties are
+/// load-bearing:
+///
+/// * It reads **[`card_shows_here`]**, the same predicate each region's own
+///   collapse rule reads, so "the surface has something to show" and "a region
+///   maps rather than collapses" cannot disagree — see [`any_card_shows_here`].
+/// * It is **per monitor**, like everything else keyed off `connector` in this
+///   module (#1050): a plugin whose frame carries `hidden_on: ["DP-2"]` leaves
+///   the right sidebar empty on DP-2 while it paints on DP-1, so DP-2's surface
+///   must stay hidden. The render list is shared; the connector is the only
+///   per-monitor input, exactly as in [`build_region`].
+/// * An **empty-tree** card (#1039/#1042 — a plugin's way of saying "nothing to
+///   show right now") counts as absent here too, so a right sidebar holding one
+///   plugin that has gone quiet is empty, not a blank 320 px slab.
+///
+/// There is deliberately no left-hand twin: the left sidebar is always mounted
+/// (it carries the built-in calendar/tasks cards, which are never empty), and
+/// #1160 leaves its behaviour untouched.
+pub fn sidebar_right_non_empty(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
+    let connector = monitor.connector();
+    map_ref! {
+        let lead = right_lead_render_signal(),
+        let top = right_top_render_signal(),
+        let bottom = right_bottom_render_signal() => {
+            let connector = connector.as_deref();
+            any_card_shows_here(lead, connector)
+                || any_card_shows_here(top, connector)
+                || any_card_shows_here(bottom, connector)
+        }
+    }
+}
+
+// ── The "any card on this side" predicate, hermetically (#1160) ──────────────
+
+#[cfg(test)]
+mod tests {
+    use super::super::shader_map::Grants;
+    use super::{HostMsg, SlotRender, any_card_shows_here, wire};
+    use tokio::sync::mpsc;
+
+    /// A render carrying a real, painting tree — the `hidden_on` set is the
+    /// variable under test.
+    fn render(plugin_id: &str, tx: &mpsc::Sender<HostMsg>, hidden_on: &[&str]) -> SlotRender {
+        SlotRender {
+            plugin_id: plugin_id.to_owned(),
+            order: 0,
+            generation: 1,
+            tree: wire::Node::Label {
+                id: None,
+                text: "hi".to_owned(),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            grants: Grants::none(),
+            outbound: tx.clone(),
+            hidden_on: hidden_on.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// A render whose root bottoms out in nothing — #1039's "nothing to show
+    /// right now" spelling, which the region collapse rule already treats as
+    /// absent.
+    fn empty_render(plugin_id: &str, tx: &mpsc::Sender<HostMsg>) -> SlotRender {
+        SlotRender {
+            tree: wire::Node::Row {
+                id: None,
+                classes: vec![],
+                spacing: 0,
+                children: vec![],
+                tooltip: None,
+            },
+            ..render(plugin_id, tx, &[])
+        }
+    }
+
+    #[test]
+    fn an_empty_mailbox_shows_nothing() {
+        assert!(!any_card_shows_here(&[], Some("DP-1")));
+    }
+
+    #[test]
+    fn a_painting_card_shows_here() {
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(any_card_shows_here(&[render("p", &tx, &[])], Some("DP-1")));
+    }
+
+    /// The #1050 half: a card hidden on **this** connector leaves this
+    /// monitor's right sidebar empty even though the mailbox is not.
+    ///
+    /// **Deletion check:** dropping `card_shows_here`'s
+    /// `!hidden_on_this_output(…)` term turns this red.
+    #[test]
+    fn a_card_hidden_on_this_output_does_not_count() {
+        let (tx, _rx) = mpsc::channel(4);
+        let renders = [render("p", &tx, &["DP-1"])];
+        assert!(!any_card_shows_here(&renders, Some("DP-1")));
+        // …and the very same list is non-empty on the other screen, which is
+        // what makes this a statement about the connector rather than about
+        // the card.
+        assert!(any_card_shows_here(&renders, Some("DP-2")));
+    }
+
+    /// The #1039/#1042 half: a card whose tree renders nothing does not keep
+    /// the surface alive either.
+    ///
+    /// **Deletion check:** dropping `card_shows_here`'s
+    /// `!root_renders_nothing(…)` term turns this red.
+    #[test]
+    fn a_card_rendering_nothing_does_not_count() {
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(!any_card_shows_here(
+            &[empty_render("p", &tx)],
+            Some("DP-1")
+        ));
+    }
+
+    /// One painting sibling is enough — the predicate is an OR, so a quiet
+    /// plugin next to a live one must not hide the sidebar.
+    #[test]
+    fn one_painting_card_among_quiet_ones_is_enough() {
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(any_card_shows_here(
+            &[empty_render("quiet", &tx), render("live", &tx, &[])],
+            Some("DP-1")
+        ));
+    }
+
+    /// A monitor GDK reports no connector for is never hidden by name — the
+    /// same safe direction [`super::hidden_on_this_output`] documents.
+    #[test]
+    fn a_connectorless_monitor_is_never_hidden_by_name() {
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(any_card_shows_here(&[render("p", &tx, &["DP-1"])], None));
+    }
 }

@@ -1091,6 +1091,10 @@ fn ctx_with(
         panels: Mutable::new(Vec::new()),
         clock_rx,
         visibility_rx,
+        // #1160: the right sidebar's own aggregate. These session tests drive
+        // left-sidebar and bar mounts, so no task ever reads it; the sender is
+        // dropped immediately, which the seeding read tolerates.
+        visibility_right_rx: watch::channel(false).1,
         accent_rx,
         spectrum_rx,
         calendar_rx,
@@ -3243,6 +3247,10 @@ fn ctx_now_playing_lane() -> (ListenerCtx, watch::Sender<bool>, watch::Sender<No
         panels: Mutable::new(Vec::new()),
         clock_rx,
         visibility_rx,
+        // #1160: the right sidebar's own aggregate. These session tests drive
+        // left-sidebar and bar mounts, so no task ever reads it; the sender is
+        // dropped immediately, which the seeding read tolerates.
+        visibility_right_rx: watch::channel(false).1,
         accent_rx,
         spectrum_rx,
         calendar_rx,

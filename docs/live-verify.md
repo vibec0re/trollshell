@@ -1532,6 +1532,63 @@ title` in the stderr tail — worth a deliberate look on first run, since
       home-manager `home.file` entry, `0444` in the Nix store) is refused the
       same way — `metadata` follows the link.
 
+- [ ] **(#1236)** The Claude usage limits on the chip and in the drawer. Needs a
+      box where Claude Code is **logged in** (`~/.claude/.credentials.json`
+      exists with a live `claudeAiOauth.accessToken`) — the same precondition
+      the bridge's subscription modes already have. The endpoint is unofficial
+      and undocumented, so this is the half only a live account can show: the
+      hermetic tests pin a captured body, not the server's behaviour.
+  1. **The meters appear.** Restart the bridge (control-center Plugins tab, or
+     `Control.ReloadPlugins`) and watch the chip for a minute — the first poll
+     fires immediately at startup. Expect one compact level meter per **active**
+     limit, at most two, to the right of `sub`/`api` and the counts. Hover each:
+     `Session (5 h): 80% — resets in 2 h 15 min`, and the whole-pill hover is
+     still the #957 sentence, unchanged. Cross-check the numbers against
+     `/usage` in the `claude` CLI — they are the same two bars.
+     Note what the endpoint reported for this account on 2026-09-13: three rows
+     (`session`, `weekly_all`, `weekly_scoped`) of which only **one** was
+     `is_active`, so a single meter on the chip is a correct rendering, not a
+     bug. The panel is where all three show.
+  2. **The panel.** Click the chip → the drawer opens on `Claude usage` with
+     every row the server sent, a full-width bar each, the percent, and the
+     reset both ways (`resets 2026-09-13 13:50 UTC · in 2 h 15 min`). An
+     inactive row is greyed and says `not counting right now` rather than being
+     dropped. The header says how fresh the numbers are (`updated 2 min ago`).
+     If the account has pay-as-you-go extra usage **enabled**, there is one more
+     row for it — nobody here does, so that row is hermetic-only.
+  3. **Stale, and recovered.** `mv ~/.claude/.credentials.json{,.bak}` → within
+     five minutes the meters vanish, the chip **stays** (glyphs, mode, counts
+     untouched), and its hover gains a second line naming the file: _"no Claude
+     login found at … — run `claude` once to sign in"_. The panel header shows
+     the same sentence. `mv` it back → the next poll restores the meters with no
+     restart. An **expired** token (leave the box overnight without running
+     `claude`) shows the other sentence, _"usage stale — run `claude` once to
+     refresh the login"_; running `claude` once refreshes it and the meters come
+     back. The bridge must **never** write that file —
+     `stat -c %y ~/.claude/.credentials.json` before and after an hour of
+     polling, with `claude` not run in between, must be unchanged.
+  4. **Nothing leaks.** `journalctl --user -u trollshell-plugin-claude-bridge | grep -c 'sk-ant'`
+     → `0`, including after forcing a failure (step 3) with
+     `RUST_LOG=hytte_claude_bridge=debug`.
+  5. **(FIX ROUND, #1254) `api` mode gets a subscription note, not a sign-in
+     prompt.** With `CLAUDE_BRIDGE_MODE=api` on a box with no
+     `~/.claude/.credentials.json`, hover the chip: the second line reads
+     "usage limits are a subscription feature — no Claude Code login is
+     expected in API-key mode", never the claude-modes' "run `claude` once to
+     sign in" — `api` mode never spawns `claude`, so that instruction is for a
+     login this mode does not need.
+  6. **(FIX ROUND, #1254) The staleness ceiling is hermetic-only.**
+     `poll_forever` republishes a fresh `at` on every attempt, success or
+     failure, so an ordinary network hiccup or an expired token never goes
+     stale — only a poll task that stopped publishing entirely (a panic, since
+     it is deliberately unsupervised) would reach `usage::STALE_AFTER` (three
+     poll periods, 15 min). Nothing short of killing that one tokio task from
+     outside the process reproduces that live; the unit tests
+     (`usage::tests::a_report_is_stale_only_past_the_ceiling`,
+     `plugin::tests::a_wedged_poll_drops_its_meters_past_the_staleness_ceiling`)
+     cover the ceiling directly with an injected `at`. There is no live step
+     for it.
+
 ## Caw (morning briefing)
 
 - [ ] **(#483)** Poke caw and confirm the taller 8-row briefing bubble renders

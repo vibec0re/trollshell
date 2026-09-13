@@ -19,6 +19,24 @@
 //! HTTP listener is bound and spawned before the SDK loop is entered**: the API
 //! is the primary duty and must not depend on the shell being up.
 //!
+//! # …and since #1236 it reads the Claude account's usage limits
+//!
+//! A second task on that same HTTP runtime polls
+//! `GET https://api.anthropic.com/api/oauth/usage` every five minutes with the
+//! OAuth access token Claude Code keeps in `~/.claude/.credentials.json`, and
+//! the chip paints `limits[]` as one level meter per active bucket, with the
+//! whole list in a drawer panel. See [`usage`] for the wire contract (parse the
+//! generic list, tolerate everything else) and for the credential rules, which
+//! are the load-bearing part: the file is **read-only** to this daemon, re-read
+//! per poll, never refreshed — `claude` owns that rotation and rotating it out
+//! from under the CLI is the one way to break the user's own login — and the
+//! token never reaches a log line, a tooltip or an error string. A 401 renders
+//! as "usage stale — run `claude` once", not as a refresh.
+//!
+//! It adds **no** environment variable and no configuration: the endpoint is a
+//! constant and the credential path follows Claude Code's own
+//! `$CLAUDE_CONFIG_DIR`/`$HOME` resolution.
+//!
 //! # The INBOUND side is KEYLESS — and that is a correctness requirement
 //!
 //! The bridge validates **no bearer token at all** on the route it serves. It
@@ -137,6 +155,7 @@ mod retired;
 mod session;
 mod socket;
 mod status;
+mod usage;
 mod wire;
 
 use std::path::PathBuf;
@@ -448,6 +467,14 @@ async fn accept_loop(socket: socket::BridgeSocket, bridge: Arc<Bridge>) {
     }
 }
 
+/// Whether the usage poll's only consumer will ever exist: named separately
+/// from the `if host_socket_available { plugin::run() } else { .. }` fork so
+/// the two decisions read as one gate rather than two `if`s on the same bool
+/// that a future edit could accidentally point at different conditions.
+fn should_poll_usage(host_socket_available: bool) -> bool {
+    host_socket_available
+}
+
 /// The process's two duties, in priority order (#866).
 ///
 /// `main` is **not** `#[tokio::main]` any more, and that is load-bearing:
@@ -490,6 +517,36 @@ fn main() -> ExitCode {
     let http = rt.spawn(accept_loop(serving.socket, serving.bridge));
     rt.spawn(supervise_http(http));
 
+    // Computed once: both the poll gate below and the thread-disposition fork
+    // at the bottom of this function have to agree on it, and a duplicated
+    // `plugin::host_socket_available()` call is a chance for that agreement to
+    // silently drift if one call site is ever edited without the other.
+    let host_socket_available = plugin::host_socket_available();
+
+    // The Claude usage poll (#1236) — on the HTTP runtime, not the SDK's, for
+    // the same reason the listener is: the numbers must keep arriving while the
+    // shell is down and the chip is sitting in its dial backoff, and the SDK's
+    // current-thread runtime is handed the main thread below and never gives it
+    // back. Deliberately **unsupervised**, unlike `accept_loop`: this one is a
+    // display feed, and a bridge whose API is answering perfectly must not exit
+    // because a status poll fell over. `poll_forever` cannot return, and if it
+    // panicked the chip would simply stop growing meters.
+    //
+    // Run in **every mode**, including `api`: the limits it reports belong to
+    // the box's Claude Code login, which exists regardless of which backend
+    // this bridge happens to be spending. But gated on
+    // `should_poll_usage`/`host_socket_available`: the poll's only consumer is
+    // the chip below, and the branch with no host socket to dial has no chip to
+    // feed — spending the owner's bearer every five minutes with nobody
+    // reading the board would be silent waste on the one request that carries
+    // it.
+    if should_poll_usage(host_socket_available) {
+        rt.spawn(usage::poll_forever(
+            usage::DEFAULT_BASE_URL.to_owned(),
+            usage::credentials_path(),
+        ));
+    }
+
     // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host
     // socket to dial *ever*, and the SDK would exit the process over it — which
     // would take the API down with it. Park on the HTTP runtime instead.
@@ -502,7 +559,7 @@ fn main() -> ExitCode {
     // `hytte_plugin_proto::socket_path` in the SDK), and if they ever disagree
     // the API must **not** go down with the chip. A daemon that panics on the
     // disagreement would do exactly that.
-    if plugin::host_socket_available() {
+    if host_socket_available {
         // Diverges: the SDK owns this thread for the rest of the process.
         plugin::run()
     } else {
@@ -513,7 +570,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BUDGET, Mode, Settings};
+    use super::{DEFAULT_BUDGET, Mode, Settings, should_poll_usage};
     use std::time::Duration;
 
     /// A `Settings` whose only interesting field is the one under test.
@@ -536,6 +593,23 @@ mod tests {
     #[test]
     fn the_default_budget_is_under_the_clients_global_timeout() {
         assert!(DEFAULT_BUDGET < Duration::from_secs(10));
+    }
+
+    /// **The usage-poll gate.** The poll's only consumer is the chip the SDK
+    /// paints once it dials the host socket, so the two must move together —
+    /// this pins that `should_poll_usage` is exactly `host_socket_available`,
+    /// not a fixed `true` that would spend the bearer in the branch with
+    /// nothing to feed.
+    #[test]
+    fn the_usage_poll_runs_only_where_its_only_consumer_can() {
+        assert!(
+            should_poll_usage(true),
+            "a host socket to dial ⇒ a chip that will read the board"
+        );
+        assert!(
+            !should_poll_usage(false),
+            "no host socket ⇒ the parked branch has no chip to feed"
+        );
     }
 
     /// Mode parsing: the persisted-session path is the default, and a typo in a

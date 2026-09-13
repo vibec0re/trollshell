@@ -150,6 +150,7 @@ pub fn set_app_muted(app_name: &str, muted: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hytte_config::test_support::scratch_home;
 
     #[test]
     fn parse_empty_returns_empty() {
@@ -191,26 +192,13 @@ mod tests {
 
     // ── State migration (#1226) ─────────────────────────────────────────────
 
-    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().to_path_buf();
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
-                ("XDG_STATE_HOME", None::<&str>),
-                ("XDG_CONFIG_HOME", None::<&str>),
-            ],
-            || body(&home),
-        )
-    }
-
     fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".config/trollshell/muted-apps.toml")
     }
 
     #[test]
     fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let legacy = legacy_path(home);
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, "apps = [\"Discord\"]\n").unwrap();
@@ -241,7 +229,7 @@ mod tests {
 
     #[test]
     fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             state::store(
                 SUBSYSTEM,
                 &MutedAppsState {
@@ -259,7 +247,7 @@ mod tests {
 
     #[test]
     fn neither_file_present_defaults_to_empty() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             assert!(load_from_disk().is_empty());
         });
     }

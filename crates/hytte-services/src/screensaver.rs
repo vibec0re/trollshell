@@ -935,6 +935,7 @@ impl ScreenSaverIface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hytte_config::test_support::scratch_home;
 
     #[test]
     fn parse_keep_awake_defaults_off() {
@@ -968,26 +969,13 @@ mod tests {
 
     // ── State migration (#1226) ─────────────────────────────────────────────
 
-    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().to_path_buf();
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
-                ("XDG_STATE_HOME", None::<&str>),
-                ("XDG_CONFIG_HOME", None::<&str>),
-            ],
-            || body(&home),
-        )
-    }
-
     fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".config/trollshell/keep-awake.toml")
     }
 
     #[test]
     fn keep_awake_state_round_trips() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             save_keep_awake_to_disk(true);
             assert!(load_keep_awake_from_disk(), "true must round-trip as true");
 
@@ -1001,7 +989,7 @@ mod tests {
 
     #[test]
     fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let legacy = legacy_path(home);
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, "enabled = true\n").unwrap();
@@ -1034,7 +1022,7 @@ mod tests {
 
     #[test]
     fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             state::store(KEEP_AWAKE_SUBSYSTEM, &KeepAwakeState { enabled: true });
 
             let legacy = legacy_path(home);
@@ -1050,7 +1038,7 @@ mod tests {
 
     #[test]
     fn neither_file_present_defaults_to_off() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             assert!(!load_keep_awake_from_disk(), "keep-awake defaults OFF");
         });
     }

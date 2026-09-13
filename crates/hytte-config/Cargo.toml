@@ -20,12 +20,12 @@ workspace = true
 # dependency line enables it; the control center's does not.
 watch = ["dep:futures-signals", "dep:tokio"]
 # `test_support` — the process-wide tracing global default (#1022/#1043), the
-# capture harness and the scratch-overlay helper. A cargo feature rather than
+# capture harness, the scratch-overlay helper and the scratch `$HOME` (#1233). A cargo feature rather than
 # `#[cfg(test)]` because `#[cfg(test)]` is per-crate: hytte-config, trollshell
 # and hytte-reactive had each grown their own copy of the same `tracing`
 # callsite fix, two of them weaker than the third (#1040 T5). Enabled through a
 # **dev**-dependency only, so no shipped binary carries a `set_global_default`.
-test-support = ["dep:tempfile"]
+test-support = ["dep:tempfile", "dep:temp-env"]
 
 [dependencies]
 # `watch` only: the poll loop sleeps on tokio's timer and publishes into a
@@ -35,9 +35,16 @@ test-support = ["dep:tempfile"]
 futures-signals = { workspace = true, optional = true }
 serde.workspace = true
 serde_ignored.workspace = true
-# `test-support` only: `Overlay`'s scratch directory. Already this crate's
-# dev-dependency below, so enabling the feature adds no resolved package — it
-# only makes the same crate reachable from a *dependent's* test binary.
+# `test-support` only: `scratch_home`'s `$HOME`/`XDG_*` redirection (#1233).
+# Same story as `tempfile` below — already this crate's dev-dependency, so the
+# feature adds no resolved package, it only makes the helper reachable from a
+# *dependent's* test binary. `hytte-services`' own dev-dependency asks for
+# `async_closure` on top; cargo unifies the two feature sets.
+temp-env = { version = "0.3.6", optional = true }
+# `test-support` only: `Overlay`'s scratch directory and `scratch_home`'s
+# tempdir. Already this crate's dev-dependency below, so enabling the feature
+# adds no resolved package — it only makes the same crate reachable from a
+# *dependent's* test binary.
 tempfile = { workspace = true, optional = true }
 toml.workspace = true
 # The write half. See `places::render_places` for why a save patches the

@@ -171,6 +171,7 @@ pub fn remove(subsystem: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scratch_home;
 
     #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Toggle {
@@ -238,26 +239,9 @@ mod tests {
         enabled: bool,
     }
 
-    /// Clears `$XDG_STATE_HOME`/`$XDG_CONFIG_HOME` and points `$HOME` at a
-    /// tempdir before running `body`, so `path()`'s process-environment read
-    /// can never resolve into a real, ambient state or config directory —
-    /// the #1101 rule this whole feature is built to respect.
-    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().to_path_buf();
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
-                ("XDG_STATE_HOME", None::<&str>),
-                ("XDG_CONFIG_HOME", None::<&str>),
-            ],
-            || body(&home),
-        )
-    }
-
     #[test]
     fn load_or_migrate_from_migrates_once_and_leaves_the_old_file_alone() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let old = home.join("old.toml");
             std::fs::write(&old, "enabled = true\n").expect("seed old");
             let before = std::fs::metadata(&old).expect("meta");
@@ -293,7 +277,7 @@ mod tests {
 
     #[test]
     fn load_or_migrate_from_prefers_state_and_never_reads_old_again() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             let state_path = path("migrate-b").expect("state path resolves");
             store_at(&state_path, &Flag { enabled: false }).expect("seed state");
 
@@ -316,7 +300,7 @@ mod tests {
 
     #[test]
     fn load_or_migrate_from_defaults_when_neither_file_exists() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let old = home.join("never-existed.toml");
             let value: Flag = load_or_migrate_from("migrate-c", Some(&old), |_text| {
                 panic!("old does not exist; parse_old must not run")

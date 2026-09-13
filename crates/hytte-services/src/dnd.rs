@@ -142,22 +142,7 @@ pub fn set_enabled(on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Points `$HOME` at a fresh tempdir and clears `$XDG_STATE_HOME` /
-    /// `$XDG_CONFIG_HOME`, so `load_enabled_from_disk`'s process-environment
-    /// reads can never resolve into a real config or state directory (#1101).
-    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().to_path_buf();
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
-                ("XDG_STATE_HOME", None::<&str>),
-                ("XDG_CONFIG_HOME", None::<&str>),
-            ],
-            || body(&home),
-        )
-    }
+    use hytte_config::test_support::scratch_home;
 
     fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".config/trollshell/dnd.toml")
@@ -165,7 +150,7 @@ mod tests {
 
     #[test]
     fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let legacy = legacy_path(home);
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, "enabled = true\n").unwrap();
@@ -198,7 +183,7 @@ mod tests {
 
     #[test]
     fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             // Seed state directly with a value that disagrees with the
             // legacy file, so a read of the wrong source is observable.
             state::store(SUBSYSTEM, &DndState { enabled: true });
@@ -216,7 +201,7 @@ mod tests {
 
     #[test]
     fn neither_file_present_defaults_to_off() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             assert!(!load_enabled_from_disk());
         });
     }

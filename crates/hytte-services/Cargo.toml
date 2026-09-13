@@ -85,6 +85,14 @@ wayland-protocols = { version = "0.32.13", features = ["staging", "client"] }
 
 [dev-dependencies]
 futures-executor.workspace = true
+# `hytte-config`'s `test_support` (#1044): `scratch_home`, the one helper that
+# keeps a path-resolving test out of the real `~/.config/trollshell` and
+# `~/.local/state/trollshell` (#1101). It is a cargo feature rather than a
+# `#[cfg(test)]` helper precisely so this crate's test binary can reach it —
+# #1226 had grown six copies of it here before #1233 deleted them. The crate is
+# already a plain dependency above; a dev-dependency line that only adds a
+# feature changes nothing about what a non-test build links.
+hytte-config = { path = "../hytte-config", features = ["test-support"] }
 # Workspace `futures-util` sets `default-features = false` (what the main dep
 # above needs); widen back to the full default set here, matching this
 # crate's original bare `"0.3.32"` dev-dependency (Cargo only allows widening

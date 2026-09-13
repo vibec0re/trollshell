@@ -700,6 +700,7 @@ mod tests {
         WallpaperState, args_file_body, load_state, primary_image, shell_single_quote, state,
         state_from_disk, swaybg_args,
     };
+    use hytte_config::test_support::scratch_home;
     use std::collections::BTreeMap;
 
     fn expand(cmd: &str, path: &str) -> String {
@@ -1003,19 +1004,6 @@ mod tests {
 
     // ── State migration (#1226) ─────────────────────────────────────────────
 
-    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().to_path_buf();
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
-                ("XDG_STATE_HOME", None::<&str>),
-                ("XDG_CONFIG_HOME", None::<&str>),
-            ],
-            || body(&home),
-        )
-    }
-
     fn legacy_json_path(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".config/trollshell").join(LEGACY_JSON_FILE)
     }
@@ -1026,7 +1014,7 @@ mod tests {
 
     #[test]
     fn migrates_the_legacy_json_file_once_and_leaves_it_untouched() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let legacy = legacy_json_path(home);
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, r#"{"default":"/j.png"}"#).unwrap();
@@ -1062,7 +1050,7 @@ mod tests {
 
     #[test]
     fn state_wins_once_it_exists_and_neither_legacy_file_is_read_again() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             state::store(
                 SUBSYSTEM,
                 &WallpaperState {
@@ -1088,7 +1076,7 @@ mod tests {
 
     #[test]
     fn neither_legacy_file_present_defaults_to_empty() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             assert_eq!(load_state(), WallpaperState::default());
         });
     }
@@ -1097,7 +1085,7 @@ mod tests {
     fn falls_through_to_the_single_path_legacy_when_json_is_absent() {
         // The pre-#546 migration chain, preserved through #1226: no state,
         // no wallpaper.json, but the even-older wallpaper.path exists.
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let single = legacy_single_path(home);
             std::fs::create_dir_all(single.parent().unwrap()).unwrap();
             std::fs::write(&single, "/single.png\n").unwrap();

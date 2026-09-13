@@ -340,6 +340,7 @@ fn acquire(shared: &'static Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hytte_config::test_support::scratch_home;
 
     #[test]
     fn should_hold_requires_both() {
@@ -391,19 +392,6 @@ mod tests {
         assert!(parse_legacy("  enabled  =  True  ").enabled);
     }
 
-    fn with_scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().to_path_buf();
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
-                ("XDG_STATE_HOME", None::<&str>),
-                ("XDG_CONFIG_HOME", None::<&str>),
-            ],
-            || body(&home),
-        )
-    }
-
     fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
         home.join(".config/trollshell/fullscreen-inhibit.toml")
     }
@@ -419,7 +407,7 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             save_enabled_to_disk(false);
             assert!(!load_enabled_from_disk(), "false must round-trip as false");
 
@@ -432,7 +420,7 @@ mod tests {
     fn save_replaces_a_longer_pre_existing_state_file_exactly() {
         // Seed a stale state file bigger than any real payload, then confirm
         // the replacement is exact, not just "starts with the right bytes".
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             let state_path = state::path(SUBSYSTEM).unwrap();
             std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
             std::fs::write(&state_path, "x".repeat(4096)).unwrap();
@@ -451,7 +439,7 @@ mod tests {
 
     #[test]
     fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             let legacy = legacy_path(home);
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, "enabled = false\n").unwrap();
@@ -484,7 +472,7 @@ mod tests {
 
     #[test]
     fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
-        with_scratch_home(|home| {
+        scratch_home(|home| {
             state::store(SUBSYSTEM, &FullscreenInhibitState { enabled: false });
 
             let legacy = legacy_path(home);
@@ -500,7 +488,7 @@ mod tests {
 
     #[test]
     fn neither_file_present_defaults_to_on() {
-        with_scratch_home(|_home| {
+        scratch_home(|_home| {
             assert!(load_enabled_from_disk(), "fullscreen-inhibit defaults ON");
         });
     }

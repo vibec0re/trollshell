@@ -805,12 +805,12 @@ mod tests {
         self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError, parse_rfc3339,
     };
     use hytte_plugin::display::{AccentRole, RenderMode};
-    use std::time::Duration;
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Manifest, Mount, Node, Page, PluginMsg, decode, encode,
         preem::PreemWidget,
     };
     use hytte_plugin::{Input, Plugin};
+    use std::time::Duration;
 
     /// A fixed `now` so every humanised string in these tests is a constant.
     /// `2026-09-13T11:35:00Z` is 2 h 15 min before the captured session reset.
@@ -1380,9 +1380,7 @@ mod tests {
         assert!(!preems(&tree).is_empty(), "the last-good meters stay up");
         assert_eq!(
             root_tooltip(&tree),
-            Some(format!(
-                "{base}\nusage rate-limited — next try in 10 min"
-            )),
+            Some(format!("{base}\nusage rate-limited — next try in 10 min")),
             "the hover still names the failure, on its own line"
         );
 

@@ -679,17 +679,19 @@ pub async fn poll_forever(base_url: String, credentials: PathBuf) {
     let mut last_ok: Option<(i64, Usage)> = None;
     loop {
         let (base, creds) = (base_url.clone(), credentials.clone());
-        let (result, retry_after) =
-            match tokio::task::spawn_blocking(move || fetch_with_retry_after(&base, &creds)).await
-            {
-                Ok(pair) => pair,
-                Err(e) => (
-                    Err(UsageError::Io(truncate(&format!(
-                        "the usage poll task did not finish: {e}"
-                    )))),
-                    None,
-                ),
-            };
+        let (result, retry_after) = match tokio::task::spawn_blocking(move || {
+            fetch_with_retry_after(&base, &creds)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => (
+                Err(UsageError::Io(truncate(&format!(
+                    "the usage poll task did not finish: {e}"
+                )))),
+                None,
+            ),
+        };
         let (report, next_wait_value, next_last_ok) =
             advance(wait, last_ok, now_unix(), result, retry_after);
         wait = next_wait_value;
@@ -850,7 +852,9 @@ fn parse_retry_after(value: &str, now: i64) -> Option<Duration> {
     }
     let at = parse_http_date(value)?;
     let delta = at.saturating_sub(now).max(0);
-    Some(Duration::from_secs(u64::try_from(delta).unwrap_or(u64::MAX)))
+    Some(Duration::from_secs(
+        u64::try_from(delta).unwrap_or(u64::MAX),
+    ))
 }
 
 /// Parse RFC 7231 §7.1.1.1's IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) —
@@ -1434,7 +1438,10 @@ mod tests {
     /// date spelling read (module docs on [`parse_http_date`]).
     #[test]
     fn retry_after_parses_delta_seconds_and_the_http_date_form() {
-        assert_eq!(parse_retry_after("120", 1_000), Some(Duration::from_mins(2)));
+        assert_eq!(
+            parse_retry_after("120", 1_000),
+            Some(Duration::from_mins(2))
+        );
         assert_eq!(
             parse_retry_after(" 45 ", 1_000),
             Some(Duration::from_secs(45)),
@@ -1625,7 +1632,10 @@ mod tests {
             outcome: Outcome::Failed(UsageError::Http(429)),
             last_ok: Some((0, some_usage())),
         };
-        assert!(!report.is_stale(ceiling), "exactly 15 min after the numbers");
+        assert!(
+            !report.is_stale(ceiling),
+            "exactly 15 min after the numbers"
+        );
         assert!(
             report.is_stale(ceiling + 1),
             "one second further — stale by last_ok's clock, though the \

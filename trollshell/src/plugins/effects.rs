@@ -2473,47 +2473,6 @@ mod tests {
         assert!(status.success(), "writing the test stub failed: {status:?}");
     }
 
-    /// A `tracing_subscriber::fmt` writer that appends every write to a
-    /// shared, lockable buffer (#964 MEDIUM-1 review) — so a test can install
-    /// it as the default subscriber for one call and read back the *actual*
-    /// formatted log text afterward, the same fidelity `LAST_AUDIT_LINE`
-    /// already has for the audit line. Cloning shares the same underlying
-    /// buffer (it's an `Arc`), which is what `tracing_subscriber`'s
-    /// `MakeWriter` contract requires (it clones the writer per event).
-    #[derive(Clone, Default)]
-    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("capture buffer lock")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl CapturedLog {
-        /// Run `f` with this buffer installed as the default `tracing`
-        /// subscriber (ANSI off, so the text is greppable), then return
-        /// everything it wrote as a `String`.
-        fn capture(f: impl FnOnce()) -> String {
-            let log = CapturedLog::default();
-            let writer = log.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            tracing::subscriber::with_default(subscriber, f);
-            String::from_utf8(log.0.lock().expect("capture buffer lock").clone())
-                .expect("tracing output is UTF-8")
-        }
-    }
-
     #[test]
     fn command_outcome_maps_success_and_stdout() {
         // Trailing newline trimmed; success flag preserved.
@@ -2895,28 +2854,33 @@ mod tests {
     /// *and* its mirror together (exactly what "simplifying"
     /// `dispatch_detached_run_command` back to one code path would do) left
     /// this test green on the very regression it was filed to catch. It now
-    /// installs a real `tracing_subscriber` ([`CapturedLog::capture`]) and
-    /// reads the actual formatted line back — the same fidelity
-    /// `LAST_AUDIT_LINE` already had for the audit line — so deleting the
-    /// macro call this time takes the assertion's evidence with it.
+    /// installs a real subscriber
+    /// ([`hytte_config::test_support::capture`]) and reads the actual
+    /// recorded fields back — the same fidelity `LAST_AUDIT_LINE` already had
+    /// for the audit line — so deleting the macro call this time takes the
+    /// assertion's evidence with it.
+    ///
+    /// #1256: uses the shared harness rather than a scoped `with_default` of
+    /// its own — a subscriber-less sibling test hitting the same callsite
+    /// first can otherwise cache it `Interest::never()` process-wide and
+    /// leave this capture blind, which is what made it flake 1-3% on main.
     #[test]
     fn rejected_plugin_id_records_no_phantom_unit() {
         reset_captures();
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
         let router = DatasourceRouter::default();
 
-        let log = CapturedLog::capture(|| {
-            broker_effect(
-                "my plugin",
-                &Effect::RunCommand {
-                    id: 1,
-                    argv: vec!["true".to_owned()],
-                    detached: true,
-                },
-                &tx,
-                &router,
-            );
-        });
+        let (captured, _guard) = hytte_config::test_support::capture();
+        broker_effect(
+            "my plugin",
+            &Effect::RunCommand {
+                id: 1,
+                argv: vec!["true".to_owned()],
+                detached: true,
+            },
+            &tx,
+            &router,
+        );
 
         let audit_line = LAST_AUDIT_LINE
             .with(|cell| cell.borrow().clone())
@@ -2935,18 +2899,23 @@ mod tests {
         // what wasn't was the shell's own default-level `tracing::info!` line
         // for the same effect, which named the very unit the audit line
         // withheld (and did so unsanitized, with the id's raw space still in
-        // it — not even a legal unit name). Assert the REAL log text, not a
-        // stand-in for it.
+        // it — not even a legal unit name). Assert the REAL recorded event,
+        // not a stand-in for it.
+        let events = captured.events();
         assert!(
-            log.contains("RunCommand"),
+            !events.is_empty(),
             "sanity: the subscriber must have captured something, or the \
-             assertion below would pass vacuously on an empty capture: {log:?}",
+             assertion below would pass vacuously on an empty capture: {events:?}",
         );
+        let run_command_line = events
+            .iter()
+            .find(|e| e.message.contains("RunCommand"))
+            .unwrap_or_else(|| panic!("no captured event named RunCommand: {events:?}"));
         assert!(
-            !log.contains("unit="),
+            !run_command_line.fields.contains_key("unit"),
             "a rejected plugin id must not name a unit in the tracing line \
              either — an operator reading the shell's own log would see a unit \
-             `systemctl --user list-units` never has: {log}",
+             `systemctl --user list-units` never has: {run_command_line:?}",
         );
     }
 
@@ -3483,26 +3452,39 @@ mod tests {
     ///
     /// **Falsified** by dropping the `uri` field from the `tracing::info!` call
     /// in `open_uri_with`'s accepted arm.
+    ///
+    /// #1256: uses the shared [`hytte_config::test_support::capture`] harness
+    /// rather than a scoped `with_default` of its own — a subscriber-less
+    /// sibling test hitting the same callsite first (`open_uri_reported`,
+    /// `a_slow_open_uri_launch_does_not_block_the_broker`) can otherwise cache
+    /// it `Interest::never()` process-wide and leave this capture blind,
+    /// which is what made it flake 1-3% on main.
     #[test]
     fn an_open_uri_info_line_carries_the_destination() {
         reset_captures();
-        let log = CapturedLog::capture(|| {
-            open_uri_with(
-                "agents",
-                13,
-                "https://pr1ma.darkest.space/agents/argus",
-                |_uri, done| done(Ok(())),
-                |_outcome| {},
-            );
-        });
-        assert!(
-            !log.is_empty(),
-            "sanity: the subscriber must have captured something, or the \
-             assertion below would pass vacuously on an empty capture: {log:?}",
+        let (captured, _guard) = hytte_config::test_support::capture();
+        open_uri_with(
+            "agents",
+            13,
+            "https://pr1ma.darkest.space/agents/argus",
+            |_uri, done| done(Ok(())),
+            |_outcome| {},
         );
+        let events = captured.events();
         assert!(
-            log.contains("uri=https://pr1ma.darkest.space/agents/argus"),
-            "the info line names the destination the plugin asked to open: {log}",
+            !events.is_empty(),
+            "sanity: the subscriber must have captured something, or the \
+             assertion below would pass vacuously on an empty capture: {events:?}",
+        );
+        let info_line = events
+            .iter()
+            .find(|e| e.message == "plugin effect: OpenUri")
+            .unwrap_or_else(|| panic!("no captured 'plugin effect: OpenUri' event: {events:?}"));
+        assert_eq!(
+            info_line.fields.get("uri").map(String::as_str),
+            Some("https://pr1ma.darkest.space/agents/argus"),
+            "the info line names the destination the plugin asked to open: \
+             {info_line:?}",
         );
     }
 

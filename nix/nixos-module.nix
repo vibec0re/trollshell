@@ -50,7 +50,8 @@ let
     version = 1;
     plugins = lib.mapAttrs (_: plugin: {
       exec = lib.getExe plugin.package;
-      env = plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
+      env =
+        plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
       inherit (plugin) secrets;
       enabled = plugin.enable;
     }) cfg.plugins;

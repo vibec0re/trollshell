@@ -1677,7 +1677,11 @@ fn mount_or_unknown(mount: &str) -> &str {
 fn mount_display(mount: &str, declared: Option<&str>) -> String {
     match declared {
         Some(declared) if declared != mount => {
-            format!("{} · manifest: {}", mount_or_unknown(declared), mount_or_unknown(mount))
+            format!(
+                "{} · manifest: {}",
+                mount_or_unknown(declared),
+                mount_or_unknown(mount)
+            )
         }
         _ => mount_or_unknown(mount).to_owned(),
     }
@@ -1927,7 +1931,13 @@ mod tests {
     fn overlay_notes_a_differing_declared_mount() {
         let (_, _, status) = runtime_overlay(
             "active",
-            Some(&rt_with_declared(true, "SidebarTop", "SidebarRightTop", 1, 0)),
+            Some(&rt_with_declared(
+                true,
+                "SidebarTop",
+                "SidebarRightTop",
+                1,
+                0,
+            )),
         );
         assert_eq!(
             status,
@@ -2033,7 +2043,10 @@ mod tests {
             }
         }"#;
         let got = declared_mounts_from_json(text);
-        assert_eq!(got.get("agents").map(String::as_str), Some("SidebarRightTop"));
+        assert_eq!(
+            got.get("agents").map(String::as_str),
+            Some("SidebarRightTop")
+        );
     }
 
     #[test]
@@ -2078,7 +2091,10 @@ mod tests {
     fn runtime_states_leaves_declared_mount_none_when_undeclared() {
         let states: PollStates = vec![("clock".to_owned(), true, "BarCenter".to_owned(), 1, 0)];
         let rt = runtime_states(states, &HashMap::new());
-        assert_eq!(rt.get("clock").expect("an entry for clock").declared_mount, None);
+        assert_eq!(
+            rt.get("clock").expect("an entry for clock").declared_mount,
+            None
+        );
     }
 
     #[test]

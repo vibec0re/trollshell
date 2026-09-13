@@ -158,7 +158,7 @@
 //! split above, which is already exact where exactness is meaningful and does
 //! not depend on this variable at all.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use hytte::gtk::{self, glib, prelude::*};
@@ -312,9 +312,12 @@ static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// six live-verify items that lean on it. So the exit status now answers "did
 /// this run measure anything" as well as "did anything fail".
 ///
-/// The underlying double-`activate` is **#1151**, not fixed here: this counter
-/// is the detector, deliberately independent of whatever is causing a session
-/// to end early, so it stays useful if the cause changes.
+/// The double-`activate` this counter was originally watching for is
+/// **#1151**, latched shut in `main`'s `connect_activate` closure (see
+/// [`activate_once`]) so a second signal can no longer stand up a second
+/// `Runner`. This counter stays regardless, deliberately independent of that
+/// one cause: it is the detector for *any* session that ends before its first
+/// verdict, whatever produces that shape next.
 static VERDICTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn main() -> glib::ExitCode {
@@ -362,7 +365,26 @@ fn main() -> glib::ExitCode {
     let app = gtk::Application::builder()
         .application_id("mov.vibec0re.trollshell.preem-gl-diff")
         .build();
-    app.connect_activate(move |app| activate(app, &skins, exact));
+    // #1151: `activate` can fire a second time on one process — measured as
+    // `GApplication`'s own machinery, not this harness (the `connect_activate`
+    // call right below is the *only* place in this file that can trigger the
+    // signal; nothing here calls `.activate()` or emits it by name). A second
+    // `Runner` sharing the `GlSurface`'s GL pool with the first, interleaved
+    // on the same main loop, is exactly the shape #1072's wrong-framebuffer
+    // readback came from, so the second call is latched into a no-op rather
+    // than left to luck — see [`activate_once`] for the pure predicate this
+    // is built on.
+    let activated = Cell::new(false);
+    app.connect_activate(move |app| {
+        if !activate_once(&activated) {
+            println!(
+                "INFO: activate fired again on this process (#1151) — ignoring, \
+                 one Runner per GL pool"
+            );
+            return;
+        }
+        activate(app, &skins, exact);
+    });
     let status = app.run_with_args::<&str>(&[]);
     // **The verdict is ours, not `GApplication`'s.** `run_with_args` returns the
     // application's exit status, which nothing in this program sets, so a
@@ -802,6 +824,18 @@ fn out_dir() -> std::path::PathBuf {
         || std::path::PathBuf::from("gates"),
         std::path::PathBuf::from,
     )
+}
+
+/// Whether this call to the `activate` handler is the first one for `latch`
+/// (#1151).
+///
+/// **True** exactly once for a given `Cell`, starting from a fresh
+/// `Cell::new(false)`; **false** on every call after that. Pure and GL-free
+/// on purpose — [`the_second_activate_is_latched`] exercises it without a
+/// display, even though the thing it guards (`main`'s `connect_activate`
+/// closure) cannot be constructed without one.
+fn activate_once(latch: &Cell<bool>) -> bool {
+    !latch.replace(true)
 }
 
 fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
@@ -1570,4 +1604,40 @@ fn pgm(w: usize, h: usize, grey: &[u8]) -> Vec<u8> {
     let mut out = format!("P5\n{w} {h}\n255\n").into_bytes();
     out.extend_from_slice(grey);
     out
+}
+
+/// #1151: `activate` can fire twice on one process — measured on `origin/main`
+/// (10 runs against a real session bus, 6 more with the bus env cleared) as
+/// zero reproductions locally, which is consistent with the issue's own
+/// "intermittently" framing. What did settle where the second call comes
+/// from: `connect_activate` in `main` is the *only* place in this file that
+/// can trigger the signal — nothing here calls `.activate()` or emits it by
+/// name — so a second call has to be `GApplication`'s own machinery, not this
+/// harness re-entering itself. [`activate_once`] is what makes the second
+/// call a no-op regardless of which of `GApplication`'s internal paths ends
+/// up producing it.
+///
+/// `cargo test` does not run `#[test]`s inside an example by default
+/// (examples default to `test = false`, the same reason `preem_gl::parity`
+/// lives in the shell's own tree rather than inline here) — but an *explicit*
+/// `--example preem_gl_diff` selector overrides that and compiles this module
+/// with `cfg(test)`, the way any other test target would: `cargo test -p
+/// trollshell --example preem_gl_diff --features system-tests` runs it.
+#[cfg(test)]
+mod activate_latch_tests {
+    use super::activate_once;
+    use std::cell::Cell;
+
+    /// **The first call runs; every call after it is a no-op.**
+    ///
+    /// Falsified by deleting the latch (`activate_once` always returning
+    /// `true`): the second `assert!` goes red, the same shape a live run
+    /// would show as two `-- summary --` blocks instead of one.
+    #[test]
+    fn the_second_activate_is_latched() {
+        let latch = Cell::new(false);
+        assert!(activate_once(&latch), "the first call must run");
+        assert!(!activate_once(&latch), "the second call must be a no-op");
+        assert!(!activate_once(&latch), "a third call is still a no-op");
+    }
 }

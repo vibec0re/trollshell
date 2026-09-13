@@ -8,9 +8,9 @@ use hytte_plugin_proto::{
     Effect, EffectOutcome, EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel,
     MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount,
     NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget,
-    ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats,
-    StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
-    sane_fraction, sane_slider_floats,
+    ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB, ShaderData,
+    SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode,
+    encode_body, sane_fraction, sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1719,12 +1719,14 @@ fn the_per_screen_fields_bump_no_vocabulary_generation() {
     // #1050 adds two defaulted **fields**, not variants. The crate root's rule
     // ("appending a wire variant ⇒ bump `VOCAB`") therefore does not fire, and
     // the counter must not have moved for them. Pinned as an equality against
-    // the newest *variant* generation (`OPEN_URI_VOCAB`, #1045) rather than a
-    // bare literal: a later PR that legitimately appends a variant bumps both
+    // the newest *variant* generation (`SIDEBAR_RIGHT_VOCAB`, #1158) rather than
+    // a bare literal: a later PR that legitimately appends a variant bumps both
     // together and this stays green, while a reflexive `VOCAB += 1` for a field
-    // addition — the mistake this test exists to catch — turns it red.
+    // addition — the mistake this test exists to catch — turns it red. The pin
+    // moved here from `OPEN_URI_VOCAB` when #1158 appended the next variant, as
+    // that const's own doc said it would.
     assert_eq!(
-        VOCAB, OPEN_URI_VOCAB,
+        VOCAB, SIDEBAR_RIGHT_VOCAB,
         "#1050's fields must not have advanced VOCAB past the newest appended variant",
     );
     assert_eq!(
@@ -2149,28 +2151,242 @@ fn check_vocab_rejects_newer_and_accepts_same_or_older() {
 #[test]
 fn every_mount_round_trips_incl_sidebar_lead() {
     // Every `Mount` variant survives a manifest round-trip, incl. the additive
-    // `SidebarLead` (#301). `Mount` is an externally-tagged unit enum, so each
-    // variant rides the wire as its bare name — appending `SidebarLead` leaves
-    // every other variant's encoding untouched (PROTO_VERSION stays 1).
-    for mount in [
-        Mount::SidebarLead,
-        Mount::SidebarTop,
-        Mount::SidebarBottom,
-        Mount::BarLeft,
-        Mount::BarCenter,
-        Mount::BarRight,
-    ] {
+    // `SidebarLead` (#301) and the right family (#1158). `Mount` is an
+    // externally-tagged unit enum, so each variant rides the wire as its bare
+    // name — appending one leaves every other variant's encoding untouched
+    // (PROTO_VERSION stays 1).
+    //
+    // Driven off `Mount::ALL` rather than a hand-listed array: a variant added to
+    // the enum and to `ALL` is covered here the day it lands, and one added to
+    // the enum alone is caught by `every_mount_variant_names_itself_and_is_listed`.
+    for mount in Mount::ALL {
         let m = Manifest::new("weather", mount);
         let back: Manifest = decode_body(&encode_body(&m)).expect("decode manifest");
         assert_eq!(back.mount, mount, "{mount:?} round-trips");
     }
-    // The new variant rides the wire as its bare, name-tagged variant — the
+    // The #301 variant rides the wire as its bare, name-tagged variant — the
     // property that makes appending it additive (older decoders skip an unknown
     // tag rather than mis-decoding an existing one).
     let body = encode_body(&Manifest::new("weather", Mount::SidebarLead));
     assert!(
         contains(&body, b"SidebarLead"),
         "the variant name 'SidebarLead' rides the wire"
+    );
+}
+
+/// The six mounts that predate #1158 must decode **from their committed spelling**
+/// unchanged — the compat claim the epic's "the wire grows three variants rather
+/// than a `side` field" decision rests on, stated as bytes rather than as a
+/// round-trip (a round-trip re-encodes with the same table it decodes with, so it
+/// cannot see a renamed tag).
+///
+/// The names are literals here on purpose, not `wire_name()` output: reading them
+/// from the table under test would make this test agree with any rename, which is
+/// precisely the break it exists to catch. `tests/golden.rs` pins the same claim
+/// for whole frames; this is the per-variant version, cheap enough to cover all
+/// six.
+///
+/// **Falsified** by renaming any of the six variants (that name no longer decodes)
+/// or by switching `Mount` to internal/adjacent tagging (none of them do).
+#[test]
+fn the_six_pre_1158_mount_names_still_decode() {
+    for (name, want) in [
+        ("SidebarLead", Mount::SidebarLead),
+        ("SidebarTop", Mount::SidebarTop),
+        ("SidebarBottom", Mount::SidebarBottom),
+        ("BarLeft", Mount::BarLeft),
+        ("BarCenter", Mount::BarCenter),
+        ("BarRight", Mount::BarRight),
+    ] {
+        let got: Mount = decode_body(&encode_body(&name)).expect(
+            "an externally-tagged unit \
+             variant is encoded as its bare name, so a plain string decodes as one",
+        );
+        assert_eq!(got, want, "the committed spelling {name:?} still decodes");
+    }
+}
+
+/// Every [`Mount`]'s **integer index** decodes to the variant it decoded to
+/// before, frozen as a literal table (#1159 review, finding 3).
+///
+/// rmp-serde encodes a unit variant as its *name*, so nothing in this workspace
+/// ever puts an index on the wire — but the **decoder** accepts a bare integer
+/// too, which makes declaration order part of the accepted vocabulary of a crate
+/// the root doc advertises as a language-neutral schema anchor. #1159's first cut
+/// inserted the three `SidebarRight*` variants mid-enum, and the review measured
+/// the consequence: indices 3/4/5 stopped decoding as `BarLeft`/`BarCenter`/
+/// `BarRight` (their meaning on every release since #349) and started decoding as
+/// the three new sidebar-right mounts. A non-Rust client sending indices would
+/// have had three mounts silently re-pointed at the other sidebar.
+///
+/// The expected variants are **literals**, deliberately not `Mount::ALL[i]`:
+/// reading the table under test would make this agree with any future
+/// reordering, which is the whole break it exists to catch. `ALL`'s order is a
+/// separate, order-free thing (see its doc) and is not the index table.
+///
+/// **Falsified** by moving any variant within the enum — the row for its old
+/// index reds naming both spellings.
+#[test]
+fn the_mount_integer_indices_are_frozen() {
+    for (index, want) in [
+        (0_u32, Mount::SidebarLead),
+        (1, Mount::SidebarTop),
+        (2, Mount::SidebarBottom),
+        (3, Mount::BarLeft),
+        (4, Mount::BarCenter),
+        (5, Mount::BarRight),
+        (6, Mount::SidebarRightLead),
+        (7, Mount::SidebarRightTop),
+        (8, Mount::SidebarRightBottom),
+    ] {
+        let got: Mount = decode_body(&encode_body(&index))
+            .expect("rmp-serde decodes a unit variant from its integer index too");
+        assert_eq!(
+            got, want,
+            "Mount index {index} must still decode as {want:?} — this enum is \
+             append-only, because its indices are wire-visible",
+        );
+    }
+    let past_the_end: Result<Mount, _> = decode_body(&encode_body(&9_u32));
+    assert!(
+        past_the_end.is_err(),
+        "index 9 is past the end of a nine-variant enum and must not decode: \
+         {past_the_end:?}",
+    );
+}
+
+/// The three new mounts round-trip, ride the wire as their bare names, and are
+/// **not** bar regions (`is_bar` must keep answering `false` for a sidebar, or the
+/// host would report a constant `SlotVisible` of `true` for a right-sidebar card
+/// and its poller would never park — #288/#422).
+#[test]
+fn the_sidebar_right_mounts_round_trip_and_are_not_bar_regions() {
+    for (mount, name) in [
+        (Mount::SidebarRightLead, "SidebarRightLead"),
+        (Mount::SidebarRightTop, "SidebarRightTop"),
+        (Mount::SidebarRightBottom, "SidebarRightBottom"),
+    ] {
+        let body = encode_body(&Manifest::new("weather", mount));
+        assert!(
+            contains(&body, name.as_bytes()),
+            "the variant name {name:?} rides the wire"
+        );
+        let back: Manifest = decode_body(&body).expect("decode manifest");
+        assert_eq!(back.mount, mount, "{name} round-trips");
+        assert!(
+            !mount.is_bar(),
+            "{name} is a sidebar region, so `is_bar` must stay false",
+        );
+    }
+}
+
+/// Every variant in [`Mount::ALL`] names itself, parses back from that name, and
+/// puts exactly that name on the wire — so the three tables that have to agree
+/// (the enum, `wire_name`/`from_wire_name`, and serde's external tag) cannot drift
+/// apart.
+///
+/// The `match` is what makes this a guard rather than a tautology: it is
+/// exhaustive over `Mount`, so a variant appended to the enum and forgotten in
+/// `ALL` fails to *compile* here, and the length assertion catches the reverse.
+/// The expected name is a literal in each arm, never `wire_name()`'s own output.
+///
+/// **Falsified** by dropping a row from `Mount::ALL` (the length assertion reds),
+/// by returning the wrong string from one `wire_name` arm (the equality reds), or
+/// by making `from_wire_name` case-insensitive (nothing here reds — which is why
+/// `an_unknown_mount_name_does_not_parse` covers that direction separately).
+#[test]
+fn every_mount_variant_names_itself_and_is_listed() {
+    assert_eq!(
+        Mount::ALL.len(),
+        9,
+        "three sidebar regions per side plus three bar regions",
+    );
+    for mount in Mount::ALL {
+        let expected = match mount {
+            Mount::SidebarLead => "SidebarLead",
+            Mount::SidebarTop => "SidebarTop",
+            Mount::SidebarBottom => "SidebarBottom",
+            Mount::SidebarRightLead => "SidebarRightLead",
+            Mount::SidebarRightTop => "SidebarRightTop",
+            Mount::SidebarRightBottom => "SidebarRightBottom",
+            Mount::BarLeft => "BarLeft",
+            Mount::BarCenter => "BarCenter",
+            Mount::BarRight => "BarRight",
+        };
+        assert_eq!(mount.wire_name(), expected, "{mount:?} names itself");
+        assert_eq!(
+            Mount::from_wire_name(expected),
+            Some(mount),
+            "…and parses back from that name",
+        );
+        assert!(
+            contains(
+                &encode_body(&Manifest::new("p", mount)),
+                expected.as_bytes()
+            ),
+            "…and serde tags the frame with exactly that name",
+        );
+    }
+    let mut names: Vec<&str> = Mount::ALL.iter().map(|m| m.wire_name()).collect();
+    names.sort_unstable();
+    let count = names.len();
+    names.dedup();
+    assert_eq!(names.len(), count, "no two mounts share a wire name");
+}
+
+/// A name outside the vocabulary is **not** a mount — neither for the SDK's
+/// launch-time parser (which must refuse rather than silently keep the manifest's
+/// mount, #1159) nor for the decoder (an unknown tag fails the whole frame, which
+/// is what makes "an old host cannot misplace a new card" true).
+///
+/// The case variants are deliberate: `from_wire_name` is exact-matched, so
+/// `"sidebarrightlead"` must be `None`. A lenient parser here would accept a
+/// launch value the *wire* cannot carry.
+#[test]
+fn an_unknown_mount_name_does_not_parse() {
+    /// A `Register` body whose `mount` is an arbitrary string — how a host one
+    /// release behind would see a mount from the future.
+    #[derive(serde::Serialize)]
+    struct ManifestWithRawMount<'a> {
+        id: &'a str,
+        proto: u16,
+        subscribes: Vec<StateKey>,
+        capabilities: Vec<Capability>,
+        mount: &'a str,
+    }
+
+    for bad in [
+        "",
+        " ",
+        "SidebarRight",
+        "sidebarrightlead",
+        "SIDEBARRIGHTLEAD",
+        "SidebarRightLead ",
+        "SidebarRightMiddle",
+        "BarTop",
+        "Sidebar::RightLead",
+    ] {
+        assert_eq!(
+            Mount::from_wire_name(bad),
+            None,
+            "{bad:?} is not a mount name",
+        );
+    }
+
+    // And the decoder agrees: a `Register` naming a mount this build does not
+    // know fails to decode at all, rather than defaulting to one.
+    let body = encode_body(&ManifestWithRawMount {
+        id: "from-the-future",
+        proto: PROTO_VERSION,
+        subscribes: Vec::new(),
+        capabilities: Vec::new(),
+        mount: "SidebarDiagonal",
+    });
+    let err = decode_body::<Manifest>(&body)
+        .expect_err("a mount name this build has never heard of must not decode");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "…as a decode error, the loud failure #1158 chose over a silent misplace: {err:?}",
     );
 }
 
@@ -3364,20 +3580,24 @@ fn an_older_host_cannot_decode_an_open_uri_at_all() {
 /// authoring bug at the cost of a handshake refusal for every plugin rebuilt on
 /// this SDK that never opens a link — the trade #882/#893/#966 each declined.
 ///
-/// The equality `VOCAB == OPEN_URI_VOCAB` is the "newest variant" pin that used
-/// to live on `SCROLLED_VOCAB`: appending the next wire variant moves it here,
-/// and forgetting to bump `VOCAB` with it turns this red.
+/// The "newest variant" pin has since moved on to `SIDEBAR_RIGHT_VOCAB` (#1158)
+/// — the migration this paragraph predicted, kept here as
+/// `OPEN_URI_VOCAB <= VOCAB` (the census never shrinks past a shipped
+/// generation) while `the_sidebar_right_generation_bumps_the_census_only` holds
+/// the equality against the current newest.
 ///
 /// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 5 as well (the third
 /// assertion goes red, and with it every older shell's acceptance of a rebuilt
-/// plugin), or by leaving `VOCAB` at 4 (the second).
+/// plugin), or by lowering `VOCAB` below 5 (the second).
 #[test]
 fn the_open_uri_generation_bumps_the_census_only() {
     assert_eq!(OPEN_URI_VOCAB, 5, "#1045 is generation 5");
-    assert_eq!(
-        VOCAB, OPEN_URI_VOCAB,
-        "the census reaches the newest variant"
-    );
+    const {
+        assert!(
+            OPEN_URI_VOCAB <= VOCAB,
+            "the census counts it, and never un-counts a shipped generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "an appended variant does not move the unconditional ceiling",
@@ -3396,10 +3616,55 @@ fn the_open_uri_generation_bumps_the_census_only() {
         m.negotiated_vocab(SCROLLED_VOCAB) < OPEN_URI_VOCAB,
         "a #966-era host negotiates below the open-a-link generation",
     );
+    assert!(
+        m.negotiated_vocab(VOCAB) >= OPEN_URI_VOCAB,
+        "…and a host advertising the census negotiates at least it",
+    );
+}
+
+/// #1158's right-sidebar mounts are generation 6, and — like the four before it
+/// — they bump the **census only**.
+///
+/// The reason differs from all four, and that is the whole point of the const's
+/// doc: #882/#893/#966 are safe because the plugin waits for a `Hello`, #1045
+/// because its gating capability is itself undecodable on an old host. A `Mount`
+/// can do neither. It rides inside the `Register` frame that *carries*
+/// `Manifest::vocab`, so a pre-#1158 host fails `rmp-serde` on the frame and
+/// drops the connection before `check_vocab` is ever reached — the handshake
+/// refusal the counter exists to produce is structurally unreachable here, which
+/// is exactly why bumping the unconditional ceiling would buy nothing and cost
+/// every rebuilt plugin its acceptance by an older shell.
+///
+/// The last assertion states that unreachability as a fact rather than prose: a
+/// manifest on a right mount still stamps the generation an old host accepts, so
+/// `check_vocab` is not what stops it — the decode is.
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 6 (the third assertion reds,
+/// and with it every older shell's acceptance of a rebuilt plugin), or by leaving
+/// `VOCAB` at 5 while `SIDEBAR_RIGHT_VOCAB` is 6 (the second).
+#[test]
+fn the_sidebar_right_generation_bumps_the_census_only() {
+    assert_eq!(SIDEBAR_RIGHT_VOCAB, 6, "#1158 is generation 6");
     assert_eq!(
-        m.negotiated_vocab(VOCAB),
-        OPEN_URI_VOCAB,
-        "…and a host advertising the census negotiates exactly it",
+        VOCAB, SIDEBAR_RIGHT_VOCAB,
+        "the census reaches the newest appended variant",
+    );
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "an appended variant does not move the unconditional ceiling",
+    );
+
+    let m = Manifest::new("clock-demo", Mount::SidebarRightTop);
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "a right-mounted plugin stamps the same generation every other plugin does",
+    );
+    m.check_vocab()
+        .expect("and clears a same-vocab host's check like any other");
+    assert!(
+        m.vocab < SIDEBAR_RIGHT_VOCAB,
+        "so the handshake counter is NOT what keeps this mount away from an \
+         older host — the `Register` decode is (see the const's doc)",
     );
 }
 

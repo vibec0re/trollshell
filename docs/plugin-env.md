@@ -261,8 +261,37 @@ No runtime knobs — configuration is entirely via the shell/wire protocol.
 ## Shared / SDK-level environment variables
 
 The `hytte-plugin` SDK itself (`crates/hytte-plugin/src`, the `Plugin`
-trait + `run()`) reads **no** environment variables — env-based config is a
-plugin-author idiom on top of it, not part of the runtime.
+trait + `run()`) reads exactly **one** environment variable. Everything else is
+a plugin-author idiom on top of the runtime, not part of it.
+
+| Variable             | Default | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HYTTE_PLUGIN_MOUNT` | unset   | **Where the plugin's card or chip mounts**, overriding the mount its own `manifest()` asked for (#1159). One of the nine wire mount names: `SidebarLead`, `SidebarTop`, `SidebarBottom`, `SidebarRightLead`, `SidebarRightTop`, `SidebarRightBottom`, `BarLeft`, `BarCenter`, `BarRight`. Read once in `run()` before the first dial and applied to every `Register` frame the process sends, reconnects included; the plugin's own code never sees it. An unknown or empty value is a **startup failure** naming all nine spellings — never a silent fallback to the manifest, which would put the card on the other sidebar and leave the plugin looking healthy. Surrounding whitespace is trimmed; the match is otherwise exact, case included. |
+
+Set it per plugin like any other var — `programs.trollshell.plugins.<id>.env.HYTTE_PLUGIN_MOUNT = "SidebarRightTop";`
+works today, and #1161 adds a checked `plugins.<id>.mount` option that renders
+the same variable from an enum of the nine names. It is the one knob here that is
+a _deployment_ decision rather than a plugin-author one, which is why it lives on
+the launch instead of in a config file (settled on #866; see epic #1158).
+
+**Prefer an override _within_ a family — bar↔sidebar changes a plugin's
+visibility semantics and it cannot adapt.** The nine names are not
+interchangeable. `Mount::is_bar` is what decides whether the host runs the
+sidebar visibility push for a connection: a bar chip is effectively always
+on-screen, so the host reports a constant `SlotVisible` of `true` for one
+(#288/#422), and a bar-mounted plugin therefore declares no
+`StateKey::SlotVisible` subscription at all — `hytte-plugin-timer` is the live
+example ("it subscribes no host state"). Move such a plugin to a sidebar with
+this variable and the host starts running the real visibility task for it, but
+the plugin never subscribed, so under the #305 send-gate it receives nothing and
+keeps polling at full rate behind a closed sidebar. The plugin's own code never
+sees the override (that is the point of it), so it cannot compensate. A plugin
+that wants to be movable across families must declare
+`StateKey::SlotVisible` in its manifest's `subscribes` and park on the
+`SlotVisibility` frames it then receives — `hytte_plugin::poll`'s
+visibility-gated helpers are the shape for that. Moving a card between the two
+sidebars, or a chip between the three bar regions, changes nothing about
+visibility and needs no such care.
 
 `hytte-ai-providers` (the shared OpenAI-compatible chat client `pet` and
 `caw`'s brains both use) reads no timeout of its own — the per-request budget

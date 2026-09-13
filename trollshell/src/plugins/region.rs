@@ -1242,9 +1242,15 @@ pub(super) fn upsert_region(region: &Mutable<Vec<SlotRender>>, render: SlotRende
 /// different id and never matched, so siblings are undisturbed.
 ///
 /// Probes with the read lock first so a teardown never spuriously notifies a
-/// region this plugin isn't even in (each teardown checks *all six* regions —
-/// three sidebar + three bar, #349); it re-finds under the write lock to stay
-/// correct against a concurrent mutation.
+/// region this plugin isn't even in (each teardown checks **every** region —
+/// three per sidebar since #1158, plus the three bar ones, #349 — plus the shared
+/// panel list); it re-finds under the write lock to stay correct against a
+/// concurrent mutation.
+///
+/// That "every" is the contract, not the current count:
+/// `every_mount_clears_its_mailbox_on_connection_teardown` (`plugins::tests`)
+/// drives `Mount::ALL` through a real connection and names any mount missing from
+/// `handle_conn`'s clear list, because #1159's first cut shipped three that were.
 pub(super) fn clear_region_if_owned(
     region: &Mutable<Vec<SlotRender>>,
     plugin_id: &str,
@@ -1294,8 +1300,8 @@ mod gtk_tests {
     // The #897 animation probes are there for the same reason, read here because
     // the mounts that arm them are these.
     use crate::plugins::pump::{
-        animation_arms, drive_scope_releaser, live_animators, live_plugin_ids_signal,
-        reset_animation_probes,
+        RENDER_MAILBOXES, animation_arms, drive_scope_releaser, live_animators,
+        live_plugin_ids_signal, reset_animation_probes,
     };
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
@@ -3996,14 +4002,25 @@ mod gtk_tests {
         releaser.abort();
     }
 
-    /// Spawn the monitor-independent scope releaser (#921) over seven mailboxes
-    /// of which only the one at `slot` carries anything — the shape
+    /// Spawn the monitor-independent scope releaser (#921) over every render
+    /// mailbox, of which only the one at `slot` carries anything — the shape
     /// `plugins::install` wires up, minus the registry a `#[gtk::test]` has no
     /// booted `App` to provide.
     ///
-    /// `slot` indexes `live_plugin_ids_signal`'s array in `PluginHandles` field
-    /// order: 0-2 the sidebar regions, 3-5 the bar regions, 6 the shared panel
-    /// list.
+    /// `slot` indexes `live_plugin_ids_signal`'s array: 0-2 the left sidebar's
+    /// regions, 3-5 the bar regions, 6 the shared panel list, and since #1158
+    /// 7-9 the right sidebar's three, on the tail (that function's destructure
+    /// says why the order is free). Sized from `RENDER_MAILBOXES` rather than a
+    /// literal, so the next mount arrives here as a count rather than as a type
+    /// error.
+    ///
+    /// Only slots 3 and 6 are reached from this module — the two the chip and
+    /// drawer fixtures here mount into. That is deliberately *not* what pins the
+    /// union's coverage: `pump_tests`'
+    /// `every_render_mailbox_slot_contributes_to_the_live_ids_union` walks all
+    /// `RENDER_MAILBOXES` slots for that, because #1159's review measured that
+    /// dropping any of the untouched ones from the union left both test buckets
+    /// green.
     ///
     /// Returns the task handle so the test can abort it: `#[gtk::test]` funnels
     /// every test in this binary onto one main context, and a parked
@@ -4012,7 +4029,7 @@ mod gtk_tests {
         slot: usize,
         mailbox: &Mutable<Vec<SlotRender>>,
     ) -> glib::JoinHandle<()> {
-        let mut mailboxes: [Mutable<Vec<SlotRender>>; 7] =
+        let mut mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] =
             std::array::from_fn(|_| Mutable::new(Vec::new()));
         mailboxes[slot] = mailbox.clone();
         glib::MainContext::default()
@@ -4244,4 +4261,117 @@ mod gtk_tests {
             "showing the same scope again must keep it, so the animation continues",
         );
     }
+}
+
+// ── The right sidebar's three regions (#1158/#1159, P1) ──────────────────────
+//
+// Deliberately at the end of the file rather than beside their left-hand twins:
+// P1 landed alongside another change to the middle of this module, and a new
+// block at the tail conflicts with nothing. #1160 is free to move them up.
+//
+// The three signal accessors and the three slot builders are *exactly* the left
+// family's, pointed at the right family's mailboxes — the whole content of "the
+// host treats the two families identically" (`Mount`'s own doc). The card class
+// is `ts-plugin-card` here too, so a plugin moved from one sidebar to the other
+// by `HYTTE_PLUGIN_MOUNT` looks the same on both.
+//
+// Nothing calls the three `_slot` functions yet. `sidebar.rs` builds one
+// `Left + Top + Bottom` surface today; #1160 parameterises it by side and mounts
+// these three into the right one. Until then a plugin placed right registers
+// fine, routes into its mailbox, and shows its runtime mount in the
+// control-center — it just has no surface to paint on. That is the intended
+// intermediate state, which is why the `allow(dead_code)` below is scoped to
+// these three items and names the issue that removes it.
+//
+// One deliberate difference from the six builders above: these three pass
+// `monitor.connector()` **straight through** rather than wrapping it in this
+// module's local `named_connector` fold. `hytte_ui::Monitor::connector` has done
+// that fold itself since #1180 item 6 (`monitor.rs`, with its own test at the
+// source), so the local copy is already redundant here — and #1177/#1218 deletes
+// it along with the six wraps above. Writing the new sites in the post-#1218
+// form is what keeps the two branches' *clean* merge compiling: a new call site
+// at this file's tail sits outside every hunk #1218 touches, so git would
+// reconcile them silently and main would go red on `E0425: cannot find function
+// named_connector` (#1159 review, finding 9).
+
+fn right_lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_right_lead
+            .signal_cloned()
+    })
+}
+
+fn right_top_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_right_top
+            .signal_cloned()
+    })
+}
+
+fn right_bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_right_bottom
+            .signal_cloned()
+    })
+}
+
+/// The [`Mount::SidebarRightLead`](hytte_plugin_proto::Mount::SidebarRightLead)
+/// **region** — the mirror of [`sidebar_lead_slot`] on the right sidebar: a
+/// vertical container of N plugin cards, mounted at the very top of that surface.
+///
+/// Unused until #1160 builds the right sidebar; see the section comment above.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
+    build_region(
+        right_lead_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+        monitor.connector(),
+    )
+}
+
+/// The [`Mount::SidebarRightTop`](hytte_plugin_proto::Mount::SidebarRightTop)
+/// **region** — the mirror of [`sidebar_top_slot`] on the right sidebar.
+///
+/// Unused until #1160 builds the right sidebar; see the section comment above.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
+    build_region(
+        right_top_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+        monitor.connector(),
+    )
+}
+
+/// The [`Mount::SidebarRightBottom`](hytte_plugin_proto::Mount::SidebarRightBottom)
+/// **region** — the mirror of [`sidebar_bottom_slot`] on the right sidebar.
+///
+/// Unused until #1160 builds the right sidebar; see the section comment above.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "#1160 (P2) mounts the right sidebar's three slots"
+)]
+pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
+    build_region(
+        right_bottom_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+        monitor.connector(),
+    )
 }

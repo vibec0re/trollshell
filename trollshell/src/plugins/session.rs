@@ -124,11 +124,21 @@ impl Drop for SpectrumDemand {
 fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Vec<Effect>) {
     // The mount picks which region mailbox (and thus per-monitor container) the
     // tree lands in: sidebar regions render as cards, bar regions as chips
-    // (#349); both share the reconciler path.
+    // (#349); both share the reconciler path. The right sidebar's three (#1158)
+    // are ordinary rows here — one mailbox each, no side-awareness anywhere in
+    // this function, which is what "the host treats the two families
+    // identically" means in practice.
+    //
+    // This match is the host's whole placement decision, and
+    // `plugins::tests::sidebar_right_routing` pins every one of its nine arms
+    // against a real `handle_conn` (#1159): swapping two of them reds it.
     let region = match mount {
         Mount::SidebarLead => &ctx.sidebar_lead,
         Mount::SidebarTop => &ctx.sidebar_top,
         Mount::SidebarBottom => &ctx.sidebar_bottom,
+        Mount::SidebarRightLead => &ctx.sidebar_right_lead,
+        Mount::SidebarRightTop => &ctx.sidebar_right_top,
+        Mount::SidebarRightBottom => &ctx.sidebar_right_bottom,
         Mount::BarLeft => &ctx.bar_left,
         Mount::BarCenter => &ctx.bar_center,
         Mount::BarRight => &ctx.bar_right,
@@ -1637,9 +1647,25 @@ pub(super) async fn serve_conn(
     // We probe every region (a plugin lives in exactly one); `clear_region_if_owned`
     // read-locks first and returns early where this plugin isn't present, so the
     // extra probes are cheap.
+    //
+    // **All nine**, in `Mount::ALL`'s order — and that "all" is the load-bearing
+    // word, not a description of the list's current length. #1159's first review
+    // measured what happens when it drifts: the three `sidebar_right_*` mailboxes
+    // were added to `pump::live_plugin_ids_signal`'s union *without* being added
+    // here, which turned "a right-mounted plugin is not tracked by the scope
+    // releaser" into the strictly worse "tracked, and permanently stuck" — an id
+    // that can never leave the union, so `forget_scope` never fires for it, and
+    // (once #1160 mounts the surface) a dead plugin's card on glass forever.
+    // `every_mount_clears_its_mailbox_on_connection_teardown` in `tests.rs` drives
+    // `Mount::ALL` through a real socketpair and names every mount missing from
+    // this list, so the tenth mount arrives here as a failing test rather than as
+    // a leak.
     clear_region_if_owned(&ctx.sidebar_lead, &plugin_id, generation);
     clear_region_if_owned(&ctx.sidebar_top, &plugin_id, generation);
     clear_region_if_owned(&ctx.sidebar_bottom, &plugin_id, generation);
+    clear_region_if_owned(&ctx.sidebar_right_lead, &plugin_id, generation);
+    clear_region_if_owned(&ctx.sidebar_right_top, &plugin_id, generation);
+    clear_region_if_owned(&ctx.sidebar_right_bottom, &plugin_id, generation);
     clear_region_if_owned(&ctx.bar_left, &plugin_id, generation);
     clear_region_if_owned(&ctx.bar_center, &plugin_id, generation);
     clear_region_if_owned(&ctx.bar_right, &plugin_id, generation);

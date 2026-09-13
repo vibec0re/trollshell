@@ -615,7 +615,29 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
             }
         });
     }
-    drop(tx); // close sender side so channel closes when all sub-tasks end
+    // Drop this function's own `Sender`, so only the forwarders' clones keep
+    // the channel open.
+    //
+    // That used to be the whole story: each of the four clones lived in the
+    // body of a bare `tokio::spawn`, so a forwarder dying dropped its sender,
+    // and once all four were gone `rx.recv()` below returned `None` and fell
+    // through to the stream-ended cleanup that unregisters the item. Since
+    // #1172 the clones live in the **factories** above, which the supervisor
+    // holds for the life of the supervised task — so a run that returns (or
+    // panics) releases only its own per-run clone, and a permanently-panicking
+    // forwarder holds its sender across every backoff. A forwarder dying no
+    // longer unregisters the item. That is the better behaviour and is why the
+    // code is unchanged: a crashed forwarder now shows up as a `health` row
+    // and is restarted with backoff, instead of an item silently vanishing
+    // from the tray.
+    //
+    // So the only route to `None` here is the designed one: all four signal
+    // streams *ending* because the item disconnected. A `Bounded` return ends
+    // the supervisor itself, which drops the factory and with it that clone —
+    // so the last of the four to return closes the channel. (The liveness
+    // watcher observes the same disconnect as `PeerGone` and unregisters
+    // directly, without going through this channel at all.)
+    drop(tx);
 
     // Liveness watcher for PeerGone — same rationale as the signal
     // forwarders above: a panic here used to silently stop PeerGone

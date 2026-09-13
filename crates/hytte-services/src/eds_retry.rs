@@ -226,8 +226,18 @@ pub(crate) fn with_client<C, T>(
     let client = clients.get(uid).expect("just inserted; lookup can't miss");
     let res = op(client);
     if res.is_err() {
-        clients.remove(uid);
-        on_evict();
+        // `on_evict` is gated on the removal having actually removed
+        // something, which is what `tasks.rs`'s pre-#1172 `evict()` did for
+        // its `debug!` line. Unreachable today — `op` only ever runs against a
+        // client this function just cached — but the guard is what makes
+        // `with_client_runs_on_evict_only_when_it_actually_evicts` pin what its
+        // name says rather than passing by accident, and it keeps a future
+        // caller that pre-checks the cache itself from getting a spurious
+        // evict callback.
+        if clients.remove(uid).is_some() {
+            tracing::debug!(uid, "eds: evicted cached client after a failed op");
+            on_evict();
+        }
     }
     res
 }
@@ -598,6 +608,18 @@ mod tests {
     ///
     /// Falsification: move the `on_evict()` call outside the `if
     /// res.is_err()` branch and the first assertion below reds.
+    ///
+    /// **What this cannot show, deliberately.** `with_client` gates `on_evict`
+    /// on `clients.remove(uid).is_some()` — restoring what `tasks.rs`'s
+    /// pre-#1172 `evict()` did for its `debug!` — but that guard's `false` arm
+    /// is unreachable *from this API by construction*: `op` only ever runs
+    /// against a client the same call just cached, so a failure always has
+    /// something to remove. The `open`-failure case below never reaches the
+    /// guard at all, because `open()?` propagates before `op` is called. So
+    /// dropping the `is_some()` gate reds nothing here, and cannot: the guard
+    /// is what makes this test's *name* a true statement about the code and
+    /// what protects a future caller that pre-checks the cache itself, not a
+    /// branch a caller can currently take.
     #[test]
     fn with_client_runs_on_evict_only_when_it_actually_evicts() {
         let mut clients: HashMap<String, u32> = HashMap::new();

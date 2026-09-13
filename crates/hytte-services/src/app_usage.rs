@@ -249,7 +249,7 @@ async fn poll_loop(usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>, active: M
     // actually contended (one loop, calls never overlap), the `Mutex` is only
     // what lets an owned, `'static` future leave and return through a plain
     // `FnMut`.
-    let cadence_state =
+    let jiffy_state =
         std::sync::Arc::new(std::sync::Mutex::new((HashMap::<u32, u64>::new(), 0u64)));
 
     gated_poll(
@@ -257,12 +257,12 @@ async fn poll_loop(usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>, active: M
         || cadence(on_battery()),
         usage,
         move || {
-            let cadence_state = cadence_state.clone();
+            let jiffy_state = jiffy_state.clone();
             async move {
                 // `mem::take` keeps the shared map valid (empty) on the
                 // join-error path below, mirroring the pre-#1172 loop.
                 let (prev_pid, prev_total) = {
-                    let mut guard = cadence_state
+                    let mut guard = jiffy_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     (std::mem::take(&mut guard.0), guard.1)
@@ -273,7 +273,7 @@ async fn poll_loop(usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>, active: M
                 match tokio::task::spawn_blocking(move || sample_proc(&prev_pid, prev_total)).await
                 {
                     Ok(sample) => {
-                        let mut guard = cadence_state
+                        let mut guard = jiffy_state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         guard.0 = sample.cur_pid;

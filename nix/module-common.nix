@@ -854,7 +854,7 @@ self:
                 existed.
 
                 The nine values are the wire names
-                [`hytte_plugin_proto::manifest::Mount`] carries, in two
+                `hytte_plugin_proto::manifest::Mount` carries, in two
                 families: the **left** sidebar (`SidebarLead` — the very top,
                 above the built-in weather/calendar/tasks cards;
                 `SidebarTop` — after those cards, above the flex gap;

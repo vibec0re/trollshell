@@ -11916,3 +11916,176 @@ mod sidebar_right_routing {
         );
     }
 }
+
+// ── #1166: two of #435's containment measures + one composition guarantee ──
+// had no test at all, so each survived being deleted with the suite green.
+
+/// #435 measure 1, the liveness ping: a connection that never answers `Pong`
+/// must be dropped within `PING_INTERVAL * (MAX_MISSED_PONGS + 1)`, not left
+/// mounted forever (the exact symptom #435 filed). Paused time drives the
+/// wait; the plugin end is held open and never written to after `Register`,
+/// so the *liveness* arm of `serve_conn`'s `select!` — not an EOF — is what
+/// ends the connection.
+///
+/// `PING_INTERVAL`/`MAX_MISSED_PONGS` are private to `session` (unlike
+/// `EFFECT_BURST`/`OUTBOUND_CAPACITY` above, neither is `pub(super)`), so
+/// this test pins their documented values (session.rs:187/190) as literals
+/// rather than reading them — the doc comment on `PING_INTERVAL` names the
+/// exact bound checked below.
+///
+/// **Falsified** by commenting out the `() = liveness => { … }` arm of the
+/// `select!` (session.rs ~1636-1641): the reader then never resolves either
+/// (this connection sends no more frames), so `handle_conn` never returns and
+/// the closing `timeout` reds.
+#[tokio::test(start_paused = true)]
+async fn liveness_drops_a_connection_that_never_pongs() {
+    const PING_INTERVAL: Duration = Duration::from_secs(30);
+    const MAX_MISSED_PONGS: u32 = 2;
+
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    let conn = tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    // Held open (never dropped) for the whole test: dropping it would close
+    // the plugin's read half, fail the host's outbound writer, and end the
+    // connection for a reason other than the liveness mechanism under test.
+    let (_prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("hung", Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("send Register");
+    // No Pong is ever sent for the rest of this test.
+
+    // Let the handshake land and the liveness ticker arm before advancing.
+    tokio::task::yield_now().await;
+
+    // One interval short of the drop bound (2 of the tolerated 2 misses have
+    // landed, but the connection is only dropped on the *next* miss): still
+    // alive.
+    tokio::time::advance(PING_INTERVAL * MAX_MISSED_PONGS).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !conn.is_finished(),
+        "a connection that has missed only {MAX_MISSED_PONGS} of the \
+         {}-ping tolerance must still be alive one interval short of the \
+         drop bound",
+        MAX_MISSED_PONGS + 1,
+    );
+
+    // The bound itself: one more interval and the hung connection is gone.
+    tokio::time::advance(PING_INTERVAL).await;
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect(
+            "a connection that never Pongs must be dropped within \
+             PING_INTERVAL * (MAX_MISSED_PONGS + 1)",
+        )
+        .expect("conn task joined cleanly");
+}
+
+/// #435 measure 4 / #1165's composition guarantee: the reader drops any
+/// effect whose capability the plugin never declared **before** it reaches
+/// the [`EffectRateLimiter`] (`enforce_capabilities` is the inner call,
+/// `throttle_effects` the outer one, in the reader's
+/// `throttle_effects(..., enforce_capabilities(..., effects, ...), ...)`
+/// composition) — so an ungranted flood spends no rate-limiter tokens. A
+/// single frame carrying `EFFECT_BURST + 1` effects the plugin never
+/// declared the capability for is dropped whole (nothing reaches the
+/// broker), and a *granted* effect in the very next frame is still admitted
+/// — proving the bucket was never touched by the flood.
+///
+/// **Falsified** by swapping the composition so the effects are
+/// rate-limited first and capability-filtered second (session.rs
+/// ~1478-1486): the flood then spends the whole burst on effects that are
+/// dropped for capability anyway, so the second frame's granted effect is
+/// throttled out and this test's final `recv` times out.
+#[tokio::test]
+async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, mut effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bar_center = ctx.bar_center.clone();
+
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+
+    // Declares RaiseOsd only — Notify is deliberately never granted, so
+    // every Notify effect below is dropped for capability regardless of
+    // rate-limiter state.
+    let mut manifest = Manifest::new("flooder", Mount::BarCenter);
+    manifest.capabilities = vec![Capability::RaiseOsd];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("Register (RaiseOsd granted, Notify not)");
+
+    let label = |text: &str| wire::Node::Label {
+        id: Some("t".into()),
+        text: text.into(),
+        classes: vec![],
+        tooltip: None,
+    };
+
+    // EFFECT_BURST + 1 ungranted effects, all in ONE frame — enough to
+    // exhaust the rate bucket if it were ever charged.
+    let flood: Vec<Effect> = (0..=EFFECT_BURST)
+        .map(|_| Effect::Notify {
+            summary: "spam".into(),
+            body: String::new(),
+        })
+        .collect();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: label("flood"),
+            panel: None,
+            effects: flood,
+            hidden_on: Vec::new(),
+        },
+    )
+    .await
+    .expect("Render with an ungranted flood");
+    wait_for_region(&bar_center).await;
+    assert!(
+        effects_rx.try_recv().is_err(),
+        "every ungranted effect in the flood is dropped before the broker",
+    );
+
+    // A single GRANTED effect in the very next frame must still be admitted.
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: label("after"),
+            panel: None,
+            effects: vec![Effect::RaiseOsd {
+                title: "t".into(),
+                body: String::new(),
+                icon: None,
+            }],
+            hidden_on: Vec::new(),
+        },
+    )
+    .await
+    .expect("Render with a granted effect");
+
+    let brokered = tokio::time::timeout(Duration::from_secs(5), effects_rx.recv())
+        .await
+        .expect(
+            "a granted effect right after an ungranted flood must reach the \
+             broker within 5s — if it doesn't, the flood spent tokens it \
+             should never have touched",
+        )
+        .expect("the effects channel is still open");
+    assert!(
+        matches!(brokered.effect, Effect::RaiseOsd { .. }),
+        "expected the granted RaiseOsd to reach the broker, got {:?}",
+        brokered.effect,
+    );
+}

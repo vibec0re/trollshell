@@ -1627,6 +1627,17 @@ systemd-run --user --unit=trollshell-plugin-departures \
       runtime mount as `SidebarRightTop`. Then restart it with no
       `HYTTE_PLUGIN_MOUNT` and confirm it goes back to the left, and that the
       right sidebar returns to showing nothing.
+- [ ] **(#1160 review)** **An open right sidebar survives its last card
+      leaving — and can still be dismissed.** With the right sidebar **open**,
+      stop the plugin (`systemctl --user stop trollshell-plugin-departures`) or
+      wait for one that renders an empty tree when it has nothing to say. The
+      card should disappear and the strip should be released. Now press
+      `toggle-sidebar-right`: it must **close** (the open latch clears — there
+      is no `ignoring` debug line for this press). Restart the plugin: the
+      sidebar must stay closed rather than sliding open by itself. Then press
+      the keybind again with the card present and confirm it opens normally.
+      Before the #1244 review this sequence left the sidebar latched open with
+      nothing on screen, and the returning card re-opened it unasked.
 - [ ] **(#1160)** **Both sidebars open at once.** Open the left and the right
       together. Both should be revealed, both strips reserved, the tiles
       squeezed between them, and neither toggle should disturb the other.
@@ -1647,12 +1658,21 @@ systemd-run --user --unit=trollshell-plugin-departures \
       A zone-0 surface should be placed inside the non-exclusive area, so this
       should be fine; if the card paints over the bar's right end, say so on
       #1160 — the fix is a top margin of the bar's height on that window.
-- [ ] **(#1160)** **The frame's cutout.** The frame overlay tracks the _left_
-      sidebar's width only (`current_visible_width` is left-keyed). With the
-      right sidebar open, check whether the frame's right edge looks wrong
-      against the reserved strip. If it does, that is a follow-up issue
-      (`frame.rs` is outside this PR's lane), not a regression of the left
-      behaviour.
+- [ ] **(#1160 → #1247)** **The frame's cutout is right-blind — confirm the
+      known answer, don't discover it.** The frame overlay tracks the _left_
+      sidebar's width only (`frame.rs:253` reads `current_visible_width`, which
+      is hardcoded to `Side::Left`), and `cutout_rect` always puts the cutout's
+      right edge at `width - FRAME_THICKNESS`. So with the right sidebar open
+      the prediction is: the frame's 8 px right strut paints **on top of** the
+      sidebar's outer edge (the frame is `Layer::Overlay`, above the sidebar's
+      `Layer::Top`), the rounded right corners sit ~312 px _underneath_ the
+      sidebar instead of against it, the tiles niri has just reflowed to
+      `width - 320` get no frame border on their right edge at all, and the
+      frame does not even redraw during the right slide (`is_settled` is
+      left-keyed too). Check it looks like that rather than like something else
+      — a _different_ artefact is new information. The fix is **#1247**;
+      `frame.rs` is outside #1160's lane and this is not a regression of the
+      left behaviour.
 - [ ] **(#1160)** **Pollers park per side.** With a `SlotVisible`-subscribing
       plugin on the right (departures declares it) and another on the left,
       open only the **right** sidebar and confirm from

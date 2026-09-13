@@ -486,21 +486,28 @@
  * Its surface and card carry `.ts-sidebar-right-surface` / `.ts-sidebar-right`
  * IN ADDITION to the shared `.ts-sidebar-surface` / `.ts-sidebar` above, so
  * every rule authored for the sidebar applies to both sides without being
- * written twice and these two exist purely as the hook a skin mirrors its
- * paddings/radii through. The defaults below therefore restate the shared
- * padding rather than changing it: the right sidebar ships looking exactly like
- * the left, and a skin that wants them to differ has a selector to say so
- * without having to reach past `.ts-sidebar`'s specificity.
+ * written twice, and the two twins exist purely as the hook a skin mirrors its
+ * paddings/radii through.
+ *
+ * The card twin is therefore stamped from Rust (`Side::card_class`) and
+ * deliberately carries **no declarations here**: it is a hook, not a default.
+ * An earlier revision restated `.ts-sidebar`'s `padding: 0.923em`, which is the
+ * same specificity (0,1,0) and later in the file, so it WON — and would have
+ * kept winning the day anyone retuned `.ts-sidebar`'s padding, moving the left
+ * card while the right one silently stayed at the old literal. That is exactly
+ * the drift being additive was supposed to avoid (#1244 review, finding 3).
+ *
+ * The surface twin does restate `background: transparent`, and that is fine for
+ * the same reason inverted: transparency here is not a tunable — the visible
+ * content is the inner card, and a non-transparent sidebar surface paints
+ * `@window_bg_color` into the margin gaps (see `.ts-sidebar-surface` above).
+ * There is no value that could move independently.
  *
  * The `border-radius: 0` note on `.ts-sidebar` applies here too, and for the
  * mirrored reason: the frame's cutout paints its own rounded corners against
  * this card's LEFT edge. */
 .ts-sidebar-right-surface {
     background: transparent;
-}
-
-.ts-sidebar-right {
-    padding: 0.923em;
 }
 
 /* Sidebar widget cards — each top-level widget is a SOLID opaque dark card so

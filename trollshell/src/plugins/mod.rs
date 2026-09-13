@@ -194,17 +194,25 @@ pub use region::{
     sidebar_right_top_slot,
 };
 
-/// Signal that emits `true` while **some** monitor's sidebar is open — the same
-/// aggregate the host pushes to plugins as
+/// Signal that emits `true` while **some** monitor's *left* sidebar is open —
+/// the same aggregate the host pushes to left-mounted plugins as
 /// [`HostMsg::SlotVisibility`](hytte_plugin_proto::HostMsg::SlotVisibility)
 /// (#288), surfaced to the binary so it can gate its own pollers on "a sidebar
 /// card can see this" (#840).
 ///
+/// **Left only since #1160**, and deliberately: the right sidebar keeps its own
+/// aggregate on [`PluginHandles::visibility_right_tx`], and
+/// `pump::publish_right_visibility` does not touch this mirror. Every consumer
+/// of this signal is a *left*-sidebar card — today's only one is the mpris
+/// position gate in `main.rs`, whose plugin-side consumer is the audio widget's
+/// transport readout — so folding the right side in would park nothing extra and
+/// would unpark those pollers whenever an unrelated right-hand card came on
+/// screen. A future consumer that wants the other side (or the OR of both)
+/// should say so with its own accessor rather than widening this one.
+///
 /// Sidebar-scoped on purpose: a *bar*-mounted plugin is always visible (see
 /// [`Mount::is_bar`](hytte_plugin_proto::Mount::is_bar)), so this would be a
-/// constant `true` for one and gate nothing. Today's only consumer is the mpris
-/// position gate in `main.rs`, whose plugin-side consumer (the audio widget's
-/// transport readout) is a sidebar card.
+/// constant `true` for one and gate nothing.
 pub fn slot_visible_signal() -> impl Signal<Item = bool> + 'static {
     pump::slot_visible_mutable().signal()
 }

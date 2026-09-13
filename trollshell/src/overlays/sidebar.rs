@@ -1,5 +1,16 @@
-//! Per-monitor pushable left sidebar. Layer-shell window anchored
-//! `Left + Top + Bottom` on `Layer::Top`; toggles via `widgets::sidebar_toggle`.
+//! Per-monitor pushable sidebars — **one per [`Side`]** since #1158/#1160.
+//! Each is a layer-shell window on `Layer::Top` anchored `<side> + Top +
+//! Bottom`: the left one (toggled by `widgets::sidebar_toggle` and the
+//! `toggle-sidebar` action) carries the built-in calendar/tasks cards plus the
+//! three `Sidebar*` plugin regions, and the right one (the `toggle-sidebar-right`
+//! action, no chip) carries the three `SidebarRight*` regions and nothing else.
+//!
+//! Everything below describes **both** unless it says otherwise — layer,
+//! exclusive-zone machinery, revealer, scroller, settle re-assert and reflow
+//! nudge are shared code, and the four things that differ are the methods on
+//! [`Side`]. The one behavioural asymmetry is that the right surface is not
+//! mapped at all until a card shows on it ([`wire_non_empty`]); the left, never
+//! being empty, is mapped at `install` exactly as it always was.
 //!
 //! ## Persistence + z-order
 //!
@@ -363,14 +374,31 @@ pub fn toggle_on_focused(preferred: Option<&str>) {
 /// `toggle-sidebar-right` `GAction` (#1160).
 ///
 /// Differs from the left in exactly one way, and it is the epic's "hidden
-/// entirely when empty" rule: a toggle aimed at a connector whose right sidebar
-/// has no card **does nothing** and says so once at `debug!`. Flipping the state
-/// anyway would leave the user pressing a keybind that produces no visible
-/// change *and* an open flag that silently decides the surface's fate the moment
-/// an unrelated plugin dials in — the sidebar would appear to open by itself.
-/// The read is synchronous off the panel's mirrored `non_empty` (see
-/// [`SidebarPanel::non_empty`]), so the decision is made against what is on
-/// screen now, not against a value that lands on the next poll.
+/// entirely when empty" rule: a toggle that would **open** a connector's right
+/// sidebar while it has no card does nothing and says so once at `debug!`.
+/// Flipping the state anyway would leave the user pressing a keybind that
+/// produces no visible change *and* an open flag that silently decides the
+/// surface's fate the moment an unrelated plugin dials in — the sidebar would
+/// appear to open by itself. The read is synchronous off the panel's mirrored
+/// `non_empty` (see [`SidebarPanel::non_empty`]), so the decision is made
+/// against what is on screen now, not against a value that lands on the next
+/// poll.
+///
+/// A **close always goes through**, empty or not (#1244 review, finding 1).
+/// Refusing on emptiness alone produced the very bug the refusal exists to
+/// prevent, from the other direction: open the sidebar while a card is there,
+/// let the card go away — the plugin exits, or renders an empty tree (#1039's
+/// documented "nothing to show right now"), or grows a `hidden_on` entry for
+/// this output (#1050) — and the surface collapses with `open` still latched
+/// `true`. The dismissing press was a no-op, and the next card to arrive slid
+/// the sidebar open by itself. A departures board with no departures empties
+/// the sidebar on its own schedule, so this needs no crash to reach.
+///
+/// Closing an empty sidebar is never surprising and it clears the latch, which
+/// is why the guard is `!non_empty && !open` rather than `!non_empty`. The
+/// alternative — clearing `SIDEBAR_OPEN` from [`wire_non_empty`] when the feed
+/// goes false — would throw away intent the user may want back after a plugin
+/// restart, and put a second writer on [`SIDEBAR_OPEN`].
 pub fn toggle_right_on_focused(preferred: Option<&str>) {
     let Some(key) = installed_key(Side::Right, preferred) else {
         tracing::debug!(
@@ -385,14 +413,14 @@ pub fn toggle_right_on_focused(preferred: Option<&str>) {
             .get(&(Side::Right, key.clone()))
             .is_some_and(|p| p.non_empty.get())
     });
-    if !non_empty {
+    let state = sidebar_open_state(Side::Right, &key);
+    if !non_empty && !state.get() {
         tracing::debug!(
             monitor = %key,
             "toggle-sidebar-right: no plugin card mounted on the right sidebar here; ignoring"
         );
         return;
     }
-    let state = sidebar_open_state(Side::Right, &key);
     state.set(!state.get());
 }
 
@@ -562,35 +590,18 @@ fn install_side(monitor: &Monitor, side: Side) {
     revealer.set_child(Some(&clamp));
     window.set_child(Some(&revealer));
 
-    // Start clickthrough — the persistent surface keeps a full input region by
-    // default even after the revealer collapses to 0 width, so without this the
-    // closed sidebar's region still swallows clicks.
-    //
-    // Wired **before** the first `set_visible`, through `on_surface_ready`
-    // rather than as a bare post-`set_visible` call: a layer surface maps
-    // synchronously inside its one `set_visible(true)` and never remaps, so
-    // surface wiring that runs after that map silently never applies — the exact
-    // shape of the #192/#193/#212 frost regressions. On the left this is the
-    // same instant it always was (the helper's "already mapped" branch fires
-    // immediately after the `set_visible(true)` below); on the right the map can
-    // be minutes away (it waits for a card), and the helper's `connect_map` hook
-    // is what carries the input region across that gap. It is also where a blur
-    // region would be attached if the frosted-glass experiment (#312) ever comes
-    // back — one place, both sides, before the map.
-    let for_region = window.clone();
-    let open_for_region = open_state.clone();
-    let non_empty_for_region = non_empty.clone();
-    hytte::ui::on_surface_ready(&window, move |_surface| {
-        let open = effective_open(open_for_region.get(), non_empty_for_region.get());
-        apply_input_passthrough(&for_region, !open);
-    });
+    // The surface's input region, wired BEFORE the first `set_visible` — see
+    // [`wire_input_region`] for the whole #212 argument. Ordering is the point:
+    // every line that touches the surface has to be in place before the one map
+    // this window will ever get.
+    wire_input_region(&window, &open_state, &non_empty);
 
     // Present the surface ONCE — toggle goes through the revealer + open_state,
     // never through set_visible/present. See module-level note on z-order.
     //
     // The left maps here, at install, and stays alive for the process lifetime.
     // The right maps the first time a card shows on this connector and then
-    // stays alive too (see `wire_map_latch`): a *persistent* layer surface is
+    // stays alive too (see [`wire_non_empty`]): a *persistent* layer surface is
     // the design this module documents at the top, and re-presenting one on each
     // toggle is what bumped it above the bar in the first place.
     if side == Side::Left {
@@ -705,6 +716,77 @@ fn install_side(monitor: &Monitor, side: Side) {
             },
         )
     }));
+}
+
+/// Wire the surface's input region so a closed (or empty) sidebar's persistent
+/// layer-shell surface doesn't swallow pointer events, and wire it **before**
+/// the window's first `set_visible` (#212).
+///
+/// The ordering is the whole function. A layer surface maps **synchronously**
+/// inside its one `set_visible(true)` and — for a persistent surface — never
+/// remaps (`hytte_ui::LayerWindowBuilder::build`'s *Surface lifecycle* note), so
+/// surface wiring that runs after that map silently never applies. That is the
+/// exact shape of the #192/#193/#212 frost regressions, where blur was attached
+/// after the one-and-only map and did nothing, and it is why this goes through
+/// [`hytte::ui::on_surface_ready`] rather than a bare post-`set_visible` call:
+///
+/// * On the **left**, the map happens at `install` and the helper's
+///   already-mapped branch fires immediately — the same instant the pre-#1160
+///   code applied its region.
+/// * On the **right**, the map is latched to the first card ([`wire_non_empty`])
+///   and can be minutes away, so there is nothing to apply a region *to* at
+///   install time (`window.surface()` is `None`); the helper's `connect_map`
+///   hook is what carries it across that gap. This surface is the first one in
+///   the tree where the difference between the two spellings is observable at
+///   all.
+///
+/// It is also the one place a blur region would be attached if the
+/// frosted-glass experiment (#312) ever came back — one call, both sides, before
+/// the map.
+///
+/// Split out of [`install_side`] on [`wire_non_empty`]'s precedent, and for the
+/// same reason: `install_side` needs a live `Monitor` and a layer surface, so no
+/// test reaches it, and replacing this block with the pre-#1160
+/// `apply_input_passthrough(&window, true)` left the whole suite green (#1244
+/// review, finding 2). Taking a bare `gtk::Window` makes the *ordering* itself
+/// assertable — see `gtk_tests::the_input_region_is_wired_before_the_first_map`.
+///
+/// Applies `!effective_open(…)`: passthrough while the sidebar is closed **or**
+/// empty, a full region while it is actually showing something. At map time on
+/// the right that is always `true` (the toggle refuses to open an empty
+/// sidebar), and on the left it is `true` because nothing is open at install.
+fn wire_input_region(window: &gtk::Window, open: &Mutable<bool>, non_empty: &Mutable<bool>) {
+    let open = open.clone();
+    let non_empty = non_empty.clone();
+    on_map_or_now(window, move |window| {
+        let showing = effective_open(open.get(), non_empty.get());
+        apply_input_passthrough(window, !showing);
+    });
+}
+
+/// Run `apply` with the **window** as soon as its surface exists, and again on
+/// every subsequent map — [`hytte::ui::on_surface_ready`] with the argument
+/// flipped from `&gdk::Surface` to `&gtk::Window`.
+///
+/// A three-line adapter with two jobs. The obvious one: [`apply_input_passthrough`]
+/// (and `frame::install_click_through` before it) is written against the window,
+/// because that is what it has to re-ask for a surface handle on each call.
+///
+/// The one that earns it a name: it is the **seam this module's map-timing
+/// contract is assertable through** (#1244 review, finding 2). `install_side`
+/// needs a live `Monitor` and a layer surface, so nothing in CI reaches it, and
+/// replacing its `on_surface_ready` block with a bare pre-map
+/// `apply_input_passthrough` left all 1033 tests green — the #1180-item-8 shape
+/// one layer up, on the contract the right sidebar's whole design leans on.
+/// Taking a plain closure and a bare `gtk::Window` lets
+/// `gtk_tests::the_input_region_is_wired_before_the_first_map` stamp
+/// `window.is_mapped()` from inside the callback and pin *when* it ran, which no
+/// assertion on the input region itself could do: **GDK exposes no getter for a
+/// surface's input region**, so what it applied stays a code-path argument plus
+/// a live-verify item. That the wiring is deferred at all is now held by a test.
+fn on_map_or_now(window: &gtk::Window, apply: impl Fn(&gtk::Window) + 'static) {
+    let window_for_apply = window.clone();
+    hytte::ui::on_surface_ready(window, move |_surface| apply(&window_for_apply));
 }
 
 /// Mirror `source` ("does this side have a card on this connector?") into
@@ -1617,7 +1699,8 @@ mod gtk_tests {
 
     use super::{
         PANELS, SIDEBAR_WIDTH, Side, SidebarPanel, build_clamped_scroller, build_revealer,
-        open_width, sidebar_open_state, toggle_right_on_focused, wire_non_empty,
+        effective_open, on_map_or_now, open_width, sidebar_open_state, toggle_right_on_focused,
+        wire_non_empty,
     };
     use crate::scale::scale;
     use hytte::adw::{self, prelude::*};
@@ -2123,6 +2206,73 @@ mod gtk_tests {
         );
     }
 
+    /// The #212 ordering, as a test rather than as prose (#1244 review,
+    /// finding 2).
+    ///
+    /// A persistent layer surface maps synchronously inside its one
+    /// `set_visible(true)` and never remaps, so anything that touches the
+    /// surface has to be wired **before** that call or it silently never
+    /// applies. [`install_side`] wires the input region through
+    /// [`on_map_or_now`] for exactly that reason, and on the right sidebar the
+    /// gap between wiring and map is unbounded — the surface waits for its first
+    /// card.
+    ///
+    /// Nothing held that. Replacing `install_side`'s wiring with the pre-#1160
+    /// bare `apply_input_passthrough(&window, true)` — deleting the map hook the
+    /// right surface depends on — left 843 hermetic and 1033 gated tests green.
+    /// `hytte-ui`'s own tests pin the *helper's* contract; this pins that this
+    /// module's wiring defers.
+    ///
+    /// Asserts both halves, because only the pair distinguishes "deferred" from
+    /// "ran twice": nothing applies while the window has no surface, and what
+    /// does apply, applies with the window **mapped**. A bare `gtk::Window`
+    /// stands in, the same substitution `hytte-ui` makes — "has this toplevel
+    /// been mapped yet" is plain GTK mechanics.
+    ///
+    /// What it deliberately does **not** assert is the input region itself: GDK
+    /// exposes no getter for one, so what was applied stays a code-path argument
+    /// plus a live-verify item. *When* it was applied is the part that was
+    /// unheld, and it is the part that regressed in #192/#193/#212.
+    ///
+    /// **Falsification (run):** making [`on_map_or_now`] call `apply`
+    /// immediately (the pre-#1160 eager shape) turns this red on the
+    /// before-the-map assertion.
+    #[gtk::test]
+    fn the_input_region_is_wired_before_the_first_map() {
+        adw::init().expect("libadwaita init");
+        let window = surface();
+        // `Option<bool>`: `None` = never ran, `Some(mapped)` = ran, with the
+        // window's map state at that moment. One cell answers both halves.
+        let stamp: std::rc::Rc<std::cell::Cell<Option<bool>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        let stamp_for_apply = stamp.clone();
+        on_map_or_now(&window, move |w| stamp_for_apply.set(Some(w.is_mapped())));
+
+        // Wired, but the window has never been shown: there is no surface to
+        // touch yet, so nothing must have run. This is the assertion an eager
+        // apply fails — and the one that makes the `Some(true)` below mean
+        // "deferred to the map" rather than "ran at some point".
+        settle(200, || false);
+        assert_eq!(
+            stamp.get(),
+            None,
+            "nothing may be applied to the surface before the window is shown — there is no \
+             surface yet (`window.surface()` is None), so an eager apply is a silent no-op that \
+             never happens again (#212)"
+        );
+
+        window.set_visible(true);
+        settle(2000, || stamp.get().is_some());
+        let ran = stamp.get();
+        window.destroy();
+        assert_eq!(
+            ran,
+            Some(true),
+            "the wiring must run on the window's one map, with the window mapped — that is the \
+             only moment a persistent layer surface offers (#192/#193/#212)"
+        );
+    }
+
     /// A `SidebarPanel` with no live subscriptions, for the [`PANELS`]-driven
     /// toggle tests. The two `JoinHandle`s are inert futures: nothing here
     /// exercises the zone/visibility machinery, only the toggle's own decision.
@@ -2176,6 +2326,59 @@ mod gtk_tests {
                 !right.get(),
                 "a right-sidebar toggle on an output with no right-mounted card must not flip the \
                  open state — otherwise the surface springs open the moment any plugin arrives"
+            );
+        });
+    }
+
+    /// …but an **open** right sidebar can always be dismissed, even after its
+    /// last card has gone away (#1244 review, finding 1).
+    ///
+    /// The full round trip the reviewer's probe describes, because the bug is
+    /// only visible at the end of it: open with a card present → the card goes
+    /// away (the plugin exits, renders an empty tree, or hides on this output)
+    /// → the user presses the keybind to dismiss it → a card comes back. With
+    /// the guard keyed on emptiness alone the third step was a no-op and the
+    /// fourth slid the sidebar open by itself — exactly the "opens by itself"
+    /// failure the refusal exists to prevent, reached from the other side.
+    ///
+    /// This is the case the other two toggle tests could not see:
+    /// `a_toggle_on_an_empty_right_sidebar_is_a_no_op` pins the refusal at
+    /// `open == false`, `effective_open_needs_both_intent_and_content` pins the
+    /// fold, and they never meet at `open == true && non_empty == false`.
+    ///
+    /// **Falsification (run):** restoring the unconditional `if !non_empty { …
+    /// return; }` turns this red on "must be dismissable".
+    #[gtk::test]
+    fn an_open_right_sidebar_can_be_closed_after_its_last_card_leaves() {
+        adw::init().expect("libadwaita init");
+        // `with_panels`'s `right_non_empty = false` is the *after* state: the
+        // card is already gone by the time the user reaches for the keybind.
+        with_panels("DP-EMPTIED", false, || {
+            let right = sidebar_open_state(Side::Right, "DP-EMPTIED");
+            // Opened while a card was still there.
+            right.set(true);
+
+            toggle_right_on_focused(Some("DP-EMPTIED"));
+            assert!(
+                !right.get(),
+                "an open right sidebar whose last card went away must be dismissable — otherwise \
+                 the open intent stays latched with nothing on screen to explain it"
+            );
+
+            // The half that makes it a bug rather than a cosmetic refusal: a
+            // card coming back must NOT re-open a sidebar the user dismissed.
+            // `effective_open(open, non_empty)` is what the surface acts on, so
+            // this is the value that would have slid it open.
+            assert!(
+                !effective_open(right.get(), true),
+                "a card returning must not re-open a sidebar the user closed"
+            );
+
+            // …and the refusal is still in force for a fresh open attempt.
+            toggle_right_on_focused(Some("DP-EMPTIED"));
+            assert!(
+                !right.get(),
+                "with the latch cleared, an empty right sidebar refuses to open again"
             );
         });
     }

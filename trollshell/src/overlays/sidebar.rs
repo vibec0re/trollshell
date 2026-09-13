@@ -350,13 +350,17 @@ pub fn open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
 /// [`open_signal`] for either side (#1247). The frame subscribes to **both**,
 /// because either slide moves one of its two insets.
 ///
-/// This is the raw open *intent*, not [`effective_open`] — same as it always
-/// was. That is exactly what the frame wants from it: the signal's only job
-/// there is to arm the redraw tick, and a right sidebar whose toggle was
-/// refused for emptiness never emits at all (`toggle_right_on_focused` declines
-/// to write the state), so no tick is armed for a slide that will not happen.
-/// What the cutout is *drawn* from is [`current_visible_width`], which does fold
-/// in `non_empty`.
+/// This is the raw open *intent*, not [`effective_open`]. On the left that is
+/// the whole story: `non_empty` there is the constant `true`, so intent and
+/// effective state never diverge. On the right it is **not** enough by itself
+/// — a card arriving or leaving flips `non_empty` independently of this
+/// signal, which moves the revealer, the exclusive zone and
+/// [`current_visible_width`] by a whole sidebar width without this emitting at
+/// all. The frame's redraw tick learned this the hard way (#1247 review
+/// finding 1): it now arms on this signal for **both** sides *and* on
+/// `plugins::sidebar_right_non_empty` separately, rather than trying to make
+/// one function answer both "did the user ask to open/close" and "did the
+/// content change" — see `frame.rs`'s module doc for the arming signal.
 pub fn open_signal_on(side: Side, monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
     sidebar_open_state(side, &monitor_key(monitor)).signal()
 }
@@ -2601,6 +2605,86 @@ mod gtk_tests {
                 .clone()
         });
         revealer.set_reveal_child(reveal);
+    }
+
+    /// The frame's redraw tick must be armed by a right sidebar's **content**
+    /// change too, not only its raw open intent (#1247 review finding 1): on
+    /// the right, `open_state` and `non_empty` are two independent `Mutable`s,
+    /// and a card arriving or leaving moves the revealer, the exclusive zone
+    /// and [`current_visible_width_for_key`] by a whole sidebar width without
+    /// `open_state` ever changing.
+    ///
+    /// `frame.rs`'s arming subscription is spawned inline against a real
+    /// layer-shell window, so this pins its *shape* instead: it builds the
+    /// same three inputs by hand — [`sidebar_open_state`] for both sides, plus
+    /// the right panel's `non_empty` `Mutable` (the same one [`wire_non_empty`]
+    /// drives from `plugins::sidebar_right_non_empty` in production) — and
+    /// polls the combined signal directly rather than pumping a main loop.
+    ///
+    /// **Falsification (run):** dropping the third `map_ref!` input — i.e.
+    /// arming on `open_state` alone, which is what #1247 shipped before this
+    /// review — reproduces the finding exactly: the signal stays `Pending`
+    /// across the `non_empty` flip even though the visible width moves by a
+    /// full sidebar width in the same step.
+    #[gtk::test]
+    fn a_right_non_empty_change_arms_the_frames_redraw_signal() {
+        use hytte::futures_signals::map_ref;
+        use hytte::futures_signals::signal::{Signal, SignalExt};
+        use std::task::{Context, Poll, Waker};
+
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 160;
+        with_sized_panels("DP-ARM", 0, wide, || {
+            // Latch the right sidebar open with no card yet, mirroring #1244
+            // finding 1's sequence: intent arrives before content does.
+            let non_empty = PANELS.with(|panels| {
+                let panels = panels.borrow();
+                let panel = panels
+                    .get(&(Side::Right, "DP-ARM".to_owned()))
+                    .expect("test setup: the right panel was just parked");
+                panel.non_empty.set(false);
+                panel.non_empty.clone()
+            });
+            sidebar_open_state(Side::Right, "DP-ARM").set(true);
+
+            // The same three inputs as `frame.rs`'s `both_sides`, `.dedupe()`d
+            // the same way — built from `sidebar_open_state`/`non_empty`
+            // directly since this test has no `Monitor` to call
+            // `open_signal_on`/`plugins::sidebar_right_non_empty` through.
+            let arming = map_ref! {
+                let _left = sidebar_open_state(Side::Left, "DP-ARM").signal(),
+                let _right = sidebar_open_state(Side::Right, "DP-ARM").signal(),
+                let has_card = non_empty.signal().dedupe() => *has_card
+            };
+            let mut sig = std::pin::pin!(arming);
+            let mut cx = Context::from_waker(Waker::noop());
+
+            // Drain the signal's initial value before measuring.
+            assert!(matches!(
+                sig.as_mut().poll_change(&mut cx),
+                Poll::Ready(Some(false))
+            ));
+            assert!(matches!(sig.as_mut().poll_change(&mut cx), Poll::Pending));
+
+            let before = current_visible_width_for_key(Side::Right, "DP-ARM");
+            assert_eq!(
+                before,
+                frame::FRAME_THICKNESS_I32,
+                "test setup: starts empty"
+            );
+
+            non_empty.set(true); // a card dials in — #1247's own artefact sequence
+            let after = current_visible_width_for_key(Side::Right, "DP-ARM");
+            assert!(
+                after >= wide,
+                "the inset the frame draws from must move: {before} -> {after}"
+            );
+            assert!(
+                matches!(sig.as_mut().poll_change(&mut cx), Poll::Ready(Some(true))),
+                "the inset moved by {} px and the arming signal did not emit",
+                after - before
+            );
+        });
     }
 
     /// A toggle aimed at an empty right sidebar does **nothing** — it does not

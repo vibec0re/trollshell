@@ -225,8 +225,14 @@ fn sidebar_close_all_tolerates_a_reentrant_panels_read_from_the_open_state_wake(
 
             // Mount the sidebar for real: `PANELS` is private and `install` is
             // the only thing that populates it, so there is no shortcut to the
-            // state `close_all` iterates.
+            // state `close_all` iterates. Both sides — `install_right` parks a
+            // panel without mapping the surface, and without it `close_all`'s
+            // `take()` loop has exactly one entry, so "a read landing between
+            // the two panels" (the module doc above, and this test's own
+            // reasoning for reading both sides) is not actually reachable
+            // (#1269 review finding 3).
             sidebar::install(&monitor);
+            sidebar::install_right(&monitor);
 
             // Open it before tearing it down. Not strictly required to make
             // `close_all`'s `open_state.set(false)` notify (`Mutable::set`

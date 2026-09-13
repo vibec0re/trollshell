@@ -27,10 +27,17 @@
 //! visible width, the right edge the right one's (#1158/#1160). Each side is
 //! read from its own surface through `sidebar::current_visible_width(side, …)`
 //! and both are redrawn from **one** tick loop, armed by a `map_ref!` over the
-//! two open signals and broken only when [`all_settled`] says neither revealer
-//! is still moving. A side that is closed, empty or never installed reports
-//! [`FRAME_THICKNESS_I32`], which is the plain strut — so a shell with no
-//! right-mounted plugin draws exactly the frame it drew before this existed.
+//! two open signals **and** the right sidebar's content flag
+//! (`plugins::sidebar_right_non_empty`, `.dedupe()`d) and broken only when
+//! [`all_settled`] says neither revealer is still moving. The content flag is
+//! its own input rather than folded into a rewritten `open_signal_on` because
+//! on the right it is a `Mutable` independent of the raw open intent — a card
+//! arriving or leaving moves the revealer, the exclusive zone and
+//! `current_visible_width` without the intent ever changing, so the two open
+//! signals alone would arm nothing for it (#1247 review finding 1). A side
+//! that is closed, empty or never installed reports [`FRAME_THICKNESS_I32`],
+//! which is the plain strut — so a shell with no right-mounted plugin draws
+//! exactly the frame it drew before this existed.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -163,6 +170,20 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
     // one armed — and would need its own `JoinHandle` in `FrameView` and its own
     // `abort()` in `close_all` to avoid the leak documented on that field.
     //
+    // A third input, the right sidebar's content flag (#1247 review finding 1):
+    // `open_signal_on` is the raw open *intent*, and on the right that is a
+    // Mutable independent of `plugins::sidebar_right_non_empty` — the card
+    // going away (or arriving) moves the revealer, the exclusive zone and
+    // `current_visible_width` by a whole sidebar width without ever touching
+    // `open_state`. Without this input a quiet plugin's tree going empty (or a
+    // fresh one arriving) leaves the cutout stale until something unrelated
+    // (a left toggle, hot-plug, fullscreen) queues the next draw. `.dedupe()`
+    // is load-bearing, not tidiness: `sidebar_right_non_empty` is itself a
+    // `map_ref!` over the right sidebar's three render-list signals
+    // (`plugins/region.rs`), which re-emit **per plugin frame** — an animated
+    // chip would otherwise arm this tick 60×/s for the life of the session.
+    // The left needs no such input: its `non_empty` is the constant `true`.
+    //
     // Spawned raw (not a `bind`), so it has no WeakRef safety net and won't
     // stop when the window drops — the `JoinHandle` is stored in `FrameView`
     // and aborted in `close_all` on hot-plug.
@@ -170,7 +191,9 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
     let monitor_for_sidebar = monitor.clone();
     let both_sides = map_ref! {
         let left = sidebar::open_signal_on(Side::Left, monitor),
-        let right = sidebar::open_signal_on(Side::Right, monitor) => (*left, *right)
+        let right = sidebar::open_signal_on(Side::Right, monitor),
+        let right_has_card = crate::plugins::sidebar_right_non_empty(monitor).dedupe() =>
+            (*left, *right, *right_has_card)
     };
     let sidebar_sub =
         glib::MainContext::default().spawn_local(both_sides.for_each(move |_opens| {
@@ -389,6 +412,15 @@ fn all_settled(left: bool, right: bool) -> bool {
 /// Clamped at 0 for the pathological case where two open sidebars are together
 /// wider than the output — cairo takes a negative width, but nothing good
 /// follows it.
+///
+/// That case cannot reach cairo through [`install_draw`] today: whenever the
+/// two insets overlap enough to need this clamp, [`cutout_rect`]'s width has
+/// already gone to 0 and `install_draw`'s `cw <= 0.0` early return fires
+/// first, so the draw never calls this function at all. The clamp stays as
+/// defence in depth for this function's other callers/tests (it is asserted
+/// directly, pure, below) — but it is `install_draw`'s guard that is load-
+/// bearing against a negative cairo width on glass; don't delete that one
+/// believing this clamp alone covers it (#1269 review nit 4).
 fn outer_span(width: f64, left_inset: f64, right_inset: f64) -> (f64, f64) {
     let left = if left_inset > FRAME_THICKNESS {
         left_inset

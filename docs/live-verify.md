@@ -1674,9 +1674,14 @@ systemd-run --user --unit=trollshell-plugin-departures \
       **no** strut drawn over the card, the cutout's two right corners round off
       against that edge, and the tile beside it has a frame border there just
       like the left one does. Watch the slide itself — the cutout's right edge
-      must track the card the whole way in and out, not jump at the end or
-      freeze part-way (one tick loop now serves both edges and breaks only once
-      **both** revealers are at rest).
+      must track the card on the way **in**, not jump at the end or freeze
+      part-way, and must snap back to the 8 px strut the instant the close
+      starts rather than tracking the card out — the same way the left already
+      does (`current_visible_width` drops a side from the lookup as soon as
+      the close intent lands, with no reference to where the revealer
+      physically is, so the strut paints over the card for the rest of its
+      180 ms slide-out on both sides). One tick loop now serves both edges and
+      breaks only once **both** revealers are at rest.
 - [ ] **(#1247)** **Both sidebars, both insets.** Open the left and the right
       together: the frame should be inset on both sides at once, the tiles
       framed between them, and toggling one must not move the other's edge.

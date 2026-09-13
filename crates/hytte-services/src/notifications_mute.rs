@@ -76,12 +76,7 @@ fn parse_apps_line(text: &str) -> HashSet<String> {
 }
 
 fn save_to_disk(apps: &HashSet<String>) {
-    state::store(
-        SUBSYSTEM,
-        &MutedAppsState {
-            apps: apps.clone(),
-        },
-    );
+    state::store(SUBSYSTEM, &MutedAppsState { apps: apps.clone() });
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -225,7 +220,10 @@ mod tests {
             assert_eq!(apps, HashSet::from(["Discord".to_string()]));
 
             let state_path = state::path(SUBSYSTEM).unwrap();
-            assert!(state_path.exists(), "state must now hold the migrated value");
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
 
             let after = std::fs::metadata(&legacy).unwrap();
             assert_eq!(

@@ -1036,7 +1036,10 @@ mod tests {
             assert_eq!(got.default.as_deref(), Some("/j.png"));
 
             let state_path = state::path(SUBSYSTEM).unwrap();
-            assert!(state_path.exists(), "state must now hold the migrated value");
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
             assert_eq!(
                 state::load::<WallpaperState>(SUBSYSTEM).as_ref(),
                 Some(&got),

@@ -177,7 +177,10 @@ mod tests {
             );
 
             let state_path = state::path(SUBSYSTEM).unwrap();
-            assert!(state_path.exists(), "state must now hold the migrated value");
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
 
             let after = std::fs::metadata(&legacy).unwrap();
             assert_eq!(

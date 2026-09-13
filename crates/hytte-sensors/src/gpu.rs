@@ -274,6 +274,7 @@ pub struct GpuCache {
 ///
 /// Returns `(gpu_state, updated_cache)`. The caller stores the returned cache
 /// back into `PollState`.
+#[must_use]
 pub fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCache) {
     // AMD sysfs reads don't need caching — `read_amd_gpu` only walks
     // `/sys/class/drm` and exits on the first AMD card it finds.

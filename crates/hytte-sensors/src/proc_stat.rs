@@ -32,6 +32,7 @@ pub fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
     Ok(entries)
 }
 
+#[must_use]
 pub fn compute_cpu_load(prev: &[(u64, u64)], now: &[(u64, u64)]) -> CpuLoad {
     if prev.is_empty() || now.is_empty() {
         // First sample — no delta yet.

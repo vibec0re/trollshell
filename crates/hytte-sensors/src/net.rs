@@ -36,6 +36,7 @@ pub fn read_proc_net_dev() -> Result<Vec<(String, u64, u64)>, std::io::Error> {
 
 // ── /proc/net/{tcp,tcp6} parsing ─────────────────────────────────────────────
 
+#[must_use]
 pub fn read_net_connections() -> NetConnections {
     let v4 = count_tcp_states("/proc/net/tcp");
     let v6 = count_tcp_states("/proc/net/tcp6");

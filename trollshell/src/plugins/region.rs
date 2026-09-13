@@ -1294,8 +1294,8 @@ mod gtk_tests {
     // The #897 animation probes are there for the same reason, read here because
     // the mounts that arm them are these.
     use crate::plugins::pump::{
-        animation_arms, drive_scope_releaser, live_animators, live_plugin_ids_signal,
-        reset_animation_probes,
+        RENDER_MAILBOXES, animation_arms, drive_scope_releaser, live_animators,
+        live_plugin_ids_signal, reset_animation_probes,
     };
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
@@ -3996,14 +3996,17 @@ mod gtk_tests {
         releaser.abort();
     }
 
-    /// Spawn the monitor-independent scope releaser (#921) over seven mailboxes
-    /// of which only the one at `slot` carries anything — the shape
+    /// Spawn the monitor-independent scope releaser (#921) over every render
+    /// mailbox, of which only the one at `slot` carries anything — the shape
     /// `plugins::install` wires up, minus the registry a `#[gtk::test]` has no
     /// booted `App` to provide.
     ///
-    /// `slot` indexes `live_plugin_ids_signal`'s array in `PluginHandles` field
-    /// order: 0-2 the sidebar regions, 3-5 the bar regions, 6 the shared panel
-    /// list.
+    /// `slot` indexes `live_plugin_ids_signal`'s array: 0-2 the left sidebar's
+    /// regions, 3-5 the bar regions, 6 the shared panel list, and since #1158
+    /// 7-9 the right sidebar's three, on the tail (that function's destructure
+    /// says why the order is free). Sized from `RENDER_MAILBOXES` rather than a
+    /// literal, so the next mount arrives here as a count rather than as a type
+    /// error.
     ///
     /// Returns the task handle so the test can abort it: `#[gtk::test]` funnels
     /// every test in this binary onto one main context, and a parked
@@ -4012,7 +4015,7 @@ mod gtk_tests {
         slot: usize,
         mailbox: &Mutable<Vec<SlotRender>>,
     ) -> glib::JoinHandle<()> {
-        let mut mailboxes: [Mutable<Vec<SlotRender>>; 7] =
+        let mut mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] =
             std::array::from_fn(|_| Mutable::new(Vec::new()));
         mailboxes[slot] = mailbox.clone();
         glib::MainContext::default()

@@ -11791,7 +11791,7 @@ mod sidebar_right_routing {
             Mount::SidebarRightTop,
             Mount::SidebarRightBottom,
         ] {
-            assert!(!mount.is_bar(), "{} is a sidebar region", mount.wire_name(),);
+            assert!(!mount.is_bar(), "{} is a sidebar region", mount.wire_name());
         }
         assert_eq!(
             Mount::ALL.iter().filter(|m| m.is_bar()).count(),

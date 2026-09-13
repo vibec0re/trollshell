@@ -12141,6 +12141,8 @@ async fn enforce_before_throttle_ungranted_flood_spends_no_tokens() {
 /// matches `Push::Continue` and this test reds there.
 #[tokio::test]
 async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
+    const OVERFLOW: usize = 5;
+
     let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
 
     // Fill the queue exactly to capacity — every one of these is a plain
@@ -12161,7 +12163,6 @@ async fn push_state_stops_the_queue_at_capacity_and_resumes_after_a_drain() {
     // Past capacity: the queue must stop growing, and the producer must
     // neither block (this is a plain sync call, so a hang would deadlock the
     // test) nor panic — it just keeps reporting Continue.
-    const OVERFLOW: usize = 5;
     for seq in 0..OVERFLOW {
         let result = push_state(
             &out_tx,

@@ -1161,15 +1161,17 @@ fn resolved_search_path<'a>(
 /// The `plugins.json` the search path settled on, plus the cheap identity
 /// [`DeclaredMounts`] keys its cached parse on (#1260 review F7).
 ///
-/// Everything here comes from one `stat` (plus one `realpath`) per candidate
-/// — no read, no parse — which is the whole point: the tab's 2 s poll runs
-/// this on the GTK main thread and must not do the blocking read it used to.
+/// Everything here comes from one `stat` plus a `realpath`-style walk (a
+/// handful of `readlink`s — one per path component per symlink hop crossed)
+/// per candidate — no read, no parse — which is the whole point: the tab's
+/// 2 s poll runs this on the GTK main thread and must not do the blocking
+/// read it used to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PluginsJson {
     /// The file the search found, i.e. the first candidate that exists.
     path: PathBuf,
-    /// `canonicalize(path)` (`realpath(3)`, resolving **every** hop), or
-    /// `None` when the path is a regular file.
+    /// `canonicalize(path)` (`realpath(3)`, resolving **every** hop), or,
+    /// on the rare path `realpath(3)` refuses, `None`.
     ///
     /// This is the discriminator that matters in practice, but only if it
     /// resolves the whole chain: both platform modules render `plugins.json`
@@ -1193,8 +1195,9 @@ struct PluginsJson {
     /// (#1270, #1260 review N1) — bounded by the nine wire names' pairwise-
     /// distinct lengths, so a single-plugin `mount` edit still moved `len`,
     /// but a length-preserving edit (two plugins' mounts swapped, say) did
-    /// not. `canonicalize` walks every hop on both platforms and is exactly
-    /// as cheap: one syscall either way.
+    /// not. `canonicalize` resolves every hop instead of one, at a handful
+    /// of syscalls instead of one — still nothing next to reading and
+    /// parsing the file.
     link: Option<PathBuf>,
     /// `(mtime, len)` — [`hytte_config::subsystem::watch`]'s original stamp,
     /// and what actually discriminates a **hand-written** `plugins.json`
@@ -2692,14 +2695,20 @@ mod tests {
     ///
     /// The second call passes a **different** `Env` — one that would yield a
     /// real, non-empty candidate list if it were actually consulted — so a
-    /// regression that bypassed the cache (recomputing from the newest `Env`
-    /// on every call, the pre-#1270 shape) would show up as `second != first`
-    /// here, not just as an extra log line nothing in this crate can see.
+    /// regression **in [`resolved_search_path`] itself** (recomputing on
+    /// every call instead of consulting `cache`) would show up as
+    /// `second != first` here.
     ///
-    /// **Falsify**: inline `plugins_json_candidates(env)` at
-    /// [`refresh_plugins`]'s call site again (removing the cache) → this
-    /// test reds, because `resolve` would then call `plugins_json_candidates`
-    /// on every invocation and `second` would differ from `first`.
+    /// This test drives `resolved_search_path` directly against its own
+    /// throwaway `OnceCell`, so it does **not** reach [`refresh_plugins`]'s
+    /// call site — reverting that call site to
+    /// `plugins_json_candidates(&Env::from_process())` (the exact pre-#1270
+    /// per-tick shape) leaves this test green, because the regression is in
+    /// which cache `refresh_plugins` consults, not in
+    /// `resolved_search_path`'s own logic. That production wiring is what
+    /// `gtk_tests::the_tick_resolves_the_search_path_through_the_tabs_own_latch`
+    /// pins instead, by calling `refresh_plugins` itself and reading
+    /// [`PluginsState::search_path`] back out.
     #[test]
     fn the_search_path_is_resolved_once_even_across_a_changed_env() {
         let cache: OnceCell<Vec<PathBuf>> = OnceCell::new();
@@ -4380,6 +4389,36 @@ mod gtk_tests {
             before + 2,
             "both polls must take their generation at spawn; a generation taken at \
              completion makes every result the newest and the #983 gate a no-op"
+        );
+    }
+
+    /// `the_search_path_is_resolved_once_even_across_a_changed_env` drives
+    /// `resolved_search_path` with a throwaway `OnceCell`, so it is blind to
+    /// the production call site: reverting `refresh_plugins` to
+    /// `plugins_json_candidates(&Env::from_process())` — the exact pre-#1270
+    /// per-tick shape item 3 exists to delete — leaves all 182 tests green,
+    /// `PluginsState::search_path` dead but still constructed (so no
+    /// dead-code warning either).
+    #[gtk::test]
+    fn the_tick_resolves_the_search_path_through_the_tabs_own_latch() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        assert!(
+            state.search_path.get().is_none(),
+            "nothing resolves the search path before the first tick"
+        );
+        super::refresh_plugins(&state);
+        let first = state
+            .search_path
+            .get()
+            .cloned()
+            .expect("refresh_plugins must resolve THROUGH PluginsState::search_path");
+        super::refresh_plugins(&state);
+        assert_eq!(
+            state.search_path.get(),
+            Some(&first),
+            "and a second tick must reuse it, never re-resolve"
         );
     }
 

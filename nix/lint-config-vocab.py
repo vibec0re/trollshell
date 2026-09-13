@@ -729,7 +729,14 @@ def _self_test_failed(lines: list[str]) -> int:
 def main() -> int:
     try:
         failures = self_test()
-    except LookupError as e:
+    except Exception as e:
+        # Anything escaping self_test() means the scanner itself is broken,
+        # not that the tree has real vocab drift -- narrower than Exception
+        # missed whichever class the next fixture happened to raise (N1,
+        # #1279 review): the three numeric readers (ints_between_after,
+        # poll_seconds_bounds, max_rows) can raise ValueError as easily as
+        # the extractors raise LookupError, and self_test() exercises all of
+        # them.
         return _self_test_failed([f"a fixture raised {type(e).__name__}: {e}"])
     if failures:
         return _self_test_failed(failures)

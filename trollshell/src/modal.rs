@@ -11,7 +11,7 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window, on_surface_ready};
 
-use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, set_page_width};
+use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, EDIT_FORM_WIDTH, fill_page_to_its_cap};
 use crate::components::monitor_key::{is_fallback_key, monitor_key};
 use crate::components::visibility_gate::GateRegistry;
 use crate::scale::scale;
@@ -1069,8 +1069,8 @@ fn on_active_show(panel: &ModalPanel, active: &Active) {
         // The form is already seeded — `panels::workspace_edit::open` publishes
         // the whole `Draft` before the switch, because a name alone would not be
         // enough to rebuild the form (that module's doc says why). The one thing
-        // left is #1108's width cap, so the drawer does not jump narrower the
-        // moment ✎ is pressed.
+        // left is the width floor, without which the form sizes to its own
+        // minimum (#1108, re-aimed at `EDIT_FORM_WIDTH` by #1220).
         Active::WorkspaceEdit(_) => apply_workspace_edit_width_cap(panel),
     }
 }
@@ -1385,6 +1385,19 @@ pub fn switch_to_workspace_edit(key: &str) {
         if panel.current.borrow().is_some() {
             let active = Active::WorkspaceEdit(key.to_owned());
             set_stack_active(&panel, &active);
+            // …and the on-show side-effects, which for this `Active` is the width
+            // floor (#1108/#1220). **This line is the whole of #1220 in
+            // production** (#1225 review, HIGH 2): this function is the only route
+            // to `Active::WorkspaceEdit` in the tree, and it switched the stack
+            // without it, so `apply_workspace_edit_width_cap` was reachable only
+            // from `show_panel_active` — which is never called with this variant.
+            // The form therefore sized itself to its own minimum on every real ✎,
+            // which is the 418-px screenshot on #1220.
+            //
+            // `set_stack_active` first, then this, matching `show_panel_active`'s
+            // order: the cap resizes the stack child, which has to exist and be
+            // the visible one first.
+            on_active_show(&panel, &active);
             *panel.current.borrow_mut() = Some(active);
         }
     }
@@ -2100,15 +2113,23 @@ fn apply_stats_max_height(panel: &ModalPanel) {
 /// first build) — a no-op if the page was never opened on this monitor yet,
 /// exactly like [`apply_stats_max_height`].
 ///
-/// **Which width** is `panels::workspaces::current_page_width()`, not a constant
-/// (#1219): the page's own binding publishes `workspaces_page_width(columns)` on
-/// every model revision, so one monitor asks for the ordinary 680-px drawer and
-/// three for the 1080-px wide one. Reading the same published number here is what
-/// keeps this cap and [`apply_workspace_edit_width_cap`] equal at all times,
-/// which is #1108's actual contract — the Edit sub-page must measure the same as
-/// the page it replaces or the drawer jumps on ✎. Pushing
-/// `DRAWER_MAX_WIDTH_WIDE` here instead would silently undo #1219 on every show,
-/// since the floor wins over the page's own narrower request.
+/// **Which width** is the page's own ceiling, read straight back off the clamp
+/// (#1219, and #1225's review, MEDIUM 3). `panels::workspaces`' binding is the
+/// only writer of that ceiling — `workspaces_page_width(columns)` on every model
+/// revision, so one monitor asks for the ordinary 680-px drawer and three for
+/// Annika's 960 — and this floors the page at whatever it currently says. There
+/// is deliberately **no** second copy of the number for this function to read:
+/// the cell #1219 first shipped could be (and measurably was) a `MainContext`
+/// turn behind on the very first show, because `ensure_page` → `on_page_show` →
+/// `present()` is one synchronous call stack and `bind` applies on the next turn.
+/// Pushing `DRAWER_MAX_WIDTH_WIDE` here instead would silently undo #1219 on
+/// every show, since the floor wins over the page's own narrower request.
+///
+/// This cap and [`apply_workspace_edit_width_cap`] are no longer the *same*
+/// number: since #1220 the Edit form takes [`EDIT_FORM_WIDTH`] whatever the page
+/// measures, so ✎ from a 680/732-px page widens the drawer. That is #1108's
+/// no-jump contract relaxed on purpose — Annika, #1219, 2026-09-13: *"Slight jump
+/// in edit form is ok."*
 ///
 /// Needs no action-group cooperation from `panels::workspaces`:
 /// `panels::panel_workspaces` returns the `AdwClamp` itself —
@@ -2124,30 +2145,43 @@ fn apply_workspaces_width_cap(panel: &ModalPanel) {
         tracing::debug!("modal: workspaces page child is not an AdwClamp");
         return;
     };
-    set_page_width(&clamp, crate::panels::workspaces::current_page_width());
+    fill_page_to_its_cap(&clamp);
 }
 
-/// The same cap for the Workspaces **Edit** sub-page (#1108 × #1071 phase 4).
+/// The width floor for the Workspaces **Edit** sub-page (#1108 × #1071 phase 4,
+/// re-aimed by #1220).
 ///
-/// Without it the drawer visibly jumps narrower the moment ✎ is pressed and back
-/// when Save or Cancel returns: the sub-page *is* the Workspaces page with its
-/// content replaced, so it has to measure the same.
+/// Without *a* floor the sub-page is sized by whatever its content asks for as a
+/// **minimum** — `panels::workspace_edit`'s body scroller is
+/// `hscrollbar_policy: Never` with `propagate_natural_width` unset, so it reports
+/// its child's minimum as both min and natural — and that minimum is the 418-px
+/// form with a ~150-px apps column Annika screenshotted on #1220.
 ///
 /// A separate function rather than a parameter on
 /// [`apply_workspaces_width_cap`] because the two children are different shapes.
-/// That one's child is `finish_page_clamped`'s `adw::Clamp` directly; this one's
-/// is `panels::workspace_edit::edit_slot`'s bind container — a `gtk::Box` whose
-/// child is rebuilt per selection — so there is no clamp to downcast to at this
-/// level, and the request goes on the box that holds it. What keeps the two equal
-/// is that both read the *same* published number
-/// (`panels::workspaces::current_page_width()`, #1219) rather than each carrying
-/// its own constant; the form inside the slot reads it a third time, for its own
-/// clamp and for whether it stacks its columns (#1220).
+/// That one's child is `finish_page_clamped`'s `adw::Clamp` directly, so it can
+/// be floored at its own ceiling; this one's is
+/// `panels::workspace_edit::edit_slot`'s bind container — a `gtk::Box` whose
+/// child is rebuilt per selection — so there is no clamp to read a ceiling off,
+/// and the request goes on the box that holds it.
+///
+/// **The width is [`EDIT_FORM_WIDTH`], not the page's** (#1220). #1108 tied the
+/// two together so the drawer would not jump on ✎, but #1219 then made the page
+/// as narrow as 680 and a 680-px form is the bug. The form inside the slot clamps
+/// itself to the same constant, so the two halves still agree; what they no
+/// longer agree with is the page behind them, and that jump is accepted (Annika,
+/// #1219, 2026-09-13: *"Slight jump in edit form is ok."*).
+///
+/// Reached from **two** routes and both must run it: [`show_panel_active`] (the
+/// `Active` re-show path) and [`switch_to_workspace_edit`] (the ✎ button, which
+/// is the only route a user ever takes). The second one is why this is worth
+/// spelling out — it called `set_stack_active` alone until #1225's review, so in
+/// production this cap never ran at all and the form sat at its minimum.
 fn apply_workspace_edit_width_cap(panel: &ModalPanel) {
     let Some(widget) = panel.stack.child_by_name(WORKSPACE_EDIT_STACK_CHILD) else {
         return;
     };
-    widget.set_size_request(scale(crate::panels::workspaces::current_page_width()), -1);
+    widget.set_size_request(scale(EDIT_FORM_WIDTH), -1);
 }
 
 #[cfg(test)]
@@ -2856,8 +2890,7 @@ mod gtk_tests {
         Active, BarGeometry, ModalPanel, PANELS, Page, drawer_open_state, monitor_key,
         on_page_show, recompute_gates, toggle,
     };
-    use crate::components::layout::workspaces_page_width;
-    use crate::panels::workspaces::set_current_page_width_for_test;
+    use crate::components::layout::{EDIT_FORM_WIDTH, set_page_width, workspaces_page_width};
     use crate::scale::scale;
     use hytte::adw;
     use hytte::gtk::{self, prelude::*};
@@ -2918,43 +2951,45 @@ mod gtk_tests {
     /// request at its `adw::Clamp::new()` default (`-1`, meaning "no minimum, size
     /// to content") — red.
     ///
-    /// The width is seeded explicitly (#1219 made it a published number rather
-    /// than a constant): every `#[gtk::test]` in this binary shares the
-    /// thread-local it lives in, so a test that asserts on it must set it rather
-    /// than inherit whatever ran before.
+    /// The cap is the clamp's **own** ceiling (#1219, and #1225's review): the
+    /// stand-in clamp is given the ceiling `panels::workspaces`' binding would
+    /// have set for a three-column page, and the floor has to come back equal to
+    /// it. Nothing is published anywhere for this function to read — that
+    /// indirection is what could go a `MainContext` turn stale on the first show.
     #[gtk::test]
     fn on_page_show_fills_the_workspaces_clamp_to_the_cap() {
         let monitor = test_monitor();
         let panel = harness_panel(&monitor);
         let clamp = adw::Clamp::new();
+        set_page_width(&clamp, workspaces_page_width(3));
+        clamp.set_size_request(-1, -1);
         panel
             .stack
             .add_named(&clamp, Some(Page::Workspaces.stack_name()));
-        set_current_page_width_for_test(workspaces_page_width(3));
 
         on_page_show(&panel, Page::Workspaces);
 
         assert_eq!(clamp.width_request(), scale(workspaces_page_width(3)));
     }
 
-    /// #1219: the cap that arm pushes is the width `panels::workspaces` published
-    /// for the column count it is rendering — so a one-monitor box gets the
-    /// ordinary 680-px drawer, not the 1080-px three-column one. All three clamp
-    /// properties move, because the floor alone would fight the page's own
-    /// narrower ceiling and the ceilings alone would let it shrink to content
-    /// again.
+    /// #1219: the Workspaces page is floored at **its own ceiling**, whatever
+    /// column count its binding put there — so a one-monitor box gets the ordinary
+    /// 680-px drawer, not the wide three-column one. All three clamp properties
+    /// are asserted, because the floor alone would fight the page's own narrower
+    /// ceiling and the ceilings alone would let it shrink to content again.
     ///
-    /// And the two caps must be the **same number at every width** — that is
-    /// #1108's actual contract, not the constant it happened to use: the Edit
-    /// sub-page is a different stack child, so if the two disagree the drawer
-    /// jumps the moment ✎ is pressed and back on Save/Cancel.
+    /// And #1220: the Edit sub-page is **not** that number any more. It takes
+    /// `EDIT_FORM_WIDTH` at every column count, because following the page put a
+    /// 240-px fields column inside a 680-px form and left ~150 px of app list
+    /// (Annika's screenshot on #1220). The consequence — ✎ widening the drawer
+    /// from a 680/732-px page — is the jump she accepted on #1219.
     ///
-    /// **The mutation**: either `apply_workspaces_width_cap` or
-    /// `apply_workspace_edit_width_cap` reading `DRAWER_MAX_WIDTH_WIDE` again
-    /// instead of `panels::workspaces::current_page_width()` reds the one- and
-    /// two-column rounds here.
+    /// **The mutations**: `apply_workspaces_width_cap` pushing
+    /// `DRAWER_MAX_WIDTH_WIDE` again instead of reading the clamp reds the one-,
+    /// two- and three-column rounds; `apply_workspace_edit_width_cap` going back
+    /// to the page's width reds every round but the one where they coincide.
     #[gtk::test]
-    fn both_workspaces_caps_follow_the_published_width_and_stay_equal() {
+    fn the_page_fills_its_own_clamp_while_the_edit_form_takes_the_edit_width() {
         let monitor = test_monitor();
         let panel = harness_panel(&monitor);
         let clamp = adw::Clamp::new();
@@ -2968,7 +3003,12 @@ mod gtk_tests {
 
         for columns in [1usize, 2, 3, 4] {
             let want = scale(workspaces_page_width(columns));
-            set_current_page_width_for_test(workspaces_page_width(columns));
+            // What `panels::workspaces`' binding does on a model revision, and the
+            // only place this width comes from. The floor is cleared first so the
+            // assertion below is about what the cap did, not what this line did.
+            set_page_width(&clamp, workspaces_page_width(columns));
+            clamp.set_size_request(-1, -1);
+            slot.set_size_request(-1, -1);
 
             on_page_show(&panel, Page::Workspaces);
             super::on_active_show(&panel, &Active::WorkspaceEdit("chat".to_owned()));
@@ -2976,12 +3016,12 @@ mod gtk_tests {
             assert_eq!(
                 clamp.width_request(),
                 want,
-                "{columns} columns: the Workspaces page's floor"
+                "{columns} columns: the Workspaces page's floor is its own ceiling"
             );
             assert_eq!(
                 clamp.maximum_size(),
                 want,
-                "{columns} columns: the Workspaces page's ceiling"
+                "{columns} columns: the Workspaces page's ceiling, untouched by the cap"
             );
             assert_eq!(
                 clamp.tightening_threshold(),
@@ -2990,9 +3030,9 @@ mod gtk_tests {
             );
             assert_eq!(
                 slot.width_request(),
-                clamp.width_request(),
-                "{columns} columns: the Edit sub-page must measure the same as the \
-                 page it replaces, or the drawer jumps on ✎ (#1108)"
+                scale(EDIT_FORM_WIDTH),
+                "{columns} columns: the Edit sub-page takes its own width, not the \
+                 page's — a 680-px form is what #1220 was filed about"
             );
         }
     }
@@ -3035,11 +3075,66 @@ mod gtk_tests {
         panel
             .stack
             .add_named(&slot, Some(super::WORKSPACE_EDIT_STACK_CHILD));
-        set_current_page_width_for_test(workspaces_page_width(3));
 
         super::on_active_show(&panel, &Active::WorkspaceEdit("chat".to_owned()));
 
-        assert_eq!(slot.width_request(), scale(workspaces_page_width(3)));
+        assert_eq!(slot.width_request(), scale(EDIT_FORM_WIDTH));
+    }
+
+    /// …and the same guarantee **through the route a user actually takes**
+    /// (#1225 review, HIGH 2).
+    ///
+    /// `switch_to_workspace_edit` is the only caller of `Active::WorkspaceEdit`
+    /// in the tree — `panels::workspaces`' ✎ button calls it — and until this
+    /// round it called `set_stack_active` and nothing else, so
+    /// `apply_workspace_edit_width_cap` never ran in production however well the
+    /// sibling test above pinned it. The form then sized itself to its own
+    /// minimum, which is the 418-px screenshot on #1220: the body scroller is
+    /// `hscrollbar_policy: Never` without `propagate_natural_width`, so it reports
+    /// its child's minimum as its natural too and nothing widens it.
+    ///
+    /// Driven through `PANELS` with `current` set, because both are gates on that
+    /// function: it iterates `live_panels()` and skips any panel with no drawer
+    /// open. Measured on the pre-fix code the slot reads `-1` here.
+    ///
+    /// **The mutation**: deleting the `on_active_show(&panel, &active)` line from
+    /// `switch_to_workspace_edit` reds this and nothing else in the binary.
+    #[gtk::test]
+    fn the_edit_button_route_applies_the_width_cap() {
+        let monitor = test_monitor();
+        let key = monitor_key(&monitor);
+        let panel = harness_panel(&monitor);
+        let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panel
+            .stack
+            .add_named(&slot, Some(super::WORKSPACE_EDIT_STACK_CHILD));
+        // The ✎ button is *on* an open drawer, and `switch_to_workspace_edit`
+        // encodes that: a panel showing nothing is left alone.
+        *panel.current.borrow_mut() = Some(Active::Builtin(Page::Workspaces));
+        PANELS.with(|panels| {
+            panels.borrow_mut().insert(key.clone(), panel.clone());
+        });
+
+        super::switch_to_workspace_edit("chat");
+
+        assert_eq!(
+            slot.width_request(),
+            scale(EDIT_FORM_WIDTH),
+            "the ✎ route must floor the Edit sub-page, or the form sizes to its \
+             own minimum (#1220)"
+        );
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::WorkspaceEdit("chat".to_owned())),
+            "…and still switch to it"
+        );
+
+        // `PANELS`/`GATES` are process-wide thread-locals shared by every
+        // `#[gtk::test]` in this binary.
+        PANELS.with(|panels| {
+            panels.borrow_mut().remove(&key);
+        });
+        recompute_gates();
     }
 
     /// The generic drawer-opening path end to end (#1108 follow-up: the
@@ -3058,10 +3153,14 @@ mod gtk_tests {
         let monitor = test_monitor();
         let key = monitor_key(&monitor);
         let panel = harness_panel(&monitor);
+        let stand_in = adw::Clamp::new();
+        // The ceiling `panels::workspaces`' binding would have set for a
+        // three-column page; the floor under test is read back off it.
+        set_page_width(&stand_in, workspaces_page_width(3));
+        stand_in.set_size_request(-1, -1);
         panel
             .stack
-            .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
-        set_current_page_width_for_test(workspaces_page_width(3));
+            .add_named(&stand_in, Some(Page::Workspaces.stack_name()));
         PANELS.with(|panels| {
             panels.borrow_mut().insert(key.clone(), panel.clone());
         });

@@ -40,14 +40,59 @@ pub(crate) const WORKSPACES_COLUMN_SPACING: i32 = 12;
 /// Design width, in CSS px before [`crate::scale::scale`], of **one**
 /// Workspaces column.
 ///
-/// Why 360: it is what a column already gets on a three-monitor box today —
+/// Why 360: it is what a column got on a three-monitor box before #1219 —
 /// `DRAWER_MAX_WIDTH_WIDE` (1080) over three columns — so a one- or two-column
 /// page sized from it renders columns of exactly the width the wide page has
 /// always rendered, rather than a new guess. The floor under it is #508's
 /// measurement: two columns inside `DRAWER_MAX_WIDTH` (680) squeeze to ~330 px
 /// each, which is the squeeze that put the multicolumn pages on the wide clamp
 /// in the first place, so 360 sits just above the line rather than at it.
+///
+/// It governs the **two**-column width only. Three columns take
+/// [`WORKSPACES_THREE_COLUMN_WIDTH`] on Annika's word, which is narrower than
+/// three of these — see that constant.
 pub(crate) const WORKSPACES_COLUMN_WIDTH: i32 = 360;
+
+/// The three-column Workspaces page width, in CSS px before
+/// [`crate::scale::scale`] — **Annika's number**, #1219, 2026-09-13: *"IDK 960
+/// also sufficient for 3."*
+///
+/// It is deliberately **not** `3 × WORKSPACES_COLUMN_WIDTH + 2 × gutter` (1092,
+/// over the drawer's centering bound anyway) nor `DRAWER_MAX_WIDTH_WIDE` (1080):
+/// 960 less the two 12-px gutters leaves **312 px** a column, under the 360 the
+/// two-column arm is built from and a little under the ~330 px #508 measured as
+/// the squeeze line. She looked at it and judged it sufficient, so this is a
+/// decision recorded rather than a measurement — the reason the constant exists
+/// at all instead of the arm being spelled inline is so the deviation has one
+/// place to be read and one place to be changed.
+///
+/// Four or more columns keep [`DRAWER_MAX_WIDTH_WIDE`]: past three, the page is
+/// already dividing the widest drawer the centering clamp supports, and taking
+/// width *away* there would only make the squeeze worse.
+pub(crate) const WORKSPACES_THREE_COLUMN_WIDTH: i32 = 960;
+
+/// The width the Workspaces **Edit** sub-page measures, in CSS px before
+/// [`crate::scale::scale`] — always, whatever the page behind it is showing
+/// (#1220).
+///
+/// #1108 made the Edit form measure exactly what the page it replaces measures,
+/// so the drawer would not jump on ✎. #1219 then made that page's width follow
+/// its column count, which on a one-screen box is 680 — and a 680-px form is
+/// what Annika filed #1220 about: her screenshot is **418 px** of form with an
+/// apps column around 150 px, *"Apps too narrow to edit comfortable … how tf is
+/// one supposed to use this"*.
+///
+/// So the form no longer follows the page. It takes this width on every route,
+/// which leaves its app list ~700 px next to the 240-px fields column at every
+/// screen count. The cost is that ✎ from a 680- or 732-px page widens the
+/// drawer, i.e. #1108's no-jump contract is relaxed on purpose — Annika, #1219,
+/// 2026-09-13: *"Slight jump in edit form is ok."*
+///
+/// Same number as [`WORKSPACES_THREE_COLUMN_WIDTH`] and not derived from it: the
+/// two are independent decisions that happen to have landed on the same figure
+/// (hers for three columns; ours for "the apps column needs ~700 px"), and tying
+/// them together would make a future change to either silently move the other.
+pub(crate) const EDIT_FORM_WIDTH: i32 = 960;
 
 /// The width the Workspaces page (and its Edit sub-page) should measure, in CSS
 /// px before [`crate::scale::scale`], for a page rendering `columns` columns
@@ -63,9 +108,16 @@ pub(crate) const WORKSPACES_COLUMN_WIDTH: i32 = 360;
 ///   every other page uses. 0 is the no-outputs hint, which wants no more.
 /// * **2** columns → two [`WORKSPACES_COLUMN_WIDTH`] columns plus the one
 ///   [`WORKSPACES_COLUMN_SPACING`] gutter between them (732).
-/// * **3 or more** → [`DRAWER_MAX_WIDTH_WIDE`] (1080), today's width, which is
-///   also the widest the drawer's centering clamp in `modal.rs` supports. Above
-///   three the columns share it and get narrower, exactly as they do today.
+/// * **3** columns → [`WORKSPACES_THREE_COLUMN_WIDTH`] (960) — Annika's number
+///   on #1219, and 312 px a column rather than the 360 the two-column arm
+///   assumes. See that constant for why the deviation is deliberate.
+/// * **4 or more** → [`DRAWER_MAX_WIDTH_WIDE`] (1080), the width the page had
+///   at every count before #1219 and the widest the drawer's centering clamp in
+///   `modal.rs` supports. Past three the columns share it and get narrower,
+///   exactly as they did before.
+///
+/// The Edit sub-page does **not** go through this any more — it takes
+/// [`EDIT_FORM_WIDTH`] whatever the page behind it measures (#1220).
 ///
 /// `columns` is the count of columns the page actually **renders** — one per
 /// connected output plus at most one trailing "not connected" column (#1071 §5)
@@ -80,6 +132,7 @@ pub(crate) const fn workspaces_page_width(columns: usize) -> i32 {
     match columns {
         0 | 1 => DRAWER_MAX_WIDTH,
         2 => 2 * WORKSPACES_COLUMN_WIDTH + WORKSPACES_COLUMN_SPACING,
+        3 => WORKSPACES_THREE_COLUMN_WIDTH,
         _ => DRAWER_MAX_WIDTH_WIDE,
     }
 }
@@ -104,6 +157,30 @@ pub(crate) const fn workspaces_page_width(columns: usize) -> i32 {
 pub(crate) fn set_page_width(clamp: &adw::Clamp, width: i32) {
     let cap = scale(width);
     clamp.set_maximum_size(cap);
+    clamp.set_tightening_threshold(cap);
+    clamp.set_size_request(cap, -1);
+}
+
+/// Floor an already-built page clamp at **its own ceiling**, so the page fills
+/// the cap it is already clamped to instead of shrinking to its content's
+/// natural width (#1108).
+///
+/// The width is not a parameter on purpose. The clamp's `maximum_size` *is* the
+/// width the page decided on — for the Workspaces page,
+/// `panels::workspaces`' binding sets all three properties from
+/// [`workspaces_page_width`] on every model revision — so reading it back here
+/// means the number lives in exactly one place and the on-show re-push can never
+/// be a revision behind the page it is flooring (#1225 review, MEDIUM 3: the
+/// published-number cell this replaces was still at its seed on the very first
+/// show, because `bind` applies a turn later than the synchronous
+/// build → show → present call stack).
+///
+/// `tightening_threshold` is re-pushed alongside it for the reason
+/// [`finish_page`] documents — a threshold below the maximum makes the clamp
+/// over-request (#134) — so a clamp that reaches this function with the two out
+/// of step leaves it consistent.
+pub(crate) fn fill_page_to_its_cap(clamp: &adw::Clamp) {
+    let cap = clamp.maximum_size();
     clamp.set_tightening_threshold(cap);
     clamp.set_size_request(cap, -1);
 }
@@ -226,7 +303,7 @@ pub(crate) fn section(title: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::{
-        DRAWER_MAX_WIDTH, DRAWER_MAX_WIDTH_WIDE, WORKSPACES_COLUMN_SPACING,
+        DRAWER_MAX_WIDTH, DRAWER_MAX_WIDTH_WIDE, EDIT_FORM_WIDTH, WORKSPACES_COLUMN_SPACING,
         WORKSPACES_COLUMN_WIDTH, workspaces_page_width,
     };
 
@@ -234,13 +311,16 @@ mod tests {
     /// instead of the fixed `DRAWER_MAX_WIDTH_WIDE` floor #1108 pushed on every
     /// show — which drew a single 1080-px column on a one-monitor box.
     ///
-    /// The three widths are pinned as **literals**, not re-derived from the
-    /// constants above: derived expectations cannot see a changed constant (they
-    /// change with it), and these three numbers are the design — 680 for one
-    /// screen, 732 for two, 1080 from three (#1219's thread).
+    /// The widths are pinned as **literals**, not re-derived from the constants
+    /// above: derived expectations cannot see a changed constant (they change
+    /// with it), and these four numbers are the design — 680 for one screen, 732
+    /// for two, **960 for three** (Annika, #1219, 2026-09-13: *"IDK 960 also
+    /// sufficient for 3."*) and 1080 from four.
     ///
-    /// **The mutation**: any arm collapsed back to `DRAWER_MAX_WIDTH_WIDE` — or
-    /// the 2-column arm rounded to `DRAWER_MAX_WIDTH` — reds this.
+    /// **The mutation**: any arm collapsed back to `DRAWER_MAX_WIDTH_WIDE` — the
+    /// three-column one especially, which is where this PR's first round shipped
+    /// 1080 against her 960 — or the 2-column arm rounded to `DRAWER_MAX_WIDTH`,
+    /// reds this.
     #[test]
     fn the_workspaces_page_width_follows_the_column_count() {
         assert_eq!(
@@ -260,13 +340,89 @@ mod tests {
         );
         assert_eq!(
             workspaces_page_width(3),
-            1080,
-            "three columns: today's wide page"
+            960,
+            "three columns: Annika's number on #1219, not the 1080 this page had before"
         );
         assert_eq!(
             workspaces_page_width(4),
             1080,
-            "four or more share the wide page, as they do today"
+            "four or more share the wide page, as every count did before #1219"
+        );
+    }
+
+    /// The three-column width is a **judgement call, not a measurement**, so the
+    /// consequence it accepts is pinned rather than left implicit: 960 less the
+    /// two gutters is 312 px a column — under `WORKSPACES_COLUMN_WIDTH` (360),
+    /// which is what the two-column arm is built from, and a little under the
+    /// ~330 px #508 measured as the squeeze line.
+    ///
+    /// Annika looked at the alternative (1080, what the page had before #1219)
+    /// and answered *"IDK 960 also sufficient for 3."* This test exists so that
+    /// judgement is re-read the day someone changes the constant: a future width
+    /// that happens to clear 360 is fine, but silently sliding *further* below it
+    /// is not.
+    ///
+    /// **The mutation**: `WORKSPACES_THREE_COLUMN_WIDTH` dropped toward 732 reds
+    /// this on the lower bound, while the literal pin above catches the 1080
+    /// direction.
+    #[test]
+    fn three_columns_take_annikas_960_and_the_narrower_column_it_implies() {
+        let gutters = 2 * WORKSPACES_COLUMN_SPACING;
+        let share = (workspaces_page_width(3) - gutters) / 3;
+        assert_eq!(
+            share, 312,
+            "three columns inside Annika's 960 come out at 312 px each"
+        );
+        assert!(
+            share < WORKSPACES_COLUMN_WIDTH,
+            "the whole point of pinning this: 312 is *below* the {WORKSPACES_COLUMN_WIDTH} px \
+             design column, accepted on #1219 rather than measured"
+        );
+        assert!(
+            share >= 300,
+            "…but not arbitrarily below it — {share} px a column is past what she looked at"
+        );
+    }
+
+    /// #1220: the Edit form is **not** sized from the page behind it any more.
+    ///
+    /// #1108 tied the two together so the drawer would not jump on ✎; #1219 then
+    /// made the page as narrow as 680 on a one-screen box, and 680 minus the
+    /// 240-px fields column is the form Annika filed #1220 about. So the form
+    /// takes its own width, wide enough that the app list gets ~700 px at every
+    /// screen count, and the jump is accepted (*"Slight jump in edit form is
+    /// ok."*, #1219).
+    ///
+    /// **The mutation**: `EDIT_FORM_WIDTH` set back to `DRAWER_MAX_WIDTH` — or to
+    /// anything that leaves the list under 600 px — reds this.
+    #[test]
+    fn the_edit_form_is_wide_enough_for_its_app_list_at_every_page_width() {
+        assert_eq!(EDIT_FORM_WIDTH, 960, "the Edit form's own width (#1220)");
+        // 240 for the fields column, 12 for the grid's gutter — what is left is
+        // the app list, and "too narrow to edit comfortable" is the bug.
+        let apps = EDIT_FORM_WIDTH - 240 - WORKSPACES_COLUMN_SPACING;
+        assert!(
+            apps >= 700,
+            "the app list gets {apps} px beside the fields column; #1220 was filed at ~150"
+        );
+        for columns in 0..=3usize {
+            assert!(
+                EDIT_FORM_WIDTH >= workspaces_page_width(columns),
+                "up to three columns ✎ only ever *widens* the drawer — {columns} columns"
+            );
+        }
+        // Four screens or more is the one case where ✎ narrows it (1080 → 960).
+        // That is still inside "slight jump in edit form is ok" and is the price
+        // of the form having one width; pinned so the direction is a decision
+        // rather than a surprise. `workspaces_page_width(4)` is
+        // `DRAWER_MAX_WIDTH_WIDE`, so this doubles as the form still fitting the
+        // drawer's centering bound.
+        assert!(
+            EDIT_FORM_WIDTH < workspaces_page_width(4),
+            "at four columns the page ({}) is wider than the form, so ✎ narrows the \
+             drawer there — and the form stays inside the centering bound \
+             ({DRAWER_MAX_WIDTH_WIDE})",
+            workspaces_page_width(4)
         );
     }
 
@@ -301,7 +457,7 @@ mod tests {
         }
     }
 
-    /// Below the wide width, a column still clears #508's squeeze line.
+    /// At one and two columns, a column still clears #508's squeeze line.
     ///
     /// That measurement is the reason the multicolumn pages opted into
     /// `DRAWER_MAX_WIDTH_WIDE` at all: two columns inside `DRAWER_MAX_WIDTH` come
@@ -309,6 +465,12 @@ mod tests {
     /// two-column widths have to leave each column at least
     /// `WORKSPACES_COLUMN_WIDTH` (360) after the gutters are taken out — which is
     /// what makes 732 rather than 680 the two-column answer.
+    ///
+    /// **Three columns are deliberately excluded**: Annika's 960 leaves 312 px
+    /// there, under this line on purpose, and
+    /// [`three_columns_take_annikas_960_and_the_narrower_column_it_implies`] is
+    /// where that trade is written down. Widening this loop to cover it would be
+    /// asserting the opposite of the decision on #1219.
     ///
     /// **The mutation**: the 2-column arm returning `DRAWER_MAX_WIDTH` (680, i.e.
     /// 334 px a column) reds this.

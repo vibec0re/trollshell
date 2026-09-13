@@ -2859,6 +2859,45 @@ session.
       collapsed row) means the shell's override did not load, not that the
       library default is wrong.
 
+- [ ] **(#1219 / #1220)** **The Workspaces drawer's width follows the screen
+      count, and the Edit form has a width of its own.** None of this is
+      measurable off a `gtk::Window`'s idea of a minimum size, so the geometry
+      tests pin the requests and the screen is the only place the result is
+      real.
+  - **Page width per screen count.** Open the Workspaces drawer with **one**
+    screen connected: an ordinary-width drawer (~680 px, the same as the
+    Network or Audio page) with the cards no longer floating in a mostly-empty
+    1080-px column. With **two**: two columns of ~360 px, page ~732 px — a
+    touch wider than an ordinary drawer, clearly narrower than the Stats
+    multicolumn page. With **three**: **960 px**, i.e. ~312 px a column
+    (Annika's number on #1219 — worth a second look, since it is under the 360
+    the two-column width is built from, and the knob if it reads cramped is
+    `WORKSPACES_THREE_COLUMN_WIDTH` in `components/layout.rs`). Four or more
+    stays at 1080.
+  - **Hot-plug with the drawer open.** Plug or unplug a monitor while the
+    Workspaces page is showing — the page should resize itself (1 ↔ 2 ↔ 3
+    columns) without being closed and reopened, and stay centred under its
+    trigger.
+  - **✎ opens a 960-px two-column form from any page width.** Press ✎ on a
+    card. The form is always side by side — name / default layout / start at
+    login in a narrow left column, the Apps list beside it — and 960 px wide
+    whatever the page behind it measured, so **from a one- or two-screen page
+    the drawer visibly widens on ✎ and narrows back on Save/Cancel**. That jump
+    is expected and approved (Annika, #1219: _"Slight jump in edit form is
+    ok."_); what would be a regression is the form opening narrow.
+  - **The apps column is ~700 px, running or stopped.** This is #1220 itself.
+    With a **stopped** stack, ✎ and check the Apps rows have room for the name
+    plus the launch-command entry — not the ~150-px column in the issue's
+    screenshot. Then **start** the stack and ✎ again: the "Stop this workspace
+    before renaming it…" note appears under the name field and must wrap to two
+    or three short lines **inside** the narrow left column; the Apps column
+    must not shrink when it appears.
+  - **Six apps still fit without scrolling.** The form's body scroller caps at
+    `scale(FORM_MAX_HEIGHT)` (560 CSS px). Add apps up to six and confirm the
+    split form does not start scrolling before that and that Save/Cancel stay
+    on screen throughout (they sit outside the scroller — #1134's review
+    MEDIUM 5).
+
 ## Stats drawer
 
 - [ ] **(#518)** The five-card Stats drawer (CPU/Memory/Disks/GPU/Services) is

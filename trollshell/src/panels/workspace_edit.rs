@@ -11,18 +11,20 @@
 //! set by dragging it between the page's columns (Annika, on the epic
 //! thread), and phase 3 built that.
 //!
-//! ## Two columns, or one
+//! ## How wide the form is
 //!
-//! Since #1219 the drawer's width follows how many columns the Workspaces page
-//! behind this form renders, and this page has to measure the same as the page it
-//! replaces or the drawer jumps the moment ✎ is pressed (#1108). So both the
-//! form's clamp and the layout it chooses come from
-//! `panels::workspaces::current_page_width()`: at the wide width (three screens
-//! or more) the two columns sit side by side as #1134 built them, and **below it
-//! the form stacks** — the same grid, fields at `(0, 0)` and the app list at
-//! `(0, 1)` — because a 240-px fields column beside the list inside a 680-px page
-//! leaves the list under 500 px for a name, an override toggle and a command entry
-//! (#1220).
+//! [`crate::components::layout::EDIT_FORM_WIDTH`] (960), always — the same number
+//! `modal::apply_workspace_edit_width_cap` floors the drawer slot at, so the two
+//! halves of the sub-page agree.
+//!
+//! It used to be the width of the page behind it: #1108 tied them together so the
+//! drawer would not jump the moment ✎ is pressed. #1219 then made that page as
+//! narrow as 680 on a one-screen box, and 680 less the 240-px fields column is the
+//! form Annika filed #1220 about — her screenshot is 418 px of form with an apps
+//! column around 150. So the form takes its own width and the jump is accepted
+//! (Annika, #1219, 2026-09-13: *"Slight jump in edit form is ok."*). The two
+//! columns are therefore **always** side by side, as #1134 built them; the app
+//! list gets ~700 px at every screen count.
 //!
 //! ## Why this is not a `Page` variant
 //!
@@ -74,10 +76,9 @@ use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
 use crate::components::app_picker::add_app_button;
 use crate::components::desktop_entry::{self, Launchable};
 use crate::components::layout::{
-    DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page_box, page_grid_non_homogeneous,
+    EDIT_FORM_WIDTH, finish_page_clamped, page_box, page_grid_non_homogeneous,
 };
 use crate::config::workspaces::{Layout, Stack, StackApp};
-use crate::panels::workspaces::current_page_width;
 use crate::workspace_stacks::{self, StackState};
 
 /// A handle to "rebuild the app list", shared with the rows it builds.
@@ -128,9 +129,16 @@ const FIELD_COLUMN_WIDTH: i32 = 240;
 /// what's left to the expanding one, and a wrapping `gtk::Label`'s natural width
 /// is its whole *unwrapped* line. `RENAME_BLOCKED_HINT` is ~100 characters, so
 /// with `wrap(true)` and no cap the fields column asked for ~600–700 px and ate
-/// the width #1134 change 1 gave the app list — which is why the list looked
-/// narrow exactly while editing a **running** stack (the only time the note
-/// exists) and fine while editing a stopped one.
+/// the width #1134 change 1 gave the app list — measured at the floored form,
+/// 646 px of fields against 324 of list.
+///
+/// It is **not** why #1220 was filed: Annika's screenshot shows a **stopped**
+/// stack, with no note on the form, and a cramped list anyway (that was the
+/// missing width floor on the ✎ route — see
+/// `modal::apply_workspace_edit_width_cap`). This cap is still right, and still
+/// load-bearing once the floor exists: without it the note balloons the fields
+/// column the moment you edit a running stack. Both cases are asserted in
+/// [`tests::an_active_drafts_note_does_not_widen_the_fields_column`].
 ///
 /// 28 characters is about [`FIELD_COLUMN_WIDTH`] at the form's font, so the
 /// column's natural width comes out at its own 240-px request rather than above
@@ -605,24 +613,6 @@ fn build_form(seed: &Draft, resolve: &Resolver) -> gtk::Widget {
     let grid = page_grid_non_homogeneous();
     grid.add_css_class(FORM_GRID_CLASS);
 
-    // #1220: two columns are only worth having at the wide page width. Below it
-    // (one or two monitors — see `components::layout::workspaces_page_width`) the
-    // page is 680–732 px, and a 240-px fields column beside the list leaves the
-    // list under 500 px, with an app row's name, its override toggle and its
-    // command entry all inside that. So the form **stacks**: the same grid, the
-    // fields at (0, 0) and the app list at (0, 1), which gives the list the whole
-    // page width and keeps `grid.child_at` as the seam the layout is asserted
-    // through either way.
-    //
-    // Read once, here, rather than bound: the form is rebuilt per selection
-    // (`build_slot_with`'s binding tears the whole thing down and calls this
-    // again), so it picks up the current count every time it opens. A monitor
-    // hot-plugged while the form is *already* open re-lays out on the next open,
-    // not live — the page behind it does resize live, and the drawer's own width
-    // follows it, because `modal::apply_workspace_edit_width_cap` and this clamp
-    // read the same published number.
-    let stacked = current_page_width() < DRAWER_MAX_WIDTH_WIDE;
-
     // ── Left: name, layout, autostart ──────────────────────────────────────
     let fields = gtk::Box::new(gtk::Orientation::Vertical, 4);
     fields.set_size_request(crate::scale::scale(FIELD_COLUMN_WIDTH), -1);
@@ -710,12 +700,12 @@ fn build_form(seed: &Draft, resolve: &Resolver) -> gtk::Widget {
     add_row.append(&add);
     apps_column.append(&add_row);
 
-    // Right of the fields at the wide width; below them when stacked (#1220).
-    if stacked {
-        grid.attach(&apps_column, 0, 1, 1, 1);
-    } else {
-        grid.attach(&apps_column, 1, 0, 1, 1);
-    }
+    // Always right of the fields (#1134 change 1). #1220's first round stacked it
+    // under them below the wide page width, which is what a form that follows the
+    // page's width needs; this form has its own width instead
+    // (`EDIT_FORM_WIDTH`, see the module doc), so the split always fits and the
+    // stacked layout has nothing left to solve.
+    grid.attach(&apps_column, 1, 0, 1, 1);
 
     column.append(&grid);
 
@@ -757,11 +747,20 @@ fn build_form(seed: &Draft, resolve: &Resolver) -> gtk::Widget {
     page.append(&actions);
     page.append(&refusal_label);
 
-    // #1108's contract, now per-output-count (#1219): the sub-page has to measure
-    // the same as the Workspaces page it replaces, or the drawer visibly jumps the
-    // moment ✎ is pressed and back on Save/Cancel. Both read the one published
-    // number, so they cannot disagree.
-    finish_page_clamped(&page, current_page_width())
+    // The form's own width (#1220), the same constant
+    // `modal::apply_workspace_edit_width_cap` floors the drawer slot at — so the
+    // clamp inside the slot and the slot's minimum agree by construction rather
+    // than by both reading a number that could move between them.
+    //
+    // #1108 had this follow the Workspaces page instead, so the drawer would not
+    // jump on ✎. It no longer does: #1219 made that page as narrow as 680, and a
+    // 680-px form is the ~150-px app list on #1220. The jump is the accepted cost
+    // (Annika, #1219: *"Slight jump in edit form is ok."*) and it is settled per
+    // selection, not per revision — the form is rebuilt when the draft lands
+    // (`build_slot_with`'s binding), so a monitor hot-plugged while it is open
+    // changes nothing here at all; the page behind it resizes live and this page
+    // is re-laid out on the next open.
+    finish_page_clamped(&page, EDIT_FORM_WIDTH)
 }
 
 /// Close the form when its own Save succeeds; show why when it does not.
@@ -1264,7 +1263,7 @@ mod tests {
         NAME_ENTRY_CLASS, NOTHING_HINT, OVERRIDE_TOGGLE_CLASS, RENAME_BLOCKED_HINT, Resolver,
         build_slot, build_slot_with,
     };
-    use crate::components::layout::workspaces_page_width;
+    use crate::components::layout::EDIT_FORM_WIDTH;
     use crate::config::workspaces::{Layout, StackApp};
     // One definition of the geometry discipline (and of how this tree is waited
     // on), shared with the card page's tests rather than copied (review MEDIUM 5).
@@ -1371,6 +1370,16 @@ mod tests {
         }
     }
 
+    /// [`saved_draft`] with the stack **stopped** — the state Annika's #1220
+    /// screenshot is in, and the one the rename-blocked note is absent from
+    /// (`build_form` gates it on `seed.active && seed.previous.is_some()`).
+    fn stopped_draft() -> Draft {
+        Draft {
+            active: false,
+            ..saved_draft()
+        }
+    }
+
     fn ephemeral_draft() -> Draft {
         Draft {
             previous: None,
@@ -1380,17 +1389,6 @@ mod tests {
             workspace: Some(7),
             ..Draft::default()
         }
-    }
-
-    /// Publish the width a `columns`-column Workspaces page would have (#1219),
-    /// the way that page's own binding does — which is what [`super::build_form`]
-    /// reads to decide its clamp and whether it stacks its two columns (#1220).
-    ///
-    /// Every `#[gtk::test]` in this binary runs on one thread and so shares that
-    /// cell, so a test whose result depends on it must **set** it rather than
-    /// inherit whatever the previous test left behind.
-    fn with_columns(columns: usize) {
-        crate::panels::workspaces::set_current_page_width_for_test(workspaces_page_width(columns));
     }
 
     /// The two-column grid the form's fields and app list are attached into.
@@ -1404,14 +1402,11 @@ mod tests {
     /// The slot with a selection it can be driven from — the seam `edit_slot`
     /// wraps around the thread-local.
     ///
-    /// Seeds the **wide** (three-column) page width, so every test that does not
-    /// care about #1219/#1220 sees the two-column form this file has always built,
-    /// whatever order the binary runs its tests in. A test that *does* care calls
-    /// [`with_columns`] again after this and before publishing a draft — the form
-    /// is built when the draft lands, not here.
+    /// Takes no width: since #1220 the form's own width is
+    /// [`EDIT_FORM_WIDTH`] whatever the page behind it renders, so there is
+    /// nothing to seed and no run-order dependence between these tests.
     fn slot(target: &Mutable<Option<Draft>>) -> gtk::Widget {
         adw::init().expect("libadwaita init");
-        with_columns(3);
         let page = build_slot(target.signal_cloned());
         pump();
         page
@@ -1421,7 +1416,6 @@ mod tests {
     /// drive it without touching the machine's real `$XDG_DATA_DIRS`.
     fn slot_with_resolver(target: &Mutable<Option<Draft>>, resolve: Resolver) -> gtk::Widget {
         adw::init().expect("libadwaita init");
-        with_columns(3);
         let page = build_slot_with(target.signal_cloned(), resolve);
         pump();
         page
@@ -1493,18 +1487,18 @@ mod tests {
     }
 
     /// #1134 change 1: name/layout/autostart sit in a narrower left column,
-    /// and the app list gets the right column with most of the width — at the
-    /// **wide** page width, which since #1220 is the only width that splits.
+    /// and the app list gets the right column with most of the width — at
+    /// **every** page width, since #1220 gave the form a width of its own
+    /// ([`EDIT_FORM_WIDTH`]) rather than following the page behind it.
     ///
     /// **The mutation**: appending every control into one plain vertical box
-    /// again (no grid) reds this — the grid lookup itself fails.
+    /// again (no grid) reds this — the grid lookup itself fails. So does
+    /// attaching the app list at `(0, 1)`, the stacked layout #1220's first round
+    /// shipped and Annika's *"slight jump in edit form is ok"* made unnecessary.
     #[gtk::test]
     fn the_form_lays_out_in_two_columns_with_the_app_list_wide() {
         let target: Mutable<Option<Draft>> = Mutable::new(None);
-        // `slot` seeds three columns; spelled out here because this test's whole
-        // subject is the layout that width chooses.
         let page = slot(&target);
-        with_columns(3);
         target.set(Some(saved_draft()));
         pump();
 
@@ -1514,8 +1508,7 @@ mod tests {
         let right = grid.child_at(1, 0).expect("the right (apps) column");
         assert!(
             grid.child_at(0, 1).is_none(),
-            "at the wide width the two columns sit side by side, so nothing is \
-             stacked under the fields (#1220 stacks them only below it)"
+            "the two columns sit side by side, so nothing is stacked under the fields"
         );
 
         assert!(
@@ -1540,154 +1533,103 @@ mod tests {
         );
     }
 
-    /// #1220: the fields column must stay at its own 240-px request, instead of
-    /// taking the width #1134 change 1 promised the app list. Measured on the page
-    /// the issue was filed about, the column came out at 434 px against 536 px of
-    /// app list — and **two independent mechanisms** were needed to fix it, which
-    /// is why this one assertion is falsified by deleting either:
+    /// #1220: the fields column must stay at its own 240-px request instead of
+    /// taking the width #1134 change 1 promised the app list — for a **stopped**
+    /// draft and a **running** one, which look like the same bug and are not.
     ///
-    /// * the rename-blocked note was `wrap(true)` with no `max_width_chars`, so its
-    ///   natural width was its whole unwrapped ~100-character line (measured: 182 px
-    ///   with the cap, and a `gtk::Grid` hands every column its natural width before
-    ///   anything else). That is also why the list was narrow only while editing a
-    ///   **running** stack — the only kind that gets the note.
-    /// * `hexpand` propagates up from the name entry, so the fields box counted as
-    ///   an expanding one and the grid gave its column a share of the leftover
-    ///   width on top of that natural size. `fields.set_hexpand(false)` is what
-    ///   stops it.
+    /// * **Stopped** is what Annika actually filed. Her screenshot (#1220,
+    ///   10:31:55Z) is 418 px wide with `Name / eb` running straight into
+    ///   `Default layout` — no rename-blocked note anywhere — and the app list
+    ///   cramped anyway. The cause was the missing width floor on the ✎ route:
+    ///   the form sized itself to its own **minimum**, where the grid hands every
+    ///   column its minimum and nothing is wrong with the columns at all.
+    ///   `modal::switch_to_workspace_edit` applies that floor now
+    ///   (`modal::gtk_tests::the_edit_button_route_applies_the_width_cap` pins the
+    ///   route; this asserts what it buys — the list takes **≥ 60 %** of the form).
+    /// * **Running** is the second bug, visible only once the floor exists, and it
+    ///   took two mechanisms rather than one — which is why that half is falsified
+    ///   by deleting either:
+    ///   * the rename-blocked note was `wrap(true)` with no `max_width_chars`, so
+    ///     its natural width was its whole unwrapped ~100-character line (measured
+    ///     646 px), and a `gtk::Grid` hands every column its natural width before
+    ///     anything else;
+    ///   * `hexpand` propagates up from the name entry, so the fields box counted
+    ///     as an expanding one and the grid gave its column a share of the leftover
+    ///     width *on top of* that natural size (measured 434 px).
+    ///     `fields.set_hexpand(false)` is what stops it.
     ///
-    /// The measurement has to happen at a *natural* allocation, not a minimum one:
-    /// a plain `gtk::Window` sizes itself to its child's **minimum**, where the grid
-    /// hands every column its minimum (240 here, from its own size request) and
-    /// neither bug is visible. Flooring the page at the width `modal` floors the
-    /// real slot at (`apply_workspace_edit_width_cap`, #1108) is what makes the
-    /// window big enough for the naturals and the expand flags to be what decides.
+    /// The floor here is `scale(EDIT_FORM_WIDTH)` — the exact number
+    /// `modal::apply_workspace_edit_width_cap` pushes onto the real drawer slot,
+    /// so this measures the geometry production has. Without a floor a plain
+    /// `gtk::Window` sizes to its child's minimum and neither mechanism is
+    /// observable at all, which is the trap the first round of this PR fell into:
+    /// it floored the harness at a width the ✎ route never applied.
     ///
     /// **The mutations**: dropping `note.set_max_width_chars(NOTE_MAX_WIDTH_CHARS)`
-    /// reds this, and so does dropping `fields.set_hexpand(false)`.
+    /// or `fields.set_hexpand(false)` reds the running half; `EDIT_FORM_WIDTH`
+    /// dropped back to the ordinary drawer width reds both.
     #[gtk::test]
     fn an_active_drafts_note_does_not_widen_the_fields_column() {
-        let target: Mutable<Option<Draft>> = Mutable::new(None);
-        let page = slot(&target);
-        with_columns(3);
-        // `saved_draft` is active with a previous name, which is the one case that
-        // puts the note on the form.
-        target.set(Some(saved_draft()));
-        pump();
-        assert!(
-            label_texts(&page, "ts-ws-empty").contains(&RENAME_BLOCKED_HINT.to_owned()),
-            "this assertion is only meaningful while the note is on the form"
-        );
+        for (what, draft, note_expected) in [
+            ("a stopped draft", stopped_draft(), false),
+            ("a running draft", saved_draft(), true),
+        ] {
+            let target: Mutable<Option<Draft>> = Mutable::new(None);
+            let page = slot(&target);
+            target.set(Some(draft));
+            pump();
+            assert_eq!(
+                label_texts(&page, "ts-ws-empty").contains(&RENAME_BLOCKED_HINT.to_owned()),
+                note_expected,
+                "{what}: the note is on the form exactly when the stack is running, \
+                 and both halves of this test depend on which case they are in"
+            );
 
-        let floor = scale(workspaces_page_width(3));
-        page.set_size_request(floor, -1);
-        let window = gtk::Window::new();
-        window.set_child(Some(&page));
-        window.set_default_size(floor, 800);
-        window.present();
+            let floor = scale(EDIT_FORM_WIDTH);
+            page.set_size_request(floor, -1);
+            let window = gtk::Window::new();
+            window.set_child(Some(&page));
+            window.set_default_size(floor, 800);
+            window.present();
 
-        let grid = form_grid(&page);
-        let fields = grid.child_at(0, 0).expect("the fields column");
-        let apps = grid.child_at(1, 0).expect("the app-list column");
-        pump_until(2000, || fields.width() > 0 && apps.width() > 0);
+            let grid = form_grid(&page);
+            let fields = grid.child_at(0, 0).expect("the fields column");
+            let apps = grid.child_at(1, 0).expect("the app-list column");
+            pump_until(2000, || fields.width() > 0 && apps.width() > 0);
 
-        let want = scale(FIELD_COLUMN_WIDTH);
-        let slack = scale(48);
-        assert!(
-            fields.width() <= want + slack,
-            "the fields column is {} px wide, past its own {want} px request (+{slack} \
-             slack for font width): a wrapping label in it is reporting an \
-             unwrapped natural width",
-            fields.width()
-        );
-        // …and the consequence #1134 change 1 actually promised. Stated as a ratio
-        // because it survives a different font: "most of the width" is the claim,
-        // and with the note uncapped the list came out narrower than the column
-        // beside it.
-        assert!(
-            apps.width() >= 2 * fields.width(),
-            "the app list ({} px) does not get most of the width next to the \
-             fields column ({} px)",
-            apps.width(),
-            fields.width()
-        );
+            let want = scale(FIELD_COLUMN_WIDTH);
+            let slack = scale(48);
+            assert!(
+                fields.width() <= want + slack,
+                "{what}: the fields column is {} px wide, past its own {want} px request \
+                 (+{slack} slack for font width): a wrapping label in it is reporting an \
+                 unwrapped natural width",
+                fields.width()
+            );
+            // …and the consequence #1134 change 1 actually promised. Stated as a
+            // ratio because it survives a different font: "most of the width" is
+            // the claim, and with the note uncapped the list came out narrower
+            // than the column beside it.
+            assert!(
+                apps.width() >= 2 * fields.width(),
+                "{what}: the app list ({} px) does not get most of the width next to \
+                 the fields column ({} px)",
+                apps.width(),
+                fields.width()
+            );
+            // The number Annika's complaint is about, against the form's own
+            // width rather than against the other column: "Apps too narrow to
+            // edit comfortable" was ~150 px of a 418-px form, i.e. 36 %.
+            assert!(
+                apps.width() * 100 >= floor * 60,
+                "{what}: the app list is {} px of a {floor} px form — under 60 %, which \
+                 is the shape #1220 was filed about",
+                apps.width()
+            );
 
-        window.destroy();
+            window.destroy();
+        }
     }
-
-    /// #1220: below the wide page width the form **stacks** — fields above the app
-    /// list, one column — so the list gets the whole 680/732-px page instead of
-    /// what is left after a 240-px column. At the wide width it keeps #1134's
-    /// side-by-side split.
-    ///
-    /// Two slots rather than one re-seeded slot, because the form's binding is
-    /// `dedupe_cloned`: republishing an equal draft deliberately does **not**
-    /// rebuild the form (that is what makes it survive the refresh poll), so the
-    /// second layout has to come from a second form.
-    ///
-    /// **The mutation**: inverting `build_form`'s threshold (`>=` for `<`, or
-    /// pinning `stacked` to `false`) reds one half or the other.
-    #[gtk::test]
-    fn the_form_stacks_below_the_wide_width_and_splits_at_it() {
-        // ── one screen: 680 px, stacked ──────────────────────────────────────
-        let narrow_target: Mutable<Option<Draft>> = Mutable::new(None);
-        let narrow = slot(&narrow_target);
-        with_columns(1);
-        narrow_target.set(Some(saved_draft()));
-        pump();
-
-        let grid = form_grid(&narrow);
-        let fields = grid.child_at(0, 0).expect("the fields row");
-        let apps = grid
-            .child_at(0, 1)
-            .expect("below the wide width the app list stacks under the fields");
-        assert!(
-            grid.child_at(1, 0).is_none(),
-            "nothing sits beside the fields when the form is stacked — that second \
-             column is what squeezed the list on a one-screen box"
-        );
-        assert!(
-            name_field(&narrow).is_ancestor(&fields),
-            "the name field belongs in the fields row"
-        );
-        assert!(
-            app_rows(&narrow)[0].is_ancestor(&apps),
-            "the app list belongs in the row under it"
-        );
-
-        // ── two screens: 732 px, still stacked ───────────────────────────────
-        let two_target: Mutable<Option<Draft>> = Mutable::new(None);
-        let two = slot(&two_target);
-        with_columns(2);
-        two_target.set(Some(saved_draft()));
-        pump();
-        let two_grid = form_grid(&two);
-        assert!(
-            two_grid.child_at(0, 1).is_some() && two_grid.child_at(1, 0).is_none(),
-            "two screens are still below the wide width, so the form stacks there too"
-        );
-
-        // ── three screens: 1080 px, side by side ─────────────────────────────
-        let wide_target: Mutable<Option<Draft>> = Mutable::new(None);
-        let wide = slot(&wide_target);
-        with_columns(3);
-        wide_target.set(Some(saved_draft()));
-        pump();
-        let wide_grid = form_grid(&wide);
-        assert!(
-            wide_grid.child_at(1, 0).is_some(),
-            "at the wide width the app list sits beside the fields (#1134 change 1)"
-        );
-        assert!(
-            wide_grid.child_at(0, 1).is_none(),
-            "…and nothing is stacked under them"
-        );
-        assert!(
-            app_rows(&wide)[0].is_ancestor(&wide_grid.child_at(1, 0).expect("the apps column")),
-            "the app list is the thing beside the fields, not something else"
-        );
-    }
-
     /// #1134 change 2: a row with no saved override renders no launch-command
     /// entry at all — not merely a hidden one — until its toggle is switched
     /// on.

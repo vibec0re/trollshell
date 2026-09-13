@@ -291,6 +291,23 @@ def agents_option_levels(nix_src: str) -> dict[str, list[str]]:
     return {"AgentsConfig": option_leaves(outer), "Display": option_leaves(display_body)}
 
 
+def _serde_attr_lists(text: str) -> list[str]:
+    """Every `#[serde(...)]` attribute's inner content found in `text`."""
+    return re.findall(r"#\[serde\(([^)]*)\)\]", text)
+
+
+def _serde_has(text: str, pattern: str) -> bool:
+    """Whether `pattern` matches ANYWHERE inside any `#[serde(...)]`
+    attribute list in `text` — scanned as a whole list rather than by
+    position (#1241). The idiom `Display` itself uses,
+    `#[serde(default, skip_serializing_if = "…", rename = "glyph")]`, puts
+    `rename` third; a scan that only checked the first entry or two (the old
+    `"serde(rename" in body` / `"serde(default, rename" in body` prefixes)
+    scanned that green.
+    """
+    return any(re.search(pattern, attrs) for attrs in _serde_attr_lists(text))
+
+
 def struct_serde_fields(src: str, struct: str) -> list[str]:
     """The serde-visible field names of `pub struct <struct>`, in source order.
 
@@ -307,17 +324,24 @@ def struct_serde_fields(src: str, struct: str) -> list[str]:
     # Container attributes sit between the doc comment and the struct keyword;
     # 500 characters back covers the derive list and any `#[serde(...)]` line.
     head = src[max(0, m.start() - 500) : m.start()]
-    if "rename_all" in head:
+    if _serde_has(head, r"rename_all"):
         raise LookupError(f"`{struct}` carries a serde `rename_all` this scan cannot follow")
     body_start = m.end() - 1
     body_end = match_delim(src, body_start, "{", "}")
     if body_end < 0:
         raise LookupError(f"`pub struct {struct}`'s body brace never closes")
     body = src[body_start:body_end]
-    for spelling in ("rename", "flatten"):
-        if f"serde({spelling}" in body or f"serde(default, {spelling}" in body:
-            raise LookupError(f"`{struct}` uses serde `{spelling}`, which this scan cannot follow")
-    fields = re.findall(r"pub (\w+):", body)
+    if _serde_has(body, r"rename\s*="):
+        raise LookupError(f"`{struct}` uses serde `rename`, which this scan cannot follow")
+    if _serde_has(body, r"\bflatten\b"):
+        raise LookupError(f"`{struct}` uses serde `flatten`, which this scan cannot follow")
+    # `pub(crate)`/`pub(super)` is still a `pub` field as far as serde and
+    # TOML are concerned — only a Rust-side visibility restriction, which
+    # this scan must not confuse with "not a field at all" (#1241): the old
+    # `pub (\w+):` pattern had a literal space and so never matched a
+    # visibility qualifier, silently dropping the field from the comparison
+    # instead of comparing it.
+    fields = re.findall(r"pub(?:\([^)]*\))?\s+(\w+):", body)
     if not fields:
         raise LookupError(f"`pub struct {struct}` has no `pub` fields")
     return fields
@@ -483,6 +507,42 @@ def self_test() -> list[str]:
         failures.append("struct_serde_fields: a serde rename_all was not refused")
     except LookupError:
         pass
+
+    # #1241: `rename` inside a MULTI-attribute serde list, not just as the
+    # sole or leading entry — the `Display` idiom itself,
+    # `#[serde(default, skip_serializing_if = "…", rename = "glyph")]`,
+    # scanned green before this fix (the old check only looked at the
+    # attribute's first one or two entries).
+    multi_attr_renamed = '''
+    #[derive(Deserialize)]
+    pub struct MultiAttrRenamed {
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "glyph")]
+        pub icon: Option<String>,
+    }
+    '''
+    try:
+        struct_serde_fields(multi_attr_renamed, "MultiAttrRenamed")
+        failures.append("struct_serde_fields: a multi-attribute serde rename was not refused")
+    except LookupError:
+        pass
+
+    # #1241: `pub(crate)`/`pub(super)` is still a field as far as serde and
+    # TOML are concerned — the old `pub (\\w+):` pattern (note the literal
+    # space) never matched a visibility qualifier at all, silently dropping
+    # the field from the comparison instead of comparing it.
+    scoped_visibility = '''
+    #[derive(Deserialize)]
+    pub struct ScopedVisibility {
+        pub(crate) glyph: String,
+        pub(super) label: String,
+        pub plain: String,
+    }
+    '''
+    got = struct_serde_fields(scoped_visibility, "ScopedVisibility")
+    if got != ["glyph", "label", "plain"]:
+        failures.append(
+            f"struct_serde_fields: pub(crate)/pub(super) fields dropped, got {got}"
+        )
 
     agents_nix_src = '''
     config.agents = lib.mkOption {

@@ -360,6 +360,19 @@ craneLib.mkCargoDerivation (
         echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected ${toString parityCases} — a case-count regression, not a parity failure." >&2
         exit 1
       fi
+
+      # #1151: the harness carries one pure test of its own — the
+      # `activate` latch, `activate_once` — inside the example, and an
+      # example's `#[test]`s are never run by the `cargo test --workspace`
+      # line at the top of this phase (examples default to `test = false`
+      # in cargo), so without this line that pin compiles in CI and never
+      # executes. The explicit `--example` selector overrides the default.
+      # The run also re-executes the `#[path]`-included `preem_gl` suites
+      # inside the example crate; that is the price of the include, not a
+      # second source of truth, and it stays under `xvfb-run` because the
+      # included GL-arm tests are the same display-needing tests the
+      # workspace line already ran.
+      xvfb-run -a cargo test -p trollshell --locked --features system-tests --example preem_gl_diff
     '';
   }
 )

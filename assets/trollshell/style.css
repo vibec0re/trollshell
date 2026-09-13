@@ -479,6 +479,30 @@
     color: white;
 }
 
+/* Right sidebar (#1158/#1160) — the mirror of the left, anchored
+ * `Right + Top + Bottom` and hidden entirely while no plugin card is mounted on
+ * it (`overlays::sidebar::Side::Right`).
+ *
+ * Its surface and card carry `.ts-sidebar-right-surface` / `.ts-sidebar-right`
+ * IN ADDITION to the shared `.ts-sidebar-surface` / `.ts-sidebar` above, so
+ * every rule authored for the sidebar applies to both sides without being
+ * written twice and these two exist purely as the hook a skin mirrors its
+ * paddings/radii through. The defaults below therefore restate the shared
+ * padding rather than changing it: the right sidebar ships looking exactly like
+ * the left, and a skin that wants them to differ has a selector to say so
+ * without having to reach past `.ts-sidebar`'s specificity.
+ *
+ * The `border-radius: 0` note on `.ts-sidebar` applies here too, and for the
+ * mirrored reason: the frame's cutout paints its own rounded corners against
+ * this card's LEFT edge. */
+.ts-sidebar-right-surface {
+    background: transparent;
+}
+
+.ts-sidebar-right {
+    padding: 0.923em;
+}
+
 /* Sidebar widget cards — each top-level widget is a SOLID opaque dark card so
  * its text reads against a stable surface instead of straight on the blurred
  * wallpaper behind the translucent panel (#194). Background/radius/margin live

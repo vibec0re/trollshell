@@ -21,6 +21,9 @@
 //! # toggle the sidebar (no arg):
 //! busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
 //!     org.gtk.Actions Activate 'sava{sv}' toggle-sidebar 0 0
+//! # toggle the RIGHT sidebar (#1160, same shape, different verb):
+//! busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
+//!     org.gtk.Actions Activate 'sava{sv}' toggle-sidebar-right 0 0
 //! ```
 //!
 //! ## Monitor resolution
@@ -48,6 +51,8 @@ use crate::overlays::sidebar;
 ///   (`Page::stack_name` token, e.g. `"media"`, `"power-menu"`).
 /// - `power-menu` (no arg): convenience alias for `open-page("power-menu")`.
 /// - `toggle-sidebar` (no arg): flip the left sidebar.
+/// - `toggle-sidebar-right` (no arg): flip the right sidebar (#1160) — a no-op
+///   while that output's right sidebar has no plugin card mounted.
 /// - `toggle-recording` (no arg): start/stop a screen recording (#403).
 pub fn install(app: &App) {
     // Wire the shared focused-output cache (idempotent — see its docs) so
@@ -82,6 +87,25 @@ pub fn install(app: &App) {
         })
         .build();
 
+    // The right sidebar (#1158/#1160). A separate verb rather than an argument
+    // to `toggle-sidebar`: niri binds a chord to a verb, and `org.gtk.Actions`
+    // parameters have to be spelled out in the `busctl` line, so two verbs are
+    // two one-line binds while one parameterised verb is two long ones. It is
+    // also the only way to reach the right sidebar — it has no bar chip (it may
+    // not exist on this machine at all), which is why #219's "otherwise
+    // mouse-only" framing is even stronger here.
+    //
+    // A toggle aimed at a connector whose right sidebar has no plugin card is a
+    // no-op with one `debug!` line, decided inside `toggle_right_on_focused` —
+    // the epic's "hidden entirely when empty" rule reaches the keybind, not just
+    // the surface.
+    let toggle_sidebar_right = gio::ActionEntry::builder("toggle-sidebar-right")
+        .activate(|_app, _action, _param| {
+            let focused = focused_output::current();
+            sidebar::toggle_right_on_focused(focused.as_deref());
+        })
+        .build();
+
     // Screen recording (#403): start if idle, stop if recording. A niri
     // keybind binds this like the others; the region is picked via `slurp`
     // when starting. No monitor resolution needed — the recorder is global.
@@ -89,7 +113,13 @@ pub fn install(app: &App) {
         .activate(|_app, _action, _param| recorder::toggle())
         .build();
 
-    app.add_action_entries([open_page, power_menu, toggle_sidebar, toggle_recording]);
+    app.add_action_entries([
+        open_page,
+        power_menu,
+        toggle_sidebar,
+        toggle_sidebar_right,
+        toggle_recording,
+    ]);
 }
 
 /// Open the drawer to `page` on the focused output (or any mounted drawer).

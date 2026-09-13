@@ -1360,6 +1360,11 @@ pub(super) async fn serve_conn(
     // the sidebar visibility task carries so it lands *after* the
     // `SlotVisibility(true)` frame (see `visibility_task`).
     let now_playing_gated = push_gate(&manifest, StateKey::NowPlaying);
+    // Which sidebar's aggregate this connection's card follows (#1160, the #1221
+    // review's LOW 5). Resolved once, here, and used for both the visibility task
+    // below and the spectrum task's on-screen demand further down, so the two can
+    // never disagree about whether this card is being looked at.
+    let visibility_rx = visibility_source(mount, ctx);
     let visibility = if manifest.subscribes.contains(&StateKey::SlotVisible) {
         if mount.is_bar() {
             let _ = out_tx.try_send(HostMsg::SlotVisibility { visible: true });
@@ -1372,7 +1377,7 @@ pub(super) async fn serve_conn(
             // so without the re-seed it resumes stale on reopen.
             let np_rx = now_playing_gated.then(|| ctx.now_playing_rx.clone());
             Some(tokio::spawn(visibility_task(
-                ctx.visibility_rx.clone(),
+                visibility_rx.clone(),
                 np_rx,
                 out_tx.clone(),
             )))
@@ -1410,7 +1415,7 @@ pub(super) async fn serve_conn(
         .then(|| {
             tokio::spawn(spectrum_task(
                 ctx.spectrum_rx.clone(),
-                ctx.visibility_rx.clone(),
+                visibility_rx.clone(),
                 mount.is_bar(),
                 out_tx.clone(),
             ))
@@ -1749,6 +1754,47 @@ async fn snapshot_task(
         ) {
             break;
         }
+    }
+}
+
+/// Whether a mount's card lives on the **right** sidebar (#1158/#1160).
+///
+/// Written out here rather than added to `hytte-plugin-proto`'s [`Mount`] beside
+/// [`Mount::is_bar`] on purpose: `is_bar` is a *wire* fact (a bar chip is always
+/// on screen, which is why the host seeds it a constant `true`) and every
+/// consumer of the protocol shares it, while "which of this shell's two sidebar
+/// surfaces is that" is a `trollshell` fact about `overlays::sidebar`, which the
+/// proto knows nothing about. The match is exhaustive over the enum, so a tenth
+/// mount does not compile until it is classified here.
+fn is_right_sidebar(mount: Mount) -> bool {
+    match mount {
+        Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom => true,
+        Mount::SidebarLead
+        | Mount::SidebarTop
+        | Mount::SidebarBottom
+        | Mount::BarLeft
+        | Mount::BarCenter
+        | Mount::BarRight => false,
+    }
+}
+
+/// The slot-visibility aggregate this connection's card follows (#1160).
+///
+/// A plugin is told whether its card is on screen so it can park pollers while
+/// it is not; before the right sidebar existed there was one aggregate and every
+/// sidebar card read it. A right-mounted card is **not** on screen because the
+/// left sidebar opened, so it reads the right sidebar's aggregate instead.
+///
+/// A **bar** mount resolves to the left receiver and then never reads it: its
+/// `SlotVisibility` is seeded as a constant `true` (see `serve_conn`, #438) and
+/// its spectrum demand passes `always_visible`, so the receiver it is handed is
+/// inert. Resolving one anyway keeps this a total function of the mount with no
+/// `Option` for two call sites to unwrap differently.
+fn visibility_source(mount: Mount, ctx: &ListenerCtx) -> watch::Receiver<bool> {
+    if is_right_sidebar(mount) {
+        ctx.visibility_right_rx.clone()
+    } else {
+        ctx.visibility_rx.clone()
     }
 }
 

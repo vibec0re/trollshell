@@ -125,6 +125,7 @@ fn fixture_handles(
         active_panel_id: Mutable::new(None),
         clock_tx: tokio::sync::watch::channel(None).0,
         visibility_tx: tokio::sync::watch::channel(false).0,
+        visibility_right_tx: tokio::sync::watch::channel(false).0,
         accent_tx: tokio::sync::watch::channel(None).0,
         spectrum_tx: tokio::sync::watch::channel(None).0,
         calendar_tx: tokio::sync::watch::channel(Vec::new()).0,

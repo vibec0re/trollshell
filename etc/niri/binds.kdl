@@ -56,6 +56,26 @@ binds {
     // above, just a different page token.
     // Mod+W hotkey-overlay-title="Open Workspaces" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-page" "1" "s" "workspaces" "0"; }
 
+    // Sidebars (#219 verbs; the right one is #1158/#1160). Both are the same
+    // `org.gtk.Actions` shape as the clipboard bind above, just parameterless
+    // verbs — `toggle-sidebar` flips the left sidebar (the one with the bar
+    // chip, so a keybind is a convenience there), `toggle-sidebar-right` the
+    // right one, which has NO chip and is otherwise unreachable without a mouse
+    // on a layer surface that may not even be mapped.
+    //
+    // Commented out, like the workspaces bind above and for the same reason
+    // README.md gives: which chord maps to which verb is a deployer preference,
+    // and niri treats a duplicate chord as a hard config error rather than
+    // last-wins. Pick your own pair and uncomment — Mod+A / Mod+Shift+A below is
+    // a suggestion, not a default, and neither is bound by niri 26.04's stock
+    // config.
+    //
+    // A `toggle-sidebar-right` on an output whose right sidebar has no plugin
+    // card mounted does nothing at all (one `debug!` line in the shell's log);
+    // that is the epic's "hidden entirely when empty" rule, not a broken bind.
+    // Mod+A hotkey-overlay-title="Toggle Sidebar" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "toggle-sidebar" "0" "0"; }
+    // Mod+Shift+A hotkey-overlay-title="Toggle Right Sidebar" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "toggle-sidebar-right" "0" "0"; }
+
     // Column layouts (#1019) — the same binary that paints the bar chip also
     // applies one layout and exits, so these are plain `spawn`s with no shell,
     // no D-Bus and no running plugin involved: it reads $NIRI_SOCKET itself.

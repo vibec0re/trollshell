@@ -369,6 +369,10 @@ fn main() -> hytte::ui::Result<()> {
                         let connectors: Vec<String> =
                             monitors.iter().filter_map(Monitor::connector).collect();
                         fullscreen_inhibit::retain_outputs(&connectors);
+                        // Stats drawer scroll-target stash (#1177): unlike the
+                        // overlays above, it has no close_all/install pair to
+                        // re-key it on hot-plug, so it never got pruned at all.
+                        panels::stats::prune_pending_scroll(&connectors);
 
                         // Password prompt overlay on the current primary output.
                         // Guard the zero-monitor / dead-first-output case — never

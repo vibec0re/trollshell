@@ -154,6 +154,24 @@ pub fn set_scroll_target(monitor: &Monitor, section: StatsSection) {
     });
 }
 
+/// Drop every [`PENDING_SCROLL`] entry whose connector isn't in `connectors`
+/// (#1177). Unlike this file's other per-monitor stashes, [`PENDING_SCROLL`]
+/// had no `close_all`/`install` pair to re-key it on a `monitors_changed`
+/// hot-plug — a resource chip's [`set_scroll_target`] is the only writer, and
+/// a monitor that never clicks a chip again never gets its entry looked at,
+/// let alone removed — so one entry accumulated per connector ever seen for
+/// the life of the process, including every fallback (`monitor:{ptr}`) key
+/// `components::monitor_key` mints for a connector-less output, none of which
+/// is ever reused (its module doc). Called from `main.rs`'s `monitors_changed`
+/// loop alongside `fullscreen_inhibit::retain_outputs`, with the same
+/// currently-live connector list.
+pub fn prune_pending_scroll(connectors: &[String]) {
+    PENDING_SCROLL.with(|m| {
+        m.borrow_mut()
+            .retain(|key, _| connectors.iter().any(|c| c == key));
+    });
+}
+
 /// The combined stats flyout — opened from any of the CPU / memory / disk /
 /// GPU / services bar chips when `TROLLSHELL_STATS_LAYOUT=combined`. All five
 /// cards stack in one `ts-popup-column`, one click, scroll to see all
@@ -1991,9 +2009,9 @@ fn flapping_subtitle(
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, CoreLeds, Duration, StatsLayout, StatsSection,
-        TaskState, core_led_matrix_for, core_panel_scale, core_panel_tooltip, flapping_subtitle,
-        is_flapping, parse_stats_layout,
+        CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, CoreLeds, Duration, PENDING_SCROLL, StatsLayout,
+        StatsSection, TaskState, core_led_matrix_for, core_panel_scale, core_panel_tooltip,
+        flapping_subtitle, is_flapping, parse_stats_layout, prune_pending_scroll,
     };
 
     /// The [`StatsSection`] declaration order is the panel's canonical
@@ -2045,6 +2063,44 @@ mod tests {
         assert_eq!(parse_stats_layout(Some("Combined")), Err("Combined"));
         assert_eq!(parse_stats_layout(Some("grid")), Err("grid"));
         assert_eq!(parse_stats_layout(Some("")), Err(""));
+    }
+
+    /// #1177: a [`PENDING_SCROLL`] entry for a connector that's no longer
+    /// live is dropped, not accumulated forever. `set_scroll_target` is the
+    /// map's only writer and — unlike this file's other per-monitor state —
+    /// it had no `close_all`/`install` pair to re-key it on a `monitors_changed`
+    /// hot-plug, so a monitor that stashed a scroll target and then vanished
+    /// kept its entry for the rest of the process's life.
+    ///
+    /// Hermetic: bypasses [`set_scroll_target`] (which needs a real `Monitor`)
+    /// and pokes [`PENDING_SCROLL`] directly, since [`prune_pending_scroll`]
+    /// only ever reads the map's `String` keys.
+    ///
+    /// **Falsified** by reverting [`prune_pending_scroll`] to a no-op: the
+    /// `"DP-2"` entry (stashed as if a now-vanished monitor once clicked a
+    /// resource chip) survives, and the second assertion below turns red.
+    #[test]
+    fn prune_pending_scroll_drops_vanished_connectors() {
+        PENDING_SCROLL.with(|m| {
+            let mut m = m.borrow_mut();
+            m.clear();
+            m.insert("DP-1".to_owned(), StatsSection::Cpu);
+            m.insert("DP-2".to_owned(), StatsSection::Memory);
+        });
+
+        prune_pending_scroll(&["DP-1".to_owned()]);
+
+        PENDING_SCROLL.with(|m| {
+            let m = m.borrow();
+            assert!(
+                m.contains_key("DP-1"),
+                "a still-live connector's entry must survive the prune"
+            );
+            assert!(
+                !m.contains_key("DP-2"),
+                "a vanished connector's entry must be pruned"
+            );
+        });
     }
 
     // ── The per-core LED panel (#857) ────────────────────────────────────────

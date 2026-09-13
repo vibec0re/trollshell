@@ -126,3 +126,17 @@
     color: @accent_color;
     min-height: 1.846em;
 }
+
+/* Multi-sparkline default (#1177, following the #1180 item 7 precedent just
+   above). Same bare-GtkDrawingArea-needs-a-height-default reasoning as
+   `.hytte-sparkline`, but no `color` here: `MultiSparkline` generates its own
+   per-series HSL palette in Rust rather than reading the widget's theme
+   color, so the only thing the library needs to default is the height. Used
+   to live only in trollshell's stylesheet under a `ts-multi-sparkline` class
+   the library itself stamped — same namespace problem `.hytte-sparkline`'s
+   doc describes. The class is `hytte-multi-sparkline` now and the default is
+   here; a shell overrides it from its own user stylesheet, installed above
+   this one. */
+.hytte-multi-sparkline {
+    min-height: 4em;
+}

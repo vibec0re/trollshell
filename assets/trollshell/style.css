@@ -1901,8 +1901,13 @@
 
 /* Per-core CPU history graph (#196): N colored lines, so taller than the
    single-line sparkline to keep the cores legible. Colors are generated
-   per-series in Rust (HSL spread), not from the theme color. */
-.ts-multi-sparkline {
+   per-series in Rust (HSL spread), not from the theme color.
+   The shell's override of the library's `.hytte-multi-sparkline` default
+   (#1177, mirroring the `.hytte-sparkline` override just above): the widget
+   carries a `hytte-` class now, so this restates the height at the user
+   stylesheet's higher priority — tuning the shell's per-core graph stays a
+   change in this file. */
+.hytte-multi-sparkline {
     min-height: 4em;
 }
 

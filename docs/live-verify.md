@@ -2422,16 +2422,43 @@ session.
       falloff adds light at the rim and that is the point — instead every pixel
       off a rasterisation edge must be **bit-identical** (`FAIL(interior)`) and
       the edge region must stay inside the dot matrix's own budget, mean 16 /
-      max 64 (`FAIL(edges)`), against a measured worst of 10.641 / 39. The two
-      blank-frame guards bind on them too, which is what an all-black blit now
+      max 64 (`FAIL(edges)`), against a measured worst of 11.626 / 40 —
+      re-measured in #1186, the commit that gave the halo its bilinear read on
+      the stretched path; 10.641 / 39 before it, and the budget stayed put. The
+      two blank-frame guards bind on them too, which is what an all-black blit now
       trips on all four. What that gate cannot see, stated: on a dot matrix
       every pixel of a falloff dot is an `edge` by the region split's
       4-neighbour rule, so all four cases report `lit[n=0]` and the
       bit-identical clause is about the flat field only — the lattice, the
       falloff, the bloom and the comb are held by the edge budget alone.
       Measured, a scale-only dot-radius drift of +10 % is caught on one skin
-      of four (oled, edge mean 18.260 > 16) and one of +5 % on none; a
-      scale-only halo drift of +25 % on none (edge mean ≤ 12.245, max ≤ 48).
+      of four (oled, edge mean 19.182 > 16; 19.379 on the marquee's oled) and
+      one of +5 % on none; a scale-only halo drift of +25 % on none (edge mean
+      ≤ 13.379 over all eight stretched lattice cases, max ≤ 48). **Both probes
+      are spelled out here because a number nobody can reproduce is not a
+      measurement** (#1238 review): the radius one multiplies `falloff`'s
+      `denom` by 1.21 on the `u_viewport != u_grid` branch only, and the halo
+      one scales `u_bloom_strength` by 5/4 in the shader's own integer
+      arithmetic on that same branch only — `int halo = min(glow * (snapped ?
+      u_bloom_strength : u_bloom_strength * 5 / 4) / 256, 255);` at
+      `dot_matrix.frag`'s bloom composite, which measures 13.278 on
+      `dot_matrix.oled.readoutx2` and 13.379 on `marquee.oled.phase7x2`.
+
+      One gate on these eight is **not** a comparison against the kit at all
+      (#1238 review): the harness also asks the *native* readback, before the
+      box-average, what fraction of its 2×2 blocks are internally constant in
+      RGBA, and fails the case (`FAIL(flat)`) over 60 %. It exists because the
+      kit's own halo is grid-resolution by construction, so a GL arm that
+      replicates a grid value across a stretched chip agrees with the oracle
+      slightly *better* than one that resolves it per fragment — no
+      oracle-facing check can ask for the fix #1186 made, and this one does not
+      ask the oracle anything. Measured under llvmpipe, the shipping frames sit
+      at 21.3–52.1 % and the same tree with the bilinear tap reverted puts the
+      oled and crt of both kinds at 77.4–79.8 %; the lcd pair is a free control
+      at 52.1 / 46.5 on **both** trees, since its bloom radius is 0. Like the
+      bit-exact pin it is asserted only under `TROLLSHELL_PARITY_EXACT=1`,
+      i.e. in `checks.system-tests` and nowhere else; a plain run prints the
+      fraction.
 
       What only glass can answer is what neither of those can see.
 
@@ -2527,7 +2554,12 @@ session.
       #893's ceiling: every pixel off a rasterisation edge bit-identical
       (`FAIL(interior)`) plus a per-kind edge budget (`FAIL(edges)`). The
       marquee's is the dot matrix's pair, mean 16 / max 64, against a measured
-      worst of 10.781 / 40. The text box's is its own and a different *shape* of
+      worst of 11.747 / 40 (10.781 / 40 before #1186 re-measured it on the
+      marquee's own cases; the budget stayed put). The four marquee cases here
+      carry the native-flatness gate described in the dot-matrix row above, and
+      the four text-box ones do not — a text box has no emission, so there is
+      no grid-resolution texture read to protect and its frames measure 97.4 %
+      flat either way. The text box's budget is its own and a different *shape* of
       number — mean 24 / max 192 against a measured worst of 14.016 / 180 —
       because the kit anti-aliases none of this widget's edges, so every
       legitimate disagreement is the full field-to-transparent contrast (180 on

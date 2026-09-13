@@ -1360,6 +1360,12 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     // buffers of one shape (#1148 review, HIGH-2). The device scale folds into
     // the same divide: `factor` device pixels per reference pixel on each axis,
     // averaged in one pass, which leaves the layout at a device scale of 1.
+    // Asked of the **native** readback, before the average that would erase it:
+    // "is this denser render actually denser, or is it a grid-resolution
+    // quantity replicated across each block?" (#1238's review). The one check
+    // here that never looks at the oracle, and the only one that can see a
+    // halo read at the kit's grid — see `parity::flat_block_fraction`.
+    let flatness = parity::flat_block_fraction(&shot.raw, shot.alloc, case.sampling(), shot.scale);
     let (gl_raw, gl_alloc, device_scale) = match case.sampling() {
         parity::Sampling::OneToOne => (
             std::borrow::Cow::Borrowed(&shot.raw[..]),
@@ -1395,7 +1401,12 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     // scope's peak-row check and the `TROLLSHELL_PARITY_EXACT=1` zero pin at
     // 1:1 (#1143/#1148), the region split for a supersampled case. See
     // `parity::case_verdict`.
-    let verdict = parity::case_verdict(&stats, &split, case.kind(), case.sampling(), exact);
+    let verdict = parity::with_native_flatness(
+        parity::case_verdict(&stats, &split, case.kind(), case.sampling(), exact),
+        case.kind(),
+        flatness,
+        exact,
+    );
     println!(
         "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
          over {} px; peak-row mismatches {}/{}",
@@ -1409,6 +1420,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     );
     print_channels(&stats, case.sampling());
     print_regions(&split);
+    print_flatness(case.kind(), flatness);
     write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
@@ -1482,6 +1494,33 @@ fn print_regions(split: &parity::Regions) {
         show(split.field),
         show(split.lit),
     );
+}
+
+/// Print the **native-frame flatness** of a supersampled case, with the
+/// ceiling its kind is held to under `TROLLSHELL_PARITY_EXACT=1` (#1238's
+/// review).
+///
+/// Printed on every supersampled case, including the kinds that state no
+/// ceiling, because the number is the calibration: whoever adds a ceiling for
+/// the gauge or the text box needs to see what those frames measure first, and
+/// a statistic that is only printed where it is already asserted cannot tell
+/// them. See `parity::flat_block_fraction`.
+fn print_flatness(kind: parity::Kind, fraction: Option<f64>) {
+    let Some(fraction) = fraction else {
+        return;
+    };
+    match kind.flat_block_ceiling() {
+        Some(ceiling) => println!(
+            "      native flat blocks {:.1}% of the supersampled frame (ceiling {:.1}%, \
+             asserted under TROLLSHELL_PARITY_EXACT=1)",
+            fraction * 100.0,
+            ceiling * 100.0,
+        ),
+        None => println!(
+            "      native flat blocks {:.1}% of the supersampled frame (no ceiling for this kind)",
+            fraction * 100.0,
+        ),
+    }
 }
 
 /// Write the three evidence files for one case: what GL drew, what the kit

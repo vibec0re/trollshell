@@ -615,14 +615,31 @@ mod tests {
     ///
     /// A source read for the `the_shader_and_the_mapping_agree_about_*` reason —
     /// nothing in the tree compiles the GLSL until a driver does — but it is
-    /// protecting a shape rather than a number, and it is here because the
-    /// harness cannot protect this one. Measured: the grid-resolution
-    /// `texelFetch(u_tex1, ivec2(col, row))` this replaced leaves **all 100
-    /// cases green** (it moves only the four stretched dot-matrix and four
-    /// stretched marquee cases, and only by ~1 on an edge mean against a budget
-    /// of 16), so a revert to it ships silently. The two halves asserted below
-    /// are the two ways that revert can be spelled: deleting `halo_at`, or
-    /// keeping it and dropping the `snapped ?` fan-out at the call site.
+    /// protecting a shape rather than a number, and it is here because **no
+    /// comparison against the CPU oracle** can protect this one. Measured: the
+    /// grid-resolution `texelFetch(u_tex1, ivec2(col, row))` this replaced
+    /// leaves every oracle-facing check green (it moves only the four stretched
+    /// dot-matrix and four stretched marquee cases, and only by ~1 on an edge
+    /// mean against a budget of 16). It could not be otherwise: the kit's own
+    /// halo *is* grid-resolution, so replicating it agrees with the oracle
+    /// slightly **better** than resolving it per fragment does, and an
+    /// oracle-based gate could only ever penalise this change. The two halves
+    /// asserted below are the two ways that revert can be spelled: deleting
+    /// `halo_at`, or keeping it and dropping the `snapped ?` fan-out at the
+    /// call site.
+    ///
+    /// **The harness does hold it, since #1238's review — just not by
+    /// comparing.** `parity::flat_block_fraction` asks the *native*
+    /// supersampled readback whether it is actually denser than the kit's grid,
+    /// and a replicated halo answers no: the fraction of internally-constant
+    /// `n × n` blocks jumps from 33.3 %/49.3 % to 79.8 %/79.7 % on the
+    /// dot matrix's crt and oled cases under the revert, against a ceiling of
+    /// 60 % (`parity::Kind::flat_block_ceiling`). So this test is the cheap
+    /// guard that needs no driver, not the only one — and the two disagree
+    /// about which skins they cover, which is why both are here: the gate is
+    /// blind to the vfd (whose replicated frame measures exactly what the
+    /// bloomless lcd control does) and to every 1:1 case, and this test is
+    /// blind to whether `halo_at` interpolates *correctly*.
     ///
     /// What it cannot see, stated for the same reason
     /// `parity::case_verdict`'s doc states its own hole: it says nothing about

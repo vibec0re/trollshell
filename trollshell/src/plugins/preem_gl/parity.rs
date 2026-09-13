@@ -176,6 +176,21 @@ pub(crate) enum Verdict {
     /// A supersampled case's edge region is outside
     /// its kind's [`EdgeBudget`] — see [`Kind::edge_budget`].
     EdgeOverBudget,
+    /// A supersampled case's **native** frame is blockier than its kind's
+    /// [`Kind::flat_block_ceiling`] — something it draws is replicated out of
+    /// the kit's grid instead of being evaluated at the fragment's own
+    /// resolution (#1238's review).
+    ///
+    /// The one verdict here that is **not** a comparison against the oracle,
+    /// and it exists because no comparison against the oracle can see this.
+    /// The kit's own halo is grid-resolution by construction, so a GL arm that
+    /// replicates a grid value across a stretched chip agrees with the oracle
+    /// *better* than one that resolves it per fragment — #1186 measured exactly
+    /// that, all six moved cases getting worse on the edge mean. An
+    /// oracle-based gate could only ever penalise the fix. See
+    /// [`flat_block_fraction`] for the statistic and
+    /// [`with_native_flatness`] for when it is asserted.
+    GridReplicated,
 }
 
 /// [`Kind`] itself, [`Kind::ALL`] and [`Kind::gl_seam`] moved to
@@ -226,6 +241,17 @@ impl Kind {
     /// already cross-checks this answer against its own hand-written match,
     /// so the guarantee held either way — this just makes the function keep
     /// it on its own terms too.
+    ///
+    /// **This answer is not consulted at all on a supersampled case, whatever
+    /// it says** (#1238's review, LOW-2). [`case_verdict`]'s
+    /// [`Sampling::Supersampled`] arm never calls [`Stats::verdict_for`], so
+    /// the peak-row branch inside it is unreachable for every such case —
+    /// falsified by answering `true` here for all five kinds, which leaves the
+    /// harness at PASS on all 100. Nothing depends on that today (the scope has
+    /// no supersampled case, because its GL grid *is* the kit's upscaled
+    /// buffer), and it is written down because it is a latent hole: a future
+    /// `scope.*.x2` case would lose the beam check silently rather than by
+    /// anyone deciding it should.
     pub(crate) fn checks_peak_rows(self) -> bool {
         match self {
             Self::Scope => true,
@@ -386,6 +412,62 @@ impl Kind {
         }
     }
 
+    /// The ceiling on [`flat_block_fraction`] for this kind's **supersampled**
+    /// cases, or `None` for a kind whose native frame is legitimately flat
+    /// (#1238's review).
+    ///
+    /// **60 %**, and the separation it sits in is wide. Measured under llvmpipe
+    /// (Mesa 26.2.1, the flake's own) on two trees — this one, and the same
+    /// tree with #1186's bilinear halo tap reverted to the grid-resolution
+    /// `texelFetch(u_tex1, ivec2(col, row))` it replaced:
+    ///
+    /// | case | replicated halo | bilinear halo (ships) |
+    /// | --- | --- | --- |
+    /// | `dot_matrix.vfd.readoutx2` | 52.1 % | 25.0 % |
+    /// | `dot_matrix.lcd.readoutx2` | 52.1 % | 52.1 % |
+    /// | `dot_matrix.oled.readoutx2` | 79.7 % | 49.3 % |
+    /// | `dot_matrix.crt.readoutx2` | 79.8 % | 33.3 % |
+    /// | `marquee.vfd.phase7x2` | 46.5 % | 21.3 % |
+    /// | `marquee.lcd.phase7x2` | 46.5 % | 46.5 % |
+    /// | `marquee.oled.phase7x2` | 77.4 % | 44.5 % |
+    /// | `marquee.crt.phase7x2` | 77.4 % | 26.8 % |
+    ///
+    /// The **lcd pair is a control that costs nothing**: its bloom radius is 0,
+    /// so the blur is the identity and there is nothing to interpolate — it
+    /// measures the same 52.1 / 46.5 on both trees, which says the statistic
+    /// moves only where a halo exists rather than with any edit to the shader.
+    /// Against that, 60 % sits 7.9 points above the dot matrix's worst shipping
+    /// frame and 19.7 below its lowest reverted one; 13.5 and 17.4 for the
+    /// marquee.
+    ///
+    /// `None` is a measurement too. The gauge's own supersampled frames come
+    /// out at 81.8–88.7 % and the text box's at 97.4 % — a dial is mostly flat
+    /// field and a text box has no emission at all, so neither has a
+    /// grid-resolution texture read to protect and a ceiling here would be a
+    /// number invented without a failure to calibrate it against.
+    ///
+    /// **What this cannot see, stated rather than implied: the vfd.** A
+    /// replicated vfd frame measures exactly what the bloomless lcd control
+    /// does — 52.1 and 46.5 to the digit — so no ceiling that keeps the control
+    /// green can red it, and the revert reds **four** of the eight cases
+    /// (`dot_matrix.{oled,crt}.readoutx2`, `marquee.{oled,crt}.phase7x2`), not
+    /// all eight. That is a gate, not a proof; `dot_matrix.rs`'s
+    /// `the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap` is
+    /// the source read that covers the rest and needs no driver, which is why
+    /// both exist.
+    ///
+    /// Exhaustive, for [`Self::edge_budget`]'s reason, and `match_same_arms` is
+    /// allowed for it too: the two lattice kinds hold the same number and
+    /// arrived at it separately.
+    #[allow(clippy::match_same_arms)]
+    pub(crate) fn flat_block_ceiling(self) -> Option<f64> {
+        match self {
+            Self::DotMatrix => Some(0.60),
+            Self::Marquee => Some(0.60),
+            Self::Gauge | Self::TextBox | Self::Scope => None,
+        }
+    }
+
     /// The word the transcript prints.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -472,12 +554,28 @@ pub(crate) enum Sampling {
 ///   budget — a tick or an arc 50 % wider on the gauge; a dot radius 5 %
 ///   larger (caught on no skin) or a halo 25 % stronger on the dot matrix and
 ///   the marquee. Re-measured against #1186's bilinear halo, since both of
-///   those numbers are statements about the bloom: a radius 10 % larger is now
-///   caught on the **oled** of both kinds (edge mean 19.182 / 19.379 against
-///   16.0, `FAIL(edges)`) where before the halo change it was one case of four;
-///   a halo 25 % stronger is still caught on **none** of the eight, at edge
-///   mean ≤ 13.379 and max ≤ 48 against 16 / 64 — closer to the mean ceiling
-///   than the ≤ 12.245 the grid-resolution halo measured, and still inside it.
+///   those numbers are statements about the bloom: a radius 10 % larger
+///   (`denom` multiplied by 1.21 on the `u_viewport != u_grid` branch only) is
+///   now caught on the **oled** of both kinds (edge mean 19.182 / 19.379
+///   against 16.0, `FAIL(edges)`) where before the halo change it was one case
+///   of four; a halo 25 % stronger is still caught on **none** of the eight, at
+///   edge mean ≤ 13.379 and max ≤ 48 against 16 / 64 — closer to the mean
+///   ceiling than the ≤ 12.245 the grid-resolution halo measured, and still
+///   inside it.
+///
+///   **Both probes are spelled out, because a number nobody can reproduce is
+///   not a measurement** (#1238's review, LOW-1 — the radius probe stated its
+///   mutation and the halo probe did not, which is how two differently-rounded
+///   spellings of "25 % stronger" came to be compared as if they were one
+///   number). The halo probe is `u_bloom_strength` scaled by 5/4 in the
+///   shader's own integer arithmetic, on the continuous branch alone —
+///   `int halo = min(glow * (snapped ? u_bloom_strength : u_bloom_strength * 5
+///   / 4) / 256, 255);` at `dot_matrix.frag`'s bloom composite. Measured with
+///   that exact spelling: `dot_matrix.oled.readoutx2` 13.278,
+///   `marquee.oled.phase7x2` 13.379, worst edge max 48
+///   (`dot_matrix.crt.readoutx2`) — which is where the `≤ 13.379` and `≤ 48`
+///   above come from, both of them marquee-or-worse bounds over all eight
+///   cases rather than one kind's number.
 ///
 ///   **On the text box the hole has a direction, and it is worth knowing
 ///   which.** Measured: a corner arc one logical pixel **wider** on the
@@ -734,6 +832,102 @@ pub(crate) fn box_downsample(gl: &[u8], alloc: (u32, u32), factor: u32) -> (Vec<
     )
 }
 
+/// What fraction of a **native** supersampled readback's `n × n` blocks are
+/// internally constant in RGBA — the self-consistency statistic #1238's review
+/// calibrated, and the only check here that does not look at the oracle.
+///
+/// # Why a statistic on one buffer rather than a comparison of two
+///
+/// A supersampled case renders at `factor × device_scale` native pixels per
+/// reference pixel and the harness box-averages them back down before anything
+/// else is measured ([`box_downsample`]). Every other verdict in this file is
+/// computed *after* that average, against the kit — and for a quantity the kit
+/// itself holds at grid resolution, that comparison has the wrong sign. The
+/// kit's bloom is one value per grid cell; a GL arm that replicates the same
+/// value across the whole cell therefore matches the oracle **more** closely
+/// than one that resolves the halo per fragment, which is why #1186's fix moved
+/// all six bloom-carrying stretched cases *away* from zero on the edge mean. No
+/// oracle-based gate can ask for that fix; this one can, because it never asks
+/// the oracle anything.
+///
+/// What it asks instead is whether the denser render is actually denser. A
+/// quantity replicated out of the kit's grid is constant across each `n × n`
+/// block of the native frame by construction, so the blocks in a frame drawn
+/// that way are flat far more often than in one whose shading varies per
+/// fragment. The separation is large and was measured on both trees — see
+/// [`Kind::flat_block_ceiling`] for the table and the ceiling it sets.
+///
+/// `None` where there is nothing to say: a [`Sampling::OneToOne`] case (whose
+/// native frame *is* the comparison grid, so a flat block means only that the
+/// picture is flat there), a block size of 1, or an allocation that does not
+/// divide by it — the same three refusals [`box_downsample`] makes, for the
+/// same reason. Bottom-up or top-down does not matter: a block is a block
+/// under a row reversal, exactly as `box_downsample`'s own doc says.
+pub(crate) fn flat_block_fraction(
+    gl: &[u8],
+    alloc: (u32, u32),
+    sampling: Sampling,
+    device_scale: u32,
+) -> Option<f64> {
+    let Sampling::Supersampled(factor) = sampling else {
+        return None;
+    };
+    let n = (factor as usize) * (device_scale.max(1) as usize);
+    let (w, h) = (alloc.0 as usize, alloc.1 as usize);
+    if n <= 1 || w % n != 0 || h % n != 0 || gl.len() < w * h * 4 {
+        return None;
+    }
+    let (blocks_x, blocks_y) = (w / n, h / n);
+    if blocks_x == 0 || blocks_y == 0 {
+        return None;
+    }
+    let mut flat = 0_usize;
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let head = ((by * n) * w + bx * n) * 4;
+            let constant = (0..n).all(|dy| {
+                (0..n).all(|dx| {
+                    let i = (((by * n + dy) * w) + bx * n + dx) * 4;
+                    gl[i..i + 4] == gl[head..head + 4]
+                })
+            });
+            flat += usize::from(constant);
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some(flat as f64 / (blocks_x * blocks_y) as f64)
+}
+
+/// Refine a passing verdict with [`flat_block_fraction`] — the rendered gate
+/// for "the halo is read at the fragment's resolution" (#1238's review).
+///
+/// **Only under `TROLLSHELL_PARITY_EXACT=1`**, and only for a kind that states
+/// a ceiling. That is [`Kind::pinned_exact`]'s bargain, for its reason: the
+/// numbers below are calibrated against one driver in one sandbox, so this is a
+/// CI regression detector rather than a claim about what a real driver's
+/// rasteriser must produce. A plain run prints the fraction and asserts
+/// nothing.
+///
+/// Takes `prior` rather than returning a verdict of its own so a failure that
+/// is already diagnosed keeps its name: "the interior moved" and "the edges are
+/// over budget" are better answers than "the frame is blocky", and a frame
+/// nothing was drawn into would otherwise be reported here as perfectly flat —
+/// which is true, and useless.
+pub(crate) fn with_native_flatness(
+    prior: Verdict,
+    kind: Kind,
+    fraction: Option<f64>,
+    exact: bool,
+) -> Verdict {
+    if !prior.is_pass() || !exact {
+        return prior;
+    }
+    match (fraction, kind.flat_block_ceiling()) {
+        (Some(measured), Some(ceiling)) if measured > ceiling => Verdict::GridReplicated,
+        _ => prior,
+    }
+}
+
 impl Verdict {
     /// The word the transcript prints.
     pub(crate) fn label(self) -> &'static str {
@@ -746,6 +940,7 @@ impl Verdict {
             Self::NotBitExact => "FAIL(exact)",
             Self::InteriorMoved => "FAIL(interior)",
             Self::EdgeOverBudget => "FAIL(edges)",
+            Self::GridReplicated => "FAIL(flat)",
         }
     }
 
@@ -1158,7 +1353,7 @@ mod tests {
     use super::{
         CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Flatness, Kind, Layout, RegionStats,
         Regions, Sampling, Stats, Verdict, box_downsample, case_verdict, compare, distribution,
-        peak_row_tolerance, regions,
+        flat_block_fraction, peak_row_tolerance, regions, with_native_flatness,
     };
 
     /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
@@ -1346,11 +1541,20 @@ mod tests {
     /// (#1150 review, HIGH-2).
     ///
     /// The sibling above states the supersampled standard on the gauge, where
-    /// #1148's review set it. This one repeats it for #1144's kind against
-    /// #1144's numbers — worst measured on llvmpipe, edge mean 10.641 (oled)
-    /// and edge max 39 (crt) — and then shows the two budgets are not the same
-    /// number by handing one edge region to both kinds and getting two
+    /// #1148's review set it. This one repeats it for #1144's kind against the
+    /// numbers that **ship** — worst measured on llvmpipe, edge mean 11.626
+    /// (oled) and edge max 40 (crt) — and then shows the two budgets are not
+    /// the same number by handing one edge region to both kinds and getting two
     /// verdicts.
+    ///
+    /// The pair moved in #1186 (10.641 / 39 → 11.626 / 40) and this test moved
+    /// with it, because it is the **machine-checked half** of "the budget
+    /// clears the measurement" — the half that survives a reader who skips
+    /// [`Kind::edge_budget`]'s comment (#1238's review, MEDIUM-1). Both the old
+    /// numbers and the new ones clear 16.0, so nothing went red when they
+    /// drifted apart; what the drift cost is the property this test exists for.
+    /// A future tightening of `mean` toward the measurement has to red here
+    /// too, and at the old literal it would not have.
     ///
     /// **Falsified** by collapsing [`Kind::edge_budget`]'s arms onto one pair
     /// (the last assertion goes red), or by widening the dot matrix's `max`
@@ -1366,8 +1570,8 @@ mod tests {
             ..inside_by(0.0)
         };
         let mut dots = clean_regions();
-        dots.edge.mean = 10.641;
-        dots.edge.max = 39;
+        dots.edge.mean = 11.626;
+        dots.edge.max = 40;
         assert_eq!(
             case_verdict(
                 &edgy,
@@ -1411,10 +1615,13 @@ mod tests {
     /// the text box's is a different *shape* of number rather than a different
     /// value of the same one.
     ///
-    /// The marquee's worst llvmpipe measurement (edge mean 10.781 on the oled,
-    /// edge max 40 on the crt) lands inside the dot matrix's pair, which is
-    /// what one shader over one falloff should do — so this asserts it rather
-    /// than assuming it. The text box's (edge mean 14.016, edge max 180, both
+    /// The marquee's worst llvmpipe measurement — edge mean 11.747 on the oled,
+    /// edge max 40 on the crt, the numbers that **ship** after #1186 re-measured
+    /// them (10.781 / 40 before it; #1238's review, MEDIUM-1, for why this test
+    /// moves with them rather than keeping the superseded pair) — lands inside
+    /// the dot matrix's pair, which is what one shader over one falloff should
+    /// do, so this asserts it rather than assuming it. The text box's (edge
+    /// mean 14.016, edge max 180, both
     /// on the lcd) does **not**: its edges are not anti-aliased by the kit at
     /// all, so each legitimate disagreement is the full field-to-transparent
     /// contrast and the numbers are a count in disguise. Under the two lattice
@@ -1435,7 +1642,7 @@ mod tests {
             ..inside_by(0.0)
         };
         let mut ticker = clean_regions();
-        ticker.edge.mean = 10.781;
+        ticker.edge.mean = 11.747;
         ticker.edge.max = 40;
         assert_eq!(
             case_verdict(
@@ -1496,6 +1703,256 @@ mod tests {
         // `interior_max` instead. Neither is asserted here, because neither is
         // a property of this function — they are properties of the shader, and
         // the honest place for them is the doc a reader reaches first.
+    }
+
+    /// Build a native RGBA8 frame from a per-pixel function — the input
+    /// [`flat_block_fraction`] reads, in the layout a readback has.
+    fn native_frame(w: usize, h: usize, pixel: impl Fn(usize, usize) -> [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                out.extend_from_slice(&pixel(x, y));
+            }
+        }
+        out
+    }
+
+    /// **The flat-block statistic counts what it says it counts** — `n × n`
+    /// blocks that are internally constant across all four channels, with `n`
+    /// the supersample factor times the device scale (#1238's review).
+    ///
+    /// The second case is the shape the whole gate is about: a value that steps
+    /// once per *block* is a quantity replicated out of the kit's grid, and it
+    /// measures 100 % flat however dense the render is. The fourth is why the
+    /// comparison is over RGBA rather than RGB — a halo that moved only the
+    /// alpha would otherwise read as perfectly flat.
+    ///
+    /// **Falsified** by comparing three channels instead of four (the alpha
+    /// case returns 1.0), by dropping the `device_scale` term (the fifth case
+    /// returns 1.0), or by counting partial blocks at the edge.
+    #[test]
+    fn the_flat_block_statistic_counts_constant_blocks() {
+        let two = Sampling::Supersampled(2);
+        assert_eq!(
+            flat_block_fraction(&native_frame(4, 4, |_, _| [9, 9, 9, 255]), (4, 4), two, 1),
+            Some(1.0),
+            "one flat colour is entirely flat blocks",
+        );
+        let per_block = native_frame(8, 8, |x, y| [byte(x / 2), byte(y / 2), 0, 255]);
+        assert_eq!(
+            flat_block_fraction(&per_block, (8, 8), two, 1),
+            Some(1.0),
+            "a value that steps once per block is constant inside every block — \
+             which is exactly what a grid-resolution quantity looks like in a \
+             frame rendered at twice the grid's density",
+        );
+        assert_eq!(
+            flat_block_fraction(&native_frame(8, 8, |x, _| [byte(x), 0, 0, 255]), (8, 8), two, 1),
+            Some(0.0),
+            "…and a value that steps once per native pixel is flat nowhere",
+        );
+        assert_eq!(
+            flat_block_fraction(
+                &native_frame(4, 4, |x, _| [9, 9, 9, if x % 2 == 0 { 255 } else { 254 }]),
+                (4, 4),
+                two,
+                1,
+            ),
+            Some(0.0),
+            "the comparison is RGBA: a block that agrees on colour and not on \
+             alpha is not constant",
+        );
+        assert_eq!(
+            flat_block_fraction(&per_block, (8, 8), two, 2),
+            Some(0.0),
+            "**the device scale is part of the block**: at scale 2 the block is \
+             4×4 native pixels, and a value stepping every 2 varies inside it",
+        );
+        assert_eq!(
+            flat_block_fraction(
+                &native_frame(4, 4, |x, _| [byte(x / 2), 0, 0, 255]),
+                (4, 4),
+                two,
+                1,
+            ),
+            Some(1.0),
+            "…and at scale 1 that same step is one block wide",
+        );
+    }
+
+    /// A loop counter as a channel byte, for the frames above.
+    fn byte(v: usize) -> u8 {
+        u8::try_from(v).unwrap_or(u8::MAX)
+    }
+
+    /// **Nothing to say, rather than a number that means something else**: the
+    /// three refusals [`flat_block_fraction`] makes, for
+    /// [`box_downsample`]'s reasons (#1238's review).
+    ///
+    /// A 1:1 case is the one that matters. Its native frame *is* the comparison
+    /// grid, so "this block is flat" there says only that the picture is flat —
+    /// a dot matrix's black margin would fail a ceiling calibrated on a
+    /// supersampled frame, and the gate would be measuring the widget rather
+    /// than the shader.
+    ///
+    /// **Falsified** by answering `Some` for [`Sampling::OneToOne`], or by
+    /// letting an allocation that does not divide by the block size through to
+    /// the loop.
+    #[test]
+    fn the_flat_block_statistic_refuses_what_it_cannot_answer() {
+        let frame = native_frame(4, 4, |_, _| [9, 9, 9, 255]);
+        assert_eq!(
+            flat_block_fraction(&frame, (4, 4), Sampling::OneToOne, 1),
+            None,
+            "a 1:1 case has no denser render to be self-consistent about",
+        );
+        assert_eq!(
+            flat_block_fraction(&frame, (4, 4), Sampling::Supersampled(1), 1),
+            None,
+            "a factor of 1 is a block of one pixel, which is constant by \
+             definition",
+        );
+        let two = Sampling::Supersampled(2);
+        assert_eq!(
+            flat_block_fraction(&native_frame(5, 4, |_, _| [9, 9, 9, 255]), (5, 4), two, 1),
+            None,
+            "an allocation that does not divide by the block is refused rather \
+             than silently cropped — `box_downsample`'s rule, and the same \
+             reason",
+        );
+        assert_eq!(
+            flat_block_fraction(&frame[..8], (4, 4), two, 1),
+            None,
+            "…and so is a buffer too short for the allocation it claims",
+        );
+    }
+
+    /// **The two lattice kinds bound their native frame's flatness, and the
+    /// ceiling separates a replicated halo from a bilinear one** (#1238's
+    /// review, MEDIUM-3).
+    ///
+    /// The numbers are llvmpipe's, measured on both trees — the head with
+    /// #1186's bilinear tap and the same tree with it reverted to
+    /// `texelFetch(u_tex1, ivec2(col, row))`. Every shipping frame is well
+    /// under the ceiling and the reverted crt/oled frames are well over it, and
+    /// the assertions below are exactly those four numbers rather than a
+    /// paraphrase of them.
+    ///
+    /// **Falsified** by raising either kind's ceiling past the reverted
+    /// measurement, by lowering it under the shipping one, or by deleting the
+    /// `exact` gate (the sibling below).
+    #[test]
+    fn the_lattice_kinds_bound_their_native_frames_flatness() {
+        for (kind, shipping, reverted) in [
+            // `dot_matrix.lcd.readoutx2` (the worst shipping frame — its bloom
+            // radius is 0, so the tap changed nothing) and
+            // `dot_matrix.oled.readoutx2` reverted.
+            (Kind::DotMatrix, 0.521, 0.797),
+            // `marquee.lcd.phase7x2` and `marquee.oled.phase7x2` reverted.
+            (Kind::Marquee, 0.465, 0.774),
+        ] {
+            assert_eq!(
+                with_native_flatness(Verdict::Pass, kind, Some(shipping), true),
+                Verdict::Pass,
+                "{}: the frame that ships is inside the ceiling",
+                kind.label(),
+            );
+            assert_eq!(
+                with_native_flatness(Verdict::Pass, kind, Some(reverted), true),
+                Verdict::GridReplicated,
+                "{}: a halo replicated out of the kit's grid is not",
+                kind.label(),
+            );
+        }
+        // The two kinds that state no ceiling, at their own measured
+        // flatness — a dial and a text box are legitimately mostly flat, which
+        // is why neither has one and why the gauge's own number would red the
+        // lattice kinds' ceiling.
+        for (kind, measured) in [(Kind::Gauge, 0.887), (Kind::TextBox, 0.974)] {
+            assert_eq!(
+                with_native_flatness(Verdict::Pass, kind, Some(measured), true),
+                Verdict::Pass,
+                "{}: a kind with no ceiling is not held to another kind's",
+                kind.label(),
+            );
+        }
+    }
+
+    /// **The flatness gate is the exact pin's, not the ceiling's** (#1238's
+    /// review), and it never renames a failure that is already diagnosed.
+    ///
+    /// Calibrated against one driver in one sandbox, so it asserts where
+    /// `TROLLSHELL_PARITY_EXACT=1` does — `nix/checks/system-tests.nix` and
+    /// nowhere else — for the reason [`Kind::pinned_exact`] gives. Elsewhere
+    /// the harness prints the fraction and judges nothing by it.
+    ///
+    /// **Falsified** by dropping either guard in [`with_native_flatness`].
+    #[test]
+    fn only_the_exact_pin_asserts_the_native_flatness() {
+        assert_eq!(
+            with_native_flatness(Verdict::Pass, Kind::DotMatrix, Some(0.797), false),
+            Verdict::Pass,
+            "without the env, the same frame is printed and not judged",
+        );
+        assert_eq!(
+            with_native_flatness(Verdict::Pass, Kind::DotMatrix, None, true),
+            Verdict::Pass,
+            "a case with no fraction to report — every 1:1 one — is untouched",
+        );
+        for prior in [
+            Verdict::RendersNothing,
+            Verdict::UndrawnFramebuffer,
+            Verdict::InteriorMoved,
+            Verdict::EdgeOverBudget,
+        ] {
+            assert_eq!(
+                with_native_flatness(prior, Kind::DotMatrix, Some(1.0), true),
+                prior,
+                "an all-flat frame is the *symptom* of {}, not a second finding",
+                prior.label(),
+            );
+        }
+    }
+
+    /// **Every kind states whether its native frame has a flatness ceiling, and
+    /// the compiler makes a new one state it too** (#1238's review, on
+    /// `every_kind_states_its_pin_and_its_beam_check`'s pattern).
+    ///
+    /// The hand-written `match` here is the cross-check: [`Kind::ALL`] cannot
+    /// loop over a variant it does not carry, and this cannot compile against a
+    /// variant it does not name, so a sixth kind arrives with someone having
+    /// decided — on its own frames — whether "this render is denser than the
+    /// kit's grid" is a thing worth asserting about it.
+    ///
+    /// **Falsified** by flipping an arm, or by adding a variant to [`Kind`].
+    #[test]
+    fn every_kind_states_whether_its_native_frame_has_a_flatness_ceiling() {
+        for kind in Kind::ALL {
+            let ceiling = match kind {
+                // The two the gate was calibrated on, and the two whose shader
+                // reads a grid-resolution texture at all.
+                Kind::DotMatrix | Kind::Marquee => Some(0.60),
+                // A dial's face is mostly flat field and its own frames measure
+                // 81.8–88.7 % — there is no calibration here, and a ceiling
+                // invented without one is a flake.
+                Kind::Gauge => None,
+                // 97.4 %: a text box has no emission at all, so nothing in it
+                // is read from a texture and its frame is flat almost
+                // everywhere by construction.
+                Kind::TextBox => None,
+                // No supersampled scope case exists to measure — its GL grid
+                // *is* the kit's upscaled buffer, so there is nothing to render
+                // denser. `flat_block_fraction` answers `None` for every case
+                // it has.
+                Kind::Scope => None,
+            };
+            assert_eq!(
+                kind.flat_block_ceiling(),
+                ceiling,
+                "{}: the native-frame flatness ceiling",
+                kind.label(),
+            );
+        }
     }
 
     /// The `TROLLSHELL_PARITY_EXACT=1` pin binds the **dot matrix** too

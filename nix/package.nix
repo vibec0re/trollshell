@@ -340,23 +340,136 @@ let
     }
   );
 
+  # The two nixosTest probe *examples* — `hytte-ecal`'s `probe` and
+  # `hytte-services`' `wifi_probe` (nix/probe.nix, nix/wifi-probe.nix) —
+  # compiled in the CHECKS universe, not the package one (#1257).
+  #
+  # They're `--example` targets, and selecting an example target unifies
+  # that package's own dev-dependencies into the build graph (resolver v3).
+  # Between #588 and #1257 this rode `workspace`'s own `postInstall`, on
+  # `cargoArtifactsBinOnly` — the cache `workspace` (below) exists
+  # specifically to hold NO dev-dependency artifacts. So the postInstall's
+  # two builds compiled hytte-ecal's and hytte-services' dev-dep closures
+  # from scratch, and re-unified hytte-services' features, on every single
+  # `nix build` that slices `workspace` — the shell, the control center,
+  # every plugin, hytte-infobroker, hytte-claude-bridge. That reintroduced
+  # exactly the shape #572/#587/#588 removed (a package build paying for
+  # what only checks consume): #1120 turned `workspace`'s `doCheck` off
+  # (#1115) and replaced the free ride `cargo test`'s default target
+  # selection used to give the examples with these two explicit builds, in
+  # the same derivation, on the wrong cache.
+  #
+  # `cargoArtifacts` (NOT `cargoArtifactsBinOnly`) is the fix: it's the SAME
+  # dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
+  # share (`buildDepsOnly commonArgs`, above), and no package build ever
+  # reaches this derivation — that part is the actual win, confirmed by
+  # `checks.workspace-ships-no-probes`. It is NOT "zero extra compilation":
+  # measured (`nix build .#trollshell.passthru.probes --rebuild -L`,
+  # 2026-09-13), `probes` still runs **101 `Compiling` lines in ~3m14s**,
+  # against roughly the same cost the old `postInstall` paid on the wrong
+  # cache (~106 lines / ~3m04s) — barely a five-crate saving, because `-p
+  # hytte-ecal --example probe` / `-p hytte-services --example wifi_probe`
+  # fingerprint a different feature union than the `--workspace --locked`
+  # scope `cargoArtifacts` was built under (the exact `commonArgs` warning
+  # above, applied to this derivation: a `-p <crate>` stage and a
+  # `--workspace` stage disagree about shared deps and cannot fully reuse
+  # each other's target dir). The cost does not disappear; it moves out of
+  # every package build and into this one checks-universe derivation, paid
+  # once per Cargo.lock/source change rather than once per consumer.
+  # Scoped one crate at a time (`-p hytte-ecal --example probe`, then `-p
+  # hytte-services --example wifi_probe`) rather than `--workspace
+  # --examples`, for the same reason the old postInstall was: avoid pulling
+  # every OTHER workspace member's dev-deps into the union. UNMEASURED
+  # follow-up hypothesis (review, 2026-09-13): `buildDepsOnly`'s own
+  # `--all-targets` already unions every member's dev-deps into
+  # `cargoArtifacts`, so the narrower `-p` scope here may be paying a
+  # fingerprint mismatch for no matching benefit, and `--workspace
+  # --examples` — the actual union the cache was built for — could turn out
+  # cheaper. Not tried here; measure before switching.
+  #
+  # `doNotPostBuildInstallCargoBinaries = true`: `buildPackage`'s default
+  # `buildPhaseCargoCommand` captures a JSON build log into `$cargoBuildLog`
+  # and its `postBuild` hook (`installFromCargoBuildLogHook`) auto-installs
+  # from it; this derivation overrides `buildPhaseCargoCommand` with plain
+  # `cargo build` calls that never set `$cargoBuildLog`, so without this flag
+  # that `postBuild` hook fails the whole derivation looking for a log that
+  # was never produced. `installPhaseCommand` below does the install
+  # directly instead — the same `find … -print -quit` + `install -Dm755`
+  # idiom the old `workspace` postInstall used, moved here verbatim so the
+  # two binaries' provenance is unchanged. (`-print -quit` rather than `…
+  # | head -1`: stdenv's setup.sh runs under `set -eu -o pipefail`, so a
+  # `find | head` pipeline can abort the build on SIGPIPE once `head` closes
+  # the pipe; `-quit` stops the traversal at the first hit instead, with no
+  # pipe and no race.)
+  #
+  # `doInstallCargoArtifacts = false` (crane's own `buildPackage` default,
+  # stated explicitly): nothing chains off this derivation's target dir as a
+  # `cargoArtifacts` input, so packing it would burn build time and disk for
+  # no consumer — same reasoning as `checks.clippy`/`checks.system-tests`
+  # (flake.nix).
+  #
+  # `dontWrapGApps = true`, same as `workspace`: `nix/probe.nix` and
+  # `nix/wifi-probe.nix` do the GApps wrap themselves, over
+  # `workspace.passthru.devInputs.buildInputs` (plain `buildInputs`, not the
+  # `webInputs` this compile uses) — unchanged by this move, since both
+  # files already took `workspace` only for that `passthru` and now take
+  # `probes` too, for the binary.
+  #
+  # Falsify the pin (`checks.workspace-ships-no-probes`) by moving a build
+  # line back into `workspace`'s own derivation — see that check for how.
+  probes = craneLib.buildPackage (
+    commonArgs
+    // {
+      pname = "trollshell-probes";
+      cargoArtifacts = cargoArtifacts;
+      doCheck = false;
+      dontWrapGApps = true;
+      doNotPostBuildInstallCargoBinaries = true;
+      doInstallCargoArtifacts = false;
+
+      buildPhaseCargoCommand = ''
+        cargoWithProfile build --locked -p hytte-ecal --example probe
+        cargoWithProfile build --locked -p hytte-services --example wifi_probe
+      '';
+
+      installPhaseCommand = ''
+        for example in probe wifi_probe; do
+          exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name "$example" -path '*/examples/*' -print -quit)"
+          if [ -z "$exampleBin" ]; then
+            echo "ERROR: example binary '$example' was not built." >&2
+            exit 1
+          fi
+          install -Dm755 "$exampleBin" "$out/bin/$example"
+        done
+      '';
+
+      meta = {
+        description = "trollshell nixosTest probe examples — hytte-ecal's probe, hytte-services' wifi_probe (#1257)";
+        homepage = "https://github.com/vibec0re/trollshell/";
+        license = lib.licenses.mpl20;
+        platforms = lib.platforms.linux;
+      };
+    }
+  );
+
   # THE workspace compile — the single cargo invocation that produces every
   # binary this flake ships (#572, implementing kaesaecracker's plan).
   #
   # Everything downstream (the shell, the control center, the bundled widget
   # plugins — the count drifts, so trust `ls crates/hytte-plugin-*` over any
-  # number written here — the hytte-infobroker CLI, and since #588 the two
-  # nixosTest probe *examples*) is a *slice* of this one output: a `cp` of
-  # one binary out of `$out/bin`, optionally wrapped. There is no second
-  # crane invocation anywhere in the tree that compiles the default feature
-  # set, so there is no second cargo fingerprint universe that can drift out
-  # of sync with this one. The
-  # only other crane calls are `checks.{clippy,system-tests}`, which compile
-  # `--features system-tests` — a genuinely different feature union that by
-  # construction cannot be a slice of this build — and, since #1115,
-  # `checks.workspace-tests`, which reuses this derivation's own `commonArgs`
-  # (same feature union as this build) and the `cargoArtifacts` cache above
-  # (NOT the `cargoArtifactsBinOnly` this compile uses — see both for why).
+  # number written here — and the hytte-infobroker CLI) is a *slice* of this
+  # one output: a `cp` of one binary out of `$out/bin`, optionally wrapped.
+  # There is no second crane invocation anywhere in the tree that compiles
+  # the default feature set FOR A PACKAGE — the one carve-out is `probes`
+  # (above), a checks-universe compile of the two nixosTest probe examples on
+  # `cargoArtifacts` rather than `cargoArtifactsBinOnly`, so no package build
+  # ever reaches it (#1257). The only other crane calls are
+  # `checks.{clippy,system-tests}`, which compile `--features system-tests` —
+  # a genuinely different feature union that by construction cannot be a
+  # slice of this build — and, since #1115, `checks.workspace-tests`, which
+  # reuses this derivation's own `commonArgs` (same feature union as this
+  # build) and the `cargoArtifacts` cache above (NOT the
+  # `cargoArtifactsBinOnly` this compile uses — see both for why).
   #
   # History: #530 introduced an intermediate `cargoBuild` whose packed `target`
   # dir was inherited as `cargoArtifacts` by a `buildPackage` per binary, on the
@@ -396,52 +509,6 @@ let
       pname = "trollshell-workspace";
       dontWrapGApps = true;
 
-      # The two nixosTest probes — `hytte-ecal`'s `probe` and `hytte-services`'
-      # `wifi_probe` (nix/probe.nix, nix/wifi-probe.nix) — are `--example`
-      # targets, and cargo's default `build` target selection is lib + bins, so
-      # crane's installFromCargoBuildLog never sees them: they aren't in the
-      # build phase's JSON log.
-      #
-      # Before #1115 this rode `doCheck = true` for free: `cargo test`'s
-      # documented default target selection builds every example "to ensure
-      # they compile", so the check phase's `cargo test --workspace --locked`
-      # produced both binaries as a side effect of a dev-dependency compile
-      # that was already happening for the hermetic suite. `doCheck` is now
-      # `false` on this derivation (#1115) — there is no check phase here any
-      # more for that side effect to ride — so build the two examples
-      # explicitly instead.
-      #
-      # Scoped one crate at a time (`-p hytte-ecal --example probe`, then
-      # `-p hytte-services --example wifi_probe`) rather than `--workspace
-      # --examples`: selecting an example target unifies that *package's own*
-      # dev-dependencies into the build graph (resolver v3), and scoping
-      # avoids pulling every OTHER workspace member's dev-deps in too —
-      # cheaper than the `cargo test --workspace` compile this replaces, and
-      # this derivation sits on `cargoArtifactsBinOnly` (above), which has no
-      # cached "dev-deps of every member" artifact for a wider `--workspace
-      # --examples` build to matter less by matching anyway.
-      # `cargoWithProfile` (crane's helper, sourced by `cargoHelperFunctionsHook`
-      # into every phase of this derivation, not just build/check) keeps the
-      # profile the same `--release` the rest of this derivation uses.
-      #
-      # `-print -quit` rather than the usual `… | head -1`: stdenv's setup.sh
-      # runs the build script under `set -eu -o pipefail`, so a `find | head`
-      # pipeline can abort the whole build on SIGPIPE once `head` closes the
-      # pipe. `-quit` stops the traversal at the first hit instead, with no pipe
-      # and no race — and it doesn't walk the rest of a multi-GiB target dir.
-      postInstall = ''
-        cargoWithProfile build --locked -p hytte-ecal --example probe
-        cargoWithProfile build --locked -p hytte-services --example wifi_probe
-        for example in probe wifi_probe; do
-          exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name "$example" -path '*/examples/*' -print -quit)"
-          if [ -z "$exampleBin" ]; then
-            echo "ERROR: example binary '$example' was not built." >&2
-            exit 1
-          fi
-          install -Dm755 "$exampleBin" "$out/bin/$example"
-        done
-      '';
-
       # The icon-theme test env (`every_icon_name_exists_in_the_adwaita_theme_on_the_search_path`,
       # crates/hytte-plugin-niri-layouts/src/plugin.rs) used to live here as a
       # `preCheck` (#1038 review MED-4) because `doCheck = true` ran the
@@ -451,7 +518,12 @@ let
       # runs that suite now.
 
       passthru = {
-        inherit cargoArtifacts cargoArtifactsBinOnly commonArgs;
+        inherit
+          cargoArtifacts
+          cargoArtifactsBinOnly
+          commonArgs
+          probes
+          ;
         # `buildInputs` is what a **wrapper** should see; `webInputs` adds
         # WebKitGTK and is for the compile, the devShell and the one slice that
         # ships a web engine. See `webInputs`' comment above — handing the
@@ -525,14 +597,18 @@ stdenv.mkDerivation {
     )
   '';
 
-  # `workspace` is what nix/plugin.nix, nix/control-center.nix and (since #588)
-  # nix/{probe,wifi-probe}.nix slice their own binaries out of; `commonArgs` +
-  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests /
-  # since #1115 workspace-tests) reuse instead of `workspace` itself — clippy
-  # and system-tests because they compile a different feature set (`--features
-  # system-tests`) and so cannot be a slice of `workspace`, workspace-tests
-  # because `workspace` sits on `cargoArtifactsBinOnly` (no dev-dependency
-  # graph) rather than `cargoArtifacts` (which has one).
+  # `workspace` is what nix/plugin.nix and nix/control-center.nix slice their
+  # own binaries out of. `nix/probe.nix` and `nix/wifi-probe.nix` are the
+  # odd ones since #1257: they still take `workspace`, but only for
+  # `passthru.devInputs.buildInputs` (the GApps wrap env) — the binaries
+  # themselves now come from `probes` (above), not `${workspace}/bin`.
+  # `commonArgs` + `cargoArtifacts` are what the leaf flake checks (clippy /
+  # system-tests / since #1115 workspace-tests) reuse instead of `workspace`
+  # itself — clippy and system-tests because they compile a different
+  # feature set (`--features system-tests`) and so cannot be a slice of
+  # `workspace`, workspace-tests because `workspace` sits on
+  # `cargoArtifactsBinOnly` (no dev-dependency graph) rather than
+  # `cargoArtifacts` (which has one).
   passthru = workspace.passthru // {
     inherit workspace assets;
   };

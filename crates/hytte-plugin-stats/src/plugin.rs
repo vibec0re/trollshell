@@ -433,7 +433,11 @@ mod tests {
 
         // The temperature it *did* read is a real reading and does move the
         // card, so this is not "the update was dropped".
-        assert_ne!(model.view(), seed, "the temperature it did read still lands");
+        assert_ne!(
+            model.view(),
+            seed,
+            "the temperature it did read still lands"
+        );
 
         // …and the first real sample is the ring's first point.
         let _ = model.update(sample(0.5));

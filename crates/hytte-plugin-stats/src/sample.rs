@@ -538,7 +538,13 @@ mod tests {
 
         // The *second* tick has a delta, and it is a real one: core 1 spent the
         // whole window busy and core 2 none of it.
-        let second = [(700, 2_000), (350, 1_250), (100, 250), (100, 250), (100, 250)];
+        let second = [
+            (700, 2_000),
+            (350, 1_250),
+            (100, 250),
+            (100, 250),
+            (100, 250),
+        ];
         let (cpu2, per_core2) = cpu_half(&first, &second);
         assert!(cpu2.is_some(), "the second tick reports");
         assert_eq!(per_core2.len(), 4);
@@ -648,8 +654,7 @@ mod tests {
         let Msg::Sampled(snapshot) = first;
         assert_eq!(snapshot.per_core.len(), 2);
         assert!(
-            (snapshot.per_core[0] - 0.25).abs() < 1e-6
-                && (snapshot.per_core[1] - 0.5).abs() < 1e-6,
+            (snapshot.per_core[0] - 0.25).abs() < 1e-6 && (snapshot.per_core[1] - 0.5).abs() < 1e-6,
             "…carrying what the sampler produced, not a default: {:?}",
             snapshot.per_core,
         );

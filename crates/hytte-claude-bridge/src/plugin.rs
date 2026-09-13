@@ -254,7 +254,7 @@ impl Plugin for BridgeChip {
     fn view(&self) -> View {
         let now = usage::now_unix();
         let report = self.usage.as_ref();
-        View::new(chip(&self.status, report, now)).panel(panel(report, now))
+        View::new(chip(&self.status, report, now)).panel(panel(&self.status, report, now))
     }
 }
 
@@ -712,22 +712,35 @@ fn extra_row(extra: &ExtraUsage) -> Node {
 /// showing an empty page: nothing polled yet, the poll failed (the sentence,
 /// which is the only actionable thing there is), or the account genuinely
 /// reported no limits.
-fn panel(report: Option<&Report>, now: i64) -> Node {
+///
+/// The failure sentence is routed through [`usage_failure_sentence`] — the
+/// same mode adjustment the chip's [`tooltip`] applies — rather than reading
+/// [`UsageError::sentence`] directly, so the panel one click beneath the chip
+/// can never contradict it (#1254's review, N2: an API-key bridge's hover said
+/// "usage limits are a subscription feature" while the panel still told the
+/// same reader to `run claude once to sign in`).
+fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
     let mut children = vec![header(report, now)];
-    match report.map(|report| &report.outcome) {
+    match report {
         None => children.push(label("fetching usage…", &["dim-label"])),
-        Some(Outcome::Failed(error)) => children.push(label(&error.sentence(), &["warning"])),
-        Some(Outcome::Ok(usage)) => {
-            if usage.limits.is_empty() {
-                children.push(label("this account reported no limits", &["dim-label"]));
+        Some(report) => match &report.outcome {
+            Outcome::Failed(_) => {
+                let sentence = usage_failure_sentence(status, report)
+                    .unwrap_or_else(|| report.error().unwrap_or_default());
+                children.push(label(&sentence, &["warning"]));
             }
-            for (index, limit) in usage.limits.iter().enumerate() {
-                children.push(limit_row(index, limit, now));
+            Outcome::Ok(usage) => {
+                if usage.limits.is_empty() {
+                    children.push(label("this account reported no limits", &["dim-label"]));
+                }
+                for (index, limit) in usage.limits.iter().enumerate() {
+                    children.push(limit_row(index, limit, now));
+                }
+                if let Some(extra) = usage.extra_usage.as_ref().filter(|extra| extra.is_enabled) {
+                    children.push(extra_row(extra));
+                }
             }
-            if let Some(extra) = usage.extra_usage.as_ref().filter(|extra| extra.is_enabled) {
-                children.push(extra_row(extra));
-            }
-        }
+        },
     }
     Node::Box {
         id: Some(PANEL_ROOT_ID.to_owned()),
@@ -761,7 +774,7 @@ mod tests {
     use super::{
         BridgeChip, CHIP_BTN, CLAUDE_ICON, MAX_CHIP_METERS, PANEL_ROOT_ID, Tick, capped, chip,
         chip_limits, counts_label, health_icon, meter_tooltip, mode_label, mode_name, panel,
-        severity_class, severity_role, tooltip,
+        severity_class, severity_role, tooltip, usage_failure_sentence,
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
@@ -788,6 +801,13 @@ mod tests {
             errors,
             last,
         }
+    }
+
+    /// A `Status` for panel tests that do not care which mode is answering —
+    /// only [`usage_failure_sentence`]'s one special case (`NoCredentials` in
+    /// `Mode::Api`) does, and those tests build their own.
+    fn default_status() -> Status {
+        status(Mode::Subscription, false, 0, 0, Last::None)
     }
 
     /// One limit row, spelled the way the endpoint spells them.
@@ -832,6 +852,26 @@ mod tests {
                 ],
                 extra_usage: Some(ExtraUsage::default()),
             }),
+        }
+    }
+
+    /// The captured response, anchored to the **real** clock instead of this
+    /// module's fixed narrative `now()`.
+    ///
+    /// Every other fixture in this module is read through [`chip`]/[`panel`]
+    /// with a `now` handed in explicitly, so the fixed narrative time is fine
+    /// — but [`BridgeChip::view`] reads [`usage::now_unix`] itself, and cannot
+    /// be handed a different clock. A report anchored to the narrative `now()`
+    /// read through `view()` therefore ages by however long it has been since
+    /// that timestamp was written, and eventually crosses `usage::STALE_AFTER`
+    /// for real — #1254's review (N1) found exactly that latent shape in
+    /// `the_view_always_carries_a_panel`, one test over from where it had
+    /// already been fixed here. Use this wherever a fixture report is rendered
+    /// through `view()`.
+    fn fresh_report() -> Report {
+        Report {
+            at: usage::now_unix(),
+            ..captured_report()
         }
     }
 
@@ -964,9 +1004,18 @@ mod tests {
     /// The view now carries a panel — the #1236 change to #866's deliberate
     /// panel-less chip — in every state, including before the first poll, so a
     /// click always opens something that explains itself.
+    ///
+    /// Uses [`fresh_report`], not `captured_report()`: `.view()` reads the
+    /// *real* clock (`usage::now_unix()`), so a report anchored to this
+    /// module's fixed narrative `now()` renders through the staleness path
+    /// once real time has drifted past `usage::STALE_AFTER` from that
+    /// timestamp — which it already has. The last assertion is
+    /// staleness-SENSITIVE (it reads through the very path a stale report
+    /// would suppress), so the injection is load-bearing: falsify by putting
+    /// `captured_report()` back in the `Some(…)` arm and this goes red.
     #[test]
     fn the_view_always_carries_a_panel() {
-        for usage in [None, Some(captured_report())] {
+        for usage in [None, Some(fresh_report())] {
             let model = BridgeChip {
                 status: status(Mode::Subscription, false, 0, 0, Last::None),
                 usage,
@@ -976,6 +1025,18 @@ mod tests {
             assert!(view.panel.is_some());
             assert!(view.hidden_on.is_empty(), "one chip, every monitor");
         }
+
+        let model = BridgeChip {
+            status: status(Mode::Subscription, false, 1, 0, Last::Ok),
+            usage: Some(fresh_report()),
+            usage_version: 0,
+        };
+        let hover = root_tooltip(&model.view().tree).expect("a hover");
+        assert!(
+            !hover.contains("usage stale since"),
+            "a freshly-anchored report must not render through the staleness \
+             path: {hover:?}"
+        );
     }
 
     // ── (e) The chip's meters ────────────────────────────────────────────────
@@ -1022,7 +1083,12 @@ mod tests {
                 "{n} active limits ⇒ min(n, {MAX_CHIP_METERS}) meters"
             );
             assert_eq!(
-                bars(&panel(Some(&report), now())).len(),
+                bars(&panel(
+                    &status(Mode::Subscription, false, 1, 0, Last::Ok),
+                    Some(&report),
+                    now()
+                ))
+                .len(),
                 n,
                 "{n} limits ⇒ {n} panel rows"
             );
@@ -1073,10 +1139,8 @@ mod tests {
             at: now() - 120,
             outcome: Outcome::Ok(usage),
         };
-        let meters = preems(&chip_state(
-            &status(Mode::Subscription, false, 4, 0, Last::Ok),
-            Some(&report),
-        ));
+        let board = status(Mode::Subscription, false, 4, 0, Last::Ok);
+        let meters = preems(&chip_state(&board, Some(&report)));
         assert_eq!(meters.len(), 2, "two of the three rows are active");
         let ids: Vec<&str> = meters.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
@@ -1090,10 +1154,10 @@ mod tests {
              cannot collide"
         );
 
-        let rows = bars(&panel(Some(&report), now()));
+        let rows = bars(&panel(&board, Some(&report), now()));
         assert_eq!(rows.len(), 3, "the inactive row is dimmed, not dropped");
         assert!(
-            texts(&panel(Some(&report), now()))
+            texts(&panel(&board, Some(&report), now()))
                 .iter()
                 .any(|t| t.contains("not counting right now")),
             "and it says why it is greyed"
@@ -1294,6 +1358,61 @@ mod tests {
         }
     }
 
+    /// The chip hover's second line and the drawer panel's error sentence say
+    /// the SAME thing for the same `Status`/error — both routed through
+    /// [`usage_failure_sentence`], the one function that knows the mode
+    /// adjustment, rather than the panel reading [`UsageError::sentence`] on
+    /// its own (#1254's review, N2: an API-key bridge's hover said "usage
+    /// limits are a subscription feature" while the panel one click beneath
+    /// it still said "run `claude` once to sign in").
+    ///
+    /// One test per mode so a regression names which mode broke. Only the API
+    /// arm below can actually go red on today's one special case, but the
+    /// other two pin that "agree" does not silently mean "the panel forgot
+    /// the sentence entirely".
+    fn assert_panel_agrees_with_chip_hover(mode: Mode, keyed: bool) {
+        let error = UsageError::NoCredentials("/home/a/.claude/.credentials.json".into());
+        let report = Report {
+            at: now() - 30,
+            outcome: Outcome::Failed(error),
+        };
+        let board = status(mode, keyed, 9, 0, Last::Ok);
+        let expected =
+            usage_failure_sentence(&board, &report).expect("a failed report has a sentence");
+
+        let hover = root_tooltip(&chip_state(&board, Some(&report))).expect("a hover");
+        assert!(
+            hover.ends_with(&expected),
+            "{mode:?} hover does not carry the failure sentence: {hover:?}"
+        );
+
+        let panel_text = texts(&panel(&board, Some(&report), now()));
+        assert!(
+            panel_text.contains(&expected),
+            "{mode:?} panel does not carry the failure sentence: {panel_text:?}"
+        );
+    }
+
+    #[test]
+    fn the_panel_agrees_with_the_chip_hover_in_subscription_mode() {
+        assert_panel_agrees_with_chip_hover(Mode::Subscription, false);
+    }
+
+    #[test]
+    fn the_panel_agrees_with_the_chip_hover_in_reprompt_mode() {
+        assert_panel_agrees_with_chip_hover(Mode::Reprompt, false);
+    }
+
+    /// The mode that actually differs: falsify by reverting `panel`'s
+    /// threading (back to `report.error()`/`error.sentence()` with no
+    /// `&Status`) — this test goes red, since the panel would then render
+    /// `NoCredentials`'s literal "run `claude` once to sign in" instead of the
+    /// subscription-feature note the hover gives in `api` mode.
+    #[test]
+    fn the_panel_agrees_with_the_chip_hover_in_api_mode() {
+        assert_panel_agrees_with_chip_hover(Mode::Api, true);
+    }
+
     /// No error text anywhere in the chip may carry a bearer token. The arms
     /// that could — the two that wrap borrowed text — are scrubbed in
     /// `usage::fetch`; this pins that the chip does not reintroduce one by, say,
@@ -1316,7 +1435,7 @@ mod tests {
     #[test]
     fn the_panel_lists_every_row_with_both_halves_of_its_reset() {
         let report = captured_report();
-        let tree = panel(Some(&report), now());
+        let tree = panel(&default_status(), Some(&report), now());
         let text = texts(&tree);
         assert_eq!(text.first().map(String::as_str), Some("Claude usage"));
         assert!(text.contains(&"updated 2 min ago".to_owned()), "{text:?}");
@@ -1357,7 +1476,8 @@ mod tests {
     /// empty page.
     #[test]
     fn the_panel_explains_itself_when_there_is_no_list() {
-        let text = texts(&panel(None, now()));
+        let board = default_status();
+        let text = texts(&panel(&board, None, now()));
         assert!(text.contains(&"not fetched yet".to_owned()), "{text:?}");
         assert!(text.contains(&"fetching usage…".to_owned()), "{text:?}");
 
@@ -1365,19 +1485,19 @@ mod tests {
             at: now() - 90,
             outcome: Outcome::Failed(UsageError::Unauthorized),
         };
-        let text = texts(&panel(Some(&failed), now()));
+        let text = texts(&panel(&board, Some(&failed), now()));
         assert!(text.contains(&"updated 1 min ago".to_owned()), "{text:?}");
         assert!(
             text.contains(&"usage stale — run `claude` once to refresh the login".to_owned()),
             "{text:?}"
         );
-        assert!(bars(&panel(Some(&failed), now())).is_empty());
+        assert!(bars(&panel(&board, Some(&failed), now())).is_empty());
 
         let empty = Report {
             at: now(),
             outcome: Outcome::Ok(Usage::default()),
         };
-        let text = texts(&panel(Some(&empty), now()));
+        let text = texts(&panel(&board, Some(&empty), now()));
         assert!(
             text.contains(&"this account reported no limits".to_owned()),
             "{text:?}"
@@ -1388,9 +1508,10 @@ mod tests {
     /// the captured response does not, and most accounts do not.
     #[test]
     fn the_extra_usage_row_appears_only_when_it_is_enabled() {
+        let board = default_status();
         let off = captured_report();
         assert!(
-            !texts(&panel(Some(&off), now())).contains(&"Extra usage".to_owned()),
+            !texts(&panel(&board, Some(&off), now())).contains(&"Extra usage".to_owned()),
             "a disabled allowance is not a row"
         );
 
@@ -1407,12 +1528,12 @@ mod tests {
                 }),
             }),
         };
-        let text = texts(&panel(Some(&on), now()));
+        let text = texts(&panel(&board, Some(&on), now()));
         assert!(text.contains(&"Extra usage".to_owned()), "{text:?}");
         assert!(text.contains(&"30%".to_owned()), "{text:?}");
         assert!(text.contains(&"15.00 of 50.00 USD".to_owned()), "{text:?}");
         assert_eq!(
-            bars(&panel(Some(&on), now())),
+            bars(&panel(&board, Some(&on), now())),
             vec![(
                 "claude-bridge-bar-extra".to_owned(),
                 0.30,
@@ -1670,13 +1791,11 @@ mod tests {
         // `chip_state`'s fixed `now()` — so the report has to be fresh against
         // real time, not the fixed narrative time the other tests use, or the
         // #1236 staleness ceiling drops the meters this test is asserting on.
+        // `fresh_report()` is the one place that anchoring lives.
         let view = hytte_plugin::display::testing::with_render_mode(RenderMode::State, || {
             BridgeChip {
                 status: status(Mode::Api, true, 1, 0, Last::Ok),
-                usage: Some(Report {
-                    at: usage::now_unix(),
-                    ..captured_report()
-                }),
+                usage: Some(fresh_report()),
                 usage_version: 1,
             }
             .view()

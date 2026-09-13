@@ -3122,6 +3122,7 @@ dependencies = [
  "hytte-plugin-agents",
  "hytte-reactive",
  "libadwaita",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

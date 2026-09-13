@@ -59,6 +59,13 @@ hytte-config = { path = "../hytte-config" }
 # web engine. `checks.shell-has-no-web-engine` still holds.
 hytte-plugin-agents = { path = "../hytte-plugin-agents" }
 hytte-reactive = { path = "../hytte-reactive" }
+# The Plugins tab's declared-mount override (#1161): `plugins.json` is read
+# straight off disk (the same file `nix/hm-module.nix`/`nix/nixos-module.nix`
+# render), and it's JSON rather than TOML, so this is the one leaf
+# `hytte-config` doesn't already cover. Already resolved workspace-wide
+# (`hytte-plugin-agents` depends on it) — this adds an edge, not a new
+# `Cargo.lock` entry.
+serde_json.workspace = true
 # A oneshot to carry the Ping/Version reply from the tokio runtime back to the
 # GTK main thread. `sync` only — no runtime features (hytte-reactive owns it).
 tokio = { workspace = true, features = ["sync"] }

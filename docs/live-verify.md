@@ -1297,6 +1297,31 @@ opens what it claims.
       the same as with the plugin absent entirely, not the ~30 Hz/monitor a
       still-armed tick callback would cost. Re-show it (drop the `hidden_on`
       call) and confirm the animation resumes on that screen.
+- [ ] **(#1161)** `plugins.<id>.mount` override, end to end (needs #1160's
+      right sidebar on `PATH`; nothing here can be exercised in CI). Pick a
+      bundled plugin whose manifest mounts on the **left** sidebar (e.g.
+      `pet`, `SidebarTop`) and set
+      `programs.trollshell.plugins.pet.mount = "SidebarRightTop";`, then
+      rebuild/switch. The card should move to the **right** sidebar's middle
+      region — not the left one it shipped in — and
+      `cat ~/.config/trollshell/plugins.json` (or `/etc/xdg/…` under the
+      NixOS module) should show `"HYTTE_PLUGIN_MOUNT": "SidebarRightTop"` in
+      that plugin's `env`. Open the control-center's Plugins tab and select
+      it: the connection line should read something like "Connected ·
+      rendering in Sidebar, right (middle)" with **no** "manifest:" note,
+      since the override took. Now unset `mount` (delete the line) and
+      rebuild: the card returns to the **left** sidebar's own region, the
+      `HYTTE_PLUGIN_MOUNT` key disappears from `plugins.json` entirely (not
+      merely blanked), and the control-center note goes back to just the one
+      mount, no override shown. **The disagreement case**, which is what the
+      "· manifest: …" note exists for: point `mount` at a plugin binary old
+      enough to predate `HYTTE_PLUGIN_MOUNT` (or one that never reads env at
+      all) — `plugins.json` still declares the override, but the plugin
+      registers with its own compiled-in manifest mount regardless. The
+      control-center row should show **both**, e.g. "Sidebar, right (middle)
+      · manifest: Sidebar (top)" — the declared value first, the mount the
+      host actually saw second — rather than silently reporting only one of
+      the two truths.
 
 ## Infobroker
 

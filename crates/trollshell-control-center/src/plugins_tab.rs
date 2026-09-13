@@ -63,8 +63,9 @@
 //! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
 //! and each is two sequential `Control` calls with a 3 s timeout apiece — so
 //! completions can and do arrive out of order. Every poll therefore carries a
-//! [`PollGenerations`] stamp and [`on_poll_result`] drops any result older
-//! than the newest already applied. That is a *different* door from the
+//! [`PollGenerations`] stamp and [`on_poll_result_with_declared`] drops any
+//! result older than the newest already applied. That is a *different* door
+//! from the
 //! [`PendingToggle`] latch above: the latch protects a toggle the poll hasn't
 //! caught up with, whereas this protects the view from a poll the poll itself
 //! has already superseded — the latch is legitimately spent by then, so it is
@@ -72,7 +73,7 @@
 //!
 //! # Transitions-only logging (#1017)
 //!
-//! [`on_poll_result`]'s `Err` arm used to log `"ListPlugins failed"`
+//! [`on_poll_result_with_declared`]'s `Err` arm used to log `"ListPlugins failed"`
 //! unconditionally — one line every [`PLUGIN_POLL_INTERVAL`] for the whole
 //! time the shell is down, the one poller `#1002`/`#1015` (the connection
 //! banner, the revision footer, and the AI Keys tab) left unconverted. It now
@@ -83,8 +84,8 @@
 //! rather than a third hand-copy), matching `main.rs`'s `ShellProbeUi` and
 //! `ai_keys_tab`'s own guard. A stale, out-of-order completion (#983) is
 //! still dropped **before** this runs — [`PollGenerations::accept`] gates the
-//! whole of [`on_poll_result`], transition logging included, so a superseded
-//! result cannot flip `last_failing` on its way out.
+//! whole of [`on_poll_result_with_declared`], transition logging included, so
+//! a superseded result cannot flip `last_failing` on its way out.
 //!
 //! # `AdwBreakpointBin`, on contract (#856)
 //!
@@ -103,6 +104,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -194,6 +196,13 @@ struct PluginRuntime {
     rendering: bool,
     /// The mount region it registered for (wire name), or `""` if unknown.
     mount: String,
+    /// This plugin's declared `HYTTE_PLUGIN_MOUNT` override, read straight out
+    /// of `plugins.json` (#1161) — `None` when the file declares no override
+    /// for this id, in which case [`mount`](Self::mount) alone is the whole
+    /// story. When `Some` and it disagrees with [`mount`](Self::mount), the
+    /// override didn't take (an older plugin build that predates
+    /// `HYTTE_PLUGIN_MOUNT`, most likely) and the UI shows both.
+    declared_mount: Option<String>,
     /// Seconds since the host last saw a frame (or its `Register`).
     last_seen_secs: u64,
     /// Effects the host's containment guards dropped (#435 rate cap / #436
@@ -411,7 +420,7 @@ struct PluginsState {
     /// `None` before the first completion. Drives transitions-only logging
     /// (#1017, mirrors `ai_keys_tab`'s field of the same name/shape): a run
     /// of identical outcomes logs once, not once per poll — see
-    /// [`on_poll_result`].
+    /// [`on_poll_result_with_declared`].
     last_failing: Rc<Cell<Option<bool>>>,
 }
 
@@ -904,14 +913,23 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// unreachable ("unavailable").
 ///
 /// The spawn is stamped with a [`PollGenerations::issue`]d generation that
-/// [`on_poll_result`] compares against the newest already applied, so a slow
-/// poll completing after a faster later one is dropped rather than rewriting
-/// the tab with its stale answer (#983).
+/// [`on_poll_result_with_declared`] compares against the newest already
+/// applied, so a slow poll completing after a faster later one is dropped
+/// rather than rewriting the tab with its stale answer (#983).
+///
+/// [`read_declared_mounts`] runs here, once per tick, on the GTK main thread
+/// (the same idiom [`hytte_config::places::load_places`] uses — a small local
+/// file read, not worth a round trip through the tokio runtime) and the
+/// result is threaded through to [`on_poll_result_with_declared`] rather than
+/// read from inside it, so the many existing `on_poll_result` tests stay
+/// hermetic (#1161) — none of them touch the real filesystem, and none of
+/// them should start to by accident.
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
+    let declared = read_declared_mounts();
     let state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
-        on_poll_result(&state, generation, res);
+        on_poll_result_with_declared(&state, generation, res, &declared);
     });
 }
 
@@ -936,7 +954,35 @@ fn refresh_plugins(state: &PluginsState) {
 /// generation gate above, so a stale, out-of-order completion (#983) cannot
 /// flip [`PluginsState::last_failing`] on its way out — it never reaches this
 /// point.
+///
+/// A thin wrapper over [`on_poll_result_with_declared`] with an empty
+/// declared-mount map — i.e. "no plugin has a declared override" — so every
+/// existing test call keeps its exact meaning (none of these fixtures declare
+/// a `mount`, so this is also the right answer, not just a stub). The one
+/// production call site with a real map is [`refresh_plugins`].
+///
+/// `cfg`-gated to match its only callers (`gtk_tests`, which needs a real
+/// display) rather than plain `#[cfg(test)]`: the hermetic `mod tests` below
+/// never calls this, so a bare `#[cfg(test)]` would make it dead code under a
+/// `cargo test` that doesn't enable `system-tests`.
+#[cfg(all(test, feature = "system-tests"))]
 fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
+    on_poll_result_with_declared(state, generation, res, &HashMap::new());
+}
+
+/// `on_poll_result`'s real logic, parameterised by the plugin-id →
+/// declared-mount map
+/// [`read_declared_mounts`] reads out of `plugins.json` (#1161). Split out so
+/// that real filesystem read is injectable rather than baked into the
+/// function every existing poll-ordering test already drives — see
+/// `tests-must-not-touch-real-xdg` in the project's own house rules for why
+/// that separation matters here.
+fn on_poll_result_with_declared(
+    state: &PluginsState,
+    generation: u64,
+    res: PollResult,
+    declared: &HashMap<String, String>,
+) {
     if !state.polls.accept(generation) {
         tracing::debug!(
             generation,
@@ -958,21 +1004,7 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
     }
     match res {
         Ok((units, states)) if !units.is_empty() => {
-            let rt: HashMap<String, PluginRuntime> = states
-                .into_iter()
-                .map(|(id, rendering, mount, last_seen_secs, violations)| {
-                    (
-                        id,
-                        PluginRuntime {
-                            rendering,
-                            mount,
-                            last_seen_secs,
-                            violations,
-                        },
-                    )
-                })
-                .collect();
-            apply_plugins(state, &units, &rt);
+            apply_plugins(state, &units, &runtime_states(states, declared));
         }
         Ok(_) => set_placeholder(
             state,
@@ -989,6 +1021,90 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
             );
         }
     }
+}
+
+/// Zip a `ListPluginStates` reply with the declared-mount map
+/// [`read_declared_mounts`] read into `PluginRuntime`s, keyed by id (#1161).
+///
+/// Split out of [`on_poll_result_with_declared`] purely so the
+/// declared-mount attachment is unit-testable on its own: it takes no
+/// [`PluginsState`] (a live GTK widget tree `build_tab` builds, unavailable
+/// to the hermetic `mod tests` below), so a test can drive it directly rather
+/// than only through `gtk_tests`.
+fn runtime_states(
+    states: PollStates,
+    declared: &HashMap<String, String>,
+) -> HashMap<String, PluginRuntime> {
+    states
+        .into_iter()
+        .map(|(id, rendering, mount, last_seen_secs, violations)| {
+            let declared_mount = declared.get(&id).cloned();
+            (
+                id,
+                PluginRuntime {
+                    rendering,
+                    mount,
+                    declared_mount,
+                    last_seen_secs,
+                    violations,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` straight out of
+/// `plugins.json` (#1161) — the same file `nix/hm-module.nix` /
+/// `nix/nixos-module.nix` render, found by the same first-existing-wins
+/// search `trollshell::plugin_launcher::candidate_paths` uses: `$XDG_CONFIG_HOME`
+/// (else `$HOME/.config`) first, then each `$XDG_CONFIG_DIRS` entry (else
+/// `/etc/xdg`). Rebuilt here via [`hytte_config::xdg::Env`] rather than
+/// imported — `trollshell` is a binary crate, not a library another crate can
+/// link, which is the #640 argument for `hytte-config` existing as a
+/// GTK-free leaf in the first place.
+///
+/// Best-effort, the same failure mode [`hytte_config::places::load_places`]
+/// gives this tab's Places sibling: a missing, unreadable or unparsable file
+/// yields an empty map rather than an error — the row simply shows no
+/// override note, same as an unreachable shell showing no runtime overlay.
+fn read_declared_mounts() -> HashMap<String, String> {
+    let env = hytte_config::xdg::Env::from_process();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = env.config_home() {
+        candidates.push(home.join("trollshell").join("plugins.json"));
+    }
+    candidates.extend(
+        env.config_dirs()
+            .into_iter()
+            .map(|dir| dir.join("trollshell").join("plugins.json")),
+    );
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| declared_mounts_from_json(&text))
+        .unwrap_or_default()
+}
+
+/// The pure half of [`read_declared_mounts`]: `{"plugins": {"<id>": {"env":
+/// {"HYTTE_PLUGIN_MOUNT": "<name>"}}}}` → `{id: name}`, dropping any entry
+/// that is missing the key or shaped unexpectedly rather than erroring — the
+/// same tolerance the rest of this best-effort read has. Split out so a test
+/// can drive it without touching the filesystem.
+fn declared_mounts_from_json(text: &str) -> HashMap<String, String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return HashMap::new();
+    };
+    let Some(plugins) = value.get("plugins").and_then(serde_json::Value::as_object) else {
+        return HashMap::new();
+    };
+    plugins
+        .iter()
+        .filter_map(|(id, spec)| {
+            let mount = spec.get("env")?.get("HYTTE_PLUGIN_MOUNT")?.as_str()?;
+            Some((id.clone(), mount.to_owned()))
+        })
+        .collect()
 }
 
 /// Apply a non-empty unit list + runtime overlay: update the existing rows in
@@ -1501,7 +1617,7 @@ fn runtime_overlay(
             "success",
             format!(
                 "Connected · rendering in {}{}{}",
-                mount_or_unknown(&rt.mount),
+                mount_display(&rt.mount, rt.declared_mount.as_deref()),
                 violations_suffix(rt.violations),
                 seen_suffix(rt.last_seen_secs),
             ),
@@ -1528,12 +1644,42 @@ fn runtime_overlay(
     }
 }
 
-/// The mount name for display, or a stand-in when the host didn't report one.
+/// A human label for one of the nine wire names
+/// [`hytte_plugin_proto::manifest::Mount::wire_name`] carries, or a stand-in
+/// when the host didn't report one. An unrecognised, non-empty wire name (a
+/// future tenth mount this build predates) falls back to the wire name
+/// itself — never "unknown" — the same forward-compat call the wire's own
+/// `Mount::from_wire_name` makes: showing *something* beats hiding a value
+/// that genuinely exists (#1161).
 fn mount_or_unknown(mount: &str) -> &str {
-    if mount.is_empty() {
-        "an unknown region"
-    } else {
-        mount
+    match mount {
+        "" => "an unknown region",
+        "SidebarLead" => "Sidebar (top)",
+        "SidebarTop" => "Sidebar (middle)",
+        "SidebarBottom" => "Sidebar (bottom)",
+        "SidebarRightLead" => "Sidebar, right (top)",
+        "SidebarRightTop" => "Sidebar, right (middle)",
+        "SidebarRightBottom" => "Sidebar, right (bottom)",
+        "BarLeft" => "Bar (left)",
+        "BarCenter" => "Bar (center)",
+        "BarRight" => "Bar (right)",
+        other => other,
+    }
+}
+
+/// The mount line for display (#1161): the effective (host-registered) mount
+/// alone, or — when a declared override in `plugins.json` disagrees with it —
+/// both, `"<declared> · manifest: <effective>"`. The two only diverge when the
+/// override didn't take: the SDK applies `HYTTE_PLUGIN_MOUNT` before
+/// `Register` (`hytte_plugin::run`), so an override that took hold is exactly
+/// what `mount` already reports and there is nothing worth saying twice. Pure
+/// → unit-tested.
+fn mount_display(mount: &str, declared: Option<&str>) -> String {
+    match declared {
+        Some(declared) if declared != mount => {
+            format!("{} · manifest: {}", mount_or_unknown(declared), mount_or_unknown(mount))
+        }
+        _ => mount_or_unknown(mount).to_owned(),
     }
 }
 
@@ -1568,7 +1714,8 @@ type PollUnits = Vec<(String, String, bool)>;
 /// violations)` per plugin with a live host connection.
 type PollStates = Vec<(String, bool, String, u64, u32)>;
 
-/// What one [`list_plugins_and_states`] round trip hands [`on_poll_result`].
+/// What one [`list_plugins_and_states`] round trip hands
+/// [`on_poll_result_with_declared`].
 type PollResult = Result<(PollUnits, PollStates), hytte_bus::BusError>;
 
 /// `ListPlugins` → `[(id, active_state, enabled)]` for each plugin user unit.
@@ -1645,9 +1792,12 @@ async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::Bu
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        PluginRuntime, PollGenerations, is_running, mount_or_unknown, plugin_subtitle,
-        runtime_overlay, same_plugin_set, seen_suffix, status_cell, violations_suffix,
+        PluginRuntime, PollGenerations, PollStates, declared_mounts_from_json, is_running,
+        mount_display, mount_or_unknown, plugin_subtitle, runtime_overlay, runtime_states,
+        same_plugin_set, seen_suffix, status_cell, violations_suffix,
     };
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -1703,11 +1853,13 @@ mod tests {
         assert!(!polls.accept(only), "the same generation must apply once");
     }
 
-    /// A connected plugin's runtime state, for the overlay tests.
+    /// A connected plugin's runtime state, for the overlay tests. No declared
+    /// override — see [`rt_with_declared`] for that half.
     fn rt(rendering: bool, mount: &str, last_seen_secs: u64, violations: u32) -> PluginRuntime {
         PluginRuntime {
             rendering,
             mount: mount.to_owned(),
+            declared_mount: None,
             last_seen_secs,
             violations,
         }
@@ -1716,6 +1868,20 @@ mod tests {
     /// `["a", "b"]` as the owned ids the diff works on.
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    /// [`rt`] plus a declared-mount override, for the #1161 override tests.
+    fn rt_with_declared(
+        rendering: bool,
+        mount: &str,
+        declared: &str,
+        last_seen_secs: u64,
+        violations: u32,
+    ) -> PluginRuntime {
+        PluginRuntime {
+            declared_mount: Some(declared.to_owned()),
+            ..rt(rendering, mount, last_seen_secs, violations)
+        }
     }
 
     #[test]
@@ -1751,7 +1917,22 @@ mod tests {
         let (icon, css, status) = runtime_overlay("active", Some(&rt(true, "SidebarTop", 1, 0)));
         assert_eq!(icon, "emblem-ok-symbolic");
         assert_eq!(css, "success");
-        assert_eq!(status, "Connected · rendering in SidebarTop");
+        assert_eq!(status, "Connected · rendering in Sidebar (middle)");
+    }
+
+    /// The override note (#1161): a declared mount that disagrees with the
+    /// effective (host-registered) one shows both, in the detail pane's own
+    /// status line — the surface this note actually reaches.
+    #[test]
+    fn overlay_notes_a_differing_declared_mount() {
+        let (_, _, status) = runtime_overlay(
+            "active",
+            Some(&rt_with_declared(true, "SidebarTop", "SidebarRightTop", 1, 0)),
+        );
+        assert_eq!(
+            status,
+            "Connected · rendering in Sidebar, right (middle) · manifest: Sidebar (middle)"
+        );
     }
 
     #[test]
@@ -1784,14 +1965,120 @@ mod tests {
         let (_, _, status) = runtime_overlay("active", Some(&rt(true, "BarCenter", 90, 3)));
         assert_eq!(
             status,
-            "Connected · rendering in BarCenter · 3 dropped · seen 1m ago"
+            "Connected · rendering in Bar (center) · 3 dropped · seen 1m ago"
         );
+    }
+
+    /// One assertion per wire name (#1161) — every entry in
+    /// `hytte_plugin_proto::manifest::Mount::ALL` must have a human label
+    /// here, and an unrecognised (future) name must still show *something*
+    /// rather than "unknown".
+    #[test]
+    fn mount_or_unknown_covers_the_nine_wire_names() {
+        assert_eq!(mount_or_unknown("SidebarLead"), "Sidebar (top)");
+        assert_eq!(mount_or_unknown("SidebarTop"), "Sidebar (middle)");
+        assert_eq!(mount_or_unknown("SidebarBottom"), "Sidebar (bottom)");
+        assert_eq!(mount_or_unknown("SidebarRightLead"), "Sidebar, right (top)");
+        assert_eq!(
+            mount_or_unknown("SidebarRightTop"),
+            "Sidebar, right (middle)"
+        );
+        assert_eq!(
+            mount_or_unknown("SidebarRightBottom"),
+            "Sidebar, right (bottom)"
+        );
+        assert_eq!(mount_or_unknown("BarLeft"), "Bar (left)");
+        assert_eq!(mount_or_unknown("BarCenter"), "Bar (center)");
+        assert_eq!(mount_or_unknown("BarRight"), "Bar (right)");
     }
 
     #[test]
     fn mount_falls_back_when_unknown() {
-        assert_eq!(mount_or_unknown("SidebarTop"), "SidebarTop");
         assert_eq!(mount_or_unknown(""), "an unknown region");
+        // A tenth mount this build predates: shown as-is, never hidden.
+        assert_eq!(mount_or_unknown("SidebarLeftLeft"), "SidebarLeftLeft");
+    }
+
+    #[test]
+    fn mount_display_is_just_the_effective_mount_with_no_declared_value() {
+        assert_eq!(mount_display("SidebarTop", None), "Sidebar (middle)");
+    }
+
+    #[test]
+    fn mount_display_omits_the_note_when_declared_matches_effective() {
+        // The common case: the override took, so `mount` already reports it —
+        // nothing is worth saying twice.
+        assert_eq!(
+            mount_display("SidebarRightTop", Some("SidebarRightTop")),
+            "Sidebar, right (middle)"
+        );
+    }
+
+    #[test]
+    fn mount_display_notes_a_differing_declared_mount() {
+        assert_eq!(
+            mount_display("SidebarTop", Some("SidebarRightTop")),
+            "Sidebar, right (middle) · manifest: Sidebar (middle)"
+        );
+    }
+
+    // ── The declared-mount reader (#1161) ────────────────────────────────────
+
+    #[test]
+    fn declared_mounts_from_json_reads_the_env_key() {
+        let text = r#"{
+            "version": 1,
+            "plugins": {
+                "agents": { "exec": "x", "env": { "HYTTE_PLUGIN_MOUNT": "SidebarRightTop" }, "secrets": [], "enabled": true }
+            }
+        }"#;
+        let got = declared_mounts_from_json(text);
+        assert_eq!(got.get("agents").map(String::as_str), Some("SidebarRightTop"));
+    }
+
+    #[test]
+    fn declared_mounts_from_json_ignores_a_plugin_without_the_key() {
+        let text = r#"{
+            "version": 1,
+            "plugins": {
+                "pet": { "exec": "x", "env": {}, "secrets": [], "enabled": true }
+            }
+        }"#;
+        assert!(declared_mounts_from_json(text).is_empty());
+    }
+
+    #[test]
+    fn declared_mounts_from_json_is_empty_for_garbage() {
+        assert!(declared_mounts_from_json("not json at all").is_empty());
+        assert!(declared_mounts_from_json("{}").is_empty());
+        assert!(declared_mounts_from_json(r#"{"plugins": "not an object"}"#).is_empty());
+    }
+
+    // ── The declared-mount map reaches `PluginRuntime` (#1161) ───────────────
+    //
+    // `runtime_states` is the wiring `on_poll_result_with_declared` runs on
+    // every successful poll, split out precisely so this is testable without
+    // a `PluginsState` (a live GTK widget tree `build_tab` builds — this
+    // module is the hermetic half, see the module doc's "Tests must not
+    // touch the real XDG config" precedent for why the filesystem read
+    // itself is injected rather than called from in here too).
+
+    #[test]
+    fn runtime_states_attaches_the_declared_mount() {
+        let mut declared = HashMap::new();
+        declared.insert("agents".to_owned(), "SidebarRightTop".to_owned());
+        let states: PollStates = vec![("agents".to_owned(), true, "SidebarTop".to_owned(), 1, 0)];
+        let rt = runtime_states(states, &declared);
+        let agents = rt.get("agents").expect("an entry for agents");
+        assert_eq!(agents.mount, "SidebarTop");
+        assert_eq!(agents.declared_mount.as_deref(), Some("SidebarRightTop"));
+    }
+
+    #[test]
+    fn runtime_states_leaves_declared_mount_none_when_undeclared() {
+        let states: PollStates = vec![("clock".to_owned(), true, "BarCenter".to_owned(), 1, 0)];
+        let rt = runtime_states(states, &HashMap::new());
+        assert_eq!(rt.get("clock").expect("an entry for clock").declared_mount, None);
     }
 
     #[test]
@@ -1932,6 +2219,7 @@ mod gtk_tests {
                 PluginRuntime {
                     rendering: true,
                     mount: "BarCenter".to_owned(),
+                    declared_mount: None,
                     last_seen_secs: 1,
                     violations: 0,
                 },

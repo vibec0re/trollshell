@@ -691,7 +691,12 @@ whole point of the window.
       machine's trust store does not carry it, so **expect the window to open
       on an error state** rather than the page. Confirm that state names the
       failing host and all three routes (not WebKit's bare "load failed"), then
-      take the first one that applies:
+      take the first one that applies. Check this by eye, not by reading the
+      source: confirm the description text — the three bullets and the
+      `openssl s_client` one-liner — actually **renders** under the title, not
+      just the padlock icon and an empty card (#1224 was exactly that: the
+      text was there in code but Pango markup-escaping was missing, so GTK
+      silently dropped the whole description).
   1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
      Reference hyperhive's own option rather than typing the path (Mara's ask
      on #948), so the two sides cannot drift if that directory moves:

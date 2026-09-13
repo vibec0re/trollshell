@@ -83,6 +83,8 @@
 
 use std::path::PathBuf;
 
+use gtk::glib;
+
 /// Points the window at the certificate to accept for the agent's host.
 ///
 /// The value is a path to **the gateway's own leaf certificate**, in PEM — not
@@ -170,6 +172,17 @@ pub fn policy(cert: Option<&str>, url: &str) -> TlsPolicy {
 /// 3. the per-window pin, last — with the warning that it wants the gateway's
 ///    own certificate, since handing it a bundle is the mistake this text
 ///    exists to prevent.
+///
+/// # Not markup — escape before handing this to `AdwStatusPage`
+///
+/// The window shows this text via `AdwStatusPage::set_description`, and
+/// libadwaita's own docs say that property "is parsed as Pango markup". This
+/// string is not valid markup: the `openssl` one-liner's `</dev/null`
+/// (redirecting `stdin`, not closing a tag) reads to the parser as a closing
+/// tag with no matching open, so the parse fails and `AdwStatusPage` renders
+/// an **empty** description — the card had a title and nothing else (#1224).
+/// Use [`failure_description`] at the sink; this function returns the raw
+/// text so tests can pin the bug's mechanism against it.
 #[must_use]
 pub fn failure_message(host: &str) -> String {
     format!(
@@ -191,6 +204,15 @@ pub fn failure_message(host: &str) -> String {
          The header above still follows this agent's live status over host.sock, which does not \
          use TLS."
     )
+}
+
+/// [`failure_message`], escaped so it is safe to hand to
+/// `AdwStatusPage::set_description` — the sink's **one** call. See
+/// [`failure_message`]'s docs for why the raw text is not valid Pango markup
+/// on its own (#1224).
+#[must_use]
+pub fn failure_description(host: &str) -> String {
+    glib::markup_escape_text(&failure_message(host)).to_string()
 }
 
 /// The host part of an `http(s)` URL — no port, no userinfo, IPv6 literal kept
@@ -222,7 +244,9 @@ pub fn host_of(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CERT_ENV, TlsPolicy, failure_message, host_of, policy};
+    use gtk::pango;
+
+    use super::{CERT_ENV, TlsPolicy, failure_description, failure_message, host_of, policy};
     use std::path::PathBuf;
 
     /// With no override, nothing about the session's trust changes.
@@ -428,6 +452,33 @@ mod tests {
             literal < pin,
             "and the trust store — either spelling — comes before the per-window pin: {m}"
         );
+    }
+
+    /// The bug (#1224): `AdwStatusPage:description` is parsed as Pango
+    /// markup, and [`failure_message`]'s raw text is not valid markup — its
+    /// `openssl … </dev/null` reads as an unopened closing tag. This pins the
+    /// mechanism, not just the symptom, so nobody "simplifies" the escape
+    /// away at the sink: if a future edit removes the `</dev/null` fragment
+    /// and the raw message happens to become valid markup on its own, THIS
+    /// test's failure is the signal to delete it, not to reach for a `<` to
+    /// keep it red.
+    #[test]
+    fn the_raw_failure_message_is_not_valid_markup_which_is_why_the_sink_escapes_it() {
+        assert!(
+            pango::parse_markup(&failure_message("hive.local"), '\0').is_err(),
+            "if this now parses, the escape at the sink is no longer covering a real bug — see \
+             this test's doc before deleting it"
+        );
+    }
+
+    /// The escaped form the sink actually uses is valid Pango markup, and
+    /// round-trips back to exactly the text [`failure_message`] produced —
+    /// so escaping did not lose or corrupt any of the instructions.
+    #[test]
+    fn the_failure_description_is_valid_pango_markup_and_round_trips() {
+        let (_, text, _) = pango::parse_markup(&failure_description("hive.local"), '\0')
+            .expect("escaped text must be valid markup");
+        assert_eq!(text, failure_message("hive.local"));
     }
 
     #[test]

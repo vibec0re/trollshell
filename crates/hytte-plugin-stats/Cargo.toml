@@ -1,0 +1,65 @@
+[package]
+name = "hytte-plugin-stats"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "System stats as an out-of-process trollshell plugin: the compact CPU + GPU card for the right sidebar (issue #1250, P1 of epic #1248)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-stats"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin runtime SDK: the wire vocabulary, the `display` preem wrappers
+# (which decide per render whether a widget goes out as typed `Node::Preem`
+# state or as a CPU-rasterised `Node::Pixels`), the visibility-gated poll loop,
+# and all transport. It re-exports `hytte-preem` as `hytte_plugin::preem`, which
+# is where the 5x7 font this crate's per-core ramp is calibrated against lives.
+hytte-plugin = { path = "../hytte-plugin" }
+# The samplers (#1249, P0): the same `/proc` and `/sys` reads the shell's own
+# `sensors` service performs, in a GTK-free leaf, so this plugin measures the
+# machine with the shell's code rather than a second implementation of it. This
+# is the whole reason P0 existed.
+hytte-sensors = { path = "../hytte-sensors" }
+# `stats.toml` rides the #868 config layering: a `Subsystem` impl buys the XDG
+# search path, the four merge rules, unknown-key warnings and the
+# format-preserving writer from a `NAME` + a `DEFAULT_TOML`. GTK-free leaf, so a
+# plugin may link it — `hytte-plugin-agents` (#947 P1) is the precedent.
+hytte-config = { path = "../hytte-config" }
+serde.workspace = true
+# The schema's fields are raw `toml::Value`s so a bad value costs its own key
+# rather than the whole file (#1040 T1) — see `config.rs`.
+toml.workspace = true
+# The sampler task: `rt` to spawn it, `time` for the poll cadence, `sync` for
+# the message lane back to the reducer. The blocking `/proc` reads go through
+# `spawn_blocking`, which is why `rt` alone is not enough of a story — see
+# `sample.rs`.
+tokio = { workspace = true, default-features = false, features = [
+  "rt",
+  "sync",
+  "time",
+] }
+tracing.workspace = true
+# One subscriber in `main`, so `hytte-config`'s per-key rejections and
+# unknown-key warnings actually reach the journal instead of being dropped by
+# the no-subscriber no-op. Same pair `hytte-plugin-agents` resolves, so it adds
+# no `Cargo.lock` entry.
+tracing-subscriber = { workspace = true, default-features = true, features = [
+  "env-filter",
+] }
+
+[dev-dependencies]
+# `config.rs`' file round trip writes two real `stats.toml` layers into a
+# scratch directory and loads them through `load_from`, so nothing in this
+# crate's suite touches the real `$XDG_CONFIG_HOME` / `$XDG_CONFIG_DIRS`
+# (#1101). Already resolved across the workspace, so no new `Cargo.lock` entry.
+tempfile.workspace = true
+# `test-util` for `#[tokio::test(start_paused = true)]`: the poll-gate tests
+# assert that ten periods go by with nothing sampled, and virtual time makes
+# that instant rather than a ten-second stall in every `cargo test` run.
+tokio = { workspace = true, features = ["macros", "test-util"] }

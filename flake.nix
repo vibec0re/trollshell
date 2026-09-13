@@ -30,7 +30,7 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
-      # The 13 bundled widget plugins (#558), by crate = binary = flake-output
+      # The bundled widget plugins (#558), by crate = binary = flake-output
       # name. Each is packaged by nix/plugin.nix, which since #572 is a plain
       # `cp` of one already-compiled binary out of the single whole-workspace
       # compile (`trollshell.passthru.workspace`) — no cargo, no crane. Shared
@@ -50,6 +50,12 @@
         "hytte-plugin-niri-layouts"
         "hytte-plugin-pet"
         "hytte-plugin-preem-demo"
+        # One binary meant to be listed twice in `programs.trollshell.plugins`
+        # (#1250): a bar instance and a right-sidebar one, distinguished by
+        # `HYTTE_PLUGIN_ID` + `HYTTE_PLUGIN_MOUNT` on the launch. That is a
+        # deployment shape, not a packaging one — there is still exactly one
+        # slice here, and `plugins.<id>.package` points both entries at it.
+        "hytte-plugin-stats"
         "hytte-plugin-terminal"
         "hytte-plugin-timer"
         "hytte-plugin-weather"
@@ -116,7 +122,7 @@
           };
 
           # Per-plugin flake packages (#558): `packages.hytte-plugin-<id>` for
-          # each of the 13 bundled plugins. Generated from `bundledPluginNames`
+          # each bundled plugin. Generated from `bundledPluginNames`
           # (one attr each) rather than hand-written. Since #572 each is a `cp`
           # of one already-compiled binary out of `workspace` — no cargo, no
           # crane, no recompile.
@@ -238,7 +244,7 @@
             inherit workspace revision;
           };
 
-          # The 13 per-plugin packages (#558), mirroring the `packages` output.
+          # The per-plugin packages (#558), mirroring the `packages` output.
           # Merged into `checks` below so `nix flake check` actually *builds*
           # each one — the same reason #449 wired the two existing packages into
           # checks: flake check only builds what's listed here, so without this a

@@ -407,9 +407,10 @@ fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
         // A stale *successful* report is the case with nothing else to say
         // it: no error was ever recorded, so without this the chip would keep
         // painting last week's meters as if they were current.
-        Some(report) if report.usage().is_some() && report.is_stale(now) => {
-            Some(format!("usage stale since {}", usage::format_utc(report.at)))
-        }
+        Some(report) if report.usage().is_some() && report.is_stale(now) => Some(format!(
+            "usage stale since {}",
+            usage::format_utc(report.at)
+        )),
         Some(report) => usage_failure_sentence(status, report),
         None => None,
     };
@@ -764,7 +765,9 @@ mod tests {
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
-    use crate::usage::{self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError, parse_rfc3339};
+    use crate::usage::{
+        self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError, parse_rfc3339,
+    };
     use hytte_plugin::display::{AccentRole, RenderMode};
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Manifest, Mount, Node, Page, PluginMsg, decode, encode,
@@ -1232,14 +1235,21 @@ mod tests {
         };
         let tree = chip_state(&board, Some(&fresh));
         assert!(!preems(&tree).is_empty(), "still inside the ceiling");
-        assert_eq!(root_tooltip(&tree), Some(base.to_owned()), "nothing extra yet");
+        assert_eq!(
+            root_tooltip(&tree),
+            Some(base.to_owned()),
+            "nothing extra yet"
+        );
 
         let stale = Report {
             at: now() - ceiling - 1,
             ..captured_report()
         };
         let tree = chip_state(&board, Some(&stale));
-        assert!(preems(&tree).is_empty(), "one second past the ceiling ⇒ no meters");
+        assert!(
+            preems(&tree).is_empty(),
+            "one second past the ceiling ⇒ no meters"
+        );
         assert_eq!(
             root_tooltip(&tree),
             Some(format!(

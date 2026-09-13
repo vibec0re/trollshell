@@ -1225,7 +1225,10 @@ mod tests {
         assert!(!fresh.is_stale(1_000), "zero age");
         assert!(!fresh.is_stale(1_000 + ceiling), "exactly the ceiling");
         assert!(fresh.is_stale(1_000 + ceiling + 1), "one past it");
-        assert!(!fresh.is_stale(500), "a clock that moved backward is not stale");
+        assert!(
+            !fresh.is_stale(500),
+            "a clock that moved backward is not stale"
+        );
     }
 
     // ── (d) No credentials ───────────────────────────────────────────────────

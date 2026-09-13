@@ -1098,6 +1098,22 @@
 .ts-toast:hover {
     cursor: pointer;
 }
+/* Urgency-tinted border, all three FDO levels (#1177). `.ts-toast-critical`
+   already carried this — an alert border in the destructive red. `.ts-toast-low`
+   and `.ts-toast-normal` were applied by `build_card` (`overlays/notifications.rs`)
+   but styled nowhere, so every non-critical toast just fell through to
+   `.ts-toast`'s own neutral `@card_shade_color` border with no visible
+   urgency cue at all. Low dims further below that neutral (a low-urgency
+   toast should recede, not just fail to stand out); normal picks up the
+   theme's accent color — the same everyday "something happened" tint used
+   elsewhere in this file for non-alarming attention, distinct from the
+   destructive red critical gets. */
+.ts-toast-low {
+    border-color: alpha(@card_shade_color, 0.4);
+}
+.ts-toast-normal {
+    border-color: @accent_color;
+}
 .ts-toast-critical {
     border-color: @destructive_color;
 }

@@ -1,0 +1,92 @@
+{
+  "five_hour": {
+    "utilization": 80.0,
+    "resets_at": "2026-09-13T13:50:00.101848+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day": {
+    "utilization": 40.0,
+    "resets_at": "2026-09-17T15:00:00.101872+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  },
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_breakdown": {
+    "as_of": "2026-09-13T11:30:00.129557+00:00",
+    "window_started_at": "2026-09-10T15:00:00.101872+00:00",
+    "rows": [
+      { "key": "claude_code", "display_name": "Claude Code", "percent": 100 },
+      { "key": "chat", "display_name": "Chats", "percent": 0 },
+      { "key": "cowork", "display_name": "Cowork", "percent": 0 },
+      { "key": "other", "display_name": "Other", "percent": 0 }
+    ]
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 80,
+      "severity": "warning",
+      "resets_at": "2026-09-13T13:50:00.101848+00:00",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 40,
+      "severity": "normal",
+      "resets_at": "2026-09-17T15:00:00.101872+00:00",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "percent": 25,
+      "severity": "normal",
+      "resets_at": "2026-09-17T15:00:00.102097+00:00",
+      "scope": {
+        "model": { "id": null, "display_name": "Fable" },
+        "surface": null
+      },
+      "is_active": false
+    }
+  ],
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null,
+    "currency": null,
+    "decimal_places": null,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": false,
+    "daily": null,
+    "weekly": null
+  },
+  "member_dashboard_available": false,
+  "omelette_promotional": null,
+  "amber_ladder": null,
+  "cinder_cove": null,
+  "copper_kite": null,
+  "harbor_lantern": null,
+  "iguana_necktie": null,
+  "juniper_tide": null,
+  "nimbus_quill": {
+    "utilization": 0.0,
+    "resets_at": null,
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null,
+    "locked_reason": null
+  }
+}

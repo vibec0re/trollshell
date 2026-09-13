@@ -19,6 +19,24 @@
 //! HTTP listener is bound and spawned before the SDK loop is entered**: the API
 //! is the primary duty and must not depend on the shell being up.
 //!
+//! # …and since #1236 it reads the Claude account's usage limits
+//!
+//! A second task on that same HTTP runtime polls
+//! `GET https://api.anthropic.com/api/oauth/usage` every five minutes with the
+//! OAuth access token Claude Code keeps in `~/.claude/.credentials.json`, and
+//! the chip paints `limits[]` as one level meter per active bucket, with the
+//! whole list in a drawer panel. See [`usage`] for the wire contract (parse the
+//! generic list, tolerate everything else) and for the credential rules, which
+//! are the load-bearing part: the file is **read-only** to this daemon, re-read
+//! per poll, never refreshed — `claude` owns that rotation and rotating it out
+//! from under the CLI is the one way to break the user's own login — and the
+//! token never reaches a log line, a tooltip or an error string. A 401 renders
+//! as "usage stale — run `claude` once", not as a refresh.
+//!
+//! It adds **no** environment variable and no configuration: the endpoint is a
+//! constant and the credential path follows Claude Code's own
+//! `$CLAUDE_CONFIG_DIR`/`$HOME` resolution.
+//!
 //! # The INBOUND side is KEYLESS — and that is a correctness requirement
 //!
 //! The bridge validates **no bearer token at all** on the route it serves. It
@@ -137,6 +155,7 @@ mod retired;
 mod session;
 mod socket;
 mod status;
+mod usage;
 mod wire;
 
 use std::path::PathBuf;
@@ -489,6 +508,23 @@ fn main() -> ExitCode {
     });
     let http = rt.spawn(accept_loop(serving.socket, serving.bridge));
     rt.spawn(supervise_http(http));
+
+    // The Claude usage poll (#1236) — on the HTTP runtime, not the SDK's, for
+    // the same reason the listener is: the numbers must keep arriving while the
+    // shell is down and the chip is sitting in its dial backoff, and the SDK's
+    // current-thread runtime is handed the main thread below and never gives it
+    // back. Deliberately **unsupervised**, unlike `accept_loop`: this one is a
+    // display feed, and a bridge whose API is answering perfectly must not exit
+    // because a status poll fell over. `poll_forever` cannot return, and if it
+    // panicked the chip would simply stop growing meters.
+    //
+    // Run in **every** mode, including `api`: the limits it reports belong to
+    // the box's Claude Code login, which exists regardless of which backend this
+    // bridge happens to be spending.
+    rt.spawn(usage::poll_forever(
+        usage::DEFAULT_BASE_URL.to_owned(),
+        usage::credentials_path(),
+    ));
 
     // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host
     // socket to dial *ever*, and the SDK would exit the process over it — which

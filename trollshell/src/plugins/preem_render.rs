@@ -1505,19 +1505,26 @@ fn report(scope: &Scope, id: Option<&str>, widget: &vocab::PreemWidget, mapped: 
 /// update state otherwise, and no-op when nothing moved (the multi-monitor
 /// case).
 fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
-    // **The CPU fallback** (#893, per kind since #1143). A GL renderer whose
-    // `GtkGLArea` could not get
-    // a context can never draw anything, so it is rebuilt onto the kit — which
-    // `build` does on its own, because `preem_gl::arm()` consults the same
-    // latch. Checked here rather than in the short-circuit below because a
-    // failed context does not change the *widget*: without this the
-    // `same_widget` early return would keep a dead renderer forever on a scope
-    // whose plugin has gone quiet.
+    // **The CPU fallback** (#893, per kind since #1143, per *pipeline* since
+    // #1232). A GL renderer whose `GtkGLArea` could not get a context — or
+    // whose pipeline this driver will not build — can never draw anything, so
+    // it is rebuilt onto the kit, which `build` does on its own because
+    // `preem_gl::arm_for` consults the same two latches. Checked here rather
+    // than in the short-circuit below because neither failure changes the
+    // *widget*: without this the `same_widget` early return would keep a dead
+    // renderer forever on a scope whose plugin has gone quiet.
+    //
+    // Asked per program rather than per session, which is the whole of what
+    // #1232 added here: a refused `preem.scope` must not take the gauge beside
+    // it off the GPU.
     //
     // The phosphor restarts from black. That is the honest outcome: the GL arm
     // never drew a trail to inherit.
-    let gl_lost =
-        instance.renderer.as_ref().is_some_and(Renderer::is_gl) && preem_gl::arm() == Arm::Cpu;
+    let gl_lost = instance
+        .renderer
+        .as_ref()
+        .and_then(Renderer::gl_program)
+        .is_some_and(|program| preem_gl::arm_for(program) == Arm::Cpu);
     // `same_widget`, not `==`: derived `PartialEq` is not reflexive over a
     // non-finite float, and a short-circuit that never fires is a permanent
     // 20 Hz loop rather than a missed optimisation. See `sanitize_in_place`.
@@ -1809,6 +1816,44 @@ pub(super) fn rebuild_gl_renderers_on_cpu() {
             }
         }
     });
+}
+
+/// [`rebuild_gl_renderers_on_cpu`], narrowed to the instances drawing with one
+/// **refused pipeline** — the host's half of `hytte-ui`'s build-refusal hook
+/// (#1232). Answers how many chips it moved.
+///
+/// The wholesale sweep above is right for a failed context, where every GL
+/// renderer in the process is dead. A refused *pipeline* kills only the chips
+/// naming that program, and rebuilding the rest would be worse than useless:
+/// `build` would answer with the very same GL arm they already had, and a
+/// `GaugeGl` rebuilt for a scope's refusal restarts its needle's spring
+/// mid-swing — exactly the thing #1143 took care to keep across a flip.
+///
+/// **The caller records the program as refused first**, because `build` here
+/// resolves its arm through `preem_gl::arm_for`, which reads that record; see
+/// `preem_gl::on_build_refused`, and see this function's sibling above for the
+/// same ordering rule stated for `gl_abandoned`. Reverse the two and every
+/// instance rebuilds straight back onto the pipeline that will not build.
+///
+/// Caches are dropped with the renderer, so the next mapping pass rasterises
+/// the kit rather than re-serving the `Cached::Gl` uniforms this instance was
+/// last mapped with — which would keep a `UiNode::GlSurface` (and a blank
+/// chip) on screen no matter what the renderer underneath now is.
+pub(super) fn rebuild_refused_gl_renderers_on_cpu(program: GlProgram) -> usize {
+    STORE.with_borrow_mut(|store| {
+        let mut moved = 0;
+        for state in store.values_mut() {
+            for instance in state.instances.values_mut() {
+                if instance.renderer.as_ref().and_then(Renderer::gl_program) == Some(program) {
+                    instance.renderer = build(&instance.applied);
+                    instance.builds = instance.builds.saturating_add(1);
+                    instance.cached = None;
+                    moved += 1;
+                }
+            }
+        }
+        moved
+    })
 }
 
 /// Drop every cached frame **and the memoized role colors**, so the next mapping
@@ -2338,12 +2383,13 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
     let pins = pins_for(widget.style());
     Some(kit::with_pins(pins, || match widget {
         W::DotMatrix { config, state } => {
-            // GL by default (#1144), the CPU kit under the kill switch or once
-            // a context has failed — the same `preem_gl::arm` decision the
+            // GL by default (#1144), the CPU kit under the kill switch, once
+            // a context has failed, or once this driver has refused *this*
+            // pipeline (#1232) — the same `preem_gl::arm_for` decision the
             // `Scope` and the `Gauge` below take, consulted per *build* so an
-            // instance rebuilt after a context failure lands on the CPU arm
-            // (see `apply`).
-            if preem_gl::arm() == Arm::Gl {
+            // instance rebuilt after either failure lands on the CPU arm (see
+            // `apply`).
+            if preem_gl::arm_for(preem_gl::DOT_MATRIX) == Arm::Gl {
                 return Renderer::DotMatrixGl {
                     config: *config,
                     glyphs: preem_gl::encode_glyphs(&state.text),
@@ -2358,11 +2404,12 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             text: state.text.clone(),
         },
         W::TextBox { config, state } => {
-            // GL by default (#1152), the CPU kit under the kill switch or once
-            // a context has failed — the same `preem_gl::arm` decision every
+            // GL by default (#1152), the CPU kit under the kill switch, once a
+            // context has failed, or once this driver has refused this
+            // pipeline (#1232) — the same `preem_gl::arm_for` decision every
             // other arm on this seam takes.
             let boxed = text_box(*config, style);
-            if preem_gl::arm() == Arm::Gl {
+            if preem_gl::arm_for(preem_gl::TEXTBOX) == Arm::Gl {
                 let layout = boxed.layout(&state.text);
                 return Renderer::TextBoxGl {
                     block: preem_gl::encode_block(&layout),
@@ -2395,7 +2442,7 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             // the GPU it is the geometry oracle rather than a picture — see
             // `Renderer::MarqueeGl`.
             let strip = marquee_strip(*config, style, &state.text);
-            if preem_gl::arm() == Arm::Gl {
+            if preem_gl::arm_for(preem_gl::MARQUEE) == Arm::Gl {
                 return Renderer::MarqueeGl {
                     window: preem_gl::encode_window(&strip, 0),
                     strip,
@@ -2412,11 +2459,12 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             }
         }
         W::Scope { config, state } => {
-            // GL by default, the CPU kit under the kill switch or once a
-            // context has failed — `preem_gl::arm` is the whole decision, and
-            // it is consulted per *build* so an instance rebuilt after a
-            // context failure lands on the CPU arm (see `apply`).
-            if preem_gl::arm() == Arm::Gl {
+            // GL by default, the CPU kit under the kill switch, once a context
+            // has failed, or once this driver has refused this pipeline
+            // (#1232) — `preem_gl::arm_for` is the whole decision, and it is
+            // consulted per *build* so an instance rebuilt after either
+            // failure lands on the CPU arm (see `apply`).
+            if preem_gl::arm_for(preem_gl::SCOPE) == Arm::Gl {
                 return Renderer::ScopeGl {
                     config: *config,
                     // The debut batch is stamped now rather than queued —
@@ -2467,15 +2515,16 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
                 .frequency(config.frequency_hz)
                 .damping(config.damping);
             gauge.set_target(state.target);
-            // GL by default (#1143), the CPU kit under the kill switch or once
-            // a context has failed — the same `preem_gl::arm` decision the
-            // `Scope` above takes, consulted per *build* so an instance rebuilt
-            // after a context failure lands on the CPU arm (see `apply`).
+            // GL by default (#1143), the CPU kit under the kill switch, once a
+            // context has failed, or once this driver has refused this
+            // pipeline (#1232) — the same `preem_gl::arm_for` decision the
+            // `Scope` above takes, consulted per *build* so an instance
+            // rebuilt after either failure lands on the CPU arm (see `apply`).
             //
             // The needle is built either way and handed straight over: the
             // spring is the state, it is CPU-side on both arms, and a gauge
             // whose renderer flips must not restart mid-swing.
-            if preem_gl::arm() == Arm::Gl {
+            if preem_gl::arm_for(preem_gl::GAUGE) == Arm::Gl {
                 return Renderer::GaugeGl {
                     config: *config,
                     gauge,
@@ -2690,17 +2739,38 @@ impl Renderer {
     /// rasterise nothing and never be rebuilt onto the kit — a permanently
     /// blank chip.
     ///
-    /// An exhaustive `match` rather than a `matches!` (#1211): every non-GL
-    /// arm is named on its own `false` arm, so a new Renderer variant has to
-    /// answer `true` or `false` here to compile at all, rather than falling
-    /// into an implicit `_ => false`.
+    /// Delegated to [`gl_program`](Self::gl_program) rather than keeping a
+    /// second hand-written list of the same five variants (#1232). The
+    /// exhaustive-`match` property #1211 wanted here is unchanged — it moved
+    /// one function down, where a new `Renderer` variant still has to answer
+    /// `Some`/`None` to compile at all — and the two lists can no longer
+    /// disagree, which they would have done in the worst possible direction:
+    /// an arm that `is_gl` counts and `gl_program` does not is a chip nothing
+    /// ever falls back.
     fn is_gl(&self) -> bool {
+        self.gl_program().is_some()
+    }
+
+    /// The registered pipeline this renderer draws with, or `None` for a
+    /// renderer that rasterises on the CPU (#1232).
+    ///
+    /// The **one** list of which arms are GL arms, and of which program each
+    /// one names — [`is_gl`](Self::is_gl) reads it, so does
+    /// [`rebuild_refused_gl_renderers_on_cpu`], and
+    /// [`gl_surface`](Self::gl_surface) produces the same constants beside its
+    /// uniforms. Exhaustive with no catch-all, unlike `gl_surface`'s: there
+    /// the honest answer for a renderer that does not draw on the GPU is
+    /// `None` and a forgotten arm renders nothing *loudly*, while a forgotten
+    /// arm here would answer "this chip is not on the GPU" about one that is,
+    /// and the refused pipeline would keep it blank in silence — which is
+    /// #1232 itself.
+    fn gl_program(&self) -> Option<GlProgram> {
         match self {
-            Self::ScopeGl { .. }
-            | Self::GaugeGl { .. }
-            | Self::DotMatrixGl { .. }
-            | Self::MarqueeGl { .. }
-            | Self::TextBoxGl { .. } => true,
+            Self::ScopeGl { .. } => Some(preem_gl::SCOPE),
+            Self::GaugeGl { .. } => Some(preem_gl::GAUGE),
+            Self::DotMatrixGl { .. } => Some(preem_gl::DOT_MATRIX),
+            Self::MarqueeGl { .. } => Some(preem_gl::MARQUEE),
+            Self::TextBoxGl { .. } => Some(preem_gl::TEXTBOX),
             Self::DotMatrix { .. }
             | Self::SevenSeg { .. }
             | Self::TextBox { .. }
@@ -2708,7 +2778,7 @@ impl Renderer {
             | Self::Marquee { .. }
             | Self::Scope { .. }
             | Self::Gauge { .. }
-            | Self::FlipBoard { .. } => false,
+            | Self::FlipBoard { .. } => None,
         }
     }
 
@@ -3435,5 +3505,253 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
         W::Marquee { .. } => Some(preem_gl::Kind::Marquee),
         W::TextBox { .. } => Some(preem_gl::Kind::TextBox),
         W::SevenSeg { .. } | W::LedStrip { .. } | W::FlipBoard { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Arm, Renderer, Scope, UiNode, begin_pass, build, display_style, end_pass, map_widget,
+        preem_gl, vocab,
+    };
+
+    /// The `Scope` the two arms are compared through — the same shape
+    /// `plugins::tests`' GL-arm suite uses, so a reader comparing the two
+    /// files is looking at one widget.
+    fn scope_widget() -> vocab::PreemWidget {
+        vocab::PreemWidget::Scope {
+            config: vocab::ScopeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Crt),
+                cols: 48,
+                rows: 24,
+                scale: 2,
+                persistence: 184,
+            },
+            state: vocab::ScopeState {
+                samples: (0..64_u8).map(|i| f32::from(i % 9) / 4.0 - 1.0).collect(),
+            },
+        }
+    }
+
+    /// One widget per kind that **has** a GL arm, at its vocabulary defaults.
+    ///
+    /// Length-checked against [`preem_gl::Kind::ALL`], the #1211 enumeration
+    /// every other per-kind list in the tree is tied to, so a sixth GL kind
+    /// cannot land here unnoticed.
+    fn gl_capable_widgets() -> Vec<vocab::PreemWidget> {
+        use vocab::PreemWidget as W;
+        let all = vec![
+            scope_widget(),
+            W::Gauge {
+                config: vocab::GaugeConfig::default(),
+                state: vocab::GaugeState::default(),
+            },
+            W::DotMatrix {
+                config: vocab::DotMatrixConfig::default(),
+                state: vocab::DotMatrixState::default(),
+            },
+            W::Marquee {
+                config: vocab::MarqueeConfig::default(),
+                state: vocab::MarqueeState::default(),
+            },
+            W::TextBox {
+                config: vocab::TextBoxConfig::default(),
+                state: vocab::TextBoxState::default(),
+            },
+        ];
+        assert_eq!(
+            all.len(),
+            preem_gl::Kind::ALL.len(),
+            "a kit widget gained a GL arm without a sample here",
+        );
+        all
+    }
+
+    /// **#1232.** A pipeline this driver will not build takes **that** chip to
+    /// the CPU kit — and leaves every other kind on the GPU.
+    ///
+    /// This is the bug end to end, from the host's side of the seam. Shipped,
+    /// `hytte-ui` latched the refusal (#1180 item 2, so the driver is asked
+    /// once), wrote one journal line, and told nobody: `preem_gl::arm` kept
+    /// answering `Gl` because neither of the two failures it folds in had
+    /// happened, the mapping pass kept emitting a `UiNode::GlSurface`, and the
+    /// chip drew nothing at all for the life of the context.
+    ///
+    /// Driven through `hytte::ui::gl_surface::refuse_build` — the very entry
+    /// point `GlSurface::ensure_resources` calls on a real refusal, public for
+    /// exactly this reason (its own doc, and `abandon_gl`'s before it) — so
+    /// what this exercises is the production wire from `preem_gl::install`'s
+    /// hook onward, not a stand-in for it. The other end (that a real driver
+    /// refusal reaches that call) is `hytte-ui`'s
+    /// `a_refused_pipeline_calls_the_hosts_fallback_hook_once`, under
+    /// llvmpipe.
+    ///
+    /// The oracle is the **CPU arm's own output** for the same widget, which
+    /// is the kit's bytes by
+    /// `the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`'s
+    /// contract — so "renders the kit's raster" is asserted as bytes rather
+    /// than as a node kind, and a fallback that produced an empty or
+    /// differently sized buffer would fail here rather than look right.
+    ///
+    /// **Falsified** two ways: dropping the `set_build_refusal_handler` line
+    /// from `preem_gl::install` (the chip is still a `GlSurface` afterwards —
+    /// the shipped behaviour, i.e. blank on glass), and widening
+    /// `rebuild_refused_gl_renderers_on_cpu` to every GL instance (the last
+    /// assertion goes red: the gauge loses its GPU arm for a refusal that was
+    /// never about it).
+    #[test]
+    fn a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl() {
+        let _ink = crate::plugins::tests::preem_ink_lock();
+        // Registers the pipelines *and* both hooks — the context-failure one
+        // and #1232's build-refusal one.
+        preem_gl::install();
+
+        let scope = scope_widget();
+        let gauge = vocab::PreemWidget::Gauge {
+            config: vocab::GaugeConfig::default(),
+            state: vocab::GaugeState::default(),
+        };
+
+        // The oracle: the same scope on the kit, in a scope of its own. The
+        // test arm defaults to `Cpu` (`preem_gl::TEST_ARM`), so this is the
+        // plain kit path with nothing to opt into.
+        let oracle_key = Scope::detached("refused-oracle");
+        begin_pass(&oracle_key);
+        let oracle = map_widget(&oracle_key, Some("sc"), &[], &scope);
+        end_pass(&oracle_key);
+
+        let key = Scope::detached("refused-fallback");
+        preem_gl::with_gl_arm(|| {
+            begin_pass(&key);
+            let scope_before = map_widget(&key, Some("sc"), &[], &scope);
+            let gauge_before = map_widget(&key, Some("ga"), &[], &gauge);
+            end_pass(&key);
+            assert!(
+                matches!(scope_before, UiNode::GlSurface { .. }),
+                "the premise: both chips start on the GPU",
+            );
+            assert!(matches!(gauge_before, UiNode::GlSurface { .. }));
+
+            // The driver refuses the scope's pipeline, once, exactly as a
+            // realised `GlSurface` reports it.
+            hytte::ui::gl_surface::refuse_build(
+                preem_gl::SCOPE,
+                (48, 24),
+                "fragment shader failed to compile: 0:1(1): error: syntax error",
+            );
+
+            begin_pass(&key);
+            let scope_after = map_widget(&key, Some("sc"), &[], &scope);
+            let gauge_after = map_widget(&key, Some("ga"), &[], &gauge);
+            end_pass(&key);
+
+            match (&scope_after, &oracle) {
+                (
+                    UiNode::Pixels {
+                        width,
+                        height,
+                        data,
+                        ..
+                    },
+                    UiNode::Pixels {
+                        width: want_w,
+                        height: want_h,
+                        data: want,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(
+                        (width, height),
+                        (want_w, want_h),
+                        "the fallback chip is the size the kit arm would have produced",
+                    );
+                    assert_eq!(
+                        data.as_ref(),
+                        want.as_ref(),
+                        "…and it is the kit's raster, byte for byte — not a blank buffer",
+                    );
+                    assert!(
+                        !data.is_empty(),
+                        "…which is not empty, so this cannot pass vacuously",
+                    );
+                }
+                _ => panic!("a refused pipeline must leave a raster chip behind, not a GL one"),
+            }
+
+            assert!(
+                matches!(gauge_after, UiNode::GlSurface { .. }),
+                "a refused `preem.scope` says nothing about `preem.gauge`: the fallback is per \
+                 pipeline, not per session",
+            );
+        });
+    }
+
+    /// **#1232.** `Renderer::gl_program` and `Renderer::gl_surface` name the
+    /// **same** program for every GL arm.
+    ///
+    /// The two are the only places a renderer variant is mapped to a
+    /// registered pipeline: `gl_surface` decides what the reconciler draws
+    /// with, `gl_program` decides which chips a refusal of that pipeline falls
+    /// back. A pair that disagreed would send the refusal to the wrong kind —
+    /// the refused chip staying blank while an innocent one loses the GPU —
+    /// and both halves would still look right on their own.
+    ///
+    /// `plugins::tests`' `every_gl_renderer_answers_both_halves_of_the_gl_seam`
+    /// already pins that the two agree on *whether* an arm is a GL arm; what
+    /// it cannot see is which program each names.
+    ///
+    /// **Falsified** by swapping any arm's constant in `gl_program` (say
+    /// `GaugeGl => SCOPE`): this goes red naming the kind.
+    #[test]
+    fn every_gl_arm_names_one_program_in_both_places() {
+        let _ink = crate::plugins::tests::preem_ink_lock();
+        preem_gl::with_gl_arm(|| {
+            for widget in gl_capable_widgets() {
+                let renderer = build(&widget).expect("every GL-capable widget builds");
+                let style = display_style(widget.style());
+                let drawn = renderer.gl_surface(style).map(|(program, _)| program);
+                assert_eq!(
+                    renderer.gl_program(),
+                    drawn,
+                    "{}: gl_program() and gl_surface() name different pipelines",
+                    widget.kind(),
+                );
+                assert!(
+                    renderer.gl_program().is_some(),
+                    "{}: the premise — this kind is supposed to have a GL arm",
+                    widget.kind(),
+                );
+            }
+        });
+    }
+
+    /// **#1232.** A renderer the host has moved to the CPU kit answers `None`
+    /// to [`Renderer::gl_program`], so the refusal sweep cannot count it twice
+    /// and `apply`'s `gl_lost` cannot re-fire on it for ever.
+    ///
+    /// **Falsified** by giving any CPU arm a `Some(…)` in `gl_program`: the
+    /// second assertion goes red.
+    #[test]
+    fn a_cpu_renderer_names_no_pipeline() {
+        let _ink = crate::plugins::tests::preem_ink_lock();
+        let widget = scope_widget();
+        let gl = preem_gl::with_gl_arm(|| build(&widget)).expect("the GL arm builds");
+        assert_eq!(
+            gl.gl_program(),
+            Some(preem_gl::SCOPE),
+            "the premise: the GL arm draws with the scope's pipeline",
+        );
+        let cpu = build(&widget).expect("the kit arm builds");
+        assert_eq!(
+            cpu.gl_program(),
+            None,
+            "a kit renderer draws with no registered pipeline at all",
+        );
+        assert!(!Renderer::is_gl(&cpu) && Renderer::is_gl(&gl));
+        assert_eq!(
+            preem_gl::arm_for(preem_gl::SCOPE),
+            Arm::Cpu,
+            "…and the test default really is the kit arm, so the line above measured something",
+        );
     }
 }

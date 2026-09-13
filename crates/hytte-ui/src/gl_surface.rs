@@ -62,6 +62,28 @@
 //! second failed context to find out. The *diagnostic* stays once-only either
 //! way, which is what the spec's "warned once" was protecting.
 //!
+//! # When a *pipeline* will not build
+//!
+//! That is a **third** failure, and it is neither of the two above (#1232).
+//! [`abandon_gl`] covers a failed context and a missing [`GlPipeline`] covers
+//! "this kind has no GL arm" — the two cases #893 says the CPU kit exists for
+//! — but a context that comes up fine and then will not *compile or link* one
+//! particular pipeline is neither. #1180 item 2 made that refusal permanent
+//! for the surface rather than a per-frame recompile, which is the right
+//! answer for the driver and the wrong one for the widget: a build asked once
+//! is also a build nobody is ever going to retry, so without a host that hears
+//! about it the chip stays blank for the life of the context.
+//!
+//! So the surface pushes it: [`set_build_refusal_handler`] is the hook,
+//! [`refuse_build`] is the call, and both ride the per-surface
+//! `(grid, program)` latch that already bounds the compile and the journal
+//! line — **once per surface per refused build**, and again after a context
+//! recreate, which clears that latch. Pushed rather than polled, unlike the
+//! `build_refused()` accessor this replaced (PR #1199 review, LOW 5): that one
+//! shipped with its host half deferred, nothing in the tree ever read it, and
+//! a question only a per-frame walk of every reconciled tree could ask is not
+//! one a host with a hot path is ever going to ask.
+//!
 //! # Sizing and fractional scale
 //!
 //! The surface measures exactly like [`PixelSurface`](crate::PixelSurface): the
@@ -291,6 +313,18 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static ON_CONTEXT_FAILURE: RefCell<Option<Box<dyn Fn(&str)>>> = const { RefCell::new(None) };
 
+    /// The host's "the driver would not build this pipeline" hook — see
+    /// [`set_build_refusal_handler`]. Called **once per surface per refused
+    /// `(grid, program)`**, unlike [`ON_CONTEXT_FAILURE`]'s once-for-the-
+    /// process: a refusal is a fact about one pipeline, and a host that has
+    /// several is entitled to keep the ones that build.
+    ///
+    /// Boxed and taken out of the slot for the duration of a call, both for
+    /// [`ON_CONTEXT_FAILURE`]'s reasons.
+    #[allow(clippy::type_complexity)]
+    static ON_BUILD_REFUSAL: RefCell<Option<Box<dyn Fn(GlProgram, (u32, u32), &str)>>> =
+        const { RefCell::new(None) };
+
     /// Latched once any surface fails to get a context. Never cleared — see
     /// the module docs on why this is process-wide rather than per instance.
     static ABANDONED: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -336,6 +370,70 @@ pub fn register(program: GlProgram, pipeline: GlPipeline) {
 /// widget's parked clock never delivers a mapping pass to do it on.
 pub fn set_context_failure_handler(handler: impl Fn(&str) + 'static) {
     ON_CONTEXT_FAILURE.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
+}
+
+/// Install the host's **pipeline-refusal** hook — called with the program the
+/// surface was pointed at, the grid it asked for, and the driver's own reason,
+/// the first time a surface is refused that build (#1232).
+///
+/// The sibling of [`set_context_failure_handler`], for the *third* failure
+/// shape (see [`refuse_build`]): the context came up, the program is
+/// registered, and the driver will not compile or link this particular
+/// pipeline. A host that does nothing about it keeps a **blank widget for the
+/// life of that context** — the build is latched, deliberately (#1180 item 2),
+/// so nothing retries it and nothing writes a second journal line.
+///
+/// # How often it fires
+///
+/// **Once per surface per refused `(grid, program)`**, because it rides the
+/// same `RefusedBuilds::remember` latch that bounds the compile and the
+/// journal line — one latch, so the hook, the log and the driver can never
+/// disagree about what happened. Not once per process: a driver that refuses
+/// one pipeline may build every other one, and a host with several is
+/// entitled to keep them. A surface unrealized and re-realized clears its
+/// latch (the refusal was measured against a context that is gone), so a
+/// fresh context can fire the hook again.
+///
+/// # What a host is expected to do with it
+///
+/// Exactly what it does for a failed context, narrowed to the one pipeline:
+/// `trollshell`'s `plugins::preem_gl` records the program as refused so
+/// `preem_render::build` stops choosing its GL arm, rebuilds the chips already
+/// on it onto the CPU kit, and asks for one re-map — because a settled
+/// widget's parked clock will never deliver a mapping pass to do it on. The
+/// chips of *other* kinds keep their GPU arm.
+pub fn set_build_refusal_handler(handler: impl Fn(GlProgram, (u32, u32), &str) + 'static) {
+    ON_BUILD_REFUSAL.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
+}
+
+/// Report that the driver refused to build `program` at `grid`, running the
+/// host's [`set_build_refusal_handler`] hook with `reason` (the driver's info
+/// log, verbatim).
+///
+/// Called by [`GlSurface`] itself from the one place a build can be refused,
+/// behind the per-surface latch that makes it once-per-`(grid, program)`.
+/// Public for [`abandon_gl`]'s reason, and it is the same reason word for
+/// word: a driver that refuses one pipeline is not something a hermetic test
+/// can arrange, but "behave as if the driver had refused" is exactly one call
+/// — and a host testing its own fallback should drive the *production* path,
+/// not a stand-in that agrees with it by construction.
+///
+/// **This latches nothing.** [`abandon_gl`] sets a process-wide flag before it
+/// runs the hook, because the host's handler asks that flag what to rebuild
+/// onto; there is no equivalent here, since the only thing that could be
+/// latched is per surface and this function has no surface. A host that wants
+/// "never offer this program again" records that on its own side — which is
+/// where the decision belongs anyway, because `hytte-ui` does not know whether
+/// a CPU implementation exists to fall back to.
+pub fn refuse_build(program: GlProgram, grid: (u32, u32), reason: &str) {
+    // Taken out of the slot for the duration of the call: a hook is arbitrary
+    // host code and may (legitimately) re-enter this module — the host's
+    // rebuild reaches `register`, and its re-map reaches `set_state`.
+    let handler = ON_BUILD_REFUSAL.with_borrow_mut(Option::take);
+    if let Some(handler) = handler {
+        handler(program, grid, reason);
+        ON_BUILD_REFUSAL.with_borrow_mut(|slot| *slot = Some(handler));
+    }
 }
 
 /// Whether GL has been abandoned for this process — see [`abandon_gl`].
@@ -823,13 +921,50 @@ const PIPELINE_BUILD_REFUSED: &str = "a GL pipeline could not be built; the surf
     whatever it last successfully drew (nothing, before the first successful frame) and does \
     not rebuild this pipeline again until its program or grid changes";
 
+/// Report a build the driver refused: the journal line **and** the host's
+/// [`set_build_refusal_handler`] hook, both claimed off one latch (#1232).
+///
+/// Sibling of [`warn_on_target_failure`], down to taking the latch as a
+/// parameter for the same reason — and with one more thing riding on it than
+/// that one has. The hook is what turns a refusal into a fallback, so a latch
+/// that disagreed with the log about whether this refusal was news would mean
+/// a chip left blank with nothing in the journal to say so, or a host told
+/// twice about one pipeline. [`RefusedBuilds::remember`] answers once and both
+/// consumers read that answer, exactly as the warning and the *compile*
+/// already share it.
+///
+/// **Order:** the journal line first, the host second. `hytte-ui` has the
+/// driver's own words and nothing to do about them; the host's handler is
+/// arbitrary code that rebuilds widgets and may write lines of its own, and a
+/// reader should find the cause above the consequence.
+///
+/// Returns whether the refusal was news — which is what the hermetic tests
+/// read, and the reason this is a free function rather than four lines inside
+/// `imp::GlSurface::ensure_resources`: that one needs a live `hgl::Gl` and a
+/// default `cargo test` has no driver at all.
+fn report_build_refusal(refused: &RefCell<RefusedBuilds>, key: BuildKey, error: &hgl::Error) -> bool {
+    let (grid, program) = key;
+    if !refused.borrow_mut().remember(key) {
+        return false;
+    }
+    tracing::warn!(
+        %error,
+        program = program.0,
+        grid = format!("{}x{}", grid.0, grid.1),
+        "{}",
+        PIPELINE_BUILD_REFUSED
+    );
+    refuse_build(program, grid, &error.to_string());
+    true
+}
+
 mod imp {
     use super::{
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
-        GlProgram, GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED,
-        PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, RefusedBuilds, SAMPLER_NAMES, WarnLatch,
-        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, last_drawn_after, program_key,
-        refuse_data_strip, resources_reusable, steps_owed, warn_on_target_failure,
+        GlProgram, GlTarget, GlUniforms, GlValue, PROGRAM_UNREGISTERED_REFUSED, PROGRAMS,
+        RefusedBuilds, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk,
+        glib, last_drawn_after, program_key, refuse_data_strip, report_build_refusal,
+        resources_reusable, steps_owed, warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -1059,25 +1194,6 @@ mod imp {
             (true, resized)
         }
 
-        /// Whether the build this surface is *currently* asking for is one
-        /// the driver has already refused — see
-        /// [`GlSurface::build_refused`](super::GlSurface::build_refused).
-        ///
-        /// The key is rebuilt from the live program and the live state's
-        /// grid, deliberately, rather than answered from "the latch holds
-        /// anything at all": a surface repointed at a pipeline that builds
-        /// fine is not refused, even though the key that refused is still
-        /// remembered against the grid it failed at.
-        pub(super) fn build_refused(&self) -> bool {
-            let Some(program) = self.program.get() else {
-                return false;
-            };
-            let Some(grid) = self.state.borrow().as_ref().map(|state| state.grid) else {
-                return false;
-            };
-            self.refused_builds.borrow().refused((grid, program))
-        }
-
         /// The whole render: ensure resources, replay the outstanding steps,
         /// run the frame passes.
         fn draw(&self) {
@@ -1218,15 +1334,12 @@ mod imp {
                     true
                 }
                 Err(error) => {
-                    if self.refused_builds.borrow_mut().remember(key) {
-                        tracing::warn!(
-                            %error,
-                            program = program.0,
-                            grid = format!("{}x{}", grid.0, grid.1),
-                            "{}",
-                            PIPELINE_BUILD_REFUSED
-                        );
-                    }
+                    // The latch goes in, the journal line and the **host's
+                    // fallback hook** come out of the same claim (#1232) —
+                    // see `super::report_build_refusal`. Nothing is done with
+                    // the answer here: a refusal that is not news has already
+                    // been reported and already been fallen back from.
+                    report_build_refusal(&self.refused_builds, key, &error);
                     self.resources.replace(None);
                     false
                 }
@@ -2018,11 +2131,6 @@ mod imp {
                     .refused(((4, 4), program)),
                 "…keyed by (grid, program)",
             );
-            assert!(
-                surface.build_refused(),
-                "…and the host can see it: `build_refused` answers for the program and grid \
-                 the surface is currently pointed at (PR #1199 review, LOW 5)",
-            );
 
             // Out of the window: GTK unroots, which unrealizes, which is the
             // only place the per-context state is dropped. The local `surface`
@@ -2035,12 +2143,8 @@ mod imp {
             assert!(
                 surface.imp().refused_builds.borrow().keys.is_empty(),
                 "unrealize must forget refusals measured against a context that is gone \
-                 (PR #1199 review, MEDIUM 1)",
-            );
-            assert!(
-                !surface.build_refused(),
-                "…so a host that fell back to its CPU kit on the refusal may offer GL to the \
-                 context that replaces it",
+                 (PR #1199 review, MEDIUM 1) — so the build below is asked again, and the \
+                 host hears about it again if it is refused again",
             );
 
             // …and back in, onto a context GTK creates fresh.
@@ -2073,6 +2177,124 @@ mod imp {
                     .borrow()
                     .refused(((4, 4), program)),
                 "…and re-latched against the new context, so it is still asked only once",
+            );
+
+            window.destroy();
+        }
+
+        /// **#1232.** A realised widget whose pipeline the driver **refuses**
+        /// calls the host's fallback hook, once — and a pipeline the driver
+        /// **builds** calls it not at all.
+        ///
+        /// The second half is why this test needs a driver. "The hook does not
+        /// fire on success" is the *absence* of a call from a code path that
+        /// only exists when something compiles: a hermetic stand-in for it
+        /// would have to fake the success, and would then be a probe agreeing
+        /// with itself about a branch it wrote. Here the good pipeline really
+        /// is handed to the driver, really does build (asserted as the
+        /// premise, so this cannot pass vacuously on a driver that refused
+        /// both), and the hook really stays silent.
+        ///
+        /// The first half — once per surface per key, not once per frame —
+        /// is the same latch `a_refused_pipeline_is_built_once_not_once_per_frame`
+        /// measures on [`BUILD_ATTEMPTS`], read from the host's end instead:
+        /// `report_build_refusal` claims the log and the hook off that one
+        /// `remember`, so a host's fallback can never be re-run per frame
+        /// behind a journal that has gone quiet. What it adds over the
+        /// hermetic `a_refused_build_reaches_the_host_hook_once_per_key` is
+        /// the wire itself: that `ensure_resources`' `Err` arm is what calls
+        /// it, on a real refusal, through the widget.
+        ///
+        /// **Falsified** by deleting the `report_build_refusal` call from
+        /// `ensure_resources`' `Err` arm: the count goes to 0 and the chip is
+        /// back to being silently blank, which is #1232.
+        #[gtk::test]
+        fn a_refused_pipeline_calls_the_hosts_fallback_hook_once() {
+            const BROKEN: GlPass = GlPass {
+                vertex: VERTEX,
+                fragment: "void main() { this is not GLSL }",
+                target: GlTarget::Screen,
+                inputs: &[],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            };
+            const BROKEN_PASS: [GlPass; 1] = [BROKEN];
+
+            let Some((window, surface, _gl)) = realised_surface_or_skip(
+                "a_refused_pipeline_calls_the_hosts_fallback_hook_once",
+            ) else {
+                return;
+            };
+
+            type Refusals = std::rc::Rc<RefCell<Vec<(&'static str, (u32, u32), String)>>>;
+            let seen: Refusals = std::rc::Rc::new(RefCell::new(Vec::new()));
+            let sink = std::rc::Rc::clone(&seen);
+            super::super::set_build_refusal_handler(move |program, grid, reason| {
+                sink.borrow_mut().push((program.0, grid, reason.to_owned()));
+            });
+
+            let state = Arc::new(GlUniforms {
+                values: Vec::new(),
+                data: None,
+                grid: (4, 4),
+                step_seq: 0,
+            });
+
+            // One this driver builds.
+            let good = GlProgram("gl_surface_test.hook_builds");
+            PROGRAMS.with_borrow_mut(|programs| {
+                programs.insert(
+                    good,
+                    GlPipeline {
+                        aux: 0,
+                        step: &[],
+                        frame: &ONE_PASS,
+                    },
+                );
+            });
+            surface.set_state(good, 4, 4, &state);
+            surface.make_current();
+            surface.imp().draw();
+            assert!(
+                surface.imp().resources.borrow().is_some(),
+                "the premise: this driver really did build the good pipeline",
+            );
+            assert!(
+                seen.borrow().is_empty(),
+                "a pipeline that builds must tell the host nothing, got {:?}",
+                seen.borrow(),
+            );
+
+            // …and the same widget, repointed at one nobody will.
+            let broken = GlProgram("gl_surface_test.hook_refuses");
+            PROGRAMS.with_borrow_mut(|programs| {
+                programs.insert(
+                    broken,
+                    GlPipeline {
+                        aux: 0,
+                        step: &[],
+                        frame: &BROKEN_PASS,
+                    },
+                );
+            });
+            surface.set_state(broken, 4, 4, &state);
+            surface.imp().draw();
+            surface.imp().draw();
+
+            assert_eq!(
+                seen.borrow().len(),
+                1,
+                "a refused pipeline tells the host once, not once per frame",
+            );
+            assert_eq!(
+                seen.borrow()[0].0,
+                "gl_surface_test.hook_refuses",
+                "…named by program, so a host keeps the pipelines that do build",
+            );
+            assert_eq!(seen.borrow()[0].1, (4, 4), "…at the grid that was refused");
+            assert!(
+                !seen.borrow()[0].2.is_empty(),
+                "…with the driver's info log, which is the only triage a host can print",
             );
 
             window.destroy();
@@ -2314,41 +2536,6 @@ impl GlSurface {
         self.error().is_some()
     }
 
-    /// Whether the driver has **refused to build** the pipeline this surface
-    /// is currently pointed at — the program and grid its last
-    /// [`set_state`](Self::set_state) named (PR #1199 review, LOW 5).
-    ///
-    /// This is a third failure, and until now the host had no way to see it.
-    /// [`abandon_gl`] covers a failed *context* and [`GlPipeline`]'s absence
-    /// covers "this kind has no GL arm" — the two cases #893 says the CPU kit
-    /// exists for — but a context that comes up fine and then will not
-    /// *compile* a particular pipeline is neither, so the chip simply stayed
-    /// blank. #1180 item 2 made that permanent rather than a per-frame
-    /// recompile, which is the right answer for the driver and the wrong one
-    /// for the widget: a refusal that is asked once is also a refusal nobody
-    /// is ever going to retract on its own.
-    ///
-    /// Reported per instance and polled rather than pushed, because the only
-    /// consumer is a host that already runs a pump: `trollshell`'s
-    /// `plugins::pump` ticks every render, and reading a `Cell`-shaped answer
-    /// there costs nothing, while a signal would need a `Mutable` in a crate
-    /// that deliberately has none.
-    ///
-    /// **The host half is #1180 part 2**, not this commit:
-    /// `trollshell/src/plugins/preem_render.rs` is where "GL refused this
-    /// instance" becomes a per-instance swap to the CPU kit with one `warn!`,
-    /// alongside the existing `preem_gl::arm() == Arm::Cpu` swap, and that
-    /// file is being rewritten by PR #1193 (dot matrix) at the same time.
-    /// Answering the question here is the half that can land without a
-    /// conflict; nothing in the tree reads it yet.
-    ///
-    /// Goes `false` again when the surface is unrealized — the latch is per
-    /// `GdkGLContext` (see `imp::GlSurface::unrealize`), so a host that
-    /// switched to the CPU kit on a refusal may offer GL to a fresh context.
-    #[must_use]
-    pub fn build_refused(&self) -> bool {
-        self.imp().build_refused()
-    }
 }
 
 impl Default for GlSurface {
@@ -2364,11 +2551,32 @@ mod tests {
         MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, REFUSED_BUILDS,
         RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
         framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after, program_key,
-        refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
-        warn_on_target_failure,
+        refuse_build, refuse_data_strip, report_build_refusal, resources_reusable,
+        set_build_refusal_handler, steps_owed, warn_on_data_failure, warn_on_target_failure,
     };
     use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
+
+    /// What a test's [`set_build_refusal_handler`] hook recorded, per call.
+    type Refusals = Rc<RefCell<Vec<(&'static str, (u32, u32), String)>>>;
+
+    /// Install a hook that records every call, and hand back what it writes
+    /// into.
+    ///
+    /// The thread-local it installs into is never cleared, which is exactly
+    /// why this is a helper rather than a fixture with a guard: libtest gives
+    /// each `#[test]` its own thread, so the blast radius of an installed hook
+    /// is the test that installed it — the same argument
+    /// `an_abandoned_context…` rests on for the `ABANDONED` latch next door.
+    fn recording_handler() -> Refusals {
+        let seen: Refusals = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&seen);
+        set_build_refusal_handler(move |program, grid, reason| {
+            sink.borrow_mut().push((program.0, grid, reason.to_owned()));
+        });
+        seen
+    }
 
     /// **#1180 item 3.** A replay that stops early leaves the steps it did
     /// not run still owed.
@@ -2541,6 +2749,122 @@ mod tests {
         assert!(
             !refused.refused(((4, 4), scope)),
             "an evicted key is asked again — the cost of a bound, and the safe direction",
+        );
+    }
+
+    /// **#1232.** A refused build reaches the **host's** hook, once per key,
+    /// carrying the program, the grid and the driver's own words.
+    ///
+    /// This is the whole seam that was missing: #1180 item 2 latched the
+    /// refusal so the driver is asked once, and that silence is exactly what
+    /// left the chip blank for the life of the context, because nothing in the
+    /// tree ever found out. [`report_build_refusal`] is the one place a
+    /// refusal is reported, and the log and the hook are claimed off the
+    /// *same* [`RefusedBuilds::remember`] — a second latch could disagree with
+    /// the first, and "the host was told twice" and "the host was never told"
+    /// are both bugs a separate latch could produce.
+    ///
+    /// Hermetic because the reporting is split from the compiling: asking a
+    /// driver for a broken pipeline needs a driver (that is the gated
+    /// `a_refused_pipeline_calls_the_hosts_fallback_hook_once`, which also
+    /// covers the other half — that a pipeline which *builds* calls the hook
+    /// not at all, the one direction no stand-in can honestly assert).
+    ///
+    /// **Falsified** three ways: dropping the `refuse_build` call from
+    /// [`report_build_refusal`] (nothing is recorded at all); moving it above
+    /// the `remember` early return (the count goes to 3, and a host would
+    /// re-run its fallback every frame); and reporting a bare program with no
+    /// grid (the `(8, 4)` assertion goes red, and a host could not name the
+    /// chip in a journal line).
+    #[test]
+    fn a_refused_build_reaches_the_host_hook_once_per_key() {
+        let seen = recording_handler();
+        let latch = RefCell::new(RefusedBuilds::default());
+        let program = GlProgram("gl_surface_test.refusal_hook");
+        // `Error::Name` rather than a `Compile`: it is the one arm of
+        // `hgl::Error` a test can build with no driver and no info log, and
+        // `Resources::build` reaches it through `VertexArray::new` (#1180
+        // item 4), so it is a refusal this call site really can see.
+        let error = hgl::Error::Name {
+            object: "vertex array",
+        };
+
+        assert!(
+            report_build_refusal(&latch, ((4, 4), program), &error),
+            "the first refusal of a key is news",
+        );
+        assert!(
+            !report_build_refusal(&latch, ((4, 4), program), &error),
+            "…and no later one is, however many frames ask",
+        );
+        assert!(!report_build_refusal(&latch, ((4, 4), program), &error));
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "the host is told once per refused build, not once per frame",
+        );
+        assert_eq!(
+            seen.borrow()[0].0,
+            "gl_surface_test.refusal_hook",
+            "…and told which pipeline, since a host that has several keeps the rest",
+        );
+        assert_eq!(seen.borrow()[0].1, (4, 4), "…at which grid");
+        assert!(
+            seen.borrow()[0].2.contains("vertex array"),
+            "…in the driver's own words, which is the only triage there is: got {:?}",
+            seen.borrow()[0].2,
+        );
+
+        // A different key is a different fact — the same rule the compile and
+        // the journal line follow, since all three ride one `remember`.
+        assert!(report_build_refusal(&latch, ((8, 4), program), &error));
+        assert_eq!(seen.borrow().len(), 2, "a new grid is a new refusal");
+        assert_eq!(seen.borrow()[1].1, (8, 4));
+    }
+
+    /// **#1232.** The hook may re-enter this module, because a host's handler
+    /// is arbitrary code that rebuilds widgets — `trollshell`'s reaches
+    /// `register` and `set_state` on its way to swapping a chip onto the CPU
+    /// kit.
+    ///
+    /// [`refuse_build`] therefore takes the handler *out* of its slot for the
+    /// duration of the call, exactly as [`abandon_gl`] does, so a re-entrant
+    /// call finds an empty slot and returns instead of panicking on a second
+    /// mutable borrow. The inner call being dropped is the deliberate half:
+    /// one refusal is one report, and a handler that re-reports its own
+    /// refusal would otherwise recurse until the stack ran out.
+    ///
+    /// **Falsified** by holding the borrow across the call (`if let
+    /// Some(handler) = ON_BUILD_REFUSAL.borrow().as_ref()`): this panics with
+    /// `already mutably borrowed`.
+    #[test]
+    fn a_reentrant_hook_is_dropped_rather_than_deadlocked() {
+        let seen: Refusals = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&seen);
+        set_build_refusal_handler(move |program, grid, reason| {
+            sink.borrow_mut().push((program.0, grid, reason.to_owned()));
+            // The re-entry: a host rebuilding widgets can reach any of this
+            // module's entry points, and this is the sharpest of them.
+            refuse_build(GlProgram("gl_surface_test.reentrant.inner"), (1, 1), "inner");
+        });
+
+        refuse_build(GlProgram("gl_surface_test.reentrant"), (2, 2), "outer");
+
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "the outer call runs the handler; the re-entrant one finds the slot taken",
+        );
+        assert_eq!(seen.borrow()[0].0, "gl_surface_test.reentrant");
+
+        // …and the handler is back in its slot afterwards, so the *next*
+        // refusal is still reported. A `take` that forgot to put it back
+        // would leave the host deaf after its first fallback.
+        refuse_build(GlProgram("gl_surface_test.reentrant.again"), (3, 3), "again");
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "the handler is restored after the call, not consumed by it",
         );
     }
 

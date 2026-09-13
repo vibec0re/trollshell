@@ -81,8 +81,13 @@ range above is a floor, not a ceiling.
       doc comment claiming otherwise). Settings → Keep awake **on** →
       `systemctl --user restart trollshell` → the switch comes back **on** and
       `systemd-inhibit --list` shows the `idle` inhibitor **again**
-      (re-acquired). Flip off → `~/.config/trollshell/keep-awake.toml` becomes
-      `enabled = false` and it stays off across a restart.
+      (re-acquired). Flip off → `~/.local/state/trollshell/keep-awake.toml`
+      becomes `enabled = false` and it stays off across a restart.
+      (**Corrected by #1226**: the toggle files moved out of
+      `~/.config/trollshell/` into `$XDG_STATE_HOME/trollshell/`. Running this
+      check against the old path now reads a file frozen at its
+      pre-migration value and wrongly concludes the feature is broken — see
+      the "Shell state files" section below.)
 - [ ] **(#545)** A glanceable bar chip (`preferences-desktop-screensaver-symbolic`)
       appears next to the recording/settings chips **only** while keep-awake is
       engaged, and disappears the instant it's switched off. Click it → opens
@@ -4418,6 +4423,62 @@ that the widgets still work at all. `RES` here means the shell's own RSS:
       its highlight and that the highlight **clears** after ~1.5 s. The timer
       now holds the row weakly, so the failure mode to watch for is a
       highlight that sticks rather than one that never appears.
+
+## Shell state files (#1226)
+
+The seven files the shell writes when you click something — not config, which
+is what you write — moved from `~/.config/trollshell/` to
+`$XDG_STATE_HOME/trollshell/` (`~/.local/state/trollshell/` unless that
+variable is set), with a one-time, non-destructive read-migration per file.
+This is the half of #866's config/state split the layering had promised and
+not delivered. Three of the old files deliberately **stayed** in the config
+directory because external, nix-rendered systemd units hardcode their paths:
+`swaybg.args`, `wallpaper.path` and `wlsunset.args`.
+
+The checks below want a `~/.config/trollshell/` that still holds pre-migration
+toggle files, so run them on a box that was running a pre-#1226 shell — a
+fresh install has nothing to migrate and will simply start writing to the new
+location.
+
+- [ ] **(#1226)** **The migration adopts the old value.** On a shell from
+      before this PR, toggle DND on (or flip "Keep awake") so
+      `~/.config/trollshell/dnd.toml` / `keep-awake.toml` exists in the old
+      flat format. Note its bytes and mtime (`stat`). Deploy this branch and
+      `systemctl --user restart trollshell`. The toggle's on-screen state must
+      come back **as it was** — that is the migration having adopted the old
+      value, not a coincidental default.
+- [ ] **(#1226)** **The new file exists and the old one is untouched.** After
+      that restart, `~/.local/state/trollshell/dnd.toml` (or
+      `keep-awake.toml`) exists and holds the migrated value, **and**
+      `~/.config/trollshell/dnd.toml` still has its original bytes _and_
+      mtime — the migration reads it and never writes, renames or deletes it.
+      `journalctl --user -u trollshell -g 1226` shows one `info` line per
+      migrated file naming both paths.
+- [ ] **(#1226)** **Only state moves after that.** Flip the toggle again;
+      only the state file's mtime changes and the config-dir file is not
+      touched a second time. Repeat for the other four:
+      `muted-apps.toml` (mute an app's notifications),
+      `bluetooth-audio.toml`, `fullscreen-inhibit.toml`, and
+      `wallpaper.json` → `wallpaper.toml` (pick a wallpaper in Appearance).
+      The wallpaper one also changes **format**, JSON → TOML; confirm the
+      per-output map and any time-of-day rotation survived the hop.
+- [ ] **(#1226)** **State beats a hand-edited legacy file, forever.** With
+      `~/.local/state/trollshell/dnd.toml` in place, edit
+      `~/.config/trollshell/dnd.toml` to the opposite value and restart the
+      shell. The toggle must **not** change — once migrated, the legacy file
+      has no effect ever again. Then corrupt the _state_ file
+      (`echo 'nonsense {{{' > ~/.local/state/trollshell/dnd.toml`) and restart:
+      the toggle falls back to its **default** (DND off), still does not read
+      the legacy file, and the next flip repairs the state file. This is the
+      branch with a user-visible cost, so it is the one worth seeing once by
+      hand (#1233 F1).
+- [ ] **(#1226)** **The three files that stayed, stayed.**
+      `~/.config/trollshell/swaybg.args` and `wallpaper.path` are still being
+      written there after a wallpaper pick and `swaybg` still renders;
+      `~/.config/trollshell/wlsunset.args` is still written and `wlsunset`
+      still picks it up. Moving any of these would have broken the units in
+      `etc/systemd/user/` and their home-manager/NixOS-rendered mirrors,
+      which hardcode `%h/.config/trollshell/…`.
 
 ## Not carrying a live-verify list, noted for context
 

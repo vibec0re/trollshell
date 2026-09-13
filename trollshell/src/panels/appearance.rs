@@ -1,7 +1,8 @@
 //! Appearance / wallpaper drawer panel.
 //!
 //! The wallpaper picker spans three dimensions (#546), all persisted by the
-//! `wallpaper` service to `~/.config/trollshell/wallpaper.json`:
+//! `wallpaper` service to `$XDG_STATE_HOME/trollshell/wallpaper.toml` (#1226;
+//! migrated once out of the legacy `~/.config/trollshell/wallpaper.json`):
 //!
 //! - **All displays** — the default image applied to every output.
 //! - **Per-display overrides** — one image per connected output (reactively

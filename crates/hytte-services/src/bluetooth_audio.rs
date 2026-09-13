@@ -47,16 +47,21 @@
 //!
 //! # Persistence
 //!
-//! User toggle persisted to `~/.config/trollshell/bluetooth-audio.toml` as a
-//! single-line `enabled = true|false` flag. Default ON. The file is parsed
-//! permissively — any value other than `false` keeps the feature ON. Writes
-//! are best-effort; failure is logged and the in-memory state is the source
-//! of truth for the running process.
+//! User toggle persisted to `$XDG_STATE_HOME/trollshell/bluetooth-audio.toml`
+//! (#1226) as `enabled = true|false`. Default ON. One-time read-migration
+//! from the legacy `~/.config/trollshell/bluetooth-audio.toml`: if state is
+//! absent and that file exists, its value (parsed permissively — any value
+//! other than `false` keeps the feature ON) is adopted into state and the
+//! old file is left untouched; once state exists it is authoritative and the
+//! old file is never read again. Writes are best-effort; failure is logged
+//! and the in-memory state is the source of truth for the running process.
 
 use crate::config_file;
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,35 +71,64 @@ use crate::pipewire::{self, Sink};
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-/// Config file under `~/.config/trollshell/`.
-const CONFIG_FILE: &str = "bluetooth-audio.toml";
+/// The state subsystem name —
+/// `$XDG_STATE_HOME/trollshell/bluetooth-audio.toml`.
+const SUBSYSTEM: &str = "bluetooth-audio";
 
-fn load_enabled_from_disk() -> bool {
-    let Some(text) = config_file::read(CONFIG_FILE) else {
-        return true;
-    };
-    // Permissive: look for `enabled = false` anywhere; otherwise default ON.
+/// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
+const LEGACY_CONFIG_FILE: &str = "bluetooth-audio.toml";
+
+/// `#[serde(default)]` sits on the **container**, not the field: on a field it
+/// resolves to the *field type*'s `Default` (`bool::default()` — `false`),
+/// which is the opposite of this struct's documented default and the opposite
+/// of what the unparsable path gives, so a keyless-but-valid state file and a
+/// corrupt one would disagree (#1233 F4). It also future-proofs the shape: the
+/// day a second field is added, every existing state file lacks it, and the
+/// container form is what makes those files inherit this `Default` impl rather
+/// than the new field type's zero value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct BluetoothAudioState {
+    enabled: bool,
+}
+
+/// Default ON — unlike `dnd`/`keep-awake`, a fresh install auto-switches.
+impl Default for BluetoothAudioState {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Permissive legacy parser: looks for `enabled = false` anywhere in the old
+/// config file's text; anything else (missing key, malformed value, garbage)
+/// keeps the historical default ON. Only used for the one-time migration —
+/// always succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`.
+fn parse_legacy(text: &str) -> BluetoothAudioState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("false") {
-                return false;
+                return BluetoothAudioState { enabled: false };
             }
             if rhs.eq_ignore_ascii_case("true") {
-                return true;
+                return BluetoothAudioState { enabled: true };
             }
         }
     }
-    true
+    BluetoothAudioState::default()
+}
+
+fn load_enabled_from_disk() -> bool {
+    let old = config_file::path(LEGACY_CONFIG_FILE);
+    let loaded: BluetoothAudioState =
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
+    loaded.enabled
 }
 
 fn save_enabled_to_disk(enabled: bool) {
-    config_file::write(
-        "bluetooth-audio",
-        CONFIG_FILE,
-        &format!("enabled = {enabled}\n"),
-    );
+    state::store(SUBSYSTEM, &BluetoothAudioState { enabled });
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -401,6 +435,7 @@ fn react(state: &Mutex<ReactorState>, devices: &[Device], sinks: &[Sink], enable
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hytte_config::test_support::scratch_home;
 
     fn dev(addr: &str, icon: &str, connected: bool) -> Device {
         Device {
@@ -687,5 +722,116 @@ mod tests {
             "bluez_output.DE_AD_BE_EF_00_00.1",
             &dev,
         ));
+    }
+
+    // ── State migration (#1226) ─────────────────────────────────────────────
+
+    fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell/bluetooth-audio.toml")
+    }
+
+    #[test]
+    fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
+        scratch_home(|home| {
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = false\n").unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "the legacy off-value must be adopted into state"
+            );
+
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                "enabled = false\n",
+                "the legacy file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
+        scratch_home(|home| {
+            state::store(SUBSYSTEM, &BluetoothAudioState { enabled: false });
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "not even valid toml {{{").unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "state's off-value must win over the legacy file (which would default ON)"
+            );
+        });
+    }
+
+    /// State wins **even when it does not parse** — the half of #1226's
+    /// contract with a user-visible cost, and the one the `state_wins_*` test
+    /// above cannot reach because it seeds a valid state file (#1233 F1).
+    #[test]
+    fn a_corrupt_state_file_still_wins_over_the_legacy_file() {
+        scratch_home(|home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "not valid toml {{{").unwrap();
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = false\n").unwrap();
+
+            assert!(
+                load_enabled_from_disk(),
+                "a corrupt state file falls to the documented default (ON), \
+                 never back to the legacy file's OFF"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(),
+                "not valid toml {{{",
+                "the read path must not rewrite the corrupt state file"
+            );
+        });
+    }
+
+    /// A state file that exists and parses as a TOML table but carries no
+    /// `enabled` key must read the **documented** default (ON), which is what
+    /// `#[serde(default)]` on the container buys and what the same attribute
+    /// on the field silently inverts to `bool::default()` (#1233 F4). Pinned
+    /// alongside the unparsable case above so the two "this file is unusable"
+    /// paths are asserted to agree — before this they did not, and the one
+    /// that disagreed was the silent one.
+    #[test]
+    fn a_keyless_state_file_reads_the_documented_default() {
+        scratch_home(|_home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "# nothing\n").unwrap();
+
+            assert!(
+                load_enabled_from_disk(),
+                "a state file with no `enabled` key must read the struct's documented \
+                 default (ON), not `bool::default()`"
+            );
+        });
+    }
+
+    #[test]
+    fn neither_file_present_defaults_to_on() {
+        scratch_home(|_home| {
+            assert!(load_enabled_from_disk(), "bluetooth-audio defaults ON");
+        });
     }
 }

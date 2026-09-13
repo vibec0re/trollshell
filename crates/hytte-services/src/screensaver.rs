@@ -59,6 +59,7 @@ use crate::config_file;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::FdLease;
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime, shared, spawn_supervised};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -71,28 +72,47 @@ use zbus::message::Header;
 // exit and the hold vanishes on a shell restart (`crate::logind::inhibit_idle`
 // docs). To make "Keep awake" actually survive a restart — as a user reasonably
 // expects and the mechanism claimed — the desired flag is persisted to
-// `~/.config/trollshell/keep-awake.toml` and re-acquired on the next
-// `Service::start`. Flat `enabled = true|false`, **default OFF** (a fresh
-// install has caffeine off), mirroring `dnd`.
+// `$XDG_STATE_HOME/trollshell/keep-awake.toml` (#1226) and re-acquired on the
+// next `Service::start`. Flat `enabled = true|false`, **default OFF** (a
+// fresh install has caffeine off), mirroring `dnd`. One-time read-migration
+// from the legacy `~/.config/trollshell/keep-awake.toml`: if state is absent
+// and that file exists, its value is adopted into state and the old file is
+// left untouched; once state exists it is authoritative and the old file is
+// never read again.
 
-/// Config file under `~/.config/trollshell/` holding the persisted keep-awake
-/// desire.
-const KEEP_AWAKE_CONFIG_FILE: &str = "keep-awake.toml";
+/// The state subsystem name — `$XDG_STATE_HOME/trollshell/keep-awake.toml`.
+const KEEP_AWAKE_SUBSYSTEM: &str = "keep-awake";
+
+/// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
+const LEGACY_KEEP_AWAKE_CONFIG_FILE: &str = "keep-awake.toml";
+
+/// `#[serde(default)]` on the **container** (#1233 F4) — see `dnd::DndState`
+/// for why the rule is uniform rather than applied only where the two forms
+/// differ.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct KeepAwakeState {
+    enabled: bool,
+}
 
 /// Load the persisted "Keep awake" desire. **Default OFF**: only an explicit
 /// `enabled = true` re-engages caffeine on start; a missing/malformed/empty
 /// file leaves it off.
 fn load_keep_awake_from_disk() -> bool {
-    let Some(text) = config_file::read(KEEP_AWAKE_CONFIG_FILE) else {
-        return false;
-    };
-    parse_keep_awake(&text)
+    let old = config_file::path(LEGACY_KEEP_AWAKE_CONFIG_FILE);
+    let loaded: KeepAwakeState =
+        state::load_or_migrate_from(KEEP_AWAKE_SUBSYSTEM, old.as_deref(), |text| {
+            Some(KeepAwakeState {
+                enabled: parse_keep_awake(text),
+            })
+        });
+    loaded.enabled
 }
 
-/// Parse the flat `enabled = true|false` body. Default OFF — a missing key, a
-/// malformed value, or an empty file all leave caffeine off. Split out as a
-/// pure fn so it's unit-testable without touching `$HOME`; mirrors `dnd`'s
-/// parser.
+/// Parse the flat `enabled = true|false` legacy body. Default OFF — a missing
+/// key, a malformed value, or an empty file all leave caffeine off. Only used
+/// for the one-time migration; split out as a pure fn so it's unit-testable
+/// without touching `$HOME`. Mirrors `dnd`'s parser.
 fn parse_keep_awake(text: &str) -> bool {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -112,11 +132,7 @@ fn parse_keep_awake(text: &str) -> bool {
 /// Persist the "Keep awake" desire. Best-effort; failure is logged and the live
 /// hold remains the source of truth for this process.
 fn save_keep_awake_to_disk(on: bool) {
-    config_file::write(
-        "keep-awake",
-        KEEP_AWAKE_CONFIG_FILE,
-        &format!("enabled = {on}\n"),
-    );
+    state::store(KEEP_AWAKE_SUBSYSTEM, &KeepAwakeState { enabled: on });
 }
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
@@ -178,7 +194,7 @@ type OwnersMap = Arc<Mutex<HashMap<u32, String>>>;
 //
 // The held fd is owned by *this* process, so it closes on exit — the hold does
 // not survive a shell restart on its own. The desire is therefore persisted to
-// `~/.config/trollshell/keep-awake.toml` and re-acquired on the next
+// `$XDG_STATE_HOME/trollshell/keep-awake.toml` (#1226) and re-acquired on the next
 // `Service::start` (#534), so "Keep awake" stays on across a restart/upgrade
 // instead of silently lapsing while the box quietly goes back to idle-locking.
 
@@ -376,8 +392,8 @@ pub fn other_inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
 /// binding) can never thrash the logind fd. Safe to call from any thread; the
 /// async fd acquire runs on the shared runtime.
 ///
-/// The desire is persisted to `~/.config/trollshell/keep-awake.toml` so the
-/// hold is re-acquired on the next shell start (#534) — the logind fd is
+/// The desire is persisted to `$XDG_STATE_HOME/trollshell/keep-awake.toml`
+/// (#1226) so the hold is re-acquired on the next shell start (#534) — the logind fd is
 /// process-owned and would otherwise be silently dropped on restart. Persisting
 /// the user's *intent* (rather than only a confirmed hold) means a transiently
 /// failed acquire is simply retried next launch.
@@ -922,6 +938,7 @@ impl ScreenSaverIface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hytte_config::test_support::scratch_home;
 
     #[test]
     fn parse_keep_awake_defaults_off() {
@@ -951,6 +968,109 @@ mod tests {
         // value — otherwise a persisted "on" wouldn't re-engage on restart.
         assert!(parse_keep_awake(&format!("enabled = {}\n", true)));
         assert!(!parse_keep_awake(&format!("enabled = {}\n", false)));
+    }
+
+    // ── State migration (#1226) ─────────────────────────────────────────────
+
+    fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell/keep-awake.toml")
+    }
+
+    #[test]
+    fn keep_awake_state_round_trips() {
+        scratch_home(|_home| {
+            save_keep_awake_to_disk(true);
+            assert!(load_keep_awake_from_disk(), "true must round-trip as true");
+
+            save_keep_awake_to_disk(false);
+            assert!(
+                !load_keep_awake_from_disk(),
+                "false must round-trip as false"
+            );
+        });
+    }
+
+    #[test]
+    fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
+        scratch_home(|home| {
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = true\n").unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            assert!(
+                load_keep_awake_from_disk(),
+                "the legacy on-value must be adopted into state"
+            );
+
+            let state_path = state::path(KEEP_AWAKE_SUBSYSTEM).unwrap();
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                "enabled = true\n",
+                "the legacy file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
+        scratch_home(|home| {
+            state::store(KEEP_AWAKE_SUBSYSTEM, &KeepAwakeState { enabled: true });
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "not even valid toml {{{").unwrap();
+
+            assert!(
+                load_keep_awake_from_disk(),
+                "state's on-value must win over the legacy file (which would default OFF)"
+            );
+        });
+    }
+
+    /// State wins **even when it does not parse** — the half of #1226's
+    /// contract with a user-visible cost, and the one the `state_wins_*` test
+    /// above cannot reach because it seeds a valid state file (#1233 F1).
+    #[test]
+    fn a_corrupt_state_file_still_wins_over_the_legacy_file() {
+        scratch_home(|home| {
+            let state_path = state::path(KEEP_AWAKE_SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "not valid toml {{{").unwrap();
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = true\n").unwrap();
+
+            assert!(
+                !load_keep_awake_from_disk(),
+                "a corrupt state file falls to the documented default (OFF), \
+                 never back to the legacy file's ON"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(),
+                "not valid toml {{{",
+                "the read path must not rewrite the corrupt state file"
+            );
+        });
+    }
+
+    #[test]
+    fn neither_file_present_defaults_to_off() {
+        scratch_home(|_home| {
+            assert!(!load_keep_awake_from_disk(), "keep-awake defaults OFF");
+        });
     }
 
     #[test]

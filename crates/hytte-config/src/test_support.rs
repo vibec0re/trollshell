@@ -1,6 +1,6 @@
 //! Test-only plumbing every test binary in the workspace can reach (#1044).
 //!
-//! Three things live here, and each of them existed in two or three
+//! Four things live here, and each of them existed in two or more
 //! incompatible copies before this module did:
 //!
 //! - **the global default subscriber** ([`ensure_global_default`]) — the
@@ -10,7 +10,12 @@
 //!   `Subscriber` that records the events a test asserts on;
 //! - **the scratch overlay** ([`Overlay`]) — a config layer file whose mtime a
 //!   test controls to the second, which is what makes the `subsystem::watch`
-//!   poller assertable at all.
+//!   poller assertable at all;
+//! - **the scratch home** ([`scratch_home`]) — the `$HOME`/`XDG_*` redirection
+//!   that keeps a path-resolving test out of the developer's real
+//!   `~/.config/trollshell` and `~/.local/state/trollshell` (#1101). #1226 had
+//!   grown seven byte-identical copies of it before #1233's fix round hoisted
+//!   it here.
 //!
 //! # Why this is a cargo feature rather than `#[cfg(test)]`
 //!
@@ -447,4 +452,47 @@ impl Overlay {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+}
+
+// ── The scratch home ─────────────────────────────────────────────────────────
+
+/// Point `$HOME` at a fresh tempdir and clear `$XDG_STATE_HOME` /
+/// `$XDG_CONFIG_HOME` for the duration of `body`, which is handed the scratch
+/// home's path.
+///
+/// Every path this crate resolves — [`crate::xdg::config_layers`],
+/// [`crate::xdg::state_path`], [`crate::file::path`] — reads the process
+/// environment, so a test that drives any of them against the ambient
+/// environment writes into the developer's real `~/.config/trollshell` or
+/// `~/.local/state/trollshell`, pollutes the config they actually use, and
+/// then behaves differently on its second run because the file it just wrote
+/// is still there (#1101). Clearing both `XDG_*` variables rather than
+/// pointing them somewhere is deliberate: it forces the `$HOME`-relative
+/// fallback, so one variable covers every path in the crate and a test cannot
+/// half-redirect itself by setting only one of them.
+///
+/// `temp_env` serializes the mutation process-wide and puts the previous
+/// values back, which is what makes this safe under `cargo test`'s default
+/// thread pool — `std::env::set_var` is `unsafe`, and this workspace forbids
+/// `unsafe`.
+///
+/// Hoisted here by #1233's fix round: #1226 had grown **seven** byte-identical
+/// copies of this (`state.rs` plus the six `hytte-services` adopters), and a
+/// copy that quietly loses its `XDG_STATE_HOME: None` line still passes every
+/// test it guards while writing into the real state directory. That is the
+/// same "two or three incompatible copies" this module was created to end.
+///
+/// # Panics
+/// If the scratch directory cannot be created, or its path is not UTF-8.
+pub fn scratch_home<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().to_path_buf();
+    temp_env::with_vars(
+        [
+            ("HOME", Some(home.to_str().expect("utf8 tempdir"))),
+            ("XDG_STATE_HOME", None::<&str>),
+            ("XDG_CONFIG_HOME", None::<&str>),
+        ],
+        || body(&home),
+    )
 }

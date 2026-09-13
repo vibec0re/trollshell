@@ -10,43 +10,70 @@
 //!
 //! # Persistence
 //!
-//! User toggle persisted to `~/.config/trollshell/dnd.toml` as a single-line
-//! `enabled = true|false` flag. Default OFF (toasts on). Mirrors the parser
-//! shape used by `bluetooth_audio` — flat key=value, fallback off on missing
-//! file or malformed contents. Writes are best-effort; failure is logged and
-//! the in-memory state is the source of truth for the running process.
+//! User toggle persisted to `$XDG_STATE_HOME/trollshell/dnd.toml` (#1226) as
+//! `enabled = true|false`. Default OFF (toasts on). One-time read-migration
+//! from the legacy `~/.config/trollshell/dnd.toml`: if state is absent and
+//! that file exists, its value is adopted into state and the old file is
+//! left untouched; once state exists it is authoritative and the old file is
+//! never read again. Writes are best-effort; failure is logged and the
+//! in-memory state is the source of truth for the running process.
 
 use crate::config_file;
 use futures_signals::signal::{Mutable, Signal};
+use hytte_config::state;
 use hytte_reactive::{Service, registry, runtime};
+use serde::{Deserialize, Serialize};
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-/// Config file under `~/.config/trollshell/`.
-const CONFIG_FILE: &str = "dnd.toml";
+/// The state subsystem name — `$XDG_STATE_HOME/trollshell/dnd.toml`.
+const SUBSYSTEM: &str = "dnd";
 
-fn load_enabled_from_disk() -> bool {
-    let Some(text) = config_file::read(CONFIG_FILE) else {
-        return false;
-    };
-    // Permissive: look for `enabled = true` anywhere; otherwise default OFF.
+/// Legacy config file under `~/.config/trollshell/`, migrated once (#1226).
+const LEGACY_CONFIG_FILE: &str = "dnd.toml";
+
+/// `#[serde(default)]` on the **container** (#1233 F4). Here the two forms
+/// happen to coincide — the derived `Default` is the field type's — but the
+/// rule is "a state struct defaults through its `Default` impl", not "…except
+/// where the two happen to agree": on a field, serde consults the field type,
+/// which is how `bluetooth-audio` and `fullscreen-inhibit` ended up with a
+/// keyless state file reading the opposite of their documented default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct DndState {
+    enabled: bool,
+}
+
+/// Permissive legacy parser: looks for `enabled = true` anywhere in the old
+/// config file's text; anything else (missing key, malformed value, garbage)
+/// keeps the historical default OFF. Only used for the one-time migration —
+/// always succeeds, so [`load_enabled_from_disk`] wraps it in `Some` for
+/// [`state::load_or_migrate_from`]'s `parse_old`.
+fn parse_legacy(text: &str) -> DndState {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rhs) = trimmed.strip_prefix("enabled") {
             let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
             if rhs.eq_ignore_ascii_case("true") {
-                return true;
+                return DndState { enabled: true };
             }
             if rhs.eq_ignore_ascii_case("false") {
-                return false;
+                return DndState { enabled: false };
             }
         }
     }
-    false
+    DndState::default()
+}
+
+fn load_enabled_from_disk() -> bool {
+    let old = config_file::path(LEGACY_CONFIG_FILE);
+    let loaded: DndState =
+        state::load_or_migrate_from(SUBSYSTEM, old.as_deref(), |text| Some(parse_legacy(text)));
+    loaded.enabled
 }
 
 fn save_enabled_to_disk(enabled: bool) {
-    config_file::write("dnd", CONFIG_FILE, &format!("enabled = {enabled}\n"));
+    state::store(SUBSYSTEM, &DndState { enabled });
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -113,5 +140,118 @@ pub fn set_enabled(on: bool) {
     if changed == Some(true) {
         // File I/O off the GTK main thread.
         runtime::handle().spawn_blocking(move || save_enabled_to_disk(on));
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hytte_config::test_support::scratch_home;
+
+    fn legacy_path(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".config/trollshell/dnd.toml")
+    }
+
+    #[test]
+    fn migrates_the_legacy_file_once_and_leaves_it_untouched() {
+        scratch_home(|home| {
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = true\n").unwrap();
+            let before = std::fs::metadata(&legacy).unwrap();
+
+            assert!(
+                load_enabled_from_disk(),
+                "the legacy value must be adopted into state"
+            );
+
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            assert!(
+                state_path.exists(),
+                "state must now hold the migrated value"
+            );
+
+            let after = std::fs::metadata(&legacy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                "enabled = true\n",
+                "the legacy file's bytes must survive the migration untouched"
+            );
+            assert_eq!(
+                before.modified().unwrap(),
+                after.modified().unwrap(),
+                "the legacy file's mtime must survive the migration untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn state_wins_once_it_exists_and_the_legacy_file_is_never_read_again() {
+        scratch_home(|home| {
+            // Seed state directly with a value that disagrees with the
+            // legacy file, so a read of the wrong source is observable.
+            state::store(SUBSYSTEM, &DndState { enabled: true });
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "not even valid toml {{{").unwrap();
+
+            assert!(
+                load_enabled_from_disk(),
+                "state's value must win over an unparseable legacy file"
+            );
+        });
+    }
+
+    /// State wins **even when it does not parse** — the half of #1226's
+    /// contract with a user-visible cost, and the one the `state_wins_*` test
+    /// above cannot reach because it seeds a valid state file (#1233 F1).
+    #[test]
+    fn a_corrupt_state_file_still_wins_over_the_legacy_file() {
+        scratch_home(|home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "not valid toml {{{").unwrap();
+
+            let legacy = legacy_path(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "enabled = true\n").unwrap();
+
+            assert!(
+                !load_enabled_from_disk(),
+                "a corrupt state file falls to the documented default (OFF), \
+                 never back to the legacy file's ON"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(),
+                "not valid toml {{{",
+                "the read path must not rewrite the corrupt state file"
+            );
+        });
+    }
+
+    /// The `bluetooth-audio`/`fullscreen-inhibit` assertion in the one place
+    /// it is *not* observable (this struct's `Default` and its field type's
+    /// coincide). Kept anyway so the rule is one rule: a keyless state file
+    /// reads this struct's `Default` (#1233 F4).
+    #[test]
+    fn a_keyless_state_file_reads_the_documented_default() {
+        scratch_home(|_home| {
+            let state_path = state::path(SUBSYSTEM).unwrap();
+            std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+            std::fs::write(&state_path, "# nothing\n").unwrap();
+
+            assert_eq!(load_enabled_from_disk(), DndState::default().enabled);
+            assert!(!load_enabled_from_disk(), "dnd's documented default is OFF");
+        });
+    }
+
+    #[test]
+    fn neither_file_present_defaults_to_off() {
+        scratch_home(|_home| {
+            assert!(!load_enabled_from_disk());
+        });
     }
 }

@@ -80,8 +80,8 @@ use icalendar::{Calendar, CalendarComponent, Component, EventLike, EventStatus};
 
 use crate::eds_labels::short_date;
 use crate::eds_retry::{
-    INIT_BACKOFF_START, SourceFailureStreak, maybe_rebuild_session, next_backoff,
-    spawn_eds_worker, wait_backoff, with_client_retry,
+    INIT_BACKOFF_START, SourceFailureStreak, maybe_rebuild_session, next_backoff, spawn_eds_worker,
+    wait_backoff, with_client_retry,
 };
 
 // ── Public data types ────────────────────────────────────────────────────────

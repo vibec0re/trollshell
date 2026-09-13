@@ -281,7 +281,10 @@ pub(crate) fn maybe_rebuild_session<R>(
     *rebuild_pending = false;
     match open_registry() {
         Ok(r) => {
-            tracing::info!(service, "eds: rebuilt EDS session after repeated scan failures");
+            tracing::info!(
+                service,
+                "eds: rebuilt EDS session after repeated scan failures"
+            );
             *registry = r;
             on_rebuilt();
             true
@@ -606,8 +609,13 @@ mod tests {
         assert_eq!(evictions.get(), 0, "a successful op must not evict");
 
         // A failing op against the now-cached client: one eviction.
-        let _: anyhow::Result<()> =
-            with_client(&mut clients, "a", || Ok(1), |_c| anyhow::bail!("boom"), bump);
+        let _: anyhow::Result<()> = with_client(
+            &mut clients,
+            "a",
+            || Ok(1),
+            |_c| anyhow::bail!("boom"),
+            bump,
+        );
         assert_eq!(evictions.get(), 1, "a failing op must evict exactly once");
 
         // `open` itself failing: nothing was ever cached, so nothing evicts.
@@ -724,7 +732,10 @@ mod tests {
         );
 
         assert!(!did);
-        assert!(!opened.get(), "open_registry must not run when nothing is pending");
+        assert!(
+            !opened.get(),
+            "open_registry must not run when nothing is pending"
+        );
         assert!(!rebuilt.get());
         assert_eq!(registry, 1, "the registry is untouched");
     }
@@ -749,7 +760,10 @@ mod tests {
         assert!(did);
         assert!(!pending, "the pending flag is cleared");
         assert_eq!(registry, 2, "the registry is swapped for the fresh one");
-        assert!(rebuilt.get(), "on_rebuilt ran so the caller can drop its caches");
+        assert!(
+            rebuilt.get(),
+            "on_rebuilt ran so the caller can drop its caches"
+        );
     }
 
     /// A pending rebuild whose `open_registry` fails clears the pending flag
@@ -772,7 +786,10 @@ mod tests {
         );
 
         assert!(!did);
-        assert!(!pending, "cleared even on failure, so it re-paces via the streak");
+        assert!(
+            !pending,
+            "cleared even on failure, so it re-paces via the streak"
+        );
         assert_eq!(registry, 1, "the old registry is kept");
         assert!(!rebuilt.get());
     }

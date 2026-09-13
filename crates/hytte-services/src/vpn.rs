@@ -241,9 +241,12 @@ async fn poll_loop(writer: Mutable<Vec<Tunnel>>) {
     // whole `Vec<Tunnel>` just to compare — `gated_poll` compares by
     // reference against `writer.lock_ref()` instead.
     let always_active = Mutable::new(true);
-    gated_poll(always_active, || Duration::from_secs(5), writer, || async {
-        Some(collect_tunnels().await)
-    })
+    gated_poll(
+        always_active,
+        || Duration::from_secs(5),
+        writer,
+        || async { Some(collect_tunnels().await) },
+    )
     .await;
 }
 

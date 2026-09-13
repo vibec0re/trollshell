@@ -1291,7 +1291,8 @@ mine = true
         });
 
         assert!(
-            wait_until(Duration::from_secs(15), || calls.load(Ordering::SeqCst) >= 1),
+            wait_until(Duration::from_secs(15), || calls.load(Ordering::SeqCst)
+                >= 1),
             "the forwarder never ran at all"
         );
 

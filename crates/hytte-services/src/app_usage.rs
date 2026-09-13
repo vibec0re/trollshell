@@ -162,7 +162,9 @@ impl Service for AppUsageService {
         };
         let usage = handles.usage.clone();
         let active = handles.active.clone();
-        spawn_supervised("app_usage", move || poll_loop(usage.clone(), active.clone()));
+        spawn_supervised("app_usage", move || {
+            poll_loop(usage.clone(), active.clone())
+        });
         handles
     }
 }
@@ -247,38 +249,45 @@ async fn poll_loop(usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>, active: M
     // actually contended (one loop, calls never overlap), the `Mutex` is only
     // what lets an owned, `'static` future leave and return through a plain
     // `FnMut`.
-    let cadence_state = std::sync::Arc::new(std::sync::Mutex::new((HashMap::<u32, u64>::new(), 0u64)));
+    let cadence_state =
+        std::sync::Arc::new(std::sync::Mutex::new((HashMap::<u32, u64>::new(), 0u64)));
 
-    gated_poll(active, || cadence(on_battery()), usage, move || {
-        let cadence_state = cadence_state.clone();
-        async move {
-            // `mem::take` keeps the shared map valid (empty) on the
-            // join-error path below, mirroring the pre-#1172 loop.
-            let (prev_pid, prev_total) = {
-                let mut guard = cadence_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (std::mem::take(&mut guard.0), guard.1)
-            };
-
-            // The whole `/proc` walk is hundreds of synchronous file reads —
-            // far too much blocking I/O for a shared tokio worker (#434).
-            match tokio::task::spawn_blocking(move || sample_proc(&prev_pid, prev_total)).await {
-                Ok(sample) => {
+    gated_poll(
+        active,
+        || cadence(on_battery()),
+        usage,
+        move || {
+            let cadence_state = cadence_state.clone();
+            async move {
+                // `mem::take` keeps the shared map valid (empty) on the
+                // join-error path below, mirroring the pre-#1172 loop.
+                let (prev_pid, prev_total) = {
                     let mut guard = cadence_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.0 = sample.cur_pid;
-                    guard.1 = sample.total_now;
-                    Some((sample.by_cpu, sample.by_mem))
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "app_usage: /proc sample task failed");
-                    None
+                    (std::mem::take(&mut guard.0), guard.1)
+                };
+
+                // The whole `/proc` walk is hundreds of synchronous file reads —
+                // far too much blocking I/O for a shared tokio worker (#434).
+                match tokio::task::spawn_blocking(move || sample_proc(&prev_pid, prev_total)).await
+                {
+                    Ok(sample) => {
+                        let mut guard = cadence_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.0 = sample.cur_pid;
+                        guard.1 = sample.total_now;
+                        Some((sample.by_cpu, sample.by_mem))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "app_usage: /proc sample task failed");
+                        None
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await;
 }
 

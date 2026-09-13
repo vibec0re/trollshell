@@ -1298,7 +1298,11 @@ mod tests {
 
         // A read failure leaves the last-known snapshot in place.
         apply_network(&mut state, None, Instant::now(), &writer);
-        assert_eq!(writer.get_cloned().interfaces.len(), 1, "unchanged on failure");
+        assert_eq!(
+            writer.get_cloned().interfaces.len(),
+            1,
+            "unchanged on failure"
+        );
     }
 
     /// **The net-rate cache across two ticks, with a counter wrap.** A second

@@ -176,9 +176,12 @@ mod tests {
             });
 
             // Always the current value → every tick is deduped, `set` never runs.
-            let poll = gated_poll(active, || Duration::from_millis(1), writer.clone(), || async {
-                Some(7u32)
-            });
+            let poll = gated_poll(
+                active,
+                || Duration::from_millis(1),
+                writer.clone(),
+                || async { Some(7u32) },
+            );
             let _ = tokio::time::timeout(Duration::from_millis(30), poll).await;
             sub.abort();
 

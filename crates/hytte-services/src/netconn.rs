@@ -218,9 +218,12 @@ async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {
     // parameter couldn't express; it now takes `cadence` as a live source,
     // called fresh before every sleep. `None` (ss missing / failed) keeps the
     // last-known list. See the `active` field doc on `NetconnHandles`.
-    gated_poll(active, || cadence(on_battery()), writer, || async {
-        run_ss().await.map(|out| parse_ss_output(&out))
-    })
+    gated_poll(
+        active,
+        || cadence(on_battery()),
+        writer,
+        || async { run_ss().await.map(|out| parse_ss_output(&out)) },
+    )
     .await;
 }
 

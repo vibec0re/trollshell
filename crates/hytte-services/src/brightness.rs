@@ -122,26 +122,31 @@ async fn poll_loop(writer: Mutable<Option<Brightness>>) {
     // `true` `Mutable<bool>` purely to reuse the scaffolding; the park
     // branch never engages.
     let always_active = Mutable::new(true);
-    gated_poll(always_active, || Duration::from_secs(1), writer, || async {
-        // `read_state` is synchronous `std::fs` I/O (a sysfs directory walk
-        // plus two file reads per candidate device); run it on tokio's
-        // blocking pool rather than the async worker thread it used to
-        // block (#1171) — the same fix `app_usage`/`sensors` already apply
-        // to their own sysfs/procfs walks (see #434's app_usage fix for the
-        // precedent). Cadence and values are unchanged: still one read per
-        // second. The outer `Some` is unconditional (mirrors the pre-#1172
-        // loop, which always considered writing) — the *inner* `Option`,
-        // Some(device) vs None(no backlight), is the real value `gated_poll`
-        // dedupes against.
-        Some(
-            tokio::task::spawn_blocking(read_state)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "brightness: sysfs read task panicked");
-                    None
-                }),
-        )
-    })
+    gated_poll(
+        always_active,
+        || Duration::from_secs(1),
+        writer,
+        || async {
+            // `read_state` is synchronous `std::fs` I/O (a sysfs directory walk
+            // plus two file reads per candidate device); run it on tokio's
+            // blocking pool rather than the async worker thread it used to
+            // block (#1171) — the same fix `app_usage`/`sensors` already apply
+            // to their own sysfs/procfs walks (see #434's app_usage fix for the
+            // precedent). Cadence and values are unchanged: still one read per
+            // second. The outer `Some` is unconditional (mirrors the pre-#1172
+            // loop, which always considered writing) — the *inner* `Option`,
+            // Some(device) vs None(no backlight), is the real value `gated_poll`
+            // dedupes against.
+            Some(
+                tokio::task::spawn_blocking(read_state)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "brightness: sysfs read task panicked");
+                        None
+                    }),
+            )
+        },
+    )
     .await;
 }
 

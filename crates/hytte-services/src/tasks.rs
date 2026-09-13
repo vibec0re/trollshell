@@ -60,8 +60,8 @@ use icalendar::{
 
 use crate::eds_labels::short_date as day_label;
 use crate::eds_retry::{
-    INIT_BACKOFF_START, SourceFailureStreak, maybe_rebuild_session, next_backoff,
-    spawn_eds_worker, wait_backoff, with_client, with_client_retry,
+    INIT_BACKOFF_START, SourceFailureStreak, maybe_rebuild_session, next_backoff, spawn_eds_worker,
+    wait_backoff, with_client, with_client_retry,
 };
 
 // ── Public data types ────────────────────────────────────────────────────────

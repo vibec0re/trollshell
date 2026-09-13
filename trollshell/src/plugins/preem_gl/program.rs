@@ -269,6 +269,42 @@ pub(crate) fn channels(rgba: kit::Rgba) -> GlValue {
     ])
 }
 
+/// Assert that `source` declares the CRT pass's four fixed-point constants with
+/// **`hytte-preem`'s own values** (#1186).
+///
+/// A `.frag` cannot read a Rust `const`, so every shader that re-implements
+/// [`DisplayStyle::Crt`](kit::DisplayStyle)'s mask re-declares these four. That
+/// copy is unavoidable; what is not is leaving it tied to nothing. This is the
+/// #1148 MEDIUM-3 shape the gauge's lengths and intensities already had, owed
+/// to `scope_blit.frag` and to the two shaders that copied its composite
+/// verbatim — hence one helper here, in the file that owns the lineage, called
+/// once from each of the three.
+///
+/// Until #1186 made them `pub`, `dot_matrix.rs` held its literals against a
+/// second Rust copy of the same numbers declared beside its own test, which is
+/// a mirror agreeing with a mirror: moving `BAND_DIV` in the kit left both
+/// green. `gauge.rs` declined to state them at all, calling them "a purely GL
+/// quantity" — they are not, they are the kit's, and now they can be read as
+/// such.
+///
+/// **Falsified** by editing one literal in any of the three shaders, or by
+/// moving one constant in `hytte-preem/src/style.rs`.
+#[cfg(test)]
+pub(super) fn assert_crt_constants(shader: &str, source: &str) {
+    for (name, value) in [
+        ("MASK_ONE", kit::MASK_ONE.to_string()),
+        ("COORD_ONE", kit::COORD_ONE.to_string()),
+        ("BAND_DIV", kit::BAND_DIV.to_string()),
+        ("CORNER_DIV", kit::CORNER_DIV.to_string()),
+    ] {
+        let wanted = format!("const int {name} = {value};");
+        assert!(
+            source.contains(&wanted),
+            "{shader} must declare `{wanted}` — `hytte_preem::{name}`'s own value",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -505,6 +541,26 @@ mod tests {
                 declaration.split_whitespace().next_back()
             })
             .collect()
+    }
+
+    /// `scope_blit.frag`'s CRT constants are **the kit's** (#1186).
+    ///
+    /// The lineage's head: `dot_matrix.frag` and `gauge.frag` both say
+    /// "verbatim from `scope_blit.frag`" over their copies of this block, and
+    /// each has the same assertion in its own file. Before this the four were
+    /// declared here and nowhere else in the tree, so nothing could disagree
+    /// with them — the same hole #1150's review measured on the dot matrix,
+    /// where `BAND_DIV` `9 -> 8` shipped completely green.
+    ///
+    /// What it still cannot see, stated for the same reason
+    /// `the_shader_and_the_mapping_agree_about_the_crt_mask_constants` states
+    /// its own: the kit and the shader moving **together**. Only a rendered
+    /// comparison can, and the scope's own harness cases are that half.
+    ///
+    /// **Falsified** by editing any of the four literals in `scope_blit.frag`.
+    #[test]
+    fn the_blit_declares_the_kits_own_crt_constants() {
+        super::assert_crt_constants("scope_blit.frag", BLIT_FRAG);
     }
 
     /// **The uniform bag and the shipped GLSL agree, in both directions** —

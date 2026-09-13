@@ -901,29 +901,40 @@ pub fn palette_snapshot(style: DisplayStyle) -> PaletteSnapshot {
 
 // ── The CRT pass (#397) ──────────────────────────────────────────────────────
 
+// The four constants below are `pub` (#1186) for one reason, and it is worth
+// stating once here rather than four times: the shell's GPU arm re-implements
+// this pass in GLSL, where a `.frag` cannot read a Rust `const`, so three
+// shaders (`scope_blit.frag` and the two that copied it, `dot_matrix.frag` and
+// `gauge.frag`) *re-declare* them. That is the #1148 MEDIUM-3 seam — the copy
+// has to exist, so the honest shape is a test on the far side that parses the
+// shipped GLSL and holds its literal against the kit's own item. While these
+// were private the GL side compared against a second Rust copy of the number
+// instead, which is a mirror agreeing with a mirror. Re-exported at the crate
+// root; nothing about the values or the pass changed.
+
 /// Fixed-point one for a mask factor, in 256ths — the same convention
 /// [`Bloom::strength`] uses, so the kit's two post-passes read alike and both
 /// stay inside `u32`.
-const MASK_ONE: u32 = 256;
+pub const MASK_ONE: u32 = 256;
 
 /// Fixed-point one for the vignette's normalized screen coordinates. 1024
 /// resolves the falloff to ~0.1 % of a screen half-width — far finer than the
 /// [`MASK_ONE`] levels the factor is finally quantized to — while keeping
 /// `u² + v²` inside 22 bits for any buffer the kit can produce.
-const COORD_ONE: i64 = 1024;
+pub const COORD_ONE: i64 = 1024;
 
 /// Corner radius of the curved-glass mask, as a divisor of the buffer's
 /// **short** side. Short side rather than long, so a wide flat strip (the
 /// 268×36 marquee) gets a corner in proportion to the glass it actually has
 /// instead of a radius wider than the strip is tall.
-const CORNER_DIV: usize = 6;
+pub const CORNER_DIV: usize = 6;
 
 /// Width of the vignette's edge ramp, as a divisor of the buffer's short side.
 /// 9 puts the ramp at exactly one dot cell on the kit's 36 px dot strips, so
 /// there it spends itself inside the bezel and never touches a dot; on the
 /// taller surfaces (scope, gauge, boards) it reaches a few rows into the
 /// picture, which is where a real tube's edge falloff is actually visible.
-const BAND_DIV: usize = 9;
+pub const BAND_DIV: usize = 9;
 
 /// The comb's phase is stated relative to buffer row 0, and it only lands in
 /// the dot grid's seams because a dot surface puts its grid origin at its

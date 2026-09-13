@@ -366,25 +366,25 @@ mod tests {
     const SEG2_BASE: usize = 955;
     const SEG2_SLOPE: usize = 760;
 
-    /// The plateau value of the falloff, and the four fixed-point constants of
-    /// the CRT pass — the five the shader declared and nothing on this side
-    /// stated (#1150 review, MEDIUM-2).
+    /// The plateau value of the falloff — one of the five the shader declared
+    /// and nothing on this side stated (#1150 review, MEDIUM-2).
     ///
-    /// `CORE` is `intensity`'s `s <= 1/2` return; the other four are
-    /// `hytte-preem/src/style.rs`'s own (private) `MASK_ONE`, `COORD_ONE`,
-    /// `BAND_DIV` and `CORNER_DIV`, verbatim. They are a **copy**, like the
-    /// knots above, for the same reason: those items are private to the kit and
-    /// this crate cannot read them. What the tests buy is that a change to one
-    /// side alone goes red — and, for the two divisors, that the *behaviour*
-    /// they decide is measured against the kit's at a pitch where the two
-    /// candidate values actually differ. See
+    /// `CORE` is `intensity`'s `s <= 1/2` return, and it stays a **copy** for
+    /// the reason the knots above are: `intensity` is private to the kit and
+    /// this crate cannot read it. What the test buys is that a change to one
+    /// side alone goes red.
+    ///
+    /// The other four of those five — the CRT pass's `MASK_ONE`, `COORD_ONE`,
+    /// `BAND_DIV` and `CORNER_DIV` — were copies here too until #1186 made the
+    /// kit's own items `pub`. They are now read out of `hytte_preem` directly,
+    /// by `program::assert_crt_constants`, so the shader's literal is held
+    /// against the value the kit actually renders with instead of against a
+    /// second copy of the number sitting beside the test. See
     /// [`tests::the_shader_and_the_mapping_agree_about_the_crt_mask_constants`]
-    /// and the `DisplayAt::Coarse` harness case.
+    /// and — for the half that catches the kit and the shader moving *together*
+    /// — the `DisplayAt::Coarse` harness case, which renders at a pitch where
+    /// the two candidate `BAND_DIV` values actually differ.
     const CORE: usize = 255;
-    const MASK_ONE: usize = 256;
-    const COORD_ONE: usize = 1024;
-    const BAND_DIV: usize = 9;
-    const CORNER_DIV: usize = 6;
 
     /// `round(num / denom)`, half away from zero — the kit's `round_div`.
     fn round_div(num: usize, denom: usize) -> u16 {
@@ -563,9 +563,19 @@ mod tests {
     /// `band = shortSide / BAND_DIV` and every case's short side was `9 * dot`
     /// for `dot` in `{2, 4}`, where `36/9 == 36/8` and `18/9 == 18/8`.
     ///
-    /// **Falsified** by changing any of the five on either side alone. Note
-    /// what this test does *not* do: it cannot see the shader and the kit
-    /// drifting together, because the kit's copies are private. The
+    /// **The four CRT constants are now the kit's own items** (#1186), not a
+    /// second Rust copy of the same numbers declared beside this test: the
+    /// counterpart they carry is `hytte_preem::{MASK_ONE, COORD_ONE, BAND_DIV,
+    /// CORNER_DIV}`, read through the shared
+    /// `program::assert_crt_constants` that `scope_blit.frag` and
+    /// `gauge.frag` call too. That closes half of the hole below — a change to
+    /// the *kit's* value alone now reddens here, where before it moved neither
+    /// mirror. `CORE` stays a local copy because `intensity` is still private.
+    ///
+    /// **Falsified** by changing `CORE` on either side, by editing one of the
+    /// four literals in `dot_matrix.frag`, or by moving one constant in
+    /// `hytte-preem/src/style.rs`. Note what this test still does *not* do: it
+    /// cannot see the shader and the kit drifting **together**. The
     /// `dot_matrix.*.coarse` harness case is the half that can — at
     /// `MAX_DOT_PX` the short side is 72, where `72/9 == 8` and `72/8 == 9`,
     /// so the CRT vignette's ramp is a different width and the comparison
@@ -577,18 +587,7 @@ mod tests {
             BODY.contains(&wanted),
             "dot_matrix.frag must declare `{wanted}`",
         );
-        for (name, value) in [
-            ("MASK_ONE", MASK_ONE),
-            ("COORD_ONE", COORD_ONE),
-            ("BAND_DIV", BAND_DIV),
-            ("CORNER_DIV", CORNER_DIV),
-        ] {
-            let wanted = format!("const int {name} = {value};");
-            assert!(
-                BODY.contains(&wanted),
-                "dot_matrix.frag must declare `{wanted}`",
-            );
-        }
+        super::super::program::assert_crt_constants("dot_matrix.frag", BODY);
     }
 
     /// …and the same for the font metrics, which this side reads out of

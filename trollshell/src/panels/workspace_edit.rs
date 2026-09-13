@@ -138,7 +138,7 @@ const FIELD_COLUMN_WIDTH: i32 = 240;
 /// `modal::apply_workspace_edit_width_cap`). This cap is still right, and still
 /// load-bearing once the floor exists: without it the note balloons the fields
 /// column the moment you edit a running stack. Both cases are asserted in
-/// [`tests::an_active_drafts_note_does_not_widen_the_fields_column`].
+/// [`tests::the_app_list_keeps_most_of_the_width_stopped_or_running`].
 ///
 /// 28 characters is about [`FIELD_COLUMN_WIDTH`] at the form's font, so the
 /// column's natural width comes out at its own 240-px request rather than above
@@ -1569,7 +1569,7 @@ mod tests {
     /// or `fields.set_hexpand(false)` reds the running half; `EDIT_FORM_WIDTH`
     /// dropped back to the ordinary drawer width reds both.
     #[gtk::test]
-    fn an_active_drafts_note_does_not_widen_the_fields_column() {
+    fn the_app_list_keeps_most_of_the_width_stopped_or_running() {
         for (what, draft, note_expected) in [
             ("a stopped draft", stopped_draft(), false),
             ("a running draft", saved_draft(), true),
@@ -1630,6 +1630,7 @@ mod tests {
             window.destroy();
         }
     }
+
     /// #1134 change 2: a row with no saved override renders no launch-command
     /// entry at all — not merely a hidden one — until its toggle is switched
     /// on.

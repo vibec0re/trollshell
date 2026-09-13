@@ -425,6 +425,16 @@ pub fn set_build_refusal_handler(handler: impl Fn(GlProgram, (u32, u32), &str) +
 /// "never offer this program again" records that on its own side — which is
 /// where the decision belongs anyway, because `hytte-ui` does not know whether
 /// a CPU implementation exists to fall back to.
+///
+/// **A handler that panics leaves the slot empty**, so no later refusal of any
+/// pipeline is reported for the rest of the session (PR #1243 review, LOW 4).
+/// That is [`abandon_gl`]'s shipped shape, taken deliberately rather than
+/// inherited by accident: the take-out-of-slot is what lets a handler
+/// legitimately re-enter this module, and catching a host panic to put the box
+/// back would be this crate deciding that a host's unwinding handler should
+/// keep being called. The consequence is sharper here than next door, because
+/// this hook is expected to fire more than once per session — a host whose
+/// handler can panic should catch inside it.
 pub fn refuse_build(program: GlProgram, grid: (u32, u32), reason: &str) {
     // Taken out of the slot for the duration of the call: a hook is arbitrary
     // host code and may (legitimately) re-enter this module — the host's

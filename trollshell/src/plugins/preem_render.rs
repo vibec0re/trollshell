@@ -3511,13 +3511,20 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
 #[cfg(test)]
 mod tests {
     use super::{
-        Arm, Renderer, Scope, UiNode, begin_pass, build, display_style, end_pass, map_widget,
-        preem_gl, probe, vocab,
+        Arm, Renderer, Scope, UiNode, any_animating_in, begin_pass, build, display_style, end_pass,
+        map_widget, preem_gl, probe, vocab,
     };
 
-    /// The `Scope` the two arms are compared through — the same shape
-    /// `plugins::tests`' GL-arm suite uses, so a reader comparing the two
-    /// files is looking at one widget.
+    /// The `Scope` the two arms are compared through — the shape
+    /// `plugins::tests`' **context-failure** tests use, so a reader comparing
+    /// the two files is looking at one widget.
+    ///
+    /// `persistence: 256` is the kit's own infinite-phosphor ceiling and it is
+    /// load-bearing, not decoration: `build` gives such a scope `fades: false`,
+    /// `animates()` is `false` from birth, #926's frame clock parks it, and no
+    /// mapping pass is ever coming on its own. That is the case the refusal
+    /// hook's own rebuild exists for — the one `apply`'s `gl_lost` cannot
+    /// cover, because it is never re-entered.
     fn scope_widget() -> vocab::PreemWidget {
         vocab::PreemWidget::Scope {
             config: vocab::ScopeConfig {
@@ -3525,7 +3532,7 @@ mod tests {
                 cols: 48,
                 rows: 24,
                 scale: 2,
-                persistence: 184,
+                persistence: 256,
             },
             state: vocab::ScopeState {
                 samples: (0..64_u8).map(|i| f32::from(i % 9) / 4.0 - 1.0).collect(),
@@ -3593,15 +3600,28 @@ mod tests {
     /// than as a node kind, and a fallback that produced an empty or
     /// differently sized buffer would fail here rather than look right.
     ///
-    /// **Falsified** two ways, both measured: dropping the
-    /// `set_build_refusal_handler` line from `preem_gl::install` — the chip is
-    /// still a `GlSurface` afterwards, which is the shipped behaviour and so
-    /// #1232 itself — and widening `rebuild_refused_gl_renderers_on_cpu` to
-    /// every GL instance, which reds the **builds** assertion rather than the
-    /// node-kind one: the gauge is rebuilt (restarting its needle's spring
-    /// mid-swing, #1143) and then lands straight back on `GaugeGl`, because
-    /// `arm_for(GAUGE)` still says `Gl`. Asserting only the node kind would
-    /// have missed that entirely.
+    /// **The probe before the mapping pass is the load-bearing assertion**
+    /// (PR #1243 review, MEDIUM 1). Every *other* assertion here — the node
+    /// kind, the kit's bytes, the gauge still on GL — is satisfied by
+    /// `apply`'s `gl_lost` alone on the `begin_pass` that follows, so with the
+    /// probe taken afterwards the sweep this whole fix exists for survived
+    /// being replaced by `return 0` with the entire suite green. Taken before
+    /// any mapping pass, it can only be the hook's own rebuild.
+    ///
+    /// **Falsified** three ways, all measured:
+    ///
+    /// - `rebuild_refused_gl_renderers_on_cpu`'s body replaced by `return 0`
+    ///   (the `REFUSED` record kept): the builds probe above `begin_pass`
+    ///   reads `1` where `2` is due — nothing rebuilt the parked chip, which
+    ///   is #1232 for the one widget that can never re-map itself.
+    /// - the `set_build_refusal_handler` line dropped from `preem_gl::install`:
+    ///   the chip is still a `GlSurface` afterwards, i.e. the shipped
+    ///   behaviour, blank on glass.
+    /// - `rebuild_refused_gl_renderers_on_cpu` widened to every GL instance:
+    ///   reds the gauge's **builds** assertion rather than the node-kind one,
+    ///   because `build` answers with the same `GaugeGl` (`arm_for(GAUGE)`
+    ///   still says `Gl`) after restarting its needle's spring mid-swing
+    ///   (#1143). Asserting only the node kind would have missed it.
     #[test]
     fn a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl() {
         let _ink = crate::plugins::tests::preem_ink_lock();
@@ -3634,9 +3654,18 @@ mod tests {
                 "the premise: both chips start on the GPU",
             );
             assert!(matches!(gauge_before, UiNode::GlSurface { .. }));
-            let scope_builds = probe(&key, Some("sc"))
-                .expect("the scope instance exists")
-                .0;
+            // The premise that makes the sweep load-bearing, stated rather
+            // than implied (the sibling context-hook tests in
+            // `plugins::tests` state it the same way): an
+            // infinite-persistence scope answers `animates()` with `false`
+            // from birth, #926's clock parks it, and **no mapping pass is
+            // coming**. Whatever puts the kit on screen has to be the hook
+            // itself.
+            assert!(
+                !any_animating_in(std::slice::from_ref(&key)),
+                "neither chip animates, so nothing will re-map this scope on its own",
+            );
+            let scope_before_counts = probe(&key, Some("sc")).expect("the scope instance exists");
             let gauge_builds = probe(&key, Some("ga"))
                 .expect("the gauge instance exists")
                 .0;
@@ -3647,6 +3676,22 @@ mod tests {
                 preem_gl::SCOPE,
                 (48, 24),
                 "fragment shader failed to compile: 0:1(1): error: syntax error",
+            );
+
+            // **Before any mapping pass**, which is the whole point of the
+            // sweep and the one assertion `apply`'s `gl_lost` cannot satisfy
+            // on the hook's behalf (PR #1243 review, MEDIUM 1): the rebuild
+            // has already happened, here, inside the hook.
+            let scope_after_hook = probe(&key, Some("sc")).expect("the scope instance survives");
+            assert_eq!(
+                scope_after_hook.0,
+                scope_before_counts.0 + 1,
+                "the refusal hook rebuilt the renderer itself, not the next re-map — the half a \
+                 parked clock would otherwise withhold for ever",
+            );
+            assert_eq!(
+                scope_after_hook.1, scope_before_counts.1,
+                "…and did it without an apply, so no widget state was touched",
             );
 
             begin_pass(&key);
@@ -3696,7 +3741,7 @@ mod tests {
                 probe(&key, Some("sc"))
                     .expect("the scope instance exists")
                     .0,
-                scope_builds + 1,
+                scope_before_counts.0 + 1,
                 "the refused chip is rebuilt exactly once — by the sweep, not again by the \
                  mapping pass that follows it",
             );

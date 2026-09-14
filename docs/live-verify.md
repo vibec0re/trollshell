@@ -2849,6 +2849,30 @@ session.
      confirm the scope falls back to the CPU kit with one journal line rather
      than showing a blank chip. The phosphor restarts from black, which is the
      honest outcome — the GL arm never drew a trail to inherit.
+  8. **(#1298/#1299) Whether GTK actually leaves the pixel store dirty.**
+     `hytte-gl::Texture::reset_unpack_state`'s doc asserts "GTK4 may upload
+     its own textures through PBOs on some paths, which is one way
+     `GL_PIXEL_UNPACK_BUFFER` could arrive bound" — that premise is measured
+     clean in every environment CI has (llvmpipe under `Xvfb`; the parity
+     harness's 444 evidence images are byte-identical whether or not the
+     reset runs, PR #1299 review MED 2/3) but has never been observed in a
+     real Niri session, where GTK's own GSK renderer is doing real,
+     GPU-accelerated work in the same context. Capture one frame with
+     `apitrace trace -- trollshell` (or `RENDERDOC_CAPTURE_ID=1` under
+     RenderDoc) while a preem GL chip (the preem-demo scope, or any
+     `seven_seg`/`gauge`/`dot_matrix` widget) is on screen, and inspect the
+     calls immediately before this crate's own `glTexSubImage2D`/
+     `glReadPixels`: is a non-zero `GL_PIXEL_UNPACK_BUFFER`/
+     `GL_PIXEL_PACK_BUFFER` bound, and are `UNPACK_SKIP_PIXELS`/
+     `UNPACK_ROW_LENGTH`/`UNPACK_ALIGNMENT` (or their `PACK_*` counterparts)
+     non-default at that point? A "yes" on any of those turns this from an
+     asserted mechanism into an observed one; a "no" across a few sessions is
+     itself worth recording here, since it would mean the whole
+     `reset_unpack_state`/`reset_pack_state` pair defends a state this
+     driver/compositor combination never actually produces — still correct
+     to keep (the falsification in PR #1299 shows the failure mode is heap
+     corruption, not a wrong pixel, if it ever does), but no longer a
+     "might" resting on nothing.
 
 - [ ] **(#1143 / #865 / #1090)** **`Gauge` renders on a `GtkGLArea`, at the
       surface's native resolution — and that is what #1090 is waiting on.**

@@ -3753,6 +3753,15 @@ mod tests {
                 config: vocab::LedStripConfig::default(),
                 state: vocab::LedStripState::default(),
             },
+            // Not the vocabulary default, which is the empty string: a readout
+            // with no cells draws a bare field, so a fallback comparison
+            // against it would pass on any renderer that fills the background.
+            W::SevenSeg {
+                config: vocab::SevenSegConfig::default(),
+                state: vocab::SevenSegState {
+                    text: "12:34".into(),
+                },
+            },
         ];
         assert_eq!(
             all.len(),

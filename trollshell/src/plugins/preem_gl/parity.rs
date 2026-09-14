@@ -453,8 +453,47 @@ impl Kind {
             // by 3.7x, which is what actually carries it there. At 16.0 / 64
             // not one of the four would have moved.
             Self::LedStrip => EdgeBudget { mean: 3.0, max: 16 },
-            // PLACEHOLDER — calibrated below.
-            Self::SevenSeg => EdgeBudget { mean: 3.0, max: 16 },
+            // Four stretched cases, one per skin, at the clock face — the
+            // readout with the most mitres per pixel of buffer and both cell
+            // shapes on screen at once. Measured worst on llvmpipe (Mesa
+            // 26.2.2): edge mean **4.636** and edge max **32**, both on the
+            // oled — the skin with a bloom and no ghost figure-8, so its edge
+            // bin is the smallest (2634 px of 13160) and the halo is most of
+            // it. Per skin: vfd 2.511/29, lcd 1.883/18, oled 4.636/32, crt
+            // 1.332/31. Every one of the four reports `interior_max 0` — the
+            // flat field and the whole segment interior are bit-identical, so
+            // the legitimate disagreement is the mitres' own coverage and the
+            // halo's staircase around them, and nothing else.
+            //
+            // **A fifth shape.** A dot lattice makes every lit pixel an edge, a
+            // dial makes a third of the frame one, and a meter's edge bin is
+            // just its bars' borders; a readout sits between the last two — its
+            // segments are solid, but every one of them has four 45° mitres, so
+            // the edge bin is 2569–6153 px of 13160 against a `lit` bin that is
+            // sometimes four pixels (crt).
+            //
+            // **Calibrated against a drift it catches, measured rather than
+            // assumed.** The probe is #1153's: a half-native-pixel horizontal
+            // offset of the sample point on the continuous branch alone —
+            // `if (!snapped) { p.x += fp.x * 0.5; }` right after `fp` is
+            // resolved in `seven_seg.frag`'s `main`, which is a scale-only
+            // shift the 1:1 cases cannot see (all twenty stayed bit-exact under
+            // it). Under it the four go to edge mean 6.542 / 7.516 / 12.169 /
+            // 3.290 and edge max 88 / 51 / 96 / 92, so **every one of the four
+            // reds**.
+            //
+            // 7.0 / 48 is 1.51x the worst measured mean and 1.5x the worst
+            // measured max, the ratios `Gauge`, `DotMatrix` and `LedStrip` were
+            // sized at. Which half catches which probe, since they differ: the
+            // vfd and the crt red on `max` alone (88 and 92 against 48, 1.83x
+            // and 1.92x), the oled on both (1.74x and 2.0x), and the lcd on
+            // both by the **narrowest margins here** — mean 7.516 against 7.0
+            // and max 51 against 48, 1.07x and 1.06x. That the lcd is the
+            // tight one is not a coincidence: its bloom radius is 0, so it is
+            // the only skin whose edge bin is the mitres alone with no halo
+            // spread over them, which is both why its honest numbers are the
+            // second lowest and why a half-pixel shift moves it least.
+            Self::SevenSeg => EdgeBudget { mean: 7.0, max: 48 },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -2199,13 +2238,14 @@ mod tests {
                 // first place. A ceiling without a calibration is a flake
                 // (#1238's own words).
                 Kind::LedStrip => None,
-                // 93.2–97.1 % (vfd 93.2, lcd 97.1, oled 94.8, crt 93.3): a
+                // 69.8–97.0 % (vfd 76.2, lcd 97.0, oled 84.7, crt 69.8): a
                 // readout is mostly flat field with solid bars on it, so its
                 // blocks are constant almost everywhere for reasons that have
-                // nothing to do with the halo — the bloomless lcd control comes
-                // out highest, which is exactly the wrong direction for a
-                // statistic that is supposed to fall when a halo is resolved
-                // per fragment. No calibration is available here, and a ceiling
+                // nothing to do with the halo — and the **bloomless lcd**, the
+                // control this statistic uses elsewhere, comes out *highest* of
+                // the four, which is exactly the wrong direction for a
+                // detector that is supposed to fall when a halo is resolved per
+                // fragment. No calibration is available here, and a ceiling
                 // without one is a flake (#1238's own words).
                 Kind::SevenSeg => None,
             };

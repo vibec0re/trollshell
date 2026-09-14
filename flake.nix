@@ -1116,7 +1116,26 @@
           # `nixos-module-plugin-id-conflict` below (home-manager evaluates
           # `config.assertions` eagerly and throws rather than handing back an
           # inspectable false predicate — the same reason
-          # `nixos-module-plugin-mount-conflict` is NixOS-side only).
+          # `nixos-module-plugin-mount-conflict` is NixOS-side only); the
+          # disagreeing-AND-attribute-name-already-agrees-with-the-manifest-id
+          # hole that opened is `hm-module-plugin-id-conflict-unconditional`
+          # just below (#1284 fix round, review MED 1).
+          #
+          # `claude-bridge` (over `stubClaudeBridge`, `writeShellScriptBin
+          # "hytte-claude-bridge"`) pins the OTHER prefix shape — the bare
+          # `hytte-` fallback `inferManifestId` falls through to for the
+          # standalone-hat binaries — against the REAL deployment shape
+          # `nix/hm-module.nix:847`'s own `claudeBridge.*` rendering uses
+          # (attr `claude-bridge` over `pkgs.hytte-claude-bridge`): its entire
+          # rendered entry must equal `expectedClaudeBridge`, `env = { }`
+          # included, the same full-equality shape `demo` gets rather than a
+          # single-field assertion an extra `HYTTE_PLUGIN_ID` key could slide
+          # past (#1284 fix round, review MED 2 — the `left` → `demo` rename
+          # in `hm-module-plugin-mount` below had deleted the only fixture
+          # that incidentally caught this). The two `inferManifestId` asserts
+          # tie this check to the SHARED heuristic directly
+          # (`hm._module.args.inferManifestId`, off `nix/module-common.nix` —
+          # #1284 fix round, review LOW 3), not just to its rendered effect.
           hm-module-plugin-id =
             let
               hm = home-manager.lib.homeManagerConfiguration {
@@ -1140,6 +1159,7 @@
                           package = stubPlugin;
                           env.HYTTE_PLUGIN_ID = "agreeing";
                         };
+                        claude-bridge.package = stubClaudeBridge;
                       };
                     };
                   }
@@ -1155,15 +1175,95 @@
                 secrets = [ ];
                 enabled = true;
               };
+              expectedClaudeBridge = {
+                exec = pkgs.lib.getExe stubClaudeBridge;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
               assertionPredicates = map (a: a.assertion) cfg.assertions;
               probe =
+                # `_module.args` is exposed as a sibling of `config` on the
+                # `evalModules` result (`hm`), not folded into `config`
+                # itself (`lib/modules.nix` explicitly strips it back out of
+                # `config` and re-attaches it at the top level) — hence `hm.`
+                # here and not `cfg.`.
+                assert hm._module.args.inferManifestId stubPlugin == "demo";
+                assert hm._module.args.inferManifestId stubClaudeBridge == "claude-bridge";
                 assert pluginsState.plugins.demo == expectedDemo;
                 assert pluginsState.plugins.demo-side.env.HYTTE_PLUGIN_ID == "demo-side";
                 assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_ID == "agreeing";
+                assert pluginsState.plugins.claude-bridge == expectedClaudeBridge;
                 assert builtins.all (p: p) assertionPredicates;
                 builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
             in
             pkgs.runCommand "trollshell-hm-module-plugin-id-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #1284 fix round, review MED 1's regression pin: the conflict
+          # guard above used to be SKIPPED exactly where the attribute name
+          # already agrees with the inferred manifest id — `demo` (attribute
+          # name == manifest id, so nothing renders) with an explicit,
+          # disagreeing `env.HYTTE_PLUGIN_ID` evaluated clean on both
+          # platforms, silently shipping a launch whose systemd unit name
+          # and `Register` id disagreed (exactly what this option exists to
+          # remove; `nix/module-common.nix` states the invariant
+          # unconditionally: "The attribute name IS the plugin's launch-time
+          # id"). The guard is now UNCONDITIONAL — see that file's own
+          # comment on the assertion — so this must now fail to evaluate.
+          # The fixture is `hm-module-plugin-id`'s own `demo` entry (package
+          # `stubPlugin`, inferred id "demo") with
+          # `env.HYTTE_PLUGIN_ID = "something-else"` instead of nothing.
+          # home-manager evaluates `config.assertions` eagerly while
+          # building `hm.config` and throws rather than handing back an
+          # inspectable false predicate (the same reason
+          # `nixos-module-plugin-mount-conflict` is NixOS-side only), so this
+          # can only report success/failure, via `tryEval`. #1081 review
+          # M4's control-arm shape: `tryEval` alone can't distinguish "the
+          # conflict assertion rejected it" from "some unrelated attribute
+          # stopped existing", so the control below — the identical fixture
+          # with no `env.HYTTE_PLUGIN_ID` at all — has to keep succeeding.
+          # The NixOS twin, which CAN inspect the false predicate directly,
+          # is `nixos-module-plugin-id-conflict-unconditional` below.
+          hm-module-plugin-id-conflict-unconditional =
+            let
+              fixture =
+                pluginId:
+                let
+                  hm = home-manager.lib.homeManagerConfiguration {
+                    inherit pkgs;
+                    modules = [
+                      self.homeModules.default
+                      {
+                        home = {
+                          username = "alice";
+                          homeDirectory = "/home/alice";
+                          stateVersion = "24.11";
+                          enableNixpkgsReleaseCheck = false;
+                        };
+                        programs.trollshell = {
+                          enable = true;
+                          package = stubPackage;
+                          plugins.demo = {
+                            package = stubPlugin;
+                          }
+                          // pkgs.lib.optionalAttrs (pluginId != null) { env.HYTTE_PLUGIN_ID = pluginId; };
+                        };
+                      }
+                    ];
+                  };
+                in
+                builtins.unsafeDiscardStringContext hm.config.xdg.configFile."trollshell/plugins.json".text;
+              result = builtins.tryEval (builtins.deepSeq (fixture "something-else") "ok");
+              control = builtins.tryEval (builtins.deepSeq (fixture null) "ok");
+              probe =
+                assert !result.success;
+                assert control.success;
+                builtins.deepSeq { inherit result control; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-plugin-id-conflict-unconditional-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';
@@ -1522,7 +1622,9 @@
             '';
 
           # The NixOS twin of `hm-module-plugin-id` above (#1284) — same
-          # fixture shape, read back through `environment.etc` instead of
+          # fixture shape (including the `claude-bridge` bare-`hytte-`-prefix
+          # pin and the `inferManifestId` ties — see that check's own comment
+          # for both), read back through `environment.etc` instead of
           # `xdg.configFile` (see `nixos-module` above for why). `HYTTE_PLUGIN_ID`
           # has no typed option of its own to declare once in the shared
           # `nix/module-common.nix` — the override IS the attribute name — so
@@ -1551,6 +1653,7 @@
                           package = stubPlugin;
                           env.HYTTE_PLUGIN_ID = "agreeing";
                         };
+                        claude-bridge.package = stubClaudeBridge;
                       };
                     };
                     boot.loader.grub.enable = false;
@@ -1572,6 +1675,12 @@
                 secrets = [ ];
                 enabled = true;
               };
+              expectedClaudeBridge = {
+                exec = pkgs.lib.getExe stubClaudeBridge;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
               # The `plugins.<id>` id precedence assertion lives in the shared
               # `nix/module-common.nix`, so it has to hold on this platform
               # too — and this is what proves the agreeing fixture above does
@@ -1579,9 +1688,15 @@
               # `nixos-module-plugin-mount`'s own comment for why.
               assertionPredicates = map (a: a.assertion) cfg.assertions;
               probe =
+                # See `hm-module-plugin-id`'s own comment: `_module.args` is
+                # a sibling of `config` on the `evalModules` result
+                # (`nixos`), never folded into `config` itself.
+                assert nixos._module.args.inferManifestId stubPlugin == "demo";
+                assert nixos._module.args.inferManifestId stubClaudeBridge == "claude-bridge";
                 assert pluginsState.plugins.demo == expectedDemo;
                 assert pluginsState.plugins.demo-side.env.HYTTE_PLUGIN_ID == "demo-side";
                 assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_ID == "agreeing";
+                assert pluginsState.plugins.claude-bridge == expectedClaudeBridge;
                 assert builtins.all (p: p) assertionPredicates;
                 builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
             in
@@ -1645,6 +1760,55 @@
               echo "$probe" >/dev/null
               touch $out
             '';
+
+          # The NixOS twin of `hm-module-plugin-id-conflict-unconditional`
+          # above (#1284 fix round, review MED 1) — same `falsePredicates`
+          # idiom `nixos-module-plugin-id-conflict` above uses, but the
+          # fixture is the HOLE that check does not cover: attribute name
+          # "demo" already agrees with `stubPlugin`'s inferred manifest id
+          # ("demo"), which is exactly the case the guard used to skip
+          # entirely because nothing would have rendered an override. The
+          # guard is now unconditional (`nix/module-common.nix`'s own
+          # comment on the assertion), so an explicit, disagreeing
+          # `env.HYTTE_PLUGIN_ID` here must still trip exactly one false
+          # predicate naming `HYTTE_PLUGIN_ID`.
+          nixos-module-plugin-id-conflict-unconditional =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      plugins.demo = {
+                        package = stubPlugin;
+                        env.HYTTE_PLUGIN_ID = "something-else";
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
+              probe =
+                assert builtins.length falsePredicates == 1;
+                assert pkgs.lib.hasInfix "HYTTE_PLUGIN_ID" (builtins.head falsePredicates).message;
+                builtins.deepSeq { inherit falsePredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-id-conflict-unconditional-check" { inherit probe; }
+              ''
+                echo "$probe" >/dev/null
+                touch $out
+              '';
 
           # #1041: `programs.trollshell.config.core-leds` renders a base-layer
           # `core-leds.toml` spliced onto the trollshell unit's own

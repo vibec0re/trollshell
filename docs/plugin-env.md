@@ -356,8 +356,27 @@ package's binary name), the same shape #1260 gave `mount` →
 was already guaranteed on the launch side — this closes the other half, the
 `Register` id the plugin itself sends. A hand-written
 `env.HYTTE_PLUGIN_ID = "stats-side";` still works and is exactly redundant;
-setting it to anything _other_ than the attribute name is an eval error
-naming both values, the same precedence `mount`/`env.HYTTE_PLUGIN_MOUNT` get.
+setting it to a value that disagrees with the attribute name is **always**
+an eval error naming the plugin, the attribute name it renders, and the
+disagreeing value you set — unconditionally, whether or not the attribute
+name happens to already match the package's own inferred manifest id (a
+fix-round hole closed after #1284 first shipped: the guard used to skip
+exactly that case, when nothing would have rendered an override anyway).
+Same precedence `mount`/`env.HYTTE_PLUGIN_MOUNT` get.
+
+**Upgrading changes a mis-named plugin's registered id.** If an existing
+`programs.trollshell.plugins.<attr>` attribute name was never the same as
+its package's inferred manifest id — say
+`plugins.mypet.package = pkgs.hytte-plugin-pet;` — this rebuild starts
+rendering `HYTTE_PLUGIN_ID = "mypet"`, and the plugin registers under
+`mypet` where it used to register under `pet` (its own `manifest()`'s id).
+The systemd unit (`trollshell-plugin-mypet`) and the control-center's
+Plugins tab already named it `mypet`, so this removes a disagreement that
+existed one level down rather than introducing a new one — but it is worth
+checking any state a plugin keys by the id it registers under (rather than
+by mount) before you rename an attribute you already run:
+`hytte-plugin-stats`'s `[bar]`/`[sidebar]` tables, for example, pick by
+mount rather than by id, so a second `stats` instance is unaffected.
 
 **Prefer an override _within_ a family — bar↔sidebar changes a plugin's
 visibility semantics and it cannot adapt.** The nine names are not

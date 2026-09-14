@@ -4,6 +4,12 @@ self:
   options,
   lib,
   pkgs,
+  # The programs.trollshell.plugins.<id> manifest-id inference (#1284),
+  # threaded in from `nix/module-common.nix`'s `_module.args` (imported
+  # below) rather than hand-copied here — see that file's own comment for
+  # the two-prefix heuristic and why a shared definition replaced three
+  # drifting copies (#1284 fix round, review LOW 3).
+  inferManifestId,
   ...
 }:
 let
@@ -51,22 +57,23 @@ let
   #
   # `HYTTE_PLUGIN_ID` (#1284): see `nix/hm-module.nix`'s matching comment —
   # the attribute key (`id` below) IS the override, rendered only when it
-  # disagrees with `manifestId`, the id inferred from the package's own
-  # binary name: the widget-shaped `hytte-plugin-<id>` prefix tried first,
-  # falling back to the bare `hytte-` prefix for the standalone-hat binaries
-  # (`hytte-claude-bridge`, `hytte-infobroker`) that carry no `-plugin-`
-  # segment but are declared through this same option. Keep the rest of the
-  # two in sync.
+  # disagrees with `manifestId`, computed by `inferManifestId` (a module
+  # argument off `nix/module-common.nix` — the two-prefix heuristic and why
+  # `hytte-claude-bridge` is the fallback prefix's one real consumer live
+  # there now, not here; `hytte-infobroker`'s CLI is deliberately NOT wired
+  # through `programs.trollshell.plugins`, see flake.nix's
+  # `bundledPluginNames` comment). `nix/module-common.nix`'s conflict
+  # assertion is a separate, UNCONDITIONAL guard on an explicit
+  # `env.HYTTE_PLUGIN_ID` against the attribute name — it does not consult
+  # `manifestId` at all (#1284 fix round, review MED 1). Keep the rest of
+  # the two platform modules in sync.
   pluginsState = builtins.toJSON {
     version = 1;
     plugins = lib.mapAttrs (
       id: plugin:
       let
         exec = lib.getExe plugin.package;
-        binName = baseNameOf exec;
-        afterPluginPrefix = lib.removePrefix "hytte-plugin-" binName;
-        manifestId =
-          if afterPluginPrefix != binName then afterPluginPrefix else lib.removePrefix "hytte-" binName;
+        manifestId = inferManifestId plugin.package;
       in
       {
         inherit exec;

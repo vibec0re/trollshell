@@ -418,8 +418,8 @@ mod width_tests {
     /// still carry the full name.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
-    /// [`build_history_app_row_shell`] to the raw name: measured `left: 2460
-    /// / right: 823`.
+    /// [`build_history_app_row_shell`] to the raw name: measured `left: 2421
+    /// / right: 764`.
     ///
     /// Drives [`build_history_app_row_shell`] rather than
     /// `build_history_app_row` itself: the latter's mute switch needs a
@@ -456,8 +456,8 @@ mod width_tests {
     /// this fix and out of scope for this test.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
-    /// [`build_history_action_row`] to the raw summary: measured `left: 2460
-    /// / right: 823`.
+    /// [`build_history_action_row`] to the raw summary: measured `left: 2443
+    /// / right: 786`.
     #[gtk::test]
     fn history_action_row_title_ellipsises_a_long_summary() {
         adw::init().expect("libadwaita init");

@@ -151,7 +151,7 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
     };
 
     let row = adw::ActionRow::builder()
-        .title(&truncate_for_row(&profile.name))
+        .title(truncate_for_row(&profile.name))
         .subtitle(subtitle)
         .activatable(false)
         .build();
@@ -333,7 +333,7 @@ mod tests {
     ///
     /// Falsified by reverting the `truncate_for_row` call in
     /// [`build_vpn_profile_row`] to the raw name: measured `left: 2519 /
-    /// right: 906`.
+    /// right: 862`.
     #[gtk::test]
     fn vpn_profile_row_title_ellipsises_a_long_name() {
         adw::init().expect("libadwaita init");

@@ -419,7 +419,7 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
         "Tap to pair"
     };
     let row = adw::ActionRow::builder()
-        .title(&truncate_for_row(&dev.alias))
+        .title(truncate_for_row(&dev.alias))
         .subtitle(subtitle)
         .activatable(true)
         .build();
@@ -594,8 +594,8 @@ mod tests {
     /// still carry the full alias.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
-    /// [`build_device_row`] to the raw alias: measured `left: 2460 / right:
-    /// 823`.
+    /// [`build_device_row`] to the raw alias: measured `left: 2420 / right:
+    /// 763`.
     #[gtk::test]
     fn device_row_title_ellipsises_a_long_alias() {
         adw::init().expect("libadwaita init");

@@ -1302,7 +1302,7 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
 /// [`rebuild_top_apps`] documents for its own extraction.
 fn build_disk_mount_row(m: &sensors::DiskMount) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(&truncate_for_row(&m.path))
+        .title(truncate_for_row(&m.path))
         .activatable(false)
         .build();
     // A mount path is whatever the filesystem is mounted at, `&`
@@ -1878,7 +1878,7 @@ fn build_failed_units_group() -> adw::PreferencesGroup {
 /// extraction.
 fn build_failed_unit_row(unit: &systemd::FailedUnit) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(&truncate_for_row(&unit.name))
+        .title(truncate_for_row(&unit.name))
         .activatable(false)
         .build();
     // Unit names and, especially, free-form `Description=` text are
@@ -2872,7 +2872,7 @@ mod width_tests {
     ///
     /// Falsified by reverting `truncate_for_row` calls in
     /// [`rebuild_top_apps`] to the raw name: measured `left: 2460 / right:
-    /// 823` (the row; the two over-cap lengths render at genuinely different
+    /// 803` (the row; the two over-cap lengths render at genuinely different
     /// raw widths once the cap stops applying).
     #[gtk::test]
     fn top_apps_row_and_summary_ellipsise_a_long_name() {
@@ -2955,7 +2955,7 @@ mod width_tests {
     ///
     /// Falsified by reverting the `truncate_for_row` call in
     /// [`build_failed_unit_row`] to the raw name: measured `left: 2435 /
-    /// right: 815`.
+    /// right: 778`.
     #[gtk::test]
     fn failed_unit_row_ellipsises_a_long_name() {
         adw::init().expect("libadwaita init");
@@ -2985,8 +2985,8 @@ mod width_tests {
     /// same width, and the tooltip must carry the full path.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
-    /// [`build_disk_mount_row`] to the raw path: measured `left: 2435 /
-    /// right: 815`.
+    /// [`build_disk_mount_row`] to the raw path: measured `left: 2681 /
+    /// right: 1024`.
     #[gtk::test]
     fn disk_mount_row_ellipsises_a_long_path() {
         adw::init().expect("libadwaita init");
@@ -3018,7 +3018,7 @@ mod width_tests {
     /// exact same width, and the tooltip must carry the full name.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
-    /// [`apply_gpu_name_subtitle`]: measured `left: 1997 / right: 590`.
+    /// [`apply_gpu_name_subtitle`]: measured `left: 1997 / right: 616`.
     #[gtk::test]
     fn gpu_row_subtitle_ellipsises_a_long_device_name() {
         adw::init().expect("libadwaita init");

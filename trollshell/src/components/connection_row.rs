@@ -21,7 +21,7 @@ pub(crate) fn build_connection_row(c: &Connection) -> adw::ActionRow {
         None => "(unknown)".to_string(),
     };
     let row = adw::ActionRow::builder()
-        .title(&truncate_for_row(&title))
+        .title(truncate_for_row(&title))
         .build();
     // The program name is read out of `/proc`, so any process on the box
     // picks it — and the subtitle carries peer addresses (#753).
@@ -84,8 +84,8 @@ mod tests {
     /// still carry the full "name · pid N" title.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
-    /// [`build_connection_row`] to the raw title: measured `left: 2460 /
-    /// right: 823`.
+    /// [`build_connection_row`] to the raw title: measured `left: 2463 /
+    /// right: 806`.
     #[gtk::test]
     fn connection_row_title_ellipsises_a_long_program_name() {
         adw::init().expect("libadwaita init");

@@ -4,6 +4,12 @@ self:
   options,
   lib,
   pkgs,
+  # The programs.trollshell.plugins.<id> manifest-id inference (#1284),
+  # threaded in from `nix/module-common.nix`'s `_module.args` (imported
+  # below) rather than hand-copied here — see that file's own comment for
+  # the two-prefix heuristic and why a shared definition replaced three
+  # drifting copies (#1284 fix round, review LOW 3).
+  inferManifestId,
   ...
 }:
 let
@@ -52,16 +58,47 @@ let
   # typed option is the checked one) but would be a silent discard, so
   # `nix/module-common.nix` asserts the two never disagree (#1260 review
   # F5); agreeing values are merely redundant.
+  #
+  # `HYTTE_PLUGIN_ID` (#1284) gets the same treatment, on the same #1260
+  # precedent, but has no typed option of its own — the attribute NAME
+  # (`id` below) is the value, since #1250 already needs it to agree with
+  # the systemd unit name (`trollshell-plugin-<id>`) this launcher gives the
+  # plugin. `manifestId` is the plugin's own id absent an override, computed
+  # by `inferManifestId` (a module argument off `nix/module-common.nix` —
+  # see there for the two-prefix heuristic and why hytte-claude-bridge is
+  # the fallback prefix's one real consumer; `hytte-infobroker`'s CLI is
+  # deliberately NOT wired through `programs.trollshell.plugins` at all, see
+  # flake.nix's `bundledPluginNames` comment) rather than hand-declared, so
+  # nothing here can drift from the Rust constant the plugin actually
+  # registers with.
+  #
+  # `HYTTE_PLUGIN_ID` is therefore rendered only when the attribute key
+  # disagrees with that inferred id — a plugin declared under its own name
+  # (`plugins.stats`, `plugins.claude-bridge`) renders nothing, exactly as
+  # before this existed. `nix/module-common.nix`'s conflict assertion is a
+  # separate, UNCONDITIONAL guard on an explicit `env.HYTTE_PLUGIN_ID`
+  # against the attribute name — it does not consult `manifestId` at all
+  # (#1284 fix round, review MED 1), so it still fires even when nothing
+  # below would have rendered an override.
   pluginsState = builtins.toJSON (
     {
       version = 1;
-      plugins = lib.mapAttrs (_: plugin: {
-        exec = lib.getExe plugin.package;
-        env =
-          plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
-        inherit (plugin) secrets;
-        enabled = plugin.enable;
-      }) cfg.plugins;
+      plugins = lib.mapAttrs (
+        id: plugin:
+        let
+          exec = lib.getExe plugin.package;
+          manifestId = inferManifestId plugin.package;
+        in
+        {
+          inherit exec;
+          env =
+            plugin.env
+            // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })
+            // (lib.optionalAttrs (id != manifestId) { HYTTE_PLUGIN_ID = id; });
+          inherit (plugin) secrets;
+          enabled = plugin.enable;
+        }
+      ) cfg.plugins;
     }
     // (lib.optionalAttrs (cfg.systemd.target != "graphical-session.target") {
       target = cfg.systemd.target;

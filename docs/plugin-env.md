@@ -268,8 +268,10 @@ programs.trollshell.plugins = {
   # …and, once P2 (#1251) ships the chips, the same binary in the bar
   stats-bar = {
     package = trollshell.packages.${system}.hytte-plugin-stats;
-    env.HYTTE_PLUGIN_ID = "stats-bar"; # must equal the attribute name
     mount = "BarRight"; # renders HYTTE_PLUGIN_MOUNT (#1161)
+    # HYTTE_PLUGIN_ID = "stats-bar" is rendered automatically (#1284): nix
+    # derives it from this attribute name, since it differs from the
+    # package's own manifest id ("stats").
   };
 };
 ```
@@ -339,17 +341,42 @@ programs.trollshell.plugins = {
   stats = { package = pkgs.hytte-plugin-stats; };                      # the manifest's own id and mount
   stats-side = {
     package = pkgs.hytte-plugin-stats;
-    env.HYTTE_PLUGIN_ID = "stats-side";                                # must match the attribute name
     mount = "SidebarRightTop";                                         # renders HYTTE_PLUGIN_MOUNT (#1161)
   };
 };
 ```
 
-`HYTTE_PLUGIN_ID` is written out by hand above because nix does not yet render
-it from the attribute name the way `mount` renders its variable; the launcher
-already names the transient unit `trollshell-plugin-<id>` from that same name,
-so the two agreeing is currently the deployer's job. Rendering it automatically
-is follow-up work in the `nix/*-module.nix` file family.
+Since #1284, nix renders `HYTTE_PLUGIN_ID` for you — you no longer write it
+out by hand as above: both platform modules merge `HYTTE_PLUGIN_ID = "<attr>"`
+into a plugin's `env` whenever the attribute name (`stats-side` above)
+disagrees with the package's own manifest id (`stats`, inferred from the
+package's binary name), the same shape #1260 gave `mount` →
+`HYTTE_PLUGIN_MOUNT`. The launcher already names the transient unit
+`trollshell-plugin-<id>` from that same attribute name, so the two agreeing
+was already guaranteed on the launch side — this closes the other half, the
+`Register` id the plugin itself sends. A hand-written
+`env.HYTTE_PLUGIN_ID = "stats-side";` still works and is exactly redundant;
+setting it to a value that disagrees with the attribute name is **always**
+an eval error naming the plugin, the attribute name it renders, and the
+disagreeing value you set — unconditionally, whether or not the attribute
+name happens to already match the package's own inferred manifest id (a
+fix-round hole closed after #1284 first shipped: the guard used to skip
+exactly that case, when nothing would have rendered an override anyway).
+Same precedence `mount`/`env.HYTTE_PLUGIN_MOUNT` get.
+
+**Upgrading changes a mis-named plugin's registered id.** If an existing
+`programs.trollshell.plugins.<attr>` attribute name was never the same as
+its package's inferred manifest id — say
+`plugins.mypet.package = pkgs.hytte-plugin-pet;` — this rebuild starts
+rendering `HYTTE_PLUGIN_ID = "mypet"`, and the plugin registers under
+`mypet` where it used to register under `pet` (its own `manifest()`'s id).
+The systemd unit (`trollshell-plugin-mypet`) and the control-center's
+Plugins tab already named it `mypet`, so this removes a disagreement that
+existed one level down rather than introducing a new one — but it is worth
+checking any state a plugin keys by the id it registers under (rather than
+by mount) before you rename an attribute you already run:
+`hytte-plugin-stats`'s `[bar]`/`[sidebar]` tables, for example, pick by
+mount rather than by id, so a second `stats` instance is unaffected.
 
 **Prefer an override _within_ a family — bar↔sidebar changes a plugin's
 visibility semantics and it cannot adapt.** The nine names are not

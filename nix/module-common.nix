@@ -53,6 +53,44 @@ self:
     '')
   ];
 
+  # The programs.trollshell.plugins.<id> manifest-id inference (#1284), a
+  # pure function of `lib` and a plugin's own `package` derivation: nix can't
+  # see the compile-time `Manifest::new`/`PLUGIN_ID` constant a plugin
+  # registers with, only the two shapes its binary name comes in — the
+  # widget-shaped `hytte-plugin-<id>` prefix, tried first (every bundled
+  # WIDGET plugin's binary, `nix/plugin.nix`'s `meta.mainProgram`, is named
+  # that way and the crate registers the same `<id>`), falling back to the
+  # bare `hytte-<id>` prefix for the standalone-hat binaries `nix/plugin.nix`
+  # ALSO packages (`hytte-claude-bridge` — the one real consumer; its own
+  # `PLUGIN_ID` is what's left after stripping bare `hytte-`) that carry no
+  # `-plugin-` segment but are declared through this same option. A package
+  # with neither prefix (an out-of-tree third-party plugin) falls through
+  # with its full binary name, the best nix can infer with no manifest of
+  # its own to read.
+  #
+  # Exported as an extra module argument (`_module.args`, the same mechanism
+  # the module system already uses to hand every module `config`/`lib`/
+  # `pkgs`) rather than hand-copied into each of `nix/hm-module.nix` and
+  # `nix/nixos-module.nix`'s `pluginsState` — hand-copying, plus a third copy
+  # inside this file's own assertion below, is what let the three drift out
+  # of sync undetected before the #1284 fix round (review LOW 3). Both
+  # platform modules' `pluginsState` call THIS now, and so do flake.nix's
+  # `hm-module-plugin-id`/`nixos-module-plugin-id` checks
+  # (`hm._module.args.inferManifestId` / `nixos._module.args.inferManifestId`
+  # — `_module.args` is a sibling of `config` on the `evalModules` result,
+  # not folded into it) — nothing else redeclares the
+  # heuristic. NOT used by the `HYTTE_PLUGIN_ID` conflict assertion below
+  # any more: that assertion compares the attribute name against an explicit
+  # `env.HYTTE_PLUGIN_ID` directly and needs no manifest id at all (review
+  # MED 1).
+  config._module.args.inferManifestId =
+    pkg:
+    let
+      binName = baseNameOf (lib.getExe pkg);
+      afterPluginPrefix = lib.removePrefix "hytte-plugin-" binName;
+    in
+    if afterPluginPrefix != binName then afterPluginPrefix else lib.removePrefix "hytte-" binName;
+
   options.programs.trollshell = {
     enable = lib.mkEnableOption "trollshell — hytte-based Wayland desktop shell";
 
@@ -1035,6 +1073,22 @@ self:
         `hytte-plugin-<id>`). Their per-plugin runtime knobs go through
         `env` / `secrets` above.
 
+        **Running one bundled binary twice — `stats` (#1250) is the first —
+        needs two attribute sets that differ in this key.** The attribute
+        name IS the plugin's launch-time id: it names the transient
+        `trollshell-plugin-<id>` unit above and, since #1284, renders
+        `HYTTE_PLUGIN_ID = "<id>"` into that plugin's `env` whenever it
+        disagrees with the package's own manifest id (inferred from the
+        package's binary name, `hytte-plugin-<id>` stripped of its prefix —
+        no second option to keep in sync with the Rust constant). A plugin
+        declared under its own id (`plugins.stats`) renders nothing, exactly
+        as before this existed; a second instance under a different id
+        (`plugins.stats-side`) needs nothing hand-written either — see
+        `docs/plugin-env.md`'s `HYTTE_PLUGIN_ID` entry for what the SDK does
+        with it. Setting `env.HYTTE_PLUGIN_ID` by hand to anything other than
+        the attribute name is an eval error, the same precedence `mount`
+        below gets against `env.HYTTE_PLUGIN_MOUNT`.
+
         **There is no per-plugin `enable` option to find.** This option is an
         `attrsOf` submodule, so `programs.trollshell.plugins.<id>` does not
         exist in the rendered option docs until you write the attr — there is
@@ -1394,6 +1448,55 @@ self:
           prefer `mount`, which nix type-checks against the nine wire names
           at eval time, while a hand-set variable is only checked when the
           plugin tries to start (and then only by failing to).
+        '';
+      }
+    )
+    # `HYTTE_PLUGIN_ID` gets the same precedence guard as `mount` above
+    # (#1284, on the #1260 review F5 precedent), except there is no typed
+    # option to disagree with — the override IS the attribute name. Both
+    # platform modules render `HYTTE_PLUGIN_ID = "<attr>"` into `env`
+    # whenever the attribute name disagrees with the plugin's own manifest
+    # id (`inferManifestId` above) — but this guard does NOT key off that
+    # same condition, on purpose (#1284 fix round, review MED 1): it is
+    # UNCONDITIONAL, refusing any explicit `env.HYTTE_PLUGIN_ID` that
+    # disagrees with the attribute name, full stop. An earlier version of
+    # this assertion filtered on "would an override actually render", which
+    # meant a plugin declared under its OWN manifest id (nothing rendered,
+    # so the filter dropped it) with a hand-set, DIFFERENT
+    # `env.HYTTE_PLUGIN_ID` evaluated clean on both platforms — while still
+    # launching a systemd unit named after the attribute and registering
+    # under the hand-set value, exactly the unit-name-vs-Register-id
+    # disagreement this option exists to remove (the invariant two screens
+    # up states it without qualification: "The attribute name IS the
+    # plugin's launch-time id"). Agreeing values are merely redundant and
+    # pass either way.
+    (
+      let
+        conflicting = lib.filterAttrs (
+          id: plugin: (plugin.env.HYTTE_PLUGIN_ID or id) != id
+        ) config.programs.trollshell.plugins;
+        describe =
+          id: plugin:
+          ''"${id}" (programs.trollshell.plugins.${id}.env.HYTTE_PLUGIN_ID = "${plugin.env.HYTTE_PLUGIN_ID}", but the attribute name "${id}" is what plugins.json actually renders)'';
+      in
+      {
+        assertion = conflicting == { };
+        # Lazy, as every assertion message is: only forced when the predicate
+        # above is false, so naming the offenders costs nothing on a clean
+        # config.
+        message = ''
+          These programs.trollshell.plugins entries set env.HYTTE_PLUGIN_ID to
+          a value that disagrees with their own attribute name:
+          ${lib.concatStringsSep ", " (lib.mapAttrsToList describe conflicting)}.
+
+          The attribute name is the plugin's launch-time id: it names the
+          transient trollshell-plugin-<id> unit AND is merged over env when
+          plugins.json is rendered, so it always wins and the hand-set
+          HYTTE_PLUGIN_ID would be discarded with no warning — regardless of
+          whether the attribute name happens to match the package's own
+          inferred manifest id. Drop the hand-set
+          programs.trollshell.plugins.<id>.env.HYTTE_PLUGIN_ID, or set it to
+          the attribute name.
         '';
       }
     )

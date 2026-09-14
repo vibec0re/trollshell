@@ -813,7 +813,51 @@ mod tests {
         assert!(!is_valid_plugin_id("pet.service"));
         assert!(!is_valid_plugin_id("../evil"));
         assert!(!is_valid_plugin_id("a b"));
-        assert!(!is_valid_plugin_id(&"x".repeat(65)));
+        // The length boundary used to live here too, as a bare `65` with
+        // nothing behind it — see `is_valid_plugin_id_accepts_exactly_the_protos_cap_and_refuses_one_past_it`
+        // below for the cited version (#1284).
+    }
+
+    /// The length half of this guard, pinned against the proto's own ceiling
+    /// by name rather than the bare `65` this test used to carry (#1284,
+    /// following #1277 LOW 6's SDK-side mirror in `crates/hytte-plugin/src/runtime.rs`'s
+    /// `the_id_cap_is_the_sixty_four_the_launcher_hard_codes`, which measured
+    /// that a `MAX_PLUGIN_ID_BYTES` move can drift silently past every
+    /// unrelated literal on either side of the wire).
+    ///
+    /// `hytte-services` cannot import `hytte_plugin_proto::MAX_PLUGIN_ID_BYTES`
+    /// here to make that literal: this crate has no dependency on
+    /// `hytte-plugin-proto` today (a plugin-side crate — see this repo's
+    /// CLAUDE.md crate graph, "plugin side … NEVER links the shell"), and
+    /// adding one, even as a dev-dependency, just to name one `usize` would
+    /// be a new dependency edge for a single constant. The `64` below is
+    /// that constant's value, named rather than silently repeated:
+    /// `crates/hytte-plugin-proto/src/wire.rs` declares
+    /// `pub const MAX_PLUGIN_ID_BYTES: usize = 64;`, and `docs/plugin-env.md`'s
+    /// `HYTTE_PLUGIN_ID` row already prints the same number for the same
+    /// reason, in prose rather than an import.
+    ///
+    /// What this test DOES catch, with no new dependency: THIS crate's own
+    /// ceiling drifting away from the cited number — mutate
+    /// `is_valid_plugin_id`'s `id.len() <= 64` to `<= 32` and the acceptance
+    /// half below reds, because a 64-byte id (still the number the proto
+    /// authorizes today) is refused.
+    #[test]
+    fn is_valid_plugin_id_accepts_exactly_the_protos_cap_and_refuses_one_past_it() {
+        // MAX_PLUGIN_ID_BYTES, crates/hytte-plugin-proto/src/wire.rs — cited
+        // rather than imported, see the doc comment above.
+        const MAX_PLUGIN_ID_BYTES: usize = 64;
+        let at_cap = "a".repeat(MAX_PLUGIN_ID_BYTES);
+        assert!(
+            is_valid_plugin_id(&at_cap),
+            "a {MAX_PLUGIN_ID_BYTES}-byte id is exactly the proto's cap and must be accepted",
+        );
+        let past_cap = "a".repeat(MAX_PLUGIN_ID_BYTES + 1);
+        assert!(
+            !is_valid_plugin_id(&past_cap),
+            "one byte past the proto's cap ({} bytes) must be refused",
+            past_cap.len(),
+        );
     }
 
     #[test]

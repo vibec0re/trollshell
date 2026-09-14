@@ -195,6 +195,21 @@ pub(crate) fn launch(route: &Route) {
 /// path was missing per #1305 review MED-3 — mutating [`launch_binary`]'s
 /// body to an early `return` used to leave every gate green).
 ///
+/// `env` is injected — [`launch_binary`] always passes
+/// [`crate::workspace_stacks::forwarded_env`] itself, as a plain `fn`
+/// pointer, no closure needed — rather than read the process environment
+/// here directly, for two reasons at once: it is the *one* list every
+/// forwarder in the tree agrees on (`workspace_stacks::forwarded_env`,
+/// `plugins::effects::FORWARDED_ENV`, and `trollshell-control-center`'s own
+/// `agents_tab.rs` copy, whose doc calls it "the same four names, not a
+/// second list to keep in sync by hand" — #1305 review MED-4), and it lets a
+/// test pin the argv this builds with a **literal**, deterministic env
+/// instead of the real process environment, which this sandbox mostly
+/// doesn't have set anyway (edition 2024 also makes mutating it in a test
+/// `unsafe`, process-global besides — the same reason
+/// `plugins::effects::forwarded_env` is split into a thin real-env wrapper
+/// over a pure, injectable `filter_forwarded_env`).
+///
 /// No slice, no properties: this is a one-off windowed app the user asked
 /// for from the gear page, not a supervised plugin or a workspace member with
 /// a `Stop` transaction to land in — there is nothing here that needs to find
@@ -203,16 +218,11 @@ pub(crate) fn launch(route: &Route) {
 /// `"control-center"`) rather than a fixed string, so a second launch while
 /// the first is still running gets its own unit instead of colliding with it
 /// (#1305 review MED-2).
-fn control_center_launch(path: &Path) -> Launch {
+fn control_center_launch(path: &Path, env: impl FnOnce() -> Vec<(String, String)>) -> Launch {
     Launch {
         unit: effects::allocate_launch_unit("control-center", 0),
         description: "trollshell Control Center".to_owned(),
-        // The display variables a windowed program needs, forwarded from
-        // this shell — the *same* list `workspace_stacks::forwarded_env`
-        // forwards to a stack app (that function's doc: user-manager
-        // `import-environment` doesn't carry `NIRI_SOCKET`/`DISPLAY`), reused
-        // rather than a second copy of it (#1305 review MED-4).
-        env: crate::workspace_stacks::forwarded_env(),
+        env: env(),
         argv: vec![path.display().to_string()],
         ..Launch::default()
     }
@@ -224,7 +234,7 @@ fn control_center_launch(path: &Path) -> Launch {
 /// `RunCommand` use — so the control center outlives `trollshell.service` the
 /// way a plugin, or a workspace-stack app, does.
 fn launch_binary(path: &Path) {
-    let launch = control_center_launch(path);
+    let launch = control_center_launch(path, crate::workspace_stacks::forwarded_env);
     let mut cmd = launch::command(launch::SYSTEMD_RUN, &launch);
     hytte::reactive::runtime::handle().spawn(async move {
         match cmd.status().await {
@@ -318,18 +328,16 @@ mod tests {
     /// — over `launch::argv_of`/`command`, the assertion seam those two use,
     /// rather than a third hand-rolled one.
     ///
-    /// The env portion is asserted against `workspace_stacks::forwarded_env()`
-    /// itself, called a second time right here, rather than a literal
-    /// `WAYLAND_DISPLAY=…` — this crate has no `temp_env`-shaped dependency to
-    /// pin the *process* environment without `unsafe` (edition 2024 makes
-    /// `std::env::set_var` exactly that; `plugins::effects`' own
-    /// `filter_forwarded_env` split exists for the identical reason), and a
-    /// literal would either assert nothing true in a sandbox with none of
-    /// these four set, or assert a value this box happens to have. Comparing
-    /// against the shared function's own live output instead still pins the
-    /// property that actually matters here (#1305 review MED-4): this route
-    /// embeds exactly what `workspace_stacks::forwarded_env()` returns, in its
-    /// order — not a second, independently drifting list.
+    /// The env is a literal fixture, not the real process environment —
+    /// `control_center_launch` takes it injected exactly so this test can be
+    /// deterministic (see that function's doc): this sandbox has
+    /// `NIRI_SOCKET`/`WAYLAND_DISPLAY`/`DISPLAY` unset, so asserting against
+    /// `workspace_stacks::forwarded_env()`'s own *live* output — the first
+    /// version of this test did exactly that — cannot actually distinguish
+    /// "forwards the shared four names" from "forwards a private list missing
+    /// `NIRI_SOCKET`" (#1305 review MED-4's own regression) when the one name
+    /// that tells them apart happens to be unset either way. A fixture with
+    /// every name populated has no such blind spot.
     ///
     /// **Falsification:** revert `control_center_launch`'s `unit` field to
     /// the old fixed `"trollshell-control-center.service"` → the
@@ -337,12 +345,25 @@ mod tests {
     /// substring check) but the **second** launch's unit no longer differs
     /// from the first's, which the "two launches never collide" assertion
     /// below catches; replacing `control_center_launch`'s body with an early
-    /// `return Launch::default()` reds every assertion in this test at once.
+    /// `return Launch::default()` reds every assertion in this test at once;
+    /// dropping `"NIRI_SOCKET"` from the fixture's own env vec reds the
+    /// `--setenv=NIRI_SOCKET=…` assertion, proving the fixture itself isn't a
+    /// tautology.
     #[test]
     fn the_binary_route_launch_pins_its_argv_and_never_reuses_a_unit_name() {
         let path = std::path::Path::new("/usr/bin/trollshell-control-center");
-        let first = control_center_launch(path);
-        let second = control_center_launch(path);
+        let env = || {
+            vec![
+                ("WAYLAND_DISPLAY".to_owned(), "wayland-1".to_owned()),
+                (
+                    "NIRI_SOCKET".to_owned(),
+                    "/run/user/1000/niri.sock".to_owned(),
+                ),
+                ("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned()),
+            ]
+        };
+        let first = control_center_launch(path, env);
+        let second = control_center_launch(path, env);
 
         assert_ne!(
             first.unit, second.unit,
@@ -375,26 +396,25 @@ mod tests {
             !args.iter().any(|a| a.starts_with("--property=")),
             "a one-off windowed launch carries no properties: {args:?}"
         );
+        assert!(
+            args.contains(&"--setenv=WAYLAND_DISPLAY=wayland-1".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--setenv=NIRI_SOCKET=/run/user/1000/niri.sock".to_owned()),
+            "the forwarded env must include NIRI_SOCKET — the control center's own \
+             Agents tab forwards it one hop further into a trollshell-agent-window \
+             launch (#1305 review MED-4): {args:?}"
+        );
+        assert!(
+            args.contains(&"--setenv=XDG_RUNTIME_DIR=/run/user/1000".to_owned()),
+            "{args:?}"
+        );
 
         let sep = args
             .iter()
             .position(|a| a == "--")
             .expect("separator present");
-        let expected_env: Vec<String> = crate::workspace_stacks::forwarded_env()
-            .into_iter()
-            .map(|(k, v)| format!("--setenv={k}={v}"))
-            .collect();
-        let argv_env: Vec<String> = args[..sep]
-            .iter()
-            .filter(|a| a.starts_with("--setenv="))
-            .cloned()
-            .collect();
-        assert_eq!(
-            argv_env, expected_env,
-            "the forwarded env must be exactly workspace_stacks::forwarded_env()'s \
-             own output, in order — not a second, independently drifting list"
-        );
-
         assert_eq!(
             &args[sep + 1..],
             &["/usr/bin/trollshell-control-center".to_owned()],

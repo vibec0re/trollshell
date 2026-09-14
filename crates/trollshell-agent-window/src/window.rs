@@ -144,10 +144,11 @@ pub struct Window {
     /// `main.rs`'s `state: Rc<RefCell<Option<Rc<Window>>>>` caches the built
     /// window and is never cleared on close, and [`Window::build`] wires
     /// `self.header`/`self.settings` to strong self-clones of their own
-    /// (`window.rs:365`/`367`). So `me.upgrade()` can never answer `None` in
-    /// production, and "a probe's answer for a window nobody is looking at"
-    /// cannot happen yet: replacing this field with a strong self-clone in
-    /// the `spawn_future_local` leaves the whole suite green (128 passed, 0
+    /// (`press`/`decide` in [`Window::build`]). So `me.upgrade()` can never
+    /// answer `None` in production, and "a probe's answer for a window
+    /// nobody is looking at" cannot happen yet: replacing this field with a
+    /// strong self-clone in the `spawn_future_local` leaves the whole suite
+    /// green (measured against this file's own test suite: 130 passed, 0
     /// failed), and `nix/lint-bind-pins.py` does not catch it either — its
     /// two rules key on `bind*`/`connect_*` call sites, and `spawn_future_local`
     /// is neither. Kept anyway: it is the correct shape for the day either of

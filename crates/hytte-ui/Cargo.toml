@@ -12,8 +12,12 @@ workspace = true
 
 [features]
 # Opt-in test bucket: the tests that need a real display server (GTK).
-# Off by default so `cargo test` stays hermetic.
-system-tests = []
+# Off by default so `cargo test` stays hermetic. Forwards into `hytte-gl`'s
+# own same-named feature (PR #1299 review MED 3) so `gl_surface`'s gated
+# tests can reach `hgl::dirty_unpack_state_for_test`/`dirty_pack_state_for_test`
+# under `-p hytte-ui --features system-tests`, which does not otherwise turn
+# on a path dependency's feature of the same name.
+system-tests = ["hytte-gl/system-tests"]
 
 [dependencies]
 adw.workspace = true

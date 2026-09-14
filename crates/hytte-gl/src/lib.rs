@@ -698,6 +698,29 @@ impl Texture {
     /// [`Error::Storage`] for why that one call gets a `glGetError` when the
     /// render path deliberately does not.
     ///
+    /// **The storage this allocates is left undefined, not zeroed**
+    /// (`glTexStorage2D`'s own contract). An earlier revision (#1298)
+    /// overwrote it with zeroes here as defence in depth, on the theory that
+    /// a pipeline sampling a texel no pass has written yet is the hardest
+    /// possible bug to reproduce. PR #1299 review MED 2 measured that
+    /// defence against its actual cost and dropped it: every caller in this
+    /// tree already overwrites the whole texture before sampling it —
+    /// verified by filling `preem_gl`'s three auxiliary textures with `0xb7`
+    /// instead of leaving them undefined, which left the parity harness at
+    /// `PASS all 148`, byte for byte — so the zero fill was pure cost, not
+    /// insurance. That cost was not fixed, either: `hytte-ui`'s shader
+    /// widget (`shader_surface.rs`) re-creates its data texture whenever a
+    /// plugin's wire-controlled `data_size` moves, so a zero fill here would
+    /// run on a path an out-of-process plugin can drive every frame, and
+    /// `checked_extent`'s own limit is the driver's `GL_MAX_TEXTURE_SIZE` —
+    /// not this shell's wire caps — so the fill this constructor used to do
+    /// could reach a host allocation in the hundreds of megabytes for a
+    /// single call, gated by nothing this crate owns. A caller that
+    /// genuinely needs zeroed storage (a seed texture nothing writes before
+    /// it is sampled) is expected to upload its own zero buffer through
+    /// [`Texture::upload_u8`]/[`Texture::upload_f32`] — the same call every
+    /// other caller already makes.
+    ///
     /// # Errors
     ///
     /// [`Error::Extent`], [`Error::TextureSize`] or [`Error::Storage`], per
@@ -760,71 +783,13 @@ impl Texture {
             );
             gl::BindTexture(gl::TEXTURE_2D, 0);
         }
-        let texture = Self {
+        Ok(Self {
             id,
             width,
             height,
             format,
             _not_send: PhantomData,
-        };
-        texture.zero_storage();
-        Ok(texture)
-    }
-
-    /// Overwrite the storage [`Texture::new`] just allocated with zeroes.
-    ///
-    /// **`glTexStorage2D` leaves the contents undefined** — not zero. Fresh
-    /// pages on an idle machine read back as zero and recycled ones do not, so
-    /// a pipeline that samples a texel no pass has written yet is a bug whose
-    /// symptom depends on what the host was doing a moment earlier. That is the
-    /// hardest possible shape to reproduce, and #1298 spent a campaign on
-    /// exactly that hypothesis; zeroing here retires the question for every
-    /// texture in the tree at once, rather than asking each pipeline to prove
-    /// it overwrites every target before it reads one.
-    ///
-    /// It is **defence in depth, not a behaviour change**, and that was
-    /// measured rather than assumed: filling `preem_gl`'s three auxiliary
-    /// textures with `0xb7` instead of leaving them undefined left the parity
-    /// harness at `PASS all 148`, byte for byte, so nothing shipped today reads
-    /// a texel before writing it. This keeps that true by construction.
-    ///
-    /// Cost is one upload per texture *creation* — pipeline build and resize,
-    /// never per frame.
-    ///
-    /// Infallible on purpose: it runs only on storage `glTexStorage2D` has
-    /// already reported good, and a driver that refused this would refuse the
-    /// first real upload too, which is where the caller already handles it.
-    fn zero_storage(&self) {
-        let bytes = (self.width as usize)
-            .saturating_mul(self.height as usize)
-            .saturating_mul(self.format.bytes_per_texel());
-        if bytes == 0 {
-            return;
-        }
-        let zeroes = vec![0u8; bytes];
-        let (_, transfer, kind) = self.format.as_gl();
-        // SAFETY: a context is current, `self.id` is the texture just
-        // allocated, and `zeroes` holds exactly `width * height *
-        // bytes_per_texel` bytes — the region the call names — for the duration
-        // of the call. An all-zero byte pattern is the zero value of every
-        // `Format` here (`0.0f32` is four zero bytes), so one buffer serves
-        // both the byte-typed and the float-typed formats.
-        unsafe {
-            gl::BindTexture(gl::TEXTURE_2D, self.id);
-            Self::reset_unpack_state();
-            gl::TexSubImage2D(
-                gl::TEXTURE_2D,
-                0,
-                0,
-                0,
-                GLsizei::try_from(self.width).unwrap_or(0),
-                GLsizei::try_from(self.height).unwrap_or(0),
-                transfer,
-                kind,
-                zeroes.as_ptr().cast(),
-            );
-            gl::BindTexture(gl::TEXTURE_2D, 0);
-        }
+        })
     }
 
     /// This texture's `(width, height)`.
@@ -890,7 +855,7 @@ impl Texture {
     /// than a read past the end.
     ///
     /// The unpack pixel store is put into a known position first — see
-    /// [`Texture::reset_unpack_state`] for which five knobs that is and why
+    /// [`Texture::reset_unpack_state`] for which four knobs that is and why
     /// setting `UNPACK_ALIGNMENT` alone (all this used to do) was not enough.
     pub fn upload_u8(&self, _gl: &Gl, bytes: &[u8]) {
         debug_assert_ne!(
@@ -930,18 +895,19 @@ impl Texture {
         }
     }
 
-    /// Put the **whole** unpack pixel store into the position the two uploads
-    /// above assume, immediately before the `glTexSubImage2D` that reads it.
+    /// Put **the four unpack pixel-store knobs this crate's uploads
+    /// depend on** into the position the two uploads above assume,
+    /// immediately before the `glTexSubImage2D` that reads it.
     ///
     /// [`reset_fixed_function_state`]'s argument, one state group over
     /// (#1298): GTK renders its own scene into this same context and nothing
     /// promises what it leaves set, so the unpack state is *put* into a known
     /// position rather than inherited. Setting only `UNPACK_ALIGNMENT` — which
-    /// is all these two calls used to do — defends exactly one of the five
+    /// is all these two calls used to do — defends exactly one of the four
     /// knobs that decide which bytes `glTexSubImage2D` actually reads:
     ///
     /// * `UNPACK_ALIGNMENT` — GL's default of 4 reads an odd-width `R8` row
-    ///   staggered. Already defended; kept here so all five sit together.
+    ///   staggered. Already defended; kept here so all four sit together.
     /// * `UNPACK_SKIP_PIXELS` / `UNPACK_SKIP_ROWS` — a non-zero value
     ///   **offsets the source pointer**, so the upload starts one texel (or one
     ///   row) into its own data and reads that many past the end of the slice.
@@ -953,8 +919,23 @@ impl Texture {
     ///   the shader widget's 2-D buffers.
     /// * `GL_PIXEL_UNPACK_BUFFER` — with a buffer bound, the `data` pointer is
     ///   reinterpreted as a **byte offset into that buffer** and the caller's
-    ///   slice is never read at all. GTK4 uploads its own textures through PBOs
-    ///   on some paths, which is exactly how this could arrive set.
+    ///   slice is never read at all. GTK4 may upload its own textures through
+    ///   PBOs on some paths, which is one way this could arrive set — asserted
+    ///   from the GL spec, not yet observed in a live session; see
+    ///   `docs/live-verify.md`, "#893 stage B", for the item that would turn
+    ///   it into an observation.
+    ///
+    /// **Deliberately out of scope**, named rather than silently absent so
+    /// the four above read as a considered list rather than "all of them":
+    ///
+    /// * `GL_UNPACK_SWAP_BYTES` / `GL_UNPACK_LSB_FIRST` — desktop-GL-only
+    ///   knobs with no GLES equivalent. Setting either here would be
+    ///   `GL_INVALID_ENUM` on the GLES context this crate is pinned to
+    ///   (`gl_surface.rs` negotiates `GLAPI::GLES`), so there is nothing
+    ///   portable to defend.
+    /// * `GL_UNPACK_IMAGE_HEIGHT` / `GL_UNPACK_SKIP_IMAGES` — 3-D-texture
+    ///   knobs (`glTexSubImage3D`'s pixel store, GLES 3.0+). This crate has no
+    ///   3-D texture type; nothing here ever issues that call.
     ///
     /// Cheap enough to do unconditionally: one unbind and four enum-only
     /// `glPixelStorei` calls per upload, against a call that already touches
@@ -976,6 +957,27 @@ impl Texture {
             gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
             gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, 0);
             gl::PixelStorei(gl::UNPACK_SKIP_ROWS, 0);
+        }
+    }
+
+    /// **Test-only.** Leave the unpack pixel store dirty in exactly the way
+    /// [`reset_unpack_state`] exists to fix, so a live-driver test can prove
+    /// the reset call actually runs rather than merely being present in the
+    /// source.
+    ///
+    /// Gated behind `system-tests` because setting these is the reproduction
+    /// of #1298's own bug, not something any shipped path should ever do —
+    /// see `hytte-ui`'s `gl_surface` gated tests for the round-trip this
+    /// backs.
+    #[cfg(feature = "system-tests")]
+    pub fn dirty_unpack_state_for_test(_gl: &Gl) {
+        // SAFETY: as `reset_unpack_state` — enum constants and small integers
+        // only.
+        unsafe {
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 4);
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 7);
+            gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, 3);
+            gl::PixelStorei(gl::UNPACK_SKIP_ROWS, 2);
         }
     }
 
@@ -1284,6 +1286,57 @@ pub fn draw_quads(_gl: &Gl, instances: u32) {
 /// the entire point"). It exists so `hytte-ui`'s `preem_gl_diff` example can
 /// measure GL against the CPU kit; nothing on the shell's per-frame path calls
 /// it, and nothing should.
+/// Put the pack pixel store — the mirror image of
+/// [`Texture::reset_unpack_state`], one call site's worth of knobs, on the
+/// `glReadPixels` side rather than `glTexSubImage2D`'s — into a known
+/// position before every readback.
+///
+/// The same argument, aimed the other way: `GL_PACK_ROW_LENGTH`,
+/// `GL_PACK_SKIP_PIXELS` and `GL_PACK_SKIP_ROWS` all move where
+/// `glReadPixels` **writes**, and a bound `GL_PIXEL_PACK_BUFFER` retargets the
+/// write into that buffer at a byte offset instead of into `out` at all — so
+/// a caller that left any of the four set would have `read_rgba8` write
+/// outside the `width * height * 4`-byte region its caller allocated, not
+/// merely read the wrong bytes. `PACK_SKIP_ROWS` alone was demonstrated as
+/// exactly that: a corrupted heap and a `SIGABRT`, not a wrong picture (PR
+/// #1299 review HIGH).
+///
+/// Not restored afterwards, for the same reason
+/// [`Texture::reset_unpack_state`] and [`reset_fixed_function_state`] are
+/// not: this crate is not responsible for state GTK never promised to leave
+/// alone.
+fn reset_pack_state() {
+    // SAFETY: a context is current and every call takes only enum constants
+    // or small integers — none dereferences a pointer. The `BindBuffer` names
+    // the reserved zero, which is "no buffer bound" rather than an object id,
+    // so it cannot disturb a live buffer handle.
+    unsafe {
+        gl::BindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+        gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, 0);
+        gl::PixelStorei(gl::PACK_SKIP_PIXELS, 0);
+        gl::PixelStorei(gl::PACK_SKIP_ROWS, 0);
+    }
+}
+
+/// **Test-only.** Leave the pack pixel store dirty in exactly the way
+/// [`reset_pack_state`] exists to fix, so a live-driver test can prove the
+/// reset call actually runs rather than merely being present in the source.
+///
+/// Gated behind `system-tests` because setting these is the reproduction of
+/// PR #1299's HIGH finding, not something any shipped path should ever do —
+/// see `hytte-ui`'s `gl_surface` gated tests for the round-trip this backs.
+#[cfg(feature = "system-tests")]
+pub fn dirty_pack_state_for_test(_gl: &Gl) {
+    // SAFETY: as `reset_pack_state` — enum constants and small integers only.
+    unsafe {
+        gl::PixelStorei(gl::PACK_ALIGNMENT, 4);
+        gl::PixelStorei(gl::PACK_ROW_LENGTH, 7);
+        gl::PixelStorei(gl::PACK_SKIP_PIXELS, 3);
+        gl::PixelStorei(gl::PACK_SKIP_ROWS, 2);
+    }
+}
+
 #[must_use]
 pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
     let (Ok(w), Ok(h)) = (GLsizei::try_from(width), GLsizei::try_from(height)) else {
@@ -1294,11 +1347,15 @@ pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
     if len == 0 {
         return out;
     }
-    // SAFETY: a context is current, a complete framebuffer is bound, and `out`
-    // holds exactly `width * height * 4` bytes — the region `RGBA`/
-    // `UNSIGNED_BYTE` at pack alignment 1 writes for a `w`×`h` read.
+    reset_pack_state();
+    // SAFETY: a context is current, a complete framebuffer is bound, and
+    // `out` holds exactly `width * height * 4` bytes — the region `RGBA`/
+    // `UNSIGNED_BYTE` at pack alignment 1, row length 0, skip pixels/rows 0
+    // and no `PIXEL_PACK_BUFFER` bound writes for a `w`×`h` read. That is
+    // only true because `reset_pack_state` was just called: any one of those
+    // four inherited knobs would move where this write lands, not just what
+    // it contains (PR #1299 review HIGH).
     unsafe {
-        gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
         gl::ReadPixels(
             0,
             0,

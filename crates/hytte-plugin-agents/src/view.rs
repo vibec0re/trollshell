@@ -765,9 +765,11 @@ fn approval_badge(name: &str, count: usize) -> Option<Node> {
 /// which GTK resolves the way it has to: each `GtkButton` claims the click
 /// gesture at its own level, and a claim denies the gesture to every controller
 /// further up the propagation chain — so pressing the pen opens settings and
-/// does **not** also open the agent page behind it. The card's project headers
-/// have been a full-width flat button wrapping a row since #963, which is the
-/// same shape.
+/// does **not** also open the agent page behind it. This is the first place a
+/// button sits inside another button in these goldens: the card's project
+/// headers (#963) are `Node::Expander`s whose header hytte-ui builds as a
+/// `gtk::Button` over labels only. The gesture argument is GTK's own; the
+/// live-verify item is the evidence that it holds on glass.
 ///
 /// The `ts-agent-row` class moves **onto** the button rather than staying on
 /// the inner box: the stylesheet's `.ts-agents-card .ts-agent-row` padding is
@@ -1655,6 +1657,7 @@ mod tests {
             "her `(oO)` — the state glyph moved to line 2"
         );
     }
+
     /// The card carries **none** of the detail Annika called too much
     /// information: no chevron, no unfolded block, no flag chips, no
     /// `deployed` / `parent` / `agent page` rows.

@@ -1066,7 +1066,9 @@ fn a_click_on_a_vanished_or_illegal_agent_opens_nothing() {
 ///
 /// Falsification (run this round, red): point the `ids::ROW` arm at
 /// `open_detail` and the effect kind reds; give it `window::Tab::Settings` and
-/// the argv comparison reds; delete the arm and the row click emits nothing.
+/// `the_agent_page_click_launches_the_companion_window`'s literal argv pin
+/// reds (the identity assertion here cannot see it — both arms move together);
+/// delete the arm and the row click emits nothing.
 #[test]
 fn the_row_click_opens_the_same_window_as_the_agent_page_link() {
     // Window installed: both are the same detached launch.

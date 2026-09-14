@@ -1031,9 +1031,18 @@ mod gtk_tests {
     /// — and show the source really does stop even though nothing that ran
     /// ever called `stop.set` directly.
     ///
+    /// One tick after the drain below is expected either way: the callback
+    /// increments `ticks` *before* it checks `halt` (see [`heartbeat`]), so
+    /// the timer that was already armed when the guard dropped still fires
+    /// once and only then breaks. What distinguishes "stopped" from "leaked"
+    /// is the **second** sleep-and-drain: with the guard's `Drop` doing its
+    /// job the source is gone by the first drain, so nothing moves the count
+    /// again; leaked, it is still `Continue`ing every 5 ms and the second
+    /// window catches it climbing.
+    ///
     /// Falsification (restored after, red while applied): delete
-    /// `HeartbeatGuard`'s `Drop` impl above and this reds — `ticks.get()`
-    /// keeps climbing past `before` because the 5 ms source is still
+    /// `HeartbeatGuard`'s `Drop` impl above and this reds — the second
+    /// snapshot climbs past the first because the 5 ms source is still
     /// `Continue`ing.
     #[gtk::test]
     fn heartbeat_guard_stops_the_source_even_when_its_scope_panics() {
@@ -1048,15 +1057,20 @@ mod gtk_tests {
             "the panic must actually happen for this test to prove anything"
         );
 
-        // Give the 5 ms source several chances to fire if it is still alive,
-        // then pump the context so a still-running one gets to increment.
+        // First drain: lets the timer that was already armed when the guard
+        // dropped fire its one permitted last tick and break.
         std::thread::sleep(Duration::from_millis(50));
         let ctx = gtk::glib::MainContext::default();
+        while ctx.iteration(false) {}
+        let after_first_drain = ticks.get();
+
+        // Second drain: if the source is truly gone, nothing moves it again.
+        std::thread::sleep(Duration::from_millis(50));
         while ctx.iteration(false) {}
 
         assert_eq!(
             ticks.get(),
-            0,
+            after_first_drain,
             "the heartbeat kept firing after its guard's scope had already panicked away — the \
              guard's Drop did not run, or did not stop the source"
         );

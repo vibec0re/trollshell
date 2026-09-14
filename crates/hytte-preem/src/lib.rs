@@ -175,9 +175,8 @@ pub use led_matrix::{Fill, LedMatrix};
 // definitions rather than copies of them.
 pub use led_strip::{
     CELL_H as LED_CELL_H, CELL_W as LED_CELL_W, DEFAULT_LEDS, DEFAULT_WIDTH, GAP as LED_GAP,
-    LedStrip, MAX_LEDS, PAD as LED_PAD, PeakHold, cap_ink as led_cap_ink,
-    cell_x0 as led_cell_x0, led_strip, lit_count as led_lit_count, peak_led as led_peak_led,
-    strip_size as led_strip_size,
+    LedStrip, MAX_LEDS, PAD as LED_PAD, PeakHold, cap_ink as led_cap_ink, cell_x0 as led_cell_x0,
+    led_strip, lit_count as led_lit_count, peak_led as led_peak_led, strip_size as led_strip_size,
 };
 pub use marquee::{Marquee, MarqueeStrip};
 pub use scope::Scope;

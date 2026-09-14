@@ -1276,6 +1276,12 @@ fn label(case: &Case) -> String {
 }
 
 /// Push a case's state at the surface and ask for a frame.
+///
+/// The `too_many_lines` allow is the case list's, not this function's: it is
+/// one flat arm per kind with no nesting between them, and it crossed the
+/// ceiling when #1153 added the sixth. The same trade `preem_render::advance`
+/// states — splitting it would put half the drive table somewhere else.
+#[allow(clippy::too_many_lines)]
 fn drive(area: &GlSurface, case: &Case) {
     let (program, width, height, uniforms) = match case {
         Case::Scope { style, idle_steps } => {
@@ -1443,6 +1449,11 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// Build the CPU reference, compare, print the per-channel deltas and the
 /// worst pixel, and write the evidence images. Returns whether the case passed
 /// — see [`parity::Verdict`] for the five ways it can fail.
+///
+/// `too_many_lines` for [`drive`]'s reason: one flat arm per kind builds the
+/// oracle, and everything after that `match` is a single linear sequence of
+/// prints.
+#[allow(clippy::too_many_lines)]
 fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
     let label = label(case);
     let upscale = case.reference_scale();

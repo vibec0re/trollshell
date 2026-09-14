@@ -156,7 +156,10 @@ pub(crate) fn led_strip_surface(
                 // as floats for the shader to re-round: `lit_count`'s
                 // round-to-nearest and `peak_led`'s ceil-then-clamp (and both
                 // of their `NaN` rules) have one implementation this way.
-                ("u_lit", GlValue::Int(int_of(kit::led_lit_count(level, leds)))),
+                (
+                    "u_lit",
+                    GlValue::Int(int_of(kit::led_lit_count(level, leds))),
+                ),
                 (
                     "u_peak",
                     GlValue::Int(kit::led_peak_led(peak, leds).map_or(NO_PEAK, int_of)),
@@ -244,12 +247,12 @@ mod tests {
     }
 
     fn uniform(uniforms: &GlUniforms, name: &str) -> GlValue {
-        uniforms
+        let (_, value) = uniforms
             .values
             .iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| *value)
-            .unwrap_or_else(|| panic!("no uniform named {name}"))
+            .find(|(candidate, _)| *candidate == name)
+            .unwrap_or_else(|| panic!("no uniform named {name}"));
+        *value
     }
 
     /// **The uniform table is the kit's own metrics**, name for name and value
@@ -333,7 +336,10 @@ mod tests {
             "the peak dot's cap is the kit's own `cap_ink`, not a second mix",
         );
         assert_eq!(surface.uniforms.step_seq, 0, "no cross-frame GPU state");
-        assert!(surface.uniforms.data.is_none(), "this widget samples nothing");
+        assert!(
+            surface.uniforms.data.is_none(),
+            "this widget samples nothing"
+        );
     }
 
     /// **The grid and the natural size are `led_strip_size`'s buffer** — the
@@ -546,29 +552,51 @@ mod tests {
     /// kernel, dividing in floats instead of truncating, renormalising the
     /// window where it clips at a buffer edge, compositing the peak dot before
     /// the level, or dropping the `+ 127` from `mix_kit`.
+    ///
+    /// The whole sweep runs inside one [`kit::with_pins`] scope pinning
+    /// [`kit::Ink::Base`], which is what keeps it hermetic *without* reaching
+    /// for `plugins::tests`' process-wide ink mutex — this module is
+    /// `#[path]`-included by the harness and deliberately references nothing
+    /// above itself. The kit's accent is a process-global `AtomicU32` that
+    /// **both** `palette_snapshot` (here) and `LedStrip::render` (the oracle)
+    /// read at render time, and the suite runs concurrently, so a flip landing
+    /// between the two calls would make them differ for a reason that is not
+    /// this code. `with_pins` is thread-local and `Ink::Base` ignores the
+    /// accent outright, so both sides resolve the same palette by
+    /// construction. Measured: without it this test fails roughly one run in
+    /// three, against the two tests that write the global.
     #[test]
     fn the_transcribed_shader_is_bit_exact_against_the_kit_at_one_to_one() {
-        for style in kit::DisplayStyle::ALL {
-            for leds in [1_usize, 7, 24] {
-                for &(level, peak) in &[
-                    (0.0_f32, 0.0_f32),
-                    (0.5, 0.0),
-                    (1.0, 0.0),
-                    (0.35, 0.8),
-                    (0.6, 0.6),
-                    (1.0, 1.0),
-                    (0.04, 0.04),
-                ] {
-                    let reference = kit::LedStrip::new(style).leds(leds).render(level, peak);
-                    let mirror = shader_frame(style, leds, level, peak);
-                    assert_eq!(
-                        mirror,
-                        reference.data(),
-                        "{style:?} leds={leds} level={level} peak={peak}",
-                    );
+        kit::with_pins(
+            kit::Pins {
+                ink: kit::Ink::Base,
+                field: None,
+            },
+            || {
+                for style in kit::DisplayStyle::ALL {
+                    for leds in [1_usize, 7, 24] {
+                        for &(level, peak) in &[
+                            (0.0_f32, 0.0_f32),
+                            (0.5, 0.0),
+                            (1.0, 0.0),
+                            (0.35, 0.8),
+                            (0.6, 0.6),
+                            (1.0, 1.0),
+                            (0.04, 0.04),
+                        ] {
+                            let reference =
+                                kit::LedStrip::new(style).leds(leds).render(level, peak);
+                            let mirror = shader_frame(style, leds, level, peak);
+                            assert_eq!(
+                                mirror,
+                                reference.data(),
+                                "{style:?} leds={leds} level={level} peak={peak}",
+                            );
+                        }
+                    }
                 }
-            }
-        }
+            },
+        );
     }
 
     /// **The transcription above is the arithmetic the shipped shader carries**
@@ -606,7 +634,10 @@ mod tests {
         let peak_at = BODY
             .find("mix_kit(under, cap, dot)")
             .expect("the peak composite");
-        assert!(level_at < peak_at, "the peak dot composites on top of the level");
+        assert!(
+            level_at < peak_at,
+            "the peak dot composites on top of the level"
+        );
     }
 
     // ── the transcription ───────────────────────────────────────────────────
@@ -624,8 +655,10 @@ mod tests {
             radius: 0,
             strength: 0,
         });
-        let lit = kit::led_lit_count(level, leds);
-        let dot = kit::led_peak_led(peak, leds);
+        let index = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
+        let lit = index(kit::led_lit_count(level, leds));
+        let dot = kit::led_peak_led(peak, leds).map(index);
+        let last = index(leds) - 1;
         let cap = kit::led_cap_ink(palette.ink);
 
         let mut out = Vec::with_capacity(w * h * 4);
@@ -635,13 +668,13 @@ mod tests {
                 let p = (col as f32 + 0.5, row as f32 + 0.5);
                 let mut under = palette.bg;
                 if let Some(ghost) = palette.ghost {
-                    let t = stamp255(p, (w, h), 0, leds as i32 - 1, bloom);
+                    let t = stamp255(p, (w, h), 0, last, bloom);
                     if t > 0 {
                         under = mix_kit(under, ghost, t);
                     }
                 }
                 let keep = palette.mask.map_or(256, |m| mask_keep(col, row, w, h, m));
-                let level255 = layer255(p, (w, h), 0, lit as i32 - 1, bloom);
+                let level255 = layer255(p, (w, h), 0, lit - 1, bloom);
                 if level255 > 0 {
                     let i = level255 * keep / 256;
                     if i > 0 {
@@ -649,7 +682,7 @@ mod tests {
                     }
                 }
                 if let Some(dot) = dot {
-                    let dot255 = layer255(p, (w, h), dot as i32, dot as i32, bloom);
+                    let dot255 = layer255(p, (w, h), dot, dot, bloom);
                     if dot255 > 0 {
                         let i = dot255 * keep / 256;
                         if i > 0 {
@@ -701,7 +734,13 @@ mod tests {
 
     /// `stamp255` — at 1:1 the footprint is exactly one buffer pixel.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn stamp255(p: (f32, f32), _grid: (usize, usize), from: i32, to: i32, _b: kit::BloomSnapshot) -> i32 {
+    fn stamp255(
+        p: (f32, f32),
+        _grid: (usize, usize),
+        from: i32,
+        to: i32,
+        _b: kit::BloomSnapshot,
+    ) -> i32 {
         let sx = span_range(p.0 - 0.5, p.0 + 0.5, from, to);
         let sy = band_span(p.1 - 0.5, p.1 + 0.5);
         (255.0 * sx * sy + 0.5) as i32
@@ -751,6 +790,13 @@ mod tests {
     }
 
     /// `mix_kit`.
+    ///
+    /// `many_single_char_names` is allowed here and in [`mask_keep`] on
+    /// purpose: the names *are* the shader's, which is what lets a reviewer
+    /// read the two side by side and see a transcription rather than a
+    /// paraphrase. Renaming them would make this file easier to lint and
+    /// harder to check.
+    #[allow(clippy::many_single_char_names)]
     fn mix_kit(a: kit::Rgba, b: kit::Rgba, t: i32) -> kit::Rgba {
         let k = t.clamp(0, 255);
         let mut out = [0u8; 4];
@@ -762,12 +808,15 @@ mod tests {
     }
 
     /// `centred`.
-    #[allow(clippy::cast_possible_wrap)]
     fn centred(i: usize, n: usize) -> i32 {
         if n == 0 {
             return 0;
         }
-        ((2 * i as i32 + 1 - n as i32) * 1024) / n as i32
+        let (i, n) = (
+            i32::try_from(i).unwrap_or(i32::MAX),
+            i32::try_from(n).unwrap_or(i32::MAX),
+        );
+        ((2 * i + 1 - n) * 1024) / n
     }
 
     /// `isqrt`.
@@ -786,25 +835,28 @@ mod tests {
         s
     }
 
-    /// `mask_keep`.
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    /// `mask_keep` — see [`mix_kit`] on the single-character names.
+    #[allow(clippy::many_single_char_names)]
     fn mask_keep(x: usize, y: usize, w: usize, h: usize, mask: kit::MaskSnapshot) -> i32 {
+        let index = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
         let mask_one = i32::try_from(kit::MASK_ONE).unwrap();
         let coord_one = i32::try_from(kit::COORD_ONE).unwrap();
         let short = w.min(h);
-        let band = (short / kit::BAND_DIV) as i32;
-        let radius = (short / kit::CORNER_DIV) as i32;
+        let band = index(short / kit::BAND_DIV);
+        let radius = index(short / kit::CORNER_DIV);
 
         let u = centred(x, w);
         let v = centred(y, h);
-        let r2 = (u * u + v * v) / 2;
+        // The shader spells this `(u * u + v * v) / 2`; both terms are squares
+        // and so non-negative, where `midpoint` is that same truncating half.
+        let r2 = i32::midpoint(u * u, v * v);
         let depth = mask_one - i32::try_from(mask.corner_keep).unwrap();
         let radial = (mask_one - (depth * r2) / (coord_one * coord_one)).clamp(0, mask_one);
 
         let mut edge = mask_one;
         if band > 0 {
-            let ex = (x.min(w - 1 - x)) as i32;
-            let ey = (y.min(h - 1 - y)) as i32;
+            let ex = index(x.min(w - 1 - x));
+            let ey = index(y.min(h - 1 - y));
             let d = if ex < radius && ey < radius {
                 (radius - isqrt((radius - ex) * (radius - ex) + (radius - ey) * (radius - ey)))
                     .max(0)

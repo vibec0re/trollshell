@@ -3696,6 +3696,10 @@ mod tests {
                 config: vocab::TextBoxConfig::default(),
                 state: vocab::TextBoxState::default(),
             },
+            W::LedStrip {
+                config: vocab::LedStripConfig::default(),
+                state: vocab::LedStripState::default(),
+            },
         ];
         assert_eq!(
             all.len(),

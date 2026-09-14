@@ -336,6 +336,13 @@ pub(crate) const GAUGE_SUPERSAMPLE: u32 = 2;
 /// builds and drives exactly this list, and the hermetic test calls this same
 /// function to check every [`Kind::ALL`] member has at least one case per
 /// skin here, rather than trusting a count typed twice.
+///
+/// The `too_many_lines` allow is the case list's, not this function's: it is
+/// one flat `let … = …;` per kind group with no nesting between them, and it
+/// crossed the ceiling when #1153 added the sixth. Splitting it would put half
+/// the case list somewhere else, which is worse to read and worse to review
+/// than a long function — the same trade `preem_render::advance` states.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
     skins
         .iter()

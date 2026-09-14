@@ -1352,10 +1352,7 @@ fn label(case: &Case) -> String {
         // its evidence files don't collide with the same skin/meter's
         // `METER_LEDS` case — the odd-origin marquee's naming shape.
         Case::LedStrip {
-            style,
-            meter,
-            leds,
-            ..
+            style, meter, leds, ..
         } if *leds != METER_LEDS => {
             format!("led_strip.{}.{}.leds{leds}", style.name(), meter.name())
         }

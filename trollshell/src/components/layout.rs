@@ -6,7 +6,10 @@
 //! clashing with the `panels/` module name) is the titled card you
 //! attach into a grid cell. `boxed_list` builds a selection-free
 //! `gtk::ListBox` with the Adwaita `boxed-list` style. `toggle_class`
-//! adds or removes a single CSS class based on a boolean.
+//! adds or removes a single CSS class based on a boolean. `fixed_width_label`
+//! and `slim_row` are the #1302 fix-round-2 primitives: a title label whose
+//! *natural* width never depends on its text, and the `AdwActionRow`-shaped
+//! `gtk::ListBoxRow` built around one.
 
 use hytte::adw;
 use hytte::gtk::{self, prelude::*};
@@ -292,6 +295,110 @@ pub(crate) fn toggle_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool
         widget.add_css_class(class);
     } else {
         widget.remove_css_class(class);
+    }
+}
+
+/// A `gtk::Label` whose *natural* width request is pinned to `chars`
+/// characters, independent of its actual text — the per-tick half of the
+/// #1302 fix round 2.
+///
+/// `panels/media.rs`'s `ellipsized_label` idiom (`EllipsizeMode::End` +
+/// `set_max_width_chars`) is *not* enough on its own: measured directly, a
+/// 2-character label with `max_width_chars(20)` reports a 17px natural
+/// width while a 300-character label with the same cap reports 160px —
+/// bounded, but the two are still not equal, which is exactly the shape
+/// `components::format::truncate_for_row` has (see its own doc for the
+/// `AdwActionRow`/`title-lines` half of this finding). Adding
+/// `set_width_chars(chars)` — the *same* value as `max_width_chars` — pins
+/// both the minimum and the maximum to one point, and GTK's own invariant
+/// (`natural >= minimum`) then forces the natural width to that exact value
+/// regardless of content: measured, both labels above report 160px once
+/// `width_chars(20)` joins `max_width_chars(20)`. `hexpand`/`xalign(0.0)`
+/// so the label still fills whatever width its row is actually allocated
+/// and reads left-aligned, ellipsizing only the *rendered* text — the
+/// natural-width request that drives the row's (and so the drawer's) own
+/// sizing never sees the difference between a 2-character and a
+/// 300-character string.
+pub(crate) fn fixed_width_label(chars: i32) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_width_chars(chars);
+    label.set_max_width_chars(chars);
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label
+}
+
+/// The pieces of a [`slim_row`], handed back so the caller can finish
+/// wiring it: set `title`'s text (its width is already fixed), optionally
+/// show `subtitle` (hidden by default, its width is also fixed — call
+/// `.set_visible(true)` once its text is set), `header.prepend(&icon)` a
+/// prefix icon before the title column, and `suffixes.append(&widget)` any
+/// trailing value/control widgets. `row` is what the caller adds to its
+/// `AdwPreferencesGroup`/`AdwExpanderRow`.
+pub(crate) struct SlimRow {
+    pub(crate) row: gtk::ListBoxRow,
+    pub(crate) header: gtk::Box,
+    pub(crate) title: gtk::Label,
+    pub(crate) subtitle: gtk::Label,
+    pub(crate) suffixes: gtk::Box,
+}
+
+/// A `gtk::ListBoxRow` replicating `AdwActionRow`'s visual chrome — libadwaita's
+/// own stylesheet (`_lists.scss`) keys `row > box.header`'s 12px side
+/// margins/6px spacing/50px min-height, and `box.title`'s `.title`/
+/// `.subtitle` labels, off CSS class names and node structure, not off the
+/// `AdwActionRow` `GObject` type — so a bare `gtk::ListBoxRow` built with the
+/// same class names and nesting renders identically inside a boxed list.
+///
+/// Exists because `AdwActionRow` doesn't expose its title/subtitle labels, so
+/// there is no public way to bound *their* natural width (the `title-lines`
+/// finding in `components::format::truncate_for_row`'s doc) — this rebuilds
+/// the same look around title/subtitle labels whose width genuinely is
+/// bounded ([`fixed_width_label`], one cap per label since a title and its
+/// subtitle rarely want the same natural width), for the per-tick rows
+/// #1302's fix round 2 flagged (Top apps, failed units, disk mounts, the GPU
+/// device subtitle). The static rows (Bluetooth/VPN/connections/
+/// notifications, Mara's low-priority half) keep plain `AdwActionRow` +
+/// `truncate_for_row` — bounded, not constant, which the PR body says
+/// explicitly.
+pub(crate) fn slim_row(title_max_chars: i32, subtitle_max_chars: i32) -> SlimRow {
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header.add_css_class("header");
+    header.set_valign(gtk::Align::Center);
+
+    let title_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    title_box.add_css_class("title");
+    title_box.set_valign(gtk::Align::Center);
+    title_box.set_hexpand(true);
+
+    let title = fixed_width_label(title_max_chars);
+    title.add_css_class("title");
+    title_box.append(&title);
+
+    let subtitle = fixed_width_label(subtitle_max_chars);
+    subtitle.add_css_class("subtitle");
+    subtitle.set_visible(false);
+    title_box.append(&subtitle);
+
+    header.append(&title_box);
+
+    let suffixes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    suffixes.add_css_class("suffixes");
+    suffixes.set_valign(gtk::Align::Center);
+    header.append(&suffixes);
+
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&header));
+    row.set_activatable(false);
+    row.set_selectable(false);
+
+    SlimRow {
+        row,
+        header,
+        title,
+        subtitle,
+        suffixes,
     }
 }
 

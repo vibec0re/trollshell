@@ -348,18 +348,45 @@ def self_test() -> list[str]:
     return failures
 
 
+def _self_test_failed(lines: list[str]) -> int:
+    """Print the "scanner disagrees with its own fixtures" verdict and return
+    the exit-2 self-test-failure code the sibling scripts
+    (`lint-config-vocab.py`, `lint-bind-pins.py`) reserve for it.
+
+    One helper for `self_test()`'s two failure shapes — a fixture producing
+    the wrong verdict (`lines` is `self_test()`'s own return value) and a
+    fixture raising outright (`lines` is a single synthetic line describing
+    the exception, built by the caller) — so the two read the same way in CI
+    output. Before this, only the first shape went through here: the second
+    escaped `main()` as an uncaught traceback and Python's default exit 1 —
+    indistinguishable from a real lint-table divergence in the tree, which is
+    also exit 1 (#1286, N2 of the #1279 review: this file had the same
+    unguarded shape #1279 fixed in `lint-config-vocab.py` — and, unlike
+    `lint-bind-pins.py`'s `self_test()`, this one already raises today:
+    `del dropped["clippy"]["pedantic"]` over a fixture dict is a `KeyError`
+    the moment a fixture edit drops that key).
+    """
+    print("lints-tables scan: SELF-TEST FAILED", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    print(
+        "\nThe scanner disagrees with its own fixtures, so any verdict it gives on\n"
+        "the tree is meaningless. Fix the comparison, not the fixtures.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main() -> int:
-    failures = self_test()
+    try:
+        failures = self_test()
+    except Exception as e:
+        # Anything escaping self_test() means the scanner itself is broken,
+        # not that the tree has a real lint-table divergence -- exit 2, not
+        # the exit 1 a real finding uses (#1286, N2 of the #1279 review).
+        return _self_test_failed([f"a fixture raised {type(e).__name__}: {e}"])
     if failures:
-        print("lints-tables scan: SELF-TEST FAILED", file=sys.stderr)
-        for line in failures:
-            print(f"  {line}", file=sys.stderr)
-        print(
-            "\nThe scanner disagrees with its own fixtures, so any verdict it gives on\n"
-            "the tree is meaningless. Fix the comparison, not the fixtures.",
-            file=sys.stderr,
-        )
-        return 2
+        return _self_test_failed(failures)
 
     try:
         root_manifest = read_manifest(ROOT_MANIFEST)

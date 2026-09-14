@@ -1646,22 +1646,47 @@ def self_test() -> list[str]:
     return failures
 
 
+def _self_test_failed(lines: list[str]) -> int:
+    """Print the "scanner disagrees with its own fixtures" verdict and return
+    the exit-2 self-test-failure code the sibling scripts
+    (`lint-config-vocab.py`, `lint-lints-tables.py`) reserve for it.
+
+    One helper for `self_test()`'s two failure shapes — a fixture producing
+    the wrong pin count (`lines` is `self_test()`'s own return value, each
+    entry already carrying its own two-space indent) and a fixture raising
+    outright (`lines` is a single synthetic line describing the exception,
+    built by the caller) — so the two read the same way in CI output. Before
+    this, only the first shape went through here: the second escaped `main()`
+    as an uncaught traceback and Python's default exit 1 — indistinguishable
+    from a real pin found in the tree, which is also exit 1 (#1286, N2 of the
+    #1279 review: this file had the same unguarded shape #1279 fixed in
+    `lint-config-vocab.py`).
+    """
+    print("bind-pin scan: SELF-TEST FAILED", file=sys.stderr)
+    for line in lines:
+        print(line, file=sys.stderr)
+    print(
+        "\nThe scanner disagrees with its own fixtures, so any verdict it gives on the\n"
+        "tree is meaningless. Fix scan_file()/SITE_RE rather than the expectations —\n"
+        "and if a fixture is genuinely wrong, say why in the header section it cites.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main(argv: list[str]) -> int:
     # Before anything else: does the scanner still find a pin it is supposed to
     # find, and still ignore the shapes it is supposed to ignore? A clean tree
     # cannot answer either question, which is how #973 stayed green.
-    failures = self_test()
+    try:
+        failures = self_test()
+    except Exception as e:
+        # Anything escaping self_test() means the scanner itself is broken,
+        # not that the tree has a real pin -- exit 2, not the exit 1 a real
+        # finding uses (#1286, N2 of the #1279 review).
+        return _self_test_failed([f"  a fixture raised {type(e).__name__}: {e}"])
     if failures:
-        print("bind-pin scan: SELF-TEST FAILED", file=sys.stderr)
-        for line in failures:
-            print(line, file=sys.stderr)
-        print(
-            "\nThe scanner disagrees with its own fixtures, so any verdict it gives on the\n"
-            "tree is meaningless. Fix scan_file()/SITE_RE rather than the expectations —\n"
-            "and if a fixture is genuinely wrong, say why in the header section it cites.",
-            file=sys.stderr,
-        )
-        return 2
+        return _self_test_failed(failures)
 
     roots = argv[1:] or list(DEFAULT_ROOTS)
 

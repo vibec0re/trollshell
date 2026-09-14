@@ -2497,6 +2497,75 @@ mod imp {
             eprintln!("SKIPPED {test_name}: {why}");
             None
         }
+
+        /// **PR #1299 review MED 3.** Nothing CI runs could previously tell
+        /// `Texture::reset_unpack_state`/`reset_pack_state` from their
+        /// absence: `cargo test -p hytte-gl` never touches a live driver, and
+        /// the parity harness renders byte-identically whether or not either
+        /// call is present, because CI's own unpack/pack store is clean at
+        /// every upload (the review measured that too). This test closes
+        /// that hole by *forcing* the store dirty first — through
+        /// `hytte-gl`'s own `system-tests`-gated
+        /// `dirty_unpack_state_for_test`/`dirty_pack_state_for_test`, which
+        /// exist for exactly this — then driving the ordinary safe API
+        /// (`Texture::upload_u8`, [`hgl::read_rgba8`]) and asserting the
+        /// bytes it reads back are the bytes it wrote.
+        ///
+        /// Covers both halves in one round trip: `dirty_unpack_state_for_test`
+        /// before the upload proves `reset_unpack_state` still runs inside
+        /// `upload_u8`; `dirty_pack_state_for_test` before the readback proves
+        /// `reset_pack_state` still runs inside `read_rgba8`.
+        ///
+        /// **Falsified** by deleting either `reset_*_state()` call site in
+        /// `hytte-gl`: with `reset_unpack_state` gone, `UNPACK_SKIP_PIXELS`/
+        /// `SKIP_ROWS` are still set to garbage when `TexSubImage2D` runs, so
+        /// the upload reads outside its own 48-byte source slice and the
+        /// bytes read back are wrong (or the process aborts, driver
+        /// depending — see the review's own `PACKPROBE` reproduction for the
+        /// pack-side shape of that). With `reset_pack_state` gone,
+        /// `PACK_SKIP_ROWS`/`SKIP_PIXELS` are still set when `ReadPixels`
+        /// runs, which offsets **where it writes**: on the review's box that
+        /// was a corrupted heap and a `SIGABRT`, not a wrong assertion — a
+        /// crashed test binary is exactly as red as a failed one for this
+        /// purpose.
+        #[gtk::test]
+        fn an_upload_and_readback_round_trips_through_a_dirtied_pixel_store() {
+            const WIDTH: u32 = 4;
+            const HEIGHT: u32 = 3;
+
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("an_upload_and_readback_round_trips_through_a_dirtied_pixel_store")
+            else {
+                return;
+            };
+
+            let texture = hgl::Texture::new(&gl, hgl::Format::Rgba8, WIDTH, HEIGHT)
+                .expect("a 4x3 RGBA8 texture always allocates on any real driver");
+            let framebuffer = hgl::Framebuffer::new(&gl).expect("an empty FBO always allocates");
+
+            // Every byte distinct and non-zero, so a shifted/garbled read
+            // cannot accidentally look right.
+            let expected: Vec<u8> = (0..WIDTH * HEIGHT * 4)
+                .map(|i| u8::try_from((i * 7 + 11) % 251).unwrap_or(0))
+                .collect();
+
+            hgl::Texture::dirty_unpack_state_for_test(&gl);
+            texture.upload_u8(&gl, &expected);
+
+            framebuffer
+                .draw_to(&gl, &texture)
+                .expect("attaching a freshly uploaded texture must be a complete framebuffer");
+
+            hgl::dirty_pack_state_for_test(&gl);
+            let read_back = hgl::read_rgba8(&gl, WIDTH, HEIGHT);
+
+            assert_eq!(
+                read_back, expected,
+                "an upload and a readback must round-trip the same bytes even when GL's \
+                 pixel store was left dirty on both the unpack and the pack side — the \
+                 whole thesis of #1298's reset_unpack_state and PR #1299's reset_pack_state",
+            );
+        }
     }
 }
 

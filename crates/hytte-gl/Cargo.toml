@@ -7,6 +7,16 @@ repository.workspace = true
 rust-version.workspace = true
 description = "The workspace's OpenGL island: safe RAII wrappers over the `gl` crate's unsafe entry points (programs, textures, FBOs, draws) for hytte's GtkGLArea renderer."
 
+[features]
+# Opt-in test-only seam: `dirty_unpack_state_for_test`/`dirty_pack_state_for_test`
+# (PR #1299 review MED 3), which deliberately leave the pixel store in a state
+# that would corrupt an upload or a readback if `Texture::reset_unpack_state`/
+# `reset_pack_state` did not run. Off by default so the shipped crate carries
+# no function whose only job is to break its own invariant on request;
+# `hytte-ui`'s own `system-tests` feature forwards into this one so its gated
+# `gl_surface` tests can reach it under a real driver.
+system-tests = []
+
 [dependencies]
 # Already in `Cargo.lock` — `gdk4 0.11.2` depends on it — so this crate adds
 # **no** new resolved package (#893 stage B, the spec's `hytte-gl` row). The

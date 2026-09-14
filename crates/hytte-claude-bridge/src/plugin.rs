@@ -90,7 +90,10 @@
 //! the percent, the reset time as both an absolute UTC stamp and a "in 2 h
 //! 15 min", and the account's extra-usage allowance when it is enabled. The
 //! header carries the last-fetched time, or the failure sentence when the last
-//! poll produced nothing.
+//! poll produced nothing **and there is nothing left over from a previous
+//! one** — since #1283, a failed poll that still has [`usage::Report::last_ok`]
+//! numbers renders that same list, with the failure sentence appended as a
+//! footer rather than replacing it (see [`failure_footer`]).
 //!
 //! This is why the manifest now requests
 //! [`Capability::OpenPage`](hytte_plugin::proto::Capability::OpenPage) — the one
@@ -381,14 +384,20 @@ pub fn chip_limits(usage: &Usage) -> Vec<&Limit> {
 /// ones: the cap exists to stop the chip widening on the bar, and a tooltip has
 /// no width to defend.
 ///
-/// A second line is appended for whichever of three things is true, in order:
-/// the last report is too old to trust ([`Report::is_stale`], which only a
-/// wedged poll ever reaches — see [`usage::STALE_AFTER`]), the last poll
-/// failed (its own [`sentence`](UsageError::sentence), adjusted by
-/// [`usage_failure_sentence`] for the mode), or neither, in which case nothing
-/// is appended — the meters carry their own hovers, and repeating their
-/// numbers here would put the same numbers in two places that can disagree by
-/// a tick.
+/// Lines are appended below the head for whichever of these is true, in
+/// order: nothing at all, when there is nothing more specific to say — the
+/// meters carry their own hovers, and repeating their numbers here would put
+/// the same numbers in two places that can disagree by a tick; the failure
+/// sentence alone, when the last poll failed and the numbers it is still
+/// showing (if any) are not stale; the staleness stamp alone, on a *stale
+/// success* — nothing more specific to say than since when; or **both**, on a
+/// *stale failure* — the sentence first, the stamp second — so a sustained
+/// 429 never drops "next try in N min" for "usage stale since …" the way a
+/// stamp-wins rule would (#1254's N2 hover-contradicts-panel shape, and
+/// exactly the sustained-429 case #1283 was filed for; #1285's review, MED).
+/// [`Report::is_stale`] is judged past [`usage::STALE_AFTER`], and not only a
+/// wedged poll reaches it: since #1283 a *healthy* poller backing off a
+/// sustained run of 429s can too.
 fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
     let head = match status.startup {
         // Same honesty as the `…` label: no mode has been settled yet, so name
@@ -404,14 +413,26 @@ fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
         }
     };
     let second_line = match report {
-        // A stale *successful* report is the case with nothing else to say
-        // it: no error was ever recorded, so without this the chip would keep
-        // painting last week's meters as if they were current.
-        Some(report) if report.usage().is_some() && report.is_stale(now) => Some(format!(
-            "usage stale since {}",
-            usage::format_utc(report.at)
-        )),
-        Some(report) => usage_failure_sentence(status, report),
+        // A stale report — whether the *latest* poll succeeded or is still
+        // failing on top of old-enough `last_ok` numbers (#1283). `numbers_at`
+        // names when those numbers were actually fetched, which on a stale
+        // failure is `last_ok`'s clock, not this attempt's own `at`.
+        Some(report) if report.usage().is_some() && report.is_stale(now) => {
+            let stamp = format!(
+                "usage stale since {}",
+                usage::format_utc(report.numbers_at().unwrap_or(report.at))
+            );
+            match usage_failure_sentence(status, report, now) {
+                // A stale *failure*: the actionable sentence first, the
+                // staleness stamp second — never dropping "next try in
+                // N min" is the whole point (see the doc above).
+                Some(sentence) => Some(format!("{sentence}\n{stamp}")),
+                // A stale *success*: nothing more specific to say than since
+                // when — today's wording, unchanged.
+                None => Some(stamp),
+            }
+        }
+        Some(report) => usage_failure_sentence(status, report, now),
         None => None,
     };
     match second_line {
@@ -428,7 +449,7 @@ fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
 /// `claude` (module docs, `Mode::spawns_claude`) and may have no Claude Code
 /// login on the box at all. The usage limits are a subscription-account
 /// feature regardless of which backend is answering, so say that instead.
-fn usage_failure_sentence(status: &Status, report: &Report) -> Option<String> {
+fn usage_failure_sentence(status: &Status, report: &Report, now: i64) -> Option<String> {
     let Outcome::Failed(error) = &report.outcome else {
         return None;
     };
@@ -446,7 +467,7 @@ fn usage_failure_sentence(status: &Status, report: &Report) -> Option<String> {
                 .to_owned(),
         );
     }
-    report.error()
+    report.error(now)
 }
 
 /// One meter's hover: `Session (5 h): 80% — resets in 2 h 15 min`.
@@ -598,7 +619,16 @@ fn chip(status: &Status, report: Option<&Report>, now: i64) -> Node {
 fn header(report: Option<&Report>, now: i64) -> Node {
     let freshness = match report {
         None => "not fetched yet".to_owned(),
-        Some(report) => format!("updated {}", usage::humanise_since(now, report.at)),
+        // The numbers' own clock, not the attempt's — on a failure behind
+        // fresh `last_ok` numbers those are different instants, and this
+        // header draws the numbers, not the attempt (#1285's review, HIGH-1).
+        // `numbers_at()` is `None` when there is nothing to show at all
+        // (no `last_ok`), where `report.at` — the failed attempt's own
+        // timestamp — is the only clock there is to name.
+        Some(report) => format!(
+            "updated {}",
+            usage::humanise_since(now, report.numbers_at().unwrap_or(report.at))
+        ),
     };
     titled_row(
         label("Claude usage", &["heading"]),
@@ -705,36 +735,54 @@ fn extra_row(extra: &ExtraUsage) -> Node {
     }
 }
 
+/// The failure line, when the *latest* poll failed — [`usage_failure_sentence`]'s
+/// mode adjustment, the same one the chip hover applies, so the panel can
+/// never contradict it (#1254's review, N2). Used both as [`panel`]'s only
+/// content when there are no numbers at all, and as its footer under a list
+/// still drawn from [`Report::last_ok`] (#1283) — a failure names itself
+/// without ever blanking numbers that are still within [`Report::is_stale`]'s
+/// window.
+fn failure_footer(status: &Status, report: &Report, now: i64) -> Option<Node> {
+    let Outcome::Failed(error) = &report.outcome else {
+        return None;
+    };
+    let sentence =
+        usage_failure_sentence(status, report, now).unwrap_or_else(|| error.sentence(now));
+    Some(label(&sentence, &["warning"]))
+}
+
 /// The drawer page: the header, then **every** row the server sent, then the
 /// extra-usage allowance when it is on.
 ///
-/// Three states other than a list, each of which says what it knows rather than
-/// showing an empty page: nothing polled yet, the poll failed (the sentence,
-/// which is the only actionable thing there is), or the account genuinely
-/// reported no limits.
+/// States other than a list, each of which says what it knows rather than
+/// showing an empty page: nothing polled yet; there are no numbers to show at
+/// all (either the poll failed with no last-known-good numbers to fall back
+/// on, or the numbers that do exist are too old to trust) — the sentence
+/// and/or the staleness stamp are the only actionable things there are; or
+/// the account genuinely reported no limits. Since #1283 a **failed** poll
+/// that still has fresh-enough [`Report::last_ok`] numbers is a further
+/// state, not a variant of the no-numbers one: the rows render exactly as a
+/// success's would (from [`Report::usage`], which already resolves to
+/// `last_ok` on a failure), with [`failure_footer`] appended below them
+/// rather than replacing them.
 ///
-/// The failure sentence is routed through [`usage_failure_sentence`] — the
-/// same mode adjustment the chip's [`tooltip`] applies — rather than reading
-/// [`UsageError::sentence`] directly, so on the *failure* arm the panel one
-/// click beneath the chip can never contradict it (#1254's review, N2: an
-/// API-key bridge's hover said "usage limits are a subscription feature"
-/// while the panel still told the same reader to `run claude once to sign
-/// in`). The staleness arm is the one place they can still disagree — the
-/// chip drops its meters and names when the numbers stopped being current,
-/// while this function paints every bar at its old value under an "updated
-/// … ago" header with no staleness call at all — and that gap is
-/// pre-existing (#1254 N4/N5), not something this routing touches.
+/// The staleness gate mirrors [`chip`]'s — `report.usage().filter(|_|
+/// !report.is_stale(now))` — so the panel and the chip one click above it can
+/// never disagree about whether there is anything current to show. Before
+/// #1285's review this function drew straight off `report.usage()` with no
+/// cutoff at all, which was tolerable while the panel only ever rendered rows
+/// on [`Outcome::Ok`], where the age it displayed *was* the numbers' age —
+/// but #1283 is what put a failure path through here too, and a sustained 429
+/// at [`usage::MAX_BACKOFF`] is the ordinary case under it, not an edge:
+/// without the gate this painted every bar at an hours-old value under an
+/// "updated just now" header, one click below a chip that had already,
+/// correctly, dropped its own meters.
 fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
     let mut children = vec![header(report, now)];
     match report {
         None => children.push(label("fetching usage…", &["dim-label"])),
-        Some(report) => match &report.outcome {
-            Outcome::Failed(error) => {
-                let sentence =
-                    usage_failure_sentence(status, report).unwrap_or_else(|| error.sentence());
-                children.push(label(&sentence, &["warning"]));
-            }
-            Outcome::Ok(usage) => {
+        Some(report) => {
+            if let Some(usage) = report.usage().filter(|_| !report.is_stale(now)) {
                 if usage.limits.is_empty() {
                     children.push(label("this account reported no limits", &["dim-label"]));
                 }
@@ -744,8 +792,23 @@ fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
                 if let Some(extra) = usage.extra_usage.as_ref().filter(|extra| extra.is_enabled) {
                     children.push(extra_row(extra));
                 }
+                children.extend(failure_footer(status, report, now));
+            } else {
+                // `is_stale` is `false` with nothing to be stale about (no
+                // `last_ok` at all) — the failure sentence alone covers that
+                // case, same as always.
+                if report.is_stale(now) {
+                    children.push(label(
+                        &format!(
+                            "usage stale since {}",
+                            usage::format_utc(report.numbers_at().unwrap_or(report.at))
+                        ),
+                        &["warning"],
+                    ));
+                }
+                children.extend(failure_footer(status, report, now));
             }
-        },
+        }
     }
     Node::Box {
         id: Some(PANEL_ROOT_ID.to_owned()),
@@ -827,36 +890,42 @@ mod tests {
         }
     }
 
-    /// The captured three-row response, as a published report.
+    /// The captured three-row response.
+    fn captured_usage() -> Usage {
+        Usage {
+            limits: vec![
+                limit(
+                    "session",
+                    80.0,
+                    "warning",
+                    true,
+                    "2026-09-13T13:50:00.101848+00:00",
+                ),
+                limit(
+                    "weekly_all",
+                    40.0,
+                    "normal",
+                    true,
+                    "2026-09-17T15:00:00.101872+00:00",
+                ),
+                limit(
+                    "weekly_scoped",
+                    25.0,
+                    "normal",
+                    false,
+                    "2026-09-17T15:00:00.102097+00:00",
+                ),
+            ],
+            extra_usage: Some(ExtraUsage::default()),
+        }
+    }
+
+    /// The captured response, as a published report.
     fn captured_report() -> Report {
         Report {
             at: now() - 120,
-            outcome: Outcome::Ok(Usage {
-                limits: vec![
-                    limit(
-                        "session",
-                        80.0,
-                        "warning",
-                        true,
-                        "2026-09-13T13:50:00.101848+00:00",
-                    ),
-                    limit(
-                        "weekly_all",
-                        40.0,
-                        "normal",
-                        true,
-                        "2026-09-17T15:00:00.101872+00:00",
-                    ),
-                    limit(
-                        "weekly_scoped",
-                        25.0,
-                        "normal",
-                        false,
-                        "2026-09-17T15:00:00.102097+00:00",
-                    ),
-                ],
-                extra_usage: Some(ExtraUsage::default()),
-            }),
+            outcome: Outcome::Ok(captured_usage()),
+            last_ok: None,
         }
     }
 
@@ -1072,6 +1141,7 @@ mod tests {
             let report = Report {
                 at: now(),
                 outcome: Outcome::Ok(usage.clone()),
+                last_ok: None,
             };
             assert_eq!(
                 chip_limits(&usage).len(),
@@ -1143,6 +1213,7 @@ mod tests {
         let report = Report {
             at: now() - 120,
             outcome: Outcome::Ok(usage),
+            last_ok: None,
         };
         let board = status(Mode::Subscription, false, 4, 0, Last::Ok);
         let meters = preems(&chip_state(&board, Some(&report)));
@@ -1262,6 +1333,7 @@ mod tests {
             let report = Report {
                 at: now() - 30,
                 outcome: Outcome::Failed(error.clone()),
+                last_ok: None,
             };
             let tree = chip_state(&board, Some(&report));
             assert!(preems(&tree).is_empty(), "{error:?} ⇒ no meters");
@@ -1272,7 +1344,7 @@ mod tests {
             );
             assert_eq!(
                 root_tooltip(&tree),
-                Some(format!("{base}\n{}", error.sentence())),
+                Some(format!("{base}\n{}", error.sentence(now()))),
                 "{error:?} ⇒ the hover carries the one-line sentence"
             );
         }
@@ -1329,6 +1401,201 @@ mod tests {
         );
     }
 
+    /// **#1285's review, MED — a stale *failure*'s hover carries both lines,
+    /// sentence first, stamp second**, never dropping "next try in N min"
+    /// for "usage stale since …" the way a stamp-wins rule did before this
+    /// fix (the #1254 N2 hover-contradicts-panel shape, resurfacing exactly
+    /// in the sustained-429 case #1283 was filed for). A stale *success*
+    /// keeps today's stamp-only wording — pinned already by
+    /// `a_wedged_poll_drops_its_meters_past_the_staleness_ceiling` above.
+    ///
+    /// (Lifted from the review as
+    /// `a_stale_failures_hover_dates_the_numbers_not_the_attempt`, adjusted
+    /// to the combined wording item 3 settled on.)
+    ///
+    /// Falsify by reverting `tooltip`'s stale arm to always answer just the
+    /// stamp (dropping `usage_failure_sentence` on the failure branch): the
+    /// sentence line vanishes and this goes red. Falsify the stamp's own
+    /// clock separately by reverting `numbers_at().unwrap_or(at)` there to
+    /// plain `report.at`: `left: …stale since <fetched>` /
+    /// `right: …stale since <now()>`.
+    #[test]
+    fn a_stale_failures_hover_dates_the_numbers_not_the_attempt() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let ceiling = i64::try_from(usage::STALE_AFTER.as_secs()).expect("fits");
+        let fetched = now() - ceiling - 1;
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::Http(429)),
+            last_ok: Some((fetched, captured_usage())),
+        };
+        assert_eq!(
+            root_tooltip(&chip_state(&board, Some(&report))),
+            Some(format!(
+                "Claude bridge · subscription · 18 served, 0 failed\n\
+                 usage unavailable — the usage endpoint answered HTTP 429\n\
+                 usage stale since {}",
+                usage::format_utc(fetched)
+            )),
+            "the sentence stays first, and the stamp is last_ok's clock — \
+             never the failed attempt's own `at`"
+        );
+    }
+
+    // ── #1283: a failure keeps the last good numbers on the meters ──────────
+
+    /// **Item 1(a): a failed poll after a success keeps the meters up**, drawn
+    /// from `Report::last_ok`, with the failure's own sentence on the hover —
+    /// the numbers and the explanation are not the same job.
+    ///
+    /// Falsify by reverting `Report::usage`'s `Failed` arm to ignore
+    /// `last_ok` (`Outcome::Failed(_) => None`, the pre-#1283 shape): the
+    /// meters assertion goes red.
+    #[test]
+    fn a_failed_poll_after_a_success_keeps_the_meters_and_still_names_the_failure() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let base = "Claude bridge · subscription · 18 served, 0 failed";
+        let report = Report {
+            at: now() - 30,
+            // Deadline = this attempt's `at` (now() - 30) + the 10 min wait
+            // `next_wait` would have chosen — rendered at `now()` that is 570 s
+            // left, which still rounds UP to "10 min" (#1285's review, NIT).
+            outcome: Outcome::Failed(UsageError::RateLimited(now() - 30 + 600)),
+            last_ok: Some((now() - 150, captured_usage())),
+        };
+
+        let tree = chip_state(&board, Some(&report));
+        assert!(!preems(&tree).is_empty(), "the last-good meters stay up");
+        assert_eq!(
+            root_tooltip(&tree),
+            Some(format!("{base}\nusage rate-limited — next try in 10 min")),
+            "the hover still names the failure, on its own line"
+        );
+
+        let panel_text = texts(&panel(&board, Some(&report), now()));
+        assert!(
+            panel_text.contains(&"Session (5 h)".to_owned()),
+            "the panel also keeps the last-good rows: {panel_text:?}"
+        );
+        assert!(
+            panel_text.contains(&"usage rate-limited — next try in 10 min".to_owned()),
+            "…with the failure as a footer, not a replacement: {panel_text:?}"
+        );
+    }
+
+    /// **#1285's review, HIGH-1: the panel header dates the numbers on
+    /// screen, not the failed attempt that produced no numbers.** A fresh
+    /// 429 over 5-minute-old `last_ok` numbers must read "updated 5 min
+    /// ago", never "updated just now" — the header is naming when the rows
+    /// it is drawing were actually fetched.
+    ///
+    /// Falsify by reverting `header`'s `numbers_at().unwrap_or(at)` back to
+    /// plain `report.at`: the second assertion goes red (`"updated just
+    /// now"` instead of `"updated 5 min ago"`), while the no-`last_ok`
+    /// failure case (`the_panel_explains_itself_when_there_is_no_list`)
+    /// stays green either way — `numbers_at()` is `None` there, so both
+    /// spellings agree.
+    #[test]
+    fn the_panel_header_dates_the_numbers_not_the_failed_attempt() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::RateLimited(now() + 600)),
+            last_ok: Some((now() - 300, captured_usage())),
+        };
+        let text = texts(&panel(&board, Some(&report), now()));
+        assert!(
+            text.contains(&"Session (5 h)".to_owned()),
+            "rows from last_ok: {text:?}"
+        );
+        assert!(
+            text.contains(&"updated 5 min ago".to_owned()),
+            "the header must age the numbers on screen, not the failed attempt: {text:?}"
+        );
+    }
+
+    /// **#1285's review, HIGH-2: the panel's staleness gate mirrors the
+    /// chip's.** A four-hour-old `last_ok` behind a fresh 429 draws no rows
+    /// and no bars at all — just the staleness stamp and the failure
+    /// footer — exactly like the chip that has already, correctly, dropped
+    /// its own meters one click above it.
+    ///
+    /// Falsify by reverting `panel`'s gate to plain `report.usage()` (no
+    /// `.filter(|_| !report.is_stale(now))`): the first two assertions go
+    /// red — `Session (5 h)` and its bar render under an "updated just
+    /// now" header even though the numbers are four hours old.
+    #[test]
+    fn a_stale_last_ok_behind_a_fresh_429_renders_no_rows_the_stale_label_and_the_footer() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let four_hours = 4 * 3_600;
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::RateLimited(now() + 1_800)),
+            last_ok: Some((now() - four_hours, captured_usage())),
+        };
+        let tree = panel(&board, Some(&report), now());
+        let text = texts(&tree);
+        assert!(
+            !text.contains(&"Session (5 h)".to_owned()),
+            "no rows from four-hour-old numbers: {text:?}"
+        );
+        assert!(bars(&tree).is_empty(), "no bars either: {text:?}");
+        assert!(
+            text.contains(&format!(
+                "usage stale since {}",
+                usage::format_utc(now() - four_hours)
+            )),
+            "the panel names when the numbers stopped being current: {text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t.starts_with("usage rate-limited")),
+            "…and still keeps the failure footer: {text:?}"
+        );
+    }
+
+    /// **Item 1(b): once `last_ok` itself is past [`usage::STALE_AFTER`], the
+    /// chip drops the meters — the same as any other stale report — even
+    /// though the failure that produced this `Report` is fresh.**
+    #[test]
+    fn a_last_ok_older_than_the_ceiling_still_drops_the_meters() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let ceiling = i64::try_from(usage::STALE_AFTER.as_secs()).expect("fits");
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::Http(429)),
+            last_ok: Some((now() - ceiling - 1, captured_usage())),
+        };
+        let tree = chip_state(&board, Some(&report));
+        assert!(
+            preems(&tree).is_empty(),
+            "last_ok is one second past the ceiling, even though `at` is now"
+        );
+    }
+
+    /// **Item 1(c): a first poll that fails has no `last_ok`, and renders
+    /// exactly as it always has** — this is the pre-existing
+    /// `a_failed_poll_costs_the_meters_and_never_the_chip` case, named here
+    /// once more so the #1283 build issue's three test items are each
+    /// findable by name.
+    #[test]
+    fn a_first_poll_failure_has_no_last_ok_and_is_unchanged() {
+        let board = status(Mode::Subscription, false, 0, 0, Last::None);
+        let report = Report {
+            at: now(),
+            outcome: Outcome::Failed(UsageError::Unauthorized),
+            last_ok: None,
+        };
+        assert!(preems(&chip_state(&board, Some(&report))).is_empty());
+        assert!(
+            bars(&panel(&board, Some(&report), now())).is_empty(),
+            "no rows at all — nothing to fall back on"
+        );
+        assert!(
+            texts(&panel(&board, Some(&report), now()))
+                .contains(&"usage stale — run `claude` once to refresh the login".to_owned())
+        );
+    }
+
     /// **API-key mode has no login to sign in to.** `NoCredentials` in every
     /// other mode reads its own sentence — "run `claude` once to sign in" —
     /// but `api` mode never spawns `claude`, so that is advice for a login
@@ -1341,6 +1608,7 @@ mod tests {
         let report = Report {
             at: now() - 30,
             outcome: Outcome::Failed(error.clone()),
+            last_ok: None,
         };
 
         let api = status(Mode::Api, true, 9, 0, Last::Ok);
@@ -1359,7 +1627,10 @@ mod tests {
         for mode in [Mode::Subscription, Mode::Reprompt] {
             let board = status(mode, false, 9, 0, Last::Ok);
             let hover = root_tooltip(&chip_state(&board, Some(&report))).expect("a hover");
-            assert!(hover.contains(&error.sentence()), "{mode:?}: {hover:?}");
+            assert!(
+                hover.contains(&error.sentence(now())),
+                "{mode:?}: {hover:?}"
+            );
         }
     }
 
@@ -1386,6 +1657,7 @@ mod tests {
         let report = Report {
             at: now() - 30,
             outcome: Outcome::Failed(error.clone()),
+            last_ok: None,
         };
         let board = status(mode, keyed, 9, 0, Last::Ok);
 
@@ -1413,11 +1685,11 @@ mod tests {
             );
         } else {
             assert!(
-                hover.ends_with(&error.sentence()),
+                hover.ends_with(&error.sentence(now())),
                 "{mode:?} hover does not carry the failure sentence: {hover:?}"
             );
             assert!(
-                panel_text.contains(&error.sentence()),
+                panel_text.contains(&error.sentence(now())),
                 "{mode:?} panel does not carry the failure sentence: {panel_text:?}"
             );
         }
@@ -1452,6 +1724,7 @@ mod tests {
         let report = Report {
             at: now(),
             outcome: Outcome::Failed(UsageError::Io("<redacted> refused".to_owned())),
+            last_ok: None,
         };
         let tree = chip_state(&status(Mode::Api, true, 1, 0, Last::Ok), Some(&report));
         let rendered = format!("{:?}{:?}", texts(&tree), tooltips(&tree));
@@ -1514,6 +1787,7 @@ mod tests {
         let failed = Report {
             at: now() - 90,
             outcome: Outcome::Failed(UsageError::Unauthorized),
+            last_ok: None,
         };
         let text = texts(&panel(&board, Some(&failed), now()));
         assert!(text.contains(&"updated 1 min ago".to_owned()), "{text:?}");
@@ -1526,6 +1800,7 @@ mod tests {
         let empty = Report {
             at: now(),
             outcome: Outcome::Ok(Usage::default()),
+            last_ok: None,
         };
         let text = texts(&panel(&board, Some(&empty), now()));
         assert!(
@@ -1557,6 +1832,7 @@ mod tests {
                     currency: Some("USD".to_owned()),
                 }),
             }),
+            last_ok: None,
         };
         let text = texts(&panel(&board, Some(&on), now()));
         assert!(text.contains(&"Extra usage".to_owned()), "{text:?}");
@@ -1569,6 +1845,23 @@ mod tests {
                 0.30,
                 vec!["accent".to_owned()]
             )]
+        );
+    }
+
+    /// **#1285's review, LOW — "the footer appears only when the latest poll
+    /// failed" was otherwise unpinned.** A successful report's panel names no
+    /// failure at all.
+    ///
+    /// Falsify by having `failure_footer` answer `Some(…)` regardless of
+    /// `report.outcome` (e.g. dropping its `let Outcome::Failed(error) = …
+    /// else { return None; }` guard): this goes red.
+    #[test]
+    fn a_successful_panel_carries_no_failure_footer() {
+        let board = status(Mode::Subscription, false, 9, 0, Last::Ok);
+        let text = texts(&panel(&board, Some(&captured_report()), now()));
+        assert!(
+            !text.iter().any(|t| t.starts_with("usage ")),
+            "a success names no failure: {text:?}"
         );
     }
 

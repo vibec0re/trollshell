@@ -69,6 +69,7 @@
 //! sees a `CONNECT` and never the bearer: the same position
 //! [`crate::envguard`] already takes for `HTTPS_PROXY` on the `claude` child.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -108,17 +109,49 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// meaningfully behind and infrequent enough to be invisible.
 pub const POLL_EVERY: Duration = Duration::from_mins(5);
 
-/// How old a [`Report`] may be before the chip stops trusting its numbers.
+/// The 429 backoff's ceiling (#1283) — [`next_wait`] never returns more than
+/// this, however long a `Retry-After` asks for or however many consecutive
+/// 429s there have been.
 ///
-/// Three poll periods: a single slow round-trip (the fetch's own [`TIMEOUT`]
-/// plus whatever the next tick catches up on) never trips it, but a
-/// `poll_forever` that has stopped publishing at all — it is deliberately
-/// **unsupervised** (`main`'s doc comment) — goes visibly stale within one
-/// dial-backoff window instead of leaving confidently-wrong meters on the bar
-/// forever. Every poll attempt, success *or* failure, republishes a fresh
-/// [`Report::at`], so an ordinary network hiccup never reaches this ceiling —
-/// only a genuinely wedged or panicked poll task does.
+/// **Bounded by [`STALE_AFTER`] itself**, not chosen independently — the
+/// product call taken on the #1283 thread after #1285's review found the
+/// two fighting: shipped at 30 min against a 15 min staleness window, the
+/// carry-forward this PR added was *guaranteed* to go stale for the back
+/// half of every backoff cycle (numbers fetched at `T` are stale at
+/// `T + STALE_AFTER`; the next attempt was at `T + 30 min`). Capping the
+/// schedule at the window instead means the meters this PR keeps alive can
+/// never go blank *because of* the schedule — only because the server has
+/// genuinely refused for a whole `STALE_AFTER` straight. Under a permanent
+/// 429 the bridge then polls once every `MAX_BACKOFF` (== `STALE_AFTER`),
+/// four times an hour — a quarter of the ordinary [`POLL_EVERY`] cadence,
+/// and comfortably inside the "at most every 3 min" ceiling #1283 was filed
+/// under. See the `MAX_BACKOFF <= STALE_AFTER` assertion below, which pins
+/// the direction of this dependency at compile time.
+pub const MAX_BACKOFF: Duration = STALE_AFTER;
+
+/// How old the numbers behind a [`Report`] may be before the chip stops
+/// trusting them — judged against [`Report::numbers_at`], not
+/// [`Report::at`] (see [`Report::is_stale`]).
+///
+/// Three poll periods **at the ordinary cadence**: a single slow round-trip
+/// (the fetch's own [`TIMEOUT`] plus whatever the next tick catches up on)
+/// never trips it, but a `poll_forever` that has stopped publishing at all —
+/// it is deliberately **unsupervised** (`main`'s doc comment) — goes visibly
+/// stale within one window instead of leaving confidently-wrong meters on
+/// the bar forever.
+///
+/// [`MAX_BACKOFF`] is defined *from* this constant, not the other way
+/// around (see its doc) — a *healthy* poller backing off a sustained run of
+/// 429s reaches this ceiling exactly when the backoff itself hits its cap,
+/// never before: the numbers really are that old, whether the reason is a
+/// wedged task or an account still genuinely rate-limited.
 pub const STALE_AFTER: Duration = Duration::from_secs(POLL_EVERY.as_secs() * 3);
+
+/// The invariant [`MAX_BACKOFF`]'s doc promises, pinned so it cannot silently
+/// drift back apart the way it did before #1285's review: the 429 schedule
+/// must never be able to outlive the window that decides whether its own
+/// carry-forward numbers are still trusted.
+const _: () = assert!(MAX_BACKOFF.as_secs() <= STALE_AFTER.as_secs());
 
 /// Longest borrowed error text kept in a [`UsageError`]. A transport error can
 /// be a paragraph; a chip tooltip cannot.
@@ -264,8 +297,19 @@ pub enum UsageError {
     /// 401 or 403 — the token expired (they last hours) or was revoked. **Not**
     /// a signal to refresh: `claude` owns that rotation.
     Unauthorized,
-    /// Any other non-2xx.
+    /// Any other non-2xx. [`fetch`] reports a 429 through this arm too — it
+    /// carries no schedule of its own, so this is what a raw fetch call sees.
     Http(u16),
+    /// A 429, **after** [`next_wait`] has picked how long to wait before
+    /// trying again. Never constructed by [`fetch`] (which reports a 429 as
+    /// plain [`Http`](Self::Http)) — only [`advance`] promotes one to this,
+    /// since it is the one place that knows the wait. Carries the **deadline**
+    /// it actually chose (`at + wait`, Unix seconds) rather than the wait
+    /// itself: [`sentence`](Self::sentence) takes `now` and counts down to
+    /// this at render time, so the same report reads "next try in 10 min" and
+    /// then "next try in 9 min" as the chip keeps ticking, instead of freezing
+    /// the number the schedule picked at publish time (#1285's review, NIT).
+    RateLimited(i64),
     /// The request never completed (DNS, TLS, connect, read).
     Io(String),
     /// A 2xx body that did not parse as [`Usage`].
@@ -275,8 +319,11 @@ pub enum UsageError {
 impl UsageError {
     /// The one line a human reads. Never contains the token — see the module
     /// docs and `an_unauthorized_sentence_carries_no_token_bytes`.
+    ///
+    /// `now` only feeds [`RateLimited`](Self::RateLimited)'s countdown; every
+    /// other arm's wording is fixed at construction and ignores it.
     #[must_use]
-    pub fn sentence(&self) -> String {
+    pub fn sentence(&self, now: i64) -> String {
         match self {
             Self::NoCredentials(path) => format!(
                 "no Claude login found at {} — run `claude` once to sign in",
@@ -285,6 +332,26 @@ impl UsageError {
             Self::Unauthorized => "usage stale — run `claude` once to refresh the login".to_owned(),
             Self::Http(status) => {
                 format!("usage unavailable — the usage endpoint answered HTTP {status}")
+            }
+            Self::RateLimited(deadline) => {
+                let remaining = deadline.saturating_sub(now);
+                if remaining <= 0 {
+                    // The countdown reached zero (or the clock moved) between
+                    // publish and render — never claim a negative wait.
+                    "usage rate-limited — next try any moment now".to_owned()
+                } else {
+                    // `div_ceil`, never a plain divide: telling someone "next
+                    // try in 1 min" when the schedule actually chose 90 s
+                    // would have them retrying before the wait is over.
+                    // `i64::div_ceil` is still unstable (rust-lang/rust#88581)
+                    // for signed integers, so widen to `u64` first — `remaining`
+                    // is checked positive above.
+                    let remaining = u64::try_from(remaining).unwrap_or(u64::MAX);
+                    format!(
+                        "usage rate-limited — next try in {} min",
+                        remaining.div_ceil(60)
+                    )
+                }
             }
             Self::Io(what) => format!("usage unavailable — {what}"),
             Self::Parse(what) => {
@@ -377,57 +444,93 @@ fn read_access_token(path: &Path) -> Result<String, UsageError> {
 // ── The fetch ────────────────────────────────────────────────────────────────
 
 /// One poll: read the token, `GET {base_url}/api/oauth/usage`, parse the two
-/// generic fields.
+/// generic fields — the plain `Result` shape most of this module's own tests
+/// want.
 ///
-/// Blocking — call it from `spawn_blocking`, the way [`poll_forever`] does and
-/// [`crate::messages`] already does for its own `ureq` client.
+/// `poll_forever` (the one production caller) needs the `Retry-After` header
+/// too, since #1283, and calls [`fetch_with_retry_after`] directly instead;
+/// that is the whole reason this is `#[cfg(test)]` rather than the shared
+/// entry point both paths go through — a production caller of the plain
+/// `Result` shape would make this a real wrapper again, but there is none
+/// today, and an always-compiled function with no caller outside `mod tests`
+/// is dead code in the shipped binary.
+///
+/// Blocking — call it from `spawn_blocking`, the way [`fetch_with_retry_after`]
+/// does and [`crate::messages`] already does for its own `ureq` client.
 ///
 /// # Errors
 ///
 /// Every arm of [`UsageError`]; each carries a one-line
 /// [`sentence`](UsageError::sentence) and **never** the bearer token.
+#[cfg(test)]
 pub fn fetch(base_url: &str, credentials_path: &Path) -> Result<Usage, UsageError> {
-    let token = read_access_token(credentials_path)?;
+    fetch_with_retry_after(base_url, credentials_path).0
+}
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_global(Some(TIMEOUT))
-        // Read the endpoint's own body on a non-2xx rather than collapsing it
-        // into a transport error: the status is what decides the arm below.
-        .http_status_as_error(false)
-        // This is a single constant URL with no business redirecting. Without
-        // this, the bearer's only protection on a cross-host redirect is
-        // `ureq::Config::default()`'s `RedirectAuthHeaders::Never` — a
-        // dependency default this crate does not pin — and a redirect target
-        // that happens to answer `200 {}` would read as "this account has no
-        // limits" instead of an error. With `max_redirects(0)` the redirect is
-        // never followed at all (no second connection, so no header can ever
-        // reach it) and its own status falls through to the `other` arm below
-        // as `UsageError::Http`.
-        .max_redirects(0)
-        .build()
-        .into();
+/// [`fetch`]'s logic, also returning the response's `Retry-After` header
+/// (#1283) parsed to a [`Duration`] when the server sent one — read
+/// regardless of status, though only [`poll_forever`] ever looks at it, and
+/// only for a 429.
+///
+/// Both spellings RFC 7231 §7.1.3 allows are parsed
+/// ([`parse_retry_after`]): delta-seconds, and the IMF-fixdate form via
+/// [`parse_http_date`], resolved against [`now_unix`] into a duration the
+/// same way delta-seconds already is one.
+fn fetch_with_retry_after(
+    base_url: &str,
+    credentials_path: &Path,
+) -> (Result<Usage, UsageError>, Option<Duration>) {
+    let mut retry_after = None;
+    let result = (|| -> Result<Usage, UsageError> {
+        let token = read_access_token(credentials_path)?;
 
-    let url = format!("{}{USAGE_PATH}", base_url.trim_end_matches('/'));
-    let mut resp = agent
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| UsageError::Io(truncate(&scrub(&e.to_string(), &token))))?;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_global(Some(TIMEOUT))
+            // Read the endpoint's own body on a non-2xx rather than collapsing it
+            // into a transport error: the status is what decides the arm below.
+            .http_status_as_error(false)
+            // This is a single constant URL with no business redirecting. Without
+            // this, the bearer's only protection on a cross-host redirect is
+            // `ureq::Config::default()`'s `RedirectAuthHeaders::Never` — a
+            // dependency default this crate does not pin — and a redirect target
+            // that happens to answer `200 {}` would read as "this account has no
+            // limits" instead of an error. With `max_redirects(0)` the redirect is
+            // never followed at all (no second connection, so no header can ever
+            // reach it) and its own status falls through to the `other` arm below
+            // as `UsageError::Http`.
+            .max_redirects(0)
+            .build()
+            .into();
 
-    let status = resp.status().as_u16();
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| UsageError::Io(truncate(&scrub(&e.to_string(), &token))))?;
+        let url = format!("{}{USAGE_PATH}", base_url.trim_end_matches('/'));
+        let mut resp = agent
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| UsageError::Io(truncate(&scrub(&e.to_string(), &token))))?;
 
-    match status {
-        200..=299 => serde_json::from_str::<Usage>(&body)
-            .map_err(|e| UsageError::Parse(truncate(&scrub(&e.to_string(), &token)))),
-        401 | 403 => Err(UsageError::Unauthorized),
-        other => Err(UsageError::Http(other)),
-    }
+        retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_retry_after(v, now_unix()));
+
+        let status = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| UsageError::Io(truncate(&scrub(&e.to_string(), &token))))?;
+
+        match status {
+            200..=299 => serde_json::from_str::<Usage>(&body)
+                .map_err(|e| UsageError::Parse(truncate(&scrub(&e.to_string(), &token)))),
+            401 | 403 => Err(UsageError::Unauthorized),
+            other => Err(UsageError::Http(other)),
+        }
+    })();
+    (result, retry_after)
 }
 
 // ── The board the chip reads ─────────────────────────────────────────────────
@@ -441,39 +544,80 @@ pub enum Outcome {
     Failed(UsageError),
 }
 
-/// The last poll: when it ran and how it went.
+/// The last poll: when it ran, how it went, and — since #1283 — the last
+/// numbers that actually came back, even if this attempt did not produce
+/// them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
     /// Unix seconds at which the attempt completed.
     pub at: i64,
-    /// What it produced.
+    /// What this attempt produced.
     pub outcome: Outcome,
+    /// The most recent successful poll's `(at, Usage)`, carried forward
+    /// across a failure so a transient error does not blank a chip that has
+    /// good numbers to show. `None` only before this process has seen a
+    /// success. Set to `Some((self.at, usage))` whenever `outcome` is
+    /// [`Outcome::Ok`] — redundant with the payload already sitting in
+    /// `outcome` there, but it means a reader of `last_ok` alone never has to
+    /// special-case which outcome produced it.
+    pub last_ok: Option<(i64, Usage)>,
 }
 
 impl Report {
-    /// The payload, if the last attempt succeeded.
+    /// The numbers to render, whether they came from this attempt or a
+    /// previous one: this attempt's own payload on [`Outcome::Ok`], the
+    /// carried-forward [`Report::last_ok`] on [`Outcome::Failed`] (`None`
+    /// before any poll has ever succeeded).
     #[must_use]
     pub fn usage(&self) -> Option<&Usage> {
         match &self.outcome {
             Outcome::Ok(usage) => Some(usage),
-            Outcome::Failed(_) => None,
+            Outcome::Failed(_) => self.last_ok.as_ref().map(|(_, usage)| usage),
         }
     }
 
-    /// The failure sentence, if the last attempt failed.
+    /// The failure sentence, if the last attempt failed — regardless of
+    /// whether [`usage`](Self::usage) still has last-known-good numbers to
+    /// show alongside it. `now` is threaded through to
+    /// [`UsageError::sentence`], which is the only place it matters (the
+    /// [`UsageError::RateLimited`] countdown).
     #[must_use]
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self, now: i64) -> Option<String> {
         match &self.outcome {
             Outcome::Ok(_) => None,
-            Outcome::Failed(e) => Some(e.sentence()),
+            Outcome::Failed(e) => Some(e.sentence(now)),
         }
     }
 
-    /// Whether this report is too old to trust — see [`STALE_AFTER`].
+    /// When the numbers [`usage`](Self::usage) would return were actually
+    /// fetched — [`Report::at`] on a success, [`last_ok`](Self::last_ok)'s
+    /// own timestamp on a failure that still has one, `None` when there are
+    /// no numbers at all.
+    #[must_use]
+    pub fn numbers_at(&self) -> Option<i64> {
+        match &self.outcome {
+            Outcome::Ok(_) => Some(self.at),
+            Outcome::Failed(_) => self.last_ok.as_ref().map(|(at, _)| *at),
+        }
+    }
+
+    /// Whether the numbers [`usage`](Self::usage) would return are too old to
+    /// trust — see [`STALE_AFTER`].
+    ///
+    /// Judged against [`numbers_at`](Self::numbers_at), **not**
+    /// [`Report::at`]: a report can be a perfectly fresh *failure* (`at` is
+    /// this instant) while the numbers it is still offering are several polls
+    /// old, and staleness has to track those, not the moment of the attempt
+    /// that failed to refresh them. A report with no numbers at all is never
+    /// "stale" — there is nothing to be stale, and every caller here already
+    /// gates on [`usage`](Self::usage) being `Some` before asking.
     #[must_use]
     pub fn is_stale(&self, now: i64) -> bool {
+        let Some(basis) = self.numbers_at() else {
+            return false;
+        };
         let ceiling = i64::try_from(STALE_AFTER.as_secs()).unwrap_or(i64::MAX);
-        now.saturating_sub(self.at) > ceiling
+        now.saturating_sub(basis) > ceiling
     }
 }
 
@@ -506,31 +650,154 @@ pub fn version() -> u64 {
     VERSION.load(Ordering::Relaxed)
 }
 
-/// Poll forever: one fetch immediately, then one every [`POLL_EVERY`].
+/// The wait before the *next* poll, given what this one did.
+///
+/// Only a 429 backs off at all: every other outcome — a success, or any other
+/// failure (a 500, a network blip, an expired login) — answers
+/// [`POLL_EVERY`], because none of those are the account's own rate limiter
+/// telling us to slow down, and doubling the wait on one would only make the
+/// chip slower to recover from an already-transient problem. On a 429 this
+/// honours the server's own `retry_after` when it sent one, else doubles
+/// `prev_wait`; either way the result is clamped to `[POLL_EVERY,
+/// MAX_BACKOFF]`, so a chain of them is `POLL_EVERY` → `10 min` →
+/// `MAX_BACKOFF` → `MAX_BACKOFF` — never below the ordinary cadence, never
+/// above the cap (`MAX_BACKOFF` is 15 min, so doubling from `POLL_EVERY`
+/// reaches it on the second step, not the third).
+///
+/// `outcome` is the *raw* fetch outcome — a 429 still reads as
+/// [`UsageError::Http`], not yet [`UsageError::RateLimited`]; promoting it is
+/// [`advance`]'s job, once this has picked the wait that promotion names.
+///
+/// A non-429 failure resets a 429 chain **all the way** to [`POLL_EVERY`],
+/// even mid-chain — deliberate, not an oversight (#1285's review, LOW). The
+/// backoff schedule is a response to the *server* asking us to slow down; a
+/// transport failure (a dropped connection, a timeout, an unrelated 500)
+/// carries no such instruction, and there is no way to tell from here
+/// whether the rate limit that produced the earlier 429s is even still in
+/// effect. Forgetting the server's own schedule on the first sign of an
+/// unrelated problem costs at most one poll at the ordinary cadence; the
+/// alternative — remembering a 429 chain through a failure that has nothing
+/// to do with it — risks staying artificially slow for a condition that may
+/// already be over, with nothing that would ever notice and correct it.
+fn next_wait(prev_wait: Duration, outcome: &Outcome, retry_after: Option<Duration>) -> Duration {
+    let Outcome::Failed(UsageError::Http(429)) = outcome else {
+        return POLL_EVERY;
+    };
+    let candidate = retry_after.unwrap_or_else(|| prev_wait.saturating_mul(2));
+    candidate.clamp(POLL_EVERY, MAX_BACKOFF)
+}
+
+/// One poll's book-keeping: given the wait and the last-known-good numbers
+/// the previous iteration handed forward, and what this fetch just produced,
+/// decide the [`Report`] to publish and the state to carry into the next
+/// iteration.
+///
+/// Pulled out of [`poll_forever`] so both halves of #1283 — carrying
+/// `last_ok` across a failure, and the 429 backoff schedule — are plain
+/// function calls a test can drive without an event loop or a real clock.
+///
+/// Falsify the carry-forward by publishing `last_ok: None` unconditionally
+/// here (the pre-#1283 "replacing" publish): the tests documenting item 1
+/// (a)/(b) go red.
+fn advance(
+    prev_wait: Duration,
+    prev_last_ok: Option<(i64, Usage)>,
+    at: i64,
+    result: Result<Usage, UsageError>,
+    retry_after: Option<Duration>,
+) -> (Report, Duration, Option<(i64, Usage)>) {
+    let (outcome, last_ok) = match result {
+        Ok(usage) => (Outcome::Ok(usage.clone()), Some((at, usage))),
+        Err(e) => (Outcome::Failed(e), prev_last_ok),
+    };
+    let wait = next_wait(prev_wait, &outcome, retry_after);
+    let outcome = match outcome {
+        Outcome::Failed(UsageError::Http(429)) => {
+            // The deadline this attempt's own clock names, not a duration
+            // frozen at publish time — see `UsageError::RateLimited`'s doc.
+            let wait_secs = i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
+            Outcome::Failed(UsageError::RateLimited(at.saturating_add(wait_secs)))
+        }
+        other => other,
+    };
+    let report = Report {
+        at,
+        outcome,
+        last_ok: last_ok.clone(),
+    };
+    (report, wait, last_ok)
+}
+
+/// One [`fetch_with_retry_after`]-shaped answer: the fetch's own `Result`,
+/// plus whatever `Retry-After` it read off the wire (if any).
+type FetchOutcome = (Result<Usage, UsageError>, Option<Duration>);
+
+/// [`poll_forever`]'s actual loop, pulled out so a test can drive it against
+/// a scripted `fetch_once` under a virtual clock instead of a real network
+/// and a real `sleep` (#1285's review, MED — "`poll_forever`'s wiring is
+/// pinned by nothing; only `advance`/`next_wait` are").
+///
+/// The fetcher is injected rather than hard-coded so the two shapes that
+/// produce a [`FetchOutcome`] — a real `spawn_blocking` HTTP round-trip
+/// ([`poll_forever`]) and a scripted in-memory sequence (the `poll_loop`
+/// tests) — are interchangeable here; this function itself never knows
+/// which one it was handed. Every step below routes through something a
+/// test can observe from the outside — `fetch_once` (the network),
+/// [`advance`] (the book-keeping), [`publish`] (the board), and
+/// `tokio::time::sleep` (the schedule) — so a mutation that discards the
+/// computed `wait` or the carried `last_ok` breaks the loop itself, not just
+/// the pure `advance`/`next_wait` unit tests that call those functions
+/// directly and would never notice `poll_forever` stopped wiring them
+/// together correctly.
+async fn poll_loop<F, Fut>(mut fetch_once: F) -> !
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = FetchOutcome>,
+{
+    let mut wait = POLL_EVERY;
+    let mut last_ok: Option<(i64, Usage)> = None;
+    loop {
+        let (result, retry_after) = fetch_once().await;
+        let (report, next_wait_value, next_last_ok) =
+            advance(wait, last_ok, now_unix(), result, retry_after);
+        wait = next_wait_value;
+        last_ok = next_last_ok;
+        if let Outcome::Failed(ref e) = report.outcome {
+            // The sentence, never the cause verbatim and never the token.
+            // `report.at` is "now" as far as this attempt is concerned — the
+            // log line is emitted the instant the report is minted.
+            tracing::debug!(reason = %e.sentence(report.at), "usage poll produced no numbers");
+        }
+        publish(report);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Poll forever: one fetch immediately, then one every [`POLL_EVERY`] —
+/// longer when [`next_wait`] has backed off a 429.
 ///
 /// Never returns. Spawned by `main` on the HTTP runtime — deliberately *not*
 /// from the plugin SDK's session, so the numbers keep arriving while the shell
-/// is down and the chip's dial/backoff is running.
-pub async fn poll_forever(base_url: String, credentials: PathBuf) {
-    loop {
+/// is down and the chip's dial/backoff is running. A thin wrapper over
+/// [`poll_loop`]: the only thing this adds is the real fetcher —
+/// `spawn_blocking`ing [`fetch_with_retry_after`], with a task-join failure
+/// mapped to the same [`UsageError::Io`] shape a transport error would be.
+pub async fn poll_forever(base_url: String, credentials: PathBuf) -> ! {
+    poll_loop(move || {
         let (base, creds) = (base_url.clone(), credentials.clone());
-        let outcome = match tokio::task::spawn_blocking(move || fetch(&base, &creds)).await {
-            Ok(Ok(usage)) => Outcome::Ok(usage),
-            Ok(Err(e)) => Outcome::Failed(e),
-            Err(e) => Outcome::Failed(UsageError::Io(truncate(&format!(
-                "the usage poll task did not finish: {e}"
-            )))),
-        };
-        if let Outcome::Failed(ref e) = outcome {
-            // The sentence, never the cause verbatim and never the token.
-            tracing::debug!(reason = %e.sentence(), "usage poll produced no numbers");
+        async move {
+            match tokio::task::spawn_blocking(move || fetch_with_retry_after(&base, &creds)).await {
+                Ok(pair) => pair,
+                Err(e) => (
+                    Err(UsageError::Io(truncate(&format!(
+                        "the usage poll task did not finish: {e}"
+                    )))),
+                    None,
+                ),
+            }
         }
-        publish(Report {
-            at: now_unix(),
-            outcome,
-        });
-        tokio::time::sleep(POLL_EVERY).await;
-    }
+    })
+    .await
 }
 
 // ── Time, without a calendar crate ───────────────────────────────────────────
@@ -667,6 +934,92 @@ pub fn parse_rfc3339(text: &str) -> Option<i64> {
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + secs - offset)
 }
 
+/// Parse a `Retry-After` header value (#1283): either delta-seconds (`"120"`,
+/// RFC 7231 §7.1.3's first spelling) or an HTTP-date (the second — always the
+/// IMF-fixdate form in practice, e.g. `Wed, 21 Oct 2015 07:28:00 GMT`, which
+/// is the only one [`parse_http_date`] reads). `now` anchors the date arm,
+/// which names a wall-clock deadline rather than a duration; a deadline
+/// already in the past reads as a zero wait, not a negative one.
+fn parse_retry_after(value: &str, now: i64) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = parse_http_date(value)?;
+    let delta = at.saturating_sub(now).max(0);
+    Some(Duration::from_secs(
+        u64::try_from(delta).unwrap_or(u64::MAX),
+    ))
+}
+
+/// Parse RFC 7231 §7.1.1.1's IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) —
+/// the only date form a `Retry-After` header carries in practice, and the
+/// only one this reads. Always GMT by construction, so there is no offset to
+/// apply; reuses [`days_from_civil`], the same table [`parse_rfc3339`]
+/// already carries for reset times, which is what keeps this cheap enough not
+/// to need a date crate.
+///
+/// The weekday token is checked against the seven IMF abbreviations (a
+/// non-word there is the cheapest sign this is not really a fixdate at all —
+/// #1285's review, NIT); **day-for-month is not** (`31 Feb` parses) — the
+/// result only ever feeds [`parse_retry_after`], which clamps into
+/// `[POLL_EVERY, MAX_BACKOFF]` regardless, so a calendar-invalid date is
+/// harmless here in a way an unrecognisable header shape is not worth
+/// rejecting either.
+fn parse_http_date(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 29 || &bytes[26..29] != b"GMT" {
+        return None;
+    }
+    if !matches!(
+        &bytes[0..3],
+        b"Mon" | b"Tue" | b"Wed" | b"Thu" | b"Fri" | b"Sat" | b"Sun"
+    ) {
+        return None;
+    }
+    if bytes[3] != b','
+        || bytes[4] != b' '
+        || bytes[7] != b' '
+        || bytes[11] != b' '
+        || bytes[16] != b' '
+        || bytes[19] != b':'
+        || bytes[22] != b':'
+        || bytes[25] != b' '
+    {
+        return None;
+    }
+    let day = two_digits(bytes, 5)?;
+    let month: i64 = match &bytes[8..11] {
+        b"Jan" => 1,
+        b"Feb" => 2,
+        b"Mar" => 3,
+        b"Apr" => 4,
+        b"May" => 5,
+        b"Jun" => 6,
+        b"Jul" => 7,
+        b"Aug" => 8,
+        b"Sep" => 9,
+        b"Oct" => 10,
+        b"Nov" => 11,
+        b"Dec" => 12,
+        _ => return None,
+    };
+    let digits4 = bytes.get(12..16)?;
+    if !digits4.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let year = digits4
+        .iter()
+        .fold(0_i64, |acc, d| acc * 10 + i64::from(d - b'0'));
+    let hour = two_digits(bytes, 17)?;
+    let minute = two_digits(bytes, 20)?;
+    let second = two_digits(bytes, 23)?;
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second.min(59))
+}
+
 /// `2026-09-13 13:50 UTC` — the absolute half of a reset time.
 #[must_use]
 pub fn format_utc(epoch: i64) -> String {
@@ -796,14 +1149,18 @@ pub fn percent_label(percent: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BASE_URL, ExtraUsage, Limit, Outcome, Report, SEVERITY_NORMAL, STALE_AFTER, Usage,
-        UsageError, credentials_path_in, fetch, format_utc, humanise_kind, humanise_since,
-        humanise_until, parse_rfc3339, percent_label, reset_phrase, reset_short, scrub, truncate,
+        DEFAULT_BASE_URL, ExtraUsage, Limit, MAX_BACKOFF, Outcome, POLL_EVERY, Report,
+        SEVERITY_NORMAL, STALE_AFTER, Usage, UsageError, advance, credentials_path_in, fetch,
+        fetch_with_retry_after, format_utc, humanise_kind, humanise_since, humanise_until,
+        next_wait, parse_http_date, parse_retry_after, parse_rfc3339, percent_label, poll_loop,
+        reset_phrase, reset_short, scrub, truncate,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
 
     /// The **captured response** (`tests/fixtures/usage_response.json`) — the
     /// real body this endpoint returned on 2026-09-13, with the numbers rounded
@@ -819,6 +1176,14 @@ mod tests {
     /// mid-flight (`hytte-ai-providers`' `TEST_SOCKETS`, #716). Unwrap through a
     /// poison so one panicking test does not cascade.
     static TEST_SOCKETS: Mutex<()> = Mutex::new(());
+
+    /// Every test that publishes onto the process-global [`BOARD`] takes this
+    /// for its whole body — `publishing_a_report_bumps_the_version` and the
+    /// `poll_loop` wiring test below both do, and cargo runs tests in
+    /// parallel threads in one process, so one test's `publish` could
+    /// otherwise land between another's `publish` and its own `latest()`
+    /// read. Same shape as [`TEST_SOCKETS`], for the same reason.
+    static BOARD_TESTS: Mutex<()> = Mutex::new(());
 
     /// A token no real endpoint would issue, long enough that an accidental
     /// substring match is not the reason a test passes.
@@ -875,6 +1240,33 @@ mod tests {
             let raw = capture_request(&mut sock);
             let resp = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            sock.write_all(resp.as_bytes()).expect("write response");
+            raw
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Like [`fake_endpoint`], but the response also carries `extra_headers`
+    /// — exists for the one test that needs a `Retry-After` on the wire.
+    fn fake_endpoint_with_headers(
+        status: &'static str,
+        extra_headers: &[(&str, &str)],
+        body: String,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let extra = extra_headers.iter().fold(String::new(), |mut acc, (k, v)| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{k}: {v}\r\n");
+            acc
+        });
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let raw = capture_request(&mut sock);
+            let resp = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n{body}",
                 body.len(),
             );
             sock.write_all(resp.as_bytes()).expect("write response");
@@ -1066,7 +1458,8 @@ mod tests {
 
         let err = fetch(&base, &path).expect_err("a 401 is an error");
         assert_eq!(err, UsageError::Unauthorized);
-        let sentence = err.sentence();
+        // `now` is irrelevant to every arm but `RateLimited` — `0` here.
+        let sentence = err.sentence(0);
         assert_eq!(
             sentence,
             "usage stale — run `claude` once to refresh the login"
@@ -1114,8 +1507,365 @@ mod tests {
         let (base, handle) = fake_endpoint("500 Internal Server Error", "nope".to_owned());
         let err = fetch(&base, &path).expect_err("500");
         assert_eq!(err, UsageError::Http(500));
-        assert!(err.sentence().contains("HTTP 500"));
+        assert!(err.sentence(0).contains("HTTP 500"));
         drop(handle.join());
+    }
+
+    // ── (c2) 429 and `Retry-After` (#1283) ───────────────────────────────────
+
+    /// **A 429 is a plain `Http(429)` from [`fetch`] itself** — the schedule
+    /// lives in `poll_forever`/[`advance`], not here — and its own
+    /// `Retry-After` header is read off the wire and handed back alongside.
+    #[test]
+    fn a_429s_retry_after_header_is_read_as_delta_seconds() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = creds(dir.path(), FAKE_TOKEN);
+
+        let (base, handle) = fake_endpoint_with_headers(
+            "429 Too Many Requests",
+            &[("retry-after", "120")],
+            "{}".to_owned(),
+        );
+        let (result, retry_after) = fetch_with_retry_after(&base, &path);
+        assert_eq!(result.expect_err("429"), UsageError::Http(429));
+        assert_eq!(retry_after, Some(Duration::from_mins(2)));
+        drop(handle.join());
+
+        // `fetch` itself — the public entry point every other test in this
+        // file uses — sees exactly the same status, just without the header.
+        let (base, handle) = fake_endpoint("429 Too Many Requests", "{}".to_owned());
+        assert_eq!(fetch(&base, &path).expect_err("429"), UsageError::Http(429));
+        drop(handle.join());
+    }
+
+    /// No `Retry-After` header at all ⇒ `None`, not a default guess — the
+    /// schedule (`next_wait`) is what picks a number when the server didn't.
+    #[test]
+    fn a_429_with_no_retry_after_header_reports_none() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = creds(dir.path(), FAKE_TOKEN);
+        let (base, handle) = fake_endpoint("429 Too Many Requests", "{}".to_owned());
+        let (result, retry_after) = fetch_with_retry_after(&base, &path);
+        assert_eq!(result.expect_err("429"), UsageError::Http(429));
+        assert_eq!(retry_after, None);
+        drop(handle.join());
+    }
+
+    /// Delta-seconds, whitespace, garbage, and the IMF-fixdate form — the only
+    /// date spelling read (module docs on [`parse_http_date`]).
+    #[test]
+    fn retry_after_parses_delta_seconds_and_the_http_date_form() {
+        assert_eq!(
+            parse_retry_after("120", 1_000),
+            Some(Duration::from_mins(2))
+        );
+        assert_eq!(
+            parse_retry_after(" 45 ", 1_000),
+            Some(Duration::from_secs(45)),
+            "whitespace is tolerated"
+        );
+        assert_eq!(parse_retry_after("not a number", 1_000), None);
+
+        // RFC 7231 §7.1.1.1's own worked example.
+        let epoch = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").expect("parses");
+        assert_eq!(format_utc(epoch), "1994-11-06 08:49 UTC");
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", epoch - 30),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", epoch + 10),
+            Some(Duration::ZERO),
+            "a deadline already in the past is a zero wait, not an underflow"
+        );
+        assert_eq!(parse_http_date("garbage"), None);
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC"),
+            None,
+            "the header's date form is always GMT; anything else is unrecognised"
+        );
+    }
+
+    /// **#1285's review, NIT — a weekday token outside the seven IMF
+    /// abbreviations is rejected; day-for-month stays deliberately
+    /// unchecked** (the function doc says why: the result only ever feeds a
+    /// clamp, so a calendar-invalid date is harmless in a way an
+    /// unrecognisable header shape is not worth rejecting either).
+    ///
+    /// Falsify the weekday half by deleting the `matches!` guard added for
+    /// this: `parse_http_date("Xyz, 06 Nov 1994 08:49:37 GMT")` starts
+    /// parsing again and the first assertion goes red.
+    #[test]
+    fn parse_http_date_rejects_a_bad_weekday_but_not_a_bad_day_for_month() {
+        assert_eq!(
+            parse_http_date("Xyz, 06 Nov 1994 08:49:37 GMT"),
+            None,
+            "not one of the seven weekday abbreviations"
+        );
+        assert!(
+            parse_http_date("Sun, 31 Feb 1994 08:49:37 GMT").is_some(),
+            "day-for-month is deliberately unchecked — see the function doc"
+        );
+        // Every real weekday abbreviation is accepted, regardless of whether
+        // it is the one that date actually fell on — this reads the date
+        // string, not the calendar.
+        for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] {
+            assert!(
+                parse_http_date(&format!("{day}, 06 Nov 1994 08:49:37 GMT")).is_some(),
+                "{day}"
+            );
+        }
+    }
+
+    /// The 429 backoff schedule, as a table: doubling up to the cap, a
+    /// success resetting it, `Retry-After` overriding the doubling within the
+    /// `[POLL_EVERY, MAX_BACKOFF]` band, and — the point of the whole
+    /// exercise — every *other* outcome costing nothing.
+    ///
+    /// `MAX_BACKOFF` is 15 min (`== STALE_AFTER`, since #1285's review —
+    /// see its doc), so doubling from `POLL_EVERY` (5 min) reaches the cap
+    /// on the *second* step, not the third: `5 → 10 → 15 → 15`.
+    ///
+    /// Falsify by having `next_wait` ignore the 429 arm (always return
+    /// `POLL_EVERY`): the chain assertion goes red immediately.
+    #[test]
+    fn the_429_backoff_chain_doubles_to_the_cap_and_resets_on_success() {
+        let http_429 = Outcome::Failed(UsageError::Http(429));
+        let mut wait = POLL_EVERY;
+        let mut minutes = Vec::new();
+        for _ in 0..4 {
+            wait = next_wait(wait, &http_429, None);
+            minutes.push(wait.as_secs() / 60);
+        }
+        assert_eq!(minutes, vec![10, 15, 15, 15], "5 → 10 → 15 → 15 → 15");
+
+        assert_eq!(
+            next_wait(wait, &Outcome::Ok(Usage::default()), None),
+            POLL_EVERY,
+            "a success resets the schedule"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_honoured_and_clamped_to_the_poll_every_max_backoff_band() {
+        let http_429 = Outcome::Failed(UsageError::Http(429));
+        assert_eq!(
+            next_wait(POLL_EVERY, &http_429, Some(Duration::from_mins(12))),
+            Duration::from_mins(12),
+            "720 s → 12 min, inside the band"
+        );
+        assert_eq!(
+            next_wait(POLL_EVERY, &http_429, Some(Duration::from_secs(10))),
+            POLL_EVERY,
+            "10 s is below the floor — clamped up to 5 min"
+        );
+        assert_eq!(
+            next_wait(POLL_EVERY, &http_429, Some(Duration::from_mins(90))),
+            MAX_BACKOFF,
+            "an absurdly long Retry-After is clamped down to the cap"
+        );
+    }
+
+    /// **Only a 429 backs off** — a 500, an expired login, a network blip, or
+    /// success all answer `POLL_EVERY`, whatever the schedule was mid-chain.
+    #[test]
+    fn only_a_429_backs_off_every_other_outcome_is_the_ordinary_cadence() {
+        let mid_chain = Duration::from_mins(20);
+        assert_eq!(
+            next_wait(mid_chain, &Outcome::Ok(Usage::default()), None),
+            POLL_EVERY
+        );
+        assert_eq!(
+            next_wait(mid_chain, &Outcome::Failed(UsageError::Http(500)), None),
+            POLL_EVERY,
+            "a 500 does NOT back off — only 429"
+        );
+        assert_eq!(
+            next_wait(mid_chain, &Outcome::Failed(UsageError::Unauthorized), None),
+            POLL_EVERY
+        );
+    }
+
+    /// **The countdown, at render time — item 11's NIT.** `RateLimited`
+    /// carries a deadline, not a wait, so the sentence must recompute the
+    /// remaining minutes against whatever `now` it is rendered with, and
+    /// clamp to "any moment now" rather than ever naming a negative wait.
+    ///
+    /// Falsify by rendering the sentence with the deadline itself as `now`
+    /// (i.e. freezing the number at publish time, the pre-#1285-fix shape):
+    /// the second and third assertions go red.
+    #[test]
+    fn a_rate_limited_sentence_counts_down_to_the_deadline() {
+        let published = 1_000;
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published),
+            "usage rate-limited — next try in 10 min"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 90).sentence(published),
+            "usage rate-limited — next try in 2 min",
+            "a fractional minute rounds UP — never tell the reader to retry \
+             before the wait the schedule chose is actually over"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published + 570),
+            "usage rate-limited — next try in 1 min",
+            "the same report reads a lower number as the chip keeps ticking"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published + 600),
+            "usage rate-limited — next try any moment now",
+            "exactly at the deadline"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published + 601),
+            "usage rate-limited — next try any moment now",
+            "past the deadline — never a negative countdown"
+        );
+    }
+
+    // ── #1283: carrying `last_ok` across a failure ───────────────────────────
+
+    fn some_usage() -> Usage {
+        Usage {
+            limits: vec![Limit {
+                kind: "session".to_owned(),
+                percent: 50.0,
+                ..Limit::default()
+            }],
+            extra_usage: None,
+        }
+    }
+
+    /// **Item 1(a): a failed poll after a success keeps the meters up.**
+    /// `advance` is `poll_forever`'s one place that decides what to publish;
+    /// this drives it directly, with no event loop.
+    ///
+    /// Falsify by publishing `last_ok: None` unconditionally in `advance`
+    /// (the pre-#1283 "replacing" publish): the second assertion goes red.
+    #[test]
+    fn a_failed_poll_after_a_success_keeps_last_ok_on_the_report() {
+        let usage = some_usage();
+        let (ok_report, wait, last_ok) = advance(POLL_EVERY, None, 1_000, Ok(usage.clone()), None);
+        assert_eq!(ok_report.usage(), Some(&usage));
+        assert_eq!(wait, POLL_EVERY);
+
+        let (failed_report, wait, last_ok) =
+            advance(wait, last_ok, 1_300, Err(UsageError::Http(429)), None);
+        assert_eq!(
+            failed_report.usage(),
+            Some(&usage),
+            "the last-known-good numbers must still be there"
+        );
+        assert!(
+            matches!(
+                failed_report.outcome,
+                Outcome::Failed(UsageError::RateLimited(_))
+            ),
+            "a 429 is promoted once `advance` knows the wait: {:?}",
+            failed_report.outcome
+        );
+        assert_eq!(
+            failed_report.error(failed_report.at).as_deref(),
+            Some("usage rate-limited — next try in 10 min"),
+            "doubled from the POLL_EVERY the first call answered — rendered \
+             the instant the report was minted, so the countdown reads the \
+             full wait"
+        );
+        assert_eq!(wait, Duration::from_mins(10));
+        assert_eq!(last_ok, Some((1_000, usage)));
+    }
+
+    /// **#1285's review, LOW — a non-429 failure resets a 429 chain straight
+    /// back to [`POLL_EVERY`], and `last_ok` survives every step of it.**
+    /// [`a_failed_poll_after_a_success_keeps_last_ok_on_the_report`] only
+    /// carries `last_ok` through ONE failure; this drives it through two
+    /// 429s and a non-429 on top — the case no other shipped test covers.
+    ///
+    /// Falsify the reset half by having `next_wait` "remember" a 429 chain
+    /// through an unrelated failure (e.g. resetting only on `Outcome::Ok`):
+    /// the final `wait4` assertion goes red (it would still read the
+    /// mid-chain cap instead of dropping to `POLL_EVERY`). Falsify the
+    /// carry-forward half the same way that test's own doc does.
+    #[test]
+    fn a_non_429_failure_resets_a_429_chain_but_last_ok_survives_every_step() {
+        let usage = some_usage();
+        let (_, wait, last_ok) = advance(POLL_EVERY, None, 1_000, Ok(usage.clone()), None);
+
+        let (r1, wait, last_ok) = advance(wait, last_ok, 1_300, Err(UsageError::Http(429)), None);
+        assert_eq!(r1.usage(), Some(&usage), "last_ok through the first 429");
+
+        let (r2, wait, last_ok) = advance(wait, last_ok, 1_600, Err(UsageError::Http(429)), None);
+        assert_eq!(
+            wait, MAX_BACKOFF,
+            "5 → 10 → the cap (MAX_BACKOFF == 15 min)"
+        );
+        assert_eq!(r2.usage(), Some(&usage), "last_ok through the second 429");
+
+        let (r3, wait4, last_ok) = advance(
+            wait,
+            last_ok,
+            1_900,
+            Err(UsageError::Io("boom".to_owned())),
+            None,
+        );
+        assert_eq!(
+            wait4, POLL_EVERY,
+            "a chain at the cap drops straight back to 5 on an unrelated failure"
+        );
+        assert_eq!(r3.usage(), Some(&usage), "last_ok through the non-429 too");
+        assert_eq!(
+            last_ok,
+            Some((1_000, usage)),
+            "still the original success, three failures later"
+        );
+    }
+
+    /// **Item 1(c): a first poll that fails has nothing to carry, and renders
+    /// exactly as it did before #1283.**
+    #[test]
+    fn a_first_poll_failure_has_no_last_ok_and_is_unchanged() {
+        let (report, wait, last_ok) =
+            advance(POLL_EVERY, None, 1_000, Err(UsageError::Unauthorized), None);
+        assert_eq!(report.usage(), None);
+        assert_eq!(
+            report.error(1_000).as_deref(),
+            Some("usage stale — run `claude` once to refresh the login")
+        );
+        assert!(!report.is_stale(1_000), "nothing to be stale about yet");
+        assert_eq!(wait, POLL_EVERY, "only a 429 backs off");
+        assert_eq!(last_ok, None);
+    }
+
+    /// **Item 1(b): staleness is judged by `last_ok`'s clock, not the
+    /// failure's own `at`.** A success at `t=0`, then a failure a minute
+    /// later: the failure is fresh, but the numbers it is still showing are
+    /// not, and 15 minutes after `t=0` — [`STALE_AFTER`] — they go stale even
+    /// though the *failure* itself is only 14 minutes old.
+    ///
+    /// Falsify by judging staleness off `Report::at` instead of
+    /// `Report::numbers_at`: at `now = ceiling + 1` the age from `at` (60) is
+    /// only `ceiling - 59`, comfortably inside the ceiling, and this test
+    /// goes red.
+    #[test]
+    fn a_stale_last_ok_outlasts_a_much_fresher_failure() {
+        let ceiling = i64::try_from(STALE_AFTER.as_secs()).expect("fits");
+        let report = Report {
+            at: 60,
+            outcome: Outcome::Failed(UsageError::Http(429)),
+            last_ok: Some((0, some_usage())),
+        };
+        assert!(
+            !report.is_stale(ceiling),
+            "exactly 15 min after the numbers"
+        );
+        assert!(
+            report.is_stale(ceiling + 1),
+            "one second further — stale by last_ok's clock, though the \
+             failure recorded at `at: 60` is nowhere near {ceiling}s old"
+        );
     }
 
     /// A 2xx body that is not a usage document is a `Parse`, not a panic — and
@@ -1128,8 +1878,8 @@ mod tests {
         let (base, handle) = fake_endpoint("200 OK", "<html>maintenance</html>".to_owned());
         let err = fetch(&base, &path).expect_err("not a usage document");
         assert!(matches!(err, UsageError::Parse(_)), "{err:?}");
-        assert!(err.sentence().starts_with("usage unavailable"));
-        assert!(!err.sentence().contains(FAKE_TOKEN));
+        assert!(err.sentence(0).starts_with("usage unavailable"));
+        assert!(!err.sentence(0).contains(FAKE_TOKEN));
         drop(handle.join());
     }
 
@@ -1221,6 +1971,7 @@ mod tests {
         let fresh = Report {
             at: 1_000,
             outcome: Outcome::Ok(Usage::default()),
+            last_ok: None,
         };
         assert!(!fresh.is_stale(1_000), "zero age");
         assert!(!fresh.is_stale(1_000 + ceiling), "exactly the ceiling");
@@ -1245,8 +1996,8 @@ mod tests {
         let missing = dir.path().join("nope").join(".credentials.json");
         let err = fetch("http://127.0.0.1:1", &missing).expect_err("no file");
         assert_eq!(err, UsageError::NoCredentials(missing.clone()));
-        assert!(err.sentence().contains(&missing.display().to_string()));
-        assert!(err.sentence().contains("run `claude` once"));
+        assert!(err.sentence(0).contains(&missing.display().to_string()));
+        assert!(err.sentence(0).contains("run `claude` once"));
 
         // (2) Not JSON.
         let garbage = dir.path().join(".credentials.json");
@@ -1284,7 +2035,10 @@ mod tests {
         // A dead port: the fetch fails at connect, well after the read.
         let err = fetch("http://127.0.0.1:1", &path).expect_err("nothing listening");
         assert!(matches!(err, UsageError::Io(_)), "{err:?}");
-        assert!(!err.sentence().contains(FAKE_TOKEN), "nor does an Io error");
+        assert!(
+            !err.sentence(0).contains(FAKE_TOKEN),
+            "nor does an Io error"
+        );
 
         assert_eq!(std::fs::read(&path).expect("read"), before);
         assert_eq!(
@@ -1467,26 +2221,189 @@ mod tests {
     /// what lets the chip skip the lock on 59 ticks out of 60.
     #[test]
     fn publishing_a_report_bumps_the_version() {
+        let _guard = BOARD_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
         let before = super::version();
         super::publish(Report {
             at: 1_000,
             outcome: Outcome::Failed(UsageError::Unauthorized),
+            last_ok: None,
         });
         assert!(super::version() > before);
         let latest = super::latest().expect("something is published");
         assert_eq!(latest.usage(), None);
         assert_eq!(
-            latest.error().as_deref(),
+            latest.error(1_000).as_deref(),
             Some("usage stale — run `claude` once to refresh the login")
         );
 
         super::publish(Report {
             at: 2_000,
             outcome: Outcome::Ok(Usage::default()),
+            last_ok: None,
         });
         let latest = super::latest().expect("published");
         assert_eq!(latest.usage(), Some(&Usage::default()));
-        assert_eq!(latest.error(), None);
+        assert_eq!(latest.error(2_000), None);
+    }
+
+    /// **#1285's review, MED — `poll_loop`'s wiring, pinned end to end.**
+    /// `advance`/`next_wait` are unit-tested directly, but nothing drove the
+    /// *loop* itself before this: the review measured that discarding the
+    /// computed schedule (`sleep(POLL_EVERY)` instead of `sleep(wait)`) and
+    /// discarding the carry-forward (`last_ok = None;` in the loop) were both
+    /// **invisible to `cargo test`** — the exact regressions #1283 exists to
+    /// prevent.
+    ///
+    /// Scripts `429(Retry-After: 900 s) → 429 → 200 → 429` through a fake
+    /// `fetch_once` under a paused virtual clock, and checks the *published*
+    /// [`Report`]s (not `advance`'s return value) plus the virtual gap each
+    /// step actually waits — the loop's own board and its own sleep, which is
+    /// exactly what `advance`/`next_wait` unit tests cannot reach.
+    ///
+    /// Falsify either mutation from the review and this goes red — see the
+    /// PR comment for both transcripts.
+    ///
+    /// A plain `#[test]` building its own paused-clock current-thread
+    /// runtime, rather than `#[tokio::test(start_paused = true)]`, so
+    /// [`BOARD_TESTS`] can be held for the whole body: the guard is a local
+    /// in this *synchronous* function, and `Runtime::block_on` is an
+    /// ordinary blocking call from its point of view, not a suspension point
+    /// inside an `async fn` — so nothing here holds a lock across an
+    /// `.await` (`clippy::await_holding_lock`, part of `clippy::all`).
+    #[test]
+    fn poll_loop_sleeps_the_computed_wait_and_carries_last_ok_through_a_later_failure() {
+        let _guard = BOARD_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let usage = some_usage();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a current-thread runtime with a paused clock");
+
+        rt.block_on(async {
+            let task = {
+                let calls = Arc::clone(&calls);
+                let usage = usage.clone();
+                tokio::spawn(async move {
+                    poll_loop(move || {
+                        let n = calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        let usage = usage.clone();
+                        async move {
+                            match n {
+                                // A 429 with an explicit Retry-After: pins
+                                // the wait at exactly 15 min — ==
+                                // MAX_BACKOFF since item 4, so this also
+                                // probes the cap.
+                                0 => (Err(UsageError::Http(429)), Some(Duration::from_mins(15))),
+                                // A success: resets the schedule to
+                                // POLL_EVERY and seeds `last_ok`.
+                                2 => (Ok(usage), None),
+                                // A second 429 with no header (doubling
+                                // would overshoot the cap, so this also
+                                // waits 15 min), and every failure after the
+                                // success — `last_ok` must survive into
+                                // that one.
+                                _ => (Err(UsageError::Http(429)), None),
+                            }
+                        }
+                    })
+                    .await
+                })
+            };
+
+            // The first fetch runs immediately, before any sleep.
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                1,
+                "one fetch, no sleep yet"
+            );
+            let report = super::latest().expect("published");
+            assert!(
+                matches!(report.outcome, Outcome::Failed(UsageError::RateLimited(_))),
+                "{:?}",
+                report.outcome
+            );
+            assert_eq!(report.last_ok, None, "nothing to carry yet");
+
+            // The loop must sleep the computed 15 min wait, not a hardcoded
+            // POLL_EVERY (5 min) — falsifies `sleep(POLL_EVERY)` in place of
+            // `sleep(wait)`. The `yield_now` right after `advance` matters:
+            // `advance` moves the paused clock and marks any now-overdue
+            // timer ready, but a task made ready *during* one `advance` call
+            // is not actually polled until the executor's next chance to run
+            // — without flushing that here, a wrongly-short sleep (e.g. the
+            // 5 min `POLL_EVERY` mutation) would have already fired well
+            // before 899 s but this assertion would not observe it yet,
+            // making the whole probe vacuous.
+            tokio::time::advance(Duration::from_secs(15 * 60 - 1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                1,
+                "899 s in, still waiting"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                2,
+                "exactly 15 min wakes it"
+            );
+            let report = super::latest().expect("published");
+            assert!(
+                matches!(report.outcome, Outcome::Failed(UsageError::RateLimited(_))),
+                "{:?}",
+                report.outcome
+            );
+            assert_eq!(report.last_ok, None, "still nothing to carry");
+
+            // Third fetch: the success. Resets the schedule to POLL_EVERY.
+            tokio::time::advance(Duration::from_mins(15)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 3, "the success");
+            let report = super::latest().expect("published");
+            assert_eq!(report.outcome, Outcome::Ok(usage.clone()));
+            assert_eq!(report.last_ok, Some((report.at, usage.clone())));
+
+            // The success resets the wait to POLL_EVERY (5 min) — not the
+            // 15 min cap it was just backed off to. Same `yield_now` reason
+            // as above.
+            tokio::time::advance(Duration::from_secs(5 * 60 - 1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                3,
+                "299 s in, still waiting"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                4,
+                "exactly POLL_EVERY wakes it"
+            );
+
+            // The failure AFTER the success: `last_ok` must have survived
+            // the trip through the loop's own local state — falsifies
+            // `last_ok = None;` discarding the carry-forward in `poll_loop`
+            // itself.
+            let report = super::latest().expect("published");
+            assert!(
+                matches!(report.outcome, Outcome::Failed(UsageError::RateLimited(_))),
+                "{:?}",
+                report.outcome
+            );
+            assert_eq!(
+                report.usage(),
+                Some(&usage),
+                "last_ok must survive a failure that comes after the success"
+            );
+
+            task.abort();
+        });
     }
 
     /// The default base URL is the real API host, spelled once.

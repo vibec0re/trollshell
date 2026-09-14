@@ -255,6 +255,44 @@ bash/zsh/fish completions.
 
 No runtime knobs — configuration is entirely via the shell/wire protocol.
 
+### stats (`hytte-plugin-stats`)
+
+No environment-variable knobs of its own — but it is the one bundled plugin
+**meant to be listed twice**, and both of the SDK-level variables below are
+load-bearing for the second entry:
+
+```nix
+programs.trollshell.plugins = {
+  # the right-sidebar card (#1250) — the manifest's own id and mount
+  stats.package = trollshell.packages.${system}.hytte-plugin-stats;
+  # …and, once P2 (#1251) ships the chips, the same binary in the bar
+  stats-bar = {
+    package = trollshell.packages.${system}.hytte-plugin-stats;
+    env.HYTTE_PLUGIN_ID = "stats-bar"; # must equal the attribute name
+    mount = "BarRight"; # renders HYTTE_PLUGIN_MOUNT (#1161)
+  };
+};
+```
+
+Without `HYTTE_PLUGIN_ID` the second launch registers under the first one's id
+and the host drops it (`plugin id already has a live connection; rejecting the
+duplicate`) — a unit that starts cleanly, stays running, and shows nothing.
+
+Everything else is one TOML schema, `stats.toml`, which rides `hytte-config`'s
+layered `Subsystem` exactly as `agents.toml` does (merging
+`XDG_CONFIG_DIRS` → `XDG_CONFIG_HOME`, warning on an unknown key rather than
+failing, one warned line per key whose value nothing accepts). It holds **two**
+tables, `[bar]` and `[sidebar]`, and an instance reads the one for the family of
+the mount it was launched into — so one file drives both instances and there is
+no per-instance flag. Each table has five booleans (`cpu`, `per_core`,
+`history`, `temperature`, `gpu`) and `poll_seconds` (1..=60). The documented
+default is `crates/hytte-plugin-stats/src/config.rs`'s `DEFAULT_TOML`; it is the
+bottom merge layer, so a missing file behaves exactly like an untouched one.
+
+Unlike `agents.toml`, this file is **not** re-read live: the settings are
+resolved once per process, so an edit takes effect on
+`systemctl --user restart trollshell-plugin-<id>`.
+
 ### terminal (`hytte-plugin-terminal`)
 
 No runtime knobs — configuration is entirely via the shell/wire protocol.
@@ -272,24 +310,46 @@ No runtime knobs — configuration is entirely via the shell/wire protocol.
 ## Shared / SDK-level environment variables
 
 The `hytte-plugin` SDK itself (`crates/hytte-plugin/src`, the `Plugin`
-trait + `run()`) reads exactly **one** environment variable. Everything else is
-a plugin-author idiom on top of the runtime, not part of it.
+trait + `run()`) reads exactly **two** environment variables, and they are the
+same knob twice: where a launch mounts, and who it says it is. Everything else
+is a plugin-author idiom on top of the runtime, not part of it.
 
-| Variable             | Default | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HYTTE_PLUGIN_MOUNT` | unset   | **Where the plugin's card or chip mounts**, overriding the mount its own `manifest()` asked for (#1159). One of the nine wire mount names: `SidebarLead`, `SidebarTop`, `SidebarBottom`, `SidebarRightLead`, `SidebarRightTop`, `SidebarRightBottom`, `BarLeft`, `BarCenter`, `BarRight`. Read once in `run()` before the first dial and applied to every `Register` frame the process sends, reconnects included; the plugin's own code never sees it. An unknown or empty value is a **startup failure** naming all nine spellings — never a silent fallback to the manifest, which would put the card on the other sidebar and leave the plugin looking healthy. Surrounding whitespace is trimmed; the match is otherwise exact, case included. |
+| Variable             | Default | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HYTTE_PLUGIN_MOUNT` | unset   | **Where the plugin's card or chip mounts**, overriding the mount its own `manifest()` asked for (#1159). One of the nine wire mount names: `SidebarLead`, `SidebarTop`, `SidebarBottom`, `SidebarRightLead`, `SidebarRightTop`, `SidebarRightBottom`, `BarLeft`, `BarCenter`, `BarRight`. Read once in `run()` before the first dial and applied to every `Register` frame the process sends, reconnects included; the plugin's own code never sees it. An unknown or empty value is a **startup failure** naming all nine spellings — never a silent fallback to the manifest, which would put the card on the other sidebar and leave the plugin looking healthy. Surrounding whitespace is trimmed; the match is otherwise exact, case included.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `HYTTE_PLUGIN_ID`    | unset   | **Which plugin id this launch registers under**, overriding the id its own `manifest()` asked for (#1250, epic #1248). This is what lets **one binary run twice at once**: the host allows a single live connection per id and drops a duplicate (`trollshell/src/plugins/session.rs`, "plugin id already has a live connection; rejecting the duplicate"), so two launches of one plugin need two ids. The value must satisfy the launcher's own id rule — **1..=64 bytes of ASCII letters, digits, `-` or `_`** (`hytte_services::systemd::is_valid_plugin_id`, the guard that keeps a crafted value out of the `trollshell-plugin-<id>.service` template; 64 is the proto's `MAX_PLUGIN_ID_BYTES`, which the host also enforces on `Register`). Read once in `run()` before the first dial, applied to every `Register` the process sends (reconnects included) and used as the prefix on every line the process logs; the plugin's own code never sees it. An unusable value is a **startup failure** stating the rule — never a silent fallback to the manifest's id, which would look like a healthy second unit whose card never appears. Surrounding whitespace is trimmed; the charset match is otherwise byte-exact, case included. |
 
-**Set it with `programs.trollshell.plugins.<id>.mount`, not by hand** (#1161) —
-a checked enum of the nine names that renders this variable into that plugin's
-`env` in `plugins.json`. Nix rejects a misspelling at eval time; a hand-set
-`env.HYTTE_PLUGIN_MOUNT = "SidebarRightTop";` is only checked when the plugin
-tries to start, and then only by failing to. The hand-set route still works,
-but the two are **one knob and `mount` wins**: it is merged over `env` when
-`plugins.json` is rendered, so setting both to different values is an eval
+**Set the mount with `programs.trollshell.plugins.<id>.mount`, not by hand** (#1161) —
+a checked enum of the nine names that renders `HYTTE_PLUGIN_MOUNT` into that
+plugin's `env` in `plugins.json`. Nix rejects a misspelling at eval time; a
+hand-set `env.HYTTE_PLUGIN_MOUNT = "SidebarRightTop";` is only checked when the
+plugin tries to start, and then only by failing to. The hand-set route still
+works, but the two are **one knob and `mount` wins**: it is merged over `env`
+when `plugins.json` is rendered, so setting both to different values is an eval
 error rather than a silently discarded string (both platform modules assert
-this). It is the one knob here that is a _deployment_ decision rather than a
-plugin-author one, which is why it lives on the launch instead of in a config
-file (settled on #866; see epic #1158).
+this). Both variables are the knobs here that are a _deployment_ decision
+rather than a plugin-author one, which is why they live on the launch instead
+of in a config file (settled on #866; see epic #1158).
+
+A second instance of one binary is therefore two attribute sets that differ in
+the id and the mount and nothing else:
+
+```nix
+programs.trollshell.plugins = {
+  stats = { package = pkgs.hytte-plugin-stats; };                      # the manifest's own id and mount
+  stats-side = {
+    package = pkgs.hytte-plugin-stats;
+    env.HYTTE_PLUGIN_ID = "stats-side";                                # must match the attribute name
+    mount = "SidebarRightTop";                                         # renders HYTTE_PLUGIN_MOUNT (#1161)
+  };
+};
+```
+
+`HYTTE_PLUGIN_ID` is written out by hand above because nix does not yet render
+it from the attribute name the way `mount` renders its variable; the launcher
+already names the transient unit `trollshell-plugin-<id>` from that same name,
+so the two agreeing is currently the deployer's job. Rendering it automatically
+is follow-up work in the `nix/*-module.nix` file family.
 
 **Prefer an override _within_ a family — bar↔sidebar changes a plugin's
 visibility semantics and it cannot adapt.** The nine names are not

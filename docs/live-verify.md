@@ -1943,6 +1943,81 @@ systemd-run --user --unit=trollshell-plugin-departures \
       polled whenever the left sidebar opened and idled while it was being
       looked at.
 
+### Stats as a plugin (#1248 P1 / #1250)
+
+The right sidebar's first real tenant, and the first binary in the tree meant
+to run **twice**. Launch it by hand (nix does not yet render
+`HYTTE_PLUGIN_ID` from the attribute name — follow-up):
+
+```sh
+systemd-run --user --unit=trollshell-plugin-stats-side \
+    --setenv=HYTTE_PLUGIN_ID=stats-side \
+    --setenv=HYTTE_PLUGIN_MOUNT=SidebarRightTop \
+    "$(command -v hytte-plugin-stats)"
+```
+
+- [ ] **(#1250)** **The card is on the right and nowhere else.** Toggle the
+      right sidebar: a CPU + GPU card slides in — a header reading `CPU <n>%`,
+      a row of dot-matrix lamps (one cell per logical core, brighter the busier
+      the core, wrapping into banks past 16), an oscilloscope sweep of overall
+      load, a seven-segment package temperature with a `°C` label, then a `GPU`
+      header and a needle gauge. Open the **left** sidebar too and confirm the
+      card is not there, and that the **native Stats page is untouched** (the
+      five bar chips still open it, the `MultiSparkline` graphs and the
+      in-process `LedMatrix` panel are exactly as before — P1 retires nothing).
+- [ ] **(#1250)** **The lamps mean something.** Run `stress -c 2` (or busy two
+      cores any way you like) and watch: exactly two cells should brighten,
+      and they should track which cores the scheduler picked. `htop`'s per-core
+      bars are the oracle. The lamps are quantised to five steps — a core at
+      55 % and one at 65 % may show the same glyph; that is the #1156 gap
+      (`LedMatrix` is not on the wire), not a sampling bug.
+- [ ] **(#1250)** **The lamps are as chunky as the card allows.** On a box with
+      more than sixteen threads the row wraps into banks of 16, and each dot
+      must be drawn at the pitch a 16-wide row admits (3 px), not at the kit's
+      2 px floor — the row should fill the card's width, not two-thirds of it.
+      Eyeball it beside a ≤16-thread machine if you have one: the dots should
+      look the same size.
+- [ ] **(#1250)** **It is drawn by the shell, on the GPU.** With
+      `RUST_LOG=trollshell=debug` there should be no `Node::Pixels` traffic
+      from this plugin at all — the widgets go out as typed `Node::Preem`
+      state once the host advertises the preem vocabulary. Compare against
+      `TROLLSHELL_PREEM_RENDERER=cpu` on the shell: the card must still render,
+      through the CPU kit, and look the same.
+- [ ] **(#1250)** **A closed sidebar costs nothing.** Close the right sidebar
+      and watch the plugin's CPU in `top` for a minute: it should be flat zero
+      — the sampler parks on `SlotVisible(false)` and does not read `/proc` at
+      all. Open it again: the card must refresh **immediately** (the
+      hidden→visible edge), not after a whole poll period — and the first
+      frame must show a `—` headline and a `----` lamp row for that one
+      period, then a **fresh** reading. `/proc/stat` is cumulative, so the
+      re-baseline is what stops the first frame after a long park from
+      reading the mean load over however long the sidebar was shut; a number
+      appearing instantly on reopen is the bug, not the feature.
+- [ ] **(#1250)** **`stats.toml` drives it.** Write
+      `~/.config/trollshell/stats.toml` with `[sidebar]` + `per_core = false`
+      and restart the unit: the lamp row disappears and nothing else does. Then
+      `poll_seconds = 6000`: the journal must carry exactly one line naming
+      `sidebar.poll_seconds`, the cadence must fall back to 1 s, and every
+      other key must still apply. (The file is read once per process — an edit
+      needs a `systemctl --user restart`, unlike `agents.toml`.)
+- [ ] **(#1250)** **The GPU half hides itself.** On a machine with no GPU the
+      `GPU` header and the gauge must be absent entirely, not a gauge parked at
+      zero. On an Nvidia box, confirm `nvidia-smi` is not being spawned on the
+      plugin's main thread — the card must keep answering the host (clicks,
+      re-renders) while a probe is in flight.
+- [ ] **(#1250)** **`HYTTE_PLUGIN_ID` is what makes two instances possible.**
+      With the sidebar instance running, launch a **second** copy with no
+      `HYTTE_PLUGIN_ID` (just `HYTTE_PLUGIN_MOUNT=BarRight`): the host must
+      reject it — the journal line is
+      `plugin id already has a live connection; rejecting the duplicate` — and
+      nothing must appear in the bar. Add
+      `--setenv=HYTTE_PLUGIN_ID=stats-bar` and relaunch: both connections live
+      at once, both cards on screen, each journal stream prefixed with its own
+      id. Finally set a **bad** id (`--setenv=HYTTE_PLUGIN_ID=stats.bar`): the
+      unit must fail at startup with a message naming the rule, not start and
+      sit silent. (P1 renders the same card in both places; the bar chips are
+      P2, #1251.)
+
 ## Audio & media
 
 - [ ] **(#470)** Drag-safe seek slider: open the Media drawer on an active

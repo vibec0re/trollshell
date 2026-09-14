@@ -7,8 +7,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use hytte_plugin_proto::{
-    Capability, Effect, HostMsg, LogLevel, Mount, PluginMsg, ProtoError, StateKey,
-    VOCAB_UNCONDITIONAL, read_frame, socket_path, write_frame,
+    Capability, Effect, HostMsg, LogLevel, MAX_PLUGIN_ID_BYTES, Mount, PluginMsg, ProtoError,
+    StateKey, VOCAB_UNCONDITIONAL, read_frame, socket_path, write_frame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -159,6 +159,160 @@ fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
     // `AsRef<OsStr>`, so passing it directly makes the higher-ranked bound on
     // `lookup` unsatisfiable ("implementation of `FnOnce` is not general enough").
     mount_override_from(|key| std::env::var(key))
+}
+
+/// The launch-time **id** override (#1250, epic #1248): a plugin id that
+/// replaces whatever the plugin's own [`manifest`](Plugin::manifest) asked for.
+///
+/// The exact twin of [`MOUNT_ENV`], and it exists for the same deployment
+/// reason one step further on. `HYTTE_PLUGIN_MOUNT` lets one binary be *placed*
+/// anywhere; this lets the same binary run **twice at once** — the #1248 ask is
+/// the stats plugin as a bar chip and a right-sidebar card in one session. The
+/// host permits exactly one live connection per plugin id
+/// (`trollshell/src/plugins/session.rs`'s `IdGuard`, #436: "plugin id already
+/// has a live connection; rejecting the duplicate"), because two connections
+/// under one id would alternately overwrite one region card and route events to
+/// whichever rendered last. That rule is right and stays; what was missing is a
+/// way for a deployment to say *which* id each launch registers under, and the
+/// launcher already names its transient unit `trollshell-plugin-<id>` from the
+/// `programs.trollshell.plugins.<id>` attribute name — so the id a deployment
+/// means is already written down, one env var away from the handshake.
+///
+/// An **environment variable** rather than an argv flag, for
+/// [`MOUNT_ENV`]'s reasons verbatim: two bundled plugins parse their own argv
+/// with `clap` (#1116) and would reject an SDK-owned `--id`, while an env var
+/// rides the launcher's existing `env` → `--setenv=K=V` path with no launcher
+/// change at all.
+///
+/// Read once, in [`run`], before the first dial; applied to the manifest inside
+/// every [`session`] so a reconnect carries it too. The plugin's own
+/// `manifest()` is never called differently and never sees the override.
+const ID_ENV: &str = "HYTTE_PLUGIN_ID";
+
+/// The id charset, mirrored from the launcher's unit-name guard.
+///
+/// `hytte_services::systemd::is_valid_plugin_id`
+/// (`crates/hytte-services/src/systemd.rs`) is the rule of record: **non-empty,
+/// at most [`MAX_PLUGIN_ID_BYTES`] bytes, ASCII alphanumerics plus `-` and
+/// `_`**. It is what the shell applies to every id read out of `plugins.json`
+/// and to every `StartPlugin`/`StopPlugin` id on the session bus, precisely so
+/// nothing can smuggle a crafted unit name through the
+/// `trollshell-plugin-<id>.service` template.
+///
+/// This SDK cannot *call* that function — `hytte-services` links GTK, D-Bus and
+/// a reactive registry, and a plugin links none of them (that is the whole
+/// frontend-B contract) — so the rule is mirrored here and cited there. Mirrored
+/// deliberately rather than loosened: an id this accepts but the launcher
+/// rejects would be a launch that never happens, and an id the launcher accepts
+/// but this rejects would be a plugin that refuses to start under the name its
+/// own unit already carries. The length half is not a second copy at all —
+/// [`MAX_PLUGIN_ID_BYTES`] is the proto's own constant, the same 64 the host
+/// enforces on the `Register` frame before it will mount anything.
+fn is_valid_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_PLUGIN_ID_BYTES
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// An [`ID_ENV`] value that is not a usable plugin id.
+///
+/// A refusal, never a fallback, for [`MountOverrideError`]'s reason sharpened by
+/// what an id *is*: silently keeping the manifest's id is how a second instance
+/// collides with the first, and the host's answer to a collision is to drop the
+/// newcomer with one journal line. The deployment would then see one card where
+/// it asked for two, from a unit that started cleanly and stayed running. So an
+/// unusable value is fatal at startup, and the message states the rule rather
+/// than a list — the rule is four clauses, where a mount's is nine literal
+/// spellings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdOverrideError {
+    /// The value exactly as the environment carried it (untrimmed, and
+    /// lossy-converted if it was not UTF-8), so the message shows the typo
+    /// rather than a cleaned-up version of it.
+    value: String,
+}
+
+impl std::fmt::Display for IdOverrideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cap comes from the proto constant the host itself enforces, not
+        // from a literal here, so the two cannot drift apart in a message that
+        // claims to state the rule.
+        write!(
+            f,
+            "{ID_ENV}={:?} is not a plugin id; expected 1..={MAX_PLUGIN_ID_BYTES} bytes of \
+             ASCII letters, digits, `-` or `_`",
+            self.value,
+        )
+    }
+}
+
+impl std::error::Error for IdOverrideError {}
+
+/// Parse one raw [`ID_ENV`] value. The whole decision, with no environment in
+/// it, so the charset and the refusal are testable without mutating process
+/// state (`unsafe` is forbidden workspace-wide, so `std::env::set_var` is not
+/// available to a test anyway).
+///
+/// `None` in → `Ok(None)`: the variable is unset and the manifest wins.
+/// Surrounding whitespace is trimmed before the check — a trimmed id is still
+/// exactly one id, so this cannot rename anything — but nothing else is
+/// normalised: the charset match is byte-exact, **case included**, because the
+/// value has to be the same id the launcher spliced into a unit name. An empty
+/// or whitespace-only value is therefore a refusal, not "unset": the launcher
+/// can render `--setenv=HYTTE_PLUGIN_ID=` from an empty Nix string, and treating
+/// that as "no override" would hide a misconfiguration.
+fn id_override(raw: Option<&str>) -> Result<Option<String>, IdOverrideError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if is_valid_plugin_id(trimmed) {
+        Ok(Some(trimmed.to_owned()))
+    } else {
+        Err(IdOverrideError {
+            value: raw.to_owned(),
+        })
+    }
+}
+
+/// [`id_override`] over an arbitrary environment lookup — the three
+/// [`std::env::VarError`] arms, with no process state in them.
+///
+/// Split out from [`id_override_from_env`] for [`mount_override_from`]'s reason:
+/// the `NotUnicode` arm is then reachable from a test, and the `lookup` closure
+/// is handed [`ID_ENV`], so a test can also assert *which* variable was asked
+/// for rather than trusting a const it read from the same place.
+fn id_override_from(
+    lookup: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<String>, IdOverrideError> {
+    match lookup(ID_ENV) {
+        Ok(raw) => id_override(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(IdOverrideError {
+            value: raw.to_string_lossy().into_owned(),
+        }),
+    }
+}
+
+/// [`id_override_from`] against the real environment. A non-UTF-8 value is
+/// refused like any other unusable one rather than ignored.
+///
+/// This one line is what ties [`ID_ENV`] to an actual `getenv`, and it is pinned
+/// by a **real second process** — `the_id_env_var_reaches_the_register_frame`
+/// re-execs this test binary with `HYTTE_PLUGIN_ID` set (spelled as a literal
+/// there, never via the const) and asserts the overridden id comes back out of
+/// the `Register` frame. That is the #1159 review's finding 4 applied here
+/// before it can happen again: nothing in-process can set the variable
+/// (`std::env::set_var` is `unsafe` in edition 2024 and this workspace forbids
+/// `unsafe_code`), so without the child this function could be neutered to
+/// `Ok(None)` with the whole SDK suite still green.
+fn id_override_from_env() -> Result<Option<String>, IdOverrideError> {
+    // A closure rather than `std::env::var` by name, for `mount_override_from_env`'s
+    // reason: that function is generic over `AsRef<OsStr>`, which makes the
+    // higher-ranked bound on `lookup` unsatisfiable.
+    id_override_from(|key| std::env::var(key))
 }
 
 /// Reconnect backoff bounds: start small, cap so we never hammer the socket.
@@ -388,6 +542,13 @@ enum Step<M> {
 /// unit is watching; and a test can then drive all nine placements in one process
 /// without touching process state (`unsafe` is forbidden workspace-wide, so
 /// `std::env::set_var` is not available to one anyway).
+///
+/// `id_override` is the launch-time identity [`run`] resolved out of [`ID_ENV`]
+/// (#1250), and it is here for exactly the same three reasons — most of all the
+/// reconnect one: the manifest is rebuilt every session, so an id applied once
+/// in `run` would put the second instance back on the first one's id the moment
+/// the shell restarted, and the host would then reject whichever of the two
+/// redialled second.
 // One cohesive session lifecycle (handshake → seed render → the select loop over
 // every host frame → dedup); the length is the host-frame vocabulary, not
 // branching complexity — splitting it would scatter the loop for no gain.
@@ -397,6 +558,7 @@ async fn session<P, R, W>(
     mut wr: W,
     mut shutdown: watch::Receiver<bool>,
     mount_override: Option<Mount>,
+    id_override: Option<String>,
 ) -> Result<(), ProtoError>
 where
     P: Plugin,
@@ -431,6 +593,14 @@ where
     // frame below, which is the only place the mount is ever read.
     if let Some(mount) = mount_override {
         manifest.mount = mount;
+    }
+    // The launch-time identity (#1250), applied here for the same reason and
+    // before the same `Register` frame — the id is read in exactly one place
+    // below (`plugin_id`), which is both what goes on the wire and what every
+    // journal line from this session is prefixed with, so the two can never
+    // disagree about which instance is speaking.
+    if let Some(id) = id_override {
+        manifest.id = id;
     }
     // Auto-opt-in to the desktop-accent push (#376): the SDK knows how to
     // consume `HostMsg::Accent` (it feeds the `preem` kit's default tint), so it
@@ -840,6 +1010,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
     mut shutdown: watch::Receiver<bool>,
     mut connect: C,
     mount_override: Option<Mount>,
+    id_override: Option<String>,
 ) where
     P: Plugin,
     R: AsyncRead + Send + Unpin + 'static,
@@ -861,7 +1032,17 @@ async fn reconnect_loop<P, R, W, C, Fut>(
         match connected {
             Ok((rd, wr)) => {
                 let started = Instant::now();
-                let outcome = session::<P, _, _>(rd, wr, shutdown.clone(), mount_override).await;
+                // `id_override` is cloned per session rather than moved: the
+                // manifest is rebuilt on every reconnect, so every session needs
+                // its own copy of the identity this launch registers under.
+                let outcome = session::<P, _, _>(
+                    rd,
+                    wr,
+                    shutdown.clone(),
+                    mount_override,
+                    id_override.clone(),
+                )
+                .await;
                 let lived = started.elapsed();
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
@@ -925,6 +1106,20 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// doing it. The plugin's own code is not consulted and never sees the override:
 /// `manifest()` is called exactly as before.
 ///
+/// **Identity is a launch argument too** (#1250, epic #1248). `run` also reads
+/// [`ID_ENV`] (`HYTTE_PLUGIN_ID`); a value matching the launcher's id rule
+/// (1..=[`MAX_PLUGIN_ID_BYTES`] bytes of ASCII letters, digits, `-` or `_` —
+/// see [`is_valid_plugin_id`]) replaces [`Plugin::manifest`]'s own `id` in every
+/// `Register` this process sends, reconnects included, and prefixes every line
+/// this process logs. That is what lets **one binary run twice at once**: the
+/// host allows a single live connection per id and drops a duplicate, so two
+/// launches of one plugin need two ids, and the deployment already knows them —
+/// they are the `programs.trollshell.plugins.<id>` attribute names. An unusable
+/// value is a **startup failure** whose message states the rule, never a silent
+/// fallback to the manifest's id, which would look like a healthy second unit
+/// whose card never appears. As with the mount, the plugin's own code never sees
+/// it.
+///
 /// Also installs the `SIGTERM`/`SIGINT` listener for the shutdown lifecycle
 /// (#1079, crate docs' "Process shutdown" section): on either signal a
 /// process-wide flag flips, the live session (if any) finishes its in-flight
@@ -942,7 +1137,33 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// fixable short of blocking `SIGTERM` before the runtime exists.
 pub fn run<P: Plugin>() -> ! {
     let manifest = P::manifest();
-    let plugin_id = manifest.id.clone();
+    // The launch-time identity (#1250), resolved **first** — before anything can
+    // be printed — so every line this process writes is prefixed with the id the
+    // deployment actually launched it under. Two instances of one binary
+    // otherwise produce two indistinguishable journal streams, which is the one
+    // thing that makes running a plugin twice hard to operate. An unusable value
+    // is a startup failure for `IdOverrideError`'s reason, and the refusal names
+    // the id rule; `eprintln!` rather than `tracing::error!` because no plugin
+    // process installs a `tracing` subscriber (the crate docs' reason), while
+    // the journal captures the transient unit's stderr.
+    let id_override = match id_override_from_env() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("[{}] {e}", manifest.id);
+            std::process::exit(1);
+        }
+    };
+    let plugin_id = id_override.clone().unwrap_or_else(|| manifest.id.clone());
+    // One line, only when the override actually changes something — the same
+    // rule the mount override below follows. A second instance quietly wearing
+    // the first one's id is exactly what the host rejects, so say which id this
+    // launch claimed and which one its manifest asked for.
+    if id_override.as_deref().is_some_and(|id| id != manifest.id) {
+        eprintln!(
+            "[{plugin_id}] {ID_ENV}={plugin_id} overrides the manifest's {}",
+            manifest.id,
+        );
+    }
     // The launch-time placement (#1159), resolved once and before the first dial:
     // an unparseable value is a startup failure, not something a plugin limps on
     // with its manifest's mount (see `MountOverrideError`). `eprintln!` rather
@@ -1027,6 +1248,7 @@ pub fn run<P: Plugin>() -> ! {
             }
         },
         mount_override,
+        id_override,
     ));
     std::process::exit(0);
 }
@@ -1034,17 +1256,19 @@ pub fn run<P: Plugin>() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, MOUNT_ENV, MountOverrideError,
-        Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, mount_override, mount_override_from,
-        mount_override_from_env, reconnect_loop,
+        BACKOFF_BASE, BACKOFF_CAP, Backoff, ID_ENV, IMMEDIATE_FAILURE, MOUNT_ENV,
+        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, id_override, id_override_from,
+        id_override_from_env, mount_override, mount_override_from, mount_override_from_env,
+        reconnect_loop,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
     use hytte_plugin_proto::preem::PREEM_VOCAB;
     use hytte_plugin_proto::{
         AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
-        HostMsg, LogLevel, Manifest, Mount, Node, Page, PluginMsg, ProtoError, SPECTRUM_BINS,
-        StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
+        HostMsg, LogLevel, MAX_PLUGIN_ID_BYTES, Manifest, Mount, Node, Page, PluginMsg, ProtoError,
+        SPECTRUM_BINS, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame,
+        write_frame,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -1062,15 +1286,15 @@ mod tests {
         watch::channel(false).1
     }
 
-    /// [`super::session`] with **no** launch-time mount override — what every
-    /// test here wants except the #1159 placement ones, which call
-    /// `super::session` directly with a `Some`.
+    /// [`super::session`] with **no** launch-time overrides — what every test
+    /// here wants except the #1159 placement ones and the #1250 identity ones,
+    /// which call `super::session` directly with a `Some`.
     ///
     /// A shim in the test module rather than a second entry point in the shipped
-    /// lib: the override is not optional in production (it is threaded from
+    /// lib: neither override is optional in production (both are threaded from
     /// [`run`] on every path), so a `None`-defaulting wrapper there would be dead
     /// code, while here it keeps thirty-odd call sites that have nothing to do
-    /// with placement reading exactly as they did.
+    /// with placement or identity reading exactly as they did.
     async fn session<P, R, W>(
         rd: R,
         wr: W,
@@ -1081,7 +1305,7 @@ mod tests {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Unpin,
     {
-        super::session::<P, R, W>(rd, wr, shutdown, None).await
+        super::session::<P, R, W>(rd, wr, shutdown, None, None).await
     }
 
     // ── Test plugins ─────────────────────────────────────────────────────────
@@ -2827,6 +3051,7 @@ mod tests {
                 }
             },
             None,
+            None,
         );
 
         let host = async move {
@@ -2885,6 +3110,7 @@ mod tests {
                     }
                 }
             },
+            None,
             None,
         );
 
@@ -3158,6 +3384,7 @@ mod tests {
                         )>,
                     >()
                 },
+                None,
                 None,
             ),
         )
@@ -3689,6 +3916,20 @@ mod tests {
     /// following `Log`/`Render` writes fail, the session returns `Err`, and that
     /// is fine — the claim under test is entirely about the frame already read.
     async fn registered_mount(override_mount: Option<Mount>) -> Mount {
+        registered_manifest(override_mount, None).await.mount
+    }
+
+    /// The `Register` manifest a session actually sends, with both launch-time
+    /// overrides in force — what [`registered_mount`] and the #1250 identity
+    /// tests each read one field out of.
+    ///
+    /// Reads only the first frame, then drops both host halves: the plugin's
+    /// following `Log`/`Render` writes fail, the session returns `Err`, and that
+    /// is fine — the claim under test is entirely about the frame already read.
+    async fn registered_manifest(
+        override_mount: Option<Mount>,
+        override_id: Option<String>,
+    ) -> hytte_plugin_proto::Manifest {
         let (plugin_end, host_end) = duplex(64 * 1024);
         let (prd, pwr) = tokio::io::split(plugin_end);
         let (mut hrd, hwr) = tokio::io::split(host_end);
@@ -3699,14 +3940,14 @@ mod tests {
             };
             drop(hwr);
             drop(hrd);
-            manifest.mount
+            manifest
         };
 
-        let (_ended, mount) = tokio::join!(
-            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), override_mount),
+        let (_ended, manifest) = tokio::join!(
+            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), override_mount, override_id),
             host
         );
-        mount
+        manifest
     }
 
     /// No override → the plugin's own manifest wins, unchanged. The baseline
@@ -3782,6 +4023,7 @@ mod tests {
                 }
             },
             Some(Mount::SidebarRightBottom),
+            None,
         );
 
         let host = async move {
@@ -4066,5 +4308,401 @@ mod tests {
             "the environment's mount must be the mount in the Register frame",
         );
         println!("{MOUNT_ENV_CHILD_OK}");
+    }
+
+    // ── Launch-time id override (#1250, epic #1248) ─────────────────────────
+
+    /// No override → the plugin's own manifest id wins, unchanged. The baseline
+    /// every deployed plugin is on today, and the one case where a regression
+    /// would rename every existing card's mount-slot key at once.
+    #[tokio::test]
+    async fn without_an_override_the_manifest_id_registers() {
+        assert_eq!(
+            Echo::manifest().id,
+            "echo-test",
+            "precondition: the test plugin calls itself echo-test",
+        );
+        assert_eq!(
+            registered_manifest(None, None).await.id,
+            "echo-test",
+            "an unset HYTTE_PLUGIN_ID leaves the manifest's id alone",
+        );
+    }
+
+    /// The override is the id that goes out in `Register` — which is the whole
+    /// feature, because that frame is where the host's one-connection-per-id
+    /// guard reads it (`plugins/session.rs`'s `IdGuard`). Without this, a second
+    /// launch of one binary is dropped as a duplicate.
+    ///
+    /// **Falsified** by deleting the `if let Some(id) = id_override` arm in
+    /// `session`, or by applying it *after* the `Register` write.
+    #[tokio::test]
+    async fn an_id_override_reaches_the_register_frame() {
+        let manifest = registered_manifest(None, Some("stats-side".to_owned())).await;
+        assert_eq!(
+            manifest.id, "stats-side",
+            "HYTTE_PLUGIN_ID must be the id in Register",
+        );
+        assert_eq!(
+            manifest.mount,
+            Echo::manifest().mount,
+            "…and it must not disturb the mount, which has its own override",
+        );
+    }
+
+    /// Both overrides at once — the #1248 deployment, where one binary is
+    /// launched a second time under its own id *and* pinned to the other
+    /// sidebar. Neither may consume the other.
+    #[tokio::test]
+    async fn the_two_launch_overrides_compose() {
+        let manifest =
+            registered_manifest(Some(Mount::SidebarRightTop), Some("stats-side".to_owned())).await;
+        assert_eq!(manifest.id, "stats-side");
+        assert_eq!(manifest.mount, Mount::SidebarRightTop);
+    }
+
+    /// An id override survives a **reconnect**: the manifest is rebuilt from
+    /// `P::manifest()` once per session, so an override applied only on the
+    /// first pass would put this instance back on the other one's id the first
+    /// time the shell restarted — and the host would then reject whichever of
+    /// the two redialled second, leaving a running unit with no card.
+    ///
+    /// **Falsified** by moving the override onto `run`'s own `P::manifest()`
+    /// copy instead of threading it into `session` (the second handshake then
+    /// reports `echo-test`).
+    #[tokio::test]
+    async fn an_id_override_survives_a_reconnect() {
+        let (p1, h1) = duplex(64 * 1024);
+        let (p2, h2) = duplex(64 * 1024);
+        let mut pending = vec![p2, p1];
+
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
+            "stats-side",
+            never_shuts_down(),
+            move || {
+                let next = pending.pop();
+                async move {
+                    match next {
+                        Some(end) => Ok(tokio::io::split(end)),
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            None,
+            Some("stats-side".to_owned()),
+        );
+
+        let host = async move {
+            let (mut hrd1, mut hwr1) = tokio::io::split(h1);
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd1).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(
+                manifest.id, "stats-side",
+                "the first session registers under the overridden id",
+            );
+            send(&mut hwr1, &HostMsg::Shutdown).await;
+
+            let (mut hrd2, _hwr2) = tokio::io::split(h2);
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd2).await else {
+                panic!("the redial's first frame must be Register");
+            };
+            assert_eq!(
+                manifest.id, "stats-side",
+                "…and so does the session after the reconnect",
+            );
+        };
+
+        tokio::select! {
+            () = host => {}
+            () = dial_loop => unreachable!("reconnect_loop never returns with a shutdown notice that never fires"),
+        }
+    }
+
+    /// The parser, with no environment in it: unset is "no override", and the
+    /// accepted charset is the launcher's own
+    /// (`hytte_services::systemd::is_valid_plugin_id`) — ASCII alphanumerics
+    /// plus `-`/`_`, non-empty, at most `MAX_PLUGIN_ID_BYTES` bytes.
+    ///
+    /// The accepted spellings are stated as **literals** rather than generated
+    /// from `is_valid_plugin_id`, so this cannot agree with a mutated copy of
+    /// the rule; the boundary rows (exactly at the cap, one past it) are what
+    /// pin the `<=`.
+    #[test]
+    fn the_id_override_parser_accepts_the_launchers_id_charset() {
+        assert_eq!(
+            id_override(None),
+            Ok(None),
+            "an unset variable is not an error — the manifest simply wins",
+        );
+        for good in [
+            "stats",
+            "stats-side",
+            "stats_side",
+            "Stats2",
+            "0",
+            "a-b_c-9",
+            "clock-demo",
+        ] {
+            assert_eq!(
+                id_override(Some(good)),
+                Ok(Some(good.to_owned())),
+                "{good:?} is a unit-name-safe id and must parse as itself",
+            );
+        }
+        // Surrounding whitespace is tolerated because a trimmed id is still
+        // exactly one id (so this can never rename anything), and a stray space
+        // in a Nix string is otherwise a launch failure with a baffling message.
+        assert_eq!(
+            id_override(Some("  stats-side\t")),
+            Ok(Some("stats-side".to_owned())),
+            "surrounding whitespace is trimmed before the charset check",
+        );
+        // The cap, from both sides.
+        let at_cap = "a".repeat(MAX_PLUGIN_ID_BYTES);
+        assert_eq!(
+            id_override(Some(&at_cap)),
+            Ok(Some(at_cap.clone())),
+            "an id exactly at the host's cap is accepted",
+        );
+        let past_cap = "a".repeat(MAX_PLUGIN_ID_BYTES + 1);
+        assert!(
+            id_override(Some(&past_cap)).is_err(),
+            "one byte past the cap is refused — the host would drop the Register",
+        );
+    }
+
+    /// **The length half of the launcher mirror, in literals** — the charset
+    /// half already is, and that asymmetry was the finding (#1277 LOW 6).
+    ///
+    /// `hytte_services::systemd::is_valid_plugin_id` hard-codes `id.len() <= 64`
+    /// and this SDK takes its cap from [`MAX_PLUGIN_ID_BYTES`], so the two agree
+    /// only as long as that constant *is* 64. Measured: changing it to 32 left
+    /// `hytte-plugin-proto` (11), `hytte-plugin` (116) and `hytte-services`
+    /// (856) all green, because every assertion on either side derives from
+    /// whichever value it can see. The launcher would then render a unit for a
+    /// 40-byte id whose plugin refuses to start under it.
+    ///
+    /// The rows below are therefore spelled as literals: 64 bytes accepted, 65
+    /// refused, and the constant itself pinned with the reason it cannot move
+    /// alone.
+    #[test]
+    fn the_id_cap_is_the_sixty_four_the_launcher_hard_codes() {
+        assert_eq!(
+            MAX_PLUGIN_ID_BYTES, 64,
+            "hytte_services::systemd::is_valid_plugin_id hard-codes `id.len() <= 64`; \
+             moving this constant alone silently splits the mirror",
+        );
+        let at_cap = "a".repeat(64);
+        assert_eq!(
+            id_override(Some(&at_cap)),
+            Ok(Some(at_cap.clone())),
+            "a 64-byte id is what the launcher accepts, so the SDK must too",
+        );
+        assert!(
+            id_override(Some(&"a".repeat(65))).is_err(),
+            "a 65-byte id is what the launcher refuses, so the SDK must too",
+        );
+    }
+
+    /// An unusable value is **refused**, and the refusal states the rule — the
+    /// one thing that makes this recoverable for whoever set it. A silent
+    /// fallback to the manifest's id is the outcome this test exists to forbid:
+    /// the second instance would then collide with the first, the host would
+    /// drop it with one line, and the unit would look perfectly healthy.
+    ///
+    /// The empty and whitespace-only cases are here on purpose: `--setenv=K=`
+    /// from an empty Nix string is a plausible mistake, and reading it as
+    /// "unset" would swallow it. The `.`/`@`/`\` rows are the ones systemd's
+    /// *own* unit-name charset would take but the launcher's narrower id rule
+    /// does not — the whole reason that rule is narrower than systemd's.
+    ///
+    /// **Falsified** by having `id_override` return `Ok(None)` on a bad value
+    /// (every row reds), or by widening the charset to systemd's (the three
+    /// punctuation rows).
+    #[test]
+    fn an_unusable_id_override_is_refused_and_names_the_rule() {
+        for bad in [
+            "",
+            "   ",
+            "stats side",
+            "stats.side",
+            "stats@side",
+            "stats\\side",
+            "stats/side",
+            "stäts",
+            "../etc",
+        ] {
+            let err = id_override(Some(bad))
+                .expect_err("an unusable id override must be refused, never ignored");
+            assert_eq!(
+                err.value, bad,
+                "the message quotes the value verbatim, untrimmed",
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(ID_ENV),
+                "the message names the variable: {msg}"
+            );
+            assert!(
+                msg.contains(&MAX_PLUGIN_ID_BYTES.to_string()),
+                "the message states the length bound: {msg}",
+            );
+            assert!(
+                msg.contains("ASCII letters, digits, `-` or `_`"),
+                "the message states the charset: {msg}",
+            );
+        }
+    }
+
+    /// The variable's **name**, pinned as a literal — #1159 review finding 4b
+    /// applied to the twin. Every other assertion about the refusal's message
+    /// is `msg.contains(ID_ENV)`, i.e. self-referential: a typo'd const would
+    /// keep the whole suite green while shipping a feature nothing could switch
+    /// on. This string is a contract with things outside this crate —
+    /// `docs/plugin-env.md` documents it and a deployment sets it by hand — and
+    /// this const is the only thing tying that spelling to a reader.
+    #[test]
+    fn the_id_override_variable_is_named_hytte_plugin_id() {
+        assert_eq!(ID_ENV, "HYTTE_PLUGIN_ID");
+    }
+
+    /// All three `std::env::VarError` arms of the environment read, driven
+    /// through `id_override_from` with the lookup as a closure — including
+    /// `NotUnicode`, which is refused like any other unusable value.
+    ///
+    /// The closure also asserts **which** variable was asked for, from a literal
+    /// rather than from `ID_ENV`, so a renamed const cannot pass here by
+    /// agreeing with itself.
+    #[test]
+    fn every_environment_arm_of_the_id_override_is_reachable() {
+        use std::env::VarError;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let checked = |result: Result<String, VarError>| {
+            id_override_from(|key| {
+                assert_eq!(
+                    key, "HYTTE_PLUGIN_ID",
+                    "the reader must look up the documented variable",
+                );
+                result
+            })
+        };
+
+        assert_eq!(
+            checked(Err(VarError::NotPresent)),
+            Ok(None),
+            "an unset variable is not an error — the manifest simply wins",
+        );
+        assert_eq!(
+            checked(Ok("stats-side".to_owned())),
+            Ok(Some("stats-side".to_owned())),
+            "a set variable names the id",
+        );
+        let not_unicode = std::ffi::OsString::from_vec(b"stats\xffside".to_vec());
+        let err = checked(Err(VarError::NotUnicode(not_unicode)))
+            .expect_err("a non-UTF-8 value is refused, never ignored");
+        assert_eq!(
+            err.value,
+            String::from_utf8_lossy(b"stats\xffside"),
+            "the lossy conversion is what the message shows",
+        );
+    }
+
+    /// Set (to any value) only on the re-exec'd child that actually runs
+    /// [`the_id_env_var_reaches_the_register_frame_inner`]; see that test's doc.
+    const ID_ENV_CHILD: &str = "HYTTE_PLUGIN_ID_TEST_CHILD";
+
+    /// The value the parent sets and the child expects back out of `Register`.
+    /// Deliberately **not** `Echo::manifest()`'s own id, so "the override was
+    /// applied" cannot be confused with "the manifest happened to agree".
+    const ID_ENV_CHILD_VALUE: &str = "echo-test-second";
+
+    /// Printed by the child only once its whole body has run, so the parent can
+    /// tell "the scenario passed" from "`--exact` matched no test and libtest
+    /// reported `0 passed`, exit 0".
+    const ID_ENV_CHILD_OK: &str = "id-env-child-reached-the-end";
+
+    /// **The real variable, in a real process, all the way to the wire.**
+    ///
+    /// `id_override_from_env` is one line and nothing in-process can pin it:
+    /// `std::env::set_var` is `unsafe` in edition 2024 and this workspace
+    /// forbids `unsafe_code`, so a test cannot set the variable for itself. The
+    /// #1159 review measured what that costs on the mount twin — neutering the
+    /// resolver to `Ok(None)` left the SDK suite at 110 passed, and so did
+    /// typo'ing the const. So this re-execs the test binary filtered to exactly
+    /// one inner test, with `HYTTE_PLUGIN_ID` set on the **child** via
+    /// `Command::env` (a safe builder method; controlling a child's environment
+    /// needs no `unsafe`).
+    ///
+    /// The variable is spelled as a **literal** here, never through `ID_ENV`:
+    /// setting it from the same const the reader reads would agree with a typo
+    /// in it. (`the_id_override_variable_is_named_hytte_plugin_id` pins the two
+    /// together from the other side.)
+    ///
+    /// **Falsified** two ways, both red on the child's own assertion and
+    /// surfaced here as a failed child: `id_override_from_env() -> Ok(None)`,
+    /// and `ID_ENV = "HYTTE_PLUGN_ID"`.
+    #[test]
+    fn the_id_env_var_reaches_the_register_frame() {
+        let inner = "runtime::tests::the_id_env_var_reaches_the_register_frame_inner";
+        let args = ["--exact", "--nocapture", "--test-threads=1", inner];
+        assert!(
+            args.contains(&"--exact"),
+            "the re-exec must stay filtered to exactly one inner test",
+        );
+        let exe = std::env::current_exe().expect("this test binary's own path");
+        let out = std::process::Command::new(exe)
+            .args(args)
+            .env(ID_ENV_CHILD, "1")
+            .env("HYTTE_PLUGIN_ID", ID_ENV_CHILD_VALUE)
+            .output()
+            .expect("re-exec this test binary with HYTTE_PLUGIN_ID set");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child scenario failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status,
+        );
+        assert!(
+            stdout.contains(ID_ENV_CHILD_OK),
+            "the child exited 0 without reaching the end of {inner} — a stale \
+             filter matches no test and libtest still reports success\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The scenario body of [`the_id_env_var_reaches_the_register_frame`]. Does
+    /// nothing at all unless the parent's marker is set, so an ordinary
+    /// `cargo test` run — which discovers it like any other test — does not try
+    /// to run it with no `HYTTE_PLUGIN_ID` in the environment.
+    #[tokio::test]
+    async fn the_id_env_var_reaches_the_register_frame_inner() {
+        if std::env::var_os(ID_ENV_CHILD).is_none() {
+            return;
+        }
+        assert_ne!(
+            Echo::manifest().id,
+            ID_ENV_CHILD_VALUE,
+            "test setup: the override must differ from the manifest's own id",
+        );
+
+        let resolved =
+            id_override_from_env().expect("the parent set a valid HYTTE_PLUGIN_ID on this process");
+        assert_eq!(
+            resolved,
+            Some(ID_ENV_CHILD_VALUE.to_owned()),
+            "`id_override_from_env` must read the real {ID_ENV_CHILD_VALUE:?} \
+             out of this process's environment",
+        );
+        // …and through the manifest-building path `run` uses, not just the
+        // resolver: the id the *host* reads is the only thing that matters.
+        assert_eq!(
+            registered_manifest(None, resolved).await.id,
+            ID_ENV_CHILD_VALUE,
+            "the environment's id must be the id in the Register frame",
+        );
+        println!("{ID_ENV_CHILD_OK}");
     }
 }

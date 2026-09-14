@@ -31,15 +31,36 @@
 //! state. What *is* still whole-file is a layer that is not TOML at all, which
 //! degrades to the built-in defaults with a loud `error!`.
 //!
-//! # P1 renders the sidebar table only
+//! # Both tables render (P2, #1251)
 //!
-//! `[bar]` is declared, documented and parsed here, and **nothing reads it
-//! yet**: P1 (#1250) ships the sidebar card, and the bar instance is P2
-//! (#1251). It is declared now rather than later because the two tables are
-//! one decision — "which instance shows what" — and a file that grew its
-//! second half a release later would have had two shapes to migrate between.
-//! [`Stats::for_family`] already answers for both, and is tested for all nine
-//! mounts.
+//! P1 (#1250) shipped the sidebar card and left `[bar]` declared, documented
+//! and parsed with nothing reading it. P2 is the bar instance, so every key of
+//! both tables now decides something on the surface its table names.
+//!
+//! **No key is read by only one of the two surfaces.** That is a deliberate
+//! constraint on this schema rather than an accident of what P2 needed: the
+//! file has *one* shape (P1's reason — a file that grew its second half a
+//! release later would have had two shapes to migrate between), and a key that
+//! did nothing on one of them would be a shape with a hole in it. So the eight
+//! keys each name a *part of the machine*, and a table says which parts that
+//! surface draws:
+//!
+//! | key | on a bar chip | on a sidebar card |
+//! | --- | --- | --- |
+//! | `cpu` | the CPU chip | the CPU half |
+//! | `per_core` | the CPU chip's lamp is a **row**, one cell per core | the lamp row |
+//! | `history` | the CPU chip gains a scope sweep | the history sweep |
+//! | `temperature` | the `°C` reading beside the CPU and GPU chips | the seven-segment readout |
+//! | `gpu` | the GPU chip | the GPU half |
+//! | `memory` | the memory chip | a memory row + meter |
+//! | `disk` | the disk chip | a disk row, one lamp per mount |
+//! | `poll_seconds` | the sample cadence | the sample cadence |
+//!
+//! The **defaults** differ, which is the whole reason there are two tables: a
+//! bar chip has no room for a lamp row or a sweep (`per_core`/`history` off),
+//! and the sidebar card is the *compact CPU + GPU* card Annika asked for on
+//! Discussion #1235 (`memory`/`disk` off). Every one of the eight is
+//! spellable, and means the same thing, on both.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -103,7 +124,7 @@ const DEFAULT_TOML: &str = r#"# trollshell — system stats as a plugin (issue #
 # the built-in default, one journal line names it, and every other key in the
 # file still applies.
 
-# The right-sidebar card (#1250). This is what P1 draws.
+# The right-sidebar card (#1250) — the compact CPU + GPU card.
 [sidebar]
 # The CPU half: the per-core lamp row, the load history trace and the package
 # temperature all hang off this. With it off the card is GPU only.
@@ -119,22 +140,52 @@ temperature = true
 # The GPU half: a needle gauge on GPU load. It hides itself entirely when
 # there is no GPU to read, so `true` on a GPU-less machine costs nothing.
 gpu = true
+# The memory row: used / total with an LED meter, plus a swap row when this
+# machine has swap. Off by default here — the sidebar card is the COMPACT
+# CPU + GPU card; turn it on if you want the whole machine in the sidebar.
+memory = false
+# The disk row: one lamp per mounted filesystem, brighter the fuller. Off by
+# default here for the same reason as `memory`. Turning either off also stops
+# this instance from sampling the corresponding sensor, which is the real cost
+# (a mount walk plus one statvfs per mount, once per poll).
+disk = false
 # Seconds between samples while the card is on screen. The sampler parks
 # completely while the sidebar is closed, so a closed sidebar costs nothing
 # regardless of this value. 1..=60.
 poll_seconds = 1
 
-# The bar instance. DECLARED AND PARSED, NOT YET RENDERED: P1 (#1250) ships
-# the sidebar card only, and the bar chips are P2 (#1251). Editing these keys
-# today changes nothing you can see; they are here so the file has one shape
-# rather than two.
+# The bar instance (#1251) — the chips, and the drawer page a click opens.
+# Every key below has the same meaning it has above; only the defaults differ,
+# because a bar chip is a slim inline widget and a card is not.
 [bar]
+# The CPU chip: a load lamp, the package temperature, `CPU <n>%` on hover.
 cpu = true
+# Make the CPU chip's lamp a ROW — one cell per logical core, the
+# BlinkenLichten in the bar. Off by default: on a 16-thread box the row is
+# about six times the width of the single lamp it replaces.
 per_core = false
+# Give the CPU chip a scope sweep of recent load. Off by default for the same
+# width reason.
 history = false
+# The `°C` reading beside the CPU and GPU chips, exactly as the native chips
+# show it. `--` when no sensor answers.
 temperature = true
+# The GPU chip. It hides itself entirely when there is no GPU to read.
 gpu = true
+# The memory chip.
+memory = true
+# The disk chip — one lamp per mounted filesystem, the native chip's one bar
+# per mount in the vocabulary that exists.
+disk = true
+# Seconds between samples. NOTE: a bar chip is always on screen, so unlike a
+# sidebar card this instance samples continuously — there is no closed state
+# for it to park in. See `docs/plugin-env.md`.
 poll_seconds = 1
+
+# THE SERVICES CHIP IS NOT HERE, and that is deliberate: its two numbers are
+# failed systemd units (a system-bus client) and flapping shell tasks (the
+# shell's OWN task supervisor). Neither is reachable from a plugin process, so
+# the native `ts-services` chip stays — epic #1248's P3 already says so.
 "#;
 
 // ── The resolved form ────────────────────────────────────────────────────────
@@ -199,6 +250,11 @@ pub struct Card {
     pub temperature: bool,
     /// Draw the GPU half, when there is a GPU to draw.
     pub gpu: bool,
+    /// Draw memory (a chip on a bar, a row plus a meter on a card).
+    pub memory: bool,
+    /// Draw disk usage (a chip on a bar, a row on a card) — one lamp per
+    /// mounted filesystem either way.
+    pub disk: bool,
     /// Seconds between samples while the surface is on screen.
     pub poll: Duration,
 }
@@ -213,13 +269,16 @@ impl Card {
             history: true,
             temperature: true,
             gpu: true,
+            memory: false,
+            disk: false,
             poll: Duration::from_secs(DEFAULT_POLL_SECONDS),
         }
     }
 
     /// The `[bar]` defaults in Rust form. A bar chip is a slim inline widget,
     /// so the two space-hungry elements — the lamp row and the history sweep —
-    /// are off by default there. Nothing reads this until P2 (#1251).
+    /// are off by default there, while the two whole-machine readings a bar has
+    /// always carried — memory and disk — are on.
     #[must_use]
     pub const fn bar_default() -> Self {
         Self {
@@ -228,6 +287,8 @@ impl Card {
             history: false,
             temperature: true,
             gpu: true,
+            memory: true,
+            disk: true,
             poll: Duration::from_secs(DEFAULT_POLL_SECONDS),
         }
     }
@@ -286,6 +347,8 @@ pub struct CardFile {
     history: toml::Value,
     temperature: toml::Value,
     gpu: toml::Value,
+    memory: toml::Value,
+    disk: toml::Value,
     poll_seconds: toml::Value,
 }
 
@@ -321,11 +384,13 @@ impl CardFile {
             history: card.history.into(),
             temperature: card.temperature.into(),
             gpu: card.gpu.into(),
+            memory: card.memory.into(),
+            disk: card.disk.into(),
             poll_seconds: secs.into(),
         }
     }
 
-    /// Judge this table's six spellings, appending every rejection to
+    /// Judge this table's eight spellings, appending every rejection to
     /// `rejected` and falling back per key to `fallback`'s value for it.
     fn parsed(&self, knobs: &CardKnobs, fallback: Card, rejected: &mut Vec<InvalidValue>) -> Card {
         // Every rejection quotes `self.<key>` — the raw `toml::Value` — rather
@@ -361,6 +426,18 @@ impl CardFile {
                 parse_bool(&spelling(&self.gpu))
                     .map_err(|()| InvalidValue::of(&knobs.gpu, &self.gpu)),
                 fallback.gpu,
+                rejected,
+            ),
+            memory: keep(
+                parse_bool(&spelling(&self.memory))
+                    .map_err(|()| InvalidValue::of(&knobs.memory, &self.memory)),
+                fallback.memory,
+                rejected,
+            ),
+            disk: keep(
+                parse_bool(&spelling(&self.disk))
+                    .map_err(|()| InvalidValue::of(&knobs.disk, &self.disk)),
+                fallback.disk,
                 rejected,
             ),
             poll: keep(
@@ -429,7 +506,7 @@ const fn knob(key: &'static str, accepts: &'static str) -> EnvKnob {
     }
 }
 
-/// One table's six knobs. Two consts rather than a prefix spliced at runtime:
+/// One table's eight knobs. Two consts rather than a prefix spliced at runtime:
 /// [`InvalidValue`]'s key is a `&'static str`, so `bar.cpu` and `sidebar.cpu`
 /// have to be two literals — and a reader who greps a journal line for the key
 /// it names then finds it.
@@ -439,6 +516,8 @@ struct CardKnobs {
     history: EnvKnob,
     temperature: EnvKnob,
     gpu: EnvKnob,
+    memory: EnvKnob,
+    disk: EnvKnob,
     poll_seconds: EnvKnob,
 }
 
@@ -449,6 +528,8 @@ const BAR_KNOBS: CardKnobs = CardKnobs {
     history: knob("bar.history", BOOL),
     temperature: knob("bar.temperature", BOOL),
     gpu: knob("bar.gpu", BOOL),
+    memory: knob("bar.memory", BOOL),
+    disk: knob("bar.disk", BOOL),
     poll_seconds: knob("bar.poll_seconds", SECONDS),
 };
 
@@ -459,6 +540,8 @@ const SIDEBAR_KNOBS: CardKnobs = CardKnobs {
     history: knob("sidebar.history", BOOL),
     temperature: knob("sidebar.temperature", BOOL),
     gpu: knob("sidebar.gpu", BOOL),
+    memory: knob("sidebar.memory", BOOL),
+    disk: knob("sidebar.disk", BOOL),
     poll_seconds: knob("sidebar.poll_seconds", SECONDS),
 };
 
@@ -491,7 +574,7 @@ impl Subsystem for StatsConfig {
     const NAME: &'static str = NAME;
     const DEFAULT_TOML: &'static str = DEFAULT_TOML;
 
-    /// Nothing in this schema constrains anything else in it: the six keys of
+    /// Nothing in this schema constrains anything else in it: the seven keys of
     /// a table are independent look-and-feel switches plus one bounded number,
     /// and each is judged on its own in [`Self::parsed`]. A whole-file rule
     /// would be the #1040 V1 anti-pattern — one typo reverting every other key
@@ -594,6 +677,14 @@ mod tests {
             !stats.bar.per_core && !stats.bar.history,
             "a bar chip has room for neither",
         );
+        assert!(
+            stats.bar.memory && stats.bar.disk,
+            "the bar has always carried a memory and a disk chip",
+        );
+        assert!(
+            !stats.sidebar.memory && !stats.sidebar.disk,
+            "the sidebar card is the COMPACT CPU + GPU card (#1235)",
+        );
         assert_eq!(stats.bar.poll, Duration::from_secs(DEFAULT_POLL_SECONDS));
         assert_eq!(
             stats.sidebar.poll,
@@ -695,6 +786,48 @@ mod tests {
             rejected
                 .iter()
                 .any(|r| r == "bar.cpu = \"maybe\" is not valid; expected true or false"),
+            "{rejected:?}",
+        );
+    }
+
+    /// **The two keys P2 added** get the same per-key treatment as the five P1
+    /// shipped — asserted separately rather than assumed from `bar.cpu`'s row
+    /// above, because `parsed` spells every key out by hand and a key that
+    /// forgot to go through `keep` would swallow its own rejection silently
+    /// (measured: replacing `memory`'s `keep(…)` with a bare `unwrap_or` left
+    /// every config test green).
+    ///
+    /// `bar.memory` is the value-carrying half: its built-in default is **on**,
+    /// so "fell back" is distinguishable from "the file said false". The
+    /// sidebar keys default off, so for those the observable is the rejection
+    /// line itself.
+    #[test]
+    fn the_memory_and_disk_keys_are_judged_per_key_like_every_other() {
+        let (stats, rejected) =
+            resolved("[bar]\nmemory = \"yes\"\ndisk = false\n[sidebar]\nmemory = 3\ncpu = false\n");
+        assert!(
+            stats.bar.memory,
+            "a rejected key falls back to the BUILT-IN default, which for a bar is on",
+        );
+        assert!(
+            !stats.bar.disk,
+            "its sibling in the same table still applies"
+        );
+        assert!(
+            !stats.sidebar.cpu,
+            "…and so does the good key beside the bad one"
+        );
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        assert!(
+            rejected
+                .iter()
+                .any(|r| r == "bar.memory = \"yes\" is not valid; expected true or false"),
+            "{rejected:?}",
+        );
+        assert!(
+            rejected
+                .iter()
+                .any(|r| r == "sidebar.memory = 3 is not valid; expected true or false"),
             "{rejected:?}",
         );
     }

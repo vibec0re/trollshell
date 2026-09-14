@@ -10,14 +10,15 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
-use hytte_plugin::proto::{Capability, Effect, Manifest, Mount, StateKey};
+use hytte_plugin::proto::{Capability, Effect, EventKind, Manifest, Mount, Page, StateKey};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 
 use crate::card::{self, Widgets};
 use crate::config::{self, Family};
-use crate::mount;
+use crate::panel;
 use crate::sample::{Cmd, Msg, Snapshot};
+use crate::{mount, sample};
 
 /// The manifest id this binary ships with — the **first** instance's identity.
 ///
@@ -94,6 +95,10 @@ fn settings() -> Settings {
 /// The plugin's whole state.
 #[derive(Debug)]
 pub struct Stats {
+    /// Which surface this instance is: the bar chips plus the drawer page, or
+    /// the sidebar card. Decided by the launch mount (`HYTTE_PLUGIN_MOUNT`),
+    /// not by anything in the model.
+    family: Family,
     /// This instance's resolved `stats.toml` table.
     cfg: config::Card,
     /// The latest sample. Defaults to the "nothing measured yet" state, which
@@ -124,6 +129,7 @@ impl Stats {
         self.widgets.fit_cores(&snapshot.per_core);
         self.widgets
             .set_gpu(snapshot.gpu.as_ref().and_then(|g| g.load), self.dt());
+        self.widgets.set_memory(snapshot.memory.as_ref());
 
         // A withheld reading is not a sample: a cold tick (or one whose
         // `/proc/stat` read failed) must not push a fake rest value onto the
@@ -148,12 +154,43 @@ impl Stats {
         self.cfg.poll.as_secs_f32()
     }
 
-    /// A model with an explicit config — the seam every test in this module
-    /// uses, so none of them touches the process environment or the real XDG
-    /// search path.
+    /// A model with an explicit family and config — the seam every test in this
+    /// module uses, so none of them touches the process environment or the real
+    /// XDG search path.
+    ///
+    /// # A bar instance opens its own gate
+    ///
+    /// [`hytte_plugin::poll::Gate`] starts **closed**, and the only thing that
+    /// opens it is a hidden→visible edge on the command lane. A sidebar card
+    /// gets that edge from the host's visibility task; a **bar** mount gets one
+    /// constant `SlotVisibility { visible: true }` at register
+    /// (`trollshell/src/plugins/session.rs`: "a bar chip is effectively always
+    /// on-screen … seed a constant `visible: true` for bar mounts and hold no
+    /// task"), which does open the gate — but that is the *host's* answer to a
+    /// question a bar chip should not have to ask, and it is delivered with a
+    /// `try_send` on a bounded channel.
+    ///
+    /// So a bar instance opens the gate **itself**, here, by putting its own
+    /// `SetVisible(true)` on the lane before anything else can. The lane is
+    /// unbounded and `init` runs before `sources` in the same session
+    /// (`hytte_plugin::runtime`), so the sampler's first read off the gate is
+    /// this command, the first sample lands within a scheduler turn rather than
+    /// within a poll period, and **a bar chip samples on its own tick whatever
+    /// the host says about visibility** — which is the only correct answer for
+    /// a widget that is always on screen. The host's own seed then arrives as a
+    /// redundant level (`opens(true, true)` is false) and does nothing.
+    ///
+    /// The other half of the same decision is in [`Plugin::update`]: a bar
+    /// instance does not forward `SlotVisible` at all, so nothing can park it.
     #[must_use]
-    pub fn with_config(cfg: config::Card, cmds: CmdSender<Cmd>) -> Self {
+    pub fn with_config(family: Family, cfg: config::Card, cmds: CmdSender<Cmd>) -> Self {
+        if family == Family::Bar {
+            // A dropped receiver means the session is already tearing down,
+            // which is fine to ignore — the same tolerance `update` has.
+            let _ = cmds.send(Cmd::SetVisible(true));
+        }
         Self {
+            family,
             cfg,
             snapshot: Snapshot::default(),
             ring: VecDeque::new(),
@@ -167,40 +204,51 @@ impl Plugin for Stats {
     type Msg = Msg;
     type Cmd = Cmd;
 
-    /// Subscribes to [`StateKey::SlotVisible`] and asks for **no capabilities
-    /// at all**.
+    /// Subscribes to [`StateKey::SlotVisible`] and asks for exactly one
+    /// capability, [`Capability::OpenPage`].
     ///
     /// The subscription is not optional for this plugin: it is the only thing
     /// that lets the sampler park while the sidebar is closed, and
     /// `docs/plugin-env.md` makes it the requirement for any plugin that can be
-    /// moved across mount families — which this one is built to be. A bar mount
-    /// receives a constant `true` (the host treats a chip as always on screen),
-    /// so the same code polls at full rate there, correctly.
+    /// moved across mount families — which this one is built to be. A bar
+    /// instance ignores it entirely and opens its own gate; see
+    /// [`Stats::with_config`].
     ///
-    /// No capabilities, because the card asks the shell for nothing: it renders
-    /// a tree and reads sensors in its own process. In particular **not**
-    /// `RunCommand` — nothing here launches anything — and not `OpenPage`,
-    /// which would be the capability for a drawer panel this phase does not
-    /// ship (P2, #1251).
+    /// `OpenPage` is what a click on a bar chip needs
+    /// ([`Effect::OpenPage`]`(`[`Page::PluginSelf`]`)`, #1251) — the host
+    /// resolves `PluginSelf` to this plugin's own `panel` tree by the effect's
+    /// plugin id, and drops the effect with a warning if the capability is not
+    /// on the manifest. A manifest is **per binary**, not per instance, so a
+    /// sidebar instance declares it and never uses it: its card is not a click
+    /// target and it publishes no panel.
+    ///
+    /// Still **not** `RunCommand` (nothing here launches anything), not
+    /// `Notify`, not `OpenUri`. The list is asserted as exactly `[OpenPage]`
+    /// rather than as "does not contain `RunCommand`", because the host
+    /// auto-grants every manifest capability and the only safe assertion is the
+    /// whole list.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT);
         m.subscribes = vec![StateKey::SlotVisible];
-        m.capabilities = Vec::<Capability>::new();
+        m.capabilities = vec![Capability::OpenPage];
         m
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
-        Self::with_config(settings().card, cmds)
+        let settings = settings();
+        Self::with_config(settings.family, settings.card, cmds)
     }
 
     /// The sampler task: one per session, owning the `/proc` reads and the
     /// visibility gate. Its messages come back as [`Msg::Sampled`].
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = hytte_plugin::cmd_channel::<Msg>();
+        let settings = settings();
         tokio::spawn(crate::sample::sampler_task(
             cmds,
             msg_tx,
-            settings().card.poll,
+            settings.card.poll,
+            sample::Needs::of(settings.card),
         ));
         Some(Box::pin(UnboundedReceiverStream::new(msg_rx)))
     }
@@ -212,9 +260,29 @@ impl Plugin for Stats {
             // The visibility gate (#288): forward down the command lane so the
             // sampler parks and resumes. A dropped receiver means the session is
             // tearing down, which is fine to ignore.
+            //
+            // A **bar** instance does not forward it at all. The host seeds a
+            // constant `true` there and holds no task, so the only pushes a bar
+            // chip could ever see are that seed (redundant — the gate is
+            // already open, see `with_config`) and a hypothetical `false`,
+            // which would park a chip that is on screen. Dropping them makes
+            // "a bar chip samples on its own tick" a property of this plugin
+            // rather than a property of the host's current behaviour.
             Input::SlotVisible(visible) => {
-                let _ = self.cmds.send(Cmd::SetVisible(visible));
+                if self.family == Family::Sidebar {
+                    let _ = self.cmds.send(Cmd::SetVisible(visible));
+                }
             }
+            // A click on any chip opens this plugin's own drawer page (#1251).
+            // All four chips do the same thing, so the ids exist to be distinct
+            // reconciler keys rather than to be told apart here — but the set is
+            // still checked, so a click the host forwards for some other node
+            // cannot open a page.
+            Input::Event {
+                node,
+                kind: EventKind::Click,
+                ..
+            } if card::is_chip_button(&node) => return vec![Effect::OpenPage(Page::PluginSelf)],
             // Everything else is a push this plugin never subscribed to, or an
             // answer to an effect it never emits. Listed rather than wildcarded
             // so a new host→plugin frame is a compile error here — the place to
@@ -233,8 +301,22 @@ impl Plugin for Stats {
         Vec::new()
     }
 
+    /// The bar instance renders the chips **and** publishes the drawer page a
+    /// click opens; the sidebar instance renders P1's card and publishes no
+    /// panel.
+    ///
+    /// The panel is family-gated rather than always attached, because a panel
+    /// nothing can open is a surface the drawer will mount and the user can
+    /// never reach — the host parks any published panel in its mailbox whether
+    /// or not an effect ever names it. Making the sidebar card a click target
+    /// too is one `Node::Button` away and deliberately not P2's call: it would
+    /// change the card #1250 put on glass.
     fn view(&self) -> View {
-        card::card(self.cfg, &self.snapshot, &self.widgets).into()
+        match self.family {
+            Family::Bar => View::new(card::chips(self.cfg, &self.snapshot, &self.widgets))
+                .panel(panel::panel(self.cfg, &self.snapshot, &self.widgets)),
+            Family::Sidebar => card::card(self.cfg, &self.snapshot, &self.widgets).into(),
+        }
     }
 }
 
@@ -243,12 +325,21 @@ mod tests {
     use super::{DEFAULT_MOUNT, PLUGIN_ID, Settings, Stats, settings_from};
     use crate::card::HISTORY_COLS;
     use crate::config::{self, Card, Family};
-    use crate::sample::{Gpu, Msg, Snapshot};
-    use hytte_plugin::proto::{Capability, Mount, PluginMsg, StateKey, decode, encode};
-    use hytte_plugin::{Input, Plugin};
+    use crate::sample::{Cmd, Gpu, Msg, Snapshot};
+    use hytte_plugin::proto::{
+        Capability, Effect, EventKind, Mount, Page, PluginMsg, StateKey, decode, encode,
+    };
+    use hytte_plugin::{CmdReceiver, Input, Plugin};
 
     fn fresh(cfg: Card) -> Stats {
-        Stats::with_config(cfg, hytte_plugin::cmd_channel().0)
+        Stats::with_config(Family::Sidebar, cfg, hytte_plugin::cmd_channel().0)
+    }
+
+    /// A bar instance and the command lane it seeds, so a test can read what it
+    /// put there.
+    fn fresh_bar(cfg: Card) -> (Stats, CmdReceiver<Cmd>) {
+        let (tx, rx) = hytte_plugin::cmd_channel();
+        (Stats::with_config(Family::Bar, cfg, tx), rx)
     }
 
     fn sample(cpu: f32) -> Input<Msg> {
@@ -259,20 +350,26 @@ mod tests {
             gpu: Some(Gpu {
                 name: "test".to_owned(),
                 load: Some(cpu),
+                temperature_c: Some(44.0),
             }),
+            ..Snapshot::default()
         })))
     }
 
     /// The shipped manifest: the id a single instance registers under, the
     /// right sidebar, the one subscription that makes the poll gate work, and
-    /// **no capabilities**.
+    /// **exactly one capability**.
     ///
-    /// The capability list is the security-relevant half and is asserted as
-    /// *empty* rather than as "does not contain RunCommand": the host
+    /// The capability list is the security-relevant half and is asserted as the
+    /// *whole list* rather than as "does not contain RunCommand": the host
     /// auto-grants every manifest capability, so the only safe assertion is the
-    /// whole list.
+    /// whole list. P1 asserted it empty; P2 (#1251) adds `OpenPage` and nothing
+    /// else, which is what a chip click needs and the ceiling on what this
+    /// plugin can ask the shell to do.
+    ///
+    /// **Falsified** by adding any second capability.
     #[test]
-    fn the_manifest_asks_for_the_right_sidebar_and_no_capabilities() {
+    fn the_manifest_asks_for_the_right_sidebar_and_exactly_open_page() {
         let m = Stats::manifest();
         assert_eq!(m.id, PLUGIN_ID);
         assert_eq!(m.id, "stats");
@@ -280,14 +377,145 @@ mod tests {
         assert_eq!(m.mount, Mount::SidebarRightTop);
         assert_eq!(
             m.capabilities,
-            Vec::<Capability>::new(),
-            "the card asks the shell for nothing at all",
+            vec![Capability::OpenPage],
+            "a chip click opens this plugin's own page, and that is the whole ask",
+        );
+        assert!(
+            !m.capabilities.contains(&Capability::RunCommand),
+            "nothing here launches anything",
         );
         assert_eq!(
             m.subscribes,
             vec![StateKey::SlotVisible],
             "the visibility push is what parks the sampler behind a closed sidebar",
         );
+    }
+
+    /// **A click on any chip opens this plugin's own drawer page** — exactly
+    /// one effect, and the same one from all four chips.
+    ///
+    /// **Falsified** by returning `Vec::new()` from the click arm (no page
+    /// opens) or by dropping the `is_chip_button` guard (the last assertion
+    /// below then reds, because any node's click opens a page).
+    #[test]
+    fn a_click_on_a_chip_opens_the_plugins_own_page() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let _ = model.update(sample(0.5));
+
+        for class in crate::card::CHIP_CLASSES {
+            let id = crate::card::chip_button_id(class);
+            assert_eq!(
+                model.update(Input::event(id.clone(), EventKind::Click)),
+                vec![Effect::OpenPage(Page::PluginSelf)],
+                "{id}",
+            );
+        }
+
+        // …and nothing else is a page-open. A scroll on a chip is not a click,
+        // and a click on a node this plugin does not own is not ours.
+        assert!(
+            model
+                .update(Input::event(
+                    crate::card::chip_button_id("cpu"),
+                    EventKind::Scroll { dx: 0.0, dy: 1.0 },
+                ))
+                .is_empty(),
+        );
+        for other in ["stats-card", "stats-chip-services", "stats-chips", "", "x"] {
+            assert!(
+                model
+                    .update(Input::event(other, EventKind::Click))
+                    .is_empty(),
+                "{other}",
+            );
+        }
+    }
+
+    /// **The bar instance publishes the drawer page; the sidebar instance does
+    /// not** — a panel nothing can open is a surface the drawer mounts and
+    /// nobody can reach.
+    ///
+    /// **Falsified** by attaching the panel unconditionally.
+    #[test]
+    fn only_the_bar_instance_publishes_a_panel() {
+        let (mut bar, _rx) = fresh_bar(Card::bar_default());
+        let _ = bar.update(sample(0.5));
+        let view = bar.view();
+        assert!(view.panel.is_some(), "the bar instance carries its page");
+        assert_ne!(
+            view.panel.as_ref(),
+            Some(&view.tree),
+            "…and the page is a different tree from the chips",
+        );
+
+        let mut side = fresh(Card::sidebar_default());
+        let _ = side.update(sample(0.5));
+        assert!(
+            side.view().panel.is_none(),
+            "P1's card is not a click target and publishes no page",
+        );
+    }
+
+    /// The two families render two different trees off one snapshot — which is
+    /// the whole "one binary, two instances" claim, made at the level the host
+    /// actually sees.
+    #[test]
+    fn the_family_decides_which_surface_is_rendered() {
+        let (mut bar, _rx) = fresh_bar(Card::bar_default());
+        let mut side = fresh(Card::sidebar_default());
+        let _ = bar.update(sample(0.5));
+        let _ = side.update(sample(0.5));
+        assert_ne!(bar.view().tree, side.view().tree);
+    }
+
+    /// **A bar instance opens its own poll gate**: `with_config` puts exactly
+    /// one `SetVisible(true)` on the command lane, which is the hidden→visible
+    /// edge `hytte_plugin::poll::Gate` needs (it starts closed) and the reason a
+    /// bar chip does not depend on the host's constant seed frame.
+    ///
+    /// The other end of this — that one open edge then keeps the cadence
+    /// running with a silent lane — is
+    /// `crate::sample`'s `one_open_edge_then_silence_keeps_the_cadence_running`.
+    ///
+    /// **Falsified** by deleting the seed in `with_config`: the lane is empty,
+    /// the gate never opens on its own, and the chip's reading depends entirely
+    /// on a `try_send` in the host.
+    #[test]
+    fn a_bar_instance_seeds_its_own_open_edge_and_a_sidebar_one_does_not() {
+        let (_bar, mut rx) = fresh_bar(Card::bar_default());
+        assert_eq!(rx.try_recv(), Ok(Cmd::SetVisible(true)));
+        assert!(rx.try_recv().is_err(), "exactly one, not a stream of them");
+
+        let (tx, mut rx) = hytte_plugin::cmd_channel();
+        let _side = Stats::with_config(Family::Sidebar, Card::sidebar_default(), tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a sidebar card waits for the host's visibility task",
+        );
+    }
+
+    /// **A bar instance ignores a visibility push entirely**, so nothing can
+    /// park a chip that is on screen; a sidebar instance forwards it, which is
+    /// what makes a closed sidebar free.
+    ///
+    /// **Falsified** by forwarding unconditionally: the `false` push then
+    /// reaches the lane and a bar chip stops sampling.
+    #[test]
+    fn a_bar_instance_ignores_a_visibility_push() {
+        let (mut bar, mut rx) = fresh_bar(Card::bar_default());
+        assert_eq!(rx.try_recv(), Ok(Cmd::SetVisible(true)), "the seed");
+        for push in [false, true, false] {
+            assert!(bar.update(Input::SlotVisible(push)).is_empty());
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no host push reaches a bar instance's sampler",
+        );
+
+        let (tx, mut rx) = hytte_plugin::cmd_channel();
+        let mut side = Stats::with_config(Family::Sidebar, Card::sidebar_default(), tx);
+        assert!(side.update(Input::SlotVisible(false)).is_empty());
+        assert_eq!(rx.try_recv(), Ok(Cmd::SetVisible(false)));
     }
 
     /// **The mechanism**, end to end from a launch to a table: the mount
@@ -423,7 +651,7 @@ mod tests {
             cpu: None,
             per_core: Vec::new(),
             cpu_temp_c: Some(44.0),
-            gpu: None,
+            ..Snapshot::default()
         })));
         assert!(model.update(cold).is_empty());
         assert!(

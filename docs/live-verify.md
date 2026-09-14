@@ -2018,6 +2018,89 @@ systemd-run --user --unit=trollshell-plugin-stats-side \
       sit silent. (P1 renders the same card in both places; the bar chips are
       P2, #1251.)
 
+### Stats as a plugin — the bar instance (#1248 P2 / #1251)
+
+The same binary, mounted in a bar: **four chips** and the plugin's **own**
+drawer page. Launch it beside the sidebar instance above (nix renders
+`HYTTE_PLUGIN_ID` from the attribute name since #1284; by hand it is):
+
+```sh
+systemd-run --user --unit=trollshell-plugin-stats-bar \
+    --setenv=HYTTE_PLUGIN_ID=stats-bar \
+    --setenv=HYTTE_PLUGIN_MOUNT=BarRight \
+    "$(command -v hytte-plugin-stats)"
+```
+
+- [ ] **(#1251)** **Four chips, and they read like the native four.** A
+      `CPU 57° ▪`, `MEM ▪`, `DSK ▪▪`, `GPU 49° ▪` row appears in the right bar
+      group. Hover each: the text must be **exactly** what the native chip
+      beside it says — `CPU 42%`, `Memory 36%` (or `Memory: unknown`),
+      `/: 40%, /home: 73%`, `AMD Radeon RX 6800: 25%`. The disk chip must show
+      **one lamp per mounted filesystem**, and mounting a USB stick must add
+      one within a poll period.
+- [ ] **(#1251)** **The chips are text, not icons — confirm that is what you
+      want.** Each chip leads with a short word (`CPU`/`MEM`/`DSK`/`GPU`) where
+      the native chip has a bundled SVG. A plugin cannot ask for those: the
+      wire's `Node::Icon` is an icon-**theme** name and the shell ships its
+      SVGs under `share/trollshell/icons/`, which is not a theme. Closing that
+      is a shell-side change (install them into a theme) — see the PR.
+- [ ] **(#1251)** **There is no services chip, and the native one is still
+      there.** The `ts-services` chip (failed units + flapping shell tasks) is
+      not part of the plugin and must still be the shell's own. Break a user
+      unit (`systemd-run --user --unit=boom /bin/false`) and confirm the native
+      chip appears with its count, unchanged.
+- [ ] **(#1251)** **The skins carry over.** Add to
+      `~/.config/trollshell/style.css`-equivalent (the shell's
+      `assets/trollshell/style.css` is compiled in, so test with a rebuilt
+      shell or with GTK Inspector's CSS pane):
+      `.ts-cpu { background: red; }`. Every CPU surface — the native chip, the
+      plugin chip and the plugin's page rows — must tint. This is the whole
+      contract Annika asked for on #1235 ("the skins carry over"): the plugin's
+      nodes carry `ts-cpu`/`ts-memory`/`ts-disk`/`ts-gpu` and `ts-cpu-temp`/
+      `ts-gpu-temp` verbatim.
+- [ ] **(#1251)** **A click opens the plugin's own page.** Click any of the
+      four chips: the drawer opens on a page with a CPU card (load, core count,
+      the lamp row at **full width** — chunkier dots than the sidebar card's),
+      a Memory card (`11.2 GiB / 31.1 GiB (36%)` plus an LED meter, and a Swap
+      row only if this machine has swap), a GPU card (name, load, temperature,
+      the needle) and a Disks card (`N mount(s)`, the lamp row, then one row per
+      mount with `used / total (pct%)` and a bar). All four chips open the
+      **same** page — a plugin has exactly one `PluginSelf`.
+- [ ] **(#1251)** **Compare it against the native page, side by side.** The
+      native Stats page is still in the tree (P3, #1252, retires it) — open it
+      from the native chips and put the two next to each other. Expected
+      differences, all deliberate: the per-core `MultiSparkline` is **gone**
+      (the wire's `Scope` is one trace); the overall history is a scope sweep
+      instead of a sparkline; GPU load has a needle the native page does not;
+      the Services card is absent; there is one column rather than
+      `TROLLSHELL_STATS_LAYOUT`'s three layouts. **This is the visible trade
+      #1251 exists to put in front of you.** Everything else — every number,
+      every unit, every hide rule — should match.
+- [ ] **(#1251)** **Both instances alive at once.** With `stats-side` and
+      `stats-bar` both running: the right sidebar card and the bar chips are on
+      screen together, each journal stream prefixed with its own id, and the
+      two disagree about nothing (they sample the same `/proc` with the same
+      code, a second apart at most).
+- [ ] **(#1251)** **The bar samples continuously, and nothing can park it.**
+      Watch the bar instance's CPU in `top`: unlike the sidebar one it must
+      never fall to flat zero, because a bar chip is always on screen. Open and
+      close the **right sidebar** repeatedly and confirm the chips keep
+      updating throughout — a bar instance ignores `SlotVisible` entirely and
+      opens its own poll gate at startup, so a host that pushed
+      `visible = false` at it could not freeze it.
+- [ ] **(#1251)** **`stats.toml`'s `[bar]` table drives it.** Write
+      `~/.config/trollshell/stats.toml` with `[bar]` + `per_core = true` and
+      restart the bar unit: the CPU chip's single lamp becomes **one cell per
+      logical core** — the BlinkenLichten in the bar. Add `history = true`: a
+      small scope sweep joins it. Then `disk = false`: the disk chip and the
+      Disks card both disappear, and `top` should show the plugin no longer
+      `statvfs`ing (the mount walk is gated on that key). Confirm the
+      `[sidebar]` table is untouched by all of it.
+- [ ] **(#1251)** **A bad `[bar]` value costs its own key.** `memory = "yes"`:
+      the journal must carry exactly one line naming `bar.memory`, the memory
+      chip must fall back to **on** (the built-in default), and every other
+      chip must still obey the file.
+
 ## Audio & media
 
 - [ ] **(#470)** Drag-safe seek slider: open the Media drawer on an active

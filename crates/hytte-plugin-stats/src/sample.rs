@@ -70,6 +70,47 @@ pub struct Snapshot {
     /// The GPU, or `None` when there is none to read — which is what makes the
     /// GPU half of the card hide itself.
     pub gpu: Option<Gpu>,
+    /// Memory and swap, or `None` when `/proc/meminfo` could not be read or
+    /// this instance does not draw memory (see [`Needs`]).
+    pub memory: Option<Memory>,
+    /// One entry per mounted filesystem, in `/proc/self/mountinfo` order —
+    /// which is the order the native Disks card and disk chip render, and the
+    /// only ordering `hytte_sensors` defines. Empty when this instance does not
+    /// draw disks.
+    pub disks: Vec<Disk>,
+}
+
+/// The memory half of a [`Snapshot`] — the four counters the native Memory row
+/// and swap row read, and nothing else `/proc/meminfo` carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// Bytes in use — `hytte_sensors`' own definition, `total - available`.
+    pub used: u64,
+    /// Bytes of RAM. Zero is the machine the native row renders as an em dash.
+    pub total: u64,
+    /// Swap bytes in use.
+    pub swap_used: u64,
+    /// Swap bytes configured. Zero hides the swap row, exactly as the native
+    /// page does.
+    pub swap_total: u64,
+}
+
+/// One mounted filesystem.
+///
+/// A narrowing of [`hytte_sensors::DiskMount`]: `free_bytes` is dropped (it is
+/// `total - used` and nothing on either surface prints it) and `usage` is
+/// re-expressed as a sanitised `f32` the way every other load on this card is,
+/// so `view` has no conversion in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Disk {
+    /// The mount point, as the kernel spells it.
+    pub path: String,
+    /// Bytes in use.
+    pub used_bytes: u64,
+    /// Bytes on the filesystem.
+    pub total_bytes: u64,
+    /// Fullness, `0.0..=1.0`.
+    pub usage: f32,
 }
 
 /// The GPU half of a [`Snapshot`].
@@ -79,6 +120,14 @@ pub struct Gpu {
     pub name: String,
     /// Load, `0.0..=1.0`, or `None` when the vendor exposes no busy counter.
     pub load: Option<f32>,
+    /// Adapter temperature in °C, or `None` when the vendor exposes none.
+    ///
+    /// Not clamped or sanitised, for [`celsius`]'s reason — there is no
+    /// defensible range for a temperature, and a non-finite reading is drawn as
+    /// nothing rather than as a number nobody measured. Added by P2 (#1251):
+    /// the native GPU chip shows a `{c:.0}°` label beside its bar and P1's card
+    /// had no place to put one, so nothing read it until the chips existed.
+    pub temperature_c: Option<f32>,
 }
 
 /// The command lane: the host's slot-visibility push, forwarded by the reducer.
@@ -95,6 +144,61 @@ pub enum Msg {
     Sampled(Box<Snapshot>),
 }
 
+/// Which sensors this instance actually draws — so it does not pay for the
+/// ones it does not.
+///
+/// Derived from the resolved [`Card`](crate::config::Card) once at launch,
+/// because the four reads it gates are not all cheap and two of them are
+/// genuinely expensive on the wrong machine:
+///
+/// - **`gpu`** falls through to spawning `nvidia-smi` on an Nvidia box — a
+///   `fork`/`exec` per tick, which is the reason the whole read is
+///   `spawn_blocking`ed.
+/// - **`disk`** walks `/proc/self/mountinfo` and then `statvfs`es every
+///   surviving mount. On a box with a dozen filesystems that is a dozen
+///   syscalls that can each block on a slow or unresponsive filesystem.
+/// - **`temperature`** resolves an hwmon chip by `read_dir` the first time.
+/// - **`memory`** is one small `/proc/meminfo` read, gated for symmetry rather
+///   than for cost.
+///
+/// `/proc/stat` is deliberately **not** gated: it is a single small read, it is
+/// the baseline [`Sampler::reset`] exists to invalidate, and an instance that
+/// draws no CPU at all is not a shape worth a second code path.
+/// Four **independent** switches over "which sensors does this instance read",
+/// which is the same argument `crate::config::Card` makes: collapsing them into
+/// a bitflag or an enum would make "this surface draws memory but not disk"
+/// unspellable, and each one gates a different syscall.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Needs {
+    /// Read the package temperature.
+    pub temperature: bool,
+    /// Read the GPU.
+    pub gpu: bool,
+    /// Read `/proc/meminfo`.
+    pub memory: bool,
+    /// Walk the mount table and `statvfs` each mount.
+    pub disk: bool,
+}
+
+impl Needs {
+    /// What one resolved table asks the sampler for.
+    ///
+    /// The temperature and the GPU ride their own switches; on a surface whose
+    /// `cpu` is off there is no CPU chip or CPU half for the temperature to sit
+    /// beside, so it is not read either — which is the one place a *pair* of
+    /// keys decides a read.
+    #[must_use]
+    pub const fn of(card: crate::config::Card) -> Self {
+        Self {
+            temperature: card.temperature && (card.cpu || card.gpu),
+            gpu: card.gpu,
+            memory: card.memory,
+            disk: card.disk,
+        }
+    }
+}
+
 /// The stateful half of sampling: the per-tick caches `hytte_sensors` asks the
 /// caller to carry.
 ///
@@ -104,6 +208,8 @@ pub enum Msg {
 /// the GPU cache remembers whether `nvidia-smi` exists at all.
 #[derive(Debug, Default)]
 pub struct Sampler {
+    /// What this instance draws, and therefore what it reads.
+    needs: Needs,
     /// Previous `/proc/stat` (busy, total) per core.
     prev_cpu: Vec<(u64, u64)>,
     /// The resolved `/sys/class/hwmon` chip directory, once found.
@@ -113,12 +219,16 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// A sampler with cold caches. The first [`Self::tick`] has no previous
-    /// `/proc/stat` to subtract, so it publishes **no CPU reading at all** —
-    /// see [`cpu_half`], which is where that decision lives and is tested.
+    /// A sampler with cold caches, reading only what `needs` asks for. The
+    /// first [`Self::tick`] has no previous `/proc/stat` to subtract, so it
+    /// publishes **no CPU reading at all** — see [`cpu_half`], which is where
+    /// that decision lives and is tested.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(needs: Needs) -> Self {
+        Self {
+            needs,
+            ..Self::default()
+        }
     }
 
     /// Read the machine once. **Blocking** — see the module doc for why every
@@ -139,18 +249,65 @@ impl Sampler {
             self.prev_cpu = now;
         }
 
-        let temp = hytte_sensors::read_cpu_temp(&mut self.hwmon);
-        let (gpu, cache) = hytte_sensors::read_gpu_with_cache(self.gpu);
-        self.gpu = cache;
+        let cpu_temp_c = if self.needs.temperature {
+            hytte_sensors::read_cpu_temp(&mut self.hwmon)
+                .package_celsius
+                .map(celsius)
+        } else {
+            None
+        };
+
+        let gpu = if self.needs.gpu {
+            let (gpu, cache) = hytte_sensors::read_gpu_with_cache(self.gpu);
+            self.gpu = cache;
+            gpu.map(|g| Gpu {
+                name: g.name,
+                load: g.load.map(as_unit),
+                temperature_c: g.temperature_celsius.map(celsius),
+            })
+        } else {
+            None
+        };
+
+        let memory = if self.needs.memory {
+            hytte_sensors::read_proc_meminfo().ok().map(|m| Memory {
+                used: m.used,
+                total: m.total,
+                swap_used: m.swap_used,
+                swap_total: m.swap_total,
+            })
+        } else {
+            None
+        };
+
+        // The mount table is re-read every tick rather than cached behind a
+        // `POLLPRI` watcher the way `hytte-services`' own sensors service does
+        // it (#1249 left that half in the shell, since it needs an `AsyncFd`
+        // and a tokio reactor). One small `/proc` read per poll buys a plugin
+        // that notices a `mount` immediately and owns no watcher — and the
+        // `statvfs` calls beside it dominate the cost either way.
+        let disks = if self.needs.disk {
+            hytte_sensors::read_disk_for_specs(&hytte_sensors::read_mountlist())
+                .mounts
+                .into_iter()
+                .map(|m| Disk {
+                    path: m.path,
+                    used_bytes: m.used_bytes,
+                    total_bytes: m.total_bytes,
+                    usage: as_unit(m.usage),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Snapshot {
             cpu,
             per_core,
-            cpu_temp_c: temp.package_celsius.map(celsius),
-            gpu: gpu.map(|g| Gpu {
-                name: g.name,
-                load: g.load.map(as_unit),
-            }),
+            cpu_temp_c,
+            gpu,
+            memory,
+            disks,
         }
     }
 
@@ -274,8 +431,13 @@ impl Sample for Sampler {
 /// park on hidden, refresh on the hidden→visible **edge**, `MissedTickBehavior::Delay`,
 /// a close beating a due tick, no cancellation of work in flight — is unchanged
 /// and is what makes a closed sidebar genuinely free.
-pub async fn sampler_task(cmds: CmdReceiver<Cmd>, msgs: CmdSender<Msg>, period: Duration) {
-    sampler_task_with(cmds, msgs, period, Sampler::new).await;
+pub async fn sampler_task(
+    cmds: CmdReceiver<Cmd>,
+    msgs: CmdSender<Msg>,
+    period: Duration,
+    needs: Needs,
+) {
+    sampler_task_with(cmds, msgs, period, move || Sampler::new(needs)).await;
 }
 
 /// [`sampler_task`] over an arbitrary [`Sample`] — the seam the gate tests
@@ -358,8 +520,10 @@ async fn sampler_task_with<S: Sample>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, Sample, Sampler, Snapshot, as_unit, cpu_half, sampler_task, sampler_task_with,
+        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, cpu_half, sampler_task,
+        sampler_task_with,
     };
+    use crate::config::Card;
     use hytte_plugin::cmd_channel;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -400,7 +564,7 @@ mod tests {
                 cpu: Some(cpu),
                 per_core: vec![0.25, 0.5],
                 cpu_temp_c: Some(42.0),
-                gpu: None,
+                ..Snapshot::default()
             }
         }
 
@@ -572,8 +736,67 @@ mod tests {
     /// gate has ever opened.
     #[test]
     fn a_fresh_sampler_has_cold_caches() {
-        let s = Sampler::new();
+        let s = Sampler::new(Needs::default());
         assert!(format!("{s:?}").contains("prev_cpu: []"));
+    }
+
+    /// **The needs table**: what a resolved `stats.toml` table asks the sampler
+    /// to read, and — the point of the type — what it asks it *not* to.
+    ///
+    /// Pure, so the expensive reads it gates (`nvidia-smi` on an Nvidia box, a
+    /// mount walk plus one `statvfs` per filesystem) are decided by a function
+    /// a test can drive rather than by a branch only a live machine reaches.
+    ///
+    /// **Falsified** by having `Needs::of` answer `Self { temperature: true,
+    /// gpu: true, memory: true, disk: true }` unconditionally.
+    #[test]
+    fn the_needs_follow_the_table() {
+        // The two shipped tables, spelled out rather than compared to
+        // `Needs::of` of themselves.
+        assert_eq!(
+            Needs::of(Card::sidebar_default()),
+            Needs {
+                temperature: true,
+                gpu: true,
+                memory: false,
+                disk: false,
+            },
+            "the compact sidebar card reads no memory and walks no mount table",
+        );
+        assert_eq!(
+            Needs::of(Card::bar_default()),
+            Needs {
+                temperature: true,
+                gpu: true,
+                memory: true,
+                disk: true,
+            },
+        );
+
+        // Each switch gates its own read.
+        let off = |f: fn(&mut Card)| {
+            let mut cfg = Card::bar_default();
+            f(&mut cfg);
+            Needs::of(cfg)
+        };
+        assert!(!off(|c| c.gpu = false).gpu);
+        assert!(!off(|c| c.memory = false).memory);
+        assert!(!off(|c| c.disk = false).disk);
+        assert!(!off(|c| c.temperature = false).temperature);
+
+        // …and the one pair: with neither half of the card drawn there is
+        // nowhere to put a temperature, so the hwmon chip is not resolved.
+        assert!(
+            !off(|c| {
+                c.cpu = false;
+                c.gpu = false;
+            })
+            .temperature,
+        );
+        assert!(
+            off(|c| c.cpu = false).temperature,
+            "…but a GPU-only surface still shows the adapter's",
+        );
     }
 
     /// **The gate**: while the surface is hidden, nothing is sampled at all —
@@ -718,13 +941,69 @@ mod tests {
         let _ = task.await;
     }
 
+    /// **The bar instance's tick**: one open edge, then nothing on the lane
+    /// ever again, and the sampler keeps reading on the cadence.
+    ///
+    /// This is the sampler-side half of "a bar chip samples on its own tick
+    /// regardless of the sidebar gate" (#1251). The other half is in
+    /// `crate::plugin`: a bar instance puts exactly one `SetVisible(true)` on
+    /// its own lane at `init` and forwards no host visibility push at all, so
+    /// this — an open gate with a silent lane — is precisely the state a bar
+    /// instance runs in for the whole session.
+    ///
+    /// Note what it does **not** rely on: the host's constant
+    /// `SlotVisibility { visible: true }` seed for bar mounts. That seed exists
+    /// (`trollshell/src/plugins/session.rs`) and would open the gate too, but a
+    /// bar chip that samples only because the host happened to send one frame
+    /// is a chip one `try_send` away from being frozen.
+    ///
+    /// **Falsified** by making the gate answer the open edge and then re-close
+    /// (`self.visible = false` after handing back `Wake::Refresh`): exactly one
+    /// sample lands instead of one per period, which is the failure mode a bar
+    /// chip would show as a frozen reading rather than as an error.
+    #[tokio::test(start_paused = true)]
+    async fn one_open_edge_then_silence_keeps_the_cadence_running() {
+        let period = Duration::from_secs(1);
+        let calls = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+        let made = Arc::clone(&calls);
+        let task = tokio::spawn(sampler_task_with(cmd_rx, msg_tx, period, move || {
+            FakeSampler(Arc::clone(&made))
+        }));
+
+        // Exactly what `Stats::with_config` puts on the lane for a bar family,
+        // and then nothing.
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        assert!(
+            pump_until(|| calls.ticks() >= 5).await,
+            "five periods of silence must still produce five samples, got {}",
+            calls.ticks(),
+        );
+        assert_eq!(
+            calls.resets(),
+            0,
+            "…and it never re-baselines: the LOW 4 re-baseline fires on an \
+             unpark, and a chip that is always on screen never parks, so its \
+             /proc/stat window stays continuous for the whole session",
+        );
+
+        drop(cmd_tx);
+        let _ = task.await;
+    }
+
     /// …and a closed command lane ends the task, rather than polling on against
     /// a dropped reducer.
     #[tokio::test(start_paused = true)]
     async fn a_closed_lane_ends_the_task() {
         let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
         let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
-        let task = tokio::spawn(sampler_task(cmd_rx, msg_tx, Duration::from_secs(1)));
+        let task = tokio::spawn(sampler_task(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            Needs::default(),
+        ));
         drop(cmd_tx);
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

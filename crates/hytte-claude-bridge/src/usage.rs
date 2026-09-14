@@ -280,12 +280,14 @@ pub enum UsageError {
     Http(u16),
     /// A 429, **after** [`next_wait`] has picked how long to wait before
     /// trying again. Never constructed by [`fetch`] (which reports a 429 as
-    /// plain [`Http`](Self::Http)) — only [`poll_forever`] promotes one to
-    /// this, since it is the one place that knows the wait. Carries the wait
-    /// it actually chose, not the raw `Retry-After` header: with none present
-    /// that is a doubled previous wait, and [`sentence`](Self::sentence) is
-    /// where the chosen minutes reach a human.
-    RateLimited(Duration),
+    /// plain [`Http`](Self::Http)) — only [`advance`] promotes one to this,
+    /// since it is the one place that knows the wait. Carries the **deadline**
+    /// it actually chose (`at + wait`, Unix seconds) rather than the wait
+    /// itself: [`sentence`](Self::sentence) takes `now` and counts down to
+    /// this at render time, so the same report reads "next try in 10 min" and
+    /// then "next try in 9 min" as the chip keeps ticking, instead of freezing
+    /// the number the schedule picked at publish time (#1285's review, NIT).
+    RateLimited(i64),
     /// The request never completed (DNS, TLS, connect, read).
     Io(String),
     /// A 2xx body that did not parse as [`Usage`].
@@ -295,8 +297,11 @@ pub enum UsageError {
 impl UsageError {
     /// The one line a human reads. Never contains the token — see the module
     /// docs and `an_unauthorized_sentence_carries_no_token_bytes`.
+    ///
+    /// `now` only feeds [`RateLimited`](Self::RateLimited)'s countdown; every
+    /// other arm's wording is fixed at construction and ignores it.
     #[must_use]
-    pub fn sentence(&self) -> String {
+    pub fn sentence(&self, now: i64) -> String {
         match self {
             Self::NoCredentials(path) => format!(
                 "no Claude login found at {} — run `claude` once to sign in",
@@ -306,13 +311,26 @@ impl UsageError {
             Self::Http(status) => {
                 format!("usage unavailable — the usage endpoint answered HTTP {status}")
             }
-            // `div_ceil`, never a plain divide: telling someone "next try in
-            // 1 min" when the schedule actually chose 90 s would have them
-            // retrying before the wait is over.
-            Self::RateLimited(wait) => format!(
-                "usage rate-limited — next try in {} min",
-                wait.as_secs().div_ceil(60)
-            ),
+            Self::RateLimited(deadline) => {
+                let remaining = deadline.saturating_sub(now);
+                if remaining <= 0 {
+                    // The countdown reached zero (or the clock moved) between
+                    // publish and render — never claim a negative wait.
+                    "usage rate-limited — next try any moment now".to_owned()
+                } else {
+                    // `div_ceil`, never a plain divide: telling someone "next
+                    // try in 1 min" when the schedule actually chose 90 s
+                    // would have them retrying before the wait is over.
+                    // `i64::div_ceil` is still unstable (rust-lang/rust#88581)
+                    // for signed integers, so widen to `u64` first — `remaining`
+                    // is checked positive above.
+                    let remaining = u64::try_from(remaining).unwrap_or(u64::MAX);
+                    format!(
+                        "usage rate-limited — next try in {} min",
+                        remaining.div_ceil(60)
+                    )
+                }
+            }
             Self::Io(what) => format!("usage unavailable — {what}"),
             Self::Parse(what) => {
                 format!("usage unavailable — the response could not be read ({what})")
@@ -538,12 +556,14 @@ impl Report {
 
     /// The failure sentence, if the last attempt failed — regardless of
     /// whether [`usage`](Self::usage) still has last-known-good numbers to
-    /// show alongside it.
+    /// show alongside it. `now` is threaded through to
+    /// [`UsageError::sentence`], which is the only place it matters (the
+    /// [`UsageError::RateLimited`] countdown).
     #[must_use]
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self, now: i64) -> Option<String> {
         match &self.outcome {
             Outcome::Ok(_) => None,
-            Outcome::Failed(e) => Some(e.sentence()),
+            Outcome::Failed(e) => Some(e.sentence(now)),
         }
     }
 
@@ -657,7 +677,12 @@ fn advance(
     };
     let wait = next_wait(prev_wait, &outcome, retry_after);
     let outcome = match outcome {
-        Outcome::Failed(UsageError::Http(429)) => Outcome::Failed(UsageError::RateLimited(wait)),
+        Outcome::Failed(UsageError::Http(429)) => {
+            // The deadline this attempt's own clock names, not a duration
+            // frozen at publish time — see `UsageError::RateLimited`'s doc.
+            let wait_secs = i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
+            Outcome::Failed(UsageError::RateLimited(at.saturating_add(wait_secs)))
+        }
         other => other,
     };
     let report = Report {
@@ -698,7 +723,9 @@ pub async fn poll_forever(base_url: String, credentials: PathBuf) {
         last_ok = next_last_ok;
         if let Outcome::Failed(ref e) = report.outcome {
             // The sentence, never the cause verbatim and never the token.
-            tracing::debug!(reason = %e.sentence(), "usage poll produced no numbers");
+            // `report.at` is "now" as far as this attempt is concerned — the
+            // log line is emitted the instant the report is minted.
+            tracing::debug!(reason = %e.sentence(report.at), "usage poll produced no numbers");
         }
         publish(report);
         tokio::time::sleep(wait).await;
@@ -1340,7 +1367,8 @@ mod tests {
 
         let err = fetch(&base, &path).expect_err("a 401 is an error");
         assert_eq!(err, UsageError::Unauthorized);
-        let sentence = err.sentence();
+        // `now` is irrelevant to every arm but `RateLimited` — `0` here.
+        let sentence = err.sentence(0);
         assert_eq!(
             sentence,
             "usage stale — run `claude` once to refresh the login"
@@ -1388,7 +1416,7 @@ mod tests {
         let (base, handle) = fake_endpoint("500 Internal Server Error", "nope".to_owned());
         let err = fetch(&base, &path).expect_err("500");
         assert_eq!(err, UsageError::Http(500));
-        assert!(err.sentence().contains("HTTP 500"));
+        assert!(err.sentence(0).contains("HTTP 500"));
         drop(handle.join());
     }
 
@@ -1534,17 +1562,41 @@ mod tests {
         );
     }
 
+    /// **The countdown, at render time — item 11's NIT.** `RateLimited`
+    /// carries a deadline, not a wait, so the sentence must recompute the
+    /// remaining minutes against whatever `now` it is rendered with, and
+    /// clamp to "any moment now" rather than ever naming a negative wait.
+    ///
+    /// Falsify by rendering the sentence with the deadline itself as `now`
+    /// (i.e. freezing the number at publish time, the pre-#1285-fix shape):
+    /// the second and third assertions go red.
     #[test]
-    fn a_rate_limited_sentence_names_the_minutes_the_schedule_chose() {
+    fn a_rate_limited_sentence_counts_down_to_the_deadline() {
+        let published = 1_000;
         assert_eq!(
-            UsageError::RateLimited(Duration::from_mins(10)).sentence(),
+            UsageError::RateLimited(published + 600).sentence(published),
             "usage rate-limited — next try in 10 min"
         );
         assert_eq!(
-            UsageError::RateLimited(Duration::from_secs(90)).sentence(),
+            UsageError::RateLimited(published + 90).sentence(published),
             "usage rate-limited — next try in 2 min",
             "a fractional minute rounds UP — never tell the reader to retry \
              before the wait the schedule chose is actually over"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published + 570),
+            "usage rate-limited — next try in 1 min",
+            "the same report reads a lower number as the chip keeps ticking"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published + 600),
+            "usage rate-limited — next try any moment now",
+            "exactly at the deadline"
+        );
+        assert_eq!(
+            UsageError::RateLimited(published + 600).sentence(published + 601),
+            "usage rate-limited — next try any moment now",
+            "past the deadline — never a negative countdown"
         );
     }
 
@@ -1590,9 +1642,11 @@ mod tests {
             failed_report.outcome
         );
         assert_eq!(
-            failed_report.error().as_deref(),
+            failed_report.error(failed_report.at).as_deref(),
             Some("usage rate-limited — next try in 10 min"),
-            "doubled from the POLL_EVERY the first call answered"
+            "doubled from the POLL_EVERY the first call answered — rendered \
+             the instant the report was minted, so the countdown reads the \
+             full wait"
         );
         assert_eq!(wait, Duration::from_mins(10));
         assert_eq!(last_ok, Some((1_000, usage)));
@@ -1606,7 +1660,7 @@ mod tests {
             advance(POLL_EVERY, None, 1_000, Err(UsageError::Unauthorized), None);
         assert_eq!(report.usage(), None);
         assert_eq!(
-            report.error().as_deref(),
+            report.error(1_000).as_deref(),
             Some("usage stale — run `claude` once to refresh the login")
         );
         assert!(!report.is_stale(1_000), "nothing to be stale about yet");
@@ -1653,8 +1707,8 @@ mod tests {
         let (base, handle) = fake_endpoint("200 OK", "<html>maintenance</html>".to_owned());
         let err = fetch(&base, &path).expect_err("not a usage document");
         assert!(matches!(err, UsageError::Parse(_)), "{err:?}");
-        assert!(err.sentence().starts_with("usage unavailable"));
-        assert!(!err.sentence().contains(FAKE_TOKEN));
+        assert!(err.sentence(0).starts_with("usage unavailable"));
+        assert!(!err.sentence(0).contains(FAKE_TOKEN));
         drop(handle.join());
     }
 
@@ -1771,8 +1825,8 @@ mod tests {
         let missing = dir.path().join("nope").join(".credentials.json");
         let err = fetch("http://127.0.0.1:1", &missing).expect_err("no file");
         assert_eq!(err, UsageError::NoCredentials(missing.clone()));
-        assert!(err.sentence().contains(&missing.display().to_string()));
-        assert!(err.sentence().contains("run `claude` once"));
+        assert!(err.sentence(0).contains(&missing.display().to_string()));
+        assert!(err.sentence(0).contains("run `claude` once"));
 
         // (2) Not JSON.
         let garbage = dir.path().join(".credentials.json");
@@ -1810,7 +1864,10 @@ mod tests {
         // A dead port: the fetch fails at connect, well after the read.
         let err = fetch("http://127.0.0.1:1", &path).expect_err("nothing listening");
         assert!(matches!(err, UsageError::Io(_)), "{err:?}");
-        assert!(!err.sentence().contains(FAKE_TOKEN), "nor does an Io error");
+        assert!(
+            !err.sentence(0).contains(FAKE_TOKEN),
+            "nor does an Io error"
+        );
 
         assert_eq!(std::fs::read(&path).expect("read"), before);
         assert_eq!(
@@ -2003,7 +2060,7 @@ mod tests {
         let latest = super::latest().expect("something is published");
         assert_eq!(latest.usage(), None);
         assert_eq!(
-            latest.error().as_deref(),
+            latest.error(1_000).as_deref(),
             Some("usage stale — run `claude` once to refresh the login")
         );
 
@@ -2014,7 +2071,7 @@ mod tests {
         });
         let latest = super::latest().expect("published");
         assert_eq!(latest.usage(), Some(&Usage::default()));
-        assert_eq!(latest.error(), None);
+        assert_eq!(latest.error(2_000), None);
     }
 
     /// The default base URL is the real API host, spelled once.

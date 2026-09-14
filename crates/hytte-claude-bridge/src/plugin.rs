@@ -385,8 +385,9 @@ pub fn chip_limits(usage: &Usage) -> Vec<&Limit> {
 /// no width to defend.
 ///
 /// A second line is appended for whichever of three things is true, in order:
-/// the last report is too old to trust ([`Report::is_stale`], which only a
-/// wedged poll ever reaches — see [`usage::STALE_AFTER`]), the last poll
+/// the last report is too old to trust ([`Report::is_stale`] — not only a
+/// wedged poll reaches this: since #1283 a *healthy* poller backing off a
+/// sustained run of 429s can too, see [`usage::STALE_AFTER`]), the last poll
 /// failed (its own [`sentence`](UsageError::sentence), adjusted by
 /// [`usage_failure_sentence`] for the mode), or neither, in which case nothing
 /// is appended — the meters carry their own hovers, and repeating their

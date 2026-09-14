@@ -53,14 +53,23 @@ pub const MAX_LEDS: usize = 128;
 /// of it (#1181). This assertion is what makes it a copy instead.
 const _: () = assert!(MAX_LEDS == hytte_plugin_proto::MAX_LEDS as usize);
 
+// The four segment metrics below are `pub` since #1153, and re-exported at the
+// crate root as `LED_CELL_W`/`LED_CELL_H`/`LED_GAP`/`LED_PAD` (the family
+// prefix a name like `GAP` needs once it leaves this module). The reason is the
+// `Gauge::dial` one #1148 set: the shell's GPU arm re-rasterises this widget in
+// GLSL, and a `.frag` cannot read a Rust `const` — so either the shell carries
+// a hand mirror of these numbers or it reads them here and passes them as
+// uniforms. It passes them as uniforms. Additive visibility, no behaviour
+// change: nothing about the values or the render path moved.
+
 /// One LED cell's width in buffer pixels.
-const CELL_W: usize = 8;
+pub const CELL_W: usize = 8;
 /// One LED cell's height in buffer pixels (a single chunky row).
-const CELL_H: usize = 16;
+pub const CELL_H: usize = 16;
 /// Blank field gap between adjacent LED cells.
-const GAP: usize = 3;
+pub const GAP: usize = 3;
 /// Field padding around the LED row, on every side.
-const PAD: usize = 4;
+pub const PAD: usize = 4;
 
 /// The rendered width of a strip of [`DEFAULT_LEDS`] LEDs at the kit metrics:
 /// `2*PAD + n*CELL_W + (n-1)*GAP` = `8 + 192 + 69` = 269 px.
@@ -72,15 +81,59 @@ const WHITE: Rgba = [0xff, 0xff, 0xff, 0xff];
 /// How far to mix the ink toward [`WHITE`] for the peak-hold cap (`t`/255).
 const CAP_MIX: u16 = 130;
 
+/// The buffer an [`LedStrip`] of `leds` segments renders into — the kit's own
+/// `(2*PAD + n*CELL_W + (n-1)*GAP, 2*PAD + CELL_H)`, in one place.
+///
+/// `render` calls it, so this **is** the formula rather than a second copy of
+/// it, which is the whole point of it being `pub` (#1153): the shell's GPU arm
+/// needs the same buffer for the node's natural size and for the offscreen
+/// grid, and a second transcription of a width formula is exactly the mirror
+/// that drifts. A `0` count reads as one segment, matching `render`'s own
+/// `self.leds.max(1)`.
+#[must_use]
+pub fn strip_size(leds: usize) -> (usize, usize) {
+    let leds = leds.max(1);
+    (2 * PAD + leds * CELL_W + (leds - 1) * GAP, 2 * PAD + CELL_H)
+}
+
+/// The x of LED cell `i`'s left edge — `PAD + i * (CELL_W + GAP)`.
+///
+/// `pub` for [`strip_size`]'s reason (#1153): the GPU arm inverts this mapping
+/// in a fragment shader (a buffer x back to a cell index and an offset inside
+/// it), and the only honest way to hold that inversion to the kit is to check
+/// it against the kit's own forward function.
+#[must_use]
+pub fn cell_x0(i: usize) -> usize {
+    PAD + i * (CELL_W + GAP)
+}
+
+/// The peak-hold dot's **cap colour** for a palette ink: the ink mixed
+/// [`CAP_MIX`]/255 of the way toward white, so the dot reads brighter than the
+/// lit level even on a glow-free skin.
+///
+/// `render` calls it, so this is the definition and not a copy (#1153).
+/// `pub` because the shell's GPU arm composites the peak dot toward this exact
+/// quad and cannot reach `mix`, which is crate-private and stays that way.
+#[must_use]
+pub fn cap_ink(ink: Rgba) -> Rgba {
+    mix(ink, WHITE, CAP_MIX)
+}
+
 /// How many LEDs a `0.0..=1.0` level lights, rounding to the nearest segment and
 /// clamped to `[0, leds]`. `1.0` fills the strip; `0.0` lights nothing; monotone
 /// in `level`. A `NaN` level lights nothing (the saturating `as usize` cast).
+///
+/// `pub` since #1153, for [`strip_size`]'s reason: the shell's GPU arm hands
+/// the shader a segment **count**, not a level, so that the rounding rule — and
+/// every one of the four `clamp`/`round`/`NaN` decisions written down here —
+/// has exactly one implementation across both arms.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn lit_count(level: f32, leds: usize) -> usize {
+#[must_use]
+pub fn lit_count(level: f32, leds: usize) -> usize {
     // `leds` is a small segment count and the product is `0.0..=leds`, so the
     // round-then-cast neither loses precision nor wraps; `.min(leds)` caps an
     // over-unit level (and the saturating cast maps NaN → 0).
@@ -90,12 +143,16 @@ fn lit_count(level: f32, leds: usize) -> usize {
 /// The LED index the peak-hold dot sits on for a `0.0..=1.0` peak, or `None`
 /// when the peak has decayed to (or below) zero — nothing to mark. `1.0` marks
 /// the top LED, a peak just above zero marks the first; monotone in `peak`.
+///
+/// `pub` since #1153, for [`lit_count`]'s reason — the GPU arm sends the
+/// shader an index (or `-1` for "no dot"), never a peak.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn peak_led(peak: f32, leds: usize) -> Option<usize> {
+#[must_use]
+pub fn peak_led(peak: f32, leds: usize) -> Option<usize> {
     // A rested/negative peak or a NaN reads as "no dot" (the `is_nan` arm keeps
     // the `<= 0.0` check off NaN, and stays clear of a negated `>` comparison).
     if leds == 0 || peak.is_nan() || peak <= 0.0 {
@@ -203,8 +260,7 @@ impl LedStrip {
     pub fn render(&self, level: f32, peak: f32) -> Frame {
         let palette = self.style.palette();
         let leds = self.leds.max(1);
-        let width = 2 * PAD + leds * CELL_W + (leds - 1) * GAP;
-        let height = 2 * PAD + CELL_H;
+        let (width, height) = strip_size(leds);
         let mut frame = Frame::filled(width, height, palette.bg);
 
         // Ghost pass: the unlit LED matrix shows through on ghosting skins —
@@ -230,7 +286,7 @@ impl LedStrip {
         // Peak-hold dot: a single LED composited toward a brightened cap so it
         // reads distinct from the level even on a glow-free skin.
         if let Some(idx) = peak_led(peak, leds) {
-            let cap = mix(palette.ink, WHITE, CAP_MIX);
+            let cap = cap_ink(palette.ink);
             let mut dot = Emission::new(width, height);
             stamp_cell(&mut dot, idx);
             if let Some(bloom) = palette.bloom {
@@ -251,11 +307,6 @@ impl LedStrip {
 #[must_use]
 pub fn led_strip(level: f32, peak: f32, style: DisplayStyle) -> Frame {
     LedStrip::new(style).render(level, peak)
-}
-
-/// The x of LED cell `i`'s left edge.
-fn cell_x0(i: usize) -> usize {
-    PAD + i * (CELL_W + GAP)
 }
 
 /// Paint LED cell `i` flat into the frame (the ghost pass).
@@ -282,8 +333,8 @@ fn stamp_cell(lit: &mut Emission, i: usize) {
 mod tests {
     use super::super::{DisplayStyle, Frame};
     use super::{
-        CELL_W, DEFAULT_LEDS, DEFAULT_WIDTH, GAP, LedStrip, MAX_LEDS, PAD, PeakHold, led_strip,
-        lit_count, peak_led,
+        CELL_H, CELL_W, DEFAULT_LEDS, DEFAULT_WIDTH, GAP, LedStrip, MAX_LEDS, PAD, PeakHold,
+        cap_ink, cell_x0, led_strip, lit_count, peak_led, strip_size,
     };
 
     // ── LED mapping math ─────────────────────────────────────────────────────
@@ -550,6 +601,59 @@ mod tests {
         let bg = DisplayStyle::Oled.palette().bg;
         let lit = |f: &Frame| f.data().chunks_exact(4).filter(|px| *px != bg).count();
         assert!(lit(&with_dot) > lit(&no_dot), "the dot lights extra pixels");
+    }
+
+    /// **The three #1153 seams answer what the renderer actually did**, not
+    /// what a second copy of the formula says.
+    ///
+    /// `strip_size` and `cell_x0` are held against a rendered frame rather than
+    /// against their own arithmetic: the buffer's width and height come off
+    /// `render`, and the cell origins are found by *reading the pixels* — the
+    /// first column of each run that is **exactly the ink**, on a fully lit LCD
+    /// strip. The LCD is the one skin with neither a bloom nor a CRT mask, so a
+    /// lit segment composites to `mix(ghost, ink, 255)`, which is the ink
+    /// itself, and no halo widens the run by a pixel (which is precisely what a
+    /// first cut of this test measured on the OLED: every origin one column
+    /// early). `cap_ink` is held against the peak dot's own pixel on that same
+    /// skin, where the composite reduces to the cap quad itself.
+    ///
+    /// **Falsified** by changing any of the three: `+ 1` on `cell_x0`'s stride
+    /// reds the origin list, a swapped `strip_size` tuple reds the dimensions,
+    /// and a `CAP_MIX` of `129` reds the cap colour.
+    #[test]
+    fn the_gl_arms_seams_answer_what_the_renderer_drew() {
+        let leds = 7;
+        let style = DisplayStyle::Lcd;
+        let frame = LedStrip::new(style).leds(leds).render(1.0, 0.0);
+        assert_eq!((frame.width(), frame.height()), strip_size(leds));
+
+        // Every lit run's first column, read off the row through the middle of
+        // the cells — which must be exactly `cell_x0(0..leds)`.
+        let ink = style.palette().ink;
+        let y = PAD + CELL_H / 2;
+        let mut origins = Vec::new();
+        let mut previous_lit = false;
+        for x in 0..frame.width() {
+            let lit = frame.at(x, y) == ink;
+            if lit && !previous_lit {
+                origins.push(x);
+            }
+            previous_lit = lit;
+        }
+        assert_eq!(
+            origins,
+            (0..leds).map(cell_x0).collect::<Vec<_>>(),
+            "cell_x0 must name the columns the renderer actually lights",
+        );
+
+        // The cap: cell 0 is the only lit thing on this strip, so its centre
+        // pixel *is* the colour the peak pass composited toward.
+        let dot = LedStrip::new(style).leds(leds).render(0.0, 0.01);
+        assert_eq!(
+            dot.at(cell_x0(0) + CELL_W / 2, y),
+            cap_ink(ink),
+            "cap_ink must name the colour the peak dot is composited toward",
+        );
     }
 
     /// Renders are deterministic, and the three skins render differently.

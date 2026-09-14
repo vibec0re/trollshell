@@ -694,6 +694,29 @@ enum Renderer {
         /// The glyph block as the shader consumes it — see `preem_gl::textbox`.
         block: preem_gl::Block,
     },
+    /// The **GPU** arm of [`LedStrip`](Self::LedStrip) (#1153).
+    ///
+    /// It keeps the `kit::LedStrip` builder the CPU arm keeps — not to draw
+    /// with, but because it *is* the clamped config, and the mapping needs the
+    /// segment count `LedStrip::leds` resolved rather than the wire's raw one.
+    /// Every other field is the CPU arm's, verbatim: the peak-hold is CPU-side
+    /// on both arms (the kit's `PeakHold` is a pure two-float value the pump
+    /// folds), so this arm shares its `update`, `advance` and `animates`
+    /// outright, the way `GaugeGl` shares the needle's spring — and the shader
+    /// is handed the *folded* level and peak, with no decay logic crossing into
+    /// it.
+    LedStripGl {
+        /// The already-clamped config the uniforms are rebuilt from.
+        config: vocab::LedStripConfig,
+        level: f32,
+        /// The plugin's own inter-frame peak — see [`LedStrip`](Self::LedStrip).
+        explicit_peak: Option<f32>,
+        /// Shell-owned peak-hold, present iff the config declared one.
+        hold: Option<kit::PeakHold>,
+        /// The declared fall rate — see [`LedStrip`](Self::LedStrip).
+        hold_rate: f32,
+        steps: Steps,
+    },
     LedStrip {
         strip: kit::LedStrip,
         level: f32,
@@ -1902,6 +1925,7 @@ pub(super) fn invalidate_cached_frames() {
                         | Renderer::DotMatrixGl { .. }
                         | Renderer::SevenSeg { .. }
                         | Renderer::LedStrip { .. }
+                        | Renderer::LedStripGl { .. }
                         | Renderer::Marquee { .. }
                         | Renderer::MarqueeGl { .. }
                         | Renderer::Scope { .. }
@@ -2428,6 +2452,21 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             if let Some(hold) = hold.as_mut() {
                 hold.push(state.level);
             }
+            // GL by default (#1153), the CPU kit under the kill switch, once a
+            // context has failed, or once this driver has refused this pipeline
+            // (#1232) — the same `preem_gl::arm_for` decision every other arm
+            // on this seam takes. The peak-hold is built *above* the branch
+            // because it is CPU-side on both arms.
+            if preem_gl::arm_for(preem_gl::LED_STRIP) == Arm::Gl {
+                return Renderer::LedStripGl {
+                    config: *config,
+                    level: state.level,
+                    explicit_peak: state.peak,
+                    hold,
+                    hold_rate: config.peak_hold.map_or(0.0, |p| p.rate),
+                    steps: Steps::default(),
+                };
+            }
             Renderer::LedStrip {
                 strip: kit::LedStrip::new(style).leds(dim(config.leds)),
                 level: state.level,
@@ -2710,7 +2749,8 @@ impl Renderer {
             Self::SevenSeg { .. } => matches!(widget, W::SevenSeg { .. }),
             // …and the same for the two `TextBox` and `Marquee` arms (#1152).
             Self::TextBox { .. } | Self::TextBoxGl { .. } => matches!(widget, W::TextBox { .. }),
-            Self::LedStrip { .. } => matches!(widget, W::LedStrip { .. }),
+            // …and the same for the two `LedStrip` arms (#1153).
+            Self::LedStrip { .. } | Self::LedStripGl { .. } => matches!(widget, W::LedStrip { .. }),
             Self::Marquee { .. } | Self::MarqueeGl { .. } => matches!(widget, W::Marquee { .. }),
             // Both `Scope` arms answer for the same wire kind: which one an
             // instance holds is the host's choice (`preem_gl::arm`), not
@@ -2771,6 +2811,7 @@ impl Renderer {
             Self::DotMatrixGl { .. } => Some(preem_gl::DOT_MATRIX),
             Self::MarqueeGl { .. } => Some(preem_gl::MARQUEE),
             Self::TextBoxGl { .. } => Some(preem_gl::TEXTBOX),
+            Self::LedStripGl { .. } => Some(preem_gl::LED_STRIP),
             Self::DotMatrix { .. }
             | Self::SevenSeg { .. }
             | Self::TextBox { .. }
@@ -2825,8 +2866,18 @@ impl Renderer {
                 *layout = boxed.layout(text);
                 *block = preem_gl::encode_block(layout);
             }
+            // **One arm for both `LedStrip` renderers** (#1153). The peak-hold
+            // is CPU-side on both — the kit's `PeakHold` is a pure value the
+            // shell folds on its own pump — so there is nothing for the GL arm
+            // to do differently, exactly as for the gauge's spring.
             (
                 Self::LedStrip {
+                    level,
+                    explicit_peak,
+                    hold,
+                    ..
+                }
+                | Self::LedStripGl {
                     level,
                     explicit_peak,
                     hold,
@@ -2917,7 +2968,14 @@ impl Renderer {
             | Self::SevenSeg { .. }
             | Self::TextBox { .. }
             | Self::TextBoxGl { .. } => false,
+            // Both arms, one expression — see `update`.
             Self::LedStrip {
+                hold,
+                steps,
+                explicit_peak,
+                ..
+            }
+            | Self::LedStripGl {
                 hold,
                 steps,
                 explicit_peak,
@@ -3075,7 +3133,17 @@ impl Renderer {
             // negative or non-finite rate to `0.0` ("never falls"), and an
             // explicit peak masks the held one at render time — neither must
             // keep the clock awake.
+            // **The same expression on both arms**, for #926's reason: whether
+            // a meter keeps its mount's tick callback armed must not depend on
+            // which renderer drew it, or a kill-switch flip would change when
+            // the shell parks.
             Self::LedStrip {
+                hold,
+                hold_rate,
+                explicit_peak,
+                ..
+            }
+            | Self::LedStripGl {
                 hold,
                 hold_rate,
                 explicit_peak,
@@ -3156,7 +3224,8 @@ impl Renderer {
             | Self::GaugeGl { .. }
             | Self::DotMatrixGl { .. }
             | Self::MarqueeGl { .. }
-            | Self::TextBoxGl { .. } => return None,
+            | Self::TextBoxGl { .. }
+            | Self::LedStripGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
         })
@@ -3235,6 +3304,26 @@ impl Renderer {
             Self::TextBoxGl { layout, block, .. } => {
                 Some((preem_gl::TEXTBOX, preem_gl::textbox_surface(layout, block)))
             }
+            // The level and the **already-folded** peak are the two numbers the
+            // whole picture is a function of — `peak_for` is the shell's one
+            // rule for which of the plugin's explicit value and the held one is
+            // being drawn, shared with the CPU arm's `render` above, so the
+            // shader is handed a number rather than a decay policy.
+            Self::LedStripGl {
+                config,
+                level,
+                explicit_peak,
+                hold,
+                ..
+            } => Some((
+                preem_gl::LED_STRIP,
+                preem_gl::led_strip_surface(
+                    *config,
+                    *level,
+                    peak_for(*explicit_peak, hold.as_ref()),
+                    &kit::palette_snapshot(style),
+                ),
+            )),
             _ => None,
         }
     }
@@ -3504,7 +3593,8 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
         W::DotMatrix { .. } => Some(preem_gl::Kind::DotMatrix),
         W::Marquee { .. } => Some(preem_gl::Kind::Marquee),
         W::TextBox { .. } => Some(preem_gl::Kind::TextBox),
-        W::SevenSeg { .. } | W::LedStrip { .. } | W::FlipBoard { .. } => None,
+        W::LedStrip { .. } => Some(preem_gl::Kind::LedStrip),
+        W::SevenSeg { .. } | W::FlipBoard { .. } => None,
     }
 }
 
@@ -3605,6 +3695,10 @@ mod tests {
             W::TextBox {
                 config: vocab::TextBoxConfig::default(),
                 state: vocab::TextBoxState::default(),
+            },
+            W::LedStrip {
+                config: vocab::LedStripConfig::default(),
+                state: vocab::LedStripState::default(),
             },
         ];
         assert_eq!(

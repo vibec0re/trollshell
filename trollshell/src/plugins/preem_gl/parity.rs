@@ -215,7 +215,12 @@ impl Kind {
     /// compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
         match self {
-            Self::Scope | Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => true,
+            Self::Scope
+            | Self::Gauge
+            | Self::DotMatrix
+            | Self::Marquee
+            | Self::TextBox
+            | Self::LedStrip => true,
         }
     }
 
@@ -255,7 +260,7 @@ impl Kind {
     pub(crate) fn checks_peak_rows(self) -> bool {
         match self {
             Self::Scope => true,
-            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => false,
+            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox | Self::LedStrip => false,
         }
     }
 
@@ -402,6 +407,46 @@ impl Kind {
                 mean: 24.0,
                 max: 192,
             },
+            // Four stretched cases, one per skin, at the state with the most
+            // structure on the glass (a part-lit level, a peak dot floating
+            // clear of it, and therefore two separate halos). Measured worst on
+            // llvmpipe (Mesa 26.2.2): edge mean **1.727** and edge max **9**,
+            // both on the oled — the skin with a bloom and no ghost row, so its
+            // edge bin is the smallest (1242 px of 6456) and the halo is all of
+            // it. Per skin: vfd 0.692/4, lcd 0.000/0, oled 1.727/9, crt
+            // 0.284/3. The **lcd is a control that costs nothing**, exactly as
+            // it is for `flat_block_ceiling`: its bloom radius is 0, so there
+            // is no halo to resolve and its stretched frame comes back
+            // bit-identical everywhere, 0.000/0.
+            //
+            // **A fourth shape, and by far the narrowest numbers of the six.**
+            // A dot lattice makes every lit pixel an edge and a dial makes a
+            // third of the frame one; this widget's segments are solid bars, so
+            // its edge bin is only the bars' own borders and the halo's
+            // staircase around them — everything else, the flat field and the
+            // whole segment interior, is `interior` and bit-identical (measured
+            // `max 0` on the field and lit bins of all four). The legitimate
+            // disagreement is therefore the halo alone.
+            //
+            // **3.0 / 16 rather than the 16.0 / 64 three other kinds carry**,
+            // and that is the point of stating each budget on its own
+            // measurement: copying a lattice kind's pair here would leave a
+            // number that no drift this arm can suffer could ever exceed. The
+            // pair sits at ~1.74x the worst measured mean and ~1.78x the worst
+            // measured max, the ratio `Gauge` and `DotMatrix` were sized at.
+            //
+            // **Calibrated against a drift it catches, measured rather than
+            // assumed.** The probe is a half-native-pixel horizontal offset of
+            // the sample point on the continuous branch alone —
+            // `if (!snapped) { p.x += fp.x * 0.5; }` right after `fp` is
+            // resolved in `led_strip.frag`'s `main`, which is a scale-only
+            // shift the 1:1 cases cannot see. Under it the four go to edge mean
+            // 6.395 / 4.826 / 15.667 / 3.879 and edge max 58 / 36 / 64 / 59, so
+            // **every one of the four reds** — the tightest on the mean is the
+            // crt at 1.29x the ceiling, and the same case clears the `max` half
+            // by 3.7x, which is what actually carries it there. At 16.0 / 64
+            // not one of the four would have moved.
+            Self::LedStrip => EdgeBudget { mean: 3.0, max: 16 },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -467,7 +512,7 @@ impl Kind {
         match self {
             Self::DotMatrix => Some(0.60),
             Self::Marquee => Some(0.60),
-            Self::Gauge | Self::TextBox | Self::Scope => None,
+            Self::Gauge | Self::TextBox | Self::Scope | Self::LedStrip => None,
         }
     }
 
@@ -479,6 +524,7 @@ impl Kind {
             Self::DotMatrix => "dot_matrix",
             Self::Marquee => "marquee",
             Self::TextBox => "textbox",
+            Self::LedStrip => "led_strip",
         }
     }
 }
@@ -1771,6 +1817,78 @@ mod tests {
         // the honest place for them is the doc a reader reaches first.
     }
 
+    /// **The LED strip's budget is its own measurement, and the tightest of the
+    /// six** (#1153) — 3.0 / 16 against the 16.0 / 64 three other kinds carry.
+    ///
+    /// The point of a per-kind budget is that it can bind, and this is the arm
+    /// where copying a neighbour's pair would make it unable to: the strip's
+    /// worst llvmpipe measurement is edge mean **1.727** / max **9**, so under
+    /// the lattice kinds' 16.0 / 64 a drift six times that size would still pass
+    /// — which the third assertion states by measuring exactly that.
+    ///
+    /// The drift it is calibrated against is the half-native-pixel sample
+    /// offset [`Kind::edge_budget`] spells out; its worst skin (oled, edge mean
+    /// 15.667 / max 64) is the fourth assertion's input, and it reds here while
+    /// passing under the `DotMatrix`'s pair.
+    ///
+    /// **Falsified** by collapsing [`Kind::edge_budget`]'s arms onto one pair,
+    /// or by widening this kind's toward a neighbour's.
+    #[test]
+    fn the_led_strip_gets_the_tightest_edge_budget() {
+        let edgy = Stats {
+            channels: [ChannelStats {
+                mean: 0.5,
+                p99: 4.0,
+                max: 9.0,
+            }; 3],
+            ..inside_by(0.0)
+        };
+        let mut shipping = clean_regions();
+        shipping.edge.mean = 1.727;
+        shipping.edge.max = 9;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &shipping,
+                Kind::LedStrip,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "the stretched meter's own worst llvmpipe measurement passes",
+        );
+
+        let mut drifted = clean_regions();
+        drifted.edge.mean = 15.667;
+        drifted.edge.max = 64;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &drifted,
+                Kind::LedStrip,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::EdgeOverBudget,
+            "…and the half-native-pixel sample offset this pair was calibrated \
+             against does not",
+        );
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &drifted,
+                Kind::DotMatrix,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "**which is exactly what a shared budget would have missed**: the \
+             same drifted edge region is comfortably inside the lattice kinds' \
+             pair, because a dot's rim legitimately swings that far and a solid \
+             bar's edge does not",
+        );
+    }
+
     /// Build a native RGBA8 frame from a per-pixel function — the input
     /// [`flat_block_fraction`] reads, in the layout a readback has.
     fn native_frame(w: usize, h: usize, pixel: impl Fn(usize, usize) -> [u8; 4]) -> Vec<u8> {
@@ -2055,6 +2173,17 @@ mod tests {
                 // denser. `flat_block_fraction` answers `None` for every case
                 // it has.
                 Kind::Scope => None,
+                // 83.3–100.0 % (vfd 83.3, lcd 100.0, oled 88.2, crt 83.7): an
+                // LED strip's frame is mostly solid bar and flat field, so its
+                // blocks are constant almost everywhere for reasons that have
+                // nothing to do with the halo — the bloomless lcd, the control
+                // this statistic uses elsewhere, comes out at a flat 100 %. And
+                // the halo it does have is **computed** per fragment rather
+                // than read from a grid-resolution texture, so there is no
+                // replicated read here for this gate to be protecting in the
+                // first place. A ceiling without a calibration is a flake
+                // (#1238's own words).
+                Kind::LedStrip => None,
             };
             assert_eq!(
                 kind.flat_block_ceiling(),
@@ -2140,6 +2269,13 @@ mod tests {
                 // a column of a text box is a stack of glyph pixels that are
                 // all exactly the ink.
                 Kind::TextBox => (true, false),
+                // Measured at zero (#1153), and the one kind whose zero is also
+                // asserted without a driver: `led_strip.rs` mirrors the
+                // shader's arithmetic in Rust, holds the mirror to the shipped
+                // GLSL with a source scan, and compares it against the kit's
+                // own bytes on all four skins. Not a beam — a column of a lit
+                // segment is a stack of pixels that are all exactly the ink.
+                Kind::LedStrip => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

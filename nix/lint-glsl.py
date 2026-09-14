@@ -237,7 +237,11 @@ MIN_WIDGET_BODIES = 1  # the preem demo's spectrum.frag
 # `scope_decay.frag` carries the whole `(v * retained) >> 8` phosphor
 # recurrence, and with a floor of five against six files its deletion was
 # green.
-MIN_SHADERS = 8
+#
+# 8 → 10 in #1153, which is **two** bumps in one commit: `led_strip.frag` is the
+# tenth file, and the ninth (`textbox.frag`, #1152) landed without one, so this
+# floor had quietly acquired the slack its own comment above forbids.
+MIN_SHADERS = 10
 # Compilations, not files: `blur.frag` is one body compiled twice. A
 # splice that stops being found (a moved `include_str!` path, a `concat!` this
 # script's parser stops recognising) drops this — today that shows up as a
@@ -249,8 +253,11 @@ MIN_SHADERS = 8
 # than left with slack: the whole point of a floor there is that it cannot
 # tolerate a deletion, and the two per-group floors below do not add up to this
 # one on their own. It moved 7 → 9 when #893 added the widget groups and
-# 11 → 13 with #1144's `dot_matrix.frag`, which is a third doubly-spliced body.
-MIN_COMPILATIONS = 13
+# 11 → 13 with #1144's `dot_matrix.frag`, which is a third doubly-spliced body;
+# 13 → 15 in #1153, which is again two bumps in one commit — `led_strip.frag` is
+# the fifteenth compilation and `textbox.frag` (#1152) was the fourteenth
+# without one.
+MIN_COMPILATIONS = 15
 # Distinct bodies that must be spliced rather than compiled as written.
 MIN_SPLICED_BODIES = 3
 

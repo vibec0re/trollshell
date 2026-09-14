@@ -11391,8 +11391,8 @@ mod kind_enumeration {
     use super::{every_preem_widget, preem_ink_lock};
 
     /// The style every [`Case`] variant carries — a small local mirror of
-    /// `cases_for`'s field shape, exhaustive so a sixth `Case` variant with no
-    /// `style` field fails to compile here rather than being silently
+    /// `cases_for`'s field shape, exhaustive so a seventh `Case` variant with
+    /// no `style` field fails to compile here rather than being silently
     /// excluded from [`every_kind_has_a_harness_case_per_skin`].
     fn case_style(case: &Case) -> kit::DisplayStyle {
         match case {
@@ -11400,7 +11400,8 @@ mod kind_enumeration {
             | Case::Gauge { style, .. }
             | Case::DotMatrix { style, .. }
             | Case::Marquee { style, .. }
-            | Case::TextBox { style, .. } => *style,
+            | Case::TextBox { style, .. }
+            | Case::LedStrip { style, .. } => *style,
         }
     }
 

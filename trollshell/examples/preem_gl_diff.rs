@@ -205,14 +205,19 @@ mod dot_matrix;
 mod marquee;
 #[path = "../src/plugins/preem_gl/textbox.rs"]
 mod textbox;
+// The meter (#1153), included the same way and for the same reason.
+#[path = "../src/plugins/preem_gl/led_strip.rs"]
+mod led_strip;
 
 // The case list itself lives in `cases` (#1211) — see its module docs. `Case`
 // keeps its variants' field types (`DisplayAt`/`TickerAt`/`BubbleAt`/
 // `NeedleAt`) there too; their `impl`s (`.name()`/`.line()`/`.spec()`) stay
 // below, since an inherent impl only has to share a crate with its type, not
 // a file.
-use cases::{BubbleAt, DisplayAt, NeedleAt, TickerAt};
-use cases::{Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, STRETCH, TICKER_WINDOW_PX, cases_for};
+use cases::{BubbleAt, DisplayAt, MeterAt, NeedleAt, TickerAt};
+use cases::{
+    Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, METER_LEDS, STRETCH, TICKER_WINDOW_PX, cases_for,
+};
 
 /// Logical grid the **scope** cases run at. Small enough to keep the whole
 /// comparison on screen at 1× and wide enough that the graticule's 12-column
@@ -676,6 +681,58 @@ impl NeedleAt {
     }
 }
 
+impl MeterAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Half => "half",
+            Self::Full => "full",
+            Self::PeakAbove => "peakabove",
+            Self::PeakAt => "peakat",
+        }
+    }
+
+    /// `(level, peak)` — the two numbers the widget is entirely a function of,
+    /// already folded the way the shell's pump hands them to both arms.
+    ///
+    /// `0.35`/`0.8` puts the dot four segments clear of the lit run at
+    /// [`METER_LEDS`], which is wider than the widest bloom (radius 3 over an
+    /// 11 px pitch) so the two halos are genuinely separate on the glass.
+    /// `0.6`/`0.6` is the opposite arrangement: `lit_count` rounds to 14
+    /// segments and `peak_led` ceils onto index 14, so the dot sits on the
+    /// **first unlit** segment — the boundary case where the two emissions are
+    /// adjacent and the cap composites next to ink the level pass laid down.
+    fn reading(self) -> (f32, f32) {
+        match self {
+            Self::Empty => (0.0, 0.0),
+            Self::Half => (0.5, 0.0),
+            Self::Full => (1.0, 0.0),
+            Self::PeakAbove => (0.35, 0.8),
+            Self::PeakAt => (0.6, 0.6),
+        }
+    }
+}
+
+/// The kit `LedStrip` a meter case renders. One builder for both arms, for
+/// [`bubble_box`]'s reason.
+fn meter_strip(style: kit::DisplayStyle) -> kit::LedStrip {
+    kit::LedStrip::new(style).leds(METER_LEDS)
+}
+
+/// The wire config a meter case maps from — the same segment count the kit
+/// builder above takes, so the two arms cannot end up on different strips.
+fn led_strip_config(style: kit::DisplayStyle) -> vocab::LedStripConfig {
+    vocab::LedStripConfig {
+        style: style_ref(style),
+        leds: u32::try_from(METER_LEDS).unwrap_or(u32::MAX),
+        // Deliberately `None`: the shell's pump folds a declared `PeakHoldConfig`
+        // into the peak it hands *both* arms, so a harness case's peak is a
+        // number, not a decay policy. `MeterAt::reading` is that number.
+        peak_hold: None,
+    }
+}
+
 impl Case {
     // `Case::kind` — which per-kind ceiling a case is held to — moved to
     // `cases` (#1211), next to the enum itself; `plugins::tests`'
@@ -695,6 +752,7 @@ impl Case {
             Self::DotMatrix { stretch, .. }
             | Self::Marquee { stretch, .. }
             | Self::TextBox { stretch, .. }
+            | Self::LedStrip { stretch, .. }
                 if *stretch > 1 =>
             {
                 parity::Sampling::Supersampled(*stretch)
@@ -755,6 +813,23 @@ impl Case {
                 let boxed = bubble_box(*style, *bubble);
                 let layout = boxed.layout(bubble.spec().text);
                 let surface = textbox::textbox_surface(&layout, &textbox::block(&layout));
+                (surface.width, surface.height, (*stretch).max(1))
+            }
+            // The meter resolves its grid the same way, through the very
+            // mapping the shell calls. It has no upscale either — the segment
+            // metrics are its size knob — so the third element is the stretch.
+            Self::LedStrip {
+                style,
+                meter,
+                stretch,
+            } => {
+                let (level, peak) = meter.reading();
+                let surface = led_strip::led_strip_surface(
+                    led_strip_config(*style),
+                    level,
+                    peak,
+                    &kit::palette_snapshot(*style),
+                );
                 (surface.width, surface.height, (*stretch).max(1))
             }
         }
@@ -1189,10 +1264,24 @@ fn label(case: &Case) -> String {
         Case::TextBox { style, bubble, .. } => {
             format!("textbox.{}.{}", style.name(), bubble.name())
         }
+        Case::LedStrip {
+            style,
+            meter,
+            stretch,
+        } if *stretch > 1 => format!("led_strip.{}.{}x{stretch}", style.name(), meter.name()),
+        Case::LedStrip { style, meter, .. } => {
+            format!("led_strip.{}.{}", style.name(), meter.name())
+        }
     }
 }
 
 /// Push a case's state at the surface and ask for a frame.
+///
+/// The `too_many_lines` allow is the case list's, not this function's: it is
+/// one flat arm per kind with no nesting between them, and it crossed the
+/// ceiling when #1153 added the sixth. The same trade `preem_render::advance`
+/// states — splitting it would put half the drive table somewhere else.
+#[allow(clippy::too_many_lines)]
 fn drive(area: &GlSurface, case: &Case) {
     let (program, width, height, uniforms) = match case {
         Case::Scope { style, idle_steps } => {
@@ -1278,6 +1367,21 @@ fn drive(area: &GlSurface, case: &Case) {
                 surface.uniforms,
             )
         }
+        Case::LedStrip { style, meter, .. } => {
+            let (level, peak) = meter.reading();
+            let surface = led_strip::led_strip_surface(
+                led_strip_config(*style),
+                level,
+                peak,
+                &kit::palette_snapshot(*style),
+            );
+            (
+                led_strip::LED_STRIP,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
     };
     // Per case, because the kinds run at different grids — see `activate`. The
     // **requested** size, not the grid: a stretched case (#1144) deliberately
@@ -1345,6 +1449,11 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// Build the CPU reference, compare, print the per-channel deltas and the
 /// worst pixel, and write the evidence images. Returns whether the case passed
 /// — see [`parity::Verdict`] for the five ways it can fail.
+///
+/// `too_many_lines` for [`drive`]'s reason: one flat arm per kind builds the
+/// oracle, and everything after that `match` is a single linear sequence of
+/// prints.
+#[allow(clippy::too_many_lines)]
 fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
     let label = label(case);
     let upscale = case.reference_scale();
@@ -1386,6 +1495,13 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         // for this kind either — see `Case::geometry`.
         Case::TextBox { style, bubble, .. } => {
             bubble_box(*style, *bubble).render(bubble.spec().text)
+        }
+        // The kit's own meter at this reading — the *same* builder the mapping
+        // resolved its grid from, so a disagreement here is a disagreement
+        // between renderers and not between two strips.
+        Case::LedStrip { style, meter, .. } => {
+            let (level, peak) = meter.reading();
+            meter_strip(*style).render(level, peak)
         }
     };
 

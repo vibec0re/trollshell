@@ -52,7 +52,7 @@ use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{
-    DRAWER_MAX_WIDTH_WIDE, fixed_width_label, finish_page, finish_page_clamped, page_box,
+    DRAWER_MAX_WIDTH_WIDE, finish_page, finish_page_clamped, fixed_width_label, page_box,
     page_grid, slim_row,
 };
 use crate::components::markup;
@@ -2695,7 +2695,13 @@ mod reentrancy_tests {
     /// one-shot collapse guard. No registry, no `App`, no `/proc` poller:
     /// every piece of state `rebuild_top_apps` touches now arrives through
     /// its own parameters.
-    fn fresh() -> (adw::ExpanderRow, gtk::Label, Rows, MetaCache, Rc<Cell<bool>>) {
+    fn fresh() -> (
+        adw::ExpanderRow,
+        gtk::Label,
+        Rows,
+        MetaCache,
+        Rc<Cell<bool>>,
+    ) {
         adw::init().expect("libadwaita init");
         (
             adw::ExpanderRow::builder().title("Top apps").build(),
@@ -2726,7 +2732,9 @@ mod reentrancy_tests {
     fn rebuild_top_apps_tolerates_a_reentrant_rebuild_from_a_removed_row_destroy() {
         let (expander, summary, rows, meta, collapsed) = fresh();
         let seed = samples(2);
-        rebuild_top_apps(&expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed);
+        rebuild_top_apps(
+            &expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed,
+        );
         assert_eq!(
             rows.borrow().len(),
             2,
@@ -2754,7 +2762,9 @@ mod reentrancy_tests {
                     return;
                 }
                 fired_inside.set(Some(in_outer.get()));
-                rebuild_top_apps(&expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed);
+                rebuild_top_apps(
+                    &expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed,
+                );
             });
         }
         // Drop our clone before the removing pass: while it lives the row has
@@ -2763,7 +2773,9 @@ mod reentrancy_tests {
         drop(row2);
 
         in_outer.set(true);
-        rebuild_top_apps(&expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed);
+        rebuild_top_apps(
+            &expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed,
+        );
         in_outer.set(false);
 
         assert_eq!(
@@ -2902,7 +2914,13 @@ mod width_tests {
     /// The expander, the summary label and the two cells
     /// `build_top_apps_expander` builds, exactly as `reentrancy_tests::fresh`
     /// does — see there for why no registry/service is needed.
-    fn fresh_expander() -> (adw::ExpanderRow, gtk::Label, Rows, MetaCache, Rc<Cell<bool>>) {
+    fn fresh_expander() -> (
+        adw::ExpanderRow,
+        gtk::Label,
+        Rows,
+        MetaCache,
+        Rc<Cell<bool>>,
+    ) {
         adw::init().expect("libadwaita init");
         (
             adw::ExpanderRow::builder().title("Top apps").build(),

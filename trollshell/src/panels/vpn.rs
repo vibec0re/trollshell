@@ -158,6 +158,10 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
     // Profile names come from NetworkManager's connection store; markup is
     // never wanted here (#753).
     markup::plain_text(&row);
+    // A saved VPN profile's name is free text with no bound — capped to one
+    // line rather than letting it push the whole drawer wider (#1302).
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(&profile.name));
 
     let icon = gtk::Image::from_icon_name("network-vpn-symbolic");
     row.add_prefix(&icon);
@@ -309,7 +313,7 @@ fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
 /// `reactive_list`'s own #761/#771 regression test.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{bind_tunnel_groups, vpn};
+    use super::{bind_tunnel_groups, build_vpn_profile_row, vpn, wifi};
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
@@ -317,6 +321,36 @@ mod tests {
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
         while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// **The #1302 fix, pinned**: a 300-character single-token saved-profile
+    /// name must not widen the row past a 5-character one, and the tooltip
+    /// must still carry the full name.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` in
+    /// [`build_vpn_profile_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn vpn_profile_row_title_ellipsises_a_long_name() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(300);
+        let profile = |name: &str| wifi::VpnProfile {
+            name: name.to_string(),
+            connection_path: "/org/freedesktop/NetworkManager/Settings/5".to_string(),
+            active: false,
+            active_connection_path: None,
+        };
+
+        let row_long = build_vpn_profile_row(&profile(&long));
+        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_vpn_profile_row(&profile("abcde"));
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char profile name must not widen the row past a 5-char one — \
+             title_lines(1) must be capping it"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
     }
 
     /// `bind_tunnel_groups` must not keep its `column` container alive by

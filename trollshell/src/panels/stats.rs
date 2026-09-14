@@ -743,6 +743,15 @@ fn rebuild_top_apps(
         },
     );
     expander.set_subtitle(&subtitle);
+    // The collapsed summary is the heaviest app's display name plus a value
+    // suffix — an unbounded single token (a scope id with no spaces) never
+    // wraps, so it widened the whole drawer (#1302). Capped to one line, with
+    // the full (untruncated) summary mirrored into the tooltip so it's still
+    // reachable on hover. Set on every rebuild rather than once at
+    // construction so this function alone — the one a test can drive without
+    // a live signal source — carries the whole fix.
+    expander.set_subtitle_lines(1);
+    expander.set_tooltip_text(Some(&subtitle));
 
     let mut new_rows = Vec::with_capacity(list.len());
     for s in list {
@@ -755,6 +764,11 @@ fn rebuild_top_apps(
         // `meta_cache` borrowed across `set_title` (#643).
         let title = sample_display_name(s, &mut meta_cache.borrow_mut());
         row.set_title(&title);
+        // A scope id or process name is one unbreakable token, so it never
+        // wraps — capped to one line with the full name mirrored into a
+        // tooltip rather than letting it push the whole drawer wider (#1302).
+        row.set_title_lines(1);
+        row.set_tooltip_text(Some(&title));
         if s.procs > 1 {
             row.set_subtitle(&format!("{} processes", s.procs));
         }
@@ -1194,6 +1208,11 @@ fn build_live_processes_row() -> adw::ActionRow {
 
 fn build_live_gpu_row() -> adw::ActionRow {
     let row = adw::ActionRow::builder().title("GPU").build();
+    // The device name comes off the driver (`nvidia-smi`/DRM) and, while
+    // bounded in practice, is free text with no guaranteed break point —
+    // capped to one line with the full name in a tooltip rather than letting
+    // it push the whole drawer wider (#1302).
+    row.set_subtitle_lines(1);
 
     // Hide when no GPU detected.
     bind(
@@ -1208,7 +1227,7 @@ fn build_live_gpu_row() -> adw::ActionRow {
             None => String::new(),
         }),
         &row,
-        |r, t| r.set_subtitle(&t),
+        apply_gpu_name_subtitle,
     );
 
     let suffix = gtk::Label::new(None);
@@ -1235,6 +1254,15 @@ fn build_live_gpu_row() -> adw::ActionRow {
     row
 }
 
+/// Set `row`'s subtitle (and mirroring tooltip) from the GPU device `name`.
+/// Extracted out of [`build_live_gpu_row`]'s `bind` closure — a plain `fn`
+/// rather than a closure, so the colocated `#[gtk::test]` can drive it
+/// directly without a registered `sensors` service (#1302).
+fn apply_gpu_name_subtitle(row: &adw::ActionRow, name: String) {
+    row.set_subtitle(&name);
+    row.set_tooltip_text(if name.is_empty() { None } else { Some(&name) });
+}
+
 fn build_live_disk_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("Disk").build();
     bind(
@@ -1246,38 +1274,49 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
     reactive_list(
         &expander,
         sensors::disk().map(|d| d.mounts),
-        |m: &sensors::DiskMount| {
-            let row = adw::ActionRow::builder()
-                .title(&m.path)
-                .activatable(false)
-                .build();
-            // A mount path is whatever the filesystem is mounted at, `&`
-            // included (#753).
-            markup::plain_text(&row);
-            let frac = if m.total_bytes > 0 {
-                cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)
-            } else {
-                0.0
-            };
-            let pct = frac * 100.0;
-            let label = gtk::Label::new(Some(&format!(
-                "{} / {} ({pct:.0}%)",
-                fmt_bytes(m.used_bytes),
-                fmt_bytes(m.total_bytes),
-            )));
-            label.set_valign(gtk::Align::Center);
-            row.add_suffix(&label);
-            let bar = gtk::ProgressBar::new();
-            bar.add_css_class("ts-stat-progress");
-            bar.set_valign(gtk::Align::Center);
-            bar.set_fraction(frac.clamp(0.0, 1.0));
-            row.add_suffix(&bar);
-            row
-        },
+        build_disk_mount_row,
         None::<fn() -> adw::ActionRow>,
     );
 
     expander
+}
+
+/// One row of the disk-mounts list. Extracted from [`build_live_disk_expander`]
+/// (byte-identical body, modulo the closure capture becoming a parameter) so
+/// the colocated `#[gtk::test]` can build a row directly, the same reasoning
+/// [`rebuild_top_apps`] documents for its own extraction.
+fn build_disk_mount_row(m: &sensors::DiskMount) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&m.path)
+        .activatable(false)
+        .build();
+    // A mount path is whatever the filesystem is mounted at, `&`
+    // included (#753).
+    markup::plain_text(&row);
+    // A bind-mount path can run long and has no spaces to wrap at — capped to
+    // one line with the full path in a tooltip rather than letting it push
+    // the whole drawer wider (#1302).
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(&m.path));
+    let frac = if m.total_bytes > 0 {
+        cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)
+    } else {
+        0.0
+    };
+    let pct = frac * 100.0;
+    let label = gtk::Label::new(Some(&format!(
+        "{} / {} ({pct:.0}%)",
+        fmt_bytes(m.used_bytes),
+        fmt_bytes(m.total_bytes),
+    )));
+    label.set_valign(gtk::Align::Center);
+    row.add_suffix(&label);
+    let bar = gtk::ProgressBar::new();
+    bar.add_css_class("ts-stat-progress");
+    bar.set_valign(gtk::Align::Center);
+    bar.set_fraction(frac.clamp(0.0, 1.0));
+    row.add_suffix(&bar);
+    row
 }
 
 /// Disk I/O throughput history row, mirroring the network traffic row
@@ -1809,33 +1848,46 @@ fn build_failed_units_group() -> adw::PreferencesGroup {
     reactive_list(
         &group,
         systemd::failed_units(),
-        |unit: &systemd::FailedUnit| {
-            let row = adw::ActionRow::builder()
-                .title(&unit.name)
-                .activatable(false)
-                .build();
-            // Unit names and, especially, free-form `Description=` text are
-            // arbitrary — an `&` there would blank the row this flyout exists
-            // to show (#753).
-            markup::plain_text(&row);
-            let subtitle = if unit.description.is_empty() {
-                unit.sub_state.clone()
-            } else {
-                unit.description.clone()
-            };
-            row.set_subtitle(&subtitle);
-
-            let pill = gtk::Label::new(Some("failed"));
-            pill.set_valign(gtk::Align::Center);
-            pill.add_css_class("ts-pill-error");
-            row.add_suffix(&pill);
-
-            row
-        },
+        build_failed_unit_row,
         None::<fn() -> adw::ActionRow>,
     );
 
     group
+}
+
+/// One row of the failed-units list. Extracted from
+/// [`build_failed_units_group`] (byte-identical body, modulo the closure
+/// capture becoming a parameter) so the colocated `#[gtk::test]` can build a
+/// row directly, the same reasoning [`rebuild_top_apps`] documents for its own
+/// extraction.
+fn build_failed_unit_row(unit: &systemd::FailedUnit) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&unit.name)
+        .activatable(false)
+        .build();
+    // Unit names and, especially, free-form `Description=` text are
+    // arbitrary — an `&` there would blank the row this flyout exists
+    // to show (#753).
+    markup::plain_text(&row);
+    let subtitle = if unit.description.is_empty() {
+        unit.sub_state.clone()
+    } else {
+        unit.description.clone()
+    };
+    row.set_subtitle(&subtitle);
+    // A systemd unit name is one unbreakable token
+    // (`dbus-org.freedesktop.resolve1.service`-length is ordinary) that never
+    // wraps — capped to one line with the full name in a tooltip rather than
+    // letting it push the whole drawer wider (#1302).
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(&unit.name));
+
+    let pill = gtk::Label::new(Some("failed"));
+    pill.set_valign(gtk::Align::Center);
+    pill.add_css_class("ts-pill-error");
+    row.add_suffix(&pill);
+
+    row
 }
 
 /// Flapping supervised tasks — the shell's own half of the Services card
@@ -2707,6 +2759,224 @@ mod reentrancy_tests {
              a `false` means the summary's `RefMut` was still live across `value(s)` (#832) — in \
              production that is a `BorrowMutError` through a glib callback, i.e. a process abort"
         );
+    }
+}
+
+/// #1302: a daemon- or wire-supplied name that is one unbreakable token (no
+/// spaces to wrap at) never wraps, so an unbounded one raises a row's natural
+/// width and the whole drawer follows it (`modal.rs` grows the drawer to each
+/// page's natural width, up to the `AdwClamp` ceiling). Each test below
+/// builds the real production row (or, for the top-apps case, drives the real
+/// production [`rebuild_top_apps`]) over a 300-character single-token name,
+/// measures its natural width against the same shape built with a
+/// 5-character name, and asserts they're equal — i.e. that the line-count cap
+/// added for #1302 is actually doing its job — plus that the tooltip carries
+/// the full, untruncated text.
+///
+/// Needs a real display server (the rows have to be constructible and
+/// actually laid out for `measure` to mean anything), hence the
+/// `system-tests` gate, like the rest of this file's GTK tests.
+#[cfg(all(test, feature = "system-tests"))]
+mod width_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+    use hytte::services::sensors::DiskMount;
+    use hytte::services::systemd::FailedUnit;
+
+    use super::{
+        AppMeta, apply_gpu_name_subtitle, build_disk_mount_row, build_failed_unit_row,
+        rebuild_top_apps,
+    };
+
+    type Rows = Rc<RefCell<Vec<adw::ActionRow>>>;
+    type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
+
+    /// Natural (preferred) width of `w`, per this file's other `.measure(...)`
+    /// call sites (e.g. `led_panel_layout_tests`).
+    fn natural_width(w: &impl IsA<gtk::Widget>) -> i32 {
+        w.measure(gtk::Orientation::Horizontal, -1).1
+    }
+
+    /// One sample with the given single-token, space-free `name` and no
+    /// app-id — mirrors `reentrancy_tests::samples`' `app_id: None` so
+    /// `resolve_app_meta` never touches the host's installed desktop files.
+    fn proc_sample(name: &str) -> ProcSample {
+        ProcSample {
+            name: name.to_string(),
+            app_id: None,
+            cpu_frac: 0.5,
+            mem_bytes: 1024,
+            procs: 1,
+        }
+    }
+
+    /// The formatter `build_stats_cpu_card` passes to its "Top apps · CPU"
+    /// expander — copied verbatim from `reentrancy_tests::cpu_value` (private
+    /// to that module) so this module drives a real production `value` too.
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// The expander and the two cells `build_top_apps_expander` builds,
+    /// exactly as `reentrancy_tests::fresh` does — see there for why no
+    /// registry/service is needed.
+    fn fresh_expander() -> (adw::ExpanderRow, Rows, MetaCache, Rc<Cell<bool>>) {
+        adw::init().expect("libadwaita init");
+        (
+            adw::ExpanderRow::builder().title("Top apps").build(),
+            Rc::new(RefCell::new(Vec::new())),
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(Cell::new(false)),
+        )
+    }
+
+    /// **The #1302 fix, pinned**: a 300-character single-token process name
+    /// must not make either the app row or the collapsed expander summary any
+    /// wider than a 5-character one, and both must still carry the full name
+    /// in a tooltip.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` /
+    /// `expander.set_subtitle_lines(1)` in [`rebuild_top_apps`]: measured
+    /// `left: 2210 / right: 360` (the row) before restoring the fix.
+    #[gtk::test]
+    fn top_apps_row_and_summary_ellipsise_a_long_name() {
+        let (expander, rows, meta, collapsed) = fresh_expander();
+        let long = "x".repeat(300);
+
+        rebuild_top_apps(
+            &expander,
+            &rows,
+            &meta,
+            &collapsed,
+            cpu_value,
+            &[proc_sample(&long)],
+        );
+        let row_long = rows.borrow()[0].clone();
+        let row_nat_long = natural_width(&row_long);
+        let summary_nat_long = natural_width(&expander);
+
+        rebuild_top_apps(
+            &expander,
+            &rows,
+            &meta,
+            &collapsed,
+            cpu_value,
+            &[proc_sample("abcde")],
+        );
+        let row_short = rows.borrow()[0].clone();
+        let row_nat_short = natural_width(&row_short);
+        let summary_nat_short = natural_width(&expander);
+
+        assert_eq!(
+            row_nat_long, row_nat_short,
+            "a 300-char process name must not widen the row past a 5-char one — \
+             title_lines(1) must be capping it"
+        );
+        assert_eq!(
+            summary_nat_long, summary_nat_short,
+            "a 300-char heaviest-app name must not widen the collapsed expander summary past a \
+             5-char one — subtitle_lines(1) must be capping it"
+        );
+        assert_eq!(
+            row_long.tooltip_text().as_deref(),
+            Some(long.as_str()),
+            "the row's tooltip must carry the full, untruncated name"
+        );
+        let summary_tooltip = expander
+            .tooltip_text()
+            .expect("the collapsed summary's tooltip must be set");
+        assert!(
+            summary_tooltip.contains(&long),
+            "the expander's tooltip must carry the full, untruncated summary, got \
+             {summary_tooltip:?}"
+        );
+    }
+
+    /// **The #1302 fix, pinned** for the Services card: a 300-character
+    /// single-token failed-unit name must not widen the row past a
+    /// 5-character one, and the tooltip must carry the full name.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` in
+    /// [`build_failed_unit_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn failed_unit_row_ellipsises_a_long_name() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(300);
+        let unit = |name: &str| FailedUnit {
+            name: name.to_string(),
+            description: String::new(),
+            sub_state: "failed".to_string(),
+        };
+
+        let row_long = build_failed_unit_row(&unit(&long));
+        let row_short = build_failed_unit_row(&unit("abcde"));
+
+        assert_eq!(
+            natural_width(&row_long),
+            natural_width(&row_short),
+            "a 300-char unit name must not widen the row past a 5-char one"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+    }
+
+    /// **The #1302 fix, pinned** for the Disks card: a 300-character
+    /// single-token mount path must not widen the row past a 5-character one,
+    /// and the tooltip must carry the full path.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` in
+    /// [`build_disk_mount_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn disk_mount_row_ellipsises_a_long_path() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(300);
+        let mount = |path: &str| DiskMount {
+            path: path.to_string(),
+            total_bytes: 100,
+            used_bytes: 50,
+            free_bytes: 50,
+            usage: 0.5,
+        };
+
+        let row_long = build_disk_mount_row(&mount(&long));
+        let row_short = build_disk_mount_row(&mount("abcde"));
+
+        assert_eq!(
+            natural_width(&row_long),
+            natural_width(&row_short),
+            "a 300-char mount path must not widen the row past a 5-char one"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+    }
+
+    /// **The #1302 fix, pinned** for the GPU card: a 300-character
+    /// single-token device name must not widen the row past a 5-character
+    /// one, and the tooltip must carry the full name.
+    ///
+    /// Falsified by commenting out `row.set_subtitle_lines(1)` in
+    /// [`super::build_live_gpu_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn gpu_row_subtitle_ellipsises_a_long_device_name() {
+        adw::init().expect("libadwaita init");
+        let row = adw::ActionRow::builder().title("GPU").build();
+        row.set_subtitle_lines(1);
+        let long = "x".repeat(300);
+
+        apply_gpu_name_subtitle(&row, long.clone());
+        let nat_long = natural_width(&row);
+        apply_gpu_name_subtitle(&row, "abcde".to_string());
+        let nat_short = natural_width(&row);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char GPU device name must not widen the row past a 5-char one"
+        );
+        apply_gpu_name_subtitle(&row, long.clone());
+        assert_eq!(row.tooltip_text().as_deref(), Some(long.as_str()));
     }
 }
 

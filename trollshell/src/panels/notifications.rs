@@ -164,6 +164,12 @@ fn build_history_app_row(
     const MAX_PER_APP: usize = 20;
 
     let row = adw::ExpanderRow::builder().title(app).build();
+    // The freedesktop `app_name` is free text sent by whatever is posting
+    // notifications — capped to one line rather than letting it push the
+    // whole drawer wider (#1302). The body (below, unbounded) already wraps
+    // by design, so it's left alone.
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(app));
     let count = entries.len();
     if let Some(latest) = entries.first() {
         let subtitle = if count == 1 {
@@ -202,6 +208,13 @@ fn build_history_app_row(
 
 fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(&entry.summary).build();
+    // The summary is a single-line freedesktop field with no bound — capped
+    // to one line rather than letting it push the whole drawer wider
+    // (#1302). The body just below is left alone: it already wraps freely
+    // (no `subtitle_lines` cap), which is the intended multi-line rendering
+    // for a notification body.
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(&entry.summary));
     if !entry.body.is_empty() {
         row.set_subtitle(&entry.body);
     }
@@ -346,5 +359,88 @@ mod pin_tests {
         // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
         history.set((Vec::new(), ["Spotify".to_owned()].into_iter().collect()));
         pump();
+    }
+}
+
+/// Needs a real display server (the rows have to be constructible for
+/// `measure` to mean anything), hence the `system-tests` gate, like the rest
+/// of this bug class.
+#[cfg(all(test, feature = "system-tests"))]
+mod width_tests {
+    use std::collections::HashSet;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::notifications::{HistoryEntry, Urgency};
+
+    use super::{build_history_action_row, build_history_app_row};
+
+    fn entry(summary: &str) -> HistoryEntry {
+        HistoryEntry {
+            id: 1,
+            app_name: "Firefox".to_string(),
+            app_icon: String::new(),
+            summary: summary.to_string(),
+            body: String::new(),
+            urgency: Urgency::Normal,
+            image: None,
+            actions: Vec::new(),
+            reason: 2,
+            created_at: 0,
+            dismissed_at: 0,
+        }
+    }
+
+    /// **The #1302 fix, pinned** for the per-app `ExpanderRow`'s title: a
+    /// 300-character single-token `app_name` must not widen the row past a
+    /// 5-character one, and the tooltip must still carry the full name.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` in
+    /// [`build_history_app_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn history_app_row_title_ellipsises_a_long_app_name() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(300);
+        let muted = HashSet::new();
+        let e = entry("New message");
+        let bucket = [&e];
+
+        let row_long = build_history_app_row(&long, &bucket, &muted);
+        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_history_app_row("abcde", &bucket, &muted);
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char app name must not widen the row past a 5-char one — title_lines(1) \
+             must be capping it"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+    }
+
+    /// **The #1302 fix, pinned** for one history entry's summary title: a
+    /// 300-character single-token summary must not widen the row past a
+    /// 5-character one, and the tooltip must still carry the full summary.
+    /// The (unbounded, deliberately unwrapped) body is untouched by this fix
+    /// and out of scope for this test.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` in
+    /// [`build_history_action_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn history_action_row_title_ellipsises_a_long_summary() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(300);
+
+        let row_long = build_history_action_row(&entry(&long));
+        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_history_action_row(&entry("abcde"));
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char summary must not widen the row past a 5-char one — title_lines(1) \
+             must be capping it"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
     }
 }

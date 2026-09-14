@@ -73,13 +73,20 @@ fn build_bluetooth_header() -> gtk::Widget {
     let group = adw::PreferencesGroup::new();
 
     let row = adw::ActionRow::builder().title("Bluetooth").build();
+    // The adapter's own name is `bluetoothctl system-alias`-settable free
+    // text — cap it to one line rather than letting it push the drawer wider
+    // (#1302); the tooltip mirrors the full text.
+    row.set_subtitle_lines(1);
     bind(
         bluetooth::adapter().map(|a| match a {
             Some(ad) => ad.name,
             None => "No Bluetooth adapter".to_string(),
         }),
         &row,
-        |w, name| w.set_subtitle(&name),
+        |w, name| {
+            w.set_subtitle(&name);
+            w.set_tooltip_text(Some(&name));
+        },
     );
 
     let power_switch = gtk::Switch::new();
@@ -115,6 +122,8 @@ fn build_bluetooth_controls() -> gtk::Widget {
 
     // Discoverable
     let disc_row = adw::ActionRow::builder().title("Discoverable").build();
+    // Same free-text adapter name as the header row above (#1302).
+    disc_row.set_subtitle_lines(1);
     bind(
         bluetooth::adapter().map(|a| match a {
             Some(ad) if ad.discoverable && !ad.name.is_empty() => {
@@ -124,7 +133,10 @@ fn build_bluetooth_controls() -> gtk::Widget {
             _ => "Hidden from other devices".to_string(),
         }),
         &disc_row,
-        |row, text| row.set_subtitle(&text),
+        |row, text| {
+            row.set_subtitle(&text);
+            row.set_tooltip_text(Some(&text));
+        },
     );
     let disc_switch = gtk::Switch::new();
     disc_switch.set_valign(gtk::Align::Center);
@@ -414,10 +426,17 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
     // tap to pair). Markup off rather than escaped: nothing in this row wants
     // markup, and it covers the subtitle too (#753, cf. #30).
     markup::plain_text(&row);
+    // A broadcast alias is one unbreakable token with no bound — capped to
+    // one line rather than letting it push the whole drawer wider (#1302).
+    row.set_title_lines(1);
     row.set_sensitive(!is_busy);
-    if !dev.address.is_empty() {
-        row.set_tooltip_text(Some(&dev.address));
-    }
+    // The tooltip already carried the MAC address; folded the (now possibly
+    // truncated) alias in ahead of it rather than dropping either (#1302).
+    row.set_tooltip_text(Some(&if dev.address.is_empty() {
+        dev.alias.clone()
+    } else {
+        format!("{}\n{}", dev.alias, dev.address)
+    }));
 
     // Prefix: device icon, or spinner while a D-Bus call is in flight.
     if is_busy {
@@ -551,7 +570,7 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
 mod tests {
     use super::{
         Device, PairPrompt, bind_device_groups, bind_pair_prompt_banner, build_device_menu,
-        build_text_entry_row,
+        build_device_row, build_text_entry_row,
     };
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
@@ -561,6 +580,43 @@ mod tests {
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
         while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// **The #1302 fix, pinned**: a 300-character single-token device alias
+    /// (broadcast by whoever is in radio range, per `build_device_row`'s own
+    /// doc comment) must not widen the row past a 5-character one, and the
+    /// tooltip must still carry the full alias.
+    ///
+    /// Falsified by commenting out `row.set_title_lines(1)` in
+    /// [`build_device_row`]: measured `left: 2210 / right: 360`.
+    #[gtk::test]
+    fn device_row_title_ellipsises_a_long_alias() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(300);
+        let dev = |alias: &str| Device {
+            path: "/org/bluez/hci0/dev_AA".to_owned(),
+            alias: alias.to_owned(),
+            address: "AA:BB:CC:DD:EE:FF".to_owned(),
+            ..Device::default()
+        };
+
+        let row_long = build_device_row(&dev(&long), false);
+        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_device_row(&dev("abcde"), false);
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char alias must not widen the row past a 5-char one — title_lines(1) must \
+             be capping it"
+        );
+        let tooltip = row_long
+            .tooltip_text()
+            .expect("the row's tooltip must be set when an address is present");
+        assert!(
+            tooltip.contains(&long),
+            "the tooltip must still carry the full, untruncated alias, got {tooltip:?}"
+        );
     }
 
     /// `bind_device_groups` must not keep its `outer` container alive by

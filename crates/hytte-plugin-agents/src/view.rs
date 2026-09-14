@@ -92,7 +92,7 @@ use crate::config::AgentsConfig;
 use crate::model::{
     APPROVAL_BADGE_CLASS, APPROVAL_BADGE_ICON, Agent, AgentName, ExpandedGroups, Group, Hive,
     PendingApprovals, Status, UPDATE_BADGE_CLASS, UPDATE_BADGE_ICON, agent_url, group,
-    headers_wanted, model_family, terminal_targets,
+    headers_wanted, model_family,
 };
 
 /// The card's root node id.
@@ -180,22 +180,6 @@ pub mod ids {
     /// agent, so it is a whole id rather than a prefix. Not `OPEN`-prefixed:
     /// `strip_prefix("open:")` must never match it by accident.
     pub const OPEN_DASHBOARD: &str = "open-dashboard";
-    /// The card header's **"Open terminals"** button
-    /// ([#1306](https://github.com/vibec0re/trollshell/issues/1306)) — one
-    /// press, one companion window per running agent.
-    ///
-    /// A whole id, not a prefix, for [`OPEN_DASHBOARD`]'s reason: it names no
-    /// agent, because *which* agents it opens is re-read from the model at
-    /// click time ([`crate::model::terminal_targets`]) rather than carried on
-    /// the id. A roster that moved between the render and the click therefore
-    /// opens what is running **now**, which is both what the operator means and
-    /// the only version that cannot launch a window for an agent that has since
-    /// gone.
-    ///
-    /// Its dash is load-bearing exactly like the dashboard's: spelled
-    /// `open:terminals` it would parse as an [`OPEN`] target named
-    /// `"terminals"`.
-    pub const OPEN_TERMINALS: &str = "open-terminals";
     /// The pending-approval badge (#947 P3), carrying the **agent name**.
     ///
     /// Not the approval id, for [`OPEN`]'s reason and one more: the id the row
@@ -873,48 +857,6 @@ pub fn hive_summary(hive: &Hive) -> String {
     }
 }
 
-/// The card header's **"Open terminals"** button, or `None` when there is
-/// nothing to open ([#1306](https://github.com/vibec0re/trollshell/issues/1306)).
-///
-/// `None` covers both halves of "up" with one expression: a hive that is not
-/// [`Hive::Up`] has an empty roster ([`Hive::agents`]), and a hive that is up
-/// with nothing running has no [`terminal_targets`]. So a disconnected,
-/// erroring, incompatible or idle card simply has no button — rather than a
-/// disabled one, which would be a control the operator has to reason about on
-/// a surface that is already dense.
-///
-/// # The tooltip names both routes, because the view cannot know which one runs
-///
-/// `Plugin::view` takes `&self` and [`crate::window::Probe`] resolves on
-/// `&mut` — deliberately, since resolving it here would move a `PATH` scan and
-/// its warning from the first click onto the first render, i.e. onto every
-/// desktop rather than onto the ones that click. So rather than guess, the
-/// hover says what happens either way: N windows, or N browser tabs on a
-/// desktop with no `trollshell-agent-window`. #1306 asks for the tab count to
-/// be said out loud, and this is the phrasing that is true before the probe has
-/// an answer.
-fn open_terminals_button(hive: &Hive, cfg: &AgentsConfig) -> Option<Node> {
-    let count = terminal_targets(hive.agents(), cfg).len();
-    if count == 0 {
-        return None;
-    }
-    let hover = if count == 1 {
-        "open the terminal window for the one running agent (a browser tab if \
-         the companion window is not installed)"
-            .to_owned()
-    } else {
-        format!(
-            "open a terminal window for each of the {count} running agents \
-             ({count} browser tabs if the companion window is not installed)"
-        )
-    };
-    Some(icon_button(
-        ids::OPEN_TERMINALS,
-        "utilities-terminal-symbolic",
-        &hover,
-        &["flat", "ts-agent-btn"],
-    ))
-}
 
 /// The sidebar card: a titled surface, then the roster as a dense list.
 ///
@@ -930,24 +872,21 @@ pub fn card(
     expanded: &ExpandedGroups,
     approvals: &PendingApprovals,
 ) -> Node {
-    let mut title_row = vec![
-        label("AGENTS", &["ts-agents-heading"]),
-        Node::Spacer,
-        label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
-    ];
-    // **The one placement site.** #1306's other open question — card header or
-    // per-project group header — is answered by which `Vec` this line pushes
-    // into: moving it into `group_node`'s header (with `g.agents` instead of
-    // `hive.agents()`) is the whole of the other answer, because the button
-    // derives everything it says from the slice it is given.
-    title_row.extend(open_terminals_button(hive, cfg));
-    title_row.push(icon_button(
-        OVERVIEW_ID,
-        "view-list-symbolic",
-        "hive overview and the full roster",
-        &["flat", "ts-agent-btn"],
-    ));
-    let title = hrow(6, &["ts-agents-title"], title_row);
+    let title = hrow(
+        6,
+        &["ts-agents-title"],
+        vec![
+            label("AGENTS", &["ts-agents-heading"]),
+            Node::Spacer,
+            label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
+            icon_button(
+                OVERVIEW_ID,
+                "view-list-symbolic",
+                "hive overview and the full roster",
+                &["flat", "ts-agent-btn"],
+            ),
+        ],
+    );
 
     let body = match hive {
         Hive::Connecting => vec![notice(
@@ -1501,27 +1440,9 @@ mod tests {
         PendingApprovals::default()
     }
 
-    /// An agent the hive reports as not running — the other side of
-    /// [`crate::model::wants_terminal`].
-    fn stopped(name: &str) -> Agent {
-        agent(
-            name,
-            AgentStatusRow {
-                name: name.to_owned(),
-                ..AgentStatusRow::default()
-            },
-        )
-    }
-
     fn card_of(agents: Vec<Agent>) -> Node {
-        card_of_hive(&Hive::Up { agents })
-    }
-
-    /// The card for a hive in any state — what the "Open terminals" assertions
-    /// need, since three of the five states they cover are not `Up` at all.
-    fn card_of_hive(hive: &Hive) -> Node {
         super::card(
-            hive,
+            &Hive::Up { agents },
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
             &no_approvals(),
@@ -1735,95 +1656,6 @@ mod tests {
             "her `(oO)` — the state glyph moved to line 2"
         );
     }
-
-    /// **"Open terminals" is on the card header only while there is something
-    /// to open** (#1306) — and "something" is a *running* agent, not a listed
-    /// one.
-    ///
-    /// The four silent states are the ones an operator meets most: a hive that
-    /// has not answered yet, one that is unreachable, one that is up with no
-    /// agents, and — the case the filter exists for — one that is up with a
-    /// full roster where nothing is running. None of them gets a button, and a
-    /// disabled button is deliberately not the answer: the card is dense
-    /// enough that a control which cannot be pressed is worse than no control.
-    ///
-    /// Falsification (run this round, red): make
-    /// `crate::model::wants_terminal` return `true` and the all-stopped case
-    /// grows a button; drop `open_terminals_button`'s `count == 0` guard and
-    /// all four do.
-    #[test]
-    fn open_terminals_appears_only_when_an_agent_is_running() {
-        for (what, hive) in [
-            ("connecting", Hive::Connecting),
-            (
-                "unreachable",
-                Hive::Unreachable {
-                    reason: "no socket".to_owned(),
-                },
-            ),
-            ("up, empty", Hive::Up { agents: Vec::new() }),
-            (
-                "up, all stopped",
-                Hive::Up {
-                    agents: vec![stopped("argus"), stopped("stray")],
-                },
-            ),
-        ] {
-            let tree = card_of_hive(&hive);
-            assert!(
-                !button_ids(&tree).contains(&ids::OPEN_TERMINALS.to_owned()),
-                "{what}: nothing is running, so there is nothing to open — {:?}",
-                button_ids(&tree)
-            );
-        }
-
-        let tree = card_of(vec![stopped("stray"), running("argus", "Clauding…")]);
-        assert!(
-            button_ids(&tree).contains(&ids::OPEN_TERMINALS.to_owned()),
-            "one running agent is enough: {:?}",
-            button_ids(&tree)
-        );
-    }
-
-    /// The hover **says the number**, and says what happens on a desktop with
-    /// no companion window — #1306 asks for the tab count out loud, because a
-    /// press that opens six browser tabs should not be a surprise.
-    ///
-    /// The count is `terminal_targets`', i.e. the same one the fan-out walks,
-    /// which is what makes "the button cannot say 3 and open 4" a fact about
-    /// the code rather than a claim in a comment.
-    ///
-    /// Falsification: count `hive.agents()` instead of the targets and the
-    /// three-running-of-five case reads `5`.
-    #[test]
-    fn the_open_terminals_hover_names_the_count_and_the_browser_fallback() {
-        let tree = card_of(vec![
-            running("argus", "Clauding…"),
-            stopped("stray"),
-            running("nixos-choom", "idle"),
-            stopped("parked"),
-            running("trollshell-choom", "reviewing"),
-        ]);
-        let hover = icon_hover(&tree, "utilities-terminal-symbolic").expect("the button renders");
-        assert!(
-            hover.contains("each of the 3 running agents"),
-            "the hover must name how many windows a press opens: {hover}"
-        );
-        assert!(
-            hover.contains("3 browser tabs"),
-            "…and how many tabs it opens instead without the window: {hover}"
-        );
-
-        // One is its own sentence — "each of the 1 running agents" is not
-        // English, and this is the case a naive `format!` gets wrong.
-        let one = card_of(vec![running("argus", "Clauding…"), stopped("stray")]);
-        let hover = icon_hover(&one, "utilities-terminal-symbolic").expect("the button renders");
-        assert!(
-            hover.contains("the one running agent"),
-            "a single target reads as one: {hover}"
-        );
-    }
-
     /// The card carries **none** of the detail Annika called too much
     /// information: no chevron, no unfolded block, no flag chips, no
     /// `deployed` / `parent` / `agent page` rows.
@@ -2433,12 +2265,7 @@ mod tests {
         // that starts with a prefix's own word (`open`), and dropping its dash
         // for a colon would make `strip_prefix(ids::OPEN)` hand the reducer
         // `"dashboard"` as an agent name.
-        for id in [
-            super::BACK_ID,
-            super::OVERVIEW_ID,
-            ids::OPEN_DASHBOARD,
-            ids::OPEN_TERMINALS,
-        ] {
+        for id in [super::BACK_ID, super::OVERVIEW_ID, ids::OPEN_DASHBOARD] {
             assert!(!id.contains(':'), "{id}");
             assert!(
                 id.strip_prefix(ids::OPEN).is_none(),

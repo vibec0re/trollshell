@@ -885,15 +885,14 @@ openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
       size/placement rule written that way applies to two different agents'
       windows.
 
-### Talking to an agent, and opening them all (#1306, #1282 items 1-2)
+### Talking to an agent, from the pill (#1282 items 1-2)
 
-Same hive and same `agentWindow.enable`. CI proves the fan-out's shape (which
-agents, in which order, with which ids, on both desktops), that the row click
-is byte-identical to the `agent page` link's effect, and that the embedded URL
-no longer hides `input`. What it cannot prove is the three things that only
-exist on glass: that typing into the page reaches the agent, that a click
-lands on the pill rather than on one of the buttons inside it, and that N
-windows are N windows rather than one window opened N times.
+Same hive and same `agentWindow.enable`. CI proves that the row click is
+byte-identical to the `agent page` link's effect, on both desktops, and that
+the embedded URL no longer hides `input`. What it cannot prove is the two
+things that only exist on glass: that typing into the page reaches the agent,
+and that a click lands on the pill rather than on one of the buttons inside
+it.
 
 - [ ] **(#1282 item 1)** **Typing reaches the agent.** Open a running agent's
       window and confirm hyperhive's composer is **there** at the bottom of
@@ -922,35 +921,6 @@ windows are N windows rather than one window opened N times.
       carries `flat`, so there should be no frame), the status line must not
       turn bold, and hovering should highlight the **whole row** — which is
       the new affordance, and the one thing that should visibly change.
-- [ ] **(#1306)** **"Open terminals" opens one window per running agent.**
-      With several agents running, press the terminal button in the card
-      header (next to the overview button) and confirm one window appears per
-      **running** agent — and none for a stopped, paused, failed or
-      needs-login one. Hover it first and check the number in the tooltip
-      matches what you then get.
-- [ ] **(#1306)** **A second press re-focuses rather than doubling.** Press it
-      again with the windows still open: no second window per agent, because
-      each is its own `GApplication` id
-      (`mov.vibec0re.trollshell.AgentWindow.<agent>`). Then
-      `systemctl --user list-units 'trollshell-launch-*'` and confirm each
-      launch was its own transient unit, outside the shell's cgroup.
-- [ ] **(#1306)** **The button is absent when there is nothing to open.** Stop
-      every agent and confirm the button **disappears** from the card header
-      (not greys out). Then stop the hive itself
-      (`systemctl --user stop hive-c0re` or equivalent) and confirm the card
-      says "no hive" and carries no terminal button.
-- [ ] **(#1306)** **The browser fallback fans out too.** Set
-      `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
-      plugin, and confirm one press opens **N browser tabs** — one per running
-      agent, each on that agent's own hive URL — with exactly one journal line
-      about the window not being on `PATH`, not one per agent. An agent the
-      hive reports without a `url` contributes no tab; that is the same
-      silence a single row click already answers with.
-- [ ] **(#1306)** **Sanity on a big roster.** On a hive with a dozen running
-      agents, press it once and confirm the shell stays responsive while
-      twelve windows come up, and that they are **all** there (the fan-out is
-      not capped by the card's 20-row draw limit, so what the tooltip counts
-      is what you get).
 
 ### Approvals (#947 P3, spec §6.5)
 

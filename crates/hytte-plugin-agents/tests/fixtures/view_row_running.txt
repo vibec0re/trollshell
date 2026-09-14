@@ -36,21 +36,6 @@ Box {
                     tooltip: None,
                 },
                 Button {
-                    id: "open-terminals",
-                    classes: [
-                        "flat",
-                        "ts-agent-btn",
-                    ],
-                    child: Icon {
-                        id: None,
-                        name: "utilities-terminal-symbolic",
-                        classes: [],
-                        tooltip: Some(
-                            "open the terminal window for the one running agent (a browser tab if the companion window is not installed)",
-                        ),
-                    },
-                },
-                Button {
                     id: "agents-overview",
                     classes: [
                         "flat",

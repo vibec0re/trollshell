@@ -37,21 +37,6 @@ View {
                         tooltip: None,
                     },
                     Button {
-                        id: "open-terminals",
-                        classes: [
-                            "flat",
-                            "ts-agent-btn",
-                        ],
-                        child: Icon {
-                            id: None,
-                            name: "utilities-terminal-symbolic",
-                            classes: [],
-                            tooltip: Some(
-                                "open a terminal window for each of the 12 running agents (12 browser tabs if the companion window is not installed)",
-                            ),
-                        },
-                    },
-                    Button {
                         id: "agents-overview",
                         classes: [
                             "flat",

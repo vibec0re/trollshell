@@ -457,50 +457,6 @@ pub fn headers_wanted(groups: &[Group<'_>]) -> bool {
     groups.len() > 1
 }
 
-/// Does the card's **"Open terminals"** button open a window for this agent?
-///
-/// [#1306](https://github.com/vibec0re/trollshell/issues/1306) asks for "all
-/// agents in up state", and "up" is two different things in this model — the
-/// hive being [`Hive::Up`], and an agent being [`Status::Running`]. This is the
-/// second one, and it is **the switch**: @kaesaecracker's open question on that
-/// thread is running-only versus every agent the hive lists, and this predicate
-/// is the whole of the answer. Flipping it to `true` opens a terminal for every
-/// listed agent — a stopped one included — and nothing else moves: the count in
-/// the tooltip, the button's own visibility, the fan-out and its tests all read
-/// this one function.
-///
-/// Running-only is the default because a terminal for a stopped agent shows a
-/// dead feed, and because "open everything" scales with the roster rather than
-/// with what is happening.
-#[must_use]
-pub fn wants_terminal(agent: &Agent) -> bool {
-    agent.status() == Status::Running
-}
-
-/// Every agent the "Open terminals" button would open, **in the card's own row
-/// order**.
-///
-/// The order is [`group`]'s, not the hive's: the card draws grouped rows, and a
-/// fan-out that opened windows in a different order than the rows the operator
-/// is looking at would be a small lie about what the button did. The *cap* and
-/// the *collapse state* are deliberately not applied — `view::MAX_ROWS` bounds
-/// how much tree this plugin serialises every two seconds, and a collapsed
-/// group is one click from being open; neither is a statement about which
-/// agents are running. So a hive with 25 running agents opens 25 windows and
-/// the tooltip says 25, which is the truthful version of the button.
-///
-/// Called by both halves on purpose — [`crate::view::card`] for "is there a
-/// button, and what number does it say" and [`crate::plugin::Agents`] for "what
-/// does a press launch" — so the two cannot disagree about either question.
-#[must_use]
-pub fn terminal_targets<'a>(agents: &'a [Agent], cfg: &'a AgentsConfig) -> Vec<&'a Agent> {
-    group(agents, cfg)
-        .into_iter()
-        .flat_map(|g| g.agents)
-        .filter(|a| wants_terminal(a))
-        .collect()
-}
-
 /// The agent's own page URL, **as the hive states it** — never derived.
 ///
 /// Spec §5.2 had the desktop building `<home>agent/<name>/` client-side,
@@ -605,7 +561,7 @@ pub fn model_family(raw: &str) -> Option<String> {
 mod tests {
     use super::{
         Agent, AgentName, Group, Hive, PendingApprovals, Status, agent_url, group, headers_wanted,
-        model_family, terminal_targets, wants_terminal,
+        model_family,
     };
     use crate::config::AgentsConfig;
     use crate::hive::wire::{AgentStatusRow, Approval, ApprovalKind, ApprovalStatus};
@@ -927,83 +883,6 @@ mod tests {
         // Nothing is lost on the way through.
         let rendered: usize = groups.iter().map(|g| g.agents.len()).sum();
         assert_eq!(rendered, agents.len());
-    }
-
-    /// **"Open terminals" follows the card's row order, not the hive's**
-    /// (#1306) — and takes only what [`wants_terminal`] admits.
-    ///
-    /// The fixture is built so the two orders **disagree**: the hive lists
-    /// `zeta, alpha, orphan`, the card draws `nixos` before `viberoot` before
-    /// the ungrouped bucket, so a fan-out that iterated `hive.agents()` would
-    /// open `zeta` first instead of `alpha`. That is the whole reason this goes
-    /// through [`group`] rather than filtering the slice.
-    ///
-    /// Falsification (run this round, red): swap the body for
-    /// `agents.iter().filter(…)` and the order assertion reds; make
-    /// [`wants_terminal`] return `true` and `parked` joins the list.
-    #[test]
-    fn terminal_targets_are_the_running_agents_in_the_cards_own_order() {
-        let agents = vec![
-            agent("zeta", flags(false, false, false, true)),
-            agent("alpha", flags(false, false, false, true)),
-            agent("orphan", flags(false, false, false, true)),
-            agent("parked", flags(false, false, false, false)),
-        ];
-        let cfg = cfg_with_projects(&[
-            ("zeta", "viberoot"),
-            ("alpha", "nixos"),
-            ("parked", "nixos"),
-        ]);
-
-        // The hive's own order, for the contrast this test exists to draw.
-        assert_eq!(
-            agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
-            vec!["zeta", "alpha", "orphan", "parked"]
-        );
-
-        let names: Vec<&str> = terminal_targets(&agents, &cfg)
-            .into_iter()
-            .map(|a| a.name.as_str())
-            .collect();
-        assert_eq!(
-            names,
-            vec!["alpha", "zeta", "orphan"],
-            "grouped order (nixos, viberoot, ungrouped), stopped agents dropped"
-        );
-
-        // …and the predicate on its own, so the filter is falsifiable without
-        // the grouping in the way.
-        assert!(wants_terminal(&agents[0]));
-        assert!(!wants_terminal(&agents[3]));
-        for row in [
-            flags(true, false, false, true), // failed wins over running
-            flags(false, true, false, true), // needs-login wins
-            flags(false, false, true, true), // paused wins
-            flags(false, false, false, false),
-        ] {
-            assert!(
-                !wants_terminal(&agent("x", row)),
-                "only Status::Running opens a terminal"
-            );
-        }
-    }
-
-    /// A hive that is not up has no targets — the other half of the button's
-    /// visibility rule, asserted where the emptiness comes from.
-    #[test]
-    fn a_hive_that_is_not_up_has_no_terminal_targets() {
-        let cfg = AgentsConfig::default();
-        for hive in [
-            Hive::Connecting,
-            Hive::Unreachable {
-                reason: "no socket".to_owned(),
-            },
-            Hive::Error {
-                reason: "refused".to_owned(),
-            },
-        ] {
-            assert!(terminal_targets(hive.agents(), &cfg).is_empty(), "{hive:?}");
-        }
     }
 
     /// Spec §6.3: with one project the header is suppressed.

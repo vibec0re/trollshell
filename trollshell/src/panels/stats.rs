@@ -49,7 +49,7 @@ use hytte_preem::LedMatrix;
 // back under its original names so every call site below reads unchanged.
 use crate::components::app_meta::{AppMeta, fallback_icon, resolve_app_meta};
 use crate::components::cast;
-use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
+use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate, truncate_for_row};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{
     DRAWER_MAX_WIDTH_WIDE, finish_page, finish_page_clamped, page_box, page_grid,
@@ -742,14 +742,19 @@ fn rebuild_top_apps(
             format!("{name} \u{00b7} {}", value(s))
         },
     );
-    expander.set_subtitle(&subtitle);
     // The collapsed summary is the heaviest app's display name plus a value
     // suffix — an unbounded single token (a scope id with no spaces) never
-    // wraps, so it widened the whole drawer (#1302). Capped to one line, with
-    // the full (untruncated) summary mirrored into the tooltip so it's still
-    // reachable on hover. Set on every rebuild rather than once at
-    // construction so this function alone — the one a test can drive without
-    // a live signal source — carries the whole fix.
+    // wraps, and `subtitle_lines(1)` alone doesn't stop it from inflating the
+    // row's own natural width (`AdwExpanderRow`'s title/subtitle labels have
+    // no `max-width-chars` equivalent — see `truncate_for_row`'s doc), which
+    // is what widened the whole drawer (#1302). Capped to a bounded character
+    // count before it's ever laid out, with the full (untruncated) summary
+    // mirrored into the tooltip so it's still reachable on hover.
+    // `subtitle_lines(1)` stays on as a second line of defense. Set on every
+    // rebuild rather than once at construction so this function alone — the
+    // one a test can drive without a live signal source — carries the whole
+    // fix.
+    expander.set_subtitle(&truncate_for_row(&subtitle));
     expander.set_subtitle_lines(1);
     expander.set_tooltip_text(Some(&subtitle));
 
@@ -763,10 +768,11 @@ fn rebuild_top_apps(
         // temporary of the whole statement, so inlining this would hold
         // `meta_cache` borrowed across `set_title` (#643).
         let title = sample_display_name(s, &mut meta_cache.borrow_mut());
-        row.set_title(&title);
-        // A scope id or process name is one unbreakable token, so it never
-        // wraps — capped to one line with the full name mirrored into a
-        // tooltip rather than letting it push the whole drawer wider (#1302).
+        // A scope id or process name is one unbreakable token with no bound —
+        // capped (see `truncate_for_row`) rather than letting it push the
+        // whole drawer wider (#1302); the full name is mirrored into a
+        // tooltip and `title_lines(1)` stays on as a second line of defense.
+        row.set_title(&truncate_for_row(&title));
         row.set_title_lines(1);
         row.set_tooltip_text(Some(&title));
         if s.procs > 1 {
@@ -1258,8 +1264,17 @@ fn build_live_gpu_row() -> adw::ActionRow {
 /// Extracted out of [`build_live_gpu_row`]'s `bind` closure — a plain `fn`
 /// rather than a closure, so the colocated `#[gtk::test]` can drive it
 /// directly without a registered `sensors` service (#1302).
+///
+/// `name` is owned rather than `&str` because `bind`'s `apply: Fn(&W,
+/// S::Item)` (`hytte-reactive/src/bind.rs:36`) takes the signal's `String`
+/// item by value — an inline closure isn't linted for this, but a named `fn`
+/// with the same signature is (cf. `overlays/prompt.rs`'s `show_prompt`).
+#[allow(clippy::needless_pass_by_value)]
 fn apply_gpu_name_subtitle(row: &adw::ActionRow, name: String) {
-    row.set_subtitle(&name);
+    // Capped (see `truncate_for_row`) rather than letting a driver-reported
+    // device name push the whole drawer wider (#1302); the full name is
+    // mirrored into a tooltip.
+    row.set_subtitle(&truncate_for_row(&name));
     row.set_tooltip_text(if name.is_empty() { None } else { Some(&name) });
 }
 
@@ -1287,15 +1302,16 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
 /// [`rebuild_top_apps`] documents for its own extraction.
 fn build_disk_mount_row(m: &sensors::DiskMount) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(&m.path)
+        .title(&truncate_for_row(&m.path))
         .activatable(false)
         .build();
     // A mount path is whatever the filesystem is mounted at, `&`
     // included (#753).
     markup::plain_text(&row);
-    // A bind-mount path can run long and has no spaces to wrap at — capped to
-    // one line with the full path in a tooltip rather than letting it push
-    // the whole drawer wider (#1302).
+    // A bind-mount path can run long and has no spaces to wrap at — capped
+    // (see `truncate_for_row`) rather than letting it push the whole drawer
+    // wider (#1302), with the full path in a tooltip and `title_lines(1)` as
+    // a second line of defense.
     row.set_title_lines(1);
     row.set_tooltip_text(Some(&m.path));
     let frac = if m.total_bytes > 0 {
@@ -1862,7 +1878,7 @@ fn build_failed_units_group() -> adw::PreferencesGroup {
 /// extraction.
 fn build_failed_unit_row(unit: &systemd::FailedUnit) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(&unit.name)
+        .title(&truncate_for_row(&unit.name))
         .activatable(false)
         .build();
     // Unit names and, especially, free-form `Description=` text are
@@ -1877,8 +1893,9 @@ fn build_failed_unit_row(unit: &systemd::FailedUnit) -> adw::ActionRow {
     row.set_subtitle(&subtitle);
     // A systemd unit name is one unbreakable token
     // (`dbus-org.freedesktop.resolve1.service`-length is ordinary) that never
-    // wraps — capped to one line with the full name in a tooltip rather than
-    // letting it push the whole drawer wider (#1302).
+    // wraps — capped (see `truncate_for_row`) rather than letting it push the
+    // whole drawer wider (#1302), with the full name in a tooltip and
+    // `title_lines(1)` as a second line of defense.
     row.set_title_lines(1);
     row.set_tooltip_text(Some(&unit.name));
 
@@ -2762,16 +2779,20 @@ mod reentrancy_tests {
     }
 }
 
-/// #1302: a daemon- or wire-supplied name that is one unbreakable token (no
-/// spaces to wrap at) never wraps, so an unbounded one raises a row's natural
-/// width and the whole drawer follows it (`modal.rs` grows the drawer to each
-/// page's natural width, up to the `AdwClamp` ceiling). Each test below
-/// builds the real production row (or, for the top-apps case, drives the real
-/// production [`rebuild_top_apps`]) over a 300-character single-token name,
-/// measures its natural width against the same shape built with a
-/// 5-character name, and asserts they're equal — i.e. that the line-count cap
-/// added for #1302 is actually doing its job — plus that the tooltip carries
-/// the full, untruncated text.
+/// #1302: a daemon- or wire-supplied name is unbounded, and — the empirical
+/// finding behind every test in this module — `AdwActionRow`/`AdwExpanderRow`'s
+/// `title-lines`/`subtitle-lines` do NOT bound the row's own natural-width
+/// request; they only affect rendering once the row is given less width than
+/// it wants. `modal.rs`'s drawer sizing reads that natural width, so a name
+/// with no bound still blew the drawer up even with `title_lines(1)`/
+/// `subtitle_lines(1)` set — see `components::format::truncate_for_row`'s
+/// doc for the measured proof and the actual fix (capping the string itself
+/// before it's laid out). Each test below builds the real production row
+/// over a name far past `truncate_for_row`'s cap and one just past it with
+/// the same filler character, and asserts their natural widths are
+/// **exactly** equal — the real #1302 invariant: once a name is over the
+/// cap, growing it further changes nothing about what's drawn — plus that
+/// the tooltip still carries the full, untruncated text.
 ///
 /// Needs a real display server (the rows have to be constructible and
 /// actually laid out for `measure` to mean anything), hence the
@@ -2795,6 +2816,15 @@ mod width_tests {
 
     type Rows = Rc<RefCell<Vec<adw::ActionRow>>>;
     type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
+
+    /// Comfortably past `truncate_for_row`'s 60-char cap but shorter than
+    /// [`FAR_OVER_CAP`] — both must render identically once capped.
+    const OVER_CAP: usize = 90;
+    /// Far past the cap, standing in for "arbitrarily long".
+    const FAR_OVER_CAP: usize = 300;
+    /// Under the cap — used only as a sanity check that a short name is
+    /// narrower than a capped one, not for the equality assertion.
+    const UNDER_CAP: &str = "abcde";
 
     /// Natural (preferred) width of `w`, per this file's other `.measure(...)`
     /// call sites (e.g. `led_panel_layout_tests`).
@@ -2835,18 +2865,20 @@ mod width_tests {
         )
     }
 
-    /// **The #1302 fix, pinned**: a 300-character single-token process name
-    /// must not make either the app row or the collapsed expander summary any
-    /// wider than a 5-character one, and both must still carry the full name
-    /// in a tooltip.
+    /// **The #1302 fix, pinned**: an arbitrarily long process name must not
+    /// widen the app row or the collapsed expander summary any further than a
+    /// name that's merely a bit over the cap, and both must still carry the
+    /// full name in a tooltip.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` /
-    /// `expander.set_subtitle_lines(1)` in [`rebuild_top_apps`]: measured
-    /// `left: 2210 / right: 360` (the row) before restoring the fix.
+    /// Falsified by reverting `truncate_for_row` calls in
+    /// [`rebuild_top_apps`] to the raw name: measured `left: 2460 / right:
+    /// 823` (the row; the two over-cap lengths render at genuinely different
+    /// raw widths once the cap stops applying).
     #[gtk::test]
     fn top_apps_row_and_summary_ellipsise_a_long_name() {
         let (expander, rows, meta, collapsed) = fresh_expander();
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(FAR_OVER_CAP);
+        let over = "x".repeat(OVER_CAP);
 
         rebuild_top_apps(
             &expander,
@@ -2854,11 +2886,18 @@ mod width_tests {
             &meta,
             &collapsed,
             cpu_value,
-            &[proc_sample(&long)],
+            &[proc_sample(&far_over)],
         );
-        let row_long = rows.borrow()[0].clone();
-        let row_nat_long = natural_width(&row_long);
-        let summary_nat_long = natural_width(&expander);
+        let row_far = rows.borrow()[0].clone();
+        let row_nat_far = natural_width(&row_far);
+        let summary_nat_far = natural_width(&expander);
+        // The expander's tooltip (unlike a row's) is a single property
+        // `rebuild_top_apps` overwrites on every call — captured now, before
+        // the next two calls below replace it with their own subtitle.
+        let summary_tooltip_far = expander
+            .tooltip_text()
+            .expect("the collapsed summary's tooltip must be set")
+            .to_string();
 
         rebuild_top_apps(
             &expander,
@@ -2866,74 +2905,93 @@ mod width_tests {
             &meta,
             &collapsed,
             cpu_value,
-            &[proc_sample("abcde")],
+            &[proc_sample(&over)],
+        );
+        let row_over = rows.borrow()[0].clone();
+        let row_nat_over = natural_width(&row_over);
+        let summary_nat_over = natural_width(&expander);
+
+        rebuild_top_apps(
+            &expander,
+            &rows,
+            &meta,
+            &collapsed,
+            cpu_value,
+            &[proc_sample(UNDER_CAP)],
         );
         let row_short = rows.borrow()[0].clone();
         let row_nat_short = natural_width(&row_short);
-        let summary_nat_short = natural_width(&expander);
 
         assert_eq!(
-            row_nat_long, row_nat_short,
-            "a 300-char process name must not widen the row past a 5-char one — \
-             title_lines(1) must be capping it"
+            row_nat_far, row_nat_over,
+            "two over-the-cap names of different lengths must render the row at the exact same \
+             width — growth must stop at the cap"
         );
         assert_eq!(
-            summary_nat_long, summary_nat_short,
-            "a 300-char heaviest-app name must not widen the collapsed expander summary past a \
-             5-char one — subtitle_lines(1) must be capping it"
+            summary_nat_far, summary_nat_over,
+            "two over-the-cap names must render the collapsed expander summary at the exact \
+             same width too"
+        );
+        assert!(
+            row_nat_short < row_nat_far,
+            "sanity: a 5-char name must still measure narrower than a capped one"
         );
         assert_eq!(
-            row_long.tooltip_text().as_deref(),
-            Some(long.as_str()),
+            row_far.tooltip_text().as_deref(),
+            Some(far_over.as_str()),
             "the row's tooltip must carry the full, untruncated name"
         );
-        let summary_tooltip = expander
-            .tooltip_text()
-            .expect("the collapsed summary's tooltip must be set");
         assert!(
-            summary_tooltip.contains(&long),
+            summary_tooltip_far.contains(&far_over),
             "the expander's tooltip must carry the full, untruncated summary, got \
-             {summary_tooltip:?}"
+             {summary_tooltip_far:?}"
         );
     }
 
-    /// **The #1302 fix, pinned** for the Services card: a 300-character
-    /// single-token failed-unit name must not widen the row past a
-    /// 5-character one, and the tooltip must carry the full name.
+    /// **The #1302 fix, pinned** for the Services card: two failed-unit names
+    /// both past `truncate_for_row`'s cap, of different lengths, must render
+    /// the row at the exact same width, and the tooltip must carry the full
+    /// name.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` in
-    /// [`build_failed_unit_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_failed_unit_row`] to the raw name: measured `left: 2435 /
+    /// right: 815`.
     #[gtk::test]
     fn failed_unit_row_ellipsises_a_long_name() {
         adw::init().expect("libadwaita init");
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(FAR_OVER_CAP);
+        let over = "x".repeat(OVER_CAP);
         let unit = |name: &str| FailedUnit {
             name: name.to_string(),
             description: String::new(),
             sub_state: "failed".to_string(),
         };
 
-        let row_long = build_failed_unit_row(&unit(&long));
-        let row_short = build_failed_unit_row(&unit("abcde"));
+        let row_far = build_failed_unit_row(&unit(&far_over));
+        let row_over = build_failed_unit_row(&unit(&over));
+        let row_short = build_failed_unit_row(&unit(UNDER_CAP));
 
         assert_eq!(
-            natural_width(&row_long),
-            natural_width(&row_short),
-            "a 300-char unit name must not widen the row past a 5-char one"
+            natural_width(&row_far),
+            natural_width(&row_over),
+            "two over-the-cap unit names must render the row at the exact same width"
         );
-        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert!(natural_width(&row_short) < natural_width(&row_far));
+        assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 
-    /// **The #1302 fix, pinned** for the Disks card: a 300-character
-    /// single-token mount path must not widen the row past a 5-character one,
-    /// and the tooltip must carry the full path.
+    /// **The #1302 fix, pinned** for the Disks card: two mount paths both
+    /// past the cap, of different lengths, must render the row at the exact
+    /// same width, and the tooltip must carry the full path.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` in
-    /// [`build_disk_mount_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_disk_mount_row`] to the raw path: measured `left: 2435 /
+    /// right: 815`.
     #[gtk::test]
     fn disk_mount_row_ellipsises_a_long_path() {
         adw::init().expect("libadwaita init");
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(FAR_OVER_CAP);
+        let over = "x".repeat(OVER_CAP);
         let mount = |path: &str| DiskMount {
             path: path.to_string(),
             total_bytes: 100,
@@ -2942,41 +3000,48 @@ mod width_tests {
             usage: 0.5,
         };
 
-        let row_long = build_disk_mount_row(&mount(&long));
-        let row_short = build_disk_mount_row(&mount("abcde"));
+        let row_far = build_disk_mount_row(&mount(&far_over));
+        let row_over = build_disk_mount_row(&mount(&over));
+        let row_short = build_disk_mount_row(&mount(UNDER_CAP));
 
         assert_eq!(
-            natural_width(&row_long),
-            natural_width(&row_short),
-            "a 300-char mount path must not widen the row past a 5-char one"
+            natural_width(&row_far),
+            natural_width(&row_over),
+            "two over-the-cap mount paths must render the row at the exact same width"
         );
-        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert!(natural_width(&row_short) < natural_width(&row_far));
+        assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 
-    /// **The #1302 fix, pinned** for the GPU card: a 300-character
-    /// single-token device name must not widen the row past a 5-character
-    /// one, and the tooltip must carry the full name.
+    /// **The #1302 fix, pinned** for the GPU card: two device names both past
+    /// the cap, of different lengths, must render the row's subtitle at the
+    /// exact same width, and the tooltip must carry the full name.
     ///
-    /// Falsified by commenting out `row.set_subtitle_lines(1)` in
-    /// [`super::build_live_gpu_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`apply_gpu_name_subtitle`]: measured `left: 1997 / right: 590`.
     #[gtk::test]
     fn gpu_row_subtitle_ellipsises_a_long_device_name() {
         adw::init().expect("libadwaita init");
         let row = adw::ActionRow::builder().title("GPU").build();
         row.set_subtitle_lines(1);
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(FAR_OVER_CAP);
+        let over = "x".repeat(OVER_CAP);
 
-        apply_gpu_name_subtitle(&row, long.clone());
-        let nat_long = natural_width(&row);
-        apply_gpu_name_subtitle(&row, "abcde".to_string());
+        apply_gpu_name_subtitle(&row, far_over.clone());
+        let nat_far = natural_width(&row);
+        apply_gpu_name_subtitle(&row, over.clone());
+        let nat_over = natural_width(&row);
+        apply_gpu_name_subtitle(&row, UNDER_CAP.to_string());
         let nat_short = natural_width(&row);
 
         assert_eq!(
-            nat_long, nat_short,
-            "a 300-char GPU device name must not widen the row past a 5-char one"
+            nat_far, nat_over,
+            "two over-the-cap device names must render the row's subtitle at the exact same \
+             width"
         );
-        apply_gpu_name_subtitle(&row, long.clone());
-        assert_eq!(row.tooltip_text().as_deref(), Some(long.as_str()));
+        assert!(nat_short < nat_far);
+        apply_gpu_name_subtitle(&row, far_over.clone());
+        assert_eq!(row.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 }
 

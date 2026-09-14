@@ -95,6 +95,50 @@ fn humanize_since_at(t: SystemTime, now: SystemTime) -> String {
     }
 }
 
+/// The character cap [`truncate_for_row`] applies — long enough that an
+/// ordinary title still reads in full, short enough to keep a boxed-list row
+/// from dominating the drawer's width. Roughly double `widgets/window_list.rs`'s
+/// 30-char cap on its narrow bar pill, sized instead for a full-width drawer
+/// row.
+const ROW_TEXT_CAP: usize = 60;
+
+/// Cap `s` to [`ROW_TEXT_CAP`] characters, replacing anything past that with
+/// a single ellipsis character. A no-op when `s` already fits.
+///
+/// # Why this exists (#1302)
+///
+/// `AdwActionRow`/`AdwExpanderRow`'s `title-lines`/`subtitle-lines`
+/// (`gtk_label_set_lines` + `Pango::EllipsizeMode::End` on the row's internal
+/// label — libadwaita's `adw_action_row_set_title_lines`) only change how the
+/// label *renders* once it's given less width than it naturally wants; they do
+/// not shrink the label's own natural-width request, which is exactly what
+/// feeds `modal.rs`'s drawer sizing on the way up through the row's ancestors.
+/// Measured directly: an `AdwActionRow` titled with a 300-character
+/// single-token name reports the same ~2400px natural width whether
+/// `title-lines` is 0 or 1 — Pango lays out an unconstrained (`for_size = -1`)
+/// wrapping label as if it could have the whole string on one line, and
+/// `title-lines` only caps what happens if it *doesn't* get that. A bare
+/// `gtk::Label` has an escape hatch for this (`set_max_width_chars`, already
+/// used by `widgets/window_list.rs` and `panels/media.rs`'s
+/// `ellipsized_label`), but neither row type exposes an equivalent property
+/// for its built-in title/subtitle labels — so the string itself is capped
+/// before it ever reaches `set_title`/`set_subtitle`, which bounds the row's
+/// natural width directly (there's nothing longer than the cap to lay out).
+///
+/// Every call site pairs this with `title_lines(1)`/`subtitle_lines(1)` as a
+/// second line of defense (an unusual font or DPI could still make even a
+/// capped string wider than the space actually allocated) and keeps the
+/// *untruncated* original string in a tooltip — this function only ever
+/// touches what's drawn on the row, never what a hover reveals.
+pub(crate) fn truncate_for_row(s: &str) -> String {
+    if s.chars().count() <= ROW_TEXT_CAP {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(ROW_TEXT_CAP - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +310,34 @@ mod tests {
             humanize_since_at(at_offset(1_000_100), now),
             "moments from now"
         );
+    }
+
+    // ── truncate_for_row ──────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_for_row_is_a_no_op_under_the_cap() {
+        assert_eq!(truncate_for_row("short-unit.service"), "short-unit.service");
+    }
+
+    #[test]
+    fn truncate_for_row_is_a_no_op_exactly_at_the_cap() {
+        let s = "x".repeat(ROW_TEXT_CAP);
+        assert_eq!(truncate_for_row(&s), s);
+    }
+
+    #[test]
+    fn truncate_for_row_caps_a_long_name_with_a_trailing_ellipsis() {
+        let out = truncate_for_row(&"x".repeat(300));
+        assert_eq!(out.chars().count(), ROW_TEXT_CAP);
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(&out[..out.len() - '\u{2026}'.len_utf8()], "x".repeat(ROW_TEXT_CAP - 1));
+    }
+
+    #[test]
+    fn truncate_for_row_renders_any_two_over_cap_inputs_of_the_same_character_identically() {
+        // The #1302 invariant that actually matters: once a name is over the
+        // cap, growing it further must not change what's displayed at all —
+        // that's what stops the row's width from tracking name length.
+        assert_eq!(truncate_for_row(&"x".repeat(90)), truncate_for_row(&"x".repeat(300)));
     }
 }

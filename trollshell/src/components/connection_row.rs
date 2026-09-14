@@ -4,6 +4,7 @@
 use hytte::adw::{self, prelude::*};
 use hytte::services::netconn::{ConnState, Connection, Proto};
 
+use crate::components::format::truncate_for_row;
 use crate::components::markup;
 
 /// Top-N cap for each bucket of the active-connections section.
@@ -19,13 +20,16 @@ pub(crate) fn build_connection_row(c: &Connection) -> adw::ActionRow {
         },
         None => "(unknown)".to_string(),
     };
-    let row = adw::ActionRow::builder().title(&title).build();
+    let row = adw::ActionRow::builder()
+        .title(&truncate_for_row(&title))
+        .build();
     // The program name is read out of `/proc`, so any process on the box
     // picks it — and the subtitle carries peer addresses (#753).
     markup::plain_text(&row);
     // A process name (or the "name · pid N" title above) has no bound in
-    // principle — capped to one line rather than letting it push the whole
-    // drawer wider (#1302).
+    // principle — capped (see `truncate_for_row`) rather than letting it push
+    // the whole drawer wider (#1302); `title_lines(1)` is a second line of
+    // defense.
     row.set_title_lines(1);
     row.set_tooltip_text(Some(&title));
     let proto = match c.proto {
@@ -72,30 +76,38 @@ mod tests {
         }
     }
 
-    /// **The #1302 fix, pinned**: a 300-character single-token `/proc`
-    /// program name must not widen the row past a 5-character one, and the
-    /// tooltip must still carry the full "name · pid N" title.
+    /// **The #1302 fix, pinned**: two `/proc` program names both past
+    /// `truncate_for_row`'s cap, of different lengths, must render the row at
+    /// the exact same width — `title_lines(1)` alone does not bound
+    /// `AdwActionRow`'s natural width (see
+    /// `components::format::truncate_for_row`'s doc) — and the tooltip must
+    /// still carry the full "name · pid N" title.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` in
-    /// [`build_connection_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_connection_row`] to the raw title: measured `left: 2460 /
+    /// right: 823`.
     #[gtk::test]
     fn connection_row_title_ellipsises_a_long_program_name() {
         adw::init().expect("libadwaita init");
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
 
-        let row_long = build_connection_row(&conn(&long));
-        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_far = build_connection_row(&conn(&far_over));
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let row_over = build_connection_row(&conn(&over));
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
         let row_short = build_connection_row(&conn("abcde"));
         let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
 
         assert_eq!(
-            nat_long, nat_short,
-            "a 300-char program name must not widen the row past a 5-char one — \
-             title_lines(1) must be capping it"
+            nat_far, nat_over,
+            "two over-the-cap program names must render the row at the exact same width — \
+             growth must stop at the cap"
         );
-        let tooltip = row_long.tooltip_text().expect("the row's tooltip must be set");
+        assert!(nat_short < nat_far, "sanity: a 5-char name must measure narrower");
+        let tooltip = row_far.tooltip_text().expect("the row's tooltip must be set");
         assert!(
-            tooltip.contains(&long),
+            tooltip.contains(&far_over),
             "the tooltip must still carry the full, untruncated title, got {tooltip:?}"
         );
     }

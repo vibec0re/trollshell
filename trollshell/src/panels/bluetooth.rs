@@ -24,6 +24,7 @@ use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
 use hytte::services::notifications;
 
+use crate::components::format::truncate_for_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::markup;
 
@@ -74,8 +75,9 @@ fn build_bluetooth_header() -> gtk::Widget {
 
     let row = adw::ActionRow::builder().title("Bluetooth").build();
     // The adapter's own name is `bluetoothctl system-alias`-settable free
-    // text — cap it to one line rather than letting it push the drawer wider
-    // (#1302); the tooltip mirrors the full text.
+    // text — capped (see `truncate_for_row`) rather than letting it push the
+    // drawer wider (#1302); `subtitle_lines(1)` is a second line of defense
+    // and the tooltip mirrors the full text.
     row.set_subtitle_lines(1);
     bind(
         bluetooth::adapter().map(|a| match a {
@@ -84,7 +86,7 @@ fn build_bluetooth_header() -> gtk::Widget {
         }),
         &row,
         |w, name| {
-            w.set_subtitle(&name);
+            w.set_subtitle(&truncate_for_row(&name));
             w.set_tooltip_text(Some(&name));
         },
     );
@@ -134,7 +136,7 @@ fn build_bluetooth_controls() -> gtk::Widget {
         }),
         &disc_row,
         |row, text| {
-            row.set_subtitle(&text);
+            row.set_subtitle(&truncate_for_row(&text));
             row.set_tooltip_text(Some(&text));
         },
     );
@@ -417,7 +419,7 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
         "Tap to pair"
     };
     let row = adw::ActionRow::builder()
-        .title(&dev.alias)
+        .title(&truncate_for_row(&dev.alias))
         .subtitle(subtitle)
         .activatable(true)
         .build();
@@ -426,8 +428,9 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
     // tap to pair). Markup off rather than escaped: nothing in this row wants
     // markup, and it covers the subtitle too (#753, cf. #30).
     markup::plain_text(&row);
-    // A broadcast alias is one unbreakable token with no bound — capped to
-    // one line rather than letting it push the whole drawer wider (#1302).
+    // A broadcast alias is one unbreakable token with no bound — capped (see
+    // `truncate_for_row`) rather than letting it push the whole drawer wider
+    // (#1302); `title_lines(1)` is a second line of defense.
     row.set_title_lines(1);
     row.set_sensitive(!is_busy);
     // The tooltip already carried the MAC address; folded the (now possibly
@@ -582,17 +585,22 @@ mod tests {
         while gtk::glib::MainContext::default().iteration(false) {}
     }
 
-    /// **The #1302 fix, pinned**: a 300-character single-token device alias
-    /// (broadcast by whoever is in radio range, per `build_device_row`'s own
-    /// doc comment) must not widen the row past a 5-character one, and the
-    /// tooltip must still carry the full alias.
+    /// **The #1302 fix, pinned**: two device aliases (broadcast by whoever is
+    /// in radio range, per `build_device_row`'s own doc comment) both past
+    /// `truncate_for_row`'s cap, of different lengths, must render the row at
+    /// the exact same width — the real invariant, since `title_lines(1)`
+    /// alone does not bound `AdwActionRow`'s natural width (see
+    /// `components::format::truncate_for_row`'s doc) — and the tooltip must
+    /// still carry the full alias.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` in
-    /// [`build_device_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_device_row`] to the raw alias: measured `left: 2460 / right:
+    /// 823`.
     #[gtk::test]
     fn device_row_title_ellipsises_a_long_alias() {
         adw::init().expect("libadwaita init");
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
         let dev = |alias: &str| Device {
             path: "/org/bluez/hci0/dev_AA".to_owned(),
             alias: alias.to_owned(),
@@ -600,21 +608,27 @@ mod tests {
             ..Device::default()
         };
 
-        let row_long = build_device_row(&dev(&long), false);
-        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_far = build_device_row(&dev(&far_over), false);
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let row_over = build_device_row(&dev(&over), false);
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
         let row_short = build_device_row(&dev("abcde"), false);
         let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
 
         assert_eq!(
-            nat_long, nat_short,
-            "a 300-char alias must not widen the row past a 5-char one — title_lines(1) must \
-             be capping it"
+            nat_far, nat_over,
+            "two over-the-cap aliases must render the row at the exact same width — growth \
+             must stop at the cap"
         );
-        let tooltip = row_long
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char alias must still measure narrower than a capped one"
+        );
+        let tooltip = row_far
             .tooltip_text()
             .expect("the row's tooltip must be set when an address is present");
         assert!(
-            tooltip.contains(&long),
+            tooltip.contains(&far_over),
             "the tooltip must still carry the full, untruncated alias, got {tooltip:?}"
         );
     }

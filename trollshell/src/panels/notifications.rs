@@ -14,6 +14,7 @@ use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::{dnd, notifications, notifications_mute};
 
+use crate::components::format::truncate_for_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::notif_actions;
 
@@ -163,22 +164,7 @@ fn build_history_app_row(
 ) -> adw::ExpanderRow {
     const MAX_PER_APP: usize = 20;
 
-    let row = adw::ExpanderRow::builder().title(app).build();
-    // The freedesktop `app_name` is free text sent by whatever is posting
-    // notifications — capped to one line rather than letting it push the
-    // whole drawer wider (#1302). The body (below, unbounded) already wraps
-    // by design, so it's left alone.
-    row.set_title_lines(1);
-    row.set_tooltip_text(Some(app));
-    let count = entries.len();
-    if let Some(latest) = entries.first() {
-        let subtitle = if count == 1 {
-            latest.summary.clone()
-        } else {
-            format!("{} · {} entries", latest.summary, count)
-        };
-        row.set_subtitle(&subtitle);
-    }
+    let row = build_history_app_row_shell(app, entries);
 
     // Per-app mute switch.
     let mute_switch = gtk::Switch::new();
@@ -206,13 +192,48 @@ fn build_history_app_row(
     row
 }
 
+/// The title/subtitle half of [`build_history_app_row`] — everything except
+/// the mute switch (whose `bind_two_way(notifications_mute::muted_apps(), …)`
+/// needs a registered `Registry`, per this file's own `pin_tests` doc) and
+/// the per-entry rows. Extracted so the colocated `#[gtk::test]` can drive the
+/// #1302 title-capping behavior standalone, without registering a service
+/// whose `Default` reads the real `~/.config/trollshell` mute file.
+fn build_history_app_row_shell(
+    app: &str,
+    entries: &[&notifications::HistoryEntry],
+) -> adw::ExpanderRow {
+    let row = adw::ExpanderRow::builder()
+        .title(truncate_for_row(app))
+        .build();
+    // The freedesktop `app_name` is free text sent by whatever is posting
+    // notifications — capped (see `truncate_for_row`) rather than letting it
+    // push the whole drawer wider (#1302); `title_lines(1)` is a second line
+    // of defense. The body (below, unbounded) already wraps by design, so
+    // it's left alone.
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(app));
+    let count = entries.len();
+    if let Some(latest) = entries.first() {
+        let subtitle = if count == 1 {
+            latest.summary.clone()
+        } else {
+            format!("{} · {} entries", latest.summary, count)
+        };
+        row.set_subtitle(&subtitle);
+    }
+    row
+}
+
 fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(&entry.summary).build();
+    let row = adw::ActionRow::builder()
+        .title(truncate_for_row(&entry.summary))
+        .build();
     // The summary is a single-line freedesktop field with no bound — capped
-    // to one line rather than letting it push the whole drawer wider
-    // (#1302). The body just below is left alone: it already wraps freely
-    // (no `subtitle_lines` cap), which is the intended multi-line rendering
-    // for a notification body.
+    // (see `truncate_for_row`) rather than letting it push the whole drawer
+    // wider (#1302); `title_lines(1)` is a second line of defense. The body
+    // just below is left alone: it already wraps freely (no `subtitle_lines`
+    // cap), which is the intended multi-line rendering for a notification
+    // body.
     row.set_title_lines(1);
     row.set_tooltip_text(Some(&entry.summary));
     if !entry.body.is_empty() {
@@ -367,13 +388,11 @@ mod pin_tests {
 /// of this bug class.
 #[cfg(all(test, feature = "system-tests"))]
 mod width_tests {
-    use std::collections::HashSet;
-
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
     use hytte::services::notifications::{HistoryEntry, Urgency};
 
-    use super::{build_history_action_row, build_history_app_row};
+    use super::{build_history_action_row, build_history_app_row_shell};
 
     fn entry(summary: &str) -> HistoryEntry {
         HistoryEntry {
@@ -391,56 +410,73 @@ mod width_tests {
         }
     }
 
-    /// **The #1302 fix, pinned** for the per-app `ExpanderRow`'s title: a
-    /// 300-character single-token `app_name` must not widen the row past a
-    /// 5-character one, and the tooltip must still carry the full name.
+    /// **The #1302 fix, pinned** for the per-app `ExpanderRow`'s title: two
+    /// `app_name`s both past `truncate_for_row`'s cap, of different lengths,
+    /// must render the row at the exact same width — `title_lines(1)` alone
+    /// does not bound `AdwExpanderRow`'s natural width (see
+    /// `components::format::truncate_for_row`'s doc) — and the tooltip must
+    /// still carry the full name.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` in
-    /// [`build_history_app_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_history_app_row_shell`] to the raw name: measured `left: 2460
+    /// / right: 823`.
+    ///
+    /// Drives [`build_history_app_row_shell`] rather than
+    /// `build_history_app_row` itself: the latter's mute switch needs a
+    /// registered `notifications_mute` service (see the shell's own doc), and
+    /// the title-capping behavior under test lives entirely in the shell.
     #[gtk::test]
     fn history_app_row_title_ellipsises_a_long_app_name() {
         adw::init().expect("libadwaita init");
-        let long = "x".repeat(300);
-        let muted = HashSet::new();
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
         let e = entry("New message");
         let bucket = [&e];
 
-        let row_long = build_history_app_row(&long, &bucket, &muted);
-        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
-        let row_short = build_history_app_row("abcde", &bucket, &muted);
+        let row_far = build_history_app_row_shell(&far_over, &bucket);
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let row_over = build_history_app_row_shell(&over, &bucket);
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_history_app_row_shell("abcde", &bucket);
         let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
 
         assert_eq!(
-            nat_long, nat_short,
-            "a 300-char app name must not widen the row past a 5-char one — title_lines(1) \
-             must be capping it"
+            nat_far, nat_over,
+            "two over-the-cap app names must render the row at the exact same width — growth \
+             must stop at the cap"
         );
-        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert!(nat_short < nat_far, "sanity: a 5-char name must measure narrower");
+        assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 
-    /// **The #1302 fix, pinned** for one history entry's summary title: a
-    /// 300-character single-token summary must not widen the row past a
-    /// 5-character one, and the tooltip must still carry the full summary.
-    /// The (unbounded, deliberately unwrapped) body is untouched by this fix
-    /// and out of scope for this test.
+    /// **The #1302 fix, pinned** for one history entry's summary title: two
+    /// summaries both past the cap, of different lengths, must render the row
+    /// at the exact same width, and the tooltip must still carry the full
+    /// summary. The (unbounded, deliberately unwrapped) body is untouched by
+    /// this fix and out of scope for this test.
     ///
-    /// Falsified by commenting out `row.set_title_lines(1)` in
-    /// [`build_history_action_row`]: measured `left: 2210 / right: 360`.
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_history_action_row`] to the raw summary: measured `left: 2460
+    /// / right: 823`.
     #[gtk::test]
     fn history_action_row_title_ellipsises_a_long_summary() {
         adw::init().expect("libadwaita init");
-        let long = "x".repeat(300);
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
 
-        let row_long = build_history_action_row(&entry(&long));
-        let (_, nat_long, _, _) = row_long.measure(gtk::Orientation::Horizontal, -1);
+        let row_far = build_history_action_row(&entry(&far_over));
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let row_over = build_history_action_row(&entry(&over));
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
         let row_short = build_history_action_row(&entry("abcde"));
         let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
 
         assert_eq!(
-            nat_long, nat_short,
-            "a 300-char summary must not widen the row past a 5-char one — title_lines(1) \
-             must be capping it"
+            nat_far, nat_over,
+            "two over-the-cap summaries must render the row at the exact same width — growth \
+             must stop at the cap"
         );
-        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert!(nat_short < nat_far, "sanity: a 5-char summary must measure narrower");
+        assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 }

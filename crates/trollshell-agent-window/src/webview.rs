@@ -500,6 +500,13 @@ mod gtk_tests {
     /// this needs no network" is right about the *network* and does not save
     /// it: the decision is still made by a process that cannot start.
     ///
+    /// (The **network** process is a different story, and it does dial —
+    /// `window.rs`'s `gtk_tests::a_second_activation_during_the_probe_opens_no_second_connection`
+    /// records it reaching a fixture gateway once the page mounts, #1274 N3.
+    /// That process carries no navigation policy of its own; it is
+    /// `decide-policy`, dispatched on the *web* process above, that this file
+    /// cannot observe.)
+    ///
     /// (`WebViewExt::uri` is no substitute either, and that is worth recording
     /// separately: it is set by `load_uri` *before* any decision, so it reads
     /// back a refused URI unchanged. Measured — it was the first shape tried.)

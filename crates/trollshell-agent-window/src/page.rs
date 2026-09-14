@@ -290,7 +290,7 @@ mod tests {
     /// unknown values are ignored, so `header,input`, `input,header` and
     /// `input` all hide the footer, and only "no `input` anywhere in what we
     /// send" says what this window now promises. The embedded URL is asserted
-    /// too, because that — not the constant — is the string WebKit loads.
+    /// too, because that — not the constant — is the string `WebKit` loads.
     ///
     /// Falsification (run this round, red): restore `"hide=header,input"` and
     /// both halves red on the rendered URL and on the constant.

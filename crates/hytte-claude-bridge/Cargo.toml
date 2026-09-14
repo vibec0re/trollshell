@@ -74,3 +74,11 @@ ureq = { workspace = true, features = ["json", "rustls"] }
 # for exactly this), so it adds no lock entry, and being a dev-dependency it
 # links nothing into the shipped daemon.
 tempfile.workspace = true
+# `test-util` only, dev-only: `usage::poll_loop`'s `#[tokio::test(start_paused
+# = true)]` (#1285's review, MED) needs `tokio::time::{pause,advance}` to
+# drive the 429 backoff schedule under a virtual clock instead of a real
+# `sleep`. The `[dependencies]` tokio entry above already resolves the crate
+# and every other feature this test needs (`macros`, `rt-multi-thread`,
+# `time`); this dev-only edge adds one feature flag and no `Cargo.lock` entry,
+# and never reaches the shipped daemon.
+tokio = { workspace = true, features = ["test-util"] }

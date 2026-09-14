@@ -69,6 +69,7 @@
 //! sees a `CONNECT` and never the bearer: the same position
 //! [`crate::envguard`] already takes for `HTTPS_PROXY` on the `claude` child.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -727,30 +728,36 @@ fn advance(
     (report, wait, last_ok)
 }
 
-/// Poll forever: one fetch immediately, then one every [`POLL_EVERY`] —
-/// longer when [`next_wait`] has backed off a 429.
+/// One [`fetch_with_retry_after`]-shaped answer: the fetch's own `Result`,
+/// plus whatever `Retry-After` it read off the wire (if any).
+type FetchOutcome = (Result<Usage, UsageError>, Option<Duration>);
+
+/// [`poll_forever`]'s actual loop, pulled out so a test can drive it against
+/// a scripted `fetch_once` under a virtual clock instead of a real network
+/// and a real `sleep` (#1285's review, MED — "`poll_forever`'s wiring is
+/// pinned by nothing; only `advance`/`next_wait` are").
 ///
-/// Never returns. Spawned by `main` on the HTTP runtime — deliberately *not*
-/// from the plugin SDK's session, so the numbers keep arriving while the shell
-/// is down and the chip's dial/backoff is running.
-pub async fn poll_forever(base_url: String, credentials: PathBuf) {
+/// The fetcher is injected rather than hard-coded so the two shapes that
+/// produce a [`FetchOutcome`] — a real `spawn_blocking` HTTP round-trip
+/// ([`poll_forever`]) and a scripted in-memory sequence (the `poll_loop`
+/// tests) — are interchangeable here; this function itself never knows
+/// which one it was handed. Every step below routes through something a
+/// test can observe from the outside — `fetch_once` (the network),
+/// [`advance`] (the book-keeping), [`publish`] (the board), and
+/// `tokio::time::sleep` (the schedule) — so a mutation that discards the
+/// computed `wait` or the carried `last_ok` breaks the loop itself, not just
+/// the pure `advance`/`next_wait` unit tests that call those functions
+/// directly and would never notice `poll_forever` stopped wiring them
+/// together correctly.
+async fn poll_loop<F, Fut>(mut fetch_once: F) -> !
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = FetchOutcome>,
+{
     let mut wait = POLL_EVERY;
     let mut last_ok: Option<(i64, Usage)> = None;
     loop {
-        let (base, creds) = (base_url.clone(), credentials.clone());
-        let (result, retry_after) = match tokio::task::spawn_blocking(move || {
-            fetch_with_retry_after(&base, &creds)
-        })
-        .await
-        {
-            Ok(pair) => pair,
-            Err(e) => (
-                Err(UsageError::Io(truncate(&format!(
-                    "the usage poll task did not finish: {e}"
-                )))),
-                None,
-            ),
-        };
+        let (result, retry_after) = fetch_once().await;
         let (report, next_wait_value, next_last_ok) =
             advance(wait, last_ok, now_unix(), result, retry_after);
         wait = next_wait_value;
@@ -764,6 +771,33 @@ pub async fn poll_forever(base_url: String, credentials: PathBuf) {
         publish(report);
         tokio::time::sleep(wait).await;
     }
+}
+
+/// Poll forever: one fetch immediately, then one every [`POLL_EVERY`] —
+/// longer when [`next_wait`] has backed off a 429.
+///
+/// Never returns. Spawned by `main` on the HTTP runtime — deliberately *not*
+/// from the plugin SDK's session, so the numbers keep arriving while the shell
+/// is down and the chip's dial/backoff is running. A thin wrapper over
+/// [`poll_loop`]: the only thing this adds is the real fetcher —
+/// `spawn_blocking`ing [`fetch_with_retry_after`], with a task-join failure
+/// mapped to the same [`UsageError::Io`] shape a transport error would be.
+pub async fn poll_forever(base_url: String, credentials: PathBuf) -> ! {
+    poll_loop(move || {
+        let (base, creds) = (base_url.clone(), credentials.clone());
+        async move {
+            match tokio::task::spawn_blocking(move || fetch_with_retry_after(&base, &creds)).await {
+                Ok(pair) => pair,
+                Err(e) => (
+                    Err(UsageError::Io(truncate(&format!(
+                        "the usage poll task did not finish: {e}"
+                    )))),
+                    None,
+                ),
+            }
+        }
+    })
+    .await
 }
 
 // ── Time, without a calendar crate ───────────────────────────────────────────
@@ -1118,13 +1152,14 @@ mod tests {
         DEFAULT_BASE_URL, ExtraUsage, Limit, MAX_BACKOFF, Outcome, POLL_EVERY, Report,
         SEVERITY_NORMAL, STALE_AFTER, Usage, UsageError, advance, credentials_path_in, fetch,
         fetch_with_retry_after, format_utc, humanise_kind, humanise_since, humanise_until,
-        next_wait, parse_http_date, parse_retry_after, parse_rfc3339, percent_label, reset_phrase,
-        reset_short, scrub, truncate,
+        next_wait, parse_http_date, parse_retry_after, parse_rfc3339, percent_label, poll_loop,
+        reset_phrase, reset_short, scrub, truncate,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
     /// The **captured response** (`tests/fixtures/usage_response.json`) — the
@@ -1141,6 +1176,14 @@ mod tests {
     /// mid-flight (`hytte-ai-providers`' `TEST_SOCKETS`, #716). Unwrap through a
     /// poison so one panicking test does not cascade.
     static TEST_SOCKETS: Mutex<()> = Mutex::new(());
+
+    /// Every test that publishes onto the process-global [`BOARD`] takes this
+    /// for its whole body — `publishing_a_report_bumps_the_version` and the
+    /// `poll_loop` wiring test below both do, and cargo runs tests in
+    /// parallel threads in one process, so one test's `publish` could
+    /// otherwise land between another's `publish` and its own `latest()`
+    /// read. Same shape as [`TEST_SOCKETS`], for the same reason.
+    static BOARD_TESTS: Mutex<()> = Mutex::new(());
 
     /// A token no real endpoint would issue, long enough that an accidental
     /// substring match is not the reason a test passes.
@@ -2178,6 +2221,7 @@ mod tests {
     /// what lets the chip skip the lock on 59 ticks out of 60.
     #[test]
     fn publishing_a_report_bumps_the_version() {
+        let _guard = BOARD_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
         let before = super::version();
         super::publish(Report {
             at: 1_000,
@@ -2200,6 +2244,156 @@ mod tests {
         let latest = super::latest().expect("published");
         assert_eq!(latest.usage(), Some(&Usage::default()));
         assert_eq!(latest.error(2_000), None);
+    }
+
+    /// **#1285's review, MED — `poll_loop`'s wiring, pinned end to end.**
+    /// `advance`/`next_wait` are unit-tested directly, but nothing drove the
+    /// *loop* itself before this: the review measured that discarding the
+    /// computed schedule (`sleep(POLL_EVERY)` instead of `sleep(wait)`) and
+    /// discarding the carry-forward (`last_ok = None;` in the loop) were both
+    /// **invisible to `cargo test`** — the exact regressions #1283 exists to
+    /// prevent.
+    ///
+    /// Scripts `429(Retry-After: 900 s) → 429 → 200 → 429` through a fake
+    /// `fetch_once` under a paused virtual clock, and checks the *published*
+    /// [`Report`]s (not `advance`'s return value) plus the virtual gap each
+    /// step actually waits — the loop's own board and its own sleep, which is
+    /// exactly what `advance`/`next_wait` unit tests cannot reach.
+    ///
+    /// Falsify either mutation from the review and this goes red — see the
+    /// PR comment for both transcripts.
+    ///
+    /// A plain `#[test]` building its own paused-clock current-thread
+    /// runtime, rather than `#[tokio::test(start_paused = true)]`, so
+    /// [`BOARD_TESTS`] can be held for the whole body: the guard is a local
+    /// in this *synchronous* function, and `Runtime::block_on` is an
+    /// ordinary blocking call from its point of view, not a suspension point
+    /// inside an `async fn` — so nothing here holds a lock across an
+    /// `.await` (`clippy::await_holding_lock`, part of `clippy::all`).
+    #[test]
+    fn poll_loop_sleeps_the_computed_wait_and_carries_last_ok_through_a_later_failure() {
+        let _guard = BOARD_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let usage = some_usage();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a current-thread runtime with a paused clock");
+
+        rt.block_on(async {
+            let task = {
+                let calls = Arc::clone(&calls);
+                let usage = usage.clone();
+                tokio::spawn(async move {
+                    poll_loop(move || {
+                        let n = calls.fetch_add(1, AtomicOrdering::SeqCst);
+                        let usage = usage.clone();
+                        async move {
+                            match n {
+                                // A 429 with an explicit Retry-After: pins
+                                // the wait at exactly 15 min — ==
+                                // MAX_BACKOFF since item 4, so this also
+                                // probes the cap.
+                                0 => (Err(UsageError::Http(429)), Some(Duration::from_mins(15))),
+                                // A success: resets the schedule to
+                                // POLL_EVERY and seeds `last_ok`.
+                                2 => (Ok(usage), None),
+                                // A second 429 with no header (doubling
+                                // would overshoot the cap, so this also
+                                // waits 15 min), and every failure after the
+                                // success — `last_ok` must survive into
+                                // that one.
+                                _ => (Err(UsageError::Http(429)), None),
+                            }
+                        }
+                    })
+                    .await
+                })
+            };
+
+            // The first fetch runs immediately, before any sleep.
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                1,
+                "one fetch, no sleep yet"
+            );
+            let report = super::latest().expect("published");
+            assert!(
+                matches!(report.outcome, Outcome::Failed(UsageError::RateLimited(_))),
+                "{:?}",
+                report.outcome
+            );
+            assert_eq!(report.last_ok, None, "nothing to carry yet");
+
+            // The loop must sleep the computed 15 min wait, not a hardcoded
+            // POLL_EVERY (5 min) — falsifies `sleep(POLL_EVERY)` in place of
+            // `sleep(wait)`.
+            tokio::time::advance(Duration::from_secs(15 * 60 - 1)).await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                1,
+                "899 s in, still waiting"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                2,
+                "exactly 15 min wakes it"
+            );
+            let report = super::latest().expect("published");
+            assert!(
+                matches!(report.outcome, Outcome::Failed(UsageError::RateLimited(_))),
+                "{:?}",
+                report.outcome
+            );
+            assert_eq!(report.last_ok, None, "still nothing to carry");
+
+            // Third fetch: the success. Resets the schedule to POLL_EVERY.
+            tokio::time::advance(Duration::from_mins(15)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 3, "the success");
+            let report = super::latest().expect("published");
+            assert_eq!(report.outcome, Outcome::Ok(usage.clone()));
+            assert_eq!(report.last_ok, Some((report.at, usage.clone())));
+
+            // The success resets the wait to POLL_EVERY (5 min) — not the
+            // 15 min cap it was just backed off to.
+            tokio::time::advance(Duration::from_secs(5 * 60 - 1)).await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                3,
+                "299 s in, still waiting"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                calls.load(AtomicOrdering::SeqCst),
+                4,
+                "exactly POLL_EVERY wakes it"
+            );
+
+            // The failure AFTER the success: `last_ok` must have survived
+            // the trip through the loop's own local state — falsifies
+            // `last_ok = None;` discarding the carry-forward in `poll_loop`
+            // itself.
+            let report = super::latest().expect("published");
+            assert!(
+                matches!(report.outcome, Outcome::Failed(UsageError::RateLimited(_))),
+                "{:?}",
+                report.outcome
+            );
+            assert_eq!(
+                report.usage(),
+                Some(&usage),
+                "last_ok must survive a failure that comes after the success"
+            );
+
+            task.abort();
+        });
     }
 
     /// The default base URL is the real API host, spelled once.

@@ -1718,7 +1718,7 @@ mod tests {
                 // to make more writes until the reader has logged enough
                 // raced reads — this is what makes `reads >
                 // MIN_RACED_READS` a guarantee rather than a hope.
-                if (i - WARMUP_ITERATIONS) % PACE_CHECK_EVERY == 0 {
+                if (i - WARMUP_ITERATIONS).is_multiple_of(PACE_CHECK_EVERY) {
                     let mut yields = 0u32;
                     while writer_reads_seen.load(std::sync::atomic::Ordering::Relaxed)
                         <= MIN_RACED_READS

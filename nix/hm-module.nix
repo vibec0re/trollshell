@@ -58,17 +58,31 @@ let
   # (`id` below) is the value, since #1250 already needs it to agree with
   # the systemd unit name (`trollshell-plugin-<id>`) this launcher gives the
   # plugin. `manifestId` is the plugin's own id absent an override, inferred
-  # from its binary name rather than hand-declared: every bundled plugin's
-  # flake output — and binary, `nix/plugin.nix`'s `meta.mainProgram` — is
-  # named `hytte-plugin-<id>`, and the crate registers that same `<id>` with
-  # `Manifest::new` (e.g. `crates/hytte-plugin-stats/src/plugin.rs`'s
-  # `PLUGIN_ID`), so stripping the prefix off `lib.getExe`'s own result
-  # reconstructs it with no new nix-side declaration to drift from the Rust
-  # constant. `HYTTE_PLUGIN_ID` is therefore rendered only when the
-  # attribute key disagrees with that inferred id — a plugin declared under
-  # its own name (`plugins.stats`) renders nothing, exactly as before this
-  # existed. Same disagreement guard as `mount`: `nix/module-common.nix`
-  # asserts an explicit `env.HYTTE_PLUGIN_ID` never disagrees with it.
+  # from its binary name rather than hand-declared: every bundled WIDGET
+  # plugin's flake output — and binary, `nix/plugin.nix`'s
+  # `meta.mainProgram` — is named `hytte-plugin-<id>`, and the crate
+  # registers that same `<id>` with `Manifest::new` (e.g.
+  # `crates/hytte-plugin-stats/src/plugin.rs`'s `PLUGIN_ID`), so stripping
+  # that prefix off `lib.getExe`'s own result reconstructs it with no new
+  # nix-side declaration to drift from the Rust constant. The standalone-hat
+  # binaries `nix/plugin.nix` ALSO packages (`hytte-claude-bridge`,
+  # `hytte-infobroker`) don't carry the `-plugin-` segment, but they are the
+  # same `programs.trollshell.plugins.<id>` shape — `claude-bridge` is the
+  # canonical example (`hm-module`'s own fixture below) — and their own
+  # `PLUGIN_ID` is what's left after `hytte-` alone
+  # (`crates/hytte-claude-bridge/src/plugin.rs`'s `PLUGIN_ID = "claude-bridge"`
+  # off the binary `hytte-claude-bridge`), so `manifestId` tries the longer,
+  # widget-shaped prefix first and only falls back to the bare one when that
+  # didn't strip anything — a package with neither prefix (an out-of-tree
+  # third-party plugin) falls through with its full binary name, the best
+  # nix can infer with no manifest of its own to read.
+  #
+  # `HYTTE_PLUGIN_ID` is therefore rendered only when the attribute key
+  # disagrees with that inferred id — a plugin declared under its own name
+  # (`plugins.stats`, `plugins.claude-bridge`) renders nothing, exactly as
+  # before this existed. Same disagreement guard as `mount`:
+  # `nix/module-common.nix` asserts an explicit `env.HYTTE_PLUGIN_ID` never
+  # disagrees with it.
   pluginsState = builtins.toJSON (
     {
       version = 1;
@@ -76,7 +90,10 @@ let
         id: plugin:
         let
           exec = lib.getExe plugin.package;
-          manifestId = lib.removePrefix "hytte-plugin-" (baseNameOf exec);
+          binName = baseNameOf exec;
+          afterPluginPrefix = lib.removePrefix "hytte-plugin-" binName;
+          manifestId =
+            if afterPluginPrefix != binName then afterPluginPrefix else lib.removePrefix "hytte-" binName;
         in
         {
           inherit exec;

@@ -1418,17 +1418,22 @@ self:
     # option to disagree with — the override IS the attribute name, rendered
     # into `env` whenever it disagrees with the plugin's own manifest id.
     # Both platform modules infer that id from the package rather than from
-    # a second hand-declared option: every bundled plugin's flake output —
-    # and binary — is named `hytte-plugin-<id>`, and the crate registers
-    # that same `<id>` with `Manifest::new`, so stripping the prefix off
-    # `lib.getExe`'s own result reconstructs it with nothing new to drift
-    # from the Rust constant (see `nix/hm-module.nix`'s `pluginsState`
-    # comment). Refuse an explicit `env.HYTTE_PLUGIN_ID` that disagrees with
-    # the rendered value instead of letting `//` discard it silently;
-    # agreeing values are merely redundant and pass.
+    # a second hand-declared option — see `nix/hm-module.nix`'s `pluginsState`
+    # comment for the two-prefix inference (`hytte-plugin-<id>` for bundled
+    # widgets, bare `hytte-<id>` for the standalone-hat binaries like
+    # `hytte-claude-bridge`) and why nothing new drifts from the Rust
+    # constant either registers. Refuse an explicit `env.HYTTE_PLUGIN_ID`
+    # that disagrees with the rendered value instead of letting `//` discard
+    # it silently; agreeing values are merely redundant and pass.
     (
       let
-        manifestIdOf = plugin: lib.removePrefix "hytte-plugin-" (baseNameOf (lib.getExe plugin.package));
+        manifestIdOf =
+          plugin:
+          let
+            binName = baseNameOf (lib.getExe plugin.package);
+            afterPluginPrefix = lib.removePrefix "hytte-plugin-" binName;
+          in
+          if afterPluginPrefix != binName then afterPluginPrefix else lib.removePrefix "hytte-" binName;
         # The override this deployment would render for each plugin — null
         # when the attribute name already agrees with the manifest id, i.e.
         # nothing is rendered and a hand-set env.HYTTE_PLUGIN_ID (however

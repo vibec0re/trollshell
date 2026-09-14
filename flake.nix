@@ -1014,19 +1014,25 @@
           # additive — a plugin that never sets it renders the exact same
           # `plugins.json` entry as before this option existed. Two plugins,
           # one covering each half: `right` sets `mount` and must carry
-          # `HYTTE_PLUGIN_MOUNT` in its rendered `env`; `left` doesn't, and
-          # its ENTIRE rendered entry is asserted against `expectedLeft` —
+          # `HYTTE_PLUGIN_MOUNT` in its rendered `env`; `demo` doesn't, and
+          # its ENTIRE rendered entry is asserted against `expectedDemo` —
           # every field `nix/hm-module.nix`'s `pluginsState` puts on a
           # plugin, spelled out here rather than sourced from a captured
           # historical eval (a rename or a stray extra key fails this the
-          # same way an accidental `HYTTE_PLUGIN_MOUNT` leak would). Nix
-          # attrset equality after `fromJSON` is used rather than a raw
-          # `diff` — unlike `hm-module-agents-fixture` above, there is no
-          # TOML formatting to pin here, and comparing parsed values catches
-          # a real regression the way a byte diff would while staying
-          # insensitive to JSON key order (`builtins.toJSON` already sorts
-          # keys, so the two coincide in practice, but the parsed comparison
-          # is the one that says what it means).
+          # same way an accidental `HYTTE_PLUGIN_MOUNT` leak would). Named
+          # `demo` rather than `left` (its name before #1284) so its
+          # attribute agrees with `stubPlugin`'s own inferred manifest id
+          # ("demo", from `writeShellScriptBin "hytte-plugin-demo"`) and
+          # stays free of a `HYTTE_PLUGIN_ID` override too — this check is
+          # about `mount` alone; `hm-module-plugin-id` below covers the
+          # other knob with the same fixture shape. Nix attrset equality
+          # after `fromJSON` is used rather than a raw `diff` — unlike
+          # `hm-module-agents-fixture` above, there is no TOML formatting to
+          # pin here, and comparing parsed values catches a real regression
+          # the way a byte diff would while staying insensitive to JSON key
+          # order (`builtins.toJSON` already sorts keys, so the two coincide
+          # in practice, but the parsed comparison is the one that says what
+          # it means).
           hm-module-plugin-mount =
             let
               hm = home-manager.lib.homeManagerConfiguration {
@@ -1044,7 +1050,7 @@
                       enable = true;
                       package = stubPackage;
                       plugins = {
-                        left.package = stubPlugin;
+                        demo.package = stubPlugin;
                         right = {
                           package = stubPlugin;
                           mount = "SidebarRightTop";
@@ -1071,7 +1077,7 @@
               pluginsState = builtins.fromJSON (
                 builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
               );
-              expectedLeft = {
+              expectedDemo = {
                 exec = pkgs.lib.getExe stubPlugin;
                 env = { };
                 secrets = [ ];
@@ -1080,7 +1086,7 @@
               assertionPredicates = map (a: a.assertion) cfg.assertions;
               probe =
                 assert pluginsState.plugins.right.env.HYTTE_PLUGIN_MOUNT == "SidebarRightTop";
-                assert pluginsState.plugins.left == expectedLeft;
+                assert pluginsState.plugins.demo == expectedDemo;
                 assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_MOUNT == "BarRight";
                 assert builtins.all (p: p) assertionPredicates;
                 builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
@@ -1387,7 +1393,11 @@
           # declared once, in the shared `plugins` submodule
           # (`nix/module-common.nix`), so setting it under THIS module has to
           # render too, or the option would silently do nothing on a
-          # NixOS-only install — this is what would catch that.
+          # NixOS-only install — this is what would catch that. Named `demo`
+          # rather than `left` (its name before #1284) for the same reason
+          # as the home-manager twin: agreeing with `stubPlugin`'s own
+          # inferred manifest id keeps this fixture free of an incidental
+          # `HYTTE_PLUGIN_ID`, which is `nixos-module-plugin-id` below's job.
           nixos-module-plugin-mount =
             let
               nixos = nixpkgs.lib.nixosSystem {
@@ -1400,7 +1410,7 @@
                       package = stubPackage;
                       weather.fallbackCity = "Berlin";
                       plugins = {
-                        left.package = stubPlugin;
+                        demo.package = stubPlugin;
                         right = {
                           package = stubPlugin;
                           mount = "SidebarRightTop";
@@ -1428,7 +1438,7 @@
               pluginsState = builtins.fromJSON (
                 builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
               );
-              expectedLeft = {
+              expectedDemo = {
                 exec = pkgs.lib.getExe stubPlugin;
                 env = { };
                 secrets = [ ];
@@ -1445,7 +1455,7 @@
               assertionPredicates = map (a: a.assertion) cfg.assertions;
               probe =
                 assert pluginsState.plugins.right.env.HYTTE_PLUGIN_MOUNT == "SidebarRightTop";
-                assert pluginsState.plugins.left == expectedLeft;
+                assert pluginsState.plugins.demo == expectedDemo;
                 assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_MOUNT == "BarRight";
                 assert builtins.all (p: p) assertionPredicates;
                 builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";

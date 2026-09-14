@@ -52,15 +52,21 @@ let
   # `HYTTE_PLUGIN_ID` (#1284): see `nix/hm-module.nix`'s matching comment —
   # the attribute key (`id` below) IS the override, rendered only when it
   # disagrees with `manifestId`, the id inferred from the package's own
-  # binary name (`hytte-plugin-<id>`, stripped off `lib.getExe`'s result).
-  # Keep the rest of the two in sync.
+  # binary name: the widget-shaped `hytte-plugin-<id>` prefix tried first,
+  # falling back to the bare `hytte-` prefix for the standalone-hat binaries
+  # (`hytte-claude-bridge`, `hytte-infobroker`) that carry no `-plugin-`
+  # segment but are declared through this same option. Keep the rest of the
+  # two in sync.
   pluginsState = builtins.toJSON {
     version = 1;
     plugins = lib.mapAttrs (
       id: plugin:
       let
         exec = lib.getExe plugin.package;
-        manifestId = lib.removePrefix "hytte-plugin-" (baseNameOf exec);
+        binName = baseNameOf exec;
+        afterPluginPrefix = lib.removePrefix "hytte-plugin-" binName;
+        manifestId =
+          if afterPluginPrefix != binName then afterPluginPrefix else lib.removePrefix "hytte-" binName;
       in
       {
         inherit exec;

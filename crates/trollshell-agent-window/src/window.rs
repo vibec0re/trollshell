@@ -135,10 +135,30 @@ pub struct Window {
     /// This window, weakly — the handle the probe's continuation upgrades
     /// through when it lands back on the main thread (#1246).
     ///
-    /// Weak and not strong: a `spawn_future_local` holding an `Rc<Self>` would
-    /// keep the window alive for the rest of the probe's budget after it was
-    /// closed, and a probe's answer for a window nobody is looking at has
-    /// nowhere to go. `Rc::new_cyclic` is what fills it.
+    /// Weak and not strong, on the `hytte-reactive` bind-pins convention
+    /// (#224/#1244): a `spawn_future_local` that captured a strong self-clone
+    /// instead would be one more thing keeping this window alive for the rest
+    /// of the probe's budget after it was closed. **That consequence is not
+    /// reachable today** (#1274 L2, measured): three other strong `Rc`
+    /// cycles already keep every window alive for the process's whole life —
+    /// `main.rs`'s `state: Rc<RefCell<Option<Rc<Window>>>>` caches the built
+    /// window and is never cleared on close; [`Window::assemble_with_trust`]
+    /// wires `self.header`/`self.settings` to strong self-clones of their
+    /// own (`press`/`decide`, `window.rs:381`/`383`); and [`Window::build`]
+    /// itself moves a third — `let pump = Rc::clone(&this)` — into a
+    /// `spawn_future_local`, the exact shape this field exists to avoid.
+    /// That future ends only when `out_rx` closes, which needs `feed::run`
+    /// to return, which it does only once the GTK side is gone. So
+    /// `me.upgrade()` can never answer `None` in production, and "a probe's
+    /// answer for a window nobody is looking at" cannot happen yet:
+    /// replacing this field with a strong self-clone in the
+    /// `spawn_future_local` leaves the whole suite green, and
+    /// `nix/lint-bind-pins.py` does not catch it either — its two rules key
+    /// on `bind*`/`connect_*` call sites, and `spawn_future_local` is
+    /// neither. Kept anyway: it is the correct shape for the day any of
+    /// those three cycles is closed, and a probe crossing a worker thread
+    /// should not become a fourth path that pins a window nothing else is
+    /// keeping alive. `Rc::new_cyclic` is what fills it.
     me: std::rc::Weak<Self>,
     toplevel: adw::ApplicationWindow,
     stack: adw::ViewStack,
@@ -604,6 +624,23 @@ impl Window {
         self.begin_probe(page::embed_url(url));
     }
 
+    /// Retry [`Window::load_page`] once, against whatever state is current —
+    /// #1274 item 1's other retry route.
+    ///
+    /// [`Window::begin_probe`]'s `Err` arm schedules exactly one call to this
+    /// after a dead worker clears the probe latch. The latch being clear only
+    /// buys a retry if something calls `load_page` again, and on a steady
+    /// hive nothing else does: `feed::poll_once` dedups an unchanged row's
+    /// `Update::State` (`feed.rs:552`), and a second activation's route
+    /// (`main.rs`) never reaches `load_page` at all. Reads `self.last`
+    /// rather than the URL the dead probe was given, so a row that changed
+    /// in the meantime is retried against its *current* state, not a stale
+    /// one.
+    fn retry_load_page(&self) {
+        let state = self.last.borrow();
+        self.load_page(&state);
+    }
+
     /// Paint the verifying state, then check the hive's certificate **on a
     /// worker thread** — #1246.
     ///
@@ -660,17 +697,47 @@ impl Window {
             Ok(_detached) => {
                 let me = std::rc::Weak::clone(&self.me);
                 glib::spawn_future_local(async move {
-                    let Ok(trust) = wait.await else {
-                        // The worker panicked, so no verdict exists. The slot
-                        // keeps the verifying state rather than pretending a
-                        // trust decision was made — `tls::resolve` is total,
-                        // so this is unreachable short of an abort.
+                    // The upgrade has to happen after the await regardless of
+                    // the verdict, because the `Err` arm below needs `window`
+                    // too — #1274 L1. (Nothing pins the window across the
+                    // `.await` either way, before or after this reorder: `me`
+                    // was already a `Weak`, which is #1274 L2's own point,
+                    // moot by construction rather than by this ordering.)
+                    let answer = wait.await;
+                    let Some(window) = me.upgrade() else {
+                        // The window closed while this ran — there is nobody
+                        // left to show a verdict to, and nothing left to
+                        // clear.
+                        return;
+                    };
+                    let Ok(trust) = answer else {
+                        // The worker panicked, so no verdict exists —
+                        // `tls::resolve` is total, so this is unreachable
+                        // short of an abort. The old shape returned here
+                        // without touching `probe` or the page slot, which
+                        // left `load_page`'s early return
+                        // (`*page_loaded || probe.is_some()`) latched
+                        // forever: spinner up, no retry, for the life of the
+                        // process (#1274 L1). This releases the latch,
+                        // replaces the spinner with a card that says what
+                        // happened, and schedules the one retry that is
+                        // real: `feed::poll_once` dedups an unchanged row's
+                        // `Update::State` (`feed.rs:552`, pinned by
+                        // `an_unchanged_hive_sends_one_state_not_one_per_poll`),
+                        // and a second activation's route (`main.rs`) never
+                        // reaches `load_page` at all — so nothing else would
+                        // ever call it again on a steady hive.
                         tracing::error!(
                             "the TLS probe thread died without a verdict; the page was not loaded"
                         );
-                        return;
-                    };
-                    let Some(window) = me.upgrade() else {
+                        window.probe.borrow_mut().take();
+                        window.fill_page_slot(&webview::probe_died(&host));
+                        let retry = std::rc::Weak::clone(&window.me);
+                        glib::timeout_add_local_once(window.cfg.poll_interval(), move || {
+                            if let Some(window) = retry.upgrade() {
+                                window.retry_load_page();
+                            }
+                        });
                         return;
                     };
                     window.finish_probe(&embedded, &trust);
@@ -805,7 +872,7 @@ mod gtk_tests {
     use hytte_plugin_agents::model::{Agent, AgentName};
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -953,12 +1020,37 @@ mod gtk_tests {
         true
     }
 
-    /// A heartbeat on the main context, and the switch that stops it.
+    /// Stops a [`heartbeat`] source when it drops (#1274 N2).
+    ///
+    /// A plain `Rc<Cell<bool>>` a test sets by hand only closes the source on
+    /// the path that reaches the `set(true)` call — a failing assertion
+    /// *before* that call unwinds straight past it, which is exactly what
+    /// `a_slow_hive_paints_the_verifying_state_and_the_main_loop_keeps_running`
+    /// used to risk: its first three assertions ran before the old manual
+    /// stop, so any one of them failing would have left a 20 ms
+    /// `ControlFlow::Continue` timeout running on the shared default
+    /// `MainContext` for every test that runs after — the exact thing this
+    /// helper's own doc says must not happen. `Drop` runs on every exit from
+    /// the scope that holds the guard, panicking or not — but it only sets a
+    /// flag; the source removes *itself* the next time it fires and reads
+    /// that flag (`ControlFlow::Break`, see [`heartbeat`]), so it outlives
+    /// the drop by at most one period (20 ms at this file's own call sites),
+    /// not for the rest of the process.
+    struct HeartbeatGuard(Rc<Cell<bool>>);
+
+    impl Drop for HeartbeatGuard {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    /// A heartbeat on the main context, and a guard that stops it when it
+    /// drops.
     ///
     /// It has to stop: `#[gtk::test]` bodies share one `MainContext`, so a
     /// source left `Continue`ing would keep firing inside every test that runs
     /// after this one.
-    fn heartbeat(every: Duration) -> (Rc<Cell<u32>>, Rc<Cell<bool>>) {
+    fn heartbeat(every: Duration) -> (Rc<Cell<u32>>, HeartbeatGuard) {
         let ticks = Rc::new(Cell::new(0_u32));
         let stop = Rc::new(Cell::new(false));
         let counter = Rc::clone(&ticks);
@@ -971,7 +1063,58 @@ mod gtk_tests {
                 gtk::glib::ControlFlow::Continue
             }
         });
-        (ticks, stop)
+        (ticks, HeartbeatGuard(stop))
+    }
+
+    /// `HeartbeatGuard`'s whole point, proven rather than trusted (#1274 N2):
+    /// move the guard into a closure that panics — standing in for a failing
+    /// assertion between `heartbeat(...)` and the old manual `stop.set(true)`
+    /// — and show the source really does stop even though nothing that ran
+    /// ever called `stop.set` directly.
+    ///
+    /// One tick after the drain below is expected either way: the callback
+    /// increments `ticks` *before* it checks `halt` (see [`heartbeat`]), so
+    /// the timer that was already armed when the guard dropped still fires
+    /// once and only then breaks. What distinguishes "stopped" from "leaked"
+    /// is the **second** sleep-and-drain: with the guard's `Drop` doing its
+    /// job the source is gone by the first drain, so nothing moves the count
+    /// again; leaked, it is still `Continue`ing every 5 ms and the second
+    /// window catches it climbing.
+    ///
+    /// Falsification (restored after, red while applied): delete
+    /// `HeartbeatGuard`'s `Drop` impl above and this reds — the second
+    /// snapshot climbs past the first because the 5 ms source is still
+    /// `Continue`ing.
+    #[gtk::test]
+    fn heartbeat_guard_stops_the_source_even_when_its_scope_panics() {
+        let (ticks, guard) = heartbeat(Duration::from_millis(5));
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("#1274 N2: simulating a failing assertion before the manual stop");
+        }));
+        assert!(
+            panicked.is_err(),
+            "the panic must actually happen for this test to prove anything"
+        );
+
+        // First drain: lets the timer that was already armed when the guard
+        // dropped fire its one permitted last tick and break.
+        std::thread::sleep(Duration::from_millis(50));
+        let ctx = gtk::glib::MainContext::default();
+        while ctx.iteration(false) {}
+        let after_first_drain = ticks.get();
+
+        // Second drain: if the source is truly gone, nothing moves it again.
+        std::thread::sleep(Duration::from_millis(50));
+        while ctx.iteration(false) {}
+
+        assert_eq!(
+            ticks.get(),
+            after_first_drain,
+            "the heartbeat kept firing after its guard's scope had already panicked away — the \
+             guard's Drop did not run, or did not stop the source"
+        );
     }
 
     /// **The page is built once.** Two states carrying the same URL leave the
@@ -1869,6 +2012,92 @@ mod gtk_tests {
         );
     }
 
+    /// **A worker that dies without a verdict must not strand the window on
+    /// the spinner forever** — #1274 L1, the fix for the arm the #1273
+    /// adversarial review found, plus the #1287 review's MED: clearing the
+    /// latch alone painted nothing (the operator still saw
+    /// [`webview::verifying`]) and named two retry routes — the next poll, a
+    /// second activation — that do not exist for an unchanged hive.
+    ///
+    /// The resolver panics instead of answering, reached through
+    /// [`TrustResolver`] — the seam this crate's tests always inject through
+    /// (see [`window`]'s doc) — rather than by mutating `begin_probe`'s
+    /// spawned closure directly: `resolver(&asked)` panics before
+    /// `answer.send(...)` runs, so the sender drops and `wait.await` resolves
+    /// to `Err` exactly the way the reviewer's own mutation (make the worker
+    /// drop the sender and panic instead of sending) does.
+    ///
+    /// Before #1274's fix this hung out its full `pump_until` budget — the
+    /// `Err` arm returned without upgrading `me` or touching `self.probe`, so
+    /// `load_page`'s `*page_loaded || probe.is_some()` early return latched
+    /// forever and nothing could ever start a second attempt. That fix
+    /// cleared the latch but this test's own retry half was vacuous against
+    /// production: it hand-fed a second, byte-identical `Update::State` —
+    /// precisely the input `feed.rs:552` exists to suppress on a real hive
+    /// (`an_unchanged_hive_sends_one_state_not_one_per_poll`). It now sends
+    /// no second update at all: the only thing that can start a second probe
+    /// is the `glib::timeout_add_local_once` the `Err` arm schedules against
+    /// [`Window::retry_load_page`], and the pump below waits on that
+    /// directly.
+    #[gtk::test]
+    fn a_worker_that_panics_clears_the_latch_and_the_scheduled_retry_starts_a_fresh_probe() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let panics: TrustResolver = Arc::new(move |_url: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            panic!("#1274 L1 mutation: the worker dies without a verdict");
+        });
+        let (w, _rx) = window_with_trust(panics);
+
+        w.update(Update::State(up(row_at(0))));
+        assert!(
+            w.probing(),
+            "the probe must start the moment a URL is named"
+        );
+
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the probe latch was never cleared after the worker died — the window is stranded on \
+             the spinner forever (#1274 L1)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one attempt so far"
+        );
+
+        let shown = w.page_child().expect("the slot is filled");
+        assert!(
+            !webview::is_verifying(&shown),
+            "the operator is still looking at \"Verifying the hive's certificate…\" with no \
+             probe running — the #1287 review's MED, unfixed"
+        );
+        assert!(
+            webview::is_probe_died(&shown),
+            "the slot should show the probe-died card, not something else"
+        );
+
+        // No second `Update::State` here — that would be the vacuous half of
+        // the pre-#1287 test, hand-feeding exactly the input
+        // `feed::poll_once` dedups on a real hive (`feed.rs:552`). The only
+        // route that can start a fresh probe from here is the scheduled
+        // retry, so wait on it directly.
+        assert!(
+            pump_until(Duration::from_secs(10), || w.probing()),
+            "the scheduled retry never started a fresh probe"
+        );
+        assert!(
+            pump_until(Duration::from_secs(10), || !w.probing()),
+            "the second probe's worker died the same way and must clear the latch too"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "…and the retry actually ran the resolver a second time, with no update fed in \
+             between"
+        );
+    }
+
     /// **A slow hive does not freeze the window** — #1246, the whole of it.
     ///
     /// The peer is #1242's review fixture: a legal TLS record header
@@ -1894,7 +2123,10 @@ mod gtk_tests {
         let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(1500));
         let (trust, runs) = scripted_trust(Duration::from_millis(900));
         let (w, _rx) = window_with_trust(trust);
-        let (ticks, stop) = heartbeat(Duration::from_millis(20));
+        // `_heartbeat_guard` outlives every assertion below, including a
+        // panicking one — it stops the source on drop, at the end of this
+        // function's scope, whichever way that scope ends (#1274 N2).
+        let (ticks, _heartbeat_guard) = heartbeat(Duration::from_millis(20));
 
         w.update(Update::State(up(row_at(port))));
 
@@ -1915,7 +2147,6 @@ mod gtk_tests {
         );
 
         let answered = pump_until(Duration::from_secs(20), || !w.probing());
-        stop.set(true);
         assert!(answered, "the probe never answered");
 
         let (_, on_worker) = first_run(&runs);
@@ -2001,15 +2232,24 @@ mod gtk_tests {
     ///
     /// # The count is read while the probe is the only thing dialling
     ///
-    /// Measured, and worth recording because it corrects a standing note in
-    /// this crate: once the view is mounted the accept count reaches **2**
-    /// within ~300 ms. That second connection is not a second probe — the
-    /// resolver ran exactly once, asserted below — it is the embedded view's
-    /// own `load_uri` reaching `WebKitGTK`'s **network** process, which is a
-    /// different process from the web process that dies under xvfb (see
-    /// `webview.rs`'s `gtk_tests` module doc). So the socket assertion is
-    /// taken at the instant the probe answers, before the mount, and the
-    /// resolver count carries the rest of the way.
+    /// Worth recording because it corrects a standing note in this crate:
+    /// once the view is mounted the accept count reaches **2**. That second
+    /// connection is not a second probe — the resolver ran exactly once,
+    /// asserted below — it is the embedded view's own `load_uri` reaching
+    /// `WebKitGTK`'s **network** process, which is a different process from
+    /// the web process that dies under xvfb (see `webview.rs`'s `gtk_tests`
+    /// module doc, which now carries this same correction).
+    ///
+    /// Previously documented as "within ~300 ms", measured under a mutation
+    /// at 50–75 ms — a real cross-process race with the read as the
+    /// literally-next statement after `pump_until`, not a defined instant
+    /// (#1274 N1). `seen` below removes the clock instead of re-measuring it:
+    /// `pump_until`'s own predicate snapshots the accept count on every
+    /// iteration `probing()` is still `true`, which is strictly pre-mount by
+    /// construction — `finish_probe` clears `probe` **before** it mounts the
+    /// view, so the last snapshot taken while `probing()` still held is
+    /// pinned before any `load_uri` the mount could trigger, with no
+    /// wall-clock number to go stale under a slower or faster driver.
     ///
     /// Mutation (run this round, red): drop `|| self.probe.borrow().is_some()`
     /// from `load_page`'s early return — the poll behind the activation starts
@@ -2032,13 +2272,24 @@ mod gtk_tests {
             ..row_at(port)
         })));
 
+        // Snapshot the accept count on every iteration the probe is still in
+        // flight, so the last write is strictly pre-mount — see "The count is
+        // read while the probe is the only thing dialling" above (#1274 N1).
+        let seen = Cell::new(0_usize);
         assert!(
-            pump_until(Duration::from_secs(20), || !w.probing()),
+            pump_until(Duration::from_secs(20), || {
+                if w.probing() {
+                    seen.set(accepted.load(Ordering::SeqCst));
+                    false
+                } else {
+                    true
+                }
+            }),
             "the probe never answered"
         );
 
         assert_eq!(
-            accepted.load(Ordering::SeqCst),
+            seen.get(),
             1,
             "one window, one launch-time probe, one connection — the activation and the poll \
              behind it must not each open their own"

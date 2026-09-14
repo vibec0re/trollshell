@@ -162,7 +162,11 @@ use hytte_plugin_proto::{
 use tokio::sync::{mpsc, watch};
 
 mod datasource;
-mod effects;
+// `pub(crate)`, not plain `mod`, since #1305 review MED-2: `companion`'s
+// `Route::Binary` launch reuses `effects::allocate_launch_unit` for its
+// unit-name uniquifier rather than forking a second allocator — the first
+// cross-module reference into this module.
+pub(crate) mod effects;
 mod listener;
 mod preem_gl;
 mod preem_render;

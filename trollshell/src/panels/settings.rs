@@ -261,39 +261,65 @@ fn build_more_group() -> adw::PreferencesGroup {
     // for a new row (#1096 review, LOW-3, quoted above) — unlike the four
     // rows above it, this one leaves the drawer entirely rather than
     // switching to another page in it, which `control_center_row`'s
-    // `external-link-symbolic` (in place of `deep_link_row`'s
+    // `CONTROL_CENTER_TRAILING_ICON` (in place of `deep_link_row`'s
     // `go-next-symbolic`) is meant to say before it's clicked.
     more.add(&control_center_row());
 
     more
 }
 
+/// The trailing icon on the Control Center row, said to mean "activating this
+/// leaves the drawer for a separate window" — a named constant, not a string
+/// literal at the call site, because the icon that reads that way and the
+/// icon that actually exists in the Adwaita theme this ships are not the same
+/// name: `external-link-symbolic` (the first pick) does not exist in
+/// `adwaita-icon-theme`/`libadwaita`/`gtk4` and rendered as `image-missing`
+/// (#1305 review MED-1, caught by `tests::the_control_center_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing`'s
+/// `has_icon` assertion below). `window-new-symbolic` is the stock "opens in
+/// a separate window" glyph and does exist.
+const CONTROL_CENTER_TRAILING_ICON: &str = "window-new-symbolic";
+
 /// The "Control Center" row (#1304): starts, or focuses, the
-/// `trollshell-control-center` companion app. Resolves its launch
-/// [`Route`] once, when the row is built — `modal::ensure_page` caches this
-/// whole page for the life of the shell (this file's module doc), so that is
-/// also the one time the row's sensitivity/subtitle need deciding; a second
-/// resolve on every click would be harmless (`companion::resolve`'s doc) but
-/// is not needed to keep the "insensitive when missing" promise live, since
-/// neither route can appear or disappear without a shell restart.
+/// `trollshell-control-center` companion app. Resolves its launch [`Route`]
+/// when the row is built — `modal::ensure_page` caches this whole page for
+/// the life of the shell (this file's module doc), so a row built while the
+/// binary was missing stays insensitive until the shell restarts, **even
+/// though a fresh install needs no restart on the resolver's own side**: the
+/// `open-control-center` `GAction` (`commands.rs`) re-resolves on every
+/// activation, so the keybind starts working immediately while this cached
+/// row does not — see `companion`'s module doc for that asymmetry stated in
+/// full (correcting an earlier, false claim here that neither route could
+/// appear or disappear without a restart at all).
 fn control_center_row() -> adw::ActionRow {
     build_control_center_row(companion::resolve())
 }
 
 /// [`control_center_row`]'s testable half: everything after the route is
 /// already known, over an injected [`Route`] — the seam
-/// [`tests::the_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing`]
-/// uses.
+/// [`tests::the_control_center_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing`]
+/// uses. Delegates to [`build_control_center_row_with`] with the real
+/// [`crate::modal::dismiss_all`] as the "close the drawer" side effect;
+/// production never calls the `_with` form directly.
 fn build_control_center_row(route: Route) -> adw::ActionRow {
+    build_control_center_row_with(route, crate::modal::dismiss_all)
+}
+
+/// [`build_control_center_row`] with the drawer-dismiss side effect also
+/// injected, so [`tests::activating_the_row_dismisses_the_drawer`] can observe
+/// it fired without a live `modal` panel (`modal`'s panel set is a private
+/// thread-local `gtk::Window` registry that a bare test thread never
+/// populates — see `tests/modal_deeplink.rs`'s module doc for the same
+/// constraint on `modal::switch_active`).
+fn build_control_center_row_with(route: Route, dismiss: impl Fn() + 'static) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title("Control Center")
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("preferences-system-symbolic"));
-    // `external-link-symbolic`, not `deep_link_row`'s `go-next-symbolic`:
-    // every other row in this group swaps the drawer to another page, this
-    // one leaves it for a separate window entirely.
-    row.add_suffix(&gtk::Image::from_icon_name("external-link-symbolic"));
+    // Every other row in this group swaps the drawer to another page; this
+    // one leaves it for a separate window entirely, hence a different
+    // trailing icon than `deep_link_row`'s `go-next-symbolic`.
+    row.add_suffix(&gtk::Image::from_icon_name(CONTROL_CENTER_TRAILING_ICON));
 
     if matches!(route, Route::Missing) {
         row.set_sensitive(false);
@@ -308,7 +334,7 @@ fn build_control_center_row(route: Route) -> adw::ActionRow {
         // `modal::switch_active`, the same call the power-menu rows and a
         // clipboard entry's own activation make to close the drawer after an
         // action that isn't a navigation to another page in it.
-        crate::modal::dismiss_all();
+        dismiss();
     });
     row
 }
@@ -377,13 +403,34 @@ mod tests {
     /// `companion::resolve`'s module doc states for why the route can't be
     /// decided at launch time.
     ///
+    /// Also pins #1305 review MED-1: the row's trailing icon must actually
+    /// exist in the Adwaita theme this ships with — `set_gtk_icon_theme_name`
+    /// forces the same theme `main.rs` forces for a real session, since
+    /// nothing else on a bare test thread would (CLAUDE.md's `image-missing`
+    /// gotcha). `external-link-symbolic`, the first pick, does not exist in
+    /// `adwaita-icon-theme`/`libadwaita`/`gtk4` and rendered as
+    /// `image-missing`; `window-new-symbolic` does.
+    ///
     /// **Falsification:** drop the `row.set_sensitive(false)` call in
     /// `build_control_center_row`'s `Route::Missing` arm → this reds (the
     /// row stays sensitive while still showing the "not installed"
-    /// subtitle, a broken affordance rather than an honest one).
+    /// subtitle, a broken affordance rather than an honest one). Revert
+    /// `CONTROL_CENTER_TRAILING_ICON` to `"external-link-symbolic"` → the
+    /// `has_icon` assertion reds.
     #[gtk::test]
     fn the_control_center_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing() {
         adw::init().expect("libadwaita init");
+
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_icon_theme_name(Some("Adwaita"));
+        }
+        let display = gtk::gdk::Display::default().expect("a display for a #[gtk::test]");
+        assert!(
+            gtk::IconTheme::for_display(&display).has_icon(super::CONTROL_CENTER_TRAILING_ICON),
+            "{:?} must exist in the Adwaita theme this ships with, or the row's \
+             \"this opens a separate window\" affordance renders as image-missing",
+            super::CONTROL_CENTER_TRAILING_ICON
+        );
 
         let missing = super::build_control_center_row(super::Route::Missing);
         assert!(
@@ -407,6 +454,39 @@ mod tests {
             binary.subtitle().as_deref().is_none_or(str::is_empty),
             "a working route must carry no subtitle, got {:?}",
             binary.subtitle()
+        );
+    }
+
+    /// #1305 review LOW: the triage's item 1 is "launches the companion
+    /// **and closes the drawer**" — pinned here over
+    /// `build_control_center_row_with`'s injected dismiss callback rather
+    /// than a live `modal` panel, which a bare test thread never populates
+    /// (see that function's doc). The row's `"activated"` signal is emitted
+    /// directly (`emit_by_name`) — `AdwActionRow` defines it on the row
+    /// itself, so it fires the same way whether or not the row is packed
+    /// into a real `GtkListBox`.
+    ///
+    /// **Falsification:** delete the `dismiss();` call in
+    /// `build_control_center_row_with`'s `connect_activated` closure → this
+    /// reds, `dismissed` never becomes `true`.
+    #[gtk::test]
+    fn activating_the_row_dismisses_the_drawer() {
+        adw::init().expect("libadwaita init");
+
+        let dismissed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dismissed_in = dismissed.clone();
+        let row = super::build_control_center_row_with(
+            super::Route::Binary(std::path::PathBuf::from(
+                "/usr/bin/trollshell-control-center",
+            )),
+            move || dismissed_in.set(true),
+        );
+
+        row.emit_by_name::<()>("activated", &[]);
+
+        assert!(
+            dismissed.get(),
+            "activating the row must close the drawer (dismiss was never called)"
         );
     }
 }

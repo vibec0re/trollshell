@@ -604,21 +604,52 @@ mod tests {
     /// reds here instead of leaving a green mirror describing a shader nobody
     /// ships.
     ///
-    /// The five clauses are the five decisions the mirror could get wrong and
-    /// still look plausible: the window's size, each of the two truncating
-    /// divisions, the strength scaling, and the composite order.
+    /// **This scan pins every clause the #1290 review found the mirror
+    /// transcribes** (#1293 item 1): the original six (the closed-form blur's
+    /// window, its two truncating divisions, the strength scaling, `mix_kit`'s
+    /// rounding, `stamp255`'s coverage formula) plus the six the review found
+    /// missing — `span_range`'s cell walk (`advance`, `x0`, the overlap sum),
+    /// `band_span`'s band bound, `halo255`'s window clipping on both axes, the
+    /// bloom early return, `layer255`'s `min(max(…), 255)` combine, and the
+    /// ghost composite — plus `MAX_SPAN_CELLS`'s own value (item 4), pinned by
+    /// number rather than by name alone (`the_shader_reads_its_geometry_from_uniforms`
+    /// already pins the identifier). What is **not** listed here — the
+    /// continuous (non-`snapped`) branch this mirror never takes, since
+    /// [`shader_frame`] always evaluates at a pixel centre — is
+    /// `preem_gl_diff`'s job, not this test's: a driver can still disagree
+    /// with both.
     ///
     /// **Falsified** by editing any of them in the `.frag` without editing
     /// [`shader_frame`].
     #[test]
     fn the_mirror_is_the_shipped_shaders_arithmetic() {
         for clause in [
+            // the closed-form blur
             "float win = float(2 * u_bloom_radius + 1);",
             "int tmp = int(floor(255.0 * span_range(lo, hi, from, to) / win));",
             "int blurred = int(floor(float(tmp) * band_span(top, bottom) / win));",
             "return min(blurred * u_bloom_strength / 256, 255);",
+            "if (u_bloom_radius <= 0 || u_bloom_strength <= 0) {",
+            "float lo = max(p.x - half_win, 0.0);",
+            "float hi = min(p.x + half_win, float(u_grid.x));",
+            "float top = max(p.y - half_win, 0.0);",
+            "float bottom = min(p.y + half_win, float(u_grid.y));",
+            // span_range's cell walk
+            "float advance = float(u_cell_w + u_gap);",
+            "float x0 = float(u_pad) + float(i) * advance;",
+            "sum += overlap(lo, hi, x0, x0 + float(u_cell_w));",
+            // band_span's band bound
+            "return overlap(lo, hi, float(u_pad), float(u_pad + u_cell_h));",
+            // layer255's combine
+            "return min(max(stamp255(p, fp, from, to), halo255(p, from, to)), 255);",
+            // the composite
             "return (a * (255 - k) + b * k + 127) / 255;",
             "return int(255.0 * sx * sy + 0.5);",
+            "under = mix_kit(bg, ivec4(u_ghost + 0.5), ghost);",
+            // MAX_SPAN_CELLS's own value (#1293 item 4) — the identifier
+            // alone is `the_shader_reads_its_geometry_from_uniforms`'s job;
+            // this is the number the mirror's loop bound hardcodes too.
+            "const int MAX_SPAN_CELLS = 8;",
         ] {
             assert!(
                 BODY.contains(clause),

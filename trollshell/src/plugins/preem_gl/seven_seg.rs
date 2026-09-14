@@ -760,10 +760,18 @@ mod tests {
     /// to one side only reds here instead of leaving a green mirror describing
     /// a shader nobody ships.
     ///
-    /// **Every clause [`shader_frame`] transcribes is listed**, which is the
-    /// #1293 item-1 correction to #1153's version of this test: that one pinned
-    /// six clauses of a mirror that transcribed rather more, so an edit to an
-    /// unpinned line left the mirror green and wrong.
+    /// **This scan pins every clause the #1294 review found the mirror
+    /// transcribes** (#1293 item 6): the clauses #1153's precedent already
+    /// listed below, plus the eight the review found missing — the `bars[]`
+    /// order, the CRT `depth`, the `ghost &&` gate, the edge `ex`, the
+    /// two-cell loop, the colon's second dot, the comb condition and
+    /// `shortSide`. The #1153-era version of this doc claimed "every clause
+    /// is listed" and was wrong for exactly these eight (see the review); this
+    /// one names the correction instead of repeating the claim that broke.
+    /// What is **not** listed here — the continuous (non-`snapped`) branch
+    /// this mirror never takes, since [`shader_frame`] always evaluates at a
+    /// pixel centre — is `preem_gl_diff`'s job, not this test's: a driver can
+    /// still disagree with both.
     ///
     /// **Falsified** by editing any of them in either `.frag` without editing
     /// [`shader_frame`].
@@ -796,10 +804,23 @@ mod tests {
             "int index = 2 * i;",
             "int index = 2 * i + 1;",
             "int code = int(texelFetch(u_tex0, ivec2(index, 0), 0).r + 0.5);",
+            // the `ghost &&` gate (#1293 item 6): the mirror's `ghost &&`
+            // guard on the `code & (1 << COLON_BIT) == 0` check.
+            "if (ghost && (code & (1 << COLON_BIT)) == 0) {",
             "return (1 << SEG_COUNT) - 1;",
             "int mid = (lo + hi + 1) / 2;",
             "if (cell_x(mid) <= x) {",
             "vec2 local = p - vec2(cell_x(i), float(u_pad));",
+            // the two-cell loop (#1293 item 6): `strip255` walks exactly two
+            // cells, `i` and `i + 1`, which the Rust mirror's `for k in 0..2`
+            // transcribes.
+            "for (int k = 0; k < 2; ++k) {",
+            // the bars[] order (#1293 item 6): the kit's own bit order, A
+            // through G, which `kit::SEVEN_SEG_BARS.into_iter()` transcribes.
+            "u_seg_a, u_seg_b, u_seg_c, u_seg_d, u_seg_e, u_seg_f, u_seg_g",
+            // the colon's second dot (#1293 item 6): the lower dot, which
+            // `.max(bar255(…COLON_DOTS[1]))` transcribes.
+            "bar255(p, fp, snapped, u_dot_1)",
             // the composite
             "return int(texelFetch(tex, p, 0).r * 255.0 + 0.5);",
             "return (a * (255 - k) + b * k + 127) / 255;",
@@ -809,9 +830,20 @@ mod tests {
             "under = mix_kit(bg, ivec4(u_ghost + 0.5), ghost);",
             "under = mix_kit(under, ink, lit);",
             // the CRT pass
+            "int shortSide = min(w, h);",
             "int r2 = (u * u + v * v) / 2;",
+            // the CRT depth (#1293 item 6): `mask_one - corner_keep`, unpinned
+            // before even though `radial`'s formula below (which reads it)
+            // was.
+            "int depth = MASK_ONE - u_corner_keep;",
             "int radial = clamp(MASK_ONE - (depth * r2) / (COORD_ONE * COORD_ONE), 0, MASK_ONE);",
+            // the edge `ex` (#1293 item 6): `x.min(w - 1 - x)`, the short
+            // axis's distance from either edge.
+            "int ex = min(x, w - 1 - x);",
             "edge = MASK_ONE * d / band;",
+            // the comb condition (#1293 item 6): the CRT's scanline gate,
+            // `y % mask.pitch == mask.phase`.
+            "if (u_mask_pitch != 0 && (y % u_mask_pitch) == u_mask_phase) {",
             "return radial * edge / MASK_ONE * comb / MASK_ONE;",
             "return ((2 * i + 1 - n) * COORD_ONE) / n;",
             // the lit pass's sample point

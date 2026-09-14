@@ -56,11 +56,17 @@ let
   # matrix, 52 until #1152 added the two text kinds, 96 until #1209's
   # review (MEDIUM-1) added the odd-origin marquee case, one per skin,
   # 100 until #1153 added the LED strip's six per skin (five 1:1
-  # readings plus one stretched), and 124 until #1154 added the
+  # readings plus one stretched), 124 until #1154 added the
   # seven-segment readout's six per skin (five 1:1 readouts plus one
-  # stretched); bump it with the case list, in the same commit, for the
-  # reason the number is asserted at all.
-  parityCases = 148;
+  # stretched), and 148 until #1293 closed three review-residue gaps,
+  # one per skin apiece: the LED strip's `PeakInside` reading (item 2,
+  # the dot sitting inside the lit run rather than only above or
+  # adjacent to it), the LED strip's second-segment-count case (item 2,
+  # `leds = 1`), and the seven-segment readout's empty case (item 8,
+  # `u_data_len == 0` rather than the one-cell `Blank`); bump it with the
+  # case list, in the same commit, for the reason the number is asserted
+  # at all.
+  parityCases = 160;
 in
 craneLib.mkCargoDerivation (
   commonArgs

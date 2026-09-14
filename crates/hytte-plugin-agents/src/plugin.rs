@@ -17,9 +17,7 @@ use tokio::sync::mpsc;
 use crate::config::AgentsConfig;
 use crate::hive::wire::{Approval, HiveUrls, Request, Scope};
 use crate::hive::{AgentStatusRow, HiveError};
-use crate::model::{
-    Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url,
-};
+use crate::model::{Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 use crate::window;

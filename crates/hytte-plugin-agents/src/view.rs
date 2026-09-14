@@ -857,7 +857,6 @@ pub fn hive_summary(hive: &Hive) -> String {
     }
 }
 
-
 /// The sidebar card: a titled surface, then the roster as a dense list.
 ///
 /// The title matches the `Tasks` card above it — the same all-caps caption

@@ -363,29 +363,56 @@ let
   # dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
   # share (`buildDepsOnly commonArgs`, above), and no package build ever
   # reaches this derivation — that part is the actual win, confirmed by
-  # `checks.workspace-ships-no-probes`. It is NOT "zero extra compilation":
-  # measured (`nix build .#trollshell.passthru.probes --rebuild -L`,
-  # 2026-09-13), `probes` still runs **101 `Compiling` lines in ~3m14s**,
-  # against roughly the same cost the old `postInstall` paid on the wrong
-  # cache (~106 lines / ~3m04s) — barely a five-crate saving, because `-p
-  # hytte-ecal --example probe` / `-p hytte-services --example wifi_probe`
-  # fingerprint a different feature union than the `--workspace --locked`
+  # `checks.workspace-ships-no-probes`.
+  #
+  # It USED to also not be "zero extra compilation": measured (`nix build
+  # .#trollshell.passthru.probes --rebuild -L`, 2026-09-13), `probes` ran
+  # **101 `Compiling` lines in ~3m14s** with `cargoExtraArgs` scoped one crate
+  # at a time (`-p hytte-ecal --example probe`, then `-p hytte-services
+  # --example wifi_probe`) — barely a five-crate saving over the old
+  # `postInstall`'s ~106 lines, because that `-p` scope fingerprints a
+  # different feature union than the `--workspace --locked --all-targets`
   # scope `cargoArtifacts` was built under (the exact `commonArgs` warning
-  # above, applied to this derivation: a `-p <crate>` stage and a
-  # `--workspace` stage disagree about shared deps and cannot fully reuse
-  # each other's target dir). The cost does not disappear; it moves out of
-  # every package build and into this one checks-universe derivation, paid
-  # once per Cargo.lock/source change rather than once per consumer.
-  # Scoped one crate at a time (`-p hytte-ecal --example probe`, then `-p
-  # hytte-services --example wifi_probe`) rather than `--workspace
-  # --examples`, for the same reason the old postInstall was: avoid pulling
-  # every OTHER workspace member's dev-deps into the union. UNMEASURED
-  # follow-up hypothesis (review, 2026-09-13): `buildDepsOnly`'s own
-  # `--all-targets` already unions every member's dev-deps into
-  # `cargoArtifacts`, so the narrower `-p` scope here may be paying a
-  # fingerprint mismatch for no matching benefit, and `--workspace
-  # --examples` — the actual union the cache was built for — could turn out
-  # cheaper. Not tried here; measure before switching.
+  # above, applied to this derivation). #1276 tried the follow-up hypothesis
+  # that same review left unmeasured — build under the cache's OWN scope,
+  # `--workspace --example probe --example wifi_probe` (named explicitly:
+  # `--workspace --examples` would also ship `trollshell/examples/
+  # preem_gl_diff`, which must not appear in `$out/bin`) — and it held:
+  # measured (2026-09-14, same `--rebuild -L` method, box under a concurrent
+  # load campaign at the time, load average climbing 66→90 across the two
+  # runs), `Compiling` dropped from 102 to **11** — `hytte-ecal`,
+  # `hytte-config`, `hytte-reactive`, `hytte-bus`, `hytte-services` (the real
+  # workspace-member sources, which `buildDepsOnly`'s stub-source deps stage
+  # never compiles under ANY scope, so these were never going to disappear)
+  # plus `bindgen`, `libspa-sys`, `pipewire-sys`, `libspa`, `pipewire` (the
+  # one external cluster `cargoArtifacts`'s own `cargo build --release
+  # --workspace --locked` phase — no `--all-targets` there, only the check
+  # and no-run-test phases carry that — evidently fingerprints differently
+  # from an `--example`-selected build even under a matching `--workspace`
+  # scope). Gone from the count entirely: the whole gtk4/gdk4/gsk4/cairo/
+  # pango/wayland/zbus/tokio/rustls cluster — `hytte-services`' `gtk`
+  # dependency is a plain (non-dev, non-optional) one, so it was ALWAYS
+  # required for `wifi_probe`, and under `--workspace` it now reuses
+  # `cargoArtifacts`'s copy instead of rebuilding it under a `-p`-fingerprinted
+  # feature set. Wall time barely moved (4m27s → 4m1s buildPhase; 281s → 269s
+  # for the whole `nix build --rebuild -L`) purely because the load campaign
+  # got heavier between the two runs and because the two real member crates
+  # plus that gtk4/pipewire/evolution-data-server cluster dominate either
+  # build's critical path regardless of scope — the **`Compiling`-line count
+  # is the load-independent verdict** here, and it fell by ~89%.
+  #
+  # `$out/bin/{probe,wifi_probe}` are NOT byte-identical across the scope
+  # change: `probe` matches in size (611224 B) but not sha256, and
+  # `wifi_probe` changed both size (2829920 B → 3780192 B) and sha256. Same
+  # root cause as the `Compiling` drop, the other side of it: unifying
+  # features across the whole workspace in one cargo invocation (rather than
+  # two isolated `-p` invocations) changes which cfg/feature flags shared
+  # deps like `gtk`/`tokio`/`zbus` compile under, so the linked probe/wifi_probe
+  # binaries carry different code even where their size coincides. This
+  # doesn't matter for what these binaries ARE: `probes` ships nothing a
+  # `packages.*` output reaches (see above), so nothing outside
+  # `eds-nixos-test` / `wifi-nm-nixos-test` reads these bytes, and both
+  # probes still build and install successfully under the new scope.
   #
   # `doNotPostBuildInstallCargoBinaries = true`: `buildPackage`'s default
   # `buildPhaseCargoCommand` captures a JSON build log into `$cargoBuildLog`

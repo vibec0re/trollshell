@@ -432,22 +432,41 @@ struct PluginsState {
     /// parsed at most once per change to the file — see [`DeclaredMounts`]
     /// for why the 2 s poll must not re-read it (#1260 review F7).
     declared: Rc<RefCell<DeclaredMounts>>,
-    /// The `plugins.json` search path (#1260 review F8), resolved from the
-    /// process environment the first time [`refresh_plugins`] runs and held
-    /// for the rest of the tab's life.
+    /// The process environment [`plugins_json_candidates`] resolves
+    /// [`search_path`](Self::search_path) from, read once in [`build_tab`]
+    /// and reused for the tab's whole life.
     ///
     /// `hytte_config::xdg::Env::from_process()` is cheap — it only reads four
-    /// environment variables — but [`plugins_json_candidates`]'s
-    /// `env.config_home()`/`env.config_dirs()` calls `tracing::warn!` on a
-    /// relative `$XDG_CONFIG_HOME`/`$XDG_CONFIG_DIRS` (`hytte_config::xdg`'s
-    /// `is_absolute`, #985), and re-resolving the search path on every
-    /// [`PLUGIN_POLL_INTERVAL`] tick re-fires that warning every tick, for
-    /// the window's whole life, on a misconfigured box (#1270, inherited nit
-    /// from the #1260 review). The environment a running process sees cannot
-    /// change out from under it, so the search path it implies cannot
-    /// either — a `OnceCell` makes "resolved (and, if bad, warned about)
-    /// once" the type, not a convention a future edit could quietly break by
-    /// moving the `Env::from_process()` call back inside the tick.
+    /// environment variables — but [`search_path`](Self::search_path)'s
+    /// `OnceCell` only masks the **result** of consulting it: until #1286,
+    /// `refresh_plugins` still called `Env::from_process()` fresh on every
+    /// [`PLUGIN_POLL_INTERVAL`] tick and passed the new value in, immediately
+    /// discarded once `search_path` was already resolved (#1279 review N3).
+    /// Harmless while `Env::from_process()` does nothing but read four
+    /// variables, but "the process env is read at most once" was a
+    /// convention at the call site rather than a fact about the type — if
+    /// `Env::from_process()` ever grows a warning of its own (it is the one
+    /// function in `hytte_config::xdg` that touches the environment), the
+    /// tick would refire it forever on a misconfigured box, the same failure
+    /// mode [`search_path`](Self::search_path) exists to close. Holding the
+    /// resolved `Env` here instead makes "read once" the type: nothing left
+    /// on the tick's path can call `Env::from_process()` again.
+    env: Rc<hytte_config::xdg::Env>,
+    /// The `plugins.json` search path (#1260 review F8), resolved from
+    /// [`env`](Self::env) the first time [`refresh_plugins`] runs and held
+    /// for the rest of the tab's life.
+    ///
+    /// [`plugins_json_candidates`]'s `env.config_home()`/`env.config_dirs()`
+    /// calls `tracing::warn!` on a relative `$XDG_CONFIG_HOME`/
+    /// `$XDG_CONFIG_DIRS` (`hytte_config::xdg`'s `is_absolute`, #985), and
+    /// re-resolving the search path on every [`PLUGIN_POLL_INTERVAL`] tick
+    /// re-fires that warning every tick, for the window's whole life, on a
+    /// misconfigured box (#1270, inherited nit from the #1260 review). The
+    /// environment a running process sees cannot change out from under it, so
+    /// the search path it implies cannot either — a `OnceCell` makes
+    /// "resolved (and, if bad, warned about) once" the type, not a convention
+    /// a future edit could quietly break by moving the resolution back inside
+    /// the tick.
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
 }
 
@@ -487,6 +506,7 @@ struct WeakPluginsState {
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
     declared: Rc<RefCell<DeclaredMounts>>,
+    env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
 }
 
@@ -527,6 +547,7 @@ impl PluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            env: self.env.clone(),
             search_path: self.search_path.clone(),
         }
     }
@@ -562,6 +583,7 @@ impl WeakPluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            env: self.env.clone(),
             search_path: self.search_path.clone(),
         })
     }
@@ -673,6 +695,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
         declared: Rc::new(RefCell::new(DeclaredMounts::default())),
+        env: Rc::new(hytte_config::xdg::Env::from_process()),
         search_path: Rc::new(OnceCell::new()),
     };
 
@@ -962,14 +985,14 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// `serde_json` parse: the parse happens on the first tick and then only when
 /// the file's stamp changes (#1260 review F7 — see [`DeclaredMounts`] for why
 /// a stat-shaped stamp is enough for a nix-rendered store symlink). The search
-/// path itself — which candidate paths to stat — is resolved from the process
-/// environment through [`PluginsState::search_path`] once, not per tick (#1270
-/// — see that field's doc for why re-resolving it every tick is the wrong
+/// path itself — which candidate paths to stat — is resolved from
+/// [`PluginsState::env`] through [`PluginsState::search_path`] once, not per
+/// tick (#1270 — see those fields' docs for why re-resolving the search path,
+/// or rebuilding the `Env` it is resolved from, every tick is the wrong
 /// default).
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
-    let candidates =
-        resolved_search_path(&state.search_path, &hytte_config::xdg::Env::from_process());
+    let candidates = resolved_search_path(&state.search_path, &state.env);
     let declared = {
         let probe = probe_candidates(candidates);
         state
@@ -2857,6 +2880,8 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use adw::prelude::*;
@@ -4419,6 +4444,56 @@ mod gtk_tests {
             state.search_path.get(),
             Some(&first),
             "and a second tick must reuse it, never re-resolve"
+        );
+    }
+
+    /// #1286 item 2: even with [`PluginsState::search_path`]'s `OnceCell`
+    /// masking the *result*, `refresh_plugins` was still building a fresh
+    /// `hytte_config::xdg::Env::from_process()` on every tick and passing it
+    /// in, discarded the moment `search_path` was already resolved (#1279
+    /// review N3). `PluginsState::env` is meant to make that read-once too.
+    ///
+    /// Replaces the tab's `env` with one naming a directory the real process
+    /// environment does not, then drives `refresh_plugins` through it: if the
+    /// tick ever falls back to `Env::from_process()` — the real process
+    /// environment — instead of reading [`PluginsState::env`], the resolved
+    /// search path lands on the real environment's candidates instead of this
+    /// fixture's, and the assertion below fails.
+    ///
+    /// **Falsify**: change `refresh_plugins` back to
+    /// `resolved_search_path(&state.search_path, &hytte_config::xdg::Env::from_process())`
+    /// → this test reds (below and in the module comment).
+    #[gtk::test]
+    fn the_tick_reads_the_tabs_own_env_not_a_fresh_one() {
+        adw::init().expect("libadwaita init");
+        let (_bin, built) = build_tab();
+        let fixture_env = hytte_config::xdg::Env {
+            home: None,
+            config_home: Some("/should/not/be/seen/config-home".to_owned()),
+            config_dirs: Some("/should/not/be/seen/config-dirs".to_owned()),
+            state_home: None,
+        };
+        let state = PluginsState {
+            env: Rc::new(fixture_env),
+            ..built
+        };
+
+        assert!(state.search_path.get().is_none());
+        super::refresh_plugins(&state);
+        let resolved = state
+            .search_path
+            .get()
+            .cloned()
+            .expect("refresh_plugins must resolve the search path");
+        assert_eq!(
+            resolved,
+            vec![
+                PathBuf::from("/should/not/be/seen/config-home/trollshell/plugins.json"),
+                PathBuf::from("/should/not/be/seen/config-dirs/trollshell/plugins.json"),
+            ],
+            "refresh_plugins must resolve THROUGH PluginsState::env, not a \
+             fresh Env::from_process() — got the real process environment's \
+             candidates instead of the fixture's"
         );
     }
 

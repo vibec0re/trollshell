@@ -1639,18 +1639,33 @@ mod tests {
     /// a reason that is not a torn write (measured: 5 reds in 150 runs).
     /// The fix bounds the *race*, not the reader: `reads_seen` is a shared
     /// counter the reader bumps on every successful raced read, and the
-    /// writer pauses at fixed checkpoints — every `PACE_CHECK_EVERY`
-    /// writes — spinning on `yield_now()` until `reads_seen` has passed
-    /// `MIN_RACED_READS`. Because the writer physically cannot advance
-    /// past a checkpoint while that condition is false, and the condition
-    /// only becomes *more* true over time (the counter never resets),
-    /// `reads > MIN_RACED_READS` holds by construction once the writer
-    /// (and therefore the whole race) finishes — no amount of scheduler
-    /// unfairness toward the reader can make the writer outrun it. The
-    /// `PACE_MAX_YIELDS_PER_CHECK` cap is a pure safety valve (never
+    /// writer checks in at fixed checkpoints — every `PACE_CHECK_EVERY`
+    /// writes. #1289's review caught the first cut of this pacing (`while
+    /// reads_seen <= MIN_RACED_READS`, no memory of a previous checkpoint):
+    /// that condition is true only up to the *first* checkpoint where the
+    /// reader happens to have already logged `MIN_RACED_READS` reads —
+    /// including reads racing nothing at all, since the writer is parked
+    /// at checkpoint zero, before it has resumed writing — and false at
+    /// every checkpoint after, which left the remaining ~3,350 writes
+    /// completely unpaced and let the self-check pass on idle reads alone.
+    /// The checkpoint now paces on *progress since the previous
+    /// checkpoint* instead: it remembers `reads_seen` as of the last
+    /// checkpoint (`seen_at_last_checkpoint`) and spins until that count
+    /// has grown, or the reader has finished (`reader_done`, a flag the
+    /// reader sets once it leaves its own loop — an idle box can exhaust
+    /// `READ_ATTEMPTS` well before `WRITER_ITERATIONS`, and without the
+    /// flag every later checkpoint would burn its full
+    /// `PACE_MAX_YIELDS_PER_CHECK` valve waiting on reads that will never
+    /// come). Because no `PACE_CHECK_EVERY`-write window can complete
+    /// without the reader completing at least one more read inside it (or
+    /// having already finished), every checkpoint — not just the first —
+    /// overlaps a completed read by construction, which is what makes
+    /// `reads > MIN_RACED_READS` mean what it says instead of describing
+    /// one burst of reads that happened before the race did. The
+    /// `PACE_MAX_YIELDS_PER_CHECK` cap is still a pure safety valve (never
     /// expected to bite: yielding hands the scheduler straight back to a
-    /// runnable reader) so a truly pathological scheduler degrades to the
-    /// pre-#1271 behaviour instead of hanging the test forever.
+    /// runnable reader) so a truly pathological scheduler degrades toward
+    /// the pre-#1271 behaviour instead of hanging the test forever.
     #[test]
     fn write_atomic_never_exposes_a_torn_file_to_a_concurrent_reader() {
         const WARMUP_ITERATIONS: usize = 150;
@@ -1701,6 +1716,15 @@ mod tests {
         let reads_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writer_reads_seen = std::sync::Arc::clone(&reads_seen);
 
+        // #1289 review: the writer's checkpoint wait must not outlive the
+        // reader. On an idle box the reader can exhaust `READ_ATTEMPTS`
+        // well before the writer reaches `WRITER_ITERATIONS`; without this
+        // flag every remaining checkpoint would spin for the full
+        // `PACE_MAX_YIELDS_PER_CHECK` valve waiting for reads that will
+        // never come. The reader sets it once, after it leaves its loop.
+        let reader_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_reader_done = std::sync::Arc::clone(&reader_done);
+
         let writer_path = path.clone();
         let (small_w, large_w) = (small.clone(), large.clone());
         let writer = std::thread::spawn(move || {
@@ -1709,24 +1733,34 @@ mod tests {
                 write_atomic(&writer_path, body).expect("write_atomic");
             }
             writer_barrier.wait();
+            // #1289 review: pace on *progress since the last checkpoint*,
+            // not on an absolute threshold — see the test doc above for
+            // why the absolute form was vacuous.
+            let mut seen_at_last_checkpoint =
+                writer_reads_seen.load(std::sync::atomic::Ordering::Relaxed);
             for i in WARMUP_ITERATIONS..WRITER_ITERATIONS {
                 let body = if i % 2 == 0 { &small_w } else { &large_w };
                 write_atomic(&writer_path, body).expect("write_atomic");
 
                 // Pace on the reader (#1271): don't race ahead to the
                 // finish line unconditionally. At each checkpoint, refuse
-                // to make more writes until the reader has logged enough
-                // raced reads — this is what makes `reads >
-                // MIN_RACED_READS` a guarantee rather than a hope.
+                // to make more writes until the reader has logged at
+                // least one more raced read than it had at the *previous*
+                // checkpoint — this is what makes every `PACE_CHECK_EVERY`
+                // write window overlap a completed read, not just the
+                // first one.
                 if (i - WARMUP_ITERATIONS).is_multiple_of(PACE_CHECK_EVERY) {
                     let mut yields = 0u32;
-                    while writer_reads_seen.load(std::sync::atomic::Ordering::Relaxed)
-                        <= MIN_RACED_READS
+                    while !writer_reader_done.load(std::sync::atomic::Ordering::Relaxed)
+                        && writer_reads_seen.load(std::sync::atomic::Ordering::Relaxed)
+                            <= seen_at_last_checkpoint
                         && yields < PACE_MAX_YIELDS_PER_CHECK
                     {
                         std::thread::yield_now();
                         yields += 1;
                     }
+                    seen_at_last_checkpoint =
+                        writer_reads_seen.load(std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
@@ -1765,6 +1799,11 @@ mod tests {
             }
             std::thread::yield_now();
         }
+        // #1289 review: tell the writer the reader is done so a checkpoint
+        // reached after the reader has exhausted `READ_ATTEMPTS` (or the
+        // writer finished first) doesn't spin for `PACE_MAX_YIELDS_PER_CHECK`
+        // waiting on reads that will never come.
+        reader_done.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().expect("writer thread panicked");
         let reads = reads_seen.load(std::sync::atomic::Ordering::Relaxed);
         assert!(

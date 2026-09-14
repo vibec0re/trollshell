@@ -37,8 +37,9 @@
 //! probe took. `hytte-services`' own `sensors` service `spawn_blocking`s the
 //! same reads for the same reason.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hytte_plugin::poll::{Gate, Wake};
 use hytte_plugin::{CmdReceiver, CmdSender};
@@ -78,6 +79,49 @@ pub struct Snapshot {
     /// only ordering `hytte_sensors` defines. Empty when this instance does not
     /// draw disks.
     pub disks: Vec<Disk>,
+    /// Running process count (the native CPU card's "Processes" row,
+    /// `trollshell/src/panels/stats.rs:576` → `:1182`), or `None` when this
+    /// instance does not draw the CPU half (see [`Needs`]).
+    ///
+    /// Added by the #1295 review's MED 1: `hytte_sensors::read_process_count`
+    /// was already in the P0 leaf this crate samples with, so the row was a
+    /// gap in the page rather than a gap in what is reachable.
+    pub processes: Option<u64>,
+    /// Aggregate CPU clock in Hz — the native CPU card's "Clock" row
+    /// (`stats.rs:578` → `:1557`, `f.max_hz`) — or `None` when this instance
+    /// does not draw the CPU half, or when the machine has no `cpufreq`
+    /// governor (`max_ceiling_hz == 0.0`: VMs and some ARM boards), which is
+    /// the native row's own hide rule.
+    pub cpu_clock_hz: Option<f64>,
+    /// Aggregate disk-throughput history — the native Disks card's I/O row
+    /// (`stats.rs:610` → `:1293`) — or `None` when this instance does not draw
+    /// disks (see [`Needs`]). Unlike [`cpu`](Self::cpu) this is never withheld
+    /// for a cold start: `hytte_sensors::compute_disk_io` answers an empty
+    /// `prev` map with a valid zero rate rather than nothing, because a byte
+    /// counter (unlike a `/proc/stat` jiffy count) is meaningful from the very
+    /// first read.
+    pub disk_io: Option<DiskIo>,
+}
+
+/// Aggregate disk-throughput history, mirroring the native Disks card's I/O
+/// row: the current combined read/write rate, and the cumulative totals since
+/// boot.
+///
+/// A narrowing of `hytte_sensors::DiskIo`, restated locally so `Snapshot` can
+/// derive `PartialEq` — the upstream type does not, the same reason
+/// [`Memory`] and [`Disk`] are local copies rather than the upstream shapes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DiskIo {
+    /// Aggregate read rate across physical disks, bytes/sec. Sanitised to a
+    /// finite value the same way [`as_unit`] sanitises a load — see
+    /// [`finite_or_zero`].
+    pub read_bps: f64,
+    /// Aggregate write rate across physical disks, bytes/sec.
+    pub write_bps: f64,
+    /// Cumulative bytes read since boot, summed across physical disks.
+    pub total_read_bytes: u64,
+    /// Cumulative bytes written since boot, summed across physical disks.
+    pub total_write_bytes: u64,
 }
 
 /// The memory half of a [`Snapshot`] — the four counters the native Memory row
@@ -128,6 +172,15 @@ pub struct Gpu {
     /// the native GPU chip shows a `{c:.0}°` label beside its bar and P1's card
     /// had no place to put one, so nothing read it until the chips existed.
     pub temperature_c: Option<f32>,
+    /// VRAM in use, or `None` when the vendor exposes no memory counter (some
+    /// vendors report load/temperature but not memory). The native GPU card's
+    /// "GPU VRAM" history row (`trollshell/src/panels/stats.rs:632`) hides
+    /// itself unless both this and [`memory_total_bytes`](Self) are `Some` —
+    /// the same rule this page follows (#1295 review MED 1).
+    pub memory_used_bytes: Option<u64>,
+    /// VRAM installed, or `None` for the same reason as
+    /// [`memory_used_bytes`](Self).
+    pub memory_total_bytes: Option<u64>,
 }
 
 /// The command lane: the host's slot-visibility push, forwarded by the reducer.
@@ -148,36 +201,46 @@ pub enum Msg {
 /// ones it does not.
 ///
 /// Derived from the resolved [`Card`](crate::config::Card) once at launch,
-/// because the four reads it gates are not all cheap and two of them are
+/// because the reads it gates are not all cheap and several of them are
 /// genuinely expensive on the wrong machine:
 ///
 /// - **`gpu`** falls through to spawning `nvidia-smi` on an Nvidia box — a
 ///   `fork`/`exec` per tick, which is the reason the whole read is
 ///   `spawn_blocking`ed.
 /// - **`disk`** walks `/proc/self/mountinfo` and then `statvfs`es every
-///   surviving mount. On a box with a dozen filesystems that is a dozen
-///   syscalls that can each block on a slow or unresponsive filesystem.
+///   surviving mount, and (since the #1295 review's MED 1) re-reads
+///   `/proc/diskstats` for the Disks card's I/O history. On a box with a dozen
+///   filesystems that is a dozen syscalls that can each block on a slow or
+///   unresponsive filesystem.
 /// - **`temperature`** resolves an hwmon chip by `read_dir` the first time.
 /// - **`memory`** is one small `/proc/meminfo` read, gated for symmetry rather
 ///   than for cost.
+/// - **`cpu`** gates the CPU card's two newer rows (#1295 review MED 1):
+///   `read_process_count` walks every entry of `/proc`, and `read_cpu_freq`
+///   walks every core's `cpufreq` sysfs node. Both are cheap on most boxes but
+///   scale with process/core count, unlike `/proc/stat` below — and both are
+///   pointless work on an instance with no CPU half to show them on.
 ///
 /// `/proc/stat` is deliberately **not** gated: it is a single small read, it is
 /// the baseline [`Sampler::reset`] exists to invalidate, and an instance that
 /// draws no CPU at all is not a shape worth a second code path.
-/// Four **independent** switches over "which sensors does this instance read",
+/// Five **independent** switches over "which sensors does this instance read",
 /// which is the same argument `crate::config::Card` makes: collapsing them into
 /// a bitflag or an enum would make "this surface draws memory but not disk"
 /// unspellable, and each one gates a different syscall.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Needs {
+    /// Read the process count and the CPU clock (#1295 review MED 1).
+    pub cpu: bool,
     /// Read the package temperature.
     pub temperature: bool,
     /// Read the GPU.
     pub gpu: bool,
     /// Read `/proc/meminfo`.
     pub memory: bool,
-    /// Walk the mount table and `statvfs` each mount.
+    /// Walk the mount table and `statvfs` each mount, and read the disk I/O
+    /// counters (#1295 review MED 1).
     pub disk: bool,
 }
 
@@ -191,6 +254,7 @@ impl Needs {
     #[must_use]
     pub const fn of(card: crate::config::Card) -> Self {
         Self {
+            cpu: card.cpu,
             temperature: card.temperature && (card.cpu || card.gpu),
             gpu: card.gpu,
             memory: card.memory,
@@ -216,6 +280,16 @@ pub struct Sampler {
     hwmon: Option<PathBuf>,
     /// `nvidia-smi` availability and the Intel RC6 delta base.
     gpu: GpuCache,
+    /// Previous per-device `/proc/diskstats` byte counters, keyed by device
+    /// name — `hytte_sensors::compute_disk_io`'s own cache shape.
+    ///
+    /// **Not** cleared by [`reset`](Self::reset): unlike the CPU baseline,
+    /// leaving this stale means the first disk-I/O reading after an unpark
+    /// averages over however long the surface was closed rather than over a
+    /// fresh window (the same failure #1277 LOW 4 fixed for CPU load) — a
+    /// known simplification, named rather than silently carried, since the
+    /// rate is one line on a page and not the headline this card leads with.
+    prev_diskio: HashMap<String, (u64, u64, Instant)>,
 }
 
 impl Sampler {
@@ -264,7 +338,30 @@ impl Sampler {
                 name: g.name,
                 load: g.load.map(as_unit),
                 temperature_c: g.temperature_celsius.map(celsius),
+                memory_used_bytes: g.memory_used_bytes,
+                memory_total_bytes: g.memory_total_bytes,
             })
+        } else {
+            None
+        };
+
+        // The CPU card's two newer rows (#1295 review MED 1): a process count
+        // and the aggregate clock. Both ride the `cpu` need rather than the
+        // ungated `/proc/stat` read above — a `read_dir("/proc")` walk and a
+        // per-core `cpufreq` sysfs walk are not "one small read" the way
+        // `/proc/stat` is, and are pointless work on a surface with no CPU
+        // half to show them on.
+        let processes = if self.needs.cpu {
+            Some(u64::from(hytte_sensors::read_process_count()))
+        } else {
+            None
+        };
+        let cpu_clock_hz = if self.needs.cpu {
+            let freq = hytte_sensors::read_cpu_freq();
+            // The native row's own hide rule: no `cpufreq` governor at all
+            // (VMs, some ARM boards) is `max_ceiling_hz == 0.0`, and the row
+            // disappears rather than showing a flat, meaningless `0 Hz`.
+            (freq.max_ceiling_hz > 0.0).then(|| finite_or_zero(freq.max_hz))
         } else {
             None
         };
@@ -301,6 +398,25 @@ impl Sampler {
             Vec::new()
         };
 
+        // The Disks card's I/O history row (#1295 review MED 1) — gated on
+        // the same `disk` need as the mount walk above, and read from
+        // `/proc/diskstats` rather than `statvfs`: a different file, but the
+        // same "this instance does not draw disks" question decides both.
+        let disk_io = if self.needs.disk {
+            let devices = hytte_sensors::read_proc_diskstats().unwrap_or_default();
+            let now = Instant::now();
+            let (io, next) = hytte_sensors::compute_disk_io(&self.prev_diskio, devices, now);
+            self.prev_diskio = next;
+            Some(DiskIo {
+                read_bps: finite_or_zero(io.read_bps),
+                write_bps: finite_or_zero(io.write_bps),
+                total_read_bytes: io.total_read_bytes,
+                total_write_bytes: io.total_write_bytes,
+            })
+        } else {
+            None
+        };
+
         Snapshot {
             cpu,
             per_core,
@@ -308,6 +424,9 @@ impl Sampler {
             gpu,
             memory,
             disks,
+            processes,
+            cpu_clock_hz,
+            disk_io,
         }
     }
 
@@ -384,6 +503,17 @@ fn as_unit(load: f64) -> f32 {
 #[allow(clippy::cast_possible_truncation)]
 fn celsius(c: f64) -> f32 {
     c as f32
+}
+
+/// An `f64` reading with no bounded range (a byte rate, a clock frequency) as
+/// a finite value — `0.0` for anything non-finite.
+///
+/// Unlike [`as_unit`] this does **not** clamp to `0.0..=1.0`: a rate or a
+/// clock has no unit ceiling, only a "must not be `NaN`/`±inf`" floor, which
+/// is the one property that would otherwise defeat the runtime's render dedup
+/// forever (#896/#898).
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() { v } else { 0.0 }
 }
 
 /// What [`sampler_task`] needs of the thing it drives: read the machine, and
@@ -668,6 +798,9 @@ mod tests {
         assert!(s.per_core.is_empty());
         assert!(s.cpu_temp_c.is_none());
         assert!(s.gpu.is_none());
+        assert!(s.processes.is_none());
+        assert!(s.cpu_clock_hz.is_none());
+        assert!(s.disk_io.is_none());
     }
 
     /// **The first tick draws dashes** — the claim four doc comments make, made
@@ -747,8 +880,9 @@ mod tests {
     /// mount walk plus one `statvfs` per filesystem) are decided by a function
     /// a test can drive rather than by a branch only a live machine reaches.
     ///
-    /// **Falsified** by having `Needs::of` answer `Self { temperature: true,
-    /// gpu: true, memory: true, disk: true }` unconditionally.
+    /// **Falsified** by having `Needs::of` answer `Self { cpu: true,
+    /// temperature: true, gpu: true, memory: true, disk: true }`
+    /// unconditionally.
     #[test]
     fn the_needs_follow_the_table() {
         // The two shipped tables, spelled out rather than compared to
@@ -756,6 +890,7 @@ mod tests {
         assert_eq!(
             Needs::of(Card::sidebar_default()),
             Needs {
+                cpu: true,
                 temperature: true,
                 gpu: true,
                 memory: false,
@@ -766,6 +901,7 @@ mod tests {
         assert_eq!(
             Needs::of(Card::bar_default()),
             Needs {
+                cpu: true,
                 temperature: true,
                 gpu: true,
                 memory: true,
@@ -779,6 +915,7 @@ mod tests {
             f(&mut cfg);
             Needs::of(cfg)
         };
+        assert!(!off(|c| c.cpu = false).cpu);
         assert!(!off(|c| c.gpu = false).gpu);
         assert!(!off(|c| c.memory = false).memory);
         assert!(!off(|c| c.disk = false).disk);
@@ -797,6 +934,34 @@ mod tests {
             off(|c| c.cpu = false).temperature,
             "…but a GPU-only surface still shows the adapter's",
         );
+    }
+
+    /// **The four (five, since #1295's MED 1) expensive reads are gated in
+    /// `tick`, not merely derived by `Needs::of`**: with every need off, the
+    /// snapshot carries no temperature, no GPU, no memory, no mounts, no
+    /// process count and no CPU clock. This is the only thing that makes
+    /// `DEFAULT_TOML`'s "turning either off also stops this instance from
+    /// sampling the corresponding sensor" true rather than merely written
+    /// down.
+    ///
+    /// It builds a real [`Sampler`], which reads `/proc/stat` (the one
+    /// ungated read) and nothing else — it asserts about the gates, never
+    /// about the machine. Lifted from the #1295 review's MED 2, whose two
+    /// assertions (`cpu_temp_c`, `gpu`, `memory`, `disks`) are unchanged; the
+    /// `processes` / `cpu_clock_hz` / `disk_io` assertions are this round's
+    /// extension for the fifth gate MED 1 added.
+    ///
+    /// **Falsified** by deleting any one of `tick`'s five `if self.needs.*`.
+    #[test]
+    fn a_sampler_that_needs_nothing_reads_nothing_but_proc_stat() {
+        let snap = Sampler::new(Needs::default()).tick();
+        assert_eq!(snap.cpu_temp_c, None, "the hwmon read_dir is gated");
+        assert_eq!(snap.gpu, None, "the nvidia-smi fork is gated");
+        assert_eq!(snap.memory, None, "/proc/meminfo is gated");
+        assert!(snap.disks.is_empty(), "the mount walk + statvfs are gated");
+        assert_eq!(snap.processes, None, "the /proc read_dir walk is gated");
+        assert_eq!(snap.cpu_clock_hz, None, "the cpufreq sysfs walk is gated");
+        assert_eq!(snap.disk_io, None, "the /proc/diskstats read is gated");
     }
 
     /// **The gate**: while the surface is hidden, nothing is sampled at all —

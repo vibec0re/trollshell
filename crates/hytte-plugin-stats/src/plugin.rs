@@ -108,6 +108,24 @@ pub struct Stats {
     /// The overall-load history the scope sweeps, newest last, capped at the
     /// scope's own column count.
     ring: VecDeque<f32>,
+    /// The disk-I/O-history ring (#1295 review MED 1) — the drawer page's Disk
+    /// I/O sweep, normalised each tick against [`disk_io_peak`](Self) rather
+    /// than against a fixed ceiling: a byte rate has no natural `0.0..=1.0`
+    /// the way a load or a percentage does.
+    disk_io_ring: VecDeque<f32>,
+    /// The peak combined disk read+write rate this session has seen, in
+    /// bytes/sec — the auto-scale denominator for [`disk_io_ring`](Self).
+    ///
+    /// A simplification against the native row's **windowed** max
+    /// (`trollshell/src/panels/stats.rs`'s `build_history_disk_io_row`): this
+    /// one never decays, so a single burst early in a long session compresses
+    /// every quieter period after it. Named here and in `card::Widgets`'
+    /// `disk_io` doc rather than silently carried, because #1251's whole point
+    /// is an honest list of where this page and the native one diverge.
+    disk_io_peak: f32,
+    /// The GPU-VRAM-history ring (#1295 review MED 1) — already a percentage,
+    /// so no peak-tracking denominator is needed the way disk I/O's is.
+    gpu_vram_ring: VecDeque<f32>,
     /// The preem widgets, held across renders so the shell keeps one renderer
     /// instance per node (and so the raster fallback keeps its animation).
     widgets: Widgets,
@@ -130,6 +148,11 @@ impl Stats {
         self.widgets
             .set_gpu(snapshot.gpu.as_ref().and_then(|g| g.load), self.dt());
         self.widgets.set_memory(snapshot.memory.as_ref());
+        // The disk lamp row's own pitch (#1295 review LOW 4) — the same
+        // "fitted to the widest row" argument as `fit_cores`, over the mount
+        // usages rather than the core loads.
+        let disk_usages: Vec<f32> = snapshot.disks.iter().map(|d| d.usage).collect();
+        self.widgets.fit_disk_lamps(&disk_usages);
 
         // A withheld reading is not a sample: a cold tick (or one whose
         // `/proc/stat` read failed) must not push a fake rest value onto the
@@ -144,6 +167,46 @@ impl Stats {
             // cheap way to hand it one without copying on every render.
             let ring: Vec<f32> = self.ring.iter().copied().collect();
             self.widgets.push_history(&ring);
+        }
+
+        // Disk I/O (#1295 review MED 1): unlike CPU load, never withheld for a
+        // cold start (`compute_disk_io` answers an empty `prev` map with a
+        // valid zero rate) — so every tick that reads disk contributes a
+        // point, auto-scaled against the peak combined rate seen so far (see
+        // `disk_io_peak`'s doc for the honest limit of that).
+        if let Some(io) = snapshot.disk_io.as_ref() {
+            #[allow(clippy::cast_possible_truncation)]
+            let combined = (io.read_bps + io.write_bps) as f32;
+            self.disk_io_peak = self.disk_io_peak.max(combined);
+            let norm = if self.disk_io_peak > 0.0 {
+                (combined / self.disk_io_peak).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            self.disk_io_ring.push_back(card::trace_sample(norm));
+            while self.disk_io_ring.len() > card::HISTORY_COLS as usize {
+                self.disk_io_ring.pop_front();
+            }
+            let ring: Vec<f32> = self.disk_io_ring.iter().copied().collect();
+            self.widgets.push_disk_io_history(&ring);
+        }
+
+        // GPU VRAM (#1295 review MED 1): already a `0.0..=1.0` fraction, so no
+        // peak-tracking denominator is needed — withheld exactly like the
+        // native row, when the vendor answers neither used nor total.
+        if let Some((used, total)) = snapshot
+            .gpu
+            .as_ref()
+            .and_then(|g| g.memory_used_bytes.zip(g.memory_total_bytes))
+            .filter(|(_, total)| *total > 0)
+        {
+            let level = crate::format::fraction(used, total);
+            self.gpu_vram_ring.push_back(card::trace_sample(level));
+            while self.gpu_vram_ring.len() > card::HISTORY_COLS as usize {
+                self.gpu_vram_ring.pop_front();
+            }
+            let ring: Vec<f32> = self.gpu_vram_ring.iter().copied().collect();
+            self.widgets.push_gpu_vram_history(&ring);
         }
 
         self.snapshot = snapshot;
@@ -194,6 +257,9 @@ impl Stats {
             cfg,
             snapshot: Snapshot::default(),
             ring: VecDeque::new(),
+            disk_io_ring: VecDeque::new(),
+            disk_io_peak: 0.0,
+            gpu_vram_ring: VecDeque::new(),
             widgets: Widgets::default(),
             cmds,
         }
@@ -351,6 +417,7 @@ mod tests {
                 name: "test".to_owned(),
                 load: Some(cpu),
                 temperature_c: Some(44.0),
+                ..Gpu::default()
             }),
             ..Snapshot::default()
         })))
@@ -632,6 +699,46 @@ mod tests {
             let _ = model.update(sample(load));
         }
         assert_eq!(model.ring.len(), HISTORY_COLS as usize);
+    }
+
+    /// **The two #1295-review-MED-1 histories are bounded the same way**:
+    /// disk I/O and GPU VRAM each grow their own ring, capped at the scope's
+    /// width, and neither one grows when its reading is withheld — the same
+    /// "a withheld reading is not a sample" rule
+    /// `a_withheld_reading_leaves_the_trace_alone` pins for CPU.
+    ///
+    /// **Falsified** by dropping either ring's `pop_front`, or by pushing a
+    /// point when `disk_io`/the GPU's VRAM pair is `None`.
+    #[test]
+    fn the_new_page_histories_are_bounded_and_withheld_like_the_cpu_one() {
+        let mut model = fresh(Card::sidebar_default());
+        for i in 0..(HISTORY_COLS * 3) {
+            let bps = f64::from(i % 100) * 1024.0;
+            let snap = Snapshot {
+                disk_io: Some(crate::sample::DiskIo {
+                    read_bps: bps,
+                    write_bps: 0.0,
+                    total_read_bytes: 0,
+                    total_write_bytes: 0,
+                }),
+                gpu: Some(Gpu {
+                    name: "test".to_owned(),
+                    memory_used_bytes: Some(u64::from(i % 100)),
+                    memory_total_bytes: Some(100),
+                    ..Gpu::default()
+                }),
+                ..Snapshot::default()
+            };
+            let _ = model.update(Input::App(Msg::Sampled(Box::new(snap))));
+        }
+        assert_eq!(model.disk_io_ring.len(), HISTORY_COLS as usize);
+        assert_eq!(model.gpu_vram_ring.len(), HISTORY_COLS as usize);
+
+        // Withheld: neither `None` case grows its ring.
+        let mut fresh_model = fresh(Card::sidebar_default());
+        let _ = fresh_model.update(Input::App(Msg::Sampled(Box::default())));
+        assert!(fresh_model.disk_io_ring.is_empty());
+        assert!(fresh_model.gpu_vram_ring.is_empty());
     }
 
     /// **A withheld reading is not a sample**: the cold tick, whose `cpu` is

@@ -2015,8 +2015,9 @@ systemd-run --user --unit=trollshell-plugin-stats-side \
       at once, both cards on screen, each journal stream prefixed with its own
       id. Finally set a **bad** id (`--setenv=HYTTE_PLUGIN_ID=stats.bar`): the
       unit must fail at startup with a message naming the rule, not start and
-      sit silent. (P1 renders the same card in both places; the bar chips are
-      P2, #1251.)
+      sit silent. (P1 renders the same **card** in both places; since P2
+      /#1251 a `HYTTE_PLUGIN_MOUNT=BarRight` launch renders **chips**, not the
+      card — see the section right below.)
 
 ### Stats as a plugin — the bar instance (#1248 P2 / #1251)
 
@@ -2059,13 +2060,16 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       nodes carry `ts-cpu`/`ts-memory`/`ts-disk`/`ts-gpu` and `ts-cpu-temp`/
       `ts-gpu-temp` verbatim.
 - [ ] **(#1251)** **A click opens the plugin's own page.** Click any of the
-      four chips: the drawer opens on a page with a CPU card (load, core count,
-      the lamp row at **full width** — chunkier dots than the sidebar card's),
-      a Memory card (`11.2 GiB / 31.1 GiB (36%)` plus an LED meter, and a Swap
-      row only if this machine has swap), a GPU card (name, load, temperature,
-      the needle) and a Disks card (`N mount(s)`, the lamp row, then one row per
-      mount with `used / total (pct%)` and a bar). All four chips open the
-      **same** page — a plugin has exactly one `PluginSelf`.
+      four chips: the drawer opens on a page with a CPU card (load, process
+      count, core count, the lamp row at **full width** — chunkier dots than
+      the sidebar card's — the package temperature, the history sweep and the
+      clock), a Memory card (`11.2 GiB / 31.1 GiB (36%)` plus an LED meter, and
+      a Swap row only if this machine has swap), a GPU card (name, load,
+      temperature, the needle, and a VRAM history sweep when the vendor
+      reports it) and a Disks card (`N mount(s)`, the lamp row **also at full
+      width**, one row per mount with `used / total (pct%)` and a bar, then a
+      Disk I/O history sweep). All four chips open the **same** page — a
+      plugin has exactly one `PluginSelf`.
 - [ ] **(#1251)** **Compare it against the native page, side by side.** The
       native Stats page is still in the tree (P3, #1252, retires it) — open it
       from the native chips and put the two next to each other. Expected
@@ -2073,9 +2077,20 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       (the wire's `Scope` is one trace); the overall history is a scope sweep
       instead of a sparkline; GPU load has a needle the native page does not;
       the Services card is absent; there is one column rather than
-      `TROLLSHELL_STATS_LAYOUT`'s three layouts. **This is the visible trade
-      #1251 exists to put in front of you.** Everything else — every number,
-      every unit, every hide rule — should match.
+      `TROLLSHELL_STATS_LAYOUT`'s three layouts; and **Top apps · CPU / RAM**
+      is absent from both the CPU and Memory cards — `app_usage`
+      (`crates/hytte-services/src/app_usage.rs`) walks `/proc` grouped by
+      systemd app-scope and resolves icons through `gio::AppInfo`, which a
+      GTK-free plugin process cannot reach, the same shape of gap as the
+      Services card (see #1251). **This is the visible trade #1251 exists to
+      put in front of you.** Everything else — every number, every unit,
+      every hide rule — should match, including four rows that were missing
+      until this fix round and are now on the page: **Processes**, **Clock**
+      (hidden with no `cpufreq` governor, same as native), **Disk I/O**
+      history (auto-scaled against this session's peak rate rather than the
+      native row's windowed max — a named simplification, not a hidden one)
+      and **GPU VRAM** history (hidden unless the vendor reports both used and
+      total VRAM, same as native).
 - [ ] **(#1251)** **Both instances alive at once.** With `stats-side` and
       `stats-bar` both running: the right sidebar card and the bar chips are on
       screen together, each journal stream prefixed with its own id, and the
@@ -2100,6 +2115,22 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       the journal must carry exactly one line naming `bar.memory`, the memory
       chip must fall back to **on** (the built-in default), and every other
       chip must still obey the file.
+- [ ] **(#1295 review LOW 5)** **On an Nvidia box, measure the `nvidia-smi`
+      fork rate with the bar instance up.** `hytte_sensors::GpuCache`
+      (`crates/hytte-sensors/src/gpu.rs`) remembers only _whether_
+      `nvidia-smi` exists — measured from the code, there is no time-based
+      throttle on that path at all, so once it is known to exist,
+      `read_gpu_with_cache` spawns it on **every** call. The fork rate is
+      therefore exactly the sum of every poller's own cadence, not something a
+      cache smooths out: the native shell's `sensors` service (1 Hz), the bar
+      instance (1 Hz, and it cannot park), and a visible sidebar instance
+      (1 Hz) — up to **three** `nvidia-smi` processes a second at the shipped
+      `poll_seconds = 1` default, during the P2/P3 overlap. Verify it:
+      `for i in $(seq 10); do pgrep -c nvidia-smi; sleep 1; done` with the bar
+      instance running (and the sidebar open, for the worst case), and report
+      the measured count per second. If that rate is a problem on this
+      machine, `[bar] gpu = false` is the mitigation until P3 (#1252) retires
+      the native GPU chip and removes the third poller.
 
 ## Audio & media
 

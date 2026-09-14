@@ -1,22 +1,45 @@
-//! The two number formats the drawer page needs that the card did not.
+//! The number formats the drawer page needs that the card did not.
 //!
-//! Both are **deliberate mirrors** of `trollshell/src/components/format.rs`,
-//! which is where the native Stats page gets its byte and percentage strings.
-//! The plugin cannot link that module — it is `pub(crate)` inside the shell
-//! binary, and the shell is the one thing a plugin never links — so the ladder
-//! is restated here and pinned against the shell's own recorded outputs
-//! (`components/format.rs`'s `fmt_bytes` tests: `1023 → "1023 B"`,
-//! `1024 → "1.0 KiB"`, `1_048_575 → "1024.0 KiB"`, `1_048_576 → "1.0 MiB"`,
-//! `1_073_741_824 → "1.0 GiB"`, `4_509_715_660 → "4.2 GiB"`).
+//! All four are **deliberate mirrors** of `trollshell/src/components/format.rs`,
+//! which is where the native Stats page gets its byte, rate, clock and
+//! percentage strings. The plugin cannot link that module — it is
+//! `pub(crate)` inside the shell binary, and the shell is the one thing a
+//! plugin never links — so each ladder is restated here and pinned against
+//! the shell's own recorded outputs (`components/format.rs`'s own tests:
+//! `fmt_bytes`'s `1023 → "1023 B"`, `1024 → "1.0 KiB"`,
+//! `1_048_575 → "1024.0 KiB"`, `1_048_576 → "1.0 MiB"`,
+//! `1_073_741_824 → "1.0 GiB"`, `4_509_715_660 → "4.2 GiB"`; `fmt_rate`'s
+//! `1024.0 → "1.0 KiB/s"`; `fmt_hz`'s `500.0 → "500 Hz"`,
+//! `1_000.0 → "1 kHz"`, `1_000_000.0 → "1 MHz"`, `1_000_000_000.0 → "1.0 GHz"`,
+//! `3_800_000_000.0 → "3.8 GHz"`).
 //!
-//! Those six literals are the whole point of the test below: a mirror that
+//! Those literals are the whole point of the tests below: a mirror that
 //! asserts against its own arithmetic cannot see a divergence from the thing it
 //! mirrors (#1026), so the expectations are copied from the shell's test file
-//! rather than derived here.
+//! rather than derived here. `rate` and `hz` were added by the #1295 review's
+//! MED 1, for the page's new Disk I/O and CPU-clock rows.
 //!
 //! Percentages are not in this module: `crate::card::percent_text` already owns
 //! the card's `0.0..=1.0 → "42%"` mapping including the `—` arm, and the page
 //! uses that same function so the two surfaces cannot disagree.
+
+/// Bytes as the native Stats page writes them, without a rate suffix:
+/// `GiB` / `MiB` / `KiB` / `B`, one decimal place above the first threshold
+/// and none below it. Binary units, matching the shell — `1024`, not `1000`.
+///
+/// The inner ladder [`bytes`] and [`rate`] share, split out because a rate is
+/// the same ladder over a `f64`/sec rather than a `u64` total.
+fn bytes_f64(f: f64) -> String {
+    if f >= 1_073_741_824.0 {
+        format!("{:.1} GiB", f / 1_073_741_824.0)
+    } else if f >= 1_048_576.0 {
+        format!("{:.1} MiB", f / 1_048_576.0)
+    } else if f >= 1024.0 {
+        format!("{:.1} KiB", f / 1024.0)
+    } else {
+        format!("{f:.0} B")
+    }
+}
 
 /// Bytes as the native Stats page writes them: `GiB` / `MiB` / `KiB` / `B`,
 /// one decimal place above the first threshold and none below it.
@@ -29,14 +52,34 @@ pub fn bytes(b: u64) -> String {
     // want the cast named rather than hidden.
     #[allow(clippy::cast_precision_loss)]
     let f = b as f64;
-    if f >= 1_073_741_824.0 {
-        format!("{:.1} GiB", f / 1_073_741_824.0)
-    } else if f >= 1_048_576.0 {
-        format!("{:.1} MiB", f / 1_048_576.0)
-    } else if f >= 1024.0 {
-        format!("{:.1} KiB", f / 1024.0)
+    bytes_f64(f)
+}
+
+/// A byte-per-second rate as the native Disks card's I/O row writes it
+/// (`fmt_rate`: the same [`bytes`] ladder plus a `/s` suffix) — the drawer
+/// page's Disk I/O history row (#1295 review MED 1).
+///
+/// A negative rate cannot happen (`hytte_sensors::compute_disk_io` sums
+/// non-negative deltas), but `.max(0.0)` is one clause cheaper than trusting
+/// that forever, and matches [`crate::sample::finite_or_zero`]'s "never draw
+/// a number that cannot be a real reading" rule.
+#[must_use]
+pub fn rate(bps: f64) -> String {
+    format!("{}/s", bytes_f64(bps.max(0.0)))
+}
+
+/// A clock frequency in Hz as the native CPU card's "Clock" row writes it
+/// (`fmt_hz`) — the drawer page's Clock row (#1295 review MED 1).
+#[must_use]
+pub fn hz(hz: f64) -> String {
+    if hz >= 1_000_000_000.0 {
+        format!("{:.1} GHz", hz / 1_000_000_000.0)
+    } else if hz >= 1_000_000.0 {
+        format!("{:.0} MHz", hz / 1_000_000.0)
+    } else if hz >= 1_000.0 {
+        format!("{:.0} kHz", hz / 1_000.0)
     } else {
-        format!("{f:.0} B")
+        format!("{hz:.0} Hz")
     }
 }
 
@@ -73,7 +116,7 @@ pub fn fraction(used: u64, total: u64) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes, fraction, used_of_total};
+    use super::{bytes, fraction, hz, rate, used_of_total};
 
     /// **The mirror**, pinned against the shell's own recorded outputs rather
     /// than against this module's arithmetic — a mirror asserted from its own
@@ -93,6 +136,34 @@ mod tests {
             (4_509_715_660, "4.2 GiB"),
         ] {
             assert_eq!(bytes(input), want, "{input}");
+        }
+    }
+
+    /// **The rate mirror**, pinned against the shell's `fmt_rate` test —
+    /// #1295 review MED 1's Disk I/O history row.
+    #[test]
+    fn the_rate_ladder_is_the_shells_rate_ladder() {
+        assert_eq!(rate(1024.0), "1.0 KiB/s");
+        assert_eq!(rate(0.0), "0 B/s");
+        assert_eq!(
+            rate(-5.0),
+            "0 B/s",
+            "a negative rate is clamped, not signed"
+        );
+    }
+
+    /// **The clock mirror**, pinned against the shell's `fmt_hz` tests —
+    /// #1295 review MED 1's Clock row.
+    #[test]
+    fn the_hz_ladder_is_the_shells_hz_ladder() {
+        for (input, want) in [
+            (500.0, "500 Hz"),
+            (1_000.0, "1 kHz"),
+            (1_000_000.0, "1 MHz"),
+            (1_000_000_000.0, "1.0 GHz"),
+            (3_800_000_000.0, "3.8 GHz"),
+        ] {
+            assert_eq!(hz(input), want, "{input}");
         }
     }
 

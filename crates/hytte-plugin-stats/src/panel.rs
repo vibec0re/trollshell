@@ -18,6 +18,21 @@
 //! supervisor, and a plugin process can reach neither. Epic #1248's P3 already
 //! has that card staying native.
 //!
+//! **Two rows genuinely cannot follow, and everything else does.** The
+//! `#1295` review's MED 1 found five native rows missing and named nowhere:
+//! four had no dependency or wire reason to be absent (a gap in this page, not
+//! in what a GTK-free process can reach) and are here now — **Processes**
+//! (`stats.rs:576` → `:1182`), **CPU clock** (`:578` → `:1557`), **disk I/O
+//! history** (`:610` → `:1293`) and **GPU VRAM history** (`:632`), all sourced
+//! from `hytte-sensors` the same way every other row on this page is. The
+//! fifth, **Top apps · CPU / RAM** (`:579`, `:596`), is the one genuine gap:
+//! `app_usage` (`crates/hytte-services/src/app_usage.rs`) walks `/proc`
+//! grouped by systemd app-scope/service cgroup and resolves each app's icon
+//! through `gio::AppInfo` — a `hytte-services` module, which a GTK-free plugin
+//! process never links, the same shape of gap as the Services card. Not built
+//! here, and not planned — see `docs/live-verify.md`'s side-by-side item and
+//! #1251.
+//!
 //! The translation, row by row:
 //!
 //! | native | here |
@@ -25,9 +40,14 @@
 //! | `MultiSparkline` per-core history | **not drawn** — the wire's `Scope` is one trace, and N traces is N nodes; the overall sweep is the one that fits |
 //! | `Sparkline` overall CPU history | a [`Scope`](hytte_plugin::display::Scope) |
 //! | the `LedMatrix` per-core panel | the P1 lamp row, fitted to the page's own width (`card::PAGE_PX`) rather than the sidebar card's |
+//! | "Processes" row | a plain reading, `hytte_sensors::read_process_count` |
+//! | "Clock" row (`fmt_hz`) | a plain reading, `hytte_sensors::read_cpu_freq`; hidden with no `cpufreq` governor, same as native |
 //! | memory / swap `GtkProgressBar` | a [`LedStrip`](hytte_plugin::display::LedStrip) apiece, with the exact `used / total (pct%)` text beside it |
 //! | GPU load (a text suffix natively) | a [`Gauge`](hytte_plugin::display::Gauge) — the one place this page is *more* than the native one, and P1's own choice |
+//! | "GPU VRAM" history row | a [`Scope`]; hidden unless both used+total VRAM are reported, same as native |
 //! | per-mount `GtkProgressBar` | [`Node::Progress`] with the shell's own `ts-stat-progress` class |
+//! | "Disk I/O" history row | a [`Scope`], auto-scaled against the peak rate this session has seen rather than the native row's windowed max (a named simplification, `card::Widgets::disk_io`'s doc) |
+//! | Top apps · CPU / RAM | **not drawn** — shell-only, see above |
 //!
 //! **Why the mounts are `Node::Progress` and not a strip each.** #1251 asks for
 //! "progress bars become `Gauge`/`LedStrip`", and the memory and swap bars are
@@ -116,10 +136,24 @@ fn boxed(id: &str, rows: Vec<Node>) -> Node {
         .build()
 }
 
-/// The CPU card: load, the core count, the lamp row at the page's own pitch,
-/// the package temperature and the history sweep.
+/// The CPU card: load, the process count, the core count, the lamp row at the
+/// page's own pitch, the package temperature, the history sweep and the
+/// clock.
 fn cpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -> Vec<Node> {
     let mut rows = vec![header("CPU", percent_text(snapshot.cpu), "ts-cpu", None)];
+
+    // Processes — native `stats.rs:576` → `:1182`, shown unconditionally like
+    // the headline: it carries no cpufreq/hwmon gate of its own, and the `—`
+    // fallback is the seed-render state before the first tick (#1295 review
+    // MED 1).
+    rows.push(header(
+        "Processes",
+        snapshot
+            .processes
+            .map_or_else(|| "—".to_owned(), |n| n.to_string()),
+        "ts-cpu",
+        None,
+    ));
 
     if cfg.per_core {
         // `{} cores` verbatim from the native per-core header row, including
@@ -157,6 +191,14 @@ fn cpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) ->
         rows.push(widgets.history_node("stats-panel-cpu-history", cls("ts-cpu")));
     }
 
+    // Clock — native `stats.rs:578` → `:1557`'s collapsed reading
+    // (`fmt_hz(f.max_hz)`), hidden with no `cpufreq` governor exactly like the
+    // native row (#1295 review MED 1). `snapshot.cpu_clock_hz` is already
+    // `None` in that case — see `Sampler::tick`.
+    if let Some(clock_hz) = snapshot.cpu_clock_hz {
+        rows.push(header("Clock", format::hz(clock_hz), "ts-cpu", None));
+    }
+
     rows
 }
 
@@ -187,23 +229,61 @@ fn gpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) ->
         ));
     }
     rows.push(widgets.gpu_node("stats-panel-gpu-load", cls("ts-gpu")));
+
+    // GPU VRAM history — native `stats.rs:632`, hidden unless both used and
+    // total VRAM are reported (some vendors expose load/temperature but not
+    // memory), the native row's own hide rule (#1295 review MED 1).
+    if let Some((used, total)) = gpu
+        .memory_used_bytes
+        .zip(gpu.memory_total_bytes)
+        .filter(|(_, total)| *total > 0)
+    {
+        let pct = format::fraction(used, total) * 100.0;
+        rows.push(header("VRAM", format!("{pct:.0}%"), "ts-gpu", None));
+        rows.push(widgets.gpu_vram_node("stats-panel-gpu-vram", cls("ts-gpu")));
+    }
+
     rows
 }
 
-/// The Disks card: the `N mount(s)` summary and lamp row shared with the
-/// sidebar card, then one row per mount carrying the exact numbers.
+/// The Disks card: the `N mount(s)` summary and lamp row (at the page's own
+/// pitch, #1295 review LOW 4), one row per mount carrying the exact numbers,
+/// then the disk I/O history sweep.
 fn disk_rows(snapshot: &Snapshot, widgets: &Widgets) -> Vec<Node> {
-    let mut rows = card::disk_rows(snapshot, widgets, "stats-panel");
+    let mut rows = card::page_disk_rows(snapshot, widgets, "stats-panel");
     if snapshot.disks.is_empty() {
         // The native expander renders nothing at all for an empty list, which
         // on a page that is otherwise all rows reads as a broken card; one row
         // saying so is the honest version.
         rows.push(header("No mounts", String::new(), "ts-disk", None));
-        return rows;
+    } else {
+        for (i, disk) in snapshot.disks.iter().enumerate() {
+            rows.push(mount_row(i, disk));
+        }
     }
-    for (i, disk) in snapshot.disks.iter().enumerate() {
-        rows.push(mount_row(i, disk));
+
+    // Disk I/O history — native `stats.rs:610` → `:1293`'s combined rate row.
+    // Unconditional like the native one (no vendor/governor hide rule; an
+    // idle machine just draws a flat trace at the bottom rail) — #1295 review
+    // MED 1.
+    if let Some(io) = snapshot.disk_io.as_ref() {
+        rows.push(header(
+            "Disk I/O",
+            format!(
+                "\u{2193} {} \u{2191} {}",
+                format::rate(io.read_bps),
+                format::rate(io.write_bps),
+            ),
+            "ts-disk",
+            Some(format!(
+                "total \u{2193} {} \u{2191} {}",
+                format::bytes(io.total_read_bytes),
+                format::bytes(io.total_write_bytes),
+            )),
+        ));
+        rows.push(widgets.disk_io_node("stats-panel-disk-io", cls("ts-disk")));
     }
+
     rows
 }
 
@@ -264,7 +344,9 @@ mod tests {
         })
     }
 
-    /// A machine with something to say about every card.
+    /// A machine with something to say about every card — including, since
+    /// the #1295 review's MED 1, the four rows that were missing from it:
+    /// a process count, a CPU clock, a disk I/O rate and a GPU VRAM level.
     fn busy() -> Snapshot {
         Snapshot {
             cpu: Some(0.42),
@@ -274,6 +356,10 @@ mod tests {
                 name: "Test Adapter".to_owned(),
                 load: Some(0.37),
                 temperature_c: Some(52.0),
+                // 4 GiB / 16 GiB — a clean 25%, chosen so the golden's string
+                // assertion needs no float-rounding judgment call.
+                memory_used_bytes: Some(4_294_967_296),
+                memory_total_bytes: Some(17_179_869_184),
             }),
             memory: Some(Memory {
                 used: 11_999_999_000,
@@ -295,6 +381,14 @@ mod tests {
                     usage: 0.73,
                 },
             ],
+            processes: Some(287),
+            cpu_clock_hz: Some(3_800_000_000.0),
+            disk_io: Some(crate::sample::DiskIo {
+                read_bps: 2_097_152.0,
+                write_bps: 1_048_576.0,
+                total_read_bytes: 107_374_182_400,
+                total_write_bytes: 53_687_091_200,
+            }),
         }
     }
 
@@ -326,6 +420,40 @@ mod tests {
         }
     }
 
+    /// Every `ts-*`/`.ts-stat-progress` class the page carries, in tree order
+    /// — the page half of `card::tests::the_bar_renders_four_chips_each_keeping_its_class`
+    /// (#1295 review MED 3). `skeleton` deliberately records kind+id only (it
+    /// calls itself "the exact node tree", and a class is neither); this is
+    /// its sibling for the one thing `skeleton` cannot see.
+    fn classes_of(node: &Node, out: &mut Vec<String>) {
+        let children: Vec<&Node> = match node {
+            Node::Box {
+                classes, children, ..
+            }
+            | Node::Row {
+                classes, children, ..
+            }
+            | Node::ListBox {
+                classes, children, ..
+            } => {
+                out.extend(classes.iter().cloned());
+                children.iter().collect()
+            }
+            Node::Label { classes, .. }
+            | Node::Preem { classes, .. }
+            | Node::Pixels { classes, .. }
+            | Node::Progress { classes, .. } => {
+                out.extend(classes.iter().cloned());
+                Vec::new()
+            }
+            Node::Spacer => Vec::new(),
+            other => panic!("the page must not use {other:?}"),
+        };
+        for child in children {
+            classes_of(child, out);
+        }
+    }
+
     /// **The golden**: the exact node tree a `[bar]`-configured instance draws
     /// for [`busy`].
     ///
@@ -353,11 +481,15 @@ mod tests {
                 "Box#stats-panel",
                 // CPU
                 "ListBox#stats-panel-cpu",
-                "Row",
+                "Row", // CPU
                 "Label",
                 "Spacer",
                 "Label",
-                "Row",
+                "Row", // Processes (#1295 review MED 1)
+                "Label",
+                "Spacer",
+                "Label",
+                "Row", // Per-core
                 "Label",
                 "Spacer",
                 "Label",
@@ -367,6 +499,10 @@ mod tests {
                 "Label",
                 "Spacer",
                 "Preem#stats-panel-cpu-history",
+                "Row", // Clock (#1295 review MED 1)
+                "Label",
+                "Spacer",
+                "Label",
                 // Memory
                 "ListBox#stats-panel-memory",
                 "Row",
@@ -381,22 +517,27 @@ mod tests {
                 "Preem#stats-panel-swap-level",
                 // GPU
                 "ListBox#stats-panel-gpu",
-                "Row",
+                "Row", // GPU (name)
                 "Label",
                 "Spacer",
                 "Label",
-                "Row",
+                "Row", // Load
                 "Label",
                 "Spacer",
                 "Label",
-                "Row",
+                "Row", // Temperature
                 "Label",
                 "Spacer",
                 "Label",
                 "Preem#stats-panel-gpu-load",
+                "Row", // VRAM (#1295 review MED 1)
+                "Label",
+                "Spacer",
+                "Label",
+                "Preem#stats-panel-gpu-vram",
                 // Disks
                 "ListBox#stats-panel-disks",
-                "Row",
+                "Row", // Disks (N mount(s))
                 "Label",
                 "Spacer",
                 "Label",
@@ -413,6 +554,11 @@ mod tests {
                 "Spacer",
                 "Label",
                 "Progress",
+                "Row", // Disk I/O (#1295 review MED 1)
+                "Label",
+                "Spacer",
+                "Label",
+                "Preem#stats-panel-disk-io",
             ],
         );
     }
@@ -566,8 +712,12 @@ mod tests {
         for want in [
             "CPU",
             "42%",
+            "Processes",
+            "287",
             "Per-core",
             "4 cores",
+            "Clock",
+            "3.8 GHz",
             "Memory",
             "11.2 GiB / 31.2 GiB (36%)",
             "Swap",
@@ -578,15 +728,58 @@ mod tests {
             "37%",
             "Temperature",
             "52 °C",
+            "VRAM",
+            "25%",
             "Disks",
             "2 mount(s)",
             "/",
             "37.3 GiB / 93.1 GiB (40%)",
             "/home",
             "679.9 GiB / 931.3 GiB (73%)",
+            "Disk I/O",
+            "\u{2193} 2.0 MiB/s \u{2191} 1.0 MiB/s",
         ] {
             assert!(texts.iter().any(|t| t == want), "{want:?} in {texts:?}");
         }
+    }
+
+    /// The four rows the #1295 review's MED 1 found missing, each hidden
+    /// exactly the way the native row it mirrors hides — a machine that
+    /// answers `None`/`0` for every one of them draws none of the four.
+    ///
+    /// **Falsified** by dropping any of the four `if let`/unconditional
+    /// pushes MED 1 added to `cpu_rows` / `gpu_rows` / `disk_rows`.
+    #[test]
+    fn the_four_med_1_rows_hide_exactly_like_their_native_ones() {
+        let original = busy();
+        let nothing_extra = Snapshot {
+            processes: None,
+            cpu_clock_hz: None,
+            disk_io: None,
+            gpu: original.gpu.clone().map(|g| Gpu {
+                memory_used_bytes: None,
+                memory_total_bytes: None,
+                ..g
+            }),
+            ..original
+        };
+        let mut texts = Vec::new();
+        collect_text(
+            &panel(Card::bar_default(), &nothing_extra, &Widgets::default()),
+            &mut texts,
+        );
+
+        assert!(
+            !texts.iter().any(|t| t == "Clock"),
+            "no cpufreq governor, no Clock row: {texts:?}",
+        );
+        assert!(!texts.iter().any(|t| t == "VRAM"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Disk I/O"), "{texts:?}");
+        // Processes is the one MED 1 row with no hide rule — it dashes
+        // instead, the same "unmeasured, not absent" convention every other
+        // seed-render reading on this page follows.
+        assert!(texts.iter().any(|t| t == "Processes"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "—"), "{texts:?}");
     }
 
     fn collect_text(node: &Node, out: &mut Vec<String>) {
@@ -600,6 +793,40 @@ mod tests {
             }
             Node::Label { text, .. } | Node::Text { text, .. } => out.push(text.clone()),
             _ => {}
+        }
+    }
+
+    /// Every `ts-*` class the page carries, in tree order — the page half of
+    /// `card::tests::the_bar_renders_four_chips_each_keeping_its_class`, and
+    /// the only thing that pins `docs/live-verify.md`'s "the plugin's page
+    /// rows must tint". `ts-stat-progress` in particular is not decoration:
+    /// it is what makes a mount bar the shell's own pill rather than a
+    /// default `GtkProgressBar` (`assets/trollshell/style.css:1899-1913`,
+    /// applied by the host at `trollshell/src/plugins/wire_map.rs:596-600`).
+    ///
+    /// Lifted from the #1295 review's MED 3, adapted to this crate's own
+    /// `busy`/`cls` names.
+    ///
+    /// **Falsified** by dropping any `cls(...)` argument in this module — in
+    /// particular `mount_row`'s `cls("ts-stat-progress")` on the
+    /// `Node::Progress`.
+    #[test]
+    fn the_page_keeps_the_shells_own_classes() {
+        let mut got = Vec::new();
+        classes_of(
+            &panel(Card::bar_default(), &busy(), &Widgets::default()),
+            &mut got,
+        );
+        assert!(got.iter().any(|c| c == "ts-stat-progress"), "{got:?}");
+        for want in [
+            "ts-cpu",
+            "ts-cpu-temp",
+            "ts-gpu",
+            "ts-gpu-temp",
+            "ts-memory",
+            "ts-disk",
+        ] {
+            assert!(got.iter().any(|c| c == want), "{want} missing: {got:?}");
         }
     }
 }

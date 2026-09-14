@@ -363,12 +363,20 @@ pub struct Widgets {
     /// instead of [`CARD_PX`], which is what "the P1 row at full width" means.
     page_cores: DotMatrix,
     page_fitted_cells: usize,
-    /// Every **bar** lamp, and every disk lamp on every surface: one pitch,
-    /// many nodes. A `DotMatrix` wrapper carries no per-node state — the id,
-    /// the classes and the text are all arguments to `node_classed` — so one
-    /// value renders the CPU chip's lamp, the memory chip's, the GPU chip's and
-    /// the disk row's without them sharing anything but their pitch.
+    /// Every **bar** lamp, and every disk lamp on the **sidebar card**: one
+    /// pitch, many nodes. A `DotMatrix` wrapper carries no per-node state —
+    /// the id, the classes and the text are all arguments to `node_classed` —
+    /// so one value renders the CPU chip's lamp, the memory chip's, the GPU
+    /// chip's and the sidebar card's disk row without them sharing anything
+    /// but their pitch.
     lamps: DotMatrix,
+    /// The drawer page's disk-lamp row, fitted to [`PAGE_PX`] like
+    /// [`page_cores`] — #1295 review LOW 4: at the bar's fixed [`CHIP_DOT_PX`]
+    /// floor a two-mount row is `2*(6*2+1) = 26 px` wide sitting under a
+    /// per-core row six times that pitch, the same "fit the row to the
+    /// surface it is on" argument [`PAGE_PX`]'s own doc makes.
+    page_disk_lamps: DotMatrix,
+    page_disk_fitted_cells: usize,
     temp: SevenSeg,
     history: Scope,
     /// The CPU chip's sweep when `[bar] history = true`: the same trace as
@@ -377,6 +385,17 @@ pub struct Widgets {
     gpu: Gauge,
     memory: LedStrip,
     swap: LedStrip,
+    /// The drawer page's disk-I/O-history sweep (#1295 review MED 1) — the
+    /// native Disks card's combined read+write rate row
+    /// (`trollshell/src/panels/stats.rs:610` → `:1293`), auto-scaled against
+    /// the peak rate this session has seen (`Stats::apply`) rather than the
+    /// native row's windowed max: a simplification, named here because #1251's
+    /// whole point is an honest list of where this page and the native one
+    /// diverge.
+    disk_io: Scope,
+    /// The drawer page's GPU-VRAM-history sweep (#1295 review MED 1) — the
+    /// native GPU card's "GPU VRAM" row (`stats.rs:632`).
+    gpu_vram: Scope,
 }
 
 /// Logical width of the history sweep, in samples — one per poll tick, so at
@@ -391,6 +410,8 @@ impl Default for Widgets {
             page_cores: DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, DASH_CELLS)),
             page_fitted_cells: DASH_CELLS,
             lamps: DotMatrix::new(SKIN).dot_px(CHIP_DOT_PX),
+            page_disk_lamps: DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, DASH_CELLS)),
+            page_disk_fitted_cells: DASH_CELLS,
             temp: SevenSeg::new(SKIN),
             // 144x32 at 2x is 288x64 — the card's width, and short enough that
             // the sweep reads as a strip beside the lamp row rather than
@@ -406,6 +427,10 @@ impl Default for Widgets {
             // the `used / total` text that carries the exact numbers.
             memory: LedStrip::new(SKIN).leds(12),
             swap: LedStrip::new(SKIN).leds(12),
+            // Both new page-only sweeps are the same footprint as `history` —
+            // neither has a bar-sized twin, since neither row exists on a chip.
+            disk_io: Scope::with_size(SKIN, HISTORY_COLS, 32).scale(2),
+            gpu_vram: Scope::with_size(SKIN, HISTORY_COLS, 32).scale(2),
         }
     }
 }
@@ -436,6 +461,20 @@ impl Widgets {
         if cells != self.page_fitted_cells {
             self.page_cores = DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, cells));
             self.page_fitted_cells = cells;
+        }
+    }
+
+    /// Re-fit the drawer page's disk-lamp row to a fresh set of mount usages —
+    /// [`fit_cores`](Self::fit_cores)'s twin for the Disks card (#1295 review
+    /// LOW 4). The sidebar card's and the bar chip's disk lamps stay at the
+    /// fixed [`CHIP_DOT_PX`] pitch (`self.lamps`); only the page's row is
+    /// fitted to a width budget, for the same reason the per-core row's page
+    /// copy is.
+    pub fn fit_disk_lamps(&mut self, usages: &[f32]) {
+        let cells = row_cells(usages);
+        if cells != self.page_disk_fitted_cells {
+            self.page_disk_lamps = DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, cells));
+            self.page_disk_fitted_cells = cells;
         }
     }
 
@@ -476,9 +515,32 @@ impl Widgets {
         self.chip_history.push(ring);
     }
 
+    /// Stamp a fresh batch onto the drawer page's disk-I/O sweep (#1295 review
+    /// MED 1) — see [`push_history`](Self::push_history) for why it is the
+    /// whole ring rather than the newest sample.
+    pub fn push_disk_io_history(&mut self, ring: &[f32]) {
+        self.disk_io.push(ring);
+    }
+
+    /// Stamp a fresh batch onto the drawer page's GPU-VRAM sweep (#1295 review
+    /// MED 1).
+    pub fn push_gpu_vram_history(&mut self, ring: &[f32]) {
+        self.gpu_vram.push(ring);
+    }
+
     /// The card's history sweep, as a node.
     pub(crate) fn history_node(&self, id: &str, classes: Vec<Cls>) -> Node {
         self.history.node_classed(id, classes)
+    }
+
+    /// The drawer page's disk-I/O sweep.
+    pub(crate) fn disk_io_node(&self, id: &str, classes: Vec<Cls>) -> Node {
+        self.disk_io.node_classed(id, classes)
+    }
+
+    /// The drawer page's GPU-VRAM sweep.
+    pub(crate) fn gpu_vram_node(&self, id: &str, classes: Vec<Cls>) -> Node {
+        self.gpu_vram.node_classed(id, classes)
     }
 
     /// The bar chip's history sweep.
@@ -506,9 +568,17 @@ impl Widgets {
         self.swap.node_classed(id, classes)
     }
 
-    /// One small lamp row at the bar pitch — `text` is a [`lamp_rows`] row.
+    /// One small lamp row at the bar/sidebar pitch — `text` is a
+    /// [`lamp_rows`] row.
     pub(crate) fn lamp_node(&self, id: &str, classes: Vec<Cls>, text: &str) -> Node {
         self.lamps.node_classed(id, classes, text)
+    }
+
+    /// The drawer page's disk-lamp row, at the page's own pitch (#1295 review
+    /// LOW 4) — [`lamp_node`](Self::lamp_node)'s twin for
+    /// [`fit_disk_lamps`](Self::fit_disk_lamps).
+    pub(crate) fn page_disk_lamp_node(&self, id: &str, classes: Vec<Cls>, text: &str) -> Node {
+        self.page_disk_lamps.node_classed(id, classes, text)
     }
 
     /// The drawer page's per-core rows, at the page's own pitch.
@@ -685,6 +755,40 @@ pub(crate) fn disk_rows(snapshot: &Snapshot, widgets: &Widgets, prefix: &str) ->
     ]
 }
 
+/// [`disk_rows`]'s twin for the **drawer page** (#1295 review LOW 4): the same
+/// header and lamp row, but through [`Widgets::page_disk_lamp_node`] so the
+/// row draws at the page's own pitch rather than the bar/sidebar's fixed
+/// [`CHIP_DOT_PX`] floor. Not folded into `disk_rows` with a pitch parameter:
+/// the two are ten lines of otherwise-identical layout, and the module already
+/// keeps `history_node`/`chip_history_node` and `lamp_node`/
+/// `page_disk_lamp_node` as separate named wrappers rather than parametrised
+/// ones (see the module doc's precedent).
+pub(crate) fn page_disk_rows(snapshot: &Snapshot, widgets: &Widgets, prefix: &str) -> Vec<Node> {
+    let usages: Vec<f32> = snapshot.disks.iter().map(|d| d.usage).collect();
+    vec![
+        header(
+            "Disks",
+            format!("{} mount(s)", snapshot.disks.len()),
+            "ts-disk",
+            Some(disk_tooltip(&snapshot.disks)),
+        ),
+        Node::Row {
+            id: None,
+            classes: Vec::new(),
+            spacing: 4,
+            children: vec![
+                widgets.page_disk_lamp_node(
+                    &format!("{prefix}-disk-lamps"),
+                    cls("ts-disk"),
+                    &lamp_rows(&usages).join(" "),
+                ),
+                Node::Spacer,
+            ],
+            tooltip: Some(disk_tooltip(&snapshot.disks)),
+        },
+    ]
+}
+
 /// One bar chip: a click target carrying its `ts-*` class, a short word where
 /// the native chip has an icon, whatever extra nodes it draws, and the native
 /// chip's hover text on the row so it covers the whole pill.
@@ -830,6 +934,21 @@ pub fn chips(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -
         children.push(chip("GPU", "gpu", gpu_tooltip(Some(gpu)), body));
     }
 
+    // An all-off `[bar]` table has nothing to draw (#1295 review LOW 6). The
+    // host wraps every bar plugin's root in `.ts-plugin-chip`
+    // (`trollshell/src/plugins/region.rs`), which paints a background and
+    // padding — so an empty `stats-chips` `Node::Box` would still be a small,
+    // empty, translucent pill rather than nothing at all. `Node::Spacer` is
+    // the vocabulary's own "nothing" shape (its doc: "an empty, style-less
+    // box"), and the host's `root_renders_nothing` treats a card whose tree
+    // bottoms out in one as having nothing to show, hiding the whole pill —
+    // the same "hide entirely rather than draw a parked meter" rule the GPU
+    // chip already rides one level down (a machine with no adapter draws no
+    // GPU chip, not a needle at zero).
+    if children.is_empty() {
+        return Node::Spacer;
+    }
+
     Node::Box {
         id: Some("stats-chips".to_owned()),
         dir: Dir::Horizontal,
@@ -844,10 +963,10 @@ pub fn chips(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_PX, CHIP_CLASSES, CORES_PER_ROW, DASH_CELLS, LAMPS, PAGE_PX, Widgets, card,
-        chip_button_id, chips, cpu_tooltip, disk_tooltip, dot_px_for, dot_px_for_in, gpu_tooltip,
-        is_chip_button, lamp, lamp_rows, memory_tooltip, percent_text, row_cells, temp_text,
-        trace_sample,
+        CARD_PX, CHIP_CLASSES, CHIP_DOT_PX, CORES_PER_ROW, DASH_CELLS, LAMPS, PAGE_PX, Widgets,
+        card, chip_button_id, chips, cls, cpu_tooltip, disk_tooltip, dot_px_for, dot_px_for_in,
+        gpu_tooltip, is_chip_button, lamp, lamp_rows, memory_tooltip, percent_text, row_cells,
+        temp_text, trace_sample,
     };
     use crate::config::Card;
     use crate::sample::{Disk, Gpu, Memory, Snapshot};
@@ -1117,6 +1236,8 @@ mod tests {
                 name: "AMD Radeon RX 6800".to_owned(),
                 load: Some(0.25),
                 temperature_c: Some(49.0),
+                memory_used_bytes: None,
+                memory_total_bytes: None,
             }),
             memory: Some(Memory {
                 used: 11_999_999_000,
@@ -1124,6 +1245,12 @@ mod tests {
                 swap_used: 0,
                 swap_total: 0,
             }),
+            // Not exercised by the card or the chips: `processes` /
+            // `cpu_clock_hz` / `disk_io` are drawer-page-only rows
+            // (`crate::panel`), whose own `busy()` fixture carries real values.
+            processes: None,
+            cpu_clock_hz: None,
+            disk_io: None,
             disks: vec![
                 Disk {
                     path: "/".to_owned(),
@@ -1515,7 +1642,6 @@ mod tests {
             "a zero total is the native chip's unknown arm, not 0%",
         );
 
-        assert_eq!(disk_tooltip(&[]), "No mounts");
         assert_eq!(
             disk_tooltip(&busy_snapshot().disks),
             "/: 40%, /home: 73%",
@@ -1527,6 +1653,7 @@ mod tests {
                 name: "AMD Radeon RX 6800".to_owned(),
                 load: Some(0.37),
                 temperature_c: None,
+                ..Gpu::default()
             })),
             "AMD Radeon RX 6800: 37%",
         );
@@ -1535,11 +1662,23 @@ mod tests {
                 name: "AMD Radeon RX 6800".to_owned(),
                 load: None,
                 temperature_c: None,
+                ..Gpu::default()
             })),
             "AMD Radeon RX 6800",
             "no busy counter is the bare adapter name, not a dash",
         );
         assert_eq!(gpu_tooltip(None), "GPU");
+    }
+
+    /// **`"No mounts"` is an invented string, not a native one** — #1295
+    /// review NIT 7. The native disk chip (`trollshell/src/widgets/disk.rs`)
+    /// sets no tooltip at all when there are no mounts; it only ever sets one
+    /// per bar. This plugin's whole-chip tooltip has nowhere to fall back to,
+    /// so it says so instead — plausibly better, but not a mirror, and it does
+    /// not belong under a test titled "the native chips' strings".
+    #[test]
+    fn an_empty_mount_list_gets_an_invented_disk_tooltip() {
+        assert_eq!(disk_tooltip(&[]), "No mounts");
     }
 
     /// The CPU and GPU chips carry the native `{c:.0}°` label — no unit letter,
@@ -1567,6 +1706,7 @@ mod tests {
                 name: "g".to_owned(),
                 load: Some(0.5),
                 temperature_c: None,
+                ..Gpu::default()
             }),
             ..busy_snapshot()
         };
@@ -1844,6 +1984,82 @@ mod tests {
             format!("{:?}", widgets.cores),
             after,
             "past the wrap boundary the row is still 16 wide — same pitch, same widget",
+        );
+    }
+
+    /// **The drawer page's disk lamps draw at the page's own pitch, not the
+    /// bar's floor** (#1295 review LOW 4) —
+    /// `fit_cores_fits_the_card_row_and_the_page_row_separately`'s twin for
+    /// the Disks card.
+    ///
+    /// **Falsified** by pointing `fit_disk_lamps` at [`dot_px_for`] (the
+    /// bar/sidebar budget) instead of [`dot_px_for_in`]`(`[`PAGE_PX`]`, …)`:
+    /// `left: Some(2) / right: Some(6)`.
+    #[test]
+    fn fit_disk_lamps_fits_the_page_row_not_the_bars_floor() {
+        let mut widgets = Widgets::default();
+        // Two mounts: `2*(6*2+1) = 26` px at the bar's `MIN_DOT_PX` floor, the
+        // exact shape the review measured.
+        let usages = vec![0.4_f32, 0.73];
+        widgets.fit_disk_lamps(&usages);
+
+        with_render_mode(RenderMode::State, || {
+            let page_pitch = node_dot_px(
+                &widgets.page_disk_lamp_node(
+                    "stats-panel-disk-lamps",
+                    cls("ts-disk"),
+                    &lamp_rows(&usages).join(" "),
+                ),
+                "stats-panel-disk-lamps",
+            );
+            let bar_pitch = node_dot_px(
+                &widgets.lamp_node(
+                    "stats-disk-lamps",
+                    cls("ts-disk"),
+                    &lamp_rows(&usages).join(" "),
+                ),
+                "stats-disk-lamps",
+            );
+
+            assert_eq!(bar_pitch, Some(CHIP_DOT_PX), "left: {bar_pitch:?}");
+            assert_eq!(
+                page_pitch,
+                Some(dot_px_for_in(PAGE_PX, row_cells(&usages))),
+                "right: {page_pitch:?}",
+            );
+            assert!(
+                page_pitch > bar_pitch,
+                "the page's disk row must be the chunkier one: \
+                 left: {bar_pitch:?} / right: {page_pitch:?}",
+            );
+        });
+    }
+
+    /// **An all-off `[bar]` table renders nothing** (#1295 review LOW 6) — not
+    /// an empty `stats-chips` pill, which the host would still wrap in
+    /// `.ts-plugin-chip`'s background and padding.
+    ///
+    /// **Falsified** by dropping the `children.is_empty()` guard in `chips`:
+    /// the tree is then an empty `Node::Box` and this test's first assertion
+    /// reds.
+    #[test]
+    fn an_all_off_bar_configuration_renders_nothing() {
+        let cfg = Card {
+            cpu: false,
+            memory: false,
+            disk: false,
+            gpu: false,
+            ..Card::bar_default()
+        };
+        let node = chips(cfg, &busy_snapshot(), &Widgets::default());
+        assert_eq!(node, Node::Spacer, "an all-off bar draws no pill at all");
+
+        // A single switch left on is not "all off" — the ordinary one-chip
+        // case must still draw its `Node::Box`, not fall into the same guard.
+        let one_on = Card { cpu: true, ..cfg };
+        assert_ne!(
+            chips(one_on, &busy_snapshot(), &Widgets::default()),
+            Node::Spacer,
         );
     }
 }

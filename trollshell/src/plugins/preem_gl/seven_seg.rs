@@ -816,6 +816,12 @@ mod tests {
             "return ((2 * i + 1 - n) * COORD_ONE) / n;",
             // the lit pass's sample point
             "vec2 p = floor(gl_FragCoord.xy) + 0.5;",
+            // …and the two constants the mirror re-declares rather than reads.
+            // `TAPER_EDGE`'s *value* is separately held to the kit itself by
+            // `the_taper_law_is_the_kits_own_staircase`, which parses it out of
+            // this same file; this pins that the mirror's copy is that value.
+            "const float TAPER_EDGE = 0.5;",
+            "const float NO_CHAMFER = -1e9;",
         ] {
             assert!(
                 BODY.contains(clause),

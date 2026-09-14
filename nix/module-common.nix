@@ -76,7 +76,9 @@ self:
   # of sync undetected before the #1284 fix round (review LOW 3). Both
   # platform modules' `pluginsState` call THIS now, and so do flake.nix's
   # `hm-module-plugin-id`/`nixos-module-plugin-id` checks
-  # (`cfg._module.args.inferManifestId`) — nothing else redeclares the
+  # (`hm._module.args.inferManifestId` / `nixos._module.args.inferManifestId`
+  # — `_module.args` is a sibling of `config` on the `evalModules` result,
+  # not folded into it) — nothing else redeclares the
   # heuristic. NOT used by the `HYTTE_PLUGIN_ID` conflict assertion below
   # any more: that assertion compares the attribute name against an explicit
   # `env.HYTTE_PLUGIN_ID` directly and needs no manifest id at all (review

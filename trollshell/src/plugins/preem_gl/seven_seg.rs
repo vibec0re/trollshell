@@ -332,8 +332,8 @@ fn int_of(value: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, COLON_BIT, GlBlend, GlDraw, GlInput, GlTarget, GlUniforms, GlValue, SEVEN_SEG_PIPELINE,
-        kit, readout, seven_seg_surface,
+        Arc, COLON_BIT, GlBlend, GlDraw, GlInput, GlTarget, GlUniforms, GlValue,
+        SEVEN_SEG_PIPELINE, kit, readout, seven_seg_surface,
     };
 
     /// The shader body — the source the scans below read back.
@@ -488,7 +488,10 @@ mod tests {
                 "origins must strictly increase for the shader's binary search",
             );
             previous = Some(origin);
-            assert!((origin - cell.x as f32).abs() < f32::EPSILON, "cell {i}");
+            assert!(
+                (origin - super::f32_of(cell.x)).abs() < f32::EPSILON,
+                "cell {i}",
+            );
             match cell.mask {
                 Some(mask) => {
                     assert!(
@@ -496,7 +499,7 @@ mod tests {
                         "cell {i} is a digit",
                     );
                     assert!(
-                        (code as u32) & (1 << u32::from(COLON_BIT)) == 0,
+                        mask < 1 << COLON_BIT,
                         "a digit mask never reaches the colon bit",
                     );
                 }
@@ -542,7 +545,11 @@ mod tests {
             SEVEN_SEG_PIPELINE.step.is_empty(),
             "a readout carries no cross-frame GPU state",
         );
-        assert_eq!(SEVEN_SEG_PIPELINE.frame.len(), 4, "lit, blur H, blur V, blit");
+        assert_eq!(
+            SEVEN_SEG_PIPELINE.frame.len(),
+            4,
+            "lit, blur H, blur V, blit"
+        );
         assert_eq!(SEVEN_SEG_PIPELINE.frame[0].target, GlTarget::Aux(0));
         assert_eq!(SEVEN_SEG_PIPELINE.frame[1].target, GlTarget::Aux(1));
         assert_eq!(SEVEN_SEG_PIPELINE.frame[2].target, GlTarget::Aux(2));
@@ -633,7 +640,10 @@ mod tests {
     #[test]
     fn the_shader_and_the_mapping_agree_about_the_strip_encoding() {
         assert!(
-            BODY.contains(&format!("const int SEG_COUNT = {};", kit::SEVEN_SEG_BARS.len())),
+            BODY.contains(&format!(
+                "const int SEG_COUNT = {};",
+                kit::SEVEN_SEG_BARS.len()
+            )),
             "seven_seg.frag's SEG_COUNT must be `SEVEN_SEG_BARS.len()`",
         );
         assert!(
@@ -725,7 +735,17 @@ mod tests {
             },
             || {
                 for style in kit::DisplayStyle::ALL {
-                    for text in ["", " ", "8", "88", "12:34", "-", "9876543210", "x?", "07:16"] {
+                    for text in [
+                        "",
+                        " ",
+                        "8",
+                        "88",
+                        "12:34",
+                        "-",
+                        "9876543210",
+                        "x?",
+                        "07:16",
+                    ] {
                         let reference = kit::seven_seg(text, style);
                         let mirror = shader_frame(style, text);
                         assert_eq!(mirror, reference.data(), "{style:?} {text:?}");
@@ -954,8 +974,12 @@ mod tests {
     /// `cell255`.
     fn cell255(p: (f32, f32), fp: (f32, f32), snapped: bool, code: i32) -> i32 {
         if code & (1 << i32::from(COLON_BIT)) != 0 {
-            return bar255(p, fp, snapped, kit::SEVEN_SEG_COLON_DOTS[0])
-                .max(bar255(p, fp, snapped, kit::SEVEN_SEG_COLON_DOTS[1]));
+            return bar255(p, fp, snapped, kit::SEVEN_SEG_COLON_DOTS[0]).max(bar255(
+                p,
+                fp,
+                snapped,
+                kit::SEVEN_SEG_COLON_DOTS[1],
+            ));
         }
         let mut best = 0;
         for (i, bar) in kit::SEVEN_SEG_BARS.into_iter().enumerate() {
@@ -1028,10 +1052,7 @@ mod tests {
             if i >= cells {
                 break;
             }
-            let local = (
-                p.0 - cell_x(strip, i),
-                p.1 - kit::SEVEN_SEG_PAD as f32,
-            );
+            let local = (p.0 - cell_x(strip, i), p.1 - kit::SEVEN_SEG_PAD as f32);
             best = best.max(cell255(local, (1.0, 1.0), true, cell_code(strip, i, ghost)));
         }
         best
@@ -1039,25 +1060,29 @@ mod tests {
 
     /// `blur.frag`, one direction: the kit's own clipped-window, unrenormalised,
     /// truncating integer box blur.
-    fn blur_pass(src: &[i32], size: (usize, usize), radius: usize, dir: (isize, isize)) -> Vec<i32> {
+    fn blur_pass(src: &[i32], size: (usize, usize), radius: usize, dir: (i32, i32)) -> Vec<i32> {
         let (w, h) = size;
-        let radius = i32::try_from(radius).unwrap_or(0);
+        let index = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
+        let radius = index(radius);
         let window = 2 * radius + 1;
         let mut out = vec![0_i32; src.len()];
         for row in 0..h {
             for col in 0..w {
                 let mut sum = 0;
                 for d in -radius..=radius {
-                    let qx = isize::try_from(col).unwrap_or(0) + dir.0 * d as isize;
-                    let qy = isize::try_from(row).unwrap_or(0) + dir.1 * d as isize;
-                    if qx < 0
-                        || qy < 0
-                        || qx >= isize::try_from(w).unwrap_or(0)
-                        || qy >= isize::try_from(h).unwrap_or(0)
-                    {
+                    // `ivec2 q = p + BLUR_DIR * d;`, then the shader's own
+                    // four-way bounds test — the window clips at the buffer and
+                    // the divisor below stays the full window, which is what
+                    // dims the kit's edges.
+                    let q = (index(col) + dir.0 * d, index(row) + dir.1 * d);
+                    if q.0 < 0 || q.1 < 0 || q.0 >= index(w) || q.1 >= index(h) {
                         continue;
                     }
-                    sum += src[qy as usize * w + qx as usize];
+                    let (qx, qy) = (
+                        usize::try_from(q.0).unwrap_or(0),
+                        usize::try_from(q.1).unwrap_or(0),
+                    );
+                    sum += src[qy * w + qx];
                 }
                 out[row * w + col] = sum / window;
             }

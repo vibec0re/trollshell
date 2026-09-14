@@ -139,13 +139,13 @@ const LOWER_LEN: usize = DIGIT_H - 1 - LOWER_Y;
 /// index it by bit, so a reordering would light the wrong bars on both sides
 /// at once.
 pub const BARS: [Bar; 7] = [
-    Bar::hbar(HBAR_X, 0, HBAR_LEN),                  // A — top
-    Bar::vbar(DIGIT_W - THICK, 1, UPPER_LEN),        // B — top right
-    Bar::vbar(DIGIT_W - THICK, LOWER_Y, LOWER_LEN),  // C — bottom right
-    Bar::hbar(HBAR_X, DIGIT_H - THICK, HBAR_LEN),    // D — bottom
-    Bar::vbar(0, LOWER_Y, LOWER_LEN),                // E — bottom left
-    Bar::vbar(0, 1, UPPER_LEN),                      // F — top left
-    Bar::hbar(HBAR_X, MID, HBAR_LEN),                // G — middle
+    Bar::hbar(HBAR_X, 0, HBAR_LEN),                 // A — top
+    Bar::vbar(DIGIT_W - THICK, 1, UPPER_LEN),       // B — top right
+    Bar::vbar(DIGIT_W - THICK, LOWER_Y, LOWER_LEN), // C — bottom right
+    Bar::hbar(HBAR_X, DIGIT_H - THICK, HBAR_LEN),   // D — bottom
+    Bar::vbar(0, LOWER_Y, LOWER_LEN),               // E — bottom left
+    Bar::vbar(0, 1, UPPER_LEN),                     // F — top left
+    Bar::hbar(HBAR_X, MID, HBAR_LEN),               // G — middle
 ];
 
 /// The colon cell's two dots, relative to its origin.
@@ -169,7 +169,11 @@ impl Cell {
     /// This cell's width: [`DIGIT_W`] for a digit, [`COLON_W`] for a colon.
     #[must_use]
     pub const fn width(self) -> usize {
-        if self.mask.is_some() { DIGIT_W } else { COLON_W }
+        if self.mask.is_some() {
+            DIGIT_W
+        } else {
+            COLON_W
+        }
     }
 }
 
@@ -333,14 +337,13 @@ pub fn taper(k: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::super::{DisplayStyle, Ink, Pins, with_pins};
-    use super::{
-        BARS, COLON_DOTS, COLON_W, DIGIT_H, DIGIT_W, PAD, THICK, seven_seg, size, taper,
-    };
+    use super::{BARS, COLON_DOTS, COLON_W, DIGIT_H, DIGIT_W, PAD, THICK, seven_seg, size, taper};
 
     /// Every readout the digest below sweeps: the empty buffer, the all-ghost
     /// blank, the colon-bearing clock face, every digit, the minus, the widest
     /// figure-8 pair, and an uncovered char.
-    const DIGEST_READOUTS: [&str; 8] = ["", " ", "12:34", "88:88", "-", "9876543210", "x?", "07:16"];
+    const DIGEST_READOUTS: [&str; 8] =
+        ["", " ", "12:34", "88:88", "-", "9876543210", "x?", "07:16"];
 
     /// FNV-1a 64 over every byte `seven_seg` renders for
     /// [`DIGEST_READOUTS`] × [`DisplayStyle::ALL`], dimensions included.

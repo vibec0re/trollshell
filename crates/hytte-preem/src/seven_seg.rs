@@ -215,8 +215,68 @@ fn taper(k: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::DisplayStyle;
+    use super::super::{DisplayStyle, Ink, Pins, with_pins};
     use super::{DIGIT_H, PAD, seven_seg, taper};
+
+    /// Every readout the digest below sweeps: the empty buffer, the all-ghost
+    /// blank, the colon-bearing clock face, every digit, the minus, the widest
+    /// figure-8 pair, and an uncovered char.
+    const DIGEST_READOUTS: [&str; 8] = ["", " ", "12:34", "88:88", "-", "9876543210", "x?", "07:16"];
+
+    /// FNV-1a 64 over every byte `seven_seg` renders for
+    /// [`DIGEST_READOUTS`] × [`DisplayStyle::ALL`], dimensions included.
+    fn render_digest() -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |byte: u8| {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        with_pins(
+            Pins {
+                ink: Ink::Base,
+                field: None,
+            },
+            || {
+                for style in DisplayStyle::ALL {
+                    for text in DIGEST_READOUTS {
+                        let frame = seven_seg(text, style);
+                        for dim in [frame.width(), frame.height()] {
+                            for byte in u32::try_from(dim).unwrap_or(u32::MAX).to_le_bytes() {
+                                eat(byte);
+                            }
+                        }
+                        for &byte in frame.data() {
+                            eat(byte);
+                        }
+                    }
+                }
+            },
+        );
+        hash
+    }
+
+    /// **The bytes this widget renders, pinned by digest** (#1154).
+    ///
+    /// The seven segments' geometry moved out of [`stamp_digit`]'s inline
+    /// arithmetic and into the published [`super::BARS`] table so the shell's
+    /// GL arm could *read* it instead of transcribing it (the `Gauge::dial`
+    /// precedent, #1148). That is a refactor of a render path, not a visibility
+    /// change, and the only thing that can say it moved no byte is a function of
+    /// every byte — taken on the tree **before** the refactor and asserted on
+    /// the tree after.
+    ///
+    /// Pinned under [`Ink::Base`] so the process-wide accent (an atomic other
+    /// tests move in parallel) cannot make it flaky: `Ink::Base` ignores the
+    /// accent outright, so the palette is the same whatever the global holds.
+    ///
+    /// **Falsified** by moving any bar in [`super::BARS`], by changing
+    /// [`taper`], by reordering nothing at all (the stamp is a set union, so
+    /// order genuinely does not matter — which is itself worth knowing) or by
+    /// touching any of the six metrics.
+    #[test]
+    fn the_rendered_bytes_are_pinned_by_digest() {
+        assert_eq!(render_digest(), 0x54e6_1c87_61d5_b261);
+    }
 
     /// The host invariant across styles and inputs, empty string included.
     #[test]

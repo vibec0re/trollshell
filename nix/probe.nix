@@ -18,10 +18,13 @@
 # #1257 the examples are `probes` (nix/package.nix's `passthru.probes`), a
 # SEPARATE crane compile in the checks universe, on `cargoArtifacts` — the
 # same dev-deps cache `checks.{clippy,system-tests,workspace-tests}` already
-# share. That does NOT make it free: measured (2026-09-13), `probes` still
-# runs ~101 `Compiling` lines in ~3m14s — roughly what the pre-#1257
-# `postInstall` cost (~106/~3m04s), because it's a `-p`-scoped build against
-# a `--workspace`-scoped cache (see `nix/package.nix`'s `probes` comment).
+# share. That did NOT make it free at first: measured (2026-09-13), `probes`
+# ran ~101 `Compiling` lines in ~3m14s — roughly what the pre-#1257
+# `postInstall` cost (~106/~3m04s), because it was a `-p`-scoped build
+# against a `--workspace`-scoped cache. #1276 fixed the scope mismatch
+# itself (`--workspace --example probe --example wifi_probe`, matching the
+# cache's own scope): measured (2026-09-14), `Compiling` dropped to 11 — see
+# `nix/package.nix`'s `probes` comment for the full breakdown.
 # What changed is WHO pays it: no package build (this one included) reaches
 # `probes` any more, so the cost moves out of every consumer's `nix build`
 # and into one checks-universe derivation, once per Cargo.lock/source

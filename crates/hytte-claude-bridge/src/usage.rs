@@ -644,6 +644,18 @@ pub fn version() -> u64 {
 /// `outcome` is the *raw* fetch outcome — a 429 still reads as
 /// [`UsageError::Http`], not yet [`UsageError::RateLimited`]; promoting it is
 /// [`advance`]'s job, once this has picked the wait that promotion names.
+///
+/// A non-429 failure resets a 429 chain **all the way** to [`POLL_EVERY`],
+/// even mid-chain — deliberate, not an oversight (#1285's review, LOW). The
+/// backoff schedule is a response to the *server* asking us to slow down; a
+/// transport failure (a dropped connection, a timeout, an unrelated 500)
+/// carries no such instruction, and there is no way to tell from here
+/// whether the rate limit that produced the earlier 429s is even still in
+/// effect. Forgetting the server's own schedule on the first sign of an
+/// unrelated problem costs at most one poll at the ordinary cadence; the
+/// alternative — remembering a 429 chain through a failure that has nothing
+/// to do with it — risks staying artificially slow for a condition that may
+/// already be over, with nothing that would ever notice and correct it.
 fn next_wait(prev_wait: Duration, outcome: &Outcome, retry_after: Option<Duration>) -> Duration {
     let Outcome::Failed(UsageError::Http(429)) = outcome else {
         return POLL_EVERY;
@@ -890,9 +902,23 @@ fn parse_retry_after(value: &str, now: i64) -> Option<Duration> {
 /// apply; reuses [`days_from_civil`], the same table [`parse_rfc3339`]
 /// already carries for reset times, which is what keeps this cheap enough not
 /// to need a date crate.
+///
+/// The weekday token is checked against the seven IMF abbreviations (a
+/// non-word there is the cheapest sign this is not really a fixdate at all —
+/// #1285's review, NIT); **day-for-month is not** (`31 Feb` parses) — the
+/// result only ever feeds [`parse_retry_after`], which clamps into
+/// `[POLL_EVERY, MAX_BACKOFF]` regardless, so a calendar-invalid date is
+/// harmless here in a way an unrecognisable header shape is not worth
+/// rejecting either.
 fn parse_http_date(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.len() != 29 || &bytes[26..29] != b"GMT" {
+        return None;
+    }
+    if !matches!(
+        &bytes[0..3],
+        b"Mon" | b"Tue" | b"Wed" | b"Thu" | b"Fri" | b"Sat" | b"Sun"
+    ) {
         return None;
     }
     if bytes[3] != b','
@@ -1497,6 +1523,37 @@ mod tests {
         );
     }
 
+    /// **#1285's review, NIT — a weekday token outside the seven IMF
+    /// abbreviations is rejected; day-for-month stays deliberately
+    /// unchecked** (the function doc says why: the result only ever feeds a
+    /// clamp, so a calendar-invalid date is harmless in a way an
+    /// unrecognisable header shape is not worth rejecting either).
+    ///
+    /// Falsify the weekday half by deleting the `matches!` guard added for
+    /// this: `parse_http_date("Xyz, 06 Nov 1994 08:49:37 GMT")` starts
+    /// parsing again and the first assertion goes red.
+    #[test]
+    fn parse_http_date_rejects_a_bad_weekday_but_not_a_bad_day_for_month() {
+        assert_eq!(
+            parse_http_date("Xyz, 06 Nov 1994 08:49:37 GMT"),
+            None,
+            "not one of the seven weekday abbreviations"
+        );
+        assert!(
+            parse_http_date("Sun, 31 Feb 1994 08:49:37 GMT").is_some(),
+            "day-for-month is deliberately unchecked — see the function doc"
+        );
+        // Every real weekday abbreviation is accepted, regardless of whether
+        // it is the one that date actually fell on — this reads the date
+        // string, not the calendar.
+        for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] {
+            assert!(
+                parse_http_date(&format!("{day}, 06 Nov 1994 08:49:37 GMT")).is_some(),
+                "{day}"
+            );
+        }
+    }
+
     /// The 429 backoff schedule, as a table: doubling up to the cap, a
     /// success resetting it, `Retry-After` overriding the doubling within the
     /// `[POLL_EVERY, MAX_BACKOFF]` band, and — the point of the whole
@@ -1650,6 +1707,48 @@ mod tests {
         );
         assert_eq!(wait, Duration::from_mins(10));
         assert_eq!(last_ok, Some((1_000, usage)));
+    }
+
+    /// **#1285's review, LOW — a non-429 failure resets a 429 chain straight
+    /// back to [`POLL_EVERY`], and `last_ok` survives every step of it.**
+    /// [`a_failed_poll_after_a_success_keeps_last_ok_on_the_report`] only
+    /// carries `last_ok` through ONE failure; this drives it through two
+    /// 429s and a non-429 on top — the case no other shipped test covers.
+    ///
+    /// Falsify the reset half by having `next_wait` "remember" a 429 chain
+    /// through an unrelated failure (e.g. resetting only on `Outcome::Ok`):
+    /// the final `wait4` assertion goes red (it would still read the
+    /// 20-minute mid-chain value instead of dropping to `POLL_EVERY`).
+    /// Falsify the carry-forward half the same way that test's own doc does.
+    #[test]
+    fn a_non_429_failure_resets_a_429_chain_but_last_ok_survives_every_step() {
+        let usage = some_usage();
+        let (_, wait, last_ok) = advance(POLL_EVERY, None, 1_000, Ok(usage.clone()), None);
+
+        let (r1, wait, last_ok) = advance(wait, last_ok, 1_300, Err(UsageError::Http(429)), None);
+        assert_eq!(r1.usage(), Some(&usage), "last_ok through the first 429");
+
+        let (r2, wait, last_ok) = advance(wait, last_ok, 1_600, Err(UsageError::Http(429)), None);
+        assert_eq!(wait.as_secs() / 60, 20, "5 → 10 → 20");
+        assert_eq!(r2.usage(), Some(&usage), "last_ok through the second 429");
+
+        let (r3, wait4, last_ok) = advance(
+            wait,
+            last_ok,
+            1_900,
+            Err(UsageError::Io("boom".to_owned())),
+            None,
+        );
+        assert_eq!(
+            wait4, POLL_EVERY,
+            "a 20 min chain drops straight back to 5 on an unrelated failure"
+        );
+        assert_eq!(r3.usage(), Some(&usage), "last_ok through the non-429 too");
+        assert_eq!(
+            last_ok,
+            Some((1_000, usage)),
+            "still the original success, three failures later"
+        );
     }
 
     /// **Item 1(c): a first poll that fails has nothing to carry, and renders

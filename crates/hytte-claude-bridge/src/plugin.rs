@@ -1848,6 +1848,23 @@ mod tests {
         );
     }
 
+    /// **#1285's review, LOW — "the footer appears only when the latest poll
+    /// failed" was otherwise unpinned.** A successful report's panel names no
+    /// failure at all.
+    ///
+    /// Falsify by having `failure_footer` answer `Some(…)` regardless of
+    /// `report.outcome` (e.g. dropping its `let Outcome::Failed(error) = …
+    /// else { return None; }` guard): this goes red.
+    #[test]
+    fn a_successful_panel_carries_no_failure_footer() {
+        let board = status(Mode::Subscription, false, 9, 0, Last::Ok);
+        let text = texts(&panel(&board, Some(&captured_report()), now()));
+        assert!(
+            !text.iter().any(|t| t.starts_with("usage ")),
+            "a success names no failure: {text:?}"
+        );
+    }
+
     // ── The #866/#957 chip contract, unchanged ───────────────────────────────
 
     /// A subscription-mode bridge that has served nothing: loading glyph, `sub`,

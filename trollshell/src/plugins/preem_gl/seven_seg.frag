@@ -145,8 +145,12 @@ uniform vec4 u_dot_0;       // the colon's upper dot …
 uniform vec4 u_dot_1;       // … and its lower one
 uniform int u_ghost_on;     // 0 on a skin with no ghost figure-8 (the OLED)
 uniform vec4 u_ghost;       // the unlit segment colour, channels as 0..255
-uniform int u_bloom_radius; // box-blur radius in buffer px; 0 = no bloom
-uniform int u_bloom_strength;   // halo strength in 256ths; 0 = no bloom
+uniform int u_bloom_strength;   // halo strength in 256ths; 0 = no bloom;
+                            // there is no `u_bloom_radius` here (#1293 item
+                            // 9) — the radius is `blur.frag`'s uniform, read
+                            // by the two blur passes that build `u_tex1`, not
+                            // by this file, which only reads the blurred
+                            // result back and scales it
 uniform vec4 u_bg;          // the skin's field, channels as 0..255
 uniform vec4 u_ink;         // the skin's lit ink
 uniform int u_mask_on;

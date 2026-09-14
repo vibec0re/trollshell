@@ -97,6 +97,11 @@ pub(crate) enum Case {
         meter: MeterAt,
         /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
         stretch: u32,
+        /// The segment count this case renders at — [`METER_LEDS`] for every
+        /// case but one, which runs at `1` instead (#1293 item 2: every case
+        /// ran at [`METER_LEDS`], so `strip_size`'s `(leds − 1) * GAP` term
+        /// vanishing was mirror-only, never rendered on a driver).
+        leds: usize,
     },
     /// A `SevenSeg` showing one readout (#1154).
     SevenSeg {
@@ -130,9 +135,12 @@ impl Case {
 
 /// What a seven-segment case is reading out.
 ///
-/// Five, and the list is the issue's own (#1154) adapted to what the kit
-/// actually has: every segment off, every segment on, a mixed readout, every
-/// distinct digit mask in one frame, and a pinned ink.
+/// Six: the first five are the issue's own (#1154) adapted to what the kit
+/// actually has — every segment off, every segment on, a mixed readout, every
+/// distinct digit mask in one frame, and a pinned ink — plus
+/// [`Empty`](Self::Empty), closing a gap the #1294 review found (#1293 item
+/// 8): no case drove `u_data_len == 0`, the shape `SevenSegState::default()`
+/// actually is.
 ///
 /// **#1154 asks for "a mixed readout with a decimal point" and the kit has no
 /// decimal point** — `hytte-preem`'s `seven_seg` understands digits, `:`, `-`
@@ -146,22 +154,35 @@ impl Case {
 /// Two digit counts at least, as the issue asks: one cell, two, five and ten.
 #[derive(Clone, Copy)]
 pub(crate) enum ReadoutAt {
+    /// The empty string: `u_data_len == 0` and `seven_seg.frag`'s
+    /// `strip255`'s `if (u_cells <= 0) { return 0; }` early return is the
+    /// whole of the emission — the shape `data: None` binds a 1×1 zero
+    /// texture for (#1293 item 8). Different from [`Blank`](Self::Blank): a
+    /// blank readout is one ghosted cell with nothing lit; this one has no
+    /// cell at all, and it is `vocab::SevenSegState::default()` — the first
+    /// frame of every `SevenSeg` chip. Covered hermetically (`""` is in the
+    /// transcription sweep) and, before this case, never on a driver.
+    Empty,
     /// A single space: every ghost segment, nothing lit. The frame a clock
     /// spends none of its life in and a blanked readout spends all of it, and
     /// the one case where the lit emission is empty everywhere — so the halo is
     /// provably absent rather than merely dim.
     ///
-    /// **On the OLED this case carries no information, and that is worth
-    /// knowing rather than hiding** — `DisplayAt::Blank`'s finding (#1150
-    /// review, MEDIUM-3) in this widget's shape. That skin has no ghost and a
-    /// black field, so a blank readout there is a frame of pure zeros:
-    /// `verdict_for` excuses both blank guards by design (a flat reference is
-    /// not evidence of an undrawn framebuffer) and every delta is 0 for any
-    /// renderer that outputs black. It is kept rather than special-cased
-    /// because the other three skins' blank cases *do* detect — the LCD draws
-    /// its whole ghost figure-8 there — and a case list that varies by skin is
-    /// a worse thing to reason about than one case that is vacuously green on
-    /// one skin.
+    /// Two different vacuities here, not one (#1293 item 7). **Against an
+    /// undrawn framebuffer**, only the OLED's blank case is vacuous — its
+    /// field is pure black (`DisplayAt::Blank`'s finding, #1150 review,
+    /// MEDIUM-3, in this widget's shape), while the CRT's non-black field
+    /// (`[3, 7, 5]`) means a blank readout there *does* catch that failure.
+    /// **Against a geometry drift**, the CRT's blank case is vacuous too:
+    /// `palette_snapshot(Crt).ghost` is `None`, the same as the OLED's
+    /// (`Vfd`/`Lcd` both have one), so a blank CRT readout draws nothing at
+    /// all — measured `edge[n=0] lit[n=0]` against `vfd`/`lcd`'s
+    /// `edge[n=600] lit[n=580]` — and there is nothing on screen for a drift
+    /// to move (confirmed under a `snapped := false` probe, where
+    /// `oled.blank` and `crt.blank` are the two blank cases that survive
+    /// while `vfd.blank` and `lcd.blank` both red). The empty-strip coverage
+    /// is carried by the two ghosted skins only. It is kept rather than
+    /// special-cased for the reason [`MeterAt::Empty`]'s is.
     Blank,
     /// `88`: every segment of two cells lit. Every mitre in the font is
     /// adjacent to another mitre here, which is the arrangement where a taper
@@ -258,24 +279,34 @@ pub(crate) enum BubbleAt {
 
 /// What an LED-strip case's meter is reading.
 ///
-/// Five, and the list is the issue's own (#1153): the strip empty, half lit and
-/// full — the three points `lit_count`'s round-to-nearest has to land on — plus
-/// the two peak-dot arrangements the widget can be in. Those two are the ones
-/// that matter: the dot is a *second* emission with a *second* halo, composited
-/// on top of the level's, so a renderer that drew one pass instead of two, or
-/// drew them in the wrong order, agrees with the kit on the first three cases
-/// and disagrees on these.
+/// Six, and the first five are the issue's own (#1153): the strip empty, half
+/// lit and full — the three points `lit_count`'s round-to-nearest has to land
+/// on — plus the two peak-dot arrangements the widget can be in. Those two are
+/// the ones that matter: the dot is a *second* emission with a *second* halo,
+/// composited on top of the level's, so a renderer that drew one pass instead
+/// of two, or drew them in the wrong order, agrees with the kit on the first
+/// three cases and disagrees on these. The sixth, [`PeakInside`](Self::PeakInside),
+/// closes a gap the #1290 review found in the other two: no case put the dot
+/// *inside* the lit run (#1293 item 2).
 ///
 /// [`Empty`](Self::Empty) is deliberately a rested peak as well as a silent
 /// level: it is the frame a meter spends most of its life in, and it is the one
 /// where `peak_led`'s "no dot" answer reaches the shader as the `-1` sentinel.
-/// **On the OLED it carries no information**, the way `DisplayAt::Blank` does —
-/// that skin has no ghost row and a black field, so a silent strip is a frame
-/// of pure zeros that any renderer outputting black matches, and both blank
-/// guards excuse a flat reference by design. It is kept rather than
-/// special-cased because the other three skins' empty cases do detect (the LCD
-/// draws its whole ghost row there), and a case list that varies by skin is a
-/// worse thing to reason about than one case that is vacuously green on one.
+///
+/// Two different vacuities here, not one (#1293 item 3). **Against an undrawn
+/// framebuffer**, only the OLED's empty case is vacuous — its field is pure
+/// black, so a renderer that drew nothing at all still matches it, while the
+/// CRT's non-black field (`[3, 7, 5]`) means a silent strip there *does* catch
+/// that failure (measured: deleting the kind from `Kind::ALL` reds
+/// `led_strip.crt.empty` at mean 7.000, and leaves only `led_strip.oled.empty`
+/// green). **Against a segment-geometry drift**, the CRT's empty case is
+/// vacuous too: `palette_snapshot(Crt).ghost` is `None`, the same as the
+/// OLED's (`Vfd`/`Lcd` both have one), so a silent CRT strip has no segment on
+/// screen to widen either. It is kept rather than special-cased because the
+/// two ghosted skins' empty cases *do* detect a geometry drift — the VFD and
+/// LCD draw their whole ghost row there — and a case list that varies by skin
+/// is a worse thing to reason about than two cases that are each vacuously
+/// green against one kind of drift.
 #[derive(Clone, Copy)]
 pub(crate) enum MeterAt {
     /// Silence: no lit segment, no peak dot. The ghost row and the field, and
@@ -291,9 +322,19 @@ pub(crate) enum MeterAt {
     /// visibly apart, which is the arrangement a single-pass renderer cannot
     /// produce.
     PeakAbove,
-    /// The dot sitting **on** the level, where the two emissions overlap and
-    /// the cap composites over ink the level pass has already laid down.
+    /// The dot sitting on the **first unlit** segment, adjacent to the level
+    /// rather than overlapping it (#1293 item 2 — this doc used to claim the
+    /// two emissions overlap; at this case's own numbers, `lit_count`
+    /// rounding `0.6 × 24` to 14 and `peak_led` ceiling `0.6 × 24` onto index
+    /// 14, they never do). [`MeterAt::PeakInside`] is the arrangement that
+    /// actually overlaps.
     PeakAt,
+    /// The dot sitting **inside** the lit run, where `mix_kit(under = ink,
+    /// cap, dot)` genuinely composites the cap over ink the level pass has
+    /// already laid down — the overlap [`MeterAt::PeakAt`] was wrongly
+    /// documented as (#1293 item 2). No case exercised this arrangement on a
+    /// driver before.
+    PeakInside,
 }
 
 /// The segment count every LED-strip case runs at — the kit's own
@@ -512,20 +553,23 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 bubble: BubbleAt::Pinned,
                 stretch: STRETCH,
             });
-            // The meter (#1153): the strip empty, half, full, and the two
-            // peak-dot arrangements. See [`MeterAt`].
+            // The meter (#1153): the strip empty, half, full, and the three
+            // peak-dot arrangements — above the lit run, on its first unlit
+            // segment, and (#1293 item 2) inside it. See [`MeterAt`].
             let meters = [
                 MeterAt::Empty,
                 MeterAt::Half,
                 MeterAt::Full,
                 MeterAt::PeakAbove,
                 MeterAt::PeakAt,
+                MeterAt::PeakInside,
             ]
             .into_iter()
             .map(move |meter| Case::LedStrip {
                 style: *style,
                 meter,
                 stretch: 1,
+                leds: METER_LEDS,
             });
             // …and the floating-dot state given more room than its natural
             // size, which is where *this* arm's improvement lives: the segment
@@ -536,10 +580,22 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 style: *style,
                 meter: MeterAt::PeakAbove,
                 stretch: STRETCH,
+                leds: METER_LEDS,
             });
-            // The readout (#1154): blank, all-on, the clock face, every digit,
-            // and a pinned ink. See [`ReadoutAt`].
+            // …and a full strip at a **second segment count** (#1293 item 2):
+            // every other meter case runs at `METER_LEDS`, so `leds = 1` —
+            // where `strip_size`'s `(leds − 1) * GAP` term vanishes — was
+            // mirror-only, never rendered through a real GL context.
+            let single_led = std::iter::once(Case::LedStrip {
+                style: *style,
+                meter: MeterAt::Full,
+                stretch: 1,
+                leds: 1,
+            });
+            // The readout (#1154): empty, blank, all-on, the clock face,
+            // every digit, and a pinned ink. See [`ReadoutAt`].
             let readouts = [
+                ReadoutAt::Empty,
                 ReadoutAt::Blank,
                 ReadoutAt::Eights,
                 ReadoutAt::Clock,
@@ -575,6 +631,7 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 .chain(stretched_bubble)
                 .chain(meters)
                 .chain(stretched_meter)
+                .chain(single_led)
                 .chain(readouts)
                 .chain(stretched_readout)
         })

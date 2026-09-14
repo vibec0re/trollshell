@@ -693,6 +693,7 @@ impl MeterAt {
             Self::Full => "full",
             Self::PeakAbove => "peakabove",
             Self::PeakAt => "peakat",
+            Self::PeakInside => "peakinside",
         }
     }
 
@@ -702,10 +703,16 @@ impl MeterAt {
     /// `0.35`/`0.8` puts the dot four segments clear of the lit run at
     /// [`METER_LEDS`], which is wider than the widest bloom (radius 3 over an
     /// 11 px pitch) so the two halos are genuinely separate on the glass.
-    /// `0.6`/`0.6` is the opposite arrangement: `lit_count` rounds to 14
+    /// `0.6`/`0.6` is the **adjacent** arrangement: `lit_count` rounds to 14
     /// segments and `peak_led` ceils onto index 14, so the dot sits on the
-    /// **first unlit** segment — the boundary case where the two emissions are
-    /// adjacent and the cap composites next to ink the level pass laid down.
+    /// first *unlit* segment — the boundary case where the two emissions are
+    /// adjacent and the cap composites next to ink the level pass laid down,
+    /// never over it (#1293 item 2 — `cases.rs`'s `MeterAt::PeakAt` doc used
+    /// to claim these two overlap). `0.9`/`0.5` is the arrangement that
+    /// actually does: `lit_count` rounds `0.9 × 24` to 22 and `peak_led`
+    /// ceils `0.5 × 24` onto index 11, well inside `0..21`, so `mix_kit(under
+    /// = ink, cap, dot)` genuinely composites the cap over ink the level pass
+    /// already laid down — the one arrangement no case drove before.
     fn reading(self) -> (f32, f32) {
         match self {
             Self::Empty => (0.0, 0.0),
@@ -713,20 +720,25 @@ impl MeterAt {
             Self::Full => (1.0, 0.0),
             Self::PeakAbove => (0.35, 0.8),
             Self::PeakAt => (0.6, 0.6),
+            Self::PeakInside => (0.9, 0.5),
         }
     }
 }
 
 /// The kit `LedStrip` a meter case renders. One builder for both arms, for
 /// [`bubble_box`]'s reason.
-fn meter_strip(style: kit::DisplayStyle) -> kit::LedStrip {
-    kit::LedStrip::new(style).leds(METER_LEDS)
+///
+/// `leds` is [`METER_LEDS`] for every case but the one at a second segment
+/// count (#1293 item 2).
+fn meter_strip(style: kit::DisplayStyle, leds: usize) -> kit::LedStrip {
+    kit::LedStrip::new(style).leds(leds)
 }
 
 impl ReadoutAt {
     /// The word in the case label and on its evidence files.
     fn name(self) -> &'static str {
         match self {
+            Self::Empty => "empty",
             Self::Blank => "blank",
             Self::Eights => "eights",
             Self::Clock => "clock",
@@ -739,6 +751,7 @@ impl ReadoutAt {
     /// and the skin, since `kit::seven_seg` is pure.
     fn text(self) -> &'static str {
         match self {
+            Self::Empty => "",
             Self::Blank => " ",
             Self::Eights => "88",
             Self::Clock => "12:34",
@@ -777,10 +790,10 @@ fn readout_reference(style: kit::DisplayStyle, readout: ReadoutAt) -> kit::Frame
 
 /// The wire config a meter case maps from — the same segment count the kit
 /// builder above takes, so the two arms cannot end up on different strips.
-fn led_strip_config(style: kit::DisplayStyle) -> vocab::LedStripConfig {
+fn led_strip_config(style: kit::DisplayStyle, leds: usize) -> vocab::LedStripConfig {
     vocab::LedStripConfig {
         style: style_ref(style),
-        leds: u32::try_from(METER_LEDS).unwrap_or(u32::MAX),
+        leds: u32::try_from(leds).unwrap_or(u32::MAX),
         // Deliberately `None`: the shell's pump folds a declared `PeakHoldConfig`
         // into the peak it hands *both* arms, so a harness case's peak is a
         // number, not a decay policy. `MeterAt::reading` is that number.
@@ -878,10 +891,11 @@ impl Case {
                 style,
                 meter,
                 stretch,
+                leds,
             } => {
                 let (level, peak) = meter.reading();
                 let surface = led_strip::led_strip_surface(
-                    led_strip_config(*style),
+                    led_strip_config(*style, *leds),
                     level,
                     peak,
                     &kit::palette_snapshot(*style),
@@ -1334,10 +1348,19 @@ fn label(case: &Case) -> String {
         Case::TextBox { style, bubble, .. } => {
             format!("textbox.{}.{}", style.name(), bubble.name())
         }
+        // The second-segment-count case (#1293 item 2) names its `leds` so
+        // its evidence files don't collide with the same skin/meter's
+        // `METER_LEDS` case — the odd-origin marquee's naming shape.
+        Case::LedStrip {
+            style, meter, leds, ..
+        } if *leds != METER_LEDS => {
+            format!("led_strip.{}.{}.leds{leds}", style.name(), meter.name())
+        }
         Case::LedStrip {
             style,
             meter,
             stretch,
+            ..
         } if *stretch > 1 => format!("led_strip.{}.{}x{stretch}", style.name(), meter.name()),
         Case::LedStrip { style, meter, .. } => {
             format!("led_strip.{}.{}", style.name(), meter.name())
@@ -1445,10 +1468,12 @@ fn drive(area: &GlSurface, case: &Case) {
                 surface.uniforms,
             )
         }
-        Case::LedStrip { style, meter, .. } => {
+        Case::LedStrip {
+            style, meter, leds, ..
+        } => {
             let (level, peak) = meter.reading();
             let surface = led_strip::led_strip_surface(
-                led_strip_config(*style),
+                led_strip_config(*style, *leds),
                 level,
                 peak,
                 &kit::palette_snapshot(*style),
@@ -1589,9 +1614,11 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         // The kit's own meter at this reading — the *same* builder the mapping
         // resolved its grid from, so a disagreement here is a disagreement
         // between renderers and not between two strips.
-        Case::LedStrip { style, meter, .. } => {
+        Case::LedStrip {
+            style, meter, leds, ..
+        } => {
             let (level, peak) = meter.reading();
-            meter_strip(*style).render(level, peak)
+            meter_strip(*style, *leds).render(level, peak)
         }
         // The kit's own readout at this text, in this case's pin scope — the
         // *same* scope the mapping resolved its palette in, so a disagreement

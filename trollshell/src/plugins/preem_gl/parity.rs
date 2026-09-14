@@ -430,8 +430,14 @@ impl Kind {
             // third of the frame one; this widget's segments are solid bars, so
             // its edge bin is only the bars' own borders and the halo's
             // staircase around them — everything else, the flat field and the
-            // whole segment interior, is `interior` and bit-identical (measured
-            // `max 0` on the field and lit bins of all four). The legitimate
+            // segment interior, is `interior` and bit-identical (measured
+            // `max 0` on the field and lit bins of all four). That "whole
+            // segment interior" phrasing holds for three skins out of four, not
+            // all of them (#1293 item 5): the comb turns almost every lit pixel
+            // into an edge on the CRT, whose `lit` bin is a single pixel
+            // against vfd 2086 / lcd 2016 / oled 756 — true by the letter
+            // (`max 0` there too) and misleading in shape, since there is
+            // barely an interior to be bit-identical *about*. The legitimate
             // disagreement is therefore the halo alone.
             //
             // **3.0 / 16 rather than the 16.0 / 64 three other kinds carry**,

@@ -56,6 +56,14 @@ jobs:
           # Mesa/QEMU/toolchain closure plus dep caches, and the log has
           # never recorded what that looked like before nix touched it.
           df -h /nix / 2>/dev/null; free -m
+          # The runner fleet is heterogeneous — AMD EPYC 7763 and 9V74, an Intel
+          # Xeon 8370C and masked "Intel INTEL" hosts all served this repo in one
+          # day — and llvmpipe JITs the parity shaders against the host's feature
+          # set (#1298: the one red seven-seg x2 run was the one Ice Lake sample).
+          # Name the host up front so a verdict can be read against the CPU that
+          # produced it, instead of digging it out of a nixosTest VM's boot log.
+          lscpu | grep -E '^Model name' || true
+          echo "cpu flags: avx512f=$(grep -m1 -c avx512f /proc/cpuinfo) fma=$(grep -m1 -cw fma /proc/cpuinfo)" || true
 
           # Pids of the nix-daemon proper plus its per-client worker
           # processes (#1011 rec 2). Its own function, taking no arguments

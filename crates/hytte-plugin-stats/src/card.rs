@@ -1994,13 +1994,18 @@ mod tests {
     ///
     /// **Falsified** by pointing `fit_disk_lamps` at [`dot_px_for`] (the
     /// bar/sidebar budget) instead of [`dot_px_for_in`]`(`[`PAGE_PX`]`, …)`:
-    /// `left: Some(2) / right: Some(6)`.
+    /// `left: Some(3) / right: Some(6)`.
     #[test]
     fn fit_disk_lamps_fits_the_page_row_not_the_bars_floor() {
         let mut widgets = Widgets::default();
-        // Two mounts: `2*(6*2+1) = 26` px at the bar's `MIN_DOT_PX` floor, the
-        // exact shape the review measured.
-        let usages = vec![0.4_f32, 0.73];
+        // Sixteen mounts, not two: at a small cell count both `CARD_PX` and
+        // `PAGE_PX` clamp to the kit's shared `MAX_DOT_PX` ceiling and the two
+        // budgets are indistinguishable by coincidence (measured: a two-mount
+        // row saturates both to 8 px and this test would stay green under the
+        // LOW 4 mutation) — the same trap `row_cells`'s own doc names for the
+        // per-core row, and the reason `CORES_PER_ROW`-sized fixtures are used
+        // there too.
+        let usages = vec![0.5_f32; CORES_PER_ROW];
         widgets.fit_disk_lamps(&usages);
 
         with_render_mode(RenderMode::State, || {

@@ -2394,8 +2394,7 @@
                     }
                   ];
                 }).config.programs.trollshell.config.agents.window.workspace;
-              refused =
-                name: builtins.tryEval (builtins.deepSeq (fixture name) "ok");
+              refused = name: builtins.tryEval (builtins.deepSeq (fixture name) "ok");
               probe =
                 # Every shape `WindowConfig::workspace_is_usable` refuses.
                 assert !(refused "-hive").success;

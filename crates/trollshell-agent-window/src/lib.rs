@@ -4,7 +4,7 @@
 //! `docs/superpowers/specs/2026-09-07-agentic-desktop-design.md` §7).
 //!
 //! **Our chrome, their page.** The body is a `WebKitGTK` view of hyperhive's own
-//! per-agent page with `?hide=header,input` appended; everything around it —
+//! per-agent page with `?hide=header` appended; everything around it —
 //! the header with the agent's icon, name, short model word and the **live
 //! status read from `host.sock`**, start/stop/pause, and a settings tab — is
 //! ours, and reads the hive directly. Annika settled the shape on #947
@@ -12,6 +12,12 @@
 //! browser — we control it: buttons, status, settings", and at 07:43Z that the
 //! card's pen opens this window on its settings tab, so an agent has **one**
 //! surface.
+//!
+//! The page's **composer stays** — `header` is the only thing suppressed since
+//! [#1282](https://github.com/vibec0re/trollshell/issues/1282) item 1, so the
+//! window is a place to talk to the agent and not only to watch it. That is
+//! the hive's own input, on the hive's own origin; see [`page`] for why it
+//! widens nothing.
 //!
 //! It is the `trollshell-control-center` shape: a separate windowed
 //! GTK4/libadwaita binary, **never linked into the shell**, launched out of

@@ -92,7 +92,7 @@ use crate::config::AgentsConfig;
 use crate::model::{
     APPROVAL_BADGE_CLASS, APPROVAL_BADGE_ICON, Agent, AgentName, ExpandedGroups, Group, Hive,
     PendingApprovals, Status, UPDATE_BADGE_CLASS, UPDATE_BADGE_ICON, agent_url, group,
-    headers_wanted, model_family,
+    headers_wanted, model_family, terminal_targets,
 };
 
 /// The card's root node id.
@@ -159,10 +159,43 @@ pub mod ids {
     /// re-read from the model instead, so a row whose agent has since vanished
     /// opens nothing rather than opening a stale string.
     pub const OPEN: &str = "open:";
+    /// The **card row itself** — clicking the pill anywhere that is not one of
+    /// its own buttons opens that agent's companion window
+    /// ([#1282](https://github.com/vibec0re/trollshell/issues/1282) item 2,
+    /// @kaesaecracker: "open agent term on agent click in sidebar").
+    ///
+    /// A second id rather than [`OPEN`] reused, even though the two take the
+    /// **same route** in `plugin.rs` (the window, the browser as its fallback):
+    /// they are different surfaces — this one is the card, `OPEN` is the
+    /// panel's `agent page` link — and the id is what the host's audit log
+    /// records, so folding them together would make "the operator clicked a
+    /// pill" and "the operator followed a link on the drawer page" the same
+    /// event. It carries the agent name, re-parsed on arrival, for [`OPEN`]'s
+    /// reason.
+    ///
+    /// Nothing new becomes spawnable: the arm behind it emits exactly what
+    /// [`OPEN`]'s emits, out of the same [`crate::window::argv`].
+    pub const ROW: &str = "row:";
     /// The hive dashboard link on the panel — the one link that names no
     /// agent, so it is a whole id rather than a prefix. Not `OPEN`-prefixed:
     /// `strip_prefix("open:")` must never match it by accident.
     pub const OPEN_DASHBOARD: &str = "open-dashboard";
+    /// The card header's **"Open terminals"** button
+    /// ([#1306](https://github.com/vibec0re/trollshell/issues/1306)) — one
+    /// press, one companion window per running agent.
+    ///
+    /// A whole id, not a prefix, for [`OPEN_DASHBOARD`]'s reason: it names no
+    /// agent, because *which* agents it opens is re-read from the model at
+    /// click time ([`crate::model::terminal_targets`]) rather than carried on
+    /// the id. A roster that moved between the render and the click therefore
+    /// opens what is running **now**, which is both what the operator means and
+    /// the only version that cannot launch a window for an agent that has since
+    /// gone.
+    ///
+    /// Its dash is load-bearing exactly like the dashboard's: spelled
+    /// `open:terminals` it would parse as an [`OPEN`] target named
+    /// `"terminals"`.
+    pub const OPEN_TERMINALS: &str = "open-terminals";
     /// The pending-approval badge (#947 P3), carrying the **agent name**.
     ///
     /// Not the approval id, for [`OPEN`]'s reason and one more: the id the row
@@ -735,9 +768,29 @@ fn approval_badge(name: &str, count: usize) -> Option<Node> {
 /// Line 2: the state glyph, the update badge if it is set, and the harness's
 /// own status text in full.
 ///
-/// The name is a `Text`, not a `Button`: the row's click belongs to #950's
-/// `WebView` and does not exist yet, and a button that opened the drawer instead
-/// would train the wrong surface.
+/// The name is a `Text`, not a `Button`: since #1282 item 2 the **whole pill**
+/// is the button ([`ids::ROW`], opening #950's window), so a second click
+/// target inside it would only be a smaller version of the same thing — and a
+/// name button that opened the drawer instead, which is what this doc used to
+/// say did not exist yet, would train the wrong surface.
+///
+/// # Buttons inside a button
+///
+/// The pill's own controls (start/stop, the pen, the approvals badge) are
+/// `Node::Button`s **nested inside** the row button, which is deliberate and
+/// which GTK resolves the way it has to: each `GtkButton` claims the click
+/// gesture at its own level, and a claim denies the gesture to every controller
+/// further up the propagation chain — so pressing the pen opens settings and
+/// does **not** also open the agent page behind it. The card's project headers
+/// have been a full-width flat button wrapping a row since #963, which is the
+/// same shape.
+///
+/// The `ts-agent-row` class moves **onto** the button rather than staying on
+/// the inner box: the stylesheet's `.ts-agents-card .ts-agent-row` padding is
+/// what gives the pill its inset, and a button carrying its own Adwaita padding
+/// *around* a padded box would double it. One element, one padding — and
+/// `flat` is what keeps it from drawing a frame, leaving only the hover
+/// highlight, which is the affordance the row now wants.
 fn agent_row(agent: &Agent, cfg: &AgentsConfig, approvals: usize) -> Node {
     let name = agent.name.as_str();
     let status = agent.status();
@@ -793,13 +846,17 @@ fn agent_row(agent: &Agent, cfg: &AgentsConfig, approvals: usize) -> Node {
     }
     tail.push(status_caption(agent));
 
-    vstack(
-        2,
-        &["ts-agent-row"],
-        vec![
-            hrow(6, &["ts-agent-head"], head),
-            hrow(6, &["ts-agent-statusline"], tail),
-        ],
+    button(
+        format!("{}{name}", ids::ROW),
+        &["flat", "ts-agent-row"],
+        vstack(
+            2,
+            &[],
+            vec![
+                hrow(6, &["ts-agent-head"], head),
+                hrow(6, &["ts-agent-statusline"], tail),
+            ],
+        ),
     )
 }
 
@@ -816,6 +873,49 @@ pub fn hive_summary(hive: &Hive) -> String {
     }
 }
 
+/// The card header's **"Open terminals"** button, or `None` when there is
+/// nothing to open ([#1306](https://github.com/vibec0re/trollshell/issues/1306)).
+///
+/// `None` covers both halves of "up" with one expression: a hive that is not
+/// [`Hive::Up`] has an empty roster ([`Hive::agents`]), and a hive that is up
+/// with nothing running has no [`terminal_targets`]. So a disconnected,
+/// erroring, incompatible or idle card simply has no button — rather than a
+/// disabled one, which would be a control the operator has to reason about on
+/// a surface that is already dense.
+///
+/// # The tooltip names both routes, because the view cannot know which one runs
+///
+/// `Plugin::view` takes `&self` and [`crate::window::Probe`] resolves on
+/// `&mut` — deliberately, since resolving it here would move a `PATH` scan and
+/// its warning from the first click onto the first render, i.e. onto every
+/// desktop rather than onto the ones that click. So rather than guess, the
+/// hover says what happens either way: N windows, or N browser tabs on a
+/// desktop with no `trollshell-agent-window`. #1306 asks for the tab count to
+/// be said out loud, and this is the phrasing that is true before the probe has
+/// an answer.
+fn open_terminals_button(hive: &Hive, cfg: &AgentsConfig) -> Option<Node> {
+    let count = terminal_targets(hive.agents(), cfg).len();
+    if count == 0 {
+        return None;
+    }
+    let hover = if count == 1 {
+        "open the terminal window for the one running agent (a browser tab if \
+         the companion window is not installed)"
+            .to_owned()
+    } else {
+        format!(
+            "open a terminal window for each of the {count} running agents \
+             ({count} browser tabs if the companion window is not installed)"
+        )
+    };
+    Some(icon_button(
+        ids::OPEN_TERMINALS,
+        "utilities-terminal-symbolic",
+        &hover,
+        &["flat", "ts-agent-btn"],
+    ))
+}
+
 /// The sidebar card: a titled surface, then the roster as a dense list.
 ///
 /// The title matches the `Tasks` card above it — the same all-caps caption
@@ -830,21 +930,24 @@ pub fn card(
     expanded: &ExpandedGroups,
     approvals: &PendingApprovals,
 ) -> Node {
-    let title = hrow(
-        6,
-        &["ts-agents-title"],
-        vec![
-            label("AGENTS", &["ts-agents-heading"]),
-            Node::Spacer,
-            label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
-            icon_button(
-                OVERVIEW_ID,
-                "view-list-symbolic",
-                "hive overview and the full roster",
-                &["flat", "ts-agent-btn"],
-            ),
-        ],
-    );
+    let mut title_row = vec![
+        label("AGENTS", &["ts-agents-heading"]),
+        Node::Spacer,
+        label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
+    ];
+    // **The one placement site.** #1306's other open question — card header or
+    // per-project group header — is answered by which `Vec` this line pushes
+    // into: moving it into `group_node`'s header (with `g.agents` instead of
+    // `hive.agents()`) is the whole of the other answer, because the button
+    // derives everything it says from the slice it is given.
+    title_row.extend(open_terminals_button(hive, cfg));
+    title_row.push(icon_button(
+        OVERVIEW_ID,
+        "view-list-symbolic",
+        "hive overview and the full roster",
+        &["flat", "ts-agent-btn"],
+    ));
+    let title = hrow(6, &["ts-agents-title"], title_row);
 
     let body = match hive {
         Hive::Connecting => vec![notice(

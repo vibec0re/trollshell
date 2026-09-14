@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use crate::config::AgentsConfig;
 use crate::hive::wire::{Approval, HiveUrls, Request, Scope};
 use crate::hive::{AgentStatusRow, HiveError};
-use crate::model::{Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url};
+use crate::model::{
+    Agent, AgentName, ExpandedGroups, Hive, PendingApprovals, Status, agent_url, terminal_targets,
+};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 use crate::window;
@@ -695,8 +697,10 @@ impl Agents {
     ///
     /// `None` means "not this route" — either the window is not installed
     /// ([`window::Probe`], which also warns once) or the model no longer holds
-    /// the agent whose row was clicked. Both callers then take their P1 route,
-    /// so a desktop without the window keeps working exactly as it did.
+    /// the agent whose row was clicked. Every caller then takes its P1 route —
+    /// the browser for a terminal ([`Agents::open_agent_terminal`]), the drawer
+    /// page for the pen — so a desktop without the window keeps working exactly
+    /// as it did.
     ///
     /// The launch carries **only the agent's name**: the window reads
     /// `host.sock` itself, so nothing the model holds — not the URL, not the
@@ -719,6 +723,58 @@ impl Agents {
             return Vec::new();
         };
         self.open_uri(url)
+    }
+
+    /// One agent's terminal, by whichever route this desktop has: the companion
+    /// window, else the browser.
+    ///
+    /// The two callers that had this `if let Some(fx) … else` inline — the
+    /// panel's `agent page` link and, since #1282 item 2, the card row — are
+    /// the reason it is a function: #1306 adds a third caller that runs it in a
+    /// loop, and three copies of a route decision is how two of them drift.
+    fn open_agent_terminal(&mut self, name: &AgentName) -> Vec<Effect> {
+        if let Some(fx) = self.open_window(name, window::Tab::Agent) {
+            return fx;
+        }
+        self.open_agent_page(name)
+    }
+
+    /// The card header's **"Open terminals"** (#1306): one terminal per running
+    /// agent, in the card's own row order.
+    ///
+    /// Three things are deliberate here.
+    ///
+    /// **The roster is re-read at click time**, never carried on the node id —
+    /// [`crate::view::ids::OPEN_TERMINALS`] names no agent for exactly this
+    /// reason. A press opens what is running *now*, so an agent that stopped
+    /// between the render and the click gets no window.
+    ///
+    /// **Which agents** is [`terminal_targets`]', i.e. the same function the
+    /// button's own visibility and its tooltip's count come from. The button
+    /// cannot say "3" and open 4.
+    ///
+    /// **Each launch takes its own id** from the shared counter, because that
+    /// is what the id space is for: `EffectResult`'s docs call several
+    /// reply-bearing effects in flight at once the normal case, and a fan-out is
+    /// the first place in this plugin that actually produces several from one
+    /// click. Re-using one id would make the host's audit — and this plugin's
+    /// own failure toast — unable to say *which* window did not open.
+    ///
+    /// The route is uniform within a press (the probe is resolved once per
+    /// process), so this is either N launches or N `OpenUri`s, never a mix. An
+    /// agent the hive reports with no `url` contributes nothing on the browser
+    /// arm, the same silence the single-row click already answers with.
+    fn open_terminals(&mut self) -> Vec<Effect> {
+        // Cloned before the loop: `terminal_targets` borrows the roster and the
+        // config, and every launch needs `&mut self` for the id counter.
+        let targets: Vec<AgentName> = terminal_targets(self.hive.agents(), &self.cfg)
+            .into_iter()
+            .map(|a| a.name.clone())
+            .collect();
+        targets
+            .iter()
+            .flat_map(|name| self.open_agent_terminal(name))
+            .collect()
     }
 
     /// The panel's `dashboard` link — the hive's own root, from the `Urls`
@@ -773,12 +829,25 @@ impl Agents {
             // window is not installed. Annika on #947: a dedicated webview we
             // control, "not the browser"; the browser stays the fallback.
             if let Some(name) = AgentName::parse(rest) {
-                if let Some(fx) = self.open_window(&name, window::Tab::Agent) {
-                    return fx;
-                }
-                return self.open_agent_page(&name);
+                return self.open_agent_terminal(&name);
             }
             return Vec::new();
+        }
+        if let Some(rest) = node.strip_prefix(ids::ROW) {
+            // #1282 item 2, @kaesaecracker: "open agent term on agent click in
+            // sidebar". The **same route** as the link above, by construction —
+            // one call, not a second copy of the window/browser decision — so
+            // the card row spawns nothing the panel's link could not already
+            // spawn, and the pen's `--tab settings` is untouched.
+            if let Some(name) = AgentName::parse(rest) {
+                return self.open_agent_terminal(&name);
+            }
+            return Vec::new();
+        }
+        if node == ids::OPEN_TERMINALS {
+            // #1306: every running agent at once. No name on the id — see
+            // [`Agents::open_terminals`].
+            return self.open_terminals();
         }
         if let Some(rest) = node.strip_prefix(ids::APPROVALS) {
             // #947 P3. The badge re-raises the prompt for the **oldest**

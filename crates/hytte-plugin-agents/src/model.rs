@@ -457,6 +457,50 @@ pub fn headers_wanted(groups: &[Group<'_>]) -> bool {
     groups.len() > 1
 }
 
+/// Does the card's **"Open terminals"** button open a window for this agent?
+///
+/// [#1306](https://github.com/vibec0re/trollshell/issues/1306) asks for "all
+/// agents in up state", and "up" is two different things in this model — the
+/// hive being [`Hive::Up`], and an agent being [`Status::Running`]. This is the
+/// second one, and it is **the switch**: @kaesaecracker's open question on that
+/// thread is running-only versus every agent the hive lists, and this predicate
+/// is the whole of the answer. Flipping it to `true` opens a terminal for every
+/// listed agent — a stopped one included — and nothing else moves: the count in
+/// the tooltip, the button's own visibility, the fan-out and its tests all read
+/// this one function.
+///
+/// Running-only is the default because a terminal for a stopped agent shows a
+/// dead feed, and because "open everything" scales with the roster rather than
+/// with what is happening.
+#[must_use]
+pub fn wants_terminal(agent: &Agent) -> bool {
+    agent.status() == Status::Running
+}
+
+/// Every agent the "Open terminals" button would open, **in the card's own row
+/// order**.
+///
+/// The order is [`group`]'s, not the hive's: the card draws grouped rows, and a
+/// fan-out that opened windows in a different order than the rows the operator
+/// is looking at would be a small lie about what the button did. The *cap* and
+/// the *collapse state* are deliberately not applied — `view::MAX_ROWS` bounds
+/// how much tree this plugin serialises every two seconds, and a collapsed
+/// group is one click from being open; neither is a statement about which
+/// agents are running. So a hive with 25 running agents opens 25 windows and
+/// the tooltip says 25, which is the truthful version of the button.
+///
+/// Called by both halves on purpose — [`crate::view::card`] for "is there a
+/// button, and what number does it say" and [`crate::plugin::Agents`] for "what
+/// does a press launch" — so the two cannot disagree about either question.
+#[must_use]
+pub fn terminal_targets<'a>(agents: &'a [Agent], cfg: &'a AgentsConfig) -> Vec<&'a Agent> {
+    group(agents, cfg)
+        .into_iter()
+        .flat_map(|g| g.agents)
+        .filter(|a| wants_terminal(a))
+        .collect()
+}
+
 /// The agent's own page URL, **as the hive states it** — never derived.
 ///
 /// Spec §5.2 had the desktop building `<home>agent/<name>/` client-side,

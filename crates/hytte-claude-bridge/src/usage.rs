@@ -2330,8 +2330,16 @@ mod tests {
 
             // The loop must sleep the computed 15 min wait, not a hardcoded
             // POLL_EVERY (5 min) — falsifies `sleep(POLL_EVERY)` in place of
-            // `sleep(wait)`.
+            // `sleep(wait)`. The `yield_now` right after `advance` matters:
+            // `advance` moves the paused clock and marks any now-overdue
+            // timer ready, but a task made ready *during* one `advance` call
+            // is not actually polled until the executor's next chance to run
+            // — without flushing that here, a wrongly-short sleep (e.g. the
+            // 5 min `POLL_EVERY` mutation) would have already fired well
+            // before 899 s but this assertion would not observe it yet,
+            // making the whole probe vacuous.
             tokio::time::advance(Duration::from_secs(15 * 60 - 1)).await;
+            tokio::task::yield_now().await;
             assert_eq!(
                 calls.load(AtomicOrdering::SeqCst),
                 1,
@@ -2361,8 +2369,10 @@ mod tests {
             assert_eq!(report.last_ok, Some((report.at, usage.clone())));
 
             // The success resets the wait to POLL_EVERY (5 min) — not the
-            // 15 min cap it was just backed off to.
+            // 15 min cap it was just backed off to. Same `yield_now` reason
+            // as above.
             tokio::time::advance(Duration::from_secs(5 * 60 - 1)).await;
+            tokio::task::yield_now().await;
             assert_eq!(
                 calls.load(AtomicOrdering::SeqCst),
                 3,

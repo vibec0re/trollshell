@@ -855,7 +855,7 @@ impl Texture {
     /// than a read past the end.
     ///
     /// The unpack pixel store is put into a known position first — see
-    /// [`Texture::reset_unpack_state`] for which four knobs that is and why
+    /// [`Texture::reset_unpack_state`] for which five knobs that is and why
     /// setting `UNPACK_ALIGNMENT` alone (all this used to do) was not enough.
     pub fn upload_u8(&self, _gl: &Gl, bytes: &[u8]) {
         debug_assert_ne!(
@@ -895,7 +895,7 @@ impl Texture {
         }
     }
 
-    /// Put **the four unpack pixel-store knobs this crate's uploads
+    /// Put **the five unpack pixel-store knobs this crate's uploads
     /// depend on** into the position the two uploads above assume,
     /// immediately before the `glTexSubImage2D` that reads it.
     ///
@@ -903,11 +903,11 @@ impl Texture {
     /// (#1298): GTK renders its own scene into this same context and nothing
     /// promises what it leaves set, so the unpack state is *put* into a known
     /// position rather than inherited. Setting only `UNPACK_ALIGNMENT` — which
-    /// is all these two calls used to do — defends exactly one of the four
+    /// is all these two calls used to do — defends exactly one of the five
     /// knobs that decide which bytes `glTexSubImage2D` actually reads:
     ///
     /// * `UNPACK_ALIGNMENT` — GL's default of 4 reads an odd-width `R8` row
-    ///   staggered. Already defended; kept here so all four sit together.
+    ///   staggered. Already defended; kept here so all five sit together.
     /// * `UNPACK_SKIP_PIXELS` / `UNPACK_SKIP_ROWS` — a non-zero value
     ///   **offsets the source pointer**, so the upload starts one texel (or one
     ///   row) into its own data and reads that many past the end of the slice.
@@ -926,7 +926,7 @@ impl Texture {
     ///   it into an observation.
     ///
     /// **Deliberately out of scope**, named rather than silently absent so
-    /// the four above read as a considered list rather than "all of them":
+    /// the five above read as a considered list rather than "all of them":
     ///
     /// * `GL_UNPACK_SWAP_BYTES` / `GL_UNPACK_LSB_FIRST` — desktop-GL-only
     ///   knobs with no GLES equivalent. Setting either here would be
@@ -1277,15 +1277,6 @@ pub fn draw_quads(_gl: &Gl, instances: u32) {
     unsafe { gl::DrawArraysInstanced(gl::TRIANGLES, 0, 6, count) };
 }
 
-/// Read the bound framebuffer's colour back as RGBA8, row-major, bottom-up (GL
-/// order — the caller flips).
-///
-/// **The parity harness's, never the shell's.** A readback is a full pipeline
-/// stall — it is precisely what the design spec rejects for the render path
-/// ("rendering to an FBO and `glReadPixels`-ing into `Arc<[u8]>` … would defeat
-/// the entire point"). It exists so `hytte-ui`'s `preem_gl_diff` example can
-/// measure GL against the CPU kit; nothing on the shell's per-frame path calls
-/// it, and nothing should.
 /// Put the pack pixel store — the mirror image of
 /// [`Texture::reset_unpack_state`], one call site's worth of knobs, on the
 /// `glReadPixels` side rather than `glTexSubImage2D`'s — into a known
@@ -1337,6 +1328,15 @@ pub fn dirty_pack_state_for_test(_gl: &Gl) {
     }
 }
 
+/// Read the bound framebuffer's colour back as RGBA8, row-major, bottom-up (GL
+/// order — the caller flips).
+///
+/// **The parity harness's, never the shell's.** A readback is a full pipeline
+/// stall — it is precisely what the design spec rejects for the render path
+/// ("rendering to an FBO and `glReadPixels`-ing into `Arc<[u8]>` … would defeat
+/// the entire point"). It exists so `hytte-ui`'s `preem_gl_diff` example can
+/// measure GL against the CPU kit; nothing on the shell's per-frame path calls
+/// it, and nothing should.
 #[must_use]
 pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
     let (Ok(w), Ok(h)) = (GLsizei::try_from(width), GLsizei::try_from(height)) else {

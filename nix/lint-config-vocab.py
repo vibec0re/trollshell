@@ -700,18 +700,46 @@ def read(path: str) -> str:
         return fh.read()
 
 
+def _self_test_failed(lines: list[str]) -> int:
+    """Print the "scanner disagrees with its own fixtures" verdict and return
+    the exit-2 self-test-failure code the sibling scripts
+    (`lint-bind-pins.py`, `lint-lints-tables.py`) reserve for it.
+
+    One helper for `self_test()`'s two failure shapes — a fixture producing
+    the wrong answer (`lines` is `self_test()`'s own return value) and a
+    fixture raising outright (`lines` is the caught exception's message,
+    wrapped by the caller) — so the two cannot read differently to whoever is
+    staring at CI output. Before this, only the first shape went through
+    here: the second escaped `main()` as an uncaught traceback and Python's
+    default exit 1 — indistinguishable from `mount_wire_names` and friends
+    finding a *real* drift in the tree, the one thing this exit code must
+    never be confused with (#1270, inherited nit from the #1260 review).
+    """
+    print("config-vocab scan: SELF-TEST FAILED", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    print(
+        "\nThe scanner disagrees with its own fixtures, so any verdict it gives on the\n"
+        "tree is meaningless. Fix the extraction functions rather than the fixtures.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main() -> int:
-    failures = self_test()
+    try:
+        failures = self_test()
+    except Exception as e:
+        # Anything escaping self_test() means the scanner itself is broken,
+        # not that the tree has real vocab drift -- narrower than Exception
+        # missed whichever class the next fixture happened to raise (N1,
+        # #1279 review): the three numeric readers (ints_between_after,
+        # poll_seconds_bounds, max_rows) can raise ValueError as easily as
+        # the extractors raise LookupError, and self_test() exercises all of
+        # them.
+        return _self_test_failed([f"a fixture raised {type(e).__name__}: {e}"])
     if failures:
-        print("config-vocab scan: SELF-TEST FAILED", file=sys.stderr)
-        for line in failures:
-            print(f"  {line}", file=sys.stderr)
-        print(
-            "\nThe scanner disagrees with its own fixtures, so any verdict it gives on the\n"
-            "tree is meaningless. Fix the extraction functions rather than the fixtures.",
-            file=sys.stderr,
-        )
-        return 2
+        return _self_test_failed(failures)
 
     missing = [
         p

@@ -102,7 +102,7 @@
 //! adding a breakpoint strips the bin's minimum size in both directions, so the
 //! floor is set on both axes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -432,6 +432,23 @@ struct PluginsState {
     /// parsed at most once per change to the file — see [`DeclaredMounts`]
     /// for why the 2 s poll must not re-read it (#1260 review F7).
     declared: Rc<RefCell<DeclaredMounts>>,
+    /// The `plugins.json` search path (#1260 review F8), resolved from the
+    /// process environment the first time [`refresh_plugins`] runs and held
+    /// for the rest of the tab's life.
+    ///
+    /// `hytte_config::xdg::Env::from_process()` is cheap — it only reads four
+    /// environment variables — but [`plugins_json_candidates`]'s
+    /// `env.config_home()`/`env.config_dirs()` calls `tracing::warn!` on a
+    /// relative `$XDG_CONFIG_HOME`/`$XDG_CONFIG_DIRS` (`hytte_config::xdg`'s
+    /// `is_absolute`, #985), and re-resolving the search path on every
+    /// [`PLUGIN_POLL_INTERVAL`] tick re-fires that warning every tick, for
+    /// the window's whole life, on a misconfigured box (#1270, inherited nit
+    /// from the #1260 review). The environment a running process sees cannot
+    /// change out from under it, so the search path it implies cannot
+    /// either — a `OnceCell` makes "resolved (and, if bad, warned about)
+    /// once" the type, not a convention a future edit could quietly break by
+    /// moving the `Env::from_process()` call back inside the tick.
+    search_path: Rc<OnceCell<Vec<PathBuf>>>,
 }
 
 /// [`PluginsState`] with its widget handles held **weakly** — what the
@@ -470,6 +487,7 @@ struct WeakPluginsState {
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
     declared: Rc<RefCell<DeclaredMounts>>,
+    search_path: Rc<OnceCell<Vec<PathBuf>>>,
 }
 
 /// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
@@ -509,6 +527,7 @@ impl PluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            search_path: self.search_path.clone(),
         }
     }
 }
@@ -543,6 +562,7 @@ impl WeakPluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            search_path: self.search_path.clone(),
         })
     }
 }
@@ -653,6 +673,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
         declared: Rc::new(RefCell::new(DeclaredMounts::default())),
+        search_path: Rc::new(OnceCell::new()),
     };
 
     connect_selection(&state);
@@ -937,14 +958,20 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// (#1161) — none of them touch the real filesystem, and none of them should
 /// start to by accident.
 ///
-/// What this tick costs is one [`probe_plugins_json`] stat, not a read and a
+/// What this tick costs is one [`probe_candidates`] stat, not a read and a
 /// `serde_json` parse: the parse happens on the first tick and then only when
 /// the file's stamp changes (#1260 review F7 — see [`DeclaredMounts`] for why
-/// a stat-shaped stamp is enough for a nix-rendered store symlink).
+/// a stat-shaped stamp is enough for a nix-rendered store symlink). The search
+/// path itself — which candidate paths to stat — is resolved from the process
+/// environment through [`PluginsState::search_path`] once, not per tick (#1270
+/// — see that field's doc for why re-resolving it every tick is the wrong
+/// default).
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
+    let candidates =
+        resolved_search_path(&state.search_path, &hytte_config::xdg::Env::from_process());
     let declared = {
-        let probe = probe_plugins_json(&hytte_config::xdg::Env::from_process());
+        let probe = probe_candidates(candidates);
         state
             .declared
             .borrow_mut()
@@ -1106,27 +1133,71 @@ fn plugins_json_candidates(env: &hytte_config::xdg::Env) -> Vec<PathBuf> {
     candidates
 }
 
+/// [`plugins_json_candidates`], resolved through `cache` at most once — the
+/// production half of [`PluginsState::search_path`] (#1270).
+///
+/// `env.config_home()`/`env.config_dirs()` `tracing::warn!` on a relative
+/// `$XDG_CONFIG_HOME`/`$XDG_CONFIG_DIRS` (`hytte_config::xdg::is_absolute`,
+/// #985); calling [`plugins_json_candidates`] fresh on every
+/// [`refresh_plugins`] tick re-fired that warning every tick, forever, on a
+/// misconfigured box (#1260 review, inherited nit 2). `env` is only consulted
+/// the first time `cache` is empty — an `OnceCell` on the GTK main thread
+/// needs no synchronisation, and the four variables it reads cannot change
+/// for a process already running, so "resolve once" costs nothing a later
+/// tick would have wanted.
+///
+/// Taking `cache` as a parameter (rather than reading
+/// [`PluginsState::search_path`] directly) is what lets a test drive this
+/// with its own throwaway `OnceCell` and a hand-built [`Env`](hytte_config::xdg::Env)
+/// — including a relative one — without touching the real process
+/// environment (`tests-must-not-touch-real-xdg`).
+fn resolved_search_path<'a>(
+    cache: &'a OnceCell<Vec<PathBuf>>,
+    env: &hytte_config::xdg::Env,
+) -> &'a [PathBuf] {
+    cache.get_or_init(|| plugins_json_candidates(env))
+}
+
 /// The `plugins.json` the search path settled on, plus the cheap identity
 /// [`DeclaredMounts`] keys its cached parse on (#1260 review F7).
 ///
-/// Everything here comes from one `stat` (plus one `readlink`) per candidate
-/// — no read, no parse — which is the whole point: the tab's 2 s poll runs
-/// this on the GTK main thread and must not do the blocking read it used to.
+/// Everything here comes from one `stat` plus a `realpath`-style walk (a
+/// handful of `readlink`s — one per path component per symlink hop crossed)
+/// per candidate — no read, no parse — which is the whole point: the tab's
+/// 2 s poll runs this on the GTK main thread and must not do the blocking
+/// read it used to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PluginsJson {
     /// The file the search found, i.e. the first candidate that exists.
     path: PathBuf,
-    /// `readlink(path)`, or `None` when the path is a regular file.
+    /// `canonicalize(path)` (`realpath(3)`, resolving **every** hop), or,
+    /// on the rare path `realpath(3)` refuses, `None`.
     ///
-    /// This is the discriminator that matters in practice. Both platform
-    /// modules render `plugins.json` as a **symlink into the nix store**, and
-    /// every store path carries the frozen mtime `1970-01-01 00:00:01` —
-    /// measured and documented in `hytte_config::subsystem::watch`'s module
-    /// doc, which is why *that* poller stamps `(mtime, content hash)` rather
-    /// than `(mtime, len)`. A hash would mean reading the file every tick,
-    /// the cost this cache exists to avoid; the link target carries the
-    /// content hash in its own name, so for the nix-rendered case it is
-    /// exactly as sharp and costs one `readlink`.
+    /// This is the discriminator that matters in practice, but only if it
+    /// resolves the whole chain: both platform modules render `plugins.json`
+    /// as a symlink into the nix store, and every store path carries the
+    /// content hash in its own name and the frozen mtime `1970-01-01
+    /// 00:00:01` — measured and documented in
+    /// `hytte_config::subsystem::watch`'s module doc, which is why *that*
+    /// poller stamps `(mtime, content hash)` rather than `(mtime, len)`. A
+    /// hash would mean reading the file every tick, the cost this cache
+    /// exists to avoid; the fully-resolved target carries the content hash
+    /// in its own name, so it is exactly as sharp and costs one `realpath`.
+    ///
+    /// This was `read_link` — a single `readlink(2)`, one hop — through
+    /// #1260, and that hop is where home-manager's
+    /// `~/.config/… -> /nix/store/<hash>-home-manager-files/…` lands, but
+    /// NixOS's `environment.etc` renders `/etc/xdg/… -> /etc/static/…`, a
+    /// **rebuild-invariant** first hop with no hash at all (`/etc/static`
+    /// itself is the second hop, `-> /nix/store/<hash>-etc/etc`). So on
+    /// NixOS `read_link` returned the same answer across a content-changing
+    /// rebuild and the whole stamp silently degenerated to `len` alone
+    /// (#1270, #1260 review N1) — bounded by the nine wire names' pairwise-
+    /// distinct lengths, so a single-plugin `mount` edit still moved `len`,
+    /// but a length-preserving edit (two plugins' mounts swapped, say) did
+    /// not. `canonicalize` resolves every hop instead of one, at a handful
+    /// of syscalls instead of one — still nothing next to reading and
+    /// parsing the file.
     link: Option<PathBuf>,
     /// `(mtime, len)` — [`hytte_config::subsystem::watch`]'s original stamp,
     /// and what actually discriminates a **hand-written** `plugins.json`
@@ -1137,17 +1208,35 @@ struct PluginsJson {
 
 /// Probe the search path: the first existing `plugins.json` and its stamp, or
 /// `None` when no file exists anywhere on it.
+///
+/// A thin wrapper over [`probe_candidates`] for the tests below, which
+/// exercise both halves — the environment-to-paths resolution and the
+/// filesystem probe — together. [`refresh_plugins`] calls the two
+/// separately, since only the first needs to be cached (#1270).
+#[cfg(test)]
 fn probe_plugins_json(env: &hytte_config::xdg::Env) -> Option<PluginsJson> {
-    plugins_json_candidates(env).into_iter().find_map(|path| {
-        let meta = std::fs::metadata(&path).ok()?;
+    probe_candidates(&plugins_json_candidates(env))
+}
+
+/// The filesystem half of [`probe_plugins_json`]: stat every candidate path
+/// in order and return the first that exists, with its stamp.
+///
+/// Split out of what used to be `probe_plugins_json` itself so
+/// [`refresh_plugins`] can probe a **cached** candidate list
+/// ([`PluginsState::search_path`]) without re-resolving it — and re-risking
+/// the relative-`$XDG_*`-path warning `plugins_json_candidates` can trigger —
+/// on every tick (#1270).
+fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
+    candidates.iter().find_map(|path| {
+        let meta = std::fs::metadata(path).ok()?;
         if !meta.is_file() {
             return None;
         }
         Some(PluginsJson {
-            link: std::fs::read_link(&path).ok(),
+            link: std::fs::canonicalize(path).ok(),
             modified: meta.modified().ok(),
             len: meta.len(),
-            path,
+            path: path.clone(),
         })
     })
 }
@@ -1968,14 +2057,17 @@ async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::Bu
 
 #[cfg(test)]
 mod tests {
+    use std::cell::OnceCell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use super::{
         DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates,
         declared_mounts_from_json, is_running, mount_display, mount_or_unknown, plugin_subtitle,
-        probe_plugins_json, read_declared_mounts_at, runtime_overlay, runtime_states,
-        same_plugin_set, seen_suffix, status_cell, violations_suffix,
+        probe_candidates, probe_plugins_json, read_declared_mounts_at, resolved_search_path,
+        runtime_overlay, runtime_states, same_plugin_set, seen_suffix, status_cell,
+        violations_suffix,
     };
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -2500,6 +2592,157 @@ mod tests {
         let home = tempfile::tempdir().expect("a temp XDG_CONFIG_HOME");
         let dirs = tempfile::tempdir().expect("a temp XDG_CONFIG_DIRS entry");
         assert!(probe_plugins_json(&env_of(home.path(), dirs.path())).is_none());
+    }
+
+    // ── The stamp's `link` half must resolve every hop (#1270, #1260 review N1) ─
+
+    /// Force `path`'s mtime to a fixed instant, the way
+    /// `crates/hytte-config/src/places.rs`'s `config_watcher_reloads_only_on_changed_content`
+    /// does — deterministic, no filesystem-granularity flakiness, and (the
+    /// point here) identical across two otherwise-different files.
+    fn force_mtime(path: &Path, secs: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+            .expect("force the mtime");
+    }
+
+    /// **Falsification target for #1270 item 1.** `plugins.json`'s candidate
+    /// is itself a symlink to a symlink (`a -> b -> target`) — one hop
+    /// deeper than either platform module actually renders, chosen because
+    /// it is the shape that makes the difference between `read_link` (one
+    /// hop: `readlink(a)` answers `b`, full stop, however many times `b`'s
+    /// own target changes) and `canonicalize` (every hop) impossible to
+    /// miss. `target1`/`target2` are forced to the same length AND the same
+    /// mtime, so `(mtime, len)` alone cannot move — only a `link` that
+    /// resolves all the way through sees `b` re-pointed from one to the
+    /// other.
+    ///
+    /// **Falsified two ways, both pasted in the PR body**: reverting
+    /// `probe_candidates`'s `canonicalize` back to `read_link` reds this
+    /// (the immediate target is always `b`, never `target1`/`target2`
+    /// directly); setting `link: None` outright reds it too — which is
+    /// exactly the #1260 review's own measurement (all 180 pre-existing
+    /// tests stay green with the field deleted, because none of them builds
+    /// a real symlink chain).
+    #[test]
+    fn the_stamp_moves_when_a_symlink_chains_final_target_changes() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let target1 = dir.path().join("target1");
+        let target2 = dir.path().join("target2");
+        // Same length (5 bytes each), different content.
+        std::fs::write(&target1, "AAAAA").expect("write target1");
+        std::fs::write(&target2, "BBBBB").expect("write target2");
+        force_mtime(&target1, 1);
+        force_mtime(&target2, 1);
+
+        let b = dir.path().join("b");
+        let a = dir.path().join("plugins.json");
+        std::os::unix::fs::symlink(&target1, &b).expect("symlink b -> target1");
+        std::os::unix::fs::symlink(&b, &a).expect("symlink a -> b");
+
+        let candidates = vec![a.clone()];
+        let stamp1 = probe_candidates(&candidates).expect("the chain resolves to a file");
+        assert_eq!(stamp1.len, 5, "both targets are 5 bytes");
+        assert_eq!(
+            stamp1.modified,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            "both targets share the forced mtime"
+        );
+        assert_eq!(
+            stamp1.link,
+            target1.canonicalize().ok(),
+            "the resolved link must be the chain's final target"
+        );
+
+        // Re-point the INTERMEDIATE hop only — `a` itself is never touched,
+        // so `read_link(&a)` would answer `b` before this and after it.
+        std::fs::remove_file(&b).expect("remove b");
+        std::os::unix::fs::symlink(&target2, &b).expect("symlink b -> target2");
+
+        let stamp2 = probe_candidates(&candidates).expect("the chain still resolves");
+        assert_eq!(stamp2.len, stamp1.len, "length is unchanged by design");
+        assert_eq!(
+            stamp2.modified, stamp1.modified,
+            "mtime is unchanged by design"
+        );
+        assert_ne!(
+            stamp1, stamp2,
+            "canonicalize must resolve through BOTH hops and see the final \
+             target move, even though (mtime, len) alone cannot"
+        );
+        assert_eq!(
+            stamp2.link,
+            target2.canonicalize().ok(),
+            "the resolved link must follow the re-point to the new final target"
+        );
+    }
+
+    // ── The search path is resolved once, not per tick (#1270) ───────────────
+
+    /// **Item 3 pin.** No tracing-capture harness exists in this crate
+    /// (`grep -rn "fn capture(" crates/trollshell-control-center` finds
+    /// nothing — the nearest is `hytte_config::test_support`, reachable only
+    /// as a dev-dependency this crate doesn't take), so this pins the
+    /// MECHANISM that keeps [`refresh_plugins`] from re-triggering
+    /// `hytte_config::xdg`'s relative-path warning every tick, rather than
+    /// capturing the warning itself: [`resolved_search_path`] is the exact
+    /// function `refresh_plugins` calls, parameterised over `env` so a test
+    /// can drive it with a hand-built (here: relative) one instead of the
+    /// real process environment.
+    ///
+    /// The second call passes a **different** `Env` — one that would yield a
+    /// real, non-empty candidate list if it were actually consulted — so a
+    /// regression **in [`resolved_search_path`] itself** (recomputing on
+    /// every call instead of consulting `cache`) would show up as
+    /// `second != first` here.
+    ///
+    /// This test drives `resolved_search_path` directly against its own
+    /// throwaway `OnceCell`, so it does **not** reach [`refresh_plugins`]'s
+    /// call site — reverting that call site to
+    /// `plugins_json_candidates(&Env::from_process())` (the exact pre-#1270
+    /// per-tick shape) leaves this test green, because the regression is in
+    /// which cache `refresh_plugins` consults, not in
+    /// `resolved_search_path`'s own logic. That production wiring is what
+    /// `gtk_tests::the_tick_resolves_the_search_path_through_the_tabs_own_latch`
+    /// pins instead, by calling `refresh_plugins` itself and reading
+    /// [`PluginsState::search_path`] back out.
+    #[test]
+    fn the_search_path_is_resolved_once_even_across_a_changed_env() {
+        let cache: OnceCell<Vec<PathBuf>> = OnceCell::new();
+        let relative = hytte_config::xdg::Env {
+            home: None,
+            config_home: Some("relative/path".to_owned()),
+            config_dirs: None,
+            state_home: None,
+        };
+
+        let first = resolved_search_path(&cache, &relative).to_vec();
+        assert_eq!(
+            first,
+            vec![PathBuf::from("/etc/xdg/trollshell/plugins.json")],
+            "a relative XDG_CONFIG_HOME with no $HOME contributes no home \
+             leg, leaving only XDG_CONFIG_DIRS's unset-default /etc/xdg \
+             (this is also where the relative-path warning fires)"
+        );
+
+        // A second, different `Env` — an ABSOLUTE `config_home` that would
+        // add a real, DIFFERENT candidate ahead of `/etc/xdg/…` if
+        // `resolved_search_path` actually re-resolved against it.
+        let absolute = hytte_config::xdg::Env {
+            config_home: Some("/should/not/be/seen".to_owned()),
+            ..relative
+        };
+        let second = resolved_search_path(&cache, &absolute).to_vec();
+
+        assert_eq!(
+            second, first,
+            "a second tick must reuse the cached search path, not re-resolve \
+             it against a newer Env — which is exactly what would bring the \
+             per-tick relative-path warning back"
+        );
     }
 
     /// An unreadable (here: nonexistent) file is best-effort, the same as an
@@ -4146,6 +4389,36 @@ mod gtk_tests {
             before + 2,
             "both polls must take their generation at spawn; a generation taken at \
              completion makes every result the newest and the #983 gate a no-op"
+        );
+    }
+
+    /// `the_search_path_is_resolved_once_even_across_a_changed_env` drives
+    /// `resolved_search_path` with a throwaway `OnceCell`, so it is blind to
+    /// the production call site: reverting `refresh_plugins` to
+    /// `plugins_json_candidates(&Env::from_process())` — the exact pre-#1270
+    /// per-tick shape item 3 exists to delete — leaves all 182 tests green,
+    /// `PluginsState::search_path` dead but still constructed (so no
+    /// dead-code warning either).
+    #[gtk::test]
+    fn the_tick_resolves_the_search_path_through_the_tabs_own_latch() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        assert!(
+            state.search_path.get().is_none(),
+            "nothing resolves the search path before the first tick"
+        );
+        super::refresh_plugins(&state);
+        let first = state
+            .search_path
+            .get()
+            .cloned()
+            .expect("refresh_plugins must resolve THROUGH PluginsState::search_path");
+        super::refresh_plugins(&state);
+        assert_eq!(
+            state.search_path.get(),
+            Some(&first),
+            "and a second tick must reuse it, never re-resolve"
         );
     }
 

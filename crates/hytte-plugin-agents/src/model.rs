@@ -605,7 +605,7 @@ pub fn model_family(raw: &str) -> Option<String> {
 mod tests {
     use super::{
         Agent, AgentName, Group, Hive, PendingApprovals, Status, agent_url, group, headers_wanted,
-        model_family,
+        model_family, terminal_targets, wants_terminal,
     };
     use crate::config::AgentsConfig;
     use crate::hive::wire::{AgentStatusRow, Approval, ApprovalKind, ApprovalStatus};
@@ -927,6 +927,83 @@ mod tests {
         // Nothing is lost on the way through.
         let rendered: usize = groups.iter().map(|g| g.agents.len()).sum();
         assert_eq!(rendered, agents.len());
+    }
+
+    /// **"Open terminals" follows the card's row order, not the hive's**
+    /// (#1306) — and takes only what [`wants_terminal`] admits.
+    ///
+    /// The fixture is built so the two orders **disagree**: the hive lists
+    /// `zeta, alpha, orphan`, the card draws `nixos` before `viberoot` before
+    /// the ungrouped bucket, so a fan-out that iterated `hive.agents()` would
+    /// open `zeta` first instead of `alpha`. That is the whole reason this goes
+    /// through [`group`] rather than filtering the slice.
+    ///
+    /// Falsification (run this round, red): swap the body for
+    /// `agents.iter().filter(…)` and the order assertion reds; make
+    /// [`wants_terminal`] return `true` and `parked` joins the list.
+    #[test]
+    fn terminal_targets_are_the_running_agents_in_the_cards_own_order() {
+        let agents = vec![
+            agent("zeta", flags(false, false, false, true)),
+            agent("alpha", flags(false, false, false, true)),
+            agent("orphan", flags(false, false, false, true)),
+            agent("parked", flags(false, false, false, false)),
+        ];
+        let cfg = cfg_with_projects(&[
+            ("zeta", "viberoot"),
+            ("alpha", "nixos"),
+            ("parked", "nixos"),
+        ]);
+
+        // The hive's own order, for the contrast this test exists to draw.
+        assert_eq!(
+            agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["zeta", "alpha", "orphan", "parked"]
+        );
+
+        let names: Vec<&str> = terminal_targets(&agents, &cfg)
+            .into_iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "zeta", "orphan"],
+            "grouped order (nixos, viberoot, ungrouped), stopped agents dropped"
+        );
+
+        // …and the predicate on its own, so the filter is falsifiable without
+        // the grouping in the way.
+        assert!(wants_terminal(&agents[0]));
+        assert!(!wants_terminal(&agents[3]));
+        for row in [
+            flags(true, false, false, true),  // failed wins over running
+            flags(false, true, false, true),  // needs-login wins
+            flags(false, false, true, true),  // paused wins
+            flags(false, false, false, false),
+        ] {
+            assert!(
+                !wants_terminal(&agent("x", row)),
+                "only Status::Running opens a terminal"
+            );
+        }
+    }
+
+    /// A hive that is not up has no targets — the other half of the button's
+    /// visibility rule, asserted where the emptiness comes from.
+    #[test]
+    fn a_hive_that_is_not_up_has_no_terminal_targets() {
+        let cfg = AgentsConfig::default();
+        for hive in [
+            Hive::Connecting,
+            Hive::Unreachable {
+                reason: "no socket".to_owned(),
+            },
+            Hive::Error {
+                reason: "refused".to_owned(),
+            },
+        ] {
+            assert!(terminal_targets(hive.agents(), &cfg).is_empty(), "{hive:?}");
+        }
     }
 
     /// Spec §6.3: with one project the header is suppressed.

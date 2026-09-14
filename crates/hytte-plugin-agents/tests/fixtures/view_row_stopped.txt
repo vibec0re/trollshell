@@ -61,145 +61,150 @@ Box {
             ],
             dense: true,
             children: [
-                Box {
-                    id: None,
-                    dir: Vertical,
-                    spacing: 2,
-                    scroll: false,
+                Button {
+                    id: "row:trollshell-choom",
                     classes: [
+                        "flat",
                         "ts-agent-row",
                     ],
-                    children: [
-                        Row {
-                            id: None,
-                            classes: [
-                                "ts-agent-head",
-                            ],
-                            spacing: 6,
-                            children: [
-                                Icon {
-                                    id: None,
-                                    name: "system-run-symbolic",
-                                    classes: [
-                                        "ts-agent-runtime",
-                                    ],
-                                    tooltip: None,
-                                },
-                                Text {
-                                    id: None,
-                                    text: "trollshell-choom",
-                                    max_width_chars: Some(
-                                        20,
-                                    ),
-                                    ellipsize: true,
-                                    classes: [
-                                        "heading",
-                                        "ts-agent-name",
-                                    ],
-                                    tooltip: Some(
-                                        "trollshell-choom",
-                                    ),
-                                },
-                                Text {
-                                    id: None,
-                                    text: "Opus",
-                                    max_width_chars: Some(
-                                        10,
-                                    ),
-                                    ellipsize: true,
-                                    classes: [
-                                        "caption",
-                                        "dim-label",
-                                        "ts-agent-model",
-                                    ],
-                                    tooltip: Some(
-                                        "opus-5.2-20262981923899321898",
-                                    ),
-                                },
-                                Spacer,
-                                Button {
-                                    id: "start:trollshell-choom",
-                                    classes: [
-                                        "flat",
-                                        "ts-agent-btn",
-                                    ],
-                                    child: Icon {
+                    child: Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
                                         id: None,
-                                        name: "media-playback-start-symbolic",
-                                        classes: [],
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "trollshell-choom",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
                                         tooltip: Some(
-                                            "start this agent",
+                                            "trollshell-choom",
                                         ),
                                     },
-                                },
-                                Button {
-                                    id: "edit:trollshell-choom",
-                                    classes: [
-                                        "flat",
-                                        "ts-agent-btn",
-                                    ],
-                                    child: Icon {
+                                    Text {
                                         id: None,
-                                        name: "document-edit-symbolic",
-                                        classes: [],
+                                        text: "Opus",
+                                        max_width_chars: Some(
+                                            10,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "caption",
+                                            "dim-label",
+                                            "ts-agent-model",
+                                        ],
                                         tooltip: Some(
-                                            "edit this agent",
+                                            "opus-5.2-20262981923899321898",
                                         ),
                                     },
-                                },
-                            ],
-                            tooltip: None,
-                        },
-                        Row {
-                            id: None,
-                            classes: [
-                                "ts-agent-statusline",
-                            ],
-                            spacing: 6,
-                            children: [
-                                Icon {
-                                    id: None,
-                                    name: "media-playback-stop-symbolic",
-                                    classes: [
-                                        "ts-agent-state",
-                                        "dim-label",
-                                    ],
-                                    tooltip: Some(
-                                        "stopped",
-                                    ),
-                                },
-                                Icon {
-                                    id: None,
-                                    name: "software-update-available-symbolic",
-                                    classes: [
-                                        "ts-agent-badge",
-                                        "ts-agent-upd",
-                                    ],
-                                    tooltip: Some(
-                                        "config commit pending — a rebuild would change this agent's locked rev",
-                                    ),
-                                },
-                                Text {
-                                    id: None,
-                                    text: "stopped",
-                                    max_width_chars: Some(
-                                        30,
-                                    ),
-                                    ellipsize: true,
-                                    classes: [
-                                        "dim-label",
-                                        "caption",
-                                        "ts-agent-status",
-                                    ],
-                                    tooltip: Some(
-                                        "stopped",
-                                    ),
-                                },
-                            ],
-                            tooltip: None,
-                        },
-                    ],
-                    tooltip: None,
+                                    Spacer,
+                                    Button {
+                                        id: "start:trollshell-choom",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-start-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "start this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:trollshell-choom",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-stop-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "dim-label",
+                                        ],
+                                        tooltip: Some(
+                                            "stopped",
+                                        ),
+                                    },
+                                    Icon {
+                                        id: None,
+                                        name: "software-update-available-symbolic",
+                                        classes: [
+                                            "ts-agent-badge",
+                                            "ts-agent-upd",
+                                        ],
+                                        tooltip: Some(
+                                            "config commit pending — a rebuild would change this agent's locked rev",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "stopped",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "stopped",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
                 },
             ],
         },

@@ -295,25 +295,26 @@ fn a_click_on_an_unknown_or_illegal_agent_sends_nothing() {
 
 // ── the card's two buttons ───────────────────────────────────────────────────
 
-/// **The row itself is not a click target** (Annika, 2026-09-11): her spec is
-/// "click on agent opens agent page in trollshell-webview", which is #950 and
-/// does not exist yet, so nothing on the card answers to the row — only the two
-/// buttons do.
+/// **The row's click target is `row:`, and nothing else.**
 ///
-/// This asserts the *absence* through the reducer rather than through the tree,
-/// because the tree half is `view.rs`'s
-/// `a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons`: even if a name
-/// button came back, no arm here would route it. The old `chat:` prefix is the
-/// one that used to.
+/// Annika's spec was "click on agent opens agent page in trollshell-webview",
+/// which #950 built and #1282 item 2 finally wired to the pill. This test used
+/// to assert the row answered to *nothing*; what survives that change is the
+/// half that was always the point — the spellings that came before it still
+/// route nowhere, so a stale host, a stale golden, or a half-finished rename
+/// cannot quietly reach the reducer. The old `chat:` prefix is the one that
+/// used to.
 ///
-/// Falsification: re-add a `chat:`/row-activate arm pointing at `open_detail`
-/// and the first assertion reds.
+/// Falsification: re-add a `chat:`/`details:` arm pointing at `open_detail` and
+/// the loop reds; drop `AgentName::parse`'s guard on the `ids::ROW` arm and the
+/// bare-name case starts routing.
 #[test]
-fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
+fn only_the_row_prefix_routes_a_row_click() {
     let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
     m.update(status(roster("agent_status_grouped.json")));
 
-    for retired in ["chat:stray", "details:stray", "stray"] {
+    for retired in ["chat:stray", "details:stray", "stray", "row-stray"] {
         assert_eq!(
             m.update(click(retired)),
             vec![],
@@ -322,6 +323,15 @@ fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
     }
     assert_eq!(m.selected, None, "and must not select anything");
     assert!(lines(&mut rx).is_empty(), "nor ask the hive anything");
+
+    // …while the id the card actually renders does route.
+    assert!(
+        matches!(
+            m.update(click("row:stray")).as_slice(),
+            [Effect::RunCommand { .. }]
+        ),
+        "the pill's own id opens the window (#1282 item 2)"
+    );
 }
 
 /// The **edit** button — Annika's `[optionsedit]` — opens the agent's
@@ -1040,6 +1050,283 @@ fn a_click_on_a_vanished_or_illegal_agent_opens_nothing() {
         "the window resolves the URL from host.sock itself, so a row without \
          one is still openable there"
     );
+}
+
+// ── #1282 item 2: the row itself opens the window ────────────────────────────
+
+/// **A click on the pill takes the same route as the `agent page` link**, on
+/// both desktops (#1282 item 2, @kaesaecracker: "open agent term on agent click
+/// in sidebar").
+///
+/// Asserted as *identity with the link's effect* rather than as a second copy
+/// of the expected argv: the ask is "the same thing the link does", so the
+/// assertion is the comparison, and a change to the launch that touched only
+/// one of the two arms could not pass it. The ids differ because each click
+/// takes its own token, so they are compared with the id held constant.
+///
+/// Falsification (run this round, red): point the `ids::ROW` arm at
+/// `open_detail` and the effect kind reds; give it `window::Tab::Settings` and
+/// the argv comparison reds; delete the arm and the row click emits nothing.
+#[test]
+fn the_row_click_opens_the_same_window_as_the_agent_page_link() {
+    // Window installed: both are the same detached launch.
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let from_link = m.update(click("open:trollshell-choom"));
+    let from_row = m.update(click("row:trollshell-choom"));
+    assert!(
+        matches!(from_row.as_slice(), [Effect::RunCommand { .. }]),
+        "{from_row:?}"
+    );
+    assert_eq!(
+        strip_ids(&from_link),
+        strip_ids(&from_row),
+        "the row must not be a second route: {from_link:?} vs {from_row:?}"
+    );
+    assert!(
+        lines(&mut rx).is_empty(),
+        "opening a window is not a hive request"
+    );
+    assert_eq!(
+        m.selected, None,
+        "and the row does not open the drawer page behind it"
+    );
+
+    // No window: both are the same browser open, with the row's own URL.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(false));
+    m.update(status(roster("agent_status_grouped.json")));
+    let from_link = m.update(click("open:stray"));
+    let from_row = m.update(click("row:stray"));
+    assert_eq!(
+        from_row,
+        vec![Effect::OpenUri {
+            id: 1,
+            uri: "https://hive.local/agent/stray/".to_owned(),
+        }]
+    );
+    assert_eq!(strip_ids(&from_link), strip_ids(&from_row));
+}
+
+/// A row click on an agent the model no longer holds — or on an illegal name —
+/// opens **nothing**, exactly like the link's arm.
+///
+/// The row is a new id travelling back through the host, so it gets the same
+/// re-parse-and-look-up treatment as every other arm; this is what says so.
+///
+/// Falsification: have the `ids::ROW` arm trust `rest` instead of
+/// `AgentName::parse` and the illegal case reds.
+#[test]
+fn a_row_click_on_a_vanished_or_illegal_agent_opens_nothing() {
+    for installed in [true, false] {
+        let (mut m, mut rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
+        assert_eq!(m.update(click("row:ghost")), vec![], "no such agent");
+        assert_eq!(m.update(click("row:not a name")), vec![], "illegal name");
+        assert!(lines(&mut rx).is_empty(), "window installed: {installed}");
+    }
+}
+
+// ── #1306: one press, every running agent ────────────────────────────────────
+
+/// Three running agents and one stopped one → **exactly three launches, in the
+/// card's row order, with distinct ids** (#1306).
+///
+/// The roster is deliberately arranged so the card's order and the hive's
+/// disagree (`[display.*].project` puts `nixos` before `viberoot` before the
+/// ungrouped bucket, while the hive lists them the other way round), because
+/// "in the card's row order" is otherwise indistinguishable from "in the order
+/// the hive sent".
+///
+/// Falsifications, each run this round:
+/// - invert `model::wants_terminal` (stopped agents included) → **four**
+///   launches, and the name list reds;
+/// - make `take_effect_id` return a constant → the distinct-ids assertion reds;
+/// - iterate `hive.agents()` instead of `terminal_targets` → the order reds.
+#[test]
+fn open_terminals_launches_one_window_per_running_agent_in_row_order() {
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(Input::App(Msg::Config(Box::new(toml_config(
+        "[display.zeta]\nproject = \"viberoot\"\n\
+         [display.alpha]\nproject = \"nixos\"\n\
+         [display.parked]\nproject = \"nixos\"\n",
+    )))));
+    m.update(status(terminal_roster()));
+
+    let fx = m.update(click("open-terminals"));
+    assert_eq!(
+        fx.len(),
+        3,
+        "one launch per RUNNING agent — the stopped one is not one: {fx:?}"
+    );
+    let launched: Vec<String> = fx
+        .iter()
+        .map(|e| match e {
+            Effect::RunCommand { argv, detached, id } => {
+                assert!(detached, "the window outlives the shell (#953): id {id}");
+                argv.last().cloned().expect("an argv names its agent")
+            }
+            other => panic!("expected a detached launch, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        launched,
+        vec![
+            "alpha".to_owned(),
+            "zeta".to_owned(),
+            "orphan".to_owned()
+        ],
+        "grouped order (nixos, viberoot, ungrouped), not the hive's"
+    );
+
+    let ids: Vec<u64> = fx
+        .iter()
+        .map(|e| match e {
+            Effect::RunCommand { id, .. } => *id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![0, 1, 2],
+        "several effects in flight at once is the normal case, and each needs \
+         its own correlation token (#1060)"
+    );
+
+    // Each is the plain agent-tab launch — the pen's `--tab settings` is not
+    // what this button opens.
+    for e in &fx {
+        match e {
+            Effect::RunCommand { argv, .. } => assert_eq!(
+                argv.len(),
+                3,
+                "the agent tab is spelled by omitting --tab: {argv:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        lines(&mut rx).is_empty(),
+        "opening windows is not a hive request"
+    );
+    assert_eq!(m.selected, None, "and it opens no drawer page");
+}
+
+/// On a desktop with no companion window the same press opens **one browser
+/// tab per running agent** — the same fan-out through the same fallback
+/// (#1306), which is what the button's tooltip promises.
+///
+/// Falsification: drop `open_agent_terminal`'s fallback and this reds with an
+/// empty effect list; make the fan-out choose its route per agent from
+/// something other than the one probe and the "all three are `OpenUri`"
+/// assertion reds.
+#[test]
+fn without_the_window_open_terminals_opens_one_browser_tab_per_running_agent() {
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(false));
+    m.update(status(terminal_roster()));
+
+    let fx = m.update(click("open-terminals"));
+    assert_eq!(
+        fx,
+        vec![
+            Effect::OpenUri {
+                id: 0,
+                uri: "https://hive.local/agent/zeta/".to_owned(),
+            },
+            Effect::OpenUri {
+                id: 1,
+                uri: "https://hive.local/agent/alpha/".to_owned(),
+            },
+            Effect::OpenUri {
+                id: 2,
+                uri: "https://hive.local/agent/orphan/".to_owned(),
+            },
+        ],
+        "three tabs, the hive's own URLs, distinct ids — ungrouped, so the \
+         hive's order is the card's order here"
+    );
+}
+
+/// **No button while the hive is down** — and none while it is up with nothing
+/// running (#1306).
+///
+/// This is the view half of the same rule the fan-out obeys, asserted on the
+/// rendered card rather than on the model, because "the operator cannot press
+/// it" is a statement about the tree.
+///
+/// Falsification: drop `open_terminals_button`'s `count == 0` guard and the
+/// unreachable case grows a button.
+#[test]
+fn a_down_hive_has_no_open_terminals_button() {
+    let (mut m, _rx) = model();
+    assert!(
+        !button_ids(&card_of(&m)).contains(&"open-terminals".to_owned()),
+        "not even before the first poll"
+    );
+
+    m.update(Input::App(Msg::Status(Err(HiveError::Unreachable {
+        reason: "no socket — hive-c0re is not running".to_owned(),
+    }))));
+    assert!(
+        !button_ids(&card_of(&m)).contains(&"open-terminals".to_owned()),
+        "a hive that is down has no terminals to open"
+    );
+
+    m.update(status(vec![
+        AgentStatusRow {
+            name: "parked".to_owned(),
+            ..AgentStatusRow::default()
+        },
+        AgentStatusRow {
+            name: "stray".to_owned(),
+            ..AgentStatusRow::default()
+        },
+    ]));
+    assert!(
+        !button_ids(&card_of(&m)).contains(&"open-terminals".to_owned()),
+        "…and neither does a hive whose whole roster is stopped"
+    );
+
+    // One running agent brings it back, and pressing it launches exactly one.
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(terminal_roster()));
+    assert!(button_ids(&card_of(&m)).contains(&"open-terminals".to_owned()));
+}
+
+/// Three running, one stopped, each with the hive's own URL — the #1306
+/// fixture. `zeta` first so the grouped tests can reorder it.
+fn terminal_roster() -> Vec<AgentStatusRow> {
+    ["zeta", "alpha", "orphan", "parked"]
+        .into_iter()
+        .map(|name| AgentStatusRow {
+            name: name.to_owned(),
+            running: name != "parked",
+            url: Some(format!("https://hive.local/agent/{name}/")),
+            ..AgentStatusRow::default()
+        })
+        .collect()
+}
+
+/// Effects with their correlation tokens zeroed, so two clicks' *payloads* can
+/// be compared without the ids — which are distinct by design.
+fn strip_ids(effects: &[Effect]) -> Vec<Effect> {
+    effects
+        .iter()
+        .map(|e| match e.clone() {
+            Effect::RunCommand { argv, detached, .. } => Effect::RunCommand {
+                id: 0,
+                argv,
+                detached,
+            },
+            Effect::OpenUri { uri, .. } => Effect::OpenUri { id: 0, uri },
+            other => other,
+        })
+        .collect()
 }
 
 /// The panel's `dashboard` link opens the hive's own root, and only once the

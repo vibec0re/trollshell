@@ -1501,9 +1501,27 @@ mod tests {
         PendingApprovals::default()
     }
 
+    /// An agent the hive reports as not running — the other side of
+    /// [`crate::model::wants_terminal`].
+    fn stopped(name: &str) -> Agent {
+        agent(
+            name,
+            AgentStatusRow {
+                name: name.to_owned(),
+                ..AgentStatusRow::default()
+            },
+        )
+    }
+
     fn card_of(agents: Vec<Agent>) -> Node {
+        card_of_hive(&Hive::Up { agents })
+    }
+
+    /// The card for a hive in any state — what the "Open terminals" assertions
+    /// need, since three of the five states they cover are not `Up` at all.
+    fn card_of_hive(hive: &Hive) -> Node {
         super::card(
-            &Hive::Up { agents },
+            hive,
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
             &no_approvals(),
@@ -1597,11 +1615,11 @@ mod tests {
                 status.classes
             );
 
-            // …and it really is a second line: the row is a vertical stack of
-            // exactly the head row and that caption.
-            let row = find_class(&tree, "ts-agent-row").expect("the row renders");
-            let Node::Box { dir, children, .. } = &row else {
-                panic!("an agent row is a vertical stack, got {row:?}");
+            // …and it really is a second line: the row's body is a vertical
+            // stack of exactly the head row and that caption.
+            let body = row_body(&tree);
+            let Node::Box { dir, children, .. } = &body else {
+                panic!("an agent row's body is a vertical stack, got {body:?}");
             };
             assert_eq!(*dir, hytte_plugin::proto::Dir::Vertical);
             assert_eq!(children.len(), 2, "two lines, no unfold: {children:?}");
@@ -1618,6 +1636,10 @@ mod tests {
     ///
     /// Falsification: set the tooltip on `agent_row`'s `vstack` (or on line
     /// 2's `hrow`) and the row/line assertions red.
+    ///
+    /// Since #1282 item 2 the pill is a `Node::Button`, which is a vocabulary
+    /// node with **no** `tooltip` field at all — so the only place a row-level
+    /// legend could come back is the body, and that is what this reads.
     #[test]
     fn the_status_hover_is_on_the_text_not_on_the_row() {
         let long = format!(
@@ -1626,9 +1648,9 @@ mod tests {
         );
         let tree = card_of(vec![running("argus", &long)]);
 
-        let row = find_class(&tree, "ts-agent-row").expect("the row renders");
-        let Node::Box { tooltip, .. } = &row else {
-            panic!("an agent row is a vertical stack, got {row:?}")
+        let body = row_body(&tree);
+        let Node::Box { tooltip, .. } = &body else {
+            panic!("an agent row's body is a vertical stack, got {body:?}")
         };
         assert_eq!(*tooltip, None, "the row must not carry the status legend");
 
@@ -1655,10 +1677,15 @@ mod tests {
     /// [ (oO) Clauding...                                              ]
     /// ```
     ///
+    /// The pill **itself** is the third click target, and the outermost one
+    /// (#1282 item 2) — so the ids are `[row, stop, edit]` in tree order, the
+    /// row's own first.
+    ///
     /// Falsification: push a third child onto `agent_row`'s `vstack` and the
     /// line count reds; put the chevron, the pause button or any of the removed
     /// detail rows back and the button-id assertion reds; move the state glyph
-    /// back to line 1 and the last assertion does.
+    /// back to line 1 and the last assertion does; drop the row button and the
+    /// first id goes.
     #[test]
     fn a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons() {
         let mut a = running("argus", "Clauding…");
@@ -1667,15 +1694,26 @@ mod tests {
         let tree = card_of(vec![a]);
 
         let row = find_class(&tree, "ts-agent-row").expect("a row renders");
-        let Node::Box { children, .. } = &row else {
-            panic!("the row is a vertical Box, got {row:?}")
+        let body = row_body(&tree);
+        let Node::Box { children, .. } = &body else {
+            panic!("the row's body is a vertical Box, got {body:?}")
         };
         assert_eq!(children.len(), 2, "two lines, nothing else: {children:?}");
 
         assert_eq!(
             button_ids(&row),
+            vec![
+                "row:argus".to_owned(),
+                "stop:argus".to_owned(),
+                "edit:argus".to_owned()
+            ],
+            "the pill is itself a button, and it still carries exactly the \
+             mock's two controls, in her order"
+        );
+        assert_eq!(
+            button_ids(&body),
             vec!["stop:argus".to_owned(), "edit:argus".to_owned()],
-            "line 1 carries the mock's two controls, in her order"
+            "…and nothing else was added inside it"
         );
 
         // Line 1: identity + model. Line 2: the state glyph and the status.
@@ -1695,6 +1733,94 @@ mod tests {
         assert!(
             icon_hover(&status, super::Status::Running.icon()).is_some(),
             "her `(oO)` — the state glyph moved to line 2"
+        );
+    }
+
+    /// **"Open terminals" is on the card header only while there is something
+    /// to open** (#1306) — and "something" is a *running* agent, not a listed
+    /// one.
+    ///
+    /// The four silent states are the ones an operator meets most: a hive that
+    /// has not answered yet, one that is unreachable, one that is up with no
+    /// agents, and — the case the filter exists for — one that is up with a
+    /// full roster where nothing is running. None of them gets a button, and a
+    /// disabled button is deliberately not the answer: the card is dense
+    /// enough that a control which cannot be pressed is worse than no control.
+    ///
+    /// Falsification (run this round, red): make
+    /// `crate::model::wants_terminal` return `true` and the all-stopped case
+    /// grows a button; drop `open_terminals_button`'s `count == 0` guard and
+    /// all four do.
+    #[test]
+    fn open_terminals_appears_only_when_an_agent_is_running() {
+        for (what, hive) in [
+            ("connecting", Hive::Connecting),
+            (
+                "unreachable",
+                Hive::Unreachable {
+                    reason: "no socket".to_owned(),
+                },
+            ),
+            ("up, empty", Hive::Up { agents: Vec::new() }),
+            (
+                "up, all stopped",
+                Hive::Up {
+                    agents: vec![stopped("argus"), stopped("stray")],
+                },
+            ),
+        ] {
+            let tree = card_of_hive(&hive);
+            assert!(
+                !button_ids(&tree).contains(&ids::OPEN_TERMINALS.to_owned()),
+                "{what}: nothing is running, so there is nothing to open — {:?}",
+                button_ids(&tree)
+            );
+        }
+
+        let tree = card_of(vec![stopped("stray"), running("argus", "Clauding…")]);
+        assert!(
+            button_ids(&tree).contains(&ids::OPEN_TERMINALS.to_owned()),
+            "one running agent is enough: {:?}",
+            button_ids(&tree)
+        );
+    }
+
+    /// The hover **says the number**, and says what happens on a desktop with
+    /// no companion window — #1306 asks for the tab count out loud, because a
+    /// press that opens six browser tabs should not be a surprise.
+    ///
+    /// The count is `terminal_targets`', i.e. the same one the fan-out walks,
+    /// which is what makes "the button cannot say 3 and open 4" a fact about
+    /// the code rather than a claim in a comment.
+    ///
+    /// Falsification: count `hive.agents()` instead of the targets and the
+    /// three-running-of-five case reads `5`.
+    #[test]
+    fn the_open_terminals_hover_names_the_count_and_the_browser_fallback() {
+        let tree = card_of(vec![
+            running("argus", "Clauding…"),
+            stopped("stray"),
+            running("nixos-choom", "idle"),
+            stopped("parked"),
+            running("trollshell-choom", "reviewing"),
+        ]);
+        let hover = icon_hover(&tree, "utilities-terminal-symbolic").expect("the button renders");
+        assert!(
+            hover.contains("each of the 3 running agents"),
+            "the hover must name how many windows a press opens: {hover}"
+        );
+        assert!(
+            hover.contains("3 browser tabs"),
+            "…and how many tabs it opens instead without the window: {hover}"
+        );
+
+        // One is its own sentence — "each of the 1 running agents" is not
+        // English, and this is the case a naive `format!` gets wrong.
+        let one = card_of(vec![running("argus", "Clauding…"), stopped("stray")]);
+        let hover = icon_hover(&one, "utilities-terminal-symbolic").expect("the button renders");
+        assert!(
+            hover.contains("the one running agent"),
+            "a single target reads as one: {hover}"
         );
     }
 
@@ -2297,6 +2423,7 @@ mod tests {
             ids::STOP,
             ids::GROUP,
             ids::OPEN,
+            ids::ROW,
         ] {
             assert!(prefix.ends_with(':'), "{prefix}");
         }
@@ -2306,12 +2433,44 @@ mod tests {
         // that starts with a prefix's own word (`open`), and dropping its dash
         // for a colon would make `strip_prefix(ids::OPEN)` hand the reducer
         // `"dashboard"` as an agent name.
-        for id in [super::BACK_ID, super::OVERVIEW_ID, ids::OPEN_DASHBOARD] {
+        for id in [
+            super::BACK_ID,
+            super::OVERVIEW_ID,
+            ids::OPEN_DASHBOARD,
+            ids::OPEN_TERMINALS,
+        ] {
             assert!(!id.contains(':'), "{id}");
             assert!(
                 id.strip_prefix(ids::OPEN).is_none(),
                 "{id} must not parse as an OPEN target"
             );
+            assert!(
+                id.strip_prefix(ids::ROW).is_none(),
+                "{id} must not parse as a ROW target"
+            );
+        }
+        // Every prefix must also be unambiguous against every *other* prefix,
+        // which is what `click`'s `strip_prefix` chain assumes and what a new
+        // one (`row:`, #1282) is the first real chance to break: an id is
+        // routed by the first arm that matches, so one prefix being a prefix of
+        // another would silently route a whole surface to the wrong place.
+        let prefixes = [
+            ids::EDIT,
+            ids::PAUSE,
+            ids::START,
+            ids::STOP,
+            ids::GROUP,
+            ids::OPEN,
+            ids::ROW,
+            ids::APPROVALS,
+        ];
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                assert!(
+                    i == j || !a.starts_with(b),
+                    "{a} starts with {b}: one of the two arms is unreachable"
+                );
+            }
         }
     }
 
@@ -2618,5 +2777,20 @@ mod tests {
     /// The first node carrying `class`.
     fn find_class(node: &Node, class: &str) -> Option<Node> {
         rows_with_class(node, class).into_iter().next()
+    }
+
+    /// The first agent pill's **body** — the vertical stack of its two lines.
+    ///
+    /// Since #1282 item 2 the pill itself is a `Node::Button` (the row opens
+    /// the agent's window), so every assertion about "the row is two lines"
+    /// goes one level in. This unwraps that level *and checks it*, so a row
+    /// that stopped being a button reds here rather than silently making the
+    /// layout assertions describe something else.
+    fn row_body(tree: &Node) -> Node {
+        let row = find_class(tree, "ts-agent-row").expect("a row renders");
+        let Node::Button { child, .. } = row else {
+            panic!("the agent pill is a Button since #1282, got {row:?}")
+        };
+        *child
     }
 }

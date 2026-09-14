@@ -52,7 +52,8 @@ use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{
-    DRAWER_MAX_WIDTH_WIDE, finish_page, finish_page_clamped, page_box, page_grid,
+    DRAWER_MAX_WIDTH_WIDE, finish_page, finish_page_clamped, fixed_width_label, page_box,
+    page_grid, slim_row,
 };
 use crate::components::markup;
 use crate::components::monitor_key::monitor_key;
@@ -635,6 +636,14 @@ fn build_stats_gpu_card() -> adw::PreferencesGroup {
     group
 }
 
+/// Fixed natural width (in characters) of a Top-apps row's title label and
+/// the expander's own collapsed-summary label — see [`fixed_width_label`]
+/// and this module's #1302 fix-round-2 notes.
+const TOP_APPS_TITLE_CHARS: i32 = 20;
+/// Fixed natural width (in characters) of a Top-apps row's "N processes"
+/// subtitle — short by construction, but bounded on the same principle.
+const TOP_APPS_SUBTITLE_CHARS: i32 = 14;
+
 /// A collapsible "Top apps" list (CPU or RAM) bound to an [`app_usage`] signal.
 /// `value` formats each row's right-hand value. Mirrors
 /// [`build_live_disk_expander`]'s drain-and-rebuild pattern.
@@ -645,24 +654,44 @@ fn build_stats_gpu_card() -> adw::PreferencesGroup {
 /// off so an adversarial scope id can't inject Pango markup (cf. #30).
 ///
 /// The "System" bucket (all non-app-scope PIDs) gets a `computer-symbolic` icon.
+///
+/// **#1302 fix round 2**: the collapsed summary used to be `AdwExpanderRow`'s
+/// own `subtitle` — a hidden, unboundable-width label (see
+/// `components::format::truncate_for_row`'s doc for the measured proof that
+/// `title-lines`/`subtitle-lines` don't fix this). It's now a
+/// [`fixed_width_label`] added as a suffix (the same public extension point
+/// `notifications.rs`'s mute switch already uses on this row type) — a
+/// visible placement change (the summary now sits beside the chevron rather
+/// than below the title) traded for a natural width that genuinely does not
+/// depend on the name.
 fn build_top_apps_expander(
     title: &str,
     signal: impl Signal<Item = Vec<ProcSample>> + 'static,
     value: fn(&ProcSample) -> String,
 ) -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title(title).build();
-    // The child rows below have had markup off since #30, but the expander's
-    // *own* collapsed subtitle is built from the same untrusted display name
-    // and was left unguarded (#753).
     markup::plain_text(&expander);
     expander.set_expanded(false);
+
+    let summary = fixed_width_label(TOP_APPS_TITLE_CHARS);
+    summary.add_css_class("dim-label");
+    // `fixed_width_label` defaults to `hexpand(true)` + `xalign(0.0)` — right
+    // for a title column that should fill the row, wrong for a suffix: two
+    // hexpanding children split the header's spare space, leaving the text
+    // starting mid-row with a gap before the chevron (measured: title x14,
+    // summary x263, chevron x590 in a 620px header — round 3 review). A
+    // suffix should hug the chevron instead.
+    summary.set_hexpand(false);
+    summary.set_xalign(1.0);
+    summary.set_halign(gtk::Align::End);
+    expander.add_suffix(&summary);
 
     // Metadata cache: app-id → AppMeta (None = no desktop file found).
     // Lives for the lifetime of this expander's bind closure.
     let meta_cache: Rc<RefCell<HashMap<String, Option<AppMeta>>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let rows_track: Rc<RefCell<Vec<gtk::ListBoxRow>>> = Rc::new(RefCell::new(Vec::new()));
     // One-shot guard: collapse the expander the first time rows actually arrive.
     // We must not call set_expanded(false) on every tick — that would fight the
     // user's manual expand/collapse.  The build-time set_expanded(false) above
@@ -670,9 +699,17 @@ fn build_top_apps_expander(
     let collapsed_once: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let rows_for_bind = rows_track.clone();
     let collapsed_once_for_bind = collapsed_once.clone();
+    // `summary` is a *different* widget than the closure's own `expander`
+    // parameter — the sanctioned capture shape `nix/lint-bind-pins.py`
+    // documents (cf. `panels/connections.rs`'s `bind_connections_group`
+    // capturing its second `other_expander` widget the same way). `summary`
+    // is already owned by `expander`'s widget tree via `add_suffix`, so this
+    // clone doesn't change its lifetime.
+    let summary_for_bind = summary.clone();
     bind(signal, &expander, move |expander, list| {
         rebuild_top_apps(
             expander,
+            &summary_for_bind,
             &rows_for_bind,
             &meta_cache,
             &collapsed_once_for_bind,
@@ -686,7 +723,7 @@ fn build_top_apps_expander(
 
 /// One rebuild pass of a "Top apps" expander: tear down whatever the previous
 /// pass left in `rows_track`, refresh the collapsed summary, and rebuild one
-/// [`adw::ActionRow`] per entry of `list`.
+/// slim row (see [`slim_row`]) per entry of `list`.
 ///
 /// A free function taking its two cells, the one-shot `collapsed_once` guard
 /// and the `value` formatter explicitly, mirroring `panels/connections.rs`'s
@@ -711,7 +748,8 @@ fn build_top_apps_expander(
 /// `top_apps_binding_does_not_pin_expander` test is the regression guard.
 fn rebuild_top_apps(
     expander: &adw::ExpanderRow,
-    rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    summary: &gtk::Label,
+    rows_track: &Rc<RefCell<Vec<gtk::ListBoxRow>>>,
     meta_cache: &Rc<RefCell<HashMap<String, Option<AppMeta>>>>,
     collapsed_once: &Rc<Cell<bool>>,
     value: fn(&ProcSample) -> String,
@@ -742,21 +780,32 @@ fn rebuild_top_apps(
             format!("{name} \u{00b7} {}", value(s))
         },
     );
-    expander.set_subtitle(&subtitle);
+    // #1302 fix round 2: `summary`'s natural width is fixed at construction
+    // ([`fixed_width_label`]) regardless of what text lands here — the
+    // heaviest app's name can be any length without the expander (and so the
+    // drawer) following it. The full (untruncated) summary still goes in the
+    // tooltip.
+    summary.set_text(&subtitle);
+    summary.set_tooltip_text(Some(&subtitle));
 
     let mut new_rows = Vec::with_capacity(list.len());
     for s in list {
-        let row = adw::ActionRow::builder().activatable(false).build();
-        // Markup off: scope ids are untrusted — adversarial names could
-        // otherwise inject Pango markup into the title (cf. #30).
-        markup::plain_text(&row);
+        let slim = slim_row(TOP_APPS_TITLE_CHARS, TOP_APPS_SUBTITLE_CHARS);
         // Resolve first, set second: an argument-position `RefMut` is a
         // temporary of the whole statement, so inlining this would hold
-        // `meta_cache` borrowed across `set_title` (#643).
+        // `meta_cache` borrowed across `set_text` (#643).
         let title = sample_display_name(s, &mut meta_cache.borrow_mut());
-        row.set_title(&title);
+        // `gtk::Label::set_text` never interprets markup (unlike
+        // `AdwActionRow::set_title`, which needed `markup::plain_text` —
+        // #30/#753 don't apply to a bare `set_text` label). The row's own
+        // natural width is fixed by `slim_row`'s title label
+        // ([`fixed_width_label`]), independent of `title`'s length (#1302
+        // fix round 2); the tooltip still carries the full name.
+        slim.title.set_text(&title);
+        slim.row.set_tooltip_text(Some(&title));
         if s.procs > 1 {
-            row.set_subtitle(&format!("{} processes", s.procs));
+            slim.subtitle.set_text(&format!("{} processes", s.procs));
+            slim.subtitle.set_visible(true);
         }
 
         // Prefix icon: cached from the app-id, or sensible fallbacks.
@@ -773,13 +822,14 @@ fn rebuild_top_apps(
         let img = gtk::Image::from_gicon(&icon);
         img.set_icon_size(gtk::IconSize::Normal);
         img.set_valign(gtk::Align::Center);
-        row.add_prefix(&img);
+        img.add_css_class("icon");
+        slim.header.prepend(&img);
 
         let label = gtk::Label::new(Some(&value(s)));
         label.set_valign(gtk::Align::Center);
-        row.add_suffix(&label);
-        expander.add_row(&row);
-        new_rows.push(row);
+        slim.suffixes.append(&label);
+        expander.add_row(&slim.row);
+        new_rows.push(slim.row);
     }
     *rows_track.borrow_mut() = new_rows;
 
@@ -1192,8 +1242,42 @@ fn build_live_processes_row() -> adw::ActionRow {
     row
 }
 
-fn build_live_gpu_row() -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title("GPU").build();
+/// Fixed natural width (in characters) of the GPU row's title/subtitle — see
+/// [`fixed_width_label`] and this module's #1302 fix-round-2 notes. The
+/// title is the fixed literal "GPU" and could take any small cap; the
+/// subtitle is the driver-reported device name.
+const GPU_TITLE_CHARS: i32 = 6;
+const GPU_SUBTITLE_CHARS: i32 = 20;
+
+/// The GPU row's static shape — everything [`build_live_gpu_row`] builds
+/// except the `bind(sensors::gpu(), …)` calls, which need a registered
+/// `sensors` service. Extracted so the colocated `#[gtk::test]` can drive the
+/// real production row construction (constants, `slim_row` call, suffix
+/// widget) without a registry — the same reasoning
+/// `notifications.rs`'s `build_history_app_row_shell` extraction documents
+/// (round 3 review, MED: a test that reconstructs its own
+/// `fixed_width_label`/`slim_row` call instead of going through the
+/// production builder stays green when production regresses).
+///
+/// Returns the row, the subtitle label (bind target for the device name) and
+/// the suffix label (bind target for temp/load).
+fn build_gpu_row_shell() -> (gtk::ListBoxRow, gtk::Label, gtk::Label) {
+    let slim = slim_row(GPU_TITLE_CHARS, GPU_SUBTITLE_CHARS);
+    slim.title.set_text("GPU");
+
+    let suffix = gtk::Label::new(None);
+    suffix.set_valign(gtk::Align::Center);
+    slim.suffixes.append(&suffix);
+
+    (slim.row, slim.subtitle, suffix)
+}
+
+/// **#1302 fix round 2**: rebuilt on [`slim_row`] (via [`build_gpu_row_shell`])
+/// rather than `AdwActionRow` — see that function's doc and
+/// `components::format::truncate_for_row`'s for why `subtitle_lines(1)` alone
+/// didn't bound this row's natural width.
+fn build_live_gpu_row() -> gtk::ListBoxRow {
+    let (row, subtitle, suffix) = build_gpu_row_shell();
 
     // Hide when no GPU detected.
     bind(
@@ -1207,12 +1291,10 @@ fn build_live_gpu_row() -> adw::ActionRow {
             Some(state) => state.name.clone(),
             None => String::new(),
         }),
-        &row,
-        |r, t| r.set_subtitle(&t),
+        &subtitle,
+        apply_gpu_name_subtitle,
     );
 
-    let suffix = gtk::Label::new(None);
-    suffix.set_valign(gtk::Align::Center);
     bind(
         sensors::gpu().map(|g| match g {
             Some(state) => match state.temperature_celsius {
@@ -1230,10 +1312,53 @@ fn build_live_gpu_row() -> adw::ActionRow {
             label.set_visible(!txt.is_empty());
         },
     );
-    row.add_suffix(&suffix);
 
     row
 }
+
+/// Set the GPU row's subtitle label (and mirroring tooltip) from the device
+/// `name`. Extracted out of [`build_live_gpu_row`]'s `bind` closure — a plain
+/// `fn` rather than a closure, so the colocated `#[gtk::test]` can drive it
+/// directly without a registered `sensors` service (#1302).
+///
+/// `label`'s own natural width is fixed at construction
+/// ([`fixed_width_label`], via [`slim_row`]) regardless of what text lands
+/// here — the driver-reported device name can be any length without the row
+/// (and so the drawer) following it. `name` is owned rather than `&str`
+/// because `bind`'s `apply: Fn(&W, S::Item)` (`hytte-reactive/src/bind.rs:36`)
+/// takes the signal's `String` item by value — an inline closure isn't
+/// linted for this, but a named `fn` with the same signature is (cf.
+/// `overlays/prompt.rs`'s `show_prompt`).
+#[allow(clippy::needless_pass_by_value)]
+fn apply_gpu_name_subtitle(label: &gtk::Label, name: String) {
+    label.set_text(&name);
+    label.set_visible(!name.is_empty());
+    label.set_tooltip_text(if name.is_empty() { None } else { Some(&name) });
+}
+
+/// Fixed natural width (in characters) of a disk-mount row's title/subtitle
+/// — see [`fixed_width_label`] and this module's #1302 fix-round-2 notes.
+/// The subtitle is never populated (no per-mount subtitle content today) but
+/// still gets a cap, on the same principle as [`FAILED_UNIT_SUBTITLE_CHARS`].
+///
+/// **Round 3 review, HIGH**: 28 was chosen against the mount path's length,
+/// not the drawer's budget — with the value suffix (then unbounded) it
+/// pinned the Disks page at a permanent 594px against a 618px clamp (up from
+/// a pre-#1302 375px for an ordinary mount). The budget is the drawer floor,
+/// `scale(360)` (327px at the test font): with [`DISK_VALUE_CHARS`] now also
+/// fixed-width, 10 chars is what keeps the page's `#[gtk::test]`-asserted
+/// `page_natural_width <= scale(360)` — enough for `/`, `/home`, `/boot/efi`;
+/// a longer bind-mount path ellipsises, same as every other capped field.
+const DISK_MOUNT_TITLE_CHARS: i32 = 8;
+const DISK_MOUNT_SUBTITLE_CHARS: i32 = 20;
+/// Fixed natural width (in characters) of a disk-mount row's usage value —
+/// round 3 review, HIGH (LOW-3 in the original): the value, not the path, is
+/// the field that actually changes per tick (`fmt_bytes`'s output length
+/// grows with the number — `45.2 GiB / 100.0 GiB (45%)`, the review's own
+/// realistic example, is 26 characters; `fmt_bytes` has no unit above GiB, so
+/// even a multi-TB disk stays in the low tens of characters). Right-aligned,
+/// non-expanding — a value column, not a title.
+const DISK_VALUE_CHARS: i32 = 8;
 
 fn build_live_disk_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("Disk").build();
@@ -1246,38 +1371,62 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
     reactive_list(
         &expander,
         sensors::disk().map(|d| d.mounts),
-        |m: &sensors::DiskMount| {
-            let row = adw::ActionRow::builder()
-                .title(&m.path)
-                .activatable(false)
-                .build();
-            // A mount path is whatever the filesystem is mounted at, `&`
-            // included (#753).
-            markup::plain_text(&row);
-            let frac = if m.total_bytes > 0 {
-                cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)
-            } else {
-                0.0
-            };
-            let pct = frac * 100.0;
-            let label = gtk::Label::new(Some(&format!(
-                "{} / {} ({pct:.0}%)",
-                fmt_bytes(m.used_bytes),
-                fmt_bytes(m.total_bytes),
-            )));
-            label.set_valign(gtk::Align::Center);
-            row.add_suffix(&label);
-            let bar = gtk::ProgressBar::new();
-            bar.add_css_class("ts-stat-progress");
-            bar.set_valign(gtk::Align::Center);
-            bar.set_fraction(frac.clamp(0.0, 1.0));
-            row.add_suffix(&bar);
-            row
-        },
-        None::<fn() -> adw::ActionRow>,
+        build_disk_mount_row,
+        None::<fn() -> gtk::ListBoxRow>,
     );
 
     expander
+}
+
+/// One row of the disk-mounts list. Extracted from [`build_live_disk_expander`]
+/// (byte-identical body, modulo the closure capture becoming a parameter) so
+/// the colocated `#[gtk::test]` can build a row directly, the same reasoning
+/// [`rebuild_top_apps`] documents for its own extraction.
+///
+/// **#1302 fix round 2**: rebuilt on [`slim_row`] rather than `AdwActionRow`
+/// — see that function's doc and `components::format::truncate_for_row`'s for
+/// why `title_lines(1)` alone didn't bound this row's natural width.
+fn build_disk_mount_row(m: &sensors::DiskMount) -> gtk::ListBoxRow {
+    let slim = slim_row(DISK_MOUNT_TITLE_CHARS, DISK_MOUNT_SUBTITLE_CHARS);
+    // `gtk::Label::set_text` never interprets markup — unlike
+    // `AdwActionRow::set_title`, which needed `markup::plain_text` (#753)
+    // for exactly this kind of free-form text (a mount path, `&` included).
+    slim.title.set_text(&m.path);
+    // The row's own natural width is fixed by `slim_row`'s title label
+    // ([`fixed_width_label`]), independent of the path's length (#1302 fix
+    // round 2); the tooltip still carries the full path.
+    slim.row.set_tooltip_text(Some(&m.path));
+    let frac = if m.total_bytes > 0 {
+        cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)
+    } else {
+        0.0
+    };
+    let pct = frac * 100.0;
+    let usage_text = format!(
+        "{} / {} ({pct:.0}%)",
+        fmt_bytes(m.used_bytes),
+        fmt_bytes(m.total_bytes),
+    );
+    // The usage string is what actually changes per tick, not the mount
+    // path — round 3 review, HIGH (LOW-3 in the original): an unbounded
+    // value label let the page keep moving as the byte counts crossed a
+    // digit (`1 B / 2 B (50%)` → 511px, `1.1 TiB / 2.1 TiB (53%)` → 616px,
+    // same mount). Fixed-width, right-aligned, non-expanding — a value
+    // column, not a title — with the full string in a tooltip.
+    let label = fixed_width_label(DISK_VALUE_CHARS);
+    label.set_text(&usage_text);
+    label.set_hexpand(false);
+    label.set_xalign(1.0);
+    label.set_halign(gtk::Align::End);
+    label.set_valign(gtk::Align::Center);
+    label.set_tooltip_text(Some(&usage_text));
+    slim.suffixes.append(&label);
+    let bar = gtk::ProgressBar::new();
+    bar.add_css_class("ts-stat-progress");
+    bar.set_valign(gtk::Align::Center);
+    bar.set_fraction(frac.clamp(0.0, 1.0));
+    slim.suffixes.append(&bar);
+    slim.row
 }
 
 /// Disk I/O throughput history row, mirroring the network traffic row
@@ -1795,6 +1944,15 @@ fn build_stats_services_card() -> gtk::Box {
     card
 }
 
+/// Fixed natural width (in characters) of a failed-unit row's title/subtitle
+/// — see [`fixed_width_label`] and this module's #1302 fix-round-2 notes.
+/// Wider than [`TOP_APPS_TITLE_CHARS`] because unit names run long
+/// (`dbus-org.freedesktop.resolve1.service`-length is ordinary, per the
+/// original triage) — measured at 311px against the `scale(360)` floor, so
+/// no narrower than this (round 3 review: already under the floor).
+const FAILED_UNIT_TITLE_CHARS: i32 = 30;
+const FAILED_UNIT_SUBTITLE_CHARS: i32 = 34;
+
 /// Failed systemd units — the first half of the Services card, flattened per
 /// #311: no group description and no `Failed units` expander wrapper (both
 /// duplicated the count already shown on the bar chip, and the expander hid the
@@ -1809,33 +1967,49 @@ fn build_failed_units_group() -> adw::PreferencesGroup {
     reactive_list(
         &group,
         systemd::failed_units(),
-        |unit: &systemd::FailedUnit| {
-            let row = adw::ActionRow::builder()
-                .title(&unit.name)
-                .activatable(false)
-                .build();
-            // Unit names and, especially, free-form `Description=` text are
-            // arbitrary — an `&` there would blank the row this flyout exists
-            // to show (#753).
-            markup::plain_text(&row);
-            let subtitle = if unit.description.is_empty() {
-                unit.sub_state.clone()
-            } else {
-                unit.description.clone()
-            };
-            row.set_subtitle(&subtitle);
-
-            let pill = gtk::Label::new(Some("failed"));
-            pill.set_valign(gtk::Align::Center);
-            pill.add_css_class("ts-pill-error");
-            row.add_suffix(&pill);
-
-            row
-        },
-        None::<fn() -> adw::ActionRow>,
+        build_failed_unit_row,
+        None::<fn() -> gtk::ListBoxRow>,
     );
 
     group
+}
+
+/// One row of the failed-units list. Extracted from
+/// [`build_failed_units_group`] (byte-identical body, modulo the closure
+/// capture becoming a parameter) so the colocated `#[gtk::test]` can build a
+/// row directly, the same reasoning [`rebuild_top_apps`] documents for its own
+/// extraction.
+///
+/// **#1302 fix round 2**: rebuilt on [`slim_row`] rather than `AdwActionRow`
+/// — see that function's doc and `components::format::truncate_for_row`'s for
+/// why `title_lines(1)` alone didn't bound this row's natural width. The
+/// description/`sub_state` subtitle is free-form text too (#753's own
+/// comment already flagged it), so it gets the same fixed-width treatment as
+/// the title rather than being left the one unbounded field on the row.
+fn build_failed_unit_row(unit: &systemd::FailedUnit) -> gtk::ListBoxRow {
+    let slim = slim_row(FAILED_UNIT_TITLE_CHARS, FAILED_UNIT_SUBTITLE_CHARS);
+    // `gtk::Label::set_text` never interprets markup — unlike
+    // `AdwActionRow::set_title`/`set_subtitle`, which needed
+    // `markup::plain_text` (#753) for exactly this free-form text.
+    slim.title.set_text(&unit.name);
+    let subtitle = if unit.description.is_empty() {
+        &unit.sub_state
+    } else {
+        &unit.description
+    };
+    slim.subtitle.set_text(subtitle);
+    slim.subtitle.set_visible(true);
+    // The row's own natural width is fixed by `slim_row`'s labels
+    // ([`fixed_width_label`]), independent of either field's length (#1302
+    // fix round 2); the tooltip still carries the full unit name.
+    slim.row.set_tooltip_text(Some(&unit.name));
+
+    let pill = gtk::Label::new(Some("failed"));
+    pill.set_valign(gtk::Align::Center);
+    pill.add_css_class("ts-pill-error");
+    slim.suffixes.append(&pill);
+
+    slim.row
 }
 
 /// Flapping supervised tasks — the shell's own half of the Services card
@@ -2512,7 +2686,7 @@ mod reentrancy_tests {
 
     use super::{AppMeta, rebuild_top_apps};
 
-    type Rows = Rc<RefCell<Vec<adw::ActionRow>>>;
+    type Rows = Rc<RefCell<Vec<gtk::ListBoxRow>>>;
     type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
 
     thread_local! {
@@ -2575,14 +2749,22 @@ mod reentrancy_tests {
             .collect()
     }
 
-    /// The expander and the two cells `build_top_apps_expander` builds,
-    /// exactly as it builds them, plus the one-shot collapse guard. No
-    /// registry, no `App`, no `/proc` poller: every piece of state
-    /// `rebuild_top_apps` touches now arrives through its own parameters.
-    fn fresh() -> (adw::ExpanderRow, Rows, MetaCache, Rc<Cell<bool>>) {
+    /// The expander, the summary label and the two cells
+    /// `build_top_apps_expander` builds, exactly as it builds them, plus the
+    /// one-shot collapse guard. No registry, no `App`, no `/proc` poller:
+    /// every piece of state `rebuild_top_apps` touches now arrives through
+    /// its own parameters.
+    fn fresh() -> (
+        adw::ExpanderRow,
+        gtk::Label,
+        Rows,
+        MetaCache,
+        Rc<Cell<bool>>,
+    ) {
         adw::init().expect("libadwaita init");
         (
             adw::ExpanderRow::builder().title("Top apps").build(),
+            super::fixed_width_label(super::TOP_APPS_TITLE_CHARS),
             Rc::new(RefCell::new(Vec::new())),
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(Cell::new(false)),
@@ -2607,9 +2789,11 @@ mod reentrancy_tests {
     /// the full take/remove/rebuild path.
     #[gtk::test]
     fn rebuild_top_apps_tolerates_a_reentrant_rebuild_from_a_removed_row_destroy() {
-        let (expander, rows, meta, collapsed) = fresh();
+        let (expander, summary, rows, meta, collapsed) = fresh();
         let seed = samples(2);
-        rebuild_top_apps(&expander, &rows, &meta, &collapsed, cpu_value, &seed);
+        rebuild_top_apps(
+            &expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed,
+        );
         assert_eq!(
             rows.borrow().len(),
             2,
@@ -2624,6 +2808,7 @@ mod reentrancy_tests {
         let row2 = rows.borrow()[1].clone();
         {
             let expander = expander.clone();
+            let summary = summary.clone();
             let rows = Rc::clone(&rows);
             let meta = Rc::clone(&meta);
             let collapsed = Rc::clone(&collapsed);
@@ -2636,7 +2821,9 @@ mod reentrancy_tests {
                     return;
                 }
                 fired_inside.set(Some(in_outer.get()));
-                rebuild_top_apps(&expander, &rows, &meta, &collapsed, cpu_value, &seed);
+                rebuild_top_apps(
+                    &expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed,
+                );
             });
         }
         // Drop our clone before the removing pass: while it lives the row has
@@ -2645,7 +2832,9 @@ mod reentrancy_tests {
         drop(row2);
 
         in_outer.set(true);
-        rebuild_top_apps(&expander, &rows, &meta, &collapsed, cpu_value, &seed);
+        rebuild_top_apps(
+            &expander, &summary, &rows, &meta, &collapsed, cpu_value, &seed,
+        );
         in_outer.set(false);
 
         assert_eq!(
@@ -2677,12 +2866,13 @@ mod reentrancy_tests {
     /// `all()` trivially.
     #[gtk::test]
     fn top_apps_summary_releases_meta_cache_before_calling_value() {
-        let (expander, rows, meta, collapsed) = fresh();
+        let (expander, summary, rows, meta, collapsed) = fresh();
         PROBE_SAW.with_borrow_mut(Vec::clear);
         PROBE_CACHE.with_borrow_mut(|slot| *slot = Some(Rc::clone(&meta)));
 
         rebuild_top_apps(
             &expander,
+            &summary,
             &rows,
             &meta,
             &collapsed,
@@ -2707,6 +2897,341 @@ mod reentrancy_tests {
              a `false` means the summary's `RefMut` was still live across `value(s)` (#832) — in \
              production that is a `BorrowMutError` through a glib callback, i.e. a process abort"
         );
+    }
+}
+
+/// #1302 fix round 2: the real invariant a fix must pin is at the row/page
+/// level, not "growth stops at a cap" — `natural_width(name = 300 chars) ==
+/// natural_width(name = 5 chars)`, exactly, for the widget the name actually
+/// lands in. Round 1's `title_lines`/`subtitle_lines` didn't do that (measured
+/// proof in `components::format::truncate_for_row`'s doc), and neither does
+/// `truncate_for_row` alone (bounded, not constant — a 60-char capped title
+/// still measures wider than a 5-char one). What actually pins the natural
+/// width to a **constant**, independent of content, is
+/// `components::layout::fixed_width_label`: `set_width_chars(n)` *and*
+/// `set_max_width_chars(n)` at the same `n`, which — because GTK enforces
+/// `natural >= minimum` — forces natural width to exactly `n` characters
+/// regardless of whether the actual text is 2 characters or 300. Each test
+/// below measures a name-carrying widget at 300 characters and at 5, and
+/// asserts the two are **equal** — the literal #1302 ask — plus that the
+/// tooltip still carries the full, untruncated text.
+///
+/// Needs a real display server (the rows have to be constructible and
+/// actually laid out for `measure` to mean anything), hence the
+/// `system-tests` gate, like the rest of this file's GTK tests.
+#[cfg(all(test, feature = "system-tests"))]
+mod width_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+    use hytte::services::sensors::DiskMount;
+    use hytte::services::systemd::FailedUnit;
+
+    use super::{
+        AppMeta, apply_gpu_name_subtitle, build_disk_mount_row, build_failed_unit_row,
+        build_gpu_row_shell, build_top_apps_expander, rebuild_top_apps, single_card_page,
+    };
+
+    type Rows = Rc<RefCell<Vec<gtk::ListBoxRow>>>;
+    type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
+
+    /// Standing in for "arbitrarily long".
+    const LONG: usize = 300;
+    /// The short comparison point #1302 itself names.
+    const SHORT: &str = "abcde";
+
+    /// Natural (preferred) width of `w`, per this file's other `.measure(...)`
+    /// call sites (e.g. `led_panel_layout_tests`).
+    fn natural_width(w: &impl IsA<gtk::Widget>) -> i32 {
+        w.measure(gtk::Orientation::Horizontal, -1).1
+    }
+
+    /// Run the GTK main loop until it has nothing left to dispatch — needed
+    /// after a `Mutable::set` to let `bind`'s apply-loop actually run before
+    /// measuring (`bind` polls from a `glib::MainContext` task).
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// The drawer floor (`modal.rs::build_positioner`'s `scale(360)` minimum
+    /// size request) — round 3 review, HIGH: a per-tick page must sit *at*
+    /// this, not just at some name-independent constant above it. Asserted
+    /// against `single_card_page`'s own output, the same wrapper every
+    /// production per-card flyout uses.
+    fn assert_at_or_under_the_floor(nat: i32, page: &str) {
+        let floor = crate::scale::scale(360);
+        assert!(
+            nat <= floor,
+            "{page} must sit at or under the drawer floor (scale(360) = {floor}px), got {nat}px"
+        );
+    }
+
+    /// One sample with the given single-token, space-free `name` and no
+    /// app-id — mirrors `reentrancy_tests::samples`' `app_id: None` so
+    /// `resolve_app_meta` never touches the host's installed desktop files.
+    fn proc_sample(name: &str) -> ProcSample {
+        ProcSample {
+            name: name.to_string(),
+            app_id: None,
+            cpu_frac: 0.5,
+            mem_bytes: 1024,
+            procs: 1,
+        }
+    }
+
+    /// The formatter `build_stats_cpu_card` passes to its "Top apps · CPU"
+    /// expander — copied verbatim from `reentrancy_tests::cpu_value` (private
+    /// to that module) so this module drives a real production `value` too.
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// **The #1302 fix round 2, pinned — at the page, through the real
+    /// builder**: round 3 review, MED — the previous version of this test
+    /// built its own `fixed_width_label`/`rebuild_top_apps` call instead of
+    /// [`build_top_apps_expander`], so reverting production's summary label
+    /// to `gtk::Label::new(None)` left it green. This one drives the actual
+    /// production entry point (the same one `build_stats_cpu_card`/
+    /// `build_stats_memory_card` call) through a `Mutable` signal + a main-
+    /// context pump, wrapped in [`single_card_page`] — the same wrapper
+    /// `panel_stats_cpu`/`_memory` use — so both the row *and* the collapsed
+    /// summary suffix are whatever production actually built.
+    ///
+    /// Asserts the #1302 invariant (a 300-char name renders the page at the
+    /// exact same width as a 5-char one) **and** the round-3 budget rule: the
+    /// page must sit at or under the drawer floor, not just at some
+    /// name-independent constant above it.
+    ///
+    /// Falsified two ways: (1) exactly the round-3-reviewer's production
+    /// mutation — `let summary = gtk::Label::new(None);` in
+    /// [`super::build_top_apps_expander`] instead of
+    /// `fixed_width_label(TOP_APPS_TITLE_CHARS)` — which the previous harness
+    /// let through as 37 passed; this one reds on the equality assertion
+    /// (measured `left: 2484 / right: 252` for the page); (2) dropping
+    /// `set_width_chars` from [`super::fixed_width_label`] (keeping
+    /// `max_width_chars`): measured `left: 320 / right: 243` — bounded, but
+    /// no longer equal.
+    #[gtk::test]
+    fn top_apps_page_ellipsises_a_long_name_and_sits_at_the_floor() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(LONG);
+
+        let samples: Mutable<Vec<ProcSample>> = Mutable::new(vec![proc_sample(&long)]);
+        let expander =
+            build_top_apps_expander("Top apps \u{00b7} RAM", samples.signal_cloned(), cpu_value);
+        pump();
+        let page = single_card_page(expander.upcast_ref());
+        let nat_long = natural_width(&page);
+
+        samples.set(vec![proc_sample(SHORT)]);
+        pump();
+        let nat_short = natural_width(&page);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char process name must render the Top-apps page at the exact same width as \
+             a 5-char one"
+        );
+        assert_at_or_under_the_floor(nat_long, "the Top-apps page");
+    }
+
+    /// The expander, the summary label and the two cells
+    /// `build_top_apps_expander` builds, exactly as `reentrancy_tests::fresh`
+    /// does. Used only for the tooltip check below — the width claim lives
+    /// entirely in the production-driven test above, per the round 3 review's
+    /// MED finding on the previous version of this harness.
+    fn fresh_expander() -> (
+        adw::ExpanderRow,
+        gtk::Label,
+        Rows,
+        MetaCache,
+        Rc<Cell<bool>>,
+    ) {
+        adw::init().expect("libadwaita init");
+        (
+            adw::ExpanderRow::builder().title("Top apps").build(),
+            super::fixed_width_label(super::TOP_APPS_TITLE_CHARS),
+            Rc::new(RefCell::new(Vec::new())),
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(Cell::new(false)),
+        )
+    }
+
+    /// The tooltip half of the #1302 fix: unlike the natural-width pinning
+    /// (production-driven above), `.set_tooltip_text(...)` is called
+    /// identically regardless of how the label was constructed, so driving it
+    /// through [`rebuild_top_apps`] directly proves the same thing a
+    /// production-driven version would.
+    #[gtk::test]
+    fn top_apps_row_and_summary_tooltips_carry_the_full_name() {
+        let (expander, summary, rows, meta, collapsed) = fresh_expander();
+        let long = "x".repeat(LONG);
+
+        rebuild_top_apps(
+            &expander,
+            &summary,
+            &rows,
+            &meta,
+            &collapsed,
+            cpu_value,
+            &[proc_sample(&long)],
+        );
+        let row_long = rows.borrow()[0].clone();
+
+        assert_eq!(
+            row_long.tooltip_text().as_deref(),
+            Some(long.as_str()),
+            "the row's tooltip must carry the full, untruncated name"
+        );
+        let summary_tooltip = summary
+            .tooltip_text()
+            .expect("the collapsed summary's tooltip must be set");
+        assert!(
+            summary_tooltip.contains(&long),
+            "the summary's tooltip must carry the full, untruncated text, got \
+             {summary_tooltip:?}"
+        );
+    }
+
+    /// **The #1302 fix round 2, pinned** for the Services card, at the page:
+    /// a 300-character failed-unit name must render the page at the exact
+    /// same width as a 5-character one, the tooltip must carry the full
+    /// name, and the page must sit at or under the drawer floor.
+    ///
+    /// Wraps [`build_failed_unit_row`] in an `AdwPreferencesGroup` — the same
+    /// container [`super::build_failed_units_group`] adds it to — via
+    /// [`single_card_page`], so the assertion is about the page a chip
+    /// actually opens, not the bare row.
+    ///
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`]: measured `left: 311 / right: 112` at
+    /// the page.
+    #[gtk::test]
+    fn failed_unit_page_ellipsises_a_long_name_and_sits_at_the_floor() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(LONG);
+        let unit = |name: &str| FailedUnit {
+            name: name.to_string(),
+            description: String::new(),
+            sub_state: "failed".to_string(),
+        };
+
+        let row_long = build_failed_unit_row(&unit(&long));
+        let group_long = adw::PreferencesGroup::new();
+        group_long.add(&row_long);
+        let page_long = single_card_page(group_long.upcast_ref());
+        let nat_long = natural_width(&page_long);
+
+        let row_short = build_failed_unit_row(&unit(SHORT));
+        let group_short = adw::PreferencesGroup::new();
+        group_short.add(&row_short);
+        let page_short = single_card_page(group_short.upcast_ref());
+        let nat_short = natural_width(&page_short);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char unit name must render the Services page at the exact same width as a \
+             5-char one"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert_at_or_under_the_floor(nat_long, "the Services page");
+    }
+
+    /// **The #1302 fix round 2, pinned** for the Disks card, at the page: a
+    /// 300-character mount path must render the page at the exact same width
+    /// as a 5-character one, the tooltip must carry the full path, and the
+    /// page must sit at or under the drawer floor even with a *realistic*
+    /// (not tiny) usage string in the value suffix — round 3 review, HIGH
+    /// (LOW-3 in the original): the value, not the path, is the field that
+    /// actually changes per tick, and was still an unbounded `gtk::Label`.
+    ///
+    /// Wraps [`build_disk_mount_row`] in an `AdwExpanderRow` titled "Disk" —
+    /// the same container [`super::build_live_disk_expander`] adds it to —
+    /// via [`single_card_page`].
+    ///
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`]: measured `left: 318 / right: 295` at
+    /// the page, with the realistic usage string in the value suffix.
+    #[gtk::test]
+    fn disk_mount_page_ellipsises_a_long_path_and_sits_at_the_floor() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(LONG);
+        // A realistic usage string, not `50 B / 100 B` — the review's own
+        // example, and the shape that actually varies tick to tick.
+        let mount = |path: &str| DiskMount {
+            path: path.to_string(),
+            total_bytes: 100 * 1_073_741_824,
+            used_bytes: 45 * 1_073_741_824,
+            free_bytes: 55 * 1_073_741_824,
+            usage: 0.45,
+        };
+
+        let row_long = build_disk_mount_row(&mount(&long));
+        let expander_long = adw::ExpanderRow::builder().title("Disk").build();
+        expander_long.add_row(&row_long);
+        let page_long = single_card_page(expander_long.upcast_ref());
+        let nat_long = natural_width(&page_long);
+
+        let row_short = build_disk_mount_row(&mount(SHORT));
+        let expander_short = adw::ExpanderRow::builder().title("Disk").build();
+        expander_short.add_row(&row_short);
+        let page_short = single_card_page(expander_short.upcast_ref());
+        let nat_short = natural_width(&page_short);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char mount path must render the Disks page at the exact same width as a \
+             5-char one, even with a realistic used/total usage string"
+        );
+        assert_eq!(row_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert_at_or_under_the_floor(nat_long, "the Disks page");
+    }
+
+    /// **The #1302 fix round 2, pinned** for the GPU card, at the page, and
+    /// through the real builder ([`build_gpu_row_shell`], the registry-free
+    /// half of [`super::build_live_gpu_row`] — round 3 review, MED, same
+    /// shape as the Top-apps fix above): a 300-character device name must
+    /// render the page at the exact same width as a 5-character one, the
+    /// tooltip must carry the full name, and the page must sit at or under
+    /// the drawer floor.
+    ///
+    /// Wraps the shell's row in an `AdwPreferencesGroup` — the same container
+    /// [`super::build_stats_gpu_card`] adds it to — via [`single_card_page`].
+    ///
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`]: measured `left: 174 / right: 68` at
+    /// the page.
+    #[gtk::test]
+    fn gpu_page_ellipsises_a_long_device_name_and_sits_at_the_floor() {
+        adw::init().expect("libadwaita init");
+        let long = "x".repeat(LONG);
+
+        let (row_long, subtitle_long, _suffix) = build_gpu_row_shell();
+        apply_gpu_name_subtitle(&subtitle_long, long.clone());
+        let group_long = adw::PreferencesGroup::new();
+        group_long.add(&row_long);
+        let page_long = single_card_page(group_long.upcast_ref());
+        let nat_long = natural_width(&page_long);
+
+        let (row_short, subtitle_short, _suffix) = build_gpu_row_shell();
+        apply_gpu_name_subtitle(&subtitle_short, SHORT.to_string());
+        let group_short = adw::PreferencesGroup::new();
+        group_short.add(&row_short);
+        let page_short = single_card_page(group_short.upcast_ref());
+        let nat_short = natural_width(&page_short);
+
+        assert_eq!(
+            nat_long, nat_short,
+            "a 300-char device name must render the GPU page at the exact same width as a \
+             5-char one"
+        );
+        assert_eq!(subtitle_long.tooltip_text().as_deref(), Some(long.as_str()));
+        assert_at_or_under_the_floor(nat_long, "the GPU page");
     }
 }
 

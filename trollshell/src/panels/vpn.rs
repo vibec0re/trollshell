@@ -24,7 +24,7 @@ use hytte::prelude::*;
 use hytte::services::vpn;
 use hytte::services::wifi;
 
-use crate::components::format::{fmt_bytes, humanize_since};
+use crate::components::format::{fmt_bytes, humanize_since, truncate_for_row};
 use crate::components::layout::{finish_page, page_box};
 use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
@@ -151,13 +151,18 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
     };
 
     let row = adw::ActionRow::builder()
-        .title(&profile.name)
+        .title(truncate_for_row(&profile.name))
         .subtitle(subtitle)
         .activatable(false)
         .build();
     // Profile names come from NetworkManager's connection store; markup is
     // never wanted here (#753).
     markup::plain_text(&row);
+    // A saved VPN profile's name is free text with no bound — capped (see
+    // `truncate_for_row`) rather than letting it push the whole drawer wider
+    // (#1302); `title_lines(1)` is a second line of defense.
+    row.set_title_lines(1);
+    row.set_tooltip_text(Some(&profile.name));
 
     let icon = gtk::Image::from_icon_name("network-vpn-symbolic");
     row.add_prefix(&icon);
@@ -309,7 +314,7 @@ fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
 /// `reactive_list`'s own #761/#771 regression test.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{bind_tunnel_groups, vpn};
+    use super::{bind_tunnel_groups, build_vpn_profile_row, vpn, wifi};
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
@@ -317,6 +322,47 @@ mod tests {
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
         while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// **The #1302 fix, pinned**: two saved-profile names both past
+    /// `truncate_for_row`'s cap, of different lengths, must render the row at
+    /// the exact same width — `title_lines(1)` alone does not bound
+    /// `AdwActionRow`'s natural width (see
+    /// `components::format::truncate_for_row`'s doc) — and the tooltip must
+    /// still carry the full name.
+    ///
+    /// Falsified by reverting the `truncate_for_row` call in
+    /// [`build_vpn_profile_row`] to the raw name: measured `left: 2519 /
+    /// right: 862`.
+    #[gtk::test]
+    fn vpn_profile_row_title_ellipsises_a_long_name() {
+        adw::init().expect("libadwaita init");
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
+        let profile = |name: &str| wifi::VpnProfile {
+            name: name.to_string(),
+            connection_path: "/org/freedesktop/NetworkManager/Settings/5".to_string(),
+            active: false,
+            active_connection_path: None,
+        };
+
+        let row_far = build_vpn_profile_row(&profile(&far_over));
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let row_over = build_vpn_profile_row(&profile(&over));
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_vpn_profile_row(&profile("abcde"));
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_far, nat_over,
+            "two over-the-cap profile names must render the row at the exact same width — \
+             growth must stop at the cap"
+        );
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char name must measure narrower"
+        );
+        assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 
     /// `bind_tunnel_groups` must not keep its `column` container alive by

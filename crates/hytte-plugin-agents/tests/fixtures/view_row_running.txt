@@ -46,7 +46,7 @@ Box {
                         name: "utilities-terminal-symbolic",
                         classes: [],
                         tooltip: Some(
-                            "open the terminal window for the one running agent, on the \"hive\" workspace when niri is on PATH (a browser tab if the companion window is not installed)",
+                            "open the terminal window for the one running agent (a browser tab if the companion window is not installed)",
                         ),
                     },
                 },

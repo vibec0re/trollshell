@@ -34,7 +34,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hytte_config::subsystem::Subsystem;
-use hytte_config::subsystem::env::EnvKnob;
 use serde::{Deserialize, Serialize};
 
 /// The subsystem's file stem: `~/.config/trollshell/agents.toml`.
@@ -66,7 +65,7 @@ pub const MAX_POLL_SECONDS: u64 = 3600;
 /// an operator sees when they first open their overlay, and it is parsed on
 /// every load — so a syntax error in it fails any test that loads the
 /// subsystem rather than surfacing in production.
-const DEFAULT_TOML: &str = r##"# trollshell — the hyperhive agents sidebar (issue #947).
+const DEFAULT_TOML: &str = r#"# trollshell — the hyperhive agents sidebar (issue #947).
 #
 # This file is the WHOLE desktop-side surface. Everything about a cage lives
 # in the hive; everything inside a cage lives in that agent's own config
@@ -87,25 +86,6 @@ socket = "/run/hyperhive/host.sock"
 # nothing regardless of this value. 1..=3600.
 poll_seconds = 2
 
-# Which niri workspace the agents' companion windows belong on (#1306).
-#
-# "Open terminals" focuses this workspace FIRST and then launches one window
-# per running agent, so they tile there as columns instead of landing wherever
-# the compositor happens to put them. It is a name, not an index: pair it with
-# a niri window rule that sends the windows there, or the focus is all you get.
-#
-#   workspace "hive" {}
-#   window-rule {
-#       match app-id=r#"^mov\.vibec0re\.trollshell\.AgentWindow\."#
-#       open-on-workspace "hive"
-#   }
-#
-# The two names MUST be the same string — see etc/niri/agent-windows.kdl for
-# the shipped snippet. Focusing needs `niri` on the plugin's PATH; without it
-# the windows still open, just not gathered.
-[window]
-workspace = "hive"
-
 # Per-agent display overrides. Each section names an agent EXACTLY as the hive
 # reports it; a section naming an unknown agent decorates nothing and is
 # warned, not an error. All three keys are optional.
@@ -119,7 +99,7 @@ workspace = "hive"
 # the grouping Annika asked for ("Maybe grouped by <multi-repo-project>").
 # An agent with no `project` falls into an "ungrouped" group rather than
 # vanishing, and with only one group the header is suppressed entirely.
-"##;
+"#;
 
 /// One agent's display overrides — the `[display.<name>]` table.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -134,80 +114,6 @@ pub struct Display {
     /// agent in the ungrouped bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-}
-
-/// The niri workspace the companion windows gather on when nothing says
-/// otherwise (#1306, @kaesaecracker: "make this like a dynamic workspace where
-/// all agents are tiled on").
-pub const DEFAULT_WORKSPACE: &str = "hive";
-
-/// What [`WindowConfig::workspace`] accepts, as a rejection line spells it.
-const WORKSPACE_ACCEPTS: &str =
-    "a niri workspace name: non-blank, no control characters, and not starting with `-`";
-
-/// The `[window]` table — where the companion windows go.
-///
-/// A table of one key rather than a bare `window_workspace`, because #1306's
-/// answer is the first of a family: where the window opens, and later how big
-/// and on which output. A table is the cheap place to put the second one.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct WindowConfig {
-    /// The niri workspace "Open terminals" focuses before it launches, and the
-    /// one a window rule should send the windows to.
-    ///
-    /// **A name, not an index.** niri's `focus-workspace` takes either, but an
-    /// index names a position that moves as workspaces come and go, and the
-    /// whole point is that this is a *named* place the window rule can also
-    /// address. The two spellings have to be the same string in two files, so
-    /// the name is the one that reads as a promise.
-    #[serde(default = "default_workspace")]
-    pub workspace: String,
-}
-
-impl Default for WindowConfig {
-    fn default() -> Self {
-        Self {
-            workspace: default_workspace(),
-        }
-    }
-}
-
-impl WindowConfig {
-    /// Whether `workspace` is a name this plugin will put in an argv.
-    ///
-    /// It travels as its own element of
-    /// `niri msg action focus-workspace <name>`, so the rule is an **argv**
-    /// rule, not a niri one: niri itself is happy with a name containing a
-    /// space (its kdl quotes it), and so is a `Vec<String>` the host spawns
-    /// without a shell. What it is not happy with is a name starting with
-    /// `-` — niri's own parser is `clap`, which would read it as a flag — nor
-    /// with a control character, which no kdl file can round-trip and which
-    /// would corrupt the journal line that quotes it.
-    ///
-    /// Blank is rejected for the ordinary reason: it is the shape a
-    /// half-finished edit leaves behind, and `focus-workspace ""` is not a
-    /// workspace.
-    fn workspace_is_usable(&self) -> bool {
-        let name = self.workspace.trim();
-        !name.is_empty() && !name.starts_with('-') && !name.chars().any(char::is_control)
-    }
-}
-
-fn default_workspace() -> String {
-    DEFAULT_WORKSPACE.to_owned()
-}
-
-/// A key with no deprecated environment variable behind it — the shape
-/// `hytte-plugin-stats` established (#1250): [`InvalidValue`] reads only
-/// `key` and `file_accepts`, never `var`, so the empty `var` is unreachable by
-/// construction rather than a placeholder.
-const fn knob(key: &'static str, accepts: &'static str) -> EnvKnob {
-    EnvKnob {
-        var: "",
-        key,
-        env_accepts: accepts,
-        file_accepts: accepts,
-    }
 }
 
 /// The leading icon a row shows when `[display.<name>].icon` says nothing.
@@ -258,9 +164,6 @@ pub struct AgentsConfig {
     /// Pinned by `an_empty_display_entry_is_dropped_and_a_populated_one_is_not`.
     #[serde(default)]
     pub display: BTreeMap<String, Display>,
-    /// Where the companion windows go (#1306).
-    #[serde(default)]
-    pub window: WindowConfig,
 }
 
 fn default_socket() -> String {
@@ -277,7 +180,6 @@ impl Default for AgentsConfig {
             socket: default_socket(),
             poll_seconds: DEFAULT_POLL_SECONDS,
             display: BTreeMap::new(),
-            window: WindowConfig::default(),
         }
     }
 }
@@ -315,24 +217,6 @@ impl AgentsConfig {
             .and_then(|d| d.icon.as_deref())
             .filter(|i| !i.trim().is_empty())
             .unwrap_or(DEFAULT_RUNTIME_ICON)
-    }
-
-    /// The niri workspace the companion windows gather on (#1306).
-    ///
-    /// Trimmed, and [`DEFAULT_WORKSPACE`] whenever the file's value is not a
-    /// name this plugin will spell into an argv — so every reader (the
-    /// tooltip, the focus command) gets a usable name without each one
-    /// re-deciding what usable means. [`Subsystem::parsed`] is where the
-    /// rejection is *reported*; this is where it is *applied*, which is what
-    /// makes a hand-built config (one that never went through the reader)
-    /// behave like a loaded one — [`Self::poll_interval`]'s clamp, exactly.
-    #[must_use]
-    pub fn workspace(&self) -> &str {
-        if self.window.workspace_is_usable() {
-            self.window.workspace.trim()
-        } else {
-            DEFAULT_WORKSPACE
-        }
     }
 
     /// The group header `agent` sits under, or `None` for the ungrouped
@@ -436,40 +320,16 @@ impl Subsystem for AgentsConfig {
         Ok(())
     }
 
-    /// Almost every key is already its value — see [`Subsystem::Resolved`]
-    /// above. **`window.workspace` is the one exception**, and the first key in
-    /// this file with a per-key verdict at all (#1306).
+    /// Every key is already its value — see [`Subsystem::Resolved`] above.
     ///
-    /// It earns one because it is the first key here whose value leaves the
-    /// process: it becomes an element of
-    /// `niri msg action focus-workspace <name>`. A name starting with `-`
-    /// would be read as a flag by niri's own `clap` parser, and a control
-    /// character corrupts the journal line that quotes it — so a bad value is
-    /// not merely cosmetic, and #1044's rule (a bad value costs its own key,
-    /// never the file) is what it gets: the resolved config falls back to
-    /// [`DEFAULT_WORKSPACE`] and `load_layer` warns, naming the key and
-    /// quoting the value.
-    ///
-    /// **The type residual is this file's existing one**, not a new one: these
-    /// fields are natively typed rather than `toml::Value`, so
-    /// `workspace = 5` is still a whole-layer deserialisation failure while
-    /// `workspace = "-hive"` costs only this key. That is the same asymmetry
-    /// [`Subsystem::Resolved`] documents for `display`, and retyping the
-    /// schema is the follow-up it already scopes.
+    /// The rejection list is **always** empty, and that is a statement about
+    /// this schema rather than a stub: nothing here turns a string into
+    /// anything, so there is no per-key verdict to report. The keys that can
+    /// still be wrong (`socket`, `poll_seconds`) constrain the file as a whole
+    /// and are judged in [`Self::validate`], which is where the trait puts a
+    /// whole-file rule.
     fn parsed(&self) -> (Self, Vec<hytte_config::subsystem::InvalidValue>) {
-        let mut resolved = self.clone();
-        let mut rejected = Vec::new();
-        if !self.window.workspace_is_usable() {
-            // `of` rather than `written`: it renders the value the way TOML
-            // spells it (a string comes back quoted), which is what makes the
-            // journal line read as the file rather than as Rust.
-            rejected.push(hytte_config::subsystem::InvalidValue::of(
-                &knob("window.workspace", WORKSPACE_ACCEPTS),
-                &toml::Value::String(self.window.workspace.clone()),
-            ));
-            resolved.window.workspace = default_workspace();
-        }
-        (resolved, rejected)
+        (self.clone(), Vec::new())
     }
 }
 
@@ -490,8 +350,7 @@ pub fn load() -> AgentsConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentsConfig, DEFAULT_RUNTIME_ICON, DEFAULT_WORKSPACE, Display, Invalid, MAX_POLL_SECONDS,
-        MIN_POLL_SECONDS, WindowConfig,
+        AgentsConfig, DEFAULT_RUNTIME_ICON, Display, Invalid, MAX_POLL_SECONDS, MIN_POLL_SECONDS,
     };
     use hytte_config::subsystem::{Subsystem as _, assemble};
     use std::collections::BTreeMap;
@@ -564,21 +423,7 @@ mod tests {
                 socket: "/run/hyperhive/host.sock".to_owned(),
                 poll_seconds: 5,
                 display,
-                // Set by the fixture since #1306, so this is the assertion
-                // worth having: the nix option leaf, the rendered `[window]`
-                // table and this reader all agree on one string. It is
-                // deliberately NOT `DEFAULT_WORKSPACE` — a fixture that
-                // happened to render the built-in default would pass whether
-                // or not the key survived the trip.
-                window: WindowConfig {
-                    workspace: "agents".to_owned(),
-                },
             }
-        );
-        assert_eq!(
-            loaded.config.workspace(),
-            "agents",
-            "and the accessor every reader goes through sees it too"
         );
     }
 
@@ -690,83 +535,6 @@ mod tests {
         assert_eq!(cfg.poll_interval().as_secs(), MIN_POLL_SECONDS);
         cfg.poll_seconds = u64::MAX;
         assert_eq!(cfg.poll_interval().as_secs(), MAX_POLL_SECONDS);
-    }
-
-    /// `[window] workspace` defaults to the hive's own name, an overlay wins,
-    /// and surrounding whitespace is trimmed rather than spelled into an argv.
-    #[test]
-    fn the_workspace_defaults_to_hive_and_an_overlay_wins() {
-        assert_eq!(AgentsConfig::default().workspace(), DEFAULT_WORKSPACE);
-        assert_eq!(
-            from_toml("[window]\nworkspace = \"agents\"\n").workspace(),
-            "agents"
-        );
-        assert_eq!(
-            from_toml("[window]\nworkspace = \"  agents  \"\n").workspace(),
-            "agents",
-            "the name goes into an argv, so it is trimmed like every other \
-             value this file hands to something else"
-        );
-        // An empty table is the documented default, not a rejection: the key
-        // has one.
-        assert_eq!(from_toml("[window]\n").workspace(), DEFAULT_WORKSPACE);
-    }
-
-    /// **#1044's rule, on this file's first key that has it: a bad value costs
-    /// its own key and nothing else** (#1306).
-    ///
-    /// The three shapes are the ones that would produce an argv nobody can
-    /// explain — blank (`focus-workspace ""`), leading `-` (niri's own `clap`
-    /// reads it as a flag), and a control character (nothing round-trips it,
-    /// and it corrupts the journal line that quotes it). Each is reported by
-    /// [`Subsystem::parsed`], each falls back to [`DEFAULT_WORKSPACE`], and —
-    /// the half that is the actual claim — **`socket` and `poll_seconds`
-    /// survive unharmed**, which is what "costs only that key" means and what
-    /// a whole-file verdict would take away.
-    ///
-    /// Falsification (run this round, red): have `parsed` return
-    /// `(self.clone(), Vec::new())` again and the rejection list empties while
-    /// `workspace()` still repairs; drop `workspace_is_usable`'s `starts_with`
-    /// clause and `-hive` is accepted into the argv.
-    #[test]
-    fn an_unusable_workspace_costs_only_its_own_key() {
-        for bad in ["", "   ", "-hive", "--help", "hi\nthere"] {
-            let cfg = from_toml(&format!(
-                "socket = \"/run/elsewhere/host.sock\"\npoll_seconds = 7\n\
-                 [window]\nworkspace = {bad:?}\n"
-            ));
-            let (resolved, rejected) = cfg.parsed();
-
-            assert_eq!(
-                rejected.len(),
-                1,
-                "{bad:?} must be reported, once: {rejected:?}"
-            );
-            assert_eq!(rejected[0].key(), "window.workspace");
-            assert!(
-                rejected[0].to_string().contains("window.workspace ="),
-                "the line names the key and quotes the value: {}",
-                rejected[0]
-            );
-            assert_eq!(resolved.workspace(), DEFAULT_WORKSPACE);
-
-            // …and the rest of the file is untouched. This is the assertion.
-            assert_eq!(resolved.socket, "/run/elsewhere/host.sock");
-            assert_eq!(resolved.poll_seconds, 7);
-            resolved
-                .validate()
-                .expect("a bad workspace does not invalidate the file");
-        }
-
-        // A good one is reported by nobody.
-        let (resolved, rejected) = from_toml("[window]\nworkspace = \"my agents\"\n").parsed();
-        assert!(rejected.is_empty(), "{rejected:?}");
-        assert_eq!(
-            resolved.workspace(),
-            "my agents",
-            "a space is legal in a niri workspace name and travels as one argv \
-             element, so it is not this rule's business"
-        );
     }
 
     /// A key the schema DOES have, carrying the wrong type, is a hard error —

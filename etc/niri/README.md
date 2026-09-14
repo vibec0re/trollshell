@@ -190,28 +190,6 @@ Both surfaces take their own layer-shell namespace, so a niri `layer-rule` can
 address one without the other: `hytte-sidebar-<connector>` for the left and
 `hytte-sidebar-right-<connector>` for the right.
 
-## The agents' workspace (#1306)
-
-The agents card's **"Open terminals"** button opens one companion window per
-running agent. To have them land together instead of scattered, merge the two
-top-level nodes from `etc/niri/agent-windows.kdl` into your config: a named
-`workspace "hive"`, and a `window-rule` matching the app-id prefix
-`mov.vibec0re.trollshell.AgentWindow.` with `open-on-workspace "hive"`.
-
-Half of this works without the file — the plugin runs
-`niri msg action focus-workspace "hive"` before it launches anything, so the
-windows open on the focused workspace and tile there as columns (it needs
-`niri` on the plugin's PATH; without it the windows still open, just not
-gathered, and the plugin says so once in the journal). The window rule is what
-also catches a single pill click, and a window opened while you were looking at
-something else.
-
-The name is configurable and lives in **two** places that must agree:
-`window.workspace` in `~/.config/trollshell/agents.toml` (default `"hive"`) and
-the two spellings in the kdl. Nothing cross-checks them — a mismatch focuses an
-empty workspace and opens the windows on another one, which reads exactly like
-the button being broken.
-
 ## Frame struts
 
 trollshell's frame overlay (added in 2026-05-06) draws a dark gradient

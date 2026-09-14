@@ -887,17 +887,13 @@ openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
 
 ### Talking to an agent, and opening them all (#1306, #1282 items 1-2)
 
-Same hive and same `agentWindow.enable`, plus — for the workspace half —
-`etc/niri/agent-windows.kdl` merged into your niri config. CI proves the
-fan-out's shape (which agents, in which order, with which ids, on both
-desktops), that the workspace focus is one effect and precedes every launch,
-that the row click is byte-identical to the `agent page` link's effect, and
-that the embedded URL no longer hides `input`. What it cannot prove is
-everything downstream of an effect actually reaching a compositor: that typing
-into the page reaches the agent, that a click lands on the pill rather than on
-one of the buttons inside it, that N windows are N windows rather than one
-window opened N times, and — the whole of @kaesaecracker's ask — that they end
-up **tiled on one workspace**.
+Same hive and same `agentWindow.enable`. CI proves the fan-out's shape (which
+agents, in which order, with which ids, on both desktops), that the row click
+is byte-identical to the `agent page` link's effect, and that the embedded URL
+no longer hides `input`. What it cannot prove is the three things that only
+exist on glass: that typing into the page reaches the agent, that a click
+lands on the pill rather than on one of the buttons inside it, and that N
+windows are N windows rather than one window opened N times.
 
 - [ ] **(#1282 item 1)** **Typing reaches the agent.** Open a running agent's
       window and confirm hyperhive's composer is **there** at the bottom of
@@ -932,45 +928,10 @@ up **tiled on one workspace**.
       **running** agent — and none for a stopped, paused, failed or
       needs-login one. Hover it first and check the number in the tooltip
       matches what you then get.
-- [ ] **(#1306)** **They land on the hive workspace, tiled.** This is
-      @kaesaecracker's actual ask, and it is the item to do first. Merge
-      `etc/niri/agent-windows.kdl` into `~/.config/niri/config.kdl`, then press
-      the button from a **different** workspace: niri must switch to `hive`,
-      and the N windows must be columns on it — not scattered across whatever
-      was focused, and not stacked on one column. Scroll the workspace and
-      confirm every agent is there.
-- [ ] **(#1306)** **The focus goes first, and it is one command.** Watch the
-      plugin's journal (`journalctl --user -u trollshell-plugin-agents -f`,
-      with `RUST_LOG=hytte_plugin_agents=debug`), press once, and read the
-      effect order: one `niri msg action focus-workspace hive`, **then** the
-      launches — never interleaved, and never one focus per agent. The focus
-      should also appear as its own transient unit in
-      `systemctl --user list-units 'trollshell-launch-*'`, beside the window
-      ones.
-- [ ] **(#1306)** **The two names have to match.** Set
-      `window.workspace = "agents"` in `~/.config/trollshell/agents.toml`
-      **without** changing the kdl, restart the plugin, and confirm the
-      breakage is the one the README predicts: niri switches to an empty
-      `agents` workspace while the windows open on `hive`. Then fix the kdl and
-      confirm it comes back together. (Also check the tooltip now says
-      `"agents"` — it reads the same key.)
-- [ ] **(#1306)** **A pill click lands there too.** With the window rule in
-      place, click a single agent row from another workspace: that one window
-      must open on `hive` (the rule's half — the plugin emits no focus for a
-      single row click, so this item is purely about the kdl).
-- [ ] **(#1306)** **Without niri on PATH, nothing breaks.** The plugin is a
-      `systemd-run --user` unit, so the check is
-      `systemctl --user show-environment | grep -w PATH` — if `niri` is on it,
-      simulate the absence by launching the plugin by hand with a trimmed
-      `PATH`. The windows must still all open (unfocused workspace, or wherever
-      the rule sends them) and the journal must carry **exactly one** line
-      naming `niri` and saying the fan-out could not focus first — not one per
-      press.
 - [ ] **(#1306)** **A second press re-focuses rather than doubling.** Press it
       again with the windows still open: no second window per agent, because
       each is its own `GApplication` id
-      (`mov.vibec0re.trollshell.AgentWindow.<agent>`), and the workspace is
-      focused again rather than a second one being made. Then
+      (`mov.vibec0re.trollshell.AgentWindow.<agent>`). Then
       `systemctl --user list-units 'trollshell-launch-*'` and confirm each
       launch was its own transient unit, outside the shell's cgroup.
 - [ ] **(#1306)** **The button is absent when there is nothing to open.** Stop

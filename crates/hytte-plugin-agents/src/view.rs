@@ -888,33 +888,24 @@ pub fn hive_summary(hive: &Hive) -> String {
 /// `Plugin::view` takes `&self` and [`crate::window::Probe`] resolves on
 /// `&mut` — deliberately, since resolving it here would move a `PATH` scan and
 /// its warning from the first click onto the first render, i.e. onto every
-/// desktop rather than onto the ones that click. **Two** probes decide what a
-/// press does now (the window, and `niri` for the workspace focus), and the
-/// hover can consult neither.
-///
-/// So rather than guess, it says what happens either way: N windows on the
-/// configured workspace, or N browser tabs on a desktop with no
-/// `trollshell-agent-window`, with the workspace conditioned on `niri` being
-/// reachable. #1306 asks for the tab count to be said out loud; naming the
-/// workspace is the same courtesy for the half @kaesaecracker asked for on the
-/// thread, and both clauses are true before either probe has an answer.
+/// desktop rather than onto the ones that click. So rather than guess, the
+/// hover says what happens either way: N windows, or N browser tabs on a
+/// desktop with no `trollshell-agent-window`. #1306 asks for the tab count to
+/// be said out loud, and this is the phrasing that is true before the probe has
+/// an answer.
 fn open_terminals_button(hive: &Hive, cfg: &AgentsConfig) -> Option<Node> {
     let count = terminal_targets(hive.agents(), cfg).len();
     if count == 0 {
         return None;
     }
-    let workspace = cfg.workspace();
     let hover = if count == 1 {
-        format!(
-            "open the terminal window for the one running agent, on the \
-             \"{workspace}\" workspace when niri is on PATH (a browser tab if \
-             the companion window is not installed)"
-        )
+        "open the terminal window for the one running agent (a browser tab if \
+         the companion window is not installed)"
+            .to_owned()
     } else {
         format!(
-            "open a terminal window for each of the {count} running agents, on \
-             the \"{workspace}\" workspace when niri is on PATH ({count} \
-             browser tabs if the companion window is not installed)"
+            "open a terminal window for each of the {count} running agents \
+             ({count} browser tabs if the companion window is not installed)"
         )
     };
     Some(icon_button(

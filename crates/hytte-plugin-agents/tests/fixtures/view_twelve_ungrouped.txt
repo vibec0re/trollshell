@@ -47,7 +47,7 @@ View {
                             name: "utilities-terminal-symbolic",
                             classes: [],
                             tooltip: Some(
-                                "open a terminal window for each of the 12 running agents, on the \"hive\" workspace when niri is on PATH (12 browser tabs if the companion window is not installed)",
+                                "open a terminal window for each of the 12 running agents (12 browser tabs if the companion window is not installed)",
                             ),
                         },
                     },

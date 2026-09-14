@@ -29,11 +29,6 @@ hytte-plugin = { path = "../hytte-plugin" }
 # (serde / serde_ignored / toml / toml_edit / tracing), so a plugin may link it
 # — the same argument that let `trollshell-control-center` link it in #640.
 hytte-config = { path = "../hytte-config" }
-# One `toml::Value`, for the one key with a per-key verdict (#1306's
-# `window.workspace`): `InvalidValue::of` renders the rejected value the way
-# TOML spells it, and building that `Value` is the only thing this is for.
-# Already in `Cargo.lock` via `hytte-config`, so it resolves no new package.
-toml.workspace = true
 serde.workspace = true
 # `host.sock` speaks JSON lines: one object per request, one per response.
 serde_json.workspace = true

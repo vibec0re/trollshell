@@ -2084,7 +2084,6 @@
                       config.agents = {
                         socket = "/run/hyperhive/host.sock";
                         poll_seconds = 5;
-                        window.workspace = "agents";
                         display."trollshell-choom" = {
                           label = "choom";
                           project = "viberoot";
@@ -2145,7 +2144,6 @@
                       config.agents = {
                         socket = "/run/hyperhive/host.sock";
                         poll_seconds = 5;
-                        window.workspace = "agents";
                         display."trollshell-choom" = {
                           label = "choom";
                           project = "viberoot";
@@ -2285,17 +2283,6 @@
                 cat ${socketOnlyFile} >&2
                 exit 1
               fi
-              # #1306's `[window]` is the same shape as `display` and needs the
-              # same pin: its own `default` is `{ }` too, so the emptied-table
-              # half of `prune` is the only thing standing between an unset
-              # `window` and a bare `[window]` heading on every install. The
-              # `display` grep above cannot see it — a second `{ }`-defaulted
-              # attrset is a second instance of MEDIUM-1, not a re-test of it.
-              if grep -q 'window' ${socketOnlyFile}; then
-                echo "a socket-only config.agents rendered a [window] heading (#1306, same shape as #1237 review MEDIUM-1):" >&2
-                cat ${socketOnlyFile} >&2
-                exit 1
-              fi
               touch $out
             '';
 
@@ -2347,69 +2334,6 @@
                 builtins.deepSeq { inherit result control; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-agents-relative-socket-check" { inherit probe; } ''
-              echo "$probe" >/dev/null
-              touch $out
-            '';
-
-          # #1306: `window.workspace` becomes an element of
-          # `niri msg action focus-workspace <name>`, and niri's command line
-          # is `clap` — so a name starting with `-` is read as a FLAG, not as
-          # a workspace. Unlike `socket` above this is not a whole-file rule
-          # (the Rust side gives this one key its own verdict and falls back to
-          # `DEFAULT_WORKSPACE`), so the eval-time refusal is not preventing a
-          # silent revert; it is refusing in front of the operator who typed
-          # the value, naming the option path, instead of leaving them a
-          # journal line and a focus that quietly went somewhere else.
-          #
-          # Same tryEval-plus-control shape as the socket check above, and for
-          # the same #1081 M4 reason: `tryEval` reports success/failure and
-          # never the message, so only the control arm — a legal name, which
-          # must succeed — separates "the regex rejected `-hive`" from "the
-          # option no longer exists". The control doubles as the pin that an
-          # inner space is still accepted: the name travels as its own argv
-          # element and niri's kdl quotes it, so whitespace is not this rule's
-          # business and a regex that refused it would be wrong in the
-          # direction that breaks a working config.
-          nixos-module-agents-bad-workspace =
-            let
-              fixture =
-                workspace:
-                (nixpkgs.lib.nixosSystem {
-                  inherit system;
-                  modules = [
-                    self.nixosModules.default
-                    {
-                      programs.trollshell = {
-                        enable = true;
-                        package = stubPackage;
-                        weather.fallbackCity = "Berlin";
-                        config.agents.window.workspace = workspace;
-                      };
-                      boot.loader.grub.enable = false;
-                      fileSystems."/" = {
-                        device = "/dev/sda1";
-                        fsType = "ext4";
-                      };
-                      system.stateVersion = "24.11";
-                    }
-                  ];
-                }).config.programs.trollshell.config.agents.window.workspace;
-              refused = name: builtins.tryEval (builtins.deepSeq (fixture name) "ok");
-              probe =
-                # Every shape `WindowConfig::workspace_is_usable` refuses.
-                assert !(refused "-hive").success;
-                assert !(refused "--help").success;
-                assert !(refused "").success;
-                assert !(refused "   ").success;
-                assert !(refused "hi\nthere").success;
-                # …and the ones it takes, including the inner space and the
-                # built-in default's own spelling.
-                assert (refused "hive").success;
-                assert (refused "my agents").success;
-                assert (refused "hive-2").success;
-                builtins.deepSeq { inherit refused; } "ok";
-            in
-            pkgs.runCommand "trollshell-nixos-module-agents-bad-workspace-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

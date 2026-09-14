@@ -170,14 +170,6 @@ pub struct Agents {
     /// Whether the companion window (#950) can be launched — resolved once,
     /// see [`window::Probe`].
     window: window::Probe,
-    /// Whether `niri` can be launched, i.e. whether "Open terminals" can focus
-    /// the hive workspace before it opens anything (#1306).
-    ///
-    /// A **second** probe rather than a second question asked of the first: the
-    /// two binaries are installed by different things (ours by this flake,
-    /// niri by the session), so one answer cannot stand for both, and each owes
-    /// its own one-time warning naming its own consequence.
-    niri: window::Probe,
 }
 
 impl Agents {
@@ -201,7 +193,6 @@ impl Agents {
             next_effect_id: 0,
             cmd_tx,
             window: window::Probe::path(),
-            niri: window::Probe::niri(),
         }
     }
 
@@ -215,20 +206,6 @@ impl Agents {
     /// to have the window installed.
     pub fn set_window_probe(&mut self, probe: window::Probe) {
         self.window = probe;
-    }
-
-    /// Pin whether `niri` is installed, instead of resolving it against this
-    /// process's `PATH` (#1306) — [`Agents::set_window_probe`]'s seam, for the
-    /// other binary.
-    ///
-    /// It matters more here than it looks: this plugin's own tests run on
-    /// whatever machine CI or a reviewer has, and **a niri session is exactly
-    /// where a developer runs them**, so a fan-out test that inherited `PATH`
-    /// would pass locally with a focus effect in front of the launches and fail
-    /// in the sandbox without one. Every test that presses "Open terminals"
-    /// therefore states which compositor it is describing.
-    pub fn set_niri_probe(&mut self, probe: window::Probe) {
-        self.niri = probe;
     }
 
     /// Take the next correlation token. See [`Agents::next_effect_id`].
@@ -787,33 +764,6 @@ impl Agents {
     /// process), so this is either N launches or N `OpenUri`s, never a mix. An
     /// agent the hive reports with no `url` contributes nothing on the browser
     /// arm, the same silence the single-row click already answers with.
-    ///
-    /// # The workspace focus goes first
-    ///
-    /// @kaesaecracker on #1306: "make this like a dynamic workspace where all
-    /// agents are tiled on". So the press emits, **before** any launch, one
-    /// detached `niri msg action focus-workspace <workspace>` — and the
-    /// windows then open on the focused workspace and tile there as columns,
-    /// which is niri's own behaviour for new windows and needs nothing else
-    /// from us. Pairing it with the shipped window rule
-    /// (`etc/niri/agent-windows.kdl`) makes it true for a pill click too, and
-    /// for a window that was already open somewhere else.
-    ///
-    /// **Order is the mechanism, not a detail**: a focus emitted after the
-    /// launches would race them, and the effects reach the host as a list it
-    /// runs in order. The tests pin the focus's id ahead of every launch id
-    /// rather than merely asserting that a focus exists.
-    ///
-    /// No `niri` on `PATH` → **no focus effect at all**, and the launches are
-    /// byte-identical to what they would otherwise be. That is the right
-    /// failure: a window opening in the wrong place is a nuisance, a fan-out
-    /// that refused to run because the compositor's CLI is missing would be a
-    /// regression. [`window::Probe`] says so once, in the journal.
-    ///
-    /// The **dynamic** reading of that sentence — find the first empty
-    /// workspace, name it, put the windows there — is deliberately not built:
-    /// choosing an empty workspace needs niri's workspace list, and a plugin
-    /// has no compositor connection. It is on the thread as the alternative.
     fn open_terminals(&mut self) -> Vec<Effect> {
         // Cloned before the loop: `terminal_targets` borrows the roster and the
         // config, and every launch needs `&mut self` for the id counter.
@@ -821,18 +771,10 @@ impl Agents {
             .into_iter()
             .map(|a| a.name.clone())
             .collect();
-        let mut effects = Vec::with_capacity(targets.len() + 1);
-        if self.niri.available() {
-            let workspace = self.cfg.workspace().to_owned();
-            effects.push(Effect::launch(
-                self.take_effect_id(),
-                window::niri_focus_argv(&workspace),
-            ));
-        }
-        for name in &targets {
-            effects.extend(self.open_agent_terminal(name));
-        }
-        effects
+        targets
+            .iter()
+            .flat_map(|name| self.open_agent_terminal(name))
+            .collect()
     }
 
     /// The panel's `dashboard` link — the hive's own root, from the `Urls`

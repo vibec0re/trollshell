@@ -27,15 +27,6 @@
 //! with `agentWindow.enable = false` — keeps the P1 behaviour (the browser for
 //! the agent page, the drawer page for the pen) instead of a click that
 //! silently does nothing.
-//!
-//! # A second binary since #1306
-//!
-//! [`NIRI_BINARY`] is here for the same reason and on the same terms: the
-//! terminal fan-out focuses a workspace first, the only way a plugin can ask a
-//! compositor for anything is to launch its CLI, and whether that CLI exists is
-//! decided by a [`Probe`] before the effect is built. The consequence of it
-//! being missing is milder — the windows still open, they just do not gather —
-//! which is why each probe carries its own sentence rather than sharing one.
 
 use std::path::Path;
 
@@ -48,38 +39,6 @@ pub const ARG_AGENT: &str = "--agent";
 
 /// Which tab it opens on. Omitted for [`Tab::Agent`] — see [`argv`].
 pub const ARG_TAB: &str = "--tab";
-
-/// The compositor's own CLI, which is how the workspace gets focused
-/// ([#1306](https://github.com/vibec0re/trollshell/issues/1306)).
-///
-/// A plugin cannot ask the compositor anything — it has no `$NIRI_SOCKET`
-/// client and no business growing one — so the focus rides the capability it
-/// already has: one more detached `RunCommand`, of niri's own command-line
-/// tool. That is also why the *dynamic* variant @kaesaecracker raised (find
-/// the first empty workspace and rename it) is **not** here: choosing one
-/// needs niri's workspace list, and reading that list is the shell's job, not
-/// a plugin's.
-pub const NIRI_BINARY: &str = "niri";
-
-/// `niri msg action focus-workspace <workspace>` — the focus the fan-out
-/// emits before its launches.
-///
-/// The name travels as its **own** argv element, for
-/// [`argv`]'s reason and one sharper: niri's command line is `clap`, so a
-/// workspace name starting with `-` would be read as a flag. This builder does
-/// not guard that — `crate::config::AgentsConfig::workspace` does, before the
-/// name ever reaches here, which is where a bad value can cost its own key
-/// instead of producing an argv nobody can explain.
-#[must_use]
-pub fn niri_focus_argv(workspace: &str) -> Vec<String> {
-    vec![
-        NIRI_BINARY.to_owned(),
-        "msg".to_owned(),
-        "action".to_owned(),
-        "focus-workspace".to_owned(),
-        workspace.to_owned(),
-    ]
-}
 
 /// The window's two tabs, as its `--tab` argument spells them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,22 +106,10 @@ pub fn argv(name: &str, tab: Tab) -> Vec<String> {
 /// reaching into another process's environment.
 #[must_use]
 pub fn on_path() -> bool {
-    on_path_of(BINARY)
-}
-
-/// [`on_path`] for any of the programs this plugin launches — the window, and
-/// since #1306 [`NIRI_BINARY`].
-///
-/// [`on_path`] is kept as the no-argument spelling because it is the question
-/// almost everyone is asking (`trollshell-control-center` asks it by that
-/// name), and because "is the companion window installed" reads better than
-/// the same call with a constant threaded through it.
-#[must_use]
-pub fn on_path_of(binary: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(binary)))
+    std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(BINARY)))
 }
 
 /// The `PATH` [`on_path`] searched, for the warning to quote.
@@ -181,25 +128,8 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// What a missing binary costs, in the one sentence its warning adds.
-///
-/// A `&'static str` on the probe rather than a `match` inside it, because the
-/// two consequences have nothing in common: one is "this click takes its
-/// fallback route", the other is "the windows still open, just not where you
-/// wanted them". Naming the consequence is the whole value of the warning —
-/// "niri is not on PATH" on its own tells an operator nothing about what they
-/// just saw happen.
-const WINDOW_MISSING: &str = "agent pages open in the browser and the pen opens the drawer page instead (install it with \
-     programs.trollshell.agentWindow.enable)";
-
-/// See [`WINDOW_MISSING`]. #1306's half: the fan-out still opens every window,
-/// it just cannot gather them first.
-const NIRI_MISSING: &str = "\"Open terminals\" cannot focus the hive workspace first, so the agent windows open wherever \
-     the compositor puts them (a niri window rule still gathers them — see \
-     etc/niri/agent-windows.kdl)";
-
-/// Whether a binary this plugin wants to launch is there — resolved **once**
-/// per process, and complained about **once**.
+/// Whether the companion window can be launched — resolved **once** per
+/// process, and complained about **once**.
 ///
 /// Caching is not an optimisation: without it a desktop with no window would
 /// scan `PATH` and log a warning on every click of every row, which is the
@@ -207,26 +137,16 @@ const NIRI_MISSING: &str = "\"Open terminals\" cannot focus the hive workspace f
 /// window is installed by the same nix build as the plugin, so it does not
 /// appear mid-session; if it ever does, restarting the plugin's unit is the
 /// (cheap, transient) way to re-resolve.
-///
-/// It became **two** probes with #1306 — the window, and `niri` for the
-/// workspace focus — so the binary and its missing-consequence are fields
-/// rather than the constants they used to be. Everything else is unchanged,
-/// including [`Probe::fixed`]'s meaning as the window's test seam.
 #[derive(Clone, Debug)]
 pub struct Probe {
-    /// Which program this probe is about — searched on `PATH`, and named in
-    /// the warning.
-    binary: &'static str,
-    /// The sentence the warning adds: see [`WINDOW_MISSING`].
-    missing: &'static str,
     /// How the binary is located. A plain `fn` pointer rather than a boxed
-    /// closure: the only values it ever takes are [`on_path_of`] and the two
-    /// constants below, so a pointer needs no allocation and keeps [`Probe`]
-    /// `Clone` without a lifetime.
+    /// closure: the only two values it ever takes are [`on_path`] and one of
+    /// the two constants below, so a pointer needs no allocation and keeps
+    /// [`Probe`] `Clone` without a lifetime.
     ///
     /// Deliberately **not** `Copy`: [`Probe::warned`] is a latch, and a copy
     /// would silently give the copy a fresh one.
-    lookup: fn(&'static str) -> bool,
+    lookup: fn() -> bool,
     /// The resolved answer, `None` until the first click wants it.
     cached: Option<bool>,
     /// Whether the "not installed" warning has already been said.
@@ -237,20 +157,8 @@ impl Probe {
     /// The real probe: resolve [`BINARY`] against `PATH` on first use.
     #[must_use]
     pub fn path() -> Self {
-        Self::resolving(BINARY, WINDOW_MISSING)
-    }
-
-    /// The real probe for [`NIRI_BINARY`] (#1306).
-    #[must_use]
-    pub fn niri() -> Self {
-        Self::resolving(NIRI_BINARY, NIRI_MISSING)
-    }
-
-    fn resolving(binary: &'static str, missing: &'static str) -> Self {
         Self {
-            binary,
-            missing,
-            lookup: on_path_of,
+            lookup: on_path,
             cached: None,
             warned: false,
         }
@@ -259,48 +167,32 @@ impl Probe {
     /// A probe pinned to one answer — the test seam, so a reducer test states
     /// which desktop it is describing instead of inheriting the machine's
     /// `PATH`.
-    ///
-    /// This one is the **window's**; [`Probe::fixed_niri`] is the compositor's.
-    /// Two constructors rather than one taking a binary, so a test reads as the
-    /// desktop it describes ("no window installed") rather than as a string.
     #[must_use]
     pub fn fixed(available: bool) -> Self {
-        Self::pinned(BINARY, WINDOW_MISSING, available)
-    }
-
-    /// [`Probe::fixed`] for `niri` (#1306).
-    #[must_use]
-    pub fn fixed_niri(available: bool) -> Self {
-        Self::pinned(NIRI_BINARY, NIRI_MISSING, available)
-    }
-
-    fn pinned(binary: &'static str, missing: &'static str, available: bool) -> Self {
         Self {
-            binary,
-            missing,
             lookup: if available { always } else { never },
             cached: Some(available),
             warned: false,
         }
     }
 
-    /// Is the binary there? Resolves on first call and remembers.
+    /// Can the window be launched? Resolves on first call and remembers.
     pub fn available(&mut self) -> bool {
         let lookup = self.lookup;
-        let binary = self.binary;
-        let found = *self.cached.get_or_insert_with(|| lookup(binary));
+        let found = *self.cached.get_or_insert_with(lookup);
         if self.claim_warning(found) {
             // The searched `PATH` goes in the line because it is **this
             // process's**, and the launch will resolve somewhere else — see
             // [`on_path`]'s docs. An operator with a click that does nothing
             // can compare this against `systemctl --user show-environment`.
             tracing::warn!(
-                binary = self.binary,
+                binary = BINARY,
                 searched_path = %searched_path(),
-                missing = self.missing,
-                "a program this plugin launches is not on its PATH. The launch would resolve it \
-                 in the systemd user manager's environment, which is normally the same one — \
-                 compare with `systemctl --user show-environment` if it is not"
+                "the agent companion window is not on this plugin's PATH; agent pages open in \
+                 the browser and the pen opens the drawer page instead (install it with \
+                 programs.trollshell.agentWindow.enable). The launch would resolve it in the \
+                 systemd user manager's environment, which is normally the same one — compare \
+                 with `systemctl --user show-environment` if it is not"
             );
         }
         found
@@ -329,19 +221,19 @@ impl Default for Probe {
 }
 
 /// [`Probe::fixed`]'s "installed" lookup. A named `fn` rather than a closure
-/// so both arms of its `if` have the one `fn(&'static str) -> bool` type.
-fn always(_binary: &'static str) -> bool {
+/// so both arms of its `if` have the one `fn() -> bool` type.
+fn always() -> bool {
     true
 }
 
 /// [`Probe::fixed`]'s "not installed" lookup. See [`always`].
-fn never(_binary: &'static str) -> bool {
+fn never() -> bool {
     false
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ARG_AGENT, ARG_TAB, BINARY, NIRI_BINARY, Probe, Tab, argv, niri_focus_argv};
+    use super::{ARG_AGENT, ARG_TAB, BINARY, Probe, Tab, argv};
 
     /// The plain launch is `<binary> --agent <name>` and carries **no** tab
     /// argument — #950's own spelling.
@@ -427,71 +319,6 @@ mod tests {
         assert!(p.available());
         assert!(!p.claim_warning(true));
         assert!(!p.warned);
-    }
-
-    /// The workspace focus is niri's own verb, spelled exactly, with the name
-    /// as its **own** argv element (#1306).
-    ///
-    /// Pinned as a literal vector rather than assembled from the constants it
-    /// is built from, for the #1026 reason: an assertion derived from this
-    /// module's own words cannot see a mismatch with niri's command line, which
-    /// is the external interface here. `msg action focus-workspace <ref>` is
-    /// what `niri msg --help` documents.
-    ///
-    /// Falsification: drop `msg`, join the name with `=`, or reorder, and this
-    /// reds on the exact vector.
-    #[test]
-    fn the_workspace_focus_is_niris_own_verb() {
-        assert_eq!(
-            niri_focus_argv("hive"),
-            vec![
-                "niri".to_owned(),
-                "msg".to_owned(),
-                "action".to_owned(),
-                "focus-workspace".to_owned(),
-                "hive".to_owned(),
-            ]
-        );
-        assert_eq!(niri_focus_argv("hive")[0], NIRI_BINARY);
-    }
-
-    /// A workspace name with a space stays **one** argv element — there is no
-    /// shell on the detached path, and niri takes such a name happily.
-    ///
-    /// This is the half that says the `config` guard is about a *leading
-    /// hyphen* and not about whitespace: quoting is not a problem a `Vec` has.
-    #[test]
-    fn a_workspace_name_with_a_space_is_one_argument() {
-        let av = niri_focus_argv("my agents");
-        assert_eq!(av.len(), 5);
-        assert_eq!(av[4], "my agents");
-    }
-
-    /// The two probes are **independent** — each caches its own answer and
-    /// each owes its own one warning (#1306).
-    ///
-    /// Falsification: make `Probe::niri` return `Probe::path()` and the binary
-    /// assertion reds; share one `warned` latch between them (a `static`) and
-    /// the second `claim_warning` does.
-    #[test]
-    fn the_niri_probe_is_its_own_probe() {
-        let mut window = Probe::fixed(false);
-        let mut niri = Probe::fixed_niri(false);
-        assert_eq!(Probe::path().binary, BINARY);
-        assert_eq!(Probe::niri().binary, NIRI_BINARY);
-        assert_eq!(niri.binary, NIRI_BINARY, "the pinned one names it too");
-        assert_ne!(
-            window.missing, niri.missing,
-            "a missing niri and a missing window cost different things, and the \
-             warning is only useful if it says which"
-        );
-
-        // Each owes exactly one warning, and taking the window's does not take
-        // the compositor's.
-        assert!(!window.available());
-        assert!(!niri.available());
-        assert!(!window.claim_warning(false));
-        assert!(!niri.claim_warning(false));
     }
 
     /// The `"-leading-hyphen"` fixture (`model.rs`'s `AgentName` test names it

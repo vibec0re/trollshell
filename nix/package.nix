@@ -428,8 +428,7 @@ let
       doInstallCargoArtifacts = false;
 
       buildPhaseCargoCommand = ''
-        cargoWithProfile build --locked -p hytte-ecal --example probe
-        cargoWithProfile build --locked -p hytte-services --example wifi_probe
+        cargoWithProfile build --locked --workspace --example probe --example wifi_probe
       '';
 
       installPhaseCommand = ''

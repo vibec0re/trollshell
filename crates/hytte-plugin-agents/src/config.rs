@@ -142,7 +142,8 @@ pub struct Display {
 pub const DEFAULT_WORKSPACE: &str = "hive";
 
 /// What [`WindowConfig::workspace`] accepts, as a rejection line spells it.
-const WORKSPACE_ACCEPTS: &str = "a niri workspace name: non-blank, no control characters, and not starting with `-`";
+const WORKSPACE_ACCEPTS: &str =
+    "a niri workspace name: non-blank, no control characters, and not starting with `-`";
 
 /// The `[window]` table — where the companion windows go.
 ///

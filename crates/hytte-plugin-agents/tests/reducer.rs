@@ -1321,7 +1321,10 @@ fn open_terminals_focuses_the_hive_workspace_before_it_opens_anything() {
         launch_ids.iter().all(|id| *id > focus_id),
         "the focus must precede every launch: focus {focus_id}, launches {launch_ids:?}"
     );
-    assert!(lines(&mut rx).is_empty(), "none of this asks the hive anything");
+    assert!(
+        lines(&mut rx).is_empty(),
+        "none of this asks the hive anything"
+    );
 }
 
 /// The configured workspace is the one focused — and an unusable name falls

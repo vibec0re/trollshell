@@ -939,13 +939,14 @@ up **tiled on one workspace**.
       and the N windows must be columns on it — not scattered across whatever
       was focused, and not stacked on one column. Scroll the workspace and
       confirm every agent is there.
-- [ ] **(#1306)** **The focus goes first, and it is one command.** With
-      `RUST_LOG=hytte_plugin_agents=debug journalctl --user -u
-      trollshell-plugin-agents -f`, press once and read the effect order: one
-      `niri msg action focus-workspace hive`, **then** the launches — never
-      interleaved, and never one focus per agent. `systemctl --user list-units
-      'trollshell-launch-*'` should show the focus as its own transient unit
-      alongside the window ones.
+- [ ] **(#1306)** **The focus goes first, and it is one command.** Watch the
+      plugin's journal (`journalctl --user -u trollshell-plugin-agents -f`,
+      with `RUST_LOG=hytte_plugin_agents=debug`), press once, and read the
+      effect order: one `niri msg action focus-workspace hive`, **then** the
+      launches — never interleaved, and never one focus per agent. The focus
+      should also appear as its own transient unit in
+      `systemctl --user list-units 'trollshell-launch-*'`, beside the window
+      ones.
 - [ ] **(#1306)** **The two names have to match.** Set
       `window.workspace = "agents"` in `~/.config/trollshell/agents.toml`
       **without** changing the kdl, restart the plugin, and confirm the

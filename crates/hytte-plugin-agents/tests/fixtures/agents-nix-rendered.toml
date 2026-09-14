@@ -7,3 +7,6 @@ icon = "starred-symbolic"
 [display.trollshell-choom]
 label = "choom"
 project = "viberoot"
+
+[window]
+workspace = "agents"

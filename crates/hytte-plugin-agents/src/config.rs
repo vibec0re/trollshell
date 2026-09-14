@@ -564,12 +564,21 @@ mod tests {
                 socket: "/run/hyperhive/host.sock".to_owned(),
                 poll_seconds: 5,
                 display,
-                // The nix module has no `window` option yet (#1306 follow-up),
-                // so the fixture cannot set one and this is the documented
-                // default — which is the assertion worth having: a key the nix
-                // side does not render must still arrive at its default.
-                window: WindowConfig::default(),
+                // Set by the fixture since #1306, so this is the assertion
+                // worth having: the nix option leaf, the rendered `[window]`
+                // table and this reader all agree on one string. It is
+                // deliberately NOT `DEFAULT_WORKSPACE` — a fixture that
+                // happened to render the built-in default would pass whether
+                // or not the key survived the trip.
+                window: WindowConfig {
+                    workspace: "agents".to_owned(),
+                },
             }
+        );
+        assert_eq!(
+            loaded.config.workspace(),
+            "agents",
+            "and the accessor every reader goes through sees it too"
         );
     }
 

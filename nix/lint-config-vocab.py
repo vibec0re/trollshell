@@ -150,10 +150,18 @@ MODULE_COMMON_NIX = os.path.join(REPO_ROOT, "nix", "module-common.nix")
 # `config.agents`' nix option leaves, paired with the Rust struct whose serde
 # fields they must equal. One entry per *level* rather than one per subsystem:
 # `display` is both a leaf of `AgentsConfig` (the key `display` itself) and an
-# `attrsOf` submodule whose own options are `Display`'s fields.
+# `attrsOf` submodule whose own options are `Display`'s fields, and since #1306
+# `window` is the same shape one level down (a plain submodule rather than an
+# `attrsOf` one, which makes no difference here — what matters is that its own
+# options belong to `WindowConfig`).
+#
+# The first entry is the outer level; every entry after it is a nested block
+# lifted out of the outer body before it is read. Adding a third nested table to
+# `agents.toml` is therefore one line here.
 AGENTS_STRUCT_LEVELS = (
     ("config.agents = lib.mkOption {", "AgentsConfig"),
     ("display = lib.mkOption {", "Display"),
+    ("window = lib.mkOption {", "WindowConfig"),
 )
 
 
@@ -332,17 +340,27 @@ def option_leaves(body: str) -> list[str]:
 def agents_option_levels(nix_src: str) -> dict[str, list[str]]:
     """`config.agents`' option leaves, one list per Rust struct level.
 
-    The nested `display` submodule's own options (`label`/`icon`/`project`)
-    belong to `Display`, not to `AgentsConfig`, so the nested block is lifted
-    out and replaced by an empty one before the outer level is read — leaving
-    `display` itself counted exactly once, as the `AgentsConfig` field it is.
+    A nested submodule's own options belong to *its* struct, not to
+    `AgentsConfig` — `display`'s `label`/`icon`/`project` are `Display`'s and
+    `window`'s `workspace` is `WindowConfig`'s — so every nested block is
+    lifted out and replaced by an empty one before the outer level is read.
+    That leaves `display` and `window` themselves counted exactly once each, as
+    the `AgentsConfig` fields they are.
+
+    Generic over [`AGENTS_STRUCT_LEVELS`] since #1306 rather than reading index
+    0 and 1 by hand: the second nested table is the moment "one entry per
+    level" stopped being a description of a pair.
     """
-    agents_anchor, _ = AGENTS_STRUCT_LEVELS[0]
-    display_anchor, _ = AGENTS_STRUCT_LEVELS[1]
+    agents_anchor, agents_struct = AGENTS_STRUCT_LEVELS[0]
     agents_body = option_block(nix_src, agents_anchor)
-    display_body = option_block(agents_body, display_anchor)
-    outer = agents_body.replace(display_body, "{ }", 1)
-    return {"AgentsConfig": option_leaves(outer), "Display": option_leaves(display_body)}
+    outer = agents_body
+    levels: dict[str, list[str]] = {}
+    for anchor, struct in AGENTS_STRUCT_LEVELS[1:]:
+        nested = option_block(agents_body, anchor)
+        outer = outer.replace(nested, "{ }", 1)
+        levels[struct] = option_leaves(nested)
+    levels[agents_struct] = option_leaves(outer)
+    return levels
 
 
 def _serde_attr_lists(text: str) -> list[str]:
@@ -587,6 +605,11 @@ def self_test() -> list[str]:
         pub project: Option<String>,
     }
     #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+    pub struct WindowConfig {
+        #[serde(default = "default_workspace")]
+        pub workspace: String,
+    }
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
     pub struct AgentsConfig {
         #[serde(default = "default_socket")]
         pub socket: String,
@@ -594,14 +617,19 @@ def self_test() -> list[str]:
         pub poll_seconds: u64,
         #[serde(default)]
         pub display: BTreeMap<String, Display>,
+        #[serde(default)]
+        pub window: WindowConfig,
     }
     '''
     got = struct_serde_fields(struct_src, "Display")
     if got != ["label", "icon", "project"]:
         failures.append(f"struct_serde_fields: expected Display's three, got {got}")
+    got = struct_serde_fields(struct_src, "WindowConfig")
+    if got != ["workspace"]:
+        failures.append(f"struct_serde_fields: expected WindowConfig's one, got {got}")
     got = struct_serde_fields(struct_src, "AgentsConfig")
-    if got != ["socket", "poll_seconds", "display"]:
-        failures.append(f"struct_serde_fields: expected AgentsConfig's three, got {got}")
+    if got != ["socket", "poll_seconds", "display", "window"]:
+        failures.append(f"struct_serde_fields: expected AgentsConfig's four, got {got}")
     # A struct must not absorb the fields of the one declared after it — the
     # brace match is what keeps the two levels apart.
     if "label" in struct_serde_fields(struct_src, "AgentsConfig"):
@@ -678,19 +706,33 @@ def self_test() -> list[str]:
               }
             );
           };
+          window = lib.mkOption {
+            type = lib.types.submodule {
+              options = {
+                workspace = lib.mkOption { type = lib.types.nullOr lib.types.str; };
+              };
+            };
+          };
         };
       };
     };
     '''
     levels = agents_option_levels(agents_nix_src)
-    if levels["AgentsConfig"] != ["socket", "poll_seconds", "display"]:
+    if levels["AgentsConfig"] != ["socket", "poll_seconds", "display", "window"]:
         failures.append(f"agents_option_levels: outer level wrong, got {levels['AgentsConfig']}")
     if levels["Display"] != ["label", "icon", "project"]:
         failures.append(f"agents_option_levels: nested level wrong, got {levels['Display']}")
-    # The nested submodule's own options must not be counted as the
-    # subsystem's own keys — that is the whole reason the block is lifted out.
-    if set(levels["AgentsConfig"]) & set(levels["Display"]):
-        failures.append("agents_option_levels: the two levels overlap")
+    if levels["WindowConfig"] != ["workspace"]:
+        failures.append(
+            f"agents_option_levels: second nested level wrong, got {levels['WindowConfig']}"
+        )
+    # A nested submodule's own options must not be counted as the subsystem's
+    # own keys — that is the whole reason each block is lifted out. Checked for
+    # **every** nested level, so a third table cannot be added and silently
+    # leak its options into the outer set.
+    for _, struct in AGENTS_STRUCT_LEVELS[1:]:
+        if set(levels["AgentsConfig"]) & set(levels[struct]):
+            failures.append(f"agents_option_levels: AgentsConfig and {struct} overlap")
 
     return failures
 
@@ -851,11 +893,18 @@ def main() -> int:
         )
         return 1
 
+    # Every nested level is named, not just `display` — the evidence line is
+    # what a reader trusts when the check is green, so a level it does not
+    # mention is a level nobody can see it checked (#1306 added the second).
+    nested_summary = " ".join(
+        f"+ {anchor.split(' =', 1)[0]} {rust_agents_levels[struct]}"
+        for anchor, struct in AGENTS_STRUCT_LEVELS[1:]
+    )
     print(
         f"config-vocab scan: core-leds style {rust_style}, fill {rust_fill}, "
         f"rows 0-{rust_max_rows}; agents poll_seconds {rust_poll_lo}-{rust_poll_hi}, "
-        f"keys {rust_agents_levels['AgentsConfig']} + display "
-        f"{rust_agents_levels['Display']}; plugins.<id>.mount {rust_mount} "
+        f"keys {rust_agents_levels['AgentsConfig']} {nested_summary}"
+        f"; plugins.<id>.mount {rust_mount} "
         "— nix and Rust agree",
         flush=True,
     )

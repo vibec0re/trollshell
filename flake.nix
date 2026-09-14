@@ -1090,6 +1090,78 @@
               touch $out
             '';
 
+          # #1284: `programs.trollshell.plugins.<id>` renders `HYTTE_PLUGIN_ID`
+          # from the attribute name whenever it disagrees with the package's
+          # own manifest id — the same shape `hm-module-plugin-mount` above
+          # pins for `mount` → `HYTTE_PLUGIN_MOUNT` (#1161), on the #1260
+          # review F5 precedent. `demo` (attribute name == manifest id, both
+          # "demo" — `stubPlugin` is `writeShellScriptBin "hytte-plugin-demo"`,
+          # so stripping the `hytte-plugin-` prefix off its binary name gives
+          # "demo") renders nothing: its ENTIRE rendered entry is asserted
+          # against `expectedDemo`, spelling out every field
+          # `nix/hm-module.nix`'s `pluginsState` puts on a plugin, so a stray
+          # `HYTTE_PLUGIN_ID` leak fails this the same way a missing field
+          # would. `demo-side` (attribute name != manifest id) carries
+          # `HYTTE_PLUGIN_ID = "demo-side"`. `agreeing` sets
+          # `env.HYTTE_PLUGIN_ID` by hand to the SAME value the override would
+          # render — the redundant, not-a-conflict half of #1284's precedence
+          # assertion in `nix/module-common.nix`, which must keep evaluating
+          # with every predicate true. The disagreeing half is
+          # `nixos-module-plugin-id-conflict` below (home-manager evaluates
+          # `config.assertions` eagerly and throws rather than handing back an
+          # inspectable false predicate — the same reason
+          # `nixos-module-plugin-mount-conflict` is NixOS-side only).
+          hm-module-plugin-id =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      plugins = {
+                        demo.package = stubPlugin;
+                        demo-side.package = stubPlugin;
+                        agreeing = {
+                          package = stubPlugin;
+                          env.HYTTE_PLUGIN_ID = "agreeing";
+                        };
+                      };
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+              );
+              expectedDemo = {
+                exec = pkgs.lib.getExe stubPlugin;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
+              assertionPredicates = map (a: a.assertion) cfg.assertions;
+              probe =
+                assert pluginsState.plugins.demo == expectedDemo;
+                assert pluginsState.plugins.demo-side.env.HYTTE_PLUGIN_ID == "demo-side";
+                assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_ID == "agreeing";
+                assert builtins.all (p: p) assertionPredicates;
+                builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-plugin-id-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
           # Evaluate nixosModules.default the same way. Forces the module's own
           # config contributions — the swaybg/polkit user units, the session
           # vars, and the assertions — rather than system.build.toplevel, to keep
@@ -1435,6 +1507,131 @@
                 builtins.deepSeq { inherit falsePredicates; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-plugin-mount-conflict-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # The NixOS twin of `hm-module-plugin-id` above (#1284) — same
+          # fixture shape, read back through `environment.etc` instead of
+          # `xdg.configFile` (see `nixos-module` above for why). `HYTTE_PLUGIN_ID`
+          # has no typed option of its own to declare once in the shared
+          # `nix/module-common.nix` — the override IS the attribute name — so
+          # setting up a plugin under a second id has to render on THIS
+          # platform too, or the behaviour would silently differ between the
+          # two modules that both build `pluginsState` off the same shared
+          # `plugins` submodule.
+          nixos-module-plugin-id =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      plugins = {
+                        demo.package = stubPlugin;
+                        demo-side.package = stubPlugin;
+                        # See the home-manager twin: the agreeing half of
+                        # #1284's precedence assertion, which must keep
+                        # evaluating.
+                        agreeing = {
+                          package = stubPlugin;
+                          env.HYTTE_PLUGIN_ID = "agreeing";
+                        };
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
+              );
+              expectedDemo = {
+                exec = pkgs.lib.getExe stubPlugin;
+                env = { };
+                secrets = [ ];
+                enabled = true;
+              };
+              # The `plugins.<id>` id precedence assertion lives in the shared
+              # `nix/module-common.nix`, so it has to hold on this platform
+              # too — and this is what proves the agreeing fixture above does
+              # not trip it. Predicates only, never `.message`: see
+              # `nixos-module-plugin-mount`'s own comment for why.
+              assertionPredicates = map (a: a.assertion) cfg.assertions;
+              probe =
+                assert pluginsState.plugins.demo == expectedDemo;
+                assert pluginsState.plugins.demo-side.env.HYTTE_PLUGIN_ID == "demo-side";
+                assert pluginsState.plugins.agreeing.env.HYTTE_PLUGIN_ID == "agreeing";
+                assert builtins.all (p: p) assertionPredicates;
+                builtins.deepSeq { inherit pluginsState assertionPredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-id-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # The other half of #1284: an attribute name that disagrees with
+          # the package's manifest id (so a `HYTTE_PLUGIN_ID` override is
+          # active) AND an explicit `env.HYTTE_PLUGIN_ID` set to a
+          # **different** value must be refused, not silently resolved — both
+          # platform modules merge the attribute name's override over `env`
+          # on the right of `//`, so it would win with no warning and the
+          # hand-written string would be discarded.
+          #
+          # Mirror image of `nixos-module-plugin-id` above, and the same
+          # `falsePredicates` idiom `nixos-module-plugin-mount-conflict` uses:
+          # exactly one predicate must be false, and it must be *this* one
+          # (matched by message content). The assertion itself is declared
+          # once, in the shared `nix/module-common.nix`, so pinning it here
+          # pins it for the home-manager module too — and it is deliberately
+          # pinned on THIS platform because home-manager evaluates
+          # `config.assertions` eagerly while building `hm.config`, which
+          # throws rather than handing back an inspectable false predicate
+          # (the same reason `nixos-module-plugin-mount-conflict` is
+          # NixOS-side only).
+          nixos-module-plugin-id-conflict =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      plugins.conflicting = {
+                        package = stubPlugin;
+                        env.HYTTE_PLUGIN_ID = "something-else";
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
+              probe =
+                assert builtins.length falsePredicates == 1;
+                assert pkgs.lib.hasInfix "HYTTE_PLUGIN_ID" (builtins.head falsePredicates).message;
+                builtins.deepSeq { inherit falsePredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-id-conflict-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

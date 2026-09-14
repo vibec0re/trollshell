@@ -48,15 +48,30 @@ let
   # claim holds here too, and the same `//` merge order makes `mount` beat a
   # hand-set `env.HYTTE_PLUGIN_MOUNT` (asserted against in
   # `nix/module-common.nix` rather than resolved silently, #1260 review F5).
+  #
+  # `HYTTE_PLUGIN_ID` (#1284): see `nix/hm-module.nix`'s matching comment —
+  # the attribute key (`id` below) IS the override, rendered only when it
+  # disagrees with `manifestId`, the id inferred from the package's own
+  # binary name (`hytte-plugin-<id>`, stripped off `lib.getExe`'s result).
+  # Keep the rest of the two in sync.
   pluginsState = builtins.toJSON {
     version = 1;
-    plugins = lib.mapAttrs (_: plugin: {
-      exec = lib.getExe plugin.package;
-      env =
-        plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
-      inherit (plugin) secrets;
-      enabled = plugin.enable;
-    }) cfg.plugins;
+    plugins = lib.mapAttrs (
+      id: plugin:
+      let
+        exec = lib.getExe plugin.package;
+        manifestId = lib.removePrefix "hytte-plugin-" (baseNameOf exec);
+      in
+      {
+        inherit exec;
+        env =
+          plugin.env
+          // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })
+          // (lib.optionalAttrs (id != manifestId) { HYTTE_PLUGIN_ID = id; });
+        inherit (plugin) secrets;
+        enabled = plugin.enable;
+      }
+    ) cfg.plugins;
   };
 
   # Bottom-up prune of one subsystem's option value (#1237 review MEDIUM-1) —

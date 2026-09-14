@@ -52,16 +52,42 @@ let
   # typed option is the checked one) but would be a silent discard, so
   # `nix/module-common.nix` asserts the two never disagree (#1260 review
   # F5); agreeing values are merely redundant.
+  #
+  # `HYTTE_PLUGIN_ID` (#1284) gets the same treatment, on the same #1260
+  # precedent, but has no typed option of its own — the attribute NAME
+  # (`id` below) is the value, since #1250 already needs it to agree with
+  # the systemd unit name (`trollshell-plugin-<id>`) this launcher gives the
+  # plugin. `manifestId` is the plugin's own id absent an override, inferred
+  # from its binary name rather than hand-declared: every bundled plugin's
+  # flake output — and binary, `nix/plugin.nix`'s `meta.mainProgram` — is
+  # named `hytte-plugin-<id>`, and the crate registers that same `<id>` with
+  # `Manifest::new` (e.g. `crates/hytte-plugin-stats/src/plugin.rs`'s
+  # `PLUGIN_ID`), so stripping the prefix off `lib.getExe`'s own result
+  # reconstructs it with no new nix-side declaration to drift from the Rust
+  # constant. `HYTTE_PLUGIN_ID` is therefore rendered only when the
+  # attribute key disagrees with that inferred id — a plugin declared under
+  # its own name (`plugins.stats`) renders nothing, exactly as before this
+  # existed. Same disagreement guard as `mount`: `nix/module-common.nix`
+  # asserts an explicit `env.HYTTE_PLUGIN_ID` never disagrees with it.
   pluginsState = builtins.toJSON (
     {
       version = 1;
-      plugins = lib.mapAttrs (_: plugin: {
-        exec = lib.getExe plugin.package;
-        env =
-          plugin.env // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; });
-        inherit (plugin) secrets;
-        enabled = plugin.enable;
-      }) cfg.plugins;
+      plugins = lib.mapAttrs (
+        id: plugin:
+        let
+          exec = lib.getExe plugin.package;
+          manifestId = lib.removePrefix "hytte-plugin-" (baseNameOf exec);
+        in
+        {
+          inherit exec;
+          env =
+            plugin.env
+            // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })
+            // (lib.optionalAttrs (id != manifestId) { HYTTE_PLUGIN_ID = id; });
+          inherit (plugin) secrets;
+          enabled = plugin.enable;
+        }
+      ) cfg.plugins;
     }
     // (lib.optionalAttrs (cfg.systemd.target != "graphical-session.target") {
       target = cfg.systemd.target;

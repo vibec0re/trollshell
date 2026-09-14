@@ -268,8 +268,10 @@ programs.trollshell.plugins = {
   # …and, once P2 (#1251) ships the chips, the same binary in the bar
   stats-bar = {
     package = trollshell.packages.${system}.hytte-plugin-stats;
-    env.HYTTE_PLUGIN_ID = "stats-bar"; # must equal the attribute name
     mount = "BarRight"; # renders HYTTE_PLUGIN_MOUNT (#1161)
+    # HYTTE_PLUGIN_ID = "stats-bar" is rendered automatically (#1284): nix
+    # derives it from this attribute name, since it differs from the
+    # package's own manifest id ("stats").
   };
 };
 ```
@@ -339,17 +341,23 @@ programs.trollshell.plugins = {
   stats = { package = pkgs.hytte-plugin-stats; };                      # the manifest's own id and mount
   stats-side = {
     package = pkgs.hytte-plugin-stats;
-    env.HYTTE_PLUGIN_ID = "stats-side";                                # must match the attribute name
     mount = "SidebarRightTop";                                         # renders HYTTE_PLUGIN_MOUNT (#1161)
   };
 };
 ```
 
-`HYTTE_PLUGIN_ID` is written out by hand above because nix does not yet render
-it from the attribute name the way `mount` renders its variable; the launcher
-already names the transient unit `trollshell-plugin-<id>` from that same name,
-so the two agreeing is currently the deployer's job. Rendering it automatically
-is follow-up work in the `nix/*-module.nix` file family.
+Since #1284, nix renders `HYTTE_PLUGIN_ID` for you — you no longer write it
+out by hand as above: both platform modules merge `HYTTE_PLUGIN_ID = "<attr>"`
+into a plugin's `env` whenever the attribute name (`stats-side` above)
+disagrees with the package's own manifest id (`stats`, inferred from the
+package's binary name), the same shape #1260 gave `mount` →
+`HYTTE_PLUGIN_MOUNT`. The launcher already names the transient unit
+`trollshell-plugin-<id>` from that same attribute name, so the two agreeing
+was already guaranteed on the launch side — this closes the other half, the
+`Register` id the plugin itself sends. A hand-written
+`env.HYTTE_PLUGIN_ID = "stats-side";` still works and is exactly redundant;
+setting it to anything *other* than the attribute name is an eval error
+naming both values, the same precedence `mount`/`env.HYTTE_PLUGIN_MOUNT` get.
 
 **Prefer an override _within_ a family — bar↔sidebar changes a plugin's
 visibility semantics and it cannot adapt.** The nine names are not

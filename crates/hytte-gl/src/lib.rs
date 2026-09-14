@@ -760,13 +760,71 @@ impl Texture {
             );
             gl::BindTexture(gl::TEXTURE_2D, 0);
         }
-        Ok(Self {
+        let texture = Self {
             id,
             width,
             height,
             format,
             _not_send: PhantomData,
-        })
+        };
+        texture.zero_storage();
+        Ok(texture)
+    }
+
+    /// Overwrite the storage [`Texture::new`] just allocated with zeroes.
+    ///
+    /// **`glTexStorage2D` leaves the contents undefined** — not zero. Fresh
+    /// pages on an idle machine read back as zero and recycled ones do not, so
+    /// a pipeline that samples a texel no pass has written yet is a bug whose
+    /// symptom depends on what the host was doing a moment earlier. That is the
+    /// hardest possible shape to reproduce, and #1298 spent a campaign on
+    /// exactly that hypothesis; zeroing here retires the question for every
+    /// texture in the tree at once, rather than asking each pipeline to prove
+    /// it overwrites every target before it reads one.
+    ///
+    /// It is **defence in depth, not a behaviour change**, and that was
+    /// measured rather than assumed: filling `preem_gl`'s three auxiliary
+    /// textures with `0xb7` instead of leaving them undefined left the parity
+    /// harness at `PASS all 148`, byte for byte, so nothing shipped today reads
+    /// a texel before writing it. This keeps that true by construction.
+    ///
+    /// Cost is one upload per texture *creation* — pipeline build and resize,
+    /// never per frame.
+    ///
+    /// Infallible on purpose: it runs only on storage `glTexStorage2D` has
+    /// already reported good, and a driver that refused this would refuse the
+    /// first real upload too, which is where the caller already handles it.
+    fn zero_storage(&self) {
+        let bytes = (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(self.format.bytes_per_texel());
+        if bytes == 0 {
+            return;
+        }
+        let zeroes = vec![0u8; bytes];
+        let (_, transfer, kind) = self.format.as_gl();
+        // SAFETY: a context is current, `self.id` is the texture just
+        // allocated, and `zeroes` holds exactly `width * height *
+        // bytes_per_texel` bytes — the region the call names — for the duration
+        // of the call. An all-zero byte pattern is the zero value of every
+        // `Format` here (`0.0f32` is four zero bytes), so one buffer serves
+        // both the byte-typed and the float-typed formats.
+        unsafe {
+            gl::BindTexture(gl::TEXTURE_2D, self.id);
+            Self::reset_unpack_state();
+            gl::TexSubImage2D(
+                gl::TEXTURE_2D,
+                0,
+                0,
+                0,
+                GLsizei::try_from(self.width).unwrap_or(0),
+                GLsizei::try_from(self.height).unwrap_or(0),
+                transfer,
+                kind,
+                zeroes.as_ptr().cast(),
+            );
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
     }
 
     /// This texture's `(width, height)`.
@@ -804,7 +862,7 @@ impl Texture {
         // the duration of the call.
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.id);
-            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            Self::reset_unpack_state();
             gl::TexSubImage2D(
                 gl::TEXTURE_2D,
                 0,
@@ -831,8 +889,9 @@ impl Texture {
     /// this is the backstop that makes a validation bug a wrong picture rather
     /// than a read past the end.
     ///
-    /// `UNPACK_ALIGNMENT` is set to 1 — an `R8` row of odd width is not
-    /// 4-aligned, and GL's default of 4 would read the rows staggered.
+    /// The unpack pixel store is put into a known position first — see
+    /// [`Texture::reset_unpack_state`] for which five knobs that is and why
+    /// setting `UNPACK_ALIGNMENT` alone (all this used to do) was not enough.
     pub fn upload_u8(&self, _gl: &Gl, bytes: &[u8]) {
         debug_assert_ne!(
             self.format,
@@ -855,7 +914,7 @@ impl Texture {
         // names — for the duration of the call.
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.id);
-            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            Self::reset_unpack_state();
             gl::TexSubImage2D(
                 gl::TEXTURE_2D,
                 0,
@@ -868,6 +927,55 @@ impl Texture {
                 data.as_ptr().cast(),
             );
             gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
+    }
+
+    /// Put the **whole** unpack pixel store into the position the two uploads
+    /// above assume, immediately before the `glTexSubImage2D` that reads it.
+    ///
+    /// [`reset_fixed_function_state`]'s argument, one state group over
+    /// (#1298): GTK renders its own scene into this same context and nothing
+    /// promises what it leaves set, so the unpack state is *put* into a known
+    /// position rather than inherited. Setting only `UNPACK_ALIGNMENT` — which
+    /// is all these two calls used to do — defends exactly one of the five
+    /// knobs that decide which bytes `glTexSubImage2D` actually reads:
+    ///
+    /// * `UNPACK_ALIGNMENT` — GL's default of 4 reads an odd-width `R8` row
+    ///   staggered. Already defended; kept here so all five sit together.
+    /// * `UNPACK_SKIP_PIXELS` / `UNPACK_SKIP_ROWS` — a non-zero value
+    ///   **offsets the source pointer**, so the upload starts one texel (or one
+    ///   row) into its own data and reads that many past the end of the slice.
+    ///   This is the one that bites hardest here: every `preem_gl` kind encodes
+    ///   its geometry into a 1-D `R32F` strip, so a one-texel slide turns each
+    ///   cell's origin into its code.
+    /// * `UNPACK_ROW_LENGTH` — the source stride. Inert for the 1-row strips
+    ///   this tree uploads (there is no second row to stride to), but not for
+    ///   the shader widget's 2-D buffers.
+    /// * `GL_PIXEL_UNPACK_BUFFER` — with a buffer bound, the `data` pointer is
+    ///   reinterpreted as a **byte offset into that buffer** and the caller's
+    ///   slice is never read at all. GTK4 uploads its own textures through PBOs
+    ///   on some paths, which is exactly how this could arrive set.
+    ///
+    /// Cheap enough to do unconditionally: one unbind and four enum-only
+    /// `glPixelStorei` calls per upload, against a call that already touches
+    /// the texture.
+    ///
+    /// **Not** restored afterwards, deliberately — the same posture
+    /// [`reset_fixed_function_state`] takes, and for the same reason. A
+    /// save/restore pair would make this crate responsible for state GTK never
+    /// promised to leave alone; GTK sets what it needs before its own uploads,
+    /// exactly as this does.
+    fn reset_unpack_state() {
+        // SAFETY: a context is current and every call takes only enum constants
+        // or small integers — none dereferences a pointer. The `BindBuffer`
+        // names the reserved zero, which is "no buffer bound" rather than an
+        // object id, so it cannot disturb a live buffer handle.
+        unsafe {
+            gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER, 0);
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+            gl::PixelStorei(gl::UNPACK_SKIP_PIXELS, 0);
+            gl::PixelStorei(gl::UNPACK_SKIP_ROWS, 0);
         }
     }
 

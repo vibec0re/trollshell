@@ -243,7 +243,11 @@ mod tests {
     fn the_binary_is_used_when_there_is_no_desktop_entry() {
         let route = resolve_control_center(
             |_| None,
-            |_| Some(PathBuf::from("/home/user/.nix-profile/bin/trollshell-control-center")),
+            |_| {
+                Some(PathBuf::from(
+                    "/home/user/.nix-profile/bin/trollshell-control-center",
+                ))
+            },
         );
         match route {
             Route::Binary(path) => assert_eq!(

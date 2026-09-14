@@ -163,7 +163,22 @@ pub use gauge::{
     trail_fraction,
 };
 pub use led_matrix::{Fill, LedMatrix};
-pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
+// The `LED_*`/`led_*` half of this list is #1153's seam for the shell's GPU
+// arm, on the `Gauge::dial`/`DotCell` precedent (#1148/#1144): a `.frag` cannot
+// read a Rust `const`, so the shell either transcribes this widget's segment
+// metrics, its level→count rounding and its peak-dot cap mix, or it reads them
+// here and hands them to the shader. It reads them here. Renamed on the way out
+// only where the module's own spelling is too generic for a crate root — `GAP`
+// and `PAD` name a *family*'s metric once they leave `led_strip`, which is what
+// `LED_` says. Additive and visibility-only: `strip_size`, `cell_x0` and
+// `cap_ink` are each called by `LedStrip::render` itself, so they are the kit's
+// definitions rather than copies of them.
+pub use led_strip::{
+    CELL_H as LED_CELL_H, CELL_W as LED_CELL_W, DEFAULT_LEDS, DEFAULT_WIDTH, GAP as LED_GAP,
+    LedStrip, MAX_LEDS, PAD as LED_PAD, PeakHold, cap_ink as led_cap_ink,
+    cell_x0 as led_cell_x0, led_strip, lit_count as led_lit_count, peak_led as led_peak_led,
+    strip_size as led_strip_size,
+};
 pub use marquee::{Marquee, MarqueeStrip};
 pub use scope::Scope;
 pub use seven_seg::seven_seg;

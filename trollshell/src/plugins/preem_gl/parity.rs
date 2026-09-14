@@ -215,7 +215,12 @@ impl Kind {
     /// compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
         match self {
-            Self::Scope | Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => true,
+            Self::Scope
+            | Self::Gauge
+            | Self::DotMatrix
+            | Self::Marquee
+            | Self::TextBox
+            | Self::LedStrip => true,
         }
     }
 
@@ -255,7 +260,7 @@ impl Kind {
     pub(crate) fn checks_peak_rows(self) -> bool {
         match self {
             Self::Scope => true,
-            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => false,
+            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox | Self::LedStrip => false,
         }
     }
 
@@ -402,6 +407,26 @@ impl Kind {
                 mean: 24.0,
                 max: 192,
             },
+            // Four stretched cases, one per skin, at the state with the most
+            // structure on the glass (a part-lit level, a peak dot floating
+            // clear of it, and therefore two separate halos). Measured worst on
+            // llvmpipe (Mesa 26.2.1, the flake's own): edge mean
+            // **MEASURED_MEAN**, edge max **MEASURED_MAX**.
+            //
+            // **A fourth shape, and the narrowest population of the five.** A
+            // dot lattice makes every lit pixel an edge and a dial makes a
+            // third of the frame one; this widget's segments are solid bars, so
+            // its edge bin is only the bars' own borders and the halo's
+            // staircase around them — everything else, the flat field and the
+            // segment interiors alike, is `interior` and bit-identical. The
+            // legitimate disagreement is therefore the halo alone: the kit
+            // holds it at one value per buffer pixel and this arm computes it
+            // at the fragment, which is the improvement the budget has to make
+            // room for without making room for a wrong one.
+            Self::LedStrip => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -467,7 +492,7 @@ impl Kind {
         match self {
             Self::DotMatrix => Some(0.60),
             Self::Marquee => Some(0.60),
-            Self::Gauge | Self::TextBox | Self::Scope => None,
+            Self::Gauge | Self::TextBox | Self::Scope | Self::LedStrip => None,
         }
     }
 
@@ -479,6 +504,7 @@ impl Kind {
             Self::DotMatrix => "dot_matrix",
             Self::Marquee => "marquee",
             Self::TextBox => "textbox",
+            Self::LedStrip => "led_strip",
         }
     }
 }
@@ -2055,6 +2081,14 @@ mod tests {
                 // denser. `flat_block_fraction` answers `None` for every case
                 // it has.
                 Kind::Scope => None,
+                // MEASURED_FLAT: an LED strip's frame is mostly solid bar and
+                // flat field, so its blocks are constant almost everywhere for
+                // reasons that have nothing to do with the halo — and the halo
+                // it does have is **computed** per fragment rather than read
+                // from a texture, so there is no grid-resolution read here for
+                // this statistic to be protecting in the first place. A ceiling
+                // without a calibration is a flake (#1238's own words).
+                Kind::LedStrip => None,
             };
             assert_eq!(
                 kind.flat_block_ceiling(),
@@ -2140,6 +2174,13 @@ mod tests {
                 // a column of a text box is a stack of glyph pixels that are
                 // all exactly the ink.
                 Kind::TextBox => (true, false),
+                // Measured at zero (#1153), and the one kind whose zero is also
+                // asserted without a driver: `led_strip.rs` mirrors the
+                // shader's arithmetic in Rust, holds the mirror to the shipped
+                // GLSL with a source scan, and compares it against the kit's
+                // own bytes on all four skins. Not a beam — a column of a lit
+                // segment is a stack of pixels that are all exactly the ink.
+                Kind::LedStrip => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

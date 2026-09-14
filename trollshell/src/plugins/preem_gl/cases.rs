@@ -23,11 +23,11 @@
 //! has no reason to be hermetic-test-reachable and every reason to stay next
 //! to the harness code that drives it.
 //!
-//! Kept intentionally thin: the four supporting enums carry their **shape**
+//! Kept intentionally thin: the five supporting enums carry their **shape**
 //! here (so [`Case`] can name them as field types) but not their behaviour —
-//! `DisplayAt::line`, `TickerAt::line`, `BubbleAt::spec` and `NeedleAt`'s own
-//! `impl` stay in the example, since inherent impls need only share a crate
-//! with their type, not a file.
+//! `DisplayAt::line`, `TickerAt::line`, `BubbleAt::spec`, `MeterAt::reading`
+//! and `NeedleAt`'s own `impl` stay in the example, since inherent impls need
+//! only share a crate with their type, not a file.
 
 use super::kind::Kind;
 use hytte_preem as kit;
@@ -35,6 +35,8 @@ use hytte_preem as kit;
 /// One comparison: a kit widget, a skin, and the state to drive it into.
 ///
 /// Moved out of `examples/preem_gl_diff.rs` for #1211 — see the module docs.
+///
+/// The `LedStrip` variant (#1153) is the sixth.
 ///
 /// `#[allow(dead_code)]`: every field but `style` (read by [`Case::kind`]'s
 /// sibling match in `plugins::tests`) is read only by the harness's own
@@ -88,6 +90,13 @@ pub(crate) enum Case {
         /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
         stretch: u32,
     },
+    /// An `LedStrip` at one level/peak pair (#1153).
+    LedStrip {
+        style: kit::DisplayStyle,
+        meter: MeterAt,
+        /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
+        stretch: u32,
+    },
 }
 
 impl Case {
@@ -105,6 +114,7 @@ impl Case {
             Self::DotMatrix { .. } => Kind::DotMatrix,
             Self::Marquee { .. } => Kind::Marquee,
             Self::TextBox { .. } => Kind::TextBox,
+            Self::LedStrip { .. } => Kind::LedStrip,
         }
     }
 }
@@ -183,6 +193,56 @@ pub(crate) enum BubbleAt {
     /// one frame.
     Pinned,
 }
+
+/// What an LED-strip case's meter is reading.
+///
+/// Five, and the list is the issue's own (#1153): the strip empty, half lit and
+/// full — the three points `lit_count`'s round-to-nearest has to land on — plus
+/// the two peak-dot arrangements the widget can be in. Those two are the ones
+/// that matter: the dot is a *second* emission with a *second* halo, composited
+/// on top of the level's, so a renderer that drew one pass instead of two, or
+/// drew them in the wrong order, agrees with the kit on the first three cases
+/// and disagrees on these.
+///
+/// [`Empty`](Self::Empty) is deliberately a rested peak as well as a silent
+/// level: it is the frame a meter spends most of its life in, and it is the one
+/// where `peak_led`'s "no dot" answer reaches the shader as the `-1` sentinel.
+/// **On the OLED it carries no information**, the way `DisplayAt::Blank` does —
+/// that skin has no ghost row and a black field, so a silent strip is a frame
+/// of pure zeros that any renderer outputting black matches, and both blank
+/// guards excuse a flat reference by design. It is kept rather than
+/// special-cased because the other three skins' empty cases do detect (the LCD
+/// draws its whole ghost row there), and a case list that varies by skin is a
+/// worse thing to reason about than one case that is vacuously green on one.
+#[derive(Clone, Copy)]
+pub(crate) enum MeterAt {
+    /// Silence: no lit segment, no peak dot. The ghost row and the field, and
+    /// the `-1` peak sentinel.
+    Empty,
+    /// Half scale, no peak dot — the ordinary reading.
+    Half,
+    /// Full scale, no peak dot: every segment lit, so the halo's window is
+    /// saturated almost everywhere and the buffer's own edge clipping (the
+    /// unrenormalised divisor) is what is left to get wrong.
+    Full,
+    /// A quiet level with the dot floating well above it — the two emissions
+    /// visibly apart, which is the arrangement a single-pass renderer cannot
+    /// produce.
+    PeakAbove,
+    /// The dot sitting **on** the level, where the two emissions overlap and
+    /// the cap composites over ink the level pass has already laid down.
+    PeakAt,
+}
+
+/// The segment count every LED-strip case runs at — the kit's own
+/// [`kit::DEFAULT_LEDS`], which is what every meter on the glass uses and what
+/// [`kit::DEFAULT_WIDTH`] is stated for.
+///
+/// `#[allow(dead_code)]` for [`Case`]'s reason: it is read by the harness's own
+/// `led_strip_config`/`meter_strip`, which stayed in the example and so live in
+/// a different crate compilation of this same source file.
+#[allow(dead_code)]
+pub(crate) const METER_LEDS: usize = kit::DEFAULT_LEDS;
 
 /// What a dot-matrix case puts on the display.
 ///
@@ -383,6 +443,31 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 bubble: BubbleAt::Pinned,
                 stretch: STRETCH,
             });
+            // The meter (#1153): the strip empty, half, full, and the two
+            // peak-dot arrangements. See [`MeterAt`].
+            let meters = [
+                MeterAt::Empty,
+                MeterAt::Half,
+                MeterAt::Full,
+                MeterAt::PeakAbove,
+                MeterAt::PeakAt,
+            ]
+            .into_iter()
+            .map(move |meter| Case::LedStrip {
+                style: *style,
+                meter,
+                stretch: 1,
+            });
+            // …and the floating-dot state given more room than its natural
+            // size, which is where *this* arm's improvement lives: the segment
+            // edges and both halos resolved at the screen's resolution rather
+            // than replicated out of the kit's grid. `PeakAbove` because it is
+            // the one state with two separate halos on the glass at once.
+            let stretched_meter = std::iter::once(Case::LedStrip {
+                style: *style,
+                meter: MeterAt::PeakAbove,
+                stretch: STRETCH,
+            });
             scopes
                 .chain(gauges)
                 .chain(shipping)
@@ -393,6 +478,8 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 .chain(ticker_origin)
                 .chain(bubbles)
                 .chain(stretched_bubble)
+                .chain(meters)
+                .chain(stretched_meter)
         })
         .collect()
 }

@@ -27,7 +27,7 @@
 
 use hytte::ui::gl_surface::{GlPipeline, GlProgram};
 
-use super::{dot_matrix, gauge, marquee, program, textbox};
+use super::{dot_matrix, gauge, led_strip, marquee, program, textbox};
 
 /// Which kit widget a case is measuring, because the two do **not** take the
 /// same structural checks (#1143).
@@ -90,6 +90,24 @@ pub(crate) enum Kind {
     /// exactly the collapse a pin is worth taking to protect. All sixteen 1:1
     /// cases measured max |Δ| 0 on every channel.
     TextBox,
+    /// `preem.led_strip` (#1153) — **pinned bit-exact**, and the one kind here
+    /// whose pin is also asserted *hermetically*.
+    ///
+    /// Its geometry is integers all the way down — the segment bounds, the
+    /// bezel and the row band are whole buffer pixels, and the bloom window's
+    /// half-width is a half-integer — so at a pixel centre the coverage
+    /// integral is exactly `0` or `1` and the closed-form blur's two measures
+    /// are exactly the integer column and row counts the kit sums. Zero is
+    /// therefore available by construction, and it is what all twenty 1:1 cases
+    /// measured under llvmpipe.
+    ///
+    /// What makes this one different is `led_strip.rs`'s
+    /// `the_transcribed_shader_is_bit_exact_against_the_kit_at_one_to_one`: the
+    /// shader's arithmetic is mirrored in Rust, held to the shipped GLSL by a
+    /// source scan, and compared against the kit's own bytes on every skin in
+    /// `cargo test`. The pin here still says what the *driver* did; that one
+    /// says the arithmetic being pinned was right before a driver ever saw it.
+    LedStrip,
 }
 
 impl Kind {
@@ -112,12 +130,13 @@ impl Kind {
     /// consumer, so the constant was gated the same way to keep it from being
     /// an unused-in-production warning. [`super::install`] is now a
     /// consumer too, so the constant has to exist in every build.
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Scope,
         Self::Gauge,
         Self::DotMatrix,
         Self::Marquee,
         Self::TextBox,
+        Self::LedStrip,
     ];
 
     /// The `(program, pipeline)` pair [`super::install`] registers for this
@@ -139,6 +158,7 @@ impl Kind {
             Self::DotMatrix => (dot_matrix::DOT_MATRIX, dot_matrix::DOT_MATRIX_PIPELINE),
             Self::Marquee => (marquee::MARQUEE, marquee::MARQUEE_PIPELINE),
             Self::TextBox => (textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE),
+            Self::LedStrip => (led_strip::LED_STRIP, led_strip::LED_STRIP_PIPELINE),
         }
     }
 }

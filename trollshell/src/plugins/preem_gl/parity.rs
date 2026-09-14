@@ -220,7 +220,8 @@ impl Kind {
             | Self::DotMatrix
             | Self::Marquee
             | Self::TextBox
-            | Self::LedStrip => true,
+            | Self::LedStrip
+            | Self::SevenSeg => true,
         }
     }
 
@@ -260,7 +261,12 @@ impl Kind {
     pub(crate) fn checks_peak_rows(self) -> bool {
         match self {
             Self::Scope => true,
-            Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox | Self::LedStrip => false,
+            Self::Gauge
+            | Self::DotMatrix
+            | Self::Marquee
+            | Self::TextBox
+            | Self::LedStrip
+            | Self::SevenSeg => false,
         }
     }
 
@@ -447,6 +453,8 @@ impl Kind {
             // by 3.7x, which is what actually carries it there. At 16.0 / 64
             // not one of the four would have moved.
             Self::LedStrip => EdgeBudget { mean: 3.0, max: 16 },
+            // PLACEHOLDER — calibrated below.
+            Self::SevenSeg => EdgeBudget { mean: 3.0, max: 16 },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -512,7 +520,13 @@ impl Kind {
         match self {
             Self::DotMatrix => Some(0.60),
             Self::Marquee => Some(0.60),
-            Self::Gauge | Self::TextBox | Self::Scope | Self::LedStrip => None,
+            // The seven-segment readout is the fourth `None`, and a measurement
+            // too: its supersampled frames come out at 93.2–97.1 % flat blocks,
+            // because a readout is mostly field and its segments are solid
+            // bars, so there is no grid-resolution lattice for a ceiling here
+            // to protect. See [`Self::edge_budget`]'s `SevenSeg` arm for what
+            // does gate this kind's stretched cases.
+            Self::Gauge | Self::TextBox | Self::Scope | Self::LedStrip | Self::SevenSeg => None,
         }
     }
 
@@ -525,6 +539,7 @@ impl Kind {
             Self::Marquee => "marquee",
             Self::TextBox => "textbox",
             Self::LedStrip => "led_strip",
+            Self::SevenSeg => "seven_seg",
         }
     }
 }
@@ -2184,6 +2199,15 @@ mod tests {
                 // first place. A ceiling without a calibration is a flake
                 // (#1238's own words).
                 Kind::LedStrip => None,
+                // 93.2–97.1 % (vfd 93.2, lcd 97.1, oled 94.8, crt 93.3): a
+                // readout is mostly flat field with solid bars on it, so its
+                // blocks are constant almost everywhere for reasons that have
+                // nothing to do with the halo — the bloomless lcd control comes
+                // out highest, which is exactly the wrong direction for a
+                // statistic that is supposed to fall when a halo is resolved
+                // per fragment. No calibration is available here, and a ceiling
+                // without one is a flake (#1238's own words).
+                Kind::SevenSeg => None,
             };
             assert_eq!(
                 kind.flat_block_ceiling(),
@@ -2276,6 +2300,14 @@ mod tests {
                 // own bytes on all four skins. Not a beam — a column of a lit
                 // segment is a stack of pixels that are all exactly the ink.
                 Kind::LedStrip => (true, false),
+                // Measured at zero (#1154), and the second kind whose zero is
+                // also asserted without a driver: `seven_seg.rs` mirrors both
+                // the shader's arithmetic *and* `blur.frag`'s, holds them to the
+                // shipped GLSL with a source scan, and compares the result
+                // against the kit's own bytes on all four skins. Not a beam — a
+                // column of a lit segment is a stack of pixels that are all
+                // exactly the ink.
+                Kind::SevenSeg => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

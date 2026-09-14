@@ -27,7 +27,7 @@
 
 use hytte::ui::gl_surface::{GlPipeline, GlProgram};
 
-use super::{dot_matrix, gauge, led_strip, marquee, program, textbox};
+use super::{dot_matrix, gauge, led_strip, marquee, program, seven_seg, textbox};
 
 /// Which kit widget a case is measuring, because the two do **not** take the
 /// same structural checks (#1143).
@@ -108,6 +108,26 @@ pub(crate) enum Kind {
     /// `cargo test`. The pin here still says what the *driver* did; that one
     /// says the arithmetic being pinned was right before a driver ever saw it.
     LedStrip,
+    /// `preem.seven_seg` (#1154) — **pinned bit-exact**, and the second kind
+    /// whose pin is also asserted *hermetically*.
+    ///
+    /// Its segments are tapered hexagons, and this arm draws the **chamfer**
+    /// the kit's six-row staircase samples. That collapse is what the pin is
+    /// worth taking to protect: at a pixel centre each of the shape's three
+    /// half-plane residuals is a non-zero half-integer, so the point test
+    /// returns exactly `stamp_bar`'s integer range test and the two arms draw
+    /// the same picture — by construction, and silently if the construction
+    /// ever stopped holding. Zero is the only value that can say so.
+    ///
+    /// Like [`LedStrip`](Self::LedStrip), `seven_seg.rs`'s
+    /// `the_transcribed_shader_is_bit_exact_against_the_kit_at_one_to_one`
+    /// mirrors the shader's arithmetic — this one including `blur.frag`, since
+    /// unlike the meter this widget has a real blur pass — holds it to the
+    /// shipped GLSL by a source scan, and compares it against the kit's own
+    /// bytes on every skin in `cargo test`. The pin here still says what the
+    /// *driver* did; that one says the arithmetic being pinned was right before
+    /// a driver ever saw it.
+    SevenSeg,
 }
 
 impl Kind {
@@ -130,13 +150,14 @@ impl Kind {
     /// consumer, so the constant was gated the same way to keep it from being
     /// an unused-in-production warning. [`super::install`] is now a
     /// consumer too, so the constant has to exist in every build.
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Scope,
         Self::Gauge,
         Self::DotMatrix,
         Self::Marquee,
         Self::TextBox,
         Self::LedStrip,
+        Self::SevenSeg,
     ];
 
     /// The `(program, pipeline)` pair [`super::install`] registers for this
@@ -159,6 +180,7 @@ impl Kind {
             Self::Marquee => (marquee::MARQUEE, marquee::MARQUEE_PIPELINE),
             Self::TextBox => (textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE),
             Self::LedStrip => (led_strip::LED_STRIP, led_strip::LED_STRIP_PIPELINE),
+            Self::SevenSeg => (seven_seg::SEVEN_SEG, seven_seg::SEVEN_SEG_PIPELINE),
         }
     }
 }

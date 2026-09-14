@@ -663,6 +663,23 @@ enum Renderer {
     SevenSeg {
         text: String,
     },
+    /// The **GPU** arm of [`SevenSeg`](Self::SevenSeg) (#1154).
+    ///
+    /// Pure, like the CPU arm — `kit::seven_seg` is a pure function of
+    /// `(text, style)`, so there is no builder, no clock and no animation on
+    /// either side.
+    ///
+    /// What it adds is the **encoded readout**, and it is here rather than in
+    /// the mapping for #911's reason: the cell layout and the segment masks are
+    /// a function of the text alone, so re-deriving them per mapping pass would
+    /// walk the readout once per monitor and again on every re-tint.
+    /// [`update`](Self::update) rebuilds it — the only time it can move, since
+    /// [`apply`] short-circuits an unchanged widget before `update` is reached
+    /// — and every pass after that clones an `Arc`.
+    SevenSegGl {
+        /// The readout as the shader consumes it — see `preem_gl::seven_seg`.
+        readout: preem_gl::Readout,
+    },
     /// Pure, but the builder is worth keeping: it *is* the config, pre-parsed
     /// (and, uniquely in the kit, with the skin's palette already baked in — see
     /// [`invalidate_cached_frames`]).
@@ -1924,6 +1941,7 @@ pub(super) fn invalidate_cached_frames() {
                         Renderer::DotMatrix { .. }
                         | Renderer::DotMatrixGl { .. }
                         | Renderer::SevenSeg { .. }
+                        | Renderer::SevenSegGl { .. }
                         | Renderer::LedStrip { .. }
                         | Renderer::LedStripGl { .. }
                         | Renderer::Marquee { .. }
@@ -2424,9 +2442,20 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
                 dot_px: dim(config.dot_px),
             }
         }
-        W::SevenSeg { state, .. } => Renderer::SevenSeg {
-            text: state.text.clone(),
-        },
+        W::SevenSeg { state, .. } => {
+            // GL by default (#1154), the CPU kit under the kill switch, once a
+            // context has failed, or once this driver has refused this pipeline
+            // (#1232) — the same `preem_gl::arm_for` decision every other arm
+            // on this seam takes.
+            if preem_gl::arm_for(preem_gl::SEVEN_SEG) == Arm::Gl {
+                return Renderer::SevenSegGl {
+                    readout: preem_gl::encode_readout(&state.text),
+                };
+            }
+            Renderer::SevenSeg {
+                text: state.text.clone(),
+            }
+        }
         W::TextBox { config, state } => {
             // GL by default (#1152), the CPU kit under the kill switch, once a
             // context has failed, or once this driver has refused this
@@ -2746,7 +2775,10 @@ impl Renderer {
             Self::DotMatrix { .. } | Self::DotMatrixGl { .. } => {
                 matches!(widget, W::DotMatrix { .. })
             }
-            Self::SevenSeg { .. } => matches!(widget, W::SevenSeg { .. }),
+            // …and the same for the two `SevenSeg` arms (#1154).
+            Self::SevenSeg { .. } | Self::SevenSegGl { .. } => {
+                matches!(widget, W::SevenSeg { .. })
+            }
             // …and the same for the two `TextBox` and `Marquee` arms (#1152).
             Self::TextBox { .. } | Self::TextBoxGl { .. } => matches!(widget, W::TextBox { .. }),
             // …and the same for the two `LedStrip` arms (#1153).
@@ -2812,6 +2844,7 @@ impl Renderer {
             Self::MarqueeGl { .. } => Some(preem_gl::MARQUEE),
             Self::TextBoxGl { .. } => Some(preem_gl::TEXTBOX),
             Self::LedStripGl { .. } => Some(preem_gl::LED_STRIP),
+            Self::SevenSegGl { .. } => Some(preem_gl::SEVEN_SEG),
             Self::DotMatrix { .. }
             | Self::SevenSeg { .. }
             | Self::TextBox { .. }
@@ -2843,6 +2876,14 @@ impl Renderer {
                 *glyphs = preem_gl::encode_glyphs(&state.text);
             }
             (Self::SevenSeg { text }, W::SevenSeg { state, .. }) => text.clone_from(&state.text),
+            // The GL arm re-encodes the cell strip instead of keeping the
+            // `String`. Reached **only** on a real state change — `apply`
+            // returns early on an unchanged widget — so it is the one place a
+            // new strip can be minted, and every mapping pass between two of
+            // them clones the `Arc` rather than walking the readout again.
+            (Self::SevenSegGl { readout }, W::SevenSeg { state, .. }) => {
+                *readout = preem_gl::encode_readout(&state.text);
+            }
             (Self::TextBox { text, .. }, W::TextBox { state, .. }) => text.clone_from(&state.text),
             // The GL arm re-wraps and re-encodes instead of keeping the
             // `String` alone. Reached **only** on a real state change — `apply`
@@ -2966,6 +3007,7 @@ impl Renderer {
             Self::DotMatrix { .. }
             | Self::DotMatrixGl { .. }
             | Self::SevenSeg { .. }
+            | Self::SevenSegGl { .. }
             | Self::TextBox { .. }
             | Self::TextBoxGl { .. } => false,
             // Both arms, one expression — see `update`.
@@ -3126,6 +3168,7 @@ impl Renderer {
             Self::DotMatrix { .. }
             | Self::DotMatrixGl { .. }
             | Self::SevenSeg { .. }
+            | Self::SevenSegGl { .. }
             | Self::TextBox { .. }
             | Self::TextBoxGl { .. } => false,
             // A peak dot only moves while it is above the floor, has a fall
@@ -3225,7 +3268,8 @@ impl Renderer {
             | Self::DotMatrixGl { .. }
             | Self::MarqueeGl { .. }
             | Self::TextBoxGl { .. }
-            | Self::LedStripGl { .. } => return None,
+            | Self::LedStripGl { .. }
+            | Self::SevenSegGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
         })
@@ -3323,6 +3367,14 @@ impl Renderer {
                     peak_for(*explicit_peak, hold.as_ref()),
                     &kit::palette_snapshot(style),
                 ),
+            )),
+            // The readout is entirely a function of its text and its skin —
+            // `kit::seven_seg` is pure — so the encoded strip and the palette
+            // are the whole payload. No clock, no folded value, nothing to
+            // decay.
+            Self::SevenSegGl { readout } => Some((
+                preem_gl::SEVEN_SEG,
+                preem_gl::seven_seg_surface(readout, &kit::palette_snapshot(style)),
             )),
             _ => None,
         }
@@ -3594,7 +3646,8 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
         W::Marquee { .. } => Some(preem_gl::Kind::Marquee),
         W::TextBox { .. } => Some(preem_gl::Kind::TextBox),
         W::LedStrip { .. } => Some(preem_gl::Kind::LedStrip),
-        W::SevenSeg { .. } | W::FlipBoard { .. } => None,
+        W::SevenSeg { .. } => Some(preem_gl::Kind::SevenSeg),
+        W::FlipBoard { .. } => None,
     }
 }
 

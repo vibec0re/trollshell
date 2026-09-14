@@ -95,6 +95,7 @@ mod kind;
 mod led_strip;
 mod marquee;
 mod program;
+mod seven_seg;
 mod textbox;
 
 /// The parity harness's arithmetic — see the module docs there.
@@ -130,6 +131,7 @@ pub(super) use gauge::{GAUGE, gauge_surface};
 pub(super) use led_strip::{LED_STRIP, led_strip_surface};
 pub(super) use marquee::{MARQUEE, Window, marquee_surface, window as encode_window};
 pub(super) use program::{KitSurface, SCOPE, scope_surface};
+pub(super) use seven_seg::{Readout, SEVEN_SEG, readout as encode_readout, seven_seg_surface};
 pub(super) use textbox::{Block, TEXTBOX, block as encode_block, textbox_surface};
 
 /// Re-exported for `plugins::tests`' `kind_enumeration` module (#1211): both

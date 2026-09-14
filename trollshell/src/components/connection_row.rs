@@ -104,8 +104,13 @@ mod tests {
             "two over-the-cap program names must render the row at the exact same width — \
              growth must stop at the cap"
         );
-        assert!(nat_short < nat_far, "sanity: a 5-char name must measure narrower");
-        let tooltip = row_far.tooltip_text().expect("the row's tooltip must be set");
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char name must measure narrower"
+        );
+        let tooltip = row_far
+            .tooltip_text()
+            .expect("the row's tooltip must be set");
         assert!(
             tooltip.contains(&far_over),
             "the tooltip must still carry the full, untruncated title, got {tooltip:?}"

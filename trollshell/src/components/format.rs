@@ -330,7 +330,10 @@ mod tests {
         let out = truncate_for_row(&"x".repeat(300));
         assert_eq!(out.chars().count(), ROW_TEXT_CAP);
         assert!(out.ends_with('\u{2026}'));
-        assert_eq!(&out[..out.len() - '\u{2026}'.len_utf8()], "x".repeat(ROW_TEXT_CAP - 1));
+        assert_eq!(
+            &out[..out.len() - '\u{2026}'.len_utf8()],
+            "x".repeat(ROW_TEXT_CAP - 1)
+        );
     }
 
     #[test]
@@ -338,6 +341,9 @@ mod tests {
         // The #1302 invariant that actually matters: once a name is over the
         // cap, growing it further must not change what's displayed at all —
         // that's what stops the row's width from tracking name length.
-        assert_eq!(truncate_for_row(&"x".repeat(90)), truncate_for_row(&"x".repeat(300)));
+        assert_eq!(
+            truncate_for_row(&"x".repeat(90)),
+            truncate_for_row(&"x".repeat(300))
+        );
     }
 }

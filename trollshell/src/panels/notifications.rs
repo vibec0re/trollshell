@@ -445,7 +445,10 @@ mod width_tests {
             "two over-the-cap app names must render the row at the exact same width — growth \
              must stop at the cap"
         );
-        assert!(nat_short < nat_far, "sanity: a 5-char name must measure narrower");
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char name must measure narrower"
+        );
         assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 
@@ -476,7 +479,10 @@ mod width_tests {
             "two over-the-cap summaries must render the row at the exact same width — growth \
              must stop at the cap"
         );
-        assert!(nat_short < nat_far, "sanity: a 5-char summary must measure narrower");
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char summary must measure narrower"
+        );
         assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
     }
 }

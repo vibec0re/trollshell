@@ -219,7 +219,14 @@ fn build_history_app_row_shell(
         } else {
             format!("{} · {} entries", latest.summary, count)
         };
-        row.set_subtitle(&subtitle);
+        // Round 3 review, HIGH: the latest entry's `summary` is free text
+        // from whatever posted the notification — just as unbounded as
+        // `app_name` above, and the same `AdwExpanderRow`-subtitle-is-
+        // unboundable finding applies (see `truncate_for_row`'s doc). Capped
+        // the same way; the full summary/count is still one hover away.
+        row.set_subtitle(&truncate_for_row(&subtitle));
+        row.set_subtitle_lines(1);
+        row.set_tooltip_text(Some(&format!("{app}\n{subtitle}")));
     }
     row
 }
@@ -237,7 +244,17 @@ fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionR
     row.set_title_lines(1);
     row.set_tooltip_text(Some(&entry.summary));
     if !entry.body.is_empty() {
-        row.set_subtitle(&entry.body);
+        // Round 3 review, HIGH: "the body already wraps freely" is the same
+        // fallacy `truncate_for_row`'s own doc debunks — at `for_size = -1`
+        // Pango lays the whole string out on one line regardless of wrap
+        // mode, so an ordinary sentence (or a single-token URL) still drove
+        // the page to the full clamp on arrival. Capped the same way as the
+        // title; the full body is still one hover away via the tooltip
+        // (merged with the summary already set above, so hovering the row
+        // never loses either field).
+        row.set_subtitle(&truncate_for_row(&entry.body));
+        row.set_subtitle_lines(1);
+        row.set_tooltip_text(Some(&format!("{}\n{}", entry.summary, entry.body)));
     }
     if entry.urgency == notifications::Urgency::Critical {
         row.add_css_class("critical");
@@ -394,13 +411,13 @@ mod width_tests {
 
     use super::{build_history_action_row, build_history_app_row_shell};
 
-    fn entry(summary: &str) -> HistoryEntry {
+    fn entry(summary: &str, body: &str) -> HistoryEntry {
         HistoryEntry {
             id: 1,
             app_name: "Firefox".to_string(),
             app_icon: String::new(),
             summary: summary.to_string(),
-            body: String::new(),
+            body: body.to_string(),
             urgency: Urgency::Normal,
             image: None,
             actions: Vec::new(),
@@ -430,7 +447,7 @@ mod width_tests {
         adw::init().expect("libadwaita init");
         let far_over = "x".repeat(300);
         let over = "x".repeat(90);
-        let e = entry("New message");
+        let e = entry("New message", "");
         let bucket = [&e];
 
         let row_far = build_history_app_row_shell(&far_over, &bucket);
@@ -449,14 +466,62 @@ mod width_tests {
             nat_short < nat_far,
             "sanity: a 5-char name must measure narrower"
         );
-        assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
+        let tooltip = row_far.tooltip_text().expect("tooltip must be set");
+        assert!(
+            tooltip.contains(&far_over),
+            "tooltip must carry the full app name, got {tooltip:?}"
+        );
+    }
+
+    /// **Round 3 review, HIGH**: varying only the app name (as the test
+    /// above does) left the entry's `summary` field — the other half of this
+    /// row's subtitle, and just as free-text/unbounded — completely
+    /// untested; production capped the title but not the summary, so an
+    /// ordinary notification's page still jumped to the drawer's clamp on
+    /// arrival. Two summaries both past the cap, of different lengths, must
+    /// render the row at the exact same width, and the tooltip must still
+    /// carry the full summary (merged with the app name — the row now sets
+    /// one tooltip for both halves of what it shows).
+    ///
+    /// Falsified by reverting the `truncate_for_row` call added to the
+    /// summary branch in [`build_history_app_row_shell`].
+    #[gtk::test]
+    fn history_app_row_summary_ellipsises_a_long_summary() {
+        adw::init().expect("libadwaita init");
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
+
+        let e_far = entry(&far_over, "");
+        let row_far = build_history_app_row_shell("Firefox", &[&e_far]);
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let e_over = entry(&over, "");
+        let row_over = build_history_app_row_shell("Firefox", &[&e_over]);
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
+        let e_short = entry("abcde", "");
+        let row_short = build_history_app_row_shell("Firefox", &[&e_short]);
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_far, nat_over,
+            "two over-the-cap summaries must render the row at the exact same width — growth \
+             must stop at the cap"
+        );
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char summary must measure narrower"
+        );
+        let tooltip = row_far.tooltip_text().expect("tooltip must be set");
+        assert!(
+            tooltip.contains(&far_over),
+            "tooltip must carry the full, untruncated summary, got {tooltip:?}"
+        );
     }
 
     /// **The #1302 fix, pinned** for one history entry's summary title: two
     /// summaries both past the cap, of different lengths, must render the row
     /// at the exact same width, and the tooltip must still carry the full
-    /// summary. The (unbounded, deliberately unwrapped) body is untouched by
-    /// this fix and out of scope for this test.
+    /// summary. The body stays empty here — see the sibling test below for
+    /// the body's own cap.
     ///
     /// Falsified by reverting the `truncate_for_row` call in
     /// [`build_history_action_row`] to the raw summary: measured `left: 2443
@@ -467,11 +532,11 @@ mod width_tests {
         let far_over = "x".repeat(300);
         let over = "x".repeat(90);
 
-        let row_far = build_history_action_row(&entry(&far_over));
+        let row_far = build_history_action_row(&entry(&far_over, ""));
         let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
-        let row_over = build_history_action_row(&entry(&over));
+        let row_over = build_history_action_row(&entry(&over, ""));
         let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
-        let row_short = build_history_action_row(&entry("abcde"));
+        let row_short = build_history_action_row(&entry("abcde", ""));
         let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
 
         assert_eq!(
@@ -484,5 +549,47 @@ mod width_tests {
             "sanity: a 5-char summary must measure narrower"
         );
         assert_eq!(row_far.tooltip_text().as_deref(), Some(far_over.as_str()));
+    }
+
+    /// **Round 3 review, HIGH**: the previous test above varies only the
+    /// title/summary field, which was already capped — the `body` field
+    /// (the free-form notification text, e.g. an email preview or a URL) was
+    /// left completely untested and, per the review, still uncapped in
+    /// production: "the body already wraps freely" is the same fallacy
+    /// `truncate_for_row`'s own doc debunks, since a wrapping label's
+    /// natural width at `for_size = -1` is still the full single-line width.
+    /// Two bodies both past the cap, of different lengths, must render the
+    /// row at the exact same width, and the tooltip must carry the full body
+    /// (merged with the summary).
+    ///
+    /// Falsified by reverting the `truncate_for_row` call added to the body
+    /// branch in [`build_history_action_row`].
+    #[gtk::test]
+    fn history_action_row_body_ellipsises_a_long_body() {
+        adw::init().expect("libadwaita init");
+        let far_over = "x".repeat(300);
+        let over = "x".repeat(90);
+
+        let row_far = build_history_action_row(&entry("New message", &far_over));
+        let (_, nat_far, _, _) = row_far.measure(gtk::Orientation::Horizontal, -1);
+        let row_over = build_history_action_row(&entry("New message", &over));
+        let (_, nat_over, _, _) = row_over.measure(gtk::Orientation::Horizontal, -1);
+        let row_short = build_history_action_row(&entry("New message", "abcde"));
+        let (_, nat_short, _, _) = row_short.measure(gtk::Orientation::Horizontal, -1);
+
+        assert_eq!(
+            nat_far, nat_over,
+            "two over-the-cap bodies must render the row at the exact same width — growth must \
+             stop at the cap"
+        );
+        assert!(
+            nat_short < nat_far,
+            "sanity: a 5-char body must measure narrower"
+        );
+        let tooltip = row_far.tooltip_text().expect("tooltip must be set");
+        assert!(
+            tooltip.contains(&far_over),
+            "tooltip must carry the full, untruncated body, got {tooltip:?}"
+        );
     }
 }

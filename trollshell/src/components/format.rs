@@ -130,6 +130,21 @@ const ROW_TEXT_CAP: usize = 60;
 /// capped string wider than the space actually allocated) and keeps the
 /// *untruncated* original string in a tooltip — this function only ever
 /// touches what's drawn on the row, never what a hover reveals.
+///
+/// **This bounds, it does not pin to a constant** — round 3 review, LOW: a
+/// 60-char capped row is a fixed *upper* bound, but a short name still
+/// measures narrower than a long one below that bound, so the drawer can
+/// still travel between them. Measured on Bluetooth's per-device row: a
+/// 5-char alias 115px, 20-char 214px, 60-char (the cap) 530px, 300-char
+/// 535px (rounding past the cap) — ~200px of travel above the drawer's
+/// `scale(360)` floor (327px at the test font). Acceptable for the rows that
+/// use this cap (Bluetooth/VPN/connections/notifications): their text
+/// doesn't change tick to tick, so the row-widening happens at most once per
+/// device/profile/notification, not every sample. The four rows that *do*
+/// refresh every tick (Top apps, failed units, disk mounts, the GPU device
+/// subtitle) don't use this function at all — see
+/// `components::layout::fixed_width_label`, which pins to a genuine
+/// constant, for why and how.
 pub(crate) fn truncate_for_row(s: &str) -> String {
     if s.chars().count() <= ROW_TEXT_CAP {
         return s.to_string();

@@ -1175,11 +1175,7 @@ fn open_terminals_launches_one_window_per_running_agent_in_row_order() {
         .collect();
     assert_eq!(
         launched,
-        vec![
-            "alpha".to_owned(),
-            "zeta".to_owned(),
-            "orphan".to_owned()
-        ],
+        vec!["alpha".to_owned(), "zeta".to_owned(), "orphan".to_owned()],
         "grouped order (nixos, viberoot, ungrouped), not the hive's"
     );
 

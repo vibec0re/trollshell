@@ -936,9 +936,9 @@ windows are N windows rather than one window opened N times.
       launch was its own transient unit, outside the shell's cgroup.
 - [ ] **(#1306)** **The button is absent when there is nothing to open.** Stop
       every agent and confirm the button **disappears** from the card header
-      (not greys out). Same with the hive down — `systemctl --user stop
-      hive-c0re` or equivalent — where the card says "no hive" and carries no
-      terminal button.
+      (not greys out). Then stop the hive itself
+      (`systemctl --user stop hive-c0re` or equivalent) and confirm the card
+      says "no hive" and carries no terminal button.
 - [ ] **(#1306)** **The browser fallback fans out too.** Set
       `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
       plugin, and confirm one press opens **N browser tabs** — one per running

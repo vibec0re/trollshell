@@ -976,9 +976,9 @@ mod tests {
         assert!(wants_terminal(&agents[0]));
         assert!(!wants_terminal(&agents[3]));
         for row in [
-            flags(true, false, false, true),  // failed wins over running
-            flags(false, true, false, true),  // needs-login wins
-            flags(false, false, true, true),  // paused wins
+            flags(true, false, false, true), // failed wins over running
+            flags(false, true, false, true), // needs-login wins
+            flags(false, false, true, true), // paused wins
             flags(false, false, false, false),
         ] {
             assert!(

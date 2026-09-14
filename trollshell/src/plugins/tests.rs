@@ -11401,7 +11401,8 @@ mod kind_enumeration {
             | Case::DotMatrix { style, .. }
             | Case::Marquee { style, .. }
             | Case::TextBox { style, .. }
-            | Case::LedStrip { style, .. } => *style,
+            | Case::LedStrip { style, .. }
+            | Case::SevenSeg { style, .. } => *style,
         }
     }
 

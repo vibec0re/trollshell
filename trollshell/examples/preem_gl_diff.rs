@@ -208,13 +208,16 @@ mod textbox;
 // The meter (#1153), included the same way and for the same reason.
 #[path = "../src/plugins/preem_gl/led_strip.rs"]
 mod led_strip;
+// The readout (#1154), included the same way and for the same reason.
+#[path = "../src/plugins/preem_gl/seven_seg.rs"]
+mod seven_seg;
 
 // The case list itself lives in `cases` (#1211) — see its module docs. `Case`
 // keeps its variants' field types (`DisplayAt`/`TickerAt`/`BubbleAt`/
 // `NeedleAt`) there too; their `impl`s (`.name()`/`.line()`/`.spec()`) stay
 // below, since an inherent impl only has to share a crate with its type, not
 // a file.
-use cases::{BubbleAt, DisplayAt, MeterAt, NeedleAt, TickerAt};
+use cases::{BubbleAt, DisplayAt, MeterAt, NeedleAt, ReadoutAt, TickerAt};
 use cases::{
     Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, METER_LEDS, STRETCH, TICKER_WINDOW_PX, cases_for,
 };
@@ -720,6 +723,58 @@ fn meter_strip(style: kit::DisplayStyle) -> kit::LedStrip {
     kit::LedStrip::new(style).leds(METER_LEDS)
 }
 
+impl ReadoutAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Blank => "blank",
+            Self::Eights => "eights",
+            Self::Clock => "clock",
+            Self::Digits => "digits",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    /// The text this case reads out — the widget is entirely a function of it
+    /// and the skin, since `kit::seven_seg` is pure.
+    fn text(self) -> &'static str {
+        match self {
+            Self::Blank => " ",
+            Self::Eights => "88",
+            Self::Clock => "12:34",
+            Self::Digits => "9876543210",
+            Self::Pinned => "-8",
+        }
+    }
+
+    /// The palette scope this case renders in — `Ink::Fixed` for the pinned
+    /// one, the skin's own default otherwise.
+    fn pins(self) -> kit::Pins {
+        kit::Pins {
+            ink: match self {
+                Self::Pinned => kit::Ink::Fixed(PINNED_INK),
+                _ => kit::Ink::Default,
+            },
+            field: None,
+        }
+    }
+}
+
+/// The palette snapshot a readout case maps from, resolved **inside** its own
+/// pin scope so the mapping sees exactly what the kit render below will.
+///
+/// One helper for both arms, for [`bubble_box`]'s reason: a `seven_seg` resolves
+/// its palette at *render* time (unlike a `TextBox`, which bakes at
+/// construction), so both calls have to sit in the scope rather than one.
+fn readout_palette(style: kit::DisplayStyle, readout: ReadoutAt) -> kit::PaletteSnapshot {
+    kit::with_pins(readout.pins(), || kit::palette_snapshot(style))
+}
+
+/// The CPU kit's own readout at this case's text and pin scope.
+fn readout_reference(style: kit::DisplayStyle, readout: ReadoutAt) -> kit::Frame {
+    kit::with_pins(readout.pins(), || kit::seven_seg(readout.text(), style))
+}
+
 /// The wire config a meter case maps from — the same segment count the kit
 /// builder above takes, so the two arms cannot end up on different strips.
 fn led_strip_config(style: kit::DisplayStyle) -> vocab::LedStripConfig {
@@ -753,6 +808,7 @@ impl Case {
             | Self::Marquee { stretch, .. }
             | Self::TextBox { stretch, .. }
             | Self::LedStrip { stretch, .. }
+            | Self::SevenSeg { stretch, .. }
                 if *stretch > 1 =>
             {
                 parity::Sampling::Supersampled(*stretch)
@@ -829,6 +885,20 @@ impl Case {
                     level,
                     peak,
                     &kit::palette_snapshot(*style),
+                );
+                (surface.width, surface.height, (*stretch).max(1))
+            }
+            // The readout resolves its grid the same way, through the very
+            // mapping the shell calls. It has no upscale either — the cell
+            // metrics are its size knob — so the third element is the stretch.
+            Self::SevenSeg {
+                style,
+                readout,
+                stretch,
+            } => {
+                let surface = seven_seg::seven_seg_surface(
+                    &seven_seg::readout(readout.text()),
+                    &readout_palette(*style, *readout),
                 );
                 (surface.width, surface.height, (*stretch).max(1))
             }
@@ -1272,6 +1342,14 @@ fn label(case: &Case) -> String {
         Case::LedStrip { style, meter, .. } => {
             format!("led_strip.{}.{}", style.name(), meter.name())
         }
+        Case::SevenSeg {
+            style,
+            readout,
+            stretch,
+        } if *stretch > 1 => format!("seven_seg.{}.{}x{stretch}", style.name(), readout.name()),
+        Case::SevenSeg { style, readout, .. } => {
+            format!("seven_seg.{}.{}", style.name(), readout.name())
+        }
     }
 }
 
@@ -1377,6 +1455,18 @@ fn drive(area: &GlSurface, case: &Case) {
             );
             (
                 led_strip::LED_STRIP,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::SevenSeg { style, readout, .. } => {
+            let surface = seven_seg::seven_seg_surface(
+                &seven_seg::readout(readout.text()),
+                &readout_palette(*style, *readout),
+            );
+            (
+                seven_seg::SEVEN_SEG,
                 surface.width,
                 surface.height,
                 surface.uniforms,
@@ -1503,6 +1593,10 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
             let (level, peak) = meter.reading();
             meter_strip(*style).render(level, peak)
         }
+        // The kit's own readout at this text, in this case's pin scope — the
+        // *same* scope the mapping resolved its palette in, so a disagreement
+        // here is a disagreement between renderers and not between palettes.
+        Case::SevenSeg { style, readout, .. } => readout_reference(*style, *readout),
     };
 
     let requested = case.natural();

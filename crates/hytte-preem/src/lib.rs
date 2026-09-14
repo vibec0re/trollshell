@@ -180,7 +180,25 @@ pub use led_strip::{
 };
 pub use marquee::{Marquee, MarqueeStrip};
 pub use scope::Scope;
-pub use seven_seg::seven_seg;
+// The `SEVEN_SEG_*`/`seven_seg_*` half of this list is #1154's seam for the
+// shell's GPU arm, on the `Gauge::dial`/`DotCell`/`LED_CELL_W` precedent
+// (#1148/#1144/#1153): a `.frag` cannot read a Rust `const`, so the shell
+// either transcribes this widget's segment table, its taper law and its cell
+// layout, or it reads them here and hands them to the shader. It reads them
+// here. Renamed on the way out where the module's own spelling is too generic
+// for a crate root — `THICK`, `GAP`, `PAD`, `size` and `layout` all name a
+// *family*'s metric once they leave `seven_seg`.
+//
+// `layout`/`size`/`taper` are visibility-only: `seven_seg` itself calls each,
+// so they are the kit's definitions rather than copies. `BARS` is the one item
+// that is more than that — see the note above it.
+pub use seven_seg::{
+    BARS as SEVEN_SEG_BARS, Bar as SevenSegBar, COLON_DOTS as SEVEN_SEG_COLON_DOTS,
+    COLON_W as SEVEN_SEG_COLON_W, Cell as SevenSegCell, DIGIT_H as SEVEN_SEG_DIGIT_H,
+    DIGIT_W as SEVEN_SEG_DIGIT_W, GAP as SEVEN_SEG_GAP, PAD as SEVEN_SEG_PAD,
+    THICK as SEVEN_SEG_THICK, layout as seven_seg_layout, seven_seg, size as seven_seg_size,
+    taper as seven_seg_taper,
+};
 pub use split_flap::{
     CHARSET, DEFAULT_FADE_SECS, DEFAULT_FLIP_SECS, DEFAULT_GLYPH_PX, DEFAULT_STAGGER_SECS,
     FlipBoard, Mechanism,

@@ -36,7 +36,8 @@ use hytte_preem as kit;
 ///
 /// Moved out of `examples/preem_gl_diff.rs` for #1211 — see the module docs.
 ///
-/// The `LedStrip` variant (#1153) is the sixth.
+/// The `LedStrip` variant (#1153) is the sixth, the `SevenSeg` one (#1154)
+/// the seventh.
 ///
 /// `#[allow(dead_code)]`: every field but `style` (read by [`Case::kind`]'s
 /// sibling match in `plugins::tests`) is read only by the harness's own
@@ -97,6 +98,13 @@ pub(crate) enum Case {
         /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
         stretch: u32,
     },
+    /// A `SevenSeg` showing one readout (#1154).
+    SevenSeg {
+        style: kit::DisplayStyle,
+        readout: ReadoutAt,
+        /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
+        stretch: u32,
+    },
 }
 
 impl Case {
@@ -115,8 +123,62 @@ impl Case {
             Self::Marquee { .. } => Kind::Marquee,
             Self::TextBox { .. } => Kind::TextBox,
             Self::LedStrip { .. } => Kind::LedStrip,
+            Self::SevenSeg { .. } => Kind::SevenSeg,
         }
     }
+}
+
+/// What a seven-segment case is reading out.
+///
+/// Five, and the list is the issue's own (#1154) adapted to what the kit
+/// actually has: every segment off, every segment on, a mixed readout, every
+/// distinct digit mask in one frame, and a pinned ink.
+///
+/// **#1154 asks for "a mixed readout with a decimal point" and the kit has no
+/// decimal point** — `hytte-preem`'s `seven_seg` understands digits, `:`, `-`
+/// and space, and its two cell shapes are a 30 px digit and a 12 px colon.
+/// [`Clock`](Self::Clock) carries the **colon** instead, which is the kit's own
+/// second cell shape and the only thing that puts two different cell *widths*
+/// (and so a non-uniform cell pitch, which is what the shader's binary search
+/// over origins exists for) in one frame. Adding a decimal point is a change to
+/// `hytte-preem`, not something this arm gets to invent.
+///
+/// Two digit counts at least, as the issue asks: one cell, two, five and ten.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadoutAt {
+    /// A single space: every ghost segment, nothing lit. The frame a clock
+    /// spends none of its life in and a blanked readout spends all of it, and
+    /// the one case where the lit emission is empty everywhere — so the halo is
+    /// provably absent rather than merely dim.
+    ///
+    /// **On the OLED this case carries no information, and that is worth
+    /// knowing rather than hiding** — `DisplayAt::Blank`'s finding (#1150
+    /// review, MEDIUM-3) in this widget's shape. That skin has no ghost and a
+    /// black field, so a blank readout there is a frame of pure zeros:
+    /// `verdict_for` excuses both blank guards by design (a flat reference is
+    /// not evidence of an undrawn framebuffer) and every delta is 0 for any
+    /// renderer that outputs black. It is kept rather than special-cased
+    /// because the other three skins' blank cases *do* detect — the LCD draws
+    /// its whole ghost figure-8 there — and a case list that varies by skin is
+    /// a worse thing to reason about than one case that is vacuously green on
+    /// one skin.
+    Blank,
+    /// `88`: every segment of two cells lit. Every mitre in the font is
+    /// adjacent to another mitre here, which is the arrangement where a taper
+    /// drawn one pixel wide of the kit's closes a gap the kit leaves open.
+    Eights,
+    /// `12:34`: the clock face, and the only case with **two cell widths** —
+    /// see the type docs on the decimal point the kit does not have.
+    Clock,
+    /// `9876543210`: ten cells and every distinct digit mask in one frame, so a
+    /// bar indexed by the wrong bit shows somewhere.
+    Digits,
+    /// `-8` under a **pinned ink**, the `Ink::Fixed` arm of the kit's palette
+    /// precedence — so the mapping's `palette_snapshot` and the kit's own
+    /// `palette()` are compared through a pin rather than only through the
+    /// skin's default. `-` is also the one non-digit, non-colon character the
+    /// kit maps to a mask.
+    Pinned,
 }
 
 /// What a marquee case is showing, and where the message has scrolled to.
@@ -475,6 +537,32 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 meter: MeterAt::PeakAbove,
                 stretch: STRETCH,
             });
+            // The readout (#1154): blank, all-on, the clock face, every digit,
+            // and a pinned ink. See [`ReadoutAt`].
+            let readouts = [
+                ReadoutAt::Blank,
+                ReadoutAt::Eights,
+                ReadoutAt::Clock,
+                ReadoutAt::Digits,
+                ReadoutAt::Pinned,
+            ]
+            .into_iter()
+            .map(move |readout| Case::SevenSeg {
+                style: *style,
+                readout,
+                stretch: 1,
+            });
+            // …and the clock face given more room than its natural size, which
+            // is where *this* arm's improvement lives: the segments' 45° mitres
+            // and the halo around them resolved at the screen's resolution
+            // rather than replicated out of the kit's six-row stair.
+            // `Clock` because it is the case with the most mitres per pixel of
+            // buffer and both cell shapes on screen at once.
+            let stretched_readout = std::iter::once(Case::SevenSeg {
+                style: *style,
+                readout: ReadoutAt::Clock,
+                stretch: STRETCH,
+            });
             scopes
                 .chain(gauges)
                 .chain(shipping)
@@ -487,6 +575,8 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 .chain(stretched_bubble)
                 .chain(meters)
                 .chain(stretched_meter)
+                .chain(readouts)
+                .chain(stretched_readout)
         })
         .collect()
 }

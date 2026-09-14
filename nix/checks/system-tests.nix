@@ -55,10 +55,12 @@ let
   # added the `scale = 2` gauge case, 28 until #1144 added the dot
   # matrix, 52 until #1152 added the two text kinds, 96 until #1209's
   # review (MEDIUM-1) added the odd-origin marquee case, one per skin,
-  # and 100 until #1153 added the LED strip's six per skin (five 1:1
-  # readings plus one stretched); bump it with the case list, in the
-  # same commit, for the reason the number is asserted at all.
-  parityCases = 124;
+  # 100 until #1153 added the LED strip's six per skin (five 1:1
+  # readings plus one stretched), and 124 until #1154 added the
+  # seven-segment readout's six per skin (five 1:1 readouts plus one
+  # stretched); bump it with the case list, in the same commit, for the
+  # reason the number is asserted at all.
+  parityCases = 148;
 in
 craneLib.mkCargoDerivation (
   commonArgs

@@ -241,7 +241,8 @@ MIN_WIDGET_BODIES = 1  # the preem demo's spectrum.frag
 # 8 → 10 in #1153, which is **two** bumps in one commit: `led_strip.frag` is the
 # tenth file, and the ninth (`textbox.frag`, #1152) landed without one, so this
 # floor had quietly acquired the slack its own comment above forbids.
-MIN_SHADERS = 10
+# 10 → 11 in #1154 (`seven_seg.frag`).
+MIN_SHADERS = 11
 # Compilations, not files: `blur.frag` is one body compiled twice. A
 # splice that stops being found (a moved `include_str!` path, a `concat!` this
 # script's parser stops recognising) drops this — today that shows up as a
@@ -256,10 +257,12 @@ MIN_SHADERS = 10
 # 11 → 13 with #1144's `dot_matrix.frag`, which is a third doubly-spliced body;
 # 13 → 15 in #1153, which is again two bumps in one commit — `led_strip.frag` is
 # the fifteenth compilation and `textbox.frag` (#1152) was the fourteenth
-# without one.
-MIN_COMPILATIONS = 15
+# without one; 15 → 17 in #1154, whose `seven_seg.frag` is a fourth
+# doubly-spliced body (a lit layer and a blit, `dot_matrix.frag`'s shape).
+MIN_COMPILATIONS = 17
 # Distinct bodies that must be spliced rather than compiled as written.
-MIN_SPLICED_BODIES = 3
+# 3 → 4 in #1154 (`seven_seg.frag`'s `const int LAYER`).
+MIN_SPLICED_BODIES = 4
 
 # `glslangValidator` names the stage by extension. `.glsl` is deliberately
 # **absent**: it names no stage, so this script could not compile one, and

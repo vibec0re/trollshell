@@ -2002,14 +2002,21 @@ mod gtk_tests {
         let (w, _rx) = window_with_trust(panics);
 
         w.update(Update::State(up(row_at(0))));
-        assert!(w.probing(), "the probe must start the moment a URL is named");
+        assert!(
+            w.probing(),
+            "the probe must start the moment a URL is named"
+        );
 
         assert!(
             pump_until(Duration::from_secs(10), || !w.probing()),
             "the probe latch was never cleared after the worker died — the window is stranded on \
              the spinner forever (#1274 L1)"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt so far");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one attempt so far"
+        );
 
         // The 2 s poll's retry: another update reaches `load_page` with
         // neither latch held, and must start a fresh probe.

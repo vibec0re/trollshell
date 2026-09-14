@@ -356,7 +356,7 @@ package's binary name), the same shape #1260 gave `mount` →
 was already guaranteed on the launch side — this closes the other half, the
 `Register` id the plugin itself sends. A hand-written
 `env.HYTTE_PLUGIN_ID = "stats-side";` still works and is exactly redundant;
-setting it to anything *other* than the attribute name is an eval error
+setting it to anything _other_ than the attribute name is an eval error
 naming both values, the same precedence `mount`/`env.HYTTE_PLUGIN_MOUNT` get.
 
 **Prefer an override _within_ a family — bar↔sidebar changes a plugin's

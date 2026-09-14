@@ -20,18 +20,35 @@
 use super::frame::Frame;
 use super::style::{DisplayStyle, Emission};
 
+// The six metrics below, [`BARS`], [`COLON_DOTS`], [`taper`], [`layout`] and
+// [`size`] are `pub` since #1154, re-exported at the crate root under the
+// `SEVEN_SEG_`/`seven_seg_` family prefix a name like `GAP` or `size` needs
+// once it leaves this module. The reason is the `Gauge::dial` one #1148 set
+// and `LED_CELL_W` and friends followed (#1153): the shell's GPU arm
+// re-rasterises this widget in GLSL, and a `.frag` cannot read a Rust `const`
+// — so either the shell carries a hand mirror of this widget's segment
+// geometry, or it reads it here and hands it to the shader as uniforms. It
+// reads it here.
+//
+// [`BARS`] is the one item that is more than a visibility change:
+// [`stamp_cell`] used to compute the seven segments' origins inline, so
+// there was no value for the shell to read. It walks the table now, which
+// makes the table the geometry's single definition rather than a second copy
+// of it — and `the_rendered_bytes_are_pinned_by_digest` (taken on the tree
+// *before* that move) is what says it moved no pixel.
+
 /// Segment bar thickness in pixels.
-const THICK: usize = 6;
+pub const THICK: usize = 6;
 /// Digit cell width.
-const DIGIT_W: usize = 30;
+pub const DIGIT_W: usize = 30;
 /// Digit cell height.
-const DIGIT_H: usize = 54;
+pub const DIGIT_H: usize = 54;
 /// Colon cell width.
-const COLON_W: usize = 12;
+pub const COLON_W: usize = 12;
 /// Gap between adjacent cells.
-const GAP: usize = 10;
+pub const GAP: usize = 10;
 /// Field padding around the readout.
-const PAD: usize = 8;
+pub const PAD: usize = 8;
 
 /// Segment bits, the classic lettering: `A` top, `B` top-right, `C`
 /// bottom-right, `D` bottom, `E` bottom-left, `F` top-left, `G` middle.
@@ -45,22 +62,114 @@ const SEG_G: u8 = 1 << 6;
 /// All seven segments — the ghost pass and the digit 8.
 const SEG_ALL: u8 = 0x7f;
 
-/// One display cell: a digit-shaped cell with a lit-segment mask, or the
-/// two-dot colon.
-#[derive(Clone, Copy)]
-enum Cell {
-    /// A digit-width cell; `0` lights nothing (space / unknown chars).
-    Digit(u8),
-    /// A colon cell, both dots lit.
-    Colon,
+/// One stamped element of a cell: an axis-aligned bar [`THICK`] px across and
+/// `len` px along, its near corner at (`x`, `y`) **relative to the cell
+/// origin**.
+///
+/// The shape the whole widget is built out of, and the value the shell's GL
+/// arm reads instead of re-deriving (#1154). A `tapered` bar is the classic
+/// mitred hexagon — each row/column inset from both ends by [`taper`] — and an
+/// untapered one is a plain rectangle, which is what the colon's dots are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bar {
+    /// Near-corner x, relative to the cell origin.
+    pub x: usize,
+    /// Near-corner y, relative to the cell origin.
+    pub y: usize,
+    /// Length along the bar's long axis.
+    pub len: usize,
+    /// `true` when `len` runs down the y axis and [`THICK`] across x.
+    pub vertical: bool,
+    /// `true` when the ends are mitred by [`taper`].
+    pub tapered: bool,
+}
+
+impl Bar {
+    /// A horizontal tapered segment.
+    const fn hbar(x: usize, y: usize, len: usize) -> Self {
+        Self {
+            x,
+            y,
+            len,
+            vertical: false,
+            tapered: true,
+        }
+    }
+
+    /// A vertical tapered segment.
+    const fn vbar(x: usize, y: usize, len: usize) -> Self {
+        Self {
+            x,
+            y,
+            len,
+            vertical: true,
+            tapered: true,
+        }
+    }
+
+    /// One colon dot: a plain [`THICK`]×[`THICK`] square, never mitred.
+    const fn dot(x: usize, y: usize) -> Self {
+        Self {
+            x,
+            y,
+            len: THICK,
+            vertical: false,
+            tapered: false,
+        }
+    }
+}
+
+/// `G`'s top row — horizontal bars sit at the cell's vertical centre.
+const MID: usize = (DIGIT_H - THICK) / 2;
+/// Horizontal bars span the cell minus 1 px at each end.
+const HBAR_X: usize = 1;
+/// …which is [`DIGIT_W`] less those two.
+const HBAR_LEN: usize = DIGIT_W - 2;
+/// Verticals stop just short of `G` on both sides of it.
+const UPPER_LEN: usize = MID - 2;
+/// Where the lower pair starts.
+const LOWER_Y: usize = MID + THICK + 1;
+/// …and how far it runs.
+const LOWER_LEN: usize = DIGIT_H - 1 - LOWER_Y;
+
+/// The seven segments of a digit cell, **in the bit order of [`SEG_A`] …
+/// [`SEG_G`]** — index `i` is the bar lit by bit `i` of a cell's mask.
+///
+/// The order is load-bearing: [`stamp_cell`] and the shell's shader both
+/// index it by bit, so a reordering would light the wrong bars on both sides
+/// at once.
+pub const BARS: [Bar; 7] = [
+    Bar::hbar(HBAR_X, 0, HBAR_LEN),                  // A — top
+    Bar::vbar(DIGIT_W - THICK, 1, UPPER_LEN),        // B — top right
+    Bar::vbar(DIGIT_W - THICK, LOWER_Y, LOWER_LEN),  // C — bottom right
+    Bar::hbar(HBAR_X, DIGIT_H - THICK, HBAR_LEN),    // D — bottom
+    Bar::vbar(0, LOWER_Y, LOWER_LEN),                // E — bottom left
+    Bar::vbar(0, 1, UPPER_LEN),                      // F — top left
+    Bar::hbar(HBAR_X, MID, HBAR_LEN),                // G — middle
+];
+
+/// The colon cell's two dots, relative to its origin.
+pub const COLON_DOTS: [Bar; 2] = [
+    Bar::dot((COLON_W - THICK) / 2, DIGIT_H / 3 - THICK / 2),
+    Bar::dot((COLON_W - THICK) / 2, 2 * DIGIT_H / 3 - THICK / 2),
+];
+
+/// One laid-out cell of a readout: where it starts in the buffer, and which
+/// segments it lights — `None` for the colon, whose two dots are not segments
+/// and take no mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cell {
+    /// Buffer x of the cell's left edge. The top edge is always [`PAD`].
+    pub x: usize,
+    /// The lit segments as bits of [`BARS`], or `None` for a colon cell.
+    pub mask: Option<u8>,
 }
 
 impl Cell {
-    fn width(self) -> usize {
-        match self {
-            Self::Digit(_) => DIGIT_W,
-            Self::Colon => COLON_W,
-        }
+    /// This cell's width: [`DIGIT_W`] for a digit, [`COLON_W`] for a colon.
+    #[must_use]
+    pub const fn width(self) -> usize {
+        if self.mask.is_some() { DIGIT_W } else { COLON_W }
     }
 }
 
@@ -69,9 +178,9 @@ impl Cell {
 /// or guessing.
 fn cell(c: char) -> Cell {
     if c == ':' {
-        return Cell::Colon;
+        return Cell { x: 0, mask: None };
     }
-    Cell::Digit(match c {
+    let mask = match c {
         '0' => SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,
         '1' => SEG_B | SEG_C,
         '2' => SEG_A | SEG_B | SEG_G | SEG_E | SEG_D,
@@ -84,7 +193,47 @@ fn cell(c: char) -> Cell {
         '9' => SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G,
         '-' => SEG_G,
         _ => 0,
-    })
+    };
+    Cell {
+        x: 0,
+        mask: Some(mask),
+    }
+}
+
+/// Lay `text` out: one [`Cell`] per char, left to right, each carrying the
+/// buffer x it starts at.
+///
+/// The one definition of this widget's horizontal layout — [`seven_seg`] walks
+/// it for both passes, [`size`] measures it, and the shell's GL arm encodes it
+/// into the strip its shader searches (#1154). Published so none of the three
+/// has to re-derive `PAD + Σ(width + GAP)`.
+#[must_use]
+pub fn layout(text: &str) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    let mut x = PAD;
+    for c in text.chars() {
+        let cell = Cell { x, ..cell(c) };
+        cells.push(cell);
+        x += cell.width() + GAP;
+    }
+    cells
+}
+
+/// The buffer `text` renders into, `(width, height)`.
+///
+/// Width grows with the cell count and the height is fixed — `"12:34"` is
+/// 188×70. An empty readout is `2 * PAD` wide, never zero, which is what keeps
+/// the host's `len == w * h * 4` invariant satisfiable.
+#[must_use]
+pub fn size(text: &str) -> (usize, usize) {
+    extent(&layout(text))
+}
+
+/// [`size`] over an already-resolved layout, so [`seven_seg`] lays the cells
+/// out once.
+fn extent(cells: &[Cell]) -> (usize, usize) {
+    let width = cells.last().map_or(2 * PAD, |c| c.x + c.width() + PAD);
+    (width, 2 * PAD + DIGIT_H)
 }
 
 /// Render `text` as a seven-segment readout in `style`.
@@ -98,38 +247,24 @@ fn cell(c: char) -> Cell {
 pub fn seven_seg(text: &str, style: DisplayStyle) -> Frame {
     let palette = style.palette();
     // Lay the cells out once; both passes walk the same origins.
-    let mut cells: Vec<(usize, Cell)> = Vec::new();
-    let mut x = PAD;
-    for c in text.chars() {
-        let cl = cell(c);
-        cells.push((x, cl));
-        x += cl.width() + GAP;
-    }
-    let width = cells
-        .last()
-        .map_or(2 * PAD, |(ox, cl)| ox + cl.width() + PAD);
-    let height = 2 * PAD + DIGIT_H;
+    let cells = layout(text);
+    let (width, height) = extent(&cells);
     let mut frame = Frame::filled(width, height, palette.bg);
 
-    // Ghost pass: every element of every cell, flat and dim.
+    // Ghost pass: every element of every cell, flat and dim. A digit cell
+    // ghosts the full figure-8; a colon cell ghosts its two dots.
     if let Some(ghost) = palette.ghost {
-        for &(ox, cl) in &cells {
+        for &cell in &cells {
             let mut paint = |px: usize, py: usize| frame.set(px, py, ghost);
-            match cl {
-                Cell::Digit(_) => stamp_digit(ox, PAD, SEG_ALL, &mut paint),
-                Cell::Colon => stamp_colon(ox, PAD, &mut paint),
-            }
+            stamp_cell(cell.x, PAD, cell.mask.map(|_| SEG_ALL), &mut paint);
         }
     }
 
     // Lit pass: the active segments, bloomed and composited toward the ink.
     let mut lit = Emission::new(width, height);
-    for &(ox, cl) in &cells {
+    for &cell in &cells {
         let mut stamp = |px: usize, py: usize| lit.add(px, py, 255);
-        match cl {
-            Cell::Digit(mask) => stamp_digit(ox, PAD, mask, &mut stamp),
-            Cell::Colon => stamp_colon(ox, PAD, &mut stamp),
-        }
+        stamp_cell(cell.x, PAD, cell.mask, &mut stamp);
     }
     if let Some(bloom) = palette.bloom {
         lit.bloom(bloom);
@@ -138,85 +273,69 @@ pub fn seven_seg(text: &str, style: DisplayStyle) -> Frame {
     frame
 }
 
-/// Emit the pixels of a digit cell's segments per `mask`, cell origin at
-/// (`ox`, `oy`), through `sink` — the geometry is shared verbatim by the
-/// ghost pass (paint) and the lit pass (stamp).
-fn stamp_digit(ox: usize, oy: usize, mask: u8, sink: &mut impl FnMut(usize, usize)) {
-    // G's top row; horizontal bars span the cell minus 1 px at each end.
-    let mid = (DIGIT_H - THICK) / 2;
-    let hbar_x = ox + 1;
-    let hbar_len = DIGIT_W - 2;
-    if mask & SEG_A != 0 {
-        stamp_hbar(hbar_x, oy, hbar_len, sink);
-    }
-    if mask & SEG_G != 0 {
-        stamp_hbar(hbar_x, oy + mid, hbar_len, sink);
-    }
-    if mask & SEG_D != 0 {
-        stamp_hbar(hbar_x, oy + DIGIT_H - THICK, hbar_len, sink);
-    }
-    // Verticals stop just short of G on both sides of it.
-    let upper_len = mid - 2;
-    let lower_y = mid + THICK + 1;
-    let lower_len = DIGIT_H - 1 - lower_y;
-    if mask & SEG_F != 0 {
-        stamp_vbar(ox, oy + 1, upper_len, sink);
-    }
-    if mask & SEG_B != 0 {
-        stamp_vbar(ox + DIGIT_W - THICK, oy + 1, upper_len, sink);
-    }
-    if mask & SEG_E != 0 {
-        stamp_vbar(ox, oy + lower_y, lower_len, sink);
-    }
-    if mask & SEG_C != 0 {
-        stamp_vbar(ox + DIGIT_W - THICK, oy + lower_y, lower_len, sink);
+/// Emit the pixels of one cell's elements through `sink`, cell origin at
+/// (`ox`, `oy`) — the geometry is shared verbatim by the ghost pass (paint)
+/// and the lit pass (stamp).
+///
+/// `Some(mask)` is a digit cell lighting the [`BARS`] its bits name;
+/// `None` is the colon, which lights both [`COLON_DOTS`] unconditionally.
+///
+/// The bars are stamped in table order rather than in the original
+/// `A, G, D, F, B, E, C` one, and that is safe by construction: both sinks are
+/// idempotent (`Frame::set` writes a colour, `Emission::add` saturates at
+/// 255), so the stamp is a **set union** and its order cannot reach the
+/// output. `the_rendered_bytes_are_pinned_by_digest` is what says so rather
+/// than this comment.
+fn stamp_cell(ox: usize, oy: usize, mask: Option<u8>, sink: &mut impl FnMut(usize, usize)) {
+    let Some(mask) = mask else {
+        for dot in COLON_DOTS {
+            stamp_bar(ox, oy, dot, sink);
+        }
+        return;
+    };
+    for (bit, bar) in BARS.into_iter().enumerate() {
+        if mask & (1 << bit) != 0 {
+            stamp_bar(ox, oy, bar, sink);
+        }
     }
 }
 
-/// Emit a colon cell's two dots through `sink`.
-fn stamp_colon(ox: usize, oy: usize, sink: &mut impl FnMut(usize, usize)) {
-    let cx = ox + (COLON_W - THICK) / 2;
-    for cy in [DIGIT_H / 3 - THICK / 2, 2 * DIGIT_H / 3 - THICK / 2] {
-        for dy in 0..THICK {
-            for dx in 0..THICK {
-                sink(cx + dx, oy + cy + dy);
+/// One bar, stamped at a cell origin of (`ox`, `oy`).
+///
+/// Row/column `k` of [`THICK`] is inset from both ends by [`taper`] when the
+/// bar is mitred and not at all when it is not, which is the hexagonal segment
+/// shape and the colon's plain square respectively.
+fn stamp_bar(ox: usize, oy: usize, bar: Bar, sink: &mut impl FnMut(usize, usize)) {
+    let (x0, y0) = (ox + bar.x, oy + bar.y);
+    for k in 0..THICK {
+        let inset = if bar.tapered { taper(k) } else { 0 };
+        for d in inset..bar.len.saturating_sub(inset) {
+            if bar.vertical {
+                sink(x0 + k, y0 + d);
+            } else {
+                sink(x0 + d, y0 + k);
             }
-        }
-    }
-}
-
-/// A horizontal tapered bar: row `j` of [`THICK`] is inset from both ends
-/// by its distance from the bar's center line, giving the hexagonal
-/// segment shape.
-fn stamp_hbar(x0: usize, y0: usize, len: usize, sink: &mut impl FnMut(usize, usize)) {
-    for j in 0..THICK {
-        let inset = taper(j);
-        for x in (x0 + inset)..(x0 + len.saturating_sub(inset)) {
-            sink(x, y0 + j);
-        }
-    }
-}
-
-/// A vertical tapered bar, the mirror of [`stamp_hbar`].
-fn stamp_vbar(x0: usize, y0: usize, len: usize, sink: &mut impl FnMut(usize, usize)) {
-    for i in 0..THICK {
-        let inset = taper(i);
-        for y in (y0 + inset)..(y0 + len.saturating_sub(inset)) {
-            sink(x0 + i, y);
         }
     }
 }
 
 /// End-inset of a bar's row/column `k` (of [`THICK`]): 0 on the center
 /// rows, growing toward the faces — the taper that mitres the segments.
-fn taper(k: usize) -> usize {
+///
+/// `pub` since #1154 so the shell's GL arm can hold its **continuous** reading
+/// of this staircase — `max(0, |k + 0.5 - THICK/2| - 0.5)`, the 45° chamfer
+/// these integers sample — against the integers themselves.
+#[must_use]
+pub fn taper(k: usize) -> usize {
     (2 * k).abs_diff(THICK - 1).saturating_sub(1) / 2
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{DisplayStyle, Ink, Pins, with_pins};
-    use super::{DIGIT_H, PAD, seven_seg, taper};
+    use super::{
+        BARS, COLON_DOTS, COLON_W, DIGIT_H, DIGIT_W, PAD, THICK, seven_seg, size, taper,
+    };
 
     /// Every readout the digest below sweeps: the empty buffer, the all-ghost
     /// blank, the colon-bearing clock face, every digit, the minus, the widest
@@ -257,7 +376,7 @@ mod tests {
 
     /// **The bytes this widget renders, pinned by digest** (#1154).
     ///
-    /// The seven segments' geometry moved out of [`stamp_digit`]'s inline
+    /// The seven segments' geometry moved out of [`stamp_cell`]'s inline
     /// arithmetic and into the published [`super::BARS`] table so the shell's
     /// GL arm could *read* it instead of transcribing it (the `Gauge::dial`
     /// precedent, #1148). That is a refactor of a render path, not a visibility
@@ -276,6 +395,42 @@ mod tests {
     #[test]
     fn the_rendered_bytes_are_pinned_by_digest() {
         assert_eq!(render_digest(), 0x54e6_1c87_61d5_b261);
+    }
+
+    /// **[`size`] is the buffer [`seven_seg`] actually renders** — the
+    /// published measurement and the render walk one [`layout`], so a consumer
+    /// that sizes a surface from `size` and a kit that rasterises into
+    /// `seven_seg` cannot disagree (#1154).
+    ///
+    /// **Falsified** by giving `size` its own width formula and then moving
+    /// [`GAP`] or [`PAD`].
+    #[test]
+    fn the_published_size_is_the_rendered_buffer() {
+        for text in DIGEST_READOUTS {
+            let frame = seven_seg(text, DisplayStyle::Lcd);
+            assert_eq!(size(text), (frame.width(), frame.height()), "{text:?}");
+        }
+    }
+
+    /// **Every published [`Bar`] lands inside its cell**, so no element of the
+    /// last cell can reach past the buffer's right edge that [`size`] computes
+    /// from the cell widths alone (#1154).
+    ///
+    /// The premise behind `Frame::set` never clipping here, and behind the
+    /// shell's shader needing no bounds test of its own.
+    #[test]
+    fn every_bar_lies_inside_its_cell() {
+        for (bars, cell_w) in [(&BARS[..], DIGIT_W), (&COLON_DOTS[..], COLON_W)] {
+            for bar in bars {
+                let (across, along) = if bar.vertical {
+                    ((bar.x + THICK, cell_w), (bar.y + bar.len, DIGIT_H))
+                } else {
+                    ((bar.y + THICK, DIGIT_H), (bar.x + bar.len, cell_w))
+                };
+                assert!(across.0 <= across.1, "{bar:?} across {across:?}");
+                assert!(along.0 <= along.1, "{bar:?} along {along:?}");
+            }
+        }
     }
 
     /// The host invariant across styles and inputs, empty string included.

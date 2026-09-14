@@ -110,10 +110,23 @@ pub const POLL_EVERY: Duration = Duration::from_mins(5);
 
 /// The 429 backoff's ceiling (#1283) — [`next_wait`] never returns more than
 /// this, however long a `Retry-After` asks for or however many consecutive
-/// 429s there have been. Half an hour is long enough to stop hammering an
-/// endpoint that is actively telling us to slow down, and short enough that
-/// the chip finds out access is back well inside a person's working session.
-pub const MAX_BACKOFF: Duration = Duration::from_mins(30);
+/// 429s there have been.
+///
+/// **Bounded by [`STALE_AFTER`] itself**, not chosen independently — the
+/// product call taken on the #1283 thread after #1285's review found the
+/// two fighting: shipped at 30 min against a 15 min staleness window, the
+/// carry-forward this PR added was *guaranteed* to go stale for the back
+/// half of every backoff cycle (numbers fetched at `T` are stale at
+/// `T + STALE_AFTER`; the next attempt was at `T + 30 min`). Capping the
+/// schedule at the window instead means the meters this PR keeps alive can
+/// never go blank *because of* the schedule — only because the server has
+/// genuinely refused for a whole `STALE_AFTER` straight. Under a permanent
+/// 429 the bridge then polls once every `MAX_BACKOFF` (== `STALE_AFTER`),
+/// four times an hour — a quarter of the ordinary [`POLL_EVERY`] cadence,
+/// and comfortably inside the "at most every 3 min" ceiling #1283 was filed
+/// under. See the `MAX_BACKOFF <= STALE_AFTER` assertion below, which pins
+/// the direction of this dependency at compile time.
+pub const MAX_BACKOFF: Duration = STALE_AFTER;
 
 /// How old the numbers behind a [`Report`] may be before the chip stops
 /// trusting them — judged against [`Report::numbers_at`], not
@@ -123,13 +136,21 @@ pub const MAX_BACKOFF: Duration = Duration::from_mins(30);
 /// (the fetch's own [`TIMEOUT`] plus whatever the next tick catches up on)
 /// never trips it, but a `poll_forever` that has stopped publishing at all —
 /// it is deliberately **unsupervised** (`main`'s doc comment) — goes visibly
-/// stale within one dial-backoff window instead of leaving confidently-wrong
-/// meters on the bar forever. Since #1283, a *healthy* poller backing off a
-/// sustained run of 429s can reach this ceiling too — up to [`MAX_BACKOFF`]
-/// between attempts is six polls, not three — and that is the right call: the
-/// numbers really are that old, whether the reason is a wedged task or an
-/// account genuinely still rate-limited half an hour on.
+/// stale within one window instead of leaving confidently-wrong meters on
+/// the bar forever.
+///
+/// [`MAX_BACKOFF`] is defined *from* this constant, not the other way
+/// around (see its doc) — a *healthy* poller backing off a sustained run of
+/// 429s reaches this ceiling exactly when the backoff itself hits its cap,
+/// never before: the numbers really are that old, whether the reason is a
+/// wedged task or an account still genuinely rate-limited.
 pub const STALE_AFTER: Duration = Duration::from_secs(POLL_EVERY.as_secs() * 3);
+
+/// The invariant [`MAX_BACKOFF`]'s doc promises, pinned so it cannot silently
+/// drift back apart the way it did before #1285's review: the 429 schedule
+/// must never be able to outlive the window that decides whether its own
+/// carry-forward numbers are still trusted.
+const _: () = assert!(MAX_BACKOFF.as_secs() <= STALE_AFTER.as_secs());
 
 /// Longest borrowed error text kept in a [`UsageError`]. A transport error can
 /// be a paragraph; a chip tooltip cannot.
@@ -637,9 +658,10 @@ pub fn version() -> u64 {
 /// chip slower to recover from an already-transient problem. On a 429 this
 /// honours the server's own `retry_after` when it sent one, else doubles
 /// `prev_wait`; either way the result is clamped to `[POLL_EVERY,
-/// MAX_BACKOFF]`, so a chain of them is `POLL_EVERY` → `10 min` → `20 min` →
+/// MAX_BACKOFF]`, so a chain of them is `POLL_EVERY` → `10 min` →
 /// `MAX_BACKOFF` → `MAX_BACKOFF` — never below the ordinary cadence, never
-/// above the cap.
+/// above the cap (`MAX_BACKOFF` is 15 min, so doubling from `POLL_EVERY`
+/// reaches it on the second step, not the third).
 ///
 /// `outcome` is the *raw* fetch outcome — a 429 still reads as
 /// [`UsageError::Http`], not yet [`UsageError::RateLimited`]; promoting it is
@@ -1559,6 +1581,10 @@ mod tests {
     /// `[POLL_EVERY, MAX_BACKOFF]` band, and — the point of the whole
     /// exercise — every *other* outcome costing nothing.
     ///
+    /// `MAX_BACKOFF` is 15 min (`== STALE_AFTER`, since #1285's review —
+    /// see its doc), so doubling from `POLL_EVERY` (5 min) reaches the cap
+    /// on the *second* step, not the third: `5 → 10 → 15 → 15`.
+    ///
     /// Falsify by having `next_wait` ignore the 429 arm (always return
     /// `POLL_EVERY`): the chain assertion goes red immediately.
     #[test]
@@ -1570,7 +1596,7 @@ mod tests {
             wait = next_wait(wait, &http_429, None);
             minutes.push(wait.as_secs() / 60);
         }
-        assert_eq!(minutes, vec![10, 20, 30, 30], "5 → 10 → 20 → 30 → 30");
+        assert_eq!(minutes, vec![10, 15, 15, 15], "5 → 10 → 15 → 15 → 15");
 
         assert_eq!(
             next_wait(wait, &Outcome::Ok(Usage::default()), None),
@@ -1583,9 +1609,9 @@ mod tests {
     fn retry_after_is_honoured_and_clamped_to_the_poll_every_max_backoff_band() {
         let http_429 = Outcome::Failed(UsageError::Http(429));
         assert_eq!(
-            next_wait(POLL_EVERY, &http_429, Some(Duration::from_mins(15))),
-            Duration::from_mins(15),
-            "900 s → 15 min"
+            next_wait(POLL_EVERY, &http_429, Some(Duration::from_mins(12))),
+            Duration::from_mins(12),
+            "720 s → 12 min, inside the band"
         );
         assert_eq!(
             next_wait(POLL_EVERY, &http_429, Some(Duration::from_secs(10))),
@@ -1595,7 +1621,7 @@ mod tests {
         assert_eq!(
             next_wait(POLL_EVERY, &http_429, Some(Duration::from_mins(90))),
             MAX_BACKOFF,
-            "an absurdly long Retry-After is clamped down to the 30 min cap"
+            "an absurdly long Retry-After is clamped down to the cap"
         );
     }
 
@@ -1718,8 +1744,8 @@ mod tests {
     /// Falsify the reset half by having `next_wait` "remember" a 429 chain
     /// through an unrelated failure (e.g. resetting only on `Outcome::Ok`):
     /// the final `wait4` assertion goes red (it would still read the
-    /// 20-minute mid-chain value instead of dropping to `POLL_EVERY`).
-    /// Falsify the carry-forward half the same way that test's own doc does.
+    /// mid-chain cap instead of dropping to `POLL_EVERY`). Falsify the
+    /// carry-forward half the same way that test's own doc does.
     #[test]
     fn a_non_429_failure_resets_a_429_chain_but_last_ok_survives_every_step() {
         let usage = some_usage();
@@ -1729,7 +1755,10 @@ mod tests {
         assert_eq!(r1.usage(), Some(&usage), "last_ok through the first 429");
 
         let (r2, wait, last_ok) = advance(wait, last_ok, 1_600, Err(UsageError::Http(429)), None);
-        assert_eq!(wait.as_secs() / 60, 20, "5 → 10 → 20");
+        assert_eq!(
+            wait, MAX_BACKOFF,
+            "5 → 10 → the cap (MAX_BACKOFF == 15 min)"
+        );
         assert_eq!(r2.usage(), Some(&usage), "last_ok through the second 429");
 
         let (r3, wait4, last_ok) = advance(
@@ -1741,7 +1770,7 @@ mod tests {
         );
         assert_eq!(
             wait4, POLL_EVERY,
-            "a 20 min chain drops straight back to 5 on an unrelated failure"
+            "a chain at the cap drops straight back to 5 on an unrelated failure"
         );
         assert_eq!(r3.usage(), Some(&usage), "last_ok through the non-429 too");
         assert_eq!(

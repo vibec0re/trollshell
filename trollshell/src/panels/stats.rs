@@ -3007,11 +3007,15 @@ mod width_tests {
     /// page must sit at or under the drawer floor, not just at some
     /// name-independent constant above it.
     ///
-    /// Falsified with exactly the round-3-reviewer's production mutation —
-    /// `let summary = gtk::Label::new(None);` in [`super::build_top_apps_expander`]
-    /// instead of `fixed_width_label(TOP_APPS_TITLE_CHARS)` — which the
-    /// previous harness let through as 37 passed; this one reds on the
-    /// equality assertion (measured `left: 668 / right: 158` for the page).
+    /// Falsified two ways: (1) exactly the round-3-reviewer's production
+    /// mutation — `let summary = gtk::Label::new(None);` in
+    /// [`super::build_top_apps_expander`] instead of
+    /// `fixed_width_label(TOP_APPS_TITLE_CHARS)` — which the previous harness
+    /// let through as 37 passed; this one reds on the equality assertion
+    /// (measured `left: 2484 / right: 252` for the page); (2) dropping
+    /// `set_width_chars` from [`super::fixed_width_label`] (keeping
+    /// `max_width_chars`): measured `left: 320 / right: 243` — bounded, but
+    /// no longer equal.
     #[gtk::test]
     fn top_apps_page_ellipsises_a_long_name_and_sits_at_the_floor() {
         adw::init().expect("libadwaita init");
@@ -3105,8 +3109,8 @@ mod width_tests {
     /// actually opens, not the bare row.
     ///
     /// Falsified by dropping `set_width_chars` from
-    /// [`super::fixed_width_label`]: measured `left: 307 / right: 108`
-    /// (row-level; the page moves the same way).
+    /// [`super::fixed_width_label`]: measured `left: 311 / right: 112` at
+    /// the page.
     #[gtk::test]
     fn failed_unit_page_ellipsises_a_long_name_and_sits_at_the_floor() {
         adw::init().expect("libadwaita init");
@@ -3151,8 +3155,8 @@ mod width_tests {
     /// via [`single_card_page`].
     ///
     /// Falsified by dropping `set_width_chars` from
-    /// [`super::fixed_width_label`]: measured `left: 537 / right: 354`
-    /// (row-level, tiny usage string; the page moves the same way).
+    /// [`super::fixed_width_label`]: measured `left: 318 / right: 295` at
+    /// the page, with the realistic usage string in the value suffix.
     #[gtk::test]
     fn disk_mount_page_ellipsises_a_long_path_and_sits_at_the_floor() {
         adw::init().expect("libadwaita init");
@@ -3200,8 +3204,8 @@ mod width_tests {
     /// [`super::build_stats_gpu_card`] adds it to — via [`single_card_page`].
     ///
     /// Falsified by dropping `set_width_chars` from
-    /// [`super::fixed_width_label`]: measured `left: 160 / right: 41`
-    /// (subtitle-level; the page moves the same way).
+    /// [`super::fixed_width_label`]: measured `left: 174 / right: 68` at
+    /// the page.
     #[gtk::test]
     fn gpu_page_ellipsises_a_long_device_name_and_sits_at_the_floor() {
         adw::init().expect("libadwaita init");

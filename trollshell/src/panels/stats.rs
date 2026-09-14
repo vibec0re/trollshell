@@ -2922,9 +2922,11 @@ mod width_tests {
     /// what a 5-character name renders — exactly, not just "past some
     /// threshold" — and both must still carry the full name in a tooltip.
     ///
-    /// Falsified by dropping `set_width_chars`/`set_max_width_chars` from
-    /// [`super::fixed_width_label`] (paste its measured before/after in the
-    /// PR body's falsification table).
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`] (leaving `max_width_chars`, i.e.
+    /// reverting to `panels/media.rs`'s plain `ellipsized_label` idiom):
+    /// measured `left: 268 / right: 133` — bounded (both far under the
+    /// ~2400px an uncapped label would give), but no longer equal.
     #[gtk::test]
     fn top_apps_row_and_summary_ellipsise_a_long_name() {
         let (expander, summary, rows, meta, collapsed) = fresh_expander();
@@ -2989,7 +2991,9 @@ mod width_tests {
     /// 300-character failed-unit name must render the row at the exact same
     /// width as a 5-character one, and the tooltip must carry the full name.
     ///
-    /// Falsified the same way as the Top-apps test above.
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`] (see the Top-apps test above): measured
+    /// `left: 307 / right: 108`.
     #[gtk::test]
     fn failed_unit_row_ellipsises_a_long_name() {
         adw::init().expect("libadwaita init");
@@ -3015,7 +3019,9 @@ mod width_tests {
     /// mount path must render the row at the exact same width as a
     /// 5-character one, and the tooltip must carry the full path.
     ///
-    /// Falsified the same way as the Top-apps test above.
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`] (see the Top-apps test above): measured
+    /// `left: 537 / right: 354`.
     #[gtk::test]
     fn disk_mount_row_ellipsises_a_long_path() {
         adw::init().expect("libadwaita init");
@@ -3047,7 +3053,9 @@ mod width_tests {
     /// [`super::build_live_gpu_row`] builds and binds — since building the
     /// whole row needs a registered `sensors` service.
     ///
-    /// Falsified the same way as the Top-apps test above.
+    /// Falsified by dropping `set_width_chars` from
+    /// [`super::fixed_width_label`] (see the Top-apps test above): measured
+    /// `left: 160 / right: 41`.
     #[gtk::test]
     fn gpu_row_subtitle_ellipsises_a_long_device_name() {
         adw::init().expect("libadwaita init");

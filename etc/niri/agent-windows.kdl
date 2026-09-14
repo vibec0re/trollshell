@@ -1,0 +1,43 @@
+// Gather the per-agent companion windows on one niri workspace (issue #1306).
+//
+// The agents card's "Open terminals" button opens one `trollshell-agent-window`
+// per running agent. On its own that gives you N windows wherever the
+// compositor happens to put them; @kaesaecracker asked for them tiled together,
+// which is these two nodes plus one config key.
+//
+// What each half does:
+//
+//   1. The plugin emits `niri msg action focus-workspace "hive"` BEFORE it
+//      launches anything, so the windows open on the focused workspace and
+//      niri tiles them there as columns — its own behaviour for new windows,
+//      nothing further needed from us. This half needs `niri` on the plugin's
+//      PATH and nothing in this file.
+//
+//   2. The window rule below sends every agent window there regardless of
+//      what is focused — so a single pill click lands on the same workspace,
+//      and so does a window opened while you were somewhere else.
+//
+// ⚠️ The workspace name MUST equal `window.workspace` in
+// `~/.config/trollshell/agents.toml` (default `"hive"`). They are two spellings
+// of one place and nothing checks them against each other: a mismatch focuses
+// an empty workspace and opens the windows on another one, which looks exactly
+// like the feature not working.
+//
+// niri has no `include` directive, so merge these two top-level nodes into your
+// `~/.config/niri/config.kdl` by hand — anywhere at the top level, next to your
+// other `workspace` / `window-rule` nodes. niri reloads on save.
+
+// A named workspace, so it exists before anything opens on it and keeps its
+// place in the order. The block is where an `open-on-output "DP-2"` would go if
+// you want the agents on a particular monitor.
+workspace "hive" {}
+
+// Every agent window, by the app-id prefix `cli::app_id` builds
+// (`mov.vibec0re.trollshell.AgentWindow.<agent>`) — one rule for all of them.
+// The raw kdl string is so the regex's backslashes reach the regex engine
+// rather than being eaten as kdl escapes; the trailing `\.` is what stops the
+// pattern from also matching a future `…AgentWindowSomethingElse`.
+window-rule {
+    match app-id=r#"^mov\.vibec0re\.trollshell\.AgentWindow\."#
+    open-on-workspace "hive"
+}

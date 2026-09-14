@@ -1146,10 +1146,17 @@ fn a_row_click_on_a_vanished_or_illegal_agent_opens_nothing() {
 ///   launches, and the name list reds;
 /// - make `take_effect_id` return a constant → the distinct-ids assertion reds;
 /// - iterate `hive.agents()` instead of `terminal_targets` → the order reds.
+///
+/// `niri` is pinned **absent** here so this test is about the launches alone;
+/// the focus command and its ordering are the next two tests. Pinning it
+/// matters rather than being tidy: this suite is run on the machine of
+/// somebody who is very likely inside a niri session, so an unpinned probe
+/// would put a focus effect at the front locally and not in CI.
 #[test]
 fn open_terminals_launches_one_window_per_running_agent_in_row_order() {
     let (mut m, mut rx) = model();
     m.set_window_probe(Probe::fixed(true));
+    m.set_niri_probe(Probe::fixed_niri(false));
     m.update(Input::App(Msg::Config(Box::new(toml_config(
         "[display.zeta]\nproject = \"viberoot\"\n\
          [display.alpha]\nproject = \"nixos\"\n\
@@ -1224,6 +1231,7 @@ fn open_terminals_launches_one_window_per_running_agent_in_row_order() {
 fn without_the_window_open_terminals_opens_one_browser_tab_per_running_agent() {
     let (mut m, _rx) = model();
     m.set_window_probe(Probe::fixed(false));
+    m.set_niri_probe(Probe::fixed_niri(false));
     m.update(status(terminal_roster()));
 
     let fx = m.update(click("open-terminals"));
@@ -1246,6 +1254,143 @@ fn without_the_window_open_terminals_opens_one_browser_tab_per_running_agent() {
         "three tabs, the hive's own URLs, distinct ids — ungrouped, so the \
          hive's order is the card's order here"
     );
+}
+
+/// **The workspace focus comes first, and it is one effect** (#1306,
+/// @kaesaecracker: "make this like a dynamic workspace where all agents are
+/// tiled on").
+///
+/// The ordering is the whole mechanism: niri opens a new window on the
+/// **focused** workspace, so a focus emitted after the launches would race
+/// them and gather nothing. The effects reach the host as a list it runs in
+/// order, so this asserts the focus's correlation id is **below every launch
+/// id** rather than merely that a focus is somewhere in the list — an
+/// assertion a reordering could not pass by accident.
+///
+/// The workspace name is the config's, quoted as its own argv element.
+///
+/// Falsifications, each run this round:
+/// - push the focus after the loop → the "id precedes" assertion reds;
+/// - emit it per agent instead of once → the length reds;
+/// - spell the argv `niri msg action focus-workspace=<name>` or drop `msg` →
+///   the exact-argv assertion reds.
+#[test]
+fn open_terminals_focuses_the_hive_workspace_before_it_opens_anything() {
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.set_niri_probe(Probe::fixed_niri(true));
+    m.update(status(terminal_roster()));
+
+    let fx = m.update(click("open-terminals"));
+    assert_eq!(fx.len(), 4, "one focus plus three launches: {fx:?}");
+
+    let (focus_id, focus_argv) = match &fx[0] {
+        Effect::RunCommand { id, argv, detached } => {
+            assert!(detached, "the focus is detached like every other launch");
+            (*id, argv.clone())
+        }
+        other => panic!("the FIRST effect must be the focus, got {other:?}"),
+    };
+    assert_eq!(
+        focus_argv,
+        vec![
+            "niri".to_owned(),
+            "msg".to_owned(),
+            "action".to_owned(),
+            "focus-workspace".to_owned(),
+            "hive".to_owned(),
+        ],
+        "the compositor's own CLI, and the workspace as its own argv element"
+    );
+
+    // Every launch's id is strictly above the focus's — which is the ordering
+    // claim, stated on the tokens rather than on the list index.
+    let launch_ids: Vec<u64> = fx[1..]
+        .iter()
+        .map(|e| match e {
+            Effect::RunCommand { id, argv, .. } => {
+                assert_eq!(argv[0], "trollshell-agent-window", "{argv:?}");
+                *id
+            }
+            other => panic!("expected a window launch, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(focus_id, 0, "the focus takes the first token");
+    assert_eq!(launch_ids, vec![1, 2, 3]);
+    assert!(
+        launch_ids.iter().all(|id| *id > focus_id),
+        "the focus must precede every launch: focus {focus_id}, launches {launch_ids:?}"
+    );
+    assert!(lines(&mut rx).is_empty(), "none of this asks the hive anything");
+}
+
+/// The configured workspace is the one focused — and an unusable name falls
+/// back to the default rather than reaching the argv (#1306).
+///
+/// The second half is where the config's per-key tolerance meets the thing it
+/// exists for: `workspace = "-hive"` would be read as a flag by niri's own
+/// parser, so what must never happen is that string landing in an argv.
+///
+/// Falsification: have `open_terminals` read `self.cfg.window.workspace`
+/// directly instead of `self.cfg.workspace()` and the second half reds with
+/// `-hive` in the argv.
+#[test]
+fn the_focused_workspace_is_the_configured_one_and_never_an_unusable_name() {
+    let focus_target = |body: &str| {
+        let (mut m, _rx) = model();
+        m.set_window_probe(Probe::fixed(true));
+        m.set_niri_probe(Probe::fixed_niri(true));
+        m.update(Input::App(Msg::Config(Box::new(toml_config(body)))));
+        m.update(status(terminal_roster()));
+        match &m.update(click("open-terminals"))[0] {
+            Effect::RunCommand { argv, .. } => argv.last().cloned().expect("a workspace"),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    assert_eq!(focus_target("[window]\nworkspace = \"agents\"\n"), "agents");
+    assert_eq!(
+        focus_target("[window]\nworkspace = \"-hive\"\n"),
+        "hive",
+        "a name niri's parser would read as a flag never reaches the argv"
+    );
+}
+
+/// **No `niri` on `PATH` → no focus effect, and the launches are unchanged**
+/// (#1306).
+///
+/// The right failure: a window opening in the wrong place is a nuisance; a
+/// fan-out that refused to run because the compositor's CLI is missing would
+/// be a regression. Asserted as *equality with the niri-present launches*, so
+/// "unchanged" is a comparison rather than a claim.
+///
+/// Falsification: emit the focus unconditionally and the length reds; make the
+/// missing probe skip the launches too and the comparison reds.
+#[test]
+fn without_niri_there_is_no_focus_and_the_launches_are_unchanged() {
+    let launches = |niri: bool| {
+        let (mut m, _rx) = model();
+        m.set_window_probe(Probe::fixed(true));
+        m.set_niri_probe(Probe::fixed_niri(niri));
+        m.update(status(terminal_roster()));
+        m.update(click("open-terminals"))
+    };
+
+    let with = launches(true);
+    let without = launches(false);
+    assert_eq!(with.len(), 4, "{with:?}");
+    assert_eq!(without.len(), 3, "no focus at all: {without:?}");
+    assert!(
+        !without.iter().any(|e| matches!(
+            e,
+            Effect::RunCommand { argv, .. } if argv.first().is_some_and(|a| a == "niri")
+        )),
+        "{without:?}"
+    );
+
+    // The launches themselves are byte-identical once the ids are set aside —
+    // the focus consumed one token, so only the payloads can be compared.
+    assert_eq!(strip_ids(&with[1..]), strip_ids(&without));
 }
 
 /// **No button while the hive is down** — and none while it is up with nothing

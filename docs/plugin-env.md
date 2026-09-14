@@ -265,7 +265,8 @@ load-bearing for the second entry:
 programs.trollshell.plugins = {
   # the right-sidebar card (#1250) — the manifest's own id and mount
   stats.package = trollshell.packages.${system}.hytte-plugin-stats;
-  # …and, once P2 (#1251) ships the chips, the same binary in the bar
+  # …and the same binary in the bar (#1251): four chips plus the plugin's own
+  # drawer page, driven by the [bar] table of the same stats.toml
   stats-bar = {
     package = trollshell.packages.${system}.hytte-plugin-stats;
     mount = "BarRight"; # renders HYTTE_PLUGIN_MOUNT (#1161)
@@ -286,14 +287,27 @@ layered `Subsystem` exactly as `agents.toml` does (merging
 failing, one warned line per key whose value nothing accepts). It holds **two**
 tables, `[bar]` and `[sidebar]`, and an instance reads the one for the family of
 the mount it was launched into — so one file drives both instances and there is
-no per-instance flag. Each table has five booleans (`cpu`, `per_core`,
-`history`, `temperature`, `gpu`) and `poll_seconds` (1..=60). The documented
-default is `crates/hytte-plugin-stats/src/config.rs`'s `DEFAULT_TOML`; it is the
-bottom merge layer, so a missing file behaves exactly like an untouched one.
+no per-instance flag. Each table has seven booleans (`cpu`, `per_core`,
+`history`, `temperature`, `gpu`, `memory`, `disk`) and `poll_seconds` (1..=60).
+**Every key means the same thing on both tables**; only the defaults differ, and
+that is the entire reason there are two of them (a bar chip has no room for a
+lamp row or a history sweep; the sidebar card is the compact CPU + GPU card, so
+memory and disk are off there). The documented default is
+`crates/hytte-plugin-stats/src/config.rs`'s `DEFAULT_TOML`; it is the bottom
+merge layer, so a missing file behaves exactly like an untouched one.
 
 Unlike `agents.toml`, this file is **not** re-read live: the settings are
 resolved once per process, so an edit takes effect on
 `systemctl --user restart trollshell-plugin-<id>`.
+
+Two things about the **bar** instance specifically (#1251). It renders four
+chips, not five — the native `ts-services` chip counts failed systemd units and
+flapping shell tasks, neither of which a plugin process can reach, and epic
+#1248 has it staying native. And it **samples continuously**: a bar chip is
+always on screen, so unlike the sidebar card it opens its own poll gate at
+startup and ignores `SlotVisible` entirely, rather than depending on the host's
+constant `visible: true` seed for bar mounts. A closed sidebar still costs the
+_sidebar_ instance nothing.
 
 ### terminal (`hytte-plugin-terminal`)
 

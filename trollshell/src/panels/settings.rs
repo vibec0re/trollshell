@@ -40,6 +40,7 @@ use hytte::services::recorder;
 use hytte::services::screensaver;
 use hytte::services::theme::{self, Theme};
 
+use crate::companion::{self, Route};
 use crate::components::deep_link_row::deep_link_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::power_profile::build_power_profile_expander;
@@ -254,8 +255,62 @@ fn build_more_group() -> adw::PreferencesGroup {
         "view-grid-symbolic",
         crate::modal::Page::Workspaces,
     ));
+    // #1304's entry point, appended last: Mara's placement question on the
+    // issue ("bottom of the group, or the first row so it's one click from
+    // the chip?") is still open, and the bottom is this group's own default
+    // for a new row (#1096 review, LOW-3, quoted above) — unlike the four
+    // rows above it, this one leaves the drawer entirely rather than
+    // switching to another page in it, which `control_center_row`'s
+    // `external-link-symbolic` (in place of `deep_link_row`'s
+    // `go-next-symbolic`) is meant to say before it's clicked.
+    more.add(&control_center_row());
 
     more
+}
+
+/// The "Control Center" row (#1304): starts, or focuses, the
+/// `trollshell-control-center` companion app. Resolves its launch
+/// [`Route`] once, when the row is built — `modal::ensure_page` caches this
+/// whole page for the life of the shell (this file's module doc), so that is
+/// also the one time the row's sensitivity/subtitle need deciding; a second
+/// resolve on every click would be harmless (`companion::resolve`'s doc) but
+/// is not needed to keep the "insensitive when missing" promise live, since
+/// neither route can appear or disappear without a shell restart.
+fn control_center_row() -> adw::ActionRow {
+    build_control_center_row(companion::resolve())
+}
+
+/// [`control_center_row`]'s testable half: everything after the route is
+/// already known, over an injected [`Route`] — the seam
+/// [`tests::the_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing`]
+/// uses.
+fn build_control_center_row(route: Route) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Control Center")
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name("preferences-system-symbolic"));
+    // `external-link-symbolic`, not `deep_link_row`'s `go-next-symbolic`:
+    // every other row in this group swaps the drawer to another page, this
+    // one leaves it for a separate window entirely.
+    row.add_suffix(&gtk::Image::from_icon_name("external-link-symbolic"));
+
+    if matches!(route, Route::Missing) {
+        row.set_sensitive(false);
+        row.set_subtitle("trollshell-control-center is not installed");
+        return row;
+    }
+
+    row.connect_activated(move |_| {
+        companion::launch(&route);
+        // The row's action leaves the drawer for a separate window, so there
+        // is nothing left in it to switch to — dismiss rather than
+        // `modal::switch_active`, the same call the power-menu rows and a
+        // clipboard entry's own activation make to close the drawer after an
+        // action that isn't a navigation to another page in it.
+        crate::modal::dismiss_all();
+    });
+    row
 }
 
 #[cfg(all(test, feature = "system-tests"))]
@@ -314,5 +369,44 @@ mod tests {
         pump();
         assert!(switch.is_active(), "a dark session shows Dark mode ON");
         assert!(switch.is_sensitive());
+    }
+
+    /// #1304: the Control Center row is honest about a missing binary
+    /// (insensitive, subtitle naming it) and otherwise a plain, unadorned
+    /// clickable row — the same "before the click, not after" rule
+    /// `companion::resolve`'s module doc states for why the route can't be
+    /// decided at launch time.
+    ///
+    /// **Falsification:** drop the `row.set_sensitive(false)` call in
+    /// `build_control_center_row`'s `Route::Missing` arm → this reds (the
+    /// row stays sensitive while still showing the "not installed"
+    /// subtitle, a broken affordance rather than an honest one).
+    #[gtk::test]
+    fn the_control_center_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing() {
+        adw::init().expect("libadwaita init");
+
+        let missing = super::build_control_center_row(super::Route::Missing);
+        assert!(
+            !missing.is_sensitive(),
+            "a missing control center must not be clickable"
+        );
+        assert_eq!(
+            missing.subtitle().as_deref(),
+            Some("trollshell-control-center is not installed"),
+            "the row must name the missing binary rather than a silent no-op"
+        );
+
+        let binary = super::build_control_center_row(super::Route::Binary(
+            std::path::PathBuf::from("/usr/bin/trollshell-control-center"),
+        ));
+        assert!(
+            binary.is_sensitive(),
+            "a resolved binary route must be clickable"
+        );
+        assert!(
+            binary.subtitle().as_deref().is_none_or(str::is_empty),
+            "a working route must carry no subtitle, got {:?}",
+            binary.subtitle()
+        );
     }
 }

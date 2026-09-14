@@ -45,6 +45,12 @@ const TLS_FAILED: &str = "tls-failed";
 /// page slot is showing.
 const VERIFYING: &str = "tls-verifying";
 
+/// The widget name [`probe_died`] stamps on its state, and the whole of how
+/// [`is_probe_died`] recognises it — the same idiom as [`VERIFYING`], for the
+/// same reason: the widget itself is an `adw::StatusPage`, like every other
+/// card this file builds.
+const PROBE_DIED: &str = "tls-probe-died";
+
 /// Build the page widget for `url`, under the policy
 /// [`crate::tls::resolve`] settled on.
 ///
@@ -321,6 +327,43 @@ pub fn is_verifying(widget: &gtk::Widget) -> bool {
     widget.widget_name() == VERIFYING
 }
 
+/// What the page slot shows when the launch-time TLS probe's worker thread
+/// died without ever producing a verdict — #1274 item 1, the other half of
+/// `Window::begin_probe`'s `Err` arm alongside releasing the probe latch.
+///
+/// Before this, that arm cleared the latch and returned, leaving
+/// [`verifying`] on screen: the spinner kept spinning and the sentence kept
+/// promising a verdict that would never come, with the only evidence in the
+/// journal. This card replaces it with a plain statement of what actually
+/// happened and what the window does next — one scheduled retry, not a
+/// promise the code cannot keep. `tls::resolve` is total, so a worker only
+/// ends up here on a panic or an abort; naming that plainly is more honest
+/// than a card that guesses at a cause it cannot know.
+#[must_use]
+pub fn probe_died(host: &str) -> gtk::Widget {
+    let page = adw::StatusPage::builder()
+        .icon_name("dialog-warning-symbolic")
+        .title("The certificate check did not finish")
+        .description(gtk::glib::markup_escape_text(&format!(
+            "The background check of {host}'s certificate ended without an answer, so the page \
+             was not loaded. The window will try again shortly; if that attempt fails the same \
+             way, this card stays up."
+        )))
+        .build();
+    page.set_widget_name(PROBE_DIED);
+    page.set_hexpand(true);
+    page.set_vexpand(true);
+    page.upcast()
+}
+
+/// Whether `widget` is the state [`probe_died`] built.
+///
+/// `None`-free and total, like [`is_verifying`].
+#[must_use]
+pub fn is_probe_died(widget: &gtk::Widget) -> bool {
+    widget.widget_name() == PROBE_DIED
+}
+
 /// Wire the navigation policy: in-place for the agent's own origin,
 /// `on_refuse` for everything else.
 ///
@@ -502,7 +545,11 @@ mod gtk_tests {
     ///
     /// (The **network** process is a different story, and it does dial —
     /// `window.rs`'s `gtk_tests::a_second_activation_during_the_probe_opens_no_second_connection`
-    /// records it reaching a fixture gateway once the page mounts, #1274 N3.
+    /// asserts it reaching a fixture gateway once, strictly pre-mount (its
+    /// `seen` snapshot is only ever taken while the probe is still in
+    /// flight); that test's own doc additionally records, measured under
+    /// mutation, a second connection once the page mounts — `WebKit`'s
+    /// network process opening the embedded view's `load_uri`, #1274 N3.
     /// That process carries no navigation policy of its own; it is
     /// `decide-policy`, dispatched on the *web* process above, that this file
     /// cannot observe.)

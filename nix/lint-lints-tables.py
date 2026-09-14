@@ -95,6 +95,7 @@ has no `[workspace.lints]`, or `self_test()` — run first, on every invocation
 
 import os
 import sys
+import traceback
 import tomllib
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -384,7 +385,10 @@ def main() -> int:
         # Anything escaping self_test() means the scanner itself is broken,
         # not that the tree has a real lint-table divergence -- exit 2, not
         # the exit 1 a real finding uses (#1286, N2 of the #1279 review).
-        return _self_test_failed([f"a fixture raised {type(e).__name__}: {e}"])
+        return _self_test_failed(
+            [f"a fixture raised {type(e).__name__}: {e}"]
+            + ["  " + line for line in traceback.format_exc().rstrip().splitlines()]
+        )
     if failures:
         return _self_test_failed(failures)
 

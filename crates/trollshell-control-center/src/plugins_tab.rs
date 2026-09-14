@@ -4478,7 +4478,10 @@ mod gtk_tests {
             ..built
         };
 
-        assert!(state.search_path.get().is_none());
+        assert!(
+            state.search_path.get().is_none(),
+            "the candidate list is resolved on the first tick, never at build"
+        );
         super::refresh_plugins(&state);
         let resolved = state
             .search_path

@@ -429,6 +429,7 @@ the bottom of this file) disagrees with the scanner.
 import os
 import re
 import sys
+import traceback
 
 # The three trees the #831 audit covered. `trollshell/src` is where all twelve
 # hits lived; the other two came back empty and are scanned precisely so that
@@ -1684,7 +1685,10 @@ def main(argv: list[str]) -> int:
         # Anything escaping self_test() means the scanner itself is broken,
         # not that the tree has a real pin -- exit 2, not the exit 1 a real
         # finding uses (#1286, N2 of the #1279 review).
-        return _self_test_failed([f"  a fixture raised {type(e).__name__}: {e}"])
+        return _self_test_failed(
+            [f"  a fixture raised {type(e).__name__}: {e}"]
+            + ["    " + line for line in traceback.format_exc().rstrip().splitlines()]
+        )
     if failures:
         return _self_test_failed(failures)
 

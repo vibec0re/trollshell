@@ -420,7 +420,7 @@ fn stamp_cell(lit: &mut Emission, col: usize, row: usize, amount: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ColorMap, DisplayStyle, Frame};
+    use super::super::{ColorMap, DisplayStyle, Frame, Ink, Pins, with_pins};
     use super::{
         CELL, Fill, GAP, LedMatrix, PAD, WIDE_ASPECT, cell_x0, cell_y0, index_table, intensity,
         near_square, near_wide, span, sweep_pos,
@@ -1004,5 +1004,143 @@ mod tests {
                 "{style:?}: an unfed panel is the same whatever the map"
             );
         }
+    }
+
+    // ── The rendered bytes, pinned ───────────────────────────────────────────
+
+    /// Every grid shape the digest sweeps: `(cells, pinned rows)`, `None` rows
+    /// meaning the wide-rectangle default the shell's panel ships with.
+    ///
+    /// Covers both constructors' shape rules, the ragged last row (64 lamps on
+    /// 3 rows is 22 columns and two spare slots), the degenerate 1×1 panel and
+    /// the zero-lamp one.
+    const DIGEST_PANELS: [(usize, Option<usize>); 7] = [
+        (0, None),
+        (1, None),
+        (4, None),
+        (16, Some(2)),
+        (64, None),
+        (64, Some(3)),
+        (128, None),
+    ];
+
+    /// The level vectors the digest sweeps, by index — every shape the
+    /// `levels` slice can take against a grid of `cells` slots.
+    ///
+    /// `4` is the ragged one: fewer levels than slots, which is what makes
+    /// [`Fill`] observable at all.
+    #[allow(clippy::cast_precision_loss)]
+    fn digest_levels(cells: usize, variant: usize) -> Vec<f32> {
+        let ramp = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| i as f32 / (n.max(1)) as f32)
+                .collect::<Vec<_>>()
+        };
+        match variant {
+            // No levels at all: the unfed panel, and `used == 0`, which is the
+            // one state where the colour axis is bypassed outright.
+            0 => Vec::new(),
+            // Every lamp dark — the ghost pass and the field, nothing lit.
+            1 => vec![0.0; cells],
+            // Every lamp pinned — the halo's window saturated almost
+            // everywhere, so the blur's edge clipping is what is left.
+            2 => vec![1.0; cells],
+            // A ramp across the panel: every lamp a different intensity, which
+            // is what separates this widget from the strip.
+            3 => ramp(cells),
+            // Fewer levels than slots, so the ragged tail is rendered.
+            4 => ramp(cells / 2),
+            // Out-of-range and non-finite levels, which the kit clamps and
+            // darkens respectively.
+            _ => (0..cells)
+                .map(|i| match i % 4 {
+                    0 => f32::NAN,
+                    1 => -1.0,
+                    2 => 2.0,
+                    _ => 0.5,
+                })
+                .collect(),
+        }
+    }
+
+    /// Every colour axis the digest sweeps — [`ColorMap::ALL`] plus the one
+    /// parameterised map, which has no canonical value to be in that list.
+    const DIGEST_MAPS: [ColorMap; 5] = [
+        ColorMap::Style,
+        ColorMap::Rainbow,
+        ColorMap::TransPride,
+        ColorMap::Heat,
+        ColorMap::Rgb(0x2a, 0xd0, 0x7f),
+    ];
+
+    /// FNV-1a 64 over every byte [`LedMatrix::render`] produces for
+    /// [`DisplayStyle::ALL`] × [`DIGEST_MAPS`] × `Fill` × [`DIGEST_PANELS`] ×
+    /// the six [`digest_levels`] shapes, dimensions included.
+    fn render_digest() -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |byte: u8| {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        with_pins(
+            Pins {
+                ink: Ink::Base,
+                field: None,
+            },
+            || {
+                for style in DisplayStyle::ALL {
+                    for color in DIGEST_MAPS {
+                        for fill in [Fill::Spare, Fill::Blank] {
+                            for (cells, rows) in DIGEST_PANELS {
+                                let base = match rows {
+                                    Some(rows) => {
+                                        LedMatrix::new(style, cells.max(1).div_ceil(rows), rows)
+                                    }
+                                    None => LedMatrix::wide(style, cells),
+                                };
+                                let panel = base.color(color).fill(fill);
+                                for variant in 0..6 {
+                                    let frame = panel.render(&digest_levels(cells, variant));
+                                    for dim in [frame.width(), frame.height()] {
+                                        for byte in
+                                            u32::try_from(dim).unwrap_or(u32::MAX).to_le_bytes()
+                                        {
+                                            eat(byte);
+                                        }
+                                    }
+                                    for &byte in frame.data() {
+                                        eat(byte);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        hash
+    }
+
+    /// **The bytes this widget renders, pinned by digest** (#1156).
+    ///
+    /// Taken on the **pristine** renderer, before #1156 gave the module the
+    /// additive `pub` surface its GL arm reads (the lattice metrics, the
+    /// per-lamp intensity, the resolved lamp inks and the ghost-slot count) —
+    /// the `Gauge::dial` / `SEVEN_SEG_BARS` / `FlipMetrics` precedent
+    /// (#1148/#1154/#1155). A visibility change moves no byte by construction,
+    /// but publishing `lamp_inks` also *moves* the colour branch of
+    /// [`LedMatrix::render`] onto it, and the only thing that can say a render
+    /// path's refactor moved no pixel is a function of every pixel — taken on
+    /// the tree before it and asserted on the tree after.
+    ///
+    /// Pinned under [`Ink::Base`] so the process-wide accent (an atomic other
+    /// tests move in parallel) cannot make it flaky.
+    ///
+    /// **Falsified** by moving [`CELL`], [`GAP`] or [`PAD`], by changing
+    /// [`intensity`]'s rounding, by swapping either [`Fill`] arm, or by moving
+    /// [`sweep_pos`]'s half-open divisor.
+    #[test]
+    fn the_rendered_bytes_are_pinned_by_digest() {
+        assert_eq!(render_digest(), 0x5144_3bdd_5024_7071);
     }
 }

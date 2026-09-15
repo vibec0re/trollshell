@@ -2033,7 +2033,7 @@ fn base64_value(byte: u8) -> Option<u8> {
 /// before decoding, so a wrapped, saved-and-reopened block round-trips.
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
     let bytes: Vec<u8> = encoded.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err(format!(
             "base64 block has {} non-whitespace byte(s), not a multiple of 4",
             bytes.len()
@@ -2041,8 +2041,16 @@ fn base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     for group in bytes.chunks_exact(4) {
-        let pad = group.iter().filter(|&&b| b == b'=').count();
-        if pad > 2 || group[..4 - pad].iter().any(|&b| b == b'=') {
+        // Valid padding is only `XX==`, `XXX=` or `XXXX` — anything else
+        // (a `=` earlier than that, or a single `=` followed by a non-`=`)
+        // is malformed rather than merely padded.
+        let pad = match (group[2] == b'=', group[3] == b'=') {
+            (true, true) => 2,
+            (false, true) => 1,
+            (false, false) => 0,
+            (true, false) => return Err("misplaced '=' padding in a base64 group".to_owned()),
+        };
+        if group[0] == b'=' || group[1] == b'=' {
             return Err("misplaced '=' padding in a base64 group".to_owned());
         }
         let mut n: u32 = 0;
@@ -2200,18 +2208,15 @@ fn run_decode(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
-    let text = match path {
-        Some(path) => {
-            std::fs::read_to_string(path).map_err(|why| format!("reading {path}: {why}"))?
-        }
-        None => {
-            use std::io::Read as _;
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|why| format!("reading stdin: {why}"))?;
-            buf
-        }
+    let text = if let Some(path) = path {
+        std::fs::read_to_string(path).map_err(|why| format!("reading {path}: {why}"))?
+    } else {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|why| format!("reading stdin: {why}"))?;
+        buf
     };
     let frames = decode_frame_log(&text)?;
     if frames.is_empty() {

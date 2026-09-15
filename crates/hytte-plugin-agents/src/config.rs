@@ -352,7 +352,7 @@ mod tests {
     use super::{
         AgentsConfig, DEFAULT_RUNTIME_ICON, Display, Invalid, MAX_POLL_SECONDS, MIN_POLL_SECONDS,
     };
-    use hytte_config::subsystem::{Subsystem as _, assemble};
+    use hytte_config::subsystem::{Subsystem as _, assemble, assemble_base_layers};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -390,7 +390,10 @@ mod tests {
     /// halves is checked: the marker must be stripped before the schema sees
     /// it (no `unknown_keys` entry, no field), and
     /// [`hytte_config::subsystem::Loaded::locked`] must come back naming
-    /// exactly the five leaves the nix example set.
+    /// exactly the five leaves the nix example set. It goes in through
+    /// [`assemble_base_layers`] rather than [`assemble`] because that is what
+    /// it is — a nix-written base layer, with no overlay file beside it —
+    /// and a lock binds the overlay, so a base read as one would pin nothing.
     ///
     /// Falsification: change one key in the fixture without changing the
     /// nix example that produced it (or vice versa), and either this test
@@ -402,8 +405,8 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agents-nix-rendered.toml");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("missing fixture {} ({e})", path.display()));
-        let loaded =
-            assemble::<AgentsConfig>(&[(path, body)]).expect("the nix-rendered fixture assembles");
+        let loaded = assemble_base_layers::<AgentsConfig>(&[(path, body)])
+            .expect("the nix-rendered fixture assembles");
         assert!(loaded.unknown_keys.is_empty(), "{:?}", loaded.unknown_keys);
         loaded.config.validate().expect("the fixture validates");
 

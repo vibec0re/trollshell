@@ -278,7 +278,10 @@ fn env_lookup(key: &str) -> Option<String> {
 /// *this* function is a test against `init` — there is no second place for
 /// the wiring to live that a test could miss (`hytte-plugin-stats::plugin`'s
 /// `settings_from` is the same shape, for the same reason).
-fn resolve_settings(manifest_mount: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> (bool, String) {
+fn resolve_settings(
+    manifest_mount: Mount,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (bool, String) {
     (
         effective_mount(manifest_mount, lookup).is_bar(),
         card_title(lookup),

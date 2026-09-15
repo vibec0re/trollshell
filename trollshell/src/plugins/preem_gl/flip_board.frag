@@ -310,7 +310,11 @@ int cell_local_x(int col, int index) {
 // it belongs to), and `[lo, hi]` the fragment's own vertical extent in
 // card-local logical units — one whole row on the snapped branch, the
 // fragment's footprint on the continuous one.
-int flap255(int base, int x, int row, float lo, float hi, float fstep, bool snapped) {
+// Split out of `flap255` so the value the rounding below decides is a thing a
+// census can look at: `flip_board.rs`'s
+// `the_coverage_bytes_are_never_decided_by_the_divides_slack` walks exactly
+// this number to measure how close it comes to `level`'s truncation boundary.
+float flap_value(int base, int x, int row, float lo, float hi, float fstep, bool snapped) {
     float band_lo = strip_at(base + 4);
     float band_hi = strip_at(base + 5);
     float edge_lo = strip_at(base + 6);
@@ -368,6 +372,14 @@ int flap255(int base, int x, int row, float lo, float hi, float fstep, bool snap
     } else {
         value = behind;
     }
+    return value;
+}
+
+// `FlipBoard::compose_flap`'s own `if value > 0.0 { lit.add(.., level(value)) }`
+// — the emission is `0` where nothing was stamped, and `level` clamps a
+// negative into it anyway.
+int flap255(int base, int x, int row, float lo, float hi, float fstep, bool snapped) {
+    float value = flap_value(base, x, row, lo, hi, fstep, snapped);
     return value > 0.0 ? level(value) : 0;
 }
 

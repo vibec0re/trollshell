@@ -468,3 +468,1403 @@ fn u32_of(value: usize) -> u32 {
 fn int_of(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Arc, CELL_TEXELS, FLIP_BOARD_PIPELINE, GlBlend, GlDraw, GlInput, GlTarget, GlUniforms,
+        GlValue, HALO_BLUR_H_FRAG, HALO_BLUR_V_FRAG, MECH_NIXIE, MECH_SPLIT_FLAP, cards,
+        flip_board_surface, kit, pack_glyph,
+    };
+
+    /// The shader body — the source the scans below read back.
+    const BODY: &str = include_str!("flip_board.frag");
+    /// …and the blur's, which the mirror transcribes four times over.
+    const BLUR_BODY: &str = include_str!("blur.frag");
+
+    fn uniform(uniforms: &GlUniforms, name: &str) -> GlValue {
+        let (_, value) = uniforms
+            .values
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .unwrap_or_else(|| panic!("no uniform named {name}"));
+        *value
+    }
+
+    fn int_at(uniforms: &GlUniforms, name: &str) -> i32 {
+        match uniform(uniforms, name) {
+            GlValue::Int(value) => value,
+            other => panic!("{name} is {other:?}, wanted an Int"),
+        }
+    }
+
+    /// A board driven into one state: settled on `from`, told to show `to`,
+    /// then advanced by `secs`. The kit's builder chain in its own order —
+    /// `cells` rebuilds the row blank, so it comes first.
+    fn board(
+        mechanism: kit::Mechanism,
+        cells: usize,
+        from: &str,
+        to: &str,
+        secs: f32,
+        scale: usize,
+    ) -> kit::FlipBoard {
+        let mut board = kit::FlipBoard::new(mechanism).cells(cells).scale(scale);
+        board.set_text(from);
+        board.settle();
+        board.set_text(to);
+        board.advance(secs);
+        board
+    }
+
+    // ── the mapping ─────────────────────────────────────────────────────────
+
+    /// **The uniform table is the kit's own metrics**, name for name and value
+    /// for value — and every geometric row is written as the kit item it comes
+    /// from, never as the literal it currently equals (the #1164 shape).
+    ///
+    /// That is the whole reason [`kit::FlipBoard::metrics`] and the card
+    /// constants became `pub`: a `GlValue::Int(14)` here would agree with the
+    /// kit today and keep agreeing after someone widened a card, which is a
+    /// mirror agreeing with itself. The names are the contract with the GLSL —
+    /// a rename on one side alone draws nothing and says nothing — and the
+    /// order is pinned so a reordering shows as a diff.
+    ///
+    /// **Falsified** by adding, removing, renaming or reordering any row, or by
+    /// spelling a metric as a literal and then moving the kit's.
+    #[test]
+    fn the_uniform_table_is_the_kits_own_metrics() {
+        let palette = kit::palette_snapshot(kit::DisplayStyle::Crt);
+        let kit_board = board(kit::Mechanism::SplitFlap, 5, "00:00", "12:34", 0.11, 2);
+        let metrics = kit_board.metrics();
+        let surface = flip_board_surface(&cards(&kit_board), &palette);
+
+        let names: Vec<&str> = surface.uniforms.values.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "u_mechanism",
+                "u_cells",
+                "u_cell_w",
+                "u_cell_h",
+                "u_hinge",
+                "u_bezel",
+                "u_gap",
+                "u_glyph_px",
+                "u_glyph_pad",
+                "u_face_top",
+                "u_face_bottom",
+                "u_cathode",
+                "u_stack_lo",
+                "u_stack_hi",
+                "u_ghost_on",
+                "u_ghost",
+                "u_bloom_radius",
+                "u_bloom_strength",
+                "u_halo_radius",
+                "u_halo_strength",
+                "u_bg",
+                "u_ink",
+                "u_mask_on",
+                "u_mask_pitch",
+                "u_mask_phase",
+                "u_scanline_keep",
+                "u_corner_keep",
+            ],
+        );
+
+        assert_eq!(int_at(&surface.uniforms, "u_mechanism"), MECH_SPLIT_FLAP);
+        // The eight geometric rows, each against the kit's own answer.
+        for (name, value) in [
+            ("u_cells", metrics.cells),
+            ("u_cell_w", metrics.cell_w),
+            ("u_cell_h", metrics.cell_h),
+            ("u_hinge", metrics.hinge),
+            ("u_bezel", metrics.bezel),
+            ("u_gap", metrics.gap),
+            ("u_glyph_px", metrics.glyph_px),
+            ("u_glyph_pad", metrics.glyph_pad),
+        ] {
+            assert_eq!(
+                int_at(&surface.uniforms, name),
+                i32::try_from(value).unwrap(),
+                "{name}",
+            );
+        }
+        // …and the three fixture tones, as the kit's constants rather than as
+        // 255, 205 and 255.
+        assert_eq!(
+            int_at(&surface.uniforms, "u_face_top"),
+            i32::from(kit::FLIP_FACE_TOP_T),
+        );
+        assert_eq!(
+            int_at(&surface.uniforms, "u_face_bottom"),
+            i32::from(kit::FLIP_FACE_BOTTOM_T),
+        );
+        assert_eq!(
+            int_at(&surface.uniforms, "u_cathode"),
+            i32::from(kit::NIXIE_CATHODE_T),
+        );
+        // …and the cathode stack, derived by the kit from the font.
+        let (stack_lo, stack_hi) = pack_glyph(kit::nixie_cathode_stack());
+        assert_eq!(
+            int_at(&surface.uniforms, "u_stack_lo"),
+            i32::try_from(stack_lo).unwrap(),
+        );
+        assert_eq!(
+            int_at(&surface.uniforms, "u_stack_hi"),
+            i32::try_from(stack_hi).unwrap(),
+        );
+
+        assert_eq!(
+            int_at(&surface.uniforms, "u_ghost_on"),
+            i32::from(palette.ghost.is_some()),
+        );
+        let bloom = palette.bloom.expect("the CRT skin glows");
+        assert_eq!(
+            int_at(&surface.uniforms, "u_bloom_radius"),
+            i32::try_from(bloom.radius).unwrap(),
+        );
+        assert_eq!(
+            int_at(&surface.uniforms, "u_bloom_strength"),
+            i32::from(bloom.strength),
+        );
+        // A split-flap board blooms **once**, so the wide pass is off.
+        assert_eq!(int_at(&surface.uniforms, "u_halo_radius"), 0);
+        assert_eq!(int_at(&surface.uniforms, "u_halo_strength"), 0);
+        assert_eq!(
+            uniform(&surface.uniforms, "u_bg"),
+            super::channels(palette.bg),
+        );
+        assert_eq!(
+            uniform(&surface.uniforms, "u_ink"),
+            super::channels(palette.ink),
+        );
+        assert_eq!(surface.uniforms.step_seq, 0, "no cross-frame GPU state");
+    }
+
+    /// **A nixie's wide halo is the kit's own extra bloom pass**, and a split
+    /// flap has none at all.
+    ///
+    /// The kit's `render` blooms a nixie at
+    /// `bloom.radius + NIXIE_HALO_RADIUS_BONUS` / strength
+    /// [`kit::NIXIE_HALO_STRENGTH`] *before* the palette's own; this is the
+    /// mapping's half of that, and it is written as the kit's two constants
+    /// rather than as `+ 3` and `64`.
+    ///
+    /// **Falsified** by giving the split flap a wide pass, by dropping the
+    /// bonus, or by leaving the wide pass on for a skin whose `bloom` is
+    /// `None` (where the kit would not run the first `bloom` either).
+    #[test]
+    fn only_a_nixie_takes_the_kits_extra_wide_halo() {
+        for style in kit::DisplayStyle::ALL {
+            let palette = kit::palette_snapshot(style);
+            for mechanism in kit::Mechanism::ALL {
+                let kit_board = board(mechanism, 4, "0000", "1234", 0.09, 1);
+                let surface = flip_board_surface(&cards(&kit_board), &palette);
+                let wide = match (mechanism, palette.bloom) {
+                    (kit::Mechanism::Nixie, Some(bloom)) => (
+                        i32::try_from(bloom.radius + kit::NIXIE_HALO_RADIUS_BONUS).unwrap(),
+                        i32::from(kit::NIXIE_HALO_STRENGTH),
+                    ),
+                    _ => (0, 0),
+                };
+                assert_eq!(
+                    (
+                        int_at(&surface.uniforms, "u_halo_radius"),
+                        int_at(&surface.uniforms, "u_halo_strength"),
+                    ),
+                    wide,
+                    "{style:?}/{mechanism:?}",
+                );
+            }
+        }
+    }
+
+    /// **The grid is the kit's pre-upscale buffer and the natural size is that
+    /// times `scale`** — the scope's arrangement, not the gauge's, because here
+    /// `Frame::upscale` replicates *finished* pixels rather than magnifying a
+    /// rasterisation.
+    ///
+    /// **Falsified** by handing `grid` the post-upscale size (the offscreen
+    /// passes then blur at the wrong radius and the CRT comb comes out at the
+    /// wrong pitch), or by handing the reconciler the pre-upscale one (the chip
+    /// is drawn at a `scale`th of its natural size).
+    #[test]
+    fn the_grid_is_the_kits_pre_upscale_buffer() {
+        for scale in [1_usize, 2, 3, 8] {
+            for mechanism in kit::Mechanism::ALL {
+                let kit_board = board(mechanism, 5, "00:00", "12:34", 0.11, scale);
+                let metrics = kit_board.metrics();
+                let surface = flip_board_surface(
+                    &cards(&kit_board),
+                    &kit::palette_snapshot(kit::DisplayStyle::Vfd),
+                );
+                let frame = kit_board.render(kit::DisplayStyle::Vfd);
+                assert_eq!(
+                    (surface.width as usize, surface.height as usize),
+                    (frame.width(), frame.height()),
+                    "scale {scale} {mechanism:?}: the natural size is the kit's frame",
+                );
+                assert_eq!(
+                    surface.uniforms.grid,
+                    (
+                        u32::try_from(metrics.width).unwrap(),
+                        u32::try_from(metrics.height).unwrap(),
+                    ),
+                    "scale {scale} {mechanism:?}: the grid is the pre-upscale buffer",
+                );
+                assert_eq!(
+                    (
+                        surface.uniforms.grid.0 as usize * scale,
+                        surface.uniforms.grid.1 as usize * scale,
+                    ),
+                    (frame.width(), frame.height()),
+                );
+            }
+        }
+    }
+
+    /// **The strip is [`kit::FlipBoard::cell_states`]' own answer**, run
+    /// through the kit's own phase curves — [`CELL_TEXELS`] texels per cell, in
+    /// cell order.
+    ///
+    /// **Falsified** by re-deriving a cell's progress here, by transcribing
+    /// `PI * p * p` instead of calling [`kit::flap_theta`], or by encoding the
+    /// incoming card where the outgoing one belongs.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn the_strip_is_the_kits_own_cell_states() {
+        let kit_board = board(kit::Mechanism::Nixie, 5, "00:00", "12:34", 0.11, 2);
+        let metrics = kit_board.metrics();
+        let encoded = cards(&kit_board);
+        let strip = encoded.strip.as_ref().expect("five cells");
+        let states = kit_board.cell_states();
+        assert_eq!(states.len(), 5);
+        assert_eq!(strip.len(), states.len() * CELL_TEXELS);
+
+        let mid = metrics.hinge as f32;
+        for (index, cell) in states.iter().enumerate() {
+            let base = index * CELL_TEXELS;
+            let (from_lo, from_hi) = pack_glyph(kit::flip_rows_of(cell.from));
+            let (to_lo, to_hi) = pack_glyph(kit::flip_rows_of(cell.to));
+            let (sin, cos) = kit::flap_theta(cell.progress).sin_cos();
+            let squash = cos.abs();
+            let falling_up = cos >= 0.0;
+            let (band_lo, band_hi) = if falling_up {
+                (mid - squash * mid, mid)
+            } else {
+                (mid, mid + squash * mid)
+            };
+            let want = [
+                super::f32_of_bits(from_lo),
+                super::f32_of_bits(from_hi),
+                super::f32_of_bits(to_lo),
+                super::f32_of_bits(to_hi),
+                band_lo,
+                band_hi,
+                if falling_up {
+                    band_lo
+                } else {
+                    band_hi - kit::FLIP_EDGE_PX
+                },
+                if falling_up {
+                    band_lo + kit::FLIP_EDGE_PX
+                } else {
+                    band_hi
+                },
+                kit::FLIP_EDGE_T * sin,
+                kit::FLIP_SHADE_FLOOR + (1.0 - kit::FLIP_SHADE_FLOOR) * squash,
+                squash,
+                if falling_up { 1.0 } else { 0.0 },
+                f32::from(kit::flip_level(
+                    kit::nixie_afterglow(cell.progress) * kit::FLIP_GLYPH_T,
+                )),
+                f32::from(kit::flip_level(
+                    kit::nixie_ignite(cell.progress) * kit::FLIP_GLYPH_T,
+                )),
+            ];
+            assert_eq!(&strip[base..base + CELL_TEXELS], &want[..], "cell {index}");
+        }
+
+        // A board with no cells binds no strip at all, which is what makes
+        // `u_data_len == 0` the shader's "nothing to draw".
+        let empty = cards(&board(kit::Mechanism::SplitFlap, 0, "", "", 0.0, 2));
+        assert_eq!(empty.metrics.cells, 0);
+        assert!(empty.strip.is_none());
+        let surface = flip_board_surface(&empty, &kit::palette_snapshot(kit::DisplayStyle::Lcd));
+        assert!(surface.uniforms.data.is_none());
+        assert_eq!(uniform(&surface.uniforms, "u_cells"), GlValue::Int(0));
+    }
+
+    /// **The encoded board travels as one allocation** — the strip is minted
+    /// once per mapping pass and handed over by `Arc`, rather than rebuilt
+    /// inside [`flip_board_surface`].
+    #[test]
+    fn the_strip_travels_as_the_callers_allocation() {
+        let encoded = cards(&board(
+            kit::Mechanism::SplitFlap,
+            5,
+            "00:00",
+            "12:34",
+            0.11,
+            2,
+        ));
+        let surface = flip_board_surface(&encoded, &kit::palette_snapshot(kit::DisplayStyle::Oled));
+        let held = surface.uniforms.data.as_ref().expect("five cells");
+        assert!(Arc::ptr_eq(held, encoded.strip.as_ref().unwrap()));
+    }
+
+    /// **Seven passes over six aux textures, the last one on the screen** — the
+    /// structural claim the module docs make, asserted rather than described.
+    ///
+    /// **Falsified** by any of: an `aux` below `6`, a step pass (a board's
+    /// whole animation is CPU-side), a second blur stage that reads the raw
+    /// emission instead of the recombined layer, a blit that reads the lit
+    /// texture back instead of recomputing it, or a target other than the
+    /// screen last.
+    #[test]
+    fn the_pipeline_blooms_twice_and_ends_on_the_screen() {
+        assert_eq!(FLIP_BOARD_PIPELINE.aux, 6);
+        assert!(
+            FLIP_BOARD_PIPELINE.step.is_empty(),
+            "a board carries no cross-frame GPU state",
+        );
+        assert_eq!(
+            FLIP_BOARD_PIPELINE.frame.len(),
+            7,
+            "lit, wide blur H/V, recombine, blur H/V, blit",
+        );
+        let targets: Vec<GlTarget> = FLIP_BOARD_PIPELINE.frame.iter().map(|p| p.target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                GlTarget::Aux(0),
+                GlTarget::Aux(1),
+                GlTarget::Aux(2),
+                GlTarget::Aux(3),
+                GlTarget::Aux(4),
+                GlTarget::Aux(5),
+                GlTarget::Screen,
+            ],
+        );
+        let inputs: Vec<&[GlInput]> = FLIP_BOARD_PIPELINE.frame.iter().map(|p| p.inputs).collect();
+        assert_eq!(
+            inputs,
+            vec![
+                &[GlInput::Data][..],
+                &[GlInput::Aux(0)][..],
+                &[GlInput::Aux(1)][..],
+                // The recombine sees the raw emission **and** the wide blur.
+                &[GlInput::Aux(0), GlInput::Aux(2)][..],
+                // …and the skin's own blur runs over the recombined layer,
+                // which is what `Emission::bloom` applied twice means.
+                &[GlInput::Aux(3)][..],
+                &[GlInput::Aux(4)][..],
+                // The blit recomputes the lit layer and samples only the two
+                // blurred copies.
+                &[GlInput::Data, GlInput::Aux(2), GlInput::Aux(5)][..],
+            ],
+        );
+        for pass in FLIP_BOARD_PIPELINE.frame {
+            assert_eq!(pass.blend, GlBlend::Replace);
+            assert_eq!(pass.draw, GlDraw::FullScreen);
+            assert_ne!(
+                pass.target,
+                GlTarget::Accumulator,
+                "this pipeline declares no accumulator",
+            );
+        }
+    }
+
+    /// **The wide blur is `blur.frag` pointed at its own radius uniform** — the
+    /// splice declares `u_halo_radius` and defines `BLUR_RADIUS` to it, so the
+    /// two stages of a nixie's double bloom cannot end up reading one number.
+    ///
+    /// **Falsified** by dropping either splice line (the body then reads
+    /// `u_bloom_radius` in all four blur passes and the wide haze silently
+    /// becomes the narrow one), or by deleting `blur.frag`'s `#ifndef` default
+    /// (every *other* pipeline's splice stops compiling).
+    #[test]
+    fn the_wide_blur_splice_names_its_own_radius_uniform() {
+        for source in [HALO_BLUR_H_FRAG, HALO_BLUR_V_FRAG] {
+            assert!(source.contains("uniform int u_halo_radius;\n"));
+            assert!(source.contains("#define BLUR_RADIUS u_halo_radius\n"));
+        }
+        assert!(HALO_BLUR_H_FRAG.contains("const ivec2 BLUR_DIR = ivec2(1, 0);\n"));
+        assert!(HALO_BLUR_V_FRAG.contains("const ivec2 BLUR_DIR = ivec2(0, 1);\n"));
+        for clause in [
+            "#ifndef BLUR_RADIUS\n",
+            "#define BLUR_RADIUS u_bloom_radius\n",
+            "int radius = max(BLUR_RADIUS, 0);",
+        ] {
+            assert!(
+                BLUR_BODY.contains(clause),
+                "blur.frag no longer carries `{clause}` — every other splice \
+                 reads its radius through that default",
+            );
+        }
+    }
+
+    /// **The shader declares the CRT pass's four constants with the kit's own
+    /// values** — the shared #1186 helper, called here for the reason it exists
+    /// (a `.frag` cannot read a Rust `const`, so the copy must be checked).
+    #[test]
+    fn the_shader_declares_the_kits_crt_constants() {
+        super::super::program::assert_crt_constants("flip_board.frag", BODY);
+    }
+
+    /// **The shader takes its geometry from uniforms, never from a literal of
+    /// its own** — the #1164 shape adapted to a shader whose mirrored constants
+    /// are uniforms.
+    ///
+    /// **Falsified** by inlining any of them (a `const int CELL_W = 14;` beside
+    /// the CRT block), which would let the kit's own value move without moving
+    /// what CI compiles.
+    #[test]
+    fn the_shader_reads_its_geometry_from_uniforms() {
+        for name in [
+            "u_mechanism",
+            "u_cells",
+            "u_cell_w",
+            "u_cell_h",
+            "u_hinge",
+            "u_bezel",
+            "u_gap",
+            "u_glyph_px",
+            "u_glyph_pad",
+            "u_face_top",
+            "u_face_bottom",
+            "u_cathode",
+            "u_stack_lo",
+            "u_stack_hi",
+            "u_halo_strength",
+        ] {
+            assert!(
+                BODY.contains(&format!("uniform int {name};")),
+                "flip_board.frag must declare `uniform int {name};`",
+            );
+        }
+        let declared: Vec<&str> = BODY
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("const int "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                "LAYER_LIT",
+                "LAYER_HALO1",
+                "LAYER_BLIT",
+                "MECH_SPLIT_FLAP",
+                "MECH_NIXIE",
+                "GLYPH_W",
+                "GLYPH_H",
+                "CELL_TEXELS",
+                "MASK_ONE",
+                "COORD_ONE",
+                "BAND_DIV",
+                "CORNER_DIV",
+            ],
+            "flip_board.frag grew a compile-time constant — a card metric \
+             belongs in the uniform bag, where it is the kit's own item",
+        );
+    }
+
+    /// **The only geometry this shader restates is the font's glyph box**, and
+    /// it restates [`kit::font`]'s own numbers.
+    ///
+    /// It has to be a `const`: `glyph_coverage`'s loop bound cannot be a
+    /// uniform without giving up the unrolled seven iterations, and a 5×7 font
+    /// is the one thing in this widget that is not a metric a board can be
+    /// built with.
+    ///
+    /// **Falsified** by moving `font::GLYPH_W` or `GLYPH_H` without moving the
+    /// shader's copy.
+    #[test]
+    fn the_shader_restates_only_the_fonts_glyph_box() {
+        assert!(BODY.contains(&format!("const int GLYPH_W = {};", kit::font::GLYPH_W)));
+        assert!(BODY.contains(&format!("const int GLYPH_H = {};", kit::font::GLYPH_H)));
+    }
+
+    /// **The shader's `CELL_TEXELS` and the two mechanism codes are the
+    /// mapping's**, so the strip one side writes is the strip the other reads.
+    ///
+    /// A disagreement about the stride shifts every cell's state onto its
+    /// neighbour, and one about the codes draws a nixie's cross-fade with the
+    /// flap's geometry — both silent.
+    #[test]
+    fn the_shader_and_the_mapping_agree_about_the_strip_encoding() {
+        assert!(BODY.contains(&format!("const int CELL_TEXELS = {CELL_TEXELS};")));
+        assert!(BODY.contains(&format!("const int MECH_SPLIT_FLAP = {MECH_SPLIT_FLAP};")));
+        assert!(BODY.contains(&format!("const int MECH_NIXIE = {MECH_NIXIE};")));
+    }
+
+    // ── the transcription ───────────────────────────────────────────────────
+
+    /// Every board state the transcription sweep drives, as
+    /// `(cells, from, to, secs)`.
+    ///
+    /// The empty board, a settled row, five points along one change (three of
+    /// them either side of horizontal, which falls at `p = 1/sqrt(2)`), a
+    /// staggered whole-row change, cards that are not on the drum, and the
+    /// [`kit::FLIP_MAX_CELLS`] row — the widest board the kit will build, whose
+    /// 896-texel strip and 1026 px buffer no *parity* case renders, because its
+    /// natural size at the shipping upscale would be wider than the harness's
+    /// own display. Nothing bounds the cell count in a uniform array — the
+    /// per-cell payload is a data texture — so this is where that edge is
+    /// covered.
+    const SWEEP: [(usize, &str, &str, f32); 10] = [
+        (0, "", "", 0.0),
+        (5, "12:34", "12:34", 0.0),
+        (5, "00:00", "12:34", 0.03),
+        (5, "00:00", "12:34", 0.11),
+        (5, "00:00", "12:34", 0.19),
+        (5, "00:00", "12:34", 0.27),
+        (5, "00:00", "12:34", 0.37),
+        (8, "88:88:88", "PREEM   ", 0.13),
+        (8, "12:34:56", "########", 0.23),
+        (
+            kit::FLIP_MAX_CELLS,
+            "",
+            "DEPARTURES 12:34 PLATFORM 9",
+            0.17,
+        ),
+    ];
+
+    /// Every board the sweeps below drive, at the kit's `scale = 1` — the only
+    /// upscale a 1:1 comparison exists at.
+    fn sweep_boards() -> Vec<(kit::Mechanism, kit::FlipBoard)> {
+        let mut boards = Vec::new();
+        for mechanism in kit::Mechanism::ALL {
+            for (cells, from, to, secs) in SWEEP {
+                boards.push((mechanism, board(mechanism, cells, from, to, secs, 1)));
+            }
+        }
+        boards
+    }
+
+    /// **The shader's arithmetic, transcribed here, reproduces the kit byte for
+    /// byte at 1:1 — on every skin, on both mechanisms, over every board shape
+    /// this widget can draw.**
+    ///
+    /// The #1153/#1154 pattern, and the test that actually earns the bit-exact
+    /// pin: [`shader_frame`] is a line-by-line Rust transcription of
+    /// `flip_board.frag`'s snapped branch **and** of `blur.frag`, which this
+    /// pipeline runs four times — the same fold, the same two truncating
+    /// integer divisions, the same `mix_kit`, the same CRT pass, in the same
+    /// order — compared against `kit::FlipBoard::render`'s own bytes. It needs
+    /// no GL at all, and llvmpipe is not available to `cargo test`.
+    ///
+    /// **This arm's 1:1 branch is the first on this seam that is not a point
+    /// test**, and that is what makes the transcription worth having. The
+    /// scope, the dot matrix, the meter and the readout all collapse onto an
+    /// integer at a pixel centre; a flip board does not, because the kit itself
+    /// takes a fractional area average of the falling card there. So this
+    /// reproduces float arithmetic — including a fused multiply-add and two
+    /// divisions — rather than a degeneracy, and the thing most likely to go
+    /// silently wrong is an operation order.
+    ///
+    /// The transcription is held to the **shipped** GLSL by
+    /// [`the_mirror_is_the_shipped_shaders_arithmetic`], so the two cannot
+    /// drift: this test says the arithmetic is right, that one says it is the
+    /// arithmetic that ships. Neither replaces `preem_gl_diff` — a driver can
+    /// still disagree with both.
+    ///
+    /// **Falsified** by any of: dropping the `+ 127` from `mix_kit`, dividing
+    /// the blur in floats, renormalising the blur window where it clips at a
+    /// buffer edge, folding the two blur *stages* into one (a nixie blooms
+    /// twice and the second pass blurs the first's result), compositing the
+    /// fixture over the lit layer instead of under it, cutting the hinge slot
+    /// before the composite instead of after, or replacing the fused
+    /// multiply-add with a multiply and an add.
+    ///
+    /// The whole sweep runs inside one [`kit::with_pins`] scope pinning
+    /// [`kit::Ink::Base`], for `led_strip.rs`'s measured reason: the kit's
+    /// accent is a process-global `AtomicU32` that both `palette_snapshot`
+    /// (here) and `render` (the oracle) read at render time, and the suite runs
+    /// concurrently, so a flip landing between the two calls would make them
+    /// differ for a reason that is not this code.
+    #[test]
+    fn the_transcribed_shader_is_bit_exact_against_the_kit_at_one_to_one() {
+        kit::with_pins(
+            kit::Pins {
+                ink: kit::Ink::Base,
+                field: None,
+            },
+            || {
+                for style in kit::DisplayStyle::ALL {
+                    for (mechanism, kit_board) in sweep_boards() {
+                        let reference = kit_board.render(style);
+                        let mirror = shader_frame(&kit_board, style, 0.0);
+                        assert_eq!(
+                            mirror,
+                            reference.data(),
+                            "{style:?} {mechanism:?} {} cell(s)",
+                            kit_board.metrics().cells,
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    /// An upper bound on GLSL ES 3.20 §4.7.1's **2.5 ULP** allowance for
+    /// `a / b`, as a relative perturbation.
+    ///
+    /// A float's ULP is at most `EPSILON` of its own magnitude (exactly that
+    /// just above a power of two, half of it just below), so
+    /// `2.5 * f32::EPSILON` relative is never smaller than 2.5 ULP and is
+    /// usually larger — which is the direction a bound has to err in.
+    const DIVIDE_SLACK: f32 = 2.5 * f32::EPSILON;
+
+    /// The negative control's perturbation: four orders above [`DIVIDE_SLACK`],
+    /// and small enough that it is still obviously a *rounding* rather than a
+    /// different picture.
+    const CONTROL_SLACK: f32 = 1e-3;
+
+    /// **No byte of a 1:1 frame is decided by the slack GLSL ES allows the two
+    /// divisions** (#1309's lesson, answered for the one kind that cannot
+    /// remove them).
+    ///
+    /// #1309 established the rule: a shader must not divide on a branch that is
+    /// held bit-exact, because §4.7.1 pins `+`, `-` and `*` to a correctly
+    /// rounded result and allows `a / b` **2.5 ULP**, so a value sitting on a
+    /// rounding boundary is decided by the driver rather than by the geometry.
+    /// Its fix was to move the divide to the CPU — `u_px_step`.
+    ///
+    /// **That fix is unavailable here, and not by omission.** Both divisions on
+    /// this branch are the *kit's*: `FlipBoard::compose_flap` maps a
+    /// destination row onto its source span with `(lo - band_lo) / squash` and
+    /// `glyph_coverage` normalises its integral with `acc / span`. Replacing
+    /// either with a CPU-computed reciprocal would make this arm disagree with
+    /// the renderer it is measured against — `a * (1/b)` is not `a / b` — so
+    /// the honest move is to keep them and *measure* whether the slack can
+    /// reach a byte.
+    ///
+    /// It cannot, and this is the measurement: the whole 1:1 sweep re-derived
+    /// with **both** quotients perturbed by `±`[`DIVIDE_SLACK`], asserting
+    /// every byte is still the kit's. The reason it holds is structural rather
+    /// than lucky — the two quotients feed a coverage in `0..=1` which is then
+    /// weighted by `cover`, and `cover` is small exactly where the span the
+    /// second quotient normalises is small, so the error in the composed value
+    /// is bounded by `255 * squash` times the relative slack, i.e. under
+    /// `1e-4` of a byte.
+    ///
+    /// The `CONTROL_SLACK` arm is the negative control, and the reason this is
+    /// a test rather than a comment: a perturbation four orders larger **does**
+    /// move bytes, so the assertion above is measuring the arithmetic's
+    /// sensitivity and not the sweep's inability to see anything at all.
+    ///
+    /// **Falsified** by widening either slack (the control arm stops being a
+    /// control), or by making a quotient feed something the `cover` weighting
+    /// does not damp.
+    #[test]
+    fn the_coverage_bytes_are_never_decided_by_the_divides_slack() {
+        kit::with_pins(
+            kit::Pins {
+                ink: kit::Ink::Base,
+                field: None,
+            },
+            || {
+                let mut moved = 0_u32;
+                for style in kit::DisplayStyle::ALL {
+                    for (mechanism, kit_board) in sweep_boards() {
+                        let reference = kit_board.render(style);
+                        for slack in [DIVIDE_SLACK, -DIVIDE_SLACK] {
+                            assert_eq!(
+                                shader_frame(&kit_board, style, slack),
+                                reference.data(),
+                                "{style:?} {mechanism:?}: a quotient {slack:e} off its \
+                                 correctly-rounded value decided a byte",
+                            );
+                        }
+                        if shader_frame(&kit_board, style, CONTROL_SLACK) != reference.data() {
+                            moved += 1;
+                        }
+                    }
+                }
+                assert!(
+                    moved > 0,
+                    "the control never moved a byte — then the assertion above is not \
+                     measuring the divides",
+                );
+            },
+        );
+    }
+
+    /// **The transcription above is the arithmetic the shipped shaders carry**
+    /// — a source scan over `flip_board.frag` and `blur.frag`, so a fix applied
+    /// to one side only reds here instead of leaving a green mirror describing
+    /// a shader nobody ships.
+    ///
+    /// **Every clause [`shader_frame`] transcribes is listed**, which is #1293
+    /// item 1's correction applied from the start rather than as a follow-up —
+    /// the #1294 review measured eight arithmetic clauses missing from the
+    /// readout's version of this scan, each of which could be edited in the
+    /// `.frag` alone with the whole hermetic suite green. What is **not**
+    /// listed is the continuous (non-`snapped`) branch this mirror never takes,
+    /// since [`shader_frame`] always evaluates over a whole logical row: that
+    /// is `preem_gl_diff`'s job, not this test's.
+    ///
+    /// **Falsified** by editing any of them in either `.frag` without editing
+    /// [`shader_frame`].
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_mirror_is_the_shipped_shaders_arithmetic() {
+        for clause in [
+            // the strip
+            "return texelFetch(u_tex0, ivec2(index, 0), 0).r;",
+            "return int(strip_at(index) + 0.5);",
+            // the glyph lattice
+            "int word = row < 4 ? lo : hi;",
+            "int shift = (row < 4 ? row : row - 4) * 5;",
+            "int bits = (word >> shift) & 31;",
+            "return (bits >> (GLYPH_W - 1 - col)) & 1;",
+            "if (x < u_glyph_pad || y < u_glyph_pad) {",
+            "int col = (x - u_glyph_pad) / u_glyph_px;",
+            "int row = (y - u_glyph_pad) / u_glyph_px;",
+            "if (col >= GLYPH_W || row >= GLYPH_H) {",
+            "return float(glyph_bit(lo, hi, row, col));",
+            // the fold's resample
+            "float span = src_hi - src_lo;",
+            "if (span <= 0.0) {",
+            "if (x < u_glyph_pad) {",
+            "if (col >= GLYPH_W) {",
+            "float padf = float(u_glyph_pad);",
+            "float clipped_lo = max(src_lo - padf, 0.0);",
+            "float clipped_hi = min(src_hi - padf, float(GLYPH_H * u_glyph_px));",
+            "if (clipped_hi <= clipped_lo) {",
+            "for (int row = 0; row < GLYPH_H; ++row) {",
+            "float row_lo = float(row * u_glyph_px);",
+            "float row_hi = float((row + 1) * u_glyph_px);",
+            "if (row_lo >= clipped_hi) {",
+            "if (glyph_bit(lo, hi, row, col) == 1) {",
+            "acc += max(min(clipped_hi, row_hi) - max(clipped_lo, row_lo), 0.0);",
+            "return acc / span;",
+            // the rounding
+            "return int(clamp(value, 0.0, 255.0) + 0.5);",
+            // the row
+            "if (u_cells <= 0) {",
+            "int rel = col - u_bezel;",
+            "if (rel < 0) {",
+            "int pitch = max(u_cell_w + u_gap, 1);",
+            "int index = rel / pitch;",
+            "if (index >= u_cells || rel - index * pitch >= u_cell_w) {",
+            "return col - u_bezel - index * (u_cell_w + u_gap);",
+            // the flap
+            "float band_lo = strip_at(base + 4);",
+            "float band_hi = strip_at(base + 5);",
+            "float edge_lo = strip_at(base + 6);",
+            "float edge_hi = strip_at(base + 7);",
+            "float edge_peak = strip_at(base + 8);",
+            "float shade = strip_at(base + 9);",
+            "float squash = strip_at(base + 10);",
+            "bool falling_up = strip_int(base + 11) != 0;",
+            "int leaf_lo = falling_up ? strip_int(base + 0) : strip_int(base + 2);",
+            "int leaf_hi = falling_up ? strip_int(base + 1) : strip_int(base + 3);",
+            "float covered = max(min(hi, band_hi) - max(lo, band_lo), 0.0);",
+            "float cover = snapped ? covered : covered / max(fstep, 1e-6);",
+            "bool has_source = covered > 0.0 && squash > 0.0;",
+            "float mid = float(u_hinge);",
+            "float from = max(lo, band_lo);",
+            "float to = min(hi, band_hi);",
+            "src_lo = (from - band_lo) / squash;",
+            "src_hi = (to - band_lo) / squash;",
+            "src_lo = mid + (from - mid) / squash;",
+            "src_hi = mid + (to - mid) / squash;",
+            "float ruled = max(min(hi, edge_hi) - max(lo, edge_lo), 0.0);",
+            "float edge = edge_peak * (snapped ? ruled : ruled / max(fstep, 1e-6));",
+            "int behind_lo = row < u_hinge ? strip_int(base + 2) : strip_int(base + 0);",
+            "int behind_hi = row < u_hinge ? strip_int(base + 3) : strip_int(base + 1);",
+            "float behind = glyph_at(behind_lo, behind_hi, x, row) * 255.0;",
+            // …and the fused multiply-add the kit's `mul_add` is, which GLSL ES
+            // leaves free to be split unless the computation is `precise`.
+            "precise float value;",
+            "float card = glyph_coverage(leaf_lo, leaf_hi, x, src_lo, src_hi) * 255.0 * shade;",
+            "value = fma(cover, max(card, edge) - behind, behind);",
+            "value = behind;",
+            "return value > 0.0 ? level(value) : 0;",
+            // the tube
+            "bool by_out = glyph_at(strip_int(base + 0), strip_int(base + 1), x, row) > 0.0;",
+            "bool by_in = glyph_at(strip_int(base + 2), strip_int(base + 3), x, row) > 0.0;",
+            "int out_level = strip_int(base + 12);",
+            "int in_level = strip_int(base + 13);",
+            "return max(out_level, in_level);",
+            // the board
+            "int index = cell_of(col);",
+            "int local_y = row - u_bezel;",
+            "if (local_y < 0 || local_y >= u_cell_h) {",
+            "int base = index * CELL_TEXELS;",
+            "if (u_mechanism == MECH_NIXIE) {",
+            "lo = float(local_y);",
+            "hi = lo + 1.0;",
+            "float centre = p.y - float(u_bezel);",
+            "lo = centre - 0.5 * fstep;",
+            "hi = centre + 0.5 * fstep;",
+            // the fixture
+            "return local_y < u_hinge ? u_face_top : u_face_bottom;",
+            "return glyph_at(u_stack_lo, u_stack_hi, x, local_y) > 0.0 ? u_cathode : 0;",
+            // the composite
+            "return int(texelFetch(tex, p, 0).r * 255.0 + 0.5);",
+            "return (a * (255 - k) + b * k + 127) / 255;",
+            "int tone = fixture255(col, row);",
+            "under = mix_kit(bg, ivec4(u_ghost + 0.5), tone);",
+            "int lit = board255(col, row, p, fstep, snapped);",
+            "int haze = texel(u_tex1, ivec2(col, row));",
+            "lit = min(max(lit, min(haze * u_halo_strength / 256, 255)), 255);",
+            "int glow = texel(u_tex2, ivec2(col, row));",
+            "lit = min(max(lit, min(glow * u_bloom_strength / 256, 255)), 255);",
+            "lit = lit * mask_keep(col, row, cols, rows) / MASK_ONE;",
+            "under = mix_kit(under, ink, lit);",
+            // …and the slot, cut over the finished composite.
+            "if (u_mechanism == MECH_SPLIT_FLAP && row == u_bezel + u_hinge && cell_of(col) >= 0) {",
+            "o_colour = vec4(vec3(under.rgb) / 255.0, 1.0);",
+            // the CRT pass
+            "int shortSide = min(w, h);",
+            "int r2 = (u * u + v * v) / 2;",
+            "int depth = MASK_ONE - u_corner_keep;",
+            "int radial = clamp(MASK_ONE - (depth * r2) / (COORD_ONE * COORD_ONE), 0, MASK_ONE);",
+            "int ex = min(x, w - 1 - x);",
+            "edge = MASK_ONE * d / band;",
+            "if (u_mask_pitch != 0 && (y % u_mask_pitch) == u_mask_phase) {",
+            "return radial * edge / MASK_ONE * comb / MASK_ONE;",
+            "return ((2 * i + 1 - n) * COORD_ONE) / n;",
+            // the lit pass's sample point …
+            "vec2 p = floor(gl_FragCoord.xy) + 0.5;",
+            "o_colour = vec4(float(board255(col, row, p, 1.0, true)) / 255.0, 0.0, 0.0, 1.0);",
+            // … the wide-halo recombine …
+            "int emitted = texel(u_tex0, q);",
+            "int haze = min(texel(u_tex1, q) * u_halo_strength / 256, 255);",
+            "o_colour = vec4(float(max(emitted, haze)) / 255.0, 0.0, 0.0, 1.0);",
+            // … and the blit's, which #1298 took off the interpolant's value
+            // and onto the fragment's own integer index. All seven clauses are
+            // load-bearing and each fails differently — see `seven_seg.rs`'s
+            // copy of this list for the census that made them so.
+            "vec2 vp = vec2(max(u_viewport.x, 1), max(u_viewport.y, 1));",
+            "vec2 fi = clamp(floor(v_uv * vp), vec2(0.0), vp - 1.0);",
+            "vec2 px = vec2(fi.x, vp.y - 1.0 - fi.y) + 0.5;",
+            "vec2 pc = px * u_px_step;",
+            "int col = clamp(int(pc.x), 0, cols - 1);",
+            "int row = clamp(int(pc.y), 0, rows - 1);",
+            "bool snapped = (u_viewport == u_grid);",
+            "vec2 p = snapped ? vec2(float(col), float(row)) + 0.5 : pc;",
+            "float fstep = snapped ? 1.0 : u_px_step.y;",
+        ] {
+            assert!(
+                BODY.contains(clause),
+                "flip_board.frag no longer carries `{clause}` — the Rust mirror \
+                 in this module describes a shader that is not the one shipping",
+            );
+        }
+        // …and the blur, which the mirror transcribes just as literally and
+        // this pipeline runs four times.
+        for clause in [
+            "int window = 2 * radius + 1;",
+            "sum += int(texelFetch(u_tex0, q, 0).r * 255.0 + 0.5);",
+            "o_intensity = vec4(float(sum / window) / 255.0, 0.0, 0.0, 1.0);",
+            "if (q.x < 0 || q.y < 0 || q.x >= u_grid.x || q.y >= u_grid.y) {",
+        ] {
+            assert!(
+                BLUR_BODY.contains(clause),
+                "blur.frag no longer carries `{clause}` — see above",
+            );
+        }
+        // …and the three composite steps are in the kit's own order: the
+        // fixture under the lit layer, and the hinge slot cut over both. A
+        // mirror could silently invert either.
+        let fixture_at = BODY
+            .find("under = mix_kit(bg, ivec4(u_ghost + 0.5), tone);")
+            .expect("the fixture composite");
+        let lit_at = BODY
+            .find("under = mix_kit(under, ink, lit);")
+            .expect("the lit composite");
+        let slot_at = BODY
+            .find("if (u_mechanism == MECH_SPLIT_FLAP && row == u_bezel + u_hinge")
+            .expect("the slot cut");
+        assert!(fixture_at < lit_at, "the lit layer composites over the fixture");
+        assert!(slot_at > lit_at, "the hinge slot is cut over the composite");
+    }
+
+    // ── the mirror ──────────────────────────────────────────────────────────
+
+    /// `flip_board.frag`'s three layers plus `blur.frag`'s two directions run
+    /// twice, in Rust: one whole frame, top-down RGBA8, exactly as
+    /// `Frame::data` lays it out.
+    ///
+    /// Everything below mirrors the GLSL statement for statement, `f32` for
+    /// `float` and `i32` for `int`, which is what makes a disagreement with the
+    /// kit attributable to the shader rather than to this file.
+    ///
+    /// `slack` is the relative perturbation
+    /// [`the_coverage_bytes_are_never_decided_by_the_divides_slack`] applies to
+    /// the two quotients GLSL ES does not pin; `0.0` is the shipped arithmetic.
+    fn shader_frame(kit_board: &kit::FlipBoard, style: kit::DisplayStyle, slack: f32) -> Vec<u8> {
+        let palette = kit::palette_snapshot(style);
+        let encoded = cards(kit_board);
+        let metrics = encoded.metrics;
+        let (w, h) = (metrics.width, metrics.height);
+        let bloom = palette.bloom.unwrap_or(kit::BloomSnapshot {
+            radius: 0,
+            strength: 0,
+        });
+        let (halo_radius, halo_strength) = match (encoded.mechanism, palette.bloom) {
+            (kit::Mechanism::Nixie, Some(bloom)) => (
+                bloom.radius + kit::NIXIE_HALO_RADIUS_BONUS,
+                kit::NIXIE_HALO_STRENGTH,
+            ),
+            _ => (0, 0),
+        };
+
+        // `LAYER == LAYER_LIT`, at every grid pixel centre.
+        let mut emission = vec![0_i32; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                emission[row * w + col] = board255(&encoded, index(col), index(row), slack);
+            }
+        }
+        // `blur.frag` twice, at the **wide** radius …
+        let tmp = blur_pass(&emission, (w, h), halo_radius, (1, 0));
+        let wide = blur_pass(&tmp, (w, h), halo_radius, (0, 1));
+        // … then `LAYER == LAYER_HALO1`, which is `Emission::bloom`'s
+        // max-combine at the grid …
+        let recombined: Vec<i32> = emission
+            .iter()
+            .zip(&wide)
+            .map(|(emitted, blurred)| {
+                (*emitted).max((blurred * i32::from(halo_strength) / 256).min(255))
+            })
+            .collect();
+        // … and the skin's own bloom over **that**, which is what makes the two
+        // passes a composition rather than a sum.
+        let tmp = blur_pass(&recombined, (w, h), bloom.radius, (1, 0));
+        let narrow = blur_pass(&tmp, (w, h), bloom.radius, (0, 1));
+
+        // `LAYER == LAYER_BLIT`.
+        let mut out = Vec::with_capacity(w * h * 4);
+        for row in 0..h {
+            for col in 0..w {
+                let mut under = palette.bg;
+                if let Some(ghost) = palette.ghost {
+                    let tone = fixture255(&encoded, index(col), index(row));
+                    if tone > 0 {
+                        under = mix_kit(under, ghost, tone);
+                    }
+                }
+                let mut lit = board255(&encoded, index(col), index(row), slack);
+                let haze = wide[row * w + col];
+                lit = lit
+                    .max((haze * i32::from(halo_strength) / 256).min(255))
+                    .min(255);
+                let glow = narrow[row * w + col];
+                lit = lit
+                    .max((glow * i32::from(bloom.strength) / 256).min(255))
+                    .min(255);
+                if lit > 0 {
+                    if let Some(mask) = palette.mask {
+                        lit = lit * mask_keep(col, row, w, h, mask)
+                            / i32::try_from(kit::MASK_ONE).unwrap();
+                    }
+                    if lit > 0 {
+                        under = mix_kit(under, palette.ink, lit);
+                    }
+                }
+                // The slots, cut over the finished composite.
+                if encoded.mechanism == kit::Mechanism::SplitFlap
+                    && row == metrics.bezel + metrics.hinge
+                    && cell_of(&encoded, index(col)) >= 0
+                {
+                    under = palette.bg;
+                }
+                out.extend_from_slice(&[under[0], under[1], under[2], 0xff]);
+            }
+        }
+        out
+    }
+
+    /// A buffer coordinate as the `int` the GLSL carries.
+    fn index(value: usize) -> i32 {
+        i32::try_from(value).unwrap_or(i32::MAX)
+    }
+
+    /// `strip_at`.
+    fn strip_at(cards: &super::Cards, i: i32) -> f32 {
+        let strip = cards.strip.as_deref().unwrap_or(&[]);
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| strip.get(i).copied())
+            .unwrap_or(0.0)
+    }
+
+    /// `strip_int`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn strip_int(cards: &super::Cards, i: i32) -> i32 {
+        (strip_at(cards, i) + 0.5) as i32
+    }
+
+    /// `glyph_bit`.
+    fn glyph_bit(lo: i32, hi: i32, row: i32, col: i32) -> i32 {
+        let word = if row < 4 { lo } else { hi };
+        let shift = (if row < 4 { row } else { row - 4 }) * 5;
+        let bits = (word >> shift) & 31;
+        (bits >> (index(kit::font::GLYPH_W) - 1 - col)) & 1
+    }
+
+    /// `glyph_at`.
+    #[allow(clippy::cast_precision_loss)]
+    fn glyph_at(cards: &super::Cards, lo: i32, hi: i32, x: i32, y: i32) -> f32 {
+        let pad = index(cards.metrics.glyph_pad);
+        let g = index(cards.metrics.glyph_px);
+        if x < pad || y < pad {
+            return 0.0;
+        }
+        let col = (x - pad) / g;
+        let row = (y - pad) / g;
+        if col >= index(kit::font::GLYPH_W) || row >= index(kit::font::GLYPH_H) {
+            return 0.0;
+        }
+        glyph_bit(lo, hi, row, col) as f32
+    }
+
+    /// `a / b`, with the quotient perturbed by `slack` relative — the one seam
+    /// [`the_coverage_bytes_are_never_decided_by_the_divides_slack`] moves.
+    fn divide(a: f32, b: f32, slack: f32) -> f32 {
+        (a / b) * (1.0 + slack)
+    }
+
+    /// `glyph_coverage`.
+    #[allow(clippy::cast_precision_loss)]
+    fn glyph_coverage(
+        cards: &super::Cards,
+        lo: i32,
+        hi: i32,
+        x: i32,
+        src_lo: f32,
+        src_hi: f32,
+        slack: f32,
+    ) -> f32 {
+        let span = src_hi - src_lo;
+        if span <= 0.0 {
+            return 0.0;
+        }
+        let pad = index(cards.metrics.glyph_pad);
+        let g = index(cards.metrics.glyph_px);
+        if x < pad {
+            return 0.0;
+        }
+        let col = (x - pad) / g;
+        if col >= index(kit::font::GLYPH_W) {
+            return 0.0;
+        }
+        let padf = pad as f32;
+        let clipped_lo = (src_lo - padf).max(0.0);
+        let clipped_hi = (src_hi - padf).min((index(kit::font::GLYPH_H) * g) as f32);
+        if clipped_hi <= clipped_lo {
+            return 0.0;
+        }
+        let mut acc = 0.0;
+        for row in 0..index(kit::font::GLYPH_H) {
+            let row_lo = (row * g) as f32;
+            let row_hi = ((row + 1) * g) as f32;
+            if row_lo >= clipped_hi {
+                break;
+            }
+            if glyph_bit(lo, hi, row, col) == 1 {
+                acc += (clipped_hi.min(row_hi) - clipped_lo.max(row_lo)).max(0.0);
+            }
+        }
+        divide(acc, span, slack)
+    }
+
+    /// `level`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn level(value: f32) -> i32 {
+        (value.clamp(0.0, 255.0) + 0.5) as i32
+    }
+
+    /// `cell_of`.
+    fn cell_of(cards: &super::Cards, col: i32) -> i32 {
+        let metrics = cards.metrics;
+        if metrics.cells == 0 {
+            return -1;
+        }
+        let rel = col - index(metrics.bezel);
+        if rel < 0 {
+            return -1;
+        }
+        let pitch = (index(metrics.cell_w) + index(metrics.gap)).max(1);
+        let cell = rel / pitch;
+        if cell >= index(metrics.cells) || rel - cell * pitch >= index(metrics.cell_w) {
+            return -1;
+        }
+        cell
+    }
+
+    /// `cell_local_x`.
+    fn cell_local_x(cards: &super::Cards, col: i32, cell: i32) -> i32 {
+        let metrics = cards.metrics;
+        col - index(metrics.bezel) - cell * (index(metrics.cell_w) + index(metrics.gap))
+    }
+
+    /// `flap_value` — the snapped branch, where the fragment is one whole
+    /// logical row and `cover` is the covered length itself.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+    fn flap_value(
+        cards: &super::Cards,
+        base: i32,
+        x: i32,
+        row: i32,
+        lo: f32,
+        hi: f32,
+        slack: f32,
+    ) -> f32 {
+        let band_lo = strip_at(cards, base + 4);
+        let band_hi = strip_at(cards, base + 5);
+        let edge_lo = strip_at(cards, base + 6);
+        let edge_hi = strip_at(cards, base + 7);
+        let edge_peak = strip_at(cards, base + 8);
+        let shade = strip_at(cards, base + 9);
+        let squash = strip_at(cards, base + 10);
+        let falling_up = strip_int(cards, base + 11) != 0;
+        let leaf_lo = if falling_up {
+            strip_int(cards, base)
+        } else {
+            strip_int(cards, base + 2)
+        };
+        let leaf_hi = if falling_up {
+            strip_int(cards, base + 1)
+        } else {
+            strip_int(cards, base + 3)
+        };
+
+        let covered = (hi.min(band_hi) - lo.max(band_lo)).max(0.0);
+        let cover = covered;
+        let has_source = covered > 0.0 && squash > 0.0;
+
+        let mut src_lo = 0.0;
+        let mut src_hi = 0.0;
+        if has_source {
+            let mid = cards.metrics.hinge as f32;
+            let from = lo.max(band_lo);
+            let to = hi.min(band_hi);
+            if falling_up {
+                src_lo = divide(from - band_lo, squash, slack);
+                src_hi = divide(to - band_lo, squash, slack);
+            } else {
+                src_lo = mid + divide(from - mid, squash, slack);
+                src_hi = mid + divide(to - mid, squash, slack);
+            }
+        }
+
+        let ruled = (hi.min(edge_hi) - lo.max(edge_lo)).max(0.0);
+        let edge = edge_peak * ruled;
+
+        let behind_lo = if row < index(cards.metrics.hinge) {
+            strip_int(cards, base + 2)
+        } else {
+            strip_int(cards, base)
+        };
+        let behind_hi = if row < index(cards.metrics.hinge) {
+            strip_int(cards, base + 3)
+        } else {
+            strip_int(cards, base + 1)
+        };
+        let behind = glyph_at(cards, behind_lo, behind_hi, x, row) * 255.0;
+
+        if has_source {
+            let card = glyph_coverage(cards, leaf_lo, leaf_hi, x, src_lo, src_hi, slack)
+                * 255.0
+                * shade;
+            // `fma`, which is `f32::mul_add` and which the shader declares
+            // `precise` so a driver cannot split it.
+            cover.mul_add(card.max(edge) - behind, behind)
+        } else {
+            behind
+        }
+    }
+
+    /// `flap255`.
+    fn flap255(cards: &super::Cards, base: i32, x: i32, row: i32, lo: f32, hi: f32, slack: f32) -> i32 {
+        let value = flap_value(cards, base, x, row, lo, hi, slack);
+        if value > 0.0 { level(value) } else { 0 }
+    }
+
+    /// `nixie255`.
+    fn nixie255(cards: &super::Cards, base: i32, x: i32, row: i32) -> i32 {
+        let by_out =
+            glyph_at(cards, strip_int(cards, base), strip_int(cards, base + 1), x, row) > 0.0;
+        let by_in = glyph_at(
+            cards,
+            strip_int(cards, base + 2),
+            strip_int(cards, base + 3),
+            x,
+            row,
+        ) > 0.0;
+        let out_level = strip_int(cards, base + 12);
+        let in_level = strip_int(cards, base + 13);
+        match (by_out, by_in) {
+            (true, true) => out_level.max(in_level),
+            (true, false) => out_level,
+            (false, true) => in_level,
+            (false, false) => 0,
+        }
+    }
+
+    /// `board255`, on the snapped branch.
+    #[allow(clippy::cast_precision_loss)]
+    fn board255(cards: &super::Cards, col: i32, row: i32, slack: f32) -> i32 {
+        let cell = cell_of(cards, col);
+        if cell < 0 {
+            return 0;
+        }
+        let local_y = row - index(cards.metrics.bezel);
+        if local_y < 0 || local_y >= index(cards.metrics.cell_h) {
+            return 0;
+        }
+        let x = cell_local_x(cards, col, cell);
+        let base = cell * index(CELL_TEXELS);
+        if cards.mechanism == kit::Mechanism::Nixie {
+            return nixie255(cards, base, x, local_y);
+        }
+        let lo = local_y as f32;
+        flap255(cards, base, x, local_y, lo, lo + 1.0, slack)
+    }
+
+    /// `fixture255`.
+    fn fixture255(cards: &super::Cards, col: i32, row: i32) -> i32 {
+        let cell = cell_of(cards, col);
+        if cell < 0 {
+            return 0;
+        }
+        let local_y = row - index(cards.metrics.bezel);
+        if local_y < 0 || local_y >= index(cards.metrics.cell_h) {
+            return 0;
+        }
+        if cards.mechanism == kit::Mechanism::SplitFlap {
+            return if local_y < index(cards.metrics.hinge) {
+                i32::from(kit::FLIP_FACE_TOP_T)
+            } else {
+                i32::from(kit::FLIP_FACE_BOTTOM_T)
+            };
+        }
+        let x = cell_local_x(cards, col, cell);
+        let (stack_lo, stack_hi) = pack_glyph(kit::nixie_cathode_stack());
+        if glyph_at(
+            cards,
+            i32::try_from(stack_lo).unwrap_or(0),
+            i32::try_from(stack_hi).unwrap_or(0),
+            x,
+            local_y,
+        ) > 0.0
+        {
+            i32::from(kit::NIXIE_CATHODE_T)
+        } else {
+            0
+        }
+    }
+
+    /// `blur.frag`, one direction: the kit's own clipped-window,
+    /// unrenormalised, truncating integer box blur.
+    fn blur_pass(src: &[i32], size: (usize, usize), radius: usize, dir: (i32, i32)) -> Vec<i32> {
+        let (w, h) = size;
+        let radius = index(radius);
+        let window = 2 * radius + 1;
+        let mut out = vec![0_i32; src.len()];
+        for row in 0..h {
+            for col in 0..w {
+                let mut sum = 0;
+                for d in -radius..=radius {
+                    let q = (index(col) + dir.0 * d, index(row) + dir.1 * d);
+                    if q.0 < 0 || q.1 < 0 || q.0 >= index(w) || q.1 >= index(h) {
+                        continue;
+                    }
+                    let (qx, qy) = (
+                        usize::try_from(q.0).unwrap_or(0),
+                        usize::try_from(q.1).unwrap_or(0),
+                    );
+                    sum += src[qy * w + qx];
+                }
+                out[row * w + col] = sum / window;
+            }
+        }
+        out
+    }
+
+    /// `mix_kit`.
+    ///
+    /// `many_single_char_names` is allowed here and in [`mask_keep`] on
+    /// purpose: the names *are* the shader's, which is what lets a reviewer
+    /// read the two side by side and see a transcription rather than a
+    /// paraphrase.
+    #[allow(clippy::many_single_char_names)]
+    fn mix_kit(a: kit::Rgba, b: kit::Rgba, t: i32) -> kit::Rgba {
+        let k = t.clamp(0, 255);
+        let mut out = [0_u8; 4];
+        for (o, (&av, &bv)) in out.iter_mut().zip(a.iter().zip(&b)) {
+            let v = (i32::from(av) * (255 - k) + i32::from(bv) * k + 127) / 255;
+            *o = u8::try_from(v).unwrap_or(u8::MAX);
+        }
+        out
+    }
+
+    /// `centred`.
+    fn centred(i: usize, n: usize) -> i32 {
+        if n == 0 {
+            return 0;
+        }
+        (2 * index(i) + 1 - index(n)) * i32::try_from(kit::COORD_ONE).unwrap() / index(n)
+    }
+
+    /// `isqrt`.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn isqrt(n: i32) -> i32 {
+        if n <= 0 {
+            return 0;
+        }
+        let mut s = (n as f32).sqrt() as i32;
+        if (s + 1) * (s + 1) <= n {
+            s += 1;
+        }
+        if s * s > n {
+            s -= 1;
+        }
+        s
+    }
+
+    /// `mask_keep` — see [`mix_kit`] on the single-character names.
+    #[allow(clippy::many_single_char_names)]
+    fn mask_keep(x: usize, y: usize, w: usize, h: usize, mask: kit::MaskSnapshot) -> i32 {
+        let mask_one = i32::try_from(kit::MASK_ONE).unwrap();
+        let coord_one = i32::try_from(kit::COORD_ONE).unwrap();
+        let short = w.min(h);
+        let band = index(short / kit::BAND_DIV);
+        let radius = index(short / kit::CORNER_DIV);
+
+        let u = centred(x, w);
+        let v = centred(y, h);
+        // The shader spells this `(u * u + v * v) / 2`; both terms are squares
+        // and so non-negative, where `midpoint` is that same truncating half.
+        let r2 = i32::midpoint(u * u, v * v);
+        let depth = mask_one - i32::try_from(mask.corner_keep).unwrap();
+        let radial = (mask_one - (depth * r2) / (coord_one * coord_one)).clamp(0, mask_one);
+
+        let mut edge = mask_one;
+        if band > 0 {
+            let ex = index(x.min(w - 1 - x));
+            let ey = index(y.min(h - 1 - y));
+            let d = if ex < radius && ey < radius {
+                (radius - isqrt((radius - ex) * (radius - ex) + (radius - ey) * (radius - ey)))
+                    .max(0)
+            } else {
+                ex.min(ey)
+            };
+            edge = mask_one * d.min(band) / band;
+        }
+
+        let mut comb = mask_one;
+        if mask.pitch != 0 && y % mask.pitch == mask.phase {
+            comb = i32::try_from(mask.scanline_keep).unwrap();
+        }
+        radial * edge / mask_one * comb / mask_one
+    }
+}

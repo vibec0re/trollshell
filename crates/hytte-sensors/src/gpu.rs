@@ -605,7 +605,10 @@ mod tests {
             nvidia_last: Some((fake_reading("stale"), t0)),
         };
         let (state, cache) = read_nvidia_with_cache_at(seeded, t0 + NVIDIA_READING_TTL, || None);
-        assert!(state.is_none(), "a failed fork must not surface any reading");
+        assert!(
+            state.is_none(),
+            "a failed fork must not surface any reading"
+        );
         assert_eq!(cache.nvidia_available, Some(false));
         assert!(
             cache.nvidia_last.is_none(),

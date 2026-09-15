@@ -1255,11 +1255,24 @@ mod tests {
              reset — never a tick, and never a tick ahead of it",
         );
 
+        // A *prefix* check, not equality of the whole log: under real
+        // contention `pump_until` can itself take long enough (real time) for
+        // the cadence to legitimately fire again while it waits, so more than
+        // one `"tick"` landing is fine and expected — measured, dropping this
+        // to a prefix is what makes the shape (never a tick before its reset)
+        // survive the same contention campaign the sibling test's fix does.
+        // What must never appear is a `"tick"` ahead of the one `"reset"`.
         assert!(pump_until(|| calls.ticks() >= 1).await);
+        let seq = calls.sequence();
         assert_eq!(
-            calls.sequence(),
-            vec!["reset", "tick"],
-            "the read that follows must come strictly after the reset",
+            seq.first(),
+            Some(&"reset"),
+            "the very first thing in the log must be the edge's own reset: {seq:?}",
+        );
+        assert_eq!(
+            seq.get(1),
+            Some(&"tick"),
+            "…and the read that follows must come strictly after it: {seq:?}",
         );
 
         drop(cmd_tx);

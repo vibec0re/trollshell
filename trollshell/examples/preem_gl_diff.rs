@@ -240,6 +240,9 @@ mod textbox;
 // The meter (#1153), included the same way and for the same reason.
 #[path = "../src/plugins/preem_gl/led_strip.rs"]
 mod led_strip;
+// The board (#1155), included the same way and for the same reason.
+#[path = "../src/plugins/preem_gl/flip_board.rs"]
+mod flip_board;
 // The readout (#1154), included the same way and for the same reason.
 #[path = "../src/plugins/preem_gl/seven_seg.rs"]
 mod seven_seg;
@@ -249,10 +252,19 @@ mod seven_seg;
 // `NeedleAt`) there too; their `impl`s (`.name()`/`.line()`/`.spec()`) stay
 // below, since an inherent impl only has to share a crate with its type, not
 // a file.
-use cases::{BubbleAt, DisplayAt, MeterAt, NeedleAt, ReadoutAt, TickerAt};
+use cases::{BoardAt, BubbleAt, DisplayAt, MeterAt, NeedleAt, ReadoutAt, TickerAt};
 use cases::{
     Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, METER_LEDS, STRETCH, TICKER_WINDOW_PX, cases_for,
 };
+
+/// Cards in a **flip board** case's row — `HH:MM:SS`, the kit's own
+/// `DEFAULT_CELLS`, and the width every [`BoardAt`] text is written for.
+///
+/// Here rather than in `cases` because nothing in the case list itself reads
+/// it: a `Case::FlipBoard` names a state, and how many cards that state is
+/// drawn on is the harness's own choice — the same place `SCOPE_COLS` and
+/// `GAUGE_COLS` live.
+const FLIP_CELLS: usize = 8;
 
 /// Logical grid the **scope** cases run at. Small enough to keep the whole
 /// comparison on screen at 1× and wide enough that the graticule's 12-column
@@ -854,6 +866,128 @@ fn readout_reference(style: kit::DisplayStyle, readout: ReadoutAt) -> kit::Frame
     kit::with_pins(readout.pins(), || kit::seven_seg(readout.text(), style))
 }
 
+/// How far into a cell's transition [`BoardAt::Rolling`] takes the board's
+/// clock, as a fraction of the mechanism's own `default_duration_secs`.
+///
+/// `0.79` rather than a round number because the two mechanisms stagger
+/// differently and this is the one fraction that puts both in an interesting
+/// place. A **nixie** bank has no ripple, so every tube is at `p = 0.79`: both
+/// cathodes alight, the outgoing one collapsing fast and the incoming one
+/// nearly struck. A **split flap** ripples at `DEFAULT_STAGGER_SECS`, so the
+/// eight cards come out at eight different phases — six of them mid-fall, at
+/// `p` from `0.79` down to `0.07`, spanning horizontal (`p = 1/sqrt(2)`) so
+/// both the `falling_up` and the `falling down` branches are on screen at once,
+/// and the last two still waiting out their stagger at `p = 0`.
+const ROLLING_FRACTION: f32 = 0.79;
+
+impl BoardAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Rest => "rest",
+            Self::HalfFlip => "halfflip",
+            Self::Rolling => "rolling",
+            Self::Notdef => "notdef",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    /// `(what the row was resting on, what it was told to show, how far into
+    /// one transition the clock is)` — the whole of a board's state, since a
+    /// cell's progress is a closed-form function of the clock.
+    fn change(self) -> (&'static str, &'static str, f32) {
+        match self {
+            // No cells at all, so nothing to say and nowhere to say it.
+            Self::Empty => ("", "", 0.0),
+            Self::Rest => ("12:34:56", "12:34:56", 0.0),
+            // One card changed on an unstaggered board, so its clock is the
+            // board's and half a duration is exactly half a flip.
+            Self::HalfFlip => ("12:34:56", "12:34:57", 0.5),
+            Self::Rolling | Self::Pinned => ("00:00:00", "12:34:56", ROLLING_FRACTION),
+            // Eight cards that are not on the drum, all in flight: the kit's
+            // notdef box on every leaf.
+            Self::Notdef => ("12:34:56", "########", ROLLING_FRACTION),
+        }
+    }
+
+    /// The palette scope this case renders in — `Ink::Fixed` for the pinned
+    /// one, the skin's own default otherwise.
+    fn pins(self) -> kit::Pins {
+        kit::Pins {
+            ink: match self {
+                Self::Pinned => kit::Ink::Fixed(PINNED_INK),
+                _ => kit::Ink::Default,
+            },
+            field: None,
+        }
+    }
+}
+
+/// The kit `FlipBoard` a board case renders, driven into this case's state.
+/// One builder for both arms, for [`bubble_box`]'s reason — a duplicated
+/// builder is an oracle that agrees with the code by construction.
+///
+/// The builder chain's order is load-bearing and the kit says so: `cells`
+/// rebuilds the row blank, so it comes first; `stagger_secs` is a config knob
+/// and has to be set before any text; and `settle` between the two `set_text`s
+/// is what makes the second one a *change* with a clock rather than a
+/// continuation.
+fn flip_board_state(mechanism: kit::Mechanism, at: BoardAt, scale: u32) -> kit::FlipBoard {
+    let cells = match at {
+        BoardAt::Empty => 0,
+        _ => FLIP_CELLS,
+    };
+    let mut board = kit::FlipBoard::new(mechanism)
+        .cells(cells)
+        .scale(scale.max(1) as usize);
+    if matches!(at, BoardAt::HalfFlip) {
+        // The ripple would put this one changed card at its own stagger
+        // offset; without it the card's clock *is* the board's.
+        board = board.stagger_secs(0.0);
+    }
+    let (from, to, fraction) = at.change();
+    board.set_text(from);
+    board.settle();
+    board.set_text(to);
+    board.advance(mechanism.default_duration_secs() * fraction);
+    board
+}
+
+/// The palette snapshot a board case maps from, resolved **inside** its own pin
+/// scope so the mapping sees exactly what the kit render below will.
+///
+/// One helper for both arms, for [`readout_palette`]'s reason: a `FlipBoard`
+/// resolves its palette at *render* time, so both calls have to sit in the
+/// scope rather than one.
+fn board_palette(style: kit::DisplayStyle, at: BoardAt) -> kit::PaletteSnapshot {
+    kit::with_pins(at.pins(), || kit::palette_snapshot(style))
+}
+
+/// The CPU kit's own board at this case's state and pin scope — the *same*
+/// builder the mapping resolved its geometry from.
+fn board_reference(
+    style: kit::DisplayStyle,
+    mechanism: kit::Mechanism,
+    at: BoardAt,
+    scale: u32,
+) -> kit::Frame {
+    kit::with_pins(at.pins(), || {
+        flip_board_state(mechanism, at, scale).render(style)
+    })
+}
+
+/// The GL node payload a board case drives the surface with.
+fn board_surface(
+    style: kit::DisplayStyle,
+    mechanism: kit::Mechanism,
+    at: BoardAt,
+    scale: u32,
+) -> program::KitSurface {
+    let board = flip_board_state(mechanism, at, scale);
+    flip_board::flip_board_surface(&flip_board::cards(&board), &board_palette(style, at))
+}
+
 /// The wire config a meter case maps from — the same segment count the kit
 /// builder above takes, so the two arms cannot end up on different strips.
 fn led_strip_config(style: kit::DisplayStyle, leds: usize) -> vocab::LedStripConfig {
@@ -882,7 +1016,13 @@ impl Case {
     /// exact pin cannot apply to.
     fn sampling(&self) -> parity::Sampling {
         match self {
-            Self::Gauge { scale, .. } if *scale > 1 => parity::Sampling::Supersampled(*scale),
+            // The two kinds the **kit** renders at two resolutions: their
+            // `scale` is `Frame::upscale`'s, so a `scale > 1` case is the kit
+            // rasterising once and replicating against the GL arm resolving the
+            // same geometry at every device pixel.
+            Self::Gauge { scale, .. } | Self::FlipBoard { scale, .. } if *scale > 1 => {
+                parity::Sampling::Supersampled(*scale)
+            }
             Self::DotMatrix { stretch, .. }
             | Self::Marquee { stretch, .. }
             | Self::TextBox { stretch, .. }
@@ -981,6 +1121,26 @@ impl Case {
                     &readout_palette(*style, *readout),
                 );
                 (surface.width, surface.height, (*stretch).max(1))
+            }
+            // The board resolves its grid through the very mapping the shell
+            // calls too — but the third element is the kit's own **upscale**,
+            // not a stretch: `FlipBoard::render` rasterises into the grid and
+            // `Frame::upscale` replicates it, so the natural size is
+            // `grid × scale` and `cols`/`rows` here are the pre-upscale buffer
+            // (the scope's shape). Reading it off `uniforms.grid` rather than
+            // off `surface.width` is what keeps that true.
+            Self::FlipBoard {
+                style,
+                mechanism,
+                board,
+                scale,
+            } => {
+                let surface = board_surface(*style, *mechanism, *board, *scale);
+                (
+                    surface.uniforms.grid.0,
+                    surface.uniforms.grid.1,
+                    (*scale).max(1),
+                )
             }
         }
     }
@@ -1462,6 +1622,28 @@ fn label(case: &Case) -> String {
         Case::SevenSeg { style, readout, .. } => {
             format!("seven_seg.{}.{}", style.name(), readout.name())
         }
+        Case::FlipBoard {
+            style,
+            mechanism,
+            board,
+            scale,
+        } if *scale > 1 => format!(
+            "flip_board.{}.{}.{}x{scale}",
+            style.name(),
+            mechanism.name(),
+            board.name()
+        ),
+        Case::FlipBoard {
+            style,
+            mechanism,
+            board,
+            ..
+        } => format!(
+            "flip_board.{}.{}.{}",
+            style.name(),
+            mechanism.name(),
+            board.name()
+        ),
     }
 }
 
@@ -1581,6 +1763,20 @@ fn drive(area: &GlSurface, case: &Case) {
             );
             (
                 seven_seg::SEVEN_SEG,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::FlipBoard {
+            style,
+            mechanism,
+            board,
+            scale,
+        } => {
+            let surface = board_surface(*style, *mechanism, *board, *scale);
+            (
+                flip_board::FLIP_BOARD,
                 surface.width,
                 surface.height,
                 surface.uniforms,
@@ -1725,6 +1921,16 @@ fn measure(
         // *same* scope the mapping resolved its palette in, so a disagreement
         // here is a disagreement between renderers and not between palettes.
         Case::SevenSeg { style, readout, .. } => readout_reference(*style, *readout),
+        // The kit's own board at this state, in this case's pin scope, at the
+        // scale `reference_scale` decided — `1` for a supersampled case, since
+        // that is the grid the GL readback is averaged back down to, and the
+        // case's own upscale for a 1:1 one.
+        Case::FlipBoard {
+            style,
+            mechanism,
+            board,
+            ..
+        } => board_reference(*style, *mechanism, *board, upscale),
     };
 
     let requested = case.natural();

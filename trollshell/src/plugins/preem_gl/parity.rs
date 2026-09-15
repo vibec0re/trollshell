@@ -221,7 +221,8 @@ impl Kind {
             | Self::Marquee
             | Self::TextBox
             | Self::LedStrip
-            | Self::SevenSeg => true,
+            | Self::SevenSeg
+            | Self::FlipBoard => true,
         }
     }
 
@@ -266,7 +267,8 @@ impl Kind {
             | Self::Marquee
             | Self::TextBox
             | Self::LedStrip
-            | Self::SevenSeg => false,
+            | Self::SevenSeg
+            | Self::FlipBoard => false,
         }
     }
 
@@ -500,6 +502,14 @@ impl Kind {
             // spread over them, which is both why its honest numbers are the
             // second lowest and why a half-pixel shift moves it least.
             Self::SevenSeg => EdgeBudget { mean: 7.0, max: 48 },
+            // Four `scale = 2` cases, one per skin, at the state with the most
+            // card in flight — a whole row mid-flip, so every cell carries a
+            // fold boundary and a lit free edge at once. TODO(#1155): the
+            // measured pair goes here.
+            Self::FlipBoard => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -571,7 +581,19 @@ impl Kind {
             // bars, so there is no grid-resolution lattice for a ceiling here
             // to protect. See [`Self::edge_budget`]'s `SevenSeg` arm for what
             // does gate this kind's stretched cases.
-            Self::Gauge | Self::TextBox | Self::Scope | Self::LedStrip | Self::SevenSeg => None,
+            // The flip board is the fifth `None`, and a measurement too: a
+            // board is mostly bezel and solid card faces, and its one
+            // continuous quantity is a horizontal band one card tall, so its
+            // supersampled frames are overwhelmingly flat blocks and a ceiling
+            // here would be a number invented without a failure to calibrate it
+            // against. See [`Self::edge_budget`]'s `FlipBoard` arm for what
+            // does gate this kind's `scale = 2` cases.
+            Self::Gauge
+            | Self::TextBox
+            | Self::Scope
+            | Self::LedStrip
+            | Self::SevenSeg
+            | Self::FlipBoard => None,
         }
     }
 
@@ -585,6 +607,7 @@ impl Kind {
             Self::TextBox => "textbox",
             Self::LedStrip => "led_strip",
             Self::SevenSeg => "seven_seg",
+            Self::FlipBoard => "flip_board",
         }
     }
 }
@@ -2254,6 +2277,14 @@ mod tests {
                 // fragment. No calibration is available here, and a ceiling
                 // without one is a flake (#1238's own words).
                 Kind::SevenSeg => None,
+                // A board is bezel, two flat card faces and a row of 5×7
+                // bitmap glyphs, and its one continuous quantity is a
+                // horizontal band one card tall — so its supersampled frames
+                // are overwhelmingly constant blocks for reasons that have
+                // nothing to do with the halo, and the statistic has no
+                // calibration here either. TODO(#1155): the measured
+                // percentages go here.
+                Kind::FlipBoard => None,
             };
             assert_eq!(
                 kind.flat_block_ceiling(),
@@ -2354,6 +2385,15 @@ mod tests {
                 // column of a lit segment is a stack of pixels that are all
                 // exactly the ink.
                 Kind::SevenSeg => (true, false),
+                // Measured at zero (#1155), and the third kind whose zero is
+                // also asserted without a driver — and the **first whose 1:1
+                // branch is not a point test**: the kit itself takes a
+                // fractional area average of the falling card there, so the
+                // mirror reproduces float arithmetic (two divisions included)
+                // rather than collapsing out of it. Not a beam — a column of a
+                // card is a stack of glyph pixels, and the fold makes several
+                // of them tie at the same intensity.
+                Kind::FlipBoard => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

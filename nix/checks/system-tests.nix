@@ -65,8 +65,11 @@ let
   # `leds = 1`), and the seven-segment readout's empty case (item 8,
   # `u_data_len == 0` rather than the one-cell `Blank`); bump it with the
   # case list, in the same commit, for the reason the number is asserted
-  # at all.
-  parityCases = 160;
+  # at all, and 160 until #1155 added the flip board's eleven per skin
+  # (six 1:1 split-flap states, three of them re-run on the nixie for its
+  # double bloom, and both mechanisms once more at the kit's shipping
+  # `scale = 2`).
+  parityCases = 204;
 in
 craneLib.mkCargoDerivation (
   commonArgs

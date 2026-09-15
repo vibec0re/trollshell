@@ -11402,7 +11402,8 @@ mod kind_enumeration {
             | Case::Marquee { style, .. }
             | Case::TextBox { style, .. }
             | Case::LedStrip { style, .. }
-            | Case::SevenSeg { style, .. } => *style,
+            | Case::SevenSeg { style, .. }
+            | Case::FlipBoard { style, .. } => *style,
         }
     }
 

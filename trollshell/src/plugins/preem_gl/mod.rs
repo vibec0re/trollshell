@@ -92,6 +92,7 @@
 use hytte::ui::gl_surface::GlProgram;
 
 mod dot_matrix;
+mod flip_board;
 mod gauge;
 mod kind;
 mod led_strip;
@@ -129,6 +130,7 @@ mod cases;
 // textbox}` directly. The plain program name stays re-exported — used to
 // build a `UiNode::GlSurface` at every mapping call site.
 pub(super) use dot_matrix::{DOT_MATRIX, Glyphs, dot_matrix_surface, glyphs as encode_glyphs};
+pub(super) use flip_board::{FLIP_BOARD, cards as encode_cards, flip_board_surface};
 pub(super) use gauge::{GAUGE, gauge_surface};
 pub(super) use led_strip::{LED_STRIP, led_strip_surface};
 pub(super) use marquee::{MARQUEE, Window, marquee_surface, window as encode_window};

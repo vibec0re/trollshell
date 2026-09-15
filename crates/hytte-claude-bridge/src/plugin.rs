@@ -117,9 +117,10 @@
 //! to the multisubscription stuff again later". So this adds no second
 //! socket and no config file, only a mount-family switch —
 //! `hytte-plugin-stats`'s `Mount::is_bar` split, applied here the same way. A
-//! launch whose *effective* mount (`HYTTE_PLUGIN_MOUNT`, resolved a second
-//! time here — see [`effective_mount`] — because the SDK deliberately never
-//! tells a plugin its own override) is one of the three bar regions gets
+//! launch whose *effective* mount (`HYTTE_PLUGIN_MOUNT`, resolved through
+//! [`hytte_plugin::effective_mount_from`] — graduated into the SDK by #1317,
+//! since the SDK deliberately never tells a plugin its own override) is one
+//! of the three bar regions gets
 //! exactly what shipped before: the chip and its drawer panel, unchanged. Any
 //! of the six sidebar mounts instead gets [`card`]: the same title-plus-rows
 //! [`usage_card`] container the drawer panel now uses too, so "wrap it in a
@@ -196,20 +197,9 @@ const CLAUDE_ICON: &str = "claude-symbolic";
 
 /// Where the manifest mounts when the launch says nothing — today's only
 /// deployed shape, and unaffected by #1280 P1: nothing changes here unless an
-/// operator sets [`MOUNT_ENV`] to a sidebar mount.
+/// operator sets `HYTTE_PLUGIN_MOUNT` to a sidebar mount (see
+/// [`hytte_plugin::effective_mount_from`]).
 const DEFAULT_MOUNT: Mount = Mount::BarRight;
-
-/// The launch-time placement variable, as `docs/plugin-env.md` documents it and
-/// `hytte_plugin::run` reads it.
-///
-/// `hytte_plugin::run` already resolves this for the host-facing `Register`
-/// frame and deliberately never tells the plugin (see `hytte-plugin-stats`'s
-/// `mount` module for the full "why read it twice" rationale) — so a plugin
-/// that needs its own placement-dependent decision, here chip-vs-card, reads
-/// its own copy. The variable is spelled as a literal rather than imported:
-/// the SDK's own constant is private, and this is a second, independent
-/// reader of the same documented contract.
-const MOUNT_ENV: &str = "HYTTE_PLUGIN_MOUNT";
 
 /// The env var that lets an operator label the usage surfaces' title without
 /// a second `/api/oauth/profile` request — the triage's P2, deliberately
@@ -221,35 +211,9 @@ const LABEL_ENV: &str = "CLAUDE_BRIDGE_LABEL";
 /// operator-set [`LABEL_ENV`].
 const DEFAULT_TITLE: &str = "Claude usage";
 
-/// The mount this instance actually registered on: the launch override when
-/// one is set and parses, else `manifest_mount`.
-///
-/// `lookup` is injected rather than read from the process because
-/// `unsafe_code = "forbid"` rules out `std::env::set_var` (an `unsafe fn` in
-/// edition 2024), so a test that drove the real environment could not exist
-/// at all — the same reason `hytte-plugin-stats`'s `mount::effective` takes
-/// one, and the same shape.
-///
-/// Reading it twice is safe in the only way that matters: this is **strictly
-/// less permissive than the SDK's parser can be**, because the SDK has
-/// already refused the launch outright for any value it could not parse. By
-/// the time anything here runs, `HYTTE_PLUGIN_MOUNT` is either unset or a
-/// valid wire mount name — the fallback-to-`manifest_mount` arm below is
-/// unreachable in a live process and exists so this function is total and
-/// testable (`hytte-plugin-stats::mount`'s own doc makes the same claim for
-/// the identical shape; #1315's review found it survived only in this
-/// crate's test docstrings, not on the function itself).
-fn effective_mount(manifest_mount: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> Mount {
-    lookup(MOUNT_ENV)
-        .as_deref()
-        .map(str::trim)
-        .and_then(Mount::from_wire_name)
-        .unwrap_or(manifest_mount)
-}
-
 /// The title an operator asked for: [`LABEL_ENV`], trimmed, when it is set and
 /// non-blank, else [`DEFAULT_TITLE`]. Pure, for the same testability reason
-/// [`effective_mount`] takes an injected `lookup`.
+/// [`hytte_plugin::effective_mount_from`] takes an injected `lookup`.
 fn card_title(lookup: &dyn Fn(&str) -> Option<String>) -> String {
     lookup(LABEL_ENV)
         .as_deref()
@@ -259,8 +223,12 @@ fn card_title(lookup: &dyn Fn(&str) -> Option<String>) -> String {
 }
 
 /// The real process environment — the one place this module reads one, so
-/// "what does this launch say?" has a single answer and every pure function
-/// above takes it as a parameter.
+/// "what does this launch say?" has a single answer.
+///
+/// Still needed after #1317 graduated the *mount* half of
+/// [`resolve_settings`] into the SDK: [`card_title`]'s [`LABEL_ENV`] read is
+/// this crate's own, with no SDK equivalent, so `resolve_settings` still
+/// needs one lookup to hand to both halves.
 fn env_lookup(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
@@ -268,22 +236,24 @@ fn env_lookup(key: &str) -> Option<String> {
 /// Both of [`Plugin::init`]'s launch-dependent fields, `(is_bar, title)`, in
 /// one function [`Plugin::init`] is the only caller of (#1315 review, MED 3).
 ///
-/// `effective_mount` and `card_title` are well covered on their own — the
-/// gap this closes is the two lines that actually *thread* them into the
-/// model, which the review found unpinned: hardcoding either field in
-/// `init` (`is_bar: true`, or `title: DEFAULT_TITLE.to_owned()`) left every
-/// test green, because nothing exercised `init`'s own composition rather
-/// than the pure halves it calls. Pulling that composition out here, with
-/// `init` doing nothing but destructuring the result, means a test against
-/// *this* function is a test against `init` — there is no second place for
-/// the wiring to live that a test could miss (`hytte-plugin-stats::plugin`'s
-/// `settings_from` is the same shape, for the same reason).
+/// [`hytte_plugin::effective_mount_from`] and [`card_title`] are well covered
+/// on their own — the gap this closes is the two lines that actually
+/// *thread* them into the model, which the review found unpinned:
+/// hardcoding either field in `init` (`is_bar: true`, or `title:
+/// DEFAULT_TITLE.to_owned()`) left every test green, because nothing
+/// exercised `init`'s own composition rather than the pure halves it calls.
+/// Pulling that composition out here, with `init` doing nothing but
+/// destructuring the result, means a test against *this* function is a test
+/// against `init` — there is no second place for the wiring to live that a
+/// test could miss (`hytte-plugin-stats::plugin`'s `settings_from` is the
+/// same shape, for the same reason — and, since #1317, calls the identical
+/// SDK function for its own mount half).
 fn resolve_settings(
     manifest_mount: Mount,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> (bool, String) {
     (
-        effective_mount(manifest_mount, lookup).is_bar(),
+        hytte_plugin::effective_mount_from(manifest_mount, lookup).is_bar(),
         card_title(lookup),
     )
 }
@@ -333,10 +303,10 @@ struct BridgeChip {
     /// The mount family (#1280 P1): `true` on a bar mount, where
     /// [`Plugin::view`] paints the chip and its panel; `false` on a sidebar
     /// mount, where it paints the card ([`card`]) alone. Resolved once from
-    /// the launch's [`effective_mount`] — a deployment decision, not
-    /// something re-read every tick, exactly as `hytte-plugin-stats`'s
-    /// `Family::of` is (and on the same `Mount::is_bar` split the host itself
-    /// uses).
+    /// the launch's [`hytte_plugin::effective_mount_from`] — a deployment
+    /// decision, not something re-read every tick, exactly as
+    /// `hytte-plugin-stats`'s `Family::of` is (and on the same `Mount::is_bar`
+    /// split the host itself uses).
     is_bar: bool,
     /// The title both surfaces head with — [`card_title`]'s resolved value,
     /// read once for the same reason `is_bar` is.
@@ -1117,10 +1087,9 @@ pub fn run() -> ! {
 mod tests {
     use super::{
         BridgeChip, CARD_CLASS, CARD_LIST_ID, CARD_ROOT_ID, CHIP_BTN, CLAUDE_ICON, DEFAULT_MOUNT,
-        DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, MOUNT_ENV, PANEL_LIST_ID, PANEL_ROOT_ID,
-        TITLE_CHARS, Tick, capped, card, card_title, chip, chip_limits, counts_label,
-        effective_mount, health_icon, meter_tooltip, mode_label, mode_name, panel,
-        resolve_settings, severity_class, severity_role, tooltip,
+        DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, PANEL_LIST_ID, PANEL_ROOT_ID, TITLE_CHARS, Tick,
+        capped, card, card_title, chip, chip_limits, counts_label, health_icon, meter_tooltip,
+        mode_label, mode_name, panel, resolve_settings, severity_class, severity_role, tooltip,
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
@@ -1491,56 +1460,19 @@ mod tests {
         );
     }
 
-    /// [`effective_mount`] falls back to the manifest's own mount when
-    /// `HYTTE_PLUGIN_MOUNT` is unset — today's only deployed shape.
-    #[test]
-    fn effective_mount_falls_back_to_the_manifest_when_unset() {
-        assert_eq!(effective_mount(DEFAULT_MOUNT, &|_| None), DEFAULT_MOUNT);
-        assert_eq!(
-            effective_mount(Mount::SidebarRightTop, &|_| None),
-            Mount::SidebarRightTop
-        );
-    }
-
-    /// [`effective_mount`] reads [`MOUNT_ENV`] — the documented variable,
-    /// asserted as a literal rather than the constant so a rename of the
-    /// constant alone cannot pass here by agreeing with itself — and a
-    /// sidebar wire name switches the family away from a bar default.
-    #[test]
-    fn effective_mount_reads_the_documented_variable_and_switches_family() {
-        let lookup = |key: &str| {
-            assert_eq!(key, "HYTTE_PLUGIN_MOUNT");
-            Some("SidebarRightTop".to_owned())
-        };
-        assert_eq!(
-            effective_mount(DEFAULT_MOUNT, &lookup),
-            Mount::SidebarRightTop
-        );
-        assert!(!effective_mount(DEFAULT_MOUNT, &lookup).is_bar());
-        assert_eq!(MOUNT_ENV, "HYTTE_PLUGIN_MOUNT");
-    }
-
-    /// Surrounding whitespace is trimmed (matching the SDK's own parser), and
-    /// an unparseable value falls back to the manifest rather than refusing —
-    /// unlike the SDK's own `HYTTE_PLUGIN_MOUNT` parser, which refuses a
-    /// launch outright, [`effective_mount`] must stay total: it exists so
-    /// this plugin can make its *own* decision from a value the SDK has
-    /// already accepted or the process has none of.
-    #[test]
-    fn effective_mount_trims_whitespace_and_falls_back_on_garbage() {
-        assert_eq!(
-            effective_mount(DEFAULT_MOUNT, &|_| Some("  SidebarTop\t".to_owned())),
-            Mount::SidebarTop
-        );
-        for bad in ["", "   ", "barleft", "Bar-Left"] {
-            assert_eq!(
-                effective_mount(Mount::SidebarLead, &|_| Some(bad.to_owned())),
-                Mount::SidebarLead,
-                "{bad:?}"
-            );
-        }
-    }
-
+    /// The raw mount-override parsing this crate used to pin here
+    /// (`effective_mount_falls_back_to_the_manifest_when_unset`,
+    /// `effective_mount_reads_the_documented_variable_and_switches_family`,
+    /// `effective_mount_trims_whitespace_and_falls_back_on_garbage`) is now
+    /// [`hytte_plugin::effective_mount_from`]'s own contract, pinned once at
+    /// the SDK (#1317, `crates/hytte-plugin/src/runtime.rs`'s
+    /// `effective_mount_from_*` tests) rather than once per hand copy. What
+    /// stays here is what the SDK cannot pin for us: that *this* crate's
+    /// `resolve_settings` actually calls it and threads the result into
+    /// `is_bar` (below) and, in a real process, into [`Plugin::init`]
+    /// (`resolve_settings_wires_the_mount_override_and_the_label_through_to_init`,
+    /// `init_reaches_the_view_with_a_real_process_environment`).
+    ///
     /// [`card_title`] falls back to [`DEFAULT_TITLE`] when [`LABEL_ENV`] is
     /// unset or blank — the free, no-second-request default the #1280 triage
     /// settled on.
@@ -1569,10 +1501,10 @@ mod tests {
 
     /// **#1315 review MED 3** — the two lines that thread the launch
     /// environment into [`Plugin::init`]'s model are pinned here, not just
-    /// [`effective_mount`]/[`card_title`] in isolation. `init` calls nothing
-    /// but [`resolve_settings`] and destructures its result, so a test
-    /// against this function is a test against `init`'s *composition* of the
-    /// two pure halves.
+    /// [`hytte_plugin::effective_mount_from`]/[`card_title`] in isolation.
+    /// `init` calls nothing but [`resolve_settings`] and destructures its
+    /// result, so a test against this function is a test against `init`'s
+    /// *composition* of the two pure halves.
     ///
     /// It is **not**, on its own, a test against `init` itself: this pins
     /// `resolve_settings`, called directly with an injected `lookup` — a
@@ -1592,7 +1524,7 @@ mod tests {
     /// (true, card_title(lookup))                    // is_bar hardcoded
     ///   -> the first assert (`!is_bar`) reds: the sidebar override never
     ///      flips the family, so the card can never render on any mount.
-    /// (effective_mount(..).is_bar(), DEFAULT_TITLE.to_owned())  // title hardcoded
+    /// (hytte_plugin::effective_mount_from(..).is_bar(), DEFAULT_TITLE.to_owned())  // title hardcoded
     ///   -> the second assert (`title == "Home account"`) reds:
     ///      `CLAUDE_BRIDGE_LABEL` is silently ignored.
     /// ```

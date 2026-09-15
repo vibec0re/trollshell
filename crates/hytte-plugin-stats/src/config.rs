@@ -7,7 +7,8 @@
 //! its own **mount family** — `[bar]` for the three bar regions, `[sidebar]`
 //! for the six sidebar ones. No flag, no second file, no per-instance
 //! environment beyond the two the launch already carries
-//! ([`HYTTE_PLUGIN_MOUNT`](crate::mount) and `HYTTE_PLUGIN_ID`).
+//! ([`HYTTE_PLUGIN_MOUNT`](hytte_plugin::effective_mount), graduated into the
+//! SDK by #1317, and `HYTTE_PLUGIN_ID`).
 //!
 //! # What it rides
 //!

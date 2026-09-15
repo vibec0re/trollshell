@@ -17,8 +17,8 @@ use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use crate::card::{self, Widgets};
 use crate::config::{self, Family};
 use crate::panel;
+use crate::sample;
 use crate::sample::{Cmd, Msg, Snapshot};
-use crate::{mount, sample};
 
 /// The manifest id this binary ships with — the **first** instance's identity.
 ///
@@ -48,15 +48,17 @@ pub struct Settings {
 }
 
 /// Resolve the settings for one launch. Pure — the mount override is read
-/// through `lookup` and the config is handed in, so every branch is testable
-/// without an environment or a file.
+/// through `lookup` (via [`hytte_plugin::effective_mount_from`], graduated
+/// into the SDK by #1317 out of what used to be this crate's own `mount`
+/// module) and the config is handed in, so every branch is testable without an
+/// environment or a file.
 #[must_use]
 pub fn settings_from(
     manifest_mount: Mount,
     lookup: &dyn Fn(&str) -> Option<String>,
     stats: &config::Stats,
 ) -> Settings {
-    let family = Family::of(mount::effective(manifest_mount, lookup));
+    let family = Family::of(hytte_plugin::effective_mount_from(manifest_mount, lookup));
     Settings {
         family,
         card: stats.for_family(family),
@@ -81,7 +83,7 @@ fn settings() -> Settings {
     static SETTINGS: OnceLock<Settings> = OnceLock::new();
     *SETTINGS.get_or_init(|| {
         let stats = config::load();
-        let resolved = settings_from(DEFAULT_MOUNT, &mount::env_lookup, &stats);
+        let resolved = settings_from(DEFAULT_MOUNT, &|key| std::env::var(key).ok(), &stats);
         tracing::info!(
             table = resolved.family.table(),
             poll_secs = resolved.card.poll.as_secs(),

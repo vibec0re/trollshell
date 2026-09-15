@@ -453,7 +453,10 @@ mod tests {
             .expect("a panel always has slots");
         assert_eq!(strip.len(), panel.cols() * panel.rows() * LAMP_STRIDE);
         assert!(
-            strip.iter().step_by(LAMP_STRIDE).all(|amount| *amount == 0.0),
+            strip
+                .iter()
+                .step_by(LAMP_STRIDE)
+                .all(|amount| *amount == 0.0),
             "no level means no lamp is lit",
         );
         assert_eq!(
@@ -817,9 +820,8 @@ mod tests {
             if oy > 0.0 {
                 let mut c = first_c;
                 while c <= last_c && c - first_c < 8 {
-                    sum += amount_at(c, r, cells, amounts) as f32
-                        * cell_overlap(lo_x, hi_x, c)
-                        * oy;
+                    sum +=
+                        amount_at(c, r, cells, amounts) as f32 * cell_overlap(lo_x, hi_x, c) * oy;
                     c += 1;
                 }
             }

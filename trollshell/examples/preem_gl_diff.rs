@@ -1993,7 +1993,10 @@ fn measure(
     // `parity::case_verdict`.
     let verdict = parity::with_native_flatness(
         parity::case_verdict(&stats, &split, case.kind(), case.sampling(), exact),
-        case.kind(),
+        // Per **case**, not per kind (#1155 review): the flip board's two
+        // mechanisms answer this one differently and correctly, and only the
+        // case knows which it is. Every other kind's answer is its kind's.
+        case.flat_block_ceiling(),
         flatness,
         exact,
     );
@@ -2010,7 +2013,7 @@ fn measure(
     );
     print_channels(&stats, case.sampling());
     print_regions(&split);
-    print_flatness(case.kind(), flatness);
+    print_flatness(case.flat_block_ceiling(), flatness);
     let (gl_ppm, cpu_ppm) = write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
@@ -2102,11 +2105,11 @@ fn print_regions(split: &parity::Regions) {
 /// the gauge or the text box needs to see what those frames measure first, and
 /// a statistic that is only printed where it is already asserted cannot tell
 /// them. See `parity::flat_block_fraction`.
-fn print_flatness(kind: parity::Kind, fraction: Option<f64>) {
+fn print_flatness(ceiling: Option<f64>, fraction: Option<f64>) {
     let Some(fraction) = fraction else {
         return;
     };
-    match kind.flat_block_ceiling() {
+    match ceiling {
         Some(ceiling) => println!(
             "      native flat blocks {:.1}% of the supersampled frame (ceiling {:.1}%, \
              asserted under TROLLSHELL_PARITY_EXACT=1)",
@@ -2114,7 +2117,7 @@ fn print_flatness(kind: parity::Kind, fraction: Option<f64>) {
             ceiling * 100.0,
         ),
         None => println!(
-            "      native flat blocks {:.1}% of the supersampled frame (no ceiling for this kind)",
+            "      native flat blocks {:.1}% of the supersampled frame (no ceiling for this case)",
             fraction * 100.0,
         ),
     }

@@ -1127,6 +1127,23 @@ mod tests {
     /// usually larger — which is the direction a bound has to err in.
     const DIVIDE_SLACK: f32 = 2.5 * f32::EPSILON;
 
+    /// **Ten times the allowance, which the sweep also survives** (#1155
+    /// review, MEDIUM).
+    ///
+    /// Measured there: the first perturbation that moves any byte of the sweep
+    /// is `4e-6`, i.e. **13.4×** [`DIVIDE_SLACK`] (2.98e-7). So the pin holds
+    /// by a *margin*, and asserting the margin is what makes a kit change that
+    /// walks a `flap_value` onto `level`'s truncation boundary red here — while
+    /// there is still headroom — rather than at the moment it flips.
+    ///
+    /// The review also plumbed a **second** slack through the mirror's
+    /// [`divide`] so the two quotients could be perturbed in *opposite*
+    /// directions, since a driver's two independent 2.5 ULP errors are free to
+    /// be anti-correlated: the first byte moves at `4e-6` there too. The
+    /// single-`slack` model below is therefore adequate, which is why there is
+    /// one and not two.
+    const DIVIDE_SLACK_HEADROOM: f32 = 10.0 * DIVIDE_SLACK;
+
     /// The negative control's perturbation: four orders above [`DIVIDE_SLACK`],
     /// and small enough that it is still obviously a *rounding* rather than a
     /// different picture.
@@ -1152,17 +1169,27 @@ mod tests {
     /// reach a byte.
     ///
     /// It cannot, and this is the measurement: the whole 1:1 sweep re-derived
-    /// with **both** quotients perturbed by `±`[`DIVIDE_SLACK`], asserting
-    /// every byte is still the kit's. The reason it holds is structural rather
-    /// than lucky — the two quotients feed a coverage in `0..=1` which is then
+    /// with **both** quotients perturbed by `±`[`DIVIDE_SLACK`] and again by
+    /// `±`[`DIVIDE_SLACK_HEADROOM`], asserting every byte is still the kit's.
+    ///
+    /// **It holds by a margin, not by construction, and the two are different
+    /// claims** (#1155 review, MEDIUM). The structural half is real but bounds
+    /// the *error*: the two quotients feed a coverage in `0..=1` which is then
     /// weighted by `cover`, and `cover` is small exactly where the span the
-    /// second quotient normalises is small, so the error in the composed value
-    /// is bounded by `255 * squash` times the relative slack, i.e. under
-    /// `1e-4` of a byte.
+    /// second quotient normalises is small, so the composed value moves by at
+    /// most `255 * squash` times the relative slack — under `1e-4` of a byte at
+    /// [`DIVIDE_SLACK`]. Whether a *byte* moves depends on the **margin**
+    /// between that value and `level`'s truncation boundary, and nothing about
+    /// the geometry makes that margin large. It is measured instead, twice
+    /// over: [`the_fold_never_lands_on_the_rounding_boundary`] walks every
+    /// `flap_value` in the sweep and reports how close the closest comes, and
+    /// the `DIVIDE_SLACK_HEADROOM` arm here says the sweep survives ten times
+    /// the allowance. The review put the first moving byte at `4e-6`, i.e.
+    /// 13.4× — so ten is a floor under a measured number, not a guess.
     ///
     /// The `CONTROL_SLACK` arm is the negative control, and the reason this is
     /// a test rather than a comment: a perturbation four orders larger **does**
-    /// move bytes, so the assertion above is measuring the arithmetic's
+    /// move bytes, so the assertions above are measuring the arithmetic's
     /// sensitivity and not the sweep's inability to see anything at all.
     ///
     /// **Falsified** by widening either slack (the control arm stops being a
@@ -1180,7 +1207,12 @@ mod tests {
                 for style in kit::DisplayStyle::ALL {
                     for (mechanism, kit_board) in sweep_boards() {
                         let reference = kit_board.render(style);
-                        for slack in [DIVIDE_SLACK, -DIVIDE_SLACK] {
+                        for slack in [
+                            DIVIDE_SLACK,
+                            -DIVIDE_SLACK,
+                            DIVIDE_SLACK_HEADROOM,
+                            -DIVIDE_SLACK_HEADROOM,
+                        ] {
                             assert_eq!(
                                 shader_frame(&kit_board, style, slack),
                                 reference.data(),
@@ -1200,6 +1232,132 @@ mod tests {
                 );
             },
         );
+    }
+
+    /// How close the closest `flap_value` in the sweep comes to `level`'s
+    /// truncation boundary, and how many were looked at at all — the guard
+    /// against a census that walks an empty board and reports a clean answer.
+    struct Margins {
+        seen: u64,
+        closest: f32,
+    }
+
+    /// The floor [`the_fold_never_lands_on_the_rounding_boundary`] holds the
+    /// census to.
+    ///
+    /// Measured at **3.265e-3** over the whole sweep (see that test's doc), so
+    /// this is a third of it — room for a kit change to move a value without
+    /// reporting a regression, and not so much room that the statement goes
+    /// vacuous.
+    ///
+    /// **How it composes with the sibling's slack, in numbers rather than in
+    /// adjectives.** The largest displacement a relative slack `s` can produce
+    /// in a `flap_value` is `255 * squash * s`, i.e. at most `255 s`. At
+    /// [`DIVIDE_SLACK`] (2.98e-7) that is **7.6e-5** — thirteen times under
+    /// this floor, which is why no byte can move there. At
+    /// [`DIVIDE_SLACK_HEADROOM`] (2.98e-6) it is **7.6e-4**, *comparable* to
+    /// the floor — which is exactly why the ten-times arm is run as a
+    /// measurement rather than inferred from this one.
+    const MARGIN_FLOOR: f32 = 1e-3;
+
+    /// **No `flap_value` in the sweep lands on `level`'s truncation boundary**
+    /// (#1155 review, MEDIUM and LOW-1 together).
+    ///
+    /// This is the statistic `flap_value` is split out of `flap255` for, and
+    /// the one the sibling above cannot report: that one asks "did any byte
+    /// move", which is a yes/no about a perturbation that was applied, and this
+    /// one asks "how much room was there", which is what a *later* kit change
+    /// spends. A change that walks a value onto `level`'s boundary reds here
+    /// while the sibling is still comfortably green — which is the whole
+    /// difference between a gate and a coincidence.
+    ///
+    /// `level(v)` is `int(clamp(v, 0, 255) + 0.5)`, so its answer changes where
+    /// `v + 0.5` crosses an integer: the margin is that value's distance to the
+    /// nearest one. Measured over [`SWEEP`]'s ten board shapes — the **split
+    /// flap only**, since a nixie's emission is two integer cathode levels and
+    /// never reaches this rounding at all — **25 498 values looked at, closest
+    /// 3.265e-3**.
+    ///
+    /// **Falsified** by [`MARGIN_FLOOR`] being raised past the measurement, and
+    /// — the direction that matters — by any kit change to the phase curve, the
+    /// shading floor or the edge rule that walks a value onto the boundary.
+    #[test]
+    fn the_fold_never_lands_on_the_rounding_boundary() {
+        let census = kit::with_pins(
+            kit::Pins {
+                ink: kit::Ink::Base,
+                field: None,
+            },
+            || {
+                let mut census = Margins {
+                    seen: 0,
+                    closest: f32::INFINITY,
+                };
+                for (mechanism, kit_board) in sweep_boards() {
+                    if mechanism != kit::Mechanism::SplitFlap {
+                        continue;
+                    }
+                    margin_census(&kit_board, &mut census);
+                }
+                census
+            },
+        );
+        assert!(
+            census.seen > 20_000,
+            "the census looked at only {} value(s) — it is walking the wrong boards \
+             and the assertion below is vacuous",
+            census.seen,
+        );
+        assert!(
+            census.closest >= MARGIN_FLOOR,
+            "a fold value came within {:e} of `level`'s truncation boundary — under the \
+             {MARGIN_FLOOR:e} floor, so the byte there is decided by the last bit of \
+             whatever computed it rather than by the geometry",
+            census.closest,
+        );
+    }
+
+    /// Walk every fragment of `kit_board`'s cards at 1:1 and fold each
+    /// [`flap_value`]'s distance from `level`'s truncation boundary into
+    /// `census`.
+    ///
+    /// Values the clamp swallows are skipped: `level` answers `0` for
+    /// everything at or below `-0.5` and `255` for everything at or above
+    /// `254.5`, so no rounding there can change a byte and counting the
+    /// distance would report a margin that is not one.
+    #[allow(clippy::cast_precision_loss)]
+    fn margin_census(kit_board: &kit::FlipBoard, census: &mut Margins) {
+        let encoded = cards(kit_board);
+        let metrics = encoded.metrics;
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let (col, row) = (index(col), index(row));
+                let cell = cell_of(&encoded, col);
+                if cell < 0 {
+                    continue;
+                }
+                let local_y = row - index(metrics.bezel);
+                if local_y < 0 || local_y >= index(metrics.cell_h) {
+                    continue;
+                }
+                let lo = local_y as f32;
+                let value = flap_value(
+                    &encoded,
+                    cell * index(CELL_TEXELS),
+                    cell_local_x(&encoded, col, cell),
+                    local_y,
+                    lo,
+                    lo + 1.0,
+                    0.0,
+                );
+                if value <= -0.5 || value >= 254.5 {
+                    continue;
+                }
+                census.seen += 1;
+                let rounded = value + 0.5;
+                census.closest = census.closest.min((rounded - rounded.round()).abs());
+            }
+        }
     }
 
     /// **The transcription above is the arithmetic the shipped shaders carry**
@@ -1620,6 +1778,11 @@ mod tests {
 
     /// `flap_value` — the snapped branch, where the fragment is one whole
     /// logical row and `cover` is the covered length itself.
+    ///
+    /// Split out of [`flap255`] on both sides for the same reason: it is the
+    /// number [`level`]'s rounding decides, and
+    /// [`the_fold_never_lands_on_the_rounding_boundary`] walks it to measure
+    /// how much room that rounding has.
     #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     fn flap_value(
         cards: &super::Cards,

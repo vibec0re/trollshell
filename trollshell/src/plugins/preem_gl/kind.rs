@@ -147,11 +147,16 @@ pub(crate) enum Kind {
     /// Both divides are the *kit's* — `(lo - band_lo) / squash` and
     /// `acc / span`, spelled by `FlipBoard::compose_flap` — so they cannot be
     /// moved to a CPU-computed reciprocal without making the two arms disagree.
-    /// `flip_board.rs`'s
-    /// `the_coverage_bytes_are_never_decided_by_the_divides_slack` censuses
-    /// exactly that: every byte of every 1:1 case re-derived with both
-    /// quotients perturbed by ±2.5 ULP, with a negative control at a millionth
-    /// that moves bytes.
+    /// `flip_board.rs` censuses exactly that, twice over:
+    /// `the_coverage_bytes_are_never_decided_by_the_divides_slack` re-derives
+    /// every byte of every 1:1 case with both quotients perturbed by ±2.5 ULP
+    /// **and by ten times that**, with a negative control at a thousandth that
+    /// moves bytes; and `the_fold_never_lands_on_the_rounding_boundary` reports
+    /// the *margin* the first one spends — the closest any `flap_value` in the
+    /// sweep comes to `level`'s truncation boundary, 3.265e-3. The pin holds by
+    /// that margin rather than by construction, which is the honest way round:
+    /// the structural argument bounds the **error**, and whether a byte moves
+    /// is about the **margin** (#1155 review).
     ///
     /// Like [`LedStrip`](Self::LedStrip) and [`SevenSeg`](Self::SevenSeg),
     /// `flip_board.rs`'s

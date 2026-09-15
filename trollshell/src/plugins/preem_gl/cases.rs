@@ -145,6 +145,46 @@ impl Case {
             Self::FlipBoard { .. } => Kind::FlipBoard,
         }
     }
+
+    /// The native-frame flatness ceiling this case is held to —
+    /// [`Kind::flat_block_ceiling`]'s, except where a kind's own answer cannot
+    /// be stated per kind (#1155 review, HIGH).
+    ///
+    /// **The flip board is that exception, and it is why this method exists.**
+    /// Its two mechanisms answer differently and honestly: a **nixie** *is*
+    /// replication — it is a cross-fade between two 5×7 bitmap cathodes, has
+    /// no sub-pixel geometry anywhere, and its native frame is exactly what
+    /// `Frame::upscale` produces, measured **100.0 %** flat on every skin — so
+    /// arming the detector for it would red a correct render forever. A
+    /// **split flap** is not: its falling card is integrated over the
+    /// fragment's own vertical footprint, measured **92.5–93.8 %**.
+    ///
+    /// `0.97` is calibrated the way [`Kind::DotMatrix`]'s `0.60` was — against
+    /// a mutation that reverts the improvement, not against a wish. The probe
+    /// is `bool snapped = true;` in `flip_board.frag`'s `main`, which is the
+    /// whole of #1155 undone: the fold goes back to the kit's logical row,
+    /// replicated `scale` times. Under it the four `split-flap.rollingx2`
+    /// frames go **93.4 / 92.5 / 93.3 / 93.8 % → 100.0 % on all four**, and —
+    /// this is the finding — *every other gate stays green*, because
+    /// replicating the grid agrees with the oracle better than resolving per
+    /// fragment does. `0.97` sits ~3 points either side of that 6.2-point
+    /// separation. It is also the only gate in the suite that can see a drift
+    /// *inside* the continuous branch, which is a live question in this very
+    /// file: #1186's bilinear halo tap is weighed and declined there, and a
+    /// future answer that moves further toward replication has to red
+    /// somewhere.
+    ///
+    /// **Falsified** by returning the kind's answer for a split flap, which
+    /// puts the `snapped := true` probe back to `PASS all 204`.
+    pub(crate) fn flat_block_ceiling(&self) -> Option<f64> {
+        match self {
+            Self::FlipBoard {
+                mechanism: kit::Mechanism::SplitFlap,
+                ..
+            } => Some(0.97),
+            other => other.kind().flat_block_ceiling(),
+        }
+    }
 }
 
 /// Where a flip-board case's row is when the frame is taken.

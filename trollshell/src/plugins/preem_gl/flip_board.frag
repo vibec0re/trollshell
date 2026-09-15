@@ -83,11 +83,17 @@
 // arm's: `(lo - band_lo) / squash` maps a destination row onto its source span,
 // and `acc / span` normalises the coverage integral. `FlipBoard::compose_flap`
 // spells both, so removing them here would not make the two arms agree — it
-// would make them disagree. `flip_board.rs`'s
-// `the_coverage_bytes_are_never_decided_by_the_divides_slack` is the census:
-// every byte of every 1:1 parity case re-derived with both quotients perturbed
-// by ±2.5 ULP, asserting the byte never moves, with a negative control that
-// perturbs by a millionth and requires that it does.
+// would make them disagree. Two censuses in `flip_board.rs` measure what that
+// costs, and they are different statements:
+// `the_coverage_bytes_are_never_decided_by_the_divides_slack` re-derives every
+// byte of the 1:1 sweep with both quotients perturbed by ±2.5 ULP **and by ten
+// times that**, asserting no byte moves, with a negative control at a
+// thousandth that requires some do; and
+// `the_fold_never_lands_on_the_rounding_boundary` reports the *margin* — how
+// close the closest `flap_value` comes to `level`'s truncation boundary
+// (3.265e-3), which is the room a later kit change spends. The pin holds by
+// that margin, not by construction: the structural bound is on the **error**
+// (`255 * squash * slack`), and whether a byte moves is about the margin.
 //
 // A third division — `covered / fstep`, which turns the covered *length* of a
 // fragment into the covered *fraction* the kit's unit-tall row already is —
@@ -314,9 +320,12 @@ int cell_local_x(int col, int index) {
 // card-local logical units — one whole row on the snapped branch, the
 // fragment's footprint on the continuous one.
 // Split out of `flap255` so the value the rounding below decides is a thing a
-// census can look at: `flip_board.rs`'s
-// `the_coverage_bytes_are_never_decided_by_the_divides_slack` walks exactly
-// this number to measure how close it comes to `level`'s truncation boundary.
+// census can look at: `flip_board.rs`'s Rust mirror of this function is walked
+// by `the_fold_never_lands_on_the_rounding_boundary`, which measures how close
+// the closest one in the sweep comes to `level`'s truncation boundary
+// (25 498 values, closest 3.265e-3). That is the statistic a *later* kit change
+// spends, and the one its sibling — which asks only whether a perturbation
+// moved a byte — cannot report.
 float flap_value(int base, int x, int row, float lo, float hi, float fstep, bool snapped) {
     float band_lo = strip_at(base + 4);
     float band_hi = strip_at(base + 5);

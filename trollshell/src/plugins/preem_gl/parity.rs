@@ -638,13 +638,17 @@ impl Kind {
             // bars, so there is no grid-resolution lattice for a ceiling here
             // to protect. See [`Self::edge_budget`]'s `SevenSeg` arm for what
             // does gate this kind's stretched cases.
-            // The flip board is the fifth `None`, and a measurement too: a
-            // board is mostly bezel and solid card faces, and its one
-            // continuous quantity is a horizontal band one card tall, so its
-            // supersampled frames are overwhelmingly flat blocks and a ceiling
-            // here would be a number invented without a failure to calibrate it
-            // against. See [`Self::edge_budget`]'s `FlipBoard` arm for what
-            // does gate this kind's `scale = 2` cases.
+            // The flip board's `None` is the fifth, and the **only one of the
+            // five that is overridden**: it is the *nixie*'s answer, not the
+            // kind's (#1155 review, HIGH). A tube has no sub-pixel geometry at
+            // all, so its native frame is exactly `Frame::upscale` — 100.0 %
+            // flat on every skin, correctly — and a ceiling armed here would
+            // red a right render forever. Its split-flap sibling is 92.5–93.8 %
+            // and *is* gated: `cases::Case::flat_block_ceiling` arms those
+            // cases at `0.97`, calibrated against a `snapped := true` probe
+            // that takes all four to 100.0 %. That is the one gate in the suite
+            // that can see a drift *inside* the continuous branch, so a reader
+            // arriving here looking for this kind's detector should go there.
             Self::Gauge
             | Self::TextBox
             | Self::Scope
@@ -1090,12 +1094,21 @@ pub(crate) fn flat_block_fraction(
 /// Refine a passing verdict with [`flat_block_fraction`] — the rendered gate
 /// for "the halo is read at the fragment's resolution" (#1238's review).
 ///
-/// **Only under `TROLLSHELL_PARITY_EXACT=1`**, and only for a kind that states
+/// **Only under `TROLLSHELL_PARITY_EXACT=1`**, and only for a case that states
 /// a ceiling. That is [`Kind::pinned_exact`]'s bargain, for its reason: the
 /// numbers below are calibrated against one driver in one sandbox, so this is a
 /// CI regression detector rather than a claim about what a real driver's
 /// rasteriser must produce. A plain run prints the fraction and asserts
 /// nothing.
+///
+/// **`ceiling` rather than `kind` since #1155's review**, and the change is
+/// the finding: the flip board's two *mechanisms* honestly answer 93.x %
+/// (split flap) and 100.0 % (nixie, which has no sub-pixel geometry at all —
+/// its native frame **is** `Frame::upscale`, correctly), so a `Kind`-keyed
+/// ceiling can arm neither without failing the other. `cases::Case::
+/// flat_block_ceiling` resolves it per case and defaults to the kind's; every
+/// other kind's answer is unchanged, because every other kind has one
+/// mechanism.
 ///
 /// Takes `prior` rather than returning a verdict of its own so a failure that
 /// is already diagnosed keeps its name: "the interior moved" and "the edges are
@@ -1104,14 +1117,14 @@ pub(crate) fn flat_block_fraction(
 /// which is true, and useless.
 pub(crate) fn with_native_flatness(
     prior: Verdict,
-    kind: Kind,
+    ceiling: Option<f64>,
     fraction: Option<f64>,
     exact: bool,
 ) -> Verdict {
     if !prior.is_pass() || !exact {
         return prior;
     }
-    match (fraction, kind.flat_block_ceiling()) {
+    match (fraction, ceiling) {
         (Some(measured), Some(ceiling)) if measured > ceiling => Verdict::GridReplicated,
         _ => prior,
     }
@@ -2219,13 +2232,23 @@ mod tests {
             (Kind::Marquee, 0.465, 0.774),
         ] {
             assert_eq!(
-                with_native_flatness(Verdict::Pass, kind, Some(shipping), true),
+                with_native_flatness(
+                    Verdict::Pass,
+                    kind.flat_block_ceiling(),
+                    Some(shipping),
+                    true
+                ),
                 Verdict::Pass,
                 "{}: the frame that ships is inside the ceiling",
                 kind.label(),
             );
             assert_eq!(
-                with_native_flatness(Verdict::Pass, kind, Some(reverted), true),
+                with_native_flatness(
+                    Verdict::Pass,
+                    kind.flat_block_ceiling(),
+                    Some(reverted),
+                    true
+                ),
                 Verdict::GridReplicated,
                 "{}: a halo replicated out of the kit's grid is not",
                 kind.label(),
@@ -2237,7 +2260,12 @@ mod tests {
         // lattice kinds' ceiling.
         for (kind, measured) in [(Kind::Gauge, 0.887), (Kind::TextBox, 0.974)] {
             assert_eq!(
-                with_native_flatness(Verdict::Pass, kind, Some(measured), true),
+                with_native_flatness(
+                    Verdict::Pass,
+                    kind.flat_block_ceiling(),
+                    Some(measured),
+                    true
+                ),
                 Verdict::Pass,
                 "{}: a kind with no ceiling is not held to another kind's",
                 kind.label(),
@@ -2257,12 +2285,22 @@ mod tests {
     #[test]
     fn only_the_exact_pin_asserts_the_native_flatness() {
         assert_eq!(
-            with_native_flatness(Verdict::Pass, Kind::DotMatrix, Some(0.797), false),
+            with_native_flatness(
+                Verdict::Pass,
+                Kind::DotMatrix.flat_block_ceiling(),
+                Some(0.797),
+                false
+            ),
             Verdict::Pass,
             "without the env, the same frame is printed and not judged",
         );
         assert_eq!(
-            with_native_flatness(Verdict::Pass, Kind::DotMatrix, None, true),
+            with_native_flatness(
+                Verdict::Pass,
+                Kind::DotMatrix.flat_block_ceiling(),
+                None,
+                true
+            ),
             Verdict::Pass,
             "a case with no fraction to report — every 1:1 one — is untouched",
         );
@@ -2273,7 +2311,7 @@ mod tests {
             Verdict::EdgeOverBudget,
         ] {
             assert_eq!(
-                with_native_flatness(prior, Kind::DotMatrix, Some(1.0), true),
+                with_native_flatness(prior, Kind::DotMatrix.flat_block_ceiling(), Some(1.0), true),
                 prior,
                 "an all-flat frame is the *symptom* of {}, not a second finding",
                 prior.label(),
@@ -2334,18 +2372,22 @@ mod tests {
                 // fragment. No calibration is available here, and a ceiling
                 // without one is a flake (#1238's own words).
                 Kind::SevenSeg => None,
-                // 92.5–93.4 % on the split flap (vfd 93.4, lcd 92.5, oled 93.3,
-                // crt 93.8) and a flat **100.0 %** on all four nixie frames: a
-                // board is bezel, two flat card faces and a row of 5×7 bitmap
-                // glyphs, and its one continuous quantity is a horizontal band
-                // one card tall, so its supersampled frames are overwhelmingly
-                // constant blocks for reasons that have nothing to do with a
-                // halo. The nixie pair is the control that costs nothing here,
-                // and it sits at the **top** of the range rather than the
-                // bottom — exactly the wrong direction for a detector that is
-                // supposed to fall when a grid-resolution read is resolved per
-                // fragment. No calibration is available, and a ceiling without
-                // one is a flake (#1238's own words).
+                // **`None` here is the *nixie*'s answer, and the split flap
+                // overrides it per case** (#1155 review, HIGH). A tube is a
+                // cross-fade between two 5×7 bitmap cathodes with no sub-pixel
+                // geometry anywhere, so its native frame *is* `Frame::upscale`
+                // — measured **100.0 %** flat on all four skins, correctly —
+                // and a ceiling armed on this kind would red a right render
+                // forever. A split flap is the opposite (92.5–93.8 %) and the
+                // detector for it is real: `cases::Case::flat_block_ceiling`
+                // arms those cases at `0.97`, calibrated against a
+                // `snapped := true` probe that takes all four to 100.0 %.
+                //
+                // The earlier version of this comment said no calibration was
+                // available and a ceiling here would be a flake. The review
+                // falsified that by measuring one; what was actually missing
+                // was a *per-case* key, since this kind carries two mechanisms
+                // with two honest answers.
                 Kind::FlipBoard => None,
             };
             assert_eq!(

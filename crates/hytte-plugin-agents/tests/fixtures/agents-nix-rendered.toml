@@ -1,3 +1,4 @@
+_locked = ["display.argus.icon", "display.trollshell-choom.label", "display.trollshell-choom.project", "poll_seconds", "socket"]
 poll_seconds = 5
 socket = "/run/hyperhive/host.sock"
 

@@ -1888,7 +1888,13 @@
               import tomllib
               with open("${renderedFile}", "rb") as f:
                   data = tomllib.load(f)
-              assert data == {"style": "lcd", "rows": "rect"}, data
+              # `_locked` (#1227) is the dotted leaf path of EXACTLY the keys
+              # set above, beside the values — `crates/hytte-config/src/merge.rs`
+              # keeps the nix value for those whatever the overlay says. Pinned
+              # as an equality on the whole dict, so a renderer that emitted
+              # `_locked = []` (or every schema key rather than every SET one)
+              # reds here rather than shipping a lock that pins nothing.
+              assert data == {"style": "lcd", "rows": "rect", "_locked": ["rows", "style"]}, data
               '
               touch $out
             '';
@@ -1981,7 +1987,8 @@
                 import tomllib
                 with open("${renderedFile}", "rb") as f:
                     data = tomllib.load(f)
-                assert data == {"style": "lcd", "rows": "rect"}, data
+                # The `_locked` half (#1227) — see hm-module-core-leds above.
+                assert data == {"style": "lcd", "rows": "rect", "_locked": ["rows", "style"]}, data
                 '
                 touch $out
               '';
@@ -2280,6 +2287,19 @@
               fi
               if grep -q 'display' ${socketOnlyFile}; then
                 echo "a socket-only config.agents rendered a [display] heading (see #1237 review MEDIUM-1):" >&2
+                cat ${socketOnlyFile} >&2
+                exit 1
+              fi
+              # #1227, the same invariant one line over: the `_locked` list is
+              # computed from the PRUNED value, so it names exactly the keys
+              # the operator actually set — one, here. This is the "nix
+              # configuration options can be optional" half of Annika's word on
+              # #866 (2026-09-15) pinned from the other side: the arms above
+              # say nothing is rendered when nothing is set, and this says
+              # nothing extra is locked when one thing is. A renderer that
+              # emitted every schema key (or a constant `[]`) reds here.
+              if ! grep -qx '_locked = \["socket"\]' ${socketOnlyFile}; then
+                echo "a socket-only config.agents did not lock exactly the one key it set (#1227):" >&2
                 cat ${socketOnlyFile} >&2
                 exit 1
               fi

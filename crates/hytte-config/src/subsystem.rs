@@ -4818,8 +4818,7 @@ kept = true
     /// away.
     #[test]
     fn a_locked_marker_survives_a_save() {
-        let existing =
-            "_locked = [\"core.color\"]\nenabled = true\n\n[core]\ncolor = \"cyan\"\nbrightness = 3\n";
+        let existing = "_locked = [\"core.color\"]\nenabled = true\n\n[core]\ncolor = \"cyan\"\nbrightness = 3\n";
         let loaded = assembled(&[existing]);
         let out = render_overlay(existing, &loaded.config).expect("renders");
 

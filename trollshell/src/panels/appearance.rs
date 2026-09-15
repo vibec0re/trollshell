@@ -14,6 +14,11 @@
 //!   single-image and can't be told "no wallpaper" — the button would be a
 //!   silent no-op there (see [`wallpaper::has_custom_reload_backend`]).
 //!
+//! Since #1308, a **Scaling** row beside the "All displays" picker sets
+//! swaybg's `-m` mode (Fill / Fit / Center / Tile / Stretch) — one mode for
+//! every screen, insensitive with nothing set to scale. See
+//! [`scaling_row`].
+//!
 //! The user picks a file with `gtk::FileDialog`; the service rewrites its state
 //! file, re-derives the swaybg arguments, and restarts (or, on clear, stops)
 //! the swaybg unit so the change takes effect immediately.
@@ -33,7 +38,7 @@ use hytte::gtk::{self, gio};
 use hytte::prelude::*;
 use hytte::services::displays::{self, Output};
 use hytte::services::nightlight;
-use hytte::services::wallpaper::{self, Slot};
+use hytte::services::wallpaper::{self, Mode, Slot};
 
 use crate::components::layout::{finish_page, page_box};
 use crate::components::reactive_list::reactive_list;
@@ -62,6 +67,16 @@ fn build_wallpaper_group() -> adw::PreferencesGroup {
         Some(Rc::new(wallpaper::clear_default)),
     );
     group.add(&default_row);
+
+    // Scaling (#1308): one mode for every screen (Annika's per-output
+    // question is open on the issue), so it sits beside the picker rather
+    // than under it.
+    let scaling = scaling_row(
+        wallpaper::mode(),
+        wallpaper::state().map(|s| s.default.is_some() || !s.outputs.is_empty()),
+        wallpaper::set_mode,
+    );
+    group.add(&scaling);
 
     // Explicit reset to no wallpaper (#546) — clears the default, every
     // per-output override, and rotation in one go, then stops the swaybg unit.
@@ -245,6 +260,50 @@ where
     row
 }
 
+/// The "Scaling" row (#1308): an `adw::ComboRow` over swaybg's five *scaling*
+/// modes (`Mode::SCALING` — `solid_color` paints a color rather than scaling
+/// an image, so it stays out of the menu). One mode for every screen: the
+/// picker above is per-output, but scaling isn't asked to be (Annika's
+/// per-output question is open on the issue).
+///
+/// `mode_signal` drives the selected item; `on_change` fires with the mode the
+/// user just picked — `wallpaper::set_mode` in production, injected so a test
+/// can capture it instead of writing the real state; `sensitive_signal` gates
+/// the row exactly like the picker's own inline Clear button (`image_row`'s
+/// `on_clear`): insensitive with nothing set to scale.
+fn scaling_row(
+    mode_signal: impl hytte::futures_signals::signal::Signal<Item = Mode> + 'static,
+    sensitive_signal: impl hytte::futures_signals::signal::Signal<Item = bool> + 'static,
+    on_change: impl Fn(Mode) + 'static,
+) -> adw::ComboRow {
+    let labels: Vec<&str> = Mode::SCALING.iter().map(|m| m.label()).collect();
+    let model = gtk::StringList::new(&labels);
+    let row = adw::ComboRow::builder()
+        .title("Scaling")
+        .subtitle("How the image fills each display")
+        .model(&model)
+        .build();
+
+    bind_two_way(
+        mode_signal,
+        &row,
+        |row: &adw::ComboRow, mode| {
+            let idx = Mode::SCALING.iter().position(|m| *m == mode).unwrap_or(0);
+            row.set_selected(u32::try_from(idx).unwrap_or(0));
+        },
+        move |row| {
+            row.connect_selected_notify(move |row| {
+                let idx = usize::try_from(row.selected()).unwrap_or(0);
+                on_change(Mode::SCALING.get(idx).copied().unwrap_or_default());
+            })
+        },
+    );
+
+    bind(sensitive_signal, &row, adw::ComboRow::set_sensitive);
+
+    row
+}
+
 /// The Night light row's resting subtitle — what the toggle is *for*.
 const NIGHT_LIGHT_SUBTITLE: &str = "Warm the screen's color temperature after sunset";
 
@@ -397,4 +456,114 @@ fn open_wallpaper_picker(on_pick: impl Fn(String) + 'static) {
             }
         },
     );
+}
+
+/// #1308: `scaling_row` takes its signals and its write path as parameters —
+/// the same seam `image_row`'s `on_pick`/`on_clear` already use — precisely so
+/// it is testable against local `Mutable`s rather than the registered
+/// `wallpaper` service, and never touches the real `$XDG_STATE_HOME`.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{Mode, scaling_row};
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// The row's selected item follows the mode signal, at construction and
+    /// after a later change — the way every other row in this panel follows
+    /// `wallpaper::state()`.
+    ///
+    /// **Falsification:** hardcode the apply arm's `row.set_selected(0)`
+    /// instead of resolving `mode`'s position in `Mode::SCALING` — the row
+    /// opens on Fill regardless of the signal and never moves on the second
+    /// assertion.
+    #[gtk::test]
+    fn the_row_follows_the_mode_signal() {
+        adw::init().expect("libadwaita init");
+        let handle: Mutable<Mode> = Mutable::new(Mode::Tile);
+        let row = scaling_row(handle.signal(), Mutable::new(true).signal(), |_| {});
+        pump();
+
+        assert_eq!(
+            usize::try_from(row.selected()).expect("a selection"),
+            Mode::SCALING
+                .iter()
+                .position(|m| *m == Mode::Tile)
+                .expect("Tile is offered"),
+            "the row must open on the signal's own value, not always Fill"
+        );
+
+        handle.set(Mode::Center);
+        pump();
+        assert_eq!(
+            usize::try_from(row.selected()).expect("a selection"),
+            Mode::SCALING
+                .iter()
+                .position(|m| *m == Mode::Center)
+                .expect("Center is offered"),
+            "a later signal change must move the row too"
+        );
+    }
+
+    /// Selecting an item writes the mode through the injected seam — never
+    /// `wallpaper::set_mode` directly, and so never the real
+    /// `$XDG_STATE_HOME` (CLAUDE.md's tests-must-not-touch-real-XDG rule).
+    ///
+    /// **Falsification:** wire `connect_selected_notify` to a no-op (or to
+    /// the real `wallpaper::set_mode`, which this test cannot observe) — the
+    /// captured `Vec` stays empty.
+    #[gtk::test]
+    fn selecting_an_item_writes_the_state_through_the_seam() {
+        adw::init().expect("libadwaita init");
+        let picked: Rc<RefCell<Vec<Mode>>> = Rc::new(RefCell::new(Vec::new()));
+        let row = scaling_row(
+            Mutable::new(Mode::Fill).signal(),
+            Mutable::new(true).signal(),
+            {
+                let picked = Rc::clone(&picked);
+                move |mode| picked.borrow_mut().push(mode)
+            },
+        );
+        pump();
+
+        let tile_idx = Mode::SCALING
+            .iter()
+            .position(|m| *m == Mode::Tile)
+            .expect("Tile is offered");
+        row.set_selected(u32::try_from(tile_idx).unwrap());
+        pump();
+
+        assert_eq!(
+            picked.borrow().as_slice(),
+            [Mode::Tile],
+            "picking an item must call on_change with exactly the mode picked"
+        );
+    }
+
+    /// Insensitive with nothing set to scale, sensitive once something is —
+    /// the same gate `image_row`'s inline Clear button uses.
+    #[gtk::test]
+    fn the_row_is_insensitive_with_nothing_to_scale() {
+        adw::init().expect("libadwaita init");
+        let has_wallpaper: Mutable<bool> = Mutable::new(false);
+        let row = scaling_row(
+            Mutable::new(Mode::Fill).signal(),
+            has_wallpaper.signal(),
+            |_| {},
+        );
+        pump();
+
+        assert!(!row.is_sensitive(), "nothing set yet \u{21d2} insensitive");
+
+        has_wallpaper.set(true);
+        pump();
+        assert!(row.is_sensitive(), "a wallpaper is now set \u{21d2} sensitive");
+    }
 }

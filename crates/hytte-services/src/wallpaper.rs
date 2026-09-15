@@ -6,8 +6,10 @@
 //!
 //! - **Per-output** — a *default* image applied to every output, plus optional
 //!   per-connector overrides (`output name → image path`). swaybg takes the
-//!   default as a leading `-i … -m fill` and each override as a later
-//!   `-o <name> -i … -m fill`.
+//!   default as a leading `-i … -m <mode>` and each override as a later
+//!   `-o <name> -i … -m <mode>` — one [`Mode`] for every screen (#1308); the
+//!   picker is per-output, scaling isn't (yet — Annika's per-output question
+//!   is open on the issue).
 //! - **Time-of-day rotation** — a whole-screen mode that switches the wallpaper
 //!   on a fixed morning/day/evening/night schedule (see [`Slot`]). Driven by a
 //!   cheap 60 s main-loop tick; when the active slot's image changes the render
@@ -183,6 +185,122 @@ impl Slot {
     }
 }
 
+/// swaybg's scaling mode (`-m <mode>`; `swaybg(1)`'s own six words).
+///
+/// One [`Mode`] for every screen (#1308): the wallpaper picker is per-output
+/// but scaling isn't asked to be — Annika's per-output question is open on
+/// the issue — so this lives as a scalar field on [`WallpaperState`] rather
+/// than inside [`WallpaperState::outputs`], leaving room for a later
+/// per-output override to be an additive field rather than a migration.
+///
+/// [`Self::as_swaybg_arg`] is the single spelling both the render
+/// ([`swaybg_args`]) and (de)serialization read from, so the wire word and the
+/// state-file word can never drift apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    Stretch,
+    Fit,
+    /// `fill` — the triage's recommendation ("filled", and what most people
+    /// expect); a state file predating #1308 (or a legacy migration, which
+    /// never wrote a `mode` key) reads as this via `#[serde(default)]`.
+    #[default]
+    Fill,
+    Center,
+    Tile,
+    SolidColor,
+}
+
+impl Mode {
+    /// swaybg's five *scaling* modes, in the Appearance page's Scaling row
+    /// order (Fill / Fit / Center / Tile / Stretch — the #1308 triage).
+    /// [`Mode::SolidColor`] paints a color rather than scaling an image, so it
+    /// deliberately stays out of any picker.
+    pub const SCALING: [Mode; 5] = [
+        Mode::Fill,
+        Mode::Fit,
+        Mode::Center,
+        Mode::Tile,
+        Mode::Stretch,
+    ];
+
+    /// The exact word `swaybg -m` expects (`swaybg(1)`).
+    #[must_use]
+    pub fn as_swaybg_arg(self) -> &'static str {
+        match self {
+            Mode::Stretch => "stretch",
+            Mode::Fit => "fit",
+            Mode::Fill => "fill",
+            Mode::Center => "center",
+            Mode::Tile => "tile",
+            Mode::SolidColor => "solid_color",
+        }
+    }
+
+    /// Parse swaybg's own spelling; `None` for anything else — a
+    /// `wallpaper.toml` value round-trips through [`Self::as_swaybg_arg`]
+    /// only, so a hand-edited file has to match it exactly (no case-folding).
+    fn parse(word: &str) -> Option<Mode> {
+        match word {
+            "stretch" => Some(Mode::Stretch),
+            "fit" => Some(Mode::Fit),
+            "fill" => Some(Mode::Fill),
+            "center" => Some(Mode::Center),
+            "tile" => Some(Mode::Tile),
+            "solid_color" => Some(Mode::SolidColor),
+            _ => None,
+        }
+    }
+
+    /// Label for the Appearance page's Scaling row.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Stretch => "Stretch",
+            Mode::Fit => "Fit",
+            Mode::Fill => "Fill",
+            Mode::Center => "Center",
+            Mode::Tile => "Tile",
+            Mode::SolidColor => "Solid color",
+        }
+    }
+}
+
+impl Serialize for Mode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_swaybg_arg())
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    /// Never fails: an unrecognised word is the #1044-style per-key
+    /// tolerance applied to a state file — it costs only this key, not the
+    /// rest of the file, so the fallback lives *inside* deserialization
+    /// rather than surfacing a [`serde::de::Error`] that a struct-level
+    /// `toml::from_str`/`serde_json::from_str` would turn into a whole-file
+    /// rejection.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match Mode::parse(&raw) {
+            Some(mode) => Ok(mode),
+            None => {
+                tracing::warn!(
+                    key = "mode",
+                    value = %raw,
+                    "wallpaper: unrecognised scaling mode; using the default (fill) — \
+                     ignoring this key and using the built-in default"
+                );
+                Ok(Mode::default())
+            }
+        }
+    }
+}
+
 /// Time-of-day rotation config: an enable flag plus a per-slot image path.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rotation {
@@ -247,6 +365,11 @@ pub struct WallpaperState {
     /// (`BTreeMap`) so the derived render is deterministic.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, String>,
+    /// swaybg's scaling mode (`-m`), one for every screen (#1308). Absent —
+    /// a legacy migration, or a file predating #1308 — reads as
+    /// [`Mode::default`].
+    #[serde(default)]
+    pub mode: Mode,
     /// Time-of-day rotation.
     #[serde(default, skip_serializing_if = "Rotation::is_default")]
     pub rotation: Rotation,
@@ -282,7 +405,7 @@ fn swaybg_args(state: &WallpaperState, hour: u32) -> Vec<String> {
             "-i".to_string(),
             image.to_string(),
             "-m".to_string(),
-            "fill".to_string(),
+            state.mode.as_swaybg_arg().to_string(),
         ];
     }
 
@@ -298,7 +421,7 @@ fn swaybg_args(state: &WallpaperState, hour: u32) -> Vec<String> {
             "-i".to_string(),
             image.to_string(),
             "-m".to_string(),
-            "fill".to_string(),
+            state.mode.as_swaybg_arg().to_string(),
         ]);
     }
     for (name, image) in &state.outputs {
@@ -308,7 +431,7 @@ fn swaybg_args(state: &WallpaperState, hour: u32) -> Vec<String> {
             "-i".to_string(),
             image.clone(),
             "-m".to_string(),
-            "fill".to_string(),
+            state.mode.as_swaybg_arg().to_string(),
         ]);
     }
     args
@@ -605,6 +728,11 @@ pub fn default_path() -> impl Signal<Item = Option<String>> {
     state().map(|s| s.default)
 }
 
+/// Signal of the configured scaling mode — one for every screen (#1308).
+pub fn mode() -> impl Signal<Item = Mode> {
+    state().map(|s| s.mode)
+}
+
 /// Whether a custom wallpaper backend — a [`RELOAD_CMD_ENV`] reload command
 /// (e.g. `awww`) — is configured for this session.
 ///
@@ -685,6 +813,11 @@ pub fn clear_output(name: &str) {
     });
 }
 
+/// Set swaybg's scaling mode — one for every screen (#1308).
+pub fn set_mode(mode: Mode) {
+    mutate(move |s| s.mode = mode);
+}
+
 /// Enable or disable time-of-day rotation.
 pub fn set_rotation_enabled(on: bool) {
     mutate(move |s| s.rotation.enabled = on);
@@ -711,7 +844,7 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::{
-        LEGACY_JSON_FILE, LEGACY_PATH_FILE, PATH_PLACEHOLDER, Rotation, SUBSYSTEM, Slot,
+        LEGACY_JSON_FILE, LEGACY_PATH_FILE, Mode, PATH_PLACEHOLDER, Rotation, SUBSYSTEM, Slot,
         WallpaperState, args_file_body, load_state, primary_image, shell_single_quote, state,
         state_from_disk, swaybg_args,
     };
@@ -806,6 +939,7 @@ mod tests {
         let mut state = WallpaperState {
             default: Some("/d.png".into()),
             outputs: BTreeMap::new(),
+            mode: Mode::Tile,
             rotation: Rotation {
                 enabled: true,
                 morning: Some("/m.png".into()),
@@ -948,6 +1082,166 @@ mod tests {
             swaybg_args(&state, 8),
             args(&["-i", "/d.png", "-m", "fill"])
         );
+    }
+
+    // ── scaling mode (#1308) ─────────────────────────────────────────────────
+    //
+    // Every mode's `-m` word is pinned as a **literal** rather than derived
+    // from `Mode::as_swaybg_arg` (the render's own function) — an assertion
+    // built from the crate's own constant cannot see the render disagree with
+    // swaybg's actual vocabulary (`swaybg(1)`: stretch, fit, fill, center,
+    // tile, solid_color). Fill is already the default and is exercised by
+    // every other render test above.
+
+    #[test]
+    fn default_state_scales_with_fill() {
+        assert_eq!(WallpaperState::default().mode, Mode::Fill);
+    }
+
+    #[test]
+    fn swaybg_mode_stretch() {
+        let state = WallpaperState {
+            default: Some("/d.png".into()),
+            mode: Mode::Stretch,
+            ..WallpaperState::default()
+        };
+        assert_eq!(
+            swaybg_args(&state, 8),
+            args(&["-i", "/d.png", "-m", "stretch"])
+        );
+    }
+
+    #[test]
+    fn swaybg_mode_fit() {
+        let state = WallpaperState {
+            default: Some("/d.png".into()),
+            mode: Mode::Fit,
+            ..WallpaperState::default()
+        };
+        assert_eq!(swaybg_args(&state, 8), args(&["-i", "/d.png", "-m", "fit"]));
+    }
+
+    #[test]
+    fn swaybg_mode_center() {
+        let state = WallpaperState {
+            default: Some("/d.png".into()),
+            mode: Mode::Center,
+            ..WallpaperState::default()
+        };
+        assert_eq!(
+            swaybg_args(&state, 8),
+            args(&["-i", "/d.png", "-m", "center"])
+        );
+    }
+
+    #[test]
+    fn swaybg_mode_tile() {
+        let state = WallpaperState {
+            default: Some("/d.png".into()),
+            mode: Mode::Tile,
+            ..WallpaperState::default()
+        };
+        assert_eq!(
+            swaybg_args(&state, 8),
+            args(&["-i", "/d.png", "-m", "tile"])
+        );
+    }
+
+    #[test]
+    fn swaybg_mode_solid_color() {
+        let state = WallpaperState {
+            default: Some("/d.png".into()),
+            mode: Mode::SolidColor,
+            ..WallpaperState::default()
+        };
+        assert_eq!(
+            swaybg_args(&state, 8),
+            args(&["-i", "/d.png", "-m", "solid_color"])
+        );
+    }
+
+    #[test]
+    fn per_output_override_uses_the_configured_mode() {
+        let mut state = WallpaperState {
+            default: Some("/d.png".into()),
+            mode: Mode::Tile,
+            ..WallpaperState::default()
+        };
+        state.outputs.insert("DP-1".into(), "/dp1.png".into());
+        assert_eq!(
+            swaybg_args(&state, 8),
+            args(&[
+                "-i", "/d.png", "-m", "tile", // global first
+                "-o", "DP-1", "-i", "/dp1.png", "-m", "tile",
+            ])
+        );
+    }
+
+    #[test]
+    fn rotation_render_uses_the_configured_mode() {
+        let state = WallpaperState {
+            mode: Mode::Center,
+            rotation: Rotation {
+                enabled: true,
+                morning: Some("/m.png".into()),
+                ..Rotation::default()
+            },
+            ..WallpaperState::default()
+        };
+        // Hour 8 ⇒ Morning slot, rendered with the configured mode rather
+        // than a hardcoded "fill".
+        assert_eq!(
+            swaybg_args(&state, 8),
+            args(&["-i", "/m.png", "-m", "center"])
+        );
+    }
+
+    /// #1044-style per-key tolerance applied to a state file: an
+    /// unrecognised `mode` word costs only that key — it falls back to the
+    /// default and the rest of the file (`default`, `outputs`) still loads —
+    /// rather than failing the whole `toml::from_str` the way a strict
+    /// derived enum would.
+    ///
+    /// Falsified by deriving `Mode`'s `Deserialize` instead of hand-writing
+    /// it: `toml::from_str::<WallpaperState>` then returns `Err` for the
+    /// whole document and this test's `expect` panics.
+    #[test]
+    fn an_unrecognised_mode_costs_only_that_key() {
+        let toml = "default = \"/d.png\"\nmode = \"bogus\"\n\n[outputs]\n\"DP-1\" = \"/dp1.png\"\n";
+
+        let (captured, _guard) = capture();
+        let state: WallpaperState =
+            toml::from_str(toml).expect("the rest of the file must still parse");
+
+        assert_eq!(state.mode, Mode::default(), "an unusable word falls back");
+        assert_eq!(state.default.as_deref(), Some("/d.png"));
+        assert_eq!(
+            state.outputs.get("DP-1").map(String::as_str),
+            Some("/dp1.png"),
+            "a sibling key must not be dropped by the bad mode"
+        );
+
+        let warnings: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(warnings.len(), 1, "exactly one warning, got {warnings:?}");
+        assert_eq!(warnings[0].fields.get("key").map(String::as_str), Some("mode"));
+        assert_eq!(
+            warnings[0].fields.get("value").map(String::as_str),
+            Some("bogus")
+        );
+    }
+
+    /// The migration chain never wrote a `mode` key (it predates #1308), so a
+    /// legacy JSON file without one must read as the default rather than
+    /// failing to migrate at all.
+    #[test]
+    fn migrating_a_legacy_json_without_mode_defaults_to_fill() {
+        let json = r#"{"default":"/j.png"}"#;
+        let migrated = state_from_disk(Some(json), None).expect("migrates");
+        assert_eq!(migrated.mode, Mode::Fill);
     }
 
     // ── rotation fallback (#551) ─────────────────────────────────────────────
@@ -1162,6 +1456,7 @@ mod tests {
                     ("DP-2".to_string(), "/pics/o'clock.png".to_string()),
                     ("eDP-1".to_string(), "/pics/laptop.png".to_string()),
                 ]),
+                mode: Mode::Center,
                 rotation: Rotation {
                     enabled: true,
                     morning: Some("/pics/dawn.png".into()),

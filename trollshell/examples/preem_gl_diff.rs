@@ -1434,7 +1434,10 @@ impl Runner {
             // ceiling" regardless would claim a plain run checked something it
             // only ever printed.
             let flatness = if self.exact {
-                "inside their native-frame flatness ceiling where their kind states one"
+                // "case", not "kind", since #1155's review: the ceiling is
+                // resolved per case, because one kind's two mechanisms answer
+                // it differently. See `cases::Case::flat_block_ceiling`.
+                "inside their native-frame flatness ceiling where their case states one"
             } else {
                 "with their native-frame flatness printed, not asserted, since \
                  TROLLSHELL_PARITY_EXACT=1 was not set"

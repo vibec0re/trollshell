@@ -69,6 +69,13 @@ Exactly what the shell compiles, assembled the same way:
     widget body — so it is a hard failure (exit 2) rather than a shader this
     check silently never compiled.
 
+  * every one of those bodies (kit arms, the widget vertex stage, every
+    plugin `.frag` body) is also scanned, as written on disk, for the
+    Mesa-reserved-but-glslang-accepted words `RESERVED_WORDS_DELTA` names
+    (#1325) — a whole-word match outside a `//`/`/* */` comment reds with the
+    file and line, since `glslangValidator` passing one of these clean is
+    itself the false-green this check exists to catch.
+
 It refuses to pass vacuously, and every one of those guards is exit **2** (a
 broken check) rather than exit 1 (a broken shader): a missing header, a missing
 shader directory, an unknown extension, a subdirectory it does not know how to
@@ -89,11 +96,20 @@ on glass. Uniform-name drift against the bag *is* covered, from the other side:
 `the_mapping_fills_every_uniform_the_shaders_read` parses these same files and
 asserts both directions.
 
+Nor is it a full ES conformance check: `glslangValidator` itself accepts a
+handful of GLSL ES 3.00 §3.7 "reserved for future use" identifiers (`packed`,
+`row_major`, `column_major`) that Mesa's ESSL lexer refuses outright — see
+`RESERVED_WORDS_DELTA` for the measured list and why a driver-only refusal
+needs its own scan rather than a smarter validator invocation.
+
 RUNNING IT BY HAND
 ------------------
     nix shell nixpkgs#python3 nixpkgs#glslang --command python3 nix/lint-glsl.py
 
-from the repo root. `nix flake check`'s `glsl` check runs the same line.
+from the repo root. `nix flake check`'s `glsl` check runs the same line, plus
+`python3 nix/lint-glsl.py --self-test` first — the self-test proves the
+`RESERVED_WORDS_DELTA` scan actually reds instead of passing vacuously; it
+touches no shader in the tree, so it costs nothing to run in either place.
 """
 
 from __future__ import annotations
@@ -279,6 +295,156 @@ MIN_SPLICED_BODIES = 5
 # on exactly this set. A shared body added later needs an entry in both, plus a
 # decision about which stage(s) to compile it under.
 STAGES = {".vert": "vert", ".frag": "frag"}
+
+# ── Mesa-reserved words `glslangValidator` accepts (#1325) ─────────────────
+#
+# #1155's flip-board shader first drafted `packed` as an identifier.
+# `glslangValidator` compiled it clean; every Mesa driver refused it —
+# `packed` is a keyword reserved for future use by GLSL ES 3.00 §3.7
+# ("Keywords"), which a spec-conforming compiler must reject even though it
+# names no current feature, and Mesa's ESSL lexer does (`PACKED_TOK`) while
+# glslang treats it as an ordinary identifier. The whole reason this script
+# exists is that no check in the tree has a driver (see the module
+# docstring) — so this is a second, disjoint false-green in the one validator
+# CI does have, and needs its own scan rather than a driver fix.
+#
+# The list below is a **measured delta**, not the full §3.7 list transcribed:
+# every word that section reserves was compiled here as `float <word> = 1.0;`
+# (through this script's own `read_header()` assembly, as a `.frag`, so the
+# dialect matches what the shell actually compiles) and only the ones
+# `glslangValidator` accepted (exit 0) are kept — the 47 it already rejects
+# need no help from this script. Re-derive it by looping the full §3.7 list
+# through that same compile-and-check if the glslang version ever changes
+# what it accepts:
+#
+#     for word in SECTION_3_7_WORDS:
+#         write(f"{read_header()}\nfloat {word} = 1.0;\n")
+#         run(["glslangValidator", staged_path])
+#         # word belongs in the delta iff the process exits 0
+#
+# Measured 2026-09-15 against glslang 16.4.0 (Khronos Glslang Version
+# 11:16.4.0) over all 50 words GLSL ES 3.00 §3.7 lists (`packed`,
+# `row_major`, `column_major`, `input`, `output`, `hvec2/3/4`, `dvec2/3/4`,
+# `fvec2/3/4`, `filter`, `sizeof`, `cast`, `namespace`, `using`, `goto`,
+# `inline`, `noinline`, `volatile`, `public`, `static`, `extern`, `external`,
+# `interface`, `long`, `short`, `double`, `half`, `fixed`, `unsigned`,
+# `superp`, `asm`, `class`, `union`, `enum`, `typedef`, `template`, `this`,
+# `resource`, `sample`, `subroutine`, `common`, `partition`, `active`,
+# `attribute`, `varying`): glslang already rejects the other 47, and accepts
+# only these three as plain identifiers.
+#
+# Scope: only the shader **bodies** this script already compiles (the preem
+# kit arms, the widget vertex stage, every plugin `.frag` body) are scanned —
+# not `GLSL_HEADER`, `SHADER_PREAMBLE`, or a `program.rs`-style splice
+# prefix. Those three are this script's own trusted, reviewed framework text
+# (the same reason `read_header`/`read_preamble` don't validate their own
+# content beyond "carries a `#version`"/"declares `fragColor`"), not shader
+# source a plugin or a kit author writes — the class of source this scan
+# exists to protect.
+RESERVED_WORDS_DELTA = frozenset({"packed", "row_major", "column_major"})
+
+# Matches a RESERVED_WORDS_DELTA member as a whole identifier — `\b` sits at
+# a transition to/from a `\w` character, and GLSL identifier characters
+# (letters, digits, `_`) are exactly Python's `\w` in ASCII text, so
+# `packed_x` and `unpacked` both fail to match `packed` on either side.
+RESERVED_WORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in sorted(RESERVED_WORDS_DELTA)) + r")\b"
+)
+
+
+def strip_comments(text: str) -> str:
+    """Blank `//` and `/* */` comment bodies, keeping every other character
+    (newlines included) so line numbers into the result still match the
+    original file exactly.
+
+    GLSL has no string-literal syntax to dodge — unlike the Rust source this
+    script parses elsewhere (`concat_bodies`) — so a plain two-state scan
+    (line comment / block comment / neither) is the whole algorithm; no
+    quote-tracking is needed.
+    """
+    out = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "/" and i + 1 < n and text[i + 1] == "/":
+            j = i
+            while j < n and text[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+        elif text[i] == "/" and i + 1 < n and text[i + 1] == "*":
+            j = i
+            while j < n and not (text[j] == "*" and j + 1 < n and text[j + 1] == "/"):
+                if text[j] != "\n":
+                    out[j] = " "
+                j += 1
+            if j < n:
+                out[j] = out[j + 1] = " "
+                j += 2
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def scan_reserved_words(path: Path) -> list[tuple[int, str]]:
+    """`[(1-based line, word)]` for every `RESERVED_WORDS_DELTA` hit in `path`.
+
+    Scans the file **as it sits on disk** — not assembled with a header or a
+    splice prefix the way `compile_assembled` feeds `glslangValidator` — so
+    the line numbers this returns are already the original file's own line
+    numbers, with nothing to translate back through. `GLSL_HEADER`, a
+    `program.rs` splice prefix and `SHADER_PREAMBLE` are deliberately never
+    part of what gets scanned (see the scope note on `RESERVED_WORDS_DELTA`
+    above), so there is no assembled-source offset to map through for this
+    check the way `compile_assembled`'s failure output has to.
+    """
+    stripped = strip_comments(path.read_text(encoding="utf-8"))
+    return [
+        (stripped.count("\n", 0, match.start()) + 1, match.group(0))
+        for match in RESERVED_WORD_PATTERN.finditer(stripped)
+    ]
+
+
+def self_test() -> int:
+    """`--self-test`: prove the reserved-word scan actually reds.
+
+    No fixture file ships for this — a temp file assembled in-process means
+    the crane/flake source filter (`nix/package.nix`) needs no change to
+    carry it, the same reasoning `compile_assembled` already stages its
+    sources into a `tempfile.TemporaryDirectory()`. One positive case
+    (`packed` used as a plain identifier) and two negatives (a longer
+    identifier that merely contains the word; the word inside a `//`
+    comment) — the two ways a naive scan over-fires.
+    """
+    ok = True
+
+    def check(name: str, body: str, *, expect_hit: bool) -> None:
+        nonlocal ok
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / "self_test.frag"
+            staged.write_text(body, encoding="utf-8")
+            hits = scan_reserved_words(staged)
+        if bool(hits) == expect_hit:
+            print(f"  ok    self-test: {name}")
+        else:
+            ok = False
+            print(f"  FAIL  self-test: {name} (expected a hit: {expect_hit}, got: {hits})")
+
+    check("a reserved word used as an identifier reds", "float packed = 1.0;\n", expect_hit=True)
+    check(
+        "a longer identifier containing the word passes",
+        "float packed_x = 1.0;\n",
+        expect_hit=False,
+    )
+    check(
+        "the word inside a // comment passes",
+        "// packed\nfloat x = 1.0;\n",
+        expect_hit=False,
+    )
+
+    print(f"lint-glsl: self-test {'passed' if ok else 'FAILED'}")
+    return 0 if ok else 1
 
 
 def fail(message: str) -> None:
@@ -492,7 +658,28 @@ def main() -> int:
                 if line.strip():
                     print(f"        {line}")
 
+        def scan_body(label: str, path: Path) -> None:
+            """Reserved-word scan (#1325) — once per file, not once per splice.
+
+            A spliced body (`blur.frag`, `gauge.frag`, …) is compiled more than
+            once with a different prefix each time, but the prefix is trusted
+            Rust-authored text (see `RESERVED_WORDS_DELTA`'s scope note) and the
+            body text itself does not change between splices — scanning it twice
+            would print the same hit twice for no reason, so callers scan each
+            distinct `path` exactly once, ahead of its splice loop if it has one.
+            """
+            nonlocal failures
+            for line, word in scan_reserved_words(path):
+                failures += 1
+                print(f"  FAIL  {label} (reserved word)")
+                print(
+                    f"        {path}:{line}: {word!r} is a GLSL ES 3.00 §3.7 word "
+                    "reserved for future use — glslangValidator accepts it as an "
+                    "identifier, but Mesa's ESSL lexer refuses it (#1325)"
+                )
+
         for path in shaders:
+            scan_body(path.name, path)
             for index, prefix in enumerate(splices.get(path.name, [""])):
                 label = path.name if prefix == "" else f"{path.name} (splice {index})"
                 compile_assembled(label, prefix, path)
@@ -515,6 +702,7 @@ def main() -> int:
             )
         for path in known_stages:
             widget_stages += 1
+            scan_body(f"{path} (widget vertex stage)", path)
             compile_assembled(f"{path} (widget vertex stage)", "", path)
         # A `shaders/` directory is the *convention* for widget bodies, and
         # this keeps it honest: a non-`.frag` file in one is a file whose stage
@@ -535,6 +723,7 @@ def main() -> int:
         # bare filename no longer says which crate it came from.
         for path in widget_bodies():
             widget_body_count += 1
+            scan_body(f"{path} (widget body)", path)
             compile_assembled(f"{path} (widget body)", preamble, path)
 
     print(
@@ -563,4 +752,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(self_test())
     sys.exit(main())

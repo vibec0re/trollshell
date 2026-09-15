@@ -588,6 +588,7 @@
               }
               ''
                 cd ${self}
+                python3 nix/lint-glsl.py --self-test
                 python3 nix/lint-glsl.py
                 touch $out
               '';

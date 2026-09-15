@@ -193,8 +193,13 @@ inline in `flake.nix` as one-liners.
   plugin's bodies are covered the day they land), each with the
   `SHADER_PREAMBLE` interface declarations spliced in front — read out of
   `crates/hytte-ui/src/shader_surface.rs`, so a change to the published uniform
-  contract changes what CI validates in the same commit. A plugin's _runtime_
-  source is deliberately not validated anywhere; see the trust boundary below.
+  contract changes what CI validates in the same commit. Since #1325 it also
+  whole-word-scans every one of those bodies for the handful of GLSL ES 3.00
+  §3.7 words `glslangValidator` accepts as identifiers but Mesa's ESSL lexer
+  refuses (`packed`, `row_major`, `column_major`) — a driver-only false-green
+  `glslangValidator` alone cannot catch — proved by its own `--self-test` arm.
+  A plugin's _runtime_ source is deliberately not validated anywhere; see the
+  trust boundary below.
 - Since #1036, the `system-tests` check's closure carries `mesa` (llvmpipe) and
   its `preCheck` exports the software-GL env plus `TROLLSHELL_REQUIRE_GL=1`,
   so the three GL-context tests in `hytte-ui` (`gl_surface.rs`) actually run

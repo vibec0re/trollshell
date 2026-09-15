@@ -179,22 +179,27 @@ fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
 /// same family would have copied it again.
 ///
 /// **The one honest difference from [`run`]:** `run` treats an unparseable
-/// [`MOUNT_ENV`] value as a **startup failure**, refusing the launch before the
-/// first dial ever happens (see [`mount_override_from_env`]). This function
-/// cannot do that — a plugin may call it *before* `run` does, from its own
-/// `main`-time setup (`hytte-plugin-stats` resolves which config table to read
-/// from a `OnceLock` initializer that runs ahead of the `run()` call that would
-/// otherwise refuse a bad value) — so it has no "refuse the launch" available
-/// to it and falls back to `manifest` instead, the same way the two hand
-/// copies it replaces always did. That fallback is safe rather than a second,
-/// looser rule: by the time anything downstream of this function could act on
-/// a wrong answer, the *process* is already doomed regardless — `run` parses
-/// the identical variable moments later and exits status 1 before a `Register`
-/// frame is ever sent, so a connected, running session is proof the value this
-/// function saw was either unset or valid. The #1159 stance still holds: this
+/// [`MOUNT_ENV`] value as a **startup failure**, refusing the launch before
+/// the first dial (see [`mount_override_from_env`]). This function must
+/// not — a library function cannot exit its caller's process — so it falls
+/// back to `manifest`, the same way the two hand copies it replaces always
+/// did. Reachability of that arm is a property of *when* a plugin asks:
+/// every consumer in this tree asks from `init`/`sources`, i.e. after `run`
+/// has already refused a bad value and exited status 1 with no `Register`
+/// sent, so the arm is unreachable in a live process exactly as
+/// `hytte-plugin-stats`'s `mount` module claimed before this (#1317 review,
+/// MEDIUM 2 — a plugin calling this does **not**, in fact, precede `run`, and
+/// the earlier doc here claimed otherwise). A plugin that asked from its own
+/// `main`, before handing the thread to `run`, could observe the fallback —
+/// and would still be a doomed process, since `run` refuses the same value
+/// moments later; only side effects it commits in that window (the bridge's
+/// HTTP listener is the one thing in the tree that has any) would outlive the
+/// answer.
+///
+/// The #1159 stance still holds regardless of when a plugin asks: this
 /// exposes the *resolved* mount for a plugin's own read-only decisions, not a
-/// second way to change where the plugin actually mounts — nothing here writes
-/// back to [`Plugin::manifest`].
+/// second way to change where the plugin actually mounts — nothing here
+/// writes back to [`Plugin::manifest`].
 #[must_use]
 pub fn effective_mount(manifest: Mount) -> Mount {
     effective_mount_from(manifest, |key| std::env::var(key).ok())
@@ -1317,9 +1322,9 @@ pub fn run<P: Plugin>() -> ! {
 mod tests {
     use super::{
         BACKOFF_BASE, BACKOFF_CAP, Backoff, ID_ENV, IMMEDIATE_FAILURE, MOUNT_ENV,
-        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, effective_mount_from,
-        id_override, id_override_from, id_override_from_env, mount_override, mount_override_from,
-        mount_override_from_env, reconnect_loop,
+        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, effective_mount,
+        effective_mount_from, id_override, id_override_from, id_override_from_env, mount_override,
+        mount_override_from, mount_override_from_env, reconnect_loop,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -4427,6 +4432,17 @@ mod tests {
             registered_mount(resolved).await,
             want,
             "the environment's mount must be the mount in the Register frame",
+        );
+        // …and #1317's plugin-facing reader of the same variable, in the same
+        // child, for the reason this whole harness exists: nothing in-process
+        // can set `HYTTE_PLUGIN_MOUNT`, so `effective_mount`'s one `std::env::var`
+        // closure is otherwise free to be neutered with CI green — exactly what
+        // `mount_override_from_env` cost before this test.
+        assert_eq!(
+            effective_mount(Echo::manifest().mount),
+            want,
+            "`effective_mount` must read the real {MOUNT_ENV_CHILD_VALUE:?} out of \
+             this process's environment, not only through an injected lookup",
         );
         println!("{MOUNT_ENV_CHILD_OK}");
     }

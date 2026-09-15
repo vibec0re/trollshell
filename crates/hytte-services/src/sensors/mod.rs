@@ -612,130 +612,183 @@ struct PollWriters {
     mount_list: Mutable<Vec<MountSpec>>,
 }
 
-async fn poll_loop(w: PollWriters) {
-    let cpu_writer = w.cpu;
-    let cpu_freq_writer = w.cpu_freq;
-    let mem_writer = w.mem;
-    let net_writer = w.net;
-    let disk_io_writer = w.disk_io;
-    let cpu_temp_writer = w.cpu_temp;
-    let gpu_writer = w.gpu;
-    let disk_writer = w.disk;
-    let net_conn_writer = w.net_conn;
-    let proc_count_writer = w.proc_count;
-    let mount_list_reader = w.mount_list;
-    let mut state = PollState::new();
+/// Inputs to one tick's blocking body, bundled so the body itself can be
+/// swapped out (see [`poll_tick`]) without a long parameter list.
+struct TickInputs {
+    /// Cached hwmon chip dir, taken out of `PollState` for the duration of
+    /// the blocking call.
+    chip: Option<PathBuf>,
+    /// GPU probe cache, taken out of `PollState` for the duration of the
+    /// blocking call. `poll_tick` keeps its own clone so a panicked call
+    /// doesn't lose it (#1327).
+    gpu_cache: GpuCache,
+    do_gpu: bool,
+    do_net_conn: bool,
+    do_disk: bool,
+    /// Cloned mount list, only non-empty on a disk tick.
+    specs: Vec<MountSpec>,
+}
 
-    loop {
-        let now = Instant::now();
+/// The real per-tick blocking body: every blocking syscall for one tick,
+/// bundled so it runs entirely inside `tokio::task::spawn_blocking` (never on
+/// a tokio worker thread) and so a test can substitute a fake body — see
+/// [`poll_tick`] — without touching a real `/proc`/`/sys`.
+fn sample_tick(inputs: TickInputs) -> (TickData, GpuCache) {
+    let TickInputs {
+        chip,
+        gpu_cache,
+        do_gpu,
+        do_net_conn,
+        do_disk,
+        specs,
+    } = inputs;
 
-        // Snapshot tick-local flags before moving `state` fields into the closure.
-        let tick = state.tick;
-        let do_gpu = tick.is_multiple_of(2);
-        let do_net_conn = tick.is_multiple_of(2);
-        let do_disk = tick.is_multiple_of(5);
+    // CPU
+    let cpu_stat = read_proc_stat().ok();
+    // CPU clock (per-core cpufreq)
+    let cpu_freq = read_cpu_freq();
+    // Memory
+    let mem = read_proc_meminfo().ok();
+    // Network I/O
+    let net_dev = read_proc_net_dev().ok();
+    // Disk I/O (physical-disk read/write byte counters)
+    let disk_io = read_proc_diskstats().ok();
+    // CPU temp (with cached chip dir)
+    let (cpu_temp, cpu_temp_chip) = {
+        let mut ch = chip;
+        let temp = read_cpu_temp(&mut ch);
+        (temp, ch)
+    };
+    // GPU (every 2 ticks)
+    let (gpu_state, new_gpu_cache) = if do_gpu {
+        read_gpu_with_cache(gpu_cache)
+    } else {
+        (None, gpu_cache)
+    };
+    // TCP socket counts (every 2 ticks)
+    let net_conn = if do_net_conn {
+        Some(read_net_connections())
+    } else {
+        None
+    };
+    // Process count
+    let proc_count = read_process_count();
+    // Disk (every 5 ticks)
+    let disk = if do_disk {
+        Some(read_disk_for_specs(&specs))
+    } else {
+        None
+    };
+    (
+        TickData {
+            cpu_stat,
+            cpu_freq,
+            mem,
+            net_dev,
+            disk_io,
+            cpu_temp,
+            cpu_temp_chip,
+            gpu_state,
+            gpu_tick: do_gpu,
+            net_conn,
+            proc_count,
+            disk,
+        },
+        new_gpu_cache,
+    )
+}
 
-        // Take the chip-dir cache out of state so the closure can own it.
-        let chip = state.cpu_temp_chip.take();
-        // Move the GPU cache out of state so the closure can own it.
-        // On non-GPU ticks we put it back unchanged; on GPU ticks we replace it
-        // with the updated cache returned by `read_gpu_with_cache`.
-        let gpu_cache = std::mem::take(&mut state.gpu_cache);
+/// Run one poll tick: gather `TickInputs` from `state`, run `sample` on a
+/// blocking thread, and fold the result back into `state`/`w`.
+///
+/// `sample` is injectable (rather than hardcoded to [`sample_tick`]) so a
+/// test can make it panic on demand and assert what `poll_tick` does with
+/// `state.gpu_cache` afterwards, without a real `/sys`/`/proc` failure to
+/// provoke (#1327). Production always calls it with `sample_tick`, via
+/// [`poll_loop`].
+///
+/// Does **not** sleep — [`poll_loop`] owns the real 1 Hz cadence so a test
+/// can call this directly, back to back, with no wall-clock wait.
+async fn poll_tick<F>(state: &mut PollState, w: &PollWriters, sample: F)
+where
+    F: FnOnce(TickInputs) -> (TickData, GpuCache) + Send + 'static,
+{
+    let now = Instant::now();
 
-        // Mount list is cloned here (cheap — it's rarely non-empty).
-        let specs = if do_disk {
-            mount_list_reader.get_cloned()
-        } else {
-            Vec::new()
-        };
+    // Snapshot tick-local flags before moving `state` fields into the closure.
+    let tick = state.tick;
+    let do_gpu = tick.is_multiple_of(2);
+    let do_net_conn = tick.is_multiple_of(2);
+    let do_disk = tick.is_multiple_of(5);
 
-        // ── All blocking I/O runs on a dedicated blocking thread ──────────
-        let data = tokio::task::spawn_blocking(move || {
-            // CPU
-            let cpu_stat = read_proc_stat().ok();
-            // CPU clock (per-core cpufreq)
-            let cpu_freq = read_cpu_freq();
-            // Memory
-            let mem = read_proc_meminfo().ok();
-            // Network I/O
-            let net_dev = read_proc_net_dev().ok();
-            // Disk I/O (physical-disk read/write byte counters)
-            let disk_io = read_proc_diskstats().ok();
-            // CPU temp (with cached chip dir)
-            let (cpu_temp, cpu_temp_chip) = {
-                let mut ch = chip;
-                let temp = read_cpu_temp(&mut ch);
-                (temp, ch)
-            };
-            // GPU (every 2 ticks)
-            let (gpu_state, gpu_tick, new_gpu_cache) = if do_gpu {
-                let (state, cache) = read_gpu_with_cache(gpu_cache);
-                (state, true, Some(cache))
-            } else {
-                (None, false, Some(gpu_cache))
-            };
-            // TCP socket counts (every 2 ticks)
-            let net_conn = if do_net_conn {
-                Some(read_net_connections())
-            } else {
-                None
-            };
-            // Process count
-            let proc_count = read_process_count();
-            // Disk (every 5 ticks)
-            let disk = if do_disk {
-                Some(read_disk_for_specs(&specs))
-            } else {
-                None
-            };
-            (
-                TickData {
-                    cpu_stat,
-                    cpu_freq,
-                    mem,
-                    net_dev,
-                    disk_io,
-                    cpu_temp,
-                    cpu_temp_chip,
-                    gpu_state,
-                    gpu_tick,
-                    net_conn,
-                    proc_count,
-                    disk,
-                },
-                new_gpu_cache,
-            )
-        })
-        .await;
+    // Take the chip-dir cache out of state so the blocking call can own it.
+    let chip = state.cpu_temp_chip.take();
+    // Move the GPU cache out of state so the blocking call can own it, but
+    // keep a clone behind: if the call panics, the moved-in cache is gone
+    // with it, and without this clone `state.gpu_cache` would silently fall
+    // back to `Default` — re-probing `nvidia-smi` availability from scratch
+    // on the next tick (#1327).
+    let gpu_cache = std::mem::take(&mut state.gpu_cache);
+    // `GpuCache` is `Copy` today, so this is a plain bitwise copy — `gpu_cache`
+    // stays usable below for the `TickInputs` literal. If it ever loses
+    // `Copy` (it's `Clone` either way), this line becomes a move and fails to
+    // compile rather than silently breaking, which is exactly what should
+    // happen: the fix here would then be `gpu_cache.clone()`.
+    let gpu_cache_before_tick = gpu_cache;
 
-        let Ok((data, new_gpu_cache)) = data else {
-            log_blocking_io_panic(&mut state.warn_blocking_io, now);
-            state.tick = state.tick.wrapping_add(1);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-        log_blocking_io_recovery(&mut state.warn_blocking_io);
+    // Mount list is cloned here (cheap — it's rarely non-empty).
+    let specs = if do_disk {
+        w.mount_list.get_cloned()
+    } else {
+        Vec::new()
+    };
 
-        // Thread the chip cache back.
-        state.cpu_temp_chip = data.cpu_temp_chip;
+    let inputs = TickInputs {
+        chip,
+        gpu_cache,
+        do_gpu,
+        do_net_conn,
+        do_disk,
+        specs,
+    };
 
-        // Thread the GPU cache back (always returned, even on non-GPU ticks).
-        if let Some(cache) = new_gpu_cache {
-            state.gpu_cache = cache;
-        }
+    // ── All blocking I/O runs on a dedicated blocking thread ──────────
+    let data = tokio::task::spawn_blocking(move || sample(inputs)).await;
 
-        apply_cpu_load(&mut state, data.cpu_stat, &cpu_writer, now);
-        apply_cpu_freq(data.cpu_freq, &cpu_freq_writer);
-        apply_memory(&mut state, data.mem, &mem_writer, now);
-        apply_network(&mut state, data.net_dev, now, &net_writer);
-        apply_disk_io(&mut state.disk_io_prev, data.disk_io, now, &disk_io_writer);
-        apply_cpu_temp(data.cpu_temp, &cpu_temp_writer);
-        apply_gpu(data.gpu_tick, data.gpu_state, &gpu_writer);
-        apply_disk(data.disk, &disk_writer);
-        apply_conn_counts(data.net_conn, &net_conn_writer);
-        proc_count_writer.set(data.proc_count);
-
+    let Ok((data, new_gpu_cache)) = data else {
+        log_blocking_io_panic(&mut state.warn_blocking_io, now);
+        // Restore the cache the panicked call took ownership of, rather than
+        // leaving `state.gpu_cache` at the `Default` `mem::take` left behind
+        // (#1327).
+        state.gpu_cache = gpu_cache_before_tick;
         state.tick = state.tick.wrapping_add(1);
+        return;
+    };
+    log_blocking_io_recovery(&mut state.warn_blocking_io);
+
+    // Thread the chip cache back.
+    state.cpu_temp_chip = data.cpu_temp_chip;
+    // Thread the GPU cache back (always returned, even on non-GPU ticks).
+    state.gpu_cache = new_gpu_cache;
+
+    apply_cpu_load(state, data.cpu_stat, &w.cpu, now);
+    apply_cpu_freq(data.cpu_freq, &w.cpu_freq);
+    apply_memory(state, data.mem, &w.mem, now);
+    apply_network(state, data.net_dev, now, &w.net);
+    apply_disk_io(&mut state.disk_io_prev, data.disk_io, now, &w.disk_io);
+    apply_cpu_temp(data.cpu_temp, &w.cpu_temp);
+    apply_gpu(data.gpu_tick, data.gpu_state, &w.gpu);
+    apply_disk(data.disk, &w.disk);
+    apply_conn_counts(data.net_conn, &w.net_conn);
+    w.proc_count.set(data.proc_count);
+
+    state.tick = state.tick.wrapping_add(1);
+}
+
+async fn poll_loop(w: PollWriters) {
+    let mut state = PollState::new();
+    loop {
+        poll_tick(&mut state, &w, sample_tick).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -1003,13 +1056,87 @@ async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuState, GpuVendor,
-        NetConnections, NetIo, PollState, apply_conn_counts, apply_cpu_freq, apply_cpu_load,
-        apply_cpu_temp, apply_disk, apply_disk_io, apply_gpu, apply_memory, apply_network,
+        CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuCache, GpuState, GpuVendor,
+        NetConnections, NetIo, PollState, PollWriters, TickData, TickInputs, apply_conn_counts,
+        apply_cpu_freq, apply_cpu_load, apply_cpu_temp, apply_disk, apply_disk_io, apply_gpu,
+        apply_memory, apply_network, poll_tick, read_gpu_with_cache,
     };
     use futures_signals::signal::Mutable;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    /// A fresh set of `PollWriters` over brand-new `Mutable`s, for tests that
+    /// need to drive [`poll_tick`] directly without a registered `Service`.
+    fn fresh_poll_writers() -> PollWriters {
+        PollWriters {
+            cpu: Mutable::new(CpuLoad::default()),
+            cpu_freq: Mutable::new(CpuFreq::default()),
+            mem: Mutable::new(super::Memory::default()),
+            net: Mutable::new(NetIo::default()),
+            disk_io: Mutable::new(DiskIo::default()),
+            cpu_temp: Mutable::new(CpuTemp::default()),
+            gpu: Mutable::new(None),
+            disk: Mutable::new(DiskUsage::default()),
+            net_conn: Mutable::new(NetConnections::default()),
+            proc_count: Mutable::new(0),
+            mount_list: Mutable::new(Vec::new()),
+        }
+    }
+
+    // ── poll_tick: the GpuCache must survive a panicked blocking tick ───────
+    //
+    // #1327: the tick moves `state.gpu_cache` into the blocking closure and
+    // only threads a fresh cache back on success; on the `Err` (panicked)
+    // arm the moved-in cache was lost, silently resetting `state.gpu_cache`
+    // to `Default` — which costs the next tick a re-probe of `nvidia-smi`
+    // availability (and, where present, a fork) outside #1297's TTL.
+    //
+    // `GpuCache`'s fields are `pub(super)` inside `hytte-sensors`, so this
+    // crate cannot build one by hand; running the real `read_gpu_with_cache`
+    // once (fast, no real GPU or `nvidia-smi` required to terminate) is the
+    // only way to get a concrete non-`Default` value to seed with — the
+    // *panicked tick* itself never touches a real sampler, since the
+    // injected one below is pure fake.
+    //
+    // Falsification: delete the `state.gpu_cache = gpu_cache_before_tick;`
+    // restore on the `Err` arm in `poll_tick` and this reds (see the PR
+    // description for the exact line and the red output).
+    #[tokio::test]
+    async fn gpu_cache_survives_a_panicked_blocking_tick() {
+        let (_gpu_state, seeded) = read_gpu_with_cache(GpuCache::default());
+
+        let mut state = PollState::new();
+        state.gpu_cache = seeded;
+        let seeded_debug = format!("{seeded:?}");
+
+        let w = fresh_poll_writers();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_closure = Arc::clone(&calls);
+        poll_tick(
+            &mut state,
+            &w,
+            move |_inputs: TickInputs| -> (TickData, GpuCache) {
+                calls_in_closure.fetch_add(1, Ordering::SeqCst);
+                panic!("gpu_cache_survives_a_panicked_blocking_tick: injected panic (#1327)");
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the injected sampler must have run exactly once"
+        );
+        assert_eq!(
+            format!("{:?}", state.gpu_cache),
+            seeded_debug,
+            "a panicked blocking tick must restore the pre-tick GpuCache rather than silently \
+             resetting it to Default (#1327)"
+        );
+    }
 
     // ── apply_cpu_load: table test (input sample → published value) ─────────
 

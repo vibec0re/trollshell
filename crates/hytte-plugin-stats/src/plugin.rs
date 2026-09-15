@@ -854,4 +854,118 @@ mod tests {
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");
         assert_eq!(render, back);
     }
+
+    // ── settings(): the real process environment, not just settings_from ────
+    //
+    // #1327: `the_launch_mount_decides_which_table_this_instance_reads` (above)
+    // and `all_nine_mounts_resolve_to_a_table` pin `settings_from` — the pure
+    // half — thoroughly, with an injected `lookup`. But `settings()` is the
+    // *one* production call site that hands it the real environment
+    // (`&|key| std::env::var(key).ok()`), and nothing in this file exercises
+    // that line: replacing it with `&|_| None` leaves every test above green,
+    // because none of them ever calls `settings()` itself. That is the
+    // seam-wrapper hole in its third instance in this tree —
+    // `hytte-plugin::runtime`'s `the_mount_env_var_reaches_the_register_frame`
+    // and `hytte-claude-bridge::plugin`'s
+    // `init_reaches_the_view_with_a_real_process_environment` are the first
+    // two, and this follows their exact shape.
+
+    /// Set (to any value) only on the re-exec'd child that actually runs
+    /// [`settings_reads_the_real_process_environment_inner`] — the same marker
+    /// shape as the two precedents named above, and for the same reason: an
+    /// ordinary `cargo test` run discovers the inner test like any other and
+    /// must not try to run its scenario with no launch environment set up.
+    const SETTINGS_ENV_CHILD: &str = "HYTTE_PLUGIN_STATS_SETTINGS_TEST_CHILD";
+
+    /// Printed by the child only once its scenario has run to completion and
+    /// passed, so the parent can tell "the scenario passed" from "the
+    /// `--exact` filter matched no test and libtest still reports `0 passed`,
+    /// exit 0" — the failure mode a renamed inner test produces.
+    const SETTINGS_ENV_CHILD_OK: &str = "settings-env-child-reached-the-end";
+
+    /// **`settings()`'s own wiring to the real process environment.**
+    ///
+    /// `std::env::set_var` is `unsafe` in edition 2024 and this workspace
+    /// forbids `unsafe_code` outright, so no in-process test can set
+    /// `HYTTE_PLUGIN_MOUNT` for itself to drive a real `settings()` call. Same
+    /// constraint the two precedents hit, same fix: re-exec this test binary
+    /// (`std::env::current_exe`), filtered to exactly one inner test, with the
+    /// variable set on the **child** via the safe `Command::env` builder.
+    ///
+    /// The override is `BarRight`, not [`DEFAULT_MOUNT`]'s own
+    /// `SidebarRightTop`: `DEFAULT_MOUNT` is already a sidebar mount, so an
+    /// override that merely repeats it could not tell "the real environment
+    /// was read" from "the manifest's own default happened to agree" — the
+    /// same failure mode `all_nine_mounts_resolve_to_a_table`'s doc comment
+    /// above calls out for asserting a selection against itself. `BarRight` is
+    /// a different family, so a neutered `settings()` (falling back to
+    /// `DEFAULT_MOUNT`, i.e. `Family::Sidebar`) and a working one
+    /// (`Family::Bar`) give different, checkable answers.
+    ///
+    /// The child's `XDG_CONFIG_HOME`/`XDG_CONFIG_DIRS` point at an empty
+    /// scratch directory rather than being left to inherit the real ones —
+    /// tests must not resolve `stats.toml` against the user's actual
+    /// `$XDG_CONFIG_HOME` (#1101) — so `settings()`'s `config::load()` half
+    /// reads only the built-in default, same on every run.
+    ///
+    /// Falsification: replace `&|key| std::env::var(key).ok()` with `&|_|
+    /// None` inside `settings()` — the child then resolves `Family::Sidebar`
+    /// from `DEFAULT_MOUNT` regardless of the real `HYTTE_PLUGIN_MOUNT=BarRight`,
+    /// and its own assertion reds.
+    #[test]
+    fn settings_reads_the_real_process_environment() {
+        let inner = "plugin::tests::settings_reads_the_real_process_environment_inner";
+        let args = ["--exact", "--nocapture", "--test-threads=1", inner];
+        assert!(
+            args.contains(&"--exact"),
+            "the re-exec must stay filtered to exactly one inner test",
+        );
+        let exe = std::env::current_exe().expect("this test binary's own path");
+        let xdg_dir = tempfile::tempdir().expect("an empty scratch XDG directory");
+
+        let out = std::process::Command::new(&exe)
+            .args(args)
+            .env(SETTINGS_ENV_CHILD, "1")
+            .env("HYTTE_PLUGIN_MOUNT", "BarRight")
+            .env("XDG_CONFIG_HOME", xdg_dir.path())
+            .env("XDG_CONFIG_DIRS", xdg_dir.path())
+            .output()
+            .expect("re-exec this test binary with HYTTE_PLUGIN_MOUNT set");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child scenario failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status,
+        );
+        assert!(
+            stdout.contains(SETTINGS_ENV_CHILD_OK),
+            "the child exited 0 without reaching the end of {inner} — a stale filter \
+             matches no test and libtest still reports success\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The scenario body of [`settings_reads_the_real_process_environment`].
+    /// Does nothing at all unless the parent's marker is set, so an ordinary
+    /// `cargo test` run — which discovers it like any other test — does not
+    /// try to run it with no launch environment set up for it.
+    #[test]
+    fn settings_reads_the_real_process_environment_inner() {
+        if std::env::var_os(SETTINGS_ENV_CHILD).is_none() {
+            return;
+        }
+        assert_eq!(
+            std::env::var("HYTTE_PLUGIN_MOUNT").as_deref(),
+            Ok("BarRight"),
+            "test setup: the parent sets a real bar-family override",
+        );
+        assert_eq!(
+            super::settings().family,
+            Family::Bar,
+            "settings() must resolve the family from the REAL process \
+             environment (HYTTE_PLUGIN_MOUNT), not silently ignore it (#1327)",
+        );
+        println!("{SETTINGS_ENV_CHILD_OK}");
+    }
 }

@@ -94,6 +94,30 @@ pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
     STARTING.signal_cloned()
 }
 
+/// The `"<name>#<index>"` keys with a single-app start in flight (#1312) — the
+/// Edit form's own echo of [`STARTING`], scoped to one row rather than the
+/// whole stack: a click on the editor's dim icon runs [`run_app_start`]
+/// directly, without the rest of a full [`start`], so the card-level marker is
+/// the wrong shape for it (it would also disable every *other* row's icon and
+/// the whole card's Start/Stop button for the length of one launch).
+static APP_STARTING: LazyLock<Mutable<BTreeSet<String>>> =
+    LazyLock::new(|| Mutable::new(BTreeSet::new()));
+
+/// Signal of the `"<name>#<index>"` keys with a single-app start in flight.
+/// See [`APP_STARTING`].
+pub(crate) fn app_starting() -> impl Signal<Item = BTreeSet<String>> {
+    APP_STARTING.signal_cloned()
+}
+
+/// The key one editor row's in-flight marker is filed under in
+/// [`APP_STARTING`] — `name` and `index` together, the same pair
+/// [`app_launch`]'s own unit naming is keyed on, since a stack may legitimately
+/// list one desktop entry twice.
+#[must_use]
+pub(crate) fn app_starting_key(name: &str, index: usize) -> String {
+    format!("{name}#{index}")
+}
+
 /// The stacks with at least one unit up, as of the last poll.
 static SLICES_UP: LazyLock<Mutable<BTreeSet<String>>> =
     LazyLock::new(|| Mutable::new(BTreeSet::new()));
@@ -755,6 +779,44 @@ pub(crate) fn app_start(
         desktop_entry::strip_field_codes(&desktop_entry::exec_words(&entry.exec)),
         Unresolvable::NoCommand,
     )
+}
+
+/// Start one app of `name`'s stack directly (#1312) — the workspace editor's
+/// row icon, rather than the whole [`start`] transaction.
+///
+/// Resolves the entry exactly the way [`start`]'s own per-app loop does (an
+/// `exec` override wins, otherwise [`Ops::desktop_entry`]) and dispatches
+/// through [`app_start`], so the [`Launch`] this produces carries the
+/// **identical** unit name and slice a full Start would have used for this
+/// app: [`app_launch`]'s naming is keyed on `name` and `index` alone, not on
+/// which caller reached it, so Stop's slice-wide reap and the card's
+/// `slice_up`/window `Active` derivation see this exactly as if the whole
+/// stack had been Started.
+///
+/// None of §3.4's *stack*-level bookkeeping applies to launching one app on
+/// its own: no housekeeping sweep, no workspace plan, no grace window, no
+/// stray-window reconciliation, no column reorder. The row that triggered this
+/// already has its own way of knowing when to stop asking — see
+/// `panels::workspace_edit`'s bound row icon.
+///
+/// # Errors
+/// Whatever [`Ops::launch`]/[`Ops::activate`] said, or [`Unresolvable::reason`]
+/// when there was nothing to run at all.
+pub(crate) async fn run_app_start(
+    ops: &impl Ops,
+    name: &str,
+    index: usize,
+    app: &StackApp,
+) -> Result<(), String> {
+    let entry = match app.exec {
+        Some(_) => None,
+        None => ops.desktop_entry(&app.id).await,
+    };
+    match app_start(name, index, app, entry.as_ref()) {
+        AppStart::Unit(unit) => ops.launch(&unit).await,
+        AppStart::Activate { id } => ops.activate(&id).await,
+        AppStart::Unresolved { id, why } => Err(format!("{id}: {}", why.reason())),
+    }
 }
 
 /// Display/IPC variables to forward, and their values, for the ones this shell
@@ -2058,6 +2120,26 @@ pub(crate) fn spawn_stop(name: String) {
         if let Err(e) = stop(&Live, &name).await {
             report(&name, &format!("{name} did not stop: {e}"));
         }
+    });
+}
+
+/// Run [`run_app_start`] on the runtime, holding the row in flight for its
+/// whole life (#1312) — [`app_starting`], the per-row echo of what
+/// [`spawn_start`] does for the whole card with [`STARTING`].
+///
+/// A second click on the same row while the first is still in flight is not a
+/// second start: `insert` answering `false` means the key was already there,
+/// same guard [`spawn_start`] uses.
+pub(crate) fn spawn_app_start(name: String, index: usize, app: StackApp) {
+    let key = app_starting_key(&name, index);
+    if !APP_STARTING.lock_mut().insert(key.clone()) {
+        return;
+    }
+    hytte::reactive::runtime::handle().spawn(async move {
+        if let Err(e) = run_app_start(&Live, &name, index, &app).await {
+            report(&name, &format!("{} did not start: {e}", app.id));
+        }
+        APP_STARTING.lock_mut().remove(&key);
     });
 }
 

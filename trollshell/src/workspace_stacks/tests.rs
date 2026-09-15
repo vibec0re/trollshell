@@ -14,13 +14,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hytte::services::niri::{Window, WindowLayout, Workspace, WorkspaceAction};
+use hytte::services::systemd;
 
 use super::{
     AppStart, AutostartPlan, Launchable, Launched, Layout, Ops, Stack, StackApp, StackState,
     StartError, StopStep, Unresolvable, Workspaces, app_start, autostart_all, autostart_driver,
     autostart_plan, autostart_tick, column_order_batch, may_stop, missing_apps, move_to_monitor,
-    names_to_release, order_index, plan_start, release_lingering_names, save, start, state_of,
-    stop, stop_plan, stray_moves,
+    names_to_release, order_index, plan_start, release_lingering_names, run_app_start, save, start,
+    state_of, stop, stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 
@@ -166,6 +167,11 @@ struct State {
     /// The argv of every launch, in order — `Call::Launch` carries only the unit
     /// name, and #1071 §3.2 is entirely about what ends up after the `--`.
     argvs: Vec<Vec<String>>,
+    /// The slice of every launch, in order (#1312) — `Call::Launch` carries
+    /// only the unit name, and the editor row's direct start is only as good
+    /// as Stop's ability to reap it, which is a property of the slice, not the
+    /// unit name alone.
+    slices: Vec<Option<String>>,
     /// The `(name, stack)` of every `save_stack`, in order. `Call::SaveStack`
     /// carries only the name, and #1071 §3.7 is about what is *in* the entry the
     /// Save creates.
@@ -249,6 +255,11 @@ impl Script {
     /// The argv of every `systemd-run` launch, in order.
     fn launch_argvs(&self) -> Vec<Vec<String>> {
         self.0.borrow().argvs.clone()
+    }
+
+    /// The slice of every launch, in order.
+    fn launch_slices(&self) -> Vec<Option<String>> {
+        self.0.borrow().slices.clone()
     }
 
     /// The `(name, stack)` of every `workspaces.toml` write, in order.
@@ -413,6 +424,7 @@ impl Ops for Script {
         let mut state = self.0.borrow_mut();
         state.calls.push(Call::Launch(launch.unit.clone()));
         state.argvs.push(launch.argv.clone());
+        state.slices.push(launch.slice.clone());
         state.launch_error.clone().map_or(Ok(()), Err)
     }
 
@@ -1460,6 +1472,87 @@ fn a_start_launches_every_entry_even_when_the_app_id_repeats() {
         script.launch_argvs(),
         vec![vec!["Alacritty".to_owned()], vec!["Alacritty".to_owned()]],
         "both entries actually ran the entry's Exec, not a warned-and-skipped no-op"
+    );
+}
+
+// ── #1312: the editor row's direct single-app start ─────────────────────────
+
+/// The workspace editor's row icon starts one app directly through
+/// [`run_app_start`], without the rest of a [`start`] transaction — and it has
+/// to use the **identical** unit name, slice and argv a full Start would have
+/// used for that same app, or Stop's slice-wide reap and the card's Active
+/// derivation would not see it.
+///
+/// Asserted against a real [`start`] run on the same stack/name rather than a
+/// hand-written literal, so a change to `app_launch`'s naming cannot drift the
+/// two apart silently — this mirrors
+/// `a_start_resolves_each_apps_entry_and_launches_activates_or_warns` at index
+/// 1 rather than restating its fixture.
+///
+/// **The mutation**: routing the row's click through the whole stack (a full
+/// `start` for just this app) reds this on `launches().len()` — it would also
+/// launch index 0's Firefox, which this test's `direct` script never scripted
+/// an entry for and would therefore warn-and-skip instead of matching `full`'s
+/// second launch one-for-one.
+#[test]
+fn one_app_started_directly_matches_what_a_full_start_used_for_it() {
+    let alacritty = overridden("Alacritty", "alacritty -e weechat");
+    let stack = Stack {
+        apps: vec![by_id("org.mozilla.firefox"), alacritty.clone()],
+        ..Stack::default()
+    };
+
+    // The full Start, for comparison — index 1 is the override, so it needs no
+    // scripted entry either.
+    let before = vec![ws(1, 1, LEFT, None, true)];
+    let after = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    let full = Script::default()
+        .with_workspaces(&[before.clone(), before, after])
+        .with_entry("org.mozilla.firefox", "firefox --name firefox %u");
+    run(start(&full, "chat", &stack, &Workspaces::default())).expect("starts");
+    assert_eq!(
+        full.launches().len(),
+        2,
+        "both apps launched: {:?}",
+        full.calls()
+    );
+
+    // The row's own direct start of index 1 alone, on a fresh, unrelated
+    // script — no workspace snapshot at all, since `run_app_start` never asks
+    // niri anything.
+    let direct = Script::default();
+    run(run_app_start(&direct, "chat", 1, &alacritty)).expect("starts");
+
+    assert_eq!(
+        direct.launches(),
+        vec![full.launches()[1].clone()],
+        "must use the same unit name a full Start gave this app"
+    );
+    assert_eq!(
+        direct.launch_argvs(),
+        vec![full.launch_argvs()[1].clone()],
+        "must use the same argv"
+    );
+    assert_eq!(
+        direct.launch_slices(),
+        vec![full.launch_slices()[1].clone()],
+        "must land in the same slice, so Stop still reaps it"
+    );
+    assert_eq!(
+        direct.launches().len(),
+        1,
+        "only the one app, not the whole stack: {:?}",
+        direct.calls()
+    );
+    // Sanity: the unit name really is `workspace_unit_name("chat", 1)`, not
+    // merely equal to whatever the full Start happened to produce.
+    assert_eq!(
+        direct.launches()[0],
+        systemd::workspace_unit_name("chat", 1)
+    );
+    assert_eq!(
+        direct.launch_slices()[0],
+        Some(systemd::workspace_slice_name("chat"))
     );
 }
 

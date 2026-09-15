@@ -821,4 +821,46 @@ mod tests {
         );
         assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("fresh"));
     }
+
+    // ── read_gpu_with_cache, the PUBLIC wrapper (#1297 review, second round) ─
+
+    /// The public wrapper hands ITS caller's cache to the composition — pinned
+    /// against the real sysfs arms because a `GpuCache::default()` at
+    /// `read_gpu_with_cache`'s own call site defeats the TTL in production while
+    /// every seam-level test above stays green (#1297 review, second round).
+    /// Reads the real `/sys/class/drm` and, only on a box with `nvidia-smi` on
+    /// PATH, forks it once — no display, no bus, so it stays in the default bucket.
+    #[test]
+    fn the_public_wrapper_threads_the_callers_cache_through() {
+        let now = Instant::now();
+        let seeded = GpuCache {
+            nvidia_available: Some(true),
+            intel_rc6_prev: None,
+            nvidia_last: Some((fake_reading("cached"), now)),
+        };
+        let (state, cache) = read_gpu_with_cache(seeded);
+        // Every arm preserves an existing `Some(true)`: AMD/Intel via `.or(...)`,
+        // the Nvidia arm via a TTL hit. A default cache yields `Some(false)` on an
+        // AMD box, an Intel box, and a box with no GPU and no nvidia-smi (CI).
+        assert_eq!(
+            cache.nvidia_available,
+            Some(true),
+            "the wrapper dropped the caller's availability memo"
+        );
+        // Every arm carries the reading through: AMD/Intel copy it, a hit keeps it.
+        assert!(
+            cache.nvidia_last.is_some(),
+            "the wrapper dropped the caller's last reading"
+        );
+        // On a box where nvidia-smi actually answers, a hit inside the TTL must
+        // serve the seeded reading, not a fresh fork's.
+        if let Some(s) = &state
+            && s.vendor == GpuVendor::Nvidia
+        {
+            assert_eq!(
+                s.name, "cached",
+                "the wrapper forked instead of serving the cached reading"
+            );
+        }
+    }
 }

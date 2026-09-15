@@ -658,6 +658,22 @@ label.ts-gpu-temp {
 .ts-agents-card {
     padding: 0.462em 0.769em 0.615em 0.769em;
 }
+
+/* The Claude usage card (#1280 P1), on the `.ts-agents-card` precedent right
+ * above: `.ts-plugin-card` deliberately ships no padding ("the plugin owns
+ * its own inner spacing", #319) and the node vocabulary cannot express
+ * padding, so without this the title/bars/captions sit flush against the
+ * sidebar card's rounded edge. In the drawer, `.ts-plugin-panel` supplies no
+ * card surface of its own (it is deliberately transparent, see above), so the
+ * second rule paints one here — the inset alone would otherwise be a
+ * borderless list, not a card. */
+.ts-usage-card {
+    padding: 0.462em 0.769em 0.615em 0.769em;
+}
+.ts-plugin-panel .ts-usage-card {
+    background: alpha(currentColor, 0.06);
+    border-radius: 0.769em;
+}
 /* The card's title, in the same all-caps caption treatment `TASKS` and
  * `UPCOMING` use — the label carries the margins, the row carries the gap to
  * the list, exactly as `.ts-sidebar-tasks-header` does. */

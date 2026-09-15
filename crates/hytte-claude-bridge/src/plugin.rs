@@ -108,6 +108,28 @@
 //! [`severity_class`], which fall through to "normal". A bucket Anthropic adds
 //! renders on the next poll with no code change, and one they rename does not
 //! blank the chip.
+//!
+//! # A sidebar mount gets a card instead (#1280 P1)
+//!
+//! Annika's #1280 triage put a second surface on the roadmap — one card per
+//! Claude subscription — and settled the scope for this slice on the issue
+//! (2026-09-15): "just wrap it in a card so it looks better … we'll get back
+//! to the multisubscription stuff again later". So this adds no second
+//! socket and no config file, only a mount-family switch —
+//! `hytte-plugin-stats`'s `Mount::is_bar` split, applied here the same way. A
+//! launch whose *effective* mount (`HYTTE_PLUGIN_MOUNT`, resolved a second
+//! time here — see [`effective_mount`] — because the SDK deliberately never
+//! tells a plugin its own override) is one of the three bar regions gets
+//! exactly what shipped before: the chip and its drawer panel, unchanged. Any
+//! of the six sidebar mounts instead gets [`card`]: the same title-plus-rows
+//! [`usage_card`] container the drawer panel now uses too, so "wrap it in a
+//! card" improves both surfaces from one function. The title is
+//! [`DEFAULT_TITLE`] unless `CLAUDE_BRIDGE_LABEL` is set to something
+//! non-blank — free, since the process already has its own environment, and
+//! deliberately not a second `/api/oauth/profile` request (the triage's P2,
+//! still open). Neither switch is live-reloadable; both are read once at
+//! [`Plugin::init`], the same "a deployment decision, not a config value"
+//! argument `hytte-plugin-stats` makes for its own family split.
 
 use std::time::Duration;
 
@@ -131,8 +153,33 @@ const ROOT_ID: &str = "claude-bridge-root";
 /// chip was deliberately inert.
 const CHIP_BTN: &str = "claude-bridge-chip";
 
-/// The drawer panel's root.
+/// The drawer panel's root — the tree's own top-level id, unchanged by the
+/// #1280 P1 card wrapper (see [`usage_card`]): the wrapper's one new node is
+/// nested *inside* this id, not above it.
 const PANEL_ROOT_ID: &str = "claude-bridge-panel";
+
+/// The list [`usage_card`] nests inside [`PANEL_ROOT_ID`] — the node the
+/// wrapper adds. Everything that rendered directly under `PANEL_ROOT_ID`
+/// before #1280 P1 (the header, every row, the footer) renders here instead,
+/// with every one of *its own* ids untouched.
+const PANEL_LIST_ID: &str = "claude-bridge-panel-list";
+
+/// The sidebar card's root (#1280 P1) — the mount-family sibling of
+/// [`PANEL_ROOT_ID`], shown instead of the panel on a sidebar mount and never
+/// alongside it (see [`Plugin::view`]).
+const CARD_ROOT_ID: &str = "claude-bridge-card";
+
+/// The list [`usage_card`] nests inside [`CARD_ROOT_ID`] — [`PANEL_LIST_ID`]'s
+/// sidebar sibling.
+const CARD_LIST_ID: &str = "claude-bridge-card-list";
+
+/// The card class both surfaces carry (#1280 P1) — Annika's "just wrap it in a
+/// card so it looks better": the drawer panel's own surface (`.ts-drawer-content`)
+/// otherwise ships no card treatment of its own, and the sidebar host wrapper
+/// (`.ts-plugin-card`, #319) deliberately ships no padding, following the
+/// `ts-agents-card`/stats naming a plugin's own card class already uses for
+/// the same reason.
+const CARD_CLASS: &str = "ts-usage-card";
 
 /// The Claude glyph the chip leads with (#957): the eight-spoked asterisk `✳`
 /// the `claude` CLI prompts with — a generic dingbat, deliberately **not**
@@ -146,6 +193,100 @@ const PANEL_ROOT_ID: &str = "claude-bridge-panel";
 /// here and loses nothing else: the health glyph, mode and counts are
 /// independent nodes.
 const CLAUDE_ICON: &str = "claude-symbolic";
+
+/// Where the manifest mounts when the launch says nothing — today's only
+/// deployed shape, and unaffected by #1280 P1: nothing changes here unless an
+/// operator sets [`MOUNT_ENV`] to a sidebar mount.
+const DEFAULT_MOUNT: Mount = Mount::BarRight;
+
+/// The launch-time placement variable, as `docs/plugin-env.md` documents it and
+/// `hytte_plugin::run` reads it.
+///
+/// `hytte_plugin::run` already resolves this for the host-facing `Register`
+/// frame and deliberately never tells the plugin (see `hytte-plugin-stats`'s
+/// `mount` module for the full "why read it twice" rationale) — so a plugin
+/// that needs its own placement-dependent decision, here chip-vs-card, reads
+/// its own copy. The variable is spelled as a literal rather than imported:
+/// the SDK's own constant is private, and this is a second, independent
+/// reader of the same documented contract.
+const MOUNT_ENV: &str = "HYTTE_PLUGIN_MOUNT";
+
+/// The env var that lets an operator label the usage surfaces' title without
+/// a second `/api/oauth/profile` request — the triage's P2, deliberately
+/// deferred (Annika, #1280, 2026-09-15: "just wrap it in a card so it looks
+/// better … we'll get back to the multisubscription stuff again later").
+const LABEL_ENV: &str = "CLAUDE_BRIDGE_LABEL";
+
+/// The title both the sidebar card and the drawer panel head with, absent an
+/// operator-set [`LABEL_ENV`].
+const DEFAULT_TITLE: &str = "Claude usage";
+
+/// The mount this instance actually registered on: the launch override when
+/// one is set and parses, else `manifest_mount`.
+///
+/// `lookup` is injected rather than read from the process because
+/// `unsafe_code = "forbid"` rules out `std::env::set_var` (an `unsafe fn` in
+/// edition 2024), so a test that drove the real environment could not exist
+/// at all — the same reason `hytte-plugin-stats`'s `mount::effective` takes
+/// one, and the same shape.
+///
+/// Reading it twice is safe in the only way that matters: this is **strictly
+/// less permissive than the SDK's parser can be**, because the SDK has
+/// already refused the launch outright for any value it could not parse. By
+/// the time anything here runs, `HYTTE_PLUGIN_MOUNT` is either unset or a
+/// valid wire mount name — the fallback-to-`manifest_mount` arm below is
+/// unreachable in a live process and exists so this function is total and
+/// testable (`hytte-plugin-stats::mount`'s own doc makes the same claim for
+/// the identical shape; #1315's review found it survived only in this
+/// crate's test docstrings, not on the function itself).
+fn effective_mount(manifest_mount: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> Mount {
+    lookup(MOUNT_ENV)
+        .as_deref()
+        .map(str::trim)
+        .and_then(Mount::from_wire_name)
+        .unwrap_or(manifest_mount)
+}
+
+/// The title an operator asked for: [`LABEL_ENV`], trimmed, when it is set and
+/// non-blank, else [`DEFAULT_TITLE`]. Pure, for the same testability reason
+/// [`effective_mount`] takes an injected `lookup`.
+fn card_title(lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    lookup(LABEL_ENV)
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| DEFAULT_TITLE.to_owned(), str::to_owned)
+}
+
+/// The real process environment — the one place this module reads one, so
+/// "what does this launch say?" has a single answer and every pure function
+/// above takes it as a parameter.
+fn env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// Both of [`Plugin::init`]'s launch-dependent fields, `(is_bar, title)`, in
+/// one function [`Plugin::init`] is the only caller of (#1315 review, MED 3).
+///
+/// `effective_mount` and `card_title` are well covered on their own — the
+/// gap this closes is the two lines that actually *thread* them into the
+/// model, which the review found unpinned: hardcoding either field in
+/// `init` (`is_bar: true`, or `title: DEFAULT_TITLE.to_owned()`) left every
+/// test green, because nothing exercised `init`'s own composition rather
+/// than the pure halves it calls. Pulling that composition out here, with
+/// `init` doing nothing but destructuring the result, means a test against
+/// *this* function is a test against `init` — there is no second place for
+/// the wiring to live that a test could miss (`hytte-plugin-stats::plugin`'s
+/// `settings_from` is the same shape, for the same reason).
+fn resolve_settings(
+    manifest_mount: Mount,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (bool, String) {
+    (
+        effective_mount(manifest_mount, lookup).is_bar(),
+        card_title(lookup),
+    )
+}
 
 /// How often the chip re-reads [`crate::status`] and [`crate::usage`]'s board.
 ///
@@ -189,6 +330,17 @@ struct BridgeChip {
     /// to read skips the lock and the clone — 59 ticks in 60, given a five-minute
     /// poll and a five-second tick.
     usage_version: u64,
+    /// The mount family (#1280 P1): `true` on a bar mount, where
+    /// [`Plugin::view`] paints the chip and its panel; `false` on a sidebar
+    /// mount, where it paints the card ([`card`]) alone. Resolved once from
+    /// the launch's [`effective_mount`] — a deployment decision, not
+    /// something re-read every tick, exactly as `hytte-plugin-stats`'s
+    /// `Family::of` is (and on the same `Mount::is_bar` split the host itself
+    /// uses).
+    is_bar: bool,
+    /// The title both surfaces head with — [`card_title`]'s resolved value,
+    /// read once for the same reason `is_bar` is.
+    title: String,
 }
 
 impl BridgeChip {
@@ -217,21 +369,31 @@ impl Plugin for BridgeChip {
     /// usage poll is `main`'s, on the HTTP runtime, not a plugin command.
     type Cmd = std::convert::Infallible;
 
-    /// Mounts [`Mount::BarRight`] as a chip. Subscribes to nothing (the chip is
-    /// driven by its own tick off local boards, not by host state) and requests
-    /// exactly one capability — [`Capability::OpenPage`], for its own drawer
-    /// panel (#1236).
+    /// Mounts [`DEFAULT_MOUNT`] — unchanged from the plugin's first shape, and
+    /// still the id/mount a launch that sets no `HYTTE_PLUGIN_MOUNT` gets.
+    /// [`Plugin::view`] is what actually decides chip-vs-card, off the launch's
+    /// *effective* mount (#1280 P1) rather than this one. Subscribes to
+    /// nothing (both surfaces are driven by their own tick off local boards,
+    /// not by host state) and requests exactly one capability —
+    /// [`Capability::OpenPage`], for the drawer panel (#1236) a bar-family
+    /// instance publishes; a sidebar-family instance declares it too (a
+    /// manifest is per binary, not per instance, following
+    /// `hytte-plugin-stats`'s precedent) and never uses it — its card is not a
+    /// click target.
     fn manifest() -> Manifest {
-        let mut manifest = Manifest::new(PLUGIN_ID, Mount::BarRight);
+        let mut manifest = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT);
         manifest.capabilities = vec![Capability::OpenPage];
         manifest
     }
 
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &env_lookup);
         Self {
             status: status::snapshot(),
             usage: usage::latest(),
             usage_version: usage::version(),
+            is_bar,
+            title,
         }
     }
 
@@ -254,10 +416,24 @@ impl Plugin for BridgeChip {
         Vec::new()
     }
 
+    /// The bar family renders the chip **and** publishes the drawer panel a
+    /// click opens; the sidebar family renders #1280 P1's card and publishes
+    /// no panel — a card nothing can click is not a surface the drawer would
+    /// ever show (`hytte-plugin-stats`'s `Stats::view` is the same split, for
+    /// the same reason).
     fn view(&self) -> View {
         let now = usage::now_unix();
         let report = self.usage.as_ref();
-        View::new(chip(&self.status, report, now)).panel(panel(&self.status, report, now))
+        if self.is_bar {
+            View::new(chip(&self.status, report, now)).panel(panel(
+                &self.title,
+                &self.status,
+                report,
+                now,
+            ))
+        } else {
+            View::new(card(&self.title, &self.status, report, now))
+        }
     }
 }
 
@@ -526,6 +702,52 @@ fn label(text: &str, classes: &[&str]) -> Node {
     }
 }
 
+/// How many characters the title row shows before ellipsizing (#1315 review,
+/// MED 2).
+///
+/// `CLAUDE_BRIDGE_LABEL` is operator-set and unbounded — before this it was a
+/// bare `Node::Label`, whose natural width is its whole string with no cap at
+/// all, and `Node::Label` cannot wrap or ellipsize on the wire. Measured under
+/// `xvfb-run` in the real containers (`.ts-plugin-card` inside `AdwClamp`'s
+/// 320 px `maximum_size`, `.ts-plugin-panel` > `.ts-plugin-canvas` for the
+/// drawer), with the #1315 MED-1 `.ts-usage-card` padding already applied: an
+/// **uncapped** title's minimum request equals its full string width (a
+/// `GtkLabel` never shrinks below its own text), so a title past the design
+/// width is the exact `AdwClamp` "a card whose own minimum exceeds the cap is
+/// still allocated at its minimum" shape (`trollshell/src/overlays/sidebar.rs`)
+/// — a 31-character label alone measured a 364 px minimum against the 320 px
+/// design width, and the effect is **independent of length past the cap**: a
+/// 300-character label measured the same 364 px minimum uncapped, once
+/// ellipsized. An ellipsizing `Node::Text`'s minimum, by contrast, measured a
+/// constant ~162 px at every `max_width_chars` tried (14 through 24) —
+/// ellipsis is what makes the minimum small, not the cap value — so the
+/// overflow mode this constant exists to prevent cannot recur at any N; **20**
+/// is chosen for headroom rather than survival: it is the largest of the
+/// measured candidates whose *natural* width still measured comfortably under
+/// the 320 px design width (308 px, 12 px of margin) rather than saturating
+/// against `AdwClamp`'s own cap (320 px, from N=22 up) — and it matches
+/// `hytte-plugin-agents`'s `NAME_CHARS`, the same "one short sidebar-row label
+/// beside a spacer" shape.
+const TITLE_CHARS: i32 = 20;
+
+/// The title row's own label: ellipsizing and capped at [`TITLE_CHARS`], with
+/// its own full text as the hover (#1302's ask, #1315 review MED 2) — the
+/// `hytte-plugin-agents::clipped` shape, with the tooltip set **explicitly**
+/// rather than left to the host's ellipsize-with-no-tooltip default, so a
+/// falsification (dropping the cap, or dropping the tooltip) reds in this
+/// crate's own tests rather than depending on host behaviour this crate does
+/// not exercise.
+fn title_label(text: &str) -> Node {
+    Node::Text {
+        id: None,
+        text: text.to_owned(),
+        max_width_chars: Some(TITLE_CHARS),
+        ellipsize: true,
+        tooltip: Some(text.to_owned()),
+        classes: vec!["heading".to_owned()],
+    }
+}
+
 /// A symbolic icon node.
 fn icon(name: &str, classes: &[&str]) -> Node {
     Node::Icon {
@@ -614,9 +836,11 @@ fn chip(status: &Status, report: Option<&Report>, now: i64) -> Node {
     }
 }
 
-/// The drawer panel's header: the title, and either how fresh the numbers are or
-/// why there aren't any.
-fn header(report: Option<&Report>, now: i64) -> Node {
+/// The usage surface's header: `title`, and either how fresh the numbers are
+/// or why there aren't any. Shared by [`panel`] and [`card`] (#1280 P1) — the
+/// one place either surface's title is actually drawn, so the two can never
+/// print different words for the same resolved title.
+fn header(title: &str, report: Option<&Report>, now: i64) -> Node {
     let freshness = match report {
         None => "not fetched yet".to_owned(),
         // The numbers' own clock, not the attempt's — on a failure behind
@@ -630,10 +854,7 @@ fn header(report: Option<&Report>, now: i64) -> Node {
             usage::humanise_since(now, report.numbers_at().unwrap_or(report.at))
         ),
     };
-    titled_row(
-        label("Claude usage", &["heading"]),
-        label(&freshness, &["dim-label"]),
-    )
+    titled_row(title_label(title), label(&freshness, &["dim-label"]))
 }
 
 /// One limit, as a drawer row: title + percent, a full-width bar, and a caption
@@ -751,8 +972,11 @@ fn failure_footer(status: &Status, report: &Report, now: i64) -> Option<Node> {
     Some(label(&sentence, &["warning"]))
 }
 
-/// The drawer page: the header, then **every** row the server sent, then the
-/// extra-usage allowance when it is on.
+/// **Every** row the server sent, then the extra-usage allowance when it is
+/// on — the state-dependent body [`panel`] and [`card`] both draw from one
+/// report, pulled out of the drawer panel's original, single implementation
+/// verbatim by #1280 P1 so the sidebar card cannot draw a different list
+/// from the same numbers.
 ///
 /// States other than a list, each of which says what it knows rather than
 /// showing an empty page: nothing polled yet; there are no numbers to show at
@@ -767,18 +991,18 @@ fn failure_footer(status: &Status, report: &Report, now: i64) -> Option<Node> {
 /// rather than replacing them.
 ///
 /// The staleness gate mirrors [`chip`]'s — `report.usage().filter(|_|
-/// !report.is_stale(now))` — so the panel and the chip one click above it can
-/// never disagree about whether there is anything current to show. Before
-/// #1285's review this function drew straight off `report.usage()` with no
-/// cutoff at all, which was tolerable while the panel only ever rendered rows
-/// on [`Outcome::Ok`], where the age it displayed *was* the numbers' age —
-/// but #1283 is what put a failure path through here too, and a sustained 429
-/// at [`usage::MAX_BACKOFF`] is the ordinary case under it, not an edge:
-/// without the gate this painted every bar at an hours-old value under an
-/// "updated just now" header, one click below a chip that had already,
-/// correctly, dropped its own meters.
-fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
-    let mut children = vec![header(report, now)];
+/// !report.is_stale(now))` — so neither surface can ever disagree with the
+/// chip about whether there is anything current to show. Before #1285's
+/// review this function drew straight off `report.usage()` with no cutoff at
+/// all, which was tolerable while the panel only ever rendered rows on
+/// [`Outcome::Ok`], where the age it displayed *was* the numbers' age — but
+/// #1283 is what put a failure path through here too, and a sustained 429 at
+/// [`usage::MAX_BACKOFF`] is the ordinary case under it, not an edge: without
+/// the gate this painted every bar at an hours-old value under an "updated
+/// just now" header, one click below a chip that had already, correctly,
+/// dropped its own meters.
+fn usage_rows(status: &Status, report: Option<&Report>, now: i64) -> Vec<Node> {
+    let mut children = Vec::new();
     match report {
         None => children.push(label("fetching usage…", &["dim-label"])),
         Some(report) => {
@@ -810,15 +1034,67 @@ fn panel(status: &Status, report: Option<&Report>, now: i64) -> Node {
             }
         }
     }
-    Node::Box {
-        id: Some(PANEL_ROOT_ID.to_owned()),
+    children
+}
+
+/// The `ts-usage-card` container Annika asked for on #1280 P1 ("just wrap it
+/// in a card so it looks better") — one function, one shape, two callers
+/// ([`panel`] and [`card`]), which differ only in which ids they carry and
+/// which title they show, never in what is inside.
+///
+/// `root_id` becomes the returned tree's own top-level id — [`PANEL_ROOT_ID`]
+/// for the drawer panel, unchanged from before this wrapper existed, so every
+/// existing reader of "the panel's root" keeps working. `list_id` names the
+/// one node this wrapper adds: the header-plus-rows list, nested one level
+/// inside `root_id`. Nothing that rendered directly under a surface's root
+/// before #1280 P1 changes its own id — the header and every row/bar id
+/// [`usage_rows`] builds are exactly what they were; they are simply nested
+/// one box deeper now, which the tree-walking test helpers (`texts`, `bars`,
+/// `tooltips`) already recurse through.
+fn usage_card(
+    root_id: &str,
+    list_id: &str,
+    title: &str,
+    status: &Status,
+    report: Option<&Report>,
+    now: i64,
+) -> Node {
+    let mut children = vec![header(title, report, now)];
+    children.extend(usage_rows(status, report, now));
+    let list = Node::Box {
+        id: Some(list_id.to_owned()),
         dir: Dir::Vertical,
         spacing: 12,
         scroll: false,
         classes: Vec::new(),
         children,
         tooltip: None,
+    };
+    Node::Box {
+        id: Some(root_id.to_owned()),
+        dir: Dir::Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: vec![CARD_CLASS.to_owned()],
+        children: vec![list],
+        tooltip: None,
     }
+}
+
+/// The drawer page (#1236), now [`usage_card`]-wrapped (#1280 P1) so the
+/// panel reads as a card instead of a bare list. Opened by
+/// `Effect::OpenPage(Page::PluginSelf)` on a bar-family instance's chip
+/// click; a sidebar-family instance never publishes this (see [`Plugin::view`]).
+fn panel(title: &str, status: &Status, report: Option<&Report>, now: i64) -> Node {
+    usage_card(PANEL_ROOT_ID, PANEL_LIST_ID, title, status, report, now)
+}
+
+/// The sidebar card (#1280 P1): every row [`panel`] would show, in the same
+/// [`usage_card`] container, under its own title row and root id. Rendered
+/// **instead of** the chip on a sidebar-family mount — never alongside it,
+/// and never a click target (see [`Plugin::view`], [`Plugin::manifest`]).
+fn card(title: &str, status: &Status, report: Option<&Report>, now: i64) -> Node {
+    usage_card(CARD_ROOT_ID, CARD_LIST_ID, title, status, report, now)
 }
 
 // ── Entry points used by `main` ──────────────────────────────────────────────
@@ -840,9 +1116,11 @@ pub fn run() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeChip, CHIP_BTN, CLAUDE_ICON, MAX_CHIP_METERS, PANEL_ROOT_ID, Tick, capped, chip,
-        chip_limits, counts_label, health_icon, meter_tooltip, mode_label, mode_name, panel,
-        severity_class, severity_role, tooltip,
+        BridgeChip, CARD_CLASS, CARD_LIST_ID, CARD_ROOT_ID, CHIP_BTN, CLAUDE_ICON, DEFAULT_MOUNT,
+        DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, MOUNT_ENV, PANEL_LIST_ID, PANEL_ROOT_ID,
+        TITLE_CHARS, Tick, capped, card, card_title, chip, chip_limits, counts_label,
+        effective_mount, health_icon, meter_tooltip, mode_label, mode_name, panel,
+        resolve_settings, severity_class, severity_role, tooltip,
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
@@ -953,11 +1231,35 @@ mod tests {
     /// chip is small enough that its full text is the assertion.
     fn texts(node: &Node) -> Vec<String> {
         match node {
-            Node::Label { text, .. } => vec![text.clone()],
+            // #1315 review MED 2: the title row's label is now an ellipsizing
+            // `Node::Text` (see `title_label`), not a `Node::Label` — this
+            // helper has to see both, or every text-content assertion in this
+            // module would silently stop seeing the title at all.
+            Node::Label { text, .. } | Node::Text { text, .. } => vec![text.clone()],
             Node::Icon { name, .. } => vec![name.clone()],
             Node::Button { child, .. } => texts(child),
             Node::Box { children, .. } | Node::Row { children, .. } => {
                 children.iter().flat_map(texts).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every `Node::Text` in a tree, `(text, max_width_chars, ellipsize,
+    /// tooltip)` — the #1315 review MED 2 fields, since `texts()` alone
+    /// collapses a `Text` down to its string and loses them.
+    fn ellipsized_texts(node: &Node) -> Vec<(String, Option<i32>, bool, Option<String>)> {
+        match node {
+            Node::Text {
+                text,
+                max_width_chars,
+                ellipsize,
+                tooltip,
+                ..
+            } => vec![(text.clone(), *max_width_chars, *ellipsize, tooltip.clone())],
+            Node::Button { child, .. } => ellipsized_texts(child),
+            Node::Box { children, .. } | Node::Row { children, .. } => {
+                children.iter().flat_map(ellipsized_texts).collect()
             }
             _ => Vec::new(),
         }
@@ -995,8 +1297,14 @@ mod tests {
 
     /// Every tooltip in a tree, in render order.
     fn tooltips(node: &Node) -> Vec<String> {
+        // `Node::Text`'s own tooltip is `title_label`'s hover (#1315 review
+        // MED 2) — the one leaf tooltip this crate ever sets deliberately
+        // (every other label is `tooltip: None` on purpose, since the
+        // whole-pill hover lives on the chip's root box; see `label`'s doc).
         let own = match node {
-            Node::Box { tooltip, .. } | Node::Row { tooltip, .. } => tooltip.clone(),
+            Node::Box { tooltip, .. } | Node::Row { tooltip, .. } | Node::Text { tooltip, .. } => {
+                tooltip.clone()
+            }
             _ => None,
         };
         let children = match node {
@@ -1061,6 +1369,8 @@ mod tests {
             status: status(Mode::Subscription, false, 0, 0, Last::None),
             usage: Some(captured_report()),
             usage_version: 0,
+            is_bar: true,
+            title: DEFAULT_TITLE.to_owned(),
         };
         assert_eq!(
             model.update(Input::event(CHIP_BTN, EventKind::Click)),
@@ -1094,6 +1404,8 @@ mod tests {
                 status: status(Mode::Subscription, false, 0, 0, Last::None),
                 usage,
                 usage_version: 0,
+                is_bar: true,
+                title: DEFAULT_TITLE.to_owned(),
             };
             let view = model.view();
             assert!(view.panel.is_some());
@@ -1104,6 +1416,8 @@ mod tests {
             status: status(Mode::Subscription, false, 1, 0, Last::Ok),
             usage: Some(fresh_report()),
             usage_version: 0,
+            is_bar: true,
+            title: DEFAULT_TITLE.to_owned(),
         };
         let hover = root_tooltip(&model.view().tree).expect("a hover");
         assert!(
@@ -1111,6 +1425,504 @@ mod tests {
             "a freshly-anchored report must not render through the staleness \
              path: {hover:?}"
         );
+    }
+
+    // ── #1280 P1: the mount family (bar chip vs. sidebar card) ───────────────
+
+    /// **Golden — a bar mount's view is exactly the chip and its panel,
+    /// unmoved by the #1280 P1 mount-family switch.** `chip()`/`panel()`'s own
+    /// bodies are untouched by this change (item 1's "unchanged
+    /// byte-for-byte"); this test proves `Plugin::view` still reaches them
+    /// on a bar mount.
+    ///
+    /// Falsify by inverting the branches in `Plugin::view` (swap the
+    /// `if self.is_bar { .. } else { .. }` arms): `view.tree` becomes the
+    /// card's `Node::Box` instead of the chip's `Node::Button`, and the first
+    /// `assert_eq!` reds.
+    #[test]
+    fn a_bar_mount_view_is_exactly_the_chip_and_its_panel() {
+        let report = fresh_report();
+        let model = BridgeChip {
+            status: status(Mode::Api, true, 12, 1, Last::Ok),
+            usage: Some(report.clone()),
+            usage_version: 0,
+            is_bar: true,
+            title: DEFAULT_TITLE.to_owned(),
+        };
+        let view = model.view();
+        let now = usage::now_unix();
+        assert_eq!(
+            view.tree,
+            chip(&model.status, Some(&report), now),
+            "a bar mount's tree is the chip, unmoved by the #1280 P1 switch"
+        );
+        assert_eq!(
+            view.panel,
+            Some(panel(DEFAULT_TITLE, &model.status, Some(&report), now)),
+            "…and it still publishes the drawer panel"
+        );
+    }
+
+    /// **Golden — a sidebar mount's view is exactly the card, and it
+    /// publishes no panel.** The mirror of the test above: falsify the same
+    /// way, from the other side — inverting `Plugin::view`'s branches makes
+    /// `view.tree` the chip's `Node::Button` instead of the card's
+    /// `Node::Box`, and `view.panel` stops being `None`.
+    #[test]
+    fn a_sidebar_mount_view_is_exactly_the_card_and_publishes_no_panel() {
+        let report = fresh_report();
+        let model = BridgeChip {
+            status: status(Mode::Api, true, 12, 1, Last::Ok),
+            usage: Some(report.clone()),
+            usage_version: 0,
+            is_bar: false,
+            title: "Home account".to_owned(),
+        };
+        let view = model.view();
+        let now = usage::now_unix();
+        assert_eq!(
+            view.tree,
+            card("Home account", &model.status, Some(&report), now),
+            "a sidebar mount's tree is the card"
+        );
+        assert!(
+            view.panel.is_none(),
+            "the card is not a click target — a sidebar instance publishes no panel"
+        );
+    }
+
+    /// [`effective_mount`] falls back to the manifest's own mount when
+    /// `HYTTE_PLUGIN_MOUNT` is unset — today's only deployed shape.
+    #[test]
+    fn effective_mount_falls_back_to_the_manifest_when_unset() {
+        assert_eq!(effective_mount(DEFAULT_MOUNT, &|_| None), DEFAULT_MOUNT);
+        assert_eq!(
+            effective_mount(Mount::SidebarRightTop, &|_| None),
+            Mount::SidebarRightTop
+        );
+    }
+
+    /// [`effective_mount`] reads [`MOUNT_ENV`] — the documented variable,
+    /// asserted as a literal rather than the constant so a rename of the
+    /// constant alone cannot pass here by agreeing with itself — and a
+    /// sidebar wire name switches the family away from a bar default.
+    #[test]
+    fn effective_mount_reads_the_documented_variable_and_switches_family() {
+        let lookup = |key: &str| {
+            assert_eq!(key, "HYTTE_PLUGIN_MOUNT");
+            Some("SidebarRightTop".to_owned())
+        };
+        assert_eq!(
+            effective_mount(DEFAULT_MOUNT, &lookup),
+            Mount::SidebarRightTop
+        );
+        assert!(!effective_mount(DEFAULT_MOUNT, &lookup).is_bar());
+        assert_eq!(MOUNT_ENV, "HYTTE_PLUGIN_MOUNT");
+    }
+
+    /// Surrounding whitespace is trimmed (matching the SDK's own parser), and
+    /// an unparseable value falls back to the manifest rather than refusing —
+    /// unlike the SDK's own `HYTTE_PLUGIN_MOUNT` parser, which refuses a
+    /// launch outright, [`effective_mount`] must stay total: it exists so
+    /// this plugin can make its *own* decision from a value the SDK has
+    /// already accepted or the process has none of.
+    #[test]
+    fn effective_mount_trims_whitespace_and_falls_back_on_garbage() {
+        assert_eq!(
+            effective_mount(DEFAULT_MOUNT, &|_| Some("  SidebarTop\t".to_owned())),
+            Mount::SidebarTop
+        );
+        for bad in ["", "   ", "barleft", "Bar-Left"] {
+            assert_eq!(
+                effective_mount(Mount::SidebarLead, &|_| Some(bad.to_owned())),
+                Mount::SidebarLead,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// [`card_title`] falls back to [`DEFAULT_TITLE`] when [`LABEL_ENV`] is
+    /// unset or blank — the free, no-second-request default the #1280 triage
+    /// settled on.
+    #[test]
+    fn card_title_falls_back_to_the_default_when_unset_or_blank() {
+        for value in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                card_title(&|_| value.map(str::to_owned)),
+                DEFAULT_TITLE,
+                "{value:?}"
+            );
+        }
+    }
+
+    /// [`card_title`] reads [`LABEL_ENV`] — the documented variable, again a
+    /// literal rather than the constant — and trims it.
+    #[test]
+    fn card_title_uses_the_labelled_env_var_when_set_and_trims_it() {
+        let lookup = |key: &str| {
+            assert_eq!(key, "CLAUDE_BRIDGE_LABEL");
+            Some("  Home account \t".to_owned())
+        };
+        assert_eq!(card_title(&lookup), "Home account");
+        assert_eq!(LABEL_ENV, "CLAUDE_BRIDGE_LABEL");
+    }
+
+    /// **#1315 review MED 3** — the two lines that thread the launch
+    /// environment into [`Plugin::init`]'s model are pinned here, not just
+    /// [`effective_mount`]/[`card_title`] in isolation. `init` calls nothing
+    /// but [`resolve_settings`] and destructures its result, so a test
+    /// against this function is a test against `init`'s *composition* of the
+    /// two pure halves.
+    ///
+    /// It is **not**, on its own, a test against `init` itself: this pins
+    /// `resolve_settings`, called directly with an injected `lookup` — a
+    /// second-round review found that hardcoding `init`'s own field
+    /// initializer (`is_bar: true,` in place of `is_bar,`, leaving this
+    /// function entirely unused) still leaves this test, and every other
+    /// test in the file, green. That gap is closed by
+    /// [`init_reaches_the_view_with_a_real_process_environment`] below,
+    /// which calls `<BridgeChip as Plugin>::init` itself in a real process
+    /// with the real environment set. Keeping both: this one is the fast,
+    /// in-process pin on the composition of the two resolvers; the re-exec
+    /// one is the slow, unfakeable pin on `init` actually using it.
+    ///
+    /// Falsify by hardcoding either return value inside `resolve_settings`:
+    ///
+    /// ```text
+    /// (true, card_title(lookup))                    // is_bar hardcoded
+    ///   -> the first assert (`!is_bar`) reds: the sidebar override never
+    ///      flips the family, so the card can never render on any mount.
+    /// (effective_mount(..).is_bar(), DEFAULT_TITLE.to_owned())  // title hardcoded
+    ///   -> the second assert (`title == "Home account"`) reds:
+    ///      `CLAUDE_BRIDGE_LABEL` is silently ignored.
+    /// ```
+    ///
+    /// Both arms are asserted **and** their opposite (the neutral, no-env
+    /// case still resolves to the manifest's own bar mount and
+    /// [`DEFAULT_TITLE`]), so this cannot pass by hardcoding either result
+    /// to what the first half of the test expects.
+    #[test]
+    fn resolve_settings_wires_the_mount_override_and_the_label_through_to_init() {
+        let overridden = |key: &str| match key {
+            "HYTTE_PLUGIN_MOUNT" => Some("SidebarRightTop".to_owned()),
+            "CLAUDE_BRIDGE_LABEL" => Some("Home account".to_owned()),
+            _ => None,
+        };
+        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &overridden);
+        assert!(!is_bar, "a sidebar override must flip the family off bar");
+        assert_eq!(title, "Home account");
+
+        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &|_| None);
+        assert!(is_bar, "no override keeps the manifest's own bar mount");
+        assert_eq!(title, DEFAULT_TITLE);
+    }
+
+    /// Set (to any value) only on the re-exec'd child that actually runs
+    /// [`init_reaches_the_view_with_a_real_process_environment_inner`] — the
+    /// same marker shape as `hytte-plugin::runtime`'s `MOUNT_ENV_CHILD`
+    /// (`crates/hytte-plugin/src/runtime.rs:~4208`), and for the same
+    /// reason: an ordinary `cargo test` run discovers the inner test like
+    /// any other and must not try to run its scenario with no launch
+    /// environment set.
+    const INIT_ENV_CHILD: &str = "HYTTE_CLAUDE_BRIDGE_INIT_TEST_CHILD";
+
+    /// Printed by the child only once its scenario has run to completion and
+    /// passed, so the parent can tell "the scenario passed" from "the
+    /// `--exact` filter matched no test and libtest still reports `0
+    /// passed`, exit 0" — the failure mode a renamed inner test produces.
+    const INIT_ENV_CHILD_OK: &str = "init-env-child-reached-the-end";
+
+    /// **`Plugin::init`'s own wiring, in a real process — not just
+    /// `resolve_settings` in isolation** (#1315 review MED 3, second round).
+    ///
+    /// The gap this closes: `init`'s body is `let (is_bar, title) =
+    /// resolve_settings(DEFAULT_MOUNT, &env_lookup); Self { …, is_bar, title
+    /// }`. Hardcoding the field initializer — `is_bar: true,` in place of
+    /// the shorthand `is_bar,` — makes `resolve_settings` dead code from
+    /// `init`'s point of view, and nothing above catches that: every test on
+    /// this page calls `resolve_settings` (or the pure resolvers under it)
+    /// directly, never `<BridgeChip as Plugin>::init` itself. And
+    /// `std::env::set_var` is `unsafe` in edition 2024 — this workspace
+    /// forbids `unsafe_code` outright — so no in-process test can set
+    /// `HYTTE_PLUGIN_MOUNT`/`CLAUDE_BRIDGE_LABEL` for itself to drive a real
+    /// `init` call. Same constraint `hytte-plugin::runtime`'s
+    /// `the_mount_env_var_reaches_the_register_frame`
+    /// (`crates/hytte-plugin/src/runtime.rs:~4234`) hit, and the same fix:
+    /// re-exec the test binary (`std::env::current_exe`), filtered to
+    /// exactly one inner test, with the variables set on the **child** via
+    /// the safe `Command::env` builder.
+    ///
+    /// Two children, both real processes running real `init()` + `view()`:
+    /// one with both variables set, asserting the card under that title and
+    /// no panel; one with neither set (`env_remove`, not merely "not set by
+    /// this test" — a child inherits the parent's environment by default),
+    /// asserting the unchanged chip and its panel under [`DEFAULT_TITLE`].
+    ///
+    /// **Why the override child alone catches both mutations named above,
+    /// and the neutral child is not redundant with it:** a hardcoded
+    /// `is_bar: true,` passes the neutral child (which wants `is_bar` true
+    /// anyway, since `DEFAULT_MOUNT` is a bar mount) but fails the override
+    /// child, which needs `false`. A hardcoded `title:
+    /// DEFAULT_TITLE.to_owned(),` passes the neutral child (which wants
+    /// exactly that title) but fails the override child's title assertion.
+    /// The neutral child is kept anyway because it is the one place this
+    /// crate proves the *shipped default* — today's only deployed shape —
+    /// survives `init` unmolested, in the same real-process harness as the
+    /// override.
+    #[test]
+    fn init_reaches_the_view_with_a_real_process_environment() {
+        let inner = "plugin::tests::init_reaches_the_view_with_a_real_process_environment_inner";
+        let args = ["--exact", "--nocapture", "--test-threads=1", inner];
+        assert!(
+            args.contains(&"--exact"),
+            "the re-exec must stay filtered to exactly one inner test",
+        );
+        let exe = std::env::current_exe().expect("this test binary's own path");
+
+        let overridden = std::process::Command::new(&exe)
+            .args(args)
+            .env(INIT_ENV_CHILD, "1")
+            .env("HYTTE_PLUGIN_MOUNT", "SidebarRightTop")
+            .env("CLAUDE_BRIDGE_LABEL", "Home account")
+            .output()
+            .expect("re-exec this test binary with the override set");
+        assert_init_child_reached_the_end(&overridden, inner, "override");
+
+        let neutral = std::process::Command::new(&exe)
+            .args(args)
+            .env(INIT_ENV_CHILD, "1")
+            .env_remove("HYTTE_PLUGIN_MOUNT")
+            .env_remove("CLAUDE_BRIDGE_LABEL")
+            .output()
+            .expect("re-exec this test binary with neither variable set");
+        assert_init_child_reached_the_end(&neutral, inner, "neutral");
+    }
+
+    fn assert_init_child_reached_the_end(out: &std::process::Output, inner: &str, which: &str) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the {which} child scenario failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status,
+        );
+        assert!(
+            stdout.contains(INIT_ENV_CHILD_OK),
+            "the {which} child exited 0 without reaching the end of {inner} — a stale \
+             filter matches no test and libtest still reports success\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The scenario body of
+    /// [`init_reaches_the_view_with_a_real_process_environment`]. Does
+    /// nothing at all unless the parent's marker is set, so an ordinary
+    /// `cargo test` run — which discovers it like any other test — does not
+    /// try to run it with no launch environment set up for it.
+    #[test]
+    fn init_reaches_the_view_with_a_real_process_environment_inner() {
+        if std::env::var_os(INIT_ENV_CHILD).is_none() {
+            return;
+        }
+        let (tx, _rx) = hytte_plugin::cmd_channel();
+        let model = BridgeChip::init(tx);
+        let view = model.view();
+
+        match std::env::var("HYTTE_PLUGIN_MOUNT").ok().as_deref() {
+            Some("SidebarRightTop") => {
+                assert_eq!(
+                    std::env::var("CLAUDE_BRIDGE_LABEL").as_deref(),
+                    Ok("Home account"),
+                    "test setup: the override child sets both variables",
+                );
+                match &view.tree {
+                    Node::Box { id, classes, .. } => {
+                        assert_eq!(id.as_deref(), Some(CARD_ROOT_ID));
+                        assert_eq!(classes, &vec![CARD_CLASS.to_owned()]);
+                    }
+                    other => panic!("the override child's view must be the card, got {other:?}"),
+                }
+                assert!(
+                    view.panel.is_none(),
+                    "the card is not a click target — no panel"
+                );
+                let text = texts(&view.tree);
+                assert_eq!(
+                    text.first().map(String::as_str),
+                    Some("Home account"),
+                    "CLAUDE_BRIDGE_LABEL must reach the card's title: {text:?}"
+                );
+            }
+            None => {
+                match &view.tree {
+                    Node::Button { id, .. } => assert_eq!(id, CHIP_BTN),
+                    other => panic!("the neutral child's view must be the chip, got {other:?}"),
+                }
+                let panel = view
+                    .panel
+                    .as_ref()
+                    .expect("a bar mount still publishes a panel");
+                let panel_text = texts(panel);
+                assert_eq!(
+                    panel_text.first().map(String::as_str),
+                    Some(DEFAULT_TITLE),
+                    "no CLAUDE_BRIDGE_LABEL must leave the panel's default title: {panel_text:?}"
+                );
+            }
+            other => panic!("unexpected HYTTE_PLUGIN_MOUNT in the child: {other:?}"),
+        }
+        println!("{INIT_ENV_CHILD_OK}");
+    }
+
+    /// The sidebar card, for the captured three-row response: the title row,
+    /// every row [`panel`] would show, the `ts-usage-card` class and its own
+    /// root/list ids.
+    ///
+    /// Falsify by dropping [`CARD_CLASS`] from [`usage_card`]'s children: the
+    /// `classes` assertion below reds.
+    #[test]
+    fn the_card_carries_the_title_and_every_row_a_captured_report_has() {
+        let report = captured_report();
+        let tree = card("Home account", &default_status(), Some(&report), now());
+        let text = texts(&tree);
+        assert_eq!(text.first().map(String::as_str), Some("Home account"));
+        assert!(text.contains(&"Session (5 h)".to_owned()), "{text:?}");
+        assert!(text.contains(&"Weekly (all)".to_owned()), "{text:?}");
+        assert!(text.contains(&"Weekly (scoped)".to_owned()), "{text:?}");
+        assert_eq!(bars(&tree).len(), 3, "one bar per limit row");
+        match &tree {
+            Node::Box {
+                id,
+                classes,
+                children,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some(CARD_ROOT_ID));
+                assert_eq!(classes, &vec![CARD_CLASS.to_owned()]);
+                assert_eq!(children.len(), 1, "the wrapper's one new node: the list");
+                match &children[0] {
+                    Node::Box { id, .. } => assert_eq!(id.as_deref(), Some(CARD_LIST_ID)),
+                    other => panic!("the card's list must be a box, got {other:?}"),
+                }
+            }
+            other => panic!("the card root must be a box, got {other:?}"),
+        }
+    }
+
+    /// **#1315 review MED 2** — a 31-character `CLAUDE_BRIDGE_LABEL` (an
+    /// ordinary second-account name, e.g. `"Work subscription
+    /// (claude-work)"`) already exceeded the sidebar's 320 px design width
+    /// before this fix (measured: a plain, uncapped `Node::Label`'s minimum
+    /// request equals its whole string, so `AdwClamp` allocates the card at
+    /// that minimum rather than at its 320 px cap — see `TITLE_CHARS`'s own
+    /// doc for the measured numbers). The title row is now [`title_label`]:
+    /// capped and ellipsizing at [`TITLE_CHARS`], with the **full** string as
+    /// the hover — [`card`] and [`panel`] both route through it via
+    /// [`header`], so this is one assertion for both surfaces.
+    ///
+    /// The wire still carries the whole 300-character string — truncation to
+    /// the ellipsis is the host's rendering job, not this plugin's — but the
+    /// `max_width_chars`/`ellipsize` flags are what stop the overflow
+    /// regardless of how long the operator's string is: a 300-char label
+    /// measured the *same* ~162 px minimum under `xvfb-run` as a 31-char one
+    /// once ellipsized, where the *uncapped* `Node::Label` this replaces grew
+    /// its minimum with the string every time.
+    ///
+    /// Falsify by reverting [`title_label`] to `label(text, &["heading"])`:
+    /// `ellipsized_texts` finds nothing and the first assertion panics.
+    #[test]
+    fn a_300_char_label_is_capped_and_ellipsized_with_the_full_text_as_hover() {
+        let long = "x".repeat(300);
+        let report = captured_report();
+
+        for tree in [
+            card(&long, &default_status(), Some(&report), now()),
+            panel(&long, &default_status(), Some(&report), now()),
+        ] {
+            let titles = ellipsized_texts(&tree);
+            assert_eq!(
+                titles.len(),
+                1,
+                "exactly one ellipsizing node — the title row's label: {titles:?}"
+            );
+            let (text, max_width_chars, ellipsize, tooltip) = &titles[0];
+            assert_eq!(
+                text, &long,
+                "the wire carries the operator's whole string — the host ellipsizes it"
+            );
+            assert_eq!(*max_width_chars, Some(TITLE_CHARS));
+            assert!(*ellipsize, "without this flag a long cap still overflows");
+            assert_eq!(
+                tooltip.as_deref(),
+                Some(long.as_str()),
+                "the full label survives as the hover (#1302's ask)"
+            );
+        }
+    }
+
+    /// A failed poll with no last-known-good numbers still renders its
+    /// footer **inside the card**, exactly as it does inside the panel — same
+    /// [`usage_rows`], same [`failure_footer`].
+    #[test]
+    fn a_failed_report_still_renders_its_footer_inside_the_card() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let report = Report {
+            at: now() - 30,
+            outcome: Outcome::Failed(UsageError::Unauthorized),
+            last_ok: None,
+        };
+        let tree = card(DEFAULT_TITLE, &board, Some(&report), now());
+        let text = texts(&tree);
+        assert!(
+            text.contains(&"usage stale — run `claude` once to refresh the login".to_owned()),
+            "{text:?}"
+        );
+    }
+
+    /// A report past [`usage::STALE_AFTER`] renders the same "usage stale
+    /// since …" label and no bars inside the card that the panel already
+    /// carries for the same input.
+    #[test]
+    fn a_stale_report_renders_the_staleness_label_inside_the_card() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let ceiling = i64::try_from(usage::STALE_AFTER.as_secs()).expect("fits");
+        let stale = Report {
+            at: now() - ceiling - 1,
+            ..captured_report()
+        };
+        let tree = card(DEFAULT_TITLE, &board, Some(&stale), now());
+        let text = texts(&tree);
+        assert!(
+            text.iter().any(|t| t.starts_with("usage stale since")),
+            "{text:?}"
+        );
+        assert!(
+            bars(&tree).is_empty(),
+            "stale numbers render no bars in the card either"
+        );
+    }
+
+    /// **The panel wrapper is the same node shape as the card.** Both are
+    /// [`usage_card`], so the same report draws the same rows in both — the
+    /// bars in particular, whose ids [`usage_rows`] builds independently of
+    /// which surface called it.
+    ///
+    /// Falsify by having [`card`] call [`usage_rows`] with a different
+    /// argument than [`panel`] does (e.g. a report clamped to a different
+    /// `now`): the `bars` equality below reds.
+    #[test]
+    fn the_panel_and_the_card_draw_the_same_rows_from_the_same_report() {
+        let report = captured_report();
+        let board = default_status();
+        let panel_tree = panel(DEFAULT_TITLE, &board, Some(&report), now());
+        let card_tree = card(DEFAULT_TITLE, &board, Some(&report), now());
+        assert_eq!(
+            bars(&panel_tree),
+            bars(&card_tree),
+            "one function, usage_card, draws both surfaces' rows"
+        );
+        assert!(texts(&panel_tree).contains(&"Claude usage".to_owned()));
+        assert!(texts(&card_tree).contains(&"Claude usage".to_owned()));
     }
 
     // ── (e) The chip's meters ────────────────────────────────────────────────
@@ -1159,6 +1971,7 @@ mod tests {
             );
             assert_eq!(
                 bars(&panel(
+                    DEFAULT_TITLE,
                     &status(Mode::Subscription, false, 1, 0, Last::Ok),
                     Some(&report),
                     now()
@@ -1230,10 +2043,10 @@ mod tests {
              cannot collide"
         );
 
-        let rows = bars(&panel(&board, Some(&report), now()));
+        let rows = bars(&panel(DEFAULT_TITLE, &board, Some(&report), now()));
         assert_eq!(rows.len(), 3, "the inactive row is dimmed, not dropped");
         assert!(
-            texts(&panel(&board, Some(&report), now()))
+            texts(&panel(DEFAULT_TITLE, &board, Some(&report), now()))
                 .iter()
                 .any(|t| t.contains("not counting right now")),
             "and it says why it is greyed"
@@ -1472,7 +2285,7 @@ mod tests {
             "the hover still names the failure, on its own line"
         );
 
-        let panel_text = texts(&panel(&board, Some(&report), now()));
+        let panel_text = texts(&panel(DEFAULT_TITLE, &board, Some(&report), now()));
         assert!(
             panel_text.contains(&"Session (5 h)".to_owned()),
             "the panel also keeps the last-good rows: {panel_text:?}"
@@ -1503,7 +2316,7 @@ mod tests {
             outcome: Outcome::Failed(UsageError::RateLimited(now() + 600)),
             last_ok: Some((now() - 300, captured_usage())),
         };
-        let text = texts(&panel(&board, Some(&report), now()));
+        let text = texts(&panel(DEFAULT_TITLE, &board, Some(&report), now()));
         assert!(
             text.contains(&"Session (5 h)".to_owned()),
             "rows from last_ok: {text:?}"
@@ -1533,7 +2346,7 @@ mod tests {
             outcome: Outcome::Failed(UsageError::RateLimited(now() + 1_800)),
             last_ok: Some((now() - four_hours, captured_usage())),
         };
-        let tree = panel(&board, Some(&report), now());
+        let tree = panel(DEFAULT_TITLE, &board, Some(&report), now());
         let text = texts(&tree);
         assert!(
             !text.contains(&"Session (5 h)".to_owned()),
@@ -1587,11 +2400,11 @@ mod tests {
         };
         assert!(preems(&chip_state(&board, Some(&report))).is_empty());
         assert!(
-            bars(&panel(&board, Some(&report), now())).is_empty(),
+            bars(&panel(DEFAULT_TITLE, &board, Some(&report), now())).is_empty(),
             "no rows at all — nothing to fall back on"
         );
         assert!(
-            texts(&panel(&board, Some(&report), now()))
+            texts(&panel(DEFAULT_TITLE, &board, Some(&report), now()))
                 .contains(&"usage stale — run `claude` once to refresh the login".to_owned())
         );
     }
@@ -1662,7 +2475,7 @@ mod tests {
         let board = status(mode, keyed, 9, 0, Last::Ok);
 
         let hover = root_tooltip(&chip_state(&board, Some(&report))).expect("a hover");
-        let panel_text = texts(&panel(&board, Some(&report), now()));
+        let panel_text = texts(&panel(DEFAULT_TITLE, &board, Some(&report), now()));
 
         if expect_subscription_note {
             assert!(
@@ -1734,11 +2547,18 @@ mod tests {
     // ── The panel ────────────────────────────────────────────────────────────
 
     /// The panel is every row, in the server's order, with both halves of each
-    /// reset time and a header saying how fresh the numbers are.
+    /// reset time and a header saying how fresh the numbers are — now
+    /// [`usage_card`]-wrapped (#1280 P1): the returned tree's own id is still
+    /// [`PANEL_ROOT_ID`] (nothing that read "the panel's root" before this
+    /// change reads anything different), it now carries [`CARD_CLASS`], and
+    /// the one new node the wrapper adds nests everything this test already
+    /// checked — the header text, the rows, the bars — one level inside,
+    /// under [`PANEL_LIST_ID`]. Falsify by dropping `CARD_CLASS` from
+    /// [`usage_card`]'s children: the class assertion below reds.
     #[test]
     fn the_panel_lists_every_row_with_both_halves_of_its_reset() {
         let report = captured_report();
-        let tree = panel(&default_status(), Some(&report), now());
+        let tree = panel(DEFAULT_TITLE, &default_status(), Some(&report), now());
         let text = texts(&tree);
         assert_eq!(text.first().map(String::as_str), Some("Claude usage"));
         assert!(text.contains(&"updated 2 min ago".to_owned()), "{text:?}");
@@ -1770,7 +2590,24 @@ mod tests {
             ]
         );
         match &tree {
-            Node::Box { id, .. } => assert_eq!(id.as_deref(), Some(PANEL_ROOT_ID)),
+            Node::Box {
+                id,
+                classes,
+                children,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some(PANEL_ROOT_ID));
+                assert_eq!(
+                    classes,
+                    &vec![CARD_CLASS.to_owned()],
+                    "the drawer panel is wrapped in the same card class as the sidebar card"
+                );
+                assert_eq!(children.len(), 1, "the wrapper's one new node: the list");
+                match &children[0] {
+                    Node::Box { id, .. } => assert_eq!(id.as_deref(), Some(PANEL_LIST_ID)),
+                    other => panic!("the panel's list must be a box, got {other:?}"),
+                }
+            }
             other => panic!("the panel root is a box, got {other:?}"),
         }
     }
@@ -1780,7 +2617,7 @@ mod tests {
     #[test]
     fn the_panel_explains_itself_when_there_is_no_list() {
         let board = default_status();
-        let text = texts(&panel(&board, None, now()));
+        let text = texts(&panel(DEFAULT_TITLE, &board, None, now()));
         assert!(text.contains(&"not fetched yet".to_owned()), "{text:?}");
         assert!(text.contains(&"fetching usage…".to_owned()), "{text:?}");
 
@@ -1789,20 +2626,20 @@ mod tests {
             outcome: Outcome::Failed(UsageError::Unauthorized),
             last_ok: None,
         };
-        let text = texts(&panel(&board, Some(&failed), now()));
+        let text = texts(&panel(DEFAULT_TITLE, &board, Some(&failed), now()));
         assert!(text.contains(&"updated 1 min ago".to_owned()), "{text:?}");
         assert!(
             text.contains(&"usage stale — run `claude` once to refresh the login".to_owned()),
             "{text:?}"
         );
-        assert!(bars(&panel(&board, Some(&failed), now())).is_empty());
+        assert!(bars(&panel(DEFAULT_TITLE, &board, Some(&failed), now())).is_empty());
 
         let empty = Report {
             at: now(),
             outcome: Outcome::Ok(Usage::default()),
             last_ok: None,
         };
-        let text = texts(&panel(&board, Some(&empty), now()));
+        let text = texts(&panel(DEFAULT_TITLE, &board, Some(&empty), now()));
         assert!(
             text.contains(&"this account reported no limits".to_owned()),
             "{text:?}"
@@ -1816,7 +2653,8 @@ mod tests {
         let board = default_status();
         let off = captured_report();
         assert!(
-            !texts(&panel(&board, Some(&off), now())).contains(&"Extra usage".to_owned()),
+            !texts(&panel(DEFAULT_TITLE, &board, Some(&off), now()))
+                .contains(&"Extra usage".to_owned()),
             "a disabled allowance is not a row"
         );
 
@@ -1834,12 +2672,12 @@ mod tests {
             }),
             last_ok: None,
         };
-        let text = texts(&panel(&board, Some(&on), now()));
+        let text = texts(&panel(DEFAULT_TITLE, &board, Some(&on), now()));
         assert!(text.contains(&"Extra usage".to_owned()), "{text:?}");
         assert!(text.contains(&"30%".to_owned()), "{text:?}");
         assert!(text.contains(&"15.00 of 50.00 USD".to_owned()), "{text:?}");
         assert_eq!(
-            bars(&panel(&board, Some(&on), now())),
+            bars(&panel(DEFAULT_TITLE, &board, Some(&on), now())),
             vec![(
                 "claude-bridge-bar-extra".to_owned(),
                 0.30,
@@ -1858,7 +2696,12 @@ mod tests {
     #[test]
     fn a_successful_panel_carries_no_failure_footer() {
         let board = status(Mode::Subscription, false, 9, 0, Last::Ok);
-        let text = texts(&panel(&board, Some(&captured_report()), now()));
+        let text = texts(&panel(
+            DEFAULT_TITLE,
+            &board,
+            Some(&captured_report()),
+            now(),
+        ));
         assert!(
             !text.iter().any(|t| t.starts_with("usage ")),
             "a success names no failure: {text:?}"
@@ -2120,6 +2963,8 @@ mod tests {
                 status: status(Mode::Api, true, 1, 0, Last::Ok),
                 usage: Some(fresh_report()),
                 usage_version: 1,
+                is_bar: true,
+                title: DEFAULT_TITLE.to_owned(),
             }
             .view()
         });

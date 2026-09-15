@@ -126,6 +126,7 @@
 //! | `CLAUDE_BRIDGE_STATE_DIR` | `$XDG_STATE_HOME/hytte-claude-bridge` | the child's cwd, which is what scopes claude's on-disk sessions (`claude` modes only), and where the retired-session map is kept (#855) |
 //! | `CLAUDE_BRIDGE_THINKING` | `disabled` | `api` mode only: `disabled`, `adaptive`, or `auto` — see [`messages::Thinking`] |
 //! | `ANTHROPIC_API_KEY` | unset | `api` mode only: it outranks `~/.config/trollshell/anthropic.key`. In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
+//! | `CLAUDE_BRIDGE_LABEL` | unset | the title on the sidebar card and the drawer panel header (#1280 P1) — trimmed, and only used when non-blank; else `"Claude usage"`. Free (no request), and the SDK-level `HYTTE_PLUGIN_MOUNT`/`HYTTE_PLUGIN_ID` (see [`plugin`], `docs/plugin-env.md`) are what actually put the card on a sidebar |
 //!
 //! # Where `ANTHROPIC_API_KEY` comes from, after #866
 //!

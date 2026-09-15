@@ -166,11 +166,11 @@ const _: () = assert!(MAX_CELLS == hytte_plugin_proto::MAX_CELLS as usize);
 
 /// Card padding around the glyph, in **font pixels** — so it scales with
 /// [`glyph_px`](FlipBoard::glyph_px) and a bigger board stays in proportion.
-const CARD_PAD_FX: usize = 1;
+pub const CARD_PAD_FX: usize = 1;
 /// Gap between adjacent cards, in font pixels.
-const BOARD_GAP_FX: usize = 1;
+pub const BOARD_GAP_FX: usize = 1;
 /// Bezel around the card row, in font pixels.
-const BOARD_PAD_FX: usize = 1;
+pub const BOARD_PAD_FX: usize = 1;
 
 /// Default per-cell flip duration, in seconds. Fast enough that a whole
 /// `HH:MM:SS` rollover (six cards, staggered) lands inside the one second a
@@ -193,21 +193,21 @@ const MAX_STAGGER_SECS: f32 = 2.0;
 
 // Intensities, of 255.
 /// A lit font pixel.
-const GLYPH_T: f32 = 255.0;
+pub const GLYPH_T: f32 = 255.0;
 /// The upper card's face, mixed from the field toward the palette ghost.
-const FACE_TOP_T: u16 = 255;
+pub const FACE_TOP_T: u16 = 255;
 /// The lower card's face — a touch darker, because the light is above.
-const FACE_BOTTOM_T: u16 = 205;
+pub const FACE_BOTTOM_T: u16 = 205;
 /// The nixie's unlit cathode stack, mixed from the field toward the ghost.
-const CATHODE_T: u16 = 255;
+pub const CATHODE_T: u16 = 255;
 /// Peak brightness of the falling card's lit free edge, at horizontal.
-const EDGE_T: f32 = 255.0;
+pub const EDGE_T: f32 = 255.0;
 /// Thickness of that edge rule, in logical pixels.
-const EDGE_PX: f32 = 1.0;
+pub const EDGE_PX: f32 = 1.0;
 /// How dark a card gets when it is fully edge-on: the floor of the
 /// `SHADE_FLOOR + (1 - SHADE_FLOOR)·|cos θ|` lambert-ish shading, which is
 /// exactly `1.0` at both rest angles and so cannot disturb the endpoints.
-const SHADE_FLOOR: f32 = 0.45;
+pub const SHADE_FLOOR: f32 = 0.45;
 
 /// How much wider than the skin's own bloom the nixie's halo reaches. The
 /// tube's glow is a broad haze around a tight core, so the widget blooms twice:
@@ -220,9 +220,9 @@ const SHADE_FLOOR: f32 = 0.45;
 /// 63 µs). In line with the marquee's disclosed 105 µs at a comparable
 /// geometry, and the lever if it ever matters is #844's bloom bounding rather
 /// than anything here.
-const NIXIE_HALO_RADIUS_BONUS: usize = 3;
+pub const NIXIE_HALO_RADIUS_BONUS: usize = 3;
 /// Strength of that wide halo pass (of 256).
-const NIXIE_HALO_STRENGTH: u16 = 64;
+pub const NIXIE_HALO_STRENGTH: u16 = 64;
 
 /// The board's drum: every card it physically carries. Lowercase folds onto it;
 /// anything else renders as the font's notdef box.
@@ -283,6 +283,62 @@ impl Mechanism {
             Self::Nixie => 0.0,
         }
     }
+}
+
+// ── The published geometry and state (#1155) ─────────────────────────────────
+
+/// Every length a [`FlipBoard`]'s fixture is built out of, in **logical**
+/// pixels (pre-[`scale`](FlipBoard::scale)) — the answers
+/// [`FlipBoard::render`] itself lays the frame out with.
+///
+/// `pub` since #1155 for the [`super::Dial`] / [`super::SEVEN_SEG_BARS`]
+/// reason (#1148/#1154): the shell's GL arm draws this widget from uniforms
+/// and must read the kit's own numbers rather than re-derive them from the
+/// card constants, or a widened card would move one arm and not the other.
+/// Every field is the return of the private method `render` calls, so the two
+/// cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlipMetrics {
+    /// Logical pixels per font pixel — always even, see
+    /// [`FlipBoard::glyph_px`].
+    pub glyph_px: usize,
+    /// The integer upscale baked into the rendered [`Frame`].
+    pub scale: usize,
+    /// One card's width.
+    pub cell_w: usize,
+    /// One card's height — always even, so the hinge lands on a boundary.
+    pub cell_h: usize,
+    /// The hinge's cell-local row: the card's midline.
+    pub hinge: usize,
+    /// Bezel around the card row.
+    pub bezel: usize,
+    /// Gap between adjacent cards.
+    pub gap: usize,
+    /// The glyph's inset inside a card.
+    pub glyph_pad: usize,
+    /// Cells in the row — `0` for the degenerate empty board.
+    pub cells: usize,
+    /// Logical buffer width (pre-upscale).
+    pub width: usize,
+    /// Logical buffer height (pre-upscale).
+    pub height: usize,
+}
+
+/// One cell of a [`FlipBoard`] as a renderer sees it: the card it is leaving,
+/// the card it is heading to, and how far along it is *right now*.
+///
+/// `pub` since #1155 for [`FlipMetrics`]' reason. `progress` is the closed form
+/// the module docs describe — `0.0` before the cell's stagger has elapsed,
+/// `1.0` once it has landed — read through [`FlipBoard::progress`], so a GL arm
+/// and the CPU kit cannot disagree about where in a flip a frame is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlipCellState {
+    /// The outgoing card, drum-normalized.
+    pub from: char,
+    /// The incoming card, drum-normalized.
+    pub to: char,
+    /// This cell's transition progress, `0.0..=1.0`.
+    pub progress: f32,
 }
 
 // ── The board ────────────────────────────────────────────────────────────────
@@ -412,6 +468,39 @@ impl FlipBoard {
     #[must_use]
     pub fn mechanism(&self) -> Mechanism {
         self.mechanism
+    }
+
+    /// Every length this board's fixture is laid out with — see
+    /// [`FlipMetrics`] (#1155).
+    #[must_use]
+    pub fn metrics(&self) -> FlipMetrics {
+        FlipMetrics {
+            glyph_px: self.glyph_px,
+            scale: self.scale,
+            cell_w: self.cell_w(),
+            cell_h: self.cell_h(),
+            hinge: self.hinge(),
+            bezel: self.bezel(),
+            gap: self.gap(),
+            glyph_pad: self.glyph_pad(),
+            cells: self.cells.len(),
+            width: self.logical_width(),
+            height: self.logical_height(),
+        }
+    }
+
+    /// Every cell's `(from, to, progress)` at the board's current clock — see
+    /// [`FlipCellState`] (#1155).
+    #[must_use]
+    pub fn cell_states(&self) -> Vec<FlipCellState> {
+        self.cells
+            .iter()
+            .map(|cell| FlipCellState {
+                from: cell.from,
+                to: cell.to,
+                progress: self.progress(cell),
+            })
+            .collect()
     }
 
     /// The content the board is resting on, or heading to: one char per cell,
@@ -628,6 +717,19 @@ impl FlipBoard {
         BOARD_GAP_FX * self.glyph_px
     }
 
+    /// The glyph's inset inside a card, in logical pixels — the card padding
+    /// times [`glyph_px`](Self::glyph_px).
+    ///
+    /// One definition rather than the four inline `CARD_PAD_FX * g` spellings
+    /// [`stamp_glyph`](Self::stamp_glyph), [`compose_nixie`](Self::compose_nixie),
+    /// [`glyph_at`](Self::glyph_at) and
+    /// [`glyph_coverage`](Self::glyph_coverage) each carried (#1155), because
+    /// [`metrics`](Self::metrics) publishes it and a published metric that is
+    /// a fifth copy of an expression is a mirror agreeing with itself.
+    fn glyph_pad(&self) -> usize {
+        CARD_PAD_FX * self.glyph_px
+    }
+
     /// Logical buffer width (pre-upscale).
     fn logical_width(&self) -> usize {
         let n = self.cells.len();
@@ -698,7 +800,7 @@ impl FlipBoard {
     /// cell-local coordinates.
     fn stamp_glyph(&self, rows: [u8; font::GLYPH_H], mut sink: impl FnMut(usize, usize)) {
         let g = self.glyph_px;
-        let pad = CARD_PAD_FX * g;
+        let pad = self.glyph_pad();
         for (row, &bits) in rows.iter().enumerate() {
             for col in 0..font::GLYPH_W {
                 if (bits >> (font::GLYPH_W - 1 - col)) & 1 == 0 {
@@ -722,7 +824,7 @@ impl FlipBoard {
         let (out, incoming) = (level(afterglow(p) * GLYPH_T), level(ignite(p) * GLYPH_T));
         let (going, coming) = (rows_of(cell.from), rows_of(cell.to));
         let g = self.glyph_px;
-        let pad = CARD_PAD_FX * g;
+        let pad = self.glyph_pad();
         for row in 0..font::GLYPH_H {
             for col in 0..font::GLYPH_W {
                 let bit = font::GLYPH_W - 1 - col;
@@ -829,7 +931,7 @@ impl FlipBoard {
     /// `1.0` or `0.0`, the resting card's binary raster.
     fn glyph_at(&self, rows: [u8; font::GLYPH_H], x: usize, y: usize) -> f32 {
         let g = self.glyph_px;
-        let pad = CARD_PAD_FX * g;
+        let pad = self.glyph_pad();
         let (Some(col), Some(row)) = (
             x.checked_sub(pad).map(|dx| dx / g),
             y.checked_sub(pad).map(|dy| dy / g),
@@ -858,7 +960,7 @@ impl FlipBoard {
             return 0.0;
         }
         let g = self.glyph_px;
-        let pad = CARD_PAD_FX * g;
+        let pad = self.glyph_pad();
         let Some(col) = x
             .checked_sub(pad)
             .map(|dx| dx / g)
@@ -909,7 +1011,8 @@ fn blank_cell() -> Cell {
 /// Normalize `c` onto the board's [`CHARSET`] drum: uppercase (a real drum has
 /// no lowercase), or the single [`NOTDEF_CARD`] for anything the drum does not
 /// carry.
-fn drum(c: char) -> char {
+#[must_use]
+pub fn drum(c: char) -> char {
     let upper = c.to_ascii_uppercase();
     if CHARSET.contains(upper) {
         upper
@@ -919,7 +1022,8 @@ fn drum(c: char) -> char {
 }
 
 /// The 5×7 bitmap a card shows.
-fn rows_of(card: char) -> [u8; font::GLYPH_H] {
+#[must_use]
+pub fn rows_of(card: char) -> [u8; font::GLYPH_H] {
     if card == NOTDEF_CARD {
         return font::NOTDEF;
     }
@@ -933,7 +1037,8 @@ fn rows_of(card: char) -> [u8; font::GLYPH_H] {
 /// what the tube actually lights. At this font's digit coverage the ten
 /// overlap into a solid mesh — which is what a cathode stack looks like
 /// head-on, and dim enough (it is the palette's ghost) to read as depth.
-fn cathode_stack() -> [u8; font::GLYPH_H] {
+#[must_use]
+pub fn cathode_stack() -> [u8; font::GLYPH_H] {
     let mut out = [0u8; font::GLYPH_H];
     for digit in '0'..='9' {
         for (slot, bits) in out.iter_mut().zip(rows_of(digit)) {
@@ -949,14 +1054,16 @@ fn cathode_stack() -> [u8; font::GLYPH_H] {
 /// A flap is released and falls — slowest at the top, fastest as it slams into
 /// its stop. A linear `θ(p)` would be a motor turning at a constant rate, which
 /// is a shutter, not a card. See the module docs.
-fn flap_theta(p: f32) -> f32 {
+#[must_use]
+pub fn flap_theta(p: f32) -> f32 {
     PI * p * p
 }
 
 /// The striking cathode's ignition curve: fast off the mark (`ignite'(0) = 2`),
 /// easing into full brightness. Exactly `0.0` at `p = 0` and `1.0` at `p = 1`,
 /// which is what keeps the cross-fade's endpoints pixel-exact.
-fn ignite(p: f32) -> f32 {
+#[must_use]
+pub fn ignite(p: f32) -> f32 {
     let left = 1.0 - p;
     1.0 - left * left
 }
@@ -968,7 +1075,8 @@ fn ignite(p: f32) -> f32 {
 /// incoming cathode is already at 75% while the outgoing has only dropped to
 /// 75%, so both are alight and the tube briefly glows *brighter* than either
 /// digit alone — which is what two conducting cathodes actually do.
-fn afterglow(p: f32) -> f32 {
+#[must_use]
+pub fn afterglow(p: f32) -> f32 {
     1.0 - p * p
 }
 
@@ -980,7 +1088,8 @@ fn fx(value: usize) -> f32 {
 
 /// Round a `0.0..=255.0` intensity onto the emission's scale.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn level(value: f32) -> u16 {
+#[must_use]
+pub fn level(value: f32) -> u16 {
     // The clamp bounds the value before the cast, so the truncation is exact
     // and never wraps; a `NaN` clamps to the low end and reads as unlit.
     value.clamp(0.0, 255.0).round() as u16

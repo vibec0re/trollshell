@@ -199,9 +199,30 @@ pub use seven_seg::{
     THICK as SEVEN_SEG_THICK, layout as seven_seg_layout, seven_seg, size as seven_seg_size,
     taper as seven_seg_taper,
 };
+// The split-flap board's own vocabulary, and — since #1155 — the metrics, the
+// per-cell state, the two phase curves, the drum and the intensity constants
+// its renderer is written in terms of, on the `seven_seg` precedent above: the
+// shell's GL arm (`trollshell/src/plugins/preem_gl/flip_board.rs`) draws this
+// widget from uniforms and must read the kit's own numbers rather than restate
+// them, or a widened card moves one arm and not the other.
+//
+// Prefixed on the way out for the `SEVEN_SEG_*` reason — `CARD_PAD_FX`,
+// `EDGE_T` and `level` say nothing about which widget they belong to once they
+// leave `split_flap`. Everything here is visibility-only (`flap_theta`,
+// `ignite`, `afterglow`, `drum`, `rows_of`, `cathode_stack` and `level` are all
+// called by `render` itself, so they are the kit's definitions rather than
+// copies), which is what makes
+// `split_flap::tests::the_rendered_bytes_are_pinned_by_digest` able to say the
+// whole of #1155's kit change moved no pixel.
 pub use split_flap::{
-    CHARSET, DEFAULT_FADE_SECS, DEFAULT_FLIP_SECS, DEFAULT_GLYPH_PX, DEFAULT_STAGGER_SECS,
-    FlipBoard, Mechanism,
+    BOARD_GAP_FX as FLIP_BOARD_GAP_FX, BOARD_PAD_FX as FLIP_BOARD_PAD_FX,
+    CARD_PAD_FX as FLIP_CARD_PAD_FX, CATHODE_T as NIXIE_CATHODE_T, CHARSET, DEFAULT_FADE_SECS,
+    DEFAULT_FLIP_SECS, DEFAULT_GLYPH_PX, DEFAULT_STAGGER_SECS, EDGE_PX as FLIP_EDGE_PX,
+    EDGE_T as FLIP_EDGE_T, FACE_BOTTOM_T as FLIP_FACE_BOTTOM_T, FACE_TOP_T as FLIP_FACE_TOP_T,
+    FlipBoard, FlipCellState, FlipMetrics, GLYPH_T as FLIP_GLYPH_T, MAX_CELLS as FLIP_MAX_CELLS,
+    Mechanism, NIXIE_HALO_RADIUS_BONUS, NIXIE_HALO_STRENGTH, SHADE_FLOOR as FLIP_SHADE_FLOOR,
+    afterglow as nixie_afterglow, cathode_stack as nixie_cathode_stack, drum as flip_drum,
+    flap_theta, ignite as nixie_ignite, level as flip_level, rows_of as flip_rows_of,
 };
 pub use style::DisplayStyle;
 pub use textbox::{TextBox, TextBoxLayout};

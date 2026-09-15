@@ -168,7 +168,7 @@ mod datasource;
 // cross-module reference into this module.
 pub(crate) mod effects;
 mod listener;
-mod preem_gl;
+pub(crate) mod preem_gl;
 mod preem_render;
 mod pump;
 mod region;

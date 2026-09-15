@@ -27,7 +27,9 @@
 
 use hytte::ui::gl_surface::{GlPipeline, GlProgram};
 
-use super::{dot_matrix, flip_board, gauge, led_strip, marquee, program, seven_seg, textbox};
+use super::{
+    dot_matrix, flip_board, gauge, led_matrix, led_strip, marquee, program, seven_seg, textbox,
+};
 
 /// Which kit widget a case is measuring, because the two do **not** take the
 /// same structural checks (#1143).
@@ -167,6 +169,37 @@ pub(crate) enum Kind {
     /// `cargo test`. The pin here still says what the *driver* did; that one
     /// says the arithmetic being pinned was right before a driver ever saw it.
     FlipBoard,
+    /// `preem.led_matrix` (#1156) — **pinned bit-exact**, the fourth kind whose
+    /// pin is also asserted *hermetically*, and the **only kind on this seam
+    /// that no plugin can reach** (see [`on_the_wire`](Self::on_the_wire)).
+    ///
+    /// Its lattice is integers all the way down — the bezel, each lamp's
+    /// square and the pitch between them are whole buffer pixels, and the
+    /// bloom window's half-width is a half-integer — so at a pixel centre the
+    /// footprint lies wholly inside or wholly outside one lamp, the
+    /// area-weighted stamp collapses onto that lamp's own integer amount, and
+    /// the closed-form blur's measures are exactly the integer column and row
+    /// counts the kit sums. Zero is therefore available by construction.
+    ///
+    /// What makes it worth taking rather than inherited from
+    /// [`LedStrip`](Self::LedStrip), whose pipeline shape it shares, is the
+    /// step the panel adds: a meter's emission is **one** intensity on a union
+    /// of rectangles, a panel's is a different intensity per rectangle. So the
+    /// horizontal blur pass is a *weighted* measure, and the kit's `u16` `tmp`
+    /// grid truncates it **once per row** before the vertical pass ever sees
+    /// it. Hoisting that `floor` out of the row loop is the natural
+    /// simplification, it is not the kit, and it moves bytes on every skin with
+    /// a bloom — which is exactly what a bit-exact pin is for.
+    ///
+    /// Like the meter, the readout and the board, `led_matrix.rs`'s
+    /// `the_transcribed_shader_is_bit_exact_against_the_kit_at_one_to_one`
+    /// mirrors the shader's arithmetic, holds it to the shipped GLSL by a
+    /// source scan, and compares it against the kit's own bytes in
+    /// `cargo test` — across every skin, every `ColorMap`, both `Fill` arms and
+    /// five grid shapes, since the colour axis is this widget's alone. The pin
+    /// here still says what the *driver* did; that one says the arithmetic
+    /// being pinned was right before a driver ever saw it.
+    LedMatrix,
 }
 
 impl Kind {
@@ -189,7 +222,7 @@ impl Kind {
     /// consumer, so the constant was gated the same way to keep it from being
     /// an unused-in-production warning. [`super::install`] is now a
     /// consumer too, so the constant has to exist in every build.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Scope,
         Self::Gauge,
         Self::DotMatrix,
@@ -198,7 +231,52 @@ impl Kind {
         Self::LedStrip,
         Self::SevenSeg,
         Self::FlipBoard,
+        Self::LedMatrix,
     ];
+
+    /// Whether a **plugin** can put this kind on screen — i.e. whether some
+    /// `vocab::PreemWidget` maps to it (#1156).
+    ///
+    /// Eight of the nine answer `true` and always have; every per-kind list in
+    /// the tree was written when that was the whole story. `LedMatrix` is the
+    /// first kind the **shell itself** draws and the wire does not carry:
+    /// `hytte_preem::LedMatrix` has no `PreemWidget` variant, the Stats
+    /// drawer's per-core panel builds its surface directly
+    /// (`panels::stats`), and #1250's plugin renders a *dot matrix* in its
+    /// place precisely because this kit widget is not on the wire.
+    ///
+    /// So the two enumeration tests that walk a widget vocabulary — `install`'s
+    /// registration is **not** one of them, and neither is the harness's case
+    /// list — filter on this rather than dropping their "every kind is reached"
+    /// half, which is what would actually let a wire kind go unregistered
+    /// again. The reverse direction is asserted too: a kind answering `false`
+    /// here must be reached by **no** widget, so this cannot be used to excuse
+    /// a kind `gl_kind_for` merely forgot.
+    ///
+    /// An exhaustive `match` rather than a `matches!`, for
+    /// [`pinned_exact`](Self::pinned_exact)'s reason: a tenth kind must not
+    /// inherit an answer by falling off the end of a pattern.
+    ///
+    /// Its readers are all `#[cfg(test)]` — `plugins::tests`'
+    /// `kind_enumeration`, `preem_render`'s `gl_capable_widgets`, and
+    /// `parity`'s own exhaustive cross-check — so a non-test build sees it
+    /// unused. It stays a production item rather than a `#[cfg(test)]` one for
+    /// the reason [`ALL`](Self::ALL) is: the exhaustive `match` has to exist in
+    /// the same file the variants do, where a tenth kind's author meets it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn on_the_wire(self) -> bool {
+        match self {
+            Self::Scope
+            | Self::Gauge
+            | Self::DotMatrix
+            | Self::Marquee
+            | Self::TextBox
+            | Self::LedStrip
+            | Self::SevenSeg
+            | Self::FlipBoard => true,
+            Self::LedMatrix => false,
+        }
+    }
 
     /// The `(program, pipeline)` pair [`super::install`] registers for this
     /// kind.
@@ -222,6 +300,7 @@ impl Kind {
             Self::LedStrip => (led_strip::LED_STRIP, led_strip::LED_STRIP_PIPELINE),
             Self::SevenSeg => (seven_seg::SEVEN_SEG, seven_seg::SEVEN_SEG_PIPELINE),
             Self::FlipBoard => (flip_board::FLIP_BOARD, flip_board::FLIP_BOARD_PIPELINE),
+            Self::LedMatrix => (led_matrix::LED_MATRIX, led_matrix::LED_MATRIX_PIPELINE),
         }
     }
 }

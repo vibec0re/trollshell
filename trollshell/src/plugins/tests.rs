@@ -11403,7 +11403,8 @@ mod kind_enumeration {
             | Case::TextBox { style, .. }
             | Case::LedStrip { style, .. }
             | Case::SevenSeg { style, .. }
-            | Case::FlipBoard { style, .. } => *style,
+            | Case::FlipBoard { style, .. }
+            | Case::LedMatrix { style, .. } => *style,
         }
     }
 
@@ -11486,7 +11487,19 @@ mod kind_enumeration {
             let reached = widgets
                 .iter()
                 .any(|widget| preem_render::gl_kind_for(widget) == Some(kind));
-            assert!(reached, "no PreemWidget kind maps to {kind:?}");
+            // #1156: the panel is the first kind the **shell** draws and no
+            // plugin can send, so "every kind is reached from a widget" is
+            // asked of the wire kinds only — and the other direction is
+            // asserted in the same breath, so `on_the_wire` cannot be used to
+            // excuse a wire kind `gl_kind_for` merely forgot.
+            assert_eq!(
+                reached,
+                kind.on_the_wire(),
+                "{kind:?}: on_the_wire() says {}, but {} PreemWidget kind maps \
+                 to it",
+                kind.on_the_wire(),
+                if reached { "a" } else { "no" },
+            );
         }
     }
 

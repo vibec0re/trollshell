@@ -41,8 +41,8 @@ use hytte::reactive::health::{self, TaskHealth, TaskState};
 use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuFreq, CpuLoad};
 use hytte::services::systemd;
-use hytte::ui::{MultiSparkline, PixelSurface};
-use hytte_preem::LedMatrix;
+use hytte::ui::{GlSurface, MultiSparkline, PixelSurface};
+use hytte_preem::{LedMatrix, palette_snapshot};
 
 // The app-id → desktop-entry resolver used to live in this file; #1071 moved it
 // to `components/` when the Workspaces page became a second consumer. Imported
@@ -59,6 +59,7 @@ use crate::components::markup;
 use crate::components::monitor_key::monitor_key;
 use crate::components::reactive_list::reactive_list;
 use crate::config::core_leds::{self, CoreLeds};
+use crate::plugins::preem_gl;
 
 /// One card in the combined Stats page (#516). Named after the resource chip
 /// that scrolls to it, in the same top-to-bottom order [`panel_stats`] stacks
@@ -1035,6 +1036,57 @@ fn core_panel_surface() -> PixelSurface {
     panel
 }
 
+/// The surface the LED panel draws into on the **GL arm** (#1156).
+///
+/// The same alignment contract as [`core_panel_surface`], for the same two
+/// reasons: `GlSurface::measure` also answers `(0, natural, -1, -1)` with an
+/// aspect-locked height-for-width natural size, so an expanding one handed the
+/// card's whole width would answer with a matching height and inflate the row.
+fn core_panel_gl_surface() -> GlSurface {
+    let panel = GlSurface::new();
+    panel.set_halign(gtk::Align::Center);
+    panel.set_valign(gtk::Align::Center);
+    panel
+}
+
+/// Which renderer the panel draws through — GL by default,
+/// `TROLLSHELL_PREEM_RENDERER=cpu` and a failed or refused context taking it to
+/// the kit (#1156).
+///
+/// Asked **once per tick** rather than once at build time, which is what makes
+/// the fallback reach this widget at all: the panel is not in the plugin tree,
+/// so `preem_gl::install`'s context-failure hook — which rebuilds every plugin
+/// chip and asks the reconciler for a re-map — sweeps nothing here. Both of the
+/// latches `arm_for` folds in are sticky for the session, so the cost of asking
+/// again is one `Vec` scan against a list that is empty on a healthy session,
+/// once a second, and the benefit is that a context that dies under a live
+/// drawer costs the panel one frame instead of the rest of the session.
+fn core_panel_arm() -> preem_gl::Arm {
+    preem_gl::arm_for(preem_gl::LED_MATRIX)
+}
+
+/// The row's single child, rebuilt if the arm no longer matches it.
+///
+/// A `gtk::Box` holding exactly one surface, rather than a `gtk::Stack` of two:
+/// the loser would still be measured (a `Stack` measures every page) and the
+/// swap happens at most once in a session's life.
+fn core_panel_child(row: &gtk::Box, arm: preem_gl::Arm) -> gtk::Widget {
+    let wants_gl = arm == preem_gl::Arm::Gl;
+    if let Some(child) = row.first_child() {
+        if child.is::<GlSurface>() == wants_gl {
+            return child;
+        }
+        row.remove(&child);
+    }
+    let fresh: gtk::Widget = if wants_gl {
+        core_panel_gl_surface().upcast()
+    } else {
+        core_panel_surface().upcast()
+    };
+    row.append(&fresh);
+    fresh
+}
+
 /// The per-core strip: an LED panel — one lamp per core, each lit to that
 /// core's load ("Blinken Lichten", #857).
 ///
@@ -1097,15 +1149,13 @@ where
     L: Signal<Item = CoreLeds> + 'static,
 {
     let row = core_panel_row();
-    let panel = core_panel_surface();
-    row.append(&panel);
 
     let dressed = map_ref! {
         let cpu = cpu,
         let leds = leds =>
         (cpu.clone(), *leds)
     };
-    bind_per_core_leds(&panel, dressed);
+    bind_per_core_leds(&row, dressed);
 
     row
 }
@@ -1122,29 +1172,61 @@ where
 /// successor of #831's `cores_row` site in this file: #857 replaced the
 /// `gtk::FlowBox` of per-core `ProgressBar`s with the LED panel, carrying the
 /// same untestable inline accessor across.
-fn bind_per_core_leds<S>(panel: &PixelSurface, signal: S)
+fn bind_per_core_leds<S>(row: &gtk::Box, signal: S)
 where
     S: Signal<Item = (CpuLoad, CoreLeds)> + 'static,
 {
-    bind(
-        signal,
-        panel,
-        move |panel, (c, leds): (CpuLoad, CoreLeds)| {
-            let levels: Vec<f32> = c
-                .per_core
-                .iter()
-                .map(|&load| cast::f64_to_f32(load))
-                .collect();
-            let frame = core_led_matrix_for(leds, levels.len()).render(&levels);
-            panel.set_scale(core_panel_scale(frame.width(), frame.height()));
-            panel.set_pixels(
-                u32::try_from(frame.width()).unwrap_or(0),
-                u32::try_from(frame.height()).unwrap_or(0),
-                frame.data(),
-            );
-            panel.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
-        },
-    );
+    bind(signal, row, move |row, (c, leds): (CpuLoad, CoreLeds)| {
+        let levels: Vec<f32> = c
+            .per_core
+            .iter()
+            .map(|&load| cast::f64_to_f32(load))
+            .collect();
+        let matrix = core_led_matrix_for(leds, levels.len());
+        let scale = core_panel_scale(matrix.width(), matrix.height());
+        let arm = core_panel_arm();
+        let child = core_panel_child(row, arm);
+        match arm {
+            // The GPU arm (#1156): the same lamps, resolved at the screen's
+            // resolution rather than replicated `scale`-wide by the nearest-
+            // neighbour upscale. The palette is resolved **here**, in whatever
+            // pin scope the shell is in, and handed to the mapping — which is
+            // why `led_matrix_surface` takes a snapshot rather than reading
+            // one, and why both arms tint identically.
+            preem_gl::Arm::Gl => {
+                let surface: &GlSurface = child
+                    .downcast_ref()
+                    .expect("core_panel_child returns a GlSurface on the GL arm");
+                let kit = preem_gl::led_matrix_surface(
+                    &matrix,
+                    &levels,
+                    scale,
+                    &palette_snapshot(leds.style),
+                );
+                surface.set_state(
+                    preem_gl::LED_MATRIX,
+                    kit.width,
+                    kit.height,
+                    &std::sync::Arc::new(kit.uniforms),
+                );
+            }
+            // The kit, rasterised in-process — the #857 path, unchanged, and
+            // the reference the GL arm is measured against.
+            preem_gl::Arm::Cpu => {
+                let surface: &PixelSurface = child
+                    .downcast_ref()
+                    .expect("core_panel_child returns a PixelSurface on the CPU arm");
+                let frame = matrix.render(&levels);
+                surface.set_scale(scale);
+                surface.set_pixels(
+                    u32::try_from(frame.width()).unwrap_or(0),
+                    u32::try_from(frame.height()).unwrap_or(0),
+                    frame.data(),
+                );
+            }
+        }
+        child.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
+    });
 }
 
 fn build_live_memory_row() -> adw::ActionRow {
@@ -3257,9 +3339,10 @@ mod pin_tests {
     use hytte::gtk;
     use hytte::services::app_usage::ProcSample;
     use hytte::services::sensors::CpuLoad;
-    use hytte::ui::PixelSurface;
+    use hytte::ui::{GlSurface, PixelSurface};
 
     use super::{CoreLeds, bind_per_core_leds, build_top_apps_expander, per_core_leds_row};
+    use crate::plugins::preem_gl;
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
@@ -3283,25 +3366,94 @@ mod pin_tests {
         (cpu, CoreLeds::default())
     }
 
+    /// The surface the binding has put inside `row` — a `PixelSurface` under
+    /// `cargo test`, since `preem_gl`'s test arm defaults to the CPU (#1156).
+    fn panel_of(row: &gtk::Box) -> PixelSurface {
+        row.first_child()
+            .expect("the binding puts a surface in the row")
+            .downcast()
+            .expect("…and under the test arm it is a PixelSurface")
+    }
+
     /// Anti-vacuity guard for the per-core pin test below: the binding must
     /// actually apply, or "the widget died" would prove nothing about the
     /// closure. The tooltip is the apply body's last statement, so seeing it
     /// means the whole rasterise-and-upload path ran.
+    ///
+    /// Bound to the **row** rather than to the surface since #1156: the panel's
+    /// renderer is resolved per tick, so the apply closure is what decides
+    /// which surface the row holds. See [`core_panel_child`].
     #[gtk::test]
     fn per_core_leds_binding_applies_a_value() {
         adw::init().expect("libadwaita init");
-        let panel = PixelSurface::new();
+        let row = super::core_panel_row();
         let cpu: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(CpuLoad::default()));
-        bind_per_core_leds(&panel, cpu.signal_cloned());
+        bind_per_core_leds(&row, cpu.signal_cloned());
         pump();
 
         cpu.set(dressed(four_cores()));
         pump();
 
-        let tooltip = panel.tooltip_text().map(|t| t.to_string());
+        let tooltip = panel_of(&row).tooltip_text().map(|t| t.to_string());
         assert!(
             tooltip.as_deref().is_some_and(|t| t.starts_with("4 cores")),
             "the emitted CpuLoad's four cores must reach the panel's tooltip, got {tooltip:?}"
+        );
+    }
+
+    /// **The kill switch reaches this panel** (#1156): under the CPU arm the
+    /// row holds a `PixelSurface`, under the GL arm a `GlSurface`, and the
+    /// binding swaps it live rather than deciding once at build time.
+    ///
+    /// The live swap is what makes the *fallback* reach this widget at all —
+    /// the panel is not in the plugin tree, so `preem_gl::install`'s
+    /// context-failure hook sweeps nothing here and a chip built on GL at
+    /// startup would simply stay blank. Driven through `with_gl_arm`, the same
+    /// seam `plugins::tests` uses, since the real switch is an env var read
+    /// once per process.
+    ///
+    /// **Falsified** by building the surface once in [`per_core_leds_row`] and
+    /// ignoring the arm (the second assertion reports a `PixelSurface`), or by
+    /// resolving the arm once outside the apply closure (the third).
+    #[gtk::test]
+    fn the_panel_follows_the_renderer_arm() {
+        adw::init().expect("libadwaita init");
+        let row = super::core_panel_row();
+        let cpu: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(four_cores()));
+        bind_per_core_leds(&row, cpu.signal_cloned());
+        pump();
+
+        let first = row.first_child().expect("a surface after the first tick");
+        assert!(
+            first.is::<PixelSurface>(),
+            "the test arm is the CPU kit, so the row holds a PixelSurface",
+        );
+
+        preem_gl::with_gl_arm(|| {
+            cpu.set(dressed(CpuLoad {
+                overall: 0.9,
+                per_core: vec![0.9, 0.2, 0.3, 0.4],
+            }));
+            pump();
+        });
+        let swapped = row.first_child().expect("a surface after the GL tick");
+        assert!(
+            swapped.is::<GlSurface>(),
+            "the GL arm must swap the row's child for a GlSurface",
+        );
+        assert_eq!(
+            row.first_child().and_then(|c| c.next_sibling()),
+            None,
+            "…and the row still holds exactly one surface",
+        );
+
+        // …and back, because the arm can flip either way within a session: a
+        // refused pipeline takes a live GL panel to the kit.
+        cpu.set(dressed(four_cores()));
+        pump();
+        assert!(
+            row.first_child().is_some_and(|c| c.is::<PixelSurface>()),
+            "a tick back on the CPU arm swaps the kit surface in again",
         );
     }
 
@@ -3320,11 +3472,11 @@ mod pin_tests {
     #[gtk::test]
     fn per_core_leds_binding_follows_the_emitted_dressing() {
         adw::init().expect("libadwaita init");
-        let panel = PixelSurface::new();
+        let row = super::core_panel_row();
         let src: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(four_cores()));
-        bind_per_core_leds(&panel, src.signal_cloned());
+        bind_per_core_leds(&row, src.signal_cloned());
         pump();
-        let (_, automatic, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+        let (_, automatic, _, _) = panel_of(&row).measure(gtk::Orientation::Horizontal, -1);
 
         src.set((
             four_cores(),
@@ -3334,7 +3486,7 @@ mod pin_tests {
             },
         ));
         pump();
-        let (_, pinned, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+        let (_, pinned, _, _) = panel_of(&row).measure(gtk::Orientation::Horizontal, -1);
 
         assert!(
             automatic > 0 && pinned > 0,
@@ -3403,18 +3555,18 @@ mod pin_tests {
     #[gtk::test]
     fn per_core_leds_binding_does_not_pin_panel() {
         adw::init().expect("libadwaita init");
-        let panel = PixelSurface::new();
-        let weak = panel.downgrade();
+        let row = super::core_panel_row();
+        let weak = row.downgrade();
         let cpu: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(four_cores()));
-        bind_per_core_leds(&panel, cpu.signal_cloned());
+        bind_per_core_leds(&row, cpu.signal_cloned());
         pump();
 
-        drop(panel);
+        drop(row);
 
         assert!(
             weak.upgrade().is_none(),
-            "bind_per_core_leds must not pin its panel: a strong clone captured by the apply \
-             closure (rather than taking the closure's own `&PixelSurface` argument from `bind`) \
+            "bind_per_core_leds must not pin its row: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `&gtk::Box` argument from `bind`) \
              would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
 

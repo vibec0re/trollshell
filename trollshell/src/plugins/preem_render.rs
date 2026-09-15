@@ -3840,7 +3840,10 @@ mod tests {
         ];
         assert_eq!(
             all.len(),
-            preem_gl::Kind::ALL.len(),
+            preem_gl::Kind::ALL
+                .into_iter()
+                .filter(|kind| kind.on_the_wire())
+                .count(),
             "a kit widget gained a GL arm without a sample here",
         );
         all

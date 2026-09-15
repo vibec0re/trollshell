@@ -755,6 +755,230 @@ mod tests {
         );
     }
 
+    /// **Nothing on the continuous branch is decided by rounding** (#1298).
+    ///
+    /// The four supersampled readout cases are the only place in the suite
+    /// where a *coverage function* is held to bit-exactness off a rasterisation
+    /// edge, and at an integer stretch that function is maximally degenerate:
+    /// every one of the kit's boundaries is an integer buffer coordinate,
+    /// [`TAPER_EDGE`] is a half-integer, and the device lattice is
+    /// `(i + 0.5) / stretch` — so `across` and `along` come out odd multiples of
+    /// `1 / (2 * stretch)` and [`face_cov`]'s operand `0.5 - r / w` lands on a
+    /// lattice of its own, straight on top of the ramp's decision points.
+    ///
+    /// **Only one of those points costs anything to cross**, which is why this
+    /// test is about that one. Crossing `clamp`'s bounds is free: an operand
+    /// that should be `0.0` and comes out `+ε` still gives
+    /// `int(255 * ε + 0.5) == 0`, and one that should be `1.0` and comes out
+    /// `1 - ε` is still the largest thing the `min` sees. The **midpoint** is
+    /// not: `int(255 * 0.5 + 0.5)` is `int(128.0)`, sitting exactly on a
+    /// truncation boundary, so an operand a millionth under it drops the byte
+    /// to `127`. Landing *exactly* on the midpoint is fine — `q == 0.5` means
+    /// the numerator is exactly `0.0`, the divide is exact on any IEEE-754
+    /// arithmetic, and `255.0 * 0.5 + 0.5` is exactly `128.0` under GLSL ES's
+    /// correctly-rounded `*` and `+`. Landing a millionth away from it is the
+    /// failure, because then the last bit of whatever produced the sample point
+    /// decides the byte rather than the geometry.
+    ///
+    /// Which is the whole of what `seven_seg.frag`'s `fi`/`px`/`pc` exist for.
+    /// Before #1298 the sample point was the interpolated `v_uv` scaled by the
+    /// grid, and GLSL ES pins `floor`, `+`, `*` and `/` while pinning **nothing
+    /// at all** about how an implementation evaluates an attribute's plane
+    /// equation. Measured on llvmpipe at the harness's x2 clock face, that put
+    /// 8455 of the three faces' operands within `1e-3` of a decision point
+    /// *without being on one*, the closest `1e-6` away. Rebuilt from the
+    /// fragment's own integer index the lattice is exact, no operand is within
+    /// a rounding distance of the midpoint that is not on it, and the four x2
+    /// frames move at 101 / 67 / 38 / 92 pixels of 13160 — **every one of them
+    /// by exactly ±1**, which is the set the driver's last bit had been
+    /// deciding.
+    ///
+    /// The `nudge` arm is the negative control, and the reason this is a test
+    /// rather than a comment: a sample point a millionth of a pixel off the
+    /// lattice — which is what the driver's interpolant was — puts the
+    /// population back. Without it the assertion would read as a property of
+    /// the geometry when it is a property of *how the geometry is sampled*.
+    ///
+    /// Stretch 3 is in the sweep because it is the case that cannot be fixed by
+    /// making the sample point exact — `1 / 3` is not a binary fraction, so
+    /// `(i + 0.5) / 3` is a rounded number however it is computed. It passes
+    /// anyway, and for a reason worth writing down: there the chamfer's operand
+    /// lands on `0.5 ± odd/4`, a **quarter of a ramp** from the midpoint, so
+    /// the degeneracy the x2 lattice has is not a property of integer stretches
+    /// in general.
+    ///
+    /// This says the invariant holds; [`the_mirror_is_the_shipped_shaders_arithmetic`]
+    /// says the shipped GLSL is what builds the lattice it holds for. Neither
+    /// replaces the other: a `pc` quietly taken off `v_uv` again would leave
+    /// this green, because the sweep below computes its own lattice.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn the_continuous_branch_has_no_operand_near_a_decision_point() {
+        /// The one decision point of [`face_cov`]'s ramp that costs a byte to
+        /// cross — see the doc on why `clamp`'s two bounds do not.
+        const MIDPOINT: f32 = 0.5;
+        /// What counts as "a rounding distance" from it. Three orders of
+        /// magnitude above the `1e-6` the interpolant was measured at, and
+        /// three below the `0.25` the sparsest lattice here leaves.
+        const MARGIN: f32 = 1e-3;
+
+        /// One sweep's census of [`face_cov`]'s operands, against [`MIDPOINT`].
+        struct Sweep {
+            /// How many were looked at at all — the guard against a sweep that
+            /// walks an empty readout and reports a clean zero.
+            seen: u64,
+            /// Within [`MARGIN`] of the midpoint without being on it. **This
+            /// is the number that must be zero.**
+            near: u64,
+            /// Exactly on the midpoint, where the numerator is exactly zero and
+            /// the byte is `128` on any IEEE-754 arithmetic.
+            mid: u64,
+            /// The closest any operand came without being on it.
+            closest: f32,
+        }
+
+        let sweep = |text: &str, stretch: usize, nudge: f32| -> Sweep {
+            let encoded = readout(text);
+            let (w, h) = (encoded.size.0 as usize, encoded.size.1 as usize);
+            let (vw, vh) = (w * stretch, h * stretch);
+            let strip = encoded.strip.as_deref().unwrap_or(&[]);
+            let cells = i32::try_from(encoded.cells).unwrap_or(i32::MAX);
+            // `seven_seg.frag`'s `pc` and `fp`, both off the device lattice.
+            let lattice =
+                |i: usize, grid: usize, view: usize| ((i as f32 + 0.5) * grid as f32) / view as f32;
+            let fp = (w as f32 / vw as f32, h as f32 / vh as f32);
+            let (mut seen, mut near, mut mid) = (0_u64, 0_u64, 0_u64);
+            let mut closest = f32::INFINITY;
+            for jt in 0..vh {
+                for i in 0..vw {
+                    let p = (lattice(i, w, vw) + nudge, lattice(jt, h, vh) + nudge);
+                    let first = cell_at(strip, cells, p.0);
+                    for k in 0..2 {
+                        let ci = first + k;
+                        if ci >= cells {
+                            break;
+                        }
+                        let local = (p.0 - cell_x(strip, ci), p.1 - kit::SEVEN_SEG_PAD as f32);
+                        let code = cell_code(strip, ci, false);
+                        let bars: Vec<kit::SevenSegBar> = if code & (1 << i32::from(COLON_BIT)) != 0
+                        {
+                            kit::SEVEN_SEG_COLON_DOTS.to_vec()
+                        } else {
+                            kit::SEVEN_SEG_BARS
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(bit, _)| code & (1 << bit) != 0)
+                                .map(|(_, bar)| bar)
+                                .collect()
+                        };
+                        for bar in bars {
+                            let hs = kit::SEVEN_SEG_THICK as f32 * 0.5;
+                            let hl = bar.len as f32 * 0.5;
+                            let centre = if bar.vertical {
+                                (bar.x as f32 + hs, bar.y as f32 + hl)
+                            } else {
+                                (bar.x as f32 + hl, bar.y as f32 + hs)
+                            };
+                            let d = ((local.0 - centre.0).abs(), (local.1 - centre.1).abs());
+                            let along = if bar.vertical { d.1 } else { d.0 };
+                            let across = if bar.vertical { d.0 } else { d.1 };
+                            let r = bar_residuals(along, across, hl, hs, bar.tapered);
+                            let (fl, fs) = if bar.vertical {
+                                (fp.1, fp.0)
+                            } else {
+                                (fp.0, fp.1)
+                            };
+                            for (residual, width) in [(r[0], fs), (r[1], fl), (r[2], fl + fs)] {
+                                // `NO_CHAMFER` is a sentinel, not a geometry —
+                                // it is nine orders of magnitude off the ramp
+                                // and `bar_residuals`' doc says why.
+                                if residual == NO_CHAMFER {
+                                    continue;
+                                }
+                                seen += 1;
+                                let q = 0.5 - residual / width.max(1e-6);
+                                let distance = (q - MIDPOINT).abs();
+                                if distance == 0.0 {
+                                    mid += 1;
+                                    assert_eq!(
+                                        residual, 0.0,
+                                        "the ramp's midpoint was reached with a non-zero \
+                                         numerator, so it is the divide that decides the byte \
+                                         there and not the geometry",
+                                    );
+                                } else {
+                                    closest = closest.min(distance);
+                                    if distance < MARGIN {
+                                        near += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Sweep {
+                seen,
+                near,
+                mid,
+                closest,
+            }
+        };
+
+        // 2 is what the harness renders and the stretch the x2 readout cases
+        // are; 3 and 4 are the two a `scale_factor` produces. 4's ratio is a
+        // binary fraction like 2's, 3's is not — see the doc.
+        for stretch in [2_usize, 3, 4] {
+            let exact = sweep("12:34", stretch, 0.0);
+            assert!(
+                exact.seen > 100_000,
+                "the stretch-{stretch} sweep looked at only {} operand(s) — it is walking the \
+                 wrong readout and every assertion below it is vacuous",
+                exact.seen,
+            );
+            assert_eq!(
+                exact.near, 0,
+                "at stretch {stretch} the lattice leaves {} operand(s) within {MARGIN} of the \
+                 ramp's midpoint without being on it (closest {:e}) — one byte apiece, decided \
+                 by whatever produced the sample point rather than by the geometry",
+                exact.near, exact.closest,
+            );
+
+            // The control, and the reason this is a test — but only where the
+            // lattice reaches the midpoint at all, since a nudge can only push
+            // something *off* a point it is standing on. At stretch 3 it does
+            // not, which the assertion below is the statement of.
+            if exact.mid > 0 {
+                let nudged = sweep("12:34", stretch, 1e-6);
+                assert!(
+                    nudged.near > 0,
+                    "at stretch {stretch} a sample point 1e-6 off the lattice leaves none of \
+                     the {} operand(s) on the midpoint inside the margin — then the assertion \
+                     above is not measuring the sampling",
+                    exact.mid,
+                );
+            }
+        }
+
+        // **Which stretches reach the midpoint at all**, since "no operand is
+        // near it" means two different things on either side of that and only
+        // one of them is a statement. At 2 and 4 the chamfer's operand lands on
+        // it squarely and the margin above is load-bearing; at 3 it lands on
+        // `0.5 ± odd/4`, a quarter of a ramp away, so the x2 degeneracy is a
+        // property of *that* lattice and not of integer stretches at large.
+        for (stretch, reaches) in [(2_usize, true), (3, false), (4, true)] {
+            let seen = sweep("12:34", stretch, 0.0);
+            assert_eq!(
+                seen.mid > 0,
+                reaches,
+                "stretch {stretch} puts {} operand(s) exactly on the ramp's midpoint \
+                 (closest miss {:e}), which is not what this file says it does",
+                seen.mid,
+                seen.closest,
+            );
+        }
+    }
+
     /// **The transcription above is the arithmetic the shipped shaders carry**
     /// — a source scan over `seven_seg.frag` and `blur.frag`, so a fix applied
     /// to one side only reds here instead of leaving a green mirror describing
@@ -848,6 +1072,23 @@ mod tests {
             "return ((2 * i + 1 - n) * COORD_ONE) / n;",
             // the lit pass's sample point
             "vec2 p = floor(gl_FragCoord.xy) + 0.5;",
+            // …and the **blit** pass's, which #1298 took off the interpolant's
+            // value and onto the fragment's own integer index. All four
+            // clauses are load-bearing and each fails differently: drop the
+            // `floor` and the lattice is the interpolant's again; drop the
+            // `+ 0.5` and every sample sits on a buffer-pixel corner; take
+            // `col`/`row` off `v_uv` again and the two halves can disagree
+            // about which buffer pixel a fragment is in; divide before
+            // multiplying and `pc` stops being exact. See
+            // [`the_continuous_branch_has_no_operand_near_a_decision_point`],
+            // which asserts the invariant this lattice buys and cannot see
+            // whether the shipped file still builds it.
+            "vec2 fi = clamp(floor(v_uv * vp), vec2(0.0), vp - 1.0);",
+            "vec2 px = vec2(fi.x, vp.y - 1.0 - fi.y) + 0.5;",
+            "vec2 pc = px * vec2(float(cols), float(rows)) / vp;",
+            "int col = clamp(int(pc.x), 0, cols - 1);",
+            "int row = clamp(int(pc.y), 0, rows - 1);",
+            "vec2 fp = snapped ? vec2(1.0) : vec2(float(cols), float(rows)) / vp;",
             // …and the two constants the mirror re-declares rather than reads.
             // `TAPER_EDGE`'s *value* is separately held to the kit itself by
             // `the_taper_law_is_the_kits_own_staircase`, which parses it out of

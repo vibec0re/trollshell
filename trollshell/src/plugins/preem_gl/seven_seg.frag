@@ -61,6 +61,32 @@
 // holds only on a scale-1 display showing the chip at its natural size. On a
 // `scale_factor >= 2` monitor the continuous branch is the shipping path.
 //
+// # …and why the continuous branch decides nothing by rounding either (#1298)
+//
+// The coverage has no ties to *break*, but at an integer stretch it has plenty
+// to **sit on**: the kit's boundaries are integers and `TAPER_EDGE` is a
+// half-integer, so on a `(i + 0.5) / stretch` lattice every one of `face_cov`'s
+// operands lands exactly on the ramp's `0`, `0.5` or `1` — or a clear margin
+// from all three (half a ramp at the x2 the harness renders, a quarter at
+// stretch 3). Exactly on is fine: at the midpoint the numerator is exactly
+// `0.0`, so the divide is exact on any IEEE-754 arithmetic and
+// `255.0 * 0.5 + 0.5` is exactly `128.0`. A *millionth* off is not, because
+// then the last bit of whatever produced the sample point decides the byte —
+// and only the midpoint costs anything to cross, since an operand that should
+// be `0.0` and comes out `+ε` still rounds to the byte `0`, and one that
+// should be `1.0` and comes out `1 - ε` is still the largest thing the `min`
+// in `bar_cov` sees.
+//
+// Which is why `main` below builds the sample point from the fragment's own
+// integer index and reads `v_uv` only through a `floor` with a half-fragment
+// margin. GLSL ES pins `floor`, `+`, `*` and `/`; it pins nothing about how an
+// implementation evaluates an attribute's plane equation, and llvmpipe's lands
+// ~`1e-6` off — measured, 8455 operands of the harness's x2 clock face inside
+// `1e-3` of a decision point without being on one. On the rebuilt lattice that
+// count is zero, which
+// `seven_seg.rs`'s `the_continuous_branch_has_no_operand_near_a_decision_point`
+// asserts and whose negative control puts the millionth back.
+//
 // # Why this pipeline has a blur pass where `led_strip.frag` does not
 //
 // #1153's meter has a closed-form halo because its emission is a *product* of
@@ -449,22 +475,54 @@ void main() {
 
     int cols = u_grid.x;
     int rows = u_grid.y;
+    vec2 vp = vec2(max(u_viewport.x, 1), max(u_viewport.y, 1));
+    // **The sample point is built from the fragment's own integer index, not
+    // from the interpolant's value** (#1298). `v_uv` is read exactly once more
+    // in this file, through a `floor` with a **half-fragment** margin, and
+    // never again as a number: the true value at device fragment `i` is
+    // `(i + 0.5) / viewport`, so `floor(v_uv * viewport)` returns `i` for any
+    // interpolation within ±0.5 of a fragment — which is the tolerance the
+    // `col`/`row` point sampling below already lived on.
+    //
+    // That margin is the whole point. GLSL ES pins `floor`, `+` and `*` to a
+    // correctly rounded result, and pins nothing at all about how an
+    // implementation evaluates an attribute's plane equation — and the
+    // continuous branch's residuals are **exactly** on their coverage
+    // thresholds at an integer stretch (see `bar_cov`'s note below), so a
+    // sample point that is a millionth of a pixel off the lattice decides a
+    // comparison by rounding luck rather than by geometry. Measured on
+    // llvmpipe at the harness's x2 clock face: 837 fragment/bar pairs sit
+    // exactly on the chamfer's ramp midpoint and another 2215 within 1e-3 of a
+    // threshold without being on it, the closest 1e-6 away. Rebuilt from `i`
+    // the lattice is exact, and every one of those operands is either exactly
+    // on a threshold — where the chamfer's numerator is exactly `0.0`, so the
+    // division is exact on any IEEE-754 arithmetic and `255 * 0.5 + 0.5` is
+    // exactly `128.0` — or a quarter of a buffer pixel away from one.
+    vec2 fi = clamp(floor(v_uv * vp), vec2(0.0), vp - 1.0);
+    // …the same fragment as a **top-down** device-pixel centre, which is the
+    // kit's row order (`gl_FragCoord`/`v_uv` run bottom-up, and this is the
+    // one flip in the pipeline — see `LAYER_LIT`'s note above).
+    vec2 px = vec2(fi.x, vp.y - 1.0 - fi.y) + 0.5;
+    // …and in buffer units. `* grid` is exact (a buffer dimension times a
+    // half-integer index, both far inside `2^24`), and the divide's exact
+    // quotient is representable at every stretch where a residual can land on
+    // a threshold at all, which is the only place it has to be.
+    vec2 pc = px * vec2(float(cols), float(rows)) / vp;
     // Point sampling into the letterboxed fit rect, as `scope_blit.frag` does
     // it — used for the CRT pass, which is a grid-resolution quantity by
     // definition (`MaskRow` is a row of the *buffer*), and for the snapped
-    // branch's sample point below.
-    int col = clamp(int(v_uv.x * float(cols)), 0, cols - 1);
-    int row = clamp(int((1.0 - v_uv.y) * float(rows)), 0, rows - 1);
+    // branch's sample point below. Taken off `pc` rather than off `v_uv`
+    // again, so the two cannot disagree about which buffer pixel a fragment is
+    // in: at 1:1 `pc` is exactly `float(i) + 0.5`, so this is exactly `i`.
+    int col = clamp(int(pc.x), 0, cols - 1);
+    int row = clamp(int(pc.y), 0, rows - 1);
 
-    vec2 pc = vec2(v_uv.x * float(cols), (1.0 - v_uv.y) * float(rows));
     bool snapped = (u_viewport == u_grid);
     vec2 p = snapped ? vec2(float(col), float(row)) + 0.5 : pc;
     // The fragment's footprint in buffer units. Exactly `(1, 1)` on the snapped
     // branch by construction rather than by a division that happens to land
     // there — and unread there anyway, since `snapped` takes the point test.
-    vec2 fp = snapped
-        ? vec2(1.0)
-        : vec2(float(cols), float(rows)) / vec2(max(u_viewport.x, 1), max(u_viewport.y, 1));
+    vec2 fp = snapped ? vec2(1.0) : vec2(float(cols), float(rows)) / vp;
 
     ivec4 bg = ivec4(u_bg + 0.5);
     ivec4 ink = ivec4(u_ink + 0.5);

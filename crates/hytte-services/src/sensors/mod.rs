@@ -64,6 +64,11 @@ use warn_latch::{WARN_COOLDOWN, WarnLatch};
 ///
 /// Constructed inside `tokio::task::spawn_blocking` and returned to the async
 /// poll loop so that no blocking syscall runs directly on a tokio worker thread.
+///
+/// `Default` (#1327 review MEDIUM 2) is for tests only — a fake injected
+/// sampler that only cares about one or two fields can start from
+/// `TickData::default()` rather than naming all twelve.
+#[derive(Default)]
 struct TickData {
     /// Parsed `/proc/stat` entries, or `None` on read error.
     cpu_stat: Option<Vec<(u64, u64)>>,
@@ -114,7 +119,7 @@ pub struct SensorsHandles {
     pub(crate) net_connections: Mutable<NetConnections>,
     pub(crate) process_count: Mutable<u32>,
     /// Live list of real mounts from `/proc/self/mountinfo`. Updated by
-    /// `mount_watch_loop`; consumed by `poll_loop`'s disk branch.
+    /// `mount_watch_loop`; consumed by `poll_tick`'s disk branch.
     pub(crate) mount_list: Mutable<Vec<MountSpec>>,
     // ── Sparkline history (#231) ──────────────────────────────────────────────
     // Process-wide ring buffers (last `HISTORY_CAP` samples) for the Stats-panel
@@ -721,8 +726,13 @@ where
     let do_net_conn = tick.is_multiple_of(2);
     let do_disk = tick.is_multiple_of(5);
 
-    // Take the chip-dir cache out of state so the blocking call can own it.
+    // Take the chip-dir cache out of state so the blocking call can own it,
+    // keeping a clone behind for the same reason the GPU cache does below: a
+    // panicked call must not cost the *next* tick a slow `/sys/class/hwmon`
+    // re-walk (#1327 review MEDIUM 1 — the same bug the issue named, one
+    // `take()` over).
     let chip = state.cpu_temp_chip.take();
+    let chip_before_tick = chip.clone();
     // Move the GPU cache out of state so the blocking call can own it, but
     // keep a clone behind: if the call panics, the moved-in cache is gone
     // with it, and without this clone `state.gpu_cache` would silently fall
@@ -752,10 +762,11 @@ where
 
     let Ok((data, new_gpu_cache)) = data else {
         log_blocking_io_panic(&mut state.warn_blocking_io, now);
-        // Restore the cache the panicked call took ownership of, rather than
-        // leaving `state.gpu_cache` at the `Default` `mem::take` left behind
-        // (#1327).
+        // Restore both caches the panicked call took ownership of, rather
+        // than leaving them at the `Default`/`None` the `take`s left behind
+        // (#1327; the chip half is MEDIUM 1 of the review).
         state.gpu_cache = gpu_cache_before_tick;
+        state.cpu_temp_chip = chip_before_tick;
         state.tick = state.tick.wrapping_add(1);
         return;
     };
@@ -781,9 +792,35 @@ where
 }
 
 async fn poll_loop(w: PollWriters) {
+    poll_loop_with(w, sample_tick).await;
+}
+
+/// [`poll_loop`], generic over the per-tick sampler.
+///
+/// `poll_tick`'s own injectability (added for #1327's panic test) cannot, on
+/// its own, catch a mutation confined to *this* function's body — nothing
+/// above ever calls `poll_loop`/`poll_loop_with` at all, so a change here
+/// that fed `poll_tick` a sampler wrapped to discard whatever `PollState`
+/// persisted (e.g. resetting `TickInputs::gpu_cache` to `Default` every
+/// tick) would be invisible to the whole suite (#1327 review MEDIUM 2,
+/// second half — the seam-wrapper hole moved up one layer). Splitting this
+/// out is what lets a test drive the *actual* production loop, real 1 Hz
+/// sleep included, with a fake sampler standing in for `sample_tick`.
+///
+/// `sample` is `Fn` rather than `FnMut`: cloning the `Arc` once per tick
+/// (rather than needing `Clone`/interior mutability plumbed through the
+/// bound itself) is enough, since `sample_tick` and every test sampler here
+/// use `Mutex`/atomics internally when they need to remember anything across
+/// calls.
+async fn poll_loop_with<F>(w: PollWriters, sample: F)
+where
+    F: Fn(TickInputs) -> (TickData, GpuCache) + Send + Sync + 'static,
+{
+    let sample = Arc::new(sample);
     let mut state = PollState::new();
     loop {
-        poll_tick(&mut state, &w, sample_tick).await;
+        let sample = Arc::clone(&sample);
+        poll_tick(&mut state, &w, move |inputs| sample(inputs)).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -791,7 +828,7 @@ async fn poll_loop(w: PollWriters) {
 // ── Per-concern publish helpers ───────────────────────────────────────────────
 
 /// Log the blocking-I/O-task-panicked failure, rate-capped (#770). Split out
-/// of `poll_loop` to keep it under `clippy::too_many_lines` — see the
+/// of `poll_tick` to keep it under `clippy::too_many_lines` — see the
 /// `warn_latch` module docs for the cadence.
 fn log_blocking_io_panic(latch: &mut WarnLatch, now: Instant) {
     if let Some(suppressed) = latch.on_failure(now, WARN_COOLDOWN) {
@@ -819,7 +856,7 @@ fn log_blocking_io_recovery(latch: &mut WarnLatch) {
 /// Takes `&mut PollState` (rather than just `cpu_prev`) because it also owns
 /// the failure latch for #770's rate-capped `warn!` — see the `warn_latch`
 /// module docs — and threading both `&mut` pieces separately through
-/// `poll_loop`'s call site is what pushed that function over
+/// `poll_tick`'s call site is what pushed that function over
 /// `clippy::too_many_lines`.
 fn apply_cpu_load(
     state: &mut PollState,
@@ -855,7 +892,7 @@ fn apply_cpu_freq(cpu_freq: CpuFreq, writer: &Mutable<CpuFreq>) {
 /// Publish memory usage, or warn on read failure.
 ///
 /// Takes `&mut PollState` for the same reason as [`apply_cpu_load`]: it owns
-/// the #770 failure latch, and this keeps `poll_loop`'s call site to one
+/// the #770 failure latch, and this keeps `poll_tick`'s call site to one
 /// line instead of threading the latch through separately.
 fn apply_memory(
     state: &mut PollState,
@@ -1041,7 +1078,7 @@ async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
 //
 // The leaf parsers in `hytte-sensors` (`compute_cpu_load`, `compute_disk_io`,
 // …) are well covered by their own modules' tests (#1249). The `apply_*` functions
-// that fold each tick's sample into a `Mutable` — the glue `poll_loop` calls —
+// that fold each tick's sample into a `Mutable` — the glue `poll_tick` calls —
 // had none: whether a `None` sample is silently skipped vs. warned-once,
 // whether a "tick-gated" publisher (`apply_gpu`/`apply_disk`/
 // `apply_conn_counts`) actually leaves the writer untouched off-tick, and
@@ -1052,14 +1089,16 @@ async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
 mod tests {
     use super::{
         CpuFreq, CpuLoad, CpuTemp, DiskIo, DiskMount, DiskUsage, GpuCache, GpuState, GpuVendor,
-        NetConnections, NetIo, PollState, PollWriters, TickData, TickInputs, apply_conn_counts,
-        apply_cpu_freq, apply_cpu_load, apply_cpu_temp, apply_disk, apply_disk_io, apply_gpu,
-        apply_memory, apply_network, poll_tick, read_gpu_with_cache,
+        NetConnections, NetIo, PollState, PollWriters, TickData, TickInputs, WARN_COOLDOWN,
+        apply_conn_counts, apply_cpu_freq, apply_cpu_load, apply_cpu_temp, apply_disk,
+        apply_disk_io, apply_gpu, apply_memory, apply_network, poll_loop_with, poll_tick,
+        read_gpu_with_cache,
     };
     use futures_signals::signal::Mutable;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// A fresh set of `PollWriters` over brand-new `Mutable`s, for tests that
@@ -1080,31 +1119,44 @@ mod tests {
         }
     }
 
-    // ── poll_tick: the GpuCache must survive a panicked blocking tick ───────
+    // ── poll_tick: BOTH caches must survive a panicked blocking tick ────────
     //
-    // #1327: the tick moves `state.gpu_cache` into the blocking closure and
-    // only threads a fresh cache back on success; on the `Err` (panicked)
-    // arm the moved-in cache was lost, silently resetting `state.gpu_cache`
-    // to `Default` — which costs the next tick a re-probe of `nvidia-smi`
-    // availability (and, where present, a fork) outside #1297's TTL.
+    // #1327: the tick moves `state.gpu_cache` (and, review MEDIUM 1: the
+    // exact same bug, `state.cpu_temp_chip`) into the blocking closure and
+    // only threads fresh values back on success; on the `Err` (panicked) arm
+    // the moved-in values were lost, silently resetting `state.gpu_cache` to
+    // `Default` and `state.cpu_temp_chip` to `None` — which costs the next
+    // tick a re-probe of `nvidia-smi` availability (and, where present, a
+    // fork) outside #1297's TTL, and a slow `/sys/class/hwmon` re-walk for
+    // the chip dir.
     //
     // `GpuCache`'s fields are `pub(super)` inside `hytte-sensors`, so this
     // crate cannot build one by hand; running the real `read_gpu_with_cache`
     // once (fast, no real GPU or `nvidia-smi` required to terminate) is the
     // only way to get a concrete non-`Default` value to seed with — the
     // *panicked tick* itself never touches a real sampler, since the
-    // injected one below is pure fake.
+    // injected one below is pure fake. `PathBuf` (the chip dir's type) needs
+    // no such trick — it is a plain, publicly constructible `std` type.
     //
-    // Falsification: delete the `state.gpu_cache = gpu_cache_before_tick;`
-    // restore on the `Err` arm in `poll_tick` and this reds (see the PR
-    // description for the exact line and the red output).
+    // Do **not** add `PartialEq` to `GpuCache` to replace the `Debug`-string
+    // compare below: `GpuState::load` is an `f64`, and this tree has already
+    // been bitten by a derived `PartialEq` over `f64` used as an equality
+    // gate (a `NaN` defeats it forever). The string compare is the better
+    // choice here, not a workaround for `PartialEq`'s absence.
+    //
+    // Falsification (both quoted in the PR): delete
+    // `state.gpu_cache = gpu_cache_before_tick;` on the `Err` arm in
+    // `poll_tick` for the original #1327 bug, or delete
+    // `state.cpu_temp_chip = chip_before_tick;` for review MEDIUM 1.
     #[tokio::test]
-    async fn gpu_cache_survives_a_panicked_blocking_tick() {
+    async fn a_panicked_tick_restores_both_pre_tick_caches() {
         let (_gpu_state, seeded) = read_gpu_with_cache(GpuCache::default());
         let seeded_debug = format!("{seeded:?}");
+        let chip = PathBuf::from("/sys/class/hwmon/hwmon3");
 
         let mut state = PollState::new();
         state.gpu_cache = seeded;
+        state.cpu_temp_chip = Some(chip.clone());
 
         let w = fresh_poll_writers();
 
@@ -1115,7 +1167,7 @@ mod tests {
             &w,
             move |_inputs: TickInputs| -> (TickData, GpuCache) {
                 calls_in_closure.fetch_add(1, Ordering::SeqCst);
-                panic!("gpu_cache_survives_a_panicked_blocking_tick: injected panic (#1327)");
+                panic!("a_panicked_tick_restores_both_pre_tick_caches: injected panic (#1327)");
             },
         )
         .await;
@@ -1130,6 +1182,162 @@ mod tests {
             seeded_debug,
             "a panicked blocking tick must restore the pre-tick GpuCache rather than silently \
              resetting it to Default (#1327)"
+        );
+        assert_eq!(
+            state.cpu_temp_chip,
+            Some(chip),
+            "a panicked blocking tick must restore the pre-tick hwmon chip dir too \
+             (#1327 review MEDIUM 1)"
+        );
+        // LOW 2: the panic arm's other two post-conditions, pinned in the same
+        // test rather than left free — `state.tick` must still advance (a
+        // panic streak that recovers should come back on the same phase
+        // parity it left), and the #770 rate-cap latch must have recorded a
+        // failure (`log_blocking_io_panic`), not merely been left untouched.
+        // `on_failure` is `pub(super)` inside `warn_latch`, visible here as a
+        // descendant of `sensors` — a fresh call reading back `None` ("a
+        // streak is already in progress") is the only way to observe that
+        // without a tracing subscriber.
+        assert_eq!(
+            state.tick, 1,
+            "the phase counter must still advance across a panicked tick"
+        );
+        assert_eq!(
+            state
+                .warn_blocking_io
+                .on_failure(Instant::now(), WARN_COOLDOWN),
+            None,
+            "the panic must already have recorded a failure in the #770 rate-cap latch"
+        );
+    }
+
+    /// **The `Ok` arm's own forward-threading** (#1327 review MEDIUM 2): a
+    /// successful tick must *adopt* what the sampler handed back, not merely
+    /// survive a panic. Without this, restoring the pre-tick cache
+    /// unconditionally — on **both** arms, not just the panicked one — passes
+    /// [`a_panicked_tick_restores_both_pre_tick_caches`] while #1297's
+    /// `nvidia-smi` TTL memo (and the hwmon chip-dir cache) never advance at
+    /// all: every tick would re-probe/re-walk, strictly worse than the bug
+    /// #1327 names.
+    ///
+    /// `fresh` is real (via `read_gpu_with_cache`, for the same
+    /// cross-crate-construction reason as above) and `PollState::new()`
+    /// starts at `GpuCache::default()` (`nvidia_available: None`), so the two
+    /// are always distinguishable regardless of the box this runs on.
+    ///
+    /// Falsification: replace the `Ok` arm's `state.gpu_cache = new_gpu_cache;`
+    /// / `state.cpu_temp_chip = data.cpu_temp_chip;` with the pre-tick values
+    /// — this reds with the fresh cache's `Debug` string on the right and the
+    /// `Default` one (still sitting in `state` from `PollState::new()`) on
+    /// the left.
+    #[tokio::test]
+    async fn a_returning_tick_adopts_what_the_sampler_handed_back() {
+        let (_gpu_state, fresh) = read_gpu_with_cache(GpuCache::default());
+        let fresh_debug = format!("{fresh:?}");
+        let chip = PathBuf::from("/sys/class/hwmon/hwmon9");
+
+        let mut state = PollState::new();
+        let w = fresh_poll_writers();
+        let chip_in_closure = chip.clone();
+        poll_tick(&mut state, &w, move |_inputs: TickInputs| {
+            (
+                TickData {
+                    cpu_temp_chip: Some(chip_in_closure),
+                    ..TickData::default()
+                },
+                fresh,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            format!("{:?}", state.gpu_cache),
+            fresh_debug,
+            "a completed tick must adopt the cache the sampler returned"
+        );
+        assert_eq!(
+            state.cpu_temp_chip,
+            Some(chip),
+            "…and the chip dir it resolved"
+        );
+        assert_eq!(state.tick, 1, "…and the phase counter advances");
+    }
+
+    /// **The production `poll_loop` entry point itself must thread the cache
+    /// from one tick into the next** (#1327 review MEDIUM 2, second half): a
+    /// mutation confined entirely to `poll_loop`/`poll_loop_with`'s own body —
+    /// e.g. handing `poll_tick` a sampler wrapped to discard whatever
+    /// `PollState` persisted and always report a fresh `GpuCache::default()`
+    /// — is invisible to every test above, since none of them ever calls
+    /// `poll_loop`/`poll_loop_with` at all; they all drive `poll_tick`
+    /// directly. This is the same seam-wrapper shape item 2 of #1327 exists
+    /// to close, reintroduced by this file's own #1327 refactor one layer out:
+    /// `poll_tick(injected)` tested, `poll_loop` shipping untested.
+    ///
+    /// Drives two REAL ticks of `poll_loop_with` — production's own loop,
+    /// real 1 s sleep between ticks included — with an injected `Fn` sampler
+    /// that records the `GpuCache` it was handed on each call (via a
+    /// `Mutex<Vec<_>>`, since the bound is `Fn`, not `FnMut`: interior
+    /// mutability is what lets one `Arc`-shared sampler serve every tick
+    /// without `poll_loop_with` itself needing a `Clone`/`FnMut` sampler) and
+    /// hands back a distinct, real `GpuCache` on its first call. A short real
+    /// wall-clock wait (a touch over one sleep interval) is deliberate here
+    /// rather than a paused virtual clock: `spawn_blocking`'s completion is
+    /// real-thread-scheduled regardless of tokio's time driver, and mixing
+    /// that with `start_paused` is exactly the kind of interaction this
+    /// tree's own notes warn is fragile.
+    ///
+    /// Falsification: wrap `poll_loop_with`'s call to `poll_tick` so the
+    /// sampler it hands `poll_tick` always resets `TickInputs::gpu_cache` to
+    /// `GpuCache::default()` first (mutation (b) from the review) — this reds
+    /// on the second-tick assertion, `Default` on the left instead of the
+    /// first tick's real answer.
+    #[tokio::test]
+    async fn poll_loop_threads_the_cache_from_one_tick_into_the_next() {
+        let (_gpu_state, distinct) = read_gpu_with_cache(GpuCache::default());
+        let distinct_debug = format!("{distinct:?}");
+        let default_debug = format!("{:?}", GpuCache::default());
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_closure = Arc::clone(&seen);
+        let handed_out: Arc<Mutex<Option<GpuCache>>> = Arc::new(Mutex::new(Some(distinct)));
+
+        let w = fresh_poll_writers();
+        let handle = tokio::spawn(poll_loop_with(w, move |inputs: TickInputs| {
+            seen_in_closure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{:?}", inputs.gpu_cache));
+            let next = handed_out
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_default();
+            (TickData::default(), next)
+        }));
+
+        // The first tick runs immediately; the second follows the one real
+        // second `poll_loop_with` sleeps between ticks. 1.3s leaves margin
+        // without waiting for a third.
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        handle.abort();
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            seen.len() >= 2,
+            "expected at least two ticks of poll_loop_with to have run, saw {}",
+            seen.len()
+        );
+        assert_eq!(
+            seen[0], default_debug,
+            "the first tick starts from PollState::new()'s Default cache"
+        );
+        assert_eq!(
+            seen[1], distinct_debug,
+            "the second tick must see the cache the FIRST tick returned — poll_loop's own \
+             loop, not just poll_tick in isolation, must thread it (#1327 review MEDIUM 2)"
         );
     }
 
@@ -1488,7 +1696,7 @@ mod tests {
 
     // ── Tick-gated publishers: apply_gpu / apply_disk / apply_conn_counts ────
     //
-    // Each of these only publishes on its own tick cadence (`poll_loop` calls
+    // Each of these only publishes on its own tick cadence (`poll_tick` calls
     // them every tick, but with `None`/`gpu_tick: false` off-cadence) — the
     // one behaviour all three share and the one a table test alone would miss
     // if the "off-tick" row were left out.

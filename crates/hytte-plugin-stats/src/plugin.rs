@@ -955,6 +955,23 @@ mod tests {
         if std::env::var_os(SETTINGS_ENV_CHILD).is_none() {
             return;
         }
+        // The precedent's self-agreement guard (#1327 review LOW 1):
+        // `hytte-plugin::runtime`'s `the_mount_env_var_reaches_the_register_frame_inner`
+        // opens with the equivalent of this — `assert_ne!(Echo::manifest().mount, want, …)`
+        // — and this copy had dropped it, replacing it with an assertion on the
+        // environment variable's *value* rather than on the design premise the
+        // doc comment above `settings_reads_the_real_process_environment`
+        // argues: that `BarRight` differs from `DEFAULT_MOUNT`'s own family.
+        // Without this, a future `DEFAULT_MOUNT` move to a bar region — not a
+        // hypothetical on a plugin whose whole point is running on both
+        // families — would make a fully neutered `settings()` and a working
+        // one agree, and this test would stop catching it.
+        assert_ne!(
+            Family::of(DEFAULT_MOUNT),
+            Family::Bar,
+            "test setup: the override's family must differ from DEFAULT_MOUNT's own, \
+             or a neutered settings() and a working one give the same answer",
+        );
         assert_eq!(
             std::env::var("HYTTE_PLUGIN_MOUNT").as_deref(),
             Ok("BarRight"),

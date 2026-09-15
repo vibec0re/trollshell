@@ -188,20 +188,23 @@ craneLib.mkCargoDerivation (
       export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
       export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
       # #1298: llvmpipe JITs the parity shaders against the host's feature
-      # set, and the runner fleet is heterogeneous. Twice, on an Intel Xeon
-      # 8370C (Ice Lake, AVX-512), the four seven-seg x2 cases came back with
-      # interior lit pixels 34–121 of 255 darker than the kit — byte-identical
-      # between the two reds, byte-identical greens on every AMD and non-AVX-512
-      # Intel host, and a Lipschitz bound of ±1 on any conformant evaluation of
-      # the shader as written (PR #1309), so it is the driver's AVX-512 codegen
-      # miscomputing the continuous branch, not rounding. 256 keeps llvmpipe on
-      # the AVX2 vector path every green run and the parity oracle were measured
-      # on (measured here: 128/256/default give 160/160 byte-identical frames on
-      # a Zen 3 host). This is a hypothesis about Ice Lake, not a proof — the
-      # next 8370C run (the baseline step names the CPU) is the test; if it
-      # still reds, the next lever is GALLIUM_OVERRIDE_CPU_CAPS or an upstream
-      # mesa report.
-      export LP_NATIVE_VECTOR_WIDTH=256
+      # set, and the runner fleet is heterogeneous. Four times, on an Intel
+      # Xeon 8370C (Ice Lake, AVX-512), the four seven-seg x2 cases came back
+      # with lit interior pixels 34–121 of 255 darker than the kit —
+      # byte-identical across all four reds, byte-identical greens on every
+      # AMD and non-AVX-512 Intel host, and a ±2 Lipschitz bound on any
+      # conformant evaluation of the shader as written (PR #1309) — so it is
+      # the driver's AVX-512 codegen miscomputing the branch, not rounding.
+      # `LP_NATIVE_VECTOR_WIDTH=256` (#1311) was tried first and FALSIFIED by
+      # the fourth red (a tree carrying it, same bytes): the SoA width does not
+      # stop `lp_bld_misc.cpp` handing LLVM `+avx512*` from the CPU caps. This
+      # knob does — `u_cpu_detect.c` reads it before the caps are published,
+      # and `avx` zeroes `has_avx512f` (AVX2 and FMA stay), so LLVM never sees
+      # the AVX-512 features at all. Measured here (Zen 3, no AVX-512 to lose):
+      # 160/160 frames byte-identical with and without it. Still a hypothesis
+      # about Ice Lake until an 8370C draws a tree with this line; the
+      # baseline step prints the CPU, and #1319 dumps the frames if it reds.
+      export GALLIUM_OVERRIDE_CPU_CAPS=avx
       # A skip is indistinguishable from a pass in captured output
       # (same reasoning as `TROLLSHELL_REQUIRE_ICON_THEME` above):
       # this build means the three tests to run for real, so a

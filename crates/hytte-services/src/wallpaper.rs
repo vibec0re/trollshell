@@ -286,18 +286,16 @@ impl<'de> Deserialize<'de> for Mode {
         D: serde::Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        match Mode::parse(&raw) {
-            Some(mode) => Ok(mode),
-            None => {
-                tracing::warn!(
-                    key = "mode",
-                    value = %raw,
-                    "wallpaper: unrecognised scaling mode; using the default (fill) — \
-                     ignoring this key and using the built-in default"
-                );
-                Ok(Mode::default())
-            }
+        if let Some(mode) = Mode::parse(&raw) {
+            return Ok(mode);
         }
+        tracing::warn!(
+            key = "mode",
+            value = %raw,
+            "wallpaper: unrecognised scaling mode; using the default (fill) — \
+             ignoring this key and using the built-in default"
+        );
+        Ok(Mode::default())
     }
 }
 
@@ -1199,39 +1197,54 @@ mod tests {
     /// #1044-style per-key tolerance applied to a state file: an
     /// unrecognised `mode` word costs only that key — it falls back to the
     /// default and the rest of the file (`default`, `outputs`) still loads —
-    /// rather than failing the whole `toml::from_str` the way a strict
-    /// derived enum would.
+    /// rather than failing the whole `state::load` the way a strict derived
+    /// enum would (`hytte-services` deliberately has no direct `toml`
+    /// dependency — see this crate's `Cargo.toml` — so this drives the real
+    /// TOML parse through [`state::load`] against a hand-written file rather
+    /// than calling a TOML crate here).
     ///
     /// Falsified by deriving `Mode`'s `Deserialize` instead of hand-writing
-    /// it: `toml::from_str::<WallpaperState>` then returns `Err` for the
-    /// whole document and this test's `expect` panics.
+    /// it: `state::load::<WallpaperState>` then returns `None` for the whole
+    /// document (a `warn!` naming the parse error, not `key = "mode"`) and
+    /// this test's `expect` panics.
     #[test]
     fn an_unrecognised_mode_costs_only_that_key() {
-        let toml = "default = \"/d.png\"\nmode = \"bogus\"\n\n[outputs]\n\"DP-1\" = \"/dp1.png\"\n";
+        scratch_home(|_home| {
+            let path = state::path(SUBSYSTEM).expect("state path resolves");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(
+                &path,
+                "default = \"/d.png\"\nmode = \"bogus\"\n\n[outputs]\n\"DP-1\" = \"/dp1.png\"\n",
+            )
+            .expect("seed a state file with a bad mode word");
 
-        let (captured, _guard) = capture();
-        let state: WallpaperState =
-            toml::from_str(toml).expect("the rest of the file must still parse");
+            let (captured, _guard) = capture();
+            let loaded = state::load::<WallpaperState>(SUBSYSTEM)
+                .expect("the rest of the file must still parse");
 
-        assert_eq!(state.mode, Mode::default(), "an unusable word falls back");
-        assert_eq!(state.default.as_deref(), Some("/d.png"));
-        assert_eq!(
-            state.outputs.get("DP-1").map(String::as_str),
-            Some("/dp1.png"),
-            "a sibling key must not be dropped by the bad mode"
-        );
+            assert_eq!(loaded.mode, Mode::default(), "an unusable word falls back");
+            assert_eq!(loaded.default.as_deref(), Some("/d.png"));
+            assert_eq!(
+                loaded.outputs.get("DP-1").map(String::as_str),
+                Some("/dp1.png"),
+                "a sibling key must not be dropped by the bad mode"
+            );
 
-        let warnings: Vec<_> = captured
-            .events()
-            .into_iter()
-            .filter(|e| e.level == tracing::Level::WARN)
-            .collect();
-        assert_eq!(warnings.len(), 1, "exactly one warning, got {warnings:?}");
-        assert_eq!(warnings[0].fields.get("key").map(String::as_str), Some("mode"));
-        assert_eq!(
-            warnings[0].fields.get("value").map(String::as_str),
-            Some("bogus")
-        );
+            let warnings: Vec<_> = captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .collect();
+            assert_eq!(warnings.len(), 1, "exactly one warning, got {warnings:?}");
+            assert_eq!(
+                warnings[0].fields.get("key").map(String::as_str),
+                Some("mode")
+            );
+            assert_eq!(
+                warnings[0].fields.get("value").map(String::as_str),
+                Some("bogus")
+            );
+        });
     }
 
     /// The migration chain never wrote a `mode` key (it predates #1308), so a

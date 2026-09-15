@@ -1194,16 +1194,14 @@ impl Runner {
             _ => {
                 let held = self.first.borrow_mut().take();
                 let passed = match (held, capture(area, &label)) {
-                    (Some(a), Ok(b)) if a.raw == b.raw && a.alloc == b.alloc => {
-                        measure(
-                            case,
-                            &b,
-                            &self.evidence,
-                            self.exact,
-                            &self.dumped,
-                            &self.frames_skipped,
-                        )
-                    }
+                    (Some(a), Ok(b)) if a.raw == b.raw && a.alloc == b.alloc => measure(
+                        case,
+                        &b,
+                        &self.evidence,
+                        self.exact,
+                        &self.dumped,
+                        &self.frames_skipped,
+                    ),
                     (Some(_), Ok(_)) => {
                         // Two renders of one state disagreed, so whatever the
                         // numbers would say, they are not this state's.
@@ -2032,7 +2030,10 @@ fn base64_value(byte: u8) -> Option<u8> {
 /// introduced, and any `\r` a Windows-authored log carries) is stripped
 /// before decoding, so a wrapped, saved-and-reopened block round-trips.
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
-    let bytes: Vec<u8> = encoded.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let bytes: Vec<u8> = encoded
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err(format!(
             "base64 block has {} non-whitespace byte(s), not a multiple of 4",
@@ -2123,7 +2124,9 @@ fn dump_case_frames(label: &str, gl_ppm: &[u8], cpu_ppm: &[u8]) {
 /// line's own spaces (`=== preem-frame gauge.vfd.rest gl begin ===`).
 fn strip_github_log_prefix(line: &str) -> &str {
     match line.rsplit_once('\t') {
-        Some((_, after_tab)) => after_tab.split_once(' ').map_or(after_tab, |(_, rest)| rest),
+        Some((_, after_tab)) => after_tab
+            .split_once(' ')
+            .map_or(after_tab, |(_, rest)| rest),
         None => line,
     }
 }
@@ -2164,7 +2167,9 @@ fn decode_frame_log(text: &str) -> Result<Vec<(String, String, Vec<u8>)>, String
             }
             Some((case, kind, "end")) => {
                 let Some((open_case, open_kind, base64)) = open.take() else {
-                    return Err(format!("end marker for {case} {kind} with no matching begin"));
+                    return Err(format!(
+                        "end marker for {case} {kind} with no matching begin"
+                    ));
                 };
                 if open_case != case || open_kind != kind {
                     return Err(format!(
@@ -2185,7 +2190,9 @@ fn decode_frame_log(text: &str) -> Result<Vec<(String, String, Vec<u8>)>, String
         }
     }
     if let Some((case, kind, _)) = open {
-        return Err(format!("unterminated {case} {kind} block — missing an end marker"));
+        return Err(format!(
+            "unterminated {case} {kind} block — missing an end marker"
+        ));
     }
     Ok(frames)
 }
@@ -2346,9 +2353,7 @@ mod frame_dump_tests {
         let log = dump_to_string("gauge.vfd.rest.x2", &gl, &cpu);
         let prefixed: String = log
             .lines()
-            .map(|line| {
-                format!("flake-check\tsystem-tests\t2026-09-15T10:00:00.0000000Z {line}\n")
-            })
+            .map(|line| format!("flake-check\tsystem-tests\t2026-09-15T10:00:00.0000000Z {line}\n"))
             .collect();
         let frames = decode_frame_log(&prefixed).expect("a GH-prefixed log must still decode");
         assert_eq!(
@@ -2370,7 +2375,11 @@ mod frame_dump_tests {
             assert!(!should_dump_frames(true, &dumped, &skipped));
         }
         assert_eq!(dumped.get(), 0, "a pass must never count toward the cap");
-        assert_eq!(skipped.get(), 0, "a pass must never count toward the overflow line");
+        assert_eq!(
+            skipped.get(),
+            0,
+            "a pass must never count toward the overflow line"
+        );
     }
 
     /// **The cap**: the first [`FRAME_DUMP_CAP`] failing cases in a run are

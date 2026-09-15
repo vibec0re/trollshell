@@ -187,6 +187,21 @@ craneLib.mkCargoDerivation (
       export LIBGL_ALWAYS_SOFTWARE=1
       export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
       export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+      # #1298: llvmpipe JITs the parity shaders against the host's feature
+      # set, and the runner fleet is heterogeneous. Twice, on an Intel Xeon
+      # 8370C (Ice Lake, AVX-512), the four seven-seg x2 cases came back with
+      # interior lit pixels 34–121 of 255 darker than the kit — byte-identical
+      # between the two reds, byte-identical greens on every AMD and non-AVX-512
+      # Intel host, and a Lipschitz bound of ±1 on any conformant evaluation of
+      # the shader as written (PR #1309), so it is the driver's AVX-512 codegen
+      # miscomputing the continuous branch, not rounding. 256 keeps llvmpipe on
+      # the AVX2 vector path every green run and the parity oracle were measured
+      # on (measured here: 128/256/default give 160/160 byte-identical frames on
+      # a Zen 3 host). This is a hypothesis about Ice Lake, not a proof — the
+      # next 8370C run (the baseline step names the CPU) is the test; if it
+      # still reds, the next lever is GALLIUM_OVERRIDE_CPU_CAPS or an upstream
+      # mesa report.
+      export LP_NATIVE_VECTOR_WIDTH=256
       # A skip is indistinguishable from a pass in captured output
       # (same reasoning as `TROLLSHELL_REQUIRE_ICON_THEME` above):
       # this build means the three tests to run for real, so a

@@ -212,19 +212,17 @@ impl LedMatrix {
         // hardware. `Fill::Spare` ghosts every slot (the ragged tail is unlit
         // hardware); `Fill::Blank` ghosts only the slots that hold a lamp.
         if let Some(ghost) = palette.ghost {
-            let ghosted = match self.fill {
-                Fill::Spare => slots,
-                Fill::Blank => used,
-            };
-            for i in 0..ghosted {
+            for i in 0..self.ghost_slots(levels.len()) {
                 fill_cell(&mut frame, i % self.cols, i / self.cols, ghost);
             }
         }
 
         // Level pass: stamp every lamp at its own intensity, bloom, composite.
+        // `stamp_cell` skips a zero amount outright, so the spare slots
+        // `lamp_intensities` pads with cost nothing and seed no halo.
         let mut lit = Emission::new(width, height);
-        for (i, &level) in levels.iter().take(used).enumerate() {
-            stamp_cell(&mut lit, i % self.cols, i / self.cols, intensity(level));
+        for (i, &amount) in self.lamp_intensities(levels).iter().enumerate() {
+            stamp_cell(&mut lit, i % self.cols, i / self.cols, amount);
         }
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
@@ -241,25 +239,81 @@ impl LedMatrix {
             // buffer pixel to the lamp it belongs to through two small
             // geometry tables — the same "keep it O(pixels) multiplies"
             // reasoning `MaskCols` documents for the CRT pass.
-            let inks: Vec<Rgba> = levels
-                .iter()
-                .take(used)
-                .enumerate()
-                .map(|(i, &level)| self.color.ink(sweep_pos(i, used), level, palette.ink))
-                .collect();
+            let inks = self.lamp_inks(levels, palette.ink);
             let col_of = index_table(width, self.cols);
             let row_of = index_table(height, self.rows);
             lit.composite_with(&mut frame, palette.mask, |x, y| {
                 // Bloom spills a lamp's light into the gutter around it, and
                 // the gutter belongs to the nearest lamp — so a halo takes the
                 // colour of the lamp it came off. Spare slots have no ink of
-                // their own; they clamp onto the last real lamp, which only
-                // matters for a neighbour's halo bleeding into them.
-                inks[(row_of[y] * self.cols + col_of[x]).min(used - 1)]
+                // their own; they clamp onto the last real lamp — which
+                // `lamp_inks` has already baked in, so this is a plain index.
+                inks[row_of[y] * self.cols + col_of[x]]
             });
         }
 
         frame
+    }
+
+    /// How many slots the **ghost pass** paints, given `level_count` levels —
+    /// [`Fill`] resolved against this grid.
+    ///
+    /// Published for the shell's GL arm (#1156), which has to paint the same
+    /// unlit hardware from a uniform; called by [`render`](Self::render)
+    /// itself, so it is the kit's definition rather than a copy of it.
+    #[must_use]
+    pub fn ghost_slots(&self, level_count: usize) -> usize {
+        let slots = self.cols * self.rows;
+        match self.fill {
+            Fill::Spare => slots,
+            Fill::Blank => level_count.min(slots),
+        }
+    }
+
+    /// The [`Emission`] intensity (`0..=255`) of every **slot**, row-major from
+    /// the top-left — `cols * rows` of them, `0` past `levels.len()`.
+    ///
+    /// The per-lamp brightness the shell's GL arm uploads as a texture (#1156),
+    /// and the very values [`render`](Self::render) stamps: `intensity`'s
+    /// clamp, its round-to-nearest and its `NaN` rule have one implementation
+    /// this way, so the two arms cannot round a level differently.
+    #[must_use]
+    pub fn lamp_intensities(&self, levels: &[f32]) -> Vec<u16> {
+        let slots = self.cols * self.rows;
+        let used = levels.len().min(slots);
+        (0..slots)
+            .map(|i| if i < used { intensity(levels[i]) } else { 0 })
+            .collect()
+    }
+
+    /// The ink every **slot** lights in, row-major — `cols * rows` of them,
+    /// with the spare-slot clamp already applied.
+    ///
+    /// `ink` is the palette ink the skin would have used on its own, which the
+    /// caller resolves inside whatever [`with_pins`](super::with_pins) scope
+    /// applies; passing it in rather than reading `self.style.palette()` is
+    /// what keeps this **pure**, and so usable from the shell's GL mapping.
+    ///
+    /// Two rules the colour axis states elsewhere and this bakes in, so the GL
+    /// arm reads them rather than restating them: the sweep position is
+    /// [`sweep_pos`]'s half-open `i / used`, and a slot past the last real lamp
+    /// takes that lamp's ink (a neighbour's halo spilling into a spare slot is
+    /// the lamp's light, not the slot's). With no lamps at all — or under
+    /// [`ColorMap::Style`], the identity on this path — every slot is `ink`.
+    #[must_use]
+    pub fn lamp_inks(&self, levels: &[f32], ink: Rgba) -> Vec<Rgba> {
+        let slots = self.cols * self.rows;
+        let used = levels.len().min(slots);
+        if self.color == ColorMap::Style || used == 0 {
+            return vec![ink; slots];
+        }
+        let lit: Vec<Rgba> = levels
+            .iter()
+            .take(used)
+            .enumerate()
+            .map(|(i, &level)| self.color.ink(sweep_pos(i, used), level, ink))
+            .collect();
+        (0..slots).map(|i| lit[i.min(used - 1)]).collect()
     }
 }
 
@@ -357,7 +411,8 @@ fn sweep_pos(index: usize, count: usize) -> f32 {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn intensity(level: f32) -> u16 {
+#[must_use]
+pub fn intensity(level: f32) -> u16 {
     // The clamped product is `0.0..=255.0`, so the round-then-cast neither
     // loses precision nor wraps; `.min(255)` is belt-and-braces on the
     // endpoint, and the saturating cast maps NaN → 0.
@@ -384,12 +439,14 @@ fn index_table(extent: usize, cells: usize) -> Vec<usize> {
 }
 
 /// The x of the cell at column `col`.
-fn cell_x0(col: usize) -> usize {
+#[must_use]
+pub fn cell_x0(col: usize) -> usize {
     PAD + col * (CELL + GAP)
 }
 
 /// The y of the cell at row `row`.
-fn cell_y0(row: usize) -> usize {
+#[must_use]
+pub fn cell_y0(row: usize) -> usize {
     PAD + row * (CELL + GAP)
 }
 

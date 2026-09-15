@@ -41,10 +41,24 @@
 //! * the **glyphs** are 5×7 bitmap pixels and square is the look, so the
 //!   resting halves are floored to a logical pixel too ([`textbox`]'s rule:
 //!   bigger hard-edged pixels, never a smoothed font);
-//! * a **nixie** has no sub-pixel geometry at all — it is a cross-fade between
-//!   two bitmap cathodes — so its emission is a point test on both branches and
-//!   its improvement is the halo, read bilinearly at the fragment's resolution
-//!   off the snap (#1186's tap) rather than replicated out of the kit's grid.
+//! * the **halo** is read with a plain `texelFetch` at the fragment's logical
+//!   pixel on *both* branches. `dot_matrix.frag` and `seven_seg.frag` take
+//!   #1186's bilinear tap instead, and this one deliberately does not: their
+//!   grid is already the buffer a chip is drawn at, while this one is the
+//!   pre-upscale buffer and `Frame::upscale` replicates a *finished* halo, so
+//!   reading it bilinearly would invent a glow the kit never draws. It is also
+//!   what keeps the supersampled standard meetable — see `flip_board.frag`'s
+//!   note above `mix_kit` for the `interior_max == 4` that measured it.
+//!
+//! **A nixie therefore has no improvement at all, and that is the honest
+//! statement rather than an omission.** A tube is a cross-fade between two
+//! bitmap cathodes: no geometry moves, so every one of the four things above is
+//! point-sampled for it and its frame is byte-identical to the kit's at every
+//! scale. This arm draws the *flap mechanism* at native resolution, and a tube
+//! has no mechanism to draw. What it does get is the same pipeline — including
+//! the kit's own double bloom — so the two mechanisms keep one implementation
+//! instead of the board falling back to the CPU whenever a plugin picks the
+//! tube.
 //!
 //! [`textbox`]: super::textbox
 //!

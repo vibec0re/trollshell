@@ -32,10 +32,13 @@
 //     same integral is taken over the **fragment's own** vertical footprint, so
 //     the edge and the boundary land where the screen can draw them.
 //
-// The nixie has no sub-pixel geometry at all — it is a bitmap cross-fade
-// between two cathodes — so its emission is point-sampled on both arms and its
-// improvement is the **halo**, read bilinearly at the fragment's resolution off
-// the snap (#1186's tap) rather than replicated out of the kit's grid.
+// The **nixie has no sub-pixel geometry at all** — it is a cross-fade between
+// two bitmap cathodes — so every one of those three is point-sampled for it and
+// its frame is byte-identical to the kit's at every scale. That is the honest
+// statement rather than an omission: this arm draws the *flap mechanism* at
+// native resolution, and a tube has no mechanism to draw. See the note above
+// `mix_kit` on the halo, which is the one place it could have differed and
+// deliberately does not.
 //
 // # Two bloom stages, because a tube glows twice
 //
@@ -86,7 +89,7 @@
 // by ±2.5 ULP, asserting the byte never moves, with a negative control that
 // perturbs by a millionth and requires that it does.
 //
-// A third division — `cover / fp.y`, which turns the covered *length* of a
+// A third division — `covered / fstep`, which turns the covered *length* of a
 // fragment into the covered *fraction* the kit's unit-tall row already is —
 // exists **only on the continuous branch**, where nothing is held bit-exact.
 // The snapped branch's row is one buffer pixel tall by construction, so the

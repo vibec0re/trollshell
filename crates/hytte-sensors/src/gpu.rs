@@ -3,7 +3,7 @@
 use crate::cast::{millicelsius_to_celsius, percent_u64_to_ratio, u64_to_f64_count};
 
 use super::{GpuState, GpuVendor};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// True when a sysfs `device/vendor` file's contents identify an AMD PCI
 /// device (vendor ID `0x1002`). Factored out of [`read_amd_gpu`] so the
@@ -246,22 +246,140 @@ fn read_nvidia_gpu() -> Option<GpuState> {
     })
 }
 
+/// How long a successful Nvidia reading stays valid before
+/// [`read_nvidia_with_cache_at`] forks `nvidia-smi` again.
+///
+/// The samplers that drive [`read_gpu_with_cache`] tick at 1 Hz (#1249), so
+/// this is picked against that tick, not against how fast the GPU's own
+/// numbers actually move:
+///
+/// - It must be **under one tick** (1000 ms): a TTL at or above the tick
+///   period would mean some ticks return the fork's normal cost while the
+///   next tick's answer is silently the same age — worse, it would let two
+///   callers sharing one [`GpuCache`] value (#1295's bar + sidebar overlap)
+///   fall out of step by up to the TTL, one paying for a fork the other just
+///   made. Staying under the tick means the constraint holds continuously,
+///   not "on average".
+/// - It must be **long enough to matter**: several concurrent callers on the
+///   same tick (a fresh cache handed to more than one poller in the same
+///   process, or two ticks that land within the same wall-clock window) all
+///   land on the one cached reading instead of each forking their own.
+///
+/// 500 ms sits at half a tick — one `nvidia-smi` fork is guaranteed every
+/// tick (the cache can never coast for two consecutive 1 Hz ticks), while
+/// still collapsing any callers that land within the same half-second to
+/// that one fork. This is the issue's own suggestion (#1297); a shorter TTL
+/// buys nothing further since the tick, not the TTL, is now the fork rate's
+/// floor, and a longer one risks a 1 Hz sampler occasionally showing a
+/// reading from the *previous* tick.
+///
+/// This bounds forks **within one process sharing one cache value** — three
+/// processes (the native sensors service, a bar `hytte-plugin-stats`
+/// instance, a sidebar instance, #1248) each carry their own [`GpuCache`]
+/// and still fork independently. Collapsing that is #1252 (retire the native
+/// sampler) plus the sidebar instance's own parking, which already stops a
+/// closed sidebar from polling at all.
+pub const NVIDIA_READING_TTL: Duration = Duration::from_millis(500);
+
 /// Per-tick GPU cache state threaded through the poll loop.
 ///
 /// Carried alongside each GPU tick so readers never need `Mutex` or `Arc`.
-#[derive(Clone, Copy, Debug, Default)]
+/// Not [`Copy`] — [`nvidia_last`](Self::nvidia_last) carries a [`GpuState`],
+/// which owns a `String`; callers that previously relied on `Copy` move the
+/// value out with [`std::mem::take`] instead (see
+/// `hytte-services::sensors::mod::poll_loop`, the existing precedent this
+/// followed, and `hytte-plugin-stats::sample::Sampler::tick`, the caller
+/// #1297 updated to match it).
+#[derive(Clone, Debug, Default)]
 pub struct GpuCache {
     /// Whether `nvidia-smi` is available.
     ///
     /// - `None`        — not yet probed; probe on the next GPU tick.
     /// - `Some(false)` — previously absent; skip `nvidia-smi`.
-    /// - `Some(true)`  — previously present; call `nvidia-smi` directly.
+    /// - `Some(true)`  — previously present; call `nvidia-smi` directly, or
+    ///   serve [`nvidia_last`](Self::nvidia_last) if it is still within
+    ///   [`NVIDIA_READING_TTL`].
     pub(super) nvidia_available: Option<bool>,
     /// Previous RC6 residency sample for Intel GPU usage computation.
     ///
     /// `None` means either no Intel GPU detected yet, or this is the first
     /// tick (no delta available).
     pub(super) intel_rc6_prev: Option<(u64, Instant)>,
+    /// The last successful Nvidia reading and when it was taken.
+    ///
+    /// `None` until the first successful `nvidia-smi` fork, and reset to
+    /// `None` whenever a fork fails (mirrors `nvidia_available` flipping to
+    /// `Some(false)` — a failed reading is never served stale). See
+    /// [`NVIDIA_READING_TTL`] for how long a reading here stays valid.
+    pub(super) nvidia_last: Option<(GpuState, Instant)>,
+}
+
+/// The Nvidia arm of [`read_gpu_with_cache`], with the [`NVIDIA_READING_TTL`]
+/// throttle applied.
+///
+/// Isolated from the composed function (and from `Instant::now()`/
+/// `nvidia-smi` directly) purely for testability: the AMD and Intel arms are
+/// sysfs reads a test can't hermetically fake without touching `/sys`, but
+/// this arm's only external calls are the injected `now` and `read` — see
+/// this module's tests for the counting-fake-reader cases the issue asked
+/// for.
+///
+/// Availability semantics of `cache.nvidia_available` are unchanged from
+/// before #1297 — `None` probes once, `Some(false)` never forks — the new
+/// behaviour is entirely in the `Some(true)` arm, which now forks only when
+/// [`NVIDIA_READING_TTL`] has elapsed since the last successful reading, and
+/// otherwise returns a clone of it.
+fn read_nvidia_with_cache_at(
+    cache: GpuCache,
+    now: Instant,
+    read: impl FnOnce() -> Option<GpuState>,
+) -> (Option<GpuState>, GpuCache) {
+    let nv_available = cache.nvidia_available.unwrap_or(true); // unknown → optimistically try once
+    if !nv_available {
+        return (
+            None,
+            GpuCache {
+                nvidia_available: Some(false),
+                intel_rc6_prev: None,
+                nvidia_last: None,
+            },
+        );
+    }
+
+    // A reading inside the TTL is served without forking — this is the fix:
+    // previously every call with `nvidia_available == Some(true)` forked.
+    if let Some((state, sampled_at)) = &cache.nvidia_last
+        && now.saturating_duration_since(*sampled_at) < NVIDIA_READING_TTL
+    {
+        let reading = state.clone();
+        return (
+            Some(reading),
+            GpuCache {
+                nvidia_available: Some(true),
+                intel_rc6_prev: None,
+                nvidia_last: cache.nvidia_last,
+            },
+        );
+    }
+
+    match read() {
+        Some(state) => (
+            Some(state.clone()),
+            GpuCache {
+                nvidia_available: Some(true),
+                intel_rc6_prev: None,
+                nvidia_last: Some((state, now)),
+            },
+        ),
+        None => (
+            None,
+            GpuCache {
+                nvidia_available: Some(false),
+                intel_rc6_prev: None,
+                nvidia_last: None,
+            },
+        ),
+    }
 }
 
 /// Read GPU state, caching probe results across ticks.
@@ -271,6 +389,8 @@ pub struct GpuCache {
 /// `cache` carries the mutable per-tick state:
 /// - `nvidia_available`: whether `nvidia-smi` is usable (see [`GpuCache`]).
 /// - `intel_rc6_prev`: previous `(rc6_ms, Instant)` for RC6 delta computation.
+/// - `nvidia_last`: the last successful Nvidia reading, served instead of
+///   forking again while still within [`NVIDIA_READING_TTL`] (#1297).
 ///
 /// Returns `(gpu_state, updated_cache)`. The caller stores the returned cache
 /// back into `PollState`.
@@ -279,12 +399,14 @@ pub fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCache) {
     // AMD sysfs reads don't need caching — `read_amd_gpu` only walks
     // `/sys/class/drm` and exits on the first AMD card it finds.
     if let Some(state) = read_amd_gpu() {
-        // AMD present — preserve whatever nvidia_available was (no need to probe).
+        // AMD present — preserve whatever nvidia_available/nvidia_last were
+        // (no need to probe or throttle Nvidia on an AMD box).
         return (
             Some(state),
             GpuCache {
                 nvidia_available: cache.nvidia_available.or(Some(false)),
                 intel_rc6_prev: None,
+                nvidia_last: cache.nvidia_last,
             },
         );
     }
@@ -296,42 +418,19 @@ pub fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCache) {
             GpuCache {
                 nvidia_available: cache.nvidia_available.or(Some(false)),
                 intel_rc6_prev: new_rc6_prev,
+                nvidia_last: cache.nvidia_last,
             },
         );
     }
 
-    // No AMD or Intel GPU. Try nvidia if we know (or suspect) it might be present.
-    let nv_available = cache.nvidia_available.unwrap_or(true); // unknown → optimistically try once
-    if !nv_available {
-        return (
-            None,
-            GpuCache {
-                nvidia_available: Some(false),
-                intel_rc6_prev: None,
-            },
-        );
-    }
-    match read_nvidia_gpu() {
-        Some(state) => (
-            Some(state),
-            GpuCache {
-                nvidia_available: Some(true),
-                intel_rc6_prev: None,
-            },
-        ),
-        None => (
-            None,
-            GpuCache {
-                nvidia_available: Some(false),
-                intel_rc6_prev: None,
-            },
-        ),
-    }
+    // No AMD or Intel GPU. Nvidia arm carries its own reading-TTL throttle.
+    read_nvidia_with_cache_at(cache, Instant::now(), read_nvidia_gpu)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::time::Duration;
 
     // ── is_amd_vendor / amd_gpu_name_from_uevent ─────────────────────────────
@@ -420,5 +519,123 @@ mod tests {
         let (new_prev, load) = compute_intel_usage(500, Some((0, t0)), t1);
         assert_eq!(new_prev, Some((500, t1)));
         assert_eq!(load, Some(0.5));
+    }
+
+    // ── read_nvidia_with_cache_at (#1297) ────────────────────────────────────
+
+    fn fake_reading(name: &str) -> GpuState {
+        GpuState {
+            vendor: GpuVendor::Nvidia,
+            name: name.to_string(),
+            ..GpuState::default()
+        }
+    }
+
+    #[test]
+    fn nvidia_reading_ttl_collapses_repeated_calls_to_one_fork() {
+        let fork_count = Cell::new(0u32);
+        let t0 = Instant::now();
+
+        let (first, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+            fork_count.set(fork_count.get() + 1);
+            Some(fake_reading("fake nvidia"))
+        });
+        assert_eq!(
+            fork_count.get(),
+            1,
+            "the first call has no cached reading yet and must fork"
+        );
+        assert_eq!(first.as_ref().map(|s| s.name.as_str()), Some("fake nvidia"));
+
+        // Several more calls, at different instants strictly inside the TTL
+        // window, must all be served the cached reading with no further fork.
+        for step in 1..=5u64 {
+            let now = t0 + Duration::from_millis(step * 80); // up to 400ms, under the 500ms TTL
+            let (state, _) = read_nvidia_with_cache_at(cache.clone(), now, || {
+                fork_count.set(fork_count.get() + 1);
+                Some(fake_reading("should not be forked"))
+            });
+            assert_eq!(
+                fork_count.get(),
+                1,
+                "call {step} inside the TTL forked nvidia-smi again (fork count moved past 1)"
+            );
+            assert_eq!(
+                state.as_ref().map(|s| s.name.as_str()),
+                Some("fake nvidia"),
+                "call {step} inside the TTL must return the cached reading, not a fresh one"
+            );
+        }
+    }
+
+    #[test]
+    fn nvidia_reading_ttl_elapsed_forks_again() {
+        let fork_count = Cell::new(0u32);
+        let t0 = Instant::now();
+
+        let (_, cache) = read_nvidia_with_cache_at(GpuCache::default(), t0, || {
+            fork_count.set(fork_count.get() + 1);
+            Some(fake_reading("first"))
+        });
+        assert_eq!(fork_count.get(), 1);
+
+        // Landing exactly on the TTL boundary must no longer be "inside" it.
+        let (state, _) = read_nvidia_with_cache_at(cache, t0 + NVIDIA_READING_TTL, || {
+            fork_count.set(fork_count.get() + 1);
+            Some(fake_reading("second"))
+        });
+        assert_eq!(
+            fork_count.get(),
+            2,
+            "a call at the TTL boundary must fork again instead of reusing the stale reading"
+        );
+        assert_eq!(state.as_ref().map(|s| s.name.as_str()), Some("second"));
+    }
+
+    #[test]
+    fn nvidia_failed_fork_marks_unavailable_and_clears_cached_reading() {
+        let t0 = Instant::now();
+        // Seed a cache as if a reading had just been taken, then land past
+        // the TTL so the call must actually attempt a fresh fork — and have
+        // that fork fail. A failure must never leave the stale reading
+        // behind for a later call to serve.
+        let seeded = GpuCache {
+            nvidia_available: Some(true),
+            intel_rc6_prev: None,
+            nvidia_last: Some((fake_reading("stale"), t0)),
+        };
+        let (state, cache) = read_nvidia_with_cache_at(seeded, t0 + NVIDIA_READING_TTL, || None);
+        assert!(state.is_none(), "a failed fork must not surface any reading");
+        assert_eq!(cache.nvidia_available, Some(false));
+        assert!(
+            cache.nvidia_last.is_none(),
+            "a failed fork must clear the previously cached reading, not leave it stale"
+        );
+    }
+
+    #[test]
+    fn nvidia_unavailable_never_consults_cached_reading_or_forks() {
+        let t0 = Instant::now();
+        let cache = GpuCache {
+            nvidia_available: Some(false),
+            intel_rc6_prev: None,
+            // Even a (hypothetically) still-present cached reading must not
+            // surface once nvidia_available says "previously absent".
+            nvidia_last: Some((fake_reading("must not surface"), t0)),
+        };
+        let called = Cell::new(false);
+        let (state, new_cache) = read_nvidia_with_cache_at(cache, t0, || {
+            called.set(true);
+            None
+        });
+        assert!(
+            state.is_none(),
+            "nvidia_available == Some(false) must never surface a cached reading"
+        );
+        assert!(
+            !called.get(),
+            "nvidia_available == Some(false) must never fork nvidia-smi"
+        );
+        assert_eq!(new_cache.nvidia_available, Some(false));
     }
 }

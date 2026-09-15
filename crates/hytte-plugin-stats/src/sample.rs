@@ -332,7 +332,11 @@ impl Sampler {
         };
 
         let gpu = if self.needs.gpu {
-            let (gpu, cache) = hytte_sensors::read_gpu_with_cache(self.gpu);
+            // `GpuCache` is not `Copy` (#1297 — it carries the last Nvidia
+            // reading, which owns a `String`), so take it out of `self`
+            // rather than copy it, mirroring the sensors service's own
+            // `poll_loop` doing the same with `std::mem::take`.
+            let (gpu, cache) = hytte_sensors::read_gpu_with_cache(std::mem::take(&mut self.gpu));
             self.gpu = cache;
             gpu.map(|g| Gpu {
                 name: g.name,

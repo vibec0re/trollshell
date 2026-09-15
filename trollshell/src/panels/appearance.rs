@@ -564,6 +564,9 @@ mod tests {
 
         has_wallpaper.set(true);
         pump();
-        assert!(row.is_sensitive(), "a wallpaper is now set \u{21d2} sensitive");
+        assert!(
+            row.is_sensitive(),
+            "a wallpaper is now set \u{21d2} sensitive"
+        );
     }
 }

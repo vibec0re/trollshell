@@ -82,7 +82,10 @@ shader directory, an unknown extension, a subdirectory it does not know how to
 compile, a `.vert` file outside the two known shapes, fewer shaders than
 `MIN_SHADERS`, fewer compilations than `MIN_COMPILATIONS`, or no spliced body
 at all. Deleting `scope_decay.frag` — the file carrying the whole phosphor
-recurrence — used to be green.
+recurrence — used to be green. Since #1325, the set of files the reserved-word
+scan looked at and the set this run actually compiled must also come out
+identical, or that is exit 2 too — a count alone can't tell "scanned the wrong
+files" from "scanned enough of them".
 
 WHAT IT DOES NOT CHECK
 ----------------------
@@ -627,12 +630,26 @@ def main() -> int:
     compiled = 0
     widget_stages = 0
     widget_body_count = 0
+    # Which files got compiled vs. which got the #1325 reserved-word scan —
+    # see the MIN_COMPILATIONS-style guard after the `with` block below for
+    # why these are collected at all rather than trusted to match by
+    # construction: `scan_body` and `compile_assembled` are two independent
+    # calls at each of the three call sites, and nothing before #1325's fix
+    # round stopped one of the three `scan_body` calls from being deleted
+    # (or never added for a fourth group later) while the matching
+    # `compile_assembled` call kept running — both `--self-test` and a run
+    # over the real tree stay green in that state, because neither asserts
+    # the *coverage* of the scan, only that the cases it does look at behave
+    # correctly.
+    compiled_paths: set[Path] = set()
+    scanned_paths: set[Path] = set()
     with tempfile.TemporaryDirectory() as tmp:
         staged_index = 0
 
         def compile_assembled(label: str, prefix: str, path: Path) -> None:
             """Assemble `header + prefix + path` and run glslangValidator on it."""
             nonlocal failures, compiled, staged_index
+            compiled_paths.add(path)
             source = f"{header}\n{prefix}{path.read_text(encoding='utf-8')}"
             staged = Path(tmp) / f"{path.stem}.{staged_index}{path.suffix}"
             staged_index += 1
@@ -669,6 +686,7 @@ def main() -> int:
             distinct `path` exactly once, ahead of its splice loop if it has one.
             """
             nonlocal failures
+            scanned_paths.add(path)
             for line, word in scan_reserved_words(path):
                 failures += 1
                 print(f"  FAIL  {label} (reserved word)")
@@ -747,6 +765,34 @@ def main() -> int:
             f"only {widget_body_count} shader-widget body(ies), expected ≥ {MIN_WIDGET_BODIES} — "
             "a bundled plugin's fragment body went missing, so the one artifact proving "
             "the #893 contract compiles was never compiled"
+        )
+    # The #1325 reserved-word scan must cover exactly the files this run
+    # compiled — no more, no less. Deleting any one of the three `scan_body`
+    # calls above leaves `compile_assembled` running on its own for that
+    # group: `--self-test` still passes (it never touches these files at
+    # all) and the real-tree run still prints its all-clear (a file that was
+    # never scanned cannot fail a scan it never ran), so nothing above this
+    # line would have noticed. This is the same "current counts, not
+    # counts-with-headroom" shape as MIN_SHADERS/MIN_COMPILATIONS — except a
+    # count can't tell "scanned the wrong files" from "scanned enough files",
+    # so this compares the two *sets* directly instead of two numbers.
+    only_compiled = sorted(compiled_paths - scanned_paths, key=str)
+    only_scanned = sorted(scanned_paths - compiled_paths, key=str)
+    if only_compiled or only_scanned:
+        details = []
+        if only_compiled:
+            details.append(
+                "compiled but never scanned for reserved words: "
+                + ", ".join(str(p) for p in only_compiled)
+            )
+        if only_scanned:
+            details.append(
+                "scanned for reserved words but never compiled: "
+                + ", ".join(str(p) for p in only_scanned)
+            )
+        fail(
+            "the reserved-word scan and the compile pass disagree on which files they "
+            "cover — " + "; ".join(details)
         )
     return 1 if failures else 0
 

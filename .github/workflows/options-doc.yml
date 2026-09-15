@@ -17,11 +17,22 @@ permissions:
   pages: write
   id-token: write
 
-# Only one Pages deploy at a time; let an in-flight deploy finish instead of
-# racing it (mirrors GitHub's own Pages starter workflow).
+# Only one Pages deploy at a time, and the NEWEST push wins: a push cancels
+# whatever run holds the group instead of queueing behind it. GitHub's own
+# Pages starter says `false` here ("let an in-flight deploy finish"), and
+# that is what this read until #1323: on 2026-09-12 20:34Z one run (4a761915)
+# stalled in the `waiting` state on the github-pages environment gate — no
+# reviewer, no wait timer, branch policy allowing main, nothing pending on
+# GitHub's side — and with `false` it held the group for three days while
+# the 59 pushes behind it each cancelled the previous pending run and then
+# waited in turn. Nothing reported it: a run cancelled by concurrency is
+# not a failure. A deploy here is ~30 s (10 s `nix build`, 6 s deploy), so
+# cancelling an in-flight one costs nothing — the sha that was about to
+# land is superseded by the one that cancelled it — and a stalled run is
+# cancelled by the next push rather than blocking every push after it.
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:

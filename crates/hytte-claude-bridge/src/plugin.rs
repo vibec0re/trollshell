@@ -1571,7 +1571,20 @@ mod tests {
     /// environment into [`Plugin::init`]'s model are pinned here, not just
     /// [`effective_mount`]/[`card_title`] in isolation. `init` calls nothing
     /// but [`resolve_settings`] and destructures its result, so a test
-    /// against this function is a test against `init`'s own wiring.
+    /// against this function is a test against `init`'s *composition* of the
+    /// two pure halves.
+    ///
+    /// It is **not**, on its own, a test against `init` itself: this pins
+    /// `resolve_settings`, called directly with an injected `lookup` — a
+    /// second-round review found that hardcoding `init`'s own field
+    /// initializer (`is_bar: true,` in place of `is_bar,`, leaving this
+    /// function entirely unused) still leaves this test, and every other
+    /// test in the file, green. That gap is closed by
+    /// [`init_reaches_the_view_with_a_real_process_environment`] below,
+    /// which calls `<BridgeChip as Plugin>::init` itself in a real process
+    /// with the real environment set. Keeping both: this one is the fast,
+    /// in-process pin on the composition of the two resolvers; the re-exec
+    /// one is the slow, unfakeable pin on `init` actually using it.
     ///
     /// Falsify by hardcoding either return value inside `resolve_settings`:
     ///
@@ -1602,6 +1615,163 @@ mod tests {
         let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &|_| None);
         assert!(is_bar, "no override keeps the manifest's own bar mount");
         assert_eq!(title, DEFAULT_TITLE);
+    }
+
+    /// Set (to any value) only on the re-exec'd child that actually runs
+    /// [`init_reaches_the_view_with_a_real_process_environment_inner`] — the
+    /// same marker shape as `hytte-plugin::runtime`'s `MOUNT_ENV_CHILD`
+    /// (`crates/hytte-plugin/src/runtime.rs:~4208`), and for the same
+    /// reason: an ordinary `cargo test` run discovers the inner test like
+    /// any other and must not try to run its scenario with no launch
+    /// environment set.
+    const INIT_ENV_CHILD: &str = "HYTTE_CLAUDE_BRIDGE_INIT_TEST_CHILD";
+
+    /// Printed by the child only once its scenario has run to completion and
+    /// passed, so the parent can tell "the scenario passed" from "the
+    /// `--exact` filter matched no test and libtest still reports `0
+    /// passed`, exit 0" — the failure mode a renamed inner test produces.
+    const INIT_ENV_CHILD_OK: &str = "init-env-child-reached-the-end";
+
+    /// **`Plugin::init`'s own wiring, in a real process — not just
+    /// `resolve_settings` in isolation** (#1315 review MED 3, second round).
+    ///
+    /// The gap this closes: `init`'s body is `let (is_bar, title) =
+    /// resolve_settings(DEFAULT_MOUNT, &env_lookup); Self { …, is_bar, title
+    /// }`. Hardcoding the field initializer — `is_bar: true,` in place of
+    /// the shorthand `is_bar,` — makes `resolve_settings` dead code from
+    /// `init`'s point of view, and nothing above catches that: every test on
+    /// this page calls `resolve_settings` (or the pure resolvers under it)
+    /// directly, never `<BridgeChip as Plugin>::init` itself. And
+    /// `std::env::set_var` is `unsafe` in edition 2024 — this workspace
+    /// forbids `unsafe_code` outright — so no in-process test can set
+    /// `HYTTE_PLUGIN_MOUNT`/`CLAUDE_BRIDGE_LABEL` for itself to drive a real
+    /// `init` call. Same constraint `hytte-plugin::runtime`'s
+    /// `the_mount_env_var_reaches_the_register_frame`
+    /// (`crates/hytte-plugin/src/runtime.rs:~4234`) hit, and the same fix:
+    /// re-exec the test binary (`std::env::current_exe`), filtered to
+    /// exactly one inner test, with the variables set on the **child** via
+    /// the safe `Command::env` builder.
+    ///
+    /// Two children, both real processes running real `init()` + `view()`:
+    /// one with both variables set, asserting the card under that title and
+    /// no panel; one with neither set (`env_remove`, not merely "not set by
+    /// this test" — a child inherits the parent's environment by default),
+    /// asserting the unchanged chip and its panel under [`DEFAULT_TITLE`].
+    ///
+    /// **Why the override child alone catches both mutations named above,
+    /// and the neutral child is not redundant with it:** a hardcoded
+    /// `is_bar: true,` passes the neutral child (which wants `is_bar` true
+    /// anyway, since `DEFAULT_MOUNT` is a bar mount) but fails the override
+    /// child, which needs `false`. A hardcoded `title:
+    /// DEFAULT_TITLE.to_owned(),` passes the neutral child (which wants
+    /// exactly that title) but fails the override child's title assertion.
+    /// The neutral child is kept anyway because it is the one place this
+    /// crate proves the *shipped default* — today's only deployed shape —
+    /// survives `init` unmolested, in the same real-process harness as the
+    /// override.
+    #[test]
+    fn init_reaches_the_view_with_a_real_process_environment() {
+        let inner = "plugin::tests::init_reaches_the_view_with_a_real_process_environment_inner";
+        let args = ["--exact", "--nocapture", "--test-threads=1", inner];
+        assert!(
+            args.contains(&"--exact"),
+            "the re-exec must stay filtered to exactly one inner test",
+        );
+        let exe = std::env::current_exe().expect("this test binary's own path");
+
+        let overridden = std::process::Command::new(&exe)
+            .args(args)
+            .env(INIT_ENV_CHILD, "1")
+            .env("HYTTE_PLUGIN_MOUNT", "SidebarRightTop")
+            .env("CLAUDE_BRIDGE_LABEL", "Home account")
+            .output()
+            .expect("re-exec this test binary with the override set");
+        assert_init_child_reached_the_end(&overridden, inner, "override");
+
+        let neutral = std::process::Command::new(&exe)
+            .args(args)
+            .env(INIT_ENV_CHILD, "1")
+            .env_remove("HYTTE_PLUGIN_MOUNT")
+            .env_remove("CLAUDE_BRIDGE_LABEL")
+            .output()
+            .expect("re-exec this test binary with neither variable set");
+        assert_init_child_reached_the_end(&neutral, inner, "neutral");
+    }
+
+    fn assert_init_child_reached_the_end(out: &std::process::Output, inner: &str, which: &str) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the {which} child scenario failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status,
+        );
+        assert!(
+            stdout.contains(INIT_ENV_CHILD_OK),
+            "the {which} child exited 0 without reaching the end of {inner} — a stale \
+             filter matches no test and libtest still reports success\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The scenario body of
+    /// [`init_reaches_the_view_with_a_real_process_environment`]. Does
+    /// nothing at all unless the parent's marker is set, so an ordinary
+    /// `cargo test` run — which discovers it like any other test — does not
+    /// try to run it with no launch environment set up for it.
+    #[test]
+    fn init_reaches_the_view_with_a_real_process_environment_inner() {
+        if std::env::var_os(INIT_ENV_CHILD).is_none() {
+            return;
+        }
+        let (tx, _rx) = hytte_plugin::cmd_channel();
+        let model = BridgeChip::init(tx);
+        let view = model.view();
+
+        match std::env::var("HYTTE_PLUGIN_MOUNT").ok().as_deref() {
+            Some("SidebarRightTop") => {
+                assert_eq!(
+                    std::env::var("CLAUDE_BRIDGE_LABEL").as_deref(),
+                    Ok("Home account"),
+                    "test setup: the override child sets both variables",
+                );
+                match &view.tree {
+                    Node::Box { id, classes, .. } => {
+                        assert_eq!(id.as_deref(), Some(CARD_ROOT_ID));
+                        assert_eq!(classes, &vec![CARD_CLASS.to_owned()]);
+                    }
+                    other => panic!("the override child's view must be the card, got {other:?}"),
+                }
+                assert!(
+                    view.panel.is_none(),
+                    "the card is not a click target — no panel"
+                );
+                let text = texts(&view.tree);
+                assert_eq!(
+                    text.first().map(String::as_str),
+                    Some("Home account"),
+                    "CLAUDE_BRIDGE_LABEL must reach the card's title: {text:?}"
+                );
+            }
+            None => {
+                match &view.tree {
+                    Node::Button { id, .. } => assert_eq!(id, CHIP_BTN),
+                    other => panic!("the neutral child's view must be the chip, got {other:?}"),
+                }
+                let panel = view
+                    .panel
+                    .as_ref()
+                    .expect("a bar mount still publishes a panel");
+                let panel_text = texts(panel);
+                assert_eq!(
+                    panel_text.first().map(String::as_str),
+                    Some(DEFAULT_TITLE),
+                    "no CLAUDE_BRIDGE_LABEL must leave the panel's default title: {panel_text:?}"
+                );
+            }
+            other => panic!("unexpected HYTTE_PLUGIN_MOUNT in the child: {other:?}"),
+        }
+        println!("{INIT_ENV_CHILD_OK}");
     }
 
     /// The sidebar card, for the captured three-row response: the title row,

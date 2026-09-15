@@ -672,13 +672,15 @@ whole point of the window.
       `HANDLES_COMMAND_LINE` forward — if it merely raises without switching,
       the remote command line is being dropped). Then open a **different**
       agent's window and confirm the two coexist.
-- [ ] **(#950)** **The embedded page is the feed alone.** Confirm hyperhive's
-      own header and composer are **gone** inside the view — the URL carries
-      `?hide=header,input` — and that our header (icon, name, model word, live
-      status) and the start/stop/pause buttons are the only chrome. If the
-      hive's own header is still there, the parameter regressed on the hive's
-      side (it was shipped by @the-sword-above on #950) and the fix is one
-      constant in `crates/trollshell-agent-window/src/page.rs`.
+- [ ] **(#950/#1282)** **The embedded page is the feed and its composer.**
+      Confirm hyperhive's own **header** is gone inside the view — the URL
+      carries `?hide=header` — while its **composer stays** (that is #1282
+      item 1; the `input` value left the list), and that our header (icon,
+      name, model word, live status) and the start/stop/pause buttons are the
+      only chrome we add. If the hive's own header is still there, the
+      parameter regressed on the hive's side (it was shipped by
+      @the-sword-above on #950) and the fix is one constant in
+      `crates/trollshell-agent-window/src/page.rs`.
 - [ ] **(#950)** **The header follows the hive, not the page.** Drive a status
       change from outside (`hivectl`, or the agent's own `set_status`) and
       confirm our header line changes within one `poll_seconds` **without**
@@ -882,6 +884,43 @@ openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
       `match app-id="^mov\.vibec0re\.trollshell\.AgentWindow"`. Confirm a
       size/placement rule written that way applies to two different agents'
       windows.
+
+### Talking to an agent, from the pill (#1282 items 1-2)
+
+Same hive and same `agentWindow.enable`. CI proves that the row click is
+byte-identical to the `agent page` link's effect, on both desktops, and that
+the embedded URL no longer hides `input`. What it cannot prove is the two
+things that only exist on glass: that typing into the page reaches the agent,
+and that a click lands on the pill rather than on one of the buttons inside
+it.
+
+- [ ] **(#1282 item 1)** **Typing reaches the agent.** Open a running agent's
+      window and confirm hyperhive's composer is **there** at the bottom of
+      the embedded view. Type a message and send it. Confirm it lands as a new
+      turn in that agent's stream — and, from outside the window (`hivectl`,
+      the dashboard, or the agent's own log), that the agent actually received
+      it. This is the whole of item 1: everything else about the page is the
+      hive's.
+- [ ] **(#1282 item 1)** **The composer does not cost the origin pin.** With
+      the composer focused, confirm the #950 origin check still holds — follow
+      an off-hive link in the feed and confirm the window does not move
+      (re-run the "**The view stays on the hive**" item above with input
+      enabled). Typing changes nothing about `navigable_in_place`; this is
+      here because it is the thing a reviewer will want to have seen.
+- [ ] **(#1282 item 2)** **The pill opens the window.** Click an agent row in
+      the sidebar card **on its text** — the name, the model word, the status
+      line, the empty space between them — and confirm that agent's companion
+      window opens on the **agent** tab. Then click the **pen** on the same
+      row and confirm it still opens on **Settings** and does **not** also
+      open the agent page behind it; same for start/stop and the approvals
+      badge, which must do their own job and nothing else. (GTK gives the
+      inner button the gesture; this is the item that proves it does.)
+- [ ] **(#1282 item 2)** **The pill still looks like a pill.** It is a
+      `GtkButton` now, so check it did not grow: the row's height and inset
+      must match what it was (it keeps the same `.ts-agent-row` padding and
+      carries `flat`, so there should be no frame), the status line must not
+      turn bold, and hovering should highlight the **whole row** — which is
+      the new affordance, and the one thing that should visibly change.
 
 ### Approvals (#947 P3, spec §6.5)
 

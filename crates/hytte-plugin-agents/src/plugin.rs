@@ -695,8 +695,10 @@ impl Agents {
     ///
     /// `None` means "not this route" — either the window is not installed
     /// ([`window::Probe`], which also warns once) or the model no longer holds
-    /// the agent whose row was clicked. Both callers then take their P1 route,
-    /// so a desktop without the window keeps working exactly as it did.
+    /// the agent whose row was clicked. Every caller then takes its P1 route —
+    /// the browser for a terminal ([`Agents::open_agent_terminal`]), the drawer
+    /// page for the pen — so a desktop without the window keeps working exactly
+    /// as it did.
     ///
     /// The launch carries **only the agent's name**: the window reads
     /// `host.sock` itself, so nothing the model holds — not the URL, not the
@@ -719,6 +721,21 @@ impl Agents {
             return Vec::new();
         };
         self.open_uri(url)
+    }
+
+    /// One agent's terminal, by whichever route this desktop has: the companion
+    /// window, else the browser.
+    ///
+    /// The two callers that would otherwise have this `if let Some(fx) … else`
+    /// inline — the panel's `agent page` link and, since #1282 item 2, the card
+    /// row — are the reason it is a function: two copies of a route decision is
+    /// how one of them drifts, and the row's whole contract is that it does
+    /// exactly what the link does.
+    fn open_agent_terminal(&mut self, name: &AgentName) -> Vec<Effect> {
+        if let Some(fx) = self.open_window(name, window::Tab::Agent) {
+            return fx;
+        }
+        self.open_agent_page(name)
     }
 
     /// The panel's `dashboard` link — the hive's own root, from the `Urls`
@@ -773,10 +790,18 @@ impl Agents {
             // window is not installed. Annika on #947: a dedicated webview we
             // control, "not the browser"; the browser stays the fallback.
             if let Some(name) = AgentName::parse(rest) {
-                if let Some(fx) = self.open_window(&name, window::Tab::Agent) {
-                    return fx;
-                }
-                return self.open_agent_page(&name);
+                return self.open_agent_terminal(&name);
+            }
+            return Vec::new();
+        }
+        if let Some(rest) = node.strip_prefix(ids::ROW) {
+            // #1282 item 2, @kaesaecracker: "open agent term on agent click in
+            // sidebar". The **same route** as the link above, by construction —
+            // one call, not a second copy of the window/browser decision — so
+            // the card row spawns nothing the panel's link could not already
+            // spawn, and the pen's `--tab settings` is untouched.
+            if let Some(name) = AgentName::parse(rest) {
+                return self.open_agent_terminal(&name);
             }
             return Vec::new();
         }

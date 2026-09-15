@@ -1,7 +1,7 @@
 //! The URL the `WebKitGTK` view loads: hyperhive's own agent page, with the
 //! chrome it would draw for itself suppressed.
 //!
-//! # `?hide=header,input`
+//! # `?hide=header`
 //!
 //! Mara's constraint on [#947](https://github.com/vibec0re/trollshell/issues/947)
 //! (2026-09-11): hyperhive's agent terminal page is slated for a swarm-level
@@ -18,14 +18,40 @@
 //! So this is **one constant**, and everything else about the page is the
 //! hive's business. The window's own chrome — the header with the live status
 //! read from `host.sock`, start/stop/pause, the settings tab — replaces
-//! exactly the two things it hides.
+//! exactly the thing it hides.
 //!
 //! Unknown values being ignored is what let the flag ship before the feature
 //! did; it is also why a rename on the hive's side costs one line here.
+//!
+//! # Why `input` came back
+//!
+//! It was in the list until
+//! [#1282](https://github.com/vibec0re/trollshell/issues/1282) item 1
+//! (@kaesaecracker, "enable input in agent term"). P2 specced this window as a
+//! **monitor** — our chrome, their feed, nothing to type into — and hiding the
+//! composer was how that was spelled. That premise is what changed: a window
+//! you can only read is a worse browser tab, and #1282 item 2 makes the card's
+//! row open this window instead of a tab, so it has to be able to do
+//! everything the tab could.
+//!
+//! Showing it crosses **no boundary a browser tab does not already cross**:
+//! the composer is hyperhive's own, served from the hive's own origin, posting
+//! to the hive over its own session — this window neither reads nor writes the
+//! DOM (Mara's constraint above, unchanged) and adds no input surface of its
+//! own. The origin stays pinned by [`navigable_in_place`], so what the page
+//! does with a typed message cannot move the viewport off the hive.
+//!
+//! `header` stays hidden for the reason it always was: our header replaces it,
+//! and two headers reading the same agent — one of them ours, one of them the
+//! page's, disagreeing for a poll interval — is the confusion #950 removed.
 
 /// The query the embedded view appends — the whole of this window's contract
 /// with hyperhive's frontend.
-pub const HIDE_QUERY: &str = "hide=header,input";
+///
+/// **`header` only** since #1282 item 1: the composer stays, so the embedded
+/// page can be typed into. See the module doc for why that is not a widening
+/// of this window's trust.
+pub const HIDE_QUERY: &str = "hide=header";
 
 /// Point [`HIDE_QUERY`] at an agent's own page URL.
 ///
@@ -110,7 +136,7 @@ mod tests {
     /// every negative case here reds.
     #[test]
     fn only_the_agents_own_origin_loads_in_our_chrome() {
-        let page = "https://hive.local/agent/stray/?hide=header,input";
+        let page = "https://hive.local/agent/stray/?hide=header";
         assert!(navigable_in_place(
             page,
             "https://hive.local/agent/stray/turn/3"
@@ -128,7 +154,7 @@ mod tests {
     /// hand — a prefix test would admit it.
     #[test]
     fn a_lookalike_host_is_not_the_hive() {
-        let page = "https://hive.local/agent/stray/?hide=header,input";
+        let page = "https://hive.local/agent/stray/?hide=header";
         for hostile in [
             "https://hive.local.evil.example/login",
             "https://evil.example/hive.local/login",
@@ -197,7 +223,7 @@ mod tests {
     fn a_plain_agent_url_gains_the_hide_query() {
         assert_eq!(
             embed_url("https://hive.local/agent/trollshell-choom/"),
-            "https://hive.local/agent/trollshell-choom/?hide=header,input"
+            "https://hive.local/agent/trollshell-choom/?hide=header"
         );
     }
 
@@ -209,11 +235,11 @@ mod tests {
     fn an_existing_query_gets_an_ampersand() {
         assert_eq!(
             embed_url("https://hive.local/agent/stray/?tab=todos"),
-            "https://hive.local/agent/stray/?tab=todos&hide=header,input"
+            "https://hive.local/agent/stray/?tab=todos&hide=header"
         );
         assert_eq!(
             embed_url("https://hive.local/agent/stray/?"),
-            "https://hive.local/agent/stray/?&hide=header,input",
+            "https://hive.local/agent/stray/?&hide=header",
             "a bare trailing ? is still a query, so it is still an &"
         );
     }
@@ -227,11 +253,11 @@ mod tests {
     fn a_fragment_stays_last() {
         assert_eq!(
             embed_url("https://hive.local/agent/stray/#turn-3"),
-            "https://hive.local/agent/stray/?hide=header,input#turn-3"
+            "https://hive.local/agent/stray/?hide=header#turn-3"
         );
         assert_eq!(
             embed_url("https://hive.local/agent/stray/?a=1#turn-3"),
-            "https://hive.local/agent/stray/?a=1&hide=header,input#turn-3"
+            "https://hive.local/agent/stray/?a=1&hide=header#turn-3"
         );
     }
 
@@ -242,17 +268,40 @@ mod tests {
     fn the_hives_value_is_trimmed() {
         assert_eq!(
             embed_url("  https://hive.local/agent/stray/  "),
-            "https://hive.local/agent/stray/?hide=header,input"
+            "https://hive.local/agent/stray/?hide=header"
         );
     }
 
-    /// The constant is the two values the hive shipped, in the spelling it
-    /// shipped them — no spaces, comma-separated, `hide=` first.
+    /// The constant is the value the hive shipped, in the spelling it shipped
+    /// it — no spaces, `hide=` first.
     ///
     /// A reader would otherwise have to trust the prose above; this is the
     /// line @the-sword-above's answer pins.
     #[test]
     fn the_constant_is_the_parameter_the_hive_shipped() {
-        assert_eq!(HIDE_QUERY, "hide=header,input");
+        assert_eq!(HIDE_QUERY, "hide=header");
+    }
+
+    /// **The composer is not hidden** — #1282 item 1, and the one assertion
+    /// that would catch the old value coming back by a merge or a revert.
+    ///
+    /// It is deliberately written against the *substring* rather than against
+    /// the whole constant: the hive's `?hide=` is a comma-separated list whose
+    /// unknown values are ignored, so `header,input`, `input,header` and
+    /// `input` all hide the footer, and only "no `input` anywhere in what we
+    /// send" says what this window now promises. The embedded URL is asserted
+    /// too, because that — not the constant — is the string `WebKit` loads.
+    ///
+    /// Falsification (run this round, red): restore `"hide=header,input"` and
+    /// both halves red on the rendered URL and on the constant.
+    #[test]
+    fn the_embedded_page_keeps_its_input() {
+        assert!(
+            !HIDE_QUERY.contains("input"),
+            "the composer must not be suppressed: {HIDE_QUERY}"
+        );
+        let url = embed_url("https://hive.local/agent/stray/");
+        assert!(!url.contains("input"), "{url}");
+        assert_eq!(url, "https://hive.local/agent/stray/?hide=header");
     }
 }

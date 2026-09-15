@@ -295,25 +295,26 @@ fn a_click_on_an_unknown_or_illegal_agent_sends_nothing() {
 
 // ── the card's two buttons ───────────────────────────────────────────────────
 
-/// **The row itself is not a click target** (Annika, 2026-09-11): her spec is
-/// "click on agent opens agent page in trollshell-webview", which is #950 and
-/// does not exist yet, so nothing on the card answers to the row — only the two
-/// buttons do.
+/// **The row's click target is `row:`, and nothing else.**
 ///
-/// This asserts the *absence* through the reducer rather than through the tree,
-/// because the tree half is `view.rs`'s
-/// `a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons`: even if a name
-/// button came back, no arm here would route it. The old `chat:` prefix is the
-/// one that used to.
+/// Annika's spec was "click on agent opens agent page in trollshell-webview",
+/// which #950 built and #1282 item 2 finally wired to the pill. This test used
+/// to assert the row answered to *nothing*; what survives that change is the
+/// half that was always the point — the spellings that came before it still
+/// route nowhere, so a stale host, a stale golden, or a half-finished rename
+/// cannot quietly reach the reducer. The old `chat:` prefix is the one that
+/// used to.
 ///
-/// Falsification: re-add a `chat:`/row-activate arm pointing at `open_detail`
-/// and the first assertion reds.
+/// Falsification: re-add a `chat:`/`details:` arm pointing at `open_detail` and
+/// the loop reds; drop `AgentName::parse`'s guard on the `ids::ROW` arm and the
+/// bare-name case starts routing.
 #[test]
-fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
+fn only_the_row_prefix_routes_a_row_click() {
     let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
     m.update(status(roster("agent_status_grouped.json")));
 
-    for retired in ["chat:stray", "details:stray", "stray"] {
+    for retired in ["chat:stray", "details:stray", "stray", "row-stray"] {
         assert_eq!(
             m.update(click(retired)),
             vec![],
@@ -322,6 +323,15 @@ fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
     }
     assert_eq!(m.selected, None, "and must not select anything");
     assert!(lines(&mut rx).is_empty(), "nor ask the hive anything");
+
+    // …while the id the card actually renders does route.
+    assert!(
+        matches!(
+            m.update(click("row:stray")).as_slice(),
+            [Effect::RunCommand { .. }]
+        ),
+        "the pill's own id opens the window (#1282 item 2)"
+    );
 }
 
 /// The **edit** button — Annika's `[optionsedit]` — opens the agent's
@@ -1040,6 +1050,103 @@ fn a_click_on_a_vanished_or_illegal_agent_opens_nothing() {
         "the window resolves the URL from host.sock itself, so a row without \
          one is still openable there"
     );
+}
+
+// ── #1282 item 2: the row itself opens the window ────────────────────────────
+
+/// **A click on the pill takes the same route as the `agent page` link**, on
+/// both desktops (#1282 item 2, @kaesaecracker: "open agent term on agent click
+/// in sidebar").
+///
+/// Asserted as *identity with the link's effect* rather than as a second copy
+/// of the expected argv: the ask is "the same thing the link does", so the
+/// assertion is the comparison, and a change to the launch that touched only
+/// one of the two arms could not pass it. The ids differ because each click
+/// takes its own token, so they are compared with the id held constant.
+///
+/// Falsification (run this round, red): point the `ids::ROW` arm at
+/// `open_detail` and the effect kind reds; give it `window::Tab::Settings` and
+/// `the_agent_page_click_launches_the_companion_window`'s literal argv pin
+/// reds (the identity assertion here cannot see it — both arms move together);
+/// delete the arm and the row click emits nothing.
+#[test]
+fn the_row_click_opens_the_same_window_as_the_agent_page_link() {
+    // Window installed: both are the same detached launch.
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let from_link = m.update(click("open:trollshell-choom"));
+    let from_row = m.update(click("row:trollshell-choom"));
+    assert!(
+        matches!(from_row.as_slice(), [Effect::RunCommand { .. }]),
+        "{from_row:?}"
+    );
+    assert_eq!(
+        strip_ids(&from_link),
+        strip_ids(&from_row),
+        "the row must not be a second route: {from_link:?} vs {from_row:?}"
+    );
+    assert!(
+        lines(&mut rx).is_empty(),
+        "opening a window is not a hive request"
+    );
+    assert_eq!(
+        m.selected, None,
+        "and the row does not open the drawer page behind it"
+    );
+
+    // No window: both are the same browser open, with the row's own URL.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(false));
+    m.update(status(roster("agent_status_grouped.json")));
+    let from_link = m.update(click("open:stray"));
+    let from_row = m.update(click("row:stray"));
+    assert_eq!(
+        from_row,
+        vec![Effect::OpenUri {
+            id: 1,
+            uri: "https://hive.local/agent/stray/".to_owned(),
+        }]
+    );
+    assert_eq!(strip_ids(&from_link), strip_ids(&from_row));
+}
+
+/// A row click on an agent the model no longer holds — or on an illegal name —
+/// opens **nothing**, exactly like the link's arm.
+///
+/// The row is a new id travelling back through the host, so it gets the same
+/// re-parse-and-look-up treatment as every other arm; this is what says so.
+///
+/// Falsification: have the `ids::ROW` arm trust `rest` instead of
+/// `AgentName::parse` and the illegal case reds.
+#[test]
+fn a_row_click_on_a_vanished_or_illegal_agent_opens_nothing() {
+    for installed in [true, false] {
+        let (mut m, mut rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
+        assert_eq!(m.update(click("row:ghost")), vec![], "no such agent");
+        assert_eq!(m.update(click("row:not a name")), vec![], "illegal name");
+        assert!(lines(&mut rx).is_empty(), "window installed: {installed}");
+    }
+}
+
+/// Effects with their correlation tokens zeroed, so two clicks' *payloads* can
+/// be compared without the ids — which are distinct by design.
+fn strip_ids(effects: &[Effect]) -> Vec<Effect> {
+    effects
+        .iter()
+        .map(|e| match e.clone() {
+            Effect::RunCommand { argv, detached, .. } => Effect::RunCommand {
+                id: 0,
+                argv,
+                detached,
+            },
+            Effect::OpenUri { uri, .. } => Effect::OpenUri { id: 0, uri },
+            other => other,
+        })
+        .collect()
 }
 
 /// The panel's `dashboard` link opens the hive's own root, and only once the

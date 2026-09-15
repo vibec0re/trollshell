@@ -159,6 +159,23 @@ pub mod ids {
     /// re-read from the model instead, so a row whose agent has since vanished
     /// opens nothing rather than opening a stale string.
     pub const OPEN: &str = "open:";
+    /// The **card row itself** — clicking the pill anywhere that is not one of
+    /// its own buttons opens that agent's companion window
+    /// ([#1282](https://github.com/vibec0re/trollshell/issues/1282) item 2,
+    /// @kaesaecracker: "open agent term on agent click in sidebar").
+    ///
+    /// A second id rather than [`OPEN`] reused, even though the two take the
+    /// **same route** in `plugin.rs` (the window, the browser as its fallback):
+    /// they are different surfaces — this one is the card, `OPEN` is the
+    /// panel's `agent page` link — and the id is what the host's audit log
+    /// records, so folding them together would make "the operator clicked a
+    /// pill" and "the operator followed a link on the drawer page" the same
+    /// event. It carries the agent name, re-parsed on arrival, for [`OPEN`]'s
+    /// reason.
+    ///
+    /// Nothing new becomes spawnable: the arm behind it emits exactly what
+    /// [`OPEN`]'s emits, out of the same [`crate::window::argv`].
+    pub const ROW: &str = "row:";
     /// The hive dashboard link on the panel — the one link that names no
     /// agent, so it is a whole id rather than a prefix. Not `OPEN`-prefixed:
     /// `strip_prefix("open:")` must never match it by accident.
@@ -735,9 +752,31 @@ fn approval_badge(name: &str, count: usize) -> Option<Node> {
 /// Line 2: the state glyph, the update badge if it is set, and the harness's
 /// own status text in full.
 ///
-/// The name is a `Text`, not a `Button`: the row's click belongs to #950's
-/// `WebView` and does not exist yet, and a button that opened the drawer instead
-/// would train the wrong surface.
+/// The name is a `Text`, not a `Button`: since #1282 item 2 the **whole pill**
+/// is the button ([`ids::ROW`], opening #950's window), so a second click
+/// target inside it would only be a smaller version of the same thing — and a
+/// name button that opened the drawer instead, which is what this doc used to
+/// say did not exist yet, would train the wrong surface.
+///
+/// # Buttons inside a button
+///
+/// The pill's own controls (start/stop, the pen, the approvals badge) are
+/// `Node::Button`s **nested inside** the row button, which is deliberate and
+/// which GTK resolves the way it has to: each `GtkButton` claims the click
+/// gesture at its own level, and a claim denies the gesture to every controller
+/// further up the propagation chain — so pressing the pen opens settings and
+/// does **not** also open the agent page behind it. This is the first place a
+/// button sits inside another button in these goldens: the card's project
+/// headers (#963) are `Node::Expander`s whose header hytte-ui builds as a
+/// `gtk::Button` over labels only. The gesture argument is GTK's own; the
+/// live-verify item is the evidence that it holds on glass.
+///
+/// The `ts-agent-row` class moves **onto** the button rather than staying on
+/// the inner box: the stylesheet's `.ts-agents-card .ts-agent-row` padding is
+/// what gives the pill its inset, and a button carrying its own Adwaita padding
+/// *around* a padded box would double it. One element, one padding — and
+/// `flat` is what keeps it from drawing a frame, leaving only the hover
+/// highlight, which is the affordance the row now wants.
 fn agent_row(agent: &Agent, cfg: &AgentsConfig, approvals: usize) -> Node {
     let name = agent.name.as_str();
     let status = agent.status();
@@ -793,13 +832,17 @@ fn agent_row(agent: &Agent, cfg: &AgentsConfig, approvals: usize) -> Node {
     }
     tail.push(status_caption(agent));
 
-    vstack(
-        2,
-        &["ts-agent-row"],
-        vec![
-            hrow(6, &["ts-agent-head"], head),
-            hrow(6, &["ts-agent-statusline"], tail),
-        ],
+    button(
+        format!("{}{name}", ids::ROW),
+        &["flat", "ts-agent-row"],
+        vstack(
+            2,
+            &[],
+            vec![
+                hrow(6, &["ts-agent-head"], head),
+                hrow(6, &["ts-agent-statusline"], tail),
+            ],
+        ),
     )
 }
 
@@ -1494,11 +1537,11 @@ mod tests {
                 status.classes
             );
 
-            // …and it really is a second line: the row is a vertical stack of
-            // exactly the head row and that caption.
-            let row = find_class(&tree, "ts-agent-row").expect("the row renders");
-            let Node::Box { dir, children, .. } = &row else {
-                panic!("an agent row is a vertical stack, got {row:?}");
+            // …and it really is a second line: the row's body is a vertical
+            // stack of exactly the head row and that caption.
+            let body = row_body(&tree);
+            let Node::Box { dir, children, .. } = &body else {
+                panic!("an agent row's body is a vertical stack, got {body:?}");
             };
             assert_eq!(*dir, hytte_plugin::proto::Dir::Vertical);
             assert_eq!(children.len(), 2, "two lines, no unfold: {children:?}");
@@ -1515,6 +1558,10 @@ mod tests {
     ///
     /// Falsification: set the tooltip on `agent_row`'s `vstack` (or on line
     /// 2's `hrow`) and the row/line assertions red.
+    ///
+    /// Since #1282 item 2 the pill is a `Node::Button`, which is a vocabulary
+    /// node with **no** `tooltip` field at all — so the only place a row-level
+    /// legend could come back is the body, and that is what this reads.
     #[test]
     fn the_status_hover_is_on_the_text_not_on_the_row() {
         let long = format!(
@@ -1523,9 +1570,9 @@ mod tests {
         );
         let tree = card_of(vec![running("argus", &long)]);
 
-        let row = find_class(&tree, "ts-agent-row").expect("the row renders");
-        let Node::Box { tooltip, .. } = &row else {
-            panic!("an agent row is a vertical stack, got {row:?}")
+        let body = row_body(&tree);
+        let Node::Box { tooltip, .. } = &body else {
+            panic!("an agent row's body is a vertical stack, got {body:?}")
         };
         assert_eq!(*tooltip, None, "the row must not carry the status legend");
 
@@ -1552,10 +1599,15 @@ mod tests {
     /// [ (oO) Clauding...                                              ]
     /// ```
     ///
+    /// The pill **itself** is the third click target, and the outermost one
+    /// (#1282 item 2) — so the ids are `[row, stop, edit]` in tree order, the
+    /// row's own first.
+    ///
     /// Falsification: push a third child onto `agent_row`'s `vstack` and the
     /// line count reds; put the chevron, the pause button or any of the removed
     /// detail rows back and the button-id assertion reds; move the state glyph
-    /// back to line 1 and the last assertion does.
+    /// back to line 1 and the last assertion does; drop the row button and the
+    /// first id goes.
     #[test]
     fn a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons() {
         let mut a = running("argus", "Clauding…");
@@ -1564,15 +1616,26 @@ mod tests {
         let tree = card_of(vec![a]);
 
         let row = find_class(&tree, "ts-agent-row").expect("a row renders");
-        let Node::Box { children, .. } = &row else {
-            panic!("the row is a vertical Box, got {row:?}")
+        let body = row_body(&tree);
+        let Node::Box { children, .. } = &body else {
+            panic!("the row's body is a vertical Box, got {body:?}")
         };
         assert_eq!(children.len(), 2, "two lines, nothing else: {children:?}");
 
         assert_eq!(
             button_ids(&row),
+            vec![
+                "row:argus".to_owned(),
+                "stop:argus".to_owned(),
+                "edit:argus".to_owned()
+            ],
+            "the pill is itself a button, and it still carries exactly the \
+             mock's two controls, in her order"
+        );
+        assert_eq!(
+            button_ids(&body),
             vec!["stop:argus".to_owned(), "edit:argus".to_owned()],
-            "line 1 carries the mock's two controls, in her order"
+            "…and nothing else was added inside it"
         );
 
         // Line 1: identity + model. Line 2: the state glyph and the status.
@@ -2194,6 +2257,7 @@ mod tests {
             ids::STOP,
             ids::GROUP,
             ids::OPEN,
+            ids::ROW,
         ] {
             assert!(prefix.ends_with(':'), "{prefix}");
         }
@@ -2209,6 +2273,33 @@ mod tests {
                 id.strip_prefix(ids::OPEN).is_none(),
                 "{id} must not parse as an OPEN target"
             );
+            assert!(
+                id.strip_prefix(ids::ROW).is_none(),
+                "{id} must not parse as a ROW target"
+            );
+        }
+        // Every prefix must also be unambiguous against every *other* prefix,
+        // which is what `click`'s `strip_prefix` chain assumes and what a new
+        // one (`row:`, #1282) is the first real chance to break: an id is
+        // routed by the first arm that matches, so one prefix being a prefix of
+        // another would silently route a whole surface to the wrong place.
+        let prefixes = [
+            ids::EDIT,
+            ids::PAUSE,
+            ids::START,
+            ids::STOP,
+            ids::GROUP,
+            ids::OPEN,
+            ids::ROW,
+            ids::APPROVALS,
+        ];
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                assert!(
+                    i == j || !a.starts_with(b),
+                    "{a} starts with {b}: one of the two arms is unreachable"
+                );
+            }
         }
     }
 
@@ -2515,5 +2606,20 @@ mod tests {
     /// The first node carrying `class`.
     fn find_class(node: &Node, class: &str) -> Option<Node> {
         rows_with_class(node, class).into_iter().next()
+    }
+
+    /// The first agent pill's **body** — the vertical stack of its two lines.
+    ///
+    /// Since #1282 item 2 the pill itself is a `Node::Button` (the row opens
+    /// the agent's window), so every assertion about "the row is two lines"
+    /// goes one level in. This unwraps that level *and checks it*, so a row
+    /// that stopped being a button reds here rather than silently making the
+    /// layout assertions describe something else.
+    fn row_body(tree: &Node) -> Node {
+        let row = find_class(tree, "ts-agent-row").expect("a row renders");
+        let Node::Button { child, .. } = row else {
+            panic!("the agent pill is a Button since #1282, got {row:?}")
+        };
+        *child
     }
 }

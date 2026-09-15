@@ -1565,7 +1565,7 @@ pub(crate) mod tls_tests {
                 bundle: anchors(),
                 source: Source::HiveDir,
             },
-            &format!("https://localhost:{port}/agent/stray/?hide=header,input"),
+            &format!("https://localhost:{port}/agent/stray/?hide=header"),
         );
         let TlsPolicy::AllowCertificateForHost {
             cert: Pinned::VerifiedPem(pem),

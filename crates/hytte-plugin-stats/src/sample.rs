@@ -577,6 +577,35 @@ pub async fn sampler_task(
 /// `spawn_blocking` and is therefore gone if that task panics or is cancelled:
 /// recovering from that without ending the whole task (see the `Err` arm) needs
 /// a way to build a fresh one.
+///
+/// # Invariant: the reset happens-before the read it guards (#1313)
+///
+/// On the hidden→visible edge, a due tick can never be handed back ahead of
+/// the edge that owes the re-baseline — this is a property of the code, not
+/// of scheduler luck. Two things make it so, and both live one level down in
+/// [`hytte_plugin::poll::Gate::next`]: the cadence's `, if open` guard means
+/// `interval.tick()` is not even polled while the gate is closed (so nothing
+/// can be "due ahead of" an edge that hasn't happened yet), and `biased;`
+/// means that once open, a simultaneously-ready visibility command always
+/// wins a tie against a due tick. Either way, [`Wake::Refresh`] for the open
+/// edge is returned only *after* `Gate` has already reset its own interval —
+/// so by the time this loop's `Wake::Refresh` arm runs, the cadence is
+/// already a full period out. This task's own `parked.swap(…)` re-baseline
+/// (below) then runs synchronously, strictly before the `spawn_blocking` read
+/// it gates, on the same thread — so the first frame after a reopen is always
+/// measured over a fresh window (#1277 LOW 4), never over the mean of however
+/// long the sidebar was shut.
+///
+/// What this invariant does **not** cover: a *regular* cadence tick's own
+/// `spawn_blocking` read runs on a real blocking-pool thread and can complete
+/// at any wall-clock moment, independent of this task's own progress. A test
+/// that infers "the reopen happened" from a rising tick *count* rather than
+/// from the reset itself can be fooled by a late-finishing, unrelated tick
+/// from before the close — which is a test-observation hazard, not a
+/// violation of this invariant. See
+/// `reopening_the_sidebar_re_baselines_before_it_reads`'s own notes and
+/// `a_tick_due_while_hidden_never_reads_before_the_unpark_reset`, which pins
+/// the ordering directly instead.
 async fn sampler_task_with<S: Sample>(
     cmds: CmdReceiver<Cmd>,
     msgs: CmdSender<Msg>,
@@ -664,10 +693,22 @@ mod tests {
     /// The counters are what make the gate observable: "nothing arrived on the
     /// message lane" and "the sampler was never called" are different claims,
     /// and only the second one is about the gate (#1277 MEDIUM 2).
+    ///
+    /// `sequence` exists because the counters alone cannot tell "the reopen's
+    /// own read" apart from an unrelated one that happens to land afterwards
+    /// (#1313): `tick()` runs on a real blocking-pool thread and can complete
+    /// — and bump `ticks` — at any wall-clock moment relative to the sampler
+    /// task's own progress, so a regular cadence tick from *before* a close
+    /// can finish late and push `ticks()` past whatever a test captured as
+    /// "before the reopen", with no reset anywhere near it. A recorded order
+    /// is the only thing that survives that: it is what
+    /// [`a_tick_due_while_hidden_never_reads_before_the_unpark_reset`] checks
+    /// instead of a count.
     #[derive(Debug, Default)]
     struct Calls {
         ticks: AtomicUsize,
         resets: AtomicUsize,
+        sequence: std::sync::Mutex<Vec<&'static str>>,
     }
 
     impl Calls {
@@ -678,6 +719,14 @@ mod tests {
         fn resets(&self) -> usize {
             self.resets.load(Ordering::SeqCst)
         }
+
+        fn record(&self, what: &'static str) {
+            self.sequence.lock().expect("not poisoned").push(what);
+        }
+
+        fn sequence(&self) -> Vec<&'static str> {
+            self.sequence.lock().expect("not poisoned").clone()
+        }
     }
 
     /// A sampler that reads nothing at all and counts what it was asked to do.
@@ -686,6 +735,7 @@ mod tests {
     impl Sample for FakeSampler {
         fn tick(&mut self) -> Snapshot {
             let n = self.0.ticks.fetch_add(1, Ordering::SeqCst);
+            self.0.record("tick");
             // A different reading each tick (from a literal table, so there is
             // no cast the pedantic lints would refuse), so a test can tell one
             // sample from the next on the wire.
@@ -700,6 +750,7 @@ mod tests {
 
         fn reset(&mut self) {
             self.0.resets.fetch_add(1, Ordering::SeqCst);
+            self.0.record("reset");
         }
     }
 
@@ -1070,6 +1121,21 @@ mod tests {
     /// a *close* is the classifier — which is why this is a flag and not a
     /// `Wake` arm, and why it needs a test of its own.
     ///
+    /// **#1313:** the assertion used to be `assert!(pump_until(|| ticks() >
+    /// before)); assert_eq!(resets(), 1)` — waiting for *any* tick past
+    /// `before`, then checking the reset. That is order-dependent for a
+    /// reason that has nothing to do with `Gate`'s own ordering: `tick()`
+    /// runs on a real blocking-pool thread, so a *regular* cadence tick from
+    /// the first open window (queued the instant virtual time crossed its
+    /// period, independently of anything below) can finish late — after the
+    /// close, after `pump_ten_periods`, even after the reopen is sent — and
+    /// bump `ticks()` past `before` with no reset anywhere near it, because it
+    /// was never the reopen's own read. Measured: 25/200 runs (12.5%) red
+    /// under `taskset -c 0-3` plus four pinned burners on those cores, 0/200
+    /// idle — see the PR body. The fix checks the direct signal (`resets()`)
+    /// right after the edge, before ever asking about a tick, so a stale
+    /// tick landing late cannot be mistaken for the reopen's own.
+    ///
     /// **Falsified** by deleting the `parked.swap(…)` branch: `resets` stays 0.
     #[tokio::test(start_paused = true)]
     async fn reopening_the_sidebar_re_baselines_before_it_reads() {
@@ -1095,11 +1161,105 @@ mod tests {
         pump_ten_periods(period).await;
         cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
 
+        // Check the reset *directly*, right after the edge, before ever
+        // asking about a tick — one yield is enough, because processing an
+        // already-queued visibility command needs no real work (no
+        // `spawn_blocking`) before the reset runs; a `pump_until` here would
+        // be exactly the proxy that let a stale tick fool this test before.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.resets(),
+            1,
+            "the re-open must drop the stale /proc/stat baseline exactly once, \
+             and it must have done so before anything else observable happens",
+        );
+
         assert!(pump_until(|| calls.ticks() > before).await);
         assert_eq!(
             calls.resets(),
             1,
-            "the re-open must drop the stale /proc/stat baseline exactly once",
+            "…and still exactly once by the time the reopen's own read lands",
+        );
+
+        drop(cmd_tx);
+        let _ = task.await;
+    }
+
+    /// **The ordering, pinned directly rather than inferred from a count**
+    /// (#1313): a tick that was "due" while the gate was hidden — by the
+    /// wall the interval would have crossed, had it been polled — must not
+    /// produce a read before the unpark reset. `Calls::sequence()` records
+    /// `"tick"`/`"reset"` in the exact order they happened, which is what
+    /// lets this test tell the true order apart from a count that a stale
+    /// event could satisfy by coincidence (see the sibling test's #1313
+    /// note).
+    ///
+    /// The gate starts closed, so a single close→ten-periods→open drives
+    /// exactly one edge with no earlier open to leave a stray tick in
+    /// flight — the one thing that made the sibling test's `ticks() >
+    /// before` proxy foolable is structurally absent here.
+    ///
+    /// This is also where the module's ordering invariant is exercised: on
+    /// the hidden→visible edge, [`hytte_plugin::poll::Gate::next`] resets its
+    /// own interval and returns [`Wake::Refresh`] for the edge **before**
+    /// ever polling `interval.tick()` again (its `, if open` guard excludes
+    /// that branch entirely while `self.visible` is still `false`, and its
+    /// `biased;` ordering prefers a ready command over a simultaneously-due
+    /// tick once open) — so a due tick can never be handed back ahead of the
+    /// edge that was supposed to reset it. This task's own `parked.swap(…)`
+    /// reset then runs synchronously, before the `spawn_blocking` read it
+    /// gates. Falsifying either half (below) reds this test.
+    ///
+    /// **Falsified** by:
+    /// - deleting `hytte_plugin::poll::Gate`'s `self.reset()` call on the
+    ///   open edge — the `assert_eq!(calls.sequence(), vec!["reset"])` still
+    ///   passes (this task's own reset is independent), but see the sibling
+    ///   falsification table in the PR body for what that breaks instead;
+    /// - deleting the `parked.swap(…)` branch here: `calls.sequence()` never
+    ///   contains `"reset"` at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_due_while_hidden_never_reads_before_the_unpark_reset() {
+        let period = Duration::from_secs(1);
+        let calls = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+        let made = Arc::clone(&calls);
+        let task = tokio::spawn(sampler_task_with(cmd_rx, msg_tx, period, move || {
+            FakeSampler(Arc::clone(&made))
+        }));
+
+        // The gate starts closed; a redundant close is a level, not an edge,
+        // but the classifier flags it regardless — any close invalidates the
+        // next open, not only a close that followed an open.
+        cmd_tx.send(Cmd::SetVisible(false)).expect("lane is live");
+
+        // Ten periods of virtual time with the gate never open. Were the
+        // interval polled at all here, `MissedTickBehavior::Delay` would make
+        // its very next `.tick()` resolve immediately on the next poll — this
+        // is exactly the "due tick queued behind the edge" shape #1313 is
+        // about, and `Gate::next`'s `, if open` guard is what is supposed to
+        // keep it from ever being polled while hidden.
+        pump_ten_periods(period).await;
+        assert_eq!(
+            calls.sequence(),
+            Vec::<&str>::new(),
+            "the closed gate must not have sampled or reset at all yet",
+        );
+
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.sequence(),
+            vec!["reset"],
+            "the only thing that may have happened by now is the edge's own \
+             reset — never a tick, and never a tick ahead of it",
+        );
+
+        assert!(pump_until(|| calls.ticks() >= 1).await);
+        assert_eq!(
+            calls.sequence(),
+            vec!["reset", "tick"],
+            "the read that follows must come strictly after the reset",
         );
 
         drop(cmd_tx);

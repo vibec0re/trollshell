@@ -16,8 +16,10 @@
 //!
 //! Since #1308, a **Scaling** row beside the "All displays" picker sets
 //! swaybg's `-m` mode (Fill / Fit / Center / Tile / Stretch) — one mode for
-//! every screen, insensitive with nothing set to scale. See
-//! [`scaling_row`].
+//! every screen, insensitive with nothing configured to scale (which
+//! `default`/`outputs`/`rotation` can each make true — see
+//! [`anything_configured_to_scale`]) or under a custom reload backend, same
+//! as the Clear button above. See [`scaling_row`].
 //!
 //! The user picks a file with `gtk::FileDialog`; the service rewrites its state
 //! file, re-derives the swaybg arguments, and restarts (or, on clear, stops)
@@ -54,6 +56,37 @@ pub fn panel_appearance() -> gtk::Widget {
     finish_page(&column)
 }
 
+/// Whether swaybg is (or would be) painting anything at all: a default
+/// image, a per-output override, or a rotation with *any* slot configured
+/// (#1314 review MED-1).
+///
+/// Any slot, not the one active this hour — `build_rotation_group` writes
+/// only `rotation.*` for a rotation-only setup (no `default`, no `outputs`),
+/// and `wallpaper::swaybg_args` renders whichever slot resolves for the
+/// current hour, so gating on "the render is non-empty right now" would make
+/// the Scaling row flicker sensitive/insensitive with the clock the moment a
+/// rotation with, say, only `evening` set crossed into a different slot.
+fn anything_configured_to_scale(s: &wallpaper::WallpaperState) -> bool {
+    s.default.is_some()
+        || !s.outputs.is_empty()
+        || (s.rotation.enabled && Slot::ALL.iter().any(|slot| s.rotation.image(*slot).is_some()))
+}
+
+/// The Scaling row's sensitivity: usable exactly when swaybg is actually
+/// painting something (`anything_configured_to_scale`) *and* no custom
+/// reload backend has taken over (#1314 review MED-1/MED-2) — a `reload()`
+/// with `TROLLSHELL_WALLPAPER_RELOAD_CMD` set never touches the swaybg unit
+/// `swaybg.args` is written for, so a pick there would write state and
+/// change nothing anyone reads. `custom_backend` is a plain `bool` — read
+/// once via `wallpaper::has_custom_reload_backend()` at the call site,
+/// since the env var is fixed for the session — rather than this function
+/// reading the environment itself, so it stays a pure, directly testable
+/// predicate over the same two facts the Wallpaper group's Clear button
+/// already gates on.
+fn scaling_is_usable(custom_backend: bool, s: &wallpaper::WallpaperState) -> bool {
+    !custom_backend && anything_configured_to_scale(s)
+}
+
 /// The "Wallpaper" group: the all-displays default plus the explicit
 /// "Clear wallpaper" reset. Both rows are static, so their order is stable.
 fn build_wallpaper_group() -> adw::PreferencesGroup {
@@ -70,12 +103,27 @@ fn build_wallpaper_group() -> adw::PreferencesGroup {
 
     // Scaling (#1308): one mode for every screen (Annika's per-output
     // question is open on the issue), so it sits beside the picker rather
-    // than under it.
+    // than under it. Sensitive only when swaybg is actually painting
+    // something (#1314 review MED-1/MED-2): a rotation-only setup (no
+    // `default`, no `outputs`) still renders, and a custom reload backend
+    // never reads `swaybg.args` at all, so the row would be a live control
+    // over nothing in either case.
+    let custom_backend = wallpaper::has_custom_reload_backend();
     let scaling = scaling_row(
         wallpaper::mode(),
-        wallpaper::state().map(|s| s.default.is_some() || !s.outputs.is_empty()),
+        wallpaper::state().map(move |s| scaling_is_usable(custom_backend, &s)),
         wallpaper::set_mode,
     );
+    if custom_backend {
+        // Same reasoning and the same wording shape as the Clear button's
+        // tooltip below: a custom backend only ever receives the primary
+        // image path, so a Scaling pick would write state, re-derive
+        // `swaybg.args`, and change nothing anyone reads.
+        scaling.set_tooltip_text(Some(
+            "Scaling isn't available with a custom wallpaper backend \u{2014} \
+             it only receives the image path",
+        ));
+    }
     group.add(&scaling);
 
     // Explicit reset to no wallpaper (#546) — clears the default, every
@@ -269,14 +317,24 @@ where
 /// `mode_signal` drives the selected item; `on_change` fires with the mode the
 /// user just picked — `wallpaper::set_mode` in production, injected so a test
 /// can capture it instead of writing the real state; `sensitive_signal` gates
-/// the row exactly like the picker's own inline Clear button (`image_row`'s
-/// `on_clear`): insensitive with nothing set to scale.
+/// the row (`anything_configured_to_scale` and the custom-backend check in
+/// production — see `build_wallpaper_group`), the same way the Wallpaper
+/// group's own Clear button is gated.
+///
+/// When the file holds a mode outside `Mode::SCALING` (today only
+/// `solid_color`), the row appends a trailing item naming it rather than
+/// silently showing "Fill" at index 0 — #1314 review LOW-1: `AdwComboRow`
+/// only fires `notify::selected` on an actual index change, so if the row
+/// merely *displayed* Fill while the state held something else, picking Fill
+/// would select the already-selected index 0 and write nothing, leaving no
+/// way out of the unlisted mode.
 fn scaling_row(
     mode_signal: impl hytte::futures_signals::signal::Signal<Item = Mode> + 'static,
     sensitive_signal: impl hytte::futures_signals::signal::Signal<Item = bool> + 'static,
     on_change: impl Fn(Mode) + 'static,
 ) -> adw::ComboRow {
     let labels: Vec<&str> = Mode::SCALING.iter().map(|m| m.label()).collect();
+    let base_len = u32::try_from(Mode::SCALING.len()).unwrap_or(0);
     let model = gtk::StringList::new(&labels);
     let row = adw::ComboRow::builder()
         .title("Scaling")
@@ -287,14 +345,32 @@ fn scaling_row(
     bind_two_way(
         mode_signal,
         &row,
-        |row: &adw::ComboRow, mode| {
-            let idx = Mode::SCALING.iter().position(|m| *m == mode).unwrap_or(0);
-            row.set_selected(u32::try_from(idx).unwrap_or(0));
+        {
+            let model = model.clone();
+            move |row: &adw::ComboRow, mode| {
+                let extra = model.n_items().saturating_sub(base_len);
+                if let Some(idx) = Mode::SCALING.iter().position(|m| *m == mode) {
+                    if extra > 0 {
+                        model.splice(base_len, extra, &[]);
+                    }
+                    row.set_selected(u32::try_from(idx).unwrap_or(0));
+                } else {
+                    let placeholder = format!("{} (from file)", mode.label());
+                    model.splice(base_len, extra, &[placeholder.as_str()]);
+                    row.set_selected(base_len);
+                }
+            }
         },
         move |row| {
             row.connect_selected_notify(move |row| {
                 let idx = usize::try_from(row.selected()).unwrap_or(0);
-                on_change(Mode::SCALING.get(idx).copied().unwrap_or_default());
+                // A selection at or past `Mode::SCALING`'s length is the
+                // trailing placeholder above — it names the file's current
+                // out-of-vocabulary value and isn't itself pickable, so only
+                // a real entry writes.
+                if let Some(mode) = Mode::SCALING.get(idx).copied() {
+                    on_change(mode);
+                }
             })
         },
     );
@@ -464,16 +540,88 @@ fn open_wallpaper_picker(on_pick: impl Fn(String) + 'static) {
 /// `wallpaper` service, and never touches the real `$XDG_STATE_HOME`.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{Mode, scaling_row};
+    use super::{Mode, anything_configured_to_scale, scaling_is_usable, scaling_row};
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
+    use hytte::services::wallpaper::{Rotation, WallpaperState};
     use std::cell::RefCell;
     use std::rc::Rc;
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
         while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    // ── the sensitivity predicates (pure — no GTK needed) ──────────────────
+
+    /// #1314 review MED-1: a rotation-only setup (no `default`, no
+    /// `outputs`) still renders — `wallpaper::swaybg_args`'s own rotation
+    /// branch resolves the active slot's image — so the row must be
+    /// sensitive, and gating on `default`/`outputs` alone (the pre-fix
+    /// predicate) missed it entirely.
+    ///
+    /// **Falsification:** go back to `s.default.is_some() ||
+    /// !s.outputs.is_empty()` — `rotation_only` reds.
+    #[test]
+    fn rotation_only_setup_is_seen_as_configured() {
+        let truly_empty = WallpaperState::default();
+        assert!(
+            !anything_configured_to_scale(&truly_empty),
+            "nothing set anywhere \u{21d2} nothing to scale"
+        );
+
+        let rotation_only = WallpaperState {
+            rotation: Rotation {
+                enabled: true,
+                evening: Some("/e.png".into()),
+                ..Rotation::default()
+            },
+            ..WallpaperState::default()
+        };
+        assert!(
+            anything_configured_to_scale(&rotation_only),
+            "a rotation-only setup with no default and no per-output override \
+             still paints a wallpaper, so the row must be sensitive"
+        );
+    }
+
+    /// Rotation *enabled* with every slot unset renders nothing
+    /// (`wallpaper::swaybg_args`'s own "on with nothing configured" case) —
+    /// gating on the bare `enabled` flag rather than "any slot has an image"
+    /// would wrongly light the row up for a session that just turned
+    /// rotation on and hasn't picked any slot image yet.
+    #[test]
+    fn rotation_enabled_with_no_slot_images_is_still_nothing_to_scale() {
+        let state = WallpaperState {
+            rotation: Rotation {
+                enabled: true,
+                ..Rotation::default()
+            },
+            ..WallpaperState::default()
+        };
+        assert!(!anything_configured_to_scale(&state));
+    }
+
+    /// #1314 review MED-2: a custom reload backend never touches the swaybg
+    /// unit `swaybg.args` is written for, so the row must be insensitive
+    /// under one regardless of what the state otherwise holds — even a
+    /// fully-configured default.
+    ///
+    /// **Falsification:** drop the `!custom_backend &&` half —
+    /// `custom_backend_wins_even_with_a_default_set` reds.
+    #[test]
+    fn custom_backend_wins_even_with_a_default_set() {
+        let state = WallpaperState {
+            default: Some("/d.png".into()),
+            ..WallpaperState::default()
+        };
+        assert!(scaling_is_usable(false, &state), "no custom backend, configured \u{21d2} usable");
+        assert!(
+            !scaling_is_usable(true, &state),
+            "a custom backend never reads swaybg.args, so it wins over an \
+             otherwise-configured state"
+        );
     }
 
     /// The row's selected item follows the mode signal, at construction and
@@ -567,6 +715,93 @@ mod tests {
         assert!(
             row.is_sensitive(),
             "a wallpaper is now set \u{21d2} sensitive"
+        );
+    }
+
+    // ── a mode outside the row's own vocabulary (#1314 review LOW-1) ───────
+
+    /// A file holding `solid_color` must not silently render as "Fill" — it
+    /// gets a named trailing placeholder instead, so the row never states a
+    /// mode the state does not actually have.
+    #[gtk::test]
+    fn a_mode_outside_the_menu_gets_a_named_placeholder_instead_of_fill() {
+        adw::init().expect("libadwaita init");
+        let row = scaling_row(
+            Mutable::new(Mode::SolidColor).signal(),
+            Mutable::new(true).signal(),
+            |_| {},
+        );
+        pump();
+
+        let scaling_len = u32::try_from(Mode::SCALING.len()).unwrap();
+        assert_eq!(
+            row.selected(),
+            scaling_len,
+            "an out-of-vocabulary mode must select the trailing placeholder, \
+             not silently sit on index 0 (\"Fill\")"
+        );
+
+        let model = row
+            .model()
+            .and_then(|m| m.downcast::<gtk::StringList>().ok())
+            .expect("a StringList model");
+        assert_eq!(model.n_items(), scaling_len + 1);
+        assert_eq!(
+            model.string(scaling_len).as_deref(),
+            Some("Solid color (from file)"),
+            "the placeholder must name the file's actual value"
+        );
+    }
+
+    /// The whole point of the placeholder: picking a *real* entry while it
+    /// is showing must actually write, and the placeholder must then drop.
+    /// Before this fix, the row displayed "Fill" (index 0) while the state
+    /// held `solid_color`, and re-picking "Fill" was a no-op — `AdwComboRow`
+    /// only commits on an actual index change, and index 0 was already
+    /// "selected" as far as the widget was concerned.
+    ///
+    /// **Falsification:** go back to `Mode::SCALING.iter().position(|m| *m
+    /// == mode).unwrap_or(0)` with no placeholder — `row.set_selected(0)`
+    /// is then a no-op (0 is already selected) and `picked` stays empty.
+    #[gtk::test]
+    fn picking_a_real_mode_from_the_placeholder_state_writes_through() {
+        adw::init().expect("libadwaita init");
+        let picked: Rc<RefCell<Vec<Mode>>> = Rc::new(RefCell::new(Vec::new()));
+        let handle: Mutable<Mode> = Mutable::new(Mode::SolidColor);
+        let row = scaling_row(handle.signal(), Mutable::new(true).signal(), {
+            let picked = Rc::clone(&picked);
+            move |mode| picked.borrow_mut().push(mode)
+        });
+        pump();
+
+        let fill_idx = Mode::SCALING
+            .iter()
+            .position(|m| *m == Mode::Fill)
+            .expect("Fill is offered");
+        row.set_selected(u32::try_from(fill_idx).unwrap());
+        pump();
+
+        assert_eq!(
+            picked.borrow().as_slice(),
+            [Mode::Fill],
+            "picking Fill while the placeholder was showing must write through"
+        );
+
+        // Production feeds the write above back through `wallpaper::set_mode`
+        // → `wallpaper::mode()`'s own signal; simulate that round trip by
+        // driving the same `handle` this row is bound to, and confirm the
+        // placeholder is then dropped rather than left stranded.
+        handle.set(Mode::Fill);
+        pump();
+
+        let model = row
+            .model()
+            .and_then(|m| m.downcast::<gtk::StringList>().ok())
+            .expect("a StringList model");
+        assert_eq!(
+            model.n_items(),
+            u32::try_from(Mode::SCALING.len()).unwrap(),
+            "the placeholder must be dropped once the signal reflects a real mode"
         );
     }
 }

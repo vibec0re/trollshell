@@ -275,23 +275,43 @@ impl Serialize for Mode {
 }
 
 impl<'de> Deserialize<'de> for Mode {
-    /// Never fails: an unrecognised word is the #1044-style per-key
-    /// tolerance applied to a state file — it costs only this key, not the
-    /// rest of the file, so the fallback lives *inside* deserialization
+    /// Never fails: an unrecognised *word* — or, since #1314 review LOW-2, a
+    /// value of the wrong *type* entirely (`mode = 3`) — is the #1044-style
+    /// per-key tolerance applied to a state file: it costs only this key, not
+    /// the rest of the file, so the fallback lives *inside* deserialization
     /// rather than surfacing a [`serde::de::Error`] that a struct-level
     /// `toml::from_str`/`serde_json::from_str` would turn into a whole-file
     /// rejection.
+    ///
+    /// Deserializing through [`serde_json::Value`] rather than `String` is
+    /// the fix: `String::deserialize(deserializer)?`'s `?` only ever ran the
+    /// fallback once a string had already come back, so a non-string `mode`
+    /// sank the whole file — `state::load` returned `None`, `load_state`
+    /// fell to the zero state, and the loader's own "the next write
+    /// overwrites this file" warning meant the very next pick would have
+    /// destroyed the rest of the selection on disk. `serde_json::Value`'s own
+    /// `Deserialize` impl is format-agnostic (it drives *any* conforming
+    /// `Deserializer`, TOML's included, through `deserialize_any` correctly
+    /// — the same trick this workspace has no other use for, chosen instead
+    /// of hand-writing a `Visitor` with a `visit_*` arm per TOML/JSON shape),
+    /// so this one call handles a string, a bare integer, a float, a bool, an
+    /// array or a table alike.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = String::deserialize(deserializer)?;
-        if let Some(mode) = Mode::parse(&raw) {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        if let Some(mode) = raw.as_str().and_then(Mode::parse) {
             return Ok(mode);
         }
+        // A string shows bare (`bogus`, matching every other #1044 tolerance
+        // warning in this crate); anything else — the wrong-type case this
+        // fix exists for — shows its own JSON-ish rendering (`3`, `true`,
+        // `[1]`, `{...}`), which is still exactly what the file held.
+        let shown = raw.as_str().map_or_else(|| raw.to_string(), str::to_string);
         tracing::warn!(
             key = "mode",
-            value = %raw,
+            value = %shown,
             "wallpaper: unrecognised scaling mode; using the default (fill) — \
              ignoring this key and using the built-in default"
         );
@@ -1243,6 +1263,55 @@ mod tests {
             assert_eq!(
                 warnings[0].fields.get("value").map(String::as_str),
                 Some("bogus")
+            );
+        });
+    }
+
+    /// #1314 review LOW-2: the #1044 tolerance covers a bad *word*, not just
+    /// a bad *value* — a `mode` of the wrong TOML type must cost only that
+    /// key too, not sink the whole `state::load` the way `?`-on-
+    /// `String::deserialize` used to.
+    ///
+    /// Falsified by reverting `Mode::deserialize` to
+    /// `String::deserialize(deserializer)?`: `state::load` returns `None`
+    /// for the whole file and this test's `expect` panics.
+    #[test]
+    fn a_non_string_mode_costs_only_that_key() {
+        scratch_home(|_home| {
+            let path = state::path(SUBSYSTEM).expect("state path resolves");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(
+                &path,
+                "default = \"/d.png\"\nmode = 3\n\n[outputs]\n\"DP-1\" = \"/dp1.png\"\n",
+            )
+            .expect("seed a state file with a wrong-typed mode value");
+
+            let (captured, _guard) = capture();
+            let loaded = state::load::<WallpaperState>(SUBSYSTEM)
+                .expect("a wrong-typed mode must not sink the whole file");
+
+            assert_eq!(loaded.mode, Mode::default(), "an unusable value falls back");
+            assert_eq!(loaded.default.as_deref(), Some("/d.png"));
+            assert_eq!(
+                loaded.outputs.get("DP-1").map(String::as_str),
+                Some("/dp1.png"),
+                "a sibling key must not be dropped by the bad mode"
+            );
+
+            let warnings: Vec<_> = captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN)
+                .collect();
+            assert_eq!(warnings.len(), 1, "exactly one warning, got {warnings:?}");
+            assert_eq!(
+                warnings[0].fields.get("key").map(String::as_str),
+                Some("mode")
+            );
+            assert_eq!(
+                warnings[0].fields.get("value").map(String::as_str),
+                Some("3"),
+                "the warning must still name what the file actually held"
             );
         });
     }

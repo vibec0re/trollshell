@@ -2334,13 +2334,18 @@ mod tests {
                 // fragment. No calibration is available here, and a ceiling
                 // without one is a flake (#1238's own words).
                 Kind::SevenSeg => None,
-                // A board is bezel, two flat card faces and a row of 5×7
-                // bitmap glyphs, and its one continuous quantity is a
-                // horizontal band one card tall — so its supersampled frames
-                // are overwhelmingly constant blocks for reasons that have
-                // nothing to do with the halo, and the statistic has no
-                // calibration here either. TODO(#1155): the measured
-                // percentages go here.
+                // 92.5–93.4 % on the split flap (vfd 93.4, lcd 92.5, oled 93.3,
+                // crt 93.8) and a flat **100.0 %** on all four nixie frames: a
+                // board is bezel, two flat card faces and a row of 5×7 bitmap
+                // glyphs, and its one continuous quantity is a horizontal band
+                // one card tall, so its supersampled frames are overwhelmingly
+                // constant blocks for reasons that have nothing to do with a
+                // halo. The nixie pair is the control that costs nothing here,
+                // and it sits at the **top** of the range rather than the
+                // bottom — exactly the wrong direction for a detector that is
+                // supposed to fall when a grid-resolution read is resolved per
+                // fragment. No calibration is available, and a ceiling without
+                // one is a flake (#1238's own words).
                 Kind::FlipBoard => None,
             };
             assert_eq!(

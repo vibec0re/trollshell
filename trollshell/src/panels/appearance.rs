@@ -69,7 +69,10 @@ pub fn panel_appearance() -> gtk::Widget {
 fn anything_configured_to_scale(s: &wallpaper::WallpaperState) -> bool {
     s.default.is_some()
         || !s.outputs.is_empty()
-        || (s.rotation.enabled && Slot::ALL.iter().any(|slot| s.rotation.image(*slot).is_some()))
+        || (s.rotation.enabled
+            && Slot::ALL
+                .iter()
+                .any(|slot| s.rotation.image(*slot).is_some()))
 }
 
 /// The Scaling row's sensitivity: usable exactly when swaybg is actually
@@ -616,7 +619,10 @@ mod tests {
             default: Some("/d.png".into()),
             ..WallpaperState::default()
         };
-        assert!(scaling_is_usable(false, &state), "no custom backend, configured \u{21d2} usable");
+        assert!(
+            scaling_is_usable(false, &state),
+            "no custom backend, configured \u{21d2} usable"
+        );
         assert!(
             !scaling_is_usable(true, &state),
             "a custom backend never reads swaybg.args, so it wins over an \

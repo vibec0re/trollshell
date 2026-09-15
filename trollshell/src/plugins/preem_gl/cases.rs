@@ -168,7 +168,7 @@ impl Case {
 /// advancing an unstaggered board's clock to `duration / 2`. And **no uniform
 /// array bounds the cell count** — the per-cell strip is a data *texture*, so
 /// [`kit::FLIP_MAX_CELLS`] is not a cliff any shader can fall off and there is
-/// no MAX_CELLS edge case to render here. The widest board the kit will build
+/// no `MAX_CELLS` edge case to render here. The widest board the kit will build
 /// (64 cells, 896 strip texels, a 1026 px logical buffer) is covered
 /// hermetically instead, in `flip_board.rs`'s transcription sweep; a 2052 px
 /// natural size would be wider than the harness's own display.
@@ -759,14 +759,15 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
             // arm's improvement lives: the fold's boundary and the falling
             // card's lit free edge resolved at the screen's resolution rather
             // than as `scale`-tall bands of one logical stair.
-            let shipping_boards = kit::Mechanism::ALL
-                .into_iter()
-                .map(move |mechanism| Case::FlipBoard {
-                    style: *style,
-                    mechanism,
-                    board: BoardAt::Rolling,
-                    scale: FLIP_SUPERSAMPLE,
-                });
+            let shipping_boards =
+                kit::Mechanism::ALL
+                    .into_iter()
+                    .map(move |mechanism| Case::FlipBoard {
+                        style: *style,
+                        mechanism,
+                        board: BoardAt::Rolling,
+                        scale: FLIP_SUPERSAMPLE,
+                    });
             scopes
                 .chain(gauges)
                 .chain(shipping)

@@ -3313,10 +3313,10 @@ impl Renderer {
             | Self::MarqueeGl { .. }
             | Self::TextBoxGl { .. }
             | Self::LedStripGl { .. }
-            | Self::SevenSegGl { .. } => return None,
+            | Self::SevenSegGl { .. }
+            | Self::FlipBoardGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
-            Self::FlipBoardGl { .. } => return None,
         })
     }
 
@@ -3670,7 +3670,8 @@ fn dots(offset: f32, period: usize) -> usize {
 /// to the second rasterises nothing and is never rebuilt onto the kit: a
 /// permanently blank chip, with no warning and no fallback.
 ///
-/// `None` when `build` declines the widget (the `force_unsupported` test knob).
+/// `None` when `build` declines the widget (the `force_unsupported` test
+/// knob).
 #[cfg(test)]
 pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
     let renderer = build(widget)?;
@@ -3692,7 +3693,16 @@ pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
 /// `cfg(test)`-only, since nothing outside a test needs a widget's *kind* —
 /// only whether its renderer draws on the GPU, which [`Renderer::is_gl`]
 /// answers without naming one.
+///
+/// **`unnecessary_wraps` is allowed deliberately**, and #1155 is when it
+/// started firing: with the flip board's arm, *every* wire kind names a
+/// `Kind`, so the `Option` currently has no `None` arm. Unwrapping it would
+/// make "does this widget kind have a GL arm at all" unaskable — it is the
+/// question this function exists for, `every_gl_kind_widget_takes_the_gl_arm`
+/// reads both answers, and the day the vocabulary grows a kind with no
+/// pipeline the honest answer has to be sayable without a signature change.
 #[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind> {
     use vocab::PreemWidget as W;
     match widget {
@@ -3816,6 +3826,15 @@ mod tests {
                 config: vocab::SevenSegConfig::default(),
                 state: vocab::SevenSegState {
                     text: "12:34".into(),
+                },
+            },
+            // Not the vocabulary default either, for the readout's reason: a
+            // blank board is a bezel and eight ghost cards, which a renderer
+            // that only painted the fixture would match.
+            W::FlipBoard {
+                config: vocab::FlipBoardConfig::default(),
+                state: vocab::FlipBoardState {
+                    text: "12:34:56".into(),
                 },
             },
         ];

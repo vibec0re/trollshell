@@ -1024,12 +1024,7 @@ mod tests {
         (5, "00:00", "12:34", 0.37),
         (8, "88:88:88", "PREEM   ", 0.13),
         (8, "12:34:56", "########", 0.23),
-        (
-            kit::FLIP_MAX_CELLS,
-            "",
-            "DEPARTURES 12:34 PLATFORM 9",
-            0.17,
-        ),
+        (kit::FLIP_MAX_CELLS, "", "DEPARTURES 12:34 PLATFORM 9", 0.17),
     ];
 
     /// Every board the sweeps below drive, at the kit's `scale = 1` — the only
@@ -1382,7 +1377,10 @@ mod tests {
         let slot_at = BODY
             .find("if (u_mechanism == MECH_SPLIT_FLAP && row == u_bezel + u_hinge")
             .expect("the slot cut");
-        assert!(fixture_at < lit_at, "the lit layer composites over the fixture");
+        assert!(
+            fixture_at < lit_at,
+            "the lit layer composites over the fixture"
+        );
         assert!(slot_at > lit_at, "the hinge slot is cut over the composite");
     }
 
@@ -1672,9 +1670,8 @@ mod tests {
         let behind = glyph_at(cards, behind_lo, behind_hi, x, row) * 255.0;
 
         if has_source {
-            let card = glyph_coverage(cards, leaf_lo, leaf_hi, x, src_lo, src_hi, slack)
-                * 255.0
-                * shade;
+            let card =
+                glyph_coverage(cards, leaf_lo, leaf_hi, x, src_lo, src_hi, slack) * 255.0 * shade;
             // `fma`, which is `f32::mul_add` and which the shader declares
             // `precise` so a driver cannot split it.
             cover.mul_add(card.max(edge) - behind, behind)
@@ -1684,15 +1681,28 @@ mod tests {
     }
 
     /// `flap255`.
-    fn flap255(cards: &super::Cards, base: i32, x: i32, row: i32, lo: f32, hi: f32, slack: f32) -> i32 {
+    fn flap255(
+        cards: &super::Cards,
+        base: i32,
+        x: i32,
+        row: i32,
+        lo: f32,
+        hi: f32,
+        slack: f32,
+    ) -> i32 {
         let value = flap_value(cards, base, x, row, lo, hi, slack);
         if value > 0.0 { level(value) } else { 0 }
     }
 
     /// `nixie255`.
     fn nixie255(cards: &super::Cards, base: i32, x: i32, row: i32) -> i32 {
-        let by_out =
-            glyph_at(cards, strip_int(cards, base), strip_int(cards, base + 1), x, row) > 0.0;
+        let by_out = glyph_at(
+            cards,
+            strip_int(cards, base),
+            strip_int(cards, base + 1),
+            x,
+            row,
+        ) > 0.0;
         let by_in = glyph_at(
             cards,
             strip_int(cards, base + 2),

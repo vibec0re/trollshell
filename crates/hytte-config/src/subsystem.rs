@@ -4816,17 +4816,36 @@ kept = true
     ///
     /// Red if the `merge::LOCKED_KEY` arm of [`collect_paths`]' skip goes
     /// away.
+    ///
+    /// Asserted **byte-for-byte** rather than by `contains`, on the #1331
+    /// re-verify's ask: the marker is written the awkward way a hand-editing
+    /// operator would — leading comment, multi-line array, single-quoted name,
+    /// trailing comment — and a save that flips an unrelated key must leave
+    /// that block identical. A `contains` check would survive a reformat, and
+    /// "the writer does not rewrite bytes it was not asked to" is the actual
+    /// contract.
+    ///
+    /// The marker here is the overlay's own, so it pins nothing (`locked` is
+    /// empty) — which is the point: an inert marker is still the operator's
+    /// bytes.
     #[test]
     fn a_locked_marker_survives_a_save() {
-        let existing = "_locked = [\"core.color\"]\nenabled = true\n\n[core]\ncolor = \"cyan\"\nbrightness = 3\n";
+        let existing = "# my pins\n_locked = [\n  'core.color',   # keep this one\n]\nenabled = true\n\n[core]\ncolor = \"cyan\"\nbrightness = 3\n";
         let loaded = assembled(&[existing]);
-        let out = render_overlay(existing, &loaded.config).expect("renders");
+        let mut value = loaded.config.clone();
+        value.enabled = !value.enabled;
 
+        let out = render_overlay_locking(existing, &value, &loaded.locked).expect("renders");
+
+        let want = "# my pins\n_locked = [\n  'core.color',   # keep this one\n]\n";
         assert!(
-            out.contains("_locked = [\"core.color\"]"),
-            "the writer does not delete bytes it was not asked to: {out}"
+            out.starts_with(want),
+            "the marker block must be byte-identical:\n---\n{out}\n---"
         );
-        assert!(out.contains("color = \"cyan\""), "{out}");
+        assert!(
+            out.contains("enabled = false"),
+            "the real edit lands: {out}"
+        );
     }
 
     /// A lock naming a key its own layer does not set pins **nothing**, and
@@ -4950,5 +4969,65 @@ kept = true
         assert!(loaded.is_locked("core.brightness"), "{:?}", loaded.locked);
         assert_eq!(loaded.config.core.brightness, 3, "nix's value");
         assert_eq!(loaded.sources.len(), 1, "and only the base was read");
+    }
+
+    /// The mirror of the test above, and the case that is *normal* rather than
+    /// rare: a `XDG_CONFIG_DIRS` entry that carries no file for this subsystem
+    /// must not move the overlay slot. [`crate::xdg::Env::config_layers`]
+    /// emits one path per configured base dir, and a live session has several
+    /// (home-manager's profile, the per-user profile, the system profile,
+    /// `/etc/xdg`) of which at most one ever holds a given subsystem's file —
+    /// so "every requested path was read" is false on essentially every real
+    /// load.
+    ///
+    /// Red if [`load_from`] decides the overlay slot by counting the paths it
+    /// read against the paths it asked for: the overlay is then folded as a
+    /// base, [`merge::merge_all_locked`] is handed `None` for the overlay, and
+    /// **no** lock binds anything — the operator's `brightness = 7` wins and
+    /// nothing is reported.
+    #[test]
+    fn a_missing_lower_base_does_not_move_the_overlay_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("absent.toml");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&base, LOCKED_BASE).expect("seed the base");
+        std::fs::write(&overlay, "[core]\nbrightness = 7\n").expect("seed the overlay");
+        let paths = [absent, base, overlay];
+
+        let loaded = load_from::<Leds>(&paths).expect("loads");
+
+        assert_eq!(loaded.config.core.brightness, 3, "nix's value is kept");
+        assert!(loaded.is_locked("core.brightness"), "{:?}", loaded.locked);
+        assert_eq!(
+            loaded.lock_findings.len(),
+            1,
+            "and the refusal is reported: {:?}",
+            loaded.lock_findings
+        );
+    }
+
+    /// [`assemble_base_layers`] has one call site in the workspace and it is in
+    /// another crate, so this is `hytte-config`'s own pin on the entry point
+    /// (#1331 re-verify, item 6): a base layer read as one keeps its lock.
+    ///
+    /// Red if `assemble_base_layers` ever forwards `has_overlay = true` — the
+    /// single layer becomes the overlay and its marker pins nothing.
+    #[test]
+    fn assemble_base_layers_keeps_a_base_layers_lock() {
+        let loaded: Loaded<Leds> =
+            assemble_base_layers(&layers(&[LOCKED_BASE])).expect("a lone base layer assembles");
+
+        assert_eq!(
+            loaded.locked,
+            BTreeSet::from(["core.brightness".to_owned()]),
+            "the marker binds the overlay that does not exist yet"
+        );
+        assert!(loaded.is_locked("core.brightness"));
+        assert!(
+            loaded.lock_findings.is_empty(),
+            "nothing above it to refuse: {:?}",
+            loaded.lock_findings
+        );
     }
 }

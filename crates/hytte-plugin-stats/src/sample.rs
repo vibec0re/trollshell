@@ -269,7 +269,8 @@ impl Needs {
 /// All three are "remember the last answer so the next one is cheap or
 /// possible at all": `/proc/stat` is cumulative so a *load* needs the previous
 /// reading, the hwmon chip directory costs a `read_dir` walk to resolve, and
-/// the GPU cache remembers whether `nvidia-smi` exists at all.
+/// the GPU cache remembers whether `nvidia-smi` exists at all, plus (#1297)
+/// its last reading and Intel's RC6 delta base.
 #[derive(Debug, Default)]
 pub struct Sampler {
     /// What this instance draws, and therefore what it reads.
@@ -278,7 +279,8 @@ pub struct Sampler {
     prev_cpu: Vec<(u64, u64)>,
     /// The resolved `/sys/class/hwmon` chip directory, once found.
     hwmon: Option<PathBuf>,
-    /// `nvidia-smi` availability and the Intel RC6 delta base.
+    /// `nvidia-smi` availability, its last successful reading (#1297), and
+    /// the Intel RC6 delta base.
     gpu: GpuCache,
     /// Previous per-device `/proc/diskstats` byte counters, keyed by device
     /// name — `hytte_sensors::compute_disk_io`'s own cache shape.
@@ -332,7 +334,11 @@ impl Sampler {
         };
 
         let gpu = if self.needs.gpu {
-            let (gpu, cache) = hytte_sensors::read_gpu_with_cache(self.gpu);
+            // `GpuCache` is not `Copy` (#1297 — it carries the last Nvidia
+            // reading, which owns a `String`), so take it out of `self`
+            // rather than copy it, mirroring the sensors service's own
+            // `poll_loop` doing the same with `std::mem::take`.
+            let (gpu, cache) = hytte_sensors::read_gpu_with_cache(std::mem::take(&mut self.gpu));
             self.gpu = cache;
             gpu.map(|g| Gpu {
                 name: g.name,
@@ -442,16 +448,21 @@ impl Sampler {
     /// cost of re-baselining is one poll period of dashes, which is the honest
     /// answer and is exactly what a cold start already shows.
     ///
-    /// The hwmon path and the GPU cache are deliberately **kept**: the chip
-    /// directory is a `read_dir` walk whose answer does not go stale, and
-    /// `GpuCache` is mostly "does `nvidia-smi` exist", which is a `fork`/`exec`
-    /// to re-learn on every sidebar open. Its `intel_rc6_prev` half *is* a
-    /// cumulative base with the same staleness, but its fields are private to
-    /// `hytte-sensors` and there is no seam to clear one without the other —
-    /// so on an Intel box the GPU needle, not the CPU row, wears one stale
-    /// frame per open. Worth a seam if it ever shows on glass.
+    /// The hwmon path is deliberately **kept**: the chip directory is a
+    /// `read_dir` walk whose answer does not go stale. The GPU cache's
+    /// *availability* memo is kept too — whether `nvidia-smi` exists is a
+    /// `fork`/`exec` to re-learn — but everything else in it is a
+    /// measurement anchored to a moment before the park: the last Nvidia
+    /// reading (#1297) and the Intel RC6 delta base both predate the close,
+    /// so serving either on the first frame after an unpark would be exactly
+    /// the stale-frame failure the `/proc/stat` baseline above exists to
+    /// avoid — just on the GPU needle instead of the CPU row.
+    /// [`GpuCache::forget_readings`](hytte_sensors::GpuCache::forget_readings)
+    /// is that seam (#1297 review MEDIUM 1; before it, only the Intel half
+    /// had this problem — the Nvidia reading didn't exist yet to go stale).
     pub fn reset(&mut self) {
         self.prev_cpu.clear();
+        self.gpu.forget_readings();
     }
 }
 

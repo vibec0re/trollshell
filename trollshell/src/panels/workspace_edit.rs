@@ -68,7 +68,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use hytte::futures_signals::map_ref;
-use hytte::futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte::futures_signals::signal::{LocalBoxSignal, Mutable, Signal, SignalExt, always};
 use hytte::gtk::{self, gdk, glib, pango, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri::{self, Window, Workspace};
@@ -118,16 +118,6 @@ const FORM_GRID_CLASS: &str = "ts-ws-edit-grid";
 /// 2). Off, a row shows only its icon and name; on, it reveals
 /// [`EXEC_ENTRY_CLASS`] pre-filled with the resolved command.
 const OVERRIDE_TOGGLE_CLASS: &str = "ts-ws-edit-override";
-
-/// CSS class on a row's icon button when the app has a window on the stack's
-/// workspace right now (#1312) — normal opacity, a click does nothing.
-const APP_ICON_RUNNING_CLASS: &str = "ts-stack-app-running";
-
-/// CSS class on a row's icon button when it does not — GTK/Adwaita's own
-/// built-in de-emphasis class (opacity, not colour), the same one a plain
-/// `gtk::Label` uses for secondary text. Reused rather than a new `ts-*` rule:
-/// the icon button needs exactly that treatment and nothing bespoke.
-const APP_ICON_DIM_CLASS: &str = "dim-label";
 
 /// Design-baseline width, in CSS px before [`crate::scale::scale`], of the
 /// left column holding name/layout/autostart — narrow on purpose, since #1134
@@ -534,71 +524,131 @@ fn live_resolver() -> Resolver {
 }
 
 /// How an editor row derives its live [`RowVisual`], given the stack's name
-/// (`None` for an ephemeral card), its niri workspace id if it is on screen,
-/// its apps, and the row's index within them.
+/// (`None` for an ephemeral card) and — when the app is in the **saved**
+/// stack — its apps there plus the app's own index among them.
 ///
 /// Passed in rather than called from inside [`app_row`], for the same reason
 /// [`Resolver`] is: [`live_row_visual`] reaches `niri::workspaces()` and
 /// `niri::windows()`, which are `Registry` accessors that panic without one
 /// registered — and this page's own `#[gtk::test]`s build a form with no
 /// `Registry` at all (module doc, "The form must survive the refresh poll").
-type RowVisualSource = Rc<
-    dyn Fn(
-        Option<String>,
-        Option<u64>,
-        Vec<StackApp>,
-        usize,
-    ) -> hytte::futures_signals::signal::LocalBoxSignal<'static, RowVisual>,
->;
+///
+/// `saved` rather than the draft's own apps/index (#1312 review MED-4): the
+/// draft can be reordered, added to or trimmed without a Save, and the row's
+/// *launch* has to agree with what is actually in `workspaces.toml` — see
+/// [`saved_index_of`].
+type RowVisualSource =
+    Rc<dyn Fn(Option<String>, Option<(Vec<StackApp>, usize)>) -> LocalRowVisualSignal>;
 
-/// [`RowVisualSource`]'s real implementation (#1312): `state_of`/
-/// `missing_apps`, live off niri's workspace/window signals plus
-/// `workspace_stacks`' own `slices_up`/`starting`/`app_starting` — the same
-/// two derivations (`state_of`, `missing_apps`) the Workspaces page's card
-/// strips already use to light an app's icon.
-fn live_row_visual() -> RowVisualSource {
-    use hytte::futures_signals::signal::SignalExt;
+/// [`RowVisualSource`]'s return type, spelled once.
+type LocalRowVisualSignal = LocalBoxSignal<'static, RowVisual>;
 
-    Rc::new(|stack_name, ephemeral_workspace, sibling_apps, index| {
-        map_ref! {
-            let workspaces = niri::workspaces(),
-            let windows = niri::windows(),
-            let slices_up = workspace_stacks::slices_up(),
-            let starting = workspace_stacks::starting(),
-            let app_starting = workspace_stacks::app_starting() => {
-                let this_starting = stack_name.as_deref().is_some_and(|n| {
-                    app_starting.contains(&workspace_stacks::app_starting_key(n, index))
-                });
-                if this_starting {
-                    RowVisual::Starting
-                } else {
-                    let (state, workspace) = match &stack_name {
-                        Some(n) => (
-                            workspace_stacks::state_of(
-                                n,
-                                workspaces,
-                                windows,
-                                slices_up.contains(n),
-                                starting,
-                            ),
-                            live_workspace_id(workspaces, n),
-                        ),
-                        // An ephemeral card has no name yet, but it is on
-                        // screen by construction — its apps came *from* the
-                        // workspace's own windows (`ephemeral_draft`).
-                        None => (StackState::Active, ephemeral_workspace),
-                    };
-                    if app_row_running(state, &sibling_apps, index, workspace, windows) {
-                        RowVisual::Lit
-                    } else {
-                        RowVisual::Dim
-                    }
-                }
+/// How `name` is currently on a workspace, and this app's window on it, given
+/// already-resolved live signals — the part of [`RowVisualSource`] that does
+/// not care whether those signals are the real `niri`/`workspace_stacks`
+/// globals or scripted `Mutable`s (#1312 review LOW 7: split out so a test can
+/// drive `build_app_icon`/`app_row` through this seam end to end, the same
+/// split `panels::workspaces`' `build_panel`/`model` already uses).
+fn row_visual_signal<W, N, U, T, A>(
+    stack_name: Option<String>,
+    saved: Option<(Vec<StackApp>, usize)>,
+    workspaces: W,
+    windows: N,
+    slices_up: U,
+    starting: T,
+    app_starting: A,
+) -> LocalRowVisualSignal
+where
+    W: Signal<Item = Vec<Workspace>> + 'static,
+    N: Signal<Item = Vec<Window>> + 'static,
+    U: Signal<Item = BTreeSet<String>> + 'static,
+    T: Signal<Item = BTreeSet<String>> + 'static,
+    A: Signal<Item = BTreeSet<String>> + 'static,
+{
+    let Some(name) = stack_name else {
+        // An ephemeral card has no stack to start into at all — its apps came
+        // *from* the workspace's own windows (`ephemeral_draft`), so it is
+        // always Lit and never a click target (#1312 review LOW 6).
+        return always(RowVisual::Lit).boxed_local();
+    };
+    let Some((saved_apps, saved_index)) = saved else {
+        // Not (yet) in the saved file — a just-added, unsaved row has no unit
+        // to file a start under (#1312 review MED-4).
+        return always(RowVisual::Decoration).boxed_local();
+    };
+    map_ref! {
+        let workspaces = workspaces,
+        let windows = windows,
+        let slices_up = slices_up,
+        let starting = starting,
+        let app_starting = app_starting => {
+            let this_starting = app_starting.contains(&workspace_stacks::app_starting_key(&name, saved_index));
+            if this_starting {
+                RowVisual::Starting
+            } else {
+                let state = workspace_stacks::state_of(
+                    &name,
+                    workspaces,
+                    windows,
+                    slices_up.contains(&name),
+                    starting,
+                );
+                let workspace = live_workspace_id(workspaces, &name);
+                app_row_visual(state, &saved_apps, saved_index, workspace, windows)
             }
         }
-        .dedupe()
-        .boxed_local()
+    }
+    .dedupe()
+    .boxed_local()
+}
+
+/// [`RowVisualSource`]'s real implementation (#1312): [`row_visual_signal`]
+/// fed the real `niri::workspaces()`/`niri::windows()` and
+/// `workspace_stacks`' own `slices_up`/`starting`/`app_starting`.
+fn live_row_visual() -> RowVisualSource {
+    Rc::new(|stack_name, saved| {
+        row_visual_signal(
+            stack_name,
+            saved,
+            niri::workspaces(),
+            niri::windows(),
+            workspace_stacks::slices_up(),
+            workspace_stacks::starting(),
+            workspace_stacks::app_starting(),
+        )
     })
+}
+
+/// How an editor row finds the app it is showing in the **saved** stack
+/// (#1312 review MED-4), given the stack's name. `None` when the stack itself
+/// has not been saved at all (an ephemeral card, or — defensively — a name
+/// the file does not have).
+///
+/// Passed in rather than called from inside [`build_app_icon`], for the same
+/// reason [`RowVisualSource`] is: the real one reaches
+/// `config::workspaces::current()`, a `Registry` accessor.
+type SavedStackSource = Rc<dyn Fn(&str) -> Option<Stack>>;
+
+/// [`SavedStackSource`]'s real implementation.
+fn live_saved_stack() -> SavedStackSource {
+    Rc::new(|name: &str| {
+        crate::config::workspaces::current()
+            .stacks
+            .get(name)
+            .cloned()
+    })
+}
+
+/// The impure lookups one editor row needs, bundled into one struct rather
+/// than three trailing parameters (`app_row` and friends were at
+/// `clippy::too_many_arguments` with them separate): the override toggle's
+/// [`Resolver`], the row icon's [`RowVisualSource`], and its
+/// [`SavedStackSource`]. `Clone` is cheap — every field is an `Rc`.
+#[derive(Clone)]
+struct RowSeams {
+    resolve: Resolver,
+    row_visual: RowVisualSource,
+    saved_stack: SavedStackSource,
 }
 
 // ── The published selection ──────────────────────────────────────────────────
@@ -637,14 +687,20 @@ fn build_slot<S>(target: S) -> gtk::Widget
 where
     S: Signal<Item = Option<Draft>> + 'static,
 {
-    build_slot_with(target, live_resolver(), live_row_visual())
+    build_slot_with(
+        target,
+        RowSeams {
+            resolve: live_resolver(),
+            row_visual: live_row_visual(),
+            saved_stack: live_saved_stack(),
+        },
+    )
 }
 
-/// [`build_slot`] with the override toggle's resolver and the row icon's live
-/// signal source both injected, so a `#[gtk::test]` can drive either without
-/// touching the machine's real `$XDG_DATA_DIRS` or requiring a registered
-/// `Registry`.
-fn build_slot_with<S>(target: S, resolve: Resolver, row_visual: RowVisualSource) -> gtk::Widget
+/// [`build_slot`] with every [`RowSeams`] seam injected, so a `#[gtk::test]`
+/// can drive any of them without touching the machine's real
+/// `$XDG_DATA_DIRS` or requiring a registered `Registry`.
+fn build_slot_with<S>(target: S, seams: RowSeams) -> gtk::Widget
 where
     S: Signal<Item = Option<Draft>> + 'static,
 {
@@ -661,7 +717,7 @@ where
             root.remove(&child);
         }
         if let Some(draft) = draft {
-            root.append(&build_form(&draft, &resolve, &row_visual));
+            root.append(&build_form(&draft, &seams));
         } else {
             let hint = gtk::Label::new(Some(NOTHING_HINT));
             hint.add_css_class("ts-ws-empty");
@@ -673,7 +729,7 @@ where
 }
 
 /// The form for one card.
-fn build_form(seed: &Draft, resolve: &Resolver, row_visual: &RowVisualSource) -> gtk::Widget {
+fn build_form(seed: &Draft, seams: &RowSeams) -> gtk::Widget {
     // The form's own state. Every control writes into it; Save reads it once.
     // An `Rc<RefCell<…>>` rather than a `Mutable` because nothing subscribes —
     // the app list is the only part that redraws, and it redraws because an
@@ -761,7 +817,7 @@ fn build_form(seed: &Draft, resolve: &Resolver, row_visual: &RowVisualSource) ->
     let apps_column = gtk::Box::new(gtk::Orientation::Vertical, 6);
     apps_column.set_hexpand(true);
 
-    let (apps, redraw) = build_app_list(&draft, resolve, row_visual);
+    let (apps, redraw) = build_app_list(&draft, seams);
     apps_column.append(&section_label("Apps"));
     apps_column.append(&apps);
 
@@ -1024,11 +1080,7 @@ fn build_name_field(seed: &Draft, draft: &Rc<RefCell<Draft>>) -> gtk::Entry {
 ///
 /// Returns both because the rows' own buttons need the handle and the caller
 /// needs the widget; see [`Redraw`] for why a rebuild rather than a patch.
-fn build_app_list(
-    draft: &Rc<RefCell<Draft>>,
-    resolve: &Resolver,
-    row_visual: &RowVisualSource,
-) -> (gtk::ListBox, Redraw) {
+fn build_app_list(draft: &Rc<RefCell<Draft>>, seams: &RowSeams) -> (gtk::ListBox, Redraw) {
     let apps = gtk::ListBox::new();
     apps.add_css_class("boxed-list");
     apps.add_css_class("ts-ws-edit-apps");
@@ -1040,8 +1092,7 @@ fn build_app_list(
     let rebuild: Rc<dyn Fn()> = {
         let draft = Rc::clone(draft);
         let redraw = Rc::clone(&redraw);
-        let resolve = Rc::clone(resolve);
-        let row_visual = Rc::clone(row_visual);
+        let seams = seams.clone();
         // Weak, so the closure the list itself transitively holds does not pin
         // the list (#224's contract, stated by hand because this is not a
         // `bind`).
@@ -1062,15 +1113,7 @@ fn build_app_list(
                 return;
             }
             for (index, app) in rows.iter().enumerate() {
-                apps.append(&app_row(
-                    index,
-                    app,
-                    &meta_cache,
-                    &draft,
-                    &redraw,
-                    &resolve,
-                    &row_visual,
-                ));
+                apps.append(&app_row(index, app, &meta_cache, &draft, &redraw, &seams));
             }
         })
     };
@@ -1148,31 +1191,37 @@ fn commit(ticket: u64, plan: &SavePlan) {
 // ── #1312: the editor row's icon starts a stopped app ───────────────────────
 
 /// What an editor row's icon should look like right now.
-///
-/// A third state beyond simple lit/dim: a click on [`Self::Dim`] fires
-/// [`workspace_stacks::spawn_app_start`], and the row has to say so while that
-/// launch is in flight — the same reason the whole card has [`StackState`]'s
-/// own `Starting` rather than just Active/Inactive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowVisual {
-    /// The app has a window on the stack's workspace, per [`app_row_running`].
-    /// Normal opacity, [`APP_ICON_RUNNING_CLASS`] — a click does nothing.
+    /// The app has a window on the stack's workspace, per [`app_row_visual`].
+    /// Normal opacity, [`crate::panels::workspaces::APP_RUNNING_CLASS`] — a
+    /// click does nothing.
     Lit,
-    /// No window (yet). [`APP_ICON_DIM_CLASS`], tooltip "Start <app>" — a
-    /// click starts it.
+    /// No window (yet), and the stack has a workspace to start it into.
+    /// [`crate::panels::workspaces::APP_IDLE_CLASS`], tooltip "Start <app>" —
+    /// a click starts it.
     Dim,
-    /// This row's own click started it and [`workspace_stacks::run_app_start`]
-    /// has not resolved yet. The same spinner/insensitive treatment
-    /// `panels::workspaces`' `start_stop_button` uses for the whole stack's
-    /// `Starting`.
+    /// Either this row's own click started it and
+    /// [`workspace_stacks::run_app_start`] has not resolved yet, or the whole
+    /// stack's own Start is in flight (#1312 review MED-2: it would race that
+    /// Start for the very same `--unit=`). The same spinner/insensitive
+    /// treatment `panels::workspaces`' `start_stop_button` uses for the whole
+    /// card's `Starting`.
     Starting,
+    /// Nothing to click: the stack has no workspace at all
+    /// ([`StackState::Inactive`], review HIGH), or this app is not (yet) at
+    /// this position in the **saved** stack — a just-added, unsaved row
+    /// (review MED-4). Same idle look as [`Self::Dim`], no tooltip, and a
+    /// click does nothing.
+    Decoration,
 }
 
 /// Whether a click on an editor row's icon should start the app.
 ///
 /// Only from [`RowVisual::Dim`]: [`RowVisual::Lit`] does nothing (the Triage's
-/// "or focuses — not asked, so not built"), and [`RowVisual::Starting`] means
-/// one is already in flight for this exact row.
+/// "or focuses — not asked, so not built"); [`RowVisual::Starting`] means one
+/// is already in flight, for this row or the whole stack; [`RowVisual::Decoration`]
+/// means there is nothing to start into or nothing saved to start.
 #[must_use]
 fn row_click_starts(visual: RowVisual) -> bool {
     visual == RowVisual::Dim
@@ -1219,30 +1268,70 @@ fn app_is_running(
     after >= missing_count
 }
 
-/// Whether an editor row's icon should read as running (#1312): the stack has
-/// an Active workspace right now, per [`StackState`], and this app has a
-/// window on it, per [`app_is_running`] — the same two derivations
-/// (`state_of`/`missing_apps`) the Workspaces page's card strips already use
-/// to light an app's icon.
+/// An editor row's [`RowVisual`], from [`StackState`] and this app's window
+/// presence (#1312) — the same two derivations (`state_of`, `missing_apps`)
+/// the Workspaces page's card strips already use to light an app's icon.
 ///
-/// `Inactive` has no workspace to check at all. `Starting` is dim for every
-/// row too: `spawn_start` marks the whole stack in flight before niri has even
-/// named its workspace (`release_lingering_names` runs first), so there may be
-/// nothing yet to resolve a window against — a row lights the moment the state
-/// settles to `Active`, on the very next signal tick, same as everything else
+/// `Inactive` has no workspace to start into at all (review HIGH): a click
+/// there would have nowhere to put the launched window, so the row is
+/// [`RowVisual::Decoration`], not a stopped-and-clickable [`RowVisual::Dim`].
+/// `Starting` reads as [`RowVisual::Starting`] for every row, not merely dim
+/// (review MED-2): `spawn_start` marks the whole stack in flight before niri
+/// has even named its workspace, so there may be nothing yet to resolve a
+/// window against, **and** a click there would race that Start for the exact
+/// same `--unit=` [`workspace_stacks::app_launch`] would give this app. A row
+/// settles to [`RowVisual::Lit`] or [`RowVisual::Dim`] the moment the state
+/// reaches `Active`, on the very next signal tick, same as everything else
 /// this page reads live.
 #[must_use]
-fn app_row_running(
+fn app_row_visual(
     state: StackState,
     apps: &[StackApp],
     index: usize,
     workspace: Option<u64>,
     windows: &[Window],
-) -> bool {
+) -> RowVisual {
     match state {
-        StackState::Inactive | StackState::Starting => false,
-        StackState::Active => app_is_running(apps, index, workspace, windows),
+        StackState::Inactive => RowVisual::Decoration,
+        StackState::Starting => RowVisual::Starting,
+        StackState::Active => {
+            if app_is_running(apps, index, workspace, windows) {
+                RowVisual::Lit
+            } else {
+                RowVisual::Dim
+            }
+        }
     }
+}
+
+/// Where the app at `index` of the **draft**'s `apps` actually is in the
+/// **saved** stack's own app list (#1312 review MED-4) — `None` when it is
+/// not there at all (a just-added, unsaved row).
+///
+/// Matched by desktop id and **ordinal among same-id draft rows**, not by
+/// position: the draft can be reordered without a Save, so position alone
+/// would file an app under a sibling's saved unit the moment the user drags a
+/// row past one of a different id. Ordinal rather than the whole struct (id
+/// *and* `exec`) so toggling an override on/off before saving does not, on
+/// its own, make a row look unsaved — only the **set** of ids at or before
+/// `index` changing does that.
+///
+/// Exact for the ordinary case (nothing has reordered *among* this id's own
+/// duplicates) and the best available answer when it has — the same
+/// trade-off [`app_is_running`]'s count-aware matching already makes.
+#[must_use]
+fn saved_index_of(saved_apps: &[StackApp], draft_apps: &[StackApp], index: usize) -> Option<usize> {
+    let target_id = &draft_apps.get(index)?.id;
+    let ordinal = draft_apps[..=index]
+        .iter()
+        .filter(|a| &a.id == target_id)
+        .count();
+    saved_apps
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| &a.id == target_id)
+        .nth(ordinal - 1)
+        .map(|(i, _)| i)
 }
 
 /// The workspace `name` is on right now, matched the way niri (and
@@ -1278,32 +1367,44 @@ fn bind_row_icon<S>(
 where
     S: Signal<Item = RowVisual> + 'static,
 {
-    let latest = Rc::new(Cell::new(RowVisual::Dim));
+    use crate::components::layout::toggle_class;
+    use crate::panels::workspaces::{APP_IDLE_CLASS, APP_RUNNING_CLASS};
+
+    let latest = Rc::new(Cell::new(RowVisual::Decoration));
     let image = image.clone();
     let display = display.to_owned();
     let store = Rc::clone(&latest);
     bind(visual, button, move |button, visual| {
         store.set(visual);
+        // #1312 review LOW 8: the doc always claimed this; only the code
+        // disagreed. `Starting`/`Decoration` are never a click target
+        // (`row_click_starts`), so this is the affordance matching the fact
+        // rather than a second gate.
+        button.set_sensitive(matches!(visual, RowVisual::Lit | RowVisual::Dim));
         match visual {
             RowVisual::Starting => {
                 let spinner = gtk::Spinner::new();
                 spinner.start();
                 button.set_child(Some(&spinner));
                 button.set_tooltip_text(Some("Starting…"));
-                button.remove_css_class(APP_ICON_RUNNING_CLASS);
-                button.remove_css_class(APP_ICON_DIM_CLASS);
             }
             RowVisual::Lit => {
                 button.set_child(Some(&image));
-                button.add_css_class(APP_ICON_RUNNING_CLASS);
-                button.remove_css_class(APP_ICON_DIM_CLASS);
+                toggle_class(&image, APP_RUNNING_CLASS, true);
+                toggle_class(&image, APP_IDLE_CLASS, false);
                 button.set_tooltip_text(None);
             }
             RowVisual::Dim => {
                 button.set_child(Some(&image));
-                button.remove_css_class(APP_ICON_RUNNING_CLASS);
-                button.add_css_class(APP_ICON_DIM_CLASS);
+                toggle_class(&image, APP_RUNNING_CLASS, false);
+                toggle_class(&image, APP_IDLE_CLASS, true);
                 button.set_tooltip_text(Some(&format!("Start {display}")));
+            }
+            RowVisual::Decoration => {
+                button.set_child(Some(&image));
+                toggle_class(&image, APP_RUNNING_CLASS, false);
+                toggle_class(&image, APP_IDLE_CLASS, true);
+                button.set_tooltip_text(None);
             }
         }
     });
@@ -1335,31 +1436,41 @@ fn build_app_icon(
     image: &gtk::Image,
     display: &str,
     draft: &Rc<RefCell<Draft>>,
-    row_visual: &RowVisualSource,
+    seams: &RowSeams,
 ) -> gtk::Button {
-    // The name and the (possibly ephemeral) workspace id come off the draft
-    // once, here at row-build time: any edit that could invalidate them
-    // (add/remove/drag) rebuilds every row from scratch anyway (see
-    // `Redraw`'s doc), so a snapshot is valid for this row's whole life.
-    let (stack_name, ephemeral_workspace, sibling_apps) = {
+    // The name and the draft's own apps come off the draft once, here at
+    // row-build time: any edit that could invalidate them (add/remove/drag)
+    // rebuilds every row from scratch anyway (see `Redraw`'s doc), so a
+    // snapshot is valid for this row's whole life.
+    let (stack_name, draft_apps) = {
         let seed = draft.borrow();
-        (seed.previous.clone(), seed.workspace, seed.apps.clone())
+        (seed.previous.clone(), seed.apps.clone())
     };
+    // #1312 review MED-4: resolved once, against the same snapshot, so the
+    // visual and the click agree about which saved row (if any) this is.
+    let saved: Option<(Vec<StackApp>, usize)> = stack_name.as_deref().and_then(|name| {
+        let stack = (seams.saved_stack)(name)?;
+        let saved_index = saved_index_of(&stack.apps, &draft_apps, index)?;
+        Some((stack.apps, saved_index))
+    });
+
     let icon_button = gtk::Button::new();
     icon_button.add_css_class("flat");
     icon_button.set_valign(gtk::Align::Center);
     icon_button.set_child(Some(image));
 
-    let visual = row_visual(stack_name, ephemeral_workspace, sibling_apps, index);
+    let visual = (seams.row_visual)(stack_name.clone(), saved.clone());
     let visual_cell = bind_row_icon(&icon_button, image, display, visual);
     let draft = Rc::clone(draft);
     wire_row_click(&icon_button, &visual_cell, move || {
-        let (name, app) = {
-            let seed = draft.borrow();
-            (seed.previous.clone(), seed.apps.get(index).cloned())
+        let Some((name, (_, saved_index))) = stack_name.clone().zip(saved.clone()) else {
+            return;
         };
-        if let (Some(name), Some(app)) = (name, app) {
-            workspace_stacks::spawn_app_start(name, index, app);
+        // The app itself still comes off the *live* draft (an override
+        // toggled since this row was built should be respected); only the
+        // unit it launches into is pinned to the saved index.
+        if let Some(app) = draft.borrow().apps.get(index).cloned() {
+            workspace_stacks::spawn_app_start(name, saved_index, app);
         }
     });
     icon_button
@@ -1373,8 +1484,7 @@ fn app_row(
     meta_cache: &MetaCache,
     draft: &Rc<RefCell<Draft>>,
     redraw: &Redraw,
-    resolve: &Resolver,
-    row_visual: &RowVisualSource,
+    seams: &RowSeams,
 ) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class(APP_ROW_CLASS);
@@ -1407,7 +1517,7 @@ fn app_row(
     let image = gtk::Image::from_gicon(&icon);
     image.set_icon_size(gtk::IconSize::Normal);
 
-    let icon_button = build_app_icon(index, &image, &display, draft, row_visual);
+    let icon_button = build_app_icon(index, &image, &display, draft, seams);
     body.append(&icon_button);
 
     let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -1461,7 +1571,7 @@ fn app_row(
     {
         let draft = Rc::clone(draft);
         let redraw = Rc::clone(redraw);
-        let resolve = Rc::clone(resolve);
+        let resolve = Rc::clone(&seams.resolve);
         let id = app.id.clone();
         toggle.connect_toggled(move |button| {
             {
@@ -1576,20 +1686,22 @@ fn section_label(text: &str) -> gtk::Label {
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::{
-        APP_ICON_DIM_CLASS, APP_ICON_RUNNING_CLASS, APP_ROW_CLASS, Draft, EXEC_ENTRY_CLASS,
-        FIELD_COLUMN_WIDTH, FORM_GRID_CLASS, NAME_ENTRY_CLASS, NOTHING_HINT, OVERRIDE_TOGGLE_CLASS,
-        RENAME_BLOCKED_HINT, Resolver, RowVisual, RowVisualSource, bind_row_icon, build_slot_with,
-        live_resolver, wire_row_click,
+        APP_ROW_CLASS, Draft, EXEC_ENTRY_CLASS, FIELD_COLUMN_WIDTH, FORM_GRID_CLASS,
+        NAME_ENTRY_CLASS, NOTHING_HINT, OVERRIDE_TOGGLE_CLASS, RENAME_BLOCKED_HINT, Resolver,
+        RowSeams, RowVisual, RowVisualSource, SavedStackSource, bind_row_icon, build_slot_with,
+        live_resolver, row_visual_signal, wire_row_click,
     };
     use crate::components::layout::EDIT_FORM_WIDTH;
-    use crate::config::workspaces::{Layout, StackApp};
+    use crate::config::workspaces::{Layout, Stack, StackApp};
     // One definition of the geometry discipline (and of how this tree is waited
     // on), shared with the card page's tests rather than copied (review MEDIUM 5).
     use crate::panels::workspaces::tests::{assert_inside_and_hittable, pump_until};
+    use crate::panels::workspaces::{APP_IDLE_CLASS, APP_RUNNING_CLASS};
     use crate::scale::scale;
     use hytte::adw;
     use hytte::futures_signals::signal::{Mutable, SignalExt, always};
     use hytte::gtk::{self, prelude::*};
+    use hytte::services::niri::{Window, WindowLayout, Workspace};
     use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::rc::Rc;
@@ -1725,7 +1837,23 @@ mod tests {
     /// specifically about the row icon just needs rows that build without
     /// panicking.
     fn dim_row_visual() -> RowVisualSource {
-        Rc::new(|_, _, _, _| always(RowVisual::Dim).boxed_local())
+        Rc::new(|_, _| always(RowVisual::Dim).boxed_local())
+    }
+
+    /// A [`SavedStackSource`] that never has one (#1312) — paired with
+    /// [`dim_row_visual`], which never consults it either, so every test
+    /// below that isn't specifically about the row icon is unaffected by
+    /// either seam.
+    fn no_saved_stack() -> SavedStackSource {
+        Rc::new(|_| None)
+    }
+
+    /// [`slot`]/[`slot_with_resolver`]'s shared body, every seam injected.
+    fn slot_with(target: &Mutable<Option<Draft>>, seams: RowSeams) -> gtk::Widget {
+        adw::init().expect("libadwaita init");
+        let page = build_slot_with(target.signal_cloned(), seams);
+        pump();
+        page
     }
 
     /// The slot with a selection it can be driven from — the seam `edit_slot`
@@ -1735,19 +1863,27 @@ mod tests {
     /// [`EDIT_FORM_WIDTH`] whatever the page behind it renders, so there is
     /// nothing to seed and no run-order dependence between these tests.
     fn slot(target: &Mutable<Option<Draft>>) -> gtk::Widget {
-        adw::init().expect("libadwaita init");
-        let page = build_slot_with(target.signal_cloned(), live_resolver(), dim_row_visual());
-        pump();
-        page
+        slot_with(
+            target,
+            RowSeams {
+                resolve: live_resolver(),
+                row_visual: dim_row_visual(),
+                saved_stack: no_saved_stack(),
+            },
+        )
     }
 
     /// [`slot`] with the override toggle's resolver injected too, so a test can
     /// drive it without touching the machine's real `$XDG_DATA_DIRS`.
     fn slot_with_resolver(target: &Mutable<Option<Draft>>, resolve: Resolver) -> gtk::Widget {
-        adw::init().expect("libadwaita init");
-        let page = build_slot_with(target.signal_cloned(), resolve, dim_row_visual());
-        pump();
-        page
+        slot_with(
+            target,
+            RowSeams {
+                resolve,
+                row_visual: dim_row_visual(),
+                saved_stack: no_saved_stack(),
+            },
+        )
     }
 
     /// §5: the sub-page opens **from a saved card**, showing every field of the
@@ -2523,12 +2659,13 @@ mod tests {
     }
 
     /// #1312: the row icon's bound class follows a `RowVisual` signal live —
-    /// [`APP_ICON_RUNNING_CLASS`] on `Lit`, gone on `Dim`, and vice versa.
+    /// [`APP_RUNNING_CLASS`] on `Lit`, gone on `Dim`/`Decoration`, and vice
+    /// versa — plus `Starting`/`Decoration` actually going insensitive
+    /// (review LOW 8).
     ///
     /// **The mutation**: swapping the two classes in [`bind_row_icon`]'s
-    /// `match` (or dropping the `remove_css_class` calls) reds this — the
-    /// class present after a flip would be the wrong one, or both would
-    /// linger.
+    /// `match` (or dropping the `toggle_class` calls) reds this — the class
+    /// present after a flip would be the wrong one, or both would linger.
     #[gtk::test]
     fn the_row_icon_class_follows_the_signal() {
         adw::init().expect("libadwaita init");
@@ -2538,30 +2675,54 @@ mod tests {
         let _cell = bind_row_icon(&button, &image, "Alacritty", visual.signal());
         pump();
 
+        // #1312 review LOW 5: the classes live on the `gtk::Image` — the
+        // card's own selectors, reused, would not match a `gtk::Button`.
         assert!(
-            button.has_css_class(APP_ICON_DIM_CLASS),
+            image.has_css_class(APP_IDLE_CLASS),
             "starts dim: no window yet"
         );
-        assert!(!button.has_css_class(APP_ICON_RUNNING_CLASS));
+        assert!(!image.has_css_class(APP_RUNNING_CLASS));
+        assert!(button.is_sensitive(), "dim is still a click target");
 
         visual.set(RowVisual::Lit);
         pump();
         assert!(
-            button.has_css_class(APP_ICON_RUNNING_CLASS),
+            image.has_css_class(APP_RUNNING_CLASS),
             "the window appeared — the icon must light"
         );
         assert!(
-            !button.has_css_class(APP_ICON_DIM_CLASS),
-            "the dim class must not linger once lit"
+            !image.has_css_class(APP_IDLE_CLASS),
+            "the idle class must not linger once lit"
+        );
+        assert!(button.is_sensitive(), "lit is still a click target (no-op)");
+
+        visual.set(RowVisual::Starting);
+        pump();
+        assert!(
+            !button.is_sensitive(),
+            "#1312 review LOW 8: Starting must actually be insensitive, not \
+             merely documented as such"
+        );
+
+        visual.set(RowVisual::Decoration);
+        pump();
+        assert!(
+            image.has_css_class(APP_IDLE_CLASS),
+            "decoration looks idle, like a stopped app"
+        );
+        assert!(
+            !button.is_sensitive(),
+            "decoration is not a click target — nothing to start into"
         );
 
         visual.set(RowVisual::Dim);
         pump();
         assert!(
-            button.has_css_class(APP_ICON_DIM_CLASS),
+            image.has_css_class(APP_IDLE_CLASS),
             "the window went away again — the icon must dim"
         );
-        assert!(!button.has_css_class(APP_ICON_RUNNING_CLASS));
+        assert!(!image.has_css_class(APP_RUNNING_CLASS));
+        assert!(button.is_sensitive());
     }
 
     /// #1312: a click on the row icon only calls the starter from
@@ -2608,13 +2769,156 @@ mod tests {
         button.emit_clicked();
         assert_eq!(starts.get(), 2, "dim again once the signal says so");
     }
+
+    /// A minimal niri workspace named `name` — this module's own fixture,
+    /// since `workspace_stacks::tests`'s is private to that module.
+    fn ws_named(id: u64, name: &str) -> Workspace {
+        Workspace {
+            id,
+            idx: 1,
+            name: Some(name.to_owned()),
+            output: Some("DP-1".to_owned()),
+            is_urgent: false,
+            is_active: false,
+            is_focused: false,
+            active_window_id: None,
+        }
+    }
+
+    /// [`ws_named`]'s window counterpart.
+    fn win_on(id: u64, workspace: u64, app_id: &str) -> Window {
+        Window {
+            id,
+            title: None,
+            app_id: Some(app_id.to_owned()),
+            pid: Some(1000 + i32::try_from(id).expect("small id")),
+            workspace_id: Some(workspace),
+            is_focused: false,
+            is_floating: false,
+            is_urgent: false,
+            layout: WindowLayout {
+                pos_in_scrolling_layout: Some((1, 1)),
+                tile_size: (100.0, 100.0),
+                window_size: (100, 100),
+                tile_pos_in_workspace_view: Some((0.0, 0.0)),
+                window_offset_in_tile: (0.0, 0.0),
+            },
+            focus_timestamp: None,
+        }
+    }
+
+    /// A [`RowVisualSource`] built on the real [`row_visual_signal`] (#1312
+    /// review LOW 7) but fed scripted `Mutable`s instead of the real
+    /// `niri`/`workspace_stacks` globals — so this drives `build_app_icon`/
+    /// `app_row` through the actual production seam, not a constant.
+    fn scripted_row_visual(
+        workspaces: Mutable<Vec<Workspace>>,
+        windows: Mutable<Vec<Window>>,
+        slices_up: Mutable<BTreeSet<String>>,
+        starting: Mutable<BTreeSet<String>>,
+        app_starting: Mutable<BTreeSet<String>>,
+    ) -> RowVisualSource {
+        Rc::new(move |stack_name, saved| {
+            row_visual_signal(
+                stack_name,
+                saved,
+                workspaces.signal_cloned(),
+                windows.signal_cloned(),
+                slices_up.signal_cloned(),
+                starting.signal_cloned(),
+                app_starting.signal_cloned(),
+            )
+        })
+    }
+
+    /// #1312 review LOW 7: `build_app_icon`/`app_row` driven end to end
+    /// through the **real** [`row_visual_signal`] and a real
+    /// [`SavedStackSource`] — every other test here injects
+    /// [`dim_row_visual`]/[`no_saved_stack`], which never exercises either
+    /// seam's actual logic.
+    ///
+    /// **The mutation**: `saved_index_of` returning the *draft* index
+    /// unconditionally (skipping the saved-stack lookup this test's
+    /// `firefox`+`alacritty` pair depends on) reds this — `alacritty`'s row
+    /// would look for a window at index 0, which only `firefox`'s window
+    /// satisfies, and it would light on the wrong evidence or not at all.
+    #[gtk::test]
+    fn a_saved_apps_row_lights_through_the_real_seam_end_to_end() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let workspaces: Mutable<Vec<Workspace>> = Mutable::new(vec![ws_named(9, "chat")]);
+        let windows: Mutable<Vec<Window>> = Mutable::new(Vec::new());
+        let slices_up: Mutable<BTreeSet<String>> = Mutable::new(BTreeSet::new());
+        let starting: Mutable<BTreeSet<String>> = Mutable::new(BTreeSet::new());
+        let app_starting: Mutable<BTreeSet<String>> = Mutable::new(BTreeSet::new());
+
+        let saved_apps = vec![
+            crate::config::workspaces::StackApp {
+                id: "firefox".to_owned(),
+                exec: None,
+            },
+            crate::config::workspaces::StackApp {
+                id: "alacritty".to_owned(),
+                exec: None,
+            },
+        ];
+        let saved_stack: SavedStackSource = {
+            let saved_apps = saved_apps.clone();
+            Rc::new(move |name: &str| {
+                (name == "chat").then(|| Stack {
+                    apps: saved_apps.clone(),
+                    ..Stack::default()
+                })
+            })
+        };
+        let row_visual = scripted_row_visual(
+            workspaces,
+            windows.clone(),
+            slices_up,
+            starting,
+            app_starting,
+        );
+
+        let page = slot_with(
+            &target,
+            RowSeams {
+                resolve: live_resolver(),
+                row_visual,
+                saved_stack,
+            },
+        );
+
+        let mut draft = saved_draft();
+        draft.previous = Some("chat".to_owned());
+        draft.workspace = Some(9);
+        draft.apps = saved_apps;
+        target.set(Some(draft));
+        pump();
+
+        let icons = || by_class(&page, APP_IDLE_CLASS);
+        assert_eq!(
+            icons().len(),
+            2,
+            "both rows start idle — niether app has a window yet"
+        );
+
+        // Firefox's window appears.
+        windows.set(vec![win_on(50, 9, "firefox")]);
+        pump();
+        let lit = by_class(&page, APP_RUNNING_CLASS);
+        assert_eq!(lit.len(), 1, "exactly one row lights: {lit:?}");
+        assert_eq!(
+            by_class(&page, APP_IDLE_CLASS).len(),
+            1,
+            "the other (alacritty) is still idle"
+        );
+    }
 }
 
 #[cfg(test)]
 mod model_tests {
     use super::{
-        Draft, RowVisual, SaveError, SavePlan, app_row_running, ephemeral_apps, move_app,
-        plan_save, rename_is_blocked, resolved_command, row_click_starts,
+        Draft, RowVisual, SaveError, SavePlan, app_row_visual, ephemeral_apps, move_app, plan_save,
+        rename_is_blocked, resolved_command, row_click_starts, saved_index_of,
     };
     use crate::components::desktop_entry::Launchable;
     use crate::config::workspaces::{Layout, Stack, StackApp};
@@ -3033,30 +3337,37 @@ mod model_tests {
 
     /// #1312: the editor row's icon lights only for `Active` with a matching
     /// window — all four of `state_of`'s states (`Active` split into its two
-    /// sub-cases).
+    /// sub-cases), and the review's HIGH/MED-2 fixes: `Inactive` is
+    /// `Decoration` (nowhere to start into), `Starting` is `Starting` (would
+    /// race the whole stack's own Start for the same unit), neither is `Dim`.
     ///
-    /// **The mutation**: inverting the predicate (or answering `true` for
+    /// **The mutation**: inverting the predicate (or answering `Dim` for
     /// `Inactive`/`Starting`) reds every case here.
     #[test]
     fn a_row_lights_only_when_active_and_its_app_has_a_window() {
         let apps = vec![app("Alacritty", None)];
         let here = [window(1, 9, "Alacritty")];
 
-        assert!(
-            app_row_running(StackState::Active, &apps, 0, Some(9), &here),
+        assert_eq!(
+            app_row_visual(StackState::Active, &apps, 0, Some(9), &here),
+            RowVisual::Lit,
             "Active + a matching window → lit"
         );
-        assert!(
-            !app_row_running(StackState::Active, &apps, 0, Some(9), &[]),
+        assert_eq!(
+            app_row_visual(StackState::Active, &apps, 0, Some(9), &[]),
+            RowVisual::Dim,
             "Active + no window → dim"
         );
-        assert!(
-            !app_row_running(StackState::Inactive, &apps, 0, Some(9), &here),
-            "Inactive has no workspace to check → dim, even with a matching window"
+        assert_eq!(
+            app_row_visual(StackState::Inactive, &apps, 0, Some(9), &here),
+            RowVisual::Decoration,
+            "Inactive has no workspace to start into → decoration, even with a \
+             matching window elsewhere"
         );
-        assert!(
-            !app_row_running(StackState::Starting, &apps, 0, Some(9), &here),
-            "Starting hasn't settled yet → dim"
+        assert_eq!(
+            app_row_visual(StackState::Starting, &apps, 0, Some(9), &here),
+            RowVisual::Starting,
+            "the whole stack is starting → starting, not a click target"
         );
     }
 
@@ -3072,14 +3383,75 @@ mod model_tests {
         let apps = vec![app("Alacritty", None), app("Alacritty", None)];
         let here = [window(1, 9, "Alacritty")];
 
-        assert!(
-            app_row_running(StackState::Active, &apps, 0, Some(9), &here),
+        assert_eq!(
+            app_row_visual(StackState::Active, &apps, 0, Some(9), &here),
+            RowVisual::Lit,
             "the first entry has the one open window"
         );
-        assert!(
-            !app_row_running(StackState::Active, &apps, 1, Some(9), &here),
+        assert_eq!(
+            app_row_visual(StackState::Active, &apps, 1, Some(9), &here),
+            RowVisual::Dim,
             "the second entry has none left"
         );
+    }
+
+    /// #1312 review MED-2: a click during the whole stack's own `Starting`
+    /// must not fire — it would race that Start for the same `--unit=`.
+    ///
+    /// **The mutation**: mapping `Starting` back to `Dim` in
+    /// [`app_row_visual`] reds this.
+    #[test]
+    fn a_row_is_not_clickable_while_the_whole_stack_is_starting() {
+        let apps = vec![app("Alacritty", None)];
+        let here = [window(1, 9, "Alacritty")];
+        let visual = app_row_visual(StackState::Starting, &apps, 0, Some(9), &here);
+        assert_eq!(visual, RowVisual::Starting);
+        assert!(!row_click_starts(visual));
+    }
+
+    /// #1312 review MED-4: a draft reordered but not (yet) saved still starts
+    /// under the **saved** index, not its own current position.
+    ///
+    /// **The mutation**: using the draft's own `index` unchanged (skipping
+    /// `saved_index_of`) reds this — it would resolve to 0 for both apps
+    /// instead of disagreeing with their draft positions.
+    #[test]
+    fn a_reordered_unsaved_draft_still_resolves_the_saved_index() {
+        let saved = vec![app("firefox", None), app("alacritty", None)];
+        // The user dragged alacritty to the top and has not saved.
+        let draft = vec![app("alacritty", None), app("firefox", None)];
+
+        assert_eq!(
+            saved_index_of(&saved, &draft, 0),
+            Some(1),
+            "alacritty, now at draft position 0, is saved at index 1"
+        );
+        assert_eq!(
+            saved_index_of(&saved, &draft, 1),
+            Some(0),
+            "firefox, now at draft position 1, is saved at index 0"
+        );
+    }
+
+    /// #1312 review MED-4: an app just added to the draft and never saved has
+    /// no saved index — the row it would build is decoration, not a start
+    /// under some other app's unit.
+    #[test]
+    fn a_newly_added_unsaved_app_has_no_saved_index() {
+        let saved = vec![app("firefox", None)];
+        let draft = vec![app("firefox", None), app("alacritty", None)];
+        assert_eq!(saved_index_of(&saved, &draft, 1), None);
+    }
+
+    /// A duplicate id in the draft still resolves ordinally: the **second**
+    /// draft occurrence of an id maps to the **second** saved occurrence, not
+    /// back to the first.
+    #[test]
+    fn a_duplicate_id_resolves_by_ordinal_not_by_first_match() {
+        let saved = vec![app("Alacritty", None), app("Alacritty", None)];
+        let draft = saved.clone();
+        assert_eq!(saved_index_of(&saved, &draft, 0), Some(0));
+        assert_eq!(saved_index_of(&saved, &draft, 1), Some(1));
     }
 
     /// A click on the editor row's icon only starts anything from

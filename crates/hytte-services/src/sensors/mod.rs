@@ -729,12 +729,7 @@ where
     // back to `Default` — re-probing `nvidia-smi` availability from scratch
     // on the next tick (#1327).
     let gpu_cache = std::mem::take(&mut state.gpu_cache);
-    // `GpuCache` is `Copy` today, so this is a plain bitwise copy — `gpu_cache`
-    // stays usable below for the `TickInputs` literal. If it ever loses
-    // `Copy` (it's `Clone` either way), this line becomes a move and fails to
-    // compile rather than silently breaking, which is exactly what should
-    // happen: the fix here would then be `gpu_cache.clone()`.
-    let gpu_cache_before_tick = gpu_cache;
+    let gpu_cache_before_tick = gpu_cache.clone();
 
     // Mount list is cloned here (cheap — it's rarely non-empty).
     let specs = if do_disk {
@@ -1106,10 +1101,10 @@ mod tests {
     #[tokio::test]
     async fn gpu_cache_survives_a_panicked_blocking_tick() {
         let (_gpu_state, seeded) = read_gpu_with_cache(GpuCache::default());
+        let seeded_debug = format!("{seeded:?}");
 
         let mut state = PollState::new();
         state.gpu_cache = seeded;
-        let seeded_debug = format!("{seeded:?}");
 
         let w = fresh_poll_writers();
 

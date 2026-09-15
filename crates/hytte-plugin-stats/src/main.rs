@@ -13,8 +13,9 @@
 //!
 //! - [`config`] — `stats.toml`: `[bar]` and `[sidebar]`, over `hytte-config`'s
 //!   `Subsystem` layering, with per-key tolerance.
-//! - [`mount`] — the effective mount, and why this plugin reads a variable the
-//!   SDK has already read.
+//! - [`plugin::settings_from`] — this instance's effective mount
+//!   (`hytte_plugin::effective_mount_from`, graduated into the SDK by #1317)
+//!   decides which of the two tables above it reads.
 //! - [`sample`] — the `/proc` and `/sys` reads (through `hytte-sensors`, the
 //!   shell's own samplers) and the visibility-gated task that drives them.
 //! - [`card`] — the geometry, the per-core lamp ramp, the sidebar card and the
@@ -48,7 +49,6 @@
 mod card;
 mod config;
 mod format;
-mod mount;
 mod panel;
 mod plugin;
 mod sample;

@@ -503,6 +503,16 @@ mod runtime;
 
 pub use runtime::run;
 
+/// The resolved mount a plugin actually registered on — [`Plugin::manifest`]'s
+/// own mount, overlaid by a launch-time `HYTTE_PLUGIN_MOUNT` override — for the
+/// rare plugin that needs that answer for a decision of its own (which config
+/// table to read, which of two layouts to draw), without re-parsing the
+/// variable [`run`] already reads (#1317). See [`runtime::effective_mount`]'s
+/// own doc for the one way this differs from what `run` does with the same
+/// value, and [`runtime::effective_mount_from`] for the injectable twin a
+/// plugin's own tests need.
+pub use runtime::{effective_mount, effective_mount_from};
+
 /// The full wire vocabulary, re-exported so a plugin depends on this crate
 /// alone. (`Manifest`, `Node`, `Effect`, … are what a plugin actually names;
 /// the codec/framing helpers matter only if you bypass [`run`].)

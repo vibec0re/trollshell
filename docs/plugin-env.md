@@ -185,6 +185,24 @@ Also reads `$HOME` (to locate `places.toml`) and `$XDG_STATE_HOME`/`$HOME`
 (for the expression/briefing-stamp state dir) — standard XDG paths, not
 per-plugin knobs.
 
+### claude-bridge (`hytte-claude-bridge`)
+
+Its own env table (`CLAUDE_BRIDGE_MODE`, `CLAUDE_BRIDGE_MODEL`,
+`CLAUDE_BRIDGE_TIMEOUT_SECS`, `CLAUDE_BRIDGE_STATE_DIR`,
+`CLAUDE_BRIDGE_THINKING`, `ANTHROPIC_API_KEY`, and — since #1280 P1 —
+`CLAUDE_BRIDGE_LABEL`, the sidebar card/panel title) lives in the crate's own
+`main.rs` module doc rather than duplicated here, since it isn't one of the
+`hytte-plugin-*` crates this page otherwise inventories. What belongs here is
+the mount: like `stats`, it renders differently by mount **family**
+(`Mount::is_bar`) rather than by a config flag — mount it in a sidebar family
+(`plugins.<id>.mount = "SidebarRightTop"`) to get the usage card instead of
+the bar chip; a bar mount (the default, unchanged) keeps the chip and its
+drawer panel. A second Claude subscription is a second `plugins.<id>` entry
+with its own `CLAUDE_CONFIG_DIR` (and, per the two-instance shape above, its
+own `HYTTE_PLUGIN_ID`) — the multi-subscription work itself (a per-instance
+socket, so a second account also gets its own API endpoint) is still open on
+#1280.
+
 ### clock-demo (`hytte-plugin-clock-demo`)
 
 No runtime knobs — configuration is entirely via the shell/wire protocol.

@@ -335,10 +335,12 @@ const PINNED_NOTDEF: [u8; 4] = [0x80, 0x60, 0xa0, 0xff];
 /// the transcript in one run (#1310) — see [`dump_case_frames`] and the
 /// module docs' "Recovering frames from a failing CI run" section. Chosen so
 /// the worst-seen run (four failing cases, #1298) is nowhere near the cap
-/// while a run where every case fails cannot blow the job-log budget: the
-/// largest evidence pair (a seven-seg ×2 case, ~13 160 px × 3 B ≈ 40 KiB per
-/// `.ppm`, ~55 KiB base64 each) is on the order of 110 KiB per case, so eight
-/// cases is under a megabyte.
+/// while a run where every case fails cannot blow the job-log budget:
+/// measured against a real 160-case run, the largest evidence file of any
+/// case is a `seven_seg.*.digits` `.ppm` at 85 274 bytes (28 420 px × 3 B),
+/// ~113.7 KiB base64 before line breaks — so the worst possible case (both
+/// its `.gl.ppm` and `.cpu.ppm` at that size) is on the order of 230 KiB, and
+/// eight of those is under 2 MiB.
 const FRAME_DUMP_CAP: u32 = 8;
 
 /// Base64 line width for [`dump_case_frames`]'s marker blocks — the

@@ -157,6 +157,38 @@
 //! supersampled cases are unaffected either way: their verdict is the region
 //! split above, which is already exact where exactness is meaningful and does
 //! not depend on this variable at all.
+//!
+//! # Recovering frames from a failing CI run (#1310)
+//!
+//! `checkPhase` never produces `$out` for a failing derivation, so the
+//! `.gl.ppm`/`.cpu.ppm` files [`write_evidence`] puts under
+//! `PREEM_GL_DIFF_OUT` (`$out/parity` in `nix/checks/system-tests.nix`) are
+//! unreachable for exactly the runs that matter — #1298's two Ice Lake reds
+//! could only be studied through the per-case verdict line, not the frames.
+//! So on every `FAIL(*)` verdict (never on `PASS` — a green run's log does not
+//! grow) this binary now also base64-encodes that case's two evidence images
+//! into its own stdout, between `=== preem-frame <case> {gl,cpu} {begin,end}
+//! ===` marker lines, wrapped at [`BASE64_WRAP`] columns — the exact bytes
+//! [`write_evidence`] wrote to disk, so the decoded file is byte-identical.
+//! Capped at [`FRAME_DUMP_CAP`] cases per run, with one "not dumped" line
+//! naming how many more failing cases were skipped, so a catastrophic run
+//! cannot blow the job-log budget.
+//!
+//! Fetch the transcript — `gh run view <id> --log` for a live run, `gh api
+//! repos/<owner>/<repo>/actions/jobs/<job-id>/logs` for one already gone from
+//! the run list — and decode it back into files with:
+//!
+//! ```sh
+//! gh run view <id> --log | \
+//!   cargo run -p trollshell --example preem_gl_diff -- --decode --out frames
+//! ```
+//!
+//! `--decode` reads a file path instead of stdin if one is given, and strips
+//! GitHub's own `<job>\t<step>\t<timestamp> ` line prefix before matching a
+//! marker (see [`strip_github_log_prefix`]), so a plain local transcript
+//! (saved with `| tee`, no prefix at all) decodes the same way. See
+//! [`run_decode`]/[`decode_frame_log`] for the format the marker pairs use
+//! and [`dump_case_frames`] for what emits them.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -299,6 +331,22 @@ const BUBBLE_LINES: u32 = 3;
 const PINNED_INK: [u8; 4] = [0xf0, 0xd0, 0xff, 0xff];
 const PINNED_NOTDEF: [u8; 4] = [0x80, 0x60, 0xa0, 0xff];
 
+/// How many failing cases' `.gl.ppm`/`.cpu.ppm` pairs get base64-dumped into
+/// the transcript in one run (#1310) — see [`dump_case_frames`] and the
+/// module docs' "Recovering frames from a failing CI run" section. Chosen so
+/// the worst-seen run (four failing cases, #1298) is nowhere near the cap
+/// while a run where every case fails cannot blow the job-log budget: the
+/// largest evidence pair (a seven-seg ×2 case, ~13 160 px × 3 B ≈ 40 KiB per
+/// `.ppm`, ~55 KiB base64 each) is on the order of 110 KiB per case, so eight
+/// cases is under a megabyte.
+const FRAME_DUMP_CAP: u32 = 8;
+
+/// Base64 line width for [`dump_case_frames`]'s marker blocks — the
+/// historical MIME/PEM wrap column. The job log and a `gh`-fetched
+/// transcript are both plain text either way, so this is purely for a human
+/// scrolling past one on the way to something else.
+const BASE64_WRAP: usize = 76;
+
 /// Whether any case failed, for [`main`]'s exit status.
 ///
 /// A process-global rather than a value threaded out of `activate`, because
@@ -329,7 +377,20 @@ static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 static VERDICTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn main() -> glib::ExitCode {
-    let skins = match parse_skins(&std::env::args().skip(1).collect::<Vec<_>>()) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--decode` is a standalone mode (#1310): it never touches GL or GTK, so
+    // it is dispatched before `parse_skins` — a decode invocation carries no
+    // `--skins` and needs none of the harness below.
+    if args.first().map(String::as_str) == Some("--decode") {
+        return match run_decode(&args[1..]) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("preem_gl_diff --decode: {why}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
+    let skins = match parse_skins(&args) {
         Ok(skins) => skins,
         Err(usage) => {
             println!("{usage}");
@@ -431,7 +492,10 @@ fn parse_skins(args: &[String]) -> Result<Vec<kit::DisplayStyle>, String> {
 preem_gl_diff — #893 stage B GL/CPU parity harness
 
 USAGE:
-  cargo run -p trollshell --example preem_gl_diff -- [--skins vfd,lcd,oled,crt]";
+  cargo run -p trollshell --example preem_gl_diff -- [--skins vfd,lcd,oled,crt]
+  cargo run -p trollshell --example preem_gl_diff -- --decode [--out DIR] [LOGFILE]
+      recover a failing case's frames dumped into the job log (#1310);
+      reads LOGFILE, or stdin if none is given";
     let mut skins: Vec<kit::DisplayStyle> = kit::DisplayStyle::ALL.to_vec();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -1050,6 +1114,8 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
         phase: std::cell::Cell::new(0),
         failures: std::cell::Cell::new(0),
         first: RefCell::new(None),
+        dumped: Cell::new(0),
+        frames_skipped: Cell::new(0),
     });
 
     glib::timeout_add_local(std::time::Duration::from_millis(60), {
@@ -1080,6 +1146,12 @@ struct Runner {
     failures: std::cell::Cell<u32>,
     /// The first of the two readbacks, held for the stability check.
     first: RefCell<Option<Capture>>,
+    /// How many failing cases have had their frames base64-dumped into the
+    /// transcript so far — see [`FRAME_DUMP_CAP`].
+    dumped: Cell<u32>,
+    /// How many failing cases exceeded [`FRAME_DUMP_CAP`] and were **not**
+    /// dumped — [`Runner::summary`] reports this count in one line.
+    frames_skipped: Cell<u32>,
 }
 
 impl Runner {
@@ -1123,7 +1195,14 @@ impl Runner {
                 let held = self.first.borrow_mut().take();
                 let passed = match (held, capture(area, &label)) {
                     (Some(a), Ok(b)) if a.raw == b.raw && a.alloc == b.alloc => {
-                        measure(case, &b, &self.evidence, self.exact)
+                        measure(
+                            case,
+                            &b,
+                            &self.evidence,
+                            self.exact,
+                            &self.dumped,
+                            &self.frames_skipped,
+                        )
                     }
                     (Some(_), Ok(_)) => {
                         // Two renders of one state disagreed, so whatever the
@@ -1213,6 +1292,16 @@ impl Runner {
                 self.failures.get(),
                 self.cases.len()
             );
+            // #1310: past `FRAME_DUMP_CAP` dumped cases, every further failing
+            // case is counted here instead of dumped, in this one line, so a
+            // run where every case fails cannot blow the job log.
+            let skipped = self.frames_skipped.get();
+            if skipped > 0 {
+                println!(
+                    "…and {skipped} more failing case(s), not dumped — \
+                     FRAME_DUMP_CAP is {FRAME_DUMP_CAP} case(s) per run"
+                );
+            }
             FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         println!("=== preem_gl_diff done — paste this into issue #893 ===");
@@ -1565,11 +1654,23 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// worst pixel, and write the evidence images. Returns whether the case passed
 /// — see [`parity::Verdict`] for the five ways it can fail.
 ///
+/// On a failing verdict, also dumps the case's two evidence images as base64
+/// into the transcript (#1310) — `dumped`/`skipped` are [`Runner::dumped`]/
+/// [`Runner::frames_skipped`], threaded through rather than read off a
+/// `Runner` so this stays callable (and tested) without one.
+///
 /// `too_many_lines` for [`drive`]'s reason: one flat arm per kind builds the
 /// oracle, and everything after that `match` is a single linear sequence of
 /// prints.
 #[allow(clippy::too_many_lines)]
-fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
+fn measure(
+    case: &Case,
+    shot: &Capture,
+    evidence: &std::path::Path,
+    exact: bool,
+    dumped: &Cell<u32>,
+    skipped: &Cell<u32>,
+) -> bool {
     let label = label(case);
     let upscale = case.reference_scale();
 
@@ -1704,7 +1805,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     print_channels(&stats, case.sampling());
     print_regions(&split);
     print_flatness(case.kind(), flatness);
-    write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
+    let (gl_ppm, cpu_ppm) = write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
     // on purpose, for a driver this harness has never measured. Under llvmpipe
@@ -1718,6 +1819,13 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
              1:1 {} case",
             case.kind().label(),
         );
+    }
+
+    // #1310: never on a `PASS` — a green run's log must not grow — and capped
+    // at `FRAME_DUMP_CAP` even among the failing ones. See
+    // [`should_dump_frames`] for the pure predicate this is built on.
+    if should_dump_frames(verdict.is_pass(), dumped, skipped) {
+        dump_case_frames(&label, &gl_ppm, &cpu_ppm);
     }
 
     verdict.is_pass()
@@ -1807,7 +1915,10 @@ fn print_flatness(kind: parity::Kind, fraction: Option<f64>) {
 }
 
 /// Write the three evidence files for one case: what GL drew, what the kit
-/// drew, and where they disagree.
+/// drew, and where they disagree. Returns the `.gl.ppm`/`.cpu.ppm` bytes it
+/// wrote, so a failing case's caller ([`measure`]) can dump the **exact**
+/// same bytes into the job log (#1310) rather than re-deriving them and
+/// risking the two falling out of step.
 ///
 /// Netpbm rather than PNG, and deliberately: PNG needs a deflate stream, which
 /// means a dependency, and this is an example in a workspace that has no image
@@ -1821,23 +1932,27 @@ fn write_evidence(
     layout: parity::Layout,
     reference: &kit::Frame,
     deltas: &[u8],
-) {
+) -> (Vec<u8>, Vec<u8>) {
     let (w, h) = (reference.width(), reference.height());
     let mut cpu = Vec::with_capacity(w * h * 3);
     for pixel in reference.data().chunks_exact(4) {
         cpu.extend_from_slice(&pixel[..3]);
     }
-    let files: [(&str, Vec<u8>); 3] = [
-        ("gl.ppm", ppm(w, h, &parity::gl_image(gl, layout))),
-        ("cpu.ppm", ppm(w, h, &cpu)),
-        ("delta.pgm", pgm(w, h, deltas)),
+    let gl_ppm = ppm(w, h, &parity::gl_image(gl, layout));
+    let cpu_ppm = ppm(w, h, &cpu);
+    let delta_pgm = pgm(w, h, deltas);
+    let files: [(&str, &Vec<u8>); 3] = [
+        ("gl.ppm", &gl_ppm),
+        ("cpu.ppm", &cpu_ppm),
+        ("delta.pgm", &delta_pgm),
     ];
     for (suffix, bytes) in files {
         let path = dir.join(format!("{label}.{suffix}"));
-        if let Err(why) = std::fs::write(&path, &bytes) {
+        if let Err(why) = std::fs::write(&path, bytes) {
             println!("INFO {label}: could not write {} — {why}", path.display());
         }
     }
+    (gl_ppm, cpu_ppm)
 }
 
 /// A binary `P6` (RGB) netpbm.
@@ -1852,6 +1967,265 @@ fn pgm(w: usize, h: usize, grey: &[u8]) -> Vec<u8> {
     let mut out = format!("P5\n{w} {h}\n255\n").into_bytes();
     out.extend_from_slice(grey);
     out
+}
+
+// --- #1310: dumping and recovering a failing case's evidence frames -------
+//
+// The job log is the only place a failing sandboxed `nix flake check` run
+// leaves anything reachable — `checkPhase` never produces `$out` for a
+// failing derivation — so a `FAIL(*)` verdict base64-encodes that case's two
+// `.ppm` files straight into stdout, and `--decode` reverses it. Both
+// directions are hand-rolled (RFC 4648 standard alphabet, padded) rather than
+// pulling in a crate: this workspace has no other reason to depend on one,
+// and the format is small enough that encode and decode are each a handful
+// of pure, cheaply-tested lines. See the module docs' "Recovering frames from
+// a failing CI run" section for the operator-facing shape.
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// RFC 4648 standard base64, padded — plain ASCII, one line.
+/// [`wrap_base64`] is what breaks it into [`BASE64_WRAP`]-column lines.
+fn base64_encode(data: &[u8]) -> String {
+    /// The alphabet character for one 6-bit group of a 24-bit accumulator.
+    fn sextet(n: u32, shift: u32) -> char {
+        char::from(BASE64_ALPHABET[usize::try_from(n >> shift & 0x3f).unwrap_or(0)])
+    }
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(sextet(n, 18));
+        out.push(sextet(n, 12));
+        out.push(if chunk.len() > 1 { sextet(n, 6) } else { '=' });
+        out.push(if chunk.len() > 2 { sextet(n, 0) } else { '=' });
+    }
+    out
+}
+
+/// Split an already-encoded base64 string into [`BASE64_WRAP`]-column lines.
+/// `encoded` is pure ASCII by construction ([`base64_encode`]'s alphabet), so
+/// slicing on byte offsets never lands inside a multi-byte character.
+fn wrap_base64(encoded: &str) -> impl Iterator<Item = &str> {
+    encoded
+        .as_bytes()
+        .chunks(BASE64_WRAP)
+        .map(|chunk| std::str::from_utf8(chunk).expect("base64_encode only emits ASCII"))
+}
+
+/// The value of one base64 alphabet character, or `None` for `=` (padding,
+/// handled by the caller) and anything else.
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// The inverse of [`base64_encode`]. Whitespace (the newlines [`wrap_base64`]
+/// introduced, and any `\r` a Windows-authored log carries) is stripped
+/// before decoding, so a wrapped, saved-and-reopened block round-trips.
+fn base64_decode(encoded: &str) -> Result<Vec<u8>, String> {
+    let bytes: Vec<u8> = encoded.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err(format!(
+            "base64 block has {} non-whitespace byte(s), not a multiple of 4",
+            bytes.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for group in bytes.chunks_exact(4) {
+        let pad = group.iter().filter(|&&b| b == b'=').count();
+        if pad > 2 || group[..4 - pad].iter().any(|&b| b == b'=') {
+            return Err("misplaced '=' padding in a base64 group".to_owned());
+        }
+        let mut n: u32 = 0;
+        for &byte in group {
+            let value = if byte == b'=' {
+                0
+            } else {
+                base64_value(byte).ok_or_else(|| format!("invalid base64 byte {byte:#x}"))?
+            };
+            n = (n << 6) | u32::from(value);
+        }
+        let triple = n.to_be_bytes();
+        match pad {
+            0 => out.extend_from_slice(&triple[1..4]),
+            1 => out.extend_from_slice(&triple[1..3]),
+            _ => out.push(triple[1]),
+        }
+    }
+    Ok(out)
+}
+
+/// One `=== preem-frame <case> <kind> <state> ===` marker line.
+fn frame_marker(case: &str, kind: &str, state: &str) -> String {
+    format!("=== preem-frame {case} {kind} {state} ===")
+}
+
+/// Whether one case's frames should be dumped into the transcript, updating
+/// `dumped`/`skipped` either way (#1310) — **never** on a passing verdict, so
+/// a green run's log does not grow at all, and capped at [`FRAME_DUMP_CAP`]
+/// among the failing ones, past which every further case is only counted
+/// (`skipped`), not dumped. Pure and GL-free on purpose, the same shape
+/// [`activate_once`] is — `frame_dump_tests` exercises both rules without a
+/// capture in sight.
+fn should_dump_frames(passed: bool, dumped: &Cell<u32>, skipped: &Cell<u32>) -> bool {
+    if passed {
+        return false;
+    }
+    if dumped.get() < FRAME_DUMP_CAP {
+        dumped.set(dumped.get() + 1);
+        true
+    } else {
+        skipped.set(skipped.get() + 1);
+        false
+    }
+}
+
+/// Base64-dump a failing case's two evidence images into the transcript,
+/// between marker lines `decode_frame_log` can find again — see the module
+/// docs' "Recovering frames from a failing CI run" section. Called from
+/// [`measure`], already behind the `FRAME_DUMP_CAP` gate.
+fn dump_case_frames(label: &str, gl_ppm: &[u8], cpu_ppm: &[u8]) {
+    for (kind, bytes) in [("gl", gl_ppm), ("cpu", cpu_ppm)] {
+        println!("{}", frame_marker(label, kind, "begin"));
+        for line in wrap_base64(&base64_encode(bytes)) {
+            println!("{line}");
+        }
+        println!("{}", frame_marker(label, kind, "end"));
+    }
+}
+
+/// Strip GitHub's own log-fetch line prefix, if present:
+/// `<job>\t<step>\t<timestamp> <rest>` — the shape both `gh run view --log`
+/// and the REST `.../logs` route the issue names emit, one line per log
+/// line. The marker and base64 content this file prints never contains a
+/// tab, so the **last** tab in a line is unambiguously the one GitHub
+/// inserted before the timestamp; stripping through the first space after it
+/// then drops the timestamp itself. A line with no tab (a plain local
+/// transcript, saved with e.g. `| tee`) is returned unchanged — critically,
+/// *without* also stripping to the first space, which would mangle a marker
+/// line's own spaces (`=== preem-frame gauge.vfd.rest gl begin ===`).
+fn strip_github_log_prefix(line: &str) -> &str {
+    match line.rsplit_once('\t') {
+        Some((_, after_tab)) => after_tab.split_once(' ').map_or(after_tab, |(_, rest)| rest),
+        None => line,
+    }
+}
+
+/// Parse a (prefix-stripped) line as a `preem-frame` marker, returning
+/// `(case, kind, state)`. `case` is whatever sits between `preem-frame ` and
+/// the trailing `<kind> <state> ===`, so a case label may not itself contain
+/// a space — true of every label [`label`] produces.
+fn parse_marker(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line
+        .strip_prefix("=== preem-frame ")?
+        .strip_suffix(" ===")?;
+    let mut parts = rest.rsplitn(3, ' ');
+    let state = parts.next()?;
+    let kind = parts.next()?;
+    let case = parts.next()?;
+    Some((case, kind, state))
+}
+
+/// Decode every `preem-frame` marker pair out of a job-log transcript (or a
+/// plain local one — see [`strip_github_log_prefix`]), returning `(case,
+/// kind, bytes)` triples in the order their `begin` markers appeared. The
+/// inverse of [`dump_case_frames`].
+fn decode_frame_log(text: &str) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+    let mut frames = Vec::new();
+    let mut open: Option<(String, String, String)> = None;
+    for raw_line in text.lines() {
+        let line = strip_github_log_prefix(raw_line);
+        match parse_marker(line) {
+            Some((case, kind, "begin")) => {
+                if let Some((open_case, open_kind, _)) = &open {
+                    return Err(format!(
+                        "nested begin marker for {case} {kind} while \
+                         {open_case} {open_kind} was still open"
+                    ));
+                }
+                open = Some((case.to_owned(), kind.to_owned(), String::new()));
+            }
+            Some((case, kind, "end")) => {
+                let Some((open_case, open_kind, base64)) = open.take() else {
+                    return Err(format!("end marker for {case} {kind} with no matching begin"));
+                };
+                if open_case != case || open_kind != kind {
+                    return Err(format!(
+                        "end marker {case} {kind} does not match open {open_case} {open_kind}"
+                    ));
+                }
+                let bytes = base64_decode(&base64)?;
+                frames.push((case.to_owned(), kind.to_owned(), bytes));
+            }
+            Some((case, kind, other)) => {
+                return Err(format!("unknown marker state {other:?} for {case} {kind}"));
+            }
+            None => {
+                if let Some((_, _, base64)) = &mut open {
+                    base64.push_str(line.trim());
+                }
+            }
+        }
+    }
+    if let Some((case, kind, _)) = open {
+        return Err(format!("unterminated {case} {kind} block — missing an end marker"));
+    }
+    Ok(frames)
+}
+
+/// `--decode [--out DIR] [LOGFILE]` — reads `LOGFILE`, or stdin if none is
+/// given, decodes every marker pair with [`decode_frame_log`], and writes
+/// `<case>.gl.ppm`/`<case>.cpu.ppm` under `DIR` (`frames/` if `--out` is not
+/// given).
+fn run_decode(args: &[String]) -> Result<(), String> {
+    let mut out_dir = std::path::PathBuf::from("frames");
+    let mut path: Option<&str> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--out" => {
+                let dir = rest.next().ok_or("--out needs a directory argument")?;
+                out_dir = std::path::PathBuf::from(dir);
+            }
+            other if path.is_none() => path = Some(other),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let text = match path {
+        Some(path) => {
+            std::fs::read_to_string(path).map_err(|why| format!("reading {path}: {why}"))?
+        }
+        None => {
+            use std::io::Read as _;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|why| format!("reading stdin: {why}"))?;
+            buf
+        }
+    };
+    let frames = decode_frame_log(&text)?;
+    if frames.is_empty() {
+        println!("no preem-frame markers found — nothing to decode");
+        return Ok(());
+    }
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|why| format!("creating {}: {why}", out_dir.display()))?;
+    for (case, kind, bytes) in &frames {
+        let file = out_dir.join(format!("{case}.{kind}.ppm"));
+        std::fs::write(&file, bytes).map_err(|why| format!("writing {}: {why}", file.display()))?;
+        println!("wrote {} ({} bytes)", file.display(), bytes.len());
+    }
+    Ok(())
 }
 
 /// #1151: `activate` can fire twice on one process — measured on `origin/main`
@@ -1887,5 +2261,143 @@ mod activate_latch_tests {
         assert!(activate_once(&latch), "the first call must run");
         assert!(!activate_once(&latch), "the second call must be a no-op");
         assert!(!activate_once(&latch), "a third call is still a no-op");
+    }
+}
+
+/// #1310: the failing-case evidence dump and its decoder. Everything here is
+/// pure and GL-free — no capture, no display — the same shape
+/// `activate_latch_tests` above is, and runs for the same reason (`cargo
+/// test -p trollshell --example preem_gl_diff`, an explicit `--example`
+/// selector, is what turns this example's `#[test]`s on at all).
+#[cfg(test)]
+mod frame_dump_tests {
+    use super::{
+        FRAME_DUMP_CAP, base64_decode, base64_encode, decode_frame_log, frame_marker,
+        should_dump_frames, wrap_base64,
+    };
+    use std::cell::Cell;
+
+    /// A small synthetic frame: a real PPM header plus pixel bytes that span
+    /// the full `0x00..=0xff` range, so the round trip is exercised on binary
+    /// data and not just printable ASCII. The decoder never parses netpbm —
+    /// it only has to move bytes — so nothing here needs a real image.
+    fn synthetic_ppm(seed: u8) -> Vec<u8> {
+        let mut bytes = b"P6\n2 2\n255\n".to_vec();
+        for i in 0..12u16 {
+            bytes.push(seed.wrapping_add(u8::try_from(i * 23).unwrap_or(0)));
+        }
+        bytes
+    }
+
+    /// What [`super::dump_case_frames`] would print for one case, built the
+    /// same way it is, so the roundtrip test below feeds
+    /// [`decode_frame_log`] exactly what a real failing run would.
+    fn dump_to_string(label: &str, gl: &[u8], cpu: &[u8]) -> String {
+        let mut out = String::new();
+        for (kind, bytes) in [("gl", gl), ("cpu", cpu)] {
+            out.push_str(&frame_marker(label, kind, "begin"));
+            out.push('\n');
+            for line in wrap_base64(&base64_encode(bytes)) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str(&frame_marker(label, kind, "end"));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// **The decoder recovers byte-identical frames**, in order, for both
+    /// halves of a case.
+    ///
+    /// Falsified (see the PR body for the paste) by corrupting
+    /// [`wrap_base64`] to drop the last character of each wrapped line: the
+    /// `assert_eq!` on the recovered bytes goes red instead of the decode
+    /// merely erroring, which is what proves this test looks at the
+    /// **bytes**, not just "did decoding not crash".
+    #[test]
+    fn the_decoder_recovers_byte_identical_frames() {
+        let gl = synthetic_ppm(0x10);
+        let cpu = synthetic_ppm(0xa0);
+        let log = dump_to_string("scope.crt.idle0", &gl, &cpu);
+        let frames = decode_frame_log(&log).expect("well-formed markers must decode");
+        assert_eq!(
+            frames,
+            vec![
+                ("scope.crt.idle0".to_owned(), "gl".to_owned(), gl),
+                ("scope.crt.idle0".to_owned(), "cpu".to_owned(), cpu),
+            ]
+        );
+    }
+
+    /// A line carrying GitHub's own log-fetch prefix (`gh run view --log`'s
+    /// shape: `<job>\t<step>\t<timestamp> <rest>`) decodes exactly like the
+    /// unprefixed transcript — including on a marker line, whose own spaces
+    /// must survive the strip.
+    #[test]
+    fn a_github_log_prefix_is_stripped_before_matching() {
+        let gl = synthetic_ppm(0x01);
+        let cpu = synthetic_ppm(0xfe);
+        let log = dump_to_string("gauge.vfd.rest.x2", &gl, &cpu);
+        let prefixed: String = log
+            .lines()
+            .map(|line| {
+                format!("flake-check\tsystem-tests\t2026-09-15T10:00:00.0000000Z {line}\n")
+            })
+            .collect();
+        let frames = decode_frame_log(&prefixed).expect("a GH-prefixed log must still decode");
+        assert_eq!(
+            frames,
+            vec![
+                ("gauge.vfd.rest.x2".to_owned(), "gl".to_owned(), gl),
+                ("gauge.vfd.rest.x2".to_owned(), "cpu".to_owned(), cpu),
+            ]
+        );
+    }
+
+    /// **A passing verdict never dumps and never touches either counter** —
+    /// the rule that keeps a green run's log from growing at all.
+    #[test]
+    fn a_pass_verdict_emits_no_markers() {
+        let dumped = Cell::new(0);
+        let skipped = Cell::new(0);
+        for _ in 0..3 {
+            assert!(!should_dump_frames(true, &dumped, &skipped));
+        }
+        assert_eq!(dumped.get(), 0, "a pass must never count toward the cap");
+        assert_eq!(skipped.get(), 0, "a pass must never count toward the overflow line");
+    }
+
+    /// **The cap**: the first [`FRAME_DUMP_CAP`] failing cases in a run are
+    /// dumped, and every one after that is counted in `skipped` instead —
+    /// the number [`super::Runner::summary`]'s "not dumped" line prints.
+    #[test]
+    fn failing_cases_past_the_cap_are_counted_not_dumped() {
+        let dumped = Cell::new(0);
+        let skipped = Cell::new(0);
+        let extra = 3;
+        let dumped_count = (0..FRAME_DUMP_CAP + extra)
+            .filter(|_| should_dump_frames(false, &dumped, &skipped))
+            .count();
+        assert_eq!(u32::try_from(dumped_count).unwrap_or(0), FRAME_DUMP_CAP);
+        assert_eq!(dumped.get(), FRAME_DUMP_CAP);
+        assert_eq!(skipped.get(), extra);
+    }
+
+    /// A base64 block one character short of a full group is rejected rather
+    /// than silently decoding to truncated bytes.
+    #[test]
+    fn a_truncated_base64_block_is_rejected() {
+        let mut broken = base64_encode(&synthetic_ppm(0x55));
+        broken.pop();
+        assert!(base64_decode(&broken).is_err());
+    }
+
+    /// An `end` marker with no `begin` — e.g. a job log the runner cut off
+    /// mid-block — is a decode error, not a silently-empty result.
+    #[test]
+    fn an_unopened_end_marker_is_rejected() {
+        let log = format!("{}\n", frame_marker("scope.crt.idle0", "gl", "end"));
+        assert!(decode_frame_log(&log).is_err());
     }
 }

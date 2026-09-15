@@ -1257,13 +1257,22 @@ mod tests {
             "the closed gate must not have sampled or reset at all yet",
         );
 
+        // One yield does not bound the *blocking-pool* thread the way it
+        // bounds the sampler task: under real contention a `spawn_blocking`
+        // closure can occasionally still complete before this yield returns,
+        // so the log may already hold `["reset", "tick"]` here rather than
+        // just `["reset"]` (measured: 1/200 runs under `taskset -c 0-3` plus
+        // four pinned burners). What must never happen is a tick recorded
+        // *first* — that is the one thing checked here; the pair's own order
+        // is re-checked, unconditionally, right below.
         cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
         tokio::task::yield_now().await;
         assert_eq!(
+            calls.sequence().first(),
+            Some(&"reset"),
+            "the first thing that may have happened by now must be the edge's \
+             own reset — never a tick ahead of it: {:?}",
             calls.sequence(),
-            vec!["reset"],
-            "the only thing that may have happened by now is the edge's own \
-             reset — never a tick, and never a tick ahead of it",
         );
 
         // A *prefix* check, not equality of the whole log: under real

@@ -755,6 +755,160 @@ mod tests {
         );
     }
 
+    /// The one decision point of [`face_cov`]'s ramp that costs a byte to
+    /// cross — see [`the_continuous_branch_has_no_operand_near_a_decision_point`]
+    /// on why `clamp`'s two bounds do not.
+    const MIDPOINT: f32 = 0.5;
+
+    /// What counts as "a rounding distance" from [`MIDPOINT`]. Three orders of
+    /// magnitude above the `1e-6` the interpolant was measured at, and three
+    /// below the `0.25` the sparsest lattice here leaves.
+    const MARGIN: f32 = 1e-3;
+
+    /// One [`sweep_operands`] census of [`face_cov`]'s operands, against
+    /// [`MIDPOINT`].
+    struct Sweep {
+        /// How many were looked at at all — the guard against a sweep that
+        /// walks an empty readout and reports a clean zero.
+        seen: u64,
+        /// Within [`MARGIN`] of the midpoint without being on it. **This is the
+        /// number that must be zero.**
+        near: u64,
+        /// Exactly on the midpoint, where the numerator is exactly zero and the
+        /// byte is `128` on any IEEE-754 arithmetic.
+        mid: u64,
+        /// The closest any operand came without being on it.
+        closest: f32,
+    }
+
+    /// The elements a cell's `code` lights, which is what `cell255` walks: a
+    /// colon's two dots, or the digit's own subset of the seven bars.
+    fn lit_elements(code: i32) -> Vec<kit::SevenSegBar> {
+        if code & (1 << i32::from(COLON_BIT)) != 0 {
+            return kit::SEVEN_SEG_COLON_DOTS.to_vec();
+        }
+        kit::SEVEN_SEG_BARS
+            .into_iter()
+            .enumerate()
+            .filter(|(bit, _)| code & (1 << bit) != 0)
+            .map(|(_, bar)| bar)
+            .collect()
+    }
+
+    /// `bar255`'s three `(numerator, width)` pairs at `point` — the three
+    /// [`face_cov`] calls [`bar_cov`] `min`-combines, before the divide.
+    ///
+    /// An untapered bar's [`NO_CHAMFER`] is dropped rather than censused: it is
+    /// a sentinel nine orders of magnitude off the ramp, not a face, and
+    /// [`bar_residuals`]' doc says why it is that far down.
+    #[allow(clippy::cast_precision_loss)]
+    fn face_operands(
+        point: (f32, f32),
+        footprint: (f32, f32),
+        bar: kit::SevenSegBar,
+    ) -> Vec<(f32, f32)> {
+        let half_short = kit::SEVEN_SEG_THICK as f32 * 0.5;
+        let half_long = bar.len as f32 * 0.5;
+        let centre = if bar.vertical {
+            (bar.x as f32 + half_short, bar.y as f32 + half_long)
+        } else {
+            (bar.x as f32 + half_long, bar.y as f32 + half_short)
+        };
+        let offset = ((point.0 - centre.0).abs(), (point.1 - centre.1).abs());
+        let (along, across) = if bar.vertical {
+            (offset.1, offset.0)
+        } else {
+            (offset.0, offset.1)
+        };
+        let residuals = bar_residuals(along, across, half_long, half_short, bar.tapered);
+        let (long, short) = if bar.vertical {
+            (footprint.1, footprint.0)
+        } else {
+            (footprint.0, footprint.1)
+        };
+        [
+            (residuals[0], short),
+            (residuals[1], long),
+            (residuals[2], long + short),
+        ]
+        .into_iter()
+        .filter(|(residual, _)| *residual > NO_CHAMFER * 0.5)
+        .collect()
+    }
+
+    /// Walk every device fragment of `text` at `stretch` and census
+    /// [`face_operands`] against [`MIDPOINT`].
+    ///
+    /// `nudge` is added to the sample point, which is
+    /// [`the_continuous_branch_has_no_operand_near_a_decision_point`]'s negative
+    /// control: the driver's interpolation error, put back.
+    #[allow(clippy::cast_precision_loss)]
+    fn sweep_operands(text: &str, stretch: usize, nudge: f32) -> Sweep {
+        let encoded = readout(text);
+        let grid = (encoded.size.0 as usize, encoded.size.1 as usize);
+        let view = (grid.0 * stretch, grid.1 * stretch);
+        let strip = encoded.strip.as_deref().unwrap_or(&[]);
+        let cells = i32::try_from(encoded.cells).unwrap_or(i32::MAX);
+        // `seven_seg.frag`'s `pc`, off the device lattice…
+        let lattice = |index: usize, side: usize, span: usize| {
+            ((index as f32 + 0.5) * side as f32) / span as f32
+        };
+        // …and its `fp`, the fragment footprint in buffer units.
+        let footprint = (grid.0 as f32 / view.0 as f32, grid.1 as f32 / view.1 as f32);
+        let mut census = Sweep {
+            seen: 0,
+            near: 0,
+            mid: 0,
+            closest: f32::INFINITY,
+        };
+        for down in 0..view.1 {
+            for across in 0..view.0 {
+                let point = (
+                    lattice(across, grid.0, view.0) + nudge,
+                    lattice(down, grid.1, view.1) + nudge,
+                );
+                let first = cell_at(strip, cells, point.0);
+                // `strip255`'s two-cell walk.
+                for step in 0..2 {
+                    let cell = first + step;
+                    if cell >= cells {
+                        break;
+                    }
+                    let local = (
+                        point.0 - cell_x(strip, cell),
+                        point.1 - kit::SEVEN_SEG_PAD as f32,
+                    );
+                    for bar in lit_elements(cell_code(strip, cell, false)) {
+                        for (numerator, width) in face_operands(local, footprint, bar) {
+                            census.seen += 1;
+                            let operand = 0.5 - numerator / width.max(1e-6);
+                            let distance = (operand - MIDPOINT).abs();
+                            if distance == 0.0 {
+                                census.mid += 1;
+                                // `±0.0` exactly, bit for bit: an operand
+                                // reaching the midpoint any other way would mean
+                                // the *divide* decided the byte there.
+                                assert_eq!(
+                                    numerator.to_bits() & 0x7fff_ffff,
+                                    0,
+                                    "the ramp's midpoint was reached with a non-zero numerator \
+                                     ({numerator:e}), so it is the divide that decides the byte \
+                                     there and not the geometry",
+                                );
+                            } else {
+                                census.closest = census.closest.min(distance);
+                                if distance < MARGIN {
+                                    census.near += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        census
+    }
+
     /// **Nothing on the continuous branch is decided by rounding** (#1298).
     ///
     /// The four supersampled readout cases are the only place in the suite
@@ -812,124 +966,12 @@ mod tests {
     /// replaces the other: a `pc` quietly taken off `v_uv` again would leave
     /// this green, because the sweep below computes its own lattice.
     #[test]
-    #[allow(clippy::cast_precision_loss)]
     fn the_continuous_branch_has_no_operand_near_a_decision_point() {
-        /// The one decision point of [`face_cov`]'s ramp that costs a byte to
-        /// cross — see the doc on why `clamp`'s two bounds do not.
-        const MIDPOINT: f32 = 0.5;
-        /// What counts as "a rounding distance" from it. Three orders of
-        /// magnitude above the `1e-6` the interpolant was measured at, and
-        /// three below the `0.25` the sparsest lattice here leaves.
-        const MARGIN: f32 = 1e-3;
-
-        /// One sweep's census of [`face_cov`]'s operands, against [`MIDPOINT`].
-        struct Sweep {
-            /// How many were looked at at all — the guard against a sweep that
-            /// walks an empty readout and reports a clean zero.
-            seen: u64,
-            /// Within [`MARGIN`] of the midpoint without being on it. **This
-            /// is the number that must be zero.**
-            near: u64,
-            /// Exactly on the midpoint, where the numerator is exactly zero and
-            /// the byte is `128` on any IEEE-754 arithmetic.
-            mid: u64,
-            /// The closest any operand came without being on it.
-            closest: f32,
-        }
-
-        let sweep = |text: &str, stretch: usize, nudge: f32| -> Sweep {
-            let encoded = readout(text);
-            let (w, h) = (encoded.size.0 as usize, encoded.size.1 as usize);
-            let (vw, vh) = (w * stretch, h * stretch);
-            let strip = encoded.strip.as_deref().unwrap_or(&[]);
-            let cells = i32::try_from(encoded.cells).unwrap_or(i32::MAX);
-            // `seven_seg.frag`'s `pc` and `fp`, both off the device lattice.
-            let lattice =
-                |i: usize, grid: usize, view: usize| ((i as f32 + 0.5) * grid as f32) / view as f32;
-            let fp = (w as f32 / vw as f32, h as f32 / vh as f32);
-            let (mut seen, mut near, mut mid) = (0_u64, 0_u64, 0_u64);
-            let mut closest = f32::INFINITY;
-            for jt in 0..vh {
-                for i in 0..vw {
-                    let p = (lattice(i, w, vw) + nudge, lattice(jt, h, vh) + nudge);
-                    let first = cell_at(strip, cells, p.0);
-                    for k in 0..2 {
-                        let ci = first + k;
-                        if ci >= cells {
-                            break;
-                        }
-                        let local = (p.0 - cell_x(strip, ci), p.1 - kit::SEVEN_SEG_PAD as f32);
-                        let code = cell_code(strip, ci, false);
-                        let bars: Vec<kit::SevenSegBar> = if code & (1 << i32::from(COLON_BIT)) != 0
-                        {
-                            kit::SEVEN_SEG_COLON_DOTS.to_vec()
-                        } else {
-                            kit::SEVEN_SEG_BARS
-                                .into_iter()
-                                .enumerate()
-                                .filter(|(bit, _)| code & (1 << bit) != 0)
-                                .map(|(_, bar)| bar)
-                                .collect()
-                        };
-                        for bar in bars {
-                            let hs = kit::SEVEN_SEG_THICK as f32 * 0.5;
-                            let hl = bar.len as f32 * 0.5;
-                            let centre = if bar.vertical {
-                                (bar.x as f32 + hs, bar.y as f32 + hl)
-                            } else {
-                                (bar.x as f32 + hl, bar.y as f32 + hs)
-                            };
-                            let d = ((local.0 - centre.0).abs(), (local.1 - centre.1).abs());
-                            let along = if bar.vertical { d.1 } else { d.0 };
-                            let across = if bar.vertical { d.0 } else { d.1 };
-                            let r = bar_residuals(along, across, hl, hs, bar.tapered);
-                            let (fl, fs) = if bar.vertical {
-                                (fp.1, fp.0)
-                            } else {
-                                (fp.0, fp.1)
-                            };
-                            for (residual, width) in [(r[0], fs), (r[1], fl), (r[2], fl + fs)] {
-                                // `NO_CHAMFER` is a sentinel, not a geometry —
-                                // it is nine orders of magnitude off the ramp
-                                // and `bar_residuals`' doc says why.
-                                if residual == NO_CHAMFER {
-                                    continue;
-                                }
-                                seen += 1;
-                                let q = 0.5 - residual / width.max(1e-6);
-                                let distance = (q - MIDPOINT).abs();
-                                if distance == 0.0 {
-                                    mid += 1;
-                                    assert_eq!(
-                                        residual, 0.0,
-                                        "the ramp's midpoint was reached with a non-zero \
-                                         numerator, so it is the divide that decides the byte \
-                                         there and not the geometry",
-                                    );
-                                } else {
-                                    closest = closest.min(distance);
-                                    if distance < MARGIN {
-                                        near += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Sweep {
-                seen,
-                near,
-                mid,
-                closest,
-            }
-        };
-
         // 2 is what the harness renders and the stretch the x2 readout cases
         // are; 3 and 4 are the two a `scale_factor` produces. 4's ratio is a
         // binary fraction like 2's, 3's is not — see the doc.
         for stretch in [2_usize, 3, 4] {
-            let exact = sweep("12:34", stretch, 0.0);
+            let exact = sweep_operands("12:34", stretch, 0.0);
             assert!(
                 exact.seen > 100_000,
                 "the stretch-{stretch} sweep looked at only {} operand(s) — it is walking the \
@@ -949,7 +991,7 @@ mod tests {
             // something *off* a point it is standing on. At stretch 3 it does
             // not, which the assertion below is the statement of.
             if exact.mid > 0 {
-                let nudged = sweep("12:34", stretch, 1e-6);
+                let nudged = sweep_operands("12:34", stretch, 1e-6);
                 assert!(
                     nudged.near > 0,
                     "at stretch {stretch} a sample point 1e-6 off the lattice leaves none of \
@@ -967,7 +1009,7 @@ mod tests {
         // `0.5 ± odd/4`, a quarter of a ramp away, so the x2 degeneracy is a
         // property of *that* lattice and not of integer stretches at large.
         for (stretch, reaches) in [(2_usize, true), (3, false), (4, true)] {
-            let seen = sweep("12:34", stretch, 0.0);
+            let seen = sweep_operands("12:34", stretch, 0.0);
             assert_eq!(
                 seen.mid > 0,
                 reaches,

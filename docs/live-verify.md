@@ -2156,15 +2156,17 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       chip must still obey the file.
 - [ ] **(#1295 review LOW 5)** **On an Nvidia box, measure the `nvidia-smi`
       fork rate with the bar instance up.** `hytte_sensors::GpuCache`
-      (`crates/hytte-sensors/src/gpu.rs`) remembers only _whether_
-      `nvidia-smi` exists — measured from the code, there is no time-based
-      throttle on that path at all, so once it is known to exist,
-      `read_gpu_with_cache` spawns it on **every** call. The fork rate is
-      therefore exactly the sum of every poller's own cadence, not something a
-      cache smooths out: the native shell's `sensors` service (1 Hz), the bar
-      instance (1 Hz, and it cannot park), and a visible sidebar instance
-      (1 Hz) — up to **three** `nvidia-smi` processes a second at the shipped
-      `poll_seconds = 1` default, during the P2/P3 overlap. Verify it:
+      (`crates/hytte-sensors/src/gpu.rs`) gained a 500 ms reading TTL in
+      #1297, but it bounds forks **within one process sharing one cache
+      value** — and every poller in the tree calls `read_gpu_with_cache`
+      exactly once per tick, at 1 Hz or slower, so the TTL never fires from a
+      cadence tick and the measured rate below is unchanged by #1297: the
+      fork rate is still exactly the sum of every poller's own cadence, not
+      something a cache smooths out: the native shell's `sensors` service
+      (1 Hz), the bar instance (1 Hz, and it cannot park), and a visible
+      sidebar instance (1 Hz) — up to **three** `nvidia-smi` processes a
+      second at the shipped `poll_seconds = 1` default, during the P2/P3
+      overlap. Verify it:
       `for i in $(seq 10); do pgrep -c nvidia-smi; sleep 1; done` with the bar
       instance running (and the sidebar open, for the worst case), and report
       the measured count per second. If that rate is a problem on this

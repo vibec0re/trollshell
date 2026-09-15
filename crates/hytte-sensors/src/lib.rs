@@ -44,7 +44,7 @@ mod proc_stat;
 pub use cpufreq::read_cpu_freq;
 pub use disk::{read_disk_for_specs, read_mountlist, read_process_count};
 pub use diskio::{compute_disk_io, read_proc_diskstats};
-pub use gpu::{GpuCache, read_gpu_with_cache};
+pub use gpu::{GpuCache, NVIDIA_READING_TTL, read_gpu_with_cache};
 pub use hwmon::read_cpu_temp;
 pub use meminfo::read_proc_meminfo;
 pub use net::{read_net_connections, read_proc_net_dev};

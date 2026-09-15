@@ -734,8 +734,16 @@ mod tests {
 
     impl Sample for FakeSampler {
         fn tick(&mut self) -> Snapshot {
-            let n = self.0.ticks.fetch_add(1, Ordering::SeqCst);
+            // Recorded *before* the counter: a test polls `ticks()` in a busy
+            // loop (`pump_until`), and the two writes are not one atomic
+            // operation — recording first guarantees the sequence log already
+            // has this entry by the moment any observer sees the counter
+            // move, rather than leaving a window where `ticks() >= 1` is true
+            // but `sequence()` has not caught up yet (measured: 3/200 idle
+            // runs of `a_tick_due_while_hidden_never_reads_before_the_unpark_reset`
+            // saw exactly that gap before this ordering was fixed).
             self.0.record("tick");
+            let n = self.0.ticks.fetch_add(1, Ordering::SeqCst);
             // A different reading each tick (from a literal table, so there is
             // no cast the pedantic lints would refuse), so a test can tell one
             // sample from the next on the wire.
@@ -749,8 +757,11 @@ mod tests {
         }
 
         fn reset(&mut self) {
-            self.0.resets.fetch_add(1, Ordering::SeqCst);
+            // Same ordering reason as `tick` above, even though nothing here
+            // currently busy-polls `resets()` — keeping both consistent means
+            // nobody has to rediscover this the same way twice.
             self.0.record("reset");
+            self.0.resets.fetch_add(1, Ordering::SeqCst);
         }
     }
 

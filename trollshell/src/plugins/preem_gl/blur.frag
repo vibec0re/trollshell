@@ -24,6 +24,20 @@
 // with `strength == 0` then reduces to `v`. Same bytes as the CPU kit's
 // `Emission::bloom` early return, without a second pipeline.
 
+// **Which radius uniform this splice reads** (#1155). `GlUniforms` is one bag
+// applied to every pass, so a pipeline that blurs twice at *two* radii — the
+// flip board's nixie, which blooms at `radius + NIXIE_HALO_RADIUS_BONUS` and
+// then at `radius` — cannot say "this pass is the wide one" any more than it
+// can say "this pass is the horizontal one". So the splice names the uniform,
+// exactly as it names the direction, and declares it: `flip_board.rs`'s wide
+// pair prepends `uniform int u_halo_radius;` and `#define BLUR_RADIUS
+// u_halo_radius`. Every existing splice defines nothing and keeps
+// `u_bloom_radius` — the default below — so this file's bytes are unchanged
+// for the scope, the gauge, the dot matrix and the readout.
+#ifndef BLUR_RADIUS
+#define BLUR_RADIUS u_bloom_radius
+#endif
+
 in vec2 v_uv;
 
 uniform sampler2D u_tex0;
@@ -34,7 +48,7 @@ out vec4 o_intensity;
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    int radius = max(u_bloom_radius, 0);
+    int radius = max(BLUR_RADIUS, 0);
     int window = 2 * radius + 1;
     int sum = 0;
     for (int d = -radius; d <= radius; ++d) {

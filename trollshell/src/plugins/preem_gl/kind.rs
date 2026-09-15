@@ -27,7 +27,7 @@
 
 use hytte::ui::gl_surface::{GlPipeline, GlProgram};
 
-use super::{dot_matrix, gauge, led_strip, marquee, program, seven_seg, textbox};
+use super::{dot_matrix, flip_board, gauge, led_strip, marquee, program, seven_seg, textbox};
 
 /// Which kit widget a case is measuring, because the two do **not** take the
 /// same structural checks (#1143).
@@ -128,6 +128,45 @@ pub(crate) enum Kind {
     /// *driver* did; that one says the arithmetic being pinned was right before
     /// a driver ever saw it.
     SevenSeg,
+    /// `preem.flip_board` (#1155) — **pinned bit-exact**, and the third kind
+    /// whose pin is also asserted *hermetically*.
+    ///
+    /// The first kind on this seam whose 1:1 branch is **not** a point test.
+    /// The scope, the dot matrix, the meter and the readout all collapse onto
+    /// an integer at a pixel centre; a flip board does not, because the kit
+    /// itself takes a fractional area average there — the falling card's fold
+    /// is an exact coverage-weighted resample of the source rows a destination
+    /// row now spans, and the kit computes it in `f32`. So this arm's 1:1
+    /// branch reproduces float arithmetic rather than collapsing out of it,
+    /// which makes the pin a statement about **operation order and rounding**
+    /// and not about a degeneracy.
+    ///
+    /// That is also why it is worth having: two of the operations are
+    /// divisions, and GLSL ES 3.20 §4.7.1 allows `a / b` **2.5 ULP** where it
+    /// pins `+`, `-` and `*` to a correctly rounded result (#1309's lesson).
+    /// Both divides are the *kit's* — `(lo - band_lo) / squash` and
+    /// `acc / span`, spelled by `FlipBoard::compose_flap` — so they cannot be
+    /// moved to a CPU-computed reciprocal without making the two arms disagree.
+    /// `flip_board.rs` censuses exactly that, twice over:
+    /// `the_coverage_bytes_are_never_decided_by_the_divides_slack` re-derives
+    /// every byte of every 1:1 case with both quotients perturbed by ±2.5 ULP
+    /// **and by ten times that**, with a negative control at a thousandth that
+    /// moves bytes; and `the_fold_never_lands_on_the_rounding_boundary` reports
+    /// the *margin* the first one spends — the closest any `flap_value` in the
+    /// sweep comes to `level`'s truncation boundary, 3.265e-3. The pin holds by
+    /// that margin rather than by construction, which is the honest way round:
+    /// the structural argument bounds the **error**, and whether a byte moves
+    /// is about the **margin** (#1155 review).
+    ///
+    /// Like [`LedStrip`](Self::LedStrip) and [`SevenSeg`](Self::SevenSeg),
+    /// `flip_board.rs`'s
+    /// `the_transcribed_shader_is_bit_exact_against_the_kit_at_one_to_one`
+    /// mirrors the shader's arithmetic — this one including `blur.frag` twice
+    /// over, since a nixie blooms twice — holds it to the shipped GLSL by a
+    /// source scan, and compares it against the kit's own bytes in
+    /// `cargo test`. The pin here still says what the *driver* did; that one
+    /// says the arithmetic being pinned was right before a driver ever saw it.
+    FlipBoard,
 }
 
 impl Kind {
@@ -150,7 +189,7 @@ impl Kind {
     /// consumer, so the constant was gated the same way to keep it from being
     /// an unused-in-production warning. [`super::install`] is now a
     /// consumer too, so the constant has to exist in every build.
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Scope,
         Self::Gauge,
         Self::DotMatrix,
@@ -158,6 +197,7 @@ impl Kind {
         Self::TextBox,
         Self::LedStrip,
         Self::SevenSeg,
+        Self::FlipBoard,
     ];
 
     /// The `(program, pipeline)` pair [`super::install`] registers for this
@@ -181,6 +221,7 @@ impl Kind {
             Self::TextBox => (textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE),
             Self::LedStrip => (led_strip::LED_STRIP, led_strip::LED_STRIP_PIPELINE),
             Self::SevenSeg => (seven_seg::SEVEN_SEG, seven_seg::SEVEN_SEG_PIPELINE),
+            Self::FlipBoard => (flip_board::FLIP_BOARD, flip_board::FLIP_BOARD_PIPELINE),
         }
     }
 }

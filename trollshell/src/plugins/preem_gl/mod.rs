@@ -6,13 +6,14 @@
 //! one module per kind — [`program`] for the `Scope`, [`gauge`] for the
 //! `Gauge` (#1143), [`dot_matrix`] for the `DotMatrix` (#1144), [`marquee`]
 //! and [`textbox`] for the two text kinds (#1152), [`led_strip`] for the meter
-//! (#1153), [`seven_seg`] for the readout (#1154) — each referencing nothing
+//! (#1153), [`seven_seg`] for the readout (#1154), [`flip_board`] for the
+//! split-flap board and the nixie readout (#1155) — each referencing nothing
 //! above it, so the parity harness can `#[path]`-include the same code the
 //! shell runs. Everything that needs the *shell* — the kill switch, the
 //! fallback latch — is here, and it is deliberately kind-agnostic. #1143
 //! predicted "a third kind is a module, a `register` line and a `preem_render`
 //! arm, with nothing in this file to change"; #1144 was exactly that, #1152
-//! was exactly that twice, and #1153 and #1154 once more each, so the
+//! was exactly that twice, and #1153, #1154 and #1155 once more each, so the
 //! prediction now reads as a measurement.
 //!
 //! The [`marquee`] is the one module here with no shader of its own: a ticker
@@ -59,10 +60,11 @@
 //!
 //! 1. the switch names `cpu`;
 //! 2. the widget kind has no GL arm — everything but `Scope`, `Gauge`,
-//!    `DotMatrix`, `Marquee`, `TextBox`, `LedStrip` and `SevenSeg` today
+//!    `DotMatrix`, `Marquee`, `TextBox`, `LedStrip`, `SevenSeg` and
+//!    `FlipBoard` today
 //!    (#1143 added the second, #1144 the third, #1152 the two text kinds on
-//!    Annika's word for the rest of #865, #1153 the meter and #1154 the
-//!    readout);
+//!    Annika's word for the rest of #865, #1153 the meter, #1154 the
+//!    readout and #1155 the board);
 //! 3. **a GL context could not be created**, which `hytte-ui` latches and
 //!    reports through the hook installed in [`install`]. Falling back is free
 //!    here in a way it is not for #893's shader widget: a kit widget *has* a
@@ -92,6 +94,7 @@
 use hytte::ui::gl_surface::GlProgram;
 
 mod dot_matrix;
+mod flip_board;
 mod gauge;
 mod kind;
 mod led_strip;
@@ -129,6 +132,7 @@ mod cases;
 // textbox}` directly. The plain program name stays re-exported — used to
 // build a `UiNode::GlSurface` at every mapping call site.
 pub(super) use dot_matrix::{DOT_MATRIX, Glyphs, dot_matrix_surface, glyphs as encode_glyphs};
+pub(super) use flip_board::{FLIP_BOARD, cards as encode_cards, flip_board_surface};
 pub(super) use gauge::{GAUGE, gauge_surface};
 pub(super) use led_strip::{LED_STRIP, led_strip_surface};
 pub(super) use marquee::{MARQUEE, Window, marquee_surface, window as encode_window};
@@ -154,9 +158,10 @@ pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
 ///
 /// **Per kind, not per widget** — one answer for the whole preem renderer, and
 /// `preem_render::build` consults it in each arm that *has* a GL pipeline.
-/// Since #1154 that is the `Scope`, the `Gauge`, the `DotMatrix`, the
-/// `Marquee`, the `TextBox`, the `LedStrip` and the `SevenSeg`; every other
-/// kind takes [`Arm::Cpu`] because there is nothing else to take.
+/// Since #1155 that is the `Scope`, the `Gauge`, the `DotMatrix`, the
+/// `Marquee`, the `TextBox`, the `LedStrip`, the `SevenSeg` and the
+/// `FlipBoard`; every other kind takes [`Arm::Cpu`] because there is nothing
+/// else to take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Arm {
     /// A `GtkGLArea` running one of the pipelines [`install`] registers — the

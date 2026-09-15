@@ -11402,7 +11402,8 @@ mod kind_enumeration {
             | Case::Marquee { style, .. }
             | Case::TextBox { style, .. }
             | Case::LedStrip { style, .. }
-            | Case::SevenSeg { style, .. } => *style,
+            | Case::SevenSeg { style, .. }
+            | Case::FlipBoard { style, .. } => *style,
         }
     }
 
@@ -11517,6 +11518,86 @@ mod kind_enumeration {
             }
         }
     }
+
+    /// **Every case's native-frame flatness ceiling is its kind's, except the
+    /// split flap's, which is armed where its kind cannot be** (#1155 review,
+    /// HIGH).
+    ///
+    /// `parity::with_native_flatness` is the only gate in the suite that can
+    /// see a drift *inside* a supersampled case's continuous branch — an oracle
+    /// comparison cannot, because replicating the kit's grid agrees with the
+    /// oracle *better* than resolving per fragment does. The review measured
+    /// exactly that: `bool snapped = true;` in `flip_board.frag` (the whole of
+    /// #1155 reverted) left `PASS all 204` with every flip-board case at
+    /// `max |Δ| 0`.
+    ///
+    /// `Kind::flat_block_ceiling` could not arm it, and that is the finding
+    /// rather than an oversight: a `FlipBoard`'s two mechanisms answer
+    /// differently and both answers are right — a **nixie** is replication
+    /// (100.0 % flat, by construction, no sub-pixel geometry anywhere) and a
+    /// **split flap** is not (92.5–93.8 %). So the ceiling is keyed per case.
+    ///
+    /// This walks the real `cases_for` output and asserts both halves, so a
+    /// later edit that drops the override — or arms the nixie by accident —
+    /// reds here without a driver.
+    ///
+    /// **Falsified** by deleting `Case::flat_block_ceiling`'s `SplitFlap` arm
+    /// (the first assertion), or by extending it to `Mechanism::ALL` (the
+    /// second).
+    #[test]
+    fn only_the_split_flaps_cases_arm_the_flatness_ceiling() {
+        for case in cases_for(&kit::DisplayStyle::ALL) {
+            let want = match &case {
+                Case::FlipBoard {
+                    mechanism: kit::Mechanism::SplitFlap,
+                    ..
+                } => Some(0.97),
+                Case::FlipBoard {
+                    mechanism: kit::Mechanism::Nixie,
+                    ..
+                } => None,
+                other => other.kind().flat_block_ceiling(),
+            };
+            assert_eq!(
+                case.flat_block_ceiling(),
+                want,
+                "{:?}: the flatness ceiling a case is held to",
+                case.kind(),
+            );
+        }
+        // …and the separation the ceiling sits in, read off the case rather
+        // than restated: every shipping split-flap frame the review measured
+        // is under it and the `snapped := true` probe's 100.0 % is over.
+        let split_flap = cases_for(&kit::DisplayStyle::ALL)
+            .into_iter()
+            .find(|case| {
+                matches!(
+                    case,
+                    Case::FlipBoard {
+                        mechanism: kit::Mechanism::SplitFlap,
+                        ..
+                    }
+                )
+            })
+            .expect("the case list carries split-flap boards");
+        let ceiling = split_flap
+            .flat_block_ceiling()
+            .expect("a split flap's cases are armed");
+        for shipping in [0.925_f64, 0.933, 0.934, 0.938] {
+            assert!(
+                shipping < ceiling,
+                "{shipping} is a shipping frame and must stay under {ceiling}",
+            );
+        }
+        assert!(
+            REPLICATED > ceiling,
+            "the `snapped := true` frame is {REPLICATED} and must red against {ceiling}",
+        );
+    }
+
+    /// What all four `split-flap.rollingx2` frames measure under the
+    /// `snapped := true` probe — the whole of #1155 reverted (#1155 review).
+    const REPLICATED: f64 = 1.0;
 
     /// **`nix/checks/system-tests.nix`'s parity-case count matches the
     /// harness's own computed total** — the other half of #1211's ask: the

@@ -221,7 +221,8 @@ impl Kind {
             | Self::Marquee
             | Self::TextBox
             | Self::LedStrip
-            | Self::SevenSeg => true,
+            | Self::SevenSeg
+            | Self::FlipBoard => true,
         }
     }
 
@@ -266,7 +267,8 @@ impl Kind {
             | Self::Marquee
             | Self::TextBox
             | Self::LedStrip
-            | Self::SevenSeg => false,
+            | Self::SevenSeg
+            | Self::FlipBoard => false,
         }
     }
 
@@ -500,6 +502,71 @@ impl Kind {
             // spread over them, which is both why its honest numbers are the
             // second lowest and why a half-pixel shift moves it least.
             Self::SevenSeg => EdgeBudget { mean: 7.0, max: 48 },
+            // **Eight** `scale = 2` cases, two per skin, at the state with the
+            // most card in flight — a whole row mid-change, so every cell
+            // carries a fold boundary and a lit free edge at once. Measured
+            // worst on llvmpipe (Mesa 26.2.1, the flake's own): edge mean
+            // **1.736** and edge max **65**, both on the oled. Per skin, split
+            // flap: vfd 1.050/58, lcd 0.486/33, oled 1.736/65, crt 0.878/51.
+            //
+            // **Four of the eight measure 0.000 / 0, and that is the shape of
+            // this kind rather than a gap.** The four are the **nixie**'s, and
+            // they are byte-identical to the kit on every skin: a tube is a
+            // cross-fade between two 5×7 bitmap cathodes, so it has no
+            // sub-pixel geometry at all, and everything this arm point-samples
+            // (the fixture, the glyphs, the halo, the CRT mask) is exactly what
+            // `Frame::upscale` replicates. Those cases therefore measure that
+            // the `scale > 1` path reproduces the kit's replication — a real
+            // statement, and the reason they are kept — but they carry no edge
+            // budget work and no drift of the *fold* can move them. The budget
+            // below is calibrated on the split flap's four alone, and a reader
+            // comparing "eight cases" against "four numbers" should find the
+            // reason here rather than in a run transcript.
+            //
+            // 2.5 / 96 is 1.44x the worst measured mean and 1.48x the worst
+            // measured max — a touch tighter on the mean than `SevenSeg`'s
+            // 1.51x, and deliberately so: measured, the `max` half cannot catch
+            // this kind's calibration drift on two of the four skins (see
+            // below), so the mean is doing the work alone and is sized to.
+            // A **sixth shape**: this kind's edge bin
+            // is the whole card row (1691–2522 px of 2860) because a card face
+            // is a ghost figure against the field, but almost all of it is
+            // bit-identical and the legitimate disagreement is confined to the
+            // two rows the fold's band boundary crosses — which is why the mean
+            // is the smallest of the six while the max is the second largest.
+            // A boundary row is where the kit averages the card's coverage over
+            // a whole logical pixel and this arm averages it over two half
+            // ones, so a single pixel there can legitimately swing a quarter of
+            // full contrast.
+            //
+            // **Calibrated against a drift it catches, measured rather than
+            // assumed.** The probe is #1153's, turned onto the axis this arm
+            // actually resolves: a half-native-pixel **vertical** offset of the
+            // sample point on the continuous branch alone —
+            // `if (!snapped) { p.y += fstep * 0.5; }` right after `fstep` in
+            // `flip_board.frag`'s `main`, a scale-only shift the 1:1 cases
+            // cannot see (all thirty-six stayed bit-exact under it). #1290's
+            // and #1294's probes shift `p.x`, which on this widget would move
+            // nothing at all: the fold is a function of `p.y` and the sample
+            // point's x is floored to a logical column before anything reads
+            // it. Under the vertical probe the four split-flap cases go to edge
+            // mean 3.497 / 2.840 / 6.085 / 2.862 and edge max 96 / 49 / 109 /
+            // 90, so **every one of the four reds**, and every one of them on
+            // the **mean**: the tightest are the lcd and the crt at 1.14x the
+            // ceiling. The four nixie cases are untouched by it, as they must
+            // be.
+            //
+            // **Which half catches it, since here only one does.** The probed
+            // lcd's edge max is **49** and the honest oled's is **65**, so no
+            // `max` that keeps the shipping frames green can red the probed
+            // lcd — the two populations overlap on that statistic. That is a
+            // property of the drift rather than of the budget: shifting the
+            // sampling window half a native pixel moves *every* boundary row a
+            // little and no boundary row a lot, where the seven-segment arm's
+            // horizontal shift moves a mitre's whole coverage. So `max: 96`
+            // is the honest ceiling on a single pixel (1.48x the worst
+            // measured) and the detector is `mean`.
+            Self::FlipBoard => EdgeBudget { mean: 2.5, max: 96 },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -571,7 +638,23 @@ impl Kind {
             // bars, so there is no grid-resolution lattice for a ceiling here
             // to protect. See [`Self::edge_budget`]'s `SevenSeg` arm for what
             // does gate this kind's stretched cases.
-            Self::Gauge | Self::TextBox | Self::Scope | Self::LedStrip | Self::SevenSeg => None,
+            // The flip board's `None` is the fifth, and the **only one of the
+            // five that is overridden**: it is the *nixie*'s answer, not the
+            // kind's (#1155 review, HIGH). A tube has no sub-pixel geometry at
+            // all, so its native frame is exactly `Frame::upscale` — 100.0 %
+            // flat on every skin, correctly — and a ceiling armed here would
+            // red a right render forever. Its split-flap sibling is 92.5–93.8 %
+            // and *is* gated: `cases::Case::flat_block_ceiling` arms those
+            // cases at `0.97`, calibrated against a `snapped := true` probe
+            // that takes all four to 100.0 %. That is the one gate in the suite
+            // that can see a drift *inside* the continuous branch, so a reader
+            // arriving here looking for this kind's detector should go there.
+            Self::Gauge
+            | Self::TextBox
+            | Self::Scope
+            | Self::LedStrip
+            | Self::SevenSeg
+            | Self::FlipBoard => None,
         }
     }
 
@@ -585,6 +668,7 @@ impl Kind {
             Self::TextBox => "textbox",
             Self::LedStrip => "led_strip",
             Self::SevenSeg => "seven_seg",
+            Self::FlipBoard => "flip_board",
         }
     }
 }
@@ -1010,12 +1094,21 @@ pub(crate) fn flat_block_fraction(
 /// Refine a passing verdict with [`flat_block_fraction`] — the rendered gate
 /// for "the halo is read at the fragment's resolution" (#1238's review).
 ///
-/// **Only under `TROLLSHELL_PARITY_EXACT=1`**, and only for a kind that states
+/// **Only under `TROLLSHELL_PARITY_EXACT=1`**, and only for a case that states
 /// a ceiling. That is [`Kind::pinned_exact`]'s bargain, for its reason: the
 /// numbers below are calibrated against one driver in one sandbox, so this is a
 /// CI regression detector rather than a claim about what a real driver's
 /// rasteriser must produce. A plain run prints the fraction and asserts
 /// nothing.
+///
+/// **`ceiling` rather than `kind` since #1155's review**, and the change is
+/// the finding: the flip board's two *mechanisms* honestly answer 93.x %
+/// (split flap) and 100.0 % (nixie, which has no sub-pixel geometry at all —
+/// its native frame **is** `Frame::upscale`, correctly), so a `Kind`-keyed
+/// ceiling can arm neither without failing the other. `cases::Case::
+/// flat_block_ceiling` resolves it per case and defaults to the kind's; every
+/// other kind's answer is unchanged, because every other kind has one
+/// mechanism.
 ///
 /// Takes `prior` rather than returning a verdict of its own so a failure that
 /// is already diagnosed keeps its name: "the interior moved" and "the edges are
@@ -1024,14 +1117,14 @@ pub(crate) fn flat_block_fraction(
 /// which is true, and useless.
 pub(crate) fn with_native_flatness(
     prior: Verdict,
-    kind: Kind,
+    ceiling: Option<f64>,
     fraction: Option<f64>,
     exact: bool,
 ) -> Verdict {
     if !prior.is_pass() || !exact {
         return prior;
     }
-    match (fraction, kind.flat_block_ceiling()) {
+    match (fraction, ceiling) {
         (Some(measured), Some(ceiling)) if measured > ceiling => Verdict::GridReplicated,
         _ => prior,
     }
@@ -2139,13 +2232,23 @@ mod tests {
             (Kind::Marquee, 0.465, 0.774),
         ] {
             assert_eq!(
-                with_native_flatness(Verdict::Pass, kind, Some(shipping), true),
+                with_native_flatness(
+                    Verdict::Pass,
+                    kind.flat_block_ceiling(),
+                    Some(shipping),
+                    true
+                ),
                 Verdict::Pass,
                 "{}: the frame that ships is inside the ceiling",
                 kind.label(),
             );
             assert_eq!(
-                with_native_flatness(Verdict::Pass, kind, Some(reverted), true),
+                with_native_flatness(
+                    Verdict::Pass,
+                    kind.flat_block_ceiling(),
+                    Some(reverted),
+                    true
+                ),
                 Verdict::GridReplicated,
                 "{}: a halo replicated out of the kit's grid is not",
                 kind.label(),
@@ -2157,7 +2260,12 @@ mod tests {
         // lattice kinds' ceiling.
         for (kind, measured) in [(Kind::Gauge, 0.887), (Kind::TextBox, 0.974)] {
             assert_eq!(
-                with_native_flatness(Verdict::Pass, kind, Some(measured), true),
+                with_native_flatness(
+                    Verdict::Pass,
+                    kind.flat_block_ceiling(),
+                    Some(measured),
+                    true
+                ),
                 Verdict::Pass,
                 "{}: a kind with no ceiling is not held to another kind's",
                 kind.label(),
@@ -2177,12 +2285,22 @@ mod tests {
     #[test]
     fn only_the_exact_pin_asserts_the_native_flatness() {
         assert_eq!(
-            with_native_flatness(Verdict::Pass, Kind::DotMatrix, Some(0.797), false),
+            with_native_flatness(
+                Verdict::Pass,
+                Kind::DotMatrix.flat_block_ceiling(),
+                Some(0.797),
+                false
+            ),
             Verdict::Pass,
             "without the env, the same frame is printed and not judged",
         );
         assert_eq!(
-            with_native_flatness(Verdict::Pass, Kind::DotMatrix, None, true),
+            with_native_flatness(
+                Verdict::Pass,
+                Kind::DotMatrix.flat_block_ceiling(),
+                None,
+                true
+            ),
             Verdict::Pass,
             "a case with no fraction to report — every 1:1 one — is untouched",
         );
@@ -2193,7 +2311,7 @@ mod tests {
             Verdict::EdgeOverBudget,
         ] {
             assert_eq!(
-                with_native_flatness(prior, Kind::DotMatrix, Some(1.0), true),
+                with_native_flatness(prior, Kind::DotMatrix.flat_block_ceiling(), Some(1.0), true),
                 prior,
                 "an all-flat frame is the *symptom* of {}, not a second finding",
                 prior.label(),
@@ -2254,6 +2372,23 @@ mod tests {
                 // fragment. No calibration is available here, and a ceiling
                 // without one is a flake (#1238's own words).
                 Kind::SevenSeg => None,
+                // **`None` here is the *nixie*'s answer, and the split flap
+                // overrides it per case** (#1155 review, HIGH). A tube is a
+                // cross-fade between two 5×7 bitmap cathodes with no sub-pixel
+                // geometry anywhere, so its native frame *is* `Frame::upscale`
+                // — measured **100.0 %** flat on all four skins, correctly —
+                // and a ceiling armed on this kind would red a right render
+                // forever. A split flap is the opposite (92.5–93.8 %) and the
+                // detector for it is real: `cases::Case::flat_block_ceiling`
+                // arms those cases at `0.97`, calibrated against a
+                // `snapped := true` probe that takes all four to 100.0 %.
+                //
+                // The earlier version of this comment said no calibration was
+                // available and a ceiling here would be a flake. The review
+                // falsified that by measuring one; what was actually missing
+                // was a *per-case* key, since this kind carries two mechanisms
+                // with two honest answers.
+                Kind::FlipBoard => None,
             };
             assert_eq!(
                 kind.flat_block_ceiling(),
@@ -2354,6 +2489,15 @@ mod tests {
                 // column of a lit segment is a stack of pixels that are all
                 // exactly the ink.
                 Kind::SevenSeg => (true, false),
+                // Measured at zero (#1155), and the third kind whose zero is
+                // also asserted without a driver — and the **first whose 1:1
+                // branch is not a point test**: the kit itself takes a
+                // fractional area average of the falling card there, so the
+                // mirror reproduces float arithmetic (two divisions included)
+                // rather than collapsing out of it. Not a beam — a column of a
+                // card is a stack of glyph pixels, and the fold makes several
+                // of them tie at the same intensity.
+                Kind::FlipBoard => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

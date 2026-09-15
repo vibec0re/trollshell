@@ -110,6 +110,19 @@ pub(crate) enum Case {
         /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
         stretch: u32,
     },
+    /// A `FlipBoard` on one mechanism, at one point of one change (#1155).
+    FlipBoard {
+        style: kit::DisplayStyle,
+        mechanism: kit::Mechanism,
+        board: BoardAt,
+        /// The kit's own integer upscale, which for this widget is what the
+        /// `Frame` carries out — [`FLIP_SCALE`] compares pixel against pixel,
+        /// [`FLIP_SUPERSAMPLE`] compares a box-averaged native frame against
+        /// the kit's logical one. The `Gauge`'s arrangement, not the
+        /// `stretch` the four lattice kinds use, because here the *kit* is
+        /// what renders at two resolutions.
+        scale: u32,
+    },
 }
 
 impl Case {
@@ -129,8 +142,130 @@ impl Case {
             Self::TextBox { .. } => Kind::TextBox,
             Self::LedStrip { .. } => Kind::LedStrip,
             Self::SevenSeg { .. } => Kind::SevenSeg,
+            Self::FlipBoard { .. } => Kind::FlipBoard,
         }
     }
+
+    /// The native-frame flatness ceiling this case is held to —
+    /// [`Kind::flat_block_ceiling`]'s, except where a kind's own answer cannot
+    /// be stated per kind (#1155 review, HIGH).
+    ///
+    /// **The flip board is that exception, and it is why this method exists.**
+    /// Its two mechanisms answer differently and honestly: a **nixie** *is*
+    /// replication — it is a cross-fade between two 5×7 bitmap cathodes, has
+    /// no sub-pixel geometry anywhere, and its native frame is exactly what
+    /// `Frame::upscale` produces, measured **100.0 %** flat on every skin — so
+    /// arming the detector for it would red a correct render forever. A
+    /// **split flap** is not: its falling card is integrated over the
+    /// fragment's own vertical footprint, measured **92.5–93.8 %**.
+    ///
+    /// `0.97` is calibrated the way [`Kind::DotMatrix`]'s `0.60` was — against
+    /// a mutation that reverts the improvement, not against a wish. The probe
+    /// is `bool snapped = true;` in `flip_board.frag`'s `main`, which is the
+    /// whole of #1155 undone: the fold goes back to the kit's logical row,
+    /// replicated `scale` times. Under it the four `split-flap.rollingx2`
+    /// frames go **93.4 / 92.5 / 93.3 / 93.8 % → 100.0 % on all four**, and —
+    /// this is the finding — *every other gate stays green*, because
+    /// replicating the grid agrees with the oracle better than resolving per
+    /// fragment does. `0.97` sits ~3 points either side of that 6.2-point
+    /// separation. It is also the only gate in the suite that can see a drift
+    /// *inside* the continuous branch, which is a live question in this very
+    /// file: #1186's bilinear halo tap is weighed and declined there, and a
+    /// future answer that moves further toward replication has to red
+    /// somewhere.
+    ///
+    /// **Falsified** by returning the kind's answer for a split flap, which
+    /// puts the `snapped := true` probe back to `PASS all 204`.
+    pub(crate) fn flat_block_ceiling(&self) -> Option<f64> {
+        match self {
+            Self::FlipBoard {
+                mechanism: kit::Mechanism::SplitFlap,
+                ..
+            } => Some(0.97),
+            other => other.kind().flat_block_ceiling(),
+        }
+    }
+}
+
+/// Where a flip-board case's row is when the frame is taken.
+///
+/// Six, and the issue's own list adapted to what the kit has (#1155): at rest,
+/// one card at half a flip, the whole row in flight, the accent role, plus the
+/// empty board and a row of cards that are not on the drum.
+///
+/// **#1155 asks for "nixie at rest" and "nixie with the accent role" as
+/// separate cases**, and they are — but as a *mechanism* axis rather than as
+/// two more states, because a `Mechanism` is orthogonal to everything else in
+/// the kit. [`cases_for`] runs the whole list on the split flap (which is the
+/// mechanism with sub-pixel geometry) and [`Rest`](Self::Rest),
+/// [`Rolling`](Self::Rolling) and [`Pinned`](Self::Pinned) on the nixie (whose
+/// emission is a bitmap cross-fade with nothing continuous in it, and whose own
+/// path — the double bloom — those three cover on every skin).
+///
+/// Two things the issue assumed that the kit does not have. There is no
+/// per-cell **phase** knob: a cell's progress is a closed-form function of the
+/// board's clock and its own stagger, so "one cell at phase 0.5" is arranged by
+/// advancing an unstaggered board's clock to `duration / 2`. And **no uniform
+/// array bounds the cell count** — the per-cell strip is a data *texture*, so
+/// [`kit::FLIP_MAX_CELLS`] is not a cliff any shader can fall off and there is
+/// no `MAX_CELLS` edge case to render here. The widest board the kit will build
+/// (64 cells, 896 strip texels, a 1026 px logical buffer) is covered
+/// hermetically instead, in `flip_board.rs`'s transcription sweep; a 2052 px
+/// natural size would be wider than the harness's own display.
+#[derive(Clone, Copy)]
+pub(crate) enum BoardAt {
+    /// The empty board: `cells == 0`, so `u_data_len` is `0`, the strip is
+    /// unbound and `flip_board.frag`'s `cell_of` early return is the whole of
+    /// the emission. The buffer is two bezels wide and one card tall and the
+    /// frame is the bare field — the shape `FlipBoardConfig`'s zero-cell
+    /// degenerate case actually is, and the one case that separates "no strip"
+    /// from "a blank strip".
+    ///
+    /// **Vacuous on the OLED and on the CRT against a geometry drift**, and
+    /// worth saying rather than hiding (#1293 items 3/7 in this widget's
+    /// shape): those two skins have no `ghost`, so an empty board draws no
+    /// fixture and there is nothing on screen for a drift to move. Against an
+    /// *undrawn framebuffer* only the OLED's is vacuous, its field being pure
+    /// black where the CRT's is `[3, 7, 5]`. It is kept rather than
+    /// special-cased because the VFD's and the LCD's do detect — both paint the
+    /// bezel — and because this is the only case that reaches the zero-cell
+    /// path on a driver at all.
+    Empty,
+    /// A settled row: every cell at `progress == 1.0`, so `squash == 1`, the
+    /// falling card covers the lower half exactly and the frame *is* the
+    /// resting cards'. The endpoint the kit's own
+    /// `the_endpoints_are_exactly_the_resting_frames` pins, drawn here through
+    /// a driver.
+    Rest,
+    /// One card at **half a flip** and the rest at rest: an unstaggered board
+    /// told to change a single cell, with the clock at `duration / 2`.
+    ///
+    /// `p = 0.5` puts `theta` at `pi/4`, which is *before* horizontal
+    /// (`p = 1/sqrt(2)`), so the outgoing card is still folding away above the
+    /// hinge — the `falling_up` branch, the shading near its brightest and the
+    /// lit free edge inside the band's top.
+    HalfFlip,
+    /// The **whole row in flight**, staggered: every cell told to change at
+    /// once, with the clock partway through the ripple, so the cells are at
+    /// different phases and the frame carries a fold boundary and a free edge
+    /// per card. The state with the most continuous geometry on screen, which
+    /// is why it is the one the supersampled case runs at.
+    ///
+    /// The clock is past the last cell's stagger and inside its flip, so no
+    /// cell is waiting at `progress == 0` and none has landed — every one of
+    /// them is a *different* `squash`, which is what makes a single wrong
+    /// per-cell texel visible somewhere.
+    Rolling,
+    /// A row of cards that are **not on the drum**, mid-flip: the kit's notdef
+    /// box on both faces, so the one glyph a board renders for every uncovered
+    /// input reaches the strip encoder and the shader end to end.
+    Notdef,
+    /// [`Rolling`](Self::Rolling) again under a **pinned ink**, the `Ink::Fixed`
+    /// arm of the kit's palette precedence — so the mapping's
+    /// `palette_snapshot` and the kit's own `palette()` are compared through a
+    /// pin rather than only through the skin's default. #1155's "nixie with the
+    /// accent role", run on both mechanisms.
+    Pinned,
 }
 
 /// What a seven-segment case is reading out.
@@ -424,6 +559,15 @@ pub(crate) const TICKER_ORIGIN_WINDOW_PX: u32 = 98;
 /// [`TickerAt::Scrolled`].
 pub(crate) const TICKER_SEAM_PHASE: usize = 215;
 
+/// The upscale the **1:1** flip-board cases run at — see [`Case::FlipBoard`].
+pub(crate) const FLIP_SCALE: u32 = 1;
+
+/// The upscale the **supersampled** flip-board cases run at —
+/// `FlipBoardConfig`'s own default and `FlipBoard::new`'s, which is what every
+/// board on the glass actually uses (the `GAUGE_SUPERSAMPLE` argument, #1148
+/// review HIGH-2).
+pub(crate) const FLIP_SUPERSAMPLE: u32 = 2;
+
 /// The upscale the **1:1** gauge cases run at — see [`Case::Gauge`].
 pub(crate) const GAUGE_SCALE: u32 = 1;
 
@@ -619,6 +763,51 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 readout: ReadoutAt::Clock,
                 stretch: STRETCH,
             });
+            // The board (#1155): the whole state list on the **split flap**,
+            // which is the mechanism with sub-pixel geometry, …
+            let boards = [
+                BoardAt::Empty,
+                BoardAt::Rest,
+                BoardAt::HalfFlip,
+                BoardAt::Rolling,
+                BoardAt::Notdef,
+                BoardAt::Pinned,
+            ]
+            .into_iter()
+            .map(move |board| Case::FlipBoard {
+                style: *style,
+                mechanism: kit::Mechanism::SplitFlap,
+                board,
+                scale: FLIP_SCALE,
+            });
+            // …and the three that exercise the **nixie**'s own path — the
+            // double bloom — on every skin. Its emission is a bitmap
+            // cross-fade, so the states that differ only in sub-pixel geometry
+            // (`HalfFlip`) or in which glyph is on the card (`Notdef`,
+            // `Empty`) measure the split flap's code a second time rather than
+            // anything of the tube's. See [`BoardAt`].
+            let tubes = [BoardAt::Rest, BoardAt::Rolling, BoardAt::Pinned]
+                .into_iter()
+                .map(move |board| Case::FlipBoard {
+                    style: *style,
+                    mechanism: kit::Mechanism::Nixie,
+                    board,
+                    scale: FLIP_SCALE,
+                });
+            // …and both mechanisms at the kit's **shipping** upscale, at the
+            // state with the most geometry in flight, which is where *this*
+            // arm's improvement lives: the fold's boundary and the falling
+            // card's lit free edge resolved at the screen's resolution rather
+            // than as `scale`-tall bands of one logical stair.
+            let shipping_boards =
+                kit::Mechanism::ALL
+                    .into_iter()
+                    .map(move |mechanism| Case::FlipBoard {
+                        style: *style,
+                        mechanism,
+                        board: BoardAt::Rolling,
+                        scale: FLIP_SUPERSAMPLE,
+                    });
             scopes
                 .chain(gauges)
                 .chain(shipping)
@@ -634,6 +823,9 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 .chain(single_led)
                 .chain(readouts)
                 .chain(stretched_readout)
+                .chain(boards)
+                .chain(tubes)
+                .chain(shipping_boards)
         })
         .collect()
 }

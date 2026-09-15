@@ -887,6 +887,24 @@ enum Renderer {
     FlipBoard {
         board: kit::FlipBoard,
     },
+    /// The **GPU** arm of [`FlipBoard`](Self::FlipBoard) (#1155).
+    ///
+    /// It holds the very same `kit::FlipBoard` the CPU arm does, exactly as the
+    /// two `Gauge` arms share one `kit::Gauge`: a board's whole animation is a
+    /// closed-form function of its own clock, so the clock is CPU-side on both
+    /// arms and the two share their `update`, `advance` and `animates` arms
+    /// outright. A board whose renderer flips mid-fall keeps falling.
+    ///
+    /// It carries **no encoded strip**, and that is the one place it departs
+    /// from `DotMatrixGl`/`SevenSegGl`/`TextBoxGl`. #911's rule caches what a
+    /// state change mints; this widget's per-cell payload — the fold's band,
+    /// the shading, the free edge, the two cathode levels — moves with the
+    /// clock rather than with the text, so a cached strip would be a stale
+    /// frame. `preem_gl::encode_cards` runs in the mapping pass instead.
+    FlipBoardGl {
+        /// The board's clock and cards — the CPU arm's field, unchanged.
+        board: kit::FlipBoard,
+    },
 }
 
 /// What an instance last produced, cached so a second monitor's mapping pass
@@ -1950,7 +1968,8 @@ pub(super) fn invalidate_cached_frames() {
                         | Renderer::ScopeGl { .. }
                         | Renderer::Gauge { .. }
                         | Renderer::GaugeGl { .. }
-                        | Renderer::FlipBoard { .. },
+                        | Renderer::FlipBoard { .. }
+                        | Renderer::FlipBoardGl { .. },
                     )
                     | None => false,
                 };
@@ -2601,8 +2620,19 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             Renderer::Gauge { gauge }
         }
         W::FlipBoard { config, state } => {
+            // GL by default (#1155), the CPU kit under the kill switch, once a
+            // context has failed, or once this driver has refused this pipeline
+            // (#1232) — the same `preem_gl::arm_for` decision every other arm
+            // on this seam takes.
+            //
+            // The board is built and pointed at its text either way, and handed
+            // straight over: the clock is the state, it is CPU-side on both
+            // arms, and a board whose renderer flips must not restart mid-fall.
             let mut board = flip_board(*config, style);
             board.set_text(&state.text);
+            if preem_gl::arm_for(preem_gl::FLIP_BOARD) == Arm::Gl {
+                return Renderer::FlipBoardGl { board };
+            }
             Renderer::FlipBoard { board }
         }
     }))
@@ -2791,7 +2821,10 @@ impl Renderer {
             Self::Scope { .. } | Self::ScopeGl { .. } => matches!(widget, W::Scope { .. }),
             // …and the same for the two `Gauge` arms (#1143).
             Self::Gauge { .. } | Self::GaugeGl { .. } => matches!(widget, W::Gauge { .. }),
-            Self::FlipBoard { .. } => matches!(widget, W::FlipBoard { .. }),
+            // …and the same for the two `FlipBoard` arms (#1155).
+            Self::FlipBoard { .. } | Self::FlipBoardGl { .. } => {
+                matches!(widget, W::FlipBoard { .. })
+            }
         }
     }
 
@@ -2845,6 +2878,7 @@ impl Renderer {
             Self::TextBoxGl { .. } => Some(preem_gl::TEXTBOX),
             Self::LedStripGl { .. } => Some(preem_gl::LED_STRIP),
             Self::SevenSegGl { .. } => Some(preem_gl::SEVEN_SEG),
+            Self::FlipBoardGl { .. } => Some(preem_gl::FLIP_BOARD),
             Self::DotMatrix { .. }
             | Self::SevenSeg { .. }
             | Self::TextBox { .. }
@@ -2976,7 +3010,16 @@ impl Renderer {
             (Self::Gauge { gauge } | Self::GaugeGl { gauge, .. }, W::Gauge { state, .. }) => {
                 gauge.set_target(state.target);
             }
-            (Self::FlipBoard { board }, W::FlipBoard { state, .. }) => board.set_text(&state.text),
+            // **Both arms, one expression** — the GL one holds the very same
+            // `kit::FlipBoard`, because a board's whole animation is a
+            // closed-form function of its own clock and that clock is CPU-side
+            // either way. A board whose renderer flips must not restart
+            // mid-fall, and this is what makes that true by construction rather
+            // than by two arms agreeing.
+            (
+                Self::FlipBoard { board } | Self::FlipBoardGl { board },
+                W::FlipBoard { state, .. },
+            ) => board.set_text(&state.text),
             // Unreachable: `apply` rebuilds on a kind mismatch rather than
             // calling this. Dropping the update is the harmless outcome if that
             // ever stops being true.
@@ -3150,7 +3193,8 @@ impl Renderer {
                 gauge.advance(dt);
                 true
             }
-            Self::FlipBoard { board } => {
+            // Both board arms, one expression — see `update`.
+            Self::FlipBoard { board } | Self::FlipBoardGl { board } => {
                 if board.is_settled() || !advances(dt) {
                     return false;
                 }
@@ -3233,7 +3277,7 @@ impl Renderer {
             // …and the same property for the gauge, for free rather than by
             // construction: both arms read the one `kit::Gauge` they share.
             Self::Gauge { gauge } | Self::GaugeGl { gauge, .. } => !gauge.is_settled(),
-            Self::FlipBoard { board } => !board.is_settled(),
+            Self::FlipBoard { board } | Self::FlipBoardGl { board } => !board.is_settled(),
         }
     }
 
@@ -3269,7 +3313,8 @@ impl Renderer {
             | Self::MarqueeGl { .. }
             | Self::TextBoxGl { .. }
             | Self::LedStripGl { .. }
-            | Self::SevenSegGl { .. } => return None,
+            | Self::SevenSegGl { .. }
+            | Self::FlipBoardGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
         })
@@ -3375,6 +3420,17 @@ impl Renderer {
             Self::SevenSegGl { readout } => Some((
                 preem_gl::SEVEN_SEG,
                 preem_gl::seven_seg_surface(readout, &kit::palette_snapshot(style)),
+            )),
+            // The board's per-cell payload is a function of its **clock**, not
+            // of its text, so it is encoded here rather than cached on a state
+            // change — see `FlipBoardGl`'s own docs on why #911's rule does not
+            // reach this widget.
+            Self::FlipBoardGl { board } => Some((
+                preem_gl::FLIP_BOARD,
+                preem_gl::flip_board_surface(
+                    &preem_gl::encode_cards(board),
+                    &kit::palette_snapshot(style),
+                ),
             )),
             _ => None,
         }
@@ -3614,7 +3670,8 @@ fn dots(offset: f32, period: usize) -> usize {
 /// to the second rasterises nothing and is never rebuilt onto the kit: a
 /// permanently blank chip, with no warning and no fallback.
 ///
-/// `None` when `build` declines the widget (the `force_unsupported` test knob).
+/// `None` when `build` declines the widget (the `force_unsupported` test
+/// knob).
 #[cfg(test)]
 pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
     let renderer = build(widget)?;
@@ -3636,7 +3693,16 @@ pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
 /// `cfg(test)`-only, since nothing outside a test needs a widget's *kind* —
 /// only whether its renderer draws on the GPU, which [`Renderer::is_gl`]
 /// answers without naming one.
+///
+/// **`unnecessary_wraps` is allowed deliberately**, and #1155 is when it
+/// started firing: with the flip board's arm, *every* wire kind names a
+/// `Kind`, so the `Option` currently has no `None` arm. Unwrapping it would
+/// make "does this widget kind have a GL arm at all" unaskable — it is the
+/// question this function exists for, `every_gl_kind_widget_takes_the_gl_arm`
+/// reads both answers, and the day the vocabulary grows a kind with no
+/// pipeline the honest answer has to be sayable without a signature change.
 #[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind> {
     use vocab::PreemWidget as W;
     match widget {
@@ -3647,7 +3713,7 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
         W::TextBox { .. } => Some(preem_gl::Kind::TextBox),
         W::LedStrip { .. } => Some(preem_gl::Kind::LedStrip),
         W::SevenSeg { .. } => Some(preem_gl::Kind::SevenSeg),
-        W::FlipBoard { .. } => None,
+        W::FlipBoard { .. } => Some(preem_gl::Kind::FlipBoard),
     }
 }
 
@@ -3760,6 +3826,15 @@ mod tests {
                 config: vocab::SevenSegConfig::default(),
                 state: vocab::SevenSegState {
                     text: "12:34".into(),
+                },
+            },
+            // Not the vocabulary default either, for the readout's reason: a
+            // blank board is a bezel and eight ghost cards, which a renderer
+            // that only painted the fixture would match.
+            W::FlipBoard {
+                config: vocab::FlipBoardConfig::default(),
+                state: vocab::FlipBoardState {
+                    text: "12:34:56".into(),
                 },
             },
         ];

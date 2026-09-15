@@ -391,8 +391,12 @@ impl Plugin for BridgeChip {
         let now = usage::now_unix();
         let report = self.usage.as_ref();
         if self.is_bar {
-            View::new(chip(&self.status, report, now))
-                .panel(panel(&self.title, &self.status, report, now))
+            View::new(chip(&self.status, report, now)).panel(panel(
+                &self.title,
+                &self.status,
+                report,
+                now,
+            ))
         } else {
             View::new(card(&self.title, &self.status, report, now))
         }
@@ -1400,7 +1404,10 @@ mod tests {
             assert_eq!(key, "HYTTE_PLUGIN_MOUNT");
             Some("SidebarRightTop".to_owned())
         };
-        assert_eq!(effective_mount(DEFAULT_MOUNT, &lookup), Mount::SidebarRightTop);
+        assert_eq!(
+            effective_mount(DEFAULT_MOUNT, &lookup),
+            Mount::SidebarRightTop
+        );
         assert!(!effective_mount(DEFAULT_MOUNT, &lookup).is_bar());
         assert_eq!(MOUNT_ENV, "HYTTE_PLUGIN_MOUNT");
     }
@@ -2280,7 +2287,8 @@ mod tests {
         let board = default_status();
         let off = captured_report();
         assert!(
-            !texts(&panel(DEFAULT_TITLE, &board, Some(&off), now())).contains(&"Extra usage".to_owned()),
+            !texts(&panel(DEFAULT_TITLE, &board, Some(&off), now()))
+                .contains(&"Extra usage".to_owned()),
             "a disabled allowance is not a row"
         );
 
@@ -2322,7 +2330,12 @@ mod tests {
     #[test]
     fn a_successful_panel_carries_no_failure_footer() {
         let board = status(Mode::Subscription, false, 9, 0, Last::Ok);
-        let text = texts(&panel(DEFAULT_TITLE, &board, Some(&captured_report()), now()));
+        let text = texts(&panel(
+            DEFAULT_TITLE,
+            &board,
+            Some(&captured_report()),
+            now(),
+        ));
         assert!(
             !text.iter().any(|t| t.starts_with("usage ")),
             "a success names no failure: {text:?}"

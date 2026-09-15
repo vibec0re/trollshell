@@ -988,6 +988,7 @@ fn level(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Ink, Pins, with_pins};
     use super::{
         CARD_PAD_FX, CHARSET, DEFAULT_FLIP_SECS, DisplayStyle, FlipBoard, Frame, MAX_CELLS,
         MAX_SCALE, Mechanism, NOTDEF_CARD, PI, afterglow, cathode_stack, drum, flap_theta, font,
@@ -1036,6 +1037,111 @@ mod tests {
     /// One buffer row as bytes.
     fn row(frame: &Frame, y: usize) -> Vec<u8> {
         (0..frame.width()).flat_map(|x| frame.at(x, y)).collect()
+    }
+
+    // ── The rendered bytes, pinned by digest (#1155) ─────────────────────────
+
+    /// Every board state the digest below sweeps: `(cells, from, to, secs)`.
+    ///
+    /// The empty board, a single cell at the instant of its change, a settled
+    /// row, three points along one flip (two of them either side of
+    /// horizontal, which falls at `p = 1/√2`), a staggered whole-row change,
+    /// off-drum cards, and the [`MAX_CELLS`] row.
+    const DIGEST_BOARDS: [(usize, &str, &str, f32); 9] = [
+        (0, "", "", 0.0),
+        (1, " ", "8", 0.0),
+        (5, "12:34", "12:34", 0.0),
+        (5, "00:00", "12:34", 0.07),
+        (5, "00:00", "12:34", 0.19),
+        (5, "00:00", "12:34", 0.31),
+        (8, "88:88:88", "PREEM   ", 0.11),
+        (8, "        ", "åäö 💕", 0.23),
+        (MAX_CELLS, "", "DEPARTURES 12:34 PLATFORM 9", 0.17),
+    ];
+
+    /// Every geometry the digest sweeps: `(glyph_px, scale)` — the kit default,
+    /// the unscaled board the GL arm's 1:1 parity cases run at, and a coarser
+    /// card.
+    const DIGEST_METRICS: [(usize, usize); 3] = [(2, 2), (2, 1), (4, 2)];
+
+    /// One board driven into a digest state: settled on `from`, told to show
+    /// `to`, then advanced by `secs`.
+    fn digest_board(
+        mechanism: Mechanism,
+        (cells, from, to, secs): (usize, &str, &str, f32),
+        (glyph_px, scale): (usize, usize),
+    ) -> FlipBoard {
+        let mut board = FlipBoard::new(mechanism)
+            .cells(cells)
+            .glyph_px(glyph_px)
+            .scale(scale);
+        board.set_text(from);
+        board.settle();
+        board.set_text(to);
+        board.advance(secs);
+        board
+    }
+
+    /// FNV-1a 64 over every byte [`FlipBoard::render`] produces for
+    /// [`Mechanism::ALL`] × [`DisplayStyle::ALL`] × [`DIGEST_BOARDS`] ×
+    /// [`DIGEST_METRICS`], dimensions included.
+    fn render_digest() -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |byte: u8| {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        with_pins(
+            Pins {
+                ink: Ink::Base,
+                field: None,
+            },
+            || {
+                for mechanism in Mechanism::ALL {
+                    for style in DisplayStyle::ALL {
+                        for state in DIGEST_BOARDS {
+                            for metrics in DIGEST_METRICS {
+                                let frame = digest_board(mechanism, state, metrics).render(style);
+                                for dim in [frame.width(), frame.height()] {
+                                    for byte in u32::try_from(dim).unwrap_or(u32::MAX).to_le_bytes()
+                                    {
+                                        eat(byte);
+                                    }
+                                }
+                                for &byte in frame.data() {
+                                    eat(byte);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        hash
+    }
+
+    /// **The bytes this widget renders, pinned by digest** (#1155).
+    ///
+    /// #1155 gave the module an additive `pub` surface — the card metrics, the
+    /// per-cell state, the phase curves, the drum and the intensity constants —
+    /// so the shell's GL arm could *read* the kit rather than transcribe it
+    /// (the `Gauge::dial` / `SEVEN_SEG_BARS` precedent, #1148/#1154), and moved
+    /// the four inline `CARD_PAD_FX * g` spellings onto one
+    /// [`FlipBoard::glyph_pad`] that the published metrics answer with too. A
+    /// visibility change moves no byte by construction; that last one is a
+    /// refactor of a render path, and the only thing that can say it moved no
+    /// pixel is a function of every pixel — taken on the tree **before** it and
+    /// asserted on the tree after.
+    ///
+    /// Pinned under [`Ink::Base`] so the process-wide accent (an atomic other
+    /// tests move in parallel) cannot make it flaky.
+    ///
+    /// **Falsified** by moving any of the four card-metric constants, either
+    /// phase curve, the shading floor, the edge rule, the nixie's halo pair, or
+    /// the drum.
+    #[test]
+    fn the_rendered_bytes_are_pinned_by_digest() {
+        assert_eq!(render_digest(), 0x4ef1_e76c_9cb5_e33d);
     }
 
     // ── The host contract ────────────────────────────────────────────────────

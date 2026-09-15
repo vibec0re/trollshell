@@ -140,16 +140,26 @@ failing, and is re-read on the next poll after an edit — no plugin restart,
 the same live-reload `places.toml` gets.
 
 That schema has **two** writable surfaces, not one (#1227 item 1). Your own
-`~/.config/trollshell/agents.toml` is the overlay and always wins; nix owns
-the layer below it through `programs.trollshell.config.agents`
-(`nix/module-common.nix`), a typed option rendering the same keys into
-`/etc/xdg/trollshell/agents.toml` (NixOS module) or a store path spliced onto
-the shell unit's `XDG_CONFIG_DIRS` (home-manager). The two are genuinely
-merged rather than shadowing each other, and a rebuild never touches the
-overlay — so declaring the fleet-wide `socket` and `[display.*]` roster in
-nix while keeping a hand edit for the one machine's quirk is the intended
-shape. An unset option leaf renders no key at all, which is not the same as
-rendering the default: it leaves the decision to the layer below.
+`~/.config/trollshell/agents.toml` is the overlay; nix owns the layer below it
+through `programs.trollshell.config.agents` (`nix/module-common.nix`), a typed
+option rendering the same keys into `/etc/xdg/trollshell/agents.toml` (NixOS
+module) or a store path spliced onto the shell unit's `XDG_CONFIG_DIRS`
+(home-manager). The two are genuinely merged rather than shadowing each other,
+and a rebuild never touches the overlay — so declaring the fleet-wide `socket`
+and `[display.*]` roster in nix while keeping a hand edit for the one machine's
+quirk is the intended shape. An unset option leaf renders no key at all, which
+is not the same as rendering the default: it leaves the decision to the layer
+below.
+
+Which key wins depends on whether nix set it (#1227, Annika's call on #866,
+2026-09-15). A key you set in nix is **locked**: the rendered file carries a
+`_locked` list naming exactly those keys, the merge keeps the nix value however
+the overlay spells it, and an overlay line at one of them produces one journal
+line naming the subsystem, the key and the file — never a silent drop. A key
+nix does not set is untouched by any of that: the overlay wins when present,
+exactly as it always did. Since only the keys you actually set are rendered,
+`config.agents = { }` locks nothing at all, which is the "nix configuration
+options can be optional" half of that call.
 
 **Approvals have no knob either (#947 P3).** Pending hive approvals raise the
 shell's consent prompt, and that rides the same `host.sock` and the same

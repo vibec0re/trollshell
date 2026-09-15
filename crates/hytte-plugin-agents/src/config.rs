@@ -385,6 +385,13 @@ mod tests {
     /// bodies as plain strings, the same seam every other test in this file
     /// uses.
     ///
+    /// Since #1227 the fixture also carries the `_locked` list nix renders
+    /// beside the values, so this test is where the wire between the two
+    /// halves is checked: the marker must be stripped before the schema sees
+    /// it (no `unknown_keys` entry, no field), and
+    /// [`hytte_config::subsystem::Loaded::locked`] must come back naming
+    /// exactly the five leaves the nix example set.
+    ///
     /// Falsification: change one key in the fixture without changing the
     /// nix example that produced it (or vice versa), and either this test
     /// or `nix build .#checks.x86_64-linux.nixos-module-agents-fixture`
@@ -399,6 +406,23 @@ mod tests {
             assemble::<AgentsConfig>(&[(path, body)]).expect("the nix-rendered fixture assembles");
         assert!(loaded.unknown_keys.is_empty(), "{:?}", loaded.unknown_keys);
         loaded.config.validate().expect("the fixture validates");
+
+        assert_eq!(
+            loaded.locked.iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "display.argus.icon",
+                "display.trollshell-choom.label",
+                "display.trollshell-choom.project",
+                "poll_seconds",
+                "socket",
+            ],
+            "#1227: the lock names exactly the leaves the nix example set"
+        );
+        assert!(
+            loaded.lock_findings.is_empty(),
+            "a base layer alone has nothing above it to refuse: {:?}",
+            loaded.lock_findings
+        );
 
         let mut display = BTreeMap::new();
         display.insert(

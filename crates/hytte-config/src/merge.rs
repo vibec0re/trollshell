@@ -6,7 +6,7 @@
 //!
 //! | | rule |
 //! |---|---|
-//! | **scalars** | the overlay wins **when the key is present**; an *absent* key falls through to the layer below, an explicitly-unset one removes it |
+//! | **scalars** | the overlay wins **when the key is present**, *unless a layer below locked that key* (#1227); an *absent* key falls through to the layer below, an explicitly-unset one removes it |
 //! | **tables**  | deep merge, key by key |
 //! | **arrays**  | **replace, never append** |
 //! | **unknown keys** | warn, never fail |
@@ -96,6 +96,68 @@
 //! It is a `warn!` that changes no behaviour, and the alternative is silence on
 //! the likelier typo — the invisible failure this crate exists to argue
 //! against.
+//!
+//! # A key a layer below has pinned (#1227)
+//!
+//! Rule 1 says "the overlay wins when present". Mara asked for the one
+//! exception (#866, 2026-09-13: "i want the values i set in nix to not be
+//! shadowable in the state one"), Annika settled it on by default and per key
+//! (#866, 2026-09-15: "fine by me that nix config has precedence - as long as
+//! nix configuration options can be optional"), and this is where it is
+//! honoured.
+//!
+//! A layer declares the keys it pins in [`LOCKED_KEY`], beside the values
+//! themselves — nix renders one entry per option leaf the operator actually
+//! set, so an option nobody sets locks nothing and the "options stay optional"
+//! half is a property of the *rendering* rather than a knob here:
+//!
+//! ```toml
+//! # base layer, written by nix
+//! _locked = ["brightness", "core.color"]
+//! brightness = 3
+//!
+//! [core]
+//! color = "amber"
+//! ```
+//! ```toml
+//! # your overlay
+//! brightness = 7           # refused, reported: the base layer pinned it
+//! [core]
+//! color = "cyan"           # refused, reported
+//! label = "front"          # fine: an unlocked sibling still overlays
+//! ```
+//!
+//! Three properties are worth stating, because each is a way to get this
+//! wrong:
+//!
+//! * **A lock binds the layers *above* it, never the one it is written in.**
+//!   [`merge_all_locked`] accumulates the set as it folds, so the locking
+//!   layer's own values land first and every later layer is measured against
+//!   them. That is also why the overlay's own [`LOCKED_KEY`] is inert rather
+//!   than special-cased away: there is no layer above it to bind.
+//! * **A refusal is reported, never silent.** [`Merged::shadowed`] names the
+//!   layer and the key for every attempt, once per key per layer, and
+//!   [`crate::subsystem::assemble`] turns each into the journal line and the
+//!   [`crate::subsystem::Finding`] a settings UI reads. Dropping the value
+//!   without saying so is the invisible failure the three sections above
+//!   already argue against; this one costs the operator an edit they believe
+//!   took effect.
+//! * **[`UNSET_KEY`] cannot bypass it.** `_unset = ["brightness"]` against a
+//!   locked key is an override attempt like any other — it is refused and
+//!   reported, or the lock would be one line away from meaningless.
+//!
+//! Paths are dotted from the table the marker appears in, so a top-level
+//! `_locked = ["core.color"]` and a `_locked = ["color"]` inside `[core]` mean
+//! the same thing. Nix renders the first spelling. Locking a *table* path
+//! locks it whole; locking a leaf under it leaves its siblings alone, and a
+//! replacement that would take a locked descendant with it (a scalar written
+//! over a table holding one) is refused as a whole. Arrays are atomic, because
+//! rule 3 makes them atomic: locking an array key locks the array.
+//!
+//! The marker never reaches the schema, for [`UNSET_KEY`]'s reasons and by the
+//! same mechanism; [`malformed_locked`] is [`malformed_unset`]'s twin, so a
+//! `_locked = "brightness"` that pins nothing is said out loud rather than
+//! dropped.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -106,6 +168,105 @@ use std::fmt;
 /// in this workspace uses that shape, so it cannot collide with a real key.
 pub const UNSET_KEY: &str = "_unset";
 
+/// Reserved key naming the keys **this layer pins against every layer above
+/// it** (#1227) — see the module docs.
+///
+/// Underscore-prefixed for [`UNSET_KEY`]'s reason, and deliberately the same
+/// spelling shape: the two markers are the only vocabulary this module adds to
+/// a subsystem's file, and a reader who has met one should recognise the other.
+pub const LOCKED_KEY: &str = "_locked";
+
+/// One override a [`LOCKED_KEY`] refused, as data.
+///
+/// Carries no message, unlike [`MalformedUnset`] and [`InertUnset`]: the
+/// sentence the operator needs names the subsystem *and* the file they must
+/// edit ("`core-leds.brightness` is set in nix and cannot be overridden from
+/// ~/.config/trollshell/core-leds.toml"), and this module has never seen
+/// either. [`crate::subsystem::assemble`] composes it, from the one format
+/// string there, so there is no second rendering here to drift from it.
+///
+/// `#[non_exhaustive]` for [`InertUnset`]'s reason: every construction site is
+/// in this crate and a third field (the layer that declared the lock, say) is
+/// plausible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Shadowed {
+    /// Index into the layers handed to [`merge_all_locked`] — the layer that
+    /// tried to override, not the one that locked the key.
+    pub layer: usize,
+    /// Dotted path of the key the override was refused on.
+    pub key: String,
+}
+
+/// What [`merge_all_locked`] learned folding the layers together.
+///
+/// `#[non_exhaustive]`: every construction site is in this crate, and this is
+/// the shape a fifth merge rule would grow a field on.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Merged {
+    /// The merged table, with every [`UNSET_KEY`] and [`LOCKED_KEY`] marker
+    /// gone — the same table [`merge_all`] returns.
+    pub table: toml::Table,
+    /// Dotted paths every layer declared locked, unioned. Returned as data so
+    /// a settings UI can grey a row (and a save can skip it) without
+    /// re-parsing the base layers itself.
+    pub locked: BTreeSet<String>,
+    /// Every override the locks refused, in layer order. One entry per key per
+    /// layer: an overlay that both unsets and re-sets the same locked key made
+    /// one mistake and gets one report.
+    pub shadowed: Vec<Shadowed>,
+}
+
+/// Where a lock refusal is recorded while one layer is merged.
+///
+/// Threaded as an `Option` rather than being folded into a second copy of
+/// [`merge_into`]: the two functions would be the same forty lines with four
+/// `if`s moved, and "the locked path is skipped" has to hold at every depth
+/// and in the [`UNSET_KEY`] arm as well as the assignment one.
+struct Locks<'a> {
+    locked: &'a BTreeSet<String>,
+    layer: usize,
+    shadowed: &'a mut Vec<Shadowed>,
+    /// Paths already reported **for this layer**, so one key costs one report
+    /// however many ways this layer tried to move it.
+    seen: &'a mut BTreeSet<String>,
+}
+
+impl Locks<'_> {
+    /// Whether a *whole-value* write at `path` may not happen, recording the
+    /// refusal if so.
+    ///
+    /// Refused when `path` is locked itself **or** when it is the root of a
+    /// subtree holding a locked path: rules 1 and 3 replace whole, so writing
+    /// a scalar over a table would take a locked leaf underneath it with it,
+    /// and the refusal has to be whole too.
+    fn refuses(&mut self, path: &str) -> bool {
+        let under = format!("{path}.");
+        let hit = self.locked.contains(path) || self.locked.iter().any(|l| l.starts_with(&under));
+        hit && self.record(path)
+    }
+
+    /// [`Self::refuses`] for the deep-merge arm, where a lock *inside* the
+    /// table is honoured by the recursion rather than here: only an exact lock
+    /// on the table itself stops the descent.
+    fn refuses_exactly(&mut self, path: &str) -> bool {
+        self.locked.contains(path) && self.record(path)
+    }
+
+    /// Always `true` — the return is a convenience for the two predicates
+    /// above, not a verdict.
+    fn record(&mut self, path: &str) -> bool {
+        if self.seen.insert(path.to_owned()) {
+            self.shadowed.push(Shadowed {
+                layer: self.layer,
+                key: path.to_owned(),
+            });
+        }
+        true
+    }
+}
+
 /// Merge `overlay` onto `base` in place, applying the three structural rules.
 ///
 /// Only keys the overlay actually mentions are touched, which is the whole of
@@ -115,46 +276,91 @@ pub const UNSET_KEY: &str = "_unset";
 /// A malformed [`UNSET_KEY`] is dropped rather than honoured; run
 /// [`malformed_unset`] over the same table *before* merging if you want to
 /// **say** so.
+///
+/// [`LOCKED_KEY`] markers are stripped but **not honoured** here: a lock binds
+/// the layers *above* the one that declared it, and a two-table merge has no
+/// layer order to read that from. [`merge_all_locked`] is where locking
+/// happens.
 pub fn merge_into(base: &mut toml::Table, overlay: &toml::Table) {
+    merge_into_locked(base, overlay, "", &mut None);
+}
+
+fn merge_into_locked(
+    base: &mut toml::Table,
+    overlay: &toml::Table,
+    prefix: &str,
+    locks: &mut Option<Locks<'_>>,
+) {
     // The explicit-unset half of "absent is not null". Runs first so an
     // overlay may both unset an inherited key and set a fresh value for it.
     if let Some(names) = overlay.get(UNSET_KEY).and_then(toml::Value::as_array) {
         for name in names.iter().filter_map(toml::Value::as_str) {
+            // #1227: erasing a locked key is an override like any other. Left
+            // out, the lock would be one `_unset` line away from meaningless —
+            // the removed key falls back to `DEFAULT_TOML`, which is exactly
+            // the value nix was asked to displace.
+            if locks
+                .as_mut()
+                .is_some_and(|l| l.refuses(&format!("{prefix}{name}")))
+            {
+                continue;
+            }
             base.remove(name);
         }
     }
 
     for (key, value) in overlay {
-        if key == UNSET_KEY {
+        if key == UNSET_KEY || key == LOCKED_KEY {
             continue;
         }
-        match (base.get_mut(key.as_str()), value) {
-            // Tables: deep merge, key by key. Without this arm the whole
-            // sub-table would be replaced and every key the overlay did not
-            // restate would vanish.
-            //
-            // A union of keys, so the result carries a key the schema owns iff
-            // some layer did — which is what lets rule 2's reader-side
-            // corollary (#1025, module docs) be asked once of the merged table
-            // rather than layer by layer, and lets a marker's erasure be
-            // honoured *before* it is asked. The corollary reads nothing but
-            // the merged table: whether a block ended up empty because a marker
-            // emptied it or because the user typed it that way is a difference
-            // it deliberately does not consult (#1088 review, M2).
-            (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_into(into, from),
+        let path = format!("{prefix}{key}");
+        // Tables: deep merge, key by key. Without this branch the whole
+        // sub-table would be replaced and every key the overlay did not
+        // restate would vanish.
+        //
+        // A union of keys, so the result carries a key the schema owns iff
+        // some layer did — which is what lets rule 2's reader-side corollary
+        // (#1025, module docs) be asked once of the merged table rather than
+        // layer by layer, and lets a marker's erasure be honoured *before* it
+        // is asked. The corollary reads nothing but the merged table: whether
+        // a block ended up empty because a marker emptied it or because the
+        // user typed it that way is a difference it deliberately does not
+        // consult (#1088 review, M2).
+        //
+        // An `if let`/`else` rather than the two-armed `match` this was until
+        // #1227: the lock check made each branch a block, which is exactly
+        // when `clippy::single_match_else` starts asking for this shape.
+        if let (Some(toml::Value::Table(into)), toml::Value::Table(from)) =
+            (base.get_mut(key.as_str()), value)
+        {
+            // Only an *exact* lock stops the descent. A lock deeper inside is
+            // honoured one level down, which is what lets a locked
+            // `core.color` sit beside an overlayable `core.label` in the table
+            // the overlay is restating.
+            if locks.as_mut().is_some_and(|l| l.refuses_exactly(&path)) {
+                continue;
+            }
+            merge_into_locked(into, from, &format!("{path}."), locks);
+        } else {
             // Everything else — scalars, arrays, and a table with nothing (or
             // a scalar) under it — replaces whole. An array is deliberately
             // not concatenated or merged element-wise: appending leaves no way
             // to remove an inherited element.
+            //
+            // The lock refusal here is the *whole-value* one, subtree included
+            // (#1227): a scalar written over a table carrying a locked leaf
+            // would take that leaf with it, and there is no partial
+            // replacement for this merge to fall back on.
             //
             // The replacement goes through `stripped` rather than being cloned
             // verbatim, which is what makes "the marker never survives" true
             // inside it too — including inside an array-of-tables element,
             // where a verbatim clone used to carry the marker through to the
             // schema as a bogus unknown key (#987).
-            _ => {
-                base.insert(key.clone(), stripped(value));
+            if locks.as_mut().is_some_and(|l| l.refuses(&path)) {
+                continue;
             }
+            base.insert(key.clone(), stripped(value));
         }
     }
 }
@@ -180,10 +386,19 @@ fn stripped(value: &toml::Value) -> toml::Value {
     }
 }
 
-/// A [`UNSET_KEY`] marker whose shape [`merge_into`] cannot honour.
+/// A reserved marker whose shape the merge cannot honour — a [`UNSET_KEY`]
+/// (from [`malformed_unset`]) or, since #1227, a [`LOCKED_KEY`] (from
+/// [`malformed_locked`]).
+///
+/// The name predates the second marker and is kept because the type is public,
+/// `#[non_exhaustive]` and identical for both: [`Self::key`] names the
+/// offending marker, whichever it is, and [`Self::found`] the type found where
+/// an array of key names was expected. The caller knows which function it
+/// called; [`crate::subsystem::FindingKind`] is where the two are told apart
+/// for a reader who did not.
 ///
 /// Reported rather than logged: the merge has never seen a file name, and with
-/// three or four candidate layers in play an unattributed "your `_unset` is
+/// three or four candidate layers in play an unattributed "your marker is
 /// malformed" is close to useless.
 ///
 /// `#[non_exhaustive]` because a third field is plausible — the layer it came
@@ -228,37 +443,60 @@ impl fmt::Display for MalformedUnset {
 #[must_use]
 pub fn malformed_unset(table: &toml::Table) -> Vec<MalformedUnset> {
     let mut out = Vec::new();
-    collect_malformed(table, "", &mut out);
+    collect_malformed(table, UNSET_KEY, "", &mut out);
     out
 }
 
-fn collect_malformed(table: &toml::Table, prefix: &str, out: &mut Vec<MalformedUnset>) {
-    match table.get(UNSET_KEY) {
+/// [`malformed_unset`]'s twin for [`LOCKED_KEY`] (#1227): every marker
+/// [`merge_all_locked`] will read past without pinning anything.
+///
+/// The same walk with the same reporting split, because it is the same defect
+/// one marker over — and a worse one to leave silent. A dropped `_unset` costs
+/// the user an erasure they can see did not happen; a dropped `_locked` in a
+/// nix-written base layer costs them the guarantee the whole feature is
+/// (#866: "the values I set in nix are not shadowable"), silently, in a file
+/// they never open.
+#[must_use]
+pub fn malformed_locked(table: &toml::Table) -> Vec<MalformedUnset> {
+    let mut out = Vec::new();
+    collect_malformed(table, LOCKED_KEY, "", &mut out);
+    out
+}
+
+fn collect_malformed(
+    table: &toml::Table,
+    marker: &'static str,
+    prefix: &str,
+    out: &mut Vec<MalformedUnset>,
+) {
+    match table.get(marker) {
         None => {}
         Some(toml::Value::Array(names)) => {
             for (i, name) in names.iter().enumerate() {
                 if name.as_str().is_none() {
                     out.push(MalformedUnset {
-                        key: format!("{prefix}{UNSET_KEY}[{i}]"),
+                        key: format!("{prefix}{marker}[{i}]"),
                         found: name.type_str(),
                     });
                 }
             }
         }
         Some(other) => out.push(MalformedUnset {
-            key: format!("{prefix}{UNSET_KEY}"),
+            key: format!("{prefix}{marker}"),
             found: other.type_str(),
         }),
     }
 
     for (key, value) in table {
         // Already reported above, and never a table worth descending into
-        // even when somebody writes one there.
-        if key == UNSET_KEY {
+        // even when somebody writes one there. Both markers are skipped
+        // whichever one is being checked: descending into the *other* one
+        // would attribute its contents a path that does not exist.
+        if key == UNSET_KEY || key == LOCKED_KEY {
             continue;
         }
         if let toml::Value::Table(nested) = value {
-            collect_malformed(nested, &format!("{prefix}{key}."), out);
+            collect_malformed(nested, marker, &format!("{prefix}{key}."), out);
         }
     }
 }
@@ -321,11 +559,12 @@ pub fn inert_unset(layers: &[toml::Table]) -> Vec<InertUnset> {
 }
 
 /// Every dotted key path in `table`, tables included, marker keys excluded —
-/// "what this layer sets". The marker itself is machinery, never a key a
-/// sibling marker could be naming.
+/// "what this layer sets". A marker ([`UNSET_KEY`] or [`LOCKED_KEY`]) is
+/// machinery, never a key a sibling marker could be naming, so
+/// `_unset = ["_locked"]` is inert rather than a key that "exists".
 fn collect_key_paths(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
     for (key, value) in table {
-        if key == UNSET_KEY {
+        if key == UNSET_KEY || key == LOCKED_KEY {
             continue;
         }
         let path = format!("{prefix}{key}");
@@ -357,7 +596,7 @@ fn collect_inert(
     }
 
     for (key, value) in table {
-        if key == UNSET_KEY {
+        if key == UNSET_KEY || key == LOCKED_KEY {
             continue;
         }
         if let toml::Value::Table(nested) = value {
@@ -379,13 +618,77 @@ pub fn merge(mut base: toml::Table, overlay: &toml::Table) -> toml::Table {
 /// Starts from an empty table rather than from the first layer so that even
 /// the bottom layer is normalised: an [`UNSET_KEY`] down there refers to
 /// nothing and is simply dropped, instead of leaking into the result.
+///
+/// [`merge_all_locked`]'s table, for the callers that have no use for the
+/// other two halves. There is deliberately no "merge without honouring the
+/// locks" spelling: one fold, one rule.
 #[must_use]
 pub fn merge_all<I: IntoIterator<Item = toml::Table>>(layers: I) -> toml::Table {
-    let mut out = toml::Table::new();
-    for layer in layers {
-        merge_into(&mut out, &layer);
+    merge_all_locked(layers).table
+}
+
+/// [`merge_all`], returning the lock set and every override it refused
+/// alongside the merged table (#1227).
+///
+/// The fold is what makes "a lock binds the layers above it" true: each
+/// layer is merged against the locks declared *so far*, and only then does its
+/// own [`LOCKED_KEY`] join the set. The locking layer's own values therefore
+/// land normally, and the top layer — the operator's overlay — can declare
+/// locks all it likes and bind nothing, which is the right answer rather than
+/// a case to special-case.
+///
+/// A malformed [`LOCKED_KEY`] pins nothing; run [`malformed_locked`] over each
+/// layer *before* folding if you want to **say** so, the same way
+/// [`malformed_unset`] pairs with [`merge_into`].
+#[must_use]
+pub fn merge_all_locked<I: IntoIterator<Item = toml::Table>>(layers: I) -> Merged {
+    let mut out = Merged::default();
+    for (layer, table) in layers.into_iter().enumerate() {
+        // Scoped so the shared borrow of `out.locked` ends before the line
+        // below extends it — the fold's whole ordering rule, in two lines.
+        {
+            let mut seen = BTreeSet::new();
+            let mut locks = Some(Locks {
+                locked: &out.locked,
+                layer,
+                shadowed: &mut out.shadowed,
+                seen: &mut seen,
+            });
+            merge_into_locked(&mut out.table, &table, "", &mut locks);
+        }
+        collect_locks(&table, "", &mut out.locked);
     }
     out
+}
+
+/// Every path `table` declares locked, dotted from `table`'s own root.
+///
+/// Walks nested tables, so a marker inside `[core]` locks `core.<name>` — the
+/// same relative-to-its-table reading [`UNSET_KEY`] has. Nix renders the
+/// top-level dotted spelling; a hand-written base layer may use either, and
+/// neither is silently swallowed. Arrays are not walked, for
+/// [`malformed_unset`]'s reason: rule 3 replaces them whole, so nothing inside
+/// one is addressable by a marker outside it.
+///
+/// A name that is itself dotted is taken as a path, which is what makes the
+/// two spellings equivalent — and carries the quoted-TOML-key ambiguity
+/// [`MalformedUnset::key`] documents, in the direction that at worst locks a
+/// key nobody asked to lock in a schema no member of this workspace has.
+fn collect_locks(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
+    if let Some(names) = table.get(LOCKED_KEY).and_then(toml::Value::as_array) {
+        for name in names.iter().filter_map(toml::Value::as_str) {
+            out.insert(format!("{prefix}{name}"));
+        }
+    }
+
+    for (key, value) in table {
+        if key == UNSET_KEY || key == LOCKED_KEY {
+            continue;
+        }
+        if let toml::Value::Table(nested) = value {
+            collect_locks(nested, &format!("{prefix}{key}."), out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -920,5 +1223,327 @@ mod tests {
 
         let keys: Vec<&str> = out.iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys, ["aa", "bb", "core.cc"]);
+    }
+
+    // ── #1227: the per-key nix lock ─────────────────────────────────────────
+
+    /// Fold `bodies` the way [`crate::subsystem::assemble`] does — lowest
+    /// precedence first — and hand back everything the locks learned.
+    fn folded(bodies: &[&str]) -> Merged {
+        merge_all_locked(bodies.iter().map(|b| table(b)))
+    }
+
+    /// The headline rule. A base layer that pins a key keeps its value
+    /// whatever the overlay says, and the attempt is reported rather than
+    /// swallowed.
+    ///
+    /// Red if the `refuses` guard in the fallthrough arm of `merge_into_locked`
+    /// goes away (`brightness` becomes 7), and red if the `shadowed.push` goes
+    /// away (no report).
+    #[test]
+    fn a_locked_scalar_keeps_the_base_value_and_the_attempt_is_reported() {
+        let out = folded(&[
+            "brightness = 1\n",
+            "_locked = [\"brightness\"]\nbrightness = 3\n",
+            "brightness = 7\n",
+        ]);
+
+        assert_eq!(
+            out.table["brightness"].as_integer(),
+            Some(3),
+            "nix has precedence per key (#866, 2026-09-15)"
+        );
+        assert_eq!(
+            out.shadowed,
+            vec![Shadowed {
+                layer: 2,
+                key: "brightness".into(),
+            }],
+            "and the refusal is named, once"
+        );
+        assert_eq!(
+            out.locked,
+            BTreeSet::from(["brightness".to_owned()]),
+            "the set the caller greys rows from"
+        );
+    }
+
+    /// Per **key**, not per file or per table: a locked key inside a table the
+    /// overlay is also editing costs that key and nothing else.
+    ///
+    /// Red if the deep-merge arm stops recursing with the lock context, and
+    /// red if `refuses_exactly` in that arm is widened to `refuses` (the whole
+    /// `[core]` table would be refused and `label` would be lost).
+    #[test]
+    fn a_locked_nested_key_is_kept_while_an_unlocked_sibling_still_overlays() {
+        let out = folded(&[
+            "_locked = [\"core.color\"]\n\n[core]\ncolor = \"amber\"\nlabel = \"front\"\n",
+            "[core]\ncolor = \"cyan\"\nlabel = \"back\"\n",
+        ]);
+
+        let core = out.table["core"].as_table().expect("a table");
+        assert_eq!(core["color"].as_str(), Some("amber"), "locked -> kept");
+        assert_eq!(
+            core["label"].as_str(),
+            Some("back"),
+            "its unlocked sibling still follows rule 1"
+        );
+        let keys: Vec<&str> = out.shadowed.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["core.color"], "one key refused, one report");
+    }
+
+    /// Rule 3 makes arrays atomic, so a locked array is atomic: the overlay's
+    /// whole replacement is refused rather than merged element-wise.
+    #[test]
+    fn a_locked_array_is_refused_whole() {
+        let out = folded(&[
+            "_locked = [\"palette\"]\npalette = [\"amber\", \"rust\"]\n",
+            "palette = [\"cyan\"]\n",
+        ]);
+
+        let palette: Vec<&str> = out.table["palette"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(palette, ["amber", "rust"]);
+        assert_eq!(out.shadowed.len(), 1, "{:?}", out.shadowed);
+    }
+
+    /// [`UNSET_KEY`] is an override attempt like any other. Without this the
+    /// lock is one line away from meaningless: the key would fall through to
+    /// `DEFAULT_TOML`, which is exactly the value nix was asked to displace.
+    ///
+    /// Red if the `refuses` guard in the [`UNSET_KEY`] loop goes away.
+    #[test]
+    fn an_unset_cannot_erase_a_locked_key() {
+        let out = folded(&[
+            "_locked = [\"brightness\"]\nbrightness = 3\n",
+            "_unset = [\"brightness\"]\n",
+        ]);
+
+        assert_eq!(
+            out.table["brightness"].as_integer(),
+            Some(3),
+            "erasing a locked key is overriding it"
+        );
+        assert_eq!(out.shadowed.len(), 1, "{:?}", out.shadowed);
+    }
+
+    /// One key, one report — however many ways one layer tried to move it.
+    ///
+    /// Red if the `seen` dedup in `Locks::record` goes away (two reports for
+    /// the one mistake), which is the mutation the "reported once at load"
+    /// half of the design is about.
+    #[test]
+    fn an_overlay_that_both_unsets_and_sets_a_locked_key_is_reported_once() {
+        let out = folded(&[
+            "_locked = [\"brightness\"]\nbrightness = 3\n",
+            "_unset = [\"brightness\"]\nbrightness = 7\n",
+        ]);
+
+        assert_eq!(out.table["brightness"].as_integer(), Some(3));
+        assert_eq!(
+            out.shadowed,
+            vec![Shadowed {
+                layer: 1,
+                key: "brightness".into(),
+            }],
+            "one mistake, one line to read"
+        );
+    }
+
+    /// A lock binds the layers **above** it and never the one that wrote it:
+    /// the locking layer's own value lands normally, or a base layer could not
+    /// set the key it is pinning.
+    ///
+    /// Red if [`merge_all_locked`] extends the lock set before merging the
+    /// layer rather than after (the base's own `brightness = 3` would be
+    /// refused and the result would be the bottom layer's 1).
+    #[test]
+    fn a_lock_binds_the_layers_above_it_and_not_the_one_that_wrote_it() {
+        let out = folded(&[
+            "brightness = 1\n",
+            "_locked = [\"brightness\"]\nbrightness = 3\n",
+        ]);
+
+        assert_eq!(out.table["brightness"].as_integer(), Some(3));
+        assert!(out.shadowed.is_empty(), "{:?}", out.shadowed);
+    }
+
+    /// …which is also why the top layer's own marker is inert rather than
+    /// special-cased away: there is nothing above it to bind.
+    #[test]
+    fn an_overlays_own_lock_binds_nothing() {
+        let out = folded(&[
+            "brightness = 3\n",
+            "_locked = [\"brightness\"]\nbrightness = 7\n",
+        ]);
+
+        assert_eq!(out.table["brightness"].as_integer(), Some(7));
+        assert!(out.shadowed.is_empty(), "{:?}", out.shadowed);
+    }
+
+    /// Two `XDG_CONFIG_DIRS` entries both declaring locks union, and the
+    /// earlier one still binds the later one.
+    #[test]
+    fn locks_from_two_base_layers_union() {
+        let out = folded(&[
+            "_locked = [\"a\"]\na = 1\nb = 1\nc = 1\n",
+            "_locked = [\"b\"]\na = 2\nb = 2\nc = 2\n",
+            "a = 9\nb = 9\nc = 9\n",
+        ]);
+
+        assert_eq!(
+            out.locked,
+            BTreeSet::from(["a".to_owned(), "b".to_owned()]),
+            "the union, not the last one's"
+        );
+        assert_eq!(out.table["a"].as_integer(), Some(1), "locked by layer 0");
+        assert_eq!(out.table["b"].as_integer(), Some(2), "locked by layer 1");
+        assert_eq!(out.table["c"].as_integer(), Some(9), "unlocked -> rule 1");
+
+        let named: Vec<(usize, &str)> = out
+            .shadowed
+            .iter()
+            .map(|s| (s.layer, s.key.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            [(1, "a"), (2, "a"), (2, "b")],
+            "layer 1's own attempt on `a` is refused too — a lock binds every \
+             layer above it, not only the top one"
+        );
+    }
+
+    /// A scalar written over a table holding a locked leaf is refused
+    /// **whole**: rules 1 and 3 replace whole, so a partial replacement is not
+    /// a thing this merge can express, and letting it through would take the
+    /// locked leaf with it.
+    ///
+    /// Red if `Locks::refuses`' subtree test (the `starts_with` half) goes
+    /// away.
+    #[test]
+    fn a_scalar_written_over_a_table_holding_a_locked_leaf_is_refused_whole() {
+        let out = folded(&[
+            "_locked = [\"core.color\"]\n\n[core]\ncolor = \"amber\"\n",
+            "core = \"red\"\n",
+        ]);
+
+        let core = out.table["core"]
+            .as_table()
+            .expect("the table survives the attempted replacement");
+        assert_eq!(core["color"].as_str(), Some("amber"));
+        let keys: Vec<&str> = out.shadowed.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["core"]);
+    }
+
+    /// Locking a table locks it whole — the one lock that is not a leaf, and
+    /// the reason [`crate::subsystem::Loaded::is_locked`] asks about ancestors.
+    #[test]
+    fn locking_a_table_locks_every_key_under_it() {
+        let out = folded(&[
+            "_locked = [\"core\"]\n\n[core]\ncolor = \"amber\"\n",
+            "[core]\ncolor = \"cyan\"\nlabel = \"back\"\n",
+        ]);
+
+        let core = out.table["core"].as_table().expect("a table");
+        assert_eq!(core["color"].as_str(), Some("amber"));
+        assert!(
+            !core.contains_key("label"),
+            "a locked table takes its whole shape with it: {core:?}"
+        );
+        let keys: Vec<&str> = out.shadowed.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["core"]);
+    }
+
+    /// The two spellings mean the same thing, so a hand-written base layer can
+    /// use either and nix's dotted one is not privileged.
+    #[test]
+    fn a_nested_locked_marker_means_the_same_as_a_dotted_top_level_one() {
+        let nested = folded(&[
+            "[core]\n_locked = [\"color\"]\ncolor = \"amber\"\n",
+            "[core]\ncolor = \"cyan\"\n",
+        ]);
+        let dotted = folded(&[
+            "_locked = [\"core.color\"]\n\n[core]\ncolor = \"amber\"\n",
+            "[core]\ncolor = \"cyan\"\n",
+        ]);
+
+        assert_eq!(nested.locked, BTreeSet::from(["core.color".to_owned()]));
+        assert_eq!(nested.locked, dotted.locked);
+        assert_eq!(nested.table, dotted.table);
+    }
+
+    /// The marker is machinery and must never reach the schema — at every
+    /// depth, and through a replacement, exactly as [`UNSET_KEY`] must not.
+    ///
+    /// Red if the `key == LOCKED_KEY` skip in `merge_into_locked` goes away.
+    #[test]
+    fn the_locked_marker_never_reaches_the_merged_table() {
+        let out = folded(&[
+            "_locked = [\"a\"]\na = 1\n\n[core]\n_locked = [\"color\"]\ncolor = \"amber\"\n",
+            "core = { _locked = [\"nope\"], fresh = 2 }\n",
+        ]);
+
+        assert!(!out.table.contains_key(LOCKED_KEY), "{:?}", out.table);
+        let core = out.table["core"].as_table().expect("a table");
+        assert!(
+            !core.contains_key(LOCKED_KEY),
+            "not at depth either: {core:?}"
+        );
+    }
+
+    /// [`merge_all`] is [`merge_all_locked`]'s table, so there is no second
+    /// merge with a second rule — a caller that wants only the table still
+    /// gets the locks honoured.
+    #[test]
+    fn merge_all_honours_a_lock_too() {
+        let out = merge_all([
+            table("_locked = [\"brightness\"]\nbrightness = 3\n"),
+            table("brightness = 7\n"),
+        ]);
+
+        assert_eq!(out["brightness"].as_integer(), Some(3));
+    }
+
+    /// A `_locked` the fold cannot read pins nothing, so it is found rather
+    /// than dropped in silence — the worse half of [`malformed_unset`]'s
+    /// argument, since the layer that wrote it is nix's.
+    #[test]
+    fn a_malformed_locked_marker_is_found_and_pins_nothing() {
+        let bad = table("_locked = \"brightness\"\nbrightness = 3\n");
+
+        let found = malformed_locked(&bad);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].key, "_locked");
+        assert_eq!(found[0].found, "string");
+        assert_eq!(
+            found[0].to_string(),
+            "_locked should be a key name, but is a string"
+        );
+
+        let out = merge_all_locked([bad, table("brightness = 7\n")]);
+        assert!(out.locked.is_empty(), "{:?}", out.locked);
+        assert_eq!(
+            out.table["brightness"].as_integer(),
+            Some(7),
+            "it really pinned nothing — which is what the finding is for"
+        );
+        assert!(!out.table.contains_key(LOCKED_KEY), "{:?}", out.table);
+    }
+
+    /// Each marker's check sees only its own shape: a well-formed `_unset`
+    /// beside a malformed `_locked` produces one finding, not two.
+    #[test]
+    fn the_two_marker_checks_do_not_report_each_other() {
+        let mixed = table("_unset = [\"gone\"]\n_locked = 3\ngone = 1\n");
+
+        assert!(malformed_unset(&mixed).is_empty(), "{mixed:?}");
+        let locked = malformed_locked(&mixed);
+        assert_eq!(locked.len(), 1, "{locked:?}");
+        assert_eq!(locked[0].key, "_locked");
+        assert_eq!(locked[0].found, "integer");
     }
 }

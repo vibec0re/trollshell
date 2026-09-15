@@ -229,6 +229,16 @@ const DEFAULT_TITLE: &str = "Claude usage";
 /// edition 2024), so a test that drove the real environment could not exist
 /// at all — the same reason `hytte-plugin-stats`'s `mount::effective` takes
 /// one, and the same shape.
+///
+/// Reading it twice is safe in the only way that matters: this is **strictly
+/// less permissive than the SDK's parser can be**, because the SDK has
+/// already refused the launch outright for any value it could not parse. By
+/// the time anything here runs, `HYTTE_PLUGIN_MOUNT` is either unset or a
+/// valid wire mount name — the fallback-to-`manifest_mount` arm below is
+/// unreachable in a live process and exists so this function is total and
+/// testable (`hytte-plugin-stats::mount`'s own doc makes the same claim for
+/// the identical shape; #1315's review found it survived only in this
+/// crate's test docstrings, not on the function itself).
 fn effective_mount(manifest_mount: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> Mount {
     lookup(MOUNT_ENV)
         .as_deref()
@@ -253,6 +263,26 @@ fn card_title(lookup: &dyn Fn(&str) -> Option<String>) -> String {
 /// above takes it as a parameter.
 fn env_lookup(key: &str) -> Option<String> {
     std::env::var(key).ok()
+}
+
+/// Both of [`Plugin::init`]'s launch-dependent fields, `(is_bar, title)`, in
+/// one function [`Plugin::init`] is the only caller of (#1315 review, MED 3).
+///
+/// `effective_mount` and `card_title` are well covered on their own — the
+/// gap this closes is the two lines that actually *thread* them into the
+/// model, which the review found unpinned: hardcoding either field in
+/// `init` (`is_bar: true`, or `title: DEFAULT_TITLE.to_owned()`) left every
+/// test green, because nothing exercised `init`'s own composition rather
+/// than the pure halves it calls. Pulling that composition out here, with
+/// `init` doing nothing but destructuring the result, means a test against
+/// *this* function is a test against `init` — there is no second place for
+/// the wiring to live that a test could miss (`hytte-plugin-stats::plugin`'s
+/// `settings_from` is the same shape, for the same reason).
+fn resolve_settings(manifest_mount: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> (bool, String) {
+    (
+        effective_mount(manifest_mount, lookup).is_bar(),
+        card_title(lookup),
+    )
 }
 
 /// How often the chip re-reads [`crate::status`] and [`crate::usage`]'s board.
@@ -354,12 +384,13 @@ impl Plugin for BridgeChip {
     }
 
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &env_lookup);
         Self {
             status: status::snapshot(),
             usage: usage::latest(),
             usage_version: usage::version(),
-            is_bar: effective_mount(DEFAULT_MOUNT, &env_lookup).is_bar(),
-            title: card_title(&env_lookup),
+            is_bar,
+            title,
         }
     }
 
@@ -668,6 +699,52 @@ fn label(text: &str, classes: &[&str]) -> Node {
     }
 }
 
+/// How many characters the title row shows before ellipsizing (#1315 review,
+/// MED 2).
+///
+/// `CLAUDE_BRIDGE_LABEL` is operator-set and unbounded — before this it was a
+/// bare `Node::Label`, whose natural width is its whole string with no cap at
+/// all, and `Node::Label` cannot wrap or ellipsize on the wire. Measured under
+/// `xvfb-run` in the real containers (`.ts-plugin-card` inside `AdwClamp`'s
+/// 320 px `maximum_size`, `.ts-plugin-panel` > `.ts-plugin-canvas` for the
+/// drawer), with the #1315 MED-1 `.ts-usage-card` padding already applied: an
+/// **uncapped** title's minimum request equals its full string width (a
+/// `GtkLabel` never shrinks below its own text), so a title past the design
+/// width is the exact `AdwClamp` "a card whose own minimum exceeds the cap is
+/// still allocated at its minimum" shape (`trollshell/src/overlays/sidebar.rs`)
+/// — a 31-character label alone measured a 364 px minimum against the 320 px
+/// design width, and the effect is **independent of length past the cap**: a
+/// 300-character label measured the same 364 px minimum uncapped, once
+/// ellipsized. An ellipsizing `Node::Text`'s minimum, by contrast, measured a
+/// constant ~162 px at every `max_width_chars` tried (14 through 24) —
+/// ellipsis is what makes the minimum small, not the cap value — so the
+/// overflow mode this constant exists to prevent cannot recur at any N; **20**
+/// is chosen for headroom rather than survival: it is the largest of the
+/// measured candidates whose *natural* width still measured comfortably under
+/// the 320 px design width (308 px, 12 px of margin) rather than saturating
+/// against `AdwClamp`'s own cap (320 px, from N=22 up) — and it matches
+/// `hytte-plugin-agents`'s `NAME_CHARS`, the same "one short sidebar-row label
+/// beside a spacer" shape.
+const TITLE_CHARS: i32 = 20;
+
+/// The title row's own label: ellipsizing and capped at [`TITLE_CHARS`], with
+/// its own full text as the hover (#1302's ask, #1315 review MED 2) — the
+/// `hytte-plugin-agents::clipped` shape, with the tooltip set **explicitly**
+/// rather than left to the host's ellipsize-with-no-tooltip default, so a
+/// falsification (dropping the cap, or dropping the tooltip) reds in this
+/// crate's own tests rather than depending on host behaviour this crate does
+/// not exercise.
+fn title_label(text: &str) -> Node {
+    Node::Text {
+        id: None,
+        text: text.to_owned(),
+        max_width_chars: Some(TITLE_CHARS),
+        ellipsize: true,
+        tooltip: Some(text.to_owned()),
+        classes: vec!["heading".to_owned()],
+    }
+}
+
 /// A symbolic icon node.
 fn icon(name: &str, classes: &[&str]) -> Node {
     Node::Icon {
@@ -774,10 +851,7 @@ fn header(title: &str, report: Option<&Report>, now: i64) -> Node {
             usage::humanise_since(now, report.numbers_at().unwrap_or(report.at))
         ),
     };
-    titled_row(
-        label(title, &["heading"]),
-        label(&freshness, &["dim-label"]),
-    )
+    titled_row(title_label(title), label(&freshness, &["dim-label"]))
 }
 
 /// One limit, as a drawer row: title + percent, a full-width bar, and a caption
@@ -1040,9 +1114,10 @@ pub fn run() -> ! {
 mod tests {
     use super::{
         BridgeChip, CARD_CLASS, CARD_LIST_ID, CARD_ROOT_ID, CHIP_BTN, CLAUDE_ICON, DEFAULT_MOUNT,
-        DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, MOUNT_ENV, PANEL_LIST_ID, PANEL_ROOT_ID, Tick,
-        capped, card, card_title, chip, chip_limits, counts_label, effective_mount, health_icon,
-        meter_tooltip, mode_label, mode_name, panel, severity_class, severity_role, tooltip,
+        DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, MOUNT_ENV, PANEL_LIST_ID, PANEL_ROOT_ID,
+        TITLE_CHARS, Tick, capped, card, card_title, chip, chip_limits, counts_label,
+        effective_mount, health_icon, meter_tooltip, mode_label, mode_name, panel,
+        resolve_settings, severity_class, severity_role, tooltip,
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
@@ -1153,11 +1228,35 @@ mod tests {
     /// chip is small enough that its full text is the assertion.
     fn texts(node: &Node) -> Vec<String> {
         match node {
-            Node::Label { text, .. } => vec![text.clone()],
+            // #1315 review MED 2: the title row's label is now an ellipsizing
+            // `Node::Text` (see `title_label`), not a `Node::Label` — this
+            // helper has to see both, or every text-content assertion in this
+            // module would silently stop seeing the title at all.
+            Node::Label { text, .. } | Node::Text { text, .. } => vec![text.clone()],
             Node::Icon { name, .. } => vec![name.clone()],
             Node::Button { child, .. } => texts(child),
             Node::Box { children, .. } | Node::Row { children, .. } => {
                 children.iter().flat_map(texts).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every `Node::Text` in a tree, `(text, max_width_chars, ellipsize,
+    /// tooltip)` — the #1315 review MED 2 fields, since `texts()` alone
+    /// collapses a `Text` down to its string and loses them.
+    fn ellipsized_texts(node: &Node) -> Vec<(String, Option<i32>, bool, Option<String>)> {
+        match node {
+            Node::Text {
+                text,
+                max_width_chars,
+                ellipsize,
+                tooltip,
+                ..
+            } => vec![(text.clone(), *max_width_chars, *ellipsize, tooltip.clone())],
+            Node::Button { child, .. } => ellipsized_texts(child),
+            Node::Box { children, .. } | Node::Row { children, .. } => {
+                children.iter().flat_map(ellipsized_texts).collect()
             }
             _ => Vec::new(),
         }
@@ -1195,8 +1294,14 @@ mod tests {
 
     /// Every tooltip in a tree, in render order.
     fn tooltips(node: &Node) -> Vec<String> {
+        // `Node::Text`'s own tooltip is `title_label`'s hover (#1315 review
+        // MED 2) — the one leaf tooltip this crate ever sets deliberately
+        // (every other label is `tooltip: None` on purpose, since the
+        // whole-pill hover lives on the chip's root box; see `label`'s doc).
         let own = match node {
-            Node::Box { tooltip, .. } | Node::Row { tooltip, .. } => tooltip.clone(),
+            Node::Box { tooltip, .. } | Node::Row { tooltip, .. } | Node::Text { tooltip, .. } => {
+                tooltip.clone()
+            }
             _ => None,
         };
         let children = match node {
@@ -1459,6 +1564,43 @@ mod tests {
         assert_eq!(LABEL_ENV, "CLAUDE_BRIDGE_LABEL");
     }
 
+    /// **#1315 review MED 3** — the two lines that thread the launch
+    /// environment into [`Plugin::init`]'s model are pinned here, not just
+    /// [`effective_mount`]/[`card_title`] in isolation. `init` calls nothing
+    /// but [`resolve_settings`] and destructures its result, so a test
+    /// against this function is a test against `init`'s own wiring.
+    ///
+    /// Falsify by hardcoding either return value inside `resolve_settings`:
+    ///
+    /// ```text
+    /// (true, card_title(lookup))                    // is_bar hardcoded
+    ///   -> the first assert (`!is_bar`) reds: the sidebar override never
+    ///      flips the family, so the card can never render on any mount.
+    /// (effective_mount(..).is_bar(), DEFAULT_TITLE.to_owned())  // title hardcoded
+    ///   -> the second assert (`title == "Home account"`) reds:
+    ///      `CLAUDE_BRIDGE_LABEL` is silently ignored.
+    /// ```
+    ///
+    /// Both arms are asserted **and** their opposite (the neutral, no-env
+    /// case still resolves to the manifest's own bar mount and
+    /// [`DEFAULT_TITLE`]), so this cannot pass by hardcoding either result
+    /// to what the first half of the test expects.
+    #[test]
+    fn resolve_settings_wires_the_mount_override_and_the_label_through_to_init() {
+        let overridden = |key: &str| match key {
+            "HYTTE_PLUGIN_MOUNT" => Some("SidebarRightTop".to_owned()),
+            "CLAUDE_BRIDGE_LABEL" => Some("Home account".to_owned()),
+            _ => None,
+        };
+        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &overridden);
+        assert!(!is_bar, "a sidebar override must flip the family off bar");
+        assert_eq!(title, "Home account");
+
+        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &|_| None);
+        assert!(is_bar, "no override keeps the manifest's own bar mount");
+        assert_eq!(title, DEFAULT_TITLE);
+    }
+
     /// The sidebar card, for the captured three-row response: the title row,
     /// every row [`panel`] would show, the `ts-usage-card` class and its own
     /// root/list ids.
@@ -1491,6 +1633,57 @@ mod tests {
                 }
             }
             other => panic!("the card root must be a box, got {other:?}"),
+        }
+    }
+
+    /// **#1315 review MED 2** — a 31-character `CLAUDE_BRIDGE_LABEL` (an
+    /// ordinary second-account name, e.g. `"Work subscription
+    /// (claude-work)"`) already exceeded the sidebar's 320 px design width
+    /// before this fix (measured: a plain, uncapped `Node::Label`'s minimum
+    /// request equals its whole string, so `AdwClamp` allocates the card at
+    /// that minimum rather than at its 320 px cap — see `TITLE_CHARS`'s own
+    /// doc for the measured numbers). The title row is now [`title_label`]:
+    /// capped and ellipsizing at [`TITLE_CHARS`], with the **full** string as
+    /// the hover — [`card`] and [`panel`] both route through it via
+    /// [`header`], so this is one assertion for both surfaces.
+    ///
+    /// The wire still carries the whole 300-character string — truncation to
+    /// the ellipsis is the host's rendering job, not this plugin's — but the
+    /// `max_width_chars`/`ellipsize` flags are what stop the overflow
+    /// regardless of how long the operator's string is: a 300-char label
+    /// measured the *same* ~162 px minimum under `xvfb-run` as a 31-char one
+    /// once ellipsized, where the *uncapped* `Node::Label` this replaces grew
+    /// its minimum with the string every time.
+    ///
+    /// Falsify by reverting [`title_label`] to `label(text, &["heading"])`:
+    /// `ellipsized_texts` finds nothing and the first assertion panics.
+    #[test]
+    fn a_300_char_label_is_capped_and_ellipsized_with_the_full_text_as_hover() {
+        let long = "x".repeat(300);
+        let report = captured_report();
+
+        for tree in [
+            card(&long, &default_status(), Some(&report), now()),
+            panel(&long, &default_status(), Some(&report), now()),
+        ] {
+            let titles = ellipsized_texts(&tree);
+            assert_eq!(
+                titles.len(),
+                1,
+                "exactly one ellipsizing node — the title row's label: {titles:?}"
+            );
+            let (text, max_width_chars, ellipsize, tooltip) = &titles[0];
+            assert_eq!(
+                text, &long,
+                "the wire carries the operator's whole string — the host ellipsizes it"
+            );
+            assert_eq!(*max_width_chars, Some(TITLE_CHARS));
+            assert!(*ellipsize, "without this flag a long cap still overflows");
+            assert_eq!(
+                tooltip.as_deref(),
+                Some(long.as_str()),
+                "the full label survives as the hover (#1302's ask)"
+            );
         }
     }
 

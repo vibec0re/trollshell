@@ -1147,7 +1147,15 @@ mod tests {
     /// right after the edge, before ever asking about a tick, so a stale
     /// tick landing late cannot be mistaken for the reopen's own.
     ///
-    /// **Falsified** by deleting the `parked.swap(…)` branch: `resets` stays 0.
+    /// **Falsified** by:
+    /// - deleting the `parked.swap(…)` branch: `resets` stays 0, every run;
+    /// - deleting `hytte_plugin::poll::Gate::next`'s `biased;`: 10/200 red
+    ///   under the same contention (0/200 idle) — the mechanism this test was
+    ///   originally fooled by is exactly what `biased` prevents: without it,
+    ///   a close racing a simultaneously-due tick from the still-open first
+    ///   window can lose the race and get deferred behind an extra,
+    ///   unrelated tick, delaying `parked`'s own reset past this test's
+    ///   direct check.
     #[tokio::test(start_paused = true)]
     async fn reopening_the_sidebar_re_baselines_before_it_reads() {
         let period = Duration::from_secs(1);
@@ -1210,24 +1218,23 @@ mod tests {
     /// flight — the one thing that made the sibling test's `ticks() >
     /// before` proxy foolable is structurally absent here.
     ///
-    /// This is also where the module's ordering invariant is exercised: on
-    /// the hidden→visible edge, [`hytte_plugin::poll::Gate::next`] resets its
-    /// own interval and returns [`Wake::Refresh`] for the edge **before**
-    /// ever polling `interval.tick()` again (its `, if open` guard excludes
-    /// that branch entirely while `self.visible` is still `false`, and its
-    /// `biased;` ordering prefers a ready command over a simultaneously-due
-    /// tick once open) — so a due tick can never be handed back ahead of the
-    /// edge that was supposed to reset it. This task's own `parked.swap(…)`
-    /// reset then runs synchronously, before the `spawn_blocking` read it
-    /// gates. Falsifying either half (below) reds this test.
+    /// This task's own `parked.swap(…)` reset runs synchronously, strictly
+    /// before the `spawn_blocking` read it gates — that half is exercised and
+    /// falsified directly below. The other half of the invariant — that
+    /// [`hytte_plugin::poll::Gate::next`]'s `, if open` guard and `biased;`
+    /// ordering are what keep a due tick from ever being handed back ahead of
+    /// the edge in the first place — lives one crate over and is exercised
+    /// there and by the sibling test, not by this one: this test starts
+    /// hidden and drives exactly one edge, with no earlier open to leave a
+    /// stray tick racing the close the way the sibling test's history shows
+    /// (see its own #1313 note) — so `biased` has nothing to arbitrate here.
+    /// Measured (200 runs, `taskset -c 0-3` plus four pinned burners): both
+    /// deleting `biased;` and deleting `Gate`'s `self.reset()` leave this
+    /// test green throughout; the sibling test is what catches the former,
+    /// and `hytte_plugin::poll`'s own suite catches the latter (below).
     ///
-    /// **Falsified** by:
-    /// - deleting `hytte_plugin::poll::Gate`'s `self.reset()` call on the
-    ///   open edge — the `assert_eq!(calls.sequence(), vec!["reset"])` still
-    ///   passes (this task's own reset is independent), but see the sibling
-    ///   falsification table in the PR body for what that breaks instead;
-    /// - deleting the `parked.swap(…)` branch here: `calls.sequence()` never
-    ///   contains `"reset"` at all.
+    /// **Falsified** by deleting the `parked.swap(…)` branch here:
+    /// `calls.sequence()` never contains `"reset"` at all.
     #[tokio::test(start_paused = true)]
     async fn a_tick_due_while_hidden_never_reads_before_the_unpark_reset() {
         let period = Duration::from_secs(1);

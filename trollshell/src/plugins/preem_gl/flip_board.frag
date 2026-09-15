@@ -198,9 +198,9 @@ int strip_int(int index) {
 // `flip_board.rs`'s `pack_glyph`. The kit indexes a row's bits from the *left*
 // (`GLYPH_W - 1 - col`), and so does this.
 int glyph_bit(int lo, int hi, int row, int col) {
-    int packed = row < 4 ? lo : hi;
+    int word = row < 4 ? lo : hi;
     int shift = (row < 4 ? row : row - 4) * 5;
-    int bits = (packed >> shift) & 31;
+    int bits = (word >> shift) & 31;
     return (bits >> (GLYPH_W - 1 - col)) & 1;
 }
 
@@ -447,30 +447,34 @@ int texel(sampler2D tex, ivec2 p) {
     return int(texelFetch(tex, p, 0).r * 255.0 + 0.5);
 }
 
-// A blurred layer read at a **continuous** grid position: the four texels
-// around `p` mixed bilinearly (#1186, verbatim from `dot_matrix.frag`).
+// **There is no `halo_at` here, and that is a decision** (#1186's tap,
+// deliberately not taken).
 //
-// Its `+ 0.5` is a truncation boundary the geometry reaches at an integer
-// stretch, exactly as `seven_seg.frag`'s does, and it is deliberately left
-// alone for the same reason: the boundary is reached with a non-zero value, so
-// there is no exact numerator to lean on, and moving it would change the
-// bloom's bytes everywhere rather than only where an implementation could
-// disagree. It is worth one 255th of `glow`, which the scaling below and the
-// `max` can only shrink. The snapped branch never reaches it.
-int halo_at(sampler2D tex, vec2 p) {
-    vec2 t = p - 0.5;                   // texel centres sit at integer + 0.5
-    vec2 base = floor(t);
-    vec2 f = t - base;
-    ivec2 lo = ivec2(0, 0);
-    ivec2 hi = u_grid - 1;
-    ivec2 a = clamp(ivec2(base), lo, hi);
-    ivec2 b = clamp(ivec2(base) + 1, lo, hi);
-    float v00 = float(texel(tex, ivec2(a.x, a.y)));
-    float v10 = float(texel(tex, ivec2(b.x, a.y)));
-    float v01 = float(texel(tex, ivec2(a.x, b.y)));
-    float v11 = float(texel(tex, ivec2(b.x, b.y)));
-    return int(mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y) + 0.5);
-}
+// `dot_matrix.frag` and `seven_seg.frag` read their blurred layer bilinearly on
+// the continuous branch, so a stretched chip's bloom is not a grid staircase.
+// This widget reads it with a plain `texelFetch` at the fragment's logical
+// pixel instead, on both branches, for two reasons that point the same way:
+//
+//   * **it is what the kit does.** Those two widgets have no upscale at all —
+//     their pitch *is* their size knob — so their grid is already the buffer a
+//     chip is drawn at and a bilinear read invents nothing. A flip board's
+//     grid is the *pre-upscale* buffer and `Frame::upscale` replicates the
+//     finished halo, so reading it bilinearly would be this arm inventing a
+//     halo the kit never draws.
+//   * **it is what keeps the supersampled standard meetable.** A board is a
+//     glowing card row on a flat bezel, so the halo reaches pixels whose
+//     reference value is the flat field — `regions()`' `field` bin. Measured
+//     with the bilinear tap in place, `flip_board.vfd.split-flap.rollingx2`
+//     came back `field[n=292 mean 0.110 max 4]`, i.e. `interior_max == 4`, and
+//     a supersampled case must be bit-identical off every rasterisation edge.
+//     The one thing here that genuinely cannot be point-sampled is the fold,
+//     because a rotating card moves *between* rows; everything else is the
+//     kit's own replication and matching it exactly is the whole point.
+//
+// The consequence, stated rather than left to be discovered: a **nixie** has no
+// continuous geometry at all, so with the halo point-sampled its frame is
+// byte-identical to the kit's at every scale and its supersampled cases measure
+// the replication rather than an improvement. See `flip_board.rs`'s module docs.
 
 // `hytte-preem/src/style.rs`'s `mix`: `a` toward `b` by `t`/255, channel-wise,
 // with the same `+ 127` rounding.
@@ -608,14 +612,13 @@ void main() {
     }
 
     // `Emission::bloom`, twice: the nixie's wide haze and then the skin's own,
-    // each max-combined under the original. The reads are gated exactly the way
-    // the sample point is (#1186) — a single `texelFetch` on the snapped
-    // branch, which is what keeps the 1:1 cases bit-exact, and the bilinear tap
-    // on the continuous one.
+    // each max-combined under the original. Both reads are point samples at the
+    // fragment's logical pixel on **either** branch — see the note above
+    // `mix_kit` on why this file does not take #1186's bilinear tap.
     int lit = board255(col, row, p, fstep, snapped);
-    int haze = snapped ? texel(u_tex1, ivec2(col, row)) : halo_at(u_tex1, pc);
+    int haze = texel(u_tex1, ivec2(col, row));
     lit = min(max(lit, min(haze * u_halo_strength / 256, 255)), 255);
-    int glow = snapped ? texel(u_tex2, ivec2(col, row)) : halo_at(u_tex2, pc);
+    int glow = texel(u_tex2, ivec2(col, row));
     lit = min(max(lit, min(glow * u_bloom_strength / 256, 255)), 255);
 
     // `Emission::composite`: unlit pixels are skipped *before* the mask is

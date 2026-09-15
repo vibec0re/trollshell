@@ -502,14 +502,71 @@ impl Kind {
             // spread over them, which is both why its honest numbers are the
             // second lowest and why a half-pixel shift moves it least.
             Self::SevenSeg => EdgeBudget { mean: 7.0, max: 48 },
-            // Four `scale = 2` cases, one per skin, at the state with the most
-            // card in flight — a whole row mid-flip, so every cell carries a
-            // fold boundary and a lit free edge at once. TODO(#1155): the
-            // measured pair goes here.
-            Self::FlipBoard => EdgeBudget {
-                mean: 16.0,
-                max: 64,
-            },
+            // **Eight** `scale = 2` cases, two per skin, at the state with the
+            // most card in flight — a whole row mid-change, so every cell
+            // carries a fold boundary and a lit free edge at once. Measured
+            // worst on llvmpipe (Mesa 26.2.1, the flake's own): edge mean
+            // **1.736** and edge max **65**, both on the oled. Per skin, split
+            // flap: vfd 1.050/58, lcd 0.486/33, oled 1.736/65, crt 0.878/51.
+            //
+            // **Four of the eight measure 0.000 / 0, and that is the shape of
+            // this kind rather than a gap.** The four are the **nixie**'s, and
+            // they are byte-identical to the kit on every skin: a tube is a
+            // cross-fade between two 5×7 bitmap cathodes, so it has no
+            // sub-pixel geometry at all, and everything this arm point-samples
+            // (the fixture, the glyphs, the halo, the CRT mask) is exactly what
+            // `Frame::upscale` replicates. Those cases therefore measure that
+            // the `scale > 1` path reproduces the kit's replication — a real
+            // statement, and the reason they are kept — but they carry no edge
+            // budget work and no drift of the *fold* can move them. The budget
+            // below is calibrated on the split flap's four alone, and a reader
+            // comparing "eight cases" against "four numbers" should find the
+            // reason here rather than in a run transcript.
+            //
+            // 2.5 / 96 is 1.44x the worst measured mean and 1.48x the worst
+            // measured max — a touch tighter on the mean than `SevenSeg`'s
+            // 1.51x, and deliberately so: measured, the `max` half cannot catch
+            // this kind's calibration drift on two of the four skins (see
+            // below), so the mean is doing the work alone and is sized to.
+            // A **sixth shape**: this kind's edge bin
+            // is the whole card row (1691–2522 px of 2860) because a card face
+            // is a ghost figure against the field, but almost all of it is
+            // bit-identical and the legitimate disagreement is confined to the
+            // two rows the fold's band boundary crosses — which is why the mean
+            // is the smallest of the six while the max is the second largest.
+            // A boundary row is where the kit averages the card's coverage over
+            // a whole logical pixel and this arm averages it over two half
+            // ones, so a single pixel there can legitimately swing a quarter of
+            // full contrast.
+            //
+            // **Calibrated against a drift it catches, measured rather than
+            // assumed.** The probe is #1153's, turned onto the axis this arm
+            // actually resolves: a half-native-pixel **vertical** offset of the
+            // sample point on the continuous branch alone —
+            // `if (!snapped) { p.y += fstep * 0.5; }` right after `fstep` in
+            // `flip_board.frag`'s `main`, a scale-only shift the 1:1 cases
+            // cannot see (all thirty-six stayed bit-exact under it). #1290's
+            // and #1294's probes shift `p.x`, which on this widget would move
+            // nothing at all: the fold is a function of `p.y` and the sample
+            // point's x is floored to a logical column before anything reads
+            // it. Under the vertical probe the four split-flap cases go to edge
+            // mean 3.497 / 2.840 / 6.085 / 2.862 and edge max 96 / 49 / 109 /
+            // 90, so **every one of the four reds**, and every one of them on
+            // the **mean**: the tightest are the lcd and the crt at 1.14x the
+            // ceiling. The four nixie cases are untouched by it, as they must
+            // be.
+            //
+            // **Which half catches it, since here only one does.** The probed
+            // lcd's edge max is **49** and the honest oled's is **65**, so no
+            // `max` that keeps the shipping frames green can red the probed
+            // lcd — the two populations overlap on that statistic. That is a
+            // property of the drift rather than of the budget: shifting the
+            // sampling window half a native pixel moves *every* boundary row a
+            // little and no boundary row a lot, where the seven-segment arm's
+            // horizontal shift moves a mitre's whole coverage. So `max: 96`
+            // is the honest ceiling on a single pixel (1.48x the worst
+            // measured) and the detector is `mean`.
+            Self::FlipBoard => EdgeBudget { mean: 2.5, max: 96 },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,

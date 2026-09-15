@@ -277,10 +277,10 @@ pub(crate) fn cards(board: &kit::FlipBoard) -> Cards {
         let (from_lo, from_hi) = pack_glyph(kit::flip_rows_of(cell.from));
         let (to_lo, to_hi) = pack_glyph(kit::flip_rows_of(cell.to));
         strip.extend_from_slice(&[
-            from_lo,
-            from_hi,
-            to_lo,
-            to_hi,
+            f32_of_bits(from_lo),
+            f32_of_bits(from_hi),
+            f32_of_bits(to_lo),
+            f32_of_bits(to_hi),
             band_lo,
             band_hi,
             edge_lo,
@@ -354,8 +354,8 @@ pub(crate) fn flip_board_surface(cards: &Cards, palette: &kit::PaletteSnapshot) 
                 ("u_cathode", GlValue::Int(i32::from(kit::NIXIE_CATHODE_T))),
                 // …and the unlit cathode stack, derived from the font by the
                 // kit rather than drawn here.
-                ("u_stack_lo", GlValue::Float(stack_lo)),
-                ("u_stack_hi", GlValue::Float(stack_hi)),
+                ("u_stack_lo", GlValue::Int(i32_of_bits(stack_lo))),
+                ("u_stack_hi", GlValue::Int(i32_of_bits(stack_hi))),
                 (
                     "u_ghost_on",
                     GlValue::Int(i32::from(palette.ghost.is_some())),
@@ -406,15 +406,15 @@ pub(crate) fn flip_board_surface(cards: &Cards, palette: &kit::PaletteSnapshot) 
     }
 }
 
-/// One glyph's seven 5-bit font rows as the two `f32` texels the strip carries:
-/// rows `0..4` in the first, `4..7` in the second, five bits each, low row
-/// first.
+/// One glyph's seven 5-bit font rows as two packed words: rows `0..4` in the
+/// first, `4..7` in the second, five bits each, low row first.
 ///
-/// Two texels rather than one because seven rows are 35 bits and an `f32`
-/// carries 24 exactly; two rather than seven because 20 and 15 bits both are.
-/// The kit indexes a row's bits from the *left* (`GLYPH_W - 1 - col`) and so
-/// does the shader, so only the row packing is this side's invention.
-fn pack_glyph(rows: [u8; kit::font::GLYPH_H]) -> (f32, f32) {
+/// Two words rather than one because seven rows are 35 bits and both an `f32`
+/// texel and an `int` uniform carry 24 exactly; two rather than seven because
+/// 20 and 15 bits both are. The kit indexes a row's bits from the *left*
+/// (`GLYPH_W - 1 - col`) and so does the shader, so only the row packing is
+/// this side's invention.
+fn pack_glyph(rows: [u8; kit::font::GLYPH_H]) -> (u32, u32) {
     let mut lo = 0_u32;
     let mut hi = 0_u32;
     for (index, bits) in rows.into_iter().enumerate() {
@@ -428,14 +428,21 @@ fn pack_glyph(rows: [u8; kit::font::GLYPH_H]) -> (f32, f32) {
             hi |= bits << ((index - 4) * kit::font::GLYPH_W);
         }
     }
-    (f32_of_bits(lo), f32_of_bits(hi))
+    (lo, hi)
 }
 
-/// A packed glyph word as the `f32` a texel carries. Bounded by `2^20`, far
-/// inside `f32`'s exact integer range.
+/// A packed glyph word as the `f32` a strip texel carries. Bounded by `2^20`,
+/// far inside `f32`'s exact integer range.
 #[allow(clippy::cast_precision_loss)]
 fn f32_of_bits(value: u32) -> f32 {
     value as f32
+}
+
+/// A packed glyph word as the `int` a uniform carries — the cathode stack's
+/// two, which are uniforms rather than strip texels because the stack is the
+/// same figure in every cell.
+fn i32_of_bits(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 /// A small buffer coordinate or count as an exact `f32` — `hytte-preem`'s own

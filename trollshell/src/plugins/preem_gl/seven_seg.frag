@@ -68,24 +68,44 @@
 // half-integer, so on a `(i + 0.5) / stretch` lattice every one of `face_cov`'s
 // operands lands exactly on the ramp's `0`, `0.5` or `1` — or a clear margin
 // from all three (half a ramp at the x2 the harness renders, a quarter at
-// stretch 3). Exactly on is fine: at the midpoint the numerator is exactly
-// `0.0`, so the divide is exact on any IEEE-754 arithmetic and
-// `255.0 * 0.5 + 0.5` is exactly `128.0`. A *millionth* off is not, because
-// then the last bit of whatever produced the sample point decides the byte —
-// and only the midpoint costs anything to cross, since an operand that should
-// be `0.0` and comes out `+ε` still rounds to the byte `0`, and one that
-// should be `1.0` and comes out `1 - ε` is still the largest thing the `min`
-// in `bar_cov` sees.
+// stretch 3). Exactly on is fine *if it is computed exactly*: at the midpoint
+// the numerator is exactly `0.0`, `0.0 / w` is `0.0` with no tolerance at all,
+// and `255.0 * 0.5 + 0.5` is exactly `128.0`. A *millionth* off is not,
+// because `int(…)` truncates there and the last bit of whatever produced the
+// sample point decides the byte. Only the midpoint costs anything to cross:
+// an operand that should be `0.0` and comes out `+ε` still rounds to the byte
+// `0`, and one that should be `1.0` and comes out `1 - ε` is still the largest
+// thing the `min` in `bar_cov` sees.
 //
-// Which is why `main` below builds the sample point from the fragment's own
-// integer index and reads `v_uv` only through a `floor` with a half-fragment
-// margin. GLSL ES pins `floor`, `+`, `*` and `/`; it pins nothing about how an
-// implementation evaluates an attribute's plane equation, and llvmpipe's lands
-// ~`1e-6` off — measured, 8455 operands of the harness's x2 clock face inside
-// `1e-3` of a decision point without being on one. On the rebuilt lattice that
-// count is zero, which
-// `seven_seg.rs`'s `the_continuous_branch_has_no_operand_near_a_decision_point`
-// asserts and whose negative control puts the millionth back.
+// **What GLSL ES actually pins** (3.20 §4.7.1, the profile `GLSL_HEADER`
+// selects) is the whole of the argument, so it is quoted rather than
+// paraphrased:
+//
+//     a + b, a - b, a * b      Correctly rounded.
+//     <, <=, ==, >, >=         Correct result.
+//     a / b, 1.0 / b           2.5 ULP for |b| in [2^-126, 2^126].
+//
+// Two consequences, and `main` below answers both:
+//
+//   * **Attribute interpolation is not in that table at all.** So the sample
+//     point is rebuilt from the fragment's own integer index, and `v_uv` is
+//     read only through a `floor` with a half-fragment margin. Measured on
+//     llvmpipe, the interpolant lands ~`1e-6` off the lattice — 8455 operands
+//     of the harness's x2 clock face inside `1e-3` of a decision point without
+//     being on one. On the rebuilt lattice that count is **zero**.
+//   * **`/` is 2.5 ULP, not exact.** A shader forming `grid / viewport` itself
+//     may be handed it 2.5 ULP of its own magnitude off — 3.8e-5 at a sample
+//     point reaching 188 buffer pixels, 38x the interpolation error above, and
+//     enough on its own to move the chamfer's exact `0.5` to `0.49992` and the
+//     byte to `127`. So that divide is `u_px_step`, done once on the CPU where
+//     IEEE-754 says correctly rounded, and the shader multiplies.
+//
+// `seven_seg.rs`'s `the_coverage_operands_are_never_near_a_decision_point`
+// asserts what that buys, with a negative control that puts the millionth
+// back. The **other** rounding boundary on this branch is `halo_at`'s
+// `int(mix(…) + 0.5)`, which is reached and is deliberately left alone — see
+// `the_halo_tap_rounds_on_a_boundary_the_geometry_reaches` for the census and
+// the reason.
 //
 // # Why this pipeline has a blur pass where `led_strip.frag` does not
 //
@@ -151,6 +171,11 @@ uniform ivec2 u_grid;       // the buffer, which for this widget *is* native:
                             // there is no upscale, the cell metrics are the
                             // size knob (the dot matrix's situation, #1091)
 uniform ivec2 u_viewport;   // the pass's viewport — equal to the grid at 1:1
+uniform vec2 u_px_step;     // `vec2(u_grid) / vec2(max(u_viewport, 1))`, the
+                            // device→buffer step — **divided on the CPU**
+                            // (`gl_surface.rs`, #1298) because GLSL ES 3.20
+                            // §4.7.1 allows `a / b` 2.5 ULP and pins `*`
+                            // exactly; see the header
 uniform int u_cells;        // display cells, digits and colons together
 uniform int u_pad;          // `hytte_preem::SEVEN_SEG_PAD`: every cell's top
                             // edge, and the field padding around the readout
@@ -379,6 +404,24 @@ int texel(sampler2D tex, ivec2 p) {
 // around `p` mixed bilinearly (#1186, verbatim from `dot_matrix.frag` — see
 // that file for why this is hand-written rather than a filtered `texture()`
 // call, and why `CLAMP_TO_EDGE`'s border behaviour is spelled out here).
+//
+// **The `+ 0.5` here is the branch's second rounding boundary, and the
+// geometry reaches it** (#1298). At an integer stretch `f` is exactly
+// `{0.25, 0.75}` and the four taps are integers, so the bilinear result is a
+// multiple of `1/16` and lands on `k + 0.5` exactly — 583 / 0 / 374 / 796
+// native pixels of 13160 on the harness's vfd / lcd / oled / crt x2 clock
+// faces (`seven_seg.rs`'s
+// `the_halo_tap_rounds_on_a_boundary_the_geometry_reaches`, which is where
+// those numbers are re-derivable; the lcd's `0` is `palette.bloom` being
+// `None`, so the aux is identically zero and no mix of zeroes can land on a
+// half). It is **deliberately left as it is**:
+// unlike the chamfer's, this boundary is reached with a non-zero value, so
+// there is no exact numerator to lean on, and moving it would change the
+// bloom's bytes everywhere rather than only where an ISA could disagree. It
+// is worth one 255th of `glow`, which `glow * u_bloom_strength / 256` and the
+// `max` below can only shrink — the same ±1 bound the coverage carries, and
+// the reason the claim upstream is about `face_cov`'s operands rather than
+// about this whole branch.
 int halo_at(vec2 p) {
     vec2 t = p - 0.5;                   // texel centres sit at integer + 0.5
     vec2 base = floor(t);
@@ -484,30 +527,37 @@ void main() {
     // interpolation within ±0.5 of a fragment — which is the tolerance the
     // `col`/`row` point sampling below already lived on.
     //
-    // That margin is the whole point. GLSL ES pins `floor`, `+` and `*` to a
-    // correctly rounded result, and pins nothing at all about how an
-    // implementation evaluates an attribute's plane equation — and the
-    // continuous branch's residuals are **exactly** on their coverage
+    // That margin is the whole point. GLSL ES 3.20 §4.7.1 pins `floor`, `+`,
+    // `-` and `*` to a **correctly rounded** result; it pins nothing at all
+    // about how an implementation evaluates an attribute's plane equation —
+    // and the continuous branch's residuals are **exactly** on their coverage
     // thresholds at an integer stretch (see `bar_cov`'s note below), so a
-    // sample point that is a millionth of a pixel off the lattice decides a
-    // comparison by rounding luck rather than by geometry. Measured on
-    // llvmpipe at the harness's x2 clock face: 837 fragment/bar pairs sit
-    // exactly on the chamfer's ramp midpoint and another 2215 within 1e-3 of a
-    // threshold without being on it, the closest 1e-6 away. Rebuilt from `i`
-    // the lattice is exact, and every one of those operands is either exactly
-    // on a threshold — where the chamfer's numerator is exactly `0.0`, so the
-    // division is exact on any IEEE-754 arithmetic and `255 * 0.5 + 0.5` is
-    // exactly `128.0` — or a quarter of a buffer pixel away from one.
+    // sample point a millionth of a pixel off the lattice decides a comparison
+    // by rounding luck rather than by geometry. Measured on llvmpipe at the
+    // harness's x2 clock face before this was rebuilt: 2215 of the chamfer's
+    // operands landed within 1e-3 of a decision point *without being on one*,
+    // the closest 1e-6 away.
+    //
+    // `gl_FragCoord` cannot stand in for `v_uv` here, and that is the one
+    // "simplification" a later reader will reach for: the screen pass narrows
+    // the viewport to the **letterbox fit rect**, whose origin is not the
+    // framebuffer's, and this file has no uniform for that origin.
+    // `LAYER_LIT` above may use `gl_FragCoord` because its pass renders at
+    // `(0, 0, w, h)`. `fullscreen.vert`'s own header says the same thing.
     vec2 fi = clamp(floor(v_uv * vp), vec2(0.0), vp - 1.0);
     // …the same fragment as a **top-down** device-pixel centre, which is the
     // kit's row order (`gl_FragCoord`/`v_uv` run bottom-up, and this is the
     // one flip in the pipeline — see `LAYER_LIT`'s note above).
     vec2 px = vec2(fi.x, vp.y - 1.0 - fi.y) + 0.5;
-    // …and in buffer units. `* grid` is exact (a buffer dimension times a
-    // half-integer index, both far inside `2^24`), and the divide's exact
-    // quotient is representable at every stretch where a residual can land on
-    // a threshold at all, which is the only place it has to be.
-    vec2 pc = px * vec2(float(cols), float(rows)) / vp;
+    // …and in buffer units, by **one multiply**. §4.7.1 allows `a / b` 2.5
+    // ULP, which at `pc` up to 188 is 3.8e-5 — 38x the interpolation error
+    // this rebuild removes and more than enough to walk the chamfer's exact
+    // `0.5` off its own threshold — so the divide is `u_px_step`, done once on
+    // the CPU where IEEE-754 says "correctly rounded". At a power-of-two
+    // stretch that uniform is exactly `1/2^k` and `px` is an exact
+    // half-integer, so this product is exact and every residual below it is
+    // too.
+    vec2 pc = px * u_px_step;
     // Point sampling into the letterboxed fit rect, as `scope_blit.frag` does
     // it — used for the CRT pass, which is a grid-resolution quantity by
     // definition (`MaskRow` is a row of the *buffer*), and for the snapped
@@ -519,10 +569,12 @@ void main() {
 
     bool snapped = (u_viewport == u_grid);
     vec2 p = snapped ? vec2(float(col), float(row)) + 0.5 : pc;
-    // The fragment's footprint in buffer units. Exactly `(1, 1)` on the snapped
-    // branch by construction rather than by a division that happens to land
-    // there — and unread there anyway, since `snapped` takes the point test.
-    vec2 fp = snapped ? vec2(1.0) : vec2(float(cols), float(rows)) / vp;
+    // The fragment's footprint in buffer units, which is the same step — the
+    // device→buffer ratio *is* how much buffer one fragment covers. Exactly
+    // `(1, 1)` on the snapped branch by construction rather than by a division
+    // that happens to land there — and unread there anyway, since `snapped`
+    // takes the point test.
+    vec2 fp = snapped ? vec2(1.0) : u_px_step;
 
     ivec4 bg = ivec4(u_bg + 0.5);
     ivec4 ink = ivec4(u_ink + 0.5);

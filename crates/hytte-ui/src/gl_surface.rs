@@ -284,9 +284,9 @@ pub struct GlUniforms {
     /// program does not declare resolves to location `-1`, which GL ignores —
     /// so one bag can feed passes that each use a subset of it.
     ///
-    /// The surface adds five of its own on top, which a bag must not shadow:
-    /// `u_grid`, `u_viewport`, `u_data_len`, `u_step_back`, and the `u_tex0…`
-    /// samplers.
+    /// The surface adds six of its own on top, which a bag must not shadow:
+    /// `u_grid`, `u_viewport`, `u_px_step`, `u_data_len`, `u_step_back`, and
+    /// the `u_tex0…` samplers.
     pub values: Vec<(&'static str, GlValue)>,
     /// The 1-D `R32F` data strip, uploaded as `u_data_len` texels. `None`
     /// binds a 1×1 zero texture and sets `u_data_len` to `0`.
@@ -1630,6 +1630,32 @@ mod imp {
                 [
                     i32::try_from(viewport.0).unwrap_or(i32::MAX),
                     i32::try_from(viewport.1).unwrap_or(i32::MAX),
+                ],
+            );
+            // **The device→buffer step, divided here rather than in the
+            // shader** (#1298). GLSL ES 3.20 §4.7.1 pins `a + b`, `a - b` and
+            // `a * b` to a correctly rounded result and allows `a / b` and
+            // `1.0 / b` **2.5 ULP** — so a shader that forms `grid / viewport`
+            // itself can be handed the quotient 2.5 ULP of *its own magnitude*
+            // off, which for a sample point that reaches 188 buffer pixels is
+            // 3.8e-5, and a coverage function with a residual sitting exactly
+            // on a threshold then decides a byte by the driver's divide.
+            // Rust's `f32` division is IEEE-754 correctly rounded, so at an
+            // integer power-of-two stretch (the common one: a scale-2 monitor,
+            // and what the `preem_gl_diff` harness renders) this is *exactly*
+            // `1/2^k` and the shader's `px * u_px_step` is a single exact
+            // multiply. At any other ratio it is the correctly rounded value,
+            // which is the best a float can hold and identical on every host.
+            //
+            // Per axis, because `fit_rect` scales to the tighter one in
+            // integers and the two need not come out equal.
+            #[allow(clippy::cast_precision_loss)]
+            program.set_vec2(
+                gl,
+                "u_px_step",
+                [
+                    self.grid.0 as f32 / viewport.0.max(1) as f32,
+                    self.grid.1 as f32 / viewport.1.max(1) as f32,
                 ],
             );
             program.set_int(gl, "u_data_len", i32::try_from(self.data_len).unwrap_or(0));

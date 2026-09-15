@@ -127,11 +127,16 @@ use crate::workspace_stacks::{self, StackState, state_of};
 
 /// CSS class on an app icon whose app has at least one window open on the
 /// card's workspace.
-const APP_RUNNING_CLASS: &str = "ts-ws-app-running";
+///
+/// `pub(crate)` since #1312's review LOW 5: the Edit form's row icon is the
+/// same running/idle state for the same reason, on the same kind of widget
+/// (a `gtk::Image`), so it reuses this class rather than inventing a second
+/// one with no stylesheet rule behind it.
+pub(crate) const APP_RUNNING_CLASS: &str = "ts-ws-app-running";
 
 /// The complement of [`APP_RUNNING_CLASS`] — a saved app of the stack with no
-/// window open.
-const APP_IDLE_CLASS: &str = "ts-ws-app-idle";
+/// window open. `pub(crate)` for the same reason.
+pub(crate) const APP_IDLE_CLASS: &str = "ts-ws-app-idle";
 
 /// CSS class on a card that is not on a screen (#1071 §5).
 const CARD_INACTIVE_CLASS: &str = "ts-ws-card-inactive";

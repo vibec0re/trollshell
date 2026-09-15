@@ -14,13 +14,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hytte::services::niri::{Window, WindowLayout, Workspace, WorkspaceAction};
+use hytte::services::systemd;
 
 use super::{
-    AppStart, AutostartPlan, Launchable, Launched, Layout, Ops, Stack, StackApp, StackState,
-    StartError, StopStep, Unresolvable, Workspaces, app_start, autostart_all, autostart_driver,
-    autostart_plan, autostart_tick, column_order_batch, may_stop, missing_apps, move_to_monitor,
-    names_to_release, order_index, plan_start, release_lingering_names, save, start, state_of,
-    stop, stop_plan, stray_moves,
+    APP_STARTING, AppStart, AutostartPlan, Launchable, Launched, Layout, Ops, Stack, StackApp,
+    StackState, StartError, StopStep, Unresolvable, Workspaces, app_start, app_starting_key,
+    autostart_all, autostart_driver, autostart_plan, autostart_tick, column_order_batch, may_stop,
+    missing_apps, move_to_monitor, names_to_release, order_index, plan_start,
+    release_lingering_names, run_app_start, run_app_start_bounded, save, start, state_of, stop,
+    stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 
@@ -156,6 +158,9 @@ struct State {
     /// pid → unit, for `unit_for_pid`.
     units: BTreeMap<u32, String>,
     launch_error: Option<String>,
+    /// #1312 review MED-3: when set, `launch` never returns — the "wedged
+    /// `systemd-run`" case [`APP_STARTING_CEILING`] exists for.
+    launch_hangs: bool,
     /// When set, the scripted `workspaces.toml` write fails with it.
     save_error: Option<String>,
     /// desktop id → the entry `$XDG_DATA_DIRS` would have yielded. Absent = the
@@ -166,6 +171,11 @@ struct State {
     /// The argv of every launch, in order — `Call::Launch` carries only the unit
     /// name, and #1071 §3.2 is entirely about what ends up after the `--`.
     argvs: Vec<Vec<String>>,
+    /// The slice of every launch, in order (#1312) — `Call::Launch` carries
+    /// only the unit name, and the editor row's direct start is only as good
+    /// as Stop's ability to reap it, which is a property of the slice, not the
+    /// unit name alone.
+    slices: Vec<Option<String>>,
     /// The `(name, stack)` of every `save_stack`, in order. `Call::SaveStack`
     /// carries only the name, and #1071 §3.7 is about what is *in* the entry the
     /// Save creates.
@@ -251,6 +261,11 @@ impl Script {
         self.0.borrow().argvs.clone()
     }
 
+    /// The slice of every launch, in order.
+    fn launch_slices(&self) -> Vec<Option<String>> {
+        self.0.borrow().slices.clone()
+    }
+
     /// The `(name, stack)` of every `workspaces.toml` write, in order.
     fn saved_stacks(&self) -> Vec<(String, Stack)> {
         self.0.borrow().saved_stacks.clone()
@@ -285,6 +300,12 @@ impl Script {
 
     fn with_slice_up(self, name: &str) -> Self {
         self.0.borrow_mut().slices_up.insert(name.to_owned());
+        self
+    }
+
+    /// A `launch` that never returns (#1312 review MED-3).
+    fn hangs_on_launch(self) -> Self {
+        self.0.borrow_mut().launch_hangs = true;
         self
     }
 
@@ -410,9 +431,15 @@ impl Ops for Script {
     }
 
     async fn launch(&self, launch: &Launch) -> Result<(), String> {
+        // Read and dropped before the `.await` below — never held across it.
+        let hangs = self.0.borrow().launch_hangs;
+        if hangs {
+            std::future::pending::<()>().await;
+        }
         let mut state = self.0.borrow_mut();
         state.calls.push(Call::Launch(launch.unit.clone()));
         state.argvs.push(launch.argv.clone());
+        state.slices.push(launch.slice.clone());
         state.launch_error.clone().map_or(Ok(()), Err)
     }
 
@@ -1461,6 +1488,194 @@ fn a_start_launches_every_entry_even_when_the_app_id_repeats() {
         vec![vec!["Alacritty".to_owned()], vec!["Alacritty".to_owned()]],
         "both entries actually ran the entry's Exec, not a warned-and-skipped no-op"
     );
+}
+
+// ── #1312: the editor row's direct single-app start ─────────────────────────
+
+/// The workspace editor's row icon starts one app directly through
+/// [`run_app_start`], without the rest of a [`start`] transaction — and it has
+/// to use the **identical** unit name, slice and argv a full Start would have
+/// used for that same app, or Stop's slice-wide reap and the card's Active
+/// derivation would not see it.
+///
+/// Asserted against a real [`start`] run on the same stack/name rather than a
+/// hand-written literal, so a change to `app_launch`'s naming cannot drift the
+/// two apart silently — this mirrors
+/// `a_start_resolves_each_apps_entry_and_launches_activates_or_warns` at index
+/// 1 rather than restating its fixture.
+///
+/// **The mutation**: routing the row's click through the whole stack (a full
+/// `start` for just this app) reds this on `launches().len()` — it would also
+/// launch index 0's Firefox, which this test's `direct` script never scripted
+/// an entry for and would therefore warn-and-skip instead of matching `full`'s
+/// second launch one-for-one.
+#[test]
+fn one_app_started_directly_matches_what_a_full_start_used_for_it() {
+    let alacritty = overridden("Alacritty", "alacritty -e weechat");
+    let stack = Stack {
+        apps: vec![by_id("org.mozilla.firefox"), alacritty.clone()],
+        ..Stack::default()
+    };
+
+    // The full Start, for comparison — index 1 is the override, so it needs no
+    // scripted entry either.
+    let before = vec![ws(1, 1, LEFT, None, true)];
+    let after = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    let full = Script::default()
+        .with_workspaces(&[before.clone(), before, after])
+        .with_entry("org.mozilla.firefox", "firefox --name firefox %u");
+    run(start(&full, "chat", &stack, &Workspaces::default())).expect("starts");
+    assert_eq!(
+        full.launches().len(),
+        2,
+        "both apps launched: {:?}",
+        full.calls()
+    );
+
+    // The row's own direct start of index 1 alone, on a fresh, unrelated
+    // script — `run_app_start` still asks niri where "chat" is (review HIGH),
+    // so it has to be scripted, but sends no batch of its own: the window
+    // opening in the right place already, so `reconcile` settles on its first
+    // read with nothing to move.
+    let direct = Script::default()
+        .with_workspaces(&[vec![ws(9, 1, LEFT, Some("chat"), false)]])
+        .with_windows(&[vec![win(50, 9, "Alacritty")]]);
+    run(run_app_start(&direct, "chat", 1, &alacritty)).expect("starts");
+    assert!(
+        direct.actions().is_empty(),
+        "no SetName, no Focus, no move — the window is already home: {:?}",
+        direct.calls()
+    );
+
+    assert_eq!(
+        direct.launches(),
+        vec![full.launches()[1].clone()],
+        "must use the same unit name a full Start gave this app"
+    );
+    assert_eq!(
+        direct.launch_argvs(),
+        vec![full.launch_argvs()[1].clone()],
+        "must use the same argv"
+    );
+    assert_eq!(
+        direct.launch_slices(),
+        vec![full.launch_slices()[1].clone()],
+        "must land in the same slice, so Stop still reaps it"
+    );
+    assert_eq!(
+        direct.launches().len(),
+        1,
+        "only the one app, not the whole stack: {:?}",
+        direct.calls()
+    );
+    // Sanity: the unit name really is `workspace_unit_name("chat", 1)`, not
+    // merely equal to whatever the full Start happened to produce.
+    assert_eq!(
+        direct.launches()[0],
+        systemd::workspace_unit_name("chat", 1)
+    );
+    assert_eq!(
+        direct.launch_slices()[0],
+        Some(systemd::workspace_slice_name("chat"))
+    );
+}
+
+/// #1312 review HIGH: with nowhere to put the window, [`run_app_start`]
+/// refuses rather than launching into whatever workspace happens to be
+/// focused.
+///
+/// **The mutation**: dropping the `named` check (launching unconditionally)
+/// reds this — `launches()` would carry one entry instead of none.
+#[test]
+fn a_direct_start_refuses_when_the_stack_has_no_workspace() {
+    let script = Script::default(); // no workspace named "chat" at all
+    let err = run(run_app_start(&script, "chat", 0, &by_id("Alacritty"))).expect_err("must refuse");
+    assert!(
+        err.contains("chat"),
+        "the refusal should name the stack: {err}"
+    );
+    assert!(
+        script.launches().is_empty(),
+        "nothing may launch with nowhere for its window to land: {:?}",
+        script.calls()
+    );
+}
+
+/// #1312 review HIGH: a direct start puts its window on the stack's own
+/// workspace the same way a full Start does — via [`reconcile`]/
+/// [`stray_moves`], not by focusing anything.
+///
+/// **The mutation**: deleting the `reconcile` call in [`run_app_start`] reds
+/// this — `actions()` would come back empty instead of carrying the move.
+#[test]
+fn a_direct_start_moves_a_stray_window_of_that_app_onto_the_stacks_workspace() {
+    let workspaces = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    // Opened on another workspace (2) after the before-snapshot, then found
+    // there again on the next read, then found moved home — three reads:
+    // the `before` snapshot, `reconcile`'s first tick, and its second.
+    let before: Vec<Window> = Vec::new();
+    let elsewhere = vec![win(50, 2, "Alacritty")];
+    let home = vec![win(50, 1, "Alacritty")];
+    let script = Script::default()
+        .with_workspaces(&[workspaces])
+        .with_windows(&[before, elsewhere, home])
+        .with_plain_entries(&["Alacritty"]);
+
+    run(run_app_start(&script, "chat", 0, &by_id("Alacritty"))).expect("starts");
+
+    assert_eq!(
+        script.actions(),
+        vec![WorkspaceAction::MoveWindow {
+            window: 50,
+            workspace: 1
+        }],
+        "the window that opened elsewhere must land on the stack's own \
+         workspace, and no `Focus`/`SetName` besides: {:?}",
+        script.calls()
+    );
+}
+
+/// #1312 review MED-3: a launch that never returns must not leave
+/// [`APP_STARTING`] set for the life of the shell — [`run_app_start_bounded`]
+/// bounds it at [`APP_STARTING_CEILING`], the same way [`run_start`] bounds a
+/// whole-stack Start at `STARTING_CEILING`.
+///
+/// Paused time (`tokio`'s `test-util`, already a dev-dependency for #435's
+/// `handshake_timeout_drops_a_silent_connection`), the same pattern
+/// `hytte-reactive::poll`'s tests use: with the wedged `launch` parking on
+/// [`std::future::pending`] forever, the ceiling's own timer is the *only*
+/// thing the runtime can make progress on, so tokio auto-advances straight to
+/// it rather than this test burning [`APP_STARTING_CEILING`] for real.
+///
+/// **The mutation**: deleting the `tokio::time::timeout` wrap in
+/// [`run_app_start_bounded`] (calling `run_app_start` directly) hangs this
+/// test rather than reding it — which is exactly the bug: nothing ever
+/// bounds the wedged launch, so there is no timer left for the paused clock
+/// to advance to.
+#[test]
+fn a_wedged_launch_is_bounded_and_the_marker_clears() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a current-thread runtime");
+    runtime.block_on(async {
+        tokio::time::pause();
+
+        let script = Script::default()
+            .with_workspaces(&[vec![ws(1, 1, LEFT, Some("chat"), false)]])
+            .with_plain_entries(&["Alacritty"])
+            .hangs_on_launch();
+
+        let key = app_starting_key("chat", 0);
+        APP_STARTING.lock_mut().insert(key.clone());
+
+        run_app_start_bounded(&script, "chat", 0, &by_id("Alacritty")).await;
+
+        assert!(
+            !APP_STARTING.get_cloned().contains(&key),
+            "the marker must clear once the ceiling fires, not stay set forever"
+        );
+    });
 }
 
 /// A D-Bus activation records **no unit**, because the bus started the process

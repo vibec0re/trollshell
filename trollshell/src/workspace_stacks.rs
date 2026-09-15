@@ -67,6 +67,21 @@ const SLICE_STOP_TICKS: u32 = 25;
 /// which is [`GRACE`] plus however long the apps take to launch.
 const STARTING_CEILING: Duration = Duration::from_secs(90);
 
+/// The ceiling on one editor row's own direct start (#1312 review MED-3).
+///
+/// Shorter than [`STARTING_CEILING`] on purpose: a full Start covers *every*
+/// app in the stack, sequentially, plus [`GRACE`]; [`run_app_start`] is one
+/// launch plus the same [`GRACE`] window (spent inside its own `reconcile`
+/// call), so it needs `GRACE` plus headroom for one `systemd-run`/D-Bus
+/// activation, not for a whole stack's worth. Without this, a wedged
+/// `Live::launch` (`.output().await` on `systemd-run`, no timeout of its own)
+/// or a wedged `Live::activate` (a `oneshot` fed from a `MainContext::invoke`
+/// closure that never runs) leaves [`APP_STARTING`] set — and unlike
+/// `STARTING`, closing and reopening the Edit form does not clear a
+/// process-global `Mutable`, so the row would stay a dead spinner for the
+/// life of the shell.
+const APP_STARTING_CEILING: Duration = Duration::from_secs(20);
+
 /// A card's state (#1071 §3.3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum StackState {
@@ -92,6 +107,30 @@ static STARTING: LazyLock<Mutable<BTreeSet<String>>> =
 /// Signal of the names with a Start in flight.
 pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
     STARTING.signal_cloned()
+}
+
+/// The `"<name>#<index>"` keys with a single-app start in flight (#1312) — the
+/// Edit form's own echo of [`STARTING`], scoped to one row rather than the
+/// whole stack: a click on the editor's dim icon runs [`run_app_start`]
+/// directly, without the rest of a full [`start`], so the card-level marker is
+/// the wrong shape for it (it would also disable every *other* row's icon and
+/// the whole card's Start/Stop button for the length of one launch).
+static APP_STARTING: LazyLock<Mutable<BTreeSet<String>>> =
+    LazyLock::new(|| Mutable::new(BTreeSet::new()));
+
+/// Signal of the `"<name>#<index>"` keys with a single-app start in flight.
+/// See [`APP_STARTING`].
+pub(crate) fn app_starting() -> impl Signal<Item = BTreeSet<String>> {
+    APP_STARTING.signal_cloned()
+}
+
+/// The key one editor row's in-flight marker is filed under in
+/// [`APP_STARTING`] — `name` and `index` together, the same pair
+/// [`app_launch`]'s own unit naming is keyed on, since a stack may legitimately
+/// list one desktop entry twice.
+#[must_use]
+pub(crate) fn app_starting_key(name: &str, index: usize) -> String {
+    format!("{name}#{index}")
 }
 
 /// The stacks with at least one unit up, as of the last poll.
@@ -755,6 +794,92 @@ pub(crate) fn app_start(
         desktop_entry::strip_field_codes(&desktop_entry::exec_words(&entry.exec)),
         Unresolvable::NoCommand,
     )
+}
+
+/// Start one app of `name`'s stack directly (#1312) — the workspace editor's
+/// row icon, rather than the whole [`start`] transaction.
+///
+/// Resolves the entry exactly the way [`start`]'s own per-app loop does (an
+/// `exec` override wins, otherwise [`Ops::desktop_entry`]) and dispatches
+/// through [`app_start`], so the [`Launch`] this produces carries the
+/// **identical** unit name and slice a full Start would have used for this
+/// app: [`app_launch`]'s naming is keyed on `name` and `index` alone, not on
+/// which caller reached it, so Stop's slice-wide reap and the card's
+/// `slice_up`/window `Active` derivation see this exactly as if the whole
+/// stack had been Started.
+///
+/// # Where the window lands (review HIGH)
+///
+/// Sending nothing to niri is not "less bookkeeping" — a launched program
+/// opens its window on whatever workspace is **focused**, and the Edit
+/// drawer's own opening does not change that, so the window would land
+/// wherever the user happened to be standing rather than in the stack. Read
+/// literally, `state_of`'s window check would then never see it, the row
+/// would never light, and a second click would collide with the first
+/// launch's still-pinned `--unit=`.
+///
+/// So this reads the stack's own workspace first — [`named`], the same
+/// case-insensitive match [`state_of`]/[`plan_start`] use — and **refuses**
+/// with no launch at all when the stack has none: there is nowhere to put the
+/// window, and the caller's own row is decoration in that state anyway
+/// (`panels::workspace_edit`'s `RowVisual::Decoration`). Once launched, this
+/// runs the *same* [`reconcile`] a full Start runs, over a synthetic one-app
+/// stack — [`stray_moves`] already does exactly "a new window of this app,
+/// wherever it landed, comes home" and costs no focus steal, which is the
+/// mechanism `Focus`ing the workspace would otherwise be needed for.
+///
+/// # Errors
+/// [`Ops::workspaces`]'s own error, `"{name} has no workspace to start
+/// into"` when the stack is not on one, whatever [`Ops::launch`]/
+/// [`Ops::activate`] said, or [`Unresolvable::reason`] when there was nothing
+/// to run at all.
+pub(crate) async fn run_app_start(
+    ops: &impl Ops,
+    name: &str,
+    index: usize,
+    app: &StackApp,
+) -> Result<(), String> {
+    let workspaces = ops.workspaces().await?;
+    let Some(workspace) = named(&workspaces, name).map(|w| w.id) else {
+        return Err(format!(
+            "{name} has no workspace to start into — start the whole stack first"
+        ));
+    };
+
+    let entry = match app.exec {
+        Some(_) => None,
+        None => ops.desktop_entry(&app.id).await,
+    };
+
+    // The pre-launch snapshot, the same leg `start` takes before its own
+    // per-app loop (#1071 §3.4 step 2): what tells this launch's window from
+    // one the user already had open of the same app, elsewhere.
+    let before: BTreeSet<u64> = ops.windows().await?.iter().map(|w| w.id).collect();
+
+    let units = match app_start(name, index, app, entry.as_ref()) {
+        AppStart::Unit(unit) => {
+            let unit_name = unit.unit.clone();
+            ops.launch(&unit).await?;
+            BTreeSet::from([unit_name])
+        }
+        // No unit: the bus started it, so it is in nobody's slice — same
+        // reasoning as `start`'s own `AppStart::Activate` arm.
+        AppStart::Activate { id } => {
+            ops.activate(&id).await?;
+            BTreeSet::new()
+        }
+        AppStart::Unresolved { id, why } => return Err(format!("{id}: {}", why.reason())),
+    };
+
+    let launched = Launched { before, units };
+    // A one-app "stack": `reconcile`/`stray_moves` only need `stack.apps` for
+    // their `wanted` set, and this is the whole set for a direct start.
+    let one = Stack {
+        apps: vec![app.clone()],
+        ..Stack::default()
+    };
+    reconcile(ops, &one, workspace, &launched).await;
+    Ok(())
 }
 
 /// Display/IPC variables to forward, and their values, for the ones this shell
@@ -2059,6 +2184,54 @@ pub(crate) fn spawn_stop(name: String) {
             report(&name, &format!("{name} did not stop: {e}"));
         }
     });
+}
+
+/// Run [`run_app_start`] on the runtime, holding the row in flight for its
+/// whole life (#1312) — [`app_starting`], the per-row echo of what
+/// [`spawn_start`] does for the whole card with [`STARTING`].
+///
+/// A second click on the same row while the first is still in flight is not a
+/// second start: `insert` answering `false` means the key was already there,
+/// same guard [`spawn_start`] uses.
+pub(crate) fn spawn_app_start(name: String, index: usize, app: StackApp) {
+    let key = app_starting_key(&name, index);
+    if !APP_STARTING.lock_mut().insert(key) {
+        return;
+    }
+    hytte::reactive::runtime::handle().spawn(async move {
+        run_app_start_bounded(&Live, &name, index, &app).await;
+    });
+}
+
+/// [`run_app_start`], bounded by [`APP_STARTING_CEILING`] and with
+/// [`APP_STARTING`] released on every exit path (#1312 review MED-3) — the
+/// per-row echo of what [`run_start`] does for the whole card with
+/// [`STARTING_CEILING`]/[`STARTING`].
+///
+/// Split out of [`spawn_app_start`] (mirroring [`run_start`]/[`spawn_start`])
+/// so a test can drive the ceiling itself: `spawn_app_start` reaches the
+/// process-wide tokio runtime, which a test cannot observe from the outside,
+/// while this is an ordinary `async fn` over an injected [`Ops`].
+async fn run_app_start_bounded(ops: &impl Ops, name: &str, index: usize, app: &StackApp) {
+    let key = app_starting_key(name, index);
+    let outcome =
+        tokio::time::timeout(APP_STARTING_CEILING, run_app_start(ops, name, index, app)).await;
+    // Released before the reporting, so a wedged launch cannot leave the row
+    // spinning for the life of the shell — `run_start`'s own reasoning for
+    // clearing `STARTING` before it reports.
+    APP_STARTING.lock_mut().remove(&key);
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => report(name, &format!("{} did not start: {e}", app.id)),
+        Err(_) => report(
+            name,
+            &format!(
+                "{} is still starting after {}s — it may have started; check the journal",
+                app.id,
+                APP_STARTING_CEILING.as_secs()
+            ),
+        ),
+    }
 }
 
 /// Surface a failed Start or Stop to the **user**, not only to the journal.

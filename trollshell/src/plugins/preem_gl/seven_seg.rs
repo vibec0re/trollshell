@@ -945,6 +945,11 @@ mod tests {
 
         let (vw, vh) = (w * stretch, h * stretch);
         let step = (w as f32 / vw as f32, h as f32 / vh as f32);
+        // `halo_at`'s `hi`, hoisted: the grid's last index on each axis.
+        let last = (
+            i32::try_from(w).unwrap_or(i32::MAX) - 1,
+            i32::try_from(h).unwrap_or(i32::MAX) - 1,
+        );
         let mut hits: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
         for down in 0..vh {
             for across in 0..vw {
@@ -953,10 +958,10 @@ mod tests {
                 let offset = (point.0 - 0.5, point.1 - 0.5);
                 let base = (offset.0.floor(), offset.1.floor());
                 let frac = (offset.0 - base.0, offset.1 - base.1);
-                let lo_x = (base.0 as i32).clamp(0, w as i32 - 1);
-                let lo_y = (base.1 as i32).clamp(0, h as i32 - 1);
-                let hi_x = (base.0 as i32 + 1).clamp(0, w as i32 - 1);
-                let hi_y = (base.1 as i32 + 1).clamp(0, h as i32 - 1);
+                let lo_x = (base.0 as i32).clamp(0, last.0);
+                let lo_y = (base.1 as i32).clamp(0, last.1);
+                let hi_x = (base.0 as i32 + 1).clamp(0, last.0);
+                let hi_y = (base.1 as i32 + 1).clamp(0, last.1);
                 let tap = |x: i32, y: i32| blurred[(y as usize) * w + (x as usize)] as f32;
                 let mix = |a: f32, b: f32, t: f32| a * (1.0 - t) + b * t;
                 let top = mix(tap(lo_x, lo_y), tap(hi_x, lo_y), frac.0);

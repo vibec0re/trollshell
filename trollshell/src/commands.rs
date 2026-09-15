@@ -34,6 +34,7 @@
 //! helpers, which fall back to any mounted surface when the focused output is
 //! unknown.
 
+use hytte::adw;
 use hytte::gtk::{gio, glib};
 use hytte::prelude::*;
 use hytte::services::recorder;
@@ -54,11 +55,27 @@ use crate::overlays::sidebar;
 /// - `toggle-sidebar-right` (no arg): flip the right sidebar (#1160) — a no-op
 ///   while that output's right sidebar has no plugin card mounted.
 /// - `toggle-recording` (no arg): start/stop a screen recording (#403).
+/// - `open-control-center` (no arg): start (or, if it's already running,
+///   focus) the `trollshell-control-center` companion app — the same thing
+///   the gear page's "Control Center" row does (#1304).
 pub fn install(app: &App) {
     // Wire the shared focused-output cache (idempotent — see its docs) so
     // command handlers below can resolve the focused monitor.
     focused_output::install();
+    app.add_action_entries(entries());
+}
 
+/// The `GActionEntry`s [`install`] registers, pulled into their own function
+/// so [`tests::every_verb_registers_as_a_named_action`] can build them
+/// against a plain `adw::Application` instead of the full `hytte_ui::App`
+/// lifecycle — `App` exposes no lightweight test constructor (it wraps a
+/// running `GApplication` plus the monitor-hotplug `Mutable`), and nothing
+/// below actually needs one: every closure either ignores its `&Application`
+/// parameter or reaches state through a free function
+/// (`focused_output::current`, `sidebar::…`, `recorder::toggle`,
+/// `companion::…`), none of which `install` sets up — that's
+/// [`focused_output::install`]'s job, called once above.
+fn entries() -> Vec<gio::ActionEntry<adw::Application>> {
     let open_page = gio::ActionEntry::builder("open-page")
         .parameter_type(Some(glib::VariantTy::STRING))
         .activate(|_app, _action, param| {
@@ -113,17 +130,69 @@ pub fn install(app: &App) {
         .activate(|_app, _action, _param| recorder::toggle())
         .build();
 
-    app.add_action_entries([
+    // The control center companion app (#1304): the same route/launch
+    // `panels::settings`'s "Control Center" row uses, so a niri keybind can
+    // reach it without a mouse. Resolved fresh on each activation — see
+    // `companion::resolve`'s doc for why that's cheap and correct.
+    let open_control_center = gio::ActionEntry::builder("open-control-center")
+        .activate(|_app, _action, _param| crate::companion::launch(&crate::companion::resolve()))
+        .build();
+
+    vec![
         open_page,
         power_menu,
         toggle_sidebar,
         toggle_sidebar_right,
         toggle_recording,
-    ]);
+        open_control_center,
+    ]
 }
 
 /// Open the drawer to `page` on the focused output (or any mounted drawer).
 fn open_focused_page(page: Page) {
     let focused = focused_output::current();
     modal::open_on_focused(focused.as_deref(), page);
+}
+
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::entries;
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+
+    /// [`entries`]'s verbs actually register as named `GAction`s on a real
+    /// `adw::Application`'s action map — the same auto-exported
+    /// `org.gtk.Actions` surface niri's `busctl … Activate` calls drive
+    /// (module doc). Built against a plain `adw::Application` rather than the
+    /// full `hytte_ui::App`/`AppBuilder` lifecycle, since [`entries`] was
+    /// split out exactly so this doesn't need one — see its doc.
+    ///
+    /// Gated behind `system-tests` like `panels::settings`'s GTK test module:
+    /// `adw::Application` still touches GTK's type system.
+    ///
+    /// **Falsification:** drop `open_control_center` from `entries`'s
+    /// trailing `vec![…]` (#1304) → this reds,
+    /// `lookup_action("open-control-center")` comes back `None`.
+    #[gtk::test]
+    fn every_verb_registers_as_a_named_action() {
+        adw::init().expect("libadwaita init");
+        let app = adw::Application::builder()
+            .application_id("mov.vibec0re.trollshell.commands-test")
+            .build();
+        app.add_action_entries(entries());
+
+        for verb in [
+            "open-page",
+            "power-menu",
+            "toggle-sidebar",
+            "toggle-sidebar-right",
+            "toggle-recording",
+            "open-control-center",
+        ] {
+            assert!(
+                app.lookup_action(verb).is_some(),
+                "expected a registered action named {verb:?}"
+            );
+        }
+    }
 }

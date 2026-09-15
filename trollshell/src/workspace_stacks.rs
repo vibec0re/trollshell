@@ -759,7 +759,16 @@ pub(crate) fn app_start(
 
 /// Display/IPC variables to forward, and their values, for the ones this shell
 /// actually has.
-fn forwarded_env() -> Vec<(String, String)> {
+///
+/// `pub(crate)` since #1305 review MED-4: `crate::companion`'s `Route::Binary`
+/// launch reuses this list rather than carrying a second, independently
+/// drifting one — the same four names `plugins::effects::FORWARDED_ENV` and
+/// `trollshell-control-center`'s own `agents_tab.rs` copy already agree on
+/// (that file's doc: "the same four names, not a second list to keep in sync
+/// by hand"). `NIRI_SOCKET` matters one hop further than the control center
+/// itself: its Agents tab forwards it again into a `trollshell-agent-window`
+/// launch, which has nothing to forward if this shell never gave it one.
+pub(crate) fn forwarded_env() -> Vec<(String, String)> {
     [
         "WAYLAND_DISPLAY",
         "NIRI_SOCKET",

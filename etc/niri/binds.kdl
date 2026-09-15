@@ -76,6 +76,14 @@ binds {
     // Mod+A hotkey-overlay-title="Toggle Sidebar" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "toggle-sidebar" "0" "0"; }
     // Mod+Shift+A hotkey-overlay-title="Toggle Right Sidebar" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "toggle-sidebar-right" "0" "0"; }
 
+    // Control Center (#1304) — starts the trollshell-control-center companion
+    // app, or focuses it if it's already running (the desktop-entry launch
+    // route activates the existing unique-application-id instance rather than
+    // opening a twin); the same `open-control-center` verb the gear page's
+    // "Control Center" row uses (commands.rs). Same shape and same reason as
+    // the sidebar binds above: commented out, pick your own chord.
+    // Mod+C hotkey-overlay-title="Open Control Center" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-control-center" "0" "0"; }
+
     // Column layouts (#1019) — the same binary that paints the bar chip also
     // applies one layout and exits, so these are plain `spawn`s with no shell,
     // no D-Bus and no running plugin involved: it reads $NIRI_SOCKET itself.

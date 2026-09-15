@@ -1539,7 +1539,18 @@ pub(super) fn launch_unit_name(plugin_id: &str, id: u64, pid: u32, seq: u64) -> 
 /// [`launch_unit_name`] with the host's uniquifiers filled in — a fresh, unique
 /// name on every call (#953, M2). Not pure (it bumps [`LAUNCH_SEQ`]), which is
 /// why the formatting half is kept separate and testable.
-pub(super) fn allocate_launch_unit(plugin_id: &str, id: u64) -> String {
+///
+/// `pub(crate)` since #1305 review MED-2: `crate::companion`'s `Route::Binary`
+/// launch calls this too (`allocate_launch_unit("control-center", 0)`), so the
+/// control center's own second-click collision (a fixed `--unit=` makes a
+/// relaunch while the app is still open a silent no-op — `systemd-run` refuses
+/// with "was already loaded") gets the same fix this module already has for
+/// the identical plugin-restart case, instead of a second hand-rolled
+/// allocator. `"control-center"` is a plain ASCII+hyphen literal this module
+/// controls, well inside [`systemd::is_valid_plugin_id`]'s charset — that
+/// guard runs on plugin-supplied ids at [`start_detached`], which this caller
+/// never goes through, but the literal would pass it regardless.
+pub(crate) fn allocate_launch_unit(plugin_id: &str, id: u64) -> String {
     let seq = LAUNCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     launch_unit_name(plugin_id, id, std::process::id(), seq)
 }

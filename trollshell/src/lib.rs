@@ -38,6 +38,11 @@
 #![allow(clippy::must_use_candidate)]
 
 pub mod assets;
+// In the closure since #1304: `panels::settings`' "Control Center" row in the
+// gear page's More group resolves its launch route through this module, and
+// `panels` is already in the closure below (`modal.rs` mounts
+// `panels::panel_settings()`).
+pub mod companion;
 pub mod components;
 // In the closure since #869: `panels::stats` reads the per-core LED panel's
 // dressing from `config::core_leds`, the config-file layering's first live

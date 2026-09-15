@@ -6,6 +6,7 @@
 // list; see `lib.rs`'s module doc for what it covers and why (#738).
 mod assets;
 mod commands;
+mod companion;
 mod components;
 mod config;
 mod control;

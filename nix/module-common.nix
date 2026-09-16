@@ -91,6 +91,48 @@ self:
     in
     if afterPluginPrefix != binName then afterPluginPrefix else lib.removePrefix "hytte-" binName;
 
+  # The `_locked` list a rendered base-layer config file carries beside its
+  # values (#1227; Annika on #866, 2026-09-15: "fine by me that nix config has
+  # precedence - as long as nix configuration options can be optional").
+  #
+  # Every dotted leaf path of a PRUNED subsystem value — so `{ style = "lcd";
+  # display.argus.icon = "x"; }` gives `[ "display.argus.icon" "style" ]`.
+  # `crates/hytte-config/src/merge.rs` reads it off the base layer and keeps
+  # the base value for those keys whatever `~/.config/trollshell/<name>.toml`
+  # says, reporting the refused override once per load.
+  #
+  # **The "options stay optional" half is this function's input, not a knob.**
+  # It is handed the same `prune`d attrset the values are rendered from, so a
+  # leaf nobody set is not in it, and a subsystem nobody configured renders no
+  # file for it to appear in (the `filtered == { }` guard in both platform
+  # modules). `config.<subsystem> = { }` therefore locks exactly nothing, which
+  # `checks.modules-agents-absent-when-unset` pins.
+  #
+  # A leaf is anything that is not an attrset to walk into: scalars, lists
+  # (rule 3 replaces arrays whole, so a locked array is atomic) and — with the
+  # same `!lib.isDerivation` guard `prune` documents at length — a package.
+  # Sorted, so the rendered bytes are stable across nix's own attrset ordering
+  # and the two byte-fixture checks stay meaningful.
+  #
+  # Exported through `_module.args` rather than hand-copied into both platform
+  # modules, for the reason `inferManifestId` above gives: the copies drift,
+  # and `prune` already has to be kept in sync by hand across the same two
+  # files.
+  config._module.args.lockedLeafPaths =
+    let
+      walk =
+        prefix: set:
+        lib.concatMap (
+          name:
+          let
+            value = set.${name};
+            path = "${prefix}${name}";
+          in
+          if lib.isAttrs value && !lib.isDerivation value then walk "${path}." value else [ path ]
+        ) (lib.attrNames set);
+    in
+    set: lib.sort (a: b: a < b) (walk "" set);
+
   options.programs.trollshell = {
     enable = lib.mkEnableOption "trollshell — hytte-based Wayland desktop shell";
 
@@ -1132,6 +1174,18 @@ self:
     # default base entry `hytte-config` falls back to when
     # `$XDG_CONFIG_DIRS` is unset).
     #
+    # Since #1227 a rendered file also carries `_locked` — the dotted leaf
+    # paths of exactly the keys the operator set — and
+    # `crates/hytte-config/src/merge.rs` keeps the nix value for those
+    # whatever the overlay says, reporting the refused override once. That is
+    # Mara's ask on #866 ("i want the values i set in nix to not be shadowable
+    # in the state one") as Annika settled it there on 2026-09-15 ("fine by me
+    # that nix config has precedence - as long as nix configuration options can
+    # be optional"): per key, on by default, no knob. The "optional" half is
+    # structural rather than a switch — every leaf is nullable, the list is
+    # computed from the PRUNED value, and a subsystem nobody configured renders
+    # no file at all, so `config.<subsystem> = { }` locks nothing.
+    #
     # The option shape every later subsystem family copies (decided once,
     # #1041): one attrset per subsystem name under `config.<subsystem>`,
     # renders to `<base>/trollshell/<subsystem>.toml`. `core-leds` was the
@@ -1231,10 +1285,16 @@ self:
         your own `$XDG_CONFIG_HOME` overlay — see the note above `config`).
         Every field defaults to `null` ("no opinion"), so setting only
         `style` here leaves `color`/`rows`/`fill` to whatever the overlay
-        or the built-in default says. A value here is still the *lowest*
-        of the two nix-writable precedence layers: your own hand-edited
-        `~/.config/trollshell/core-leds.toml` always wins over it, and a
-        rebuild that changes this option never touches that file.
+        (your own `~/.config/trollshell/core-leds.toml`) or the built-in
+        default says.
+
+        **A key you set here is locked** (#1227): the rendered file carries
+        a `_locked` list naming exactly the keys you set, the merge keeps
+        the nix value for those whatever the overlay says, and an overlay
+        line at one of them is reported once in the journal rather than
+        silently ignored. Keys you do *not* set are untouched by that — the
+        overlay wins for them, exactly as before. A rebuild that changes
+        this option still never touches your overlay file.
       '';
     };
 
@@ -1392,12 +1452,17 @@ self:
         your own `$XDG_CONFIG_HOME` overlay — see the note above `config`).
         Every field defaults to `null`/`{ }` ("no opinion"), so setting
         only `socket` here leaves `poll_seconds`/`display` to whatever the
-        overlay or the plugin's own built-in default
-        (`crates/hytte-plugin-agents/src/config.rs`'s `DEFAULT_TOML`)
-        says. A value here is still the *lowest* of the two nix-writable
-        precedence layers: your own hand-edited
-        `~/.config/trollshell/agents.toml` always wins over it, and a
-        rebuild that changes this option never touches that file.
+        overlay (`~/.config/trollshell/agents.toml`) or the plugin's own
+        built-in default (`crates/hytte-plugin-agents/src/config.rs`'s
+        `DEFAULT_TOML`) says.
+
+        **A key you set here is locked** (#1227) — see
+        `config.core-leds`'s description for the rule, which is the same
+        one for every subsystem: the rendered file names the keys you set
+        in `_locked`, the merge keeps the nix value for those, the
+        override is reported once, and unset keys still overlay normally.
+        A rebuild that changes this option still never touches your
+        overlay file.
       '';
     };
   };

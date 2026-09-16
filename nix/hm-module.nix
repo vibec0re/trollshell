@@ -10,6 +10,11 @@ self:
   # the two-prefix heuristic and why a shared definition replaced three
   # drifting copies (#1284 fix round, review LOW 3).
   inferManifestId,
+  # The `_locked` leaf-path list a rendered base-layer config file carries
+  # beside its values (#1227), threaded in from the same `_module.args` for
+  # the same reason — see `nix/module-common.nix` for what it renders and why
+  # only SET keys reach it.
+  lockedLeafPaths,
   ...
 }:
 let
@@ -167,13 +172,27 @@ let
   # `generate` shells out to) fails on that, it does not silently drop it.
   # `core-leds` has no nested field, so `prune` is a plain `filterAttrs`
   # there — it strictly subsumes the flat filter it replaces.
+  #
+  # Since #1227 the rendered file also carries `_locked` — the dotted leaf
+  # paths of `filtered`, i.e. exactly the keys the operator set — which
+  # `crates/hytte-config/src/merge.rs` reads to keep the nix value for those
+  # keys whatever `~/.config/trollshell/<name>.toml` says. It is computed from
+  # `filtered`, AFTER the prune, so "nix configuration options can be optional"
+  # (Annika, #866) holds by construction: an unset leaf is not in the list, and
+  # a subsystem nobody configured never gets past the `filtered == { }` guard
+  # to have a list at all.
   configFiles = lib.filterAttrs (_: v: v != null) (
     lib.mapAttrs (
       name: value:
       let
         filtered = prune value;
       in
-      if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
+      if filtered == { } then
+        null
+      else
+        (pkgs.formats.toml { }).generate "${name}.toml" (
+          filtered // { _locked = lockedLeafPaths filtered; }
+        )
     ) cfg.config
   );
 

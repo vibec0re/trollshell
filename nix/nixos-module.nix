@@ -10,6 +10,11 @@ self:
   # the two-prefix heuristic and why a shared definition replaced three
   # drifting copies (#1284 fix round, review LOW 3).
   inferManifestId,
+  # The `_locked` leaf-path list a rendered base-layer config file carries
+  # beside its values (#1227), threaded in from the same `_module.args` for
+  # the same reason — see `nix/module-common.nix` for what it renders and why
+  # only SET keys reach it.
+  lockedLeafPaths,
   ...
 }:
 let
@@ -119,13 +124,22 @@ let
   # field nests a submodule's own unset fields one level below `value`, and
   # `core-leds` has no nested field so `prune` is a plain `filterAttrs`
   # there).
+  #
+  # The `_locked` list (#1227) is the other half `nix/hm-module.nix` documents
+  # at length: the dotted leaf paths of `filtered`, computed after the prune so
+  # only keys the operator actually set are pinned.
   configFiles = lib.filterAttrs (_: v: v != null) (
     lib.mapAttrs (
       name: value:
       let
         filtered = prune value;
       in
-      if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
+      if filtered == { } then
+        null
+      else
+        (pkgs.formats.toml { }).generate "${name}.toml" (
+          filtered // { _locked = lockedLeafPaths filtered; }
+        )
     ) cfg.config
   );
 in

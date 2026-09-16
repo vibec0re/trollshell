@@ -93,6 +93,34 @@
 //! The `warn!` calls are unchanged; the `Vec` is filled from the same two
 //! loops, not a second pass.
 //!
+//! # A fifth and sixth shape: the nix lock (#1227)
+//!
+//! Annika settled (#866, 2026-09-15) that what nix sets has precedence per
+//! key, as long as every option stays optional.
+//! [`crate::merge::LOCKED_KEY`] is how a base layer says which keys it set;
+//! the merge honours it, and this module does the same two things it does for
+//! every other marker shape:
+//!
+//! * a `_locked` the fold cannot read pins nothing, so
+//!   [`crate::merge::malformed_locked`] finds it and [`assemble`] warns
+//!   **naming the layer file** ([`FindingKind::MalformedLocked`]);
+//! * an override the lock refused is warned about once, naming the subsystem,
+//!   the key and the file to go and edit ([`shadowed_message`],
+//!   [`FindingKind::ShadowedLockedKey`]) — a *value* being dropped, which is
+//!   the one thing here that is not a marker doing nothing, so it is the one
+//!   with a sentence of its own.
+//!
+//! Both land on [`Loaded::lock_findings`] as data, beside the lock set itself
+//! on [`Loaded::locked`]. That set is the editor's half of the feature: a
+//! settings UI greys the rows [`Loaded::is_locked`] answers for, and hands the
+//! same set back to [`save_overlay_to_locked`] so a save cannot write a nix
+//! value into the operator's own file.
+//!
+//! **Only *set* keys are locked, so "optional" is preserved by construction.**
+//! Nothing here decides that: nix renders one `_locked` entry per option leaf
+//! the operator actually set, an option nobody sets renders no file at all,
+//! and an empty `_locked` pins nothing. There is deliberately no knob.
+//!
 //! # Why the writer patches instead of re-rendering
 //!
 //! Same reason as `places` (#703): once the control center can edit a file a
@@ -387,12 +415,13 @@ pub fn warn_rejected_value(subsystem: &str, key: &str, invalid: &str) {
     tracing::warn!(subsystem, key, "{}", rejected_value_message(invalid));
 }
 
-/// Which [`crate::merge::UNSET_KEY`] problem a [`Finding`] reports.
+/// Which reserved-marker problem a [`Finding`] reports.
 ///
 /// `#[non_exhaustive]`: every [`Finding`] is built inside this crate, from
-/// [`crate::merge::MalformedUnset`]/[`crate::merge::InertUnset`], and a third
-/// marker shape is plausible the same way a third field on either of those is
-/// (their own docs).
+/// [`crate::merge::MalformedUnset`]/[`crate::merge::InertUnset`]/[`crate::merge::Shadowed`],
+/// and a fourth marker shape is plausible the same way a third field on any of
+/// those is (their own docs). #1227 added two of them, which is the prediction
+/// coming true.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FindingKind {
@@ -403,6 +432,19 @@ pub enum FindingKind {
     /// A well-formed [`crate::merge::UNSET_KEY`] name that matched no key any
     /// layer sets — from a [`crate::merge::InertUnset`].
     InertUnset,
+    /// A [`crate::merge::LOCKED_KEY`] marker whose shape
+    /// [`crate::merge::merge_all_locked`] could not honour, so it pinned
+    /// nothing — from [`crate::merge::malformed_locked`] (#1227).
+    MalformedLocked,
+    /// A well-formed [`crate::merge::LOCKED_KEY`] name that the layer
+    /// declaring it does not itself set, so it pinned nothing — from
+    /// [`crate::merge::inert_locked`] (#1331 review, LOW 4).
+    InertLocked,
+    /// The overlay tried to change a key a base layer had locked, and was
+    /// refused — from a [`crate::merge::Shadowed`] (#1227). The only finding
+    /// here that reports a *value* being dropped rather than a marker doing
+    /// nothing, which is why it gets its own [`Loaded`] field.
+    ShadowedLockedKey,
 }
 
 /// One `_unset`-marker problem [`assemble`] found, attributed to the layer it
@@ -495,6 +537,74 @@ pub struct Loaded<S> {
     /// warned exactly the same way and are **not** in this `Vec`. Add a field
     /// for either the day something needs to read it back as data.
     pub unset_findings: Vec<Finding>,
+    /// Dotted paths a base layer pinned with [`crate::merge::LOCKED_KEY`]
+    /// (#1227) — what nix set, and therefore what a settings UI must grey out
+    /// and what [`save_overlay_to_locked`] must skip.
+    ///
+    /// Returned here, rather than left for the caller to re-parse the base
+    /// layers for, so the editor and the merge cannot disagree about which
+    /// keys are locked: this is the same set [`assemble`] actually enforced,
+    /// not a second reading of the same files. [`crate::merge::Merged::locked`]
+    /// spells out the two exclusions that make that sentence true — the
+    /// operator's **own** marker is not in here, or a save would drop the very
+    /// value they just edited (#1331 review, HIGH 1).
+    ///
+    /// Query it with [`Loaded::is_locked`] rather than by membership, which
+    /// misses a leaf under a locked table.
+    pub locked: BTreeSet<String>,
+    /// Every [`crate::merge::LOCKED_KEY`] problem this load found: an overlay
+    /// override that was refused ([`FindingKind::ShadowedLockedKey`]) and a
+    /// marker that pinned nothing ([`FindingKind::MalformedLocked`],
+    /// [`FindingKind::InertLocked`]).
+    ///
+    /// Separate from [`Self::unset_findings`] for the reason that field's own
+    /// doc gives for adding a field instead of widening one: it is named for
+    /// what it holds. Warned exactly the same way, and — like the `_unset`
+    /// findings — returned as data so a settings UI can show the operator
+    /// which of their lines the base layer refused, instead of leaving it in
+    /// a journal nobody reads.
+    pub lock_findings: Vec<Finding>,
+}
+
+impl<S> Loaded<S> {
+    /// Whether the dotted `path` was pinned by a base layer — itself, or by
+    /// an ancestor table being locked whole.
+    ///
+    /// The ancestor half is what makes this the right query for a settings UI:
+    /// `_locked = ["core"]` pins everything under `[core]`, and a row asking
+    /// about `core.color` by plain set membership would be offered as editable
+    /// and then have its save silently refused on the next load.
+    ///
+    /// **It answers for a leaf row, not for a whole-value write at a table**
+    /// (#1331 review, LOW 5). It walks *up* only, so `is_locked("core")` is
+    /// `false` when just `core.color` is pinned — while the merge's own
+    /// `Locks::refuses` (in [`crate::merge`]) walks *down* as well and refuses a
+    /// scalar written over `[core]`, because rules 1 and 3 replace whole and
+    /// would take the locked leaf with it. The two predicates therefore
+    /// disagree about a table, deliberately, and the save path is right to use
+    /// this one: [`render_overlay_locking`] filters *per path* through
+    /// [`locked_here`], so it writes the unlocked subset key by key and never
+    /// emits the whole-table scalar the merge would refuse.
+    #[must_use]
+    pub fn is_locked(&self, path: &str) -> bool {
+        locked_here(&self.locked, path)
+    }
+}
+
+/// [`Loaded::is_locked`] over a bare set — the shared predicate, so the reader
+/// and [`render_overlay_locking`]'s writer answer it identically.
+fn locked_here(locked: &BTreeSet<String>, path: &str) -> bool {
+    if locked.contains(path) {
+        return true;
+    }
+    let mut rest = path;
+    while let Some(cut) = rest.rfind('.') {
+        rest = &rest[..cut];
+        if locked.contains(rest) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Why a layered load or save failed.
@@ -576,6 +686,34 @@ const MALFORMED_UNSET_MESSAGE: &str = "_unset must be an array of key names; ign
 /// tests select on it exactly, so the negative ones cannot go green-and-blind
 /// on a reworded string.
 const INERT_UNSET_MESSAGE: &str = "_unset names a key no config layer sets; it removes nothing";
+
+/// The one message a malformed [`merge::LOCKED_KEY`] produces — a `const` for
+/// [`MALFORMED_UNSET_MESSAGE`]'s anti-drift reason.
+const MALFORMED_LOCKED_MESSAGE: &str =
+    "_locked must be an array of key names; ignoring it, so nothing in this layer is pinned";
+
+/// The one message an inert [`merge::LOCKED_KEY`] name produces — a `const`
+/// for [`MALFORMED_UNSET_MESSAGE`]'s anti-drift reason.
+const INERT_LOCKED_MESSAGE: &str =
+    "_locked names a key this layer does not set; it pins nothing, so an overlay still wins";
+
+/// The one message an override refused by a [`merge::LOCKED_KEY`] produces.
+///
+/// A fixed constant naming neither the key nor the layer, like the two above:
+/// the `warn!` carries both as structured fields, and the sentence a human
+/// reads is [`shadowed_message`], which this `warn!` deliberately does not
+/// duplicate.
+const SHADOWED_LOCKED_MESSAGE: &str =
+    "this key is set in nix and cannot be overridden from an overlay; keeping the nix value";
+
+/// The house sentence for a refused override (#1227), in one place.
+///
+/// Names the subsystem, the key and the file the operator has to go and edit —
+/// the three things `crate::merge` has never seen, which is why it hands back
+/// [`merge::Shadowed`] as data and this is where the wording lives.
+fn shadowed_message(subsystem: &str, key: &str, layer: &str) -> String {
+    format!("{subsystem}.{key} is set in nix and cannot be overridden from {layer}")
+}
 
 /// How a layer is named in a diagnostic. `None` is [`Subsystem::DEFAULT_TOML`],
 /// which is not a file — a complaint about *that* one is our bug, not the
@@ -665,7 +803,92 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// for a known key of the wrong type, [`ConfigError::Invalid`] when
 /// [`Subsystem::validate`] rejects the result. An *unknown* key is none of
 /// these — it is warned and reported in [`Loaded::unknown_keys`].
+///
+/// The **last** layer is taken to be the operator's writable overlay, which is
+/// the shape [`crate::xdg::Env::config_layers`] produces and the half of
+/// #1227's rule that decides which `_locked` markers bind anything (see
+/// [`crate::merge::merge_all_locked`]). Call [`assemble_base_layers`] instead
+/// when every layer given is a nix-written base — including the common case
+/// where `$XDG_CONFIG_HOME/trollshell/<name>.toml` simply does not exist yet,
+/// which is what [`load_from`] does.
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
+    assemble_layers::<S>(layers, !layers.is_empty())
+}
+
+/// [`assemble`], told that **no** layer given is the operator's overlay.
+///
+/// Two callers: [`load_from`], when the overlay file does not exist (the
+/// locks still have to come back, because the editor greys rows from them and
+/// the save that *creates* that file is exactly the one that must not write
+/// nix's values into it), and a test naming a base layer on its own.
+///
+/// # Errors
+/// As [`assemble`].
+pub fn assemble_base_layers<S: Subsystem>(
+    layers: &[(PathBuf, String)],
+) -> Result<Loaded<S>, ConfigError> {
+    assemble_layers::<S>(layers, false)
+}
+
+/// Every [`merge::LOCKED_KEY`] marker across `tables` that pins nothing,
+/// warned **naming the layer** and returned as data (#1227, and #1331's LOW 4
+/// for the second shape).
+///
+/// Its own function rather than two more loops inside `assemble_layers`: the
+/// `_unset` pair up there is #988/#1008's, this pair is #1227's, and keeping
+/// them apart is what lets [`Loaded::lock_findings`] be built in one place —
+/// one `push` beside each `warn!`, so the journal and the data cannot drift
+/// about *which* markers were found.
+///
+/// Both shapes are the same failure: a marker that looks like a guarantee and
+/// is not one, in a file the operator does not open. A malformed one the fold
+/// cannot read pins nothing; a well-formed one naming a key its own layer does
+/// not set would pin a key nix never wrote, so the fold does not honour it
+/// either.
+fn locked_marker_findings<S: Subsystem>(
+    paths: &[Option<&Path>],
+    tables: &[toml::Table],
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (path, table) in paths.iter().zip(tables) {
+        for bad in merge::malformed_locked(table) {
+            tracing::warn!(
+                subsystem = S::NAME,
+                layer = %layer_name(*path),
+                key = %bad.key,
+                found = bad.found,
+                "{MALFORMED_LOCKED_MESSAGE}"
+            );
+            out.push(Finding {
+                layer: (*path).map(Path::to_path_buf),
+                key: bad.key.clone(),
+                kind: FindingKind::MalformedLocked,
+                message: bad.to_string(),
+            });
+        }
+    }
+
+    for inert in merge::inert_locked(tables) {
+        tracing::warn!(
+            subsystem = S::NAME,
+            layer = %layer_name(paths[inert.layer]),
+            key = %inert.key,
+            "{INERT_LOCKED_MESSAGE}"
+        );
+        out.push(Finding {
+            layer: paths[inert.layer].map(Path::to_path_buf),
+            key: inert.key.clone(),
+            kind: FindingKind::InertLocked,
+            message: inert.to_string(),
+        });
+    }
+    out
+}
+
+fn assemble_layers<S: Subsystem>(
+    layers: &[(PathBuf, String)],
+    has_overlay: bool,
+) -> Result<Loaded<S>, ConfigError> {
     // #1022: several tests below call `assemble` directly — bypassing both
     // `capture` and the `assembled` test helper, the two call sites named in
     // `crate::test_support`'s own doc — because they assert on something
@@ -742,9 +965,41 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         });
     }
 
-    let merged = merge::merge_all(tables);
+    let mut lock_findings = locked_marker_findings::<S>(&paths, &tables);
 
-    let (config, unknown_keys) = read_merged::<S>(merged)?;
+    // #1331 review, HIGH 1 and MEDIUM 2: the last layer is the operator's
+    // overlay (unless the caller said otherwise), and the rule is "the union
+    // of every base layer's lock binds it, and nothing else" — so the split is
+    // made here, once, and handed over as two arguments rather than left for
+    // `merge` to guess from a position.
+    let overlay = if has_overlay { tables.pop() } else { None };
+    let merged = merge::merge_all_locked(tables, overlay);
+
+    // #1227: an override the lock refused is *reported*, never silently
+    // dropped. Once per key — `merge` dedupes, so an overlay that both
+    // `_unset`s and re-sets one locked key made one mistake and reads one line
+    // here. `source` names the base layer the kept value actually came from,
+    // which `layer` cannot: that one names the file the operator must edit.
+    for shadow in &merged.shadowed {
+        let layer = layer_name(paths[shadow.layer]);
+        tracing::warn!(
+            subsystem = S::NAME,
+            layer = %layer,
+            key = %shadow.key,
+            source = %shadow
+                .source
+                .map_or_else(|| "(unknown)".to_owned(), |i| layer_name(paths[i])),
+            "{SHADOWED_LOCKED_MESSAGE}"
+        );
+        lock_findings.push(Finding {
+            layer: paths[shadow.layer].map(Path::to_path_buf),
+            key: shadow.key.clone(),
+            kind: FindingKind::ShadowedLockedKey,
+            message: shadowed_message(S::NAME, &shadow.key, &layer),
+        });
+    }
+
+    let (config, unknown_keys) = read_merged::<S>(merged.table)?;
 
     // Rule 4: loud, but never fatal. A typo must be visible and must not take
     // the shell down.
@@ -765,6 +1020,8 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         sources: layers.iter().map(|(path, _)| path.clone()).collect(),
         unknown_keys,
         unset_findings,
+        locked: merged.locked,
+        lock_findings,
     })
 }
 
@@ -1100,7 +1357,18 @@ fn read_layers(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, ConfigError>
 /// As [`assemble`], plus [`ConfigError::Unreadable`] for a layer that exists
 /// but cannot be read.
 pub fn load_from<S: Subsystem>(paths: &[PathBuf]) -> Result<Loaded<S>, ConfigError> {
-    assemble::<S>(&read_layers(paths)?)
+    let layers = read_layers(paths)?;
+    // The overlay is the last *requested* path, whether or not the file is
+    // there — `read_layers` skips a missing one, and "no overlay yet" is the
+    // normal case on a fresh machine. Asking the read-back list instead would
+    // promote the top base layer into the overlay slot and its `_locked` would
+    // then be dropped from `Loaded::locked`, which is the set an editor greys
+    // rows from and the set the very first save skips (#1331 review, HIGH 1
+    // shape, with the sign flipped).
+    let has_overlay = paths
+        .last()
+        .is_some_and(|want| layers.last().is_some_and(|(got, _)| got == want));
+    assemble_layers::<S>(&layers, has_overlay)
 }
 
 /// Load `S` from the process environment's XDG search path.
@@ -1204,7 +1472,7 @@ fn wanted<S: Subsystem + serde::Serialize>(value: &S) -> Result<toml::Table, Con
 }
 
 /// Every dotted key path in `table`, tables included — except the
-/// [`merge::UNSET_KEY`] marker, at any depth.
+/// [`merge::UNSET_KEY`] and [`merge::LOCKED_KEY`] markers, at any depth.
 ///
 /// The exclusion is by name, deliberately, rather than left to
 /// [`serde_ignored`]: [`merge::merge_into`] strips the marker before the
@@ -1213,9 +1481,15 @@ fn wanted<S: Subsystem + serde::Serialize>(value: &S) -> Result<toml::Table, Con
 /// stale sweep in [`patch`] would go on to delete the user's explicit erasure
 /// on the next save — silently, and with the erased key falling back to the
 /// inherited value on the load after that (#990).
+///
+/// [`merge::LOCKED_KEY`] is the same defect one marker over, and it was left
+/// out until the #1331 review measured it: the save deleted an overlay's
+/// `_locked` line, which is bytes this writer was not asked to touch, and —
+/// paired with HIGH 1 — erased the evidence of why the save had dropped the
+/// operator's values.
 fn collect_paths(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
     for (key, value) in table {
-        if key == merge::UNSET_KEY {
+        if key == merge::UNSET_KEY || key == merge::LOCKED_KEY {
             continue;
         }
         let path = format!("{prefix}{key}");
@@ -1610,15 +1884,79 @@ pub fn render_overlay<S: Subsystem + serde::Serialize>(
     existing: &str,
     value: &S,
 ) -> Result<String, ConfigError> {
-    let want = wanted(value)?;
+    render_overlay_locking::<S>(existing, value, &BTreeSet::new())
+}
+
+/// [`render_overlay`], leaving every key a base layer pinned (#1227) exactly
+/// as it found it.
+///
+/// `locked` is [`Loaded::locked`] — the set the load actually enforced, never
+/// a second reading of the base files. Hand it in and a save becomes what
+/// Annika's rule (#866, 2026-09-15) says it should be: the operator's overlay
+/// carries their own keys and says nothing about nix's.
+///
+/// **"Skipped" means neither written nor deleted.** `value` is a *whole*
+/// config, so its locked fields carry the value the merge kept — nix's — and
+/// writing them back would pin nix's current answer into the overlay, where it
+/// would go on shadowing the *next* nix value the moment the lock moved. The
+/// stale-key sweep is held off the same paths for the mirror-image reason: a
+/// line the operator already had there is theirs, this writer's whole argument
+/// is that it does not rewrite bytes it was not asked to, and the load already
+/// tells them — once, by name — that the line is being refused.
+///
+/// # Errors
+/// As [`render_overlay`].
+pub fn render_overlay_locking<S: Subsystem + serde::Serialize>(
+    existing: &str,
+    value: &S,
+    locked: &BTreeSet<String>,
+) -> Result<String, ConfigError> {
+    let want = without_locked(&wanted(value)?, locked, "");
     let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e: toml_edit::TomlError| {
         ConfigError::Encode(format!("the file being replaced is not valid TOML: {e}"))
     })?;
     let have = parse_layer(existing, None).map_err(|e| ConfigError::Encode(e.to_string()))?;
-    let owned = schema_paths::<S>(&have);
+    let owned = schema_paths::<S>(&have).map(|paths| {
+        paths
+            .into_iter()
+            .filter(|path| !locked_here(locked, path))
+            .collect()
+    });
 
     patch(doc.as_table_mut(), &want, &have, owned.as_ref(), "");
     Ok(doc.to_string())
+}
+
+/// `table` without any path [`locked_here`] answers for — the writer's half of
+/// the lock.
+///
+/// A locked *table* path takes its subtree with it, which is the same "locking
+/// a table locks it whole" rule [`crate::merge`] applies on the read side. A
+/// table left empty by the filtering is dropped rather than written as a bare
+/// heading: [`patch`] would otherwise create a `[core]` block for a table
+/// whose every key this save is deliberately not writing.
+fn without_locked(table: &toml::Table, locked: &BTreeSet<String>, prefix: &str) -> toml::Table {
+    let mut out = toml::Table::new();
+    for (key, value) in table {
+        let path = format!("{prefix}{key}");
+        if locked_here(locked, &path) {
+            continue;
+        }
+        match value {
+            toml::Value::Table(nested) => {
+                let kept = without_locked(nested, locked, &format!("{path}."));
+                // An originally-empty table still round-trips as one; only a
+                // table this filter emptied is dropped.
+                if !kept.is_empty() || nested.is_empty() {
+                    out.insert(key.clone(), toml::Value::Table(kept));
+                }
+            }
+            other => {
+                out.insert(key.clone(), other.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Write `value` to `path` as this subsystem's overlay, atomically.
@@ -1642,6 +1980,32 @@ pub fn save_overlay_to<S: Subsystem + serde::Serialize>(
     path: &Path,
     value: &S,
 ) -> Result<(), ConfigError> {
+    save_overlay_to_locked::<S>(path, value, &BTreeSet::new())
+}
+
+/// [`save_overlay_to`], skipping every key a base layer pinned (#1227).
+///
+/// This is the save an editor with a loaded config should call, passing
+/// [`Loaded::locked`] straight through: the plain spelling above writes the
+/// whole value, so a locked key's *inherited* value would be pinned into the
+/// operator's own file and go on shadowing the base layer after the lock moved
+/// — the "stale overlay value re-written by a later save" the design on #1227
+/// names. [`render_overlay_locking`] carries the full argument for why a
+/// skipped key is neither written **nor** deleted.
+///
+/// The plain spelling is kept, rather than this one replacing it, because a
+/// subsystem with no `programs.trollshell.config.<name>` option has no base
+/// layer to be locked by and nothing to thread (`trollshell`'s `workspaces` is
+/// the case today). The day such an option is added, adding it is the review
+/// moment that should move that subsystem's save onto this function.
+///
+/// # Errors
+/// As [`save_overlay_to`].
+pub fn save_overlay_to_locked<S: Subsystem + serde::Serialize>(
+    path: &Path,
+    value: &S,
+    locked: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
     value
         .validate()
         .map_err(|e| ConfigError::Invalid(e.to_string()))?;
@@ -1657,7 +2021,7 @@ pub fn save_overlay_to<S: Subsystem + serde::Serialize>(
         }
     };
 
-    let body = render_overlay(&existing, value)?;
+    let body = render_overlay_locking::<S>(&existing, value, locked)?;
     file::write_atomic(path, &body, Durability::FsyncParent)
         .map_err(|e| ConfigError::Write(e.to_string()))
 }
@@ -1670,8 +2034,20 @@ pub fn save_overlay_to<S: Subsystem + serde::Serialize>(
 /// [`ConfigError::NoOverlayPath`] when there is nowhere to write, plus
 /// anything [`save_overlay_to`] returns.
 pub fn save_overlay<S: Subsystem + serde::Serialize>(value: &S) -> Result<(), ConfigError> {
+    save_overlay_locked::<S>(value, &BTreeSet::new())
+}
+
+/// [`save_overlay`] with [`save_overlay_to_locked`]'s lock skipping — the
+/// process-environment spelling a settings UI wants (#1227).
+///
+/// # Errors
+/// As [`save_overlay`].
+pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
+    value: &S,
+    locked: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
     let path = xdg::overlay_path(S::NAME).ok_or(ConfigError::NoOverlayPath)?;
-    save_overlay_to(&path, value)
+    save_overlay_to_locked::<S>(&path, value, locked)
 }
 
 #[cfg(test)]
@@ -4094,5 +4470,564 @@ kept = true
 
         assert_eq!(resolved, (4, "desk".to_string()));
         assert_eq!(captured.warnings(), Vec::<String>::new());
+    }
+
+    // ── #1227: the per-key nix lock, through the real load and save ─────────
+
+    /// A nix base layer pinning `core.brightness`, and an overlay that tries
+    /// to move it. The two bodies every test below starts from.
+    const LOCKED_BASE: &str = "_locked = [\"core.brightness\"]\n\n[core]\nbrightness = 3\n";
+    const SHADOWING_OVERLAY: &str = "[core]\nbrightness = 7\ncolor = \"cyan\"\n";
+
+    fn shadow_warnings(captured: &Captured) -> Vec<CapturedEvent> {
+        captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == SHADOWED_LOCKED_MESSAGE)
+            .collect()
+    }
+
+    fn locked_warnings(captured: &Captured) -> Vec<CapturedEvent> {
+        captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == MALFORMED_LOCKED_MESSAGE)
+            .collect()
+    }
+
+    /// The whole feature through [`assemble`], which is what every production
+    /// load runs: the nix value survives, the operator's attempt is warned
+    /// about **once**, naming the file they have to open, and their unlocked
+    /// key in the same table still wins.
+    ///
+    /// Red if [`assemble`]'s `merge_all_locked` call loses its locks — the
+    /// seam mutation, since `load`/`load_from`/`load_layer`/`initial_load` all
+    /// funnel through this one call site and a test that only drove
+    /// `merge::merge_all_locked` would not see it.
+    #[test]
+    fn a_locked_key_survives_the_load_and_the_override_is_warned_once() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&[LOCKED_BASE, SHADOWING_OVERLAY]);
+
+        assert_eq!(
+            loaded.config.core.brightness, 3,
+            "what nix set is what the shell reads"
+        );
+        assert_eq!(
+            loaded.config.core.color, "cyan",
+            "an unlocked key in the same table still overlays"
+        );
+
+        let warnings = shadow_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "one attempt, one line: {warnings:#?}");
+        let fields = &warnings[0].fields;
+        assert_eq!(
+            fields.get("layer").map(String::as_str),
+            Some("/layer/1.toml"),
+            "the file the operator can open: {fields:#?}"
+        );
+        assert_eq!(
+            fields.get("key").map(String::as_str),
+            Some("core.brightness")
+        );
+        assert_eq!(
+            fields.get("subsystem").map(String::as_str),
+            Some("core-leds")
+        );
+    }
+
+    /// The same load, as **data**: the lock set a settings UI greys rows from
+    /// and the finding it shows beside them, in the house wording.
+    ///
+    /// Red if [`assemble`] stops filling `Loaded::locked` (the other half of
+    /// the seam mutation — the merge still enforces the lock, but no editor
+    /// can learn which keys are pinned), and red if the `lock_findings.push`
+    /// goes away.
+    #[test]
+    fn the_lock_set_and_its_finding_reach_the_caller_as_data() {
+        let loaded = assembled(&[LOCKED_BASE, SHADOWING_OVERLAY]);
+
+        assert_eq!(
+            loaded.locked,
+            BTreeSet::from(["core.brightness".to_owned()]),
+            "exactly the keys nix set"
+        );
+        assert_eq!(loaded.lock_findings.len(), 1, "{:?}", loaded.lock_findings);
+        let finding = &loaded.lock_findings[0];
+        assert_eq!(finding.kind, FindingKind::ShadowedLockedKey);
+        assert_eq!(finding.layer.as_deref(), Some(Path::new("/layer/1.toml")));
+        assert_eq!(finding.key, "core.brightness");
+        assert_eq!(
+            finding.message,
+            "core-leds.core.brightness is set in nix and cannot be overridden from /layer/1.toml",
+            "the house sentence, pinned as a literal so rewording it is not silent"
+        );
+        assert!(
+            loaded.unset_findings.is_empty(),
+            "a lock is not an `_unset` problem: {:?}",
+            loaded.unset_findings
+        );
+    }
+
+    /// The report is per **load**, not accumulated in a static somewhere: two
+    /// loads of the same files each say it once.
+    ///
+    /// The other reading of "reported once" — once per key per load — is
+    /// `an_overlay_that_both_unsets_and_sets_a_locked_key_is_reported_once`
+    /// in [`crate::merge`]'s own tests.
+    #[test]
+    fn two_loads_each_report_the_shadow_once() {
+        let (captured, _guard) = capture();
+
+        let first = assembled(&[LOCKED_BASE, SHADOWING_OVERLAY]);
+        let second = assembled(&[LOCKED_BASE, SHADOWING_OVERLAY]);
+
+        assert_eq!(first.lock_findings.len(), 1, "{:?}", first.lock_findings);
+        assert_eq!(second.lock_findings.len(), 1, "{:?}", second.lock_findings);
+        assert_eq!(
+            shadow_warnings(&captured).len(),
+            2,
+            "one line per load, and never two per key"
+        );
+    }
+
+    /// `_locked` is merge machinery: it must not reach the schema, and must
+    /// not be reported as a key the schema does not know (rule 4) on top.
+    ///
+    /// Red if the `key == LOCKED_KEY` skip in `merge::merge_into_locked` goes
+    /// away — `unknown_keys` grows a `_locked` entry the operator cannot act
+    /// on.
+    #[test]
+    fn the_locked_marker_is_never_an_unknown_key() {
+        let loaded = assembled(&[LOCKED_BASE, SHADOWING_OVERLAY]);
+
+        assert!(
+            loaded.unknown_keys.is_empty(),
+            "the marker is stripped before the schema sees the table: {:?}",
+            loaded.unknown_keys
+        );
+    }
+
+    /// [`Loaded::is_locked`] answers for a leaf **under** a locked table, not
+    /// just for the exact path — otherwise a settings UI offers a row as
+    /// editable and then has its save silently refused on the next load.
+    #[test]
+    fn is_locked_answers_for_a_leaf_under_a_locked_table() {
+        // Two layers, the empty one being the overlay: a lock binds the
+        // overlay, so the layer declaring it has to be a base.
+        let loaded = assembled(&["_locked = [\"core\"]\n\n[core]\nbrightness = 3\n", ""]);
+
+        assert!(loaded.is_locked("core"), "the table itself");
+        assert!(loaded.is_locked("core.brightness"), "a leaf under it");
+        assert!(loaded.is_locked("core.color"), "…even one no layer sets");
+        assert!(!loaded.is_locked("enabled"), "and nothing outside it");
+        assert!(
+            !loaded.is_locked("corex.brightness"),
+            "the ancestor test is on path segments, not on a string prefix"
+        );
+    }
+
+    /// A `_locked` the fold cannot read pins nothing, and the layer that wrote
+    /// it is nix's — so it is warned about **naming the layer**, exactly as a
+    /// malformed `_unset` is (#988's argument, one marker over).
+    ///
+    /// Red if the [`merge::malformed_locked`] loop in [`assemble`] goes away.
+    #[test]
+    fn a_malformed_locked_marker_warns_naming_the_layer() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&[
+            "_locked = \"core.brightness\"\n\n[core]\nbrightness = 3\n",
+            SHADOWING_OVERLAY,
+        ]);
+
+        let warnings = locked_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "one marker, one warning: {warnings:#?}");
+        let fields = &warnings[0].fields;
+        assert_eq!(
+            fields.get("layer").map(String::as_str),
+            Some("/layer/0.toml")
+        );
+        assert_eq!(fields.get("key").map(String::as_str), Some("_locked"));
+        assert_eq!(fields.get("found").map(String::as_str), Some("string"));
+
+        assert_eq!(loaded.lock_findings.len(), 1, "{:?}", loaded.lock_findings);
+        assert_eq!(loaded.lock_findings[0].kind, FindingKind::MalformedLocked);
+        assert_eq!(
+            loaded.config.core.brightness, 7,
+            "it really pinned nothing — which is precisely why it has to be said"
+        );
+        assert!(
+            loaded.unknown_keys.is_empty(),
+            "and it is still stripped: {:?}",
+            loaded.unknown_keys
+        );
+    }
+
+    /// The writer's half. A save hands back the **whole** config, so a locked
+    /// key carries the value the merge kept — nix's — and writing it would pin
+    /// nix's current answer into the operator's own file, where it would go on
+    /// shadowing the base layer after the lock moved.
+    ///
+    /// Red if [`render_overlay_locking`]'s `without_locked` call goes away, or
+    /// if [`save_overlay_to_locked`] stops threading its `locked` argument
+    /// (the save-path seam mutation).
+    #[test]
+    fn a_save_leaves_a_locked_key_out_of_the_overlay() {
+        let loaded = assembled(&[LOCKED_BASE, "[core]\ncolor = \"cyan\"\n"]);
+        let locked = loaded.locked.clone();
+        assert_eq!(loaded.config.core.brightness, 3, "inherited from nix");
+
+        let out = render_overlay_locking("[core]\ncolor = \"cyan\"\n", &loaded.config, &locked)
+            .expect("renders");
+
+        assert!(
+            !out.contains("brightness"),
+            "the nix value must not be pinned into the overlay: {out}"
+        );
+        assert!(
+            out.contains("color = \"cyan\""),
+            "…while every unlocked key is written as before: {out}"
+        );
+
+        let unlocked =
+            render_overlay("[core]\ncolor = \"cyan\"\n", &loaded.config).expect("renders");
+        assert!(
+            unlocked.contains("brightness = 3"),
+            "control: without the lock set this writer does pin it, which is \
+             the defect the argument above is about: {unlocked}"
+        );
+    }
+
+    /// "Skipped" means neither written **nor deleted**: a line the operator
+    /// already had at a locked key is theirs, this writer does not rewrite
+    /// bytes it was not asked to, and the load already tells them by name that
+    /// the line is being refused.
+    #[test]
+    fn a_save_does_not_delete_an_existing_overlay_line_at_a_locked_key() {
+        let existing = "[core]\n# mine, and refused\nbrightness = 7\ncolor = \"cyan\"\n";
+        let loaded = assembled(&[LOCKED_BASE, existing]);
+        let mut value = loaded.config.clone();
+        value.core.color = "rust".into();
+
+        let out = render_overlay_locking(existing, &value, &loaded.locked).expect("renders");
+
+        assert!(
+            out.contains("brightness = 7"),
+            "the operator's own line survives, comment and all: {out}"
+        );
+        assert!(out.contains("# mine, and refused"), "{out}");
+        assert!(
+            out.contains("color = \"rust\""),
+            "the real edit lands: {out}"
+        );
+    }
+
+    /// End to end over real files: load a locked base plus an overlay, save,
+    /// and reload. The nix value must still be what the shell reads, and the
+    /// overlay must still not carry it.
+    #[test]
+    fn a_locked_key_round_trips_through_a_real_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&base, LOCKED_BASE).expect("seed the base");
+        std::fs::write(&overlay, "[core]\ncolor = \"cyan\"\n").expect("seed the overlay");
+        let paths = [base, overlay.clone()];
+
+        let loaded = load_from::<Leds>(&paths).expect("loads");
+        let mut value = loaded.config.clone();
+        value.core.color = "rust".into();
+        save_overlay_to_locked(&overlay, &value, &loaded.locked).expect("saves");
+
+        let written = std::fs::read_to_string(&overlay).expect("read back");
+        assert!(
+            !written.contains("brightness"),
+            "the overlay carries the operator's keys and says nothing about nix's: {written}"
+        );
+
+        let reloaded = load_from::<Leds>(&paths).expect("reloads");
+        assert_eq!(reloaded.config.core.color, "rust", "the edit took");
+        assert_eq!(
+            reloaded.config.core.brightness, 3,
+            "and nix still has precedence: {written}"
+        );
+        assert!(
+            reloaded.lock_findings.is_empty(),
+            "nothing to refuse any more, so nothing to report: {:?}",
+            reloaded.lock_findings
+        );
+    }
+
+    /// The "options stay optional" half, from the reader's side: a base layer
+    /// that declares no `_locked` at all behaves exactly as it did before
+    /// #1227 — overlay wins when present.
+    #[test]
+    fn a_base_layer_with_no_lock_changes_nothing() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\nbrightness = 3\n", SHADOWING_OVERLAY]);
+
+        assert_eq!(loaded.config.core.brightness, 7, "rule 1, untouched");
+        assert!(loaded.locked.is_empty(), "{:?}", loaded.locked);
+        assert!(
+            loaded.lock_findings.is_empty(),
+            "{:?}",
+            loaded.lock_findings
+        );
+        assert!(shadow_warnings(&captured).is_empty());
+    }
+
+    // ── #1331 review: what the merge enforced, and what a save may touch ────
+
+    /// A save must never drop a key on the strength of a marker the operator
+    /// wrote in **their own** file — that marker bound nothing, and the value
+    /// the save is carrying is theirs (#1331 review, HIGH 1).
+    ///
+    /// Red if [`merge::merge_all_locked`] collects the overlay's own
+    /// [`merge::LOCKED_KEY`] into [`Loaded::locked`]: the operator's edit is
+    /// silently replaced by the base's value, with no line anywhere saying so.
+    #[test]
+    fn a_save_does_not_skip_a_key_the_overlays_own_marker_named() {
+        let existing = "_locked = [\"core.color\"]\n\n[core]\ncolor = \"cyan\"\n";
+        let loaded = assembled(&["[core]\ncolor = \"amber\"\n", existing]);
+        assert!(
+            loaded.locked.is_empty(),
+            "the overlay's own marker enforced nothing: {:?}",
+            loaded.locked
+        );
+        assert!(!loaded.is_locked("core.color"), "so no row is greyed");
+
+        let mut value = loaded.config.clone();
+        value.core.color = "rust".into();
+        let out = render_overlay_locking(existing, &value, &loaded.locked).expect("renders");
+
+        assert!(
+            out.contains("color = \"rust\""),
+            "the operator's own edit: {out}"
+        );
+    }
+
+    /// #990's rule for the second marker: `_locked` is stripped before the
+    /// schema sees the table, so [`serde_ignored`] cannot report it and the
+    /// stale sweep in [`patch`] would count it as ours and delete it (#1331
+    /// review, MEDIUM 3).
+    ///
+    /// Red if the `merge::LOCKED_KEY` arm of [`collect_paths`]' skip goes
+    /// away.
+    ///
+    /// Asserted **byte-for-byte** rather than by `contains`, on the #1331
+    /// re-verify's ask: the marker is written the awkward way a hand-editing
+    /// operator would — leading comment, multi-line array, single-quoted name,
+    /// trailing comment — and a save that flips an unrelated key must leave
+    /// that block identical. A `contains` check would survive a reformat, and
+    /// "the writer does not rewrite bytes it was not asked to" is the actual
+    /// contract.
+    ///
+    /// The marker here is the overlay's own, so it pins nothing (`locked` is
+    /// empty) — which is the point: an inert marker is still the operator's
+    /// bytes.
+    #[test]
+    fn a_locked_marker_survives_a_save() {
+        let existing = "# my pins\n_locked = [\n  'core.color',   # keep this one\n]\nenabled = true\n\n[core]\ncolor = \"cyan\"\nbrightness = 3\n";
+        let loaded = assembled(&[existing]);
+        let mut value = loaded.config.clone();
+        value.enabled = !value.enabled;
+
+        let out = render_overlay_locking(existing, &value, &loaded.locked).expect("renders");
+
+        let want = "# my pins\n_locked = [\n  'core.color',   # keep this one\n]\n";
+        assert!(
+            out.starts_with(want),
+            "the marker block must be byte-identical:\n---\n{out}\n---"
+        );
+        assert!(
+            out.contains("enabled = false"),
+            "the real edit lands: {out}"
+        );
+    }
+
+    /// A lock naming a key its own layer does not set pins **nothing**, and
+    /// the layer and key are named — otherwise the operator's value is refused
+    /// in favour of [`Subsystem::DEFAULT_TOML`], a value nix never wrote,
+    /// under a sentence claiming nix set it (#1331 review, LOW 4).
+    ///
+    /// Red if the [`merge::inert_locked`] loop in `assemble_layers` goes away,
+    /// and red (differently) if `collect_locks` stops filtering: the config
+    /// reads 3, the built-in default, instead of the overlay's 9.
+    #[test]
+    fn an_inert_lock_warns_naming_the_layer_and_pins_nothing() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&[
+            "_locked = [\"core.brightness\"]\n\n[core]\ncolor = \"amber\"\n",
+            "[core]\nbrightness = 7\n",
+        ]);
+
+        let warnings: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == INERT_LOCKED_MESSAGE)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert_eq!(
+            warnings[0].fields.get("layer").map(String::as_str),
+            Some("/layer/0.toml")
+        );
+        assert_eq!(
+            warnings[0].fields.get("key").map(String::as_str),
+            Some("core.brightness")
+        );
+
+        assert!(loaded.locked.is_empty(), "{:?}", loaded.locked);
+        assert_eq!(
+            loaded.config.core.brightness, 7,
+            "the overlay's value stands — nothing was pinned"
+        );
+        assert!(shadow_warnings(&captured).is_empty());
+        assert_eq!(loaded.lock_findings.len(), 1, "{:?}", loaded.lock_findings);
+        assert_eq!(loaded.lock_findings[0].kind, FindingKind::InertLocked);
+    }
+
+    /// The journal line names **both** files: `layer` is the one the operator
+    /// must edit (their overlay) and `source` the base the kept value actually
+    /// came from — which matters the moment two base directories are in play
+    /// (#1331 review, MEDIUM 2).
+    #[test]
+    fn the_refusal_names_the_base_the_kept_value_came_from() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&[
+            "_locked = [\"core.brightness\"]\n\n[core]\nbrightness = 1\n",
+            "[core]\nbrightness = 3\n",
+            SHADOWING_OVERLAY,
+        ]);
+
+        assert_eq!(
+            loaded.config.core.brightness, 3,
+            "the more important base dir still wins the value"
+        );
+        let warnings = shadow_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert_eq!(
+            warnings[0].fields.get("layer").map(String::as_str),
+            Some("/layer/2.toml"),
+            "the file to go and edit"
+        );
+        assert_eq!(
+            warnings[0].fields.get("source").map(String::as_str),
+            Some("/layer/1.toml"),
+            "the file the kept value lives in"
+        );
+    }
+
+    /// A lock in the **least** important `XDG_CONFIG_DIRS` entry does not beat
+    /// the most important one — the inversion [`crate::xdg`]'s module doc
+    /// exists to prevent, through the real load (#1331 review, MEDIUM 2).
+    #[test]
+    fn a_base_lock_does_not_beat_a_more_important_base_dir() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&[
+            "_locked = [\"core.color\"]\n\n[core]\ncolor = \"lcd\"\n",
+            "[core]\ncolor = \"crt\"\n",
+            "",
+        ]);
+
+        assert_eq!(loaded.config.core.color, "crt", "XDG precedence holds");
+        assert!(shadow_warnings(&captured).is_empty());
+        assert!(loaded.is_locked("core.color"), "…and the overlay is bound");
+    }
+
+    /// With no overlay **file** — the normal state of a fresh machine —
+    /// [`load_from`] must still hand back every base lock, because that set is
+    /// what an editor greys rows from and what the save that *creates* the
+    /// overlay skips.
+    ///
+    /// Red if [`load_from`] decides the overlay slot from the files it managed
+    /// to read rather than from the paths it was asked for: the top base is
+    /// promoted into the overlay slot, its lock vanishes from
+    /// [`Loaded::locked`], and every row it should have greyed is offered as
+    /// editable on the machine where nobody has written an overlay yet.
+    ///
+    /// The save half is deliberately not asserted here: a first save *seeds*
+    /// [`Subsystem::DEFAULT_TOML`] into the new file (see
+    /// [`save_overlay_to_locked`]'s own doc), so the fresh overlay carries the
+    /// documented default's line at every key, locked ones included. That is
+    /// the seeding rule, not the lock's, and it predates #1227.
+    #[test]
+    fn a_missing_overlay_file_still_leaves_the_base_locks_enforceable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&base, LOCKED_BASE).expect("seed the base");
+        let paths = [base, overlay];
+
+        let loaded = load_from::<Leds>(&paths).expect("loads");
+
+        assert!(loaded.is_locked("core.brightness"), "{:?}", loaded.locked);
+        assert_eq!(loaded.config.core.brightness, 3, "nix's value");
+        assert_eq!(loaded.sources.len(), 1, "and only the base was read");
+    }
+
+    /// The mirror of the test above, and the case that is *normal* rather than
+    /// rare: a `XDG_CONFIG_DIRS` entry that carries no file for this subsystem
+    /// must not move the overlay slot. [`crate::xdg::Env::config_layers`]
+    /// emits one path per configured base dir, and a live session has several
+    /// (home-manager's profile, the per-user profile, the system profile,
+    /// `/etc/xdg`) of which at most one ever holds a given subsystem's file —
+    /// so "every requested path was read" is false on essentially every real
+    /// load.
+    ///
+    /// Red if [`load_from`] decides the overlay slot by counting the paths it
+    /// read against the paths it asked for: the overlay is then folded as a
+    /// base, [`merge::merge_all_locked`] is handed `None` for the overlay, and
+    /// **no** lock binds anything — the operator's `brightness = 7` wins and
+    /// nothing is reported.
+    #[test]
+    fn a_missing_lower_base_does_not_move_the_overlay_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("absent.toml");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&base, LOCKED_BASE).expect("seed the base");
+        std::fs::write(&overlay, "[core]\nbrightness = 7\n").expect("seed the overlay");
+        let paths = [absent, base, overlay];
+
+        let loaded = load_from::<Leds>(&paths).expect("loads");
+
+        assert_eq!(loaded.config.core.brightness, 3, "nix's value is kept");
+        assert!(loaded.is_locked("core.brightness"), "{:?}", loaded.locked);
+        assert_eq!(
+            loaded.lock_findings.len(),
+            1,
+            "and the refusal is reported: {:?}",
+            loaded.lock_findings
+        );
+    }
+
+    /// [`assemble_base_layers`] has one call site in the workspace and it is in
+    /// another crate, so this is `hytte-config`'s own pin on the entry point
+    /// (#1331 re-verify, item 6): a base layer read as one keeps its lock.
+    ///
+    /// Red if `assemble_base_layers` ever forwards `has_overlay = true` — the
+    /// single layer becomes the overlay and its marker pins nothing.
+    #[test]
+    fn assemble_base_layers_keeps_a_base_layers_lock() {
+        let loaded: Loaded<Leds> =
+            assemble_base_layers(&layers(&[LOCKED_BASE])).expect("a lone base layer assembles");
+
+        assert_eq!(
+            loaded.locked,
+            BTreeSet::from(["core.brightness".to_owned()]),
+            "the marker binds the overlay that does not exist yet"
+        );
+        assert!(loaded.is_locked("core.brightness"));
+        assert!(
+            loaded.lock_findings.is_empty(),
+            "nothing above it to refuse: {:?}",
+            loaded.lock_findings
+        );
     }
 }

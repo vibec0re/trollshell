@@ -241,9 +241,9 @@ inline in `flake.nix` as one-liners.
   build's own output carries them. No new closure inputs — it runs through
   the same `mesa`/`xvfb-run` the GL tests already pulled in.
 
-Since #1231 the workflow (`.github/workflows/nix-flake-check.yml`) does not
-run `nix flake check` itself any more. Five of the checks above are each a
-full workspace compile (`packages.trollshell`'s release build off the bin-only
+Since #1231 the workflow (`.github/workflows/nix-flake-check.yml`) no longer
+runs those checks as one `nix flake check` on one runner. Five of them are
+each a full workspace compile (`packages.trollshell`'s release build off the bin-only
 deps cache; `workspace-tests`, `system-tests`, `clippy` and `rustdoc` off the
 dev-graph one), and running three of them concurrently on one 4-core runner
 made the wall time their _sum_ — 51, 73 and 86+ min against the 75-minute
@@ -257,13 +257,17 @@ are ~2 min each). Everything else — treefmt, the five source scans,
 `options-doc`, the 26 module evals — is one `cheap` job. **The required check
 is the aggregate job named `flake-check`**, which `needs:` every job above and
 is red if any failed, was cancelled or was skipped; that name is what branch
-protection and the merge poller read, so it does not move. A step in the
-`cheap` job guards the layout against rot: it diffs `nix flake show`'s check
-list against every `checks.<system>.<name>` installable the workflow actually
-builds and fails on any difference in either direction — so a new check nobody
-adds to a job cannot silently go untested — and since that command forces
-every output leaf on both systems it doubles as the whole-flake eval sweep
-`nix flake check` used to give. What the split costs is CPU, not wall time:
+protection and the merge poller read, so it does not move. It is only the
+_builds_ that moved out: the `cheap` job still runs
+`nix flake check --no-build --all-systems` for the evaluation sweep and the
+per-output-type checks (`nixosModules.default` among them) that nothing else
+does. What a hand-written build list would lose is "everything in `checks`
+runs", so a step beside it guards the layout against rot: it diffs
+`nix flake show`'s check list against every `checks.<system>.<name>`
+installable the workflow actually builds — read out of the workflow file
+itself, so it cannot drift from what the jobs run — and fails in either
+direction, so a new check nobody adds to a job cannot silently go untested.
+What the split costs is CPU, not wall time:
 runners share no Nix store, so each job compiles the deps closure it needs
 rather than one run compiling it once (#1268). A cross-run binary cache
 (#1231 item 2) is what turns those into hits, and it needs a token.

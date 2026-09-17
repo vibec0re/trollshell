@@ -1985,9 +1985,10 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
     if locked.is_empty() {
         return Ok(S::DEFAULT_TOML.to_string());
     }
-    let mut doc: toml_edit::DocumentMut = S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
-        ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
-    })?;
+    let mut doc: toml_edit::DocumentMut =
+        S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
+            ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
+        })?;
     strip_locked(doc.as_table_mut(), locked, "");
     Ok(doc.to_string())
 }
@@ -2006,7 +2007,10 @@ fn strip_locked(doc: &mut dyn toml_edit::TableLike, locked: &BTreeSet<String>, p
             .get(&key)
             .and_then(toml_edit::Item::as_table_like)
             .is_some_and(toml_edit::TableLike::is_empty);
-        let Some(sub) = doc.get_mut(&key).and_then(toml_edit::Item::as_table_like_mut) else {
+        let Some(sub) = doc
+            .get_mut(&key)
+            .and_then(toml_edit::Item::as_table_like_mut)
+        else {
             continue;
         };
         strip_locked(sub, locked, &format!("{path}."));
@@ -5056,8 +5060,11 @@ kept = true
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().join("base.toml");
         let overlay = dir.path().join("overlay.toml");
-        std::fs::write(&base, "_locked = [\"core.color\"]\n\n[core]\ncolor = \"lcd\"\n")
-            .expect("seed the base");
+        std::fs::write(
+            &base,
+            "_locked = [\"core.color\"]\n\n[core]\ncolor = \"lcd\"\n",
+        )
+        .expect("seed the base");
         let paths = [base, overlay.clone()];
 
         let loaded = load_from::<Leds>(&paths).expect("first load, no overlay yet");

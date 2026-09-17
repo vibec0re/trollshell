@@ -19,13 +19,14 @@
 //! # Coverage
 //!
 //! Printable ASCII (letters both cases, digits, and common punctuation —
-//! `! ? . , : ; ' " ( ) - ~ / …`) plus the accented set a German/Swedish
-//! desktop produces: `å ä ö Å Ä Ö ü Ü ß é`. Any uncovered char (emoji
-//! included) has no glyph — [`glyph`] returns `None` and renderers draw the
-//! dim hollow [`NOTDEF`] box instead, never a panic. The accented uppercase
-//! and `å/Å` glyphs are compact approximations — the ring on `å` is a single
-//! dot, and the umlaut/ring uppercase bodies are squeezed into five rows to
-//! leave room for the diacritic.
+//! `! ? . , : ; ' " ( ) - ~ / % …`) plus the accented set a German/Swedish
+//! desktop produces: `å ä ö Å Ä Ö ü Ü ß é`, plus the degree sign `°` (#1354 —
+//! caw's weather line and usage line are the two shipped callers). Any
+//! uncovered char (emoji included) has no glyph — [`glyph`] returns `None`
+//! and renderers draw the dim hollow [`NOTDEF`] box instead, never a panic.
+//! The accented uppercase and `å/Å` glyphs are compact approximations — the
+//! ring on `å` is a single dot, and the umlaut/ring uppercase bodies are
+//! squeezed into five rows to leave room for the diacritic.
 
 /// Glyph cell width in pixels.
 pub const GLYPH_W: usize = 5;
@@ -144,6 +145,19 @@ pub fn glyph(c: char) -> Option<&'static [u8; GLYPH_H]> {
         ],
         '"' => &[
             0b10100, 0b10100, 0b10100, 0b00000, 0b00000, 0b00000, 0b00000,
+        ],
+        // '%' (#1354): a dot top-left, a dot bottom-right, and a diagonal
+        // stroke between them — 180°-rotationally symmetric, same one-pixel
+        // stroke weight the digits use (compare '2'/'7's diagonal tails).
+        //   ##..#
+        //   ##.#.
+        //   ...#.
+        //   ..#..
+        //   .#...
+        //   .#.##
+        //   #..##
+        '%' => &[
+            0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011,
         ],
         '\'' => &[
             0b00100, 0b00100, 0b01000, 0b00000, 0b00000, 0b00000, 0b00000,
@@ -368,14 +382,28 @@ pub fn glyph(c: char) -> Option<&'static [u8; GLYPH_H]> {
     })
 }
 
-/// Non-ASCII glyphs: German/Swedish accents plus the ellipsis. Compact
-/// approximations (see the module's Coverage note).
+/// Non-ASCII glyphs: German/Swedish accents plus the ellipsis and the degree
+/// sign. Compact approximations (see the module's Coverage note).
 fn glyph_extra(c: char) -> Option<&'static [u8; GLYPH_H]> {
     Some(match c {
         // Horizontal ellipsis (U+2026) — also the wrap overflow marker;
         // non-ASCII, so it lives here.
         '…' => &[
             0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b10101, 0b10101,
+        ],
+        // '°' (U+00B0, #1354): a small hollow ring sitting high in the cell
+        // (superscript position, like a real degree sign), rest of the cell
+        // empty — same single-pixel stroke weight as the NOTDEF box, just
+        // three rows tall and three columns wide.
+        //   .###.
+        //   .#.#.
+        //   .###.
+        //   .....
+        //   .....
+        //   .....
+        //   .....
+        '°' => &[
+            0b01110, 0b01010, 0b01110, 0b00000, 0b00000, 0b00000, 0b00000,
         ],
         'ä' => &[
             0b01010, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111,
@@ -422,10 +450,46 @@ mod tests {
     fn covered_chars_have_glyphs() {
         let covered = "abcdefghijklmnopqrstuvwxyz\
                        ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                       0123456789 !?.,:;'\"()-~/…åäöÅÄÖüÜßé";
+                       0123456789 !?.,:;'\"()-~/%°…åäöÅÄÖüÜßé";
         for c in covered.chars() {
             assert!(glyph(c).is_some(), "expected a glyph for {c:?}");
         }
+    }
+
+    /// #1354: `%` and `°` used to fall back to the [`NOTDEF`] box (caw's
+    /// usage and weather lines hit exactly this) — both now resolve to a real
+    /// glyph, and neither one happens to render as the hollow box either.
+    #[test]
+    fn percent_and_degree_resolve_to_own_glyph_not_the_box() {
+        for c in ['%', '°'] {
+            let g = glyph(c);
+            assert!(g.is_some(), "expected a glyph for {c:?}");
+            assert_ne!(g, Some(&NOTDEF), "{c:?} must not render as the notdef box");
+        }
+    }
+
+    /// Pins `%`'s 7 row bytes: a dot top-left, a dot bottom-right, and a
+    /// diagonal stroke between them (see the doc comment on the match arm).
+    #[test]
+    fn percent_glyph_bytes() {
+        assert_eq!(
+            glyph('%'),
+            Some(&[
+                0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011
+            ])
+        );
+    }
+
+    /// Pins `°`'s 7 row bytes: a small hollow ring in the top three rows,
+    /// empty below (see the doc comment on the match arm).
+    #[test]
+    fn degree_glyph_bytes() {
+        assert_eq!(
+            glyph('°'),
+            Some(&[
+                0b01110, 0b01010, 0b01110, 0b00000, 0b00000, 0b00000, 0b00000
+            ])
+        );
     }
 
     /// An uncovered char (e.g. an emoji) maps to no glyph — renderers then

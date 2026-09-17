@@ -356,8 +356,8 @@ pub(crate) const PANEL_SCALE: u32 = 1;
 /// The upscale the **supersampled** LED-panel case runs at.
 ///
 /// A real shipping value rather than a chosen one: `core_panel_scale` answers
-/// 5 at 4 and 8 cores, 3 at 16, **2 at 32**, and 1 from 64 up, so a 32-core
-/// box's panel is exactly this. Taking the smallest of the above-one answers is
+/// 6 at 1 core, 5 at 4, 3 at 8 and at 16, **2 at 32**, and 1 from 64 up, so a
+/// 32-core box's panel is exactly this. Taking the smallest of the above-one answers is
 /// the conservative choice — a larger factor gives the box filter more room to
 /// agree with the oracle, not less.
 pub(crate) const PANEL_SUPERSAMPLE: u32 = 2;

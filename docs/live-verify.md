@@ -3402,9 +3402,9 @@ session.
      byte-identical at 1:1 under llvmpipe, so a visible difference on a real
      driver is this arm's first real-hardware finding.
   2. **Where the improvement is, and where it is not.** `core_panel_scale`
-     answers 5 at 4–8 cores, 3 at 16, **2 at 32** and **1 from 64 up**, so
-     whether you can see anything at all depends on your core count. On a box
-     of 32 cores or fewer the GL frame's lamp edges and — much more visibly —
+     answers 6 at 1 core, 5 at 4, 3 at 8 and at 16, **2 at 32** and **1 from 64
+     up**, so whether you can see anything at all depends on your core count.
+     On a box of 32 cores or fewer the GL frame's lamp edges and — much more visibly —
      its **halo** should be smooth where the CPU one is a staircase of
      `scale`-wide blocks. On a 64-core box the two are the same resolution and
      this check is vacuous by construction; say so rather than reporting "no

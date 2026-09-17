@@ -856,10 +856,12 @@ impl PanelAt {
                 levels[cores / 2] = 1.0;
                 levels
             }
+            // The degenerate panel's one lamp at a partial intensity, so it is
+            // not just another all-or-nothing frame.
+            Self::Single => vec![0.61],
             // A ramp that never lands on 0 or 1 at either end, so every lamp
             // carries a *different* partial intensity — the state the meter's
             // all-or-nothing segments cannot be in.
-            Self::Single => vec![0.61],
             Self::Ramp | Self::Style | Self::Ragged => (0..cores)
                 .map(|i| (i as f32 + 0.5) / cores as f32)
                 .collect(),

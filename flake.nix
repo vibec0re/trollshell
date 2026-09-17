@@ -702,6 +702,40 @@
             }
           );
 
+          # Gate rustdoc warnings on the workspace's docs (#1328): a
+          # `private_intra_doc_links` or `broken_intra_doc_links` warning is a
+          # broken link on a **published** API page — the one place a plugin
+          # author reads the SDK — and nothing caught it before this: `cargo
+          # doc` was not part of `nix flake check`, so PR #1322 shipped ten
+          # `private_intra_doc_links` warnings on `hytte-plugin`'s public
+          # `effective_mount`/`effective_mount_from` docs unnoticed. Own leaf
+          # row, on the `workspace-tests` precedent above — not folded into
+          # it, since a doc build is its own failure mode and `glsl`/
+          # `bind-pins`/`lints-tables` already establish that a leaf check
+          # gets its own row rather than riding an existing one. Shares
+          # `cargoArtifacts` with the checks above instead of compiling its
+          # own dependency graph.
+          #
+          # `craneLib.cargoDoc` defaults `cargoDocExtraArgs` to `--no-deps`
+          # (only this workspace's own docs, not every dependency's) and
+          # `cargoExtraArgs` to `--locked`; `commonArgs.cargoExtraArgs`
+          # already carries `--workspace --locked` (#572), so this call runs
+          # exactly `cargo doc --workspace --locked --no-deps`, matching the
+          # `cargo doc --workspace --no-deps` in the issue and CLAUDE.md.
+          # `RUSTDOCFLAGS="-D warnings"` is what turns a warning into a build
+          # failure — `cargo doc` alone exits 0 on one.
+          rustdoc = craneLib.cargoDoc (
+            trollshell.passthru.commonArgs
+            // {
+              cargoArtifacts = trollshell.passthru.cargoArtifacts;
+              RUSTDOCFLAGS = "-D warnings";
+              # Leaf/terminal check: nothing consumes its target dir (this
+              # already matches `cargoDoc`'s own default, spelled out here
+              # for the same reason `workspace-tests` above does).
+              doInstallCargoArtifacts = false;
+            }
+          );
+
           # Run the `system-tests` cargo-feature bucket (#232): the
           # whole-file-`#![cfg(feature = "system-tests")]` integration tests
           # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,

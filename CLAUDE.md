@@ -200,6 +200,22 @@ inline in `flake.nix` as one-liners.
   `glslangValidator` alone cannot catch — proved by its own `--self-test` arm.
   A plugin's _runtime_ source is deliberately not validated anywhere; see the
   trust boundary below.
+- `rustdoc` (#1328): `cargo doc --workspace --no-deps` with
+  `RUSTDOCFLAGS="-D warnings"`, on the `workspace-tests` precedent above —
+  its own leaf row, not folded into it, sharing `cargoArtifacts` rather than
+  compiling a fresh dependency graph. Nothing ran `cargo doc` in CI before
+  this: PR #1322 shipped ten `private_intra_doc_links` warnings on
+  `hytte-plugin`'s public `effective_mount`/`effective_mount_from` docs
+  unnoticed, and a rustdoc warning on a `pub` item is a broken link on the
+  one page a plugin author actually reads for the SDK. `private_intra_doc_links`
+  (a public item's doc linking a private one) and `broken_intra_doc_links` (an
+  unresolvable path, an ambiguous `mod`-vs-`fn`/`macro` name, or an invalid
+  anchor) are fixed in the doc comment itself — linking an already-public item
+  instead, an explicit `[`name`](Self::name)`-style path, a `mod@`/disambiguated
+  path, or dropping the markdown link syntax to plain code when nothing public
+  is a legitimate target — never with `#[allow]` or `#[doc(hidden)]`. Run it by
+  hand from the devShell with
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
 - Since #1036, the `system-tests` check's closure carries `mesa` (llvmpipe) and
   its `preCheck` exports the software-GL env plus `TROLLSHELL_REQUIRE_GL=1`,
   so the three GL-context tests in `hytte-ui` (`gl_surface.rs`) actually run

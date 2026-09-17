@@ -123,6 +123,19 @@ pub(crate) enum Case {
         /// what renders at two resolutions.
         scale: u32,
     },
+    /// A `LedMatrix` panel at one fixture brightness grid (#1156).
+    LedMatrix {
+        style: kit::DisplayStyle,
+        panel: PanelAt,
+        /// The shell's own integer upscale — `core_panel_scale`'s answer, which
+        /// `PixelSurface::set_scale` replicates on the CPU arm.
+        /// [`PANEL_SCALE`] compares pixel against pixel,
+        /// [`PANEL_SUPERSAMPLE`] compares a box-averaged native frame against
+        /// the kit's logical one. The `Gauge`'s and the `FlipBoard`'s
+        /// arrangement, not the `stretch` the four lattice kinds use, because
+        /// the panel's on-glass size *is* an integer multiple of its buffer.
+        scale: u32,
+    },
 }
 
 impl Case {
@@ -143,14 +156,23 @@ impl Case {
             Self::LedStrip { .. } => Kind::LedStrip,
             Self::SevenSeg { .. } => Kind::SevenSeg,
             Self::FlipBoard { .. } => Kind::FlipBoard,
+            Self::LedMatrix { .. } => Kind::LedMatrix,
         }
     }
 
     /// The native-frame flatness ceiling this case is held to —
     /// [`Kind::flat_block_ceiling`]'s, except where a kind's own answer cannot
-    /// be stated per kind (#1155 review, HIGH).
+    /// be stated per kind (#1155 review, HIGH; #1156 review, HIGH-1).
     ///
-    /// **The flip board is that exception, and it is why this method exists.**
+    /// **Two kinds are that exception**, for one reason wearing two shapes: a
+    /// kind whose case list mixes a surface with sub-pixel geometry and a
+    /// surface that is honestly pure replication has no single honest answer,
+    /// so the key has to be finer than the kind. The flip board splits on its
+    /// **mechanism** (nixie vs split flap) and the LED panel on its **skin**
+    /// (the bloomless lcd vs the three that halo).
+    ///
+    /// **The flip board is the original exception, and it is why this method
+    /// exists.**
     /// Its two mechanisms answer differently and honestly: a **nixie** *is*
     /// replication — it is a cross-fade between two 5×7 bitmap cathodes, has
     /// no sub-pixel geometry anywhere, and its native frame is exactly what
@@ -174,14 +196,54 @@ impl Case {
     /// future answer that moves further toward replication has to red
     /// somewhere.
     ///
-    /// **Falsified** by returning the kind's answer for a split flap, which
-    /// puts the `snapped := true` probe back to `PASS all 204`.
+    /// **The LED panel is the second exception, and for the same reason**
+    /// (#1156 review, HIGH-1): its **lcd** is this widget's nixie. That skin's
+    /// bloom radius is `0`, so it has no halo to resolve per fragment and its
+    /// native frame genuinely *is* `Frame::upscale` — measured **100.0 %** —
+    /// while the three skins that do bloom measure **56.8 / 64.7 / 58.7 %**
+    /// (vfd / oled / crt). A ceiling armed on the *kind* would red a correct
+    /// lcd render forever, exactly as one armed on `FlipBoard` would red a
+    /// correct nixie.
+    ///
+    /// `0.80` is calibrated against the same reversion probe, transplanted:
+    /// `bool snapped = true;` in `led_matrix.frag`'s `main`, which is the whole
+    /// of #1156 undone — no footprint integral, no closed-form halo at the
+    /// fragment, `PixelSurface`'s staircase reproduced on the GPU. Under it the
+    /// four `rampx2` frames go **56.8 / 100.0 / 64.7 / 58.7 % → 100.0 % on all
+    /// four**, and — this is the finding that makes the ceiling necessary —
+    /// *every other gate stays green*: the four cases come back `mean 0.000 /
+    /// max 0` on **every** bin, i.e. bit-identical to the oracle and so
+    /// *better* than the shipping render, `interior_max()` is `0`, the edge
+    /// budget is unreached and `TROLLSHELL_PARITY_EXACT=1` is satisfied. The
+    /// 1:1 cases cannot see it by construction (`snapped` is already `true`
+    /// there) and nothing hermetic can either, since `led_matrix.rs`'s
+    /// `shader_frame` transcribes the snapped branch only.
+    ///
+    /// `0.80` sits in a **~35-point** gap (64.7 → 100.0), far wider than the
+    /// 6.2 points `0.97` was cut from, so it is ~15 points clear on either
+    /// side. The **other** probe — #1153's half-native-pixel `p.x` shift — is
+    /// recorded beside it rather than instead of it, because the two catch
+    /// different things: it *keeps* the continuous branch and moves it
+    /// sideways, taking flatness **down** to 52.2 / 89.0 / 57.3 / 52.7 % (all
+    /// under this ceiling, correctly) while reddening the edge budget on all
+    /// four. A reversion raises flatness; a drift inside the branch raises the
+    /// edge delta. Neither gate alone covers both.
+    ///
+    /// **Falsified** by returning the kind's answer for a split flap or for a
+    /// blooming panel, which puts the matching `snapped := true` probe back to
+    /// `PASS all 236`; or by dropping the lcd carve-out, which reds the
+    /// shipping lcd frame at 100.0 %.
     pub(crate) fn flat_block_ceiling(&self) -> Option<f64> {
         match self {
             Self::FlipBoard {
                 mechanism: kit::Mechanism::SplitFlap,
                 ..
             } => Some(0.97),
+            Self::LedMatrix { style, scale, .. }
+                if *scale > 1 && !matches!(style, kit::DisplayStyle::Lcd) =>
+            {
+                Some(0.80)
+            }
             other => other.kind().flat_block_ceiling(),
         }
     }
@@ -267,6 +329,96 @@ pub(crate) enum BoardAt {
     /// accent role", run on both mechanisms.
     Pinned,
 }
+
+/// What an LED-panel case's grid is showing (#1156).
+///
+/// Seven, and every one of them is a **fixture**: a fixed brightness grid, not
+/// a live `sensors::cpu()` reading, because a parity case has to be the same
+/// picture on both arms and on every run. The issue asks for exactly that.
+///
+/// The choice covers what this shader has to get right that
+/// [`MeterAt`]'s does not — a *different* intensity per rectangle, a colour per
+/// lamp, and a ragged tail — plus the two states a panel spends its life in.
+///
+/// Two different vacuities here, not one, the way [`MeterAt`]'s doc records
+/// them. **Against an undrawn framebuffer**, only the OLED's [`Dark`](Self::Dark)
+/// case is vacuous — its field is pure black, while the CRT's non-black field
+/// (`[3, 7, 5]`) means a dark panel there does catch that. **Against a lattice
+/// drift**, the CRT's dark case is vacuous too: `palette_snapshot(Crt).ghost`
+/// is `None`, the same as the OLED's, so a dark CRT panel draws nothing at all
+/// and there is no lamp on screen to move. Both are kept rather than
+/// special-cased, for the reason `MeterAt`'s are: the VFD's and the LCD's *do*
+/// detect (both paint the whole ghost grid there), and a case list that varies
+/// by skin is a worse thing to reason about than two cases that are each
+/// vacuously green against one kind of drift.
+#[derive(Clone, Copy)]
+pub(crate) enum PanelAt {
+    /// Every lamp at rest on the shipping panel: the ghost grid and the field,
+    /// nothing lit. The frame an idle machine's drawer actually shows, and the
+    /// one case where the lit emission is empty everywhere — so the halo is
+    /// provably absent rather than merely dim.
+    Dark,
+    /// A ramp across the lamps — every lamp a **different** brightness, which
+    /// is the whole difference between this widget and the meter, and the
+    /// arrangement where one wrong texel of the per-lamp strip shows.
+    Ramp,
+    /// Every lamp pinned: the halo's window is saturated almost everywhere, so
+    /// the buffer's own edge clipping (the unrenormalised divisor) is what is
+    /// left to get wrong.
+    Full,
+    /// One lamp lit in the middle of a resting grid: an **isolated halo**, with
+    /// field and unlit hardware all round it, which is the one arrangement
+    /// where the closed-form blur's spill is not overlapped by a neighbour's
+    /// and a wrong window shows as a wrong-sized glow.
+    Lonely,
+    /// A **ragged** last row under [`kit::Fill::Blank`]: 64 lamps on a 22×3
+    /// grid, so two slots hold no lamp at all. The case that reaches
+    /// `ghost_slots`' second arm on a driver.
+    ///
+    /// It does **not** exercise the spare slots' ink clamp, although an
+    /// earlier draft of this doc said it did (#1156 review, MEDIUM-1). No
+    /// shipped skin blooms further than `GAP`, so no halo ever reaches another
+    /// lamp's `index_table` column and the ink closure is never called on a
+    /// spare slot at all — `hytte-preem`'s
+    /// `no_skins_halo_can_reach_another_lamps_pixels` reds the day that
+    /// changes. What pins the clamp today is the uploaded strip
+    /// (`led_matrix.rs`'s `the_strip_carries_the_kits_own_lamp_amounts_and_inks`).
+    Ragged,
+    /// The degenerate **1×1** panel — a single-core box. `cols - 1` and
+    /// `rows - 1` are both `0`, so every index clamp in the shader collapses,
+    /// and it is the panel `core_panel_scale` blows up hardest — 6x, the top
+    /// of the ladder (6 / 5 / 3 / 3 / 2 / 1 at 1 / 4 / 8 / 16 / 32 / 64+
+    /// cores), so a 4-, 8- or 16-core box is above 2 as well.
+    Single,
+    /// The ramp again under [`kit::ColorMap::Style`] — the skin's single
+    /// accent-tinted ink, which is the branch `LedMatrix::render` takes
+    /// *verbatim* through `Emission::composite`. Every other case here runs the
+    /// `core-leds.toml` default (`ColorMap::Heat`), so without this one the
+    /// single-ink path — the one every other kit widget shares — never reaches
+    /// a driver through this widget.
+    Style,
+}
+
+/// The lamp count every LED-panel case but [`PanelAt::Single`] and
+/// [`PanelAt::Ragged`] runs at — a 32-core box, which is the largest core count
+/// `core_panel_scale` still gives [`PANEL_SUPERSAMPLE`] to.
+///
+/// `#[allow(dead_code)]` for [`Case`]'s reason: read by the harness's own
+/// `panel_grid`, which stayed in the example.
+#[allow(dead_code)]
+pub(crate) const PANEL_CORES: usize = 32;
+
+/// The upscale the **1:1** LED-panel cases run at — see [`Case::LedMatrix`].
+pub(crate) const PANEL_SCALE: u32 = 1;
+
+/// The upscale the **supersampled** LED-panel case runs at.
+///
+/// A real shipping value rather than a chosen one: `core_panel_scale` answers
+/// 6 at 1 core, 5 at 4, 3 at 8 and at 16, **2 at 32**, and 1 from 64 up, so a
+/// 32-core box's panel is exactly this. Taking the smallest of the above-one answers is
+/// the conservative choice — a larger factor gives the box filter more room to
+/// agree with the oracle, not less.
+pub(crate) const PANEL_SUPERSAMPLE: u32 = 2;
 
 /// What a seven-segment case is reading out.
 ///
@@ -808,6 +960,34 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                         board: BoardAt::Rolling,
                         scale: FLIP_SUPERSAMPLE,
                     });
+            // The panel (#1156): the seven fixture grids, at the kit's own
+            // buffer resolution. See [`PanelAt`].
+            let panels = [
+                PanelAt::Dark,
+                PanelAt::Ramp,
+                PanelAt::Full,
+                PanelAt::Lonely,
+                PanelAt::Ragged,
+                PanelAt::Single,
+                PanelAt::Style,
+            ]
+            .into_iter()
+            .map(move |panel| Case::LedMatrix {
+                style: *style,
+                panel,
+                scale: PANEL_SCALE,
+            });
+            // …and the ramp at the shell's own shipping upscale, which is where
+            // *this* arm's improvement lives: every lamp's edge and the whole
+            // halo resolved at the screen's resolution rather than replicated
+            // out of the kit's small buffer by `PixelSurface`. `Ramp` because
+            // it is the state with a different intensity in every lamp, so the
+            // halo has structure everywhere rather than only at the grid's rim.
+            let shipping_panel = std::iter::once(Case::LedMatrix {
+                style: *style,
+                panel: PanelAt::Ramp,
+                scale: PANEL_SUPERSAMPLE,
+            });
             scopes
                 .chain(gauges)
                 .chain(shipping)
@@ -826,6 +1006,8 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 .chain(boards)
                 .chain(tubes)
                 .chain(shipping_boards)
+                .chain(panels)
+                .chain(shipping_panel)
         })
         .collect()
 }

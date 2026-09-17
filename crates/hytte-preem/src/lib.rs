@@ -162,7 +162,27 @@ pub use gauge::{
     TAIL_FLARE, TRAIL_SPAN_SECS, TRAIL_T, VALUE_HW_BONUS, VALUE_T, bloom_radius, on_dial,
     trail_fraction,
 };
-pub use led_matrix::{Fill, LedMatrix};
+// The `LED_MATRIX_*`/`led_matrix_*` half of this list is #1156's seam for the
+// shell's GPU arm, on the `LED_CELL_W`/`SEVEN_SEG_*`/`FlipMetrics` precedent
+// below (#1153/#1154/#1155): a `.frag` cannot read a Rust `const`, so the shell
+// either transcribes this widget's lattice metrics and its level→intensity
+// rounding, or it reads them here and hands them to the shader. It reads them
+// here. Prefixed on the way out for the `LED_CELL_W` reason — `CELL`, `GAP` and
+// `PAD` name a *family*'s metric once they leave `led_matrix`, and the strip
+// already spent the short `LED_` prefix.
+//
+// Visibility-only, every item: `intensity`, `cell_x0` and `cell_y0` are each
+// called by `LedMatrix::render` itself, and `ghost_slots`/`lamp_intensities`/
+// `lamp_inks` are called by it too (#1156 moved the ghost-slot count, the
+// stamp loop and the colour branch onto them rather than adding a fourth,
+// fifth and sixth copy) — which is what makes
+// `led_matrix::tests::the_rendered_bytes_are_pinned_by_digest` able to say the
+// whole of #1156's kit change moved no pixel.
+pub use led_matrix::{
+    CELL as LED_MATRIX_CELL, Fill, GAP as LED_MATRIX_GAP, LedMatrix, PAD as LED_MATRIX_PAD,
+    cell_x0 as led_matrix_cell_x0, cell_y0 as led_matrix_cell_y0,
+    intensity as led_matrix_intensity,
+};
 // The `LED_*`/`led_*` half of this list is #1153's seam for the shell's GPU
 // arm, on the `Gauge::dial`/`DotCell` precedent (#1148/#1144): a `.frag` cannot
 // read a Rust `const`, so the shell either transcribes this widget's segment

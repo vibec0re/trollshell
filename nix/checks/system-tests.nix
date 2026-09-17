@@ -69,7 +69,12 @@ let
   # (six 1:1 split-flap states, three of them re-run on the nixie for its
   # double bloom, and both mechanisms once more at the kit's shipping
   # `scale = 2`).
-  parityCases = 204;
+  # …and 204 until #1156 added the LED panel's eight per skin (seven 1:1
+  # fixture grids plus one at the shell's own shipping `scale = 2`). That kind
+  # is the first on this seam no plugin can reach — the Stats drawer's per-core
+  # panel is a widget the shell itself rasterises — so it is also the first
+  # whose cases exercise a mapping `preem_render` never calls.
+  parityCases = 236;
 in
 craneLib.mkCargoDerivation (
   commonArgs

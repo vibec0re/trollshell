@@ -97,6 +97,7 @@ mod dot_matrix;
 mod flip_board;
 mod gauge;
 mod kind;
+mod led_matrix;
 mod led_strip;
 mod marquee;
 mod program;
@@ -134,9 +135,18 @@ mod cases;
 pub(super) use dot_matrix::{DOT_MATRIX, Glyphs, dot_matrix_surface, glyphs as encode_glyphs};
 pub(super) use flip_board::{FLIP_BOARD, cards as encode_cards, flip_board_surface};
 pub(super) use gauge::{GAUGE, gauge_surface};
+// The one kind that is not on the wire (#1156): the Stats drawer's per-core
+// panel is a widget the *shell* rasterises, so its mapping is reached from
+// `panels::stats` rather than from `preem_render`, and this re-export is
+// `pub(crate)` where the others are `pub(super)`. See `led_matrix`'s module
+// docs, and `kind::Kind::on_the_wire`.
+pub(crate) use led_matrix::{LED_MATRIX, led_matrix_surface};
 pub(super) use led_strip::{LED_STRIP, led_strip_surface};
 pub(super) use marquee::{MARQUEE, Window, marquee_surface, window as encode_window};
-pub(super) use program::{KitSurface, SCOPE, scope_surface};
+// `KitSurface` is `pub(crate)` for #1156: `panels::stats` builds one directly
+// for the LED panel, which no plugin node reaches.
+pub(crate) use program::KitSurface;
+pub(super) use program::{SCOPE, scope_surface};
 pub(super) use seven_seg::{Readout, SEVEN_SEG, readout as encode_readout, seven_seg_surface};
 pub(super) use textbox::{Block, TEXTBOX, block as encode_block, textbox_surface};
 
@@ -163,7 +173,7 @@ pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
 /// `FlipBoard`; every other kind takes [`Arm::Cpu`] because there is nothing
 /// else to take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Arm {
+pub(crate) enum Arm {
     /// A `GtkGLArea` running one of the pipelines [`install`] registers — the
     /// default.
     Gl,
@@ -240,11 +250,33 @@ thread_local! {
 /// tests use, since building a `Renderer::ScopeGl` needs no GL at all (only
 /// *drawing* one does).
 #[cfg(test)]
-pub(super) fn with_gl_arm<T>(body: impl FnOnce() -> T) -> T {
+pub(crate) fn with_gl_arm<T>(body: impl FnOnce() -> T) -> T {
     let previous = TEST_ARM.replace(Arm::Gl);
     let out = body();
     TEST_ARM.set(previous);
     out
+}
+
+/// Record `program` as refused by this driver, through the **production**
+/// hook — the seam a consumer outside `plugins` needs to exercise the latch
+/// [`arm_for`] folds in (#1156 review, MEDIUM-3).
+///
+/// `panels::stats` is the first such consumer: the Stats drawer's LED panel is
+/// a kit widget the shell draws itself, so its fallback test lives beside it
+/// rather than in `plugins::tests`, where [`on_build_refused`]'s `pub(super)`
+/// would already be in scope. This is a one-line forward to that function
+/// rather than a stand-in for it, so a test still drives the real wire.
+///
+/// **Sticky and thread-local, like everything [`arm_for`] reads** — see
+/// [`REFUSED`]. A plain `#[test]` gets its own thread and so its own blast
+/// radius; a `#[gtk::test]` does **not** — `gtk4-macros` marshals every one of
+/// them onto a single shared GTK main thread ("creates a main thread for GTK
+/// and runs all tests on that thread"), so refusing a pipeline there would
+/// poison every other `#[gtk::test]` in the binary that expects the GL arm, in
+/// an order libtest does not fix. Callers must be plain `#[test]`s.
+#[cfg(test)]
+pub(crate) fn refuse_for_test(program: GlProgram, reason: &str) {
+    on_build_refused(program, (0, 0), reason);
 }
 
 /// The arm a `Scope` built now should take.
@@ -317,7 +349,7 @@ thread_local! {
 /// Narrower than a second `gl_abandoned`, deliberately: a refused
 /// `preem.scope` says nothing about `preem.gauge`, and a session that loses
 /// one pipeline keeps the GPU arm for every other kind on the bar.
-pub(super) fn arm_for(program: GlProgram) -> Arm {
+pub(crate) fn arm_for(program: GlProgram) -> Arm {
     if REFUSED.with_borrow(|refused| refused.contains(&program)) {
         return Arm::Cpu;
     }

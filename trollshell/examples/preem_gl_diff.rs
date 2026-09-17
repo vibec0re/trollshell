@@ -246,15 +246,21 @@ mod flip_board;
 // The readout (#1154), included the same way and for the same reason.
 #[path = "../src/plugins/preem_gl/seven_seg.rs"]
 mod seven_seg;
+// The panel (#1156), included the same way and for the same reason. The one
+// kind here that no plugin can send: `panels::stats` builds its surface from
+// this very mapping.
+#[path = "../src/plugins/preem_gl/led_matrix.rs"]
+mod led_matrix;
 
 // The case list itself lives in `cases` (#1211) — see its module docs. `Case`
 // keeps its variants' field types (`DisplayAt`/`TickerAt`/`BubbleAt`/
 // `NeedleAt`) there too; their `impl`s (`.name()`/`.line()`/`.spec()`) stay
 // below, since an inherent impl only has to share a crate with its type, not
 // a file.
-use cases::{BoardAt, BubbleAt, DisplayAt, MeterAt, NeedleAt, ReadoutAt, TickerAt};
+use cases::{BoardAt, BubbleAt, DisplayAt, MeterAt, NeedleAt, PanelAt, ReadoutAt, TickerAt};
 use cases::{
-    Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, METER_LEDS, STRETCH, TICKER_WINDOW_PX, cases_for,
+    Case, GAUGE_SCALE, GAUGE_SUPERSAMPLE, METER_LEDS, PANEL_CORES, STRETCH, TICKER_WINDOW_PX,
+    cases_for,
 };
 
 /// Cards in a **flip board** case's row — `HH:MM:SS`, the kit's own
@@ -812,6 +818,78 @@ fn meter_strip(style: kit::DisplayStyle, leds: usize) -> kit::LedStrip {
     kit::LedStrip::new(style).leds(leds)
 }
 
+impl PanelAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Ramp => "ramp",
+            Self::Full => "full",
+            Self::Lonely => "lonely",
+            Self::Ragged => "ragged",
+            Self::Single => "single",
+            Self::Style => "style",
+        }
+    }
+
+    /// How many lamps this case's panel holds.
+    fn cores(self) -> usize {
+        match self {
+            Self::Single => 1,
+            // The ragged case is the shell's own `rows = 3` shape at 64 cores:
+            // 22 columns, 66 slots, two of them spare. See `PanelAt::Ragged`.
+            Self::Ragged => 64,
+            _ => PANEL_CORES,
+        }
+    }
+
+    /// The **fixture** brightness grid, deliberately not a live reading — one
+    /// level per lamp, as `panels::stats` feeds the kit.
+    #[allow(clippy::cast_precision_loss)]
+    fn levels(self) -> Vec<f32> {
+        let cores = self.cores();
+        match self {
+            Self::Dark => vec![0.0; cores],
+            Self::Full => vec![1.0; cores],
+            Self::Lonely => {
+                let mut levels = vec![0.0; cores];
+                levels[cores / 2] = 1.0;
+                levels
+            }
+            // The degenerate panel's one lamp at a partial intensity, so it is
+            // not just another all-or-nothing frame.
+            Self::Single => vec![0.61],
+            // A ramp that never lands on 0 or 1 at either end, so every lamp
+            // carries a *different* partial intensity — the state the meter's
+            // all-or-nothing segments cannot be in.
+            Self::Ramp | Self::Style | Self::Ragged => (0..cores)
+                .map(|i| (i as f32 + 0.5) / cores as f32)
+                .collect(),
+        }
+    }
+}
+
+/// The kit `LedMatrix` a panel case renders, in the shape and dressing
+/// `panels::stats`' `core_led_matrix_for` builds. One builder for both arms,
+/// for [`bubble_box`]'s reason.
+fn panel_grid(style: kit::DisplayStyle, at: PanelAt) -> kit::LedMatrix {
+    let cores = at.cores();
+    match at {
+        // The pinned-row shape `core-leds.toml`'s `rows = 3` produces, with the
+        // ragged tail left blank — the one case where `ghost_slots`' second arm
+        // and the spare slots' ink clamp reach a driver.
+        PanelAt::Ragged => kit::LedMatrix::new(style, cores.div_ceil(3), 3)
+            .color(kit::ColorMap::Heat)
+            .fill(kit::Fill::Blank),
+        // The single-ink path `LedMatrix::render` takes verbatim, which every
+        // other kit widget shares.
+        PanelAt::Style => kit::LedMatrix::wide(style, cores).color(kit::ColorMap::Style),
+        // Everything else runs the shipped default: the automatic wide
+        // rectangle, `ColorMap::Heat`, `Fill::Spare`.
+        _ => kit::LedMatrix::wide(style, cores).color(kit::ColorMap::Heat),
+    }
+}
+
 impl ReadoutAt {
     /// The word in the case label and on its evidence files.
     fn name(self) -> &'static str {
@@ -988,6 +1066,18 @@ fn board_surface(
     flip_board::flip_board_surface(&flip_board::cards(&board), &board_palette(style, at))
 }
 
+/// The GL node payload a panel case drives the surface with — the same
+/// `panel_grid` builder the CPU reference renders, so a disagreement is between
+/// renderers and not between two panels.
+fn panel_surface(style: kit::DisplayStyle, at: PanelAt, scale: u32) -> program::KitSurface {
+    led_matrix::led_matrix_surface(
+        &panel_grid(style, at),
+        &at.levels(),
+        scale,
+        &kit::palette_snapshot(style),
+    )
+}
+
 /// The wire config a meter case maps from — the same segment count the kit
 /// builder above takes, so the two arms cannot end up on different strips.
 fn led_strip_config(style: kit::DisplayStyle, leds: usize) -> vocab::LedStripConfig {
@@ -1020,7 +1110,11 @@ impl Case {
             // `scale` is `Frame::upscale`'s, so a `scale > 1` case is the kit
             // rasterising once and replicating against the GL arm resolving the
             // same geometry at every device pixel.
-            Self::Gauge { scale, .. } | Self::FlipBoard { scale, .. } if *scale > 1 => {
+            Self::Gauge { scale, .. }
+            | Self::FlipBoard { scale, .. }
+            | Self::LedMatrix { scale, .. }
+                if *scale > 1 =>
+            {
                 parity::Sampling::Supersampled(*scale)
             }
             Self::DotMatrix { stretch, .. }
@@ -1136,6 +1230,24 @@ impl Case {
                 scale,
             } => {
                 let surface = board_surface(*style, *mechanism, *board, *scale);
+                (
+                    surface.uniforms.grid.0,
+                    surface.uniforms.grid.1,
+                    (*scale).max(1),
+                )
+            }
+            // The panel resolves its grid through the very mapping the shell
+            // calls too, and — like the board — the third element is an
+            // **upscale** rather than a stretch: the kit rasterises into the
+            // grid and `PixelSurface::set_scale` replicates it, so the natural
+            // size is `grid × scale`. Reading it off `uniforms.grid` rather
+            // than off `surface.width` is what keeps that true.
+            Self::LedMatrix {
+                style,
+                panel,
+                scale,
+            } => {
+                let surface = panel_surface(*style, *panel, *scale);
                 (
                     surface.uniforms.grid.0,
                     surface.uniforms.grid.1,
@@ -1647,6 +1759,14 @@ fn label(case: &Case) -> String {
             mechanism.name(),
             board.name()
         ),
+        Case::LedMatrix {
+            style,
+            panel,
+            scale,
+        } if *scale > 1 => format!("led_matrix.{}.{}x{scale}", style.name(), panel.name()),
+        Case::LedMatrix { style, panel, .. } => {
+            format!("led_matrix.{}.{}", style.name(), panel.name())
+        }
     }
 }
 
@@ -1780,6 +1900,19 @@ fn drive(area: &GlSurface, case: &Case) {
             let surface = board_surface(*style, *mechanism, *board, *scale);
             (
                 flip_board::FLIP_BOARD,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::LedMatrix {
+            style,
+            panel,
+            scale,
+        } => {
+            let surface = panel_surface(*style, *panel, *scale);
+            (
+                led_matrix::LED_MATRIX,
                 surface.width,
                 surface.height,
                 surface.uniforms,
@@ -1934,6 +2067,16 @@ fn measure(
             board,
             ..
         } => board_reference(*style, *mechanism, *board, upscale),
+        // The kit's own panel at this fixture grid — the *same* builder the
+        // mapping resolved its grid from, so a disagreement here is a
+        // disagreement between renderers and not between two panels. The
+        // `upscale` is `PixelSurface::set_scale`'s nearest-neighbour
+        // replication, which is what the CPU arm on the glass actually does
+        // with this frame, so the reference reproduces it with the kit's own
+        // `Frame::upscale` rather than with a second copy of that rule.
+        Case::LedMatrix { style, panel, .. } => panel_grid(*style, *panel)
+            .render(&panel.levels())
+            .upscale(upscale as usize),
     };
 
     let requested = case.natural();

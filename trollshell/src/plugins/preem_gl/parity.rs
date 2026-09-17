@@ -222,7 +222,8 @@ impl Kind {
             | Self::TextBox
             | Self::LedStrip
             | Self::SevenSeg
-            | Self::FlipBoard => true,
+            | Self::FlipBoard
+            | Self::LedMatrix => true,
         }
     }
 
@@ -268,7 +269,8 @@ impl Kind {
             | Self::TextBox
             | Self::LedStrip
             | Self::SevenSeg
-            | Self::FlipBoard => false,
+            | Self::FlipBoard
+            | Self::LedMatrix => false,
         }
     }
 
@@ -567,6 +569,52 @@ impl Kind {
             // is the honest ceiling on a single pixel (1.48x the worst
             // measured) and the detector is `mean`.
             Self::FlipBoard => EdgeBudget { mean: 2.5, max: 96 },
+            // Four `scale = 2` cases, one per skin, at the fixture grid with a
+            // *different* brightness in every lamp — so the halo has structure
+            // everywhere rather than only at the grid's rim. Measured worst on
+            // llvmpipe (Mesa 26.2.2, `GALLIUM_OVERRIDE_CPU_CAPS=avx`): edge
+            // mean **0.997** and edge max **9**, both on the oled — the skin
+            // with a bloom and no ghost grid, so its edge bin is the smallest
+            // of the three that have one and the halo is most of it. Per skin:
+            // vfd 0.672/4, lcd 0.000/0, oled 0.997/9, crt 0.264/2.
+            //
+            // **The lcd is a control that costs nothing**, exactly as it is for
+            // `LedStrip` and for `flat_block_ceiling`: its bloom radius is 0, so
+            // there is no halo to resolve, and every lamp edge in its
+            // supersampled frame lands on a whole device pixel at `scale = 2` —
+            // it comes back bit-identical everywhere, 0.000/0.
+            //
+            // **A seventh shape, and the narrowest numbers of the seven.** This
+            // widget's lamps are flat squares, so — as with the meter — its
+            // edge bin is only the lamps' own borders and the halo's staircase
+            // around them, and the whole lamp interior and the flat field are
+            // `interior` and bit-identical (measured `max 0` on the `field` and
+            // `lit` bins of all four). The legitimate disagreement is the halo
+            // alone, and a panel's halo is *dimmer* than a meter's for the same
+            // skin because a lamp is 8×8 where a segment is 8×16 — which is why
+            // these numbers come in under `LedStrip`'s 1.727/9 on the same skin.
+            //
+            // **1.75 / 16 rather than the meter's 3.0 / 16**: 1.76x the worst
+            // measured mean and 1.78x the worst measured max, the ratio
+            // `Gauge`, `DotMatrix`, `LedStrip` and `SevenSeg` were all sized at.
+            //
+            // **Calibrated against a drift it catches, measured rather than
+            // assumed.** The probe is #1153's: a half-native-pixel horizontal
+            // offset of the sample point on the continuous branch alone —
+            // `if (!snapped) { p.x += fp.x * 0.5; }` right after `fp` is
+            // resolved in `led_matrix.frag`'s `main`, a scale-only shift the
+            // 1:1 cases cannot see (all twenty-eight stayed bit-exact under
+            // it). Under it the four go to edge mean 4.691 / 3.442 / 5.970 /
+            // 2.085 and edge max 60 / 31 / 62 / 52, so **every one of the four
+            // reds, and on both halves** — the tightest is the crt on the mean
+            // at 1.19x the ceiling, and the same case clears the `max` half by
+            // 3.25x; the tightest on `max` is the lcd at 1.94x. That the lcd
+            // detects at all is the point of keeping a bloomless control: its
+            // honest frame is 0.000/0, so the probe has nothing to hide behind.
+            Self::LedMatrix => EdgeBudget {
+                mean: 1.75,
+                max: 16,
+            },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -649,12 +697,25 @@ impl Kind {
             // that takes all four to 100.0 %. That is the one gate in the suite
             // that can see a drift *inside* the continuous branch, so a reader
             // arriving here looking for this kind's detector should go there.
+            // The LED panel's `None` is the sixth and the **second that is
+            // overridden**, on exactly that precedent (#1156 review, HIGH-1):
+            // it is the *lcd*'s answer, not the kind's. That skin blooms at
+            // radius 0, so it has no halo to resolve per fragment and its
+            // native frame genuinely *is* `Frame::upscale` — 100.0 % flat,
+            // correctly — while the three skins that do bloom measure
+            // 56.8 / 64.7 / 58.7 % and *are* gated:
+            // `cases::Case::flat_block_ceiling` arms their `scale = 2` cases
+            // at `0.80`, calibrated against the same `snapped := true` probe,
+            // which takes all four to 100.0 % while leaving every other gate
+            // green. Same instruction as the flip board's: a reader looking
+            // for this kind's detector should go there.
             Self::Gauge
             | Self::TextBox
             | Self::Scope
             | Self::LedStrip
             | Self::SevenSeg
-            | Self::FlipBoard => None,
+            | Self::FlipBoard
+            | Self::LedMatrix => None,
         }
     }
 
@@ -669,6 +730,7 @@ impl Kind {
             Self::LedStrip => "led_strip",
             Self::SevenSeg => "seven_seg",
             Self::FlipBoard => "flip_board",
+            Self::LedMatrix => "led_matrix",
         }
     }
 }
@@ -2389,6 +2451,31 @@ mod tests {
                 // was a *per-case* key, since this kind carries two mechanisms
                 // with two honest answers.
                 Kind::FlipBoard => None,
+                // **`None` here is the *lcd*'s answer, and the three blooming
+                // skins override it per case** (#1156 review, HIGH-1). The lcd
+                // is this widget's nixie: bloom radius 0, nothing to resolve
+                // per fragment, so its native frame *is* `Frame::upscale` —
+                // measured 100.0 %, correctly — and a ceiling armed on this
+                // kind would red a right render forever. The vfd, oled and crt
+                // are the opposite (56.8 / 64.7 / 58.7 %) and the detector for
+                // them is real: `cases::Case::flat_block_ceiling` arms their
+                // `scale = 2` cases at `0.80`, calibrated against a
+                // `snapped := true` probe that takes all four to 100.0 %.
+                //
+                // The earlier version of this comment claimed this statistic
+                // "moves the **wrong way** here, so no value of it could catch
+                // that drift", citing the `p.x` probe's 52.2 / 89.0 / 57.3 /
+                // 52.7 %. That reasoning was wrong, and the error is worth
+                // naming because it is easy to repeat: a half-native-pixel
+                // **shift** of the sample point is not a reversion. It keeps
+                // the continuous branch and moves it sideways, which is why it
+                // reds the *edge budget* and leaves flatness low. The
+                // reversion probe is `snapped := true`, it raises flatness to
+                // 100.0 %, and it is invisible to every other gate — including
+                // `TROLLSHELL_PARITY_EXACT=1`, since a replicated frame is
+                // bit-identical to the oracle. Two probes, two gates, recorded
+                // side by side in `cases::Case::flat_block_ceiling`.
+                Kind::LedMatrix => None,
             };
             assert_eq!(
                 kind.flat_block_ceiling(),
@@ -2498,6 +2585,19 @@ mod tests {
                 // card is a stack of glyph pixels, and the fold makes several
                 // of them tie at the same intensity.
                 Kind::FlipBoard => (true, false),
+                // Measured at zero (#1156), and the fourth kind whose zero is
+                // also asserted without a driver: `led_matrix.rs` mirrors the
+                // shader's arithmetic, holds it to the shipped GLSL with a
+                // source scan, and compares it against the kit's own bytes
+                // across every skin, every `ColorMap`, both `Fill` arms and
+                // five grid shapes. Its lattice is integers all the way down,
+                // so zero is available by construction — and worth pinning
+                // because the closed-form blur's **per-row** truncation, which
+                // the meter's single-intensity emission does not have, is a
+                // thing the natural simplification gets wrong. Not a beam — a
+                // column of a lit lamp is a stack of pixels that are all
+                // exactly the ink.
+                Kind::LedMatrix => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),
@@ -2512,6 +2612,54 @@ mod tests {
                 kind.label(),
             );
         }
+    }
+
+    /// **Every kind states whether a plugin can reach it, and the compiler
+    /// makes a new one state it too** (#1156, on
+    /// `every_kind_states_its_pin_and_its_beam_check`'s pattern).
+    ///
+    /// [`Kind::on_the_wire`] is what the two widget-vocabulary enumeration
+    /// tests filter on — `plugins::tests`' `every_gl_kind_widget_takes_the_gl_arm`
+    /// and `preem_render`'s `gl_capable_widgets` — so a wrong `false` here
+    /// would excuse exactly the gap #1211 built those tests to close: a wire
+    /// kind `gl_kind_for` forgot. The hand-written `match` is the cross-check,
+    /// and the two tests assert the **other** direction against the real
+    /// vocabulary, so a `false` claimed here for a kind a widget does reach
+    /// reds there rather than passing quietly.
+    ///
+    /// **Falsified** by flipping an arm, or by adding a variant to [`Kind`].
+    #[test]
+    #[allow(clippy::match_same_arms)]
+    fn every_kind_states_whether_a_plugin_can_reach_it() {
+        for kind in Kind::ALL {
+            let on_the_wire = match kind {
+                // Every kind that predates #1156 is a `vocab::PreemWidget`
+                // variant a plugin sends over the socket.
+                Kind::Scope => true,
+                Kind::Gauge => true,
+                Kind::DotMatrix => true,
+                Kind::Marquee => true,
+                Kind::TextBox => true,
+                Kind::LedStrip => true,
+                Kind::SevenSeg => true,
+                Kind::FlipBoard => true,
+                // The panel is the shell's own widget: `hytte_preem::LedMatrix`
+                // has no wire vocabulary at all, which is why #1250's stats
+                // plugin renders a *dot matrix* in its place.
+                Kind::LedMatrix => false,
+            };
+            assert_eq!(
+                kind.on_the_wire(),
+                on_the_wire,
+                "{}: whether a plugin can put this kind on screen",
+                kind.label(),
+            );
+        }
+        assert!(
+            Kind::ALL.into_iter().any(|kind| !kind.on_the_wire()),
+            "anti-vacuity: at least one kind is off the wire, or the two \
+             enumeration tests' filter is proving nothing",
+        );
     }
 
     /// Every guard fires **ahead** of both standards: a breach is reported as a

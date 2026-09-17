@@ -3386,6 +3386,80 @@ session.
      `hytte-ui` instead, saying the data texture could not be allocated and
      carrying the driver's own limit. Put both back afterwards.
 
+- [ ] **(#1156 / #865)** **The Stats drawer's per-core LED panel on the GPU.**
+      The ninth kind on the `Scope` seam and the **first one no plugin can
+      reach**: `hytte_preem::LedMatrix` is not on the wire, so this is a widget
+      the shell itself rasterises (`panels/stats.rs`, #857) and the only arm
+      whose on-glass check is a _drawer page_ rather than a plugin card.
+
+      Open the drawer's **Stats** page and look at the "Blinken Lichten" row
+      under Per-core. Then restart with `TROLLSHELL_PREEM_RENDERER=cpu` in the
+      **unit's** environment (`systemctl --user edit trollshell`, not your login
+      shell) and look again.
+
+  1. **They must be the same picture.** Not just "both draw lamps": same lamp
+     positions, same bezel, same colours, same overall glow. CI pins them
+     byte-identical at 1:1 under llvmpipe, so a visible difference on a real
+     driver is this arm's first real-hardware finding.
+  2. **Where the improvement is, and where it is not.** `core_panel_scale`
+     answers 6 at 1 core, 5 at 4, 3 at 8 and at 16, **2 at 32** and **1 from 64
+     up**, so whether you can see anything at all depends on your core count.
+     On a box of 32 cores or fewer the GL frame's lamp edges and — much more visibly —
+     its **halo** should be smooth where the CPU one is a staircase of
+     `scale`-wide blocks. On a 64-core box the two are the same resolution and
+     this check is vacuous by construction; say so rather than reporting "no
+     difference" as a pass.
+  3. **Every dressing.** `~/.config/trollshell/core-leds.toml` (#1040) drives
+     `style`, `color`, `rows` and `fill`, and the colour axis is this widget's
+     alone — every other kit surface has one ink. Walk `color` through
+     `heat` (the default), `style`, `rainbow`, `transpride` and an
+     `rgb` triple; the two arms must agree on each. Also walk `fill` with a
+     `rows` that leaves a ragged tail (`rows = 3` on a 64-core box: 22 columns,
+     two spare slots): `spare` ghosts all 66 slots and `blank` only the 64 that
+     hold a lamp, so the two must differ by exactly that unlit hardware and
+     agree with each other arm for arm.
+
+     What this item deliberately does **not** ask for is the spare slots' ink
+     clamp, which an earlier draft did (#1156 review, MEDIUM-1): with every
+     shipped skin's bloom radius at or under `GAP`, no lamp's halo ever reaches
+     another lamp's `index_table` column, so nothing bleeds into a blank slot
+     and the check could neither pass nor fail. `hytte-preem`'s
+     `no_skins_halo_can_reach_another_lamps_pixels` is what will tell you the
+     day that stops being true; until it reds, the clamp is pinned on the
+     uploaded strip instead (`the_strip_carries_the_kits_own_lamp_amounts_and_inks`).
+
+     A save alone re-skins the panel with the shell up; that is #869's payoff
+     and it must survive the arm swap.
+
+  4. **The fallback, and it is this kind's sharpest edge.** The panel is not in
+     the plugin tree, so `preem_gl::install`'s context-failure hook sweeps
+     nothing here — the arm is re-resolved on every `sensors::cpu()` tick
+     instead, which is once a second. Force a context failure and confirm the
+     panel is back on the kit **within about a second** rather than blank for
+     the rest of the session, with one journal line. A blank row here would be
+     the exact shape #1156 built the per-tick resolve to avoid.
+  5. **The row's geometry did not move.** The #702 non-regression: the Stats
+     page's minimum width must not grow, and a wide card must not inflate the
+     row's height. `GlSurface::measure` answers `(0, natural, -1, -1)` the same
+     way `PixelSurface` does and the surface is `halign: Center` with no
+     expand, but this is the first time a `GlSurface` has been laid out inside
+     an `adw` card rather than on a bar.
+
+     What CI already holds: the golden uniform table against the kit's own
+     `LED_MATRIX_CELL`/`GAP`/`PAD`, the strip encoding against
+     `lamp_intensities`/`lamp_inks`, `ghost_slots`' two `Fill` arms, the
+     grid-and-scale relation, the kill switch and the live arm swap (both
+     directions) as a GTK test, the whole shader transcribed in Rust and
+     compared against the kit's bytes on every skin × every `ColorMap` × both
+     `Fill` arms × five grid shapes — and, under llvmpipe in
+     `checks.system-tests`, **twenty-eight** 1:1 cases (four skins × dark /
+     ramp / full / lonely / ragged / single / style) at **max |Δ| 0 of 255 on
+     every channel**, plus **four** at the shell's own shipping `scale = 2`,
+     box-averaged back down and held to the supersampled standard: every pixel
+     off a rasterisation edge bit-identical (measured `max 0` on the `field`
+     and `lit` bins of all four) plus an edge budget of mean 1.75 / max 16,
+     against a measured worst of 0.997 / 9.
+
 ## Screen recording
 
 - [ ] **(#458)** Rebuild the NixOS/home-manager config with `wf-recorder` +

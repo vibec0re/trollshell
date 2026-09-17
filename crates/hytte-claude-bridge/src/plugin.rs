@@ -135,10 +135,13 @@
 use std::time::Duration;
 
 use hytte_plugin::display::{AccentRole, LedStrip, StyleName};
-use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page};
+use hytte_plugin::proto::{
+    Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page, ProvidedDatasource,
+};
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_stream};
 
 use crate::Mode;
+use crate::datasource;
 use crate::status::{self, Last, Startup, Status};
 use crate::usage::{self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError};
 use crate::wallets::openrouter;
@@ -406,9 +409,22 @@ impl Plugin for BridgeChip {
     /// manifest is per binary, not per instance, following
     /// `hytte-plugin-stats`'s precedent) and never uses it — its card is not a
     /// click target.
+    ///
+    /// It also **provides** one datasource (#1262): the quota percentages it
+    /// already polls, served to any plugin that asks so the box grows no
+    /// second reader of the OAuth token — see [`crate::datasource`] for the
+    /// route and the payload contract. `DatasourceProvider` is the capability
+    /// that gates the answer; `provides` is what the host registers the id
+    /// under, and it is deliberately declared on **both** mount families for
+    /// the same reason `OpenPage` is: a manifest is per binary, and a sidebar
+    /// instance answers queries just as well as a bar one.
     fn manifest() -> Manifest {
         let mut manifest = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT);
-        manifest.capabilities = vec![Capability::OpenPage];
+        manifest.capabilities = vec![Capability::OpenPage, Capability::DatasourceProvider];
+        manifest.provides = vec![ProvidedDatasource::new(
+            datasource::DATASOURCE_ID,
+            vec![datasource::SCOPE_CURRENT.to_owned()],
+        )];
         manifest
     }
 
@@ -445,6 +461,23 @@ impl Plugin for BridgeChip {
                 self.refresh_openrouter();
             }
             Input::Event { node, kind, .. } => return Self::on_event(&node, &kind),
+            // A routed `claude-usage` query (#1262). Re-read the board first —
+            // the version compare is the same cheap no-op the tick does — so an
+            // answer is never a tick behind the numbers the chip is painting,
+            // and hand the projection to `datasource::answer`, which owns the
+            // whole contract including the three staleness refusals.
+            //
+            // `request_id` is echoed **verbatim**: it is the host's opaque
+            // correlation, not the requester's token. `datasource` and `scope`
+            // are ignored deliberately — this provider declares exactly one of
+            // each, and the host refuses anything else before it reaches here.
+            Input::DatasourceQuery { request_id, .. } => {
+                self.refresh_usage();
+                return vec![Effect::DatasourceResult {
+                    request_id,
+                    outcome: datasource::answer(self.usage.as_ref(), usage::now_unix()),
+                }];
+            }
             _ => {}
         }
         Vec::new()
@@ -1536,28 +1569,89 @@ mod tests {
 
     // ── The manifest ─────────────────────────────────────────────────────────
 
-    /// The manifest is the whole of this plugin's host contract: a bar chip that
-    /// asks for exactly one capability. A second one creeping in here is a real
-    /// change (the host cap-checks effects), so pin the list.
+    /// The manifest is the whole of this plugin's host contract: a bar chip
+    /// that asks for exactly two capabilities and serves exactly one
+    /// datasource. A third capability creeping in here is a real change (the
+    /// host cap-checks effects), so pin the list.
     #[test]
-    fn the_manifest_is_a_bar_chip_that_asks_only_to_open_its_own_panel() {
+    fn the_manifest_is_a_bar_chip_that_opens_its_panel_and_serves_its_usage() {
         let m: Manifest = BridgeChip::manifest();
         assert_eq!(m.id, "claude-bridge");
         assert_eq!(m.mount, Mount::BarRight);
         assert!(m.mount.is_bar(), "it is a chip, not a sidebar card");
         assert_eq!(
             m.capabilities,
-            vec![Capability::OpenPage],
-            "the drawer panel, and nothing else"
+            vec![Capability::OpenPage, Capability::DatasourceProvider],
+            "the drawer panel and the #1262 datasource, and nothing else"
         );
         assert!(
             m.subscribes.is_empty(),
             "it ticks off its own boards, not host state"
         );
-        assert!(m.provides.is_empty());
-        // Sanity: `Manifest::new` alone requests none, so the line above is this
-        // plugin's, not the constructor's.
+        // #1262: the host registers a provider by the id spelled here, and
+        // refuses any scope this list does not carry — so both are pinned as
+        // literals, the provider's half of the route's two-sided rename gate.
+        assert_eq!(m.provides.len(), 1);
+        assert_eq!(m.provides[0].id, "claude-usage");
+        assert!(m.provides[0].serves_scope("current"));
+        assert!(
+            !m.provides[0].serves_scope("next"),
+            "a scope this provider never declared must stay refusable"
+        );
+        // Sanity: `Manifest::new` alone requests none, so the lines above are
+        // this plugin's, not the constructor's.
         assert!(Manifest::new("x", Mount::BarRight).capabilities.is_empty());
+        assert!(Manifest::new("x", Mount::BarRight).provides.is_empty());
+    }
+
+    /// The provider half of the route (#1262): a host-forwarded query is
+    /// answered from the board in hand, echoing the host's opaque correlation
+    /// verbatim. The payload's own shape is
+    /// `datasource::tests::the_ready_payload_is_this_exact_frame`'s business;
+    /// what this pins is the wiring — that the arm exists, answers, and
+    /// answers *this* `request_id`.
+    #[test]
+    fn a_forwarded_query_is_answered_from_the_board() {
+        let mut model = BridgeChip {
+            status: status(Mode::Subscription, false, 0, 0, Last::None),
+            usage: None,
+            // A version the board cannot be at, so `refresh_usage` really
+            // re-reads rather than trusting the `None` seeded above.
+            usage_version: u64::MAX,
+            is_bar: true,
+            title: DEFAULT_TITLE.to_owned(),
+            // #1347's second wallet at its no-key values: this route answers
+            // off the Claude board alone, so the `OpenRouter` one is not part
+            // of what is being pinned here.
+            ..no_wallet()
+        };
+        let effects = model.update(Input::DatasourceQuery {
+            request_id: 4242,
+            datasource: crate::datasource::DATASOURCE_ID.to_owned(),
+            scope: crate::datasource::SCOPE_CURRENT.to_owned(),
+            params: "{}".to_owned(),
+        });
+        let [
+            Effect::DatasourceResult {
+                request_id,
+                outcome,
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("a forwarded query must produce exactly one result: {effects:?}");
+        };
+        assert_eq!(*request_id, 4242, "the host correlation is echoed verbatim");
+        // The board really was re-read on the way in — `refresh_usage` is what
+        // keeps an answer from being a tick behind the chip, and the seeded
+        // `u64::MAX` is a version a monotonic counter starting at zero can
+        // never be at.
+        assert_ne!(model.usage_version, u64::MAX, "the board was not re-read");
+        // Deliberately NO assertion about *which* outcome came back: the board
+        // is a process-global that this binary's own `usage` tests publish to
+        // from other threads. The payload and the three staleness refusals are
+        // pinned in `datasource::tests`, which injects both the report and the
+        // clock; what is pinned here is the wiring.
+        let _ = outcome;
     }
 
     /// Clicking the chip asks the host to open this plugin's own panel; a click

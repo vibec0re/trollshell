@@ -42,3 +42,11 @@ toml.workspace = true
 # Local wall-clock for the briefing trigger (once a day, at a set hour) and
 # RFC 3339 departure timestamps → "in N min". `clock` for `Local::now()`.
 chrono = { workspace = true, features = ["clock", "std"] }
+
+[dev-dependencies]
+# `macros` + `test-util` for `await_usage`'s two `#[tokio::test]`s (#1262): the
+# deadline one runs under `start_paused` so asserting the full `USAGE_WAIT`
+# budget is instant instead of a 15 s stall in every `cargo test` run. Dev-only
+# — the shipped binary's tokio feature set above is unchanged, and `test-util`
+# pulls no new package (`rt`/`sync`/`time` are already on).
+tokio = { workspace = true, features = ["macros", "test-util"] }

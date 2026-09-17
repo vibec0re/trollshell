@@ -1138,6 +1138,44 @@ pub fn humanise_kind(kind: &str) -> String {
     }
 }
 
+/// The **short** label for a server-chosen `kind` — [`humanise_kind`]'s sibling
+/// for surfaces measured in characters rather than pixels (#1262): the
+/// `claude-usage` datasource's rows, which caw's morning briefing renders into
+/// one line of a 220-char speech bubble.
+///
+/// Same positional rule, same no-lookup stance, three differences:
+///
+/// - the window is spelled the way a glance reads it — `5h` / `7d` / `30d`,
+///   not `Session (5 h)` / `Weekly` / `Monthly`;
+/// - an `all` tail is **dropped**, because the unqualified weekly bucket
+///   already *is* "all" and `7d all` would be noise; every other tail rides
+///   along (`weekly_scoped` → `7d scoped`), which is what keeps two weekly
+///   rows distinguishable in a line that has room for neither's full name;
+/// - an unrecognised head keeps its raw spelling with underscores spaced but
+///   is **not** capitalised — the consumer of this is lowercase prose.
+///
+/// Anthropic adding a bucket therefore costs its row a nice short name, never
+/// the row itself.
+#[must_use]
+pub fn short_kind(kind: &str) -> String {
+    let kind = kind.trim();
+    if kind.is_empty() {
+        return "limit".to_owned();
+    }
+    let (head, tail) = kind.split_once('_').unwrap_or((kind, ""));
+    let window = match head {
+        "session" => Some("5h"),
+        "weekly" => Some("7d"),
+        "monthly" => Some("30d"),
+        _ => None,
+    };
+    match (window, tail) {
+        (Some(window), "" | "all") => window.to_owned(),
+        (Some(window), tail) => format!("{window} {}", tail.replace('_', " ")),
+        (None, _) => kind.replace('_', " "),
+    }
+}
+
 /// Raise the first character of `text`.
 fn capitalise(text: &str) -> String {
     let mut chars = text.chars();

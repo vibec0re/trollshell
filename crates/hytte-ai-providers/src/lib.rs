@@ -348,7 +348,7 @@ pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Resul
 /// *noticed*: `stale_key_file_notice` renders one line naming the file and the
 /// option to declare instead, which this prints to stderr. After that window
 /// the notice, `config_dir` and `load_key_from`'s `config_dir` parameter all
-/// go with it — see the follow-up issue linked from #1330.
+/// go with it — see #1349.
 #[must_use]
 pub fn load_key(name: &str) -> Option<String> {
     let env_override = std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok();

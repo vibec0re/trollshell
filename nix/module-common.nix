@@ -964,14 +964,23 @@ self:
                 login keyring — managed by the control-center's AI Keys tab,
                 never written to disk or this config — and passes it to the
                 plugin as the `<SLOT>_API_KEY` environment variable (e.g.
-                "openrouter" → OPENROUTER_API_KEY), which is exactly the
-                override hytte-ai-providers' `load_key` reads first. So an
-                LLM-backed plugin picks the key up with no per-plugin config:
-                `plugins.pet.secrets = [ "openrouter" ];`. A slot with no
-                stored key is simply skipped (the plugin runs keyless and uses
-                its own fallback); a plugin that doesn't list a slot never gets
-                that key in its environment. Rotating a key in the
-                control-center relaunches the running plugins that declare it.
+                "openrouter" → OPENROUTER_API_KEY), which is exactly — and,
+                since #1330, *only* — what hytte-ai-providers' `load_key`
+                reads. So an LLM-backed plugin picks the key up with no
+                per-plugin config: `plugins.pet.secrets = [ "openrouter" ];`.
+                A slot with no stored key is simply skipped (the plugin runs
+                keyless and uses its own fallback); a plugin that doesn't list
+                a slot never gets that key in its environment. Rotating a key
+                in the control-center relaunches the running plugins that
+                declare it.
+
+                This is the only way to supply a provider key. The on-disk
+                `~/.config/trollshell/<slot>.key` fallback that used to sit
+                behind this option was retired in #1330 ("no fallbacks", #866);
+                a file left at that path is never read, and for one release the
+                plugin logs one line per startup naming it and pointing back
+                here. See <https://vibec0re.github.io/trollshell/plugin-env.html>
+                (source: `docs/plugin-env.md`) for the migration.
               '';
             };
 

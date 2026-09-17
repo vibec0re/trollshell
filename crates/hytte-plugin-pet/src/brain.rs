@@ -7,10 +7,11 @@
 //! chosen by config:
 //!
 //! - **[`OpenRouter`](https://openrouter.ai)** (a cloud LLM — **the default
-//!   when a key is configured**): a key from
-//!   `~/.config/trollshell/openrouter.key` (see
-//!   [`hytte_ai_providers::load_key`]) or `$PET_LLM_API_KEY`, plus a
-//!   `$PET_LLM_MODEL`, or
+//!   when a key is configured**): a key from `$OPENROUTER_API_KEY` (see
+//!   [`hytte_ai_providers::load_key`]; that is what
+//!   `programs.trollshell.plugins.pet.secrets = [ "openrouter" ]` injects from
+//!   the login keyring, and since #1330 there is no `openrouter.key` file
+//!   behind it) or `$PET_LLM_API_KEY`, plus a `$PET_LLM_MODEL`, or
 //! - a **local `llama-server`** — opt in with `$PET_LLM_URL` (e.g.
 //!   `http://127.0.0.1:8080`; see `etc/systemd/user/trollshell-pet-brain.service`).
 //!
@@ -139,9 +140,11 @@ impl Cfg {
     /// connection instead of returning a 504 the pet can fall back from. See
     /// [`hytte_ai_providers::DEFAULT_TIMEOUT`] for that ordering invariant.
     fn from_env() -> Self {
-        // The pet's OpenRouter key: the shared key file (`openrouter.key`, or
-        // its `OPENROUTER_API_KEY` override) first, then the pet-specific
-        // `$PET_LLM_API_KEY`.
+        // The pet's OpenRouter key: the shared `$OPENROUTER_API_KEY` (what the
+        // `secrets` slot injects from the keyring) first, then the
+        // pet-specific `$PET_LLM_API_KEY`. #1330 retired the
+        // `openrouter.key` file that used to sit between them, so this is two
+        // steps rather than three.
         let key = hytte_ai_providers::load_key("openrouter").or_else(|| {
             std::env::var("PET_LLM_API_KEY")
                 .ok()

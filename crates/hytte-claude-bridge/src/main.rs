@@ -157,6 +157,7 @@
 
 mod backend;
 mod bridge;
+mod datasource;
 mod envguard;
 mod http;
 mod messages;

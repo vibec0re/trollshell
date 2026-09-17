@@ -47,6 +47,15 @@ ingredient:
   `{start_hhmm, summary}`, additive under the #305 rules), only caw's gather
   side and manifest change. A follow-up issue tracks the host-side key.
 
+- **Claude usage — pulled from another plugin (#1262).** Added after the fact,
+  and the one ingredient that is neither caw's own fetch nor a host push: the
+  `hytte-claude-bridge` daemon already polls the quota endpoint for its bar
+  chip, so it serves the numbers as the `claude-usage` datasource (#509) and
+  caw queries it once at briefing time. Deliberately not a second poll of
+  `GET /api/oauth/usage` — that endpoint spends the box's Claude login, and
+  one reader of the OAuth token is the whole point. See the Follow-ups section
+  below for the shape.
+
 Why not fetch-everything-via-host now: the host push (`plugins.rs`) and the
 native calendar service are active work in other lanes, and a state key is an
 API — it deserves its own review rather than riding a plugin PR.
@@ -104,5 +113,19 @@ resolved with the pet's exact provider semantics.
 - Host-side briefing StateKeys (option (c)): `CalendarUpcoming` (+ optionally a
   session-unlock signal) pushed to subscribed plugins; caw's gather side then
   drops its own fetches ingredient by ingredient. Tracked in a follow-up issue.
-- #320 (Claude usage number) slots in as one more optional ingredient line once
-  its source exists.
+- ~~#320 (Claude usage number) slots in as one more optional ingredient line
+  once its source exists.~~ **Shipped, #1262.** The source turned out to be
+  `hytte-claude-bridge`, which polls `GET /api/oauth/usage` every five minutes
+  for its own bar chip (#1236) — so the line does not fetch anything. The
+  thread's question was whether caw should poll that endpoint too; the answer
+  is the plugin-to-plugin **datasource** route (#509): the bridge declares
+  `Capability::DatasourceProvider` plus a `claude-usage` / `current`
+  `provides` entry, caw declares `Capability::DatasourceQuery` and asks once,
+  at briefing time, the same one-shot rule every other ingredient follows. The
+  OAuth token therefore stays read by exactly one process on the box, and the
+  briefing quotes the numbers the bar is already showing. The provider refuses
+  — explicitly, with a sentence, never silence — when its board is empty or
+  its numbers are past its own `STALE_AFTER`, and caw's line is simply absent
+  then, exactly as an absent weather or departure line is. This is the first
+  ingredient caw sources from another _plugin_ rather than fetching (weather,
+  departures) or receiving as a host push (calendar).

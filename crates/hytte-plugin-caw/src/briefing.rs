@@ -1,9 +1,9 @@
 //! caw's **morning briefing** — trigger, composition, and voice (#407).
 //!
 //! Once a day caw caws the news: the day's shape (weather, the first useful
-//! departure, and the host-pushed calendar events) composed into two or three
-//! short sentences and delivered sticky in her speech bubble, mirrored as a
-//! toast.
+//! departure, the host-pushed calendar events, and — since #1262 — the Claude
+//! quota reading another plugin serves her) composed into two or three short
+//! sentences and delivered sticky in her speech bubble, mirrored as a toast.
 //!
 //! - **Trigger** ([`should_brief`], [`is_due`] plus a lock gate): due
 //!   at/after a configured local time (`$CAW_BRIEFING_TIME`, default 07:00;
@@ -41,6 +41,7 @@ use chrono::{Datelike, NaiveDate, Timelike};
 use hytte_ai_providers::{ChatOpts, Message, Provider, owner};
 
 use crate::ingredients::{self, EventBrief, Ingredients};
+use crate::usage::UsageBrief;
 
 /// Default briefing time: 07:00 local.
 const DEFAULT_TIME_MINS: u16 = 7 * 60;
@@ -296,7 +297,17 @@ pub(crate) fn compose_plain(ing: &Ingredients, day_seed: usize) -> String {
         };
         parts.push(format!("{} to {} in {}{tail}", d.line, d.direction, d.mins));
     }
-    if ing.weather.is_none() && ing.departure.is_none() && ing.events.is_empty() {
+    // #1262: last, because it is the one line that is about the desk rather
+    // than about the day. Present-or-absent like every other ingredient —
+    // there is no knob, the same way weather and departures have none.
+    if let Some(u) = &ing.usage {
+        parts.push(format!("claude burn: {}.", u.rows));
+    }
+    if ing.weather.is_none()
+        && ing.departure.is_none()
+        && ing.events.is_empty()
+        && ing.usage.is_none()
+    {
         parts.push(NO_DATA_LINE.to_owned());
     }
     parts.join(" ")
@@ -332,6 +343,10 @@ pub(crate) fn facts(ing: &Ingredients, now_stamp: &str) -> String {
             ));
         }
         None => lines.push("next train: none catchable".to_owned()),
+    }
+    match &ing.usage {
+        Some(u) => lines.push(format!("claude usage: {}", u.rows)),
+        None => lines.push("claude usage: unavailable".to_owned()),
     }
     lines.join("\n")
 }
@@ -396,13 +411,21 @@ pub(crate) fn sanitize(raw: &str) -> String {
 // ── The pipeline ─────────────────────────────────────────────────────────────
 
 /// Compose today's briefing: gather the reachable ingredients (blocking weather /
-/// departures I/O), fold in the host-pushed `events` (#484), then voice them
-/// through the provider — or hand back the plain template keyless / on any model
-/// failure. Always returns *something*; run on a `spawn_blocking` thread.
-pub(crate) fn brief_now(provider: Option<&Provider>, events: Vec<EventBrief>) -> String {
+/// departures I/O), fold in the host-pushed `events` (#484) and the
+/// plugin-sourced `usage` reading (#1262), then voice them through the provider
+/// — or hand back the plain template keyless / on any model failure. Always
+/// returns *something*; run on a `spawn_blocking` thread.
+pub(crate) fn brief_now(
+    provider: Option<&Provider>,
+    events: Vec<EventBrief>,
+    usage: Option<UsageBrief>,
+) -> String {
     let mut ing = ingredients::gather();
     // The calendar slot no longer fetches itself — the host shares it (#484).
     ing.events = events;
+    // Nor does the usage slot: the bridge serves it over the datasource route,
+    // and the caller has already asked (#1262).
+    ing.usage = usage;
     let now = chrono::Local::now();
     let plain = compose_plain(&ing, usize::try_from(now.ordinal()).unwrap_or(0));
     let Some(provider) = provider else {
@@ -445,6 +468,14 @@ mod tests {
                 leave_in: Some(2),
             }),
             events: Vec::new(),
+            usage: None,
+        }
+    }
+
+    /// The #1262 ingredient, as `usage::parse` hands it over.
+    fn usage() -> UsageBrief {
+        UsageBrief {
+            rows: "5h 37%, 7d 62%".to_owned(),
         }
     }
 
@@ -609,6 +640,44 @@ mod tests {
             text.contains("S9 to Spandau in 12 — move, choom."),
             "a tight leave-by turns urgent: {text}"
         );
+        assert!(
+            !text.contains("claude"),
+            "no usage source, no usage line: {text}"
+        );
+    }
+
+    /// #1262: the optional usage line — present when the datasource answered,
+    /// absent when it did not, and always **last**, after the day's own shape.
+    #[test]
+    fn compose_plain_usage_line_rides_last_when_the_source_answered() {
+        let with = Ingredients {
+            usage: Some(usage()),
+            ..full()
+        };
+        let text = compose_plain(&with, 0);
+        assert!(text.contains("claude burn: 5h 37%, 7d 62%."), "{text}");
+        assert!(
+            text.find("claude burn").unwrap() > text.find("S9 to Spandau").unwrap(),
+            "the desk comes after the day: {text}"
+        );
+        // …and the same ingredients without it lose exactly that sentence.
+        assert_eq!(
+            text.replace(" claude burn: 5h 37%, 7d 62%.", ""),
+            compose_plain(&full(), 0),
+        );
+    }
+
+    /// The usage reading is a real ingredient, so a morning with *only* it is
+    /// not "no data on the wire".
+    #[test]
+    fn compose_plain_usage_alone_is_not_an_empty_day() {
+        let only = Ingredients {
+            usage: Some(usage()),
+            ..Ingredients::default()
+        };
+        let text = compose_plain(&only, 3);
+        assert!(text.contains("claude burn: 5h 37%, 7d 62%."), "{text}");
+        assert!(!text.contains(NO_DATA_LINE), "{text}");
     }
 
     #[test]
@@ -692,9 +761,25 @@ mod tests {
             text.contains("next train: S9 to Spandau in 12 min (leave in 2 min)"),
             "{text}"
         );
+        // #1262: absent stated honestly, like every other slot — the persona's
+        // "never invent" rule needs something to lean on here too.
+        assert!(text.contains("claude usage: unavailable"), "{text}");
         let empty = facts(&Ingredients::default(), "Friday 08:00");
         assert!(empty.contains("weather: unavailable"), "{empty}");
         assert!(empty.contains("next train: none catchable"), "{empty}");
+        assert!(empty.contains("claude usage: unavailable"), "{empty}");
+        let with = facts(
+            &Ingredients {
+                usage: Some(usage()),
+                ..full()
+            },
+            "Thursday 07:30",
+        );
+        assert!(with.contains("claude usage: 5h 37%, 7d 62%"), "{with}");
+        assert!(
+            !with.contains("claude usage: unavailable"),
+            "one line, not both: {with}"
+        );
     }
 
     // ── Sanitize ─────────────────────────────────────────────────────────────

@@ -25,7 +25,9 @@
 //!   the host shares it), composed through [`hytte_ai_providers`] in her voice
 //!   (or a plain template, keyless), delivered sticky in the bubble until
 //!   poked and mirrored as a toast
-//!   ([`Effect::Notify`]).
+//!   ([`Effect::Notify`]). Since #1262 one more optional line: the Claude
+//!   quota reading, pulled from `hytte-claude-bridge` over the host-routed
+//!   datasource protocol (`usage.rs`) rather than polled a second time here.
 //!
 //! Environment: `CAW_EXPRESSION_PATH` (default
 //! `~/.local/state/caw/expression.json`) — the file opencaw writes; plus the
@@ -37,15 +39,19 @@ mod expression;
 mod face;
 mod ingredients;
 mod speech;
+mod usage;
 
 use std::time::Duration;
 
 use expression::Expression;
-use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
+use hytte_plugin::proto::{
+    Capability, DatasourceOutcome, Dir, Effect, EventKind, Manifest, Mount, Node, StateKey,
+};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use ingredients::EventBrief;
 use tokio::sync::mpsc;
+use usage::UsageBrief;
 
 /// Poll / animation cadence.
 const TICK: Duration = Duration::from_secs(2);
@@ -56,6 +62,17 @@ const POKE_TTL: u32 = 8;
 /// The face button's node id — the poke target.
 const FACE_ID: &str = "caw-face";
 
+/// How long the briefing loop waits for the `claude-usage` answer before it
+/// composes without the line (#1262).
+///
+/// Generous on purpose and still bounded: the host answers a query for an
+/// unprovided datasource *immediately* with `NotFound`, and caps a connected
+/// provider's silence at its own 10 s `QUERY_TIMEOUT`, so this only ever runs
+/// out if the session itself is tearing down mid-query. It is the wait that
+/// makes "the bridge is not running" cost one ingredient instead of the
+/// morning's briefing.
+const USAGE_WAIT: Duration = Duration::from_secs(15);
+
 /// Messages from the plugin's own poll loop.
 #[derive(Debug)]
 enum CawMsg {
@@ -65,6 +82,12 @@ enum CawMsg {
     /// Today's composed morning briefing (#407) and the unix second it landed
     /// (the reference for "a fresher expression takes over").
     Briefing { text: String, at_unix: u64 },
+    /// The briefing is about to compose and wants the Claude quota reading
+    /// (#1262). `update` is the only place a plugin can emit an effect, so the
+    /// loop asks *through* it: this becomes one
+    /// [`Effect::DatasourceQuery`], whose answer returns down the command lane
+    /// as [`CawCmd::Usage`].
+    NeedUsage,
 }
 
 /// Commands from `update` down to the briefing loop (the #280 lane). The host
@@ -81,6 +104,11 @@ enum CawCmd {
     /// window rather than while the human is away (#484 replacing #407's
     /// suspend-window stand-in).
     Locked(bool),
+    /// The answer to the loop's own [`CawMsg::NeedUsage`] (#1262): the parsed
+    /// Claude quota reading, or `None` when the bridge is not running, refused
+    /// (stale numbers, no login), or answered something caw cannot read. One
+    /// per ask — the loop is blocked waiting for exactly this.
+    Usage(Option<UsageBrief>),
 }
 
 /// caw's moods — must match the `enum` her `caw_express` tool advertises.
@@ -157,8 +185,19 @@ struct Caw {
     briefing: Option<(String, u64)>,
     /// The command lane to the briefing loop (#484): `update` relays the host's
     /// calendar/lock pushes down it so the loop that owns the trigger + compose
-    /// sees them.
+    /// sees them — and, since #1262, the `claude-usage` answer the loop asked
+    /// for.
     cmd_tx: CmdSender<CawCmd>,
+    /// The `request_id` of the `claude-usage` query in flight, if any (#1262).
+    /// caw mints one per ask and drops an answer that does not carry it: the
+    /// id space is hers, but a plugin that matched on nothing would relay a
+    /// stray result into a lane whose reader is waiting for exactly one.
+    /// `Option`, not a map — the briefing asks once a day and blocks on the
+    /// answer, so there is never a second one outstanding (the #963 consent
+    /// shape, for the same reason).
+    pending_usage: Option<u64>,
+    /// The next `request_id` to mint. Monotone, never reused within a session.
+    next_query_id: u64,
 }
 
 impl Caw {
@@ -232,6 +271,22 @@ impl Caw {
         let (mood, line) = POKES[self.frame % POKES.len()];
         self.poke = Some((mood, line, POKE_TTL));
     }
+
+    /// Mint one `claude-usage` query (#1262) and remember its id so the answer
+    /// can be matched. Naming the provider and scope the bridge declares is the
+    /// whole of the route from this side — the host does the lookup, the scope
+    /// check, the forward, and the timeout.
+    fn ask_for_usage(&mut self) -> Effect {
+        let request_id = self.next_query_id;
+        self.next_query_id = self.next_query_id.wrapping_add(1);
+        self.pending_usage = Some(request_id);
+        Effect::DatasourceQuery {
+            request_id,
+            provider: usage::DATASOURCE_ID.to_owned(),
+            scope: usage::SCOPE_CURRENT.to_owned(),
+            params: usage::NO_PARAMS.to_owned(),
+        }
+    }
 }
 
 impl Plugin for Caw {
@@ -253,6 +308,12 @@ impl Plugin for Caw {
             Capability::Notify,
             Capability::Calendar,
             Capability::SessionState,
+            // #1262: the requester side of the datasource protocol — the
+            // briefing sources the Claude quota reading from
+            // `hytte-claude-bridge`'s `claude-usage` datasource rather than
+            // becoming a second reader of the OAuth token. caw provides
+            // nothing, so this is `DatasourceQuery` alone.
+            Capability::DatasourceQuery,
         ];
         m
     }
@@ -266,6 +327,8 @@ impl Plugin for Caw {
             poke: None,
             briefing: None,
             cmd_tx: cmds,
+            pending_usage: None,
+            next_query_id: 1,
         }
     }
 
@@ -313,10 +376,20 @@ impl Plugin for Caw {
                             continue;
                         }
                         stamp.mark(now.date_naive());
+                        // #1262: ask the bridge for the quota reading and wait
+                        // for the one answer, draining the lane's other traffic
+                        // meanwhile. A one-shot at briefing time, not a poll —
+                        // the spec's rule for every ingredient — and bounded,
+                        // so a hive of nothing costs a line, never the news.
+                        let usage = if tx.send(CawMsg::NeedUsage).is_ok() {
+                            await_usage(&mut cmds, &mut events, &mut locked).await
+                        } else {
+                            break;
+                        };
                         let provider = cfg.provider.clone();
                         let ev = events.clone();
                         let text = tokio::task::spawn_blocking(move || {
-                            briefing::brief_now(provider.as_ref(), ev)
+                            briefing::brief_now(provider.as_ref(), ev, usage)
                         })
                         .await
                         .unwrap_or_else(|e| {
@@ -332,6 +405,10 @@ impl Plugin for Caw {
                         match cmd {
                             Some(CawCmd::Calendar(e)) => events = e,
                             Some(CawCmd::Locked(l)) => locked = l,
+                            // Only `await_usage` ever asks, and it reads the
+                            // answer itself — one arriving here is a straggler
+                            // from a wait that already timed out.
+                            Some(CawCmd::Usage(_)) => {}
                             // The lane closed: the session is tearing down.
                             None => break,
                         }
@@ -354,10 +431,43 @@ impl Plugin for Caw {
                     body: text,
                 }];
             }
+            // The briefing loop is about to compose and wants the quota
+            // reading (#1262). `update` is the only place a plugin may emit an
+            // effect, so the ask travels up the message stream and leaves as a
+            // host-routed query; the answer arrives below.
+            Input::App(CawMsg::NeedUsage) => return vec![self.ask_for_usage()],
             Input::Event { node, kind, .. } => {
                 if node == FACE_ID && matches!(kind, EventKind::Click) {
                     self.poke();
                 }
+            }
+            // The `claude-usage` answer (#1262): parse it here at the boundary
+            // — the way the calendar digest is mapped here — and relay the
+            // ingredient down the lane the waiting loop is reading. A failure
+            // (no bridge running, numbers past the bridge's own staleness
+            // window, no Claude login) is relayed as `None`, not dropped: the
+            // loop is blocked on exactly one answer per ask, and a swallowed
+            // failure would cost it the full `USAGE_WAIT` for nothing.
+            Input::DatasourceResult {
+                request_id,
+                outcome,
+            } => {
+                if self.pending_usage != Some(request_id) {
+                    // Not ours (or already answered) — drop it rather than
+                    // unblock the loop with somebody else's payload.
+                    return Vec::new();
+                }
+                self.pending_usage = None;
+                let brief = match outcome {
+                    DatasourceOutcome::Ready(payload) => usage::parse(&payload),
+                    DatasourceOutcome::Failed { error, message } => {
+                        eprintln!(
+                            "[caw] no claude usage for the briefing ({error:?}): {message}"
+                        );
+                        None
+                    }
+                };
+                let _ = self.cmd_tx.send(CawCmd::Usage(brief));
             }
             // The host's calendar digest (#484): relay the briefing-shaped events
             // down the lane to the compose loop. A send failure just means the
@@ -379,8 +489,8 @@ impl Plugin for Caw {
             | Input::AudioSpectrum(_)
             | Input::ConsentDecision { .. }
             | Input::NowPlaying(_)
-            | Input::DatasourceQuery { .. }
-            | Input::DatasourceResult { .. } => {}
+            // caw provides no datasource of her own — she only asks.
+            | Input::DatasourceQuery { .. } => {}
         }
         Vec::new()
     }
@@ -465,6 +575,40 @@ impl Plugin for Caw {
     }
 }
 
+/// Wait for the one `claude-usage` answer the loop just asked for (#1262),
+/// keeping the command lane drained while it does.
+///
+/// The other two commands are *relayed state*, not replies, and the briefing is
+/// about to read both — so a calendar or lock push that lands during the wait is
+/// applied here rather than left queued behind the answer. That is the whole
+/// reason this is a loop and not a single `recv`.
+///
+/// Returns `None` on three honest outcomes, all of which mean "compose without
+/// the line": the answer said there is nothing to say (the bridge refused, or
+/// caw could not read the frame), the lane closed (the session is tearing
+/// down), or [`USAGE_WAIT`] ran out. The last one is a backstop — the host
+/// answers `NotFound` immediately and caps a live provider at its own 10 s
+/// bound — and not a tuning knob.
+async fn await_usage(
+    cmds: &mut CmdReceiver<CawCmd>,
+    events: &mut Vec<EventBrief>,
+    locked: &mut bool,
+) -> Option<UsageBrief> {
+    let deadline = tokio::time::Instant::now() + USAGE_WAIT;
+    loop {
+        match tokio::time::timeout_at(deadline, cmds.recv()).await {
+            Ok(Some(CawCmd::Usage(brief))) => return brief,
+            Ok(Some(CawCmd::Calendar(e))) => *events = e,
+            Ok(Some(CawCmd::Locked(l))) => *locked = l,
+            Ok(None) => return None,
+            Err(_) => {
+                eprintln!("[caw] the claude-usage query went unanswered; cawing without it");
+                return None;
+            }
+        }
+    }
+}
+
 fn main() {
     hytte_plugin::run::<Caw>()
 }
@@ -472,6 +616,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::RECORDED;
 
     fn caw() -> Caw {
         caw_with_lane().0
@@ -692,6 +837,173 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(CawCmd::Locked(true))));
         let _ = c.update(Input::SessionLocked(false));
         assert!(matches!(rx.try_recv(), Ok(CawCmd::Locked(false))));
+    }
+
+    /// #1262, the consumer round trip through `update`: the loop's ask becomes
+    /// one host-routed query naming the bridge's datasource and scope, and the
+    /// provider's frame comes back down the lane as the parsed ingredient.
+    #[test]
+    fn the_usage_ask_becomes_a_query_and_the_answer_comes_back_parsed() {
+        let (mut c, mut rx) = caw_with_lane();
+        let fx = c.update(Input::App(CawMsg::NeedUsage));
+        let [
+            Effect::DatasourceQuery {
+                request_id,
+                provider,
+                scope,
+                params,
+            },
+        ] = fx.as_slice()
+        else {
+            panic!("the ask must produce exactly one query: {fx:?}");
+        };
+        assert_eq!(provider, "claude-usage");
+        assert_eq!(scope, "current");
+        assert_eq!(params, "{}");
+        let request_id = *request_id;
+
+        // The provider's answer — the frame `hytte-claude-bridge`'s own test
+        // records — lands as the ingredient.
+        let fx = c.update(Input::DatasourceResult {
+            request_id,
+            outcome: DatasourceOutcome::Ready(RECORDED.to_owned()),
+        });
+        assert!(fx.is_empty(), "relaying asks the host for nothing");
+        match rx.try_recv() {
+            Ok(CawCmd::Usage(Some(brief))) => assert_eq!(brief.rows, "5h 37%, 7d 62%"),
+            other => panic!("expected the parsed reading, got {other:?}"),
+        }
+        assert_eq!(c.pending_usage, None, "the query is no longer in flight");
+    }
+
+    /// A refusal is relayed as `None` rather than swallowed: the briefing loop
+    /// is blocked on exactly one answer per ask, so dropping a failure would
+    /// cost it the whole `USAGE_WAIT` for nothing.
+    #[test]
+    fn a_refused_query_still_unblocks_the_briefing_loop() {
+        use hytte_plugin::proto::DatasourceError;
+        let (mut c, mut rx) = caw_with_lane();
+        let fx = c.update(Input::App(CawMsg::NeedUsage));
+        let [Effect::DatasourceQuery { request_id, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let _ = c.update(Input::DatasourceResult {
+            request_id: *request_id,
+            outcome: DatasourceOutcome::Failed {
+                error: DatasourceError::NotFound,
+                message: "no connected provider for datasource 'claude-usage'".to_owned(),
+            },
+        });
+        assert!(matches!(rx.try_recv(), Ok(CawCmd::Usage(None))));
+        // …and so does a `Ready` frame caw cannot read.
+        let fx = c.update(Input::App(CawMsg::NeedUsage));
+        let [Effect::DatasourceQuery { request_id, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let _ = c.update(Input::DatasourceResult {
+            request_id: *request_id,
+            outcome: DatasourceOutcome::Ready("{\"version\":99}".to_owned()),
+        });
+        assert!(matches!(rx.try_recv(), Ok(CawCmd::Usage(None))));
+    }
+
+    /// A result carrying an id caw did not mint (or already answered) is
+    /// dropped, not relayed — the loop is waiting for exactly one answer and
+    /// must not be unblocked by a stray.
+    #[test]
+    fn a_result_for_an_unknown_request_id_is_dropped() {
+        let (mut c, mut rx) = caw_with_lane();
+        let fx = c.update(Input::App(CawMsg::NeedUsage));
+        let [Effect::DatasourceQuery { request_id, .. }] = fx.as_slice() else {
+            panic!("{fx:?}");
+        };
+        let mine = *request_id;
+        let _ = c.update(Input::DatasourceResult {
+            request_id: mine.wrapping_add(7),
+            outcome: DatasourceOutcome::Ready(RECORDED.to_owned()),
+        });
+        assert!(rx.try_recv().is_err(), "a stray must not reach the lane");
+        assert_eq!(
+            c.pending_usage,
+            Some(mine),
+            "…and the ask is still in flight"
+        );
+        // A second copy of the real answer is dropped too, once the first has
+        // cleared the slot.
+        let _ = c.update(Input::DatasourceResult {
+            request_id: mine,
+            outcome: DatasourceOutcome::Ready(RECORDED.to_owned()),
+        });
+        assert!(matches!(rx.try_recv(), Ok(CawCmd::Usage(Some(_)))));
+        let _ = c.update(Input::DatasourceResult {
+            request_id: mine,
+            outcome: DatasourceOutcome::Ready(RECORDED.to_owned()),
+        });
+        assert!(
+            rx.try_recv().is_err(),
+            "a duplicate must not reach it twice"
+        );
+    }
+
+    /// The waiting half (#1262): `await_usage` keeps the lane drained — a
+    /// calendar or lock push that lands mid-wait is applied rather than queued
+    /// behind the answer — and gives up on a closed lane.
+    #[tokio::test]
+    async fn await_usage_drains_the_lane_while_it_waits() {
+        let (tx, mut rx) = hytte_plugin::cmd_channel::<CawCmd>();
+        let mut events = Vec::new();
+        let mut locked = false;
+        tx.send(CawCmd::Locked(true)).unwrap();
+        tx.send(CawCmd::Calendar(vec![EventBrief {
+            hhmm: "10:00".to_owned(),
+            summary: "standup".to_owned(),
+        }]))
+        .unwrap();
+        tx.send(CawCmd::Usage(Some(UsageBrief {
+            rows: "5h 1%".to_owned(),
+        })))
+        .unwrap();
+        let got = await_usage(&mut rx, &mut events, &mut locked).await;
+        assert_eq!(got.map(|b| b.rows), Some("5h 1%".to_owned()));
+        assert!(locked, "the lock push landed rather than queueing");
+        assert_eq!(events.len(), 1, "so did the calendar push");
+
+        // A closed lane is "compose without it", not a hang.
+        let (tx, mut rx) = hytte_plugin::cmd_channel::<CawCmd>();
+        drop(tx);
+        assert!(
+            await_usage(&mut rx, &mut events, &mut locked)
+                .await
+                .is_none()
+        );
+    }
+
+    /// …and a lane that simply never answers gives up at [`USAGE_WAIT`]
+    /// instead of holding the morning.
+    ///
+    /// Under tokio's paused clock, which auto-advances to the next deadline
+    /// once the runtime is idle — so this costs no wall time, and the elapsed
+    /// assertion is what makes it a statement about the budget rather than
+    /// about `timeout_at` existing (drop the deadline to zero and it reds).
+    /// `tx` is deliberately alive across the wait: this is the *timeout* arm,
+    /// not the closed-lane one the test above already covers.
+    #[tokio::test(start_paused = true)]
+    async fn await_usage_gives_up_at_the_deadline() {
+        let (tx, mut rx) = hytte_plugin::cmd_channel::<CawCmd>();
+        let mut events = Vec::new();
+        let mut locked = false;
+        let started = tokio::time::Instant::now();
+        assert!(
+            await_usage(&mut rx, &mut events, &mut locked)
+                .await
+                .is_none()
+        );
+        assert!(
+            started.elapsed() >= USAGE_WAIT,
+            "it gave up early: {:?}",
+            started.elapsed()
+        );
+        drop(tx);
     }
 
     #[test]

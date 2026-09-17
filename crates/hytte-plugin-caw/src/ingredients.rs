@@ -30,6 +30,13 @@
 //! - **Calendar** — sourced entirely from the host push described above.
 //!   [`gather`] leaves [`Ingredients::events`] empty; the caller
 //!   ([`crate::briefing::brief_now`]) fills it in from the command lane.
+//! - **Claude usage** — sourced from *another plugin* (#1262): the bridge
+//!   already polls the quota endpoint for its bar chip and serves the numbers
+//!   as the `claude-usage` datasource (#509), so caw asks rather than becoming
+//!   a second reader of the OAuth token. [`gather`] leaves
+//!   [`Ingredients::usage`] `None` for the same reason it leaves `events`
+//!   empty — there is no HTTPS fetch to make here — and the same caller fills
+//!   it in from the same lane. See [`crate::usage`].
 //!
 //! Everything here is best-effort: a missing config or a failed fetch just
 //! leaves that ingredient absent and the composer degrades gracefully — caw
@@ -40,6 +47,8 @@ use std::time::Duration;
 
 use chrono::DateTime;
 use serde::Deserialize;
+
+use crate::usage::UsageBrief;
 
 // Same BVG fetch as `hytte-services/src/departures.rs` and
 // `hytte-plugin-departures/src/feed.rs` (30 / 5s / 10s, independently
@@ -70,6 +79,12 @@ pub(crate) struct Ingredients {
     /// [`crate::briefing::brief_now`], not by this struct's own gather path
     /// (see the module docs).
     pub events: Vec<EventBrief>,
+    /// The Claude quota reading (#1262). Like [`events`](Self::events) and for
+    /// the same reason, [`gather`] always leaves this `None`: it comes from
+    /// another *plugin* over the host-routed datasource protocol (#509), not
+    /// from an HTTPS fetch this module could make — see [`crate::usage`] —
+    /// and [`crate::briefing::brief_now`] fills it in from the command lane.
+    pub usage: Option<UsageBrief>,
 }
 
 /// One weather reading, already briefing-shaped.
@@ -130,6 +145,7 @@ pub(crate) fn gather() -> Ingredients {
         weather: weather_brief(place.as_ref()),
         departure: departure_brief(place.as_ref(), chrono::Utc::now().timestamp()),
         events: Vec::new(),
+        usage: None,
     }
 }
 

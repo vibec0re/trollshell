@@ -3947,7 +3947,7 @@ mod tests {
             |focused, plugin| {
                 calls
                     .borrow_mut()
-                    .push(format!("drawer:{plugin}:{focused:?}"))
+                    .push(format!("drawer:{plugin}:{focused:?}"));
             },
             |_focused, plugin, _mount| calls.borrow_mut().push(format!("dialog:{plugin}")),
         );

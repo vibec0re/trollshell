@@ -186,10 +186,19 @@ pub fn open_on_focused(preferred: Option<&str>, plugin_id: &str, mount: Mount) {
         return;
     }
 
-    // A different output (or nothing up): tear the old one down first, so
-    // "one dialog at a time" is a property of this function rather than of
-    // whoever calls it.
-    close();
+    // A different output (or nothing up): take the old window down and build the
+    // new one, so "one dialog at a time" is a property of this function rather
+    // than of whoever calls it.
+    //
+    // Deliberately *not* through [`close`]: that publishes the dismissal
+    // (selection `None`, visibility `None`), and a rebuild would then hand every
+    // plugin a `SlotVisible` false→true edge for a page that never left the
+    // screen. The window is taken here and the selection is republished once,
+    // below.
+    let previous = DIALOG.with(|d| d.borrow_mut().take());
+    if let Some(live) = previous {
+        live.window.close();
+    }
     show(&monitor, &connector, plugin_id);
     publish_selection(plugin_id, mount);
 }

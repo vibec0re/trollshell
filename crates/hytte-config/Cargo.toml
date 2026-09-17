@@ -68,5 +68,8 @@ temp-env = "0.3.6"
 # `rt`/`macros` here (test-only) is what lets `#[tokio::test]` build and run a
 # `poll_loop`/`wait_cadence` test — and it changes nothing about what a
 # consumer's non-test build links, since dev-dependencies never apply outside
-# `cargo test`.
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# `cargo test`. `test-util` joined them for #1334: `#[tokio::test(start_paused
+# = true)]` and `tokio::time::advance` both refuse to compile without it, and
+# it is what let the cadence-flip test move off the wall clock onto a
+# deterministic paused one.
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }

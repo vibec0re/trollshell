@@ -81,29 +81,40 @@ that would catch any of them drifting. `agents` is duplicate one of the
 nine, and adding it here is what the rename above is for: a third family
 adds a rule and a `*_RS` constant, not a second script.
 
-THE THIRD FAMILY IS DELIBERATELY NOT HERE YET (#1227 item 2)
-------------------------------------------------------------
-`programs.trollshell.config.places` is duplicate two of the nine, and it has
-no rule below. Both of `struct_serde_fields`' preconditions fail for it:
-`crates/hytte-config/src/places.rs`'s `PlaceCfg` and `DeparturesCfg` are
-private structs with private fields (nothing outside that module has ever
-needed the raw file schema — `Place`, the public type, is the *normalised*
-one and carries no `#[serde]` at all), so the scan finds neither
-`pub struct PlaceCfg` nor a single `pub` field. Making them public to satisfy
-a lint would widen a published API for the lint's convenience, which is the
-wrong direction; teaching this scan to read a private struct is the right one
-and is a change to `struct_serde_fields` plus its self-test, not a one-liner.
+THE THIRD FAMILY: `places` READS PRIVATE STRUCTS (#1227 item 2, #1339 item 2)
+------------------------------------------------------------------------------
+`programs.trollshell.config.places` is duplicate two of the nine, and until
+#1339 had no rule below: both of `struct_serde_fields`' preconditions failed
+for it. `crates/hytte-config/src/places.rs`'s `PlaceCfg` and `DeparturesCfg`
+are private structs with private fields (nothing outside that module has
+ever needed the raw file schema — `Place`, the public type, is the
+*normalised* one and carries no `#[serde]` at all), so the scan found
+neither `pub struct PlaceCfg` nor a single `pub` field. Making them public to
+satisfy a lint would widen a published API for the lint's convenience, which
+is the wrong direction, so `struct_serde_fields` looks the struct name up in
+`PRIVATE_STRUCTS` instead: `struct` without a leading `pub` for the
+declaration, and a bare identifier followed by `:` — no leading `pub` — for
+each field. Nothing else opts into this — every other
+family still requires `pub struct` and `pub` fields by default, so a family
+added later that forgets to ask for `private=True` gets the stricter check,
+not a silently widened one.
 
-Until then the guard for that family is the pair #1237 built for `agents`:
+`place`/`departures` are SIBLING leaves of `config.places` (`PlaceCfg`'s
+fields live inside the `listOf (submodule { … })` under `place`;
+`DeparturesCfg`'s live inside the plain `submodule` under `departures`), not
+one nested inside the other the way `agents`' `display` is — so
+`places_option_levels` needs none of `agents_option_levels`' "lift the
+nested block out first" step; it reads each leaf's block independently.
+
+The pair #1237 built for `agents` still guards the *values*:
 `checks.{nixos,hm}-module-places-fixture` pin the rendered bytes against
 `crates/hytte-config/tests/fixtures/places-nix-rendered.toml`, and
 `crates/hytte-config/tests/places_nix_base.rs` reads that same fixture back
 through the real reader and asserts every field of it. That catches a value
-or a spelling drifting; it does NOT catch the direction this script exists
+or a spelling drifting; it does not catch the direction this script exists
 for — an option leaf nix can set that the Rust schema does not know (it
 renders a key the reader silently ignores), or a schema field nix can never
-set. Both are a rename away, which is why this paragraph names the gap
-instead of leaving the omission to be discovered.
+set — which is exactly the gap the rule below closes.
 
 WHY THIS IS A NIX LINT AND NOT A `cargo test` (#1081 review, second round)
 ---------------------------------------------------------------------------
@@ -169,6 +180,7 @@ STYLE_RS = os.path.join(REPO_ROOT, "crates", "hytte-preem", "src", "style.rs")
 CORE_LEDS_RS = os.path.join(REPO_ROOT, "trollshell", "src", "config", "core_leds.rs")
 AGENTS_RS = os.path.join(REPO_ROOT, "crates", "hytte-plugin-agents", "src", "config.rs")
 MANIFEST_RS = os.path.join(REPO_ROOT, "crates", "hytte-plugin-proto", "src", "manifest.rs")
+PLACES_RS = os.path.join(REPO_ROOT, "crates", "hytte-config", "src", "places.rs")
 MODULE_COMMON_NIX = os.path.join(REPO_ROOT, "nix", "module-common.nix")
 
 # `config.agents`' nix option leaves, paired with the Rust struct whose serde
@@ -179,6 +191,34 @@ AGENTS_STRUCT_LEVELS = (
     ("config.agents = lib.mkOption {", "AgentsConfig"),
     ("display = lib.mkOption {", "Display"),
 )
+
+# `config.places`' nix option leaves, paired with the Rust struct whose serde
+# fields they must equal (#1339 item 2). Unlike `AGENTS_STRUCT_LEVELS`, these
+# two are SIBLINGS under `config.places` rather than one nested inside the
+# other — `place` is a `listOf (submodule { … })` whose own options are
+# `PlaceCfg`'s fields, `departures` is a plain `submodule` whose own options
+# are `DeparturesCfg`'s — so `places_option_levels` reads each independently,
+# with no block to lift out first the way `agents_option_levels` does for
+# `display`. There is deliberately no third entry for `config.places` itself:
+# its own two leaves (`place`, `departures`) are not the serde fields of any
+# single Rust struct — `PlaceCfg` and `DeparturesCfg` are two separate parse
+# structs, both private (see the module doc above), so `struct_serde_fields`
+# is called for these two with `private=True`.
+PLACES_STRUCT_LEVELS = (
+    ("place = lib.mkOption {", "PlaceCfg"),
+    ("departures = lib.mkOption {", "DeparturesCfg"),
+)
+
+# The (struct, file) pairs `struct_serde_fields` may read without requiring a
+# `pub` on the declaration or on its fields — see "THE THIRD FAMILY" above
+# for why these two stay private rather than being made `pub` for this
+# script's convenience. Keyed by struct name (checked by
+# `struct_serde_fields` itself, so no call site needs to opt in by hand); the
+# file is carried alongside for `main()` to read from and so this table
+# stays the one place that says both "which structs" and "from where".
+# Anything not named here still requires `pub struct` with `pub` fields, the
+# stricter default every other family is held to.
+PRIVATE_STRUCTS = {struct: PLACES_RS for _, struct in PLACES_STRUCT_LEVELS}
 
 
 def match_delim(src: str, start: int, open_c: str, close_c: str) -> int:
@@ -369,6 +409,19 @@ def agents_option_levels(nix_src: str) -> dict[str, list[str]]:
     return {"AgentsConfig": option_leaves(outer), "Display": option_leaves(display_body)}
 
 
+def places_option_levels(nix_src: str) -> dict[str, list[str]]:
+    """`config.places`' option leaves, one list per Rust struct (#1339 item 2).
+
+    Unlike `agents_option_levels`, `place` and `departures` are SIBLING
+    leaves of `config.places` — `PlaceCfg`'s fields live inside the
+    `listOf (submodule { … })` under `place`, `DeparturesCfg`'s inside the
+    plain `submodule` under `departures` — neither block sits inside the
+    other, so each is read independently with no "lift the nested block out
+    first" step.
+    """
+    return {struct: option_leaves(option_block(nix_src, anchor)) for anchor, struct in PLACES_STRUCT_LEVELS}
+
+
 def _serde_attr_lists(text: str) -> list[str]:
     """Every `#[serde(...)]` attribute's inner content found in `text`."""
     return re.findall(r"#\[serde\(([^)]*)\)\]", text)
@@ -387,7 +440,15 @@ def _serde_has(text: str, pattern: str) -> bool:
 
 
 def struct_serde_fields(src: str, struct: str) -> list[str]:
-    """The serde-visible field names of `pub struct <struct>`, in source order.
+    """The serde-visible field names of `struct <struct>`, in source order.
+
+    Requires a `pub struct` with `pub` fields UNLESS `struct` is one of
+    `PRIVATE_STRUCTS`' keys (`places.rs`'s `PlaceCfg`/`DeparturesCfg`, #1339
+    item 2) — those are read without either `pub`, since making a
+    file-schema struct public just to satisfy this scan would widen a
+    published API for the lint's convenience. The distinction is by struct
+    NAME, looked up here, so no call site has to remember to ask for it and
+    every family this table doesn't name keeps the stricter default.
 
     Raises rather than guessing if the struct (or its container attributes)
     uses a serde spelling this scan cannot follow — `rename`, `rename_all` and
@@ -396,9 +457,11 @@ def struct_serde_fields(src: str, struct: str) -> list[str]:
     names that never appear in the TOML. An untrustworthy verdict is worth
     exit 2, not a green.
     """
-    m = re.search(rf"pub struct {struct}\b[^{{]*\{{", src)
+    private = struct in PRIVATE_STRUCTS
+    struct_kw = "struct" if private else "pub struct"
+    m = re.search(rf"{struct_kw} {struct}\b[^{{]*\{{", src)
     if not m:
-        raise LookupError(f"`pub struct {struct}` not found")
+        raise LookupError(f"`{struct_kw} {struct}` not found")
     # Container attributes sit between the doc comment and the struct keyword;
     # 500 characters back covers the derive list and any `#[serde(...)]` line.
     head = src[max(0, m.start() - 500) : m.start()]
@@ -407,21 +470,29 @@ def struct_serde_fields(src: str, struct: str) -> list[str]:
     body_start = m.end() - 1
     body_end = match_delim(src, body_start, "{", "}")
     if body_end < 0:
-        raise LookupError(f"`pub struct {struct}`'s body brace never closes")
+        raise LookupError(f"`{struct_kw} {struct}`'s body brace never closes")
     body = src[body_start:body_end]
     if _serde_has(body, r"rename\s*="):
         raise LookupError(f"`{struct}` uses serde `rename`, which this scan cannot follow")
     if _serde_has(body, r"\bflatten\b"):
         raise LookupError(f"`{struct}` uses serde `flatten`, which this scan cannot follow")
-    # `pub(crate)`/`pub(super)` is still a `pub` field as far as serde and
-    # TOML are concerned — only a Rust-side visibility restriction, which
-    # this scan must not confuse with "not a field at all" (#1241): the old
-    # `pub (\w+):` pattern had a literal space and so never matched a
-    # visibility qualifier, silently dropping the field from the comparison
-    # instead of comparing it.
-    fields = re.findall(r"pub(?:\([^)]*\))?\s+(\w+):", body)
+    if private:
+        # A private struct's fields carry no visibility qualifier at all —
+        # `name: String,`, never `pub name: String,` — so the field itself,
+        # not a `pub` prefix, is what a line starts with. Anchored to the
+        # start of a (stripped) line so this cannot match a `key: value`-
+        # shaped fragment inside a doc comment or an attribute string.
+        fields = re.findall(r"^\s*(\w+):", body, re.M)
+    else:
+        # `pub(crate)`/`pub(super)` is still a `pub` field as far as serde and
+        # TOML are concerned — only a Rust-side visibility restriction, which
+        # this scan must not confuse with "not a field at all" (#1241): the old
+        # `pub (\w+):` pattern had a literal space and so never matched a
+        # visibility qualifier, silently dropping the field from the comparison
+        # instead of comparing it.
+        fields = re.findall(r"pub(?:\([^)]*\))?\s+(\w+):", body)
     if not fields:
-        raise LookupError(f"`pub struct {struct}` has no `pub` fields")
+        raise LookupError(f"`{struct_kw} {struct}` has no fields")
     return fields
 
 
@@ -681,6 +752,95 @@ def self_test() -> list[str]:
             f"struct_serde_fields: pub(crate)/pub(super) fields dropped, got {got}"
         )
 
+    # #1339 item 2: a struct named in `PRIVATE_STRUCTS` (`PlaceCfg`,
+    # `DeparturesCfg`) is read with no `pub` anywhere — the shape
+    # `places.rs`'s file-schema structs actually use.
+    places_struct_src = '''
+    #[derive(serde::Deserialize)]
+    struct PlaceCfg {
+        name: String,
+        lat: f64,
+        lon: f64,
+        #[serde(default = "default_radius_km")]
+        radius_km: f64,
+        #[serde(default)]
+        ssids: Vec<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeparturesCfg {
+        #[serde(default)]
+        endpoint: Option<String>,
+    }
+    '''
+    got = struct_serde_fields(places_struct_src, "PlaceCfg")
+    if got != ["name", "lat", "lon", "radius_km", "ssids"]:
+        failures.append(f"struct_serde_fields: expected PlaceCfg's private fields, got {got}")
+    got = struct_serde_fields(places_struct_src, "DeparturesCfg")
+    if got != ["endpoint"]:
+        failures.append(f"struct_serde_fields: expected DeparturesCfg's private field, got {got}")
+    # The allow-list is by NAME, not a blanket "no `pub` required": a private
+    # struct under a name `PRIVATE_STRUCTS` does not list must still be
+    # refused, or adding one entry would silently loosen the check for every
+    # family, not just the one it names.
+    not_allow_listed = places_struct_src.replace("struct PlaceCfg", "struct NotAllowListed")
+    try:
+        struct_serde_fields(not_allow_listed, "NotAllowListed")
+        failures.append(
+            "struct_serde_fields: a private struct outside PRIVATE_STRUCTS was not refused"
+        )
+    except LookupError:
+        pass
+
+    places_nix_src = '''
+    config.places = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          place = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.listOf (
+                lib.types.submodule {
+                  options = {
+                    name = lib.mkOption { type = lib.types.str; };
+                    lat = lib.mkOption { type = lib.types.either lib.types.float lib.types.int; };
+                    lon = lib.mkOption { type = lib.types.either lib.types.float lib.types.int; };
+                    radius_km = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.either lib.types.float lib.types.int);
+                    };
+                    ssids = lib.mkOption { type = lib.types.nullOr (lib.types.listOf lib.types.str); };
+                  };
+                }
+              )
+            );
+            default = null;
+          };
+          departures = lib.mkOption {
+            type = lib.types.submodule {
+              options = {
+                endpoint = lib.mkOption { type = lib.types.nullOr lib.types.str; };
+              };
+            };
+            default = { };
+          };
+        };
+      };
+      default = { };
+    };
+    '''
+    place_levels = places_option_levels(places_nix_src)
+    if place_levels["PlaceCfg"] != ["name", "lat", "lon", "radius_km", "ssids"]:
+        failures.append(f"places_option_levels: place leaves wrong, got {place_levels['PlaceCfg']}")
+    if place_levels["DeparturesCfg"] != ["endpoint"]:
+        failures.append(
+            f"places_option_levels: departures leaves wrong, got {place_levels['DeparturesCfg']}"
+        )
+    # `place` and `departures` are siblings, so — unlike agents' nested
+    # `display` — there is no shared block either level could swallow from
+    # the other; a real overlap here would mean the anchors themselves
+    # collided.
+    if set(place_levels["PlaceCfg"]) & set(place_levels["DeparturesCfg"]):
+        failures.append("places_option_levels: the two levels overlap")
+
     agents_nix_src = '''
     config.agents = lib.mkOption {
       type = lib.types.submodule {
@@ -767,7 +927,7 @@ def main() -> int:
 
     missing = [
         p
-        for p in (STYLE_RS, CORE_LEDS_RS, AGENTS_RS, MANIFEST_RS, MODULE_COMMON_NIX)
+        for p in (STYLE_RS, CORE_LEDS_RS, AGENTS_RS, MANIFEST_RS, PLACES_RS, MODULE_COMMON_NIX)
         if not os.path.isfile(p)
     ]
     if missing:
@@ -779,6 +939,7 @@ def main() -> int:
     core_leds_src = read(CORE_LEDS_RS)
     agents_src = read(AGENTS_RS)
     manifest_src = read(MANIFEST_RS)
+    places_src = read(PLACES_RS)
     nix_src = read(MODULE_COMMON_NIX)
 
     try:
@@ -796,6 +957,11 @@ def main() -> int:
         rust_agents_levels = {
             struct: struct_serde_fields(agents_src, struct)
             for _, struct in AGENTS_STRUCT_LEVELS
+        }
+        nix_places_levels = places_option_levels(nix_src)
+        rust_places_levels = {
+            struct: struct_serde_fields(places_src, struct)
+            for _, struct in PLACES_STRUCT_LEVELS
         }
     except LookupError as e:
         print(f"config-vocab scan: {e}", file=sys.stderr)
@@ -840,23 +1006,45 @@ def main() -> int:
             f"but MIN_POLL_SECONDS/MAX_POLL_SECONDS are "
             f"{rust_poll_lo}/{rust_poll_hi} (crates/hytte-plugin-agents/src/config.rs)"
         )
-    for _, struct in AGENTS_STRUCT_LEVELS:
-        nix_keys = set(nix_agents_levels[struct])
-        rust_keys = set(rust_agents_levels[struct])
-        only_rust = sorted(rust_keys - nix_keys)
-        only_nix = sorted(nix_keys - rust_keys)
-        if only_rust:
-            mismatches.append(
-                f"{struct}: field(s) {only_rust} exist in "
-                f"crates/hytte-plugin-agents/src/config.rs but have no "
-                f"`programs.trollshell.config.agents` option leaf — nix can never set them"
-            )
-        if only_nix:
-            mismatches.append(
-                f"{struct}: option leaf(s) {only_nix} exist under "
-                f"`programs.trollshell.config.agents` but are not fields of `{struct}` — "
-                f"rendering them would only produce an unknown-key warning at load time"
-            )
+    # Both families compared the same way: a Rust field with no nix leaf, and
+    # a nix leaf with no Rust field, each SET-compared (not positional) so a
+    # rename on either side reds as both an add and a remove rather than
+    # passing as a silent reorder. `places` reuses this loop rather than
+    # getting a second copy — the only difference from `agents` is which
+    # struct-level table, which levels dict, and which two strings the
+    # message names.
+    for option_path, rust_file, struct_levels, nix_levels, rust_levels in (
+        (
+            "programs.trollshell.config.agents",
+            "crates/hytte-plugin-agents/src/config.rs",
+            AGENTS_STRUCT_LEVELS,
+            nix_agents_levels,
+            rust_agents_levels,
+        ),
+        (
+            "programs.trollshell.config.places",
+            "crates/hytte-config/src/places.rs",
+            PLACES_STRUCT_LEVELS,
+            nix_places_levels,
+            rust_places_levels,
+        ),
+    ):
+        for _, struct in struct_levels:
+            nix_keys = set(nix_levels[struct])
+            rust_keys = set(rust_levels[struct])
+            only_rust = sorted(rust_keys - nix_keys)
+            only_nix = sorted(nix_keys - rust_keys)
+            if only_rust:
+                mismatches.append(
+                    f"{struct}: field(s) {only_rust} exist in "
+                    f"{rust_file} but have no `{option_path}` option leaf — nix can never set them"
+                )
+            if only_nix:
+                mismatches.append(
+                    f"{struct}: option leaf(s) {only_nix} exist under "
+                    f"`{option_path}` but are not fields of `{struct}` — "
+                    f"rendering them would only produce an unknown-key warning at load time"
+                )
 
     if mismatches:
         print(
@@ -867,8 +1055,8 @@ def main() -> int:
         for line in mismatches:
             print(f"  - {line}", file=sys.stderr)
         print(
-            "\nnix/module-common.nix's `programs.trollshell.config.{core-leds,agents}` and "
-            "`plugins.<id>.mount`\nhand-mirror this vocabulary (see those options' own "
+            "\nnix/module-common.nix's `programs.trollshell.config.{core-leds,agents,places}` "
+            "and `plugins.<id>.mount`\nhand-mirror this vocabulary (see those options' own "
             "descriptions) — update whichever side\nfell behind so a base-layer render and "
             "the shell's own parser agree.",
             file=sys.stderr,
@@ -879,7 +1067,9 @@ def main() -> int:
         f"config-vocab scan: core-leds style {rust_style}, fill {rust_fill}, "
         f"rows 0-{rust_max_rows}; agents poll_seconds {rust_poll_lo}-{rust_poll_hi}, "
         f"keys {rust_agents_levels['AgentsConfig']} + display "
-        f"{rust_agents_levels['Display']}; plugins.<id>.mount {rust_mount} "
+        f"{rust_agents_levels['Display']}; places keys "
+        f"{rust_places_levels['PlaceCfg']} + departures "
+        f"{rust_places_levels['DeparturesCfg']}; plugins.<id>.mount {rust_mount} "
         "— nix and Rust agree",
         flush=True,
     )

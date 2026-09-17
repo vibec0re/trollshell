@@ -509,7 +509,8 @@ pub fn assemble_places(
     // Which layer's `place` array actually survived: the overlay's only if it
     // set one *and* no base pinned the key. Anything else that set `place` is
     // a base layer (`DEFAULT_CONFIG` is not one).
-    let overlay_wins_place = overlay_sets_place && !subsystem::locked_here(&merged.locked, PLACE_KEY);
+    let overlay_wins_place =
+        overlay_sets_place && !subsystem::locked_here(&merged.locked, PLACE_KEY);
     let base_supplies_place = base_sets_place && !overlay_wins_place;
 
     let (places, endpoint) = read_merged(&merged.table, base_supplies_place);
@@ -4084,7 +4085,10 @@ lon = 13.5
             assert_eq!(save_departures_endpoint(None), Ok(()));
             let overlay = std::fs::read_to_string(config_path().expect("$HOME"))
                 .expect("even a clear creates the overlay");
-            assert!(parse_places(&overlay).expect("valid TOML").is_empty(), "{overlay}");
+            assert!(
+                parse_places(&overlay).expect("valid TOML").is_empty(),
+                "{overlay}"
+            );
             assert!(load_layered().lock_findings.is_empty());
         });
 
@@ -4103,7 +4107,9 @@ lon = 13.5
         let filtered = seed_for(&locked);
 
         assert!(
-            parse_places(&filtered).expect("still valid TOML").is_empty(),
+            parse_places(&filtered)
+                .expect("still valid TOML")
+                .is_empty(),
             "the array is gone, not emptied of fields:\n{filtered}"
         );
         // Asserted on a *header at the start of a line*, not on the substring:
@@ -4111,7 +4117,9 @@ lon = 13.5
         // and a bare `contains` matches that comment — which is precisely the
         // text this filter has to keep.
         assert!(
-            !filtered.lines().any(|l| l.trim_start().starts_with("[[place]]")),
+            !filtered
+                .lines()
+                .any(|l| l.trim_start().starts_with("[[place]]")),
             "no [[place]] block survives:\n{filtered}"
         );
         assert!(
@@ -4240,7 +4248,11 @@ lon = 13.5
             assert!(after.endpoint_is_locked());
             assert_eq!(after.endpoint.as_deref(), Some("vbb"));
             assert_eq!(
-                after.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                after
+                    .places
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>(),
                 ["Eins"],
                 "…and not one place moved, which is why `poll` could not see this"
             );
@@ -4256,7 +4268,10 @@ lon = 13.5
     /// not ask for, pinned, under a tab saying the places come from nix.
     #[test]
     fn an_empty_array_from_a_base_layer_means_no_places() {
-        let loaded = assemble_places(&[layer("base", "_locked = [\"place\"]\nplace = []\n")], None);
+        let loaded = assemble_places(
+            &[layer("base", "_locked = [\"place\"]\nplace = []\n")],
+            None,
+        );
 
         assert!(loaded.places.is_empty(), "{:?}", loaded.places);
         assert!(loaded.places_are_locked());
@@ -4349,7 +4364,11 @@ lon = 13.5
         );
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["FromHm"],
             "the more important base wins the value; no lock arbitrates between bases"
         );
@@ -4392,16 +4411,17 @@ lon = 13.5
                     "etc",
                     "_locked = [\"place\"]\n[[place]]\nname = \"FromEtc\"\nlat = 1.0\nlon = 2.0\n",
                 ),
-                layer(
-                    "hm",
-                    "[[place]]\nname = \"FromHm\"\nlat = 3.0\nlon = 4.0\n",
-                ),
+                layer("hm", "[[place]]\nname = \"FromHm\"\nlat = 3.0\nlon = 4.0\n"),
             ],
             None,
         );
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["FromHm"],
             "base layers do not lock each other"
         );

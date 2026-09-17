@@ -385,8 +385,7 @@ impl Editor {
         // half-typed backend with the file's value two seconds after they
         // started typing it.
         let endpoint_moved = *self.endpoint.borrow() != endpoint;
-        let changed =
-            *self.base.borrow() != places || self.locked.get() != locks || endpoint_moved;
+        let changed = *self.base.borrow() != places || self.locked.get() != locks || endpoint_moved;
 
         *self.base.borrow_mut() = places;
         self.locked.set(locks);

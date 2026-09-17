@@ -880,10 +880,7 @@ mod tests {
             ],
             || {
                 let err = load_station_config().unwrap_err();
-                assert!(
-                    err.contains(".config/trollshell/places.toml"),
-                    "got: {err}"
-                );
+                assert!(err.contains(".config/trollshell/places.toml"), "got: {err}");
                 assert!(!err.contains("programs.trollshell"), "got: {err}");
             },
         );

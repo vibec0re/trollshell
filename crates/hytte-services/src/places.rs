@@ -1511,7 +1511,11 @@ mine = true
         with_seeded_config_and_base(b"", Some(NIX_BASE), |cfg, handle| {
             let before = std::fs::read_to_string(cfg).expect("readable");
             assert_eq!(
-                handle.get_cloned().iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                handle
+                    .get_cloned()
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>(),
                 ["Werkstatt"],
                 "the shell reads the nix list"
             );
@@ -1544,7 +1548,11 @@ mine = true
                 "a refused edit writes nothing at all"
             );
             assert_eq!(
-                handle.get_cloned().iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                handle
+                    .get_cloned()
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>(),
                 ["Werkstatt"],
                 "and publishes nothing either"
             );
@@ -1561,10 +1569,7 @@ mine = true
         with_seeded_config_and_base(b"", Some(BASE), |_cfg, handle| {
             assert_eq!(add_place(full_place("Zuhause")), Ok(()));
             assert!(
-                handle
-                    .get_cloned()
-                    .iter()
-                    .any(|p| p.name == "Zuhause"),
+                handle.get_cloned().iter().any(|p| p.name == "Zuhause"),
                 "the edit landed and was republished"
             );
         });

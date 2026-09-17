@@ -122,68 +122,51 @@ fn an_overlay_over_the_fixture_is_refused_and_reported() {
     );
 }
 
-/// A no-op save over the nix-rendered bytes changes **no line** — it only
-/// moves one block.
+/// A no-op save over the nix-rendered bytes rewrites **nothing at all** —
+/// `[departures]` included.
 ///
-/// This is the brief's item (c) answered with what is actually true.
-/// `render_places` is a format-preserving patch rather than a re-render, so
-/// every byte nix wrote survives it: the `_locked` line (the #1331 "a marker
-/// survives the writer's stale-key sweep" property, one writer over), nix's
-/// own within-table key order, its inline arrays, its `12.0` spelling, and the
-/// `[departures]` table this model barely knows about. What it does **not**
-/// preserve is that table's *position*: `toml_edit` re-emits a standalone
-/// table after an array-of-tables that was declared below it, so nix's
-/// alphabetical `[departures]`-then-`[[place]]` comes back with
-/// `[departures]` one `[[place]]` further down.
+/// This is the brief's item (c) answered with what is actually true, corrected
+/// from what #1338 shipped it as. `render_places` is a format-preserving
+/// patch rather than a re-render, so every byte nix wrote survives it: the
+/// `_locked` line (the #1331 "a marker survives the writer's stale-key sweep"
+/// property, one writer over), nix's own within-table key order, its inline
+/// arrays, its `12.0` spelling — **and**, since #1339, the `[departures]`
+/// table's *position* too. `render_places` used to restate each rebuilt
+/// `[[place]]` table's document position as its own index in the array (`0,
+/// 1, …`), which only matched the real file order when nothing else in the
+/// document had a lower position than the array's first entry — a standalone
+/// table declared *above* `[[place]]` does, so the array was forced back down
+/// past it on every save, walking `[departures]` one block further down each
+/// time (measured over this fixture, before the fix: `round 1` — after 1
+/// place; `round 2` — after 2, settled; i.e. **N** byte-churning saves, N =
+/// the place count, each moving the content hash `ConfigWatcher` polls — one
+/// spurious reload apiece for the shell and the control center). The fix
+/// (`space_tables`, `crates/hytte-config/src/places.rs`) reuses each rebuilt
+/// table's *own* original position instead of inventing one, so a save that
+/// reorders nothing hands every entry back exactly its own slot and
+/// `[departures]` — never touched — never moves. See
+/// `a_departures_first_edit_settles_in_the_one_save_that_makes_it` below for
+/// the *edited* (not no-op) case, which is where "one save, not N" actually
+/// bites.
 ///
-/// **One block per save, not one move** (#1338 review, L2). Measured over this
-/// fixture's two places:
-///
-/// ```text
-/// round 1: changed=true    [departures] now sits after 1 place
-/// round 2: changed=true    …after 2 places
-/// round 3: changed=false   settled
-/// ```
-///
-/// So a `[departures]`-first document costs **N** byte-churning saves (N = the
-/// number of places) before it settles at the end, and each one moves the
-/// content hash `ConfigWatcher` polls — one spurious reload apiece for the
-/// shell and for the control center. Still cosmetic (nothing reads
-/// `places.toml` positionally) and still pre-existing — the shipped
-/// `DEFAULT_CONFIG` puts `[departures]` last, which is why no test had met it —
-/// and in production this writer never runs over *these* bytes at all, because
-/// the `_locked` line above makes `check_unlocked` refuse first. Tracked on
-/// #1339; the sorted-line assertion below is green through all three of those
-/// documents, which is why the measurement is written down here rather than
-/// left to the test to imply.
-///
-/// It is deliberately not a claim that `pkgs.formats.toml` and `toml_edit`
-/// agree about rendering a document from scratch. They do not, which is
-/// exactly why this writer patches — and why in production the writer never
-/// runs over these bytes at all: nix's base layer is read-only, and the
-/// `_locked` line above means a save is refused before it starts
-/// (`places::check_unlocked`).
+/// Still pre-existing (the shipped `DEFAULT_CONFIG` puts `[departures]` last,
+/// which is why no test had met this until nix started rendering it first —
+/// alphabetically, `departures` sorts before `place`) and still not reachable
+/// through the nix path in production: the `_locked` line above means
+/// `check_unlocked` refuses the save before the writer ever runs
+/// (`a_save_is_refused_while_nix_owns_the_list` in `places.rs`'s own tests).
+/// The document this test's byte-equality is about is `render_places` itself,
+/// called directly — the same call a hand-edited, *unlocked* overlay would
+/// reach.
 #[test]
 fn a_no_op_save_over_the_nix_rendered_bytes_rewrites_no_line() {
     let parsed = places::parse_places(NIX_RENDERED).expect("the fixture parses");
 
     let rendered = places::render_places(NIX_RENDERED, &parsed).expect("the fixture re-renders");
 
-    let sorted = |text: &str| {
-        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        lines.sort();
-        lines
-    };
     assert_eq!(
-        sorted(&rendered),
-        sorted(NIX_RENDERED),
-        "a save that changes nothing must rewrite nothing"
-    );
-    assert_ne!(
         rendered, NIX_RENDERED,
-        "if this is ever byte-equal the relocation stopped happening — tighten \
-         this test to a plain byte comparison rather than leaving the weaker \
-         one standing"
+        "a save that changes nothing must rewrite nothing — [departures] included"
     );
     assert!(
         rendered.starts_with("_locked = [\"departures.endpoint\", \"place\"]\n"),
@@ -197,5 +180,59 @@ fn a_no_op_save_over_the_nix_rendered_bytes_rewrites_no_line() {
         places::parse_places(&rendered).expect("re-parses"),
         parsed,
         "and so does every place"
+    );
+}
+
+/// A real edit over a `[departures]`-first document settles in the **one**
+/// save that makes it — not the N (N = place count) the pre-#1339 writer
+/// needed before it stopped moving the table.
+///
+/// Unlike the no-op case above, this document is (deliberately) not the
+/// locked nix fixture: it is the shape a hand-edited, *unlocked* overlay can
+/// actually be — nothing stops an operator from writing `[departures]` above
+/// their `[[place]]` blocks — and the edit is a real one (a changed
+/// `walk_minutes`), so there is something for `render_places` to do besides
+/// hand every table back its own bytes.
+#[test]
+fn a_departures_first_edit_settles_in_the_one_save_that_makes_it() {
+    const HAND_EDITED: &str = "\
+[departures]
+endpoint = \"vbb\"
+
+[[place]]
+name = \"Schöneweide\"
+lat = 52.4556
+lon = 13.5085
+walk_minutes = 5
+
+[[place]]
+name = \"Werkstatt\"
+lat = 52.5163
+lon = 13.4549
+";
+
+    let mut places = places::parse_places(HAND_EDITED).expect("the fixture parses");
+    places[0].walk_minutes = 9;
+
+    let round1 = places::render_places(HAND_EDITED, &places).expect("first save renders");
+    let departures_at = |text: &str| text.find("[departures]").expect("departures is present");
+    let first_place_at = |text: &str| text.find("[[place]]").expect("a place is present");
+    assert!(
+        departures_at(&round1) < first_place_at(&round1),
+        "one save must be enough to keep [departures] above [[place]] — it \
+         started there: {round1}"
+    );
+    assert!(
+        round1.contains("walk_minutes = 9"),
+        "and the actual edit still landed: {round1}"
+    );
+
+    // The convergence claim: a second save of round 1's own (now edited)
+    // places over round 1's own bytes is a true no-op — settled in the one
+    // round the edit itself took, not walking any further.
+    let round2 = places::render_places(&round1, &places).expect("second save renders");
+    assert_eq!(
+        round2, round1,
+        "settled after the one save the edit needed — no further churn"
     );
 }

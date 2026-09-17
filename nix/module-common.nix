@@ -1465,6 +1465,261 @@ self:
         overlay file.
       '';
     };
+
+    # `places.toml` (#640/#703), the third family (#1227 item 2) — typed
+    # after `crates/hytte-config/src/places.rs`'s `PlaceCfg`/`DeparturesCfg`
+    # schema the way `agents` above is typed after `AgentsConfig`.
+    #
+    # Three things are specific to this one, and each is argued in
+    # `places.rs`'s own module docs rather than only here:
+    #
+    #   - `place` is a LIST, and rule 3 replaces arrays whole. So this option
+    #     supplies the whole list or none of it, `lockedLeafPaths` renders it
+    #     as the single leaf `"place"` (a locked array is atomic), and the
+    #     control center's Places tab goes read-only for the list whenever
+    #     this is set — which is exactly what "the values I set in nix are
+    #     not shadowable" (Mara, #866) means for an array.
+    #   - it is the first option value with an attrset INSIDE a list, which
+    #     is what made both platform modules' `prune` finally have to descend
+    #     through lists (the gap #1241 item 3 documented and left open).
+    #   - no numeric bound is mirrored here — unlike `core-leds.rows` and
+    #     `agents.poll_seconds`. `places.toml` has no `Subsystem::validate`
+    #     running at load time at all (it predates the layering and keeps its
+    #     own reader), so a bound here would be a hand-mirror with no Rust
+    #     counterpart for `checks.config-vocab` to hold it to — the one thing
+    #     that script exists to prevent. `MAX_LAT`/`MAX_LON`/`validate` still
+    #     judge a value the moment either editor touches the set.
+    #
+    # `float` OR `int` for the four numeric leaves, deliberately: nix renders
+    # a float as a TOML float (measured — `12.0` stays `12.0`), and serde
+    # reads a TOML *integer* into an `f64` too, so `lat = 52` and `lat = 52.0`
+    # both load. Pinned Rust-side by
+    # `places::tests::an_integer_coordinate_reads_back_as_a_float`.
+    config.places = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          place = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.listOf (
+                lib.types.submodule {
+                  options = {
+                    name = lib.mkOption {
+                      type = lib.types.str;
+                      example = "Schöneweide";
+                      description = ''
+                        The place's display name, and its identity
+                        everywhere else: the `place-changed` hook dedups on
+                        it and both editors address places by it. Required,
+                        and unique case-insensitively across the list
+                        (`places.rs`'s `validate`).
+                      '';
+                    };
+
+                    lat = lib.mkOption {
+                      type = lib.types.either lib.types.float lib.types.int;
+                      example = 52.4556;
+                      description = "Latitude in degrees, -90..=90. Required.";
+                    };
+
+                    lon = lib.mkOption {
+                      type = lib.types.either lib.types.float lib.types.int;
+                      example = 13.5085;
+                      description = "Longitude in degrees, -180..=180. Required.";
+                    };
+
+                    radius_km = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.either lib.types.float lib.types.int);
+                      default = null;
+                      example = 12.0;
+                      description = ''
+                        How close a GeoClue fix has to be to count as being
+                        here, when no Wi-Fi fingerprint matches. `null` (the
+                        default) sets no key, leaving `places.rs`'s
+                        `default_radius_km` (12) to decide.
+                      '';
+                    };
+
+                    ssids = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+                      default = null;
+                      example = [ "Kabelsalat" ];
+                      description = ''
+                        The Wi-Fi fingerprint: network names you reliably
+                        see HERE and not at your other places. Collect them
+                        with `trollshell --scan-aps`. An empty list never
+                        matches (detection falls through to `radius_km`);
+                        `null` sets no key at all.
+                      '';
+                    };
+
+                    match_min = lib.mkOption {
+                      type = lib.types.nullOr lib.types.ints.unsigned;
+                      default = null;
+                      example = 2;
+                      description = ''
+                        How many of `ssids` must be visible for the
+                        fingerprint to match. `null` leaves
+                        `default_match_min` (2). A value above the number of
+                        listed `ssids` is an unsatisfiable fingerprint —
+                        warned at load (`warn_unsatisfiable_fingerprints`),
+                        not refused here.
+                      '';
+                    };
+
+                    station = lib.mkOption {
+                      type = lib.types.nullOr lib.types.str;
+                      default = null;
+                      example = "900192001";
+                      description = ''
+                        Which station's departures to show here, as an id in
+                        the `[departures].endpoint` backend's own id space
+                        (BVG/VBB share one, DB uses EVA ids). `null` (the
+                        default) shows the nearest station instead.
+                      '';
+                    };
+
+                    walk_minutes = lib.mkOption {
+                      type = lib.types.nullOr lib.types.ints.unsigned;
+                      default = null;
+                      example = 10;
+                      description = ''
+                        Walk time from here to the platform, in minutes.
+                        Positive turns the departures list into a leave-by
+                        countdown; `null`/0 keeps the plain "departs in".
+                      '';
+                    };
+
+                    lines = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+                      default = null;
+                      example = [
+                        "S8"
+                        "S9"
+                      ];
+                      description = ''
+                        Line names to keep. Empty/`null` means every line
+                        through the station — the safer default, since a
+                        wrong filter fails invisibly (an empty board forever)
+                        while no filter fails visibly.
+                      '';
+                    };
+
+                    directions = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.listOf lib.types.str);
+                      default = null;
+                      example = [ "Spandau" ];
+                      description = ''
+                        Destination substrings to keep. Empty/`null` means
+                        every direction.
+                      '';
+                    };
+                  };
+                }
+              )
+            );
+            default = null;
+            example = lib.literalExpression ''
+              [
+                {
+                  name = "Schöneweide";
+                  lat = 52.4556;
+                  lon = 13.5085;
+                  station = "900192001";
+                  walk_minutes = 10;
+                }
+              ]
+            '';
+            description = ''
+              The whole `[[place]]` list, in order — the first entry is the
+              provisional home before the first location fix.
+
+              **All of it or none of it.** Arrays replace whole (#868 rule
+              3), so this is not merged with your
+              `~/.config/trollshell/places.toml`: setting it here hands the
+              list to nix, locks it (`_locked = ["place"]`), and the control
+              center's Places tab shows the entries read-only with "set in
+              nix" rather than offering a save the next load would refuse.
+              Leave it `null` (the default) to keep the list yours — the
+              `[departures]` backend below can still be nix's either way.
+
+              `[ ]` is **not** the same as `null` (#1338 review, M2). An
+              empty list is still a list: it renders `place = []`, locks it,
+              and — because arrays replace whole — means *"no places at
+              all"*. That is a usable configuration (the shell resolves to
+              "away", weather uses your raw location and departures shows
+              the nearest station), but it is a different thing from `null`,
+              which sets no key and leaves the list to your overlay or to
+              the built-in default. The distinction only exists for a
+              **base** layer: an empty `place = []` in your own overlay
+              still reads as the built-in default, because that is how the
+              editor spells "I deleted my last place" (#640).
+            '';
+          };
+
+          departures = lib.mkOption {
+            type = lib.types.submodule {
+              options = {
+                endpoint = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  example = "vbb";
+                  description = ''
+                    Which transport.rest deployment the departures fetch
+                    talks to (#1124): one of `bvg`/`vbb`/`db`, or a full
+                    `https://…` base URL. Not per-place — the whole shell
+                    fetches from one backend. `null` (the default) sets no
+                    key, leaving the overlay or the built-in default (`bvg`,
+                    Berlin) to decide.
+
+                    A plain string rather than an enum because the accepted
+                    vocabulary is open-ended (any `http(s)://` base URL); a
+                    bad value is refused by
+                    `places.rs`'s `validate_departures_endpoint` where it is
+                    read, the same way `core-leds.color`'s is.
+                  '';
+                };
+              };
+            };
+            default = { };
+            example = lib.literalExpression ''{ endpoint = "vbb"; }'';
+            description = ''
+              The `[departures]` table of `places.toml` — one key today.
+            '';
+          };
+        };
+      };
+      default = { };
+      example = lib.literalExpression ''
+        {
+          departures.endpoint = "vbb";
+          place = [
+            {
+              name = "Schöneweide";
+              lat = 52.4556;
+              lon = 13.5085;
+              station = "900192001";
+            }
+          ];
+        }
+      '';
+      description = ''
+        `places.toml`'s (#640/#703) base-layer content, rendered under
+        nix's `$XDG_CONFIG_DIRS` base layer (never your own
+        `$XDG_CONFIG_HOME` overlay — see the note above `config`), which
+        `hytte-config` reads under `~/.config/trollshell/places.toml`
+        since #1227 item 2.
+
+        Both halves are optional and lock independently: hand the place
+        list to nix and still pick your own departures backend, or the
+        other way round.
+
+        **A key you set here is locked** (#1227) — see
+        `config.core-leds`'s description for the rule. The difference
+        from the other families is what a locked *array* means: `place`
+        is one leaf, so it is all yours or all nix's, and the control
+        center says which.
+      '';
+    };
   };
 
   # hytte-plugin-usage was deleted in #1200 (#320's Claude usage-limits

@@ -305,6 +305,46 @@
           # coverage in the two module-eval checks below (#350/#355).
           stubPlugin = pkgs.writeShellScriptBin "hytte-plugin-demo" "";
 
+          # The one `programs.trollshell.config.places` example both fixture
+          # checks render (#1227 item 2). Shared rather than written twice
+          # precisely because the two checks exist to prove the NixOS and
+          # home-manager renders are byte-identical — two copies of the input
+          # would let that claim be about two different inputs.
+          #
+          # Chosen to exercise the whole schema in one document: both locked
+          # keys, every optional per-place field on the first entry and none of
+          # them on the second (which is what `prune` descending through a list
+          # has to produce), a float that keeps its `.0` (`radius_km`), a string
+          # needing no quoting drama and one with a `!` in it, and an inline
+          # array of each of the two list-valued fields.
+          placesExample = {
+            departures.endpoint = "vbb";
+            place = [
+              {
+                name = "Schöneweide";
+                lat = 52.4556;
+                lon = 13.5085;
+                station = "900192001";
+                walk_minutes = 10;
+                ssids = [
+                  "Kabelsalat"
+                  "FRITZ!Box 7590 XV"
+                ];
+                match_min = 2;
+                radius_km = 12.0;
+              }
+              {
+                name = "Werkstatt";
+                lat = 52.5163;
+                lon = 13.4549;
+                lines = [
+                  "S8"
+                  "S9"
+                ];
+              }
+            ];
+          };
+
           # Stand-ins for the two LLM backend daemons (#694), so the hm-module
           # check below can turn both units on and force their bodies without
           # pulling a full workspace compile (hytte-claude-bridge) or llama-cpp
@@ -2178,6 +2218,209 @@
             pkgs.runCommand "trollshell-hm-module-agents-fixture-check" { } ''
               if ! diff -u ${fixture} ${renderedFile}; then
                 echo "home-manager's rendered agents.toml drifted from the checked-in fixture (${fixture}) — it must stay byte-identical to the NixOS module's render, see nixos-module-agents-fixture" >&2
+                exit 1
+              fi
+              touch $out
+            '';
+
+          # `programs.trollshell.config.places` (#1227 item 2), the third
+          # family — the `agents` fixture pair above, one family over, and for
+          # the same reason: the checked-in recording
+          # (`crates/hytte-config/tests/fixtures/places-nix-rendered.toml`) is
+          # also read back through the real layered reader by a Rust test
+          # (`crates/hytte-config/tests/places_nix_base.rs`), so a renderer
+          # change and a reader change must land in the same commit or one of
+          # the three goes red.
+          #
+          # This family is the one that finally exercises `prune` **through a
+          # list**: `place` is a `listOf submodule` whose entries have seven
+          # nullable fields apiece, and the second entry in the example sets
+          # none of them. Before the `pruneValue` split in both platform
+          # modules, that entry reached `pkgs.formats.toml`'s `generate` as
+          # `station = null` and the whole eval failed ("Cannot convert data to
+          # TOML"). The fixture's second `[[place]]` block is therefore the
+          # assertion, not decoration: it has to carry exactly `lat`, `lines`,
+          # `lon` and `name`.
+          nixos-module-places-fixture =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      config.places = placesExample;
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              renderedFile = cfg.environment.etc."xdg/trollshell/places.toml".source;
+              fixture = ./crates/hytte-config/tests/fixtures/places-nix-rendered.toml;
+            in
+            pkgs.runCommand "trollshell-nixos-module-places-fixture-check" { } ''
+              if ! diff -u ${fixture} ${renderedFile}; then
+                echo "rendered places.toml drifted from the checked-in fixture (${fixture}) — it is also read back by crates/hytte-config/tests/places_nix_base.rs, so update both" >&2
+                exit 1
+              fi
+              touch $out
+            '';
+
+          # The home-manager twin, exactly as `hm-module-agents-fixture` is the
+          # NixOS one's: `configFiles` and `prune` are hand-mirrored in both
+          # platform modules, and #1227 item 2 changed `prune` in both.
+          hm-module-places-fixture =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      config.places = placesExample;
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              # Same unwrapping as `hm-module-core-leds` above — see there for
+              # why the trollshell UNIT's own `Service.Environment` is the
+              # surface to read rather than `home.sessionVariables`.
+              environment = cfg.systemd.user.services.trollshell.Service.Environment;
+              xdgEntry = pkgs.lib.findFirst (e: pkgs.lib.hasPrefix "\"XDG_CONFIG_DIRS=" e) null environment;
+              xdgValue =
+                assert xdgEntry != null;
+                pkgs.lib.removeSuffix "\"" (pkgs.lib.removePrefix "\"XDG_CONFIG_DIRS=" xdgEntry);
+              base = builtins.head (pkgs.lib.splitString ":" xdgValue);
+              renderedFile = "${base}/trollshell/places.toml";
+              fixture = ./crates/hytte-config/tests/fixtures/places-nix-rendered.toml;
+            in
+            pkgs.runCommand "trollshell-hm-module-places-fixture-check" { } ''
+              if ! diff -u ${fixture} ${renderedFile}; then
+                echo "home-manager's rendered places.toml drifted from the checked-in fixture (${fixture}) — it must stay byte-identical to the NixOS module's render, see nixos-module-places-fixture" >&2
+                exit 1
+              fi
+              touch $out
+            '';
+
+          # "nix configuration options can be optional" (Annika, #866) for the
+          # family where the phrase does the most work: `places` has TWO halves
+          # that lock independently, so the thing to pin is that setting one
+          # neither renders nor locks the other.
+          #
+          # Three arms, each a different way the invariant can break:
+          #
+          #   1. `config.places` untouched renders no file at all — the
+          #      `filtered == { }` guard, which `departures`' own
+          #      `default = { }` would defeat exactly the way `agents`' `display`
+          #      did (#1237 review MEDIUM-1) if `prune` stopped being bottom-up.
+          #   2. `departures.endpoint` alone renders the endpoint and locks
+          #      exactly `["departures.endpoint"]` — no `[[place]]`, no
+          #      `"place"` in the marker. This is the arm that keeps the Places
+          #      tab editable for someone who only wanted to pin the backend.
+          #   3. `place` alone locks exactly `["place"]` — one leaf for the
+          #      whole array, because rule 3 replaces arrays whole.
+          modules-places-absent-when-unset =
+            let
+              rendered =
+                extra:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                    extra
+                  ];
+                }).config.environment.etc;
+              untouched = rendered { };
+              endpointOnly = rendered {
+                programs.trollshell.config.places.departures.endpoint = "vbb";
+              };
+              placeOnly = rendered {
+                programs.trollshell.config.places.place = [
+                  {
+                    name = "Werkstatt";
+                    lat = 52.5163;
+                    lon = 13.4549;
+                  }
+                ];
+              };
+              probe = pkgs.runCommand "trollshell-places-optional-probe" { } ''
+                mkdir -p $out
+                ${
+                  if untouched ? "xdg/trollshell/places.toml" then
+                    ''echo "config.places unset still rendered a places.toml" >&2; exit 1''
+                  else
+                    "true"
+                }
+                cp ${endpointOnly."xdg/trollshell/places.toml".source} $out/endpoint-only.toml
+                cp ${placeOnly."xdg/trollshell/places.toml".source} $out/place-only.toml
+              '';
+            in
+            pkgs.runCommand "trollshell-modules-places-absent-when-unset-check" { inherit probe; } ''
+              endpoint="$probe/endpoint-only.toml"
+              place="$probe/place-only.toml"
+
+              want='_locked = ["departures.endpoint"]'
+              got=$(head -n1 "$endpoint")
+              if [ "$got" != "$want" ]; then
+                echo "a departures-only config.places did not lock exactly the one key it set (#1227):" >&2
+                cat "$endpoint" >&2
+                exit 1
+              fi
+              if grep -q '\[\[place\]\]' "$endpoint"; then
+                echo "a departures-only config.places rendered a [[place]] block" >&2
+                cat "$endpoint" >&2
+                exit 1
+              fi
+
+              want='_locked = ["place"]'
+              got=$(head -n1 "$place")
+              if [ "$got" != "$want" ]; then
+                echo "a place-only config.places did not lock exactly the one key it set (#1227):" >&2
+                cat "$place" >&2
+                exit 1
+              fi
+              if grep -q 'departures' "$place"; then
+                echo "a place-only config.places rendered a [departures] table" >&2
+                cat "$place" >&2
+                exit 1
+              fi
+              # `prune` through the list: the one entry sets three fields and
+              # seven nullable ones it did not, and none of the seven may show
+              # up (as `null` or otherwise).
+              if grep -qE '^(station|ssids|match_min|walk_minutes|lines|directions|radius_km) =' "$place"; then
+                echo "an unset per-place field survived prune (#1227 item 2 — nix/{hm,nixos}-module.nix's pruneValue)" >&2
+                cat "$place" >&2
                 exit 1
               fi
               touch $out

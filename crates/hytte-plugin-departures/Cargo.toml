@@ -31,9 +31,28 @@ tokio = { workspace = true, default-features = false, features = [
 ureq = { workspace = true, features = ["rustls"] }
 serde.workspace = true
 serde_json.workspace = true
-# Reads the station out of `~/.config/trollshell/places.toml` (the same config
-# file + schema the native board used, via `hytte-services::places`).
+# Reads the station out of `places.toml` — the schema and the LAYERED reader
+# themselves since #1227 item 2 (#1338 review, H3), not a hand-port against
+# `$HOME` alone. `programs.trollshell.config.places` puts the list on the
+# `XDG_CONFIG_DIRS` base layer and deliberately writes no overlay, so a loader
+# that only knew `$HOME/.config` saw no station at all and told the operator to
+# add a `[[place]]` the merge then refuses. Linking this crate is the
+# `hytte-plugin-agents` precedent (#640's argument: a GTK-free leaf library,
+# not a runtime link to the shell), and it deletes the schema port rather than
+# adding to it — three readers of one file must agree about what it says.
+hytte-config = { path = "../hytte-config" }
+# Still here for `toml::from_str` in the endpoint-resolver tests' fixtures;
+# the `[[place]]` schema itself now comes from `hytte-config`.
 toml.workspace = true
 # RFC 3339 departure timestamps → unix seconds + `HH:MM`. `clock` for the
 # fetch-time `Utc::now()` that prunes already-departed rows.
 chrono.workspace = true
+
+[dev-dependencies]
+# `$HOME`/`$XDG_CONFIG_DIRS` are what resolve the config layers, and the
+# loader tests drive them against a tempdir; `temp_env` serializes that
+# mutation across tests and puts it back (`std::env::set_var` is `unsafe`,
+# which this workspace forbids). Both are already in `Cargo.lock` via
+# `hytte-config`, so neither adds a resolved package.
+tempfile.workspace = true
+temp-env = "0.3.6"

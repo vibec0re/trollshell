@@ -593,7 +593,13 @@ impl<S> Loaded<S> {
 
 /// [`Loaded::is_locked`] over a bare set — the shared predicate, so the reader
 /// and [`render_overlay_locking`]'s writer answer it identically.
-fn locked_here(locked: &BTreeSet<String>, path: &str) -> bool {
+///
+/// `pub(crate)` since #1227 item 2: `places` is layered without being a
+/// [`Subsystem`] (it keeps its own writer — see [`crate::places`]), so it has
+/// a lock set of its own to answer the same question over, and a second copy
+/// of this walk is exactly the drift the one-predicate rule above exists to
+/// prevent.
+pub(crate) fn locked_here(locked: &BTreeSet<String>, path: &str) -> bool {
     if locked.contains(path) {
         return true;
     }
@@ -845,7 +851,14 @@ pub fn assemble_base_layers<S: Subsystem>(
 /// cannot read pins nothing; a well-formed one naming a key its own layer does
 /// not set would pin a key nix never wrote, so the fold does not honour it
 /// either.
-fn locked_marker_findings<S: Subsystem>(
+///
+/// Takes `subsystem` as a `&str` rather than being generic over `S` — it only
+/// ever wanted [`Subsystem::NAME`], and #1227 item 2 brought a second caller
+/// that has no `S` at all (`places` is layered without being a [`Subsystem`];
+/// see [`crate::places`]). One renderer, so the two families' journal lines
+/// cannot drift apart.
+pub(crate) fn locked_marker_findings(
+    subsystem: &str,
     paths: &[Option<&Path>],
     tables: &[toml::Table],
 ) -> Vec<Finding> {
@@ -853,7 +866,7 @@ fn locked_marker_findings<S: Subsystem>(
     for (path, table) in paths.iter().zip(tables) {
         for bad in merge::malformed_locked(table) {
             tracing::warn!(
-                subsystem = S::NAME,
+                subsystem,
                 layer = %layer_name(*path),
                 key = %bad.key,
                 found = bad.found,
@@ -870,7 +883,7 @@ fn locked_marker_findings<S: Subsystem>(
 
     for inert in merge::inert_locked(tables) {
         tracing::warn!(
-            subsystem = S::NAME,
+            subsystem,
             layer = %layer_name(paths[inert.layer]),
             key = %inert.key,
             "{INERT_LOCKED_MESSAGE}"
@@ -880,6 +893,41 @@ fn locked_marker_findings<S: Subsystem>(
             key: inert.key.clone(),
             kind: FindingKind::InertLocked,
             message: inert.to_string(),
+        });
+    }
+    out
+}
+
+/// Every override the locks refused, warned and returned as data — the second
+/// half of [`locked_marker_findings`], split out for the same reason and with
+/// the same two callers (#1227).
+///
+/// Once per key: [`merge::merge_all_locked`] dedupes, so an overlay that both
+/// `_unset`s and re-sets one locked key made one mistake and reads one line.
+/// `source` names the base layer the kept value actually came from, which
+/// `layer` cannot — that one names the file the operator must edit.
+pub(crate) fn shadowed_findings(
+    subsystem: &str,
+    paths: &[Option<&Path>],
+    shadowed: &[merge::Shadowed],
+) -> Vec<Finding> {
+    let mut out = Vec::with_capacity(shadowed.len());
+    for shadow in shadowed {
+        let layer = layer_name(paths[shadow.layer]);
+        tracing::warn!(
+            subsystem,
+            layer = %layer,
+            key = %shadow.key,
+            source = %shadow
+                .source
+                .map_or_else(|| "(unknown)".to_owned(), |i| layer_name(paths[i])),
+            "{SHADOWED_LOCKED_MESSAGE}"
+        );
+        out.push(Finding {
+            layer: paths[shadow.layer].map(Path::to_path_buf),
+            key: shadow.key.clone(),
+            kind: FindingKind::ShadowedLockedKey,
+            message: shadowed_message(subsystem, &shadow.key, &layer),
         });
     }
     out
@@ -965,7 +1013,7 @@ fn assemble_layers<S: Subsystem>(
         });
     }
 
-    let mut lock_findings = locked_marker_findings::<S>(&paths, &tables);
+    let mut lock_findings = locked_marker_findings(S::NAME, &paths, &tables);
 
     // #1331 review, HIGH 1 and MEDIUM 2: the last layer is the operator's
     // overlay (unless the caller said otherwise), and the rule is "the union
@@ -976,28 +1024,8 @@ fn assemble_layers<S: Subsystem>(
     let merged = merge::merge_all_locked(tables, overlay);
 
     // #1227: an override the lock refused is *reported*, never silently
-    // dropped. Once per key — `merge` dedupes, so an overlay that both
-    // `_unset`s and re-sets one locked key made one mistake and reads one line
-    // here. `source` names the base layer the kept value actually came from,
-    // which `layer` cannot: that one names the file the operator must edit.
-    for shadow in &merged.shadowed {
-        let layer = layer_name(paths[shadow.layer]);
-        tracing::warn!(
-            subsystem = S::NAME,
-            layer = %layer,
-            key = %shadow.key,
-            source = %shadow
-                .source
-                .map_or_else(|| "(unknown)".to_owned(), |i| layer_name(paths[i])),
-            "{SHADOWED_LOCKED_MESSAGE}"
-        );
-        lock_findings.push(Finding {
-            layer: paths[shadow.layer].map(Path::to_path_buf),
-            key: shadow.key.clone(),
-            kind: FindingKind::ShadowedLockedKey,
-            message: shadowed_message(S::NAME, &shadow.key, &layer),
-        });
-    }
+    // dropped — see `shadowed_findings`.
+    lock_findings.extend(shadowed_findings(S::NAME, &paths, &merged.shadowed));
 
     let (config, unknown_keys) = read_merged::<S>(merged.table)?;
 
@@ -1995,7 +2023,19 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
 
 /// The `toml_edit`-document half of [`seed_without_locked`]: recurses through
 /// `doc`, removing every key [`locked_here`] answers for.
-fn strip_locked(doc: &mut dyn toml_edit::TableLike, locked: &BTreeSet<String>, prefix: &str) {
+///
+/// `pub(crate)` since #1227 item 2: `places` seeds a not-yet-existing overlay
+/// of its own and is layered without being a [`Subsystem`] (it keeps its own
+/// `DEFAULT_CONFIG` and its own writer — see `crate::places::seed_for`), so it
+/// needs this removal and not [`seed_without_locked`]'s `S::DEFAULT_TOML`
+/// wrapper around it. One walk, so the two families cannot drift on what "with
+/// the locked keys taken out" means — which is #1333's own argument against
+/// `without_locked` and this being two different rules.
+pub(crate) fn strip_locked(
+    doc: &mut dyn toml_edit::TableLike,
+    locked: &BTreeSet<String>,
+    prefix: &str,
+) {
     let keys: Vec<String> = doc.iter().map(|(key, _)| key.to_string()).collect();
     for key in keys {
         let path = format!("{prefix}{key}");

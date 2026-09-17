@@ -1,0 +1,20 @@
+_locked = ["departures.endpoint", "place"]
+
+[departures]
+endpoint = "vbb"
+
+[[place]]
+lat = 52.4556
+lon = 13.5085
+match_min = 2
+name = "Schöneweide"
+radius_km = 12.0
+ssids = ["Kabelsalat", "FRITZ!Box 7590 XV"]
+station = "900192001"
+walk_minutes = 10
+
+[[place]]
+lat = 52.5163
+lines = ["S8", "S9"]
+lon = 13.4549
+name = "Werkstatt"

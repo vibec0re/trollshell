@@ -81,6 +81,30 @@ that would catch any of them drifting. `agents` is duplicate one of the
 nine, and adding it here is what the rename above is for: a third family
 adds a rule and a `*_RS` constant, not a second script.
 
+THE THIRD FAMILY IS DELIBERATELY NOT HERE YET (#1227 item 2)
+------------------------------------------------------------
+`programs.trollshell.config.places` is duplicate two of the nine, and it has
+no rule below. Both of `struct_serde_fields`' preconditions fail for it:
+`crates/hytte-config/src/places.rs`'s `PlaceCfg` and `DeparturesCfg` are
+private structs with private fields (nothing outside that module has ever
+needed the raw file schema — `Place`, the public type, is the *normalised*
+one and carries no `#[serde]` at all), so the scan finds neither
+`pub struct PlaceCfg` nor a single `pub` field. Making them public to satisfy
+a lint would widen a published API for the lint's convenience, which is the
+wrong direction; teaching this scan to read a private struct is the right one
+and is a change to `struct_serde_fields` plus its self-test, not a one-liner.
+
+Until then the guard for that family is the pair #1237 built for `agents`:
+`checks.{nixos,hm}-module-places-fixture` pin the rendered bytes against
+`crates/hytte-config/tests/fixtures/places-nix-rendered.toml`, and
+`crates/hytte-config/tests/places_nix_base.rs` reads that same fixture back
+through the real reader and asserts every field of it. That catches a value
+or a spelling drifting; it does NOT catch the direction this script exists
+for — an option leaf nix can set that the Rust schema does not know (it
+renders a key the reader silently ignores), or a schema field nix can never
+set. Both are a rename away, which is why this paragraph names the gap
+instead of leaving the omission to be discovered.
+
 WHY THIS IS A NIX LINT AND NOT A `cargo test` (#1081 review, second round)
 ---------------------------------------------------------------------------
 The first version of this guard *was* a `cargo test` in

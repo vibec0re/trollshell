@@ -11564,19 +11564,33 @@ mod kind_enumeration {
     /// is honestly 100.0 % flat (radius 0, no halo to resolve), while the vfd,
     /// oled and crt sit at 56.8 / 64.7 / 58.7 %.
     ///
-    /// **Falsified** by deleting `Case::flat_block_ceiling`'s `SplitFlap` arm
-    /// or its `LedMatrix` arm (the first assertion), by extending the former to
-    /// `Mechanism::ALL` or the latter to every skin (the second), or by arming
-    /// a panel's 1:1 cases, where `snapped` is already `true` and the statistic
-    /// is 100.0 % by construction.
+    /// **The stretched gauge is the third** (#1090, second report), and it
+    /// needs this for the same reason wearing a third shape. A dial whose
+    /// allocation exceeds its grid was point-sampled out of that grid, i.e.
+    /// replicated — and the four `gauge.*.sweep.s2` cases measured **100.0 %
+    /// flat on every skin** while coming back `mean 0.000 / max 0` on every bin
+    /// against the oracle, because a replication of the kit's own picture *is*
+    /// the kit's own picture. With the continuous branch they sit at
+    /// 77.9–84.2 %. Its key is neither a mechanism nor a skin but the
+    /// **`stretch` knob**: this kind's `scale > 1` cases move the *grid*, where
+    /// flatness reports the geometry's resolution and says nothing about the
+    /// blit, so arming those would be measuring the wrong thing.
+    ///
+    /// **Falsified** by deleting `Case::flat_block_ceiling`'s `SplitFlap` arm,
+    /// its `LedMatrix` arm or its `Gauge` arm (the first assertion), by
+    /// extending the first to `Mechanism::ALL`, the second to every skin or the
+    /// third to every gauge case (the second), or by arming a panel's 1:1
+    /// cases, where `snapped` is already `true` and the statistic is 100.0 % by
+    /// construction.
     /// `match_same_arms` is allowed for the reason `Kind::flat_block_ceiling`
-    /// allows it: the three `None`s are three separate findings that happen to
-    /// agree — a nixie is replication, a bloomless lcd is replication, and a
-    /// 1:1 panel renders through the snapped branch already — and collapsing
-    /// them would hide which one a later edit changed.
+    /// allows it: the four `None`s are four separate findings that happen to
+    /// agree — a nixie is replication, a bloomless lcd is replication, a 1:1
+    /// panel renders through the snapped branch already, and an unstretched
+    /// gauge measures its geometry rather than its blit — and collapsing them
+    /// would hide which one a later edit changed.
     #[test]
     #[allow(clippy::match_same_arms)]
-    fn only_the_split_flap_and_the_blooming_panels_arm_the_flatness_ceiling() {
+    fn only_the_split_flap_blooming_panels_and_stretched_gauges_arm_the_flatness_ceiling() {
         for case in cases_for(&kit::DisplayStyle::ALL) {
             let want = match &case {
                 Case::FlipBoard {
@@ -11595,6 +11609,11 @@ mod kind_enumeration {
                 } => None,
                 Case::LedMatrix { scale, .. } if *scale > 1 => Some(0.80),
                 Case::LedMatrix { .. } => None,
+                // Only the *stretched* dial: the upscaled one renders a denser
+                // grid, where this statistic is the geometry's and not the
+                // blit's.
+                Case::Gauge { stretch, .. } if *stretch > 1 => Some(0.92),
+                Case::Gauge { .. } => None,
                 other => other.kind().flat_block_ceiling(),
             };
             assert_eq!(
@@ -11604,12 +11623,16 @@ mod kind_enumeration {
                 case.kind(),
             );
         }
-        // …and the separation the ceiling sits in, read off the case rather
-        // than restated: every shipping split-flap frame the review measured
-        // is under it and the `snapped := true` probe's 100.0 % is over.
-        let split_flap = cases_for(&kit::DisplayStyle::ALL)
-            .into_iter()
-            .find(|case| {
+        // …and the separation each armed shape's ceiling sits in, read off the
+        // case rather than restated. Three shapes, three measured separations:
+        // the split flap's 6.2 points (92.5–93.8 % against the probe's
+        // 100.0 %), the blooming panel's 35.3 (56.8–64.7 %, wider because a
+        // panel is mostly flat field and solid lamps, so the halo is a larger
+        // share of what is left to vary) and the stretched dial's 15.8
+        // (77.9–84.2 %).
+        assert_ceiling_brackets(
+            "split-flap board",
+            &matching_case(|case| {
                 matches!(
                     case,
                     Case::FlipBoard {
@@ -11617,29 +11640,12 @@ mod kind_enumeration {
                         ..
                     }
                 )
-            })
-            .expect("the case list carries split-flap boards");
-        let ceiling = split_flap
-            .flat_block_ceiling()
-            .expect("a split flap's cases are armed");
-        for shipping in [0.925_f64, 0.933, 0.934, 0.938] {
-            assert!(
-                shipping < ceiling,
-                "{shipping} is a shipping frame and must stay under {ceiling}",
-            );
-        }
-        assert!(
-            REPLICATED > ceiling,
-            "the `snapped := true` frame is {REPLICATED} and must red against {ceiling}",
+            }),
+            &[0.925, 0.933, 0.934, 0.938],
         );
-
-        // …and the same, for the panel's own separation (#1156 review,
-        // HIGH-1). Wider than the split flap's — 64.7 % to 100.0 % — because a
-        // panel is mostly flat field and solid lamps, so what the halo
-        // contributes to the statistic is a larger share of what is left.
-        let panel = cases_for(&kit::DisplayStyle::ALL)
-            .into_iter()
-            .find(|case| {
+        assert_ceiling_brackets(
+            "blooming-skin panel",
+            &matching_case(|case| {
                 matches!(
                     case,
                     Case::LedMatrix {
@@ -11648,47 +11654,92 @@ mod kind_enumeration {
                         ..
                     }
                 )
-            })
-            .expect("the case list carries a supersampled oled panel");
-        let ceiling = panel
+            }),
+            &[0.568, 0.647, 0.587],
+        );
+        // No carve-out on this one: a dial is analytic geometry over a mostly
+        // flat face, so every skin resolves per fragment and the lcd is the
+        // *least* flat of the four rather than the exception it is on a panel.
+        assert_ceiling_brackets(
+            "stretched dial",
+            &matching_case(|case| matches!(case, Case::Gauge { stretch: 2.., .. })),
+            &[0.794, 0.842, 0.798, 0.779],
+        );
+
+        // The panel lcd's *honest* frame is that same 100.0 %, which is the
+        // whole reason its key is the skin: armed on the kind, this number
+        // would red a correct render forever.
+        assert_eq!(
+            matching_case(|case| matches!(
+                case,
+                Case::LedMatrix {
+                    style: kit::DisplayStyle::Lcd,
+                    scale: 2..,
+                    ..
+                }
+            ))
+            .flat_block_ceiling(),
+            None,
+            "the bloomless lcd measures {REPLICATED} honestly and must not be armed",
+        );
+        // And the dial's *upscaled* cases measure 81.8–88.7 % — a real number,
+        // and one that would sit under the ceiling above — so "it happens to
+        // pass" is not why they are unarmed. Their flatness answers a different
+        // question (how dense is the grid, not how dense is the blit), and a
+        // ceiling there would be a second gate on the geometry wearing the
+        // blit's name.
+        assert_eq!(
+            matching_case(|case| matches!(
+                case,
+                Case::Gauge {
+                    scale: 2..,
+                    stretch: 1,
+                    ..
+                }
+            ))
+            .flat_block_ceiling(),
+            None,
+            "a denser grid is not a denser blit and must not be armed here",
+        );
+    }
+
+    /// The first case in the **real** `cases_for` output matching `want` — so
+    /// an assertion about a case shape reds when the list stops carrying it
+    /// rather than quietly testing nothing.
+    fn matching_case(want: impl Fn(&Case) -> bool) -> Case {
+        cases_for(&kit::DisplayStyle::ALL)
+            .into_iter()
+            .find(|case| want(case))
+            .expect("the case list carries the shape this assertion is about")
+    }
+
+    /// `case`'s flatness ceiling brackets the separation it was cut from: every
+    /// `shipping` frame measured on the driver sits under it, and the
+    /// `snapped := true` probe's [`REPLICATED`] sits over.
+    fn assert_ceiling_brackets(what: &str, case: &Case, shipping: &[f64]) {
+        let ceiling = case
             .flat_block_ceiling()
-            .expect("a blooming skin's supersampled panel is armed");
-        for shipping in [0.568_f64, 0.647, 0.587] {
+            .unwrap_or_else(|| panic!("a {what}'s cases are armed"));
+        for frame in shipping {
             assert!(
-                shipping < ceiling,
-                "{shipping} is a shipping blooming-skin panel frame and must stay under \
-                 {ceiling}",
+                *frame < ceiling,
+                "{frame} is a shipping {what} frame and must stay under {ceiling}",
             );
         }
         assert!(
             REPLICATED > ceiling,
-            "the panel's `snapped := true` frame is {REPLICATED} and must red against {ceiling}",
-        );
-        // The lcd's *honest* frame is that same 100.0 %, which is the whole
-        // reason the key is the skin: armed on the kind, this number would red
-        // a correct render forever.
-        let lcd = cases_for(&kit::DisplayStyle::ALL)
-            .into_iter()
-            .find(|case| {
-                matches!(
-                    case,
-                    Case::LedMatrix {
-                        style: kit::DisplayStyle::Lcd,
-                        scale: 2..,
-                        ..
-                    }
-                )
-            })
-            .expect("the case list carries a supersampled lcd panel");
-        assert_eq!(
-            lcd.flat_block_ceiling(),
-            None,
-            "the bloomless lcd measures {REPLICATED} honestly and must not be armed",
+            "the {what}'s `snapped := true` frame is {REPLICATED} and must red against \
+             {ceiling}",
         );
     }
 
-    /// What all four `split-flap.rollingx2` frames measure under the
-    /// `snapped := true` probe — the whole of #1155 reverted (#1155 review).
+    /// What a supersampled frame measures under the `snapped := true` probe —
+    /// the whole of the continuous branch reverted, so every `scale × scale`
+    /// block is one replicated value. Measured on all four
+    /// `split-flap.rollingx2` frames (#1155 review), all four `rampx2` ones
+    /// (#1156 review, HIGH-1) and all four `gauge.*.sweep.s2` ones (#1090,
+    /// second report), which is three kinds arriving at the same number for the
+    /// same reason rather than a coincidence worth three constants.
     const REPLICATED: f64 = 1.0;
 
     /// **`nix/checks/system-tests.nix`'s parity-case count matches the

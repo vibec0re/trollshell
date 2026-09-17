@@ -3460,6 +3460,52 @@ session.
      and `lit` bins of all four) plus an edge budget of mean 1.75 / max 16,
      against a measured worst of 0.997 / 9.
 
+- [ ] **(#1090)** **The big dial, at a size that is not its buffer.** #1148 gave
+      the gauge a denser grid; that only reached the screen while the grid _was_
+      what the screen showed. The blit point-sampled it into whatever allocation
+      layout handed the widget, so a dial drawn above its own buffer was a
+      nearest-neighbour replication of it — which is what Annika reported as
+      "weird aliasing artifacts" on the big preem-demo dial after #1148 shipped.
+
+      Open the preem-demo card and look at the **large** (144 × 64) gauge on the
+      **lcd** skin, where there is no halo to soften anything.
+
+  1. **The arc's outer edge is a ramp, not a staircase.** Follow the scale arc
+     from one stop to the other: the transition from ink to field should be a
+     gradient a pixel or two wide the whole way round. Terraces two device
+     pixels tall — the shape the screenshot on #1090 shows — are this defect.
+  2. **The ticks read the same weight as each other.** Every mark on the scale is
+     drawn with the same half-width; if some look chunkier than their
+     neighbours, they are landing on the replication lattice rather than on the
+     screen's pixels.
+  3. **The needle's edge, and the halo on the other three skins.** The pointer
+     should have a soft edge rather than a hard column — this is the half a
+     face-only fix would miss, and the half no gate in CI can see (a face-only
+     mutation measures 81.6–90.9 % flat, under the ceiling on every skin). On
+     vfd / oled / crt check the **bloom** the same way: a smooth halo, not a
+     grid of blocks.
+  4. **The two small dials did not move.** The 64 × 64 and 48 × 48 faces are
+     square buffers that fit their allocation, which is why they looked right in
+     the report. They must look exactly as they did.
+  5. **The needle's ghost is the trail, and only while it moves.** The second,
+     fainter stroke behind the pointer in the #1090 screenshot is the kit's
+     motion-blur fan. Let the needle settle and confirm it vanishes completely;
+     a ghost that stays at rest would be a different bug (the max-combine is
+     exact at zero velocity, and the harness's `rest` frames show one stroke).
+  6. **On a HiDPI output, every dial takes this path.** `GlSurface`'s allocation
+     is in **device** pixels, so a `scale_factor >= 2` monitor puts even an
+     unstretched chip on the continuous branch. If you have one, the small dials
+     are worth a second look there too.
+
+     What CI already holds, in `checks.system-tests`: the twenty 1:1 gauge cases
+     still at **max |Δ| 0 of 255 on every channel** (the branch they take is
+     untouched), the four shipping-`scale = 2` ones unmoved to the digit, and
+     **four new stretched cases** — the grid held at `scale = 1`, the area asked
+     for at twice it — held to a native-frame flatness ceiling of **92.0 %**
+     against a measured 77.9–84.2 %, where before this change they measured
+     **100.0 %**: a bit-exact replication of the oracle, which no delta-based
+     gate can ever red.
+
 ## Screen recording
 
 - [ ] **(#458)** Rebuild the NixOS/home-manager config with `wf-recorder` +

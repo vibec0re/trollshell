@@ -297,6 +297,23 @@ impl Kind {
             // single pixel can legitimately swing far: `max` is half of full
             // contrast, the point past which a pixel is not reporting a ramp
             // any more, and `mean` a little under twice the worst measured.
+            //
+            // **Eight since #1090's second report**, the other four being the
+            // `stretch = 2` cases it added — the grid held at `scale = 1` and
+            // only the allocation doubled, which is what layout and a HiDPI
+            // screen do to a dial. Those four are the *quieter* half and did
+            // not move this pair: measured on the same driver, edge mean
+            // **2.479** and edge max **29**, both on the oled (the skin with
+            // the strongest bloom and no ghost figure-8), against 2.443/28 on
+            // the vfd, 1.784/28 on the crt and 1.453/16 on the lcd. Quieter
+            // because a stretched frame resolves the *same* logical geometry at
+            // twice the density, while a `scale = 2` frame resolves geometry
+            // the kit never drew at that size at all — so the budget above,
+            // cut for the louder half, leaves this one ~6.5x of headroom on the
+            // mean. Their own detector is a flatness ceiling rather than this
+            // budget: before the fix all four sat at edge mean **0.000**, being
+            // an exact replication of the oracle, which no edge budget can
+            // ever red. See `cases::Case::flat_block_ceiling`'s gauge arm.
             Self::Gauge => EdgeBudget {
                 mean: 16.0,
                 max: 128,
@@ -709,6 +726,17 @@ impl Kind {
             // which takes all four to 100.0 % while leaving every other gate
             // green. Same instruction as the flip board's: a reader looking
             // for this kind's detector should go there.
+            // The gauge's `None` is the **third that is overridden** (#1090,
+            // second report), and the first overridden in the other direction:
+            // the kind genuinely has no answer, because its two supersampled
+            // case shapes measure different things. A `scale > 1` case renders
+            // a denser *grid*, where flatness reports the geometry (81.8–88.7 %
+            // — a ceiling there would say nothing about the blit); a
+            // `stretch > 1` case holds the grid at 1 and doubles only the
+            // allocation, where flatness reports the blit and nothing else, and
+            // measured **100.0 % on every skin** until that blit grew a
+            // continuous branch. `cases::Case::flat_block_ceiling` arms those
+            // four at `0.92`. Same instruction as the other two.
             Self::Gauge
             | Self::TextBox
             | Self::Scope

@@ -74,7 +74,12 @@ let
   # is the first on this seam no plugin can reach — the Stats drawer's per-core
   # panel is a widget the shell itself rasterises — so it is also the first
   # whose cases exercise a mapping `preem_render` never calls.
-  parityCases = 236;
+  # …and 236 until #1090's second report added one **stretched** gauge per
+  # skin: the same dial, the grid held at `scale = 1`, the area asked for at
+  # twice it. That is the first gauge case whose allocation is not exactly its
+  # grid — what a big dial on glass is — and so the first that measures the
+  # blit's own resampling rather than the geometry's resolution.
+  parityCases = 240;
 in
 craneLib.mkCargoDerivation (
   commonArgs
@@ -373,7 +378,8 @@ craneLib.mkCargoDerivation (
       # empties the list would ship green through the exit code
       # alone. Assert the evidence instead of trusting the exit
       # code: the case list is 4 skins × (3 scope fade depths + 3
-      # gauge needle positions + 1 gauge at the shipping upscale + 5
+      # gauge needle positions + 1 gauge at the shipping upscale + 1
+      # stretched gauge + 5
       # dot-matrix displays + 1 stretched dot matrix + 5 marquee
       # scroll phases + 1 stretched marquee + 1 marquee at a window
       # where the centred origin and the bezel diverge + 4 text boxes

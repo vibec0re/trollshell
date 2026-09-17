@@ -53,6 +53,26 @@
 //! before comparing (#1148 review, HIGH-2), which is the one gate that sees
 //! every scale-dependent line below.
 //!
+//! # The grid is not the allocation (#1090, second report)
+//!
+//! Everything above is about the *buffer* the offscreen passes fill. What
+//! reaches the screen is the blit, and until #1090's second round it
+//! point-sampled that buffer into whatever allocation layout handed the widget
+//! — so a dial shown bigger than its own grid was a nearest-neighbour
+//! **replication** of it, stair-stepped arc and all. That is not a rare
+//! configuration: `GlSurface::measure` asks for a minimum of `0` on purpose so
+//! CSS can scale a chip, and `GlSurface`'s allocation is in **device** pixels,
+//! so a `scale_factor >= 2` monitor doubles it for every chip on the screen.
+//!
+//! The fix is `gauge.frag`'s, not this file's — see its header — and it is the
+//! `dot_matrix.frag` / `flip_board.frag` shape: off `u_viewport == u_grid` the
+//! face and the lit layer are resolved at the fragment's own position and the
+//! halo is read bilinearly. Nothing here changed, and nothing here needed to:
+//! every uniform below is a length or an angle in buffer units, which is
+//! exactly what a continuous sample point in those same units needs. The
+//! harness gained one case per skin for it (`gauge.*.sweep.s2`, the `stretch`
+//! knob on `cases::Case::Gauge`) and a flatness ceiling to hold it there.
+//!
 //! # The dial geometry is the kit's, resolved by the kit
 //!
 //! This file used to carry a hand mirror of `Gauge::dial` and of the thirty-odd
@@ -951,6 +971,79 @@ mod tests {
         super::super::program::assert_crt_constants("gauge.frag", LIT_FRAG);
     }
 
+    /// **The blit resolves the picture per fragment when the allocation is not
+    /// the grid** (#1090, second report) — read back out of the shipped GLSL,
+    /// because that is the only place it is written.
+    ///
+    /// The defect this pins was a dial shown bigger than its buffer coming out
+    /// as a nearest-neighbour *replication* of it: stair-stepped arc, uneven
+    /// ticks, and — measured — a frame that was bit-identical to the kit's own
+    /// picture and 100.0 % flat `scale × scale` blocks. The gate on the glass
+    /// is `cases::Case::flat_block_ceiling`'s gauge arm, which reds the four
+    /// `gauge.*.sweep.s2` parity cases under llvmpipe; this is the hermetic
+    /// half, and it is here because **no Rust in this tree transcribes the
+    /// gauge's blit** (`led_strip.rs` is the one arm that has such a mirror),
+    /// so without it the whole detector needs a driver.
+    ///
+    /// Three claims, each its own failure mode:
+    ///
+    /// 1. the branch is taken on the *viewport against the grid* — the same
+    ///    test `dot_matrix.frag`, `flip_board.frag` and `led_matrix.frag` use —
+    ///    rather than on anything a caller could set independently;
+    /// 2. the sample point is a **ternary on it**, so the snapped side still
+    ///    reads the integer grid cell every bit-exact parity case is pinned at;
+    /// 3. both analytic layers and the halo are reached through that choice,
+    ///    i.e. the continuous branch is not the face alone.
+    ///
+    /// **Claim 3 is the one only this test can make**, and that is measured
+    /// rather than argued. A *face-only* fix — the arc and the ticks resolved
+    /// per fragment, the needle, value arc and hub still magnified out of
+    /// `u_tex0` — leaves a blocky pointer on a smooth dial, and it clears
+    /// **every** gate on the driver: `int lit = texel(u_tex0, q);` in place of
+    /// the ternary below measures `PASS all 240` under
+    /// `TROLLSHELL_PARITY_EXACT=1`, with the four stretched frames at
+    /// 83.6 / 90.9 / 84.4 / 81.6 % flat, all under the 92.0 % ceiling. The face
+    /// is most of a dial's ink, so it carries the statistic on its own.
+    ///
+    /// **Falsified** by the reversion probe the ceiling is calibrated against
+    /// (`bool snapped = true;`), which deletes claim 1's line outright; by
+    /// dropping the ternary for an unconditional `vec2(float(col), float(row))`
+    /// (claim 2, which is the pre-#1090 shader exactly); or by the face-only
+    /// mutation above (claim 3). All three were run: the first and the third
+    /// red here, and the third is green everywhere else.
+    #[test]
+    fn the_blit_resolves_the_dial_per_fragment_off_the_grid() {
+        assert!(
+            BLIT_FRAG.contains("bool snapped = (u_viewport == u_grid);"),
+            "gauge.frag decides the branch on the viewport against the grid",
+        );
+        assert!(
+            BLIT_FRAG.contains("vec2 p = snapped ? vec2(float(col), float(row)) : pc;"),
+            "the snapped side keeps the integer grid cell the 1:1 pin measures",
+        );
+        for reached in [
+            "snapped ? texel(u_tex0, q) : lit_intensity(p, pivot)",
+            "snapped ? texel(u_tex1, q) : halo_at(p)",
+        ] {
+            assert!(
+                BLIT_FRAG.contains(reached),
+                "the continuous branch must carry the lit layer and its halo too, not \
+                 the face alone: `{reached}` is not in gauge.frag",
+            );
+        }
+        // …and the two uniforms it all rides on are declared. `GlSurface`
+        // publishes both to every program, so a missing declaration here is a
+        // compile error in the driver rather than a silent zero — but the
+        // `glsl` flake check is the only thing that would see it, and this
+        // states the dependency where the reader is.
+        for uniform in ["uniform ivec2 u_viewport;", "uniform vec2 u_px_step;"] {
+            assert!(
+                BLIT_FRAG.contains(uniform),
+                "gauge.frag declares `{uniform}`",
+            );
+        }
+    }
+
     /// The shader's motion-blur intensities are the kit's `TRAIL_T`, **element
     /// for element and length included**.
     ///
@@ -1063,9 +1156,18 @@ mod tests {
     fn the_mapping_fills_every_uniform_the_shaders_read() {
         // What `hytte-ui`'s `GlSurface` supplies itself, before the host's bag
         // is applied. A shader may declare these; the mapping must not.
-        const HOST_SUPPLIED: [&str; 8] = [
+        // `u_px_step` is the ninth and joined the list with #1090's second
+        // round, which is the first thing in *this* file to declare it —
+        // `gl_surface` has set it since #1298 and `program.rs`'s twin of this
+        // list carries it for the same reason. A `uniform` the host supplies
+        // and a list here omits reads as "the mapping forgot it", so an
+        // omission reds a correct shader rather than passing a broken one; both
+        // copies are hand-written against `Resources::run` and must move
+        // together.
+        const HOST_SUPPLIED: [&str; 9] = [
             "u_grid",
             "u_viewport",
+            "u_px_step",
             "u_data_len",
             "u_step_back",
             "u_tex0",

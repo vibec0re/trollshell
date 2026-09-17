@@ -1472,7 +1472,11 @@ fn same_f64(a: f64, b: f64) -> bool {
 /// array falls back to wherever the `place` key already sits among its
 /// siblings, `toml_edit`'s own carry-forward — the same placement an
 /// all-fresh document has always had.
-fn space_tables(array: &mut toml_edit::ArrayOfTables, source: &[Option<usize>], orig_positions: &[isize]) {
+fn space_tables(
+    array: &mut toml_edit::ArrayOfTables,
+    source: &[Option<usize>],
+    orig_positions: &[isize],
+) {
     let mut next_reused = 0usize;
     let mut last_position: Option<isize> = None;
     for (j, table) in array.iter_mut().enumerate() {

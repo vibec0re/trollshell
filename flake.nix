@@ -2359,6 +2359,57 @@
               touch $out
             '';
 
+          # #1333 item 2, a residue #1331's own review flagged and left
+          # latent: `config.agents.display` is an `attrsOf` with no name
+          # validation of its own, so `display."a.b".icon = …` used to
+          # render `_locked = ["display.a.b.icon"]` — a path
+          # `crates/hytte-config/src/merge.rs`'s `collect_locks` reads by
+          # splitting on `.` with no escaping, so it becomes the FOUR-segment
+          # walk `display → a → b → icon` rather than the three-segment name
+          # the operator meant. `nix/module-common.nix`'s new `assertions`
+          # entry refuses a dotted display name at eval instead of letting it
+          # render an ambiguous lock. Same shape as
+          # `nixos-module-plugin-removed-1200` above: set the one thing that
+          # should trip exactly one predicate, and check it's the right one
+          # by message content, not by count.
+          nixos-module-agents-display-dotted-name =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      # The one thing this fixture exists to set: a dotted
+                      # display name must trip the new assertion rather than
+                      # silently render an ambiguous `_locked` path.
+                      config.agents.display."a.b".icon = "x";
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
+              probe =
+                assert builtins.length falsePredicates == 1;
+                assert pkgs.lib.hasInfix "agents.display" (builtins.head falsePredicates).message;
+                assert pkgs.lib.hasInfix "a.b" (builtins.head falsePredicates).message;
+                builtins.deepSeq { inherit falsePredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-agents-display-dotted-name-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
           # The "lean heavy on nix" counterpart to the Rust ephemeral-EDS
           # harness (#49). Split out to nix/checks/eds-nixos-test.nix
           # (#1102), mirroring how `packages` already lives under

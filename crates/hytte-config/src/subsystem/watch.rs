@@ -822,16 +822,35 @@ mod tests {
     /// at the top of the loop (#1081 review M2). Starts the source at 10 s —
     /// far longer than this test would wait out on its own — then flips it to
     /// 50 ms after 200 ms, well inside the first [`RECHECK`] tick. A
-    /// `wait_cadence` that genuinely re-checks returns close to one `RECHECK`
-    /// tick after the flip; one that reads the target once at the start blocks
-    /// for the full original 10 s.
+    /// `wait_cadence` that genuinely re-checks returns at exactly one
+    /// `RECHECK` tick after the wait began; one that reads the target once at
+    /// the start blocks for the full original 10 s.
     ///
-    /// **Red against mutation R1** (review #1081): replacing the whole loop
-    /// body with a single `tokio::time::sleep(cadence()).await` — deleting
-    /// `RECHECK`, the stepping, and the re-read — reads 10 s once and never
-    /// sees the flip, so this test's `elapsed < Duration::from_secs(3)`
-    /// assertion fails (it actually finishes around 10 s later).
-    #[tokio::test]
+    /// Runs on tokio's **paused clock** (#1334 — the real-clock version of
+    /// this test flaked once under load: PR #1331's re-verify round,
+    /// 2026-09-16, a concurrent `cargo test` descheduled the recheck timer
+    /// long enough to blow a 3 s wall-clock budget, reading a scheduling
+    /// delay as a cadence bug). Both `wait_cadence` and the flip run as
+    /// separate spawned tasks so the test body is free to drive the clock
+    /// between them; `tokio::time::advance` only marks a paused sleep ready,
+    /// nothing polls the woken task until the next `.await`, so a
+    /// `yield_now().await` follows every `advance` (rail from #1285's
+    /// review — drop it and the intermediate `is_finished` assertion below
+    /// would race the wait task's own wakeup instead of reliably losing to
+    /// it, which is exactly what let the `sleep(wrong)` mutation this test
+    /// falsifies against pass vacuously).
+    ///
+    /// **Red if `wait_cadence` reads `cadence()` once at the top of the loop
+    /// instead of on every recheck** (the #1081 mutation this test was
+    /// written for): the wait never observes the flip, so nothing resolves
+    /// it before the paused clock's idle auto-advance has to walk all the
+    /// way to the original 10 s target on its own — `elapsed` reads 10 s, not
+    /// 1 s. **Red if the recheck tick itself is the wrong length** (the
+    /// `sleep(wrong)` mutation, #1285): `elapsed` no longer lands on the
+    /// literal 1 s this test pins — deliberately a literal and not a second
+    /// read of [`RECHECK`], since a comparison against the same constant the
+    /// mutation changed would go blind to it.
+    #[tokio::test(start_paused = true)]
     async fn a_cadence_flip_mid_wait_shortens_the_remaining_wait() {
         let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let source: CadenceSource = {
@@ -845,19 +864,50 @@ mod tests {
             })
         };
 
-        let start = std::time::Instant::now();
         let flip = flipped.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             flip.store(true, std::sync::atomic::Ordering::Relaxed);
         });
-        wait_cadence(&*source).await;
-        let elapsed = start.elapsed();
 
+        let start = tokio::time::Instant::now();
+        let wait = tokio::spawn(async move {
+            wait_cadence(&*source).await;
+            tokio::time::Instant::now()
+        });
+
+        // Let both spawned tasks reach their first `.await` — registering
+        // their sleeps against `start` — before the clock moves at all.
+        tokio::task::yield_now().await;
+
+        // Advance past the 200 ms flip, well inside the first RECHECK tick.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
         assert!(
-            elapsed < Duration::from_secs(3),
-            "a cadence flip 200 ms into a 10 s wait must shorten it to about \
-             one RECHECK tick, got {elapsed:?}"
+            flipped.load(std::sync::atomic::Ordering::Relaxed),
+            "the flip task must have run by 200 ms"
+        );
+        assert!(
+            !wait.is_finished(),
+            "the wait must still be running mid-tick, not resolved by the \
+             flip alone"
+        );
+
+        // Advance through the remainder of the first RECHECK tick, so
+        // `wait_cadence`'s pending `sleep(RECHECK)` resolves and it re-reads
+        // the now-flipped cadence.
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+
+        let end = wait.await.expect("wait_cadence task must not panic");
+        let elapsed = end - start;
+
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(1),
+            "a cadence flip 200 ms into a 10 s wait must shorten it to \
+             exactly one RECHECK tick, not the original 10 s cadence, got \
+             {elapsed:?}"
         );
     }
 }

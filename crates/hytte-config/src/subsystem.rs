@@ -2006,6 +2006,20 @@ fn without_locked(table: &toml::Table, locked: &BTreeSet<String>, prefix: &str) 
 /// the very next load then refused with "is set in nix and cannot be
 /// overridden", on every load until someone deleted it by hand.
 ///
+/// #1341, a residue of #1333: [`remove_keeping_closing_space`] taking a
+/// removed key's own attached comment with it is right for that key's *own*
+/// doc line, but wrong when the removed key is the document's **first** one —
+/// in `toml_edit` a file's leading comment block is glued to the first
+/// top-level item as that item's own prefix decor and is indistinguishable
+/// from a comment the key wrote for itself, so locking `DEFAULT_TOML`'s first
+/// key dropped its whole documented preamble from the seed. [`take_header`]
+/// detaches the document's leading decor before the strip and [`put_header`]
+/// restores it onto whatever now sits first (or the document's own trailing
+/// decor, when nothing is left) — the same pair `places::render_places` and
+/// `places::seed_for` already use, one level up, for the identical reason
+/// (there the leading block is always the first `[[place]]`'s own decor,
+/// never a plain key's).
+///
 /// # Errors
 /// [`ConfigError::Encode`] if [`Subsystem::DEFAULT_TOML`] is not valid TOML —
 /// that is our bug, the same case [`ConfigError::Parse`]'s `path: None` names.
@@ -2017,8 +2031,108 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
         S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
             ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
         })?;
+    let header = take_header(&mut doc);
     strip_locked(doc.as_table_mut(), locked, "");
+    put_header(&mut doc, &header);
     Ok(doc.to_string())
+}
+
+/// Detach the document's leading comment block from whichever top-level item
+/// `toml_edit` glued it to, leaving that item (and the document) with no
+/// leading decor of its own, so [`strip_locked`] can remove the item — when
+/// its key is locked — without taking the file's own preamble along with it.
+/// [`put_header`] restores what this detaches.
+///
+/// A document's leading decor becomes the *prefix* of the first thing that
+/// follows it, and which handle holds that prefix depends on what the first
+/// item is (probed against `toml_edit` 0.25, not read off the grammar): a
+/// plain `key = value` line's is its [`toml_edit::KeyMut::leaf_decor`], a
+/// `[section]` or `[[array]]` header's is that table's own
+/// [`toml_edit::Table::decor`] (the same field [`crate::places::take_header`]
+/// reads for `places.toml`'s narrower shape, which is always an array of
+/// tables and never a plain key), and a document holding nothing but comments
+/// has no top-level item at all, so the block is
+/// [`toml_edit::DocumentMut::trailing`] instead.
+fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
+    let Some(first_key) = doc.iter().next().map(|(k, _)| k.to_owned()) else {
+        let header = doc.trailing().as_str().unwrap_or_default().to_owned();
+        doc.set_trailing("");
+        return header;
+    };
+
+    if let Some(array) = doc
+        .get_mut(&first_key)
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+    {
+        let Some(table) = array.get_mut(0) else {
+            return String::new();
+        };
+        let header = decor_prefix(table.decor());
+        table.decor_mut().set_prefix("");
+        return header;
+    }
+    if let Some(table) = doc
+        .get_mut(&first_key)
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        let header = decor_prefix(table.decor());
+        table.decor_mut().set_prefix("");
+        return header;
+    }
+    let Some((mut key, _)) = doc.get_key_value_mut(&first_key) else {
+        return String::new();
+    };
+    let header = decor_prefix(key.leaf_decor());
+    key.leaf_decor_mut().set_prefix("");
+    header
+}
+
+/// Put back what [`take_header`] detached, in front of whatever now sits
+/// first — the same item-kind dispatch, over the document as [`strip_locked`]
+/// left it. A no-op for an empty `header`, so a save with nothing locked (or
+/// nothing locked at the front) never touches decor it didn't take.
+fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
+    if header.is_empty() {
+        return;
+    }
+    let Some(first_key) = doc.iter().next().map(|(k, _)| k.to_owned()) else {
+        let rest = doc.trailing().as_str().unwrap_or_default().to_owned();
+        doc.set_trailing(format!("{header}{rest}"));
+        return;
+    };
+
+    if let Some(array) = doc
+        .get_mut(&first_key)
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+    {
+        if let Some(table) = array.get_mut(0) {
+            let rest = decor_prefix(table.decor());
+            table.decor_mut().set_prefix(format!("{header}{rest}"));
+        }
+        return;
+    }
+    if let Some(table) = doc
+        .get_mut(&first_key)
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        let rest = decor_prefix(table.decor());
+        table.decor_mut().set_prefix(format!("{header}{rest}"));
+        return;
+    }
+    if let Some((mut key, _)) = doc.get_key_value_mut(&first_key) {
+        let rest = decor_prefix(key.leaf_decor());
+        key.leaf_decor_mut().set_prefix(format!("{header}{rest}"));
+    }
+}
+
+/// A decor prefix as an owned string, or empty when there is none. Mirrors
+/// `places::decor_prefix`.
+fn decor_prefix(decor: &toml_edit::Decor) -> String {
+    decor
+        .prefix()
+        .and_then(toml_edit::RawString::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The `toml_edit`-document half of [`seed_without_locked`]: recurses through
@@ -5143,6 +5257,171 @@ kept = true
         );
         assert_eq!(reloaded.config.core.color, "lcd", "still nix's value");
         assert_eq!(reloaded.config.core.brightness, 5, "the edit round-trips");
+    }
+
+    /// #1341, the residue #1336's own body flagged: the negative of the test
+    /// above, locking [`DEFAULT`]'s **first** key (`enabled`) instead of a
+    /// nested one. `enabled` is exactly the key `toml_edit` glues the file's
+    /// whole documented preamble to — a file's leading comment block is
+    /// indistinguishable from a plain key's *own* attached comment, since
+    /// both are just that key's prefix decor — so removing `enabled` used to
+    /// take `# The per-core LED strip.` with it, and everything above it.
+    ///
+    /// Red if [`seed_without_locked`] stops lifting the document's leading
+    /// decor before the strip (reverts [`take_header`]/[`put_header`]): the
+    /// seed loses the preamble along with `enabled`'s own line, exactly as
+    /// #1341's own probe measured.
+    #[test]
+    fn a_locked_first_key_still_keeps_the_documented_preamble() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&base, "_locked = [\"enabled\"]\nenabled = false\n").expect("seed the base");
+        let paths = [base, overlay.clone()];
+
+        let loaded = load_from::<Leds>(&paths).expect("first load, no overlay yet");
+        assert!(loaded.is_locked("enabled"), "{:?}", loaded.locked);
+        assert!(!loaded.config.enabled, "nix's value");
+
+        let mut value = loaded.config.clone();
+        value.core.brightness = 5; // an unlocked edit, so the save has something of the operator's to write
+        save_overlay_to_locked(&overlay, &value, &loaded.locked).expect("first save");
+
+        let written = std::fs::read_to_string(&overlay).expect("read the fresh file");
+        assert_eq!(
+            written,
+            "# The per-core LED strip.\n\n[core]\n# Strip colour, any CSS name.\ncolor = \"amber\"\nbrightness = 5\npalette = [\"amber\", \"rust\"]\n",
+            "the preamble — everything above the first key — survives byte for byte, \
+             and only enabled's own line is gone"
+        );
+
+        let (captured, _guard) = capture();
+        let reloaded = load_from::<Leds>(&paths).expect("reloads");
+        assert!(
+            shadow_warnings(&captured).is_empty(),
+            "no line was seeded, so there is nothing to refuse: {:?}",
+            shadow_warnings(&captured)
+        );
+        assert_eq!(reloaded.config.core.brightness, 5, "the edit round-trips");
+    }
+
+    /// The sibling of the test above: lock **every** top-level key —
+    /// `enabled` and the whole `[core]` table — so [`strip_locked`] leaves
+    /// nothing at all for the restored preamble to sit in front of.
+    /// [`take_header`]/[`put_header`] must then fall back to
+    /// [`toml_edit::DocumentMut::trailing`], the same fallback
+    /// `places::take_header`/`put_header` use for a file that is nothing but
+    /// comments — and the seed this produces genuinely *is* nothing but
+    /// comments.
+    #[test]
+    fn a_fully_locked_default_still_keeps_the_preamble() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(
+            &base,
+            "_locked = [\"enabled\", \"core\"]\nenabled = false\n\n[core]\ncolor = \"lcd\"\nbrightness = 7\n",
+        )
+        .expect("seed the base");
+        let paths = [base, overlay.clone()];
+
+        let loaded = load_from::<Leds>(&paths).expect("first load, no overlay yet");
+        assert!(loaded.is_locked("enabled"), "{:?}", loaded.locked);
+        assert!(loaded.is_locked("core.color"), "{:?}", loaded.locked);
+        assert!(loaded.is_locked("core.brightness"), "{:?}", loaded.locked);
+
+        save_overlay_to_locked(&overlay, &loaded.config, &loaded.locked).expect("first save");
+
+        let written = std::fs::read_to_string(&overlay).expect("read the fresh file");
+        assert_eq!(
+            written, "# The per-core LED strip.\n",
+            "the preamble survives even though every key it precedes is locked away"
+        );
+    }
+
+    /// The production case #1341 names directly: `core-leds.style`
+    /// (`trollshell/src/config/core_leds.rs:417`) is the first key of a real
+    /// 14-line preamble, and locking it dropped the whole thing before this
+    /// fix. `hytte-config` cannot import that constant — it lives downstream,
+    /// in `trollshell` (see the crate graph in the repo's `CLAUDE.md`) — and
+    /// there is no `save_overlay_to_locked` call site under
+    /// `trollshell/src/config/` yet to hang a test on there, so this
+    /// reproduces the shape as an in-crate fixture instead: the same 14-line
+    /// general preamble, a blank line, then a second comment block glued to
+    /// the first key with nothing between them and the top of the file — the
+    /// exact run [`take_header`]/[`put_header`] must move as one block. The
+    /// preamble text below is a byte-for-byte copy, kept here for the shape
+    /// rather than as a live mirror of it; if `core_leds.rs` ever grows its
+    /// own save-path test harness, this one can move there instead.
+    #[test]
+    fn a_locked_first_key_keeps_a_real_shaped_fourteen_line_preamble() {
+        const REAL_SHAPED_DEFAULT: &str = r#"# The Stats drawer's per-core LED panel (#857): one lamp per CPU core, each
+# lit to that core's load. Every key here is look-and-feel — none of it
+# changes what is measured.
+#
+# This file is read live: save an edit and the panel re-skins within a few
+# seconds, with no shell restart. It is also layered — a nix-written base
+# under $XDG_CONFIG_DIRS, your own edits under $XDG_CONFIG_HOME — so a
+# rebuild never clobbers a hand edit and a hand edit never blocks a rebuild.
+# Delete a key to fall back to the value below; `_unset = ["style"]` erases a
+# key an underlying layer set (TOML has no null, so this is how it is spelt).
+#
+# A value no parser accepts costs its own key and nothing else: that key takes
+# the built-in default, one journal line names it, and every other key in the
+# file still applies.
+
+# The kit skin — the panel's physical character.
+#   vfd         near-black field with a phosphor halo off every lit lamp
+#   lcd         grey-green cells that ghost their unlit segments
+#   oled        pure black field, no ghost
+#   crt         scanline comb and a curved-glass vignette
+style = "vfd"
+
+# LED brightness, 1-8.
+brightness = 5
+"#;
+
+        // A marker type: [`seed_without_locked`] only reads `DEFAULT_TOML`
+        // itself, never an actual deserialized value, so there is nothing to
+        // give this type a field for.
+        #[derive(serde::Deserialize)]
+        struct RealShaped;
+
+        impl Subsystem for RealShaped {
+            const NAME: &'static str = "real-shaped";
+            const DEFAULT_TOML: &'static str = REAL_SHAPED_DEFAULT;
+            type Error = std::convert::Infallible;
+            type Resolved = ();
+            fn parsed(&self) -> ((), Vec<InvalidValue>) {
+                ((), Vec::new())
+            }
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let mut locked = BTreeSet::new();
+        locked.insert("style".to_string());
+
+        let seed =
+            seed_without_locked::<RealShaped>(&locked).expect("REAL_SHAPED_DEFAULT is valid TOML");
+
+        assert!(
+            seed.starts_with("# The Stats drawer's per-core LED panel"),
+            "the 14-line preamble survives: {seed}"
+        );
+        assert!(
+            seed.contains("A value no parser accepts costs its own key and nothing else"),
+            "…all the way to its last line: {seed}"
+        );
+        assert!(
+            !seed.contains("style = \"vfd\""),
+            "style's own line is gone: {seed}"
+        );
+        assert!(
+            seed.contains("# LED brightness, 1-8.\nbrightness = 5\n"),
+            "the key after it is untouched: {seed}"
+        );
     }
 
     /// The mirror of the test above, and the case that is *normal* rather than

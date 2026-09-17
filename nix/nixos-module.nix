@@ -98,14 +98,25 @@ let
   # `lib.filterAttrsRecursive` cannot do the second half, why an
   # attrset-valued knob with a `default = { }` (`agents`' `display`) breaks
   # the `filtered == { }` guard without it, what `!lib.isDerivation`
-  # is for, and why it does not descend into lists (#1241 item 3) — a
-  # `listOf submodule` leaf holding a `null` fails loudly at `generate`
-  # rather than being silently pruned, which is the accepted trade.
+  # is for, and why it now DOES descend into lists (#1227 item 2 —
+  # `config.places.place` is the `listOf submodule` #1241 item 3 predicted,
+  # whose nullable per-entry fields would otherwise reach `generate`), while
+  # pruning a list element rather than dropping it.
   prune =
     set:
     lib.filterAttrs (_: v: !(v == null || (lib.isAttrs v && !lib.isDerivation v && v == { }))) (
-      lib.mapAttrs (_: v: if lib.isAttrs v && !lib.isDerivation v then prune v else v) set
+      lib.mapAttrs (_: pruneValue) set
     );
+
+  # `prune`'s per-value half — see `nix/hm-module.nix`.
+  pruneValue =
+    v:
+    if lib.isList v then
+      map pruneValue v
+    else if lib.isAttrs v && !lib.isDerivation v then
+      prune v
+    else
+      v;
 
   # Base-layer config files (#866/#868, #1041): each
   # `programs.trollshell.config.<subsystem>` attrset renders to

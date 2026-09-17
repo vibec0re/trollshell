@@ -140,19 +140,38 @@ let
   # rendered file and the schema that reads it agree about what an empty
   # entry means instead of round-tripping a heading that changes nothing.
   #
-  # This does NOT descend into lists (#1241 item 3): `mapAttrs` only recurses
-  # through attrsets, so a `null` sitting inside a `listOf submodule` leaf
-  # rides through untouched. No subsystem has one today, so nothing is
-  # silently mispruned — but the day one does, a `null` element fails loudly
-  # at `pkgs.formats.toml`'s `generate` ("Cannot convert data to TOML (null
-  # values are not supported)") rather than being dropped the way an all-null
-  # attrset is. That loud failure is the acceptable outcome; staying silent
-  # about the gap was not, which is why this paragraph exists.
+  # This DOES descend into lists since #1227 item 2 — the paragraph that used
+  # to stand here said it did not, and named exactly the day it would have to
+  # (#1241 item 3): "the day one does, a `null` element fails loudly at
+  # `pkgs.formats.toml`'s `generate` … staying silent about the gap was not
+  # [acceptable]". `programs.trollshell.config.places.place` is that day: a
+  # `listOf submodule`, whose entries have seven nullable fields apiece, so
+  # without this every declared place would carry `station = null` into
+  # `generate` and fail the eval outright.
+  #
+  # A list element is pruned, never DROPPED, unlike an emptied attrset value:
+  # an element is a positional thing (the first `[[place]]` is the provisional
+  # home) and "this entry went empty" has no meaning to fall back on the way
+  # an absent key does. Every list-shaped option leaf in the tree today is a
+  # list of submodules with required fields, so an element cannot go empty
+  # anyway; a list of bare scalars (`ssids`) passes through untouched, since
+  # `pruneValue` only recurses.
   prune =
     set:
     lib.filterAttrs (_: v: !(v == null || (lib.isAttrs v && !lib.isDerivation v && v == { }))) (
-      lib.mapAttrs (_: v: if lib.isAttrs v && !lib.isDerivation v then prune v else v) set
+      lib.mapAttrs (_: pruneValue) set
     );
+
+  # One option value, pruned by shape — `prune`'s per-value half, split out so
+  # the list arm and the attrset arm are reachable from each other.
+  pruneValue =
+    v:
+    if lib.isList v then
+      map pruneValue v
+    else if lib.isAttrs v && !lib.isDerivation v then
+      prune v
+    else
+      v;
 
   # Base-layer config files (#866/#868, #1041): each
   # `programs.trollshell.config.<subsystem>` attrset renders to

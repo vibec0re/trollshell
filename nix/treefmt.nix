@@ -18,8 +18,14 @@
   # Harmless until #1227 gave the file an array (`_locked`): `json2toml` emits
   # one on a single line, taplo wraps it over six, and every one of those
   # checks goes red on a `nix fmt` nobody asked to change behaviour.
+  # `crates/hytte-config/tests/fixtures/places-nix-rendered.toml` (#1227 item
+  # 2) is the same shape one family over: a recording of
+  # `programs.trollshell.config.places`' render, pinned by
+  # `checks.{nixos,hm}-module-places-fixture` and read back by
+  # `crates/hytte-config/tests/places_nix_base.rs`.
   settings.formatter.taplo.excludes = [
     "crates/hytte-plugin-agents/tests/fixtures/*.toml"
+    "crates/hytte-config/tests/fixtures/*.toml"
   ];
 
   programs.prettier.enable = true;

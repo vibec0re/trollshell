@@ -188,6 +188,31 @@ impl Env {
         }
     }
 
+    /// The nix-written **base** layers only, **lowest precedence first**: the
+    /// `XDG_CONFIG_DIRS` entries in reverse spec order, with no overlay.
+    ///
+    /// This is the half #1227's lock rule is stated over — the union of every
+    /// base layer's `_locked` binds the overlay and nothing else
+    /// ([`crate::merge::merge_all_locked`]) — so a caller that has to hand the
+    /// two halves over as two arguments asks for them as two lists.
+    /// [`Self::config_layers`] is this plus the overlay, and is what a
+    /// [`crate::subsystem::Subsystem`] load wants.
+    ///
+    /// `places` is the caller that needs the split spelled out (#1227 item 2):
+    /// its overlay is [`crate::places::config_path`] — `$HOME/.config`, the
+    /// pre-layering spelling its writer has always resolved — rather than
+    /// `$XDG_CONFIG_HOME`, so it cannot take the overlay slot from here and
+    /// still be reading the file its writer writes.
+    #[must_use]
+    pub fn base_config_layers(&self, subsystem: &str) -> Vec<PathBuf> {
+        let file = file_name(subsystem);
+        self.config_dirs()
+            .into_iter()
+            .rev()
+            .map(|dir| dir.join(APP_DIR).join(&file))
+            .collect()
+    }
+
     /// Every `<subsystem>.toml` layer, **lowest precedence first**: the
     /// `XDG_CONFIG_DIRS` entries in reverse spec order, then the overlay.
     ///
@@ -196,14 +221,11 @@ impl Env {
     /// not the file exists — the loader skips the missing ones.
     #[must_use]
     pub fn config_layers(&self, subsystem: &str) -> Vec<PathBuf> {
-        let file = file_name(subsystem);
-        let mut layers: Vec<PathBuf> = self
-            .config_dirs()
-            .into_iter()
-            .rev()
-            .map(|dir| dir.join(APP_DIR).join(&file))
-            .collect();
-        layers.extend(self.config_home().map(|dir| dir.join(APP_DIR).join(&file)));
+        let mut layers = self.base_config_layers(subsystem);
+        layers.extend(
+            self.config_home()
+                .map(|dir| dir.join(APP_DIR).join(file_name(subsystem))),
+        );
         layers
     }
 
@@ -240,6 +262,12 @@ fn file_name(subsystem: &str) -> String {
 #[must_use]
 pub fn config_layers(subsystem: &str) -> Vec<PathBuf> {
     Env::from_process().config_layers(subsystem)
+}
+
+/// [`Env::base_config_layers`] against the process environment.
+#[must_use]
+pub fn base_config_layers(subsystem: &str) -> Vec<PathBuf> {
+    Env::from_process().base_config_layers(subsystem)
 }
 
 /// [`Env::overlay_path`] against the process environment.
@@ -301,6 +329,53 @@ mod tests {
                 "/home/annika/.config/trollshell/core-leds.toml",
             ]
         );
+    }
+
+    /// [`Env::base_config_layers`] is [`Env::config_layers`] with the overlay
+    /// slot removed — same paths, same order, one fewer entry (#1227 item 2).
+    ///
+    /// Asserted as a *relationship* rather than as a second literal list, so
+    /// the two cannot drift: a change to the reversal or to `APP_DIR` that
+    /// touched only one of them reds here even though both lists would still
+    /// look plausible on their own.
+    #[test]
+    fn the_base_layers_are_the_search_path_without_the_overlay() {
+        let env = Env {
+            config_dirs: Some("/nix/store/aaa-trollshell-config:/etc/xdg".into()),
+            ..env()
+        };
+
+        let bases = env.base_config_layers("places");
+        let all = env.config_layers("places");
+
+        assert_eq!(
+            strs(&bases),
+            [
+                "/etc/xdg/trollshell/places.toml",
+                "/nix/store/aaa-trollshell-config/trollshell/places.toml",
+            ]
+        );
+        assert_eq!(all.len(), bases.len() + 1);
+        assert_eq!(&all[..bases.len()], &bases[..]);
+        assert_eq!(all.last(), env.overlay_path("places").as_ref());
+    }
+
+    /// With no `$HOME` and no `$XDG_CONFIG_HOME` there is no overlay slot at
+    /// all, and [`Env::config_layers`] is then exactly the base list — which is
+    /// why `places` computes its bases from [`Env::base_config_layers`] rather
+    /// than popping the last entry off `config_layers` (that would eat a base
+    /// layer here).
+    #[test]
+    fn without_a_home_there_is_no_overlay_slot_to_pop() {
+        let env = Env {
+            home: None,
+            config_home: None,
+            config_dirs: Some("/etc/xdg".into()),
+            state_home: None,
+        };
+
+        assert_eq!(env.config_layers("places"), env.base_config_layers("places"));
+        assert_eq!(env.overlay_path("places"), None);
     }
 
     #[test]

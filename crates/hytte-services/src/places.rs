@@ -81,14 +81,15 @@ use crate::wifiscan::{self, AccessPoint};
 
 /// The GTK-free half of this module — schema, validation, writer.
 use hytte_config::places as model;
-pub use hytte_config::places::{Place, PlacesError, ResolvedPlace};
+pub use hytte_config::places::{Layered, Place, PlacesError, ResolvedPlace};
 
 // ── Config ────────────────────────────────────────────────────────────────--
 
 /// How often the running shell re-checks `places.toml` for live reload on AC
-/// power. Each tick is a single `stat` on a cached inode, so it stays snappy
-/// while you edit with no measurable idle cost; the file is only re-read when
-/// the mtime moves.
+/// power. Each tick is one `stat`-and-hash per *layer* (the nix base layer(s)
+/// and the overlay, #1227 item 2 — normally two), so it stays snappy while you
+/// edit with no measurable idle cost; the layers are only re-read when one of
+/// those stamps moves.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Re-check cadence on battery power: 3x AC (#505). The `stat` is nearly free
@@ -439,11 +440,23 @@ fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(
     let shared = shared::get::<Shared>().ok_or(PlacesError::NotRunning)?;
     let handle = shared.configured.clone();
     let path = model::config_path().ok_or(PlacesError::NoConfigPath)?;
+    // #1227 item 2: a nix base layer that declares `[[place]]` renders
+    // `_locked = ["place"]`, and the next load would refuse whatever we wrote
+    // to the overlay. Refuse here instead, so a `Control` caller is told rather
+    // than acknowledged and reverted one poll tick later. This is the same
+    // guard `hytte_config::places::save` applies for the control center; `edit`
+    // cannot go through `save_to` (see this function's own doc) and therefore
+    // cannot inherit it, so it is stated here too — before `EDIT_LOCK`, since
+    // it neither reads nor writes the set.
+    model::check_unlocked(model::PLACE_KEY)?;
     let _serialized = EDIT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let current = handle.get_cloned();
-    model::check_base(&path, &current)?;
+    // `check_base_layered`, not `check_base`: `current` came out of the layered
+    // reader, so a zero-places overlay has to be classified in those units too
+    // (#1227 item 2 — see `OnDisk::Places`).
+    model::check_base_layered(&path, &current)?;
     let next = f(current.as_slice())?;
     model::persist_to(&path, &next)?;
     model::warn_unsatisfiable_fingerprints(&next);

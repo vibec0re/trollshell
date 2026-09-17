@@ -28,12 +28,54 @@
 //! `[[place]]`, hand-chosen key ordering, keys this model does not even know
 //! about, and unrelated top-level tables all survive it byte for byte. `toml`
 //! stays the *reader* — one parse path, one schema — and `toml_edit` writes.
+//!
+//! # The nix base layer (#1227 item 2)
+//!
+//! Since #1227 `places.toml` is **read** through the #866/#868 layering like
+//! every other family — `$XDG_CONFIG_DIRS/trollshell/places.toml` (nix's,
+//! read-only) under `~/.config/trollshell/places.toml` (yours) under
+//! [`DEFAULT_CONFIG`] — and still **written** to exactly one file, the
+//! overlay. [`load_layered`] is the reader; [`layer_paths`] is what it reads.
+//!
+//! Three things about that are specific to `places` and are decided here
+//! rather than in [`crate::subsystem`], which this module deliberately does
+//! not go through (it keeps its own byte-pinned writer — see
+//! [`render_places`] and `tests/places_byte_identical.rs`):
+//!
+//! 1. **The overlay slot is [`config_path`], not
+//!    [`crate::xdg::Env::overlay_path`].** `places` predates the layering and
+//!    its writer has always resolved `$HOME/.config/trollshell/places.toml`
+//!    (via [`crate::file::path`]); a reader that took `$XDG_CONFIG_HOME`
+//!    instead would, on a box where the two differ, read a file the writer
+//!    never writes. Only the *base* slots come from `XDG_CONFIG_DIRS`
+//!    ([`crate::xdg::Env::base_config_layers`]).
+//!
+//! 2. **`place` is an array, and rule 3 replaces arrays whole.** So a base
+//!    layer that declares places supplies the *whole* list, an overlay that
+//!    declares places *replaces* the whole list, and there is no merging of
+//!    individual `[[place]]` blocks across layers — the same semantics every
+//!    other array key in this workspace has. The consequence for the two
+//!    editors is that a save writes the **whole merged set** into the overlay:
+//!    "the control-center edited one place" becomes "the overlay now carries
+//!    the full list", which is the only thing array-replace can mean.
+//!
+//! 3. **A locked `place` makes the set read-only, and the writer says so.**
+//!    Under #1331's rule the union of every base layer's `_locked` binds the
+//!    overlay, so `programs.trollshell.config.places.place` renders
+//!    `_locked = ["place"]` and the next load would refuse an overlay array.
+//!    Rather than let a save be silently reverted one tick later,
+//!    [`check_unlocked`] refuses it up front with [`PlacesError::Locked`] —
+//!    the same invariant `subsystem::save_overlay_to_locked` has for the
+//!    families that do go through [`crate::subsystem`]: a value the reader
+//!    would reject is never written.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::file as config_file;
+use crate::subsystem::Finding;
+use crate::{merge, subsystem, xdg};
 
 /// Config file under `~/.config/trollshell/`.
 const CONFIG_FILE: &str = "places.toml";
@@ -216,6 +258,31 @@ struct ConfigFile {
     place: Vec<PlaceCfg>,
 }
 
+impl ConfigFile {
+    /// The file's raw `[[place]]` blocks as [`Place`]s. Split out of
+    /// [`parse_places`] because #1227 item 2's layered reader arrives with a
+    /// merged [`toml::Table`] rather than with text and must not grow a second
+    /// copy of this mapping.
+    fn into_places(self) -> Vec<Place> {
+        self.place
+            .into_iter()
+            .map(|p| Place {
+                name: p.name,
+                lat: p.lat,
+                lon: p.lon,
+                radius_km: p.radius_km,
+                // SSIDs are matched verbatim (case-sensitive); just drop blanks.
+                ssids: nonblank(p.ssids),
+                match_min: p.match_min,
+                station: p.station,
+                walk_minutes: p.walk_minutes,
+                lines: nonblank(p.lines),
+                directions: nonblank(p.directions),
+            })
+            .collect()
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct PlaceCfg {
     name: String,
@@ -252,6 +319,248 @@ pub fn config_path() -> Option<PathBuf> {
     config_file::path(CONFIG_FILE)
 }
 
+/// This family's name in the XDG layering — `places.toml` in every layer, the
+/// same stem [`crate::subsystem::Subsystem::NAME`] would carry if `places`
+/// went through that trait (it does not; see the module docs).
+const SUBSYSTEM: &str = "places";
+
+/// The dotted `_locked` path naming the whole `[[place]]` array.
+///
+/// One path, not one per place: rule 3 replaces arrays whole, so a locked
+/// array is atomic and nix's `lockedLeafPaths` renders exactly this string for
+/// `programs.trollshell.config.places.place`.
+pub const PLACE_KEY: &str = "place";
+
+/// The dotted `_locked` path naming `[departures].endpoint` (#1124).
+pub const ENDPOINT_KEY: &str = "departures.endpoint";
+
+/// The nix-written base layers for `places.toml`, lowest precedence first.
+/// Paths, existing or not — [`read_base_layers`] skips the missing ones.
+#[must_use]
+pub fn base_layer_paths() -> Vec<PathBuf> {
+    xdg::base_config_layers(SUBSYSTEM)
+}
+
+/// Every layer [`load_layered`] consults, lowest precedence first: the base
+/// layers, then the overlay ([`config_path`]).
+///
+/// [`DEFAULT_CONFIG`] is not in here — it is not a file. [`ConfigWatcher`]
+/// polls exactly this list, so a `nixos-rebuild` that moves the base layer is
+/// picked up by the same two-second tick a hand edit is.
+#[must_use]
+pub fn layer_paths() -> Vec<PathBuf> {
+    let mut paths = base_layer_paths();
+    paths.extend(config_path());
+    paths
+}
+
+/// Read every base layer that exists, lowest precedence first, as
+/// `(path, body)`.
+///
+/// A missing base layer is the normal case (nothing has declared
+/// `programs.trollshell.config.places`); an **unreadable** one is warned and
+/// skipped rather than fatal, because `places` has no error channel to a
+/// caller — [`load_places`] has always answered with *some* set — and showing
+/// nix's places as though they were the user's is not an option either way.
+#[must_use]
+pub fn read_base_layers() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for path in base_layer_paths() {
+        match std::fs::read_to_string(&path) {
+            Ok(body) => out.push((path, body)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "places: base layer unreadable; ignoring it");
+            }
+        }
+    }
+    out
+}
+
+/// What a layered load of `places.toml` produced, and what it learned on the
+/// way — [`crate::subsystem::Loaded`]'s shape for the one family that does not
+/// go through that module.
+///
+/// `#[non_exhaustive]` for [`crate::subsystem::Loaded`]'s reason: every
+/// construction site is in this crate and this is the type that grows a field.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Layered {
+    /// The merged set. Never empty: a merge that yields no `[[place]]` falls
+    /// back to [`builtin_default`], exactly as [`load_places`] always has.
+    pub places: Vec<Place>,
+    /// The merged `[departures].endpoint` (#1124), normalised the way
+    /// [`parse_departures_endpoint`] normalises it.
+    pub endpoint: Option<String>,
+    /// Dotted paths the **base** layers pinned — [`PLACE_KEY`] and/or
+    /// [`ENDPOINT_KEY`] today. The set the fold actually enforced, with
+    /// [`crate::merge::Merged::locked`]'s two exclusions, so the overlay's own
+    /// marker is not in here.
+    pub locked: BTreeSet<String>,
+    /// Every `_locked` problem this load found, in
+    /// [`crate::subsystem::Loaded::lock_findings`]'s vocabulary and wording:
+    /// a refused override, a malformed marker, an inert one.
+    pub lock_findings: Vec<Finding>,
+    /// Layer files that existed and contributed, lowest precedence first.
+    /// [`DEFAULT_CONFIG`] is not listed — it is not a file.
+    pub sources: Vec<PathBuf>,
+}
+
+impl Layered {
+    /// Whether a base layer pinned `path` — itself, or by an ancestor table
+    /// being locked whole.
+    ///
+    /// The same predicate [`crate::subsystem::Loaded::is_locked`] answers, over
+    /// the same walk, because it *is* that function's body.
+    #[must_use]
+    pub fn is_locked(&self, path: &str) -> bool {
+        subsystem::locked_here(&self.locked, path)
+    }
+
+    /// Whether the `[[place]]` array is nix's, i.e. whether the two editors
+    /// must go read-only for it.
+    #[must_use]
+    pub fn places_are_locked(&self) -> bool {
+        self.is_locked(PLACE_KEY)
+    }
+
+    /// Whether `[departures].endpoint` is nix's.
+    #[must_use]
+    pub fn endpoint_is_locked(&self) -> bool {
+        self.is_locked(ENDPOINT_KEY)
+    }
+}
+
+/// Merge [`DEFAULT_CONFIG`], every base layer body and the overlay body — the
+/// pure core of [`load_layered`], so every rule above is unit-testable with no
+/// filesystem and no environment.
+///
+/// `bases` are lowest precedence first; `overlay` is the operator's own file,
+/// `None` when it does not exist. The split is handed to
+/// [`crate::merge::merge_all_locked`] as its two arguments because that split
+/// **is** #1331's rule: the union of every base's `_locked` binds the overlay
+/// and nothing else, base layers fold among themselves by XDG precedence with
+/// no enforcement between them, and the overlay's own marker pins nothing.
+///
+/// A layer that is not valid TOML is warned and **skipped**, not fatal. That is
+/// [`load_places`]'s contract ("use the default for a malformed config, and do
+/// not overwrite it") generalised one layer at a time: a typo in the overlay
+/// costs the overlay, not the nix base layer underneath it.
+#[must_use]
+pub fn assemble_places(bases: &[(PathBuf, String)], overlay: Option<(PathBuf, String)>) -> Layered {
+    // Two parallel vectors, `crate::subsystem::assemble_layers`' shape: the
+    // diagnostics want the file name beside each table, and `merge`'s own
+    // whole-stack questions want the tables as one slice.
+    let mut paths: Vec<Option<&Path>> = vec![None];
+    let mut tables: Vec<toml::Table> = vec![parse_layer(DEFAULT_CONFIG, None)];
+    let mut sources = Vec::new();
+
+    for (path, body) in bases {
+        paths.push(Some(path.as_path()));
+        tables.push(parse_layer(body, Some(path)));
+        sources.push(path.clone());
+    }
+    if let Some((path, body)) = overlay.as_ref() {
+        paths.push(Some(path.as_path()));
+        tables.push(parse_layer(body, Some(path)));
+        sources.push(path.clone());
+    }
+
+    let mut lock_findings = subsystem::locked_marker_findings(SUBSYSTEM, &paths, &tables);
+    // The last layer is the overlay when there is one — the split #1331's rule
+    // is stated over, handed over as two arguments rather than guessed from a
+    // position.
+    let overlay_table = if overlay.is_some() { tables.pop() } else { None };
+    let merged = merge::merge_all_locked(tables, overlay_table);
+    lock_findings.extend(subsystem::shadowed_findings(
+        SUBSYSTEM,
+        &paths,
+        &merged.shadowed,
+    ));
+
+    let (places, endpoint) = read_merged(&merged.table);
+    Layered {
+        places,
+        endpoint,
+        locked: merged.locked,
+        lock_findings,
+        sources,
+    }
+}
+
+/// One layer body as a table; a parse failure is warned, named, and read as an
+/// empty table so the layers under it still apply.
+fn parse_layer(body: &str, path: Option<&Path>) -> toml::Table {
+    match body.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(e) => {
+            match path {
+                Some(path) => {
+                    tracing::warn!(error = %e, path = %path.display(), "places: config parse failed; ignoring this layer");
+                }
+                None => {
+                    tracing::error!(error = %e, "built-in default places config failed to parse");
+                }
+            }
+            toml::Table::new()
+        }
+    }
+}
+
+/// The merged table as the two things this file models. Rule 4's "warn, never
+/// fail" is [`PlaceCfg`]'s own `#[serde]` tolerance here: a key this schema
+/// does not know is ignored, exactly as it is when one file is parsed.
+///
+/// The two fallbacks are [`load_places`]'s own, one layer up: a merged set that
+/// holds no usable `[[place]]` reads as [`builtin_default`] — the shell still
+/// has to be somewhere — and a `[departures]` table that yields nothing reads
+/// as `None`, "use the default".
+fn read_merged(table: &toml::Table) -> (Vec<Place>, Option<String>) {
+    let value = toml::Value::Table(table.clone());
+    let places = match value.clone().try_into::<ConfigFile>() {
+        Ok(cfg) => cfg.into_places(),
+        Err(e) => {
+            tracing::warn!(error = %e, "places: merged config does not match the [[place]] schema; using default");
+            Vec::new()
+        }
+    };
+    let endpoint = value
+        .try_into::<DeparturesConfigFile>()
+        .ok()
+        .and_then(|cfg| cfg.departures.endpoint)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    if places.is_empty() {
+        tracing::warn!("places: merged config has no [[place]]; using default");
+        return (builtin_default(), endpoint);
+    }
+    (places, endpoint)
+}
+
+/// [`assemble_places`] over the process environment's search path.
+///
+/// Reads the base layers ([`read_base_layers`]) and the overlay
+/// ([`config_path`]); a missing overlay is the normal case and is simply
+/// `None` — the locks still come back, because that is the set the editors grey
+/// rows from and the set the very first save must skip.
+#[must_use]
+pub fn load_layered() -> Layered {
+    let overlay = config_path().and_then(|path| {
+        match std::fs::read_to_string(&path) {
+            Ok(body) => Some((path, body)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                // Exists but unreadable (permissions, non-UTF-8, …): use the
+                // layers below but DON'T overwrite — the bytes may be a config
+                // we just can't read.
+                tracing::warn!(error = %e, path = %path.display(), "places: config unreadable; using the layers below it (not overwriting)");
+                None
+            }
+        }
+    });
+    assemble_places(&read_base_layers(), overlay)
+}
+
 /// Drop empty/whitespace-only entries (a stray `""` would otherwise become an
 /// accidental allow-all, since an empty needle is a substring of everything).
 fn nonblank(items: Vec<String>) -> Vec<String> {
@@ -259,25 +568,13 @@ fn nonblank(items: Vec<String>) -> Vec<String> {
 }
 
 /// Parse a config body into places. Pure, so the schema is unit-testable.
+///
+/// # Errors
+/// A `String` if `toml_text` isn't valid TOML, or holds a `[[place]]` block
+/// the schema cannot read.
 pub fn parse_places(toml_text: &str) -> Result<Vec<Place>, String> {
     let cfg: ConfigFile = toml::from_str(toml_text).map_err(|e| format!("config: {e}"))?;
-    Ok(cfg
-        .place
-        .into_iter()
-        .map(|p| Place {
-            name: p.name,
-            lat: p.lat,
-            lon: p.lon,
-            radius_km: p.radius_km,
-            // SSIDs are matched verbatim (case-sensitive); just drop blanks.
-            ssids: nonblank(p.ssids),
-            match_min: p.match_min,
-            station: p.station,
-            walk_minutes: p.walk_minutes,
-            lines: nonblank(p.lines),
-            directions: nonblank(p.directions),
-        })
-        .collect())
+    Ok(cfg.into_places())
 }
 
 /// [`DEFAULT_CONFIG`] parsed — the set every "can't use the user's config"
@@ -295,44 +592,64 @@ pub fn builtin_default() -> Vec<Place> {
     })
 }
 
-/// Load places, writing the documented default on first run. Returns
-/// [`builtin_default`] for a missing/empty/malformed user config.
+/// Load the **merged** place set — [`load_layered`]'s `places` — writing the
+/// documented default on first run.
+///
+/// Returns [`builtin_default`] when no layer contributes a usable `[[place]]`.
+///
+/// # First run, and why nix suppresses it (#1227 item 2)
+///
+/// With no overlay file this has always written [`DEFAULT_CONFIG`] into
+/// `~/.config/trollshell/places.toml` so the schema is discoverable, and
+/// carried a pre-rename `departures.toml` forward if one is there. Both still
+/// happen — **unless a base layer already declares `[[place]]`**. Writing the
+/// documented default underneath a nix-declared list would create an overlay
+/// whose `place` array *replaces* nix's (rule 3) on a box where the operator
+/// asked for the opposite, and, when that array is locked, would be refused on
+/// every subsequent load: one journal line per load, forever, about a file
+/// nobody wrote on purpose.
 #[must_use]
 pub fn load_places() -> Vec<Place> {
-    let default = builtin_default;
+    let bases = read_base_layers();
     let Some(path) = config_path() else {
-        return default();
+        return assemble_places(&bases, None).places;
     };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let overlay = match std::fs::read_to_string(&path) {
+        Ok(text) => Some((path.clone(), text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // No places.toml yet. One-time: carry forward a pre-rename
             // departures.toml if present; otherwise write the documented
-            // default so the schema is discoverable.
-            if let Some(migrated) = migrate_legacy_departures(&path) {
+            // default so the schema is discoverable. Neither when nix has
+            // already supplied the list — see the section above.
+            if base_declares_places(&bases) {
+                None
+            } else if let Some(migrated) = migrate_legacy_departures(&path) {
                 return migrated;
+            } else {
+                write_default_config();
+                None
             }
-            write_default_config();
-            return default();
         }
         Err(e) => {
-            // Exists but unreadable (permissions, non-UTF-8, …): use the default
-            // but DON'T overwrite — the bytes may be a config we just can't read.
-            tracing::warn!(error = %e, path = %path.display(), "places: config unreadable; using built-in default (not overwriting)");
-            return default();
+            // Exists but unreadable (permissions, non-UTF-8, …): use the layers
+            // below but DON'T overwrite — the bytes may be a config we just
+            // can't read.
+            tracing::warn!(error = %e, path = %path.display(), "places: config unreadable; using the layers below it (not overwriting)");
+            None
         }
     };
-    match parse_places(&text) {
-        Ok(places) if !places.is_empty() => places,
-        Ok(_) => {
-            tracing::warn!(path = %path.display(), "places: config has no [[place]]; using default");
-            default()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "places: config parse failed; using default");
-            default()
-        }
-    }
+    assemble_places(&bases, overlay).places
+}
+
+/// Whether any base layer sets `[[place]]` itself — the question
+/// [`load_places`]' first-run write and [`read_on_disk`]'s empty arm both ask,
+/// and the one thing that distinguishes "nix has an opinion about the list"
+/// from "nix set only `[departures]`".
+fn base_declares_places(bases: &[(PathBuf, String)]) -> bool {
+    bases.iter().any(|(_, body)| {
+        body.parse::<toml::Table>()
+            .is_ok_and(|table| table.contains_key(PLACE_KEY))
+    })
 }
 
 fn write_default_config() {
@@ -415,8 +732,16 @@ fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
 /// file when it actually moved, and content-checks the reparse so a `touch`
 /// or no-op save doesn't churn a re-resolve.
 pub struct ConfigWatcher {
-    path: Option<PathBuf>,
-    last: Option<(SystemTime, u64)>,
+    /// Every layer, lowest precedence first — [`layer_paths`]. Since #1227
+    /// item 2 that is the nix base layer(s) *and* the overlay, not the overlay
+    /// alone: a `nixos-rebuild` moves the base layer's store path, which is a
+    /// change to the merged set exactly the way an `$EDITOR` save is, and a
+    /// watcher that only stamped the overlay would show the previous
+    /// generation's places until the shell was restarted.
+    paths: Vec<PathBuf>,
+    /// One stamp per entry of [`Self::paths`], `None` for a layer that is not
+    /// there — which is how an *appearing* or *vanishing* layer is seen at all.
+    last: Vec<Option<(SystemTime, u64)>>,
 }
 
 impl Default for ConfigWatcher {
@@ -431,18 +756,21 @@ impl ConfigWatcher {
     /// after construction rather than replaying the state at startup.
     #[must_use]
     pub fn new() -> Self {
-        let path = config_path();
-        let last = path.as_deref().and_then(stamp);
-        Self { path, last }
+        let paths = layer_paths();
+        let last = paths.iter().map(|p| stamp(p)).collect();
+        Self { paths, last }
     }
 
-    /// Reload and return the fresh places when the file's stamp has moved
-    /// since the previous poll *and* the parsed list differs from `current`;
-    /// otherwise `None` (unchanged stamp, no config path, or an identical
+    /// Reload and return the fresh places when **some layer's** stamp has moved
+    /// since the previous poll *and* the merged list differs from `current`;
+    /// otherwise `None` (no layer moved, no layer to watch, or an identical
     /// reparse).
     pub fn poll(&mut self, current: &[Place]) -> Option<Vec<Place>> {
-        let path = self.path.as_deref()?;
-        let now = stamp(path);
+        if self.paths.is_empty() {
+            return None;
+        }
+        let now: Vec<Option<(SystemTime, u64)>> =
+            self.paths.iter().map(|p| stamp(p)).collect();
         if now == self.last {
             return None;
         }
@@ -520,6 +848,16 @@ pub enum PlacesError {
         /// The rejected raw value.
         value: String,
     },
+    /// A nix base layer pinned this key with `_locked` (#1227), so the merge
+    /// would refuse an overlay value for it on the next load. Refused here
+    /// instead of written and reverted a tick later — the invariant
+    /// `subsystem::save_overlay_to_locked` holds for the families that go
+    /// through [`crate::subsystem`]: a value the reader would reject is never
+    /// written.
+    Locked {
+        /// The pinned dotted path — [`PLACE_KEY`] or [`ENDPOINT_KEY`].
+        key: String,
+    },
 }
 
 impl std::fmt::Display for PlacesError {
@@ -560,6 +898,18 @@ impl std::fmt::Display for PlacesError {
                 f,
                 "\"{value}\" is not a departures endpoint — use {} or a full http(s):// base URL",
                 DEPARTURES_ENDPOINT_NAMES.join(", ")
+            ),
+            // The house sentence for a refused override, composed exactly the
+            // way `crate::subsystem`'s `shadowed_message` composes it — this
+            // one just arrives at the *save* instead of at the load, because
+            // `places` has an editor and can say so before the write.
+            Self::Locked { key } => write!(
+                f,
+                "places.{key} is set in nix and cannot be overridden from {}",
+                config_path().map_or_else(
+                    || "your places.toml overlay".to_owned(),
+                    |p| p.display().to_string()
+                )
             ),
         }
     }
@@ -1032,9 +1382,18 @@ fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
 enum OnDisk {
     /// No file yet: a save creates it, and there is nothing to lose.
     Absent,
-    /// A parseable file. A config that yields zero places is reported as
-    /// [`builtin_default`], because that is what [`load_places`] makes of it —
-    /// so "disk" and "memory" are compared in the same units.
+    /// A parseable file. A config that yields zero places is reported as the
+    /// caller's `fallback`, because that is what a *reader* makes of it — so
+    /// "disk" and "memory" are compared in the same units.
+    ///
+    /// That fallback was flatly [`builtin_default`] before #1227 item 2, and
+    /// still is for [`check_base`]. It stops being the right answer the moment
+    /// a base layer declares `[[place]]`: an overlay holding only
+    /// `[departures]` (which the endpoint row alone can create) yields zero
+    /// places while the layered reader reports nix's list, and comparing the
+    /// two would refuse every save as [`PlacesError::ChangedOnDisk`] against a
+    /// file nothing had changed. [`check_base_layered`] is that arm, and it is
+    /// the one the environment-resolving writers take.
     Places(Vec<Place>),
     /// The file is there but its contents can't be established. Never write
     /// over this.
@@ -1042,16 +1401,40 @@ enum OnDisk {
 }
 
 /// Classify the current `places.toml` for a writer — see [`OnDisk`].
-fn read_on_disk(path: &Path) -> OnDisk {
+///
+/// `path` is the overlay, the one file a writer ever replaces. `fallback` is
+/// what a zero-places file means to whoever is asking: [`builtin_default`] for
+/// [`check_base`], the layered reader's answer for [`check_base_layered`].
+///
+/// Pure with respect to the environment, deliberately: this is what
+/// `tests/places_byte_identical.rs` and every explicit-path test here go
+/// through, and a hidden `$XDG_CONFIG_DIRS` read in here would make all of them
+/// depend on whether the developer's own box happens to use the feature they
+/// are testing — and race any sibling test that redirects it.
+fn read_on_disk(path: &Path, fallback: &[Place]) -> OnDisk {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OnDisk::Absent,
         Err(e) => return OnDisk::Unknown(e.to_string()),
     };
     match parse_places(&text) {
-        Ok(places) if places.is_empty() => OnDisk::Places(builtin_default()),
+        Ok(places) if places.is_empty() => OnDisk::Places(fallback.to_vec()),
         Ok(places) => OnDisk::Places(places),
         Err(e) => OnDisk::Unknown(e),
+    }
+}
+
+/// What a zero-places overlay means to the **layered** reader: the nix base
+/// layer's own list if one declares `[[place]]`, else [`builtin_default`].
+///
+/// Reads the environment, so it lives beside the other environment-resolving
+/// helpers rather than inside [`read_on_disk`].
+fn layered_fallback() -> Vec<Place> {
+    let bases = read_base_layers();
+    if base_declares_places(&bases) {
+        assemble_places(&bases, None).places
+    } else {
+        builtin_default()
     }
 }
 
@@ -1114,7 +1497,24 @@ pub fn persist_to(path: &Path, places: &[Place]) -> Result<(), PlacesError> {
 /// # Errors
 /// [`PlacesError::Unreadable`] / [`PlacesError::ChangedOnDisk`], as above.
 pub fn check_base(path: &Path, base: &[Place]) -> Result<(), PlacesError> {
-    match read_on_disk(path) {
+    check_base_against(path, base, &builtin_default())
+}
+
+/// [`check_base`] for a caller that resolved `path` from the environment —
+/// i.e. one whose `base` came out of the **layered** reader (#1227 item 2).
+///
+/// The only difference is the units a zero-places overlay is reported in: see
+/// [`OnDisk::Places`] and [`layered_fallback`]. Everything else, including the
+/// two data-loss arguments on [`check_base`], is identical.
+///
+/// # Errors
+/// As [`check_base`].
+pub fn check_base_layered(path: &Path, base: &[Place]) -> Result<(), PlacesError> {
+    check_base_against(path, base, &layered_fallback())
+}
+
+fn check_base_against(path: &Path, base: &[Place], fallback: &[Place]) -> Result<(), PlacesError> {
+    match read_on_disk(path, fallback) {
         // Nothing on disk to lose, or it says exactly what we think it says.
         OnDisk::Absent => Ok(()),
         OnDisk::Places(disk) if disk == base => Ok(()),
@@ -1141,7 +1541,16 @@ pub fn check_base(path: &Path, base: &[Place]) -> Result<(), PlacesError> {
 /// # Errors
 /// Whatever [`check_base`], [`validate`] or [`persist_to`] reject.
 pub fn save_to(path: &Path, base: &[Place], next: Vec<Place>) -> Result<(), PlacesError> {
-    check_base(path, base)?;
+    save_to_against(path, base, next, &builtin_default())
+}
+
+fn save_to_against(
+    path: &Path,
+    base: &[Place],
+    next: Vec<Place>,
+    fallback: &[Place],
+) -> Result<(), PlacesError> {
+    check_base_against(path, base, fallback)?;
     let next: Vec<Place> = next.into_iter().map(normalize).collect();
     validate(&next)?;
     persist_to(path, &next)?;
@@ -1150,13 +1559,48 @@ pub fn save_to(path: &Path, base: &[Place], next: Vec<Place>) -> Result<(), Plac
     Ok(())
 }
 
-/// [`save_to`] against the user's real `~/.config/trollshell/places.toml`.
+/// Refuse a write at a key a nix base layer pinned (#1227 item 2).
+///
+/// The guard every *environment-resolving* write goes through — [`save`],
+/// [`save_departures_endpoint`], and `hytte_services::places::edit`, which
+/// composes [`check_base`]/[`persist_to`] itself. The explicit-path pair
+/// ([`save_to`], [`persist_to`]) deliberately does **not**: those are the test
+/// seams and the byte-pinned writer, and a function handed an absolute path
+/// should not go reading `$XDG_CONFIG_DIRS` behind its caller's back.
+///
+/// Reads the base layers each call. That is once per save — a rare,
+/// deliberate, user-acknowledged action — and reading them fresh is the point:
+/// a `nixos-rebuild` between the load and the save must not be answered from a
+/// cached lock set.
 ///
 /// # Errors
-/// [`PlacesError::NoConfigPath`] when `$HOME` is unset, else as [`save_to`].
+/// [`PlacesError::Locked`] when the union of the base layers' `_locked` names
+/// `key` (or an ancestor of it).
+pub fn check_unlocked(key: &str) -> Result<(), PlacesError> {
+    let locked = assemble_places(&read_base_layers(), None);
+    if locked.is_locked(key) {
+        return Err(PlacesError::Locked {
+            key: key.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// [`save_to`] against the user's real `~/.config/trollshell/places.toml`,
+/// refusing first if nix pinned the list ([`check_unlocked`]).
+///
+/// # Errors
+/// [`PlacesError::NoConfigPath`] when `$HOME` is unset,
+/// [`PlacesError::Locked`] when a base layer pinned [`PLACE_KEY`], else as
+/// [`save_to`].
 pub fn save(base: &[Place], next: Vec<Place>) -> Result<(), PlacesError> {
     let path = config_path().ok_or(PlacesError::NoConfigPath)?;
-    save_to(&path, base, next)
+    check_unlocked(PLACE_KEY)?;
+    // `save_to`'s own zero-places fallback is the built-in default, which is
+    // what a reader with no base layer reports; this caller's `base` came from
+    // the layered reader, so the comparison takes the layered fallback — see
+    // [`check_base_layered`].
+    save_to_against(&path, base, next, &layered_fallback())
 }
 
 // ── Departures endpoint (#1124) ──────────────────────────────────────────────
@@ -1255,17 +1699,6 @@ pub fn parse_departures_endpoint(toml_text: &str) -> Result<Option<String>, Stri
         .filter(|s| !s.is_empty()))
 }
 
-/// Load the configured endpoint from `~/.config/trollshell/places.toml`.
-/// `None` for a missing file, an unreadable/unparseable one, or an absent/
-/// blank key — every "can't tell" case reads the same as "use the default",
-/// mirroring [`load_places`] falling back to [`builtin_default`].
-#[must_use]
-pub fn load_departures_endpoint() -> Option<String> {
-    let path = config_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    parse_departures_endpoint(&text).ok().flatten()
-}
-
 /// Render `endpoint` into `[departures].endpoint` of whatever document
 /// `existing` holds, patching it rather than rebuilding — the endpoint-only
 /// counterpart to [`render_places`], for the same format-preserving reasons,
@@ -1352,11 +1785,29 @@ pub fn persist_departures_endpoint_to(
 /// `[[place]]` can.
 ///
 /// # Errors
-/// [`PlacesError::NoConfigPath`] when `$HOME` is unset, else as
-/// [`persist_departures_endpoint_to`].
+/// [`PlacesError::NoConfigPath`] when `$HOME` is unset,
+/// [`PlacesError::Locked`] when a base layer pinned [`ENDPOINT_KEY`] (#1227
+/// item 2), else as [`persist_departures_endpoint_to`].
 pub fn save_departures_endpoint(endpoint: Option<&str>) -> Result<(), PlacesError> {
     let path = config_path().ok_or(PlacesError::NoConfigPath)?;
+    check_unlocked(ENDPOINT_KEY)?;
     persist_departures_endpoint_to(&path, endpoint)
+}
+
+/// Load the configured endpoint — [`load_layered`]'s `endpoint`.
+///
+/// Kept as its own function because the control center reads it on its own
+/// (the entry row is built before the place list is), and because "the merged
+/// endpoint" is exactly what both callers want: an overlay value wins over the
+/// base layer's, an absent one falls through to it, and a locked one is nix's
+/// whatever the overlay says.
+///
+/// `None` for an absent/blank key at every layer — every "can't tell" case
+/// reads the same as "use the default", mirroring [`load_places`] falling back
+/// to [`builtin_default`].
+#[must_use]
+pub fn load_departures_endpoint() -> Option<String> {
+    load_layered().endpoint
 }
 
 #[cfg(test)]
@@ -1365,6 +1816,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::subsystem::FindingKind;
 
     fn default_places() -> Vec<Place> {
         parse_places(DEFAULT_CONFIG).expect("default config parses")
@@ -1442,8 +1894,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
 
-        // `temp_env` serializes $HOME mutation across tests and restores it after.
-        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+        // `temp_env` serializes the mutation across tests and restores it
+        // after. `with_layers` rather than `$HOME` alone: since #1227 item 2
+        // both `load_places` and `ConfigWatcher` read `$XDG_CONFIG_DIRS`, so a
+        // box that actually uses `programs.trollshell.config.places` would
+        // otherwise feed this test a base layer it never asked for.
+        with_layers(&root, &[], || {
             let cfg = root.join(".config/trollshell/places.toml");
             let one = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n";
             let two = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n\
@@ -1502,7 +1958,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
 
-        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+        // `with_layers`, not a bare `$HOME` — see the sibling test above.
+        with_layers(&root, &[], || {
             let cfg = root.join(".config/trollshell/places.toml");
             let one = "[[place]]\nname = \"Home1\"\nlat = 1.0\nlon = 2.0\n";
             let two = "[[place]]\nname = \"Home2\"\nlat = 1.0\nlon = 2.0\n";
@@ -2326,14 +2783,14 @@ mine = true
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("places.toml");
 
-        assert!(matches!(read_on_disk(&target), OnDisk::Absent));
+        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Absent));
 
         // A config that yields no places is reported in the same units memory
         // holds it in — what `load_places` makes of it, i.e. the default.
         std::fs::write(&target, "place = []\n").expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Places(p) if p == builtin_default()));
+        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p == builtin_default()));
         std::fs::write(&target, "# only comments\n").expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Places(p) if p == builtin_default()));
+        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p == builtin_default()));
 
         // A real config comes back as itself.
         std::fs::write(
@@ -2342,15 +2799,15 @@ mine = true
         )
         .expect("seed");
         assert!(
-            matches!(read_on_disk(&target), OnDisk::Places(p) if p.len() == 1 && p[0].name == "Home")
+            matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p.len() == 1 && p[0].name == "Home")
         );
 
         // And the two `load_places` collapses into a silent fallback stay
         // distinguishable here: unparseable, and undecodable.
         std::fs::write(&target, "[[place]]\nname = \"Home\"\nlat = \n").expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Unknown(_)));
+        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Unknown(_)));
         std::fs::write(&target, [0xff, 0xfe]).expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Unknown(_)));
+        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Unknown(_)));
     }
 
     /// Four hand-configured places and a typo. Neither editor can parse that,
@@ -2688,5 +3145,583 @@ mine = true
                 Err(PlacesError::NoConfigPath)
             );
         });
+    }
+
+    // ── The nix base layer (#1227 item 2) ────────────────────────────────────
+
+    /// A scratch `$HOME` **and** a scratch `$XDG_CONFIG_DIRS`, so no test here
+    /// can read — or be perturbed by — the developer's real base layer.
+    ///
+    /// #1227 item 2 made `places` read `$XDG_CONFIG_DIRS`, and on a box that
+    /// sets `programs.trollshell.config.places` there is a real
+    /// `/etc/xdg/trollshell/places.toml` these tests never asked for. Pinning
+    /// the variable is the difference between "this suite is hermetic" and
+    /// "this suite is hermetic on machines that do not use the feature it is
+    /// testing" (#1101's rule, one directory over).
+    ///
+    /// An **empty** `base_dirs` cannot be spelled as an empty variable — the
+    /// XDG spec (and [`crate::xdg`]) reads that as unset and falls back to
+    /// `/etc/xdg` — so "no base layer" is a scratch directory that does not
+    /// exist.
+    fn with_layers<R>(home: &Path, base_dirs: &[&Path], body: impl FnOnce() -> R) -> R {
+        let fallback = home.join("no-base-layer-here");
+        let dirs = if base_dirs.is_empty() {
+            fallback.display().to_string()
+        } else {
+            base_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        temp_env::with_vars(
+            [
+                ("HOME", Some(std::ffi::OsString::from(home))),
+                ("XDG_CONFIG_HOME", None),
+                ("XDG_CONFIG_DIRS", Some(std::ffi::OsString::from(dirs))),
+            ],
+            body,
+        )
+    }
+
+    /// `(path, body)` for a layer, without touching the filesystem — what
+    /// [`assemble_places`] takes.
+    fn layer(name: &str, body: &str) -> (PathBuf, String) {
+        (PathBuf::from(format!("/nix/store/{name}.toml")), body.to_owned())
+    }
+
+    /// Write `body` to `<dir>/trollshell/places.toml` and hand back `dir`, so a
+    /// scratch base directory reads like the real one.
+    fn base_dir(dir: &Path, body: &str) -> PathBuf {
+        let app = dir.join("trollshell");
+        std::fs::create_dir_all(&app).expect("mkdir base layer");
+        std::fs::write(app.join("places.toml"), body).expect("write base layer");
+        dir.to_path_buf()
+    }
+
+    /// A rendered base layer with the list unlocked — what a hand-written
+    /// `/etc/xdg/trollshell/places.toml` looks like.
+    const BASE_TWO: &str = "\
+[[place]]
+name = \"Werkstatt\"
+lat = 52.5
+lon = 13.4
+
+[[place]]
+name = \"Bahnhof\"
+lat = 52.4
+lon = 13.5
+";
+
+    /// The same, as `programs.trollshell.config.places.place` renders it:
+    /// `_locked` beside the values.
+    const NIX_TWO: &str = "\
+_locked = [\"place\"]
+
+[[place]]
+name = \"Werkstatt\"
+lat = 52.5
+lon = 13.4
+
+[[place]]
+name = \"Bahnhof\"
+lat = 52.4
+lon = 13.5
+";
+
+    /// The base layer supplies the list when nothing else does — the whole
+    /// point of the option.
+    ///
+    /// **Mutation:** make `assemble_places` ignore `bases` (fold only the
+    /// default and the overlay) and this is the first thing to red.
+    #[test]
+    fn a_base_layer_supplies_the_place_list_with_no_overlay() {
+        let loaded = assemble_places(&[layer("base", NIX_TWO)], None);
+
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Werkstatt", "Bahnhof"],
+            "the nix base layer's array, not the built-in default's"
+        );
+        assert_ne!(
+            loaded.places, builtin_default(),
+            "if this passes trivially the fixture stopped differing from the default"
+        );
+    }
+
+    /// Rule 3, stated for this file: the overlay's `place` array **replaces**
+    /// the base's, it does not append to it.
+    ///
+    /// **Mutation:** read the overlay as the base and the base as the overlay
+    /// (swap the two arguments) and this reds — it would report the nix list.
+    #[test]
+    fn the_overlays_array_replaces_the_bases_whole() {
+        let overlay = layer(
+            "overlay",
+            "[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
+        );
+
+        let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(overlay));
+
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Zuhause"],
+            "replace, never append (rule 3) — and never the base's two"
+        );
+    }
+
+    /// The other direction of the same rule: an overlay that mentions no
+    /// `place` at all inherits the base's array untouched. This is the shape a
+    /// `[departures]`-only overlay has, which is what the endpoint row alone
+    /// can produce.
+    #[test]
+    fn an_overlay_without_places_inherits_the_bases_array() {
+        let overlay = layer("overlay", "[departures]\nendpoint = \"vbb\"\n");
+
+        let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(overlay));
+
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Werkstatt", "Bahnhof"]
+        );
+        assert_eq!(loaded.endpoint.as_deref(), Some("vbb"));
+    }
+
+    /// Rule 1 for the one scalar this file has: present in the overlay wins,
+    /// absent falls through to the base.
+    #[test]
+    fn the_endpoint_overlays_when_present_and_falls_through_when_absent() {
+        let base = layer("base", "[departures]\nendpoint = \"db\"\n");
+
+        let inherited = assemble_places(std::slice::from_ref(&base), None);
+        assert_eq!(inherited.endpoint.as_deref(), Some("db"));
+
+        let overridden = assemble_places(
+            std::slice::from_ref(&base),
+            Some(layer("overlay", "[departures]\nendpoint = \"bvg\"\n")),
+        );
+        assert_eq!(
+            overridden.endpoint.as_deref(),
+            Some("bvg"),
+            "unlocked: the overlay wins"
+        );
+    }
+
+    /// #1331's rule applied to this file: the base layer's `_locked` binds the
+    /// overlay, the base value is kept, and the attempt is reported once — in
+    /// the house wording, with the subsystem spelled `places`.
+    #[test]
+    fn a_locked_place_array_keeps_the_base_list_and_reports_once() {
+        let (captured, _guard) = crate::test_support::capture();
+
+        let loaded = assemble_places(
+            &[layer("base", NIX_TWO)],
+            Some(layer(
+                "overlay",
+                "[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
+            )),
+        );
+
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Werkstatt", "Bahnhof"],
+            "nix has precedence per key (#866, 2026-09-15)"
+        );
+        let refusals: Vec<&Finding> = loaded
+            .lock_findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::ShadowedLockedKey)
+            .collect();
+        assert_eq!(refusals.len(), 1, "one mistake, one line to read");
+        assert_eq!(refusals[0].key, PLACE_KEY);
+        assert!(
+            refusals[0]
+                .message
+                .starts_with("places.place is set in nix and cannot be overridden from"),
+            "the house sentence, with this file's own subsystem name: {}",
+            refusals[0].message
+        );
+        assert_eq!(
+            captured
+                .warnings()
+                .iter()
+                .filter(|m| m.contains("cannot be overridden from an overlay"))
+                .count(),
+            1,
+            "and one journal line, not two"
+        );
+    }
+
+    /// An `_unset` at a locked key is an override attempt like any other.
+    /// Without this the lock is one line from meaningless: `place` would fall
+    /// through to `DEFAULT_CONFIG`, exactly the value nix was displacing.
+    #[test]
+    fn an_unset_cannot_erase_a_locked_place_array() {
+        let loaded = assemble_places(
+            &[layer("base", NIX_TWO)],
+            Some(layer("overlay", "_unset = [\"place\"]\n")),
+        );
+
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Werkstatt", "Bahnhof"]
+        );
+        assert_ne!(loaded.places, builtin_default());
+    }
+
+    /// The two keys lock independently — which is why the control center
+    /// carries two booleans rather than one "managed by nix" flag.
+    #[test]
+    fn the_endpoint_locks_without_locking_the_place_array() {
+        let loaded = assemble_places(
+            &[layer(
+                "base",
+                "_locked = [\"departures.endpoint\"]\n[departures]\nendpoint = \"db\"\n",
+            )],
+            Some(layer(
+                "overlay",
+                "[departures]\nendpoint = \"bvg\"\n\
+                 [[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
+            )),
+        );
+
+        assert_eq!(loaded.endpoint.as_deref(), Some("db"), "the nix endpoint");
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Zuhause"],
+            "…and the list is still the operator's"
+        );
+        assert!(loaded.endpoint_is_locked());
+        assert!(!loaded.places_are_locked());
+    }
+
+    /// The lock set reaches the caller as data, which is what the control
+    /// center greys rows from.
+    ///
+    /// **Mutation (seam):** return `locked: BTreeSet::new()` from
+    /// `assemble_places` — the merge still enforces the lock, but no editor
+    /// can learn which keys are pinned — and this plus the two save tests red.
+    #[test]
+    fn the_lock_set_reaches_the_caller_as_data() {
+        let loaded = assemble_places(&[layer("base", NIX_TWO)], None);
+
+        assert_eq!(
+            loaded.locked.iter().map(String::as_str).collect::<Vec<_>>(),
+            [PLACE_KEY]
+        );
+        assert!(loaded.places_are_locked());
+        assert!(!loaded.endpoint_is_locked());
+        assert!(loaded.is_locked(PLACE_KEY));
+    }
+
+    /// #1331 review, HIGH 1, for this file: the **overlay's own** `_locked`
+    /// binds nothing and is not in the returned set. Otherwise a save driven by
+    /// that set would drop the very value the operator just edited.
+    #[test]
+    fn an_overlays_own_lock_is_absent_from_the_returned_set() {
+        let loaded = assemble_places(
+            &[],
+            Some(layer(
+                "overlay",
+                "_locked = [\"place\"]\n[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
+            )),
+        );
+
+        assert!(loaded.locked.is_empty(), "there is no layer above the overlay");
+        assert!(!loaded.places_are_locked());
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Zuhause"]
+        );
+    }
+
+    /// A marker whose shape the fold cannot read pins nothing, and says so
+    /// naming the layer — `merge::malformed_locked`'s argument is worse here
+    /// than anywhere: the file is nix's and nobody opens it.
+    #[test]
+    fn a_malformed_locked_marker_in_the_base_is_reported() {
+        let loaded = assemble_places(
+            &[layer(
+                "base",
+                "_locked = \"place\"\n[[place]]\nname = \"W\"\nlat = 1.0\nlon = 2.0\n",
+            )],
+            Some(layer(
+                "overlay",
+                "[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
+            )),
+        );
+
+        assert!(
+            loaded
+                .lock_findings
+                .iter()
+                .any(|f| f.kind == FindingKind::MalformedLocked && f.key == merge::LOCKED_KEY),
+            "{:?}",
+            loaded.lock_findings
+        );
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Zuhause"],
+            "a marker that pins nothing does not pin anything"
+        );
+    }
+
+    /// …and one naming a key its own layer does not set is reported too
+    /// (#1331 review, LOW 4).
+    #[test]
+    fn an_inert_locked_marker_in_the_base_is_reported() {
+        let loaded = assemble_places(
+            &[layer("base", "_locked = [\"departures.endpoint\"]\n")],
+            None,
+        );
+
+        assert!(
+            loaded
+                .lock_findings
+                .iter()
+                .any(|f| f.kind == FindingKind::InertLocked && f.key == ENDPOINT_KEY)
+        );
+        assert!(loaded.locked.is_empty());
+    }
+
+    /// A layer that is not TOML costs that layer, not the stack — the
+    /// per-layer reading of `load_places`' old whole-file fallback.
+    #[test]
+    fn a_layer_that_is_not_toml_is_skipped_rather_than_fatal() {
+        let loaded = assemble_places(
+            &[layer("base", BASE_TWO)],
+            Some(layer("overlay", "this is not = = toml\n")),
+        );
+
+        assert_eq!(
+            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["Werkstatt", "Bahnhof"],
+            "the nix base layer still applies"
+        );
+    }
+
+    /// With no file anywhere the answer is still the documented default.
+    #[test]
+    fn no_layer_at_all_is_the_builtin_default() {
+        assert_eq!(assemble_places(&[], None).places, builtin_default());
+    }
+
+    /// An overlay that empties the array reads back as the built-in default —
+    /// `load_places`' rule since #640, unchanged by the layering, and the rule
+    /// `remove_place`'s doc in `hytte-services` leans on.
+    #[test]
+    fn an_emptied_overlay_array_still_reads_back_as_the_default() {
+        let loaded =
+            assemble_places(&[layer("base", BASE_TWO)], Some(layer("overlay", "place = []\n")));
+
+        assert_eq!(loaded.places, builtin_default());
+    }
+
+    /// Backs the nix option's `either float int` (`nix/module-common.nix`): a
+    /// coordinate written without a decimal point in the rendered base layer
+    /// must still read back as an `f64`, or every `lat = 52` an operator types
+    /// would fail the schema at load time rather than at eval.
+    #[test]
+    fn an_integer_coordinate_reads_back_as_a_float() {
+        let loaded = assemble_places(
+            &[layer(
+                "base",
+                "[[place]]\nname = \"W\"\nlat = 52\nlon = 13\nradius_km = 9\n",
+            )],
+            None,
+        );
+
+        assert_eq!(loaded.places.len(), 1);
+        assert!((loaded.places[0].lat - 52.0).abs() < f64::EPSILON);
+        assert!((loaded.places[0].lon - 13.0).abs() < f64::EPSILON);
+        assert!((loaded.places[0].radius_km - 9.0).abs() < f64::EPSILON);
+    }
+
+    /// The path split this module argues for in its own docs: the bases come
+    /// from `$XDG_CONFIG_DIRS`, the overlay is `config_path()`, and the overlay
+    /// is last.
+    #[test]
+    fn the_layer_paths_are_the_bases_then_the_writers_own_file() {
+        let home = std::env::temp_dir().join(format!("places-paths-{}", std::process::id()));
+        let one = home.join("one");
+        let two = home.join("two");
+
+        with_layers(&home, &[one.as_path(), two.as_path()], || {
+            assert_eq!(
+                layer_paths(),
+                vec![
+                    two.join("trollshell/places.toml"),
+                    one.join("trollshell/places.toml"),
+                    config_path().expect("$HOME is set"),
+                ],
+                "XDG order reversed (lowest precedence first), overlay last"
+            );
+            assert_eq!(config_path(), Some(home.join(".config/trollshell/places.toml")));
+        });
+    }
+
+    /// First run with a nix base layer must NOT write the documented default
+    /// into the overlay: that file's array would replace nix's (rule 3), and
+    /// when nix locked it every subsequent load would refuse it — one journal
+    /// line per load, forever, about a file nobody wrote on purpose.
+    #[test]
+    fn a_first_run_under_a_nix_base_layer_writes_no_overlay() {
+        let root = std::env::temp_dir().join(format!("places-firstrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = base_dir(&root.join("xdg"), NIX_TWO);
+
+        with_layers(&root, &[dir.as_path()], || {
+            let loaded = load_places();
+            assert_eq!(
+                loaded.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                ["Werkstatt", "Bahnhof"]
+            );
+            assert!(
+                !config_path().expect("$HOME").exists(),
+                "nix already supplied the list; nothing to seed"
+            );
+        });
+
+        // …and with no base layer the first-run write still happens, so the
+        // suppression above is about nix rather than about the write going
+        // away.
+        let bare = std::env::temp_dir().join(format!("places-firstrun-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        with_layers(&bare, &[], || {
+            assert_eq!(load_places(), builtin_default());
+            assert!(config_path().expect("$HOME").exists(), "the seed still happens");
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// The `check_base` hole #1227 item 2 opened and closed in the same
+    /// change: an overlay that parses to **zero** places (a `[departures]`-only
+    /// file, which the endpoint row alone can create) must be classified as
+    /// what the reader reports — the base layer's list — or every save is
+    /// refused as `ChangedOnDisk` against a file nothing changed.
+    #[test]
+    fn an_overlay_with_no_places_is_classified_as_the_base_layers_list() {
+        let root = std::env::temp_dir().join(format!("places-ondisk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = base_dir(&root.join("xdg"), "[[place]]\nname = \"W\"\nlat = 1.0\nlon = 2.0\n");
+        let overlay = root.join(".config/trollshell/places.toml");
+        std::fs::create_dir_all(overlay.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&overlay, "[departures]\nendpoint = \"vbb\"\n").expect("write");
+
+        with_layers(&root, &[dir.as_path()], || {
+            let merged = load_places();
+            assert_eq!(merged.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["W"]);
+            assert_eq!(
+                check_base_layered(&overlay, &merged),
+                Ok(()),
+                "disk and memory must be compared in the same units"
+            );
+            // …and the explicit-path `check_base` deliberately does NOT read
+            // the base layer, which is what keeps it (and every test that goes
+            // through it, `tests/places_byte_identical.rs` included) hermetic.
+            assert_eq!(
+                check_base(&overlay, &merged),
+                Err(PlacesError::ChangedOnDisk),
+                "the pure arm compares against the built-in default, by design"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A save the next load would refuse is refused up front, and leaves the
+    /// overlay untouched.
+    ///
+    /// **Mutation:** drop the `check_unlocked` call from `save` and this reds —
+    /// the write lands and the file changes.
+    #[test]
+    fn a_save_is_refused_while_nix_owns_the_list() {
+        let root = std::env::temp_dir().join(format!("places-lockedsave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = base_dir(&root.join("xdg"), NIX_TWO);
+
+        with_layers(&root, &[dir.as_path()], || {
+            let base = load_places();
+            let mut next = base.clone();
+            next.push(Place {
+                name: "Drittes".into(),
+                lat: 1.0,
+                lon: 2.0,
+                radius_km: default_radius_km(),
+                ssids: Vec::new(),
+                match_min: default_match_min(),
+                station: None,
+                walk_minutes: 0,
+                lines: Vec::new(),
+                directions: Vec::new(),
+            });
+
+            assert_eq!(
+                save(&base, next),
+                Err(PlacesError::Locked {
+                    key: PLACE_KEY.to_owned()
+                })
+            );
+            assert!(
+                !config_path().expect("$HOME").exists(),
+                "a refused save writes nothing at all"
+            );
+            assert_eq!(
+                save_departures_endpoint(Some("vbb")),
+                Ok(()),
+                "…and the unlocked key is still writable"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same guard read directly — `hytte_services::places::edit` composes
+    /// its own write path and calls this rather than `save`.
+    #[test]
+    fn check_unlocked_answers_for_each_key_separately() {
+        let root = std::env::temp_dir().join(format!("places-checkunlocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = base_dir(&root.join("xdg"), NIX_TWO);
+
+        with_layers(&root, &[dir.as_path()], || {
+            assert!(check_unlocked(PLACE_KEY).is_err());
+            assert_eq!(check_unlocked(ENDPOINT_KEY), Ok(()));
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The watcher stamps the base layer too, so a rebuild that swaps the store
+    /// path is picked up by the same tick a hand edit is.
+    #[test]
+    fn the_watcher_sees_the_base_layer_move() {
+        let root = std::env::temp_dir().join(format!("places-watchbase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = base_dir(
+            &root.join("xdg"),
+            "[[place]]\nname = \"Eins\"\nlat = 1.0\nlon = 2.0\n",
+        );
+
+        with_layers(&root, &[dir.as_path()], || {
+            let mut watcher = ConfigWatcher::new();
+            let current = load_places();
+            assert_eq!(current.len(), 1);
+            assert!(watcher.poll(&current).is_none());
+
+            base_dir(
+                &root.join("xdg"),
+                "[[place]]\nname = \"Eins\"\nlat = 1.0\nlon = 2.0\n\
+                 [[place]]\nname = \"Zwei\"\nlat = 3.0\nlon = 4.0\n",
+            );
+            let reloaded = watcher
+                .poll(&current)
+                .expect("the base layer moved → reload");
+            assert_eq!(reloaded.len(), 2);
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

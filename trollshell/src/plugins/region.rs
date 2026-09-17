@@ -807,6 +807,25 @@ pub fn set_dialog_panel(plugin_id: Option<&str>) {
     });
 }
 
+/// Which plugin's panel the dialog overlay is showing, if any — the read half of
+/// [`set_dialog_panel`].
+///
+/// Exists for the two paths that must answer "is the dialog showing *this*
+/// plugin?" without holding a copy of the selection themselves: the scope
+/// releaser's departure hook (`pump::drive_scope_releaser`, which takes the
+/// dialog down when the plugin whose page it shows disconnects, rather than
+/// leaving a blank card pinning that family's `SlotVisible` — #1361 review) and
+/// `overlays::dialog`'s own departure path.
+#[must_use]
+pub fn dialog_panel() -> Option<String> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .dialog_panel_id
+            .get_cloned()
+    })
+}
+
 /// An empty panel tree — the blank page a drawer plugin child shows when no
 /// plugin is active (or the active plugin left / has no panel).
 fn empty_panel() -> UiNode {

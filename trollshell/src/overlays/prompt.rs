@@ -97,6 +97,19 @@ pub fn install(monitor: &Monitor) {
     PROMPT_SUB.with(|s| *s.borrow_mut() = Some(handle));
 }
 
+/// Whether a secret prompt is on screen right now.
+///
+/// Read by `overlays::dialog`, for [`crate::overlays::consent::is_up`]'s reason:
+/// this surface is `Layer::Overlay` + `KeyboardMode::Exclusive`, the plugin
+/// dialog is too, and a surface created later stacks above one created earlier
+/// within a layer. A plugin page must never be raised over — and take the
+/// keyboard from — a window a passphrase is being typed into (#1361 review,
+/// HIGH-1).
+#[must_use]
+pub fn is_up() -> bool {
+    PROMPT_WINDOW.with(|w| w.borrow().is_some())
+}
+
 /// Abort the `active_prompt` subscription and close any open prompt window.
 /// Called before rebuilding on monitor hot-plug so the prompt doesn't route
 /// into a dead surface and its subscription doesn't leak.
@@ -313,6 +326,14 @@ impl Form {
 
 #[allow(clippy::needless_pass_by_value)]
 fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
+    // Take any plugin dialog down FIRST (#1361 review, HIGH-1): it is
+    // `Layer::Overlay` + `KeyboardMode::Exclusive` like this window, and within
+    // a layer a surface created *earlier* sits below one created later — so a
+    // live dialog would cover the passphrase field and keep the keyboard.
+    // `overlays::dialog::may_raise` covers the opposite arrival order. A no-op
+    // when no dialog is up.
+    crate::overlays::dialog::yield_to_shell_prompt("secret prompt");
+
     // Ensure any previous prompt is gone before creating the new one.
     close_prompt();
 

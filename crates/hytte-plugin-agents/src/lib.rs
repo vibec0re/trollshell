@@ -38,9 +38,13 @@
 //!
 //! So the edit arm **will** change when #950 lands — opening a separate GTK
 //! window is not `OpenPage(PluginSelf)`, which names a page inside the shell.
-//! [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s modal (shell
-//! vs session, still waiting on one word from her) stays the answer for every
-//! *other* plugin's page and governs nothing here.
+//! [#1010](https://github.com/vibec0re/trollshell/issues/1010) shipped that
+//! distinction as the host's routing rule: this crate's **in-shell page** (the
+//! title row's hive overview, and the edit arm's fallback when the companion
+//! window is not on `PATH`) opens in the centered dialog rather than the drawer,
+//! because this card is `Mount::Sidebar*` — with no change here, since the host
+//! routes on the mount it already knew. What #1010 does **not** govern is the
+//! #950 `RunCommand` route above: a separate GTK window is not a page.
 //!
 //! # What it links, and what it does not
 //!

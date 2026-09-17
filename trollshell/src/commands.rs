@@ -172,6 +172,7 @@ mod tests {
     use super::entries;
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
+    use hytte::reactive::registry;
 
     /// [`entries`]'s verbs actually register as named `GAction`s on a real
     /// `adw::Application`'s action map — the same auto-exported
@@ -208,5 +209,62 @@ mod tests {
                 "expected a registered action named {verb:?}"
             );
         }
+    }
+
+    /// `dialog-close` actually closes an open plugin dialog, and is a no-op when
+    /// none is up (#1361 review, MEDIUM-1).
+    ///
+    /// The test above enumerates action *names* only, so replacing this verb's
+    /// body with `()` left the whole suite green — the verb shipped registered
+    /// and inert, with nothing but a live-verify line behind it. This activates
+    /// the real entry against a seeded dialog.
+    ///
+    /// Everything except the layer surface is real: the window is a plain
+    /// `gtk::Window` (nothing in this tree can build a layer one in a test), but
+    /// the selection and the visibility contributor are published through the
+    /// shipped setters, so the assertion below is on what the shell's own state
+    /// says, not on a local flag.
+    ///
+    /// **Falsification:** replace the `activate` body with `()` — the review's
+    /// M3 mutation — → the first assertion reds.
+    #[gtk::test]
+    fn dialog_close_actually_closes_the_dialog() {
+        adw::init().expect("libadwaita init");
+        registry::reset_for_tests();
+        crate::plugins::install_test_handles();
+
+        let app = adw::Application::builder()
+            .application_id("mov.vibec0re.trollshell.commands-test-dialog")
+            .build();
+        app.add_action_entries(entries());
+
+        // Activated through the registered `GAction` itself rather than
+        // `GApplication::activate_action`, which asserts the application has
+        // been *registered* (a session-bus round trip this test has no business
+        // doing). `g_action_activate` runs the very closure `entries()` built.
+        let verb = app
+            .lookup_action("dialog-close")
+            .expect("dialog-close is registered");
+
+        // A no-op with nothing up: what makes the verb safe to bind blind.
+        verb.activate(None);
+
+        let window = crate::overlays::dialog::seed_for_test("DP-1", "demo");
+        assert!(crate::overlays::dialog::is_open(), "test setup");
+
+        verb.activate(None);
+
+        assert!(
+            !crate::overlays::dialog::is_open(),
+            "activating `dialog-close` must take the dialog down"
+        );
+        assert_eq!(
+            crate::plugins::dialog_panel(),
+            None,
+            "…and clear its selection, like every other dismissal"
+        );
+
+        window.destroy();
+        registry::reset_for_tests();
     }
 }

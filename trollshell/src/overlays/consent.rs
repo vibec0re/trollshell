@@ -263,6 +263,20 @@ pub fn install(monitor: &Monitor) {
     drop(MONITORS.with(|m| m.borrow_mut().insert(connector, monitor.clone())));
 }
 
+/// Whether a consent card is on screen right now.
+///
+/// Read by `overlays::dialog`: this surface is `Layer::Overlay` +
+/// `KeyboardMode::Exclusive` and the plugin dialog is too, and within one layer
+/// wlroots/niri stack by **surface creation order** — so a dialog raised after
+/// this card would sit above it, eat every click through its full-surface
+/// catcher and take the keyboard. A plugin holding `Consent` + `OpenPage` could
+/// otherwise cover the card asking about that very plugin (#1361 review,
+/// HIGH-1). The dialog refuses to raise while this answers `true`.
+#[must_use]
+pub fn is_up() -> bool {
+    CONSENT_WINDOW.with(|w| w.borrow().is_some())
+}
+
 /// Close any live prompt and forget the mounted monitors before a hot-plug
 /// rebuild — only the per-monitor map and the window are torn down (the
 /// focused-output tracker is the host's), so the re-install re-keys cleanly,
@@ -305,6 +319,16 @@ pub fn request(
     choices: ConsentChoices,
     outbound: mpsc::Sender<HostMsg>,
 ) {
+    // Take any plugin dialog down FIRST (#1361 review, HIGH-1). Both surfaces
+    // are `Layer::Overlay` + `KeyboardMode::Exclusive`, and within a layer
+    // wlroots/niri stack by surface creation order — so a dialog already up
+    // would sit above the card built below it, swallow every press through its
+    // full-surface catcher and keep the keyboard. `overlays::dialog::may_raise`
+    // is the other half of the rule (a dialog refuses to raise while a card is
+    // up); this is the half that covers the opposite arrival order. A no-op when
+    // no dialog is up.
+    crate::overlays::dialog::yield_to_shell_prompt("consent card");
+
     // Supersede any prompt already up (rare — one knock is typically in
     // flight). Bind-then-act, same as `close_all` above (#631): a GTK call
     // inside the `if let` would otherwise hold the scrutinee's `RefMut`

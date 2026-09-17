@@ -555,16 +555,19 @@ the reducer but cannot prove the hive agrees.
       confirm the agent really starts/stops hive-side (`hivectl list-agents`)
       within a poll or two. This is `Start`/`Stop`, a **different** hive verb
       from `SetPaused` — pause/resume is on the drawer page, not on the card.
-- [ ] **(#947 P1)** The drawer is reached from the **title row** or the **edit
-      button**. The list button beside `up · N` opens the plugin's page at the
-      hive overview — state, socket, last-poll age, a clickable `dashboard`
+- [ ] **(#947 P1, #1010)** The plugin's own page is reached from the **title
+      row** or the **edit button**. The list button beside `up · N` opens it at
+      the hive overview — state, socket, last-poll age, a clickable `dashboard`
       link, and the **full, uncapped** roster. A row's `edit` button opens that
-      agent's page instead. **Expect it top right:** that is the drawer, and it
-      is a **placeholder** — Annika settled on #947 (2026-09-11) that the edit
-      button's real destination is the agent's own #950 companion window on its
-      **settings tab**, the same window the row click opens on the agent page.
-      (#1010's modal is for every _other_ plugin page and does not govern this
-      one.) Nothing else on a row leaves the sidebar.
+      agent's page instead. **Expect it centered on the focused output:** since
+      #1010 that page opens in the plugin dialog, not the drawer, because the
+      card is `Mount::Sidebar*` — `Esc`, the close button or a click outside
+      dismisses it. (Before #1010 it opened in the drawer, top right.) It is
+      still a **placeholder** — Annika settled on #947 (2026-09-11) that the
+      edit button's real destination is the agent's own #950 companion window on
+      its **settings tab**, the same window the row click opens on the agent
+      page; what #1010 does not govern is that `RunCommand` route. Nothing else
+      on a row leaves the sidebar.
 - [ ] **(#947 P1)** The agent page is the same pill, plus what the card gave
       up. With an agent selected, confirm: a header with the runtime icon, the
       name at title size, the **model chip**, and `[start|stop]` + `[pause]` as
@@ -665,7 +668,9 @@ whole point of the window.
       shell's cgroup, so `systemctl --user restart trollshell` leaves it alive.
 - [ ] **(#950)** **The pen opens the settings tab.** Click `[edit]` on a card
       pill and confirm the same window opens **on Settings**, not on the agent
-      page, and that the drawer does **not** also open a plugin page behind it.
+      page, and that no plugin page opens behind it — since #1010 that fallback
+      would be the centered dialog rather than the drawer, and the window route
+      must not raise either.
 - [ ] **(#950)** **A second launch focuses the first.** With the window open on
       the agent page, click the pen: no second window appears, the existing one
       is presented _and_ switches to Settings (that is the
@@ -877,8 +882,9 @@ openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
 - [ ] **(#950)** **Without the window, nothing regresses.** Set
       `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
       plugin, and confirm the card's link opens the **browser** again and the
-      pen opens the plugin's own drawer page, with exactly one journal line
-      about the window not being on `PATH` (not one per click).
+      pen opens the plugin's own page — since #1010 that is the centered
+      dialog, not the drawer — with exactly one journal line about the window
+      not being on `PATH` (not one per click).
 - [ ] **(#950)** **niri rules.** The app-id carries the agent, so a rule for
       all of these windows matches the prefix — e.g.
       `match app-id="^mov\.vibec0re\.trollshell\.AgentWindow"`. Confirm a
@@ -1280,6 +1286,50 @@ four window properties below are pinned nowhere but here.
       sidebar plugin's page: the card must swap content in place (the header
       retitles) rather than stacking a second surface. Opening the same plugin's
       page again is a no-op.
+- [ ] **(#1010 HIGH-1)** **The consent card outranks the page.** Trigger a
+      plugin `RequestConsent` (the infobroker's `get` route, or an agents
+      approval) and, while the card is up, have a sidebar plugin emit
+      `OpenPage(PluginSelf)` — click its card. **No dialog may appear**; the
+      journal says `plugin dialog refused: the shell is asking the user
+    something`. The card must stay clickable and keep the keyboard. Then the
+      other order: open a page, and while it is up trigger the consent card —
+      the page must **vanish** as the card goes up (`plugin dialog closed: the
+    shell is raising its own keyboard-exclusive prompt`), never end up over
+      it. `niri msg -j layers` is the check if it is ambiguous: `hytte-dialog`
+      and `hytte-consent` must never be mapped at once.
+- [ ] **(#1010 HIGH-1)** **Same for the secret prompt.** Start a Wi-Fi connect
+      so `hytte-prompt` is up, then click a sidebar card that opens a page: no
+      dialog appears, and every character typed goes into the passphrase field.
+- [ ] **(#1010 HIGH-1)** **The chrome does not impersonate a shell prompt.** Put
+      a plugin page and a consent card on screen one after the other and confirm
+      they are told apart at a glance: the page has a popover-toned surface, a
+      tighter corner radius, a shallower shadow and a **ruled header with a
+      monospaced plugin id**; the consent card has none of those.
+- [ ] **(#1010 MEDIUM-3)** **The focused output moves.** Open a dialog on
+      monitor A, then click a window on monitor B. The page must close (journal:
+      `the focused output moved off the screen it was built on`) rather than sit
+      on A holding A's keyboard where `Esc` no longer reaches it.
+- [ ] **(#1010 MEDIUM-3)** **Hot-plug with a page up.** Plug a second monitor in
+      (and separately, unplug the one the dialog is on). The page is destroyed —
+      deliberate, matching the drawer — with one journal line (`the monitor set
+    changed`). Afterwards confirm the plugin is **not** left thinking its slot
+      is visible: with every sidebar closed it must park again (watch an
+      animating card stop, or `RUST_LOG=trollshell=debug`).
+- [ ] **(#1010 LOW)** **The plugin behind the page dies.** With a page up,
+      `systemctl --user stop trollshell-plugin-<id>`. The dialog must close
+      itself (journal: `the plugin whose page it showed disconnected`) rather
+      than leave a blank card pinning that sidebar family's `SlotVisible` — the
+      other plugins on that side must park again once the sidebar is closed.
+- [ ] **(#1010 LOW)** **A wide plugin node.** `hscrollbar_policy: Never`
+      propagates the page's own _minimum_ width through the clamp, so a plugin
+      node with a wide hard minimum (an un-ellipsised label, an explicit size
+      request) can push the card past the output. Render one and confirm the card
+      still fits the screen — the same exposure the drawer carries, worth seeing
+      once.
+- [ ] **(#1010)** **A drawer and a dialog on one output.** Open a bar chip's
+      drawer, then a sidebar card's page on the same screen. `Esc` must close
+      **only** the dialog, and it takes two outside clicks to reach the desktop
+      (the dialog's catcher, then the drawer's).
 
 ## Plugins & launcher
 

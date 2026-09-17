@@ -46,6 +46,54 @@
 //! the catcher covers it like everything else, and the first outside click
 //! closes the dialog only.
 //!
+//! # Priority: the shell's own prompts outrank a plugin's page
+//!
+//! This is the **first** `Layer::Overlay` + `KeyboardMode::Exclusive` surface in
+//! the tree that a *plugin* can raise, so the layer inventory is worth stating
+//! once — it is derived nowhere else (#1361 review, HIGH-1):
+//!
+//! | surface | layer | keyboard | raised by |
+//! | --- | --- | --- | --- |
+//! | `overlays::frame` | Overlay | none | the shell |
+//! | `overlays::prompt` (Wi-Fi/VPN secret) | Overlay | **Exclusive** | the shell |
+//! | `overlays::consent` (#487 card) | Overlay | **Exclusive** | the shell |
+//! | **this** | Overlay | **Exclusive** | `Effect::OpenPage(Page::PluginSelf)` |
+//! | `modal` (drawer), `sidebar`, `notifications`, `osd` | Top | OnDemand/none | the shell |
+//!
+//! Within one layer wlroots/niri stack by **surface creation order**, so a
+//! dialog raised after a consent card sits above it — anchored to all four
+//! edges, with a real full-surface input region — and both swallows every press
+//! aimed at the card and takes the keyboard. A plugin holding `Consent` +
+//! `OpenPage` can emit both in one render frame (`EFFECT_BURST`), which would
+//! let it make the card *asking about that very plugin* impossible to answer.
+//!
+//! Two halves close it, and both are enforced here rather than left to call
+//! order:
+//!
+//! * `may_raise` — an `OpenPage(PluginSelf)` arriving while a consent card or
+//!   a secret prompt is up is **refused** (dropped with one `debug!`, never
+//!   queued; `OpenPage` is one-way, so the plugin is told nothing either way).
+//! * [`yield_to_shell_prompt`] — a card or prompt going up takes any live dialog
+//!   down first, so the opposite arrival order cannot leave one underneath.
+//!
+//! **Why the layer stayed `Layer::Overlay`.** `Layer::Top` would give the same
+//! guarantee structurally (this surface would then sit below both shell
+//! prompts), and it was considered. It was not taken because: the spec fixes
+//! `Overlay` + `Exclusive` as §2's whole argument for the surface — `Esc` always
+//! lands and a plugin `Entry` gets the keys — and on `Top` that becomes a
+//! property of how the compositor treats exclusive keyboard interactivity
+//! *below* the overlay layer, which **nothing in CI can check** (no compositor)
+//! and which would also re-order this surface against the toasts and the OSD,
+//! which nobody asked for. The two rules above are enforceable and testable
+//! here; a layer change would trade a pinned rule for an unpinned assumption.
+//!
+//! The chrome is deliberately **not** the consent card's (#1361 review, HIGH-1,
+//! second half): `.ts-dialog-card` had been byte-for-byte `.ts-consent-root` —
+//! same surface colour, radius, border and shadow, centered on the same output —
+//! so a plugin page could pass for a shell prompt. It now carries its own
+//! treatment (a popover-toned surface, a different radius and shadow, and a
+//! ruled header whose plugin id is monospaced), which no shell prompt uses.
+//!
 //! # One window, on the focused output
 //!
 //! Not one per monitor: [`install`] keeps a connector → [`Monitor`] map and
@@ -65,13 +113,17 @@
 //! dialog.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use hytte::adw;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
+use hytte::services::niri;
 use hytte::ui::{Anchor, Layer, LayerShell, layer_window};
 use hytte_plugin_proto::Mount;
+
+use plan::Step;
+pub(crate) use plan::may_raise;
 
 use crate::overlays::sidebar::SIDEBAR_WIDTH;
 use crate::plugins;
@@ -101,13 +153,234 @@ const DIALOG_MAX_HEIGHT: i32 = 560;
 /// — a niri rule can match it, like `hytte-prompt` / `hytte-consent`.
 const DIALOG_NAMESPACE: &str = "hytte-dialog";
 
+// ── The decision half ─────────────────────────────────────────────────────────
+
+/// What one [`open_on_focused`] call *decides*, with nothing performed.
+///
+/// A module of its own, and a deliberately **hermetic** one: it imports the wire
+/// `Mount` and nothing else from this file. That is the point — `close`,
+/// `show`, the thread-locals and GTK are all out of scope here, so the sequence
+/// below cannot be changed by reaching past it for a side effect. The review's
+/// own falsification for HIGH-2 (*"route the rebuild arm through `close()`"*) is
+/// therefore not expressible in this module without first adding an import,
+/// which is exactly the edit a reviewer would see.
+///
+/// It exists because [`open_on_focused`] cannot be driven whole — building the
+/// surface needs a Wayland compositor speaking `zwlr_layer_shell_v1` — while
+/// everything it *decides* can be, on the `broker_open_page_with` shape this PR
+/// already uses for the routing rule.
+mod plan {
+    use hytte_plugin_proto::Mount;
+
+    /// One unit of work [`open_on_focused_with`] asks its caller to perform.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Step {
+        /// Retitle the live card in place (the same-output swap).
+        Retitle,
+        /// Take the previous window down **without** publishing the dismissal.
+        TakeWindow,
+        /// Build and present the surface on this connector.
+        Show(String),
+        /// Publish the selection: `Some(mount)` on open, `None` on dismissal.
+        Publish(Option<Mount>),
+    }
+
+    /// Whether a plugin page may be raised at all right now.
+    ///
+    /// The shell's own keyboard-exclusive overlays outrank a plugin-raised one:
+    /// a dialog is never raised over the #487 consent card or the Wi-Fi/VPN
+    /// secret prompt, both `Layer::Overlay` + `KeyboardMode::Exclusive` and both
+    /// stacked *below* a surface created after them. A plugin holding both
+    /// `Consent` and `OpenPage` could otherwise cover — and out-focus — the card
+    /// asking about itself (#1361 review, HIGH-1).
+    pub(crate) const fn may_raise(consent_up: bool, prompt_up: bool) -> bool {
+        !consent_up && !prompt_up
+    }
+
+    /// [`super::open_on_focused`]'s body, with the resolve, the live connector
+    /// and the effects injected.
+    ///
+    /// `shell_grab` is [`may_raise`]'s answer, taken by the caller so this stays
+    /// pure; `resolve` is the connector lookup; `live` is the connector the
+    /// dialog is currently up on, if any.
+    pub(super) fn open_on_focused_with(
+        preferred: Option<&str>,
+        mount: Mount,
+        shell_grab: bool,
+        resolve: impl FnOnce(Option<&str>) -> Option<String>,
+        live: Option<&str>,
+        mut act: impl FnMut(Step),
+    ) {
+        if shell_grab {
+            // Refused, not queued: `OpenPage` is one-way, the plugin is told
+            // nothing either way, and a queued page would pop up the instant the
+            // human answered the card — which is the same ambush one frame later.
+            return;
+        }
+        let Some(connector) = resolve(preferred) else {
+            return;
+        };
+        if live == Some(connector.as_str()) {
+            // Already up on this output: the window, its catcher and its panel
+            // slot all stay; only the header text and the selection change.
+            act(Step::Retitle);
+            act(Step::Publish(Some(mount)));
+            return;
+        }
+        if live.is_some() {
+            // A different output. The old window goes down **without** the
+            // dismissal being published: a rebuild must republish the selection
+            // exactly once, or every connected plugin sees a `SlotVisible`
+            // false→true edge for a page that never left the screen, and a
+            // sidebar plugin with no sidebar open parks and unparks its poller
+            // on exactly that edge.
+            act(Step::TakeWindow);
+        }
+        act(Step::Show(connector));
+        act(Step::Publish(Some(mount)));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Step, may_raise, open_on_focused_with};
+        use hytte_plugin_proto::Mount;
+
+        /// Collect the steps one call decides on.
+        fn steps(
+            preferred: Option<&str>,
+            shell_grab: bool,
+            resolvable: Option<&str>,
+            live: Option<&str>,
+        ) -> Vec<Step> {
+            let resolvable = resolvable.map(str::to_owned);
+            let mut steps = Vec::new();
+            open_on_focused_with(
+                preferred,
+                Mount::SidebarBottom,
+                shell_grab,
+                |_| resolvable,
+                live,
+                |s| steps.push(s),
+            );
+            steps
+        }
+
+        /// HIGH-1: a plugin's page is never raised over the shell's own
+        /// keyboard-exclusive surfaces.
+        #[test]
+        fn a_plugin_page_never_covers_the_shells_own_keyboard_grab() {
+            assert!(may_raise(false, false));
+            assert!(
+                !may_raise(true, false),
+                "the consent card may be asking about this very plugin"
+            );
+            assert!(
+                !may_raise(false, true),
+                "a Wi-Fi/VPN secret is being typed into a surface this would out-focus"
+            );
+            assert!(!may_raise(true, true));
+        }
+
+        /// …and the refusal is a refusal, not a deferral: with a card up the
+        /// call performs **nothing**, where the identical call without one shows
+        /// the page. The control half is what makes this a test of the gate
+        /// rather than of the `resolve` stub.
+        ///
+        /// This is the same-frame burst case (`EFFECT_BURST = 8`): a plugin
+        /// holding `Consent` + `OpenPage` can emit `RequestConsent` and
+        /// `OpenPage(PluginSelf)` on one render frame, and `route_render` pushes
+        /// them to the broker in order — so by the time the page is brokered the
+        /// card is already up, which is exactly `shell_grab = true` here.
+        ///
+        /// **Falsification:** drop the `if shell_grab` early return → the first
+        /// assertion reds with the control's step list.
+        #[test]
+        fn a_page_raised_while_the_shell_is_asking_is_refused_not_queued() {
+            assert_eq!(
+                steps(Some("DP-1"), true, Some("DP-1"), None),
+                Vec::new(),
+                "a page must not be raised — or queued — over a consent card or a secret prompt",
+            );
+            assert_eq!(
+                steps(Some("DP-1"), false, Some("DP-1"), None),
+                vec![
+                    Step::Show("DP-1".to_owned()),
+                    Step::Publish(Some(Mount::SidebarBottom)),
+                ],
+                "control: the same call with nothing up shows the page",
+            );
+        }
+
+        /// **The #1010 commit-2 rule.** Re-opening on a *different* output
+        /// rebuilds the one window; it must republish the selection **once** and
+        /// never publish the dismissal on the way, or every connected plugin
+        /// sees a `SlotVisible` false→true edge for a page that never left the
+        /// screen — and a sidebar plugin with no sidebar open parks and unparks
+        /// its poller on exactly that edge.
+        ///
+        /// **Falsification:** emit `Step::Publish(None)` beside the
+        /// `Step::TakeWindow` (what routing the arm through `close()` means in
+        /// step terms) → this reds. Routing it through `close()` *literally* is
+        /// not expressible here: this module imports no actor — see its docs.
+        #[test]
+        fn a_rebuild_on_another_output_never_publishes_a_dismissal() {
+            assert_eq!(
+                steps(Some("DP-2"), false, Some("DP-2"), Some("DP-1")),
+                vec![
+                    Step::TakeWindow,
+                    Step::Show("DP-2".to_owned()),
+                    Step::Publish(Some(Mount::SidebarBottom)),
+                ],
+            );
+        }
+
+        /// The same output swaps in place: no window work at all, so no scope
+        /// churn and no second surface.
+        #[test]
+        fn a_second_open_on_the_same_output_swaps_in_place() {
+            assert_eq!(
+                steps(Some("DP-1"), false, Some("DP-1"), Some("DP-1")),
+                vec![Step::Retitle, Step::Publish(Some(Mount::SidebarBottom))],
+            );
+        }
+
+        /// No monitor mounted → nowhere to show it, and nothing is published (a
+        /// stale selection must not be lowered by a call that showed nothing).
+        #[test]
+        fn nowhere_to_show_it_publishes_nothing() {
+            assert_eq!(steps(None, false, None, None), Vec::new());
+        }
+    }
+}
+
 // ── Thread-local state ────────────────────────────────────────────────────────
 
-/// The live dialog: its window, plus the connector it was built on so a second
-/// open on the *same* output can swap the selection instead of rebuilding.
+/// The live dialog: its window, the connector it was built on so a second open
+/// on the *same* output can swap the selection instead of rebuilding, and the
+/// focused-output subscription that takes it down when the user's attention
+/// moves to another screen.
 struct LiveDialog {
     window: gtk::Window,
     connector: String,
+    /// The `niri::focused_output()` subscription for this window (#1361 review,
+    /// MEDIUM-3). Aborted by [`LiveDialog::dismantle`], so a dialog never leaves
+    /// a subscription behind and a stale one can never act on a later window.
+    focus_sub: glib::JoinHandle<()>,
+}
+
+impl LiveDialog {
+    /// Take this dialog's surface down: stop watching the focused output, then
+    /// close the window. Does **not** publish anything — every caller decides
+    /// that for itself, which is what keeps a rebuild from publishing a
+    /// dismissal it did not mean.
+    fn dismantle(self) {
+        self.focus_sub.abort();
+        // Closing destroys the panel slot inside, whose own `connect_destroy`
+        // aborts its render subscription and releases the panel scope it was
+        // showing — refcounted across children (#921), so a drawer showing the
+        // same plugin keeps its renderer instances.
+        self.window.close();
+    }
 }
 
 thread_local! {
@@ -118,7 +391,13 @@ thread_local! {
     /// Mounted monitors keyed by `Monitor.connector()`, so [`open_on_focused`]
     /// can build on niri's focused output. Re-keyed on each hot-plug via
     /// [`close_all`] + [`install`], exactly as `consent.rs` does.
-    static MONITORS: RefCell<HashMap<String, Monitor>> = RefCell::new(HashMap::new());
+    ///
+    /// A `BTreeMap` rather than a `HashMap` (#1361 review, LOW) so the
+    /// "focused output unknown" fallback — the first entry — is the same output
+    /// every time instead of whichever one the hash order happened to yield;
+    /// two consecutive opens picking *different* screens would rebuild the
+    /// window for nothing.
+    static MONITORS: RefCell<BTreeMap<String, Monitor>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -143,7 +422,19 @@ pub fn install(monitor: &Monitor) {
 
 /// Close any live dialog and forget the mounted monitors before a hot-plug
 /// rebuild, mirroring `consent::close_all`. The re-install re-keys cleanly.
+///
+/// **A hot-plug destroys an open page**, and not only an unplug: `main.rs` tears
+/// every per-monitor surface down on each `monitors_changed`, so plugging a
+/// second monitor in takes the page the user was reading with it. That matches
+/// what `modal::close_all` does to the drawer, and it is deliberate — but it is
+/// visible, so it says so in the journal rather than happening silently
+/// (#1361 review, MEDIUM-3). The dismissal is published exactly once, by
+/// [`close`], which is what keeps the plugin's `SlotVisible` from being left
+/// pinned by a surface that no longer exists.
 pub fn close_all() {
+    if DIALOG.with(|d| d.borrow().is_some()) {
+        tracing::debug!("plugin dialog closed: the monitor set changed (hot-plug rebuild)");
+    }
     close();
     MONITORS.with(|m| m.borrow_mut().clear());
 }
@@ -165,42 +456,51 @@ pub fn close_all() {
 /// nowhere to show it, and the plugin is told nothing either way (`OpenPage` is
 /// a one-way effect).
 pub fn open_on_focused(preferred: Option<&str>, plugin_id: &str, mount: Mount) {
-    let Some((connector, monitor)) = resolve_monitor(preferred) else {
+    // The two refusals log here rather than in `plan`, which stays pure.
+    let shell_grab = !may_raise(
+        crate::overlays::consent::is_up(),
+        crate::overlays::prompt::is_up(),
+    );
+    if shell_grab {
+        tracing::debug!(
+            plugin = %plugin_id,
+            "plugin dialog refused: the shell is asking the user something (#1361 HIGH-1)",
+        );
+        return;
+    }
+    if resolve_connector(preferred).is_none() {
         tracing::debug!(plugin = %plugin_id, "plugin dialog: no monitor to show on");
         return;
-    };
-
-    // Already up on this output → swap the selection in place. The window, its
-    // catcher and its panel slot all stay; only the header text and the
-    // dialog's selection change, so the slot's live subscription reconciles the
-    // new plugin's tree without a second mount (and without releasing and
-    // re-taking a preem scope it may still need).
-    let same_output = DIALOG.with(|d| {
-        d.borrow()
-            .as_ref()
-            .is_some_and(|live| live.connector == connector)
-    });
-    if same_output {
-        set_title(plugin_id);
-        publish_selection(plugin_id, mount);
-        return;
     }
 
-    // A different output (or nothing up): take the old window down and build the
-    // new one, so "one dialog at a time" is a property of this function rather
-    // than of whoever calls it.
-    //
-    // Deliberately *not* through [`close`]: that publishes the dismissal
-    // (selection `None`, visibility `None`), and a rebuild would then hand every
-    // plugin a `SlotVisible` false→true edge for a page that never left the
-    // screen. The window is taken here and the selection is republished once,
-    // below.
-    let previous = DIALOG.with(|d| d.borrow_mut().take());
-    if let Some(live) = previous {
-        live.window.close();
+    plan::open_on_focused_with(
+        preferred,
+        mount,
+        shell_grab,
+        resolve_connector,
+        live_connector().as_deref(),
+        |step| perform(step, plugin_id),
+    );
+}
+
+/// Carry out one [`Step`] the plan decided on. The only place in this module
+/// that both decides nothing and touches everything.
+fn perform(step: Step, plugin_id: &str) {
+    match step {
+        Step::Retitle => set_title(plugin_id),
+        Step::TakeWindow => {
+            if let Some(live) = take_live() {
+                live.dismantle();
+            }
+        }
+        Step::Show(connector) => {
+            if let Some(monitor) = MONITORS.with(|m| m.borrow().get(&connector).cloned()) {
+                show(&monitor, &connector, plugin_id);
+            }
+        }
+        Step::Publish(Some(mount)) => publish_selection(plugin_id, mount),
+        Step::Publish(None) => publish_dismissal(),
     }
-    show(&monitor, &connector, plugin_id);
-    publish_selection(plugin_id, mount);
 }
 
 /// Dismiss the dialog: take the window down, clear the dialog's selection and
@@ -215,44 +515,150 @@ pub fn open_on_focused(preferred: Option<&str>, plugin_id: &str, mount: Mount) {
 /// drawer's `active_panel_id` is never touched here, so a drawer showing another
 /// plugin's page on another monitor keeps showing it.
 pub fn close() {
-    let taken = DIALOG.with(|d| d.borrow_mut().take());
-    let was_open = taken.is_some();
-    if let Some(live) = taken {
-        // Bind-then-act (#631): a GTK call made inside the `if let` on a
-        // `RefCell` scrutinee would hold the borrow across it.
-        //
-        // Closing destroys the panel slot inside, whose own `connect_destroy`
-        // aborts its render subscription and releases the panel scope it was
-        // showing — refcounted across children (#921), so a drawer showing the
-        // same plugin keeps its renderer instances.
-        live.window.close();
-    }
-    if was_open {
-        crate::plugins::set_dialog_panel(None);
-        crate::plugins::set_dialog_visibility(None);
-    }
+    // Bind-then-act (#631): a GTK call made inside an `if let` on a `RefCell`
+    // scrutinee would hold the borrow across it.
+    let Some(live) = take_live() else {
+        return;
+    };
+    live.dismantle();
+    publish_dismissal();
 }
 
-/// Whether a dialog is currently up. Read by [`gtk_tests`] and by nothing
-/// shipped: the shell's own surfaces coordinate through the selection handle,
-/// not through this.
+/// Take the dialog down because the **shell** needs the screen and the keyboard:
+/// a #487 consent card or a Wi-Fi/VPN secret prompt is about to be raised
+/// (#1361 review, HIGH-1).
+///
+/// The other half of `may_raise`, covering the opposite arrival order — a
+/// dialog already up when a card goes up would otherwise sit *above* it (same
+/// layer, later surface) and swallow every press aimed at it. A no-op when no
+/// dialog is up, so both call sites can call it unconditionally.
+///
+/// `raised_by` names the surface taking over, for the journal line: the page
+/// vanishing under a prompt is a visible thing happening to the user, and this
+/// is the only record of why.
+pub fn yield_to_shell_prompt(raised_by: &str) {
+    let Some(live) = take_live() else {
+        return;
+    };
+    tracing::debug!(
+        raised_by,
+        "plugin dialog closed: the shell is raising its own keyboard-exclusive prompt",
+    );
+    live.dismantle();
+    publish_dismissal();
+}
+
+/// Take the dialog down because the plugin whose page it shows **disconnected**
+/// (#1361 review, LOW).
+///
+/// Without this the page blanks (`render_active_panel`'s `None` arm) but
+/// `dialog_panel_id` and the visibility contributor stay set, so every plugin in
+/// that sidebar family goes on being told `SlotVisible = true` until a human
+/// dismisses an empty card. Called from the scope releaser's departure sweep.
+///
+/// Publishes the dismissal **unconditionally once the selection matches**, not
+/// only when a window is up: the selection is the thing being cleared, and a
+/// surface that has somehow already gone must not leave it pinned.
+pub(crate) fn close_for_departed(plugin_id: &str) {
+    // The departure sweep can be driven without a live host — `pump_tests`
+    // drives the scope releaser directly — and the accessor below `.expect()`s
+    // the handles. Same guard, same reason, as
+    // `pump::request_preem_repaint_all_when_live`.
+    if !crate::plugins::host_is_live() {
+        return;
+    }
+    if crate::plugins::dialog_panel().as_deref() != Some(plugin_id) {
+        return;
+    }
+    tracing::debug!(
+        plugin = %plugin_id,
+        "plugin dialog closed: the plugin whose page it showed disconnected",
+    );
+    if let Some(live) = take_live() {
+        live.dismantle();
+    }
+    publish_dismissal();
+}
+
+/// Take the live dialog out of its slot, releasing the borrow before the caller
+/// touches GTK (#631). The single taker — every take-down path goes through it,
+/// so "at most one window" is a property of this module rather than of its
+/// callers.
+fn take_live() -> Option<LiveDialog> {
+    DIALOG.with(|d| d.borrow_mut().take())
+}
+
+/// The connector the dialog is currently up on, if any.
+fn live_connector() -> Option<String> {
+    DIALOG.with(|d| d.borrow().as_ref().map(|live| live.connector.clone()))
+}
+
+/// Clear the dialog's selection and drop its slot-visibility contribution —
+/// **one** visibility edge, whatever took the window down.
+///
+/// Clearing only the dialog's own selection is the §2.1 contract: the drawer's
+/// `active_panel_id` is never touched here, so a drawer showing another plugin's
+/// page on another monitor keeps showing it.
+fn publish_dismissal() {
+    crate::plugins::set_dialog_panel(None);
+    crate::plugins::set_dialog_visibility(None);
+}
+
+/// Whether a dialog is currently up. Read by this module's own tests and by
+/// `commands.rs`'s `dialog-close` test; nothing shipped reads it — the shell's
+/// own surfaces coordinate through the selection handle, not through this.
 #[cfg(all(test, feature = "system-tests"))]
-fn is_open() -> bool {
+pub(crate) fn is_open() -> bool {
     DIALOG.with(|d| d.borrow().is_some())
+}
+
+/// Put a live dialog on `connector` showing `plugin_id`, with the plugin host's
+/// handles installed — the state every take-down path acts on.
+///
+/// Everything except the layer surface itself is real: the window is a plain
+/// `gtk::Window` (nothing in this tree can build a layer one in a test, see
+/// [`gtk_tests`]), but the selection and the visibility contributor are
+/// published through the shipped setters, so a take-down that forgets one of
+/// them is visible to the caller. Resets the slot-visibility edge counter, so a
+/// test can assert the dismissal costs exactly one.
+///
+/// `pub(crate)` so `commands.rs`'s `dialog-close` test can seed the same state
+/// rather than grow a second, differently-wrong copy of it.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn seed_for_test(connector: &str, plugin_id: &str) -> gtk::Window {
+    hytte::reactive::registry::reset_for_tests();
+    crate::plugins::install_test_handles();
+
+    let window = gtk::Window::new();
+    window.set_child(Some(&build_root(plugin_id, &gtk::Label::new(Some("page")))));
+    DIALOG.with(|d| {
+        *d.borrow_mut() = Some(LiveDialog {
+            window: window.clone(),
+            connector: connector.to_owned(),
+            // A real `JoinHandle` with nothing behind it: the production one
+            // watches `niri::focused_output()`, which needs the niri service.
+            focus_sub: glib::MainContext::default().spawn_local(std::future::ready(())),
+        });
+    });
+    crate::plugins::set_dialog_panel(Some(plugin_id));
+    crate::plugins::set_dialog_visibility(Some(Mount::SidebarBottom));
+    crate::plugins::reset_visibility_edges();
+    window
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
 
-/// The focused output's monitor, or any mounted one — `modal::open_on_focused`'s
-/// fallback rule, so an unknown or absent focused output still shows the page
-/// somewhere rather than silently dropping the click.
-fn resolve_monitor(preferred: Option<&str>) -> Option<(String, Monitor)> {
+/// The focused output's connector, or the first mounted one —
+/// `modal::open_on_focused`'s fallback rule, so an unknown or absent focused
+/// output still shows the page somewhere rather than silently dropping the
+/// click. Deterministic since the map became a `BTreeMap`.
+fn resolve_connector(preferred: Option<&str>) -> Option<String> {
     MONITORS.with(|m| {
         let monitors = m.borrow();
         preferred
-            .and_then(|key| monitors.get_key_value(key))
-            .or_else(|| monitors.iter().next())
-            .map(|(key, monitor)| (key.clone(), monitor.clone()))
+            .filter(|key| monitors.contains_key(*key))
+            .map(str::to_owned)
+            .or_else(|| monitors.keys().next().cloned())
     })
 }
 
@@ -295,8 +701,41 @@ fn show(monitor: &Monitor, connector: &str, plugin_id: &str) {
         *d.borrow_mut() = Some(LiveDialog {
             window,
             connector: connector.to_owned(),
+            focus_sub: watch_focused_output(connector),
         });
     });
+}
+
+/// Take the dialog down when niri's focused output moves off the screen it was
+/// built on (#1361 review, MEDIUM-3).
+///
+/// A layer surface with `KeyboardMode::Exclusive` holds the keyboard for **its
+/// own** output, so once the focus moves the card keeps the grab on a screen the
+/// user has left: `Esc` no longer reaches it, and the only dismissals left are a
+/// click on the old output's catcher and the `dialog-close` bind. Rather than
+/// move the surface — which would mean rebuilding it, losing the page's preem
+/// animation state, and doing so on every glance at another screen — the page is
+/// dismissed, which is what a click anywhere outside it already does.
+///
+/// Subscribed per window and aborted with it, so there is at most one of these
+/// alive. The connector is re-checked inside, so an abort that loses a race can
+/// still not act on a *later* window.
+fn watch_focused_output(connector: &str) -> glib::JoinHandle<()> {
+    let built_on = connector.to_owned();
+    glib::MainContext::default().spawn_local(niri::focused_output().for_each(move |focused| {
+        // `None` (niri startup, no focused workspace) is not "somewhere else" —
+        // only a *named* other output is.
+        if focused.is_some_and(|out| out != built_on)
+            && live_connector().as_deref() == Some(&*built_on)
+        {
+            tracing::debug!(
+                output = %built_on,
+                "plugin dialog closed: the focused output moved off the screen it was built on",
+            );
+            close();
+        }
+        std::future::ready(())
+    }))
 }
 
 /// Which key presses dismiss the dialog: `Escape`, and nothing else.
@@ -450,6 +889,35 @@ fn set_title(plugin_id: &str) {
     }
 }
 
+// ── Hermetic tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    /// HIGH-1's second half is only a rule if the two shell surfaces actually
+    /// call it. A source scan, on `consent.rs`'s own
+    /// `request_never_names_a_decision_of_its_own` precedent: the *behaviour* of
+    /// [`super::yield_to_shell_prompt`] is pinned in `gtk_tests`, but
+    /// `consent::request` and `prompt::show_prompt` are not reachable from any
+    /// test — both need a live `Monitor` and a compositor to build their own
+    /// layer surface — so this is what stops the rule from living in a function
+    /// nobody calls.
+    ///
+    /// **Falsification:** delete either call → this reds, naming the file.
+    #[test]
+    fn the_shell_prompts_yield_the_dialog_before_they_raise() {
+        for (file, src) in [
+            ("consent.rs", include_str!("consent.rs")),
+            ("prompt.rs", include_str!("prompt.rs")),
+        ] {
+            assert!(
+                src.contains("dialog::yield_to_shell_prompt("),
+                "{file} must take any plugin dialog down before raising its own \
+                 keyboard-exclusive surface (#1361 HIGH-1)",
+            );
+        }
+    }
+}
+
 // ── GTK integration tests (need a display → gated to `system-tests`) ─────────
 
 /// The dialog's **shape**, driven through the same builders `show` mounts.
@@ -464,16 +932,38 @@ fn set_title(plugin_id: &str) {
 /// names them — and everything below the window is pinned here.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use super::{DIALOG, LiveDialog, build_root, close, is_open, set_title, wire_escape};
+    use super::{
+        DIALOG, build_root, close, close_all, close_for_departed, is_open, seed_for_test as seed,
+        set_title, wire_escape, yield_to_shell_prompt,
+    };
     use hytte::adw::{self, prelude::*};
     use hytte::gtk::glib::translate::IntoGlib;
     use hytte::gtk::{self, gdk};
+    use hytte::reactive::registry;
 
     /// A stand-in for the plugin panel slot: the real one `.expect()`s a
     /// registered `PluginHandles`, which a `#[gtk::test]` has no booted `App`
     /// to provide (the `build_panel_child` split's argument, one level up).
     fn body() -> gtk::Label {
         gtk::Label::new(Some("page"))
+    }
+
+    /// Assert the dialog is fully down: no window, no selection, and exactly
+    /// `edges` slot-visibility edge(s) published since [`seed`].
+    fn assert_dismissed(edges: u32) {
+        assert!(!is_open(), "the window must be taken down");
+        assert_eq!(
+            crate::plugins::dialog_panel(),
+            None,
+            "the dialog's own selection must be cleared"
+        );
+        assert_eq!(
+            crate::plugins::visibility_edges(),
+            edges,
+            "a dismissal publishes exactly one slot-visibility edge — a `watch` \
+             receiver cannot see a flap, so it is counted where it is emitted",
+        );
+        registry::reset_for_tests();
     }
 
     /// The drawer's window shape, reproduced: the `gtk::Overlay`'s **main**
@@ -540,14 +1030,7 @@ mod gtk_tests {
     #[gtk::test]
     fn opening_a_second_plugin_retitles_in_place() {
         adw::init().expect("libadwaita init");
-        let window = gtk::Window::new();
-        window.set_child(Some(&build_root("first", &body())));
-        DIALOG.with(|d| {
-            *d.borrow_mut() = Some(LiveDialog {
-                window: window.clone(),
-                connector: "DP-1".to_owned(),
-            });
-        });
+        let window = seed("DP-1", "first");
 
         set_title("second");
 
@@ -565,10 +1048,11 @@ mod gtk_tests {
             "a second open on the same output must retitle the live card, not build a window"
         );
 
-        // Leave the thread-local clean for the next test on this thread —
-        // `close()` reaches the plugin registry, which a `#[gtk::test]` has no
-        // booted `App` for, so the window is dropped by hand.
-        DIALOG.with(|d| *d.borrow_mut() = None);
+        // Through the real close path, which `seed`'s installed handles make
+        // reachable — and which leaves the thread-locals clean for the next test
+        // on this thread.
+        close();
+        assert_dismissed(1);
         window.destroy();
     }
 
@@ -623,6 +1107,74 @@ mod gtk_tests {
             "every other key must proceed into the plugin's page"
         );
 
+        window.destroy();
+    }
+
+    /// HIGH-1's second half: a shell prompt going up takes a live dialog **down**
+    /// first, so the card is never built underneath one. Publishes exactly one
+    /// dismissal edge, like every other take-down.
+    ///
+    /// The wiring — that `consent::request` and `prompt::show_prompt` actually
+    /// call this — is pinned by
+    /// `the_shell_prompts_yield_the_dialog_before_they_raise` below.
+    ///
+    /// **Falsification:** make `yield_to_shell_prompt` a no-op → `is_open()`
+    /// stays true and this reds.
+    #[gtk::test]
+    fn a_shell_prompt_takes_the_dialog_down_before_it_raises() {
+        adw::init().expect("libadwaita init");
+        let window = seed("DP-1", "demo");
+
+        yield_to_shell_prompt("consent card");
+
+        assert_dismissed(1);
+        window.destroy();
+    }
+
+    /// MEDIUM-3: a hot-plug rebuild destroys an open page — deliberate, matching
+    /// `modal::close_all` — and must publish exactly one dismissal edge, so the
+    /// plugin's `SlotVisible` is not left pinned by a surface that is gone.
+    ///
+    /// **Falsification:** drop `close()` from `close_all` → `is_open()` stays
+    /// true; drop the `publish_dismissal()` from `close` → the selection stays
+    /// set and the edge count is 0.
+    #[gtk::test]
+    fn a_hot_plug_takes_the_page_down_and_publishes_one_edge() {
+        adw::init().expect("libadwaita init");
+        let window = seed("DP-1", "demo");
+
+        close_all();
+
+        assert_dismissed(1);
+        window.destroy();
+    }
+
+    /// LOW: the plugin whose page is up **disconnects**. Without this the page
+    /// blanks but the selection and the visibility contributor stay set, so
+    /// every plugin in that sidebar family keeps being told `SlotVisible = true`
+    /// until a human dismisses an empty card.
+    ///
+    /// The second half is the guard that makes it safe to call for *every*
+    /// departing plugin: a different plugin leaving must not touch the dialog.
+    ///
+    /// **Falsification:** drop the `dialog_panel() != Some(plugin_id)` early
+    /// return → the second assertion reds (an unrelated departure dismisses the
+    /// page).
+    #[gtk::test]
+    fn a_departed_plugin_takes_its_own_page_down_and_only_its_own() {
+        adw::init().expect("libadwaita init");
+
+        let window = seed("DP-1", "showing");
+        close_for_departed("someone-else");
+        assert!(
+            is_open(),
+            "another plugin leaving must not dismiss this page"
+        );
+        assert_eq!(crate::plugins::dialog_panel().as_deref(), Some("showing"));
+        assert_eq!(crate::plugins::visibility_edges(), 0);
+
+        close_for_departed("showing");
+        assert_dismissed(1);
         window.destroy();
     }
 

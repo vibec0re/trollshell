@@ -191,8 +191,14 @@ pub use region::{
 };
 // The dialog overlay's half of the panel machinery (#1010): the same body the
 // drawer mounts, over the dialog's own selection. `overlays::dialog` is the only
-// caller of both.
-pub use region::{plugin_dialog_slot, set_dialog_panel};
+// caller of both — plus `dialog_panel`, which the scope releaser's departure
+// hook reads to decide whether the dialog is showing the plugin that just left.
+pub use region::{dialog_panel, plugin_dialog_slot, set_dialog_panel};
+// The slot-visibility **edge** counter (#1361 review, HIGH-2). Test-only: a
+// `watch` receiver coalesces a `true → false → true` flap into one latest-value
+// read, so the edge is counted where it is emitted instead.
+#[cfg(test)]
+pub(crate) use pump::{reset_visibility_edges, visibility_edges};
 // The dialog's contribution to the slot-visibility aggregates (#1010 §4), so a
 // sidebar plugin whose page is up in the dialog with the sidebar closed is still
 // told its slot is visible.
@@ -606,6 +612,66 @@ struct ListenerCtx {
     /// removes them at teardown. Shared (an `Arc<Mutex<…>>` pair inside) with the
     /// GTK effect broker, which does the actual query/result routing.
     datasource: DatasourceRouter,
+}
+
+/// Whether the plugin host's handles are in the registry at all.
+///
+/// The guard `pump::request_preem_repaint_all_when_live` already carries, in
+/// the one other shape that needs it: a GTK-thread hook can be driven **without
+/// a live host** — `pump_tests` drives the scope releaser directly — and every
+/// accessor below `.expect()`s the handles. `overlays::dialog`'s departure path
+/// reads that guard for the same reason (#1361 review, LOW).
+#[must_use]
+pub fn host_is_live() -> bool {
+    registry::with(|r| r.get::<PluginHandles>().is_some())
+}
+
+/// Install a bare [`PluginHandles`] into the thread-local registry, without
+/// booting the real host (no socket listener, no tokio tasks, no process-global
+/// `PLUGIN_RUNTIME`) — the `pump_tests::FixtureService` shape, hoisted here so a
+/// test **outside** this module can reach it (#1361 review, MEDIUM-1/MEDIUM-3).
+///
+/// `commands.rs`'s `dialog-close` test and `overlays::dialog`'s teardown tests
+/// both need one: every path they drive ends in `set_dialog_panel` /
+/// `set_dialog_visibility`, which `.expect()` these handles out of the registry,
+/// and `PluginHandles`' fields are private to this module so no caller can build
+/// one itself.
+#[cfg(test)]
+pub(crate) fn install_test_handles() {
+    struct TestService;
+
+    impl Service for TestService {
+        type Handles = PluginHandles;
+
+        fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+            PluginHandles {
+                sidebar_lead: Mutable::new(Vec::new()),
+                sidebar_top: Mutable::new(Vec::new()),
+                sidebar_bottom: Mutable::new(Vec::new()),
+                sidebar_right_lead: Mutable::new(Vec::new()),
+                sidebar_right_top: Mutable::new(Vec::new()),
+                sidebar_right_bottom: Mutable::new(Vec::new()),
+                bar_left: Mutable::new(Vec::new()),
+                bar_center: Mutable::new(Vec::new()),
+                bar_right: Mutable::new(Vec::new()),
+                panels: Mutable::new(Vec::new()),
+                active_panel_id: Mutable::new(None),
+                dialog_panel_id: Mutable::new(None),
+                clock_tx: watch::channel(None).0,
+                visibility_tx: watch::channel(false).0,
+                visibility_right_tx: watch::channel(false).0,
+                accent_tx: watch::channel(None).0,
+                spectrum_tx: watch::channel(None).0,
+                calendar_tx: watch::channel(Vec::new()).0,
+                now_playing_tx: watch::channel(NowPlaying::default()).0,
+                locked_tx: watch::channel(false).0,
+                effects_rx: RefCell::new(None),
+                datasource: DatasourceRouter::default(),
+            }
+        }
+    }
+
+    registry::install(Box::new(TestService), hytte::reactive::runtime::handle());
 }
 
 impl Service for PluginsService {

@@ -3994,14 +3994,16 @@ mod tests {
     /// What #1010 *does* reach in that plugin is its in-shell page — the card's
     /// title row and the no-window-binary fallback, both
     /// `Effect::OpenPage(Page::PluginSelf)` from a `Sidebar*` mount — which
-    /// lands in the dialog per §5, with no plugin change. That half is the test
-    /// above; this one pins that the window route was not swept up with it.
+    /// lands in the dialog per §5, with no plugin change. That claim belongs to
+    /// `the_broker_routes_plugin_self_by_the_producing_mount`, **not** to this
+    /// test (#1361 review, LOW): this one pins only that the window route is a
+    /// different effect kind and so cannot be swept up by the page rule at all.
     ///
-    /// **Falsification:** make `broker_open_page_with` the destination of
-    /// `RunCommand` too (or have `effect_kind` collapse the two) → the
-    /// `effect_kind` assertion reds.
+    /// **Falsification:** have `effect_kind` collapse a detached `RunCommand`
+    /// into the plain one, or route the window launch through an `OpenPage`
+    /// spelling → this reds.
     #[test]
-    fn the_agents_window_route_is_not_a_page_and_never_reaches_the_dialog() {
+    fn the_agents_window_route_is_not_a_page() {
         let window_launch = Effect::RunCommand {
             id: 3,
             argv: vec![
@@ -4014,21 +4016,13 @@ mod tests {
         assert_eq!(
             effect_kind(&window_launch),
             "RunCommand(detached)",
-            "the per-agent window is launched, not opened as a page"
+            "the per-agent window is launched, not opened as a page — so the #1010 \
+             routing rule, which takes a `Page`, has no spelling of it to act on"
         );
-
-        // And the routing rule is only ever consulted for a page: the seam
-        // takes a `Page`, so there is no spelling of the launch above that
-        // could reach either opener.
-        let called = Cell::new(false);
-        broker_open_page_with(
-            "agents",
-            Page::Settings,
-            Mount::SidebarLead,
-            None,
-            |_, _| called.set(true),
-            |_, _, _| called.set(true),
+        assert_eq!(
+            window_launch.required_capability(),
+            Some(hytte_plugin_proto::Capability::RunCommand),
+            "…and it is gated on a different capability than a page is",
         );
-        assert!(!called.get());
     }
 }

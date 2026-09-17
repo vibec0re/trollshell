@@ -773,6 +773,18 @@ pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String
             // `forget_departed_panel_scope` for why it must not be gated on the
             // refcount.
             super::region::forget_departed_panel_scope(&Scope::panel(gone));
+            // …and, since #1361's review (LOW), the **surface** showing that
+            // plugin's page. A dialog whose plugin disconnects renders blank
+            // (`render_active_panel`'s `None` arm) but keeps `dialog_panel_id`
+            // and `DIALOG_MOUNT` set, so every plugin in that sidebar family
+            // goes on being told `SlotVisible = true` until a human dismisses an
+            // empty card. The drawer has no equivalent leak: its `SlotVisible`
+            // contribution is the sidebar's open flag, not its selection.
+            //
+            // Reached from here rather than from a teardown hook in `session`
+            // for this loop's own reason: the authoritative departure lives on a
+            // tokio task, and this is the GTK-thread side of it.
+            crate::overlays::dialog::close_for_departed(gone);
         }
         resident = next;
     }
@@ -925,7 +937,7 @@ fn request_preem_repaint(moved: &[Scope]) {
         if !on_screen.is_empty()
             && moved
                 .iter()
-                .any(|scope| scope.role() == Role::Panel && on_screen.contains(scope.plugin_id()))
+                .any(|scope| scope.role() == Role::Panel && on_screen.shows(scope.plugin_id()))
         {
             request_remap(&handles.panels);
         }
@@ -1014,15 +1026,39 @@ fn request_preem_repaint_all() {
 /// Which plugins' panel trees are on screen right now: the drawer's selection,
 /// the dialog overlay's, or both (#1010 §2.1).
 ///
+/// A pair of `Option`s rather than a `HashSet`, because this is read on **every
+/// animation tick** — i.e. every preem frame — and a set would allocate a table
+/// plus up to two `String`s there for a membership test over at most two
+/// entries (#1361 review, LOW). The pre-#1010 code cloned one `Option<String>`;
+/// this clones two and allocates nothing else.
+struct PanelSelections {
+    drawer: Option<String>,
+    dialog: Option<String>,
+}
+
+impl PanelSelections {
+    /// Nothing is on screen — neither surface has a plugin selected.
+    fn is_empty(&self) -> bool {
+        self.drawer.is_none() && self.dialog.is_none()
+    }
+
+    /// Whether `plugin_id`'s panel is the one on screen in either surface.
+    fn shows(&self, plugin_id: &str) -> bool {
+        self.drawer.as_deref() == Some(plugin_id) || self.dialog.as_deref() == Some(plugin_id)
+    }
+}
+
+/// Read both panel selections at once.
+///
 /// The one place the two handles are read together, so the two callers above
 /// cannot drift into disagreeing about what "a panel is showing" means. Returns
 /// owned ids with both guards already dropped — every caller goes on to take the
 /// `panels` mailbox's write lock, and holding a `Mutable`'s read guard across
 /// that is the deadlock shape [`request_remap`] documents.
-fn panel_selections(handles: &PluginHandles) -> HashSet<String> {
+fn panel_selections(handles: &PluginHandles) -> PanelSelections {
     let drawer = handles.active_panel_id.lock_ref().clone();
     let dialog = handles.dialog_panel_id.lock_ref().clone();
-    [drawer, dialog].into_iter().flatten().collect()
+    PanelSelections { drawer, dialog }
 }
 
 /// [`request_remap`], but only if `mailbox` actually holds a render for one of
@@ -1265,7 +1301,7 @@ fn publish_right_visibility(visible: bool) {
 /// wake the per-conn tasks. Shared by both sides' publishers so they cannot
 /// drift apart.
 fn send_if_changed(tx: &watch::Sender<bool>, visible: bool) {
-    tx.send_if_modified(|current| {
+    let changed = tx.send_if_modified(|current| {
         if *current == visible {
             false
         } else {
@@ -1273,6 +1309,40 @@ fn send_if_changed(tx: &watch::Sender<bool>, visible: bool) {
             true
         }
     });
+    #[cfg(test)]
+    if changed {
+        VISIBILITY_EDGES.with(|c| c.set(c.get() + 1));
+    }
+    #[cfg(not(test))]
+    let _ = changed;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a slot-visibility aggregate actually **changed** on this
+    /// thread (#1361 review, HIGH-2).
+    ///
+    /// Counted where the change is emitted, because a `watch` **receiver cannot
+    /// see a flap**: `borrow_and_update` is latest-value, and a
+    /// `true → false → true` sequence between two polls coalesces into one
+    /// `has_changed()` reading `true`. That is exactly the class commit 2 fixed
+    /// — a rebuild that published the dismissal on its way — so the tests that
+    /// existed for §4 could not have caught it by construction. This counter can:
+    /// the rule is that a re-open publishes **zero** edges and a real dismissal
+    /// publishes **one**.
+    static VISIBILITY_EDGES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// How many slot-visibility edges have been published on this thread.
+#[cfg(test)]
+pub(crate) fn visibility_edges() -> u32 {
+    VISIBILITY_EDGES.with(Cell::get)
+}
+
+/// Zero the edge counter before a test's own sequence.
+#[cfg(test)]
+pub(crate) fn reset_visibility_edges() {
+    VISIBILITY_EDGES.with(|c| c.set(0));
 }
 
 // ── #906 item 1: `request_preem_repaint` end-to-end, not just its predicate ──

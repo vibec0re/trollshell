@@ -11,7 +11,7 @@
 //! tell is that focus snaps to the bar specifically; a failed IPC call
 //! would have left focus on the previous window.
 //!
-//! [`yield_to_niri_focus`] breaks the tie: right after the focus request it
+//! `yield_to_niri_focus` breaks the tie: right after the focus request it
 //! drops the host surface to `KeyboardMode::None`, releasing the grab so
 //! niri's window focus sticks, then re-arms `OnDemand` so popovers keep
 //! working. `OnDemand` only grabs on a fresh pointer press, so re-arming it

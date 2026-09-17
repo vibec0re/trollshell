@@ -10,23 +10,23 @@
 //! dimensions in the frame overlay — and those take a raw `i32` in pixels with
 //! no CSS unit to ride on. This module is the imperative counterpart to the
 //! `em` convention: author the value at the **design baseline** and wrap it in
-//! [`scale`] so it tracks font size / text-scaling the same way the CSS does.
+//! `scale` so it tracks font size / text-scaling the same way the CSS does.
 //!
 //! # Design baseline
 //!
-//! Sizes passed to [`scale`] are authored as if at the Adwaita/GNOME default:
+//! Sizes passed to `scale` are authored as if at the Adwaita/GNOME default:
 //! **font 11pt rendered at 96 DPI**, i.e. one `em` ≈
-//! `11 * 96 / 72 ≈ 14.667 px` ([`BASE_EM_PX`]). At that baseline [`scale`] is
+//! `11 * 96 / 72 ≈ 14.667 px` (`BASE_EM_PX`). At that baseline `scale` is
 //! a **no-op** — `scale(px) == px` — so introducing it changes nothing for a
 //! default-configured desktop. As the effective font grows (a larger
 //! `gtk-font-name` point size, or a text-scaling-factor / DPI bump carried via
-//! `gtk-xft-dpi`), [`scale`] grows the value proportionally.
+//! `gtk-xft-dpi`), `scale` grows the value proportionally.
 //!
 //! # What it deliberately does *not* track
 //!
 //! Monitor / `HiDPI` scale is applied **separately** by GTK: every value here is
 //! in *logical* pixels, and the compositor's fractional/integer monitor scale
-//! multiplies on top when the surface is composited. So [`scale`] must **not**
+//! multiplies on top when the surface is composited. So `scale` must **not**
 //! also multiply by the monitor scale factor — doing so would double-count it.
 //! It tracks font size + text-scaling only.
 //!

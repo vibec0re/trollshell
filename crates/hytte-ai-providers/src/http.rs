@@ -14,7 +14,7 @@
 //! This is deliberately **not** [`crate::chat`]'s agent: that one fixes a 2s
 //! connect timeout, disables `http_status_as_error` (a chat caller wants the
 //! JSON error body, not a bare status `Err`), and routes through
-//! [`crate::unix`] for `unix://` base URLs. A plain-fetch agent against a
+//! `crate::unix` for `unix://` base URLs. A plain-fetch agent against a
 //! public HTTP(S) API needs none of that — different timeouts per caller,
 //! default status-as-error behaviour, TCP only.
 //!

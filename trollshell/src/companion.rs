@@ -12,12 +12,12 @@
 //! front, and showing that decision on the row, is the only honest option.
 //!
 //! - **Desktop entry** (preferred): `nix/control-center.nix` installs
-//!   [`DESKTOP_ID`]. Activating it through `gio::AppInfo::launch` also means a
+//!   `DESKTOP_ID`. Activating it through `gio::AppInfo::launch` also means a
 //!   second click activates the *running* instance rather than starting a
 //!   twin, because the control center is a unique-application-id
 //!   `GApplication`.
 //! - **Binary on `PATH`** (fallback — e.g. a `cargo run` dev session where the
-//!   desktop entry was never installed): start [`BINARY`] detached through
+//!   desktop entry was never installed): start `BINARY` detached through
 //!   `launch.rs`'s `systemd-run --user` builder, the same mechanism
 //!   `workspace_stacks::app_launch` and the plugin host's detached
 //!   `RunCommand` (`plugins::effects::detached_launch`) already use, so it
@@ -29,11 +29,11 @@
 //!   review MED-2: `systemd-run` refuses a unit name still in use with "was
 //!   already loaded or has a fragment file", and `--collect` only frees a
 //!   name once the program *exits*).
-//! - **Neither**: [`Route::Missing`] — the row this feeds stays visible but
+//! - **Neither**: `Route::Missing` — the row this feeds stays visible but
 //!   insensitive, naming the binary, rather than a silent no-op.
 //!
 //! Routes are re-resolved on demand, not cached across the session
-//! ([`resolve`] is called both when the gear page's row is built and on every
+//! (`resolve` is called both when the gear page's row is built and on every
 //! `open-control-center` action activation, `commands.rs`) — installing the
 //! control center *while the shell is running* (a `nixos-rebuild switch`, a
 //! home-manager generation, `nix profile install`) makes both routes appear

@@ -3,11 +3,11 @@
 //!
 //! The host **listens** on one same-user socket
 //! (`$XDG_RUNTIME_DIR/trollshell/plugin.sock`); plugins are systemd user units
-//! that dial in and self-identify with [`PluginMsg::Register`]. Supervision is
+//! that dial in and self-identify with `PluginMsg::Register`. Supervision is
 //! systemd's job — a crash is just a disconnect. This module is the transport
 //! only: it does **not** spawn or supervise plugins (see the spec's topology).
 //! *Launching* declared plugins (as transient units via `systemd-run --user`)
-//! is [`crate::plugin_launcher`]'s job since #419 — the transport doesn't care
+//! is `crate::plugin_launcher`'s job since #419 — the transport doesn't care
 //! who spawned a connecting plugin.
 //!
 //! ## Topology & threading
@@ -15,7 +15,7 @@
 //! The UDS listener and every per-plugin read/write task run on the process-wide
 //! tokio runtime (`runtime::handle()`). The reconciler, the effect broker, and
 //! the clock pump run on the GTK main thread. The two sides are bridged **only**
-//! through [`futures_signals::signal::Mutable`] (tokio→GTK render mailbox) and a
+//! through `futures_signals::signal::Mutable` (tokio→GTK render mailbox) and a
 //! [`tokio::sync::watch`] channel (GTK→tokio clock state) — never a shared
 //! `Arc<Mutex>` threaded through widgets.
 //!
@@ -40,7 +40,7 @@
 //! not a one-shot event, so no #277 lossiness concern).
 //!
 //! The push is **opt-in via the manifest**: it goes only to a connection that
-//! subscribes [`StateKey::SlotVisible`] (#305), exactly like the `Clock`
+//! subscribes `StateKey::SlotVisible` (#305), exactly like the `Clock`
 //! snapshot. #294 originally sent it to *every* connection, which crash-looped
 //! plugins built against a pre-#294 proto that can't decode the variant — so
 //! visibility now obeys the same state-subset rule as every other host→plugin
@@ -52,7 +52,7 @@
 //! Sidebars are **per-monitor** and a plugin's card mirrors onto every monitor's
 //! sidebar region, so `visible` is the **OR across monitors**: `true` while *any*
 //! sidebar is open, `false` only once all are closed. The GTK side keeps a
-//! per-monitor open flag ([`SLOT_VISIBILITY_BY_MONITOR`](pump), fed by
+//! per-monitor open flag (`SLOT_VISIBILITY_BY_MONITOR`, fed by
 //! `sidebar.rs` via [`set_sidebar_visibility`] / [`forget_sidebar_visibility`] —
 //! the latter on monitor hot-unplug, so a disappearing monitor that held the only
 //! open sidebar drops `visible` to `false`) and publishes the aggregate only when
@@ -101,20 +101,20 @@
 //!   The three bar regions ([`Mount::BarLeft`] / [`Mount::BarCenter`] /
 //!   [`Mount::BarRight`]) render as bar **chips** (#349) — the plugin's `view()`
 //!   tree wrapped in a `.ts-plugin-chip` pill in the matching bar group. Both
-//!   sides share one reconciler path ([`build_region`](region)); a bar region
+//!   sides share one reconciler path (`build_region`); a bar region
 //!   just lays its cards out horizontally with the chip class. `SidebarLead`
 //!   (#301) leads the sidebar — its cards render *above* the built-in
 //!   weather/calendar/tasks cards, which `SidebarTop`/`SidebarBottom` (mounted
 //!   after them) cannot. A plugin (chip or card) may **also** define an optional
 //!   drawer *panel* (#349 PR2): a second `Node` tree carried on the render
-//!   frame's `panel` field, parked in the dedicated [`PluginHandles::panels`]
+//!   frame's `panel` field, parked in the dedicated `PluginHandles::panels`
 //!   mailbox and rendered by the per-monitor plugin drawer child
 //!   ([`plugin_panel_slot`]); the plugin opens it by emitting
 //!   `Effect::OpenPage(Page::PluginSelf)`. A chip/card need not have a panel
 //!   (`panel: None`).
-//! - **State:** [`StateKey::Clock`] (the snapshot pump), plus the opt-in
-//!   host→plugin pushes gated on their own keys — [`StateKey::SlotVisible`]
-//!   (#288), [`StateKey::Accent`] (#376), and [`StateKey::AudioSpectrum`] (the
+//! - **State:** `StateKey::Clock` (the snapshot pump), plus the opt-in
+//!   host→plugin pushes gated on their own keys — `StateKey::SlotVisible`
+//!   (#288), `StateKey::Accent` (#376), and `StateKey::AudioSpectrum` (the
 //!   ~20 Hz audio tap, #405; its capture is demand-gated on the subscriber's
 //!   card being on-screen since #559).
 //! - **Effects:** the **whole** wire vocabulary is brokered — [`Effect::OpenPage`]
@@ -137,9 +137,9 @@
 //!   catch-all, so a *new* effect variant is a compile error there rather than a
 //!   silent drop.
 //!   Capability **enforcement** is host
-//!   policy (#436): an effect whose [`Capability`] the plugin didn't declare in
+//!   policy (#436): an effect whose `Capability` the plugin didn't declare in
 //!   its manifest is dropped with a warn in the connection reader
-//!   ([`enforce_capabilities`](session)) before it ever reaches the broker,
+//!   (`enforce_capabilities`) before it ever reaches the broker,
 //!   making the manifest's "the host auto-grants from the manifest" model true.
 //!   Every brokered effect is now appended to a persisted audit log, and the
 //!   `RunCommand` round-trip is brokered too (both #510).
@@ -200,12 +200,12 @@ pub use region::{
 
 /// Signal that emits `true` while **some** monitor's *left* sidebar is open —
 /// the same aggregate the host pushes to left-mounted plugins as
-/// [`HostMsg::SlotVisibility`](hytte_plugin_proto::HostMsg::SlotVisibility)
+/// [`HostMsg::SlotVisibility`]
 /// (#288), surfaced to the binary so it can gate its own pollers on "a sidebar
 /// card can see this" (#840).
 ///
 /// **Left only since #1160**, and deliberately: the right sidebar keeps its own
-/// aggregate on [`PluginHandles::visibility_right_tx`], and
+/// aggregate on `PluginHandles::visibility_right_tx`, and
 /// `pump::publish_right_visibility` does not touch this mirror. Every consumer
 /// of this signal is a *left*-sidebar card — today's only one is the mpris
 /// position gate in `main.rs`, whose plugin-side consumer is the audio widget's
@@ -289,7 +289,7 @@ pub struct PluginState {
 }
 
 /// Snapshot the connected plugins' host-side runtime state for the `Control`
-/// endpoint (#423). Reads the production host's [`PLUGIN_RUNTIME`] mirror off the
+/// endpoint (#423). Reads the production host's `PLUGIN_RUNTIME` mirror off the
 /// tokio side; returns empty before the host publishes it (or under the
 /// per-connection tests, which never set it). Presence of an id here is the
 /// "connected" signal the control-center overlays onto its unit list.

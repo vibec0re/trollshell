@@ -8,8 +8,8 @@
 //!
 //! ## The seam
 //!
-//! [`picker_popover`] takes its rows as a plain `Vec<PickerEntry>` rather than
-//! reading `gio::AppInfo::all()` itself, and [`add_app_button`] is the one-line
+//! `picker_popover` takes its rows as a plain `Vec<PickerEntry>` rather than
+//! reading `gio::AppInfo::all()` itself, and `add_app_button` is the one-line
 //! wrapper that supplies the real ones. That is what makes §5's *"filtered to
 //! `NoDisplay=false`"* falsifiable: `gio::AppInfo` is a `GObject` interface with
 //! no constructor a test can reach, so a picker that filtered `AppInfo`s
@@ -18,12 +18,12 @@
 //! seam a `#[gtk::test]` hands it one hidden entry and one visible one and reads
 //! back which rows exist.
 //!
-//! The filtering itself is [`crate::components::desktop_entry::filtered`], pure
+//! The filtering itself is `crate::components::desktop_entry::filtered`, pure
 //! and separately tested; this module is the widget around it.
 //!
 //! ## Built on first open, not on construction
 //!
-//! [`add_app_button`] hands GTK a `create-popup-func` rather than a popover, so
+//! `add_app_button` hands GTK a `create-popup-func` rather than a popover, so
 //! the `AppInfo::all()` scan and the rows happen the first time someone clicks.
 //! The button is built inside `build_form`, which runs inside a `bind`
 //! apply-loop, so an eager build put that cost in the path of *opening the Edit

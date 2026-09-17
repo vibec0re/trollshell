@@ -5,8 +5,8 @@
 //! same widget the same way in both worlds; the SDK decides **at render time**,
 //! from the generation the host advertised in
 //! [`HostMsg::Hello`](crate::proto::HostMsg::Hello), whether that widget goes on the
-//! wire as a typed [`Node::Preem`](crate::proto::Node::Preem) or as a CPU-rasterised
-//! [`Node::Pixels`](crate::proto::Node::Pixels).
+//! wire as a typed [`Node::Preem`] or as a CPU-rasterised
+//! [`Node::Pixels`].
 //!
 //! ```ignore
 //! use hytte_plugin::display::{Gauge, StyleName};
@@ -39,7 +39,7 @@
 //!
 //! That is what lets one `update`/`view` pair serve both hosts. It also means a
 //! plugin talking to a preem-speaking shell does **no rasterisation at all** —
-//! no [`Frame`](crate::preem::Frame) is allocated *per render*, and no
+//! no [`Frame`] is allocated *per render*, and no
 //! needle/phosphor math runs — which is the CPU half of the win, next to the
 //! wire half. (Per *session* the stateful wrappers still build and hold their
 //! kit renderer, phosphor buffer included, in either mode: the widget is
@@ -89,7 +89,7 @@
 //! Against a host that never says `Hello` (an older shell, or one whose renderer
 //! isn't wired yet) the recorded generation stays at the manifest's
 //! *unconditional* [`vocab`](crate::proto::Manifest::vocab), which is below
-//! [`PREEM_VOCAB`](crate::proto::preem::PREEM_VOCAB) — so every widget here rasterises
+//! [`PREEM_VOCAB`] — so every widget here rasterises
 //! exactly as it does today. Version skew degrades to the status quo, never to
 //! a blank chip and never to a refused handshake.
 //!
@@ -155,7 +155,7 @@
 //! the skin's, so a pinned widget still reads as the same device. Both arms
 //! honor all three — the raster arm resolves the palette locally with
 //! [`preem::with_pins`](crate::preem::with_pins), so a pin looks the same
-//! against a shell that speaks preem and one that does not (see [`raster_ink`]
+//! against a shell that speaks preem and one that does not (see `raster_ink`
 //! for the one part of role resolution a plugin process cannot do).
 //!
 //! #912 shipped the ink alone and called widening it a non-goal; #884 measured
@@ -226,7 +226,7 @@ pub(crate) fn raise_negotiated(vocab: u16) {
 /// `0` before a session has started. A session that never receives a `Hello`
 /// sits at the manifest's unconditional
 /// [`vocab`](crate::proto::Manifest::vocab), which is below
-/// [`PREEM_VOCAB`](crate::proto::preem::PREEM_VOCAB) by construction.
+/// [`PREEM_VOCAB`] by construction.
 #[must_use]
 pub fn negotiated_vocab() -> u16 {
     NEGOTIATED.with(std::cell::Cell::get)
@@ -234,7 +234,7 @@ pub fn negotiated_vocab() -> u16 {
 
 /// Whether the host advertised the preem widget vocabulary (#882) — i.e.
 /// whether [`negotiated_vocab`] has reached
-/// [`PREEM_VOCAB`](crate::proto::preem::PREEM_VOCAB).
+/// [`PREEM_VOCAB`].
 #[must_use]
 pub fn host_speaks_preem() -> bool {
     negotiated_vocab() >= PREEM_VOCAB
@@ -249,10 +249,10 @@ pub fn host_speaks_preem() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RenderMode {
     /// CPU-rasterise with the kit and ship a
-    /// [`Node::Pixels`](crate::proto::Node::Pixels) — the status quo, and what an
+    /// [`Node::Pixels`] — the status quo, and what an
     /// unadvertised host gets.
     Raster,
-    /// Emit a typed [`Node::Preem`](crate::proto::Node::Preem); the shell draws it and
+    /// Emit a typed [`Node::Preem`]; the shell draws it and
     /// owns its animation.
     State,
 }
@@ -1265,7 +1265,7 @@ impl LedStrip {
     /// into the plugin-side peak-hold when one is declared and the host does not
     /// speak preem.
     ///
-    /// The reading is taken through [`level_reading`] — the strip's own rule, so
+    /// The reading is taken through `level_reading` — the strip's own rule, so
     /// a non-finite level reads as rest in **both** modes rather than as a `NaN`
     /// the raster arm silently absorbs and the state arm ships forever.
     pub fn set_level(&mut self, level: f32) {
@@ -1459,7 +1459,7 @@ impl Scope {
     /// State a fresh sample batch (a normalized `-1.0..=1.0` signal). Always
     /// recorded; stamps the plugin-side phosphor only in raster mode.
     ///
-    /// Every sample is taken through [`sample_reading`], the kit's own
+    /// Every sample is taken through `sample_reading`, the kit's own
     /// `sanitize` — which `Scope::advance` applies to each one anyway, so the
     /// rasterised trace is byte-for-byte unchanged, while the batch that goes
     /// on the wire can no longer carry a `NaN` that compares unequal to itself.
@@ -1773,7 +1773,7 @@ impl Gauge {
     /// the state arm did not, until #898's review (R2) caught it. The state arm
     /// below is `Needle::set_target`'s normalisation followed by
     /// `Needle::value`, i.e. the kit's own two lines, so the modes cannot drift.
-    /// A degenerate range is resolved through [`effective_range`] first, for the
+    /// A degenerate range is resolved through `effective_range` first, for the
     /// same reason: the kit **rejects** one rather than dividing by its zero
     /// span, so the raster needle is reading on the default `0.0..=1.0` scale
     /// whatever the config says, and the state arm has to read on that same

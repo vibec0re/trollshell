@@ -8,24 +8,24 @@
 //!
 //! NM has no per-network "known" flag; instead it stores connection *profiles*
 //! under `Settings`. Each refresh tick enumerates them once
-//! ([`nm_saved_connections`]) and matches by SSID, so visible networks report
+//! (`nm_saved_connections`) and matches by SSID, so visible networks report
 //! `known: true` with their connection object path. `forget`
-//! ([`nm_forget`]) deletes that profile via `Settings.Connection.Delete`.
+//! (`nm_forget`) deletes that profile via `Settings.Connection.Delete`.
 //!
 //! # Joining a network
 //!
-//! [`nm_connect`] branches on whether the target SSID already has a saved
+//! `nm_connect` branches on whether the target SSID already has a saved
 //! profile (the `known` flag [`crate::wifi::connect_network`] threads down from
 //! the scan snapshot):
 //!
 //! * **known** → `ActivateConnection` with `"/"` for the connection path, so NM
 //!   auto-selects the best stored profile for the AP.
 //! * **unknown** → `AddAndActivateConnection` with a freshly-built settings dict
-//!   ([`new_wifi_connection_settings`]). `ActivateConnection` can only *select*
+//!   (`new_wifi_connection_settings`). `ActivateConnection` can only *select*
 //!   an existing profile, so it can never join a never-before-seen network.
 //!
 //! Either way the dict/profile carries **no passphrase**: NM therefore asks the
-//! registered secret agent (see [`register_nm_agent`] and the `wifi::nm_agent`
+//! registered secret agent (see `register_nm_agent` and the `wifi::nm_agent`
 //! module) for it via `GetSecrets`, which drives the same prompt overlay the iwd
 //! backend uses.
 
@@ -62,7 +62,7 @@ type ConnectionSettings = HashMap<String, HashMap<String, OwnedValue>>;
 /// A saved `NetworkManager` wired (ethernet) connection profile, surfaced to the
 /// network panel so it can be activated / deactivated / forgotten.
 ///
-/// Built once per refresh tick by [`nm_wired_profiles`] from the
+/// Built once per refresh tick by `nm_wired_profiles` from the
 /// `802-3-ethernet` saved connections, joined against NM's active connections
 /// (for [`WiredProfile::active`]) and the ethernet devices (for
 /// [`WiredProfile::device_path`]).
@@ -86,7 +86,7 @@ pub struct WiredProfile {
 /// A saved `NetworkManager` VPN connection profile, surfaced to the VPN panel
 /// so it can be activated / deactivated.
 ///
-/// Built once per refresh tick by [`nm_vpn_profiles`] from the `vpn` saved
+/// Built once per refresh tick by `nm_vpn_profiles` from the `vpn` saved
 /// connections, joined against NM's active connections. Unlike a wired profile,
 /// a VPN does **not** bind to a device — it rides the primary connection — so
 /// activation passes `"/"` for both the device and specific-object. Deactivation

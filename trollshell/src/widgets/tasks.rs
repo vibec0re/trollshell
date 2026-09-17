@@ -1,7 +1,7 @@
 //! Sidebar tasks widget. Subscribes to
 //! [`hytte::services::tasks::tasks()`] and renders incomplete VTODOs from
 //! every EDS task list. Reads + writes go through libecal via
-//! [`hytte_services::tasks`], so the widget treats every task (local
+//! `hytte_services::tasks`, so the widget treats every task (local
 //! and remote-synced alike) as editable — the service handles per-
 //! backend transport.
 //!

@@ -8,7 +8,7 @@
 //! bottom two rows shouldn't power off the machine. The first activation
 //! arms the row (retitled, `destructive-action`, auto-reverts after a few
 //! seconds); the second activation within that window runs the real
-//! action. See [`power_action_row`] for the arm/disarm mechanics.
+//! action. See `power_action_row` for the arm/disarm mechanics.
 
 use std::cell::Cell;
 use std::rc::Rc;

@@ -12,10 +12,10 @@
 //! SSID is deployed everywhere.
 //!
 //! `NetworkManager` scans on its own cadence; we re-read every
-//! [`SCAN_INTERVAL`] on AC power, stretched to [`BATTERY_SCAN_INTERVAL`] (3x)
+//! `SCAN_INTERVAL` on AC power, stretched to `BATTERY_SCAN_INTERVAL` (3x)
 //! on battery (#505) — the visible set only changes when you physically move,
 //! so a leisurely poll is plenty either way. The wait is checked in
-//! [`RECHECK`]-sized steps rather than one fixed `tokio::time::interval`, so a
+//! `RECHECK`-sized steps rather than one fixed `tokio::time::interval`, so a
 //! power-state flip mid-wait is honoured within a few seconds instead of only
 //! on the next cycle.
 //!

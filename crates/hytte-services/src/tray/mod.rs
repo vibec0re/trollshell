@@ -18,8 +18,8 @@
 //! # Module layout
 //!
 //! The untrusted-input parsers (the `com.canonical.dbusmenu` layout tree and
-//! the `RegisterStatusNotifierItem` argument) live in [`parse`], which is
-//! pure and hermetically unit-tested; the menu data shapes live in [`types`].
+//! the `RegisterStatusNotifierItem` argument) live in `parse`, which is
+//! pure and hermetically unit-tested; the menu data shapes live in `types`.
 //! This file keeps the service, D-Bus, and signal-emit logic.
 
 mod parse;

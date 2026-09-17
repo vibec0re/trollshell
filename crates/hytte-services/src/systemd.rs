@@ -240,7 +240,7 @@ pub(crate) fn parse_plugin_id(unit: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
-/// `<id>` → `trollshell-plugin-<id>.service`. Inverse of [`parse_plugin_id`].
+/// `<id>` → `trollshell-plugin-<id>.service`. Inverse of `parse_plugin_id`.
 /// `pub` so the shell's declarative launcher (#419) names the transient unit
 /// it hands `systemd-run --user` with the same template.
 #[must_use]
@@ -328,7 +328,7 @@ pub(crate) fn merge_plugin_units(
 /// runtime + enablement state (#348). Two one-shot calls to the *user* manager
 /// (`systemd --user`, session bus): `ListUnitFilesByPatterns` for the installed
 /// set + enablement, `ListUnitsByPatterns` for live `ActiveState` +
-/// `Description`, merged by [`merge_plugin_units`].
+/// `Description`, merged by `merge_plugin_units`.
 ///
 /// # Errors
 /// Propagates any `hytte_bus` call error (e.g. no user manager reachable).
@@ -434,7 +434,7 @@ const WS_NAME_MAX: usize = 32;
 /// A valid workspace-stack name (#1071 §3.1).
 ///
 /// Lowercase ASCII alphanumerics with **single interior dashes** — no leading,
-/// trailing or doubled dash, non-empty, at most [`WS_NAME_MAX`] bytes.
+/// trailing or doubled dash, non-empty, at most `WS_NAME_MAX` bytes.
 ///
 /// This is stricter than [`is_valid_plugin_id`] and the difference is not
 /// stylistic. `-` is systemd's *slice-hierarchy separator*, so the name is
@@ -581,7 +581,7 @@ pub async fn unit_for_pid(pid: u32) -> Result<Option<String>> {
 
 /// Stop `unit` (a full unit name, e.g. `app-niri-foot-1234.scope`).
 ///
-/// `replace` mode, matching [`manage_unit`]. Stopping a unit that was never
+/// `replace` mode, matching `manage_unit`. Stopping a unit that was never
 /// created succeeds — measured: `systemctl --user stop` of an absent slice exits
 /// 0 — so Stop is idempotent and a caller need not check first.
 ///

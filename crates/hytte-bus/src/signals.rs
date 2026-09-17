@@ -94,7 +94,7 @@ pub enum SignalItem {
 
 /// Handle on a live signal subscription. Cloning is cheap and does not cancel;
 /// dropping the last clone tears down the subscription (push-based, via
-/// [`HandleTracker`]).
+/// `HandleTracker`).
 pub struct SignalSubscription {
     inner: Arc<SubInner>,
     tracker: Arc<HandleTracker>,

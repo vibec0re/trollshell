@@ -49,7 +49,7 @@
 //! row is exactly the "looks like it never existed" failure #1174 filed, so the
 //! row is kept and marked `Returned` instead.
 //!
-//! That exception is **bounded by name**: [`returned`] replaces any earlier
+//! That exception is **bounded by name**: `returned` replaces any earlier
 //! `Returned` row carrying the same [`TaskHealth::name`], so the table holds at
 //! most one per distinct supervised name — a few dozen, the same order as the
 //! live rows. A diagnostics view that never lies does not need an unbounded

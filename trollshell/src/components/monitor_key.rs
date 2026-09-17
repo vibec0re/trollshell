@@ -14,8 +14,8 @@
 //! address is *not* stable across a rebuild — the next `monitors_changed`
 //! cycle gets a fresh `GdkMonitor` at a new address — so a fallback-keyed
 //! entry can never be looked up again once its owning monitor is torn down.
-//! Callers that keep a per-monitor `HashMap` keyed by [`monitor_key`] MUST
-//! prune fallback-keyed entries in their `close_all` (see [`is_fallback_key`])
+//! Callers that keep a per-monitor `HashMap` keyed by `monitor_key` MUST
+//! prune fallback-keyed entries in their `close_all` (see `is_fallback_key`)
 //! or they leak one `Mutable` per hot-plug cycle for every connector-less
 //! monitor.
 

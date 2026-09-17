@@ -56,7 +56,7 @@
 //! them — `rows` included, since the key takes the word `"rect"` as readily as
 //! the variable did. It additionally takes the TOML integer `0` for the same
 //! automatic rectangle, which is what [`CoreLedsConfig::DEFAULT_TOML`] states,
-//! and [`rows_spelling`] maps that back onto the variable's vocabulary so
+//! and `rows_spelling` maps that back onto the variable's vocabulary so
 //! **one** parser decides both — [`CoreLedsConfig::parsed`] is the only path
 //! from raw spelling to [`CoreLeds`], so "what the file rejects" and "what the
 //! variable rejects" cannot drift. The one deliberate divergence is that `0`,
@@ -65,8 +65,8 @@
 //!
 //! # Live reload
 //!
-//! [`watch::Watcher`] polls every layer's change stamp on [`CONFIG_POLL_INTERVAL`]
-//! on AC power, [`BATTERY_CONFIG_POLL_INTERVAL`] on battery (#1041/#1081) — a
+//! [`watch::Watcher`] polls every layer's change stamp on `CONFIG_POLL_INTERVAL`
+//! on AC power, `BATTERY_CONFIG_POLL_INTERVAL` on battery (#1041/#1081) — a
 //! `(mtime, content hash)` read per layer per tick (`watch`'s own doc explains
 //! why a hash rather than a bare `stat`), re-parsing only when a stamp actually
 //! moves. A reload of a layer that is not TOML keeps the last good file layer
@@ -562,7 +562,7 @@ fill = "spare"
     /// Four [`env::removed`] calls, one per knob, mirroring the four
     /// [`env::key`] calls this replaced: a family #2 still mid-deprecation
     /// keeps calling `key`, one call per knob for the same reason (see
-    /// [`env`]'s module doc) — this is the shape its own step 3 will take.
+    /// [`mod@env`]'s module doc) — this is the shape its own step 3 will take.
     /// There is no `parse` argument any more: a variable that does nothing is
     /// never read for its value, only checked for whether it is set at all,
     /// so each call's only effect is the one warning [`env::removed`] emits
@@ -622,7 +622,7 @@ pub struct CoreLedsHandles {
 /// calls the **real** `start`. What is left unpinned is [`service`]'s three
 /// argument expressions — deliberately, and that is as thin as this can get
 /// without `set_var`: they are `xdg::config_layers`, `env::process_env` and
-/// [`self::on_battery`], each covered on its own elsewhere.
+/// `self::on_battery`, each covered on its own elsewhere.
 pub struct CoreLedsService {
     /// Layer paths, lowest precedence first.
     paths: Vec<PathBuf>,

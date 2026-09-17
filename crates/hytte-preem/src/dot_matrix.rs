@@ -366,7 +366,7 @@ impl DotMatrix {
 /// One dot cell's **radial falloff**, as plain, public data — what a renderer
 /// outside this crate needs to draw the same dot somewhere else.
 ///
-/// [`Dots`] itself is `pub(super)` and stays that way: it is the kit's own
+/// `Dots` itself is `pub(super)` and stays that way: it is the kit's own
 /// internal currency, shared with [`Marquee`](super::Marquee), and widening it
 /// would make every field a compatibility promise. What #1144's GPU renderer
 /// needs is narrower and honest as a snapshot — the clamped pitch and the
@@ -375,7 +375,7 @@ impl DotMatrix {
 /// hands out a [`Palette`](super::PaletteSnapshot).
 ///
 /// **Additive only.** Nothing in the kit reads this type; no render path
-/// changed to produce it. It is a projection of [`Dots`], and
+/// changed to produce it. It is a projection of `Dots`, and
 /// `the_published_cell_is_the_falloff_the_kit_stamps` asserts that projection
 /// is exact, so the two cannot drift without going red.
 ///

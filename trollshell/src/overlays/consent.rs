@@ -37,7 +37,7 @@
 //! answer it either way. `Esc` still dismisses (sending nothing), which is the
 //! deliberate no-op the card wants a key for.
 //!
-//! **Bounded (60 s).** Every prompt tears down after [`PROMPT_TIMEOUT`], so a
+//! **Bounded (60 s).** Every prompt tears down after `PROMPT_TIMEOUT`, so a
 //! wedged UI never leaves a card on screen; whether that teardown *sends* a
 //! decision is the table above. Every prompt resolves **exactly once** — the
 //! first of a button click, `Esc`, or the timeout wins and cancels the rest.
@@ -283,7 +283,7 @@ pub fn close_all() {
 
 /// Raise a consent prompt on the focused output and route the human's choice back
 /// to the requesting plugin over `outbound` as
-/// [`HostMsg::ConsentDecision`](hytte_plugin_proto::HostMsg::ConsentDecision),
+/// [`HostMsg::ConsentDecision`],
 /// keyed by `request_id` (#487 phase 1b). GTK-main-thread only (the effect broker
 /// runs there).
 ///

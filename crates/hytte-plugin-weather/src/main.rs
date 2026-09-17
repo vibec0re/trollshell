@@ -18,7 +18,7 @@
 //! the worker turns into an immediate fetch. Slot-visibility gating
 //! ([`Input::SlotVisible`], #288) is deliberately unused: at a 15-minute cadence
 //! there is nothing worth parking while the sidebar is closed. The manifest
-//! therefore does **not** subscribe [`StateKey::SlotVisible`], so under the
+//! therefore does **not** subscribe `StateKey::SlotVisible`, so under the
 //! opt-in push rule (#305) the host never sends the visibility frame at all —
 //! the reducer still folds a stray `SlotVisible` to a no-op as a belt-and-braces
 //! guard.

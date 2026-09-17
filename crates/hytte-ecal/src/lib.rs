@@ -7,7 +7,7 @@
 //!
 //! Every public method is **sync** and blocks. EDS spawns its own threads
 //! internally; libecal's GMainContext usage means a process-wide
-//! [`GMainContext`] must be iterated for some operations (notably async
+//! `GMainContext` must be iterated for some operations (notably async
 //! ones we don't use). The sync APIs we expose handle that themselves.
 //!
 //! Wrappers own their underlying GObjects and `g_object_unref` on drop.
@@ -52,7 +52,7 @@
 //! - **P2 — `GError**` out-param.** `&mut err` points at a live local
 //!   initialised to `ptr::null_mut()`, which is exactly what a `GError**`
 //!   out-param wants. The callee either leaves it null or stores a `GError`
-//!   it transfers to us; [`take_error`] reads and frees it at most once.
+//!   it transfers to us; `take_error` reads and frees it at most once.
 //! - **P3 — thread affinity.** `Registry`, `CalClient`, `CalClientView` and
 //!   `MainContext` are `!Send`/`!Sync` (raw pointers), so this crate never
 //!   lets two threads touch one object; no call here races another on the
@@ -237,7 +237,7 @@ unsafe extern "C" fn no_op_destroy(_: *mut c_void) {}
 // ── ESource ──────────────────────────────────────────────────────────────────
 
 /// One configured source. Cheap-to-clone? No — `Source` owns a ref;
-/// dropping calls `g_object_unref`. Borrow via [`Self::raw`] for sub-
+/// dropping calls `g_object_unref`. Borrow via `Self::raw` for sub-
 /// objects (like [`CalClient::connect`]) that don't take ownership.
 pub struct Source {
     raw: *mut sys::ESource,
@@ -604,7 +604,7 @@ impl CalClient {
     /// we already hold, independent of EDS backend state. The component's
     /// `EXDATE` properties (cancelled occurrences) are excluded and its
     /// `RDATE` properties (extra one-off occurrences) added — see
-    /// [`expand_component`].
+    /// `expand_component`.
     pub fn generate_instances(&self, start_unix: i64, end_unix: i64) -> Result<Vec<EventInstance>> {
         // Fetch every master component. We need the live `ICalComponent*`
         // (not the iCal string) to expand, so we walk the GSList ourselves
@@ -1827,7 +1827,7 @@ unsafe extern "C" fn no_op_closure_notify(_data: *mut c_void, _closure: *mut sys
 
 // ── MainContext ──────────────────────────────────────────────────────────────
 
-/// A private GLib [`GMainContext`], pushed thread-default on construction so
+/// A private GLib `GMainContext`, pushed thread-default on construction so
 /// EDS views created on this thread deliver their signals here (not to the
 /// global default context, which trollshell's GTK thread owns). Iterate it with
 /// [`MainContext::iterate`] to dispatch pending view signals.
@@ -1912,7 +1912,7 @@ unsafe impl Send for Waker {}
 unsafe impl Sync for Waker {}
 
 impl Waker {
-    /// Break a [`MainContext::iterate(true)`] out of its block so the owning
+    /// Break a `MainContext::iterate(true)` out of its block so the owning
     /// thread loops promptly (e.g. to pick up a newly-queued command).
     pub fn wake(&self) {
         // SAFETY: `self.raw` is the context this `Waker` holds its own ref to,

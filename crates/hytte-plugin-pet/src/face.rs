@@ -35,7 +35,7 @@
 //! # Blink
 //!
 //! [`is_blink`] is a pure hash of the frame counter (no RNG read in the render
-//! path, so [`crate::Pet::view`] stays pure): open-eyed moods shut their eyes
+//! path, so `crate::Pet::view` stays pure): open-eyed moods shut their eyes
 //! for one frame on a blink, roughly one in six ticks and never twice running.
 //! Sleepy eyes are already closed.
 //!

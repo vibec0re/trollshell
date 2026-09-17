@@ -8,7 +8,7 @@
 //! binaries over one shared library:
 //!
 //! - **`hytte-plugin-infobroker`** (`src/plugin.rs`) — a normal out-of-process
-//!   [`hytte_plugin`] widget: a bar chip + its own drawer [`panel`] (the
+//!   [`hytte_plugin`] widget: a bar chip + its own drawer `panel` (the
 //!   #349/#415 `View { tree, panel }` mechanism) listing grants, datasource
 //!   status, and a recent-requests audit trail, with per-row revoke/allow
 //!   buttons. It ALSO runs the broker socket server ([`broker::serve`]).

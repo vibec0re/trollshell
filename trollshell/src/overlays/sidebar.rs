@@ -9,7 +9,7 @@
 //! exclusive-zone machinery, revealer, scroller, settle re-assert and reflow
 //! nudge are shared code, and the four things that differ are the methods on
 //! [`Side`]. The one behavioural asymmetry is that the right surface is not
-//! mapped at all until a card shows on it ([`wire_non_empty`]); the left, never
+//! mapped at all until a card shows on it (`wire_non_empty`); the left, never
 //! being empty, is mapped at `install` exactly as it always was.
 //!
 //! ## Persistence + z-order
@@ -26,7 +26,7 @@
 //!
 //! `GtkRevealer` (`SlideRight`) animates the card's allocated width between 0
 //! and the card's open width on open/close. The exclusive zone is set
-//! **explicitly** from the open-state subscription ([`open_width`] open, `0`
+//! **explicitly** from the open-state subscription (`open_width` open, `0`
 //! closed) rather than driven by `auto_exclusive_zone_enable()` — the auto path
 //! failed to reclaim space cleanly on close (the bar stayed pushed even after
 //! the revealer settled at 0 width), so we drive it directly. Niri snaps tiles +
@@ -41,7 +41,7 @@
 //! strip than the surface paints: the sidebar overhangs the tile niri put beside
 //! it and swallows the window's left border and rounded corners, which niri
 //! draws just outside the window geometry in the 8 px strut gap
-//! (`etc/niri/frame.kdl`). [`open_width`] reads the live measurement instead —
+//! (`etc/niri/frame.kdl`). `open_width` reads the live measurement instead —
 //! the same "read live, not once" rule `frame.rs` applies to the bar's height
 //! (#441), and what this subsystem's own design spec asked for in the first
 //! place ("read revealer allocation",
@@ -75,7 +75,7 @@
 //!
 //! ## Scrolling
 //!
-//! The card stack sits in a [`gtk::ScrolledWindow`] ([`build_scroller`], #965).
+//! The card stack sits in a [`gtk::ScrolledWindow`] (`build_scroller`, #965).
 //! Without it a card taller than the surface simply overflowed: GTK allocates a
 //! widget at least its minimum height, the layer surface's height is the
 //! compositor's to give, and the excess was drawn past the bottom edge with no
@@ -92,11 +92,11 @@
 //! becomes scroll.
 //!
 //! The scroller is spliced **between** the `AdwClamp` and the card
-//! ([`build_clamped_scroller`], which `install` and the tests share so the tests
+//! (`build_clamped_scroller`, which `install` and the tests share so the tests
 //! measure the shipped nesting), so the revealer's child — the thing
-//! [`open_width`] measures — is the same `AdwClamp` it always was, and the
+//! `open_width` measures — is the same `AdwClamp` it always was, and the
 //! numbers reaching it through the scroller are the card's own; see
-//! [`build_scroller`] for why `hscrollbar_policy = Never` is what makes that
+//! `build_scroller` for why `hscrollbar_policy = Never` is what makes that
 //! true.
 //!
 //! The surface's own allocation is what bounds the viewport, and it follows the
@@ -115,13 +115,13 @@
 //! The frame overlay (`Layer::Overlay`, above the bar) reads
 //! [`current_visible_width`] each animation tick and shifts its cutout's
 //! left **and right** edges to match — the sidebar surface (below the frame)
-//! shows through the cutout. [`open_width`] is the authority on both sides, so
+//! shows through the cutout. `open_width` is the authority on both sides, so
 //! neither cutout edge can disagree with the strip niri reserved.
 //!
 //! Since #1247 every frame-facing accessor here — [`current_visible_width`],
 //! [`is_settled`], [`open_signal_on`] — takes a [`Side`], because the frame has
 //! two insets to compute and each follows its own surface. The left's answers
-//! are unchanged: [`effective_open`] is the identity on a side whose `non_empty`
+//! are unchanged: `effective_open` is the identity on a side whose `non_empty`
 //! is the constant `true`, so a left-only shell reads exactly what it read
 //! before.
 //!
@@ -139,7 +139,7 @@
 //! re-assert nudges niri to reflow the monitor's active workspace right after
 //! it commits the closed (`0`) zone — never on open, where niri already
 //! reflows its own reserve, and never on a redundant closed→closed re-assert;
-//! see [`should_reflow_after_close`] for the exact edge and
+//! see `should_reflow_after_close` for the exact edge and
 //! `hytte_services::niri::reflow_workspace` for the nudge itself (the same
 //! move-to-first/move-to-last/move-to-first chain
 //! `hytte-plugin-niri-layouts`'s `apply` sends after resizing columns, for
@@ -165,14 +165,14 @@ use crate::scale::scale;
 /// **Design-baseline** width of the sidebar surface when fully open, in CSS px,
 /// authored at the 1x baseline `crate::scale` documents (font 11pt @ 96 DPI).
 /// Matches the "frame border ~320px" geometry from the spec; the frame's cutout
-/// left edge animates from [`frame::FRAME_THICKNESS_I32`] (8) up to the open
+/// left edge animates from `frame::FRAME_THICKNESS_I32` (8) up to the open
 /// width while the sidebar reveals.
 ///
 /// This is the **floor**, not the final width: it is `scale()`d into the card's
 /// `set_size_request` and the `AdwClamp` bounds, and the surface still measures
 /// wider than that floor whenever a child's minimum width demands it. Everything
 /// that has to agree with what the surface *paints* — the exclusive zone and the
-/// frame's cutout left edge — goes through [`open_width`], never through this
+/// frame's cutout left edge — goes through `open_width`, never through this
 /// constant (#737).
 pub const SIDEBAR_WIDTH: i32 = 320;
 
@@ -188,7 +188,7 @@ pub const SIDEBAR_WIDTH: i32 = 320;
 /// left sidebar carries the built-in calendar/tasks cards and is therefore never
 /// empty, so it is mounted unconditionally; the right one holds nothing but
 /// plugin regions, so it is not mapped at all until a card shows there (see
-/// [`install_side`]).
+/// `install_side`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Side {
     /// The original sidebar: anchored `Left + Top + Bottom`, always mounted.
@@ -341,7 +341,7 @@ fn effective_open(open: bool, non_empty: bool) -> bool {
 
 /// Signal that emits the **left** sidebar's open/closed state for `monitor` —
 /// the one the bar chip drives and `components::open_refresh` re-runs on.
-/// Backed by [`SIDEBAR_OPEN`] so callers can subscribe before `install` has run
+/// Backed by `SIDEBAR_OPEN` so callers can subscribe before `install` has run
 /// for this monitor.
 pub fn open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
     open_signal_on(Side::Left, monitor)
@@ -350,7 +350,7 @@ pub fn open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
 /// [`open_signal`] for either side (#1247). The frame subscribes to **both**,
 /// because either slide moves one of its two insets.
 ///
-/// This is the raw open *intent*, not [`effective_open`]. On the left that is
+/// This is the raw open *intent*, not `effective_open`. On the left that is
 /// the whole story: `non_empty` there is the constant `true`, so intent and
 /// effective state never diverge. On the right it is **not** enough by itself
 /// — a card arriving or leaving flips `non_empty` independently of this
@@ -387,7 +387,7 @@ fn toggle_side(side: Side, monitor: &Monitor) {
 /// the `preferred` connector if one is installed there, else on any installed
 /// sidebar. Backs the `toggle-sidebar` `GAction` driven by a niri keybind —
 /// `preferred` is niri's focused output. Looks the connector up in the live
-/// [`PANELS`] map (not [`SIDEBAR_OPEN`]) so it targets a real installed surface
+/// `PANELS` map (not `SIDEBAR_OPEN`) so it targets a real installed surface
 /// and never conjures a dangling open-state entry for a nonexistent monitor.
 pub fn toggle_on_focused(preferred: Option<&str>) {
     if let Some(key) = installed_key(Side::Left, preferred) {
@@ -406,7 +406,7 @@ pub fn toggle_on_focused(preferred: Option<&str>) {
 /// produces no visible change *and* an open flag that silently decides the
 /// surface's fate the moment an unrelated plugin dials in — the sidebar would
 /// appear to open by itself. The read is synchronous off the panel's mirrored
-/// `non_empty` (see [`SidebarPanel::non_empty`]), so the decision is made
+/// `non_empty` (see `SidebarPanel::non_empty`), so the decision is made
 /// against what is on screen now, not against a value that lands on the next
 /// poll.
 ///
@@ -422,9 +422,9 @@ pub fn toggle_on_focused(preferred: Option<&str>) {
 ///
 /// Closing an empty sidebar is never surprising and it clears the latch, which
 /// is why the guard is `!non_empty && !open` rather than `!non_empty`. The
-/// alternative — clearing `SIDEBAR_OPEN` from [`wire_non_empty`] when the feed
+/// alternative — clearing `SIDEBAR_OPEN` from `wire_non_empty` when the feed
 /// goes false — would throw away intent the user may want back after a plugin
-/// restart, and put a second writer on [`SIDEBAR_OPEN`].
+/// restart, and put a second writer on `SIDEBAR_OPEN`.
 pub fn toggle_right_on_focused(preferred: Option<&str>) {
     let Some(key) = installed_key(Side::Right, preferred) else {
         tracing::debug!(
@@ -524,13 +524,13 @@ fn open_width_from_natural(natural: i32) -> i32 {
 }
 
 /// Currently visible width of `side`'s sidebar card on `monitor`, in CSS px —
-/// the measured [`open_width`] while that side is showing. Returns
+/// the measured `open_width` while that side is showing. Returns
 /// `frame::FRAME_THICKNESS_I32` when the sidebar is closed, empty, hasn't been
 /// installed yet, or the per-`(side, monitor)` panel is missing. The frame calls
 /// it **once per side** each animation tick to compute its two cutout edges
 /// (#1247).
 ///
-/// "Showing" is [`effective_open`], not the raw open flag: a right sidebar whose
+/// "Showing" is `effective_open`, not the raw open flag: a right sidebar whose
 /// last card left is latched `open` with a collapsed revealer and a released
 /// exclusive zone, and the frame must draw its right strut against the screen
 /// edge for it, not against a 320 px strip nothing is painting. The left's

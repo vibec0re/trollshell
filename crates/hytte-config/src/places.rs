@@ -819,7 +819,7 @@ fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     Some((meta.modified().ok()?, std::hash::Hasher::finish(&hasher)))
 }
 
-/// Watches `places.toml` for live reload by polling its [`stamp`] — mtime plus
+/// Watches `places.toml` for live reload by polling its `stamp` — mtime plus
 /// a content hash. Remembers the last-seen stamp so a poll only re-reads the
 /// file when it actually moved, and content-checks the reparse so a `touch`
 /// or no-op save doesn't churn a re-resolve.

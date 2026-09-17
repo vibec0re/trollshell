@@ -6,14 +6,14 @@
 //! 1. **`GeoClue2`** (`org.freedesktop.GeoClue2`, system bus). `GetClient` →
 //!    set `DesktopId` + `RequestedAccuracyLevel` (City) → subscribe
 //!    `LocationUpdated` → `Start`. We take the first location and stop; the
-//!    whole attempt is bounded by [`GEOCLUE_TIMEOUT`].
+//!    whole attempt is bounded by `GEOCLUE_TIMEOUT`.
 //! 2. **Env-var fallback** `TROLLSHELL_WEATHER_CITY`. Forward-geocoded via
 //!    Open-Meteo's geocoding endpoint. Used when `GeoClue2` is absent,
 //!    denied, or times out.
 //!
 //! The [`LocationState`] (Resolving → Resolved/Unavailable) is published on a
 //! `Mutable` exposed both via [`current`] (registry signal, for main-thread
-//! widgets) and via [`shared_location`] (a process-global clone, so
+//! widgets) and via `shared_location` (a process-global clone, so
 //! `weather`'s tokio task can read it without touching the thread-local
 //! registry).
 
@@ -238,10 +238,10 @@ pub fn current() -> impl Signal<Item = LocationState> {
 /// Re-run resolution: cancel any cached result and try `GeoClue2` + the env
 /// var again. Lets consumers recover from a transient failure.
 ///
-/// In-tree its caller is [`link_up_watcher`], which fires it on every link-up
+/// In-tree its caller is `link_up_watcher`, which fires it on every link-up
 /// edge; a shell author can also call it from a "refresh location" affordance.
-/// It is *not* the only thing that re-resolves — [`run_resolve_loop`] also
-/// retries a failed attempt on the [`RESOLVE_RETRY`] ramp all by itself, which
+/// It is *not* the only thing that re-resolves — `run_resolve_loop` also
+/// retries a failed attempt on the `RESOLVE_RETRY` ramp all by itself, which
 /// is what keeps a boot-time failure from being permanent on a host with no
 /// `networkd` (#1170).
 pub fn refresh() {
@@ -263,7 +263,7 @@ pub fn current_override() -> PlaceOverride {
 
 /// Switch to manual location: forward-geocode `city` and use it, ignoring
 /// `GeoClue2`. Triggers an immediate re-resolve. Fire-and-forget — a city that
-/// fails to geocode simply keeps the last good location (see [`resolve_loop`]).
+/// fails to geocode simply keeps the last good location (see `resolve_loop`).
 pub fn set_manual_city(city: String) {
     if let Some(s) = shared::get::<Shared>() {
         s.place_override.set(PlaceOverride {

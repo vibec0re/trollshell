@@ -342,7 +342,7 @@ fn shell_unreachable_error() -> hytte_bus::BusError {
 
 /// Apply one `ListAiKeys` completion — unless `generation` is older than the
 /// newest already applied, in which case it is dropped whole (#1003, mirrors
-/// [`crate::plugins_tab::on_poll_result`]'s #983 guard).
+/// `crate::plugins_tab::on_poll_result`'s #983 guard).
 fn on_ai_status_result(
     state: &AiKeysState,
     generation: u64,

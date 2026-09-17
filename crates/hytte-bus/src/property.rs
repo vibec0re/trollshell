@@ -38,7 +38,7 @@ struct PropertyInner<T> {
 
 /// Handle on a live property-tracking task. Cloning is cheap and does not
 /// cancel; dropping the last clone tears down the background task (push-based,
-/// via [`HandleTracker`]).
+/// via `HandleTracker`).
 pub struct PropertySignal<T> {
     inner: Arc<PropertyInner<T>>,
     tracker: Arc<HandleTracker>,

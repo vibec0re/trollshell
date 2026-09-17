@@ -4,7 +4,7 @@
 //!
 //! # How it differs from [`GlSurface`](crate::gl_surface)
 //!
-//! [`GlSurface`] draws a pipeline the *host* registered: several passes of
+//! `GlSurface` draws a pipeline the *host* registered: several passes of
 //! `&'static str` GLSL over a ping-pong accumulator, named by a
 //! [`GlProgram`](crate::gl_surface::GlProgram) key. Everything about it is known
 //! at compile time except the uniforms.
@@ -24,7 +24,7 @@
 //! data upload.** The cache is keyed by a hash of the assembled source (header +
 //! preamble + body) and holds the source itself alongside, so the hash is the
 //! fast path and the string compare closes the collision — see
-//! [`ProgramCache::ensure`]. It lives on the *instance* and dies with it: a
+//! `ProgramCache::ensure`. It lives on the *instance* and dies with it: a
 //! process-wide cache would have to outlive the GL context that linked its
 //! programs, and program objects are not portable across share groups the way a
 //! `&'static str` key is.
@@ -36,7 +36,7 @@
 //! widget is "compiling", so nothing has to hold a previous frame across one.
 //!
 //! Both of those bounds are per **source**, and each remembers the last
-//! [`WARNED_SOURCES`]/[`FAILED_SOURCES`] of them — the same number, fed in the
+//! `WARNED_SOURCES`/`FAILED_SOURCES` of them — the same number, fed in the
 //! same order, so a source that leaves one leaves the other. A one-entry latch
 //! let two broken sources alternating write a line every frame (#968's second
 //! review) and — until #1180 item 2, which is the same defect one field over —
@@ -58,7 +58,7 @@
 //!
 //! Two things about that clock, both consequences rather than choices, and both
 //! stated because a shader author can see them: it **wraps hourly**
-//! ([`TIME_WRAP_SECS`] — an `f32` of unwrapped seconds loses a quarter-second of
+//! (`TIME_WRAP_SECS` — an `f32` of unwrapped seconds loses a quarter-second of
 //! resolution after a month of uptime), and it **restarts on unmap/remap**,
 //! because `origin` is dropped with the GL objects in `unrealize` and a remap is
 //! genuinely a new first frame.
@@ -94,7 +94,7 @@
 //! # Sizing
 //!
 //! Measured exactly like [`PixelSurface`](crate::PixelSurface) and
-//! [`GlSurface`]: the node's `width`/`height` are the natural size, the minimum
+//! `GlSurface`: the node's `width`/`height` are the natural size, the minimum
 //! is `0` on both axes so CSS can scale it, the height is aspect-locked for the
 //! width it is offered, and the draw is letterboxed into the largest
 //! natural-aspect rect that fits — through the very same
@@ -118,7 +118,7 @@ use crate::gl_surface::{GLSL_HEADER, GlValue, abandon_gl, fit_rect};
 /// supplies this — the wire contract is fragment-only.
 const SHADER_VERT: &str = include_str!("shader_fullscreen.vert");
 
-/// The interface declarations spliced between [`GLSL_HEADER`] and a plugin's
+/// The interface declarations spliced between `GLSL_HEADER` and a plugin's
 /// fragment body, and **the versioned half of the contract** documented on
 /// [`Node::Shader`](crate::widget_tree::Node::Shader).
 ///

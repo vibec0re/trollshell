@@ -23,7 +23,7 @@
 //! reorder or a prop change reuses the existing widget (keeping focus,
 //! animation state, and avoiding flicker) instead of destroying it.
 //! Children *without* an id fall back to positional matching. The diff
-//! decision is factored into the pure, GTK-free [`plan_diff`] so its
+//! decision is factored into the pure, GTK-free `plan_diff` so its
 //! insert / remove / reorder / keyed-vs-positional behaviour is unit-tested
 //! without a display server.
 //!
@@ -92,7 +92,7 @@ pub enum EventKind {
     /// on a trailing-edge throttle (never one per raw motion tick) and **only**
     /// for user-driven changes — a programmatic re-render that moves the thumb
     /// does not fire it (the reconciler wires `change-value`, not
-    /// `value-changed`; see [`attach_slider`]).
+    /// `value-changed`; see `attach_slider`).
     ValueChanged {
         /// The slider's new position, clamped to its `min..=max`.
         value: f64,
@@ -125,29 +125,29 @@ pub enum EventKind {
 /// `set_tooltip_markup` would hand it a parser.
 ///
 /// It is a **mutable prop**, reconciled centrally rather than per variant (see
-/// [`node_tooltip`] and its two call sites in [`build_node`]/[`update_in_place`]),
+/// `node_tooltip` and its two call sites in `build_node`/`update_in_place`),
 /// so build and update cannot drift: a changed string retitles in place, and a
 /// drop back to `None` **clears** the tooltip instead of leaving a stale one
-/// stuck on the widget. It is not part of a node's identity — [`reusable`] keys
+/// stuck on the widget. It is not part of a node's identity — `reusable` keys
 /// on kind and id only — so a tooltip change never rebuilds a widget.
 ///
 /// Two refinements came with #961:
 ///
-/// - **Which widget it is armed on** is [`tooltip_target`]'s answer, not always
+/// - **Which widget it is armed on** is `tooltip_target`'s answer, not always
 ///   the node's own widget: an [`Expander`](Node::Expander) arms it on the
 ///   header button, because the node's widget is the outer box that also holds
 ///   the revealed body.
 /// - **[`Text`](Node::Text) has a default.** An ellipsizing `Text` with no
 ///   explicit tooltip gets its own full `text` as the hover, which is the only
-///   way a reader can see what the `…` swallowed. [`node_tooltip`] is where
-///   that derivation lives, so the snapshot in [`NodeDesc::tooltip`] records
+///   way a reader can see what the `…` swallowed. `node_tooltip` is where
+///   that derivation lives, so the snapshot in `NodeDesc::tooltip` records
 ///   the *effective* string and a later text change re-applies it. A derived
 ///   hover is a child's tooltip like any other, so inside an
 ///   [`Expander`](Node::Expander) header it wins over the header's own legend
 ///   — see the wire vocabulary's tooltip section for why that is left alone.
 ///
 /// A **blank** tooltip — empty *or* whitespace-only, derived or explicit —
-/// arms nothing: [`node_tooltip`] filters, because GTK normalises `""` but not
+/// arms nothing: `node_tooltip` filters, because GTK normalises `""` but not
 /// `"   "` and would pop an empty tooltip window on hover. Since an explicit
 /// value is read *before* the derived one, an explicit blank also **suppresses**
 /// the `Text` default rather than falling back to it, which is the plugin-side
@@ -205,8 +205,8 @@ pub enum Node {
         classes: Vec<String>,
         /// Drop the auto-created `GtkListBoxRow` wrappers' theme height floor
         /// (mutable prop; #966) by marking each with
-        /// [`DENSE_ROW_CLASS`](crate::widget_tree::DENSE_ROW_CLASS). See
-        /// [`apply_dense_rows`].
+        /// [`DENSE_ROW_CLASS`]. See
+        /// `apply_dense_rows`.
         dense: bool,
         /// Child nodes (typically [`Node::Row`]s), diffed by key/position.
         children: Vec<Node>,
@@ -263,7 +263,7 @@ pub enum Node {
         /// Hover text (`set_tooltip_text`), or `None` — which is **not** the
         /// same as "no tooltip": an `ellipsize: true` node with `None` here
         /// gets its own `text` as the hover, unless that text is blank (#961).
-        /// See [the tooltip section](Node#tooltips) and [`node_tooltip`], which
+        /// See [the tooltip section](Node#tooltips) and `node_tooltip`, which
         /// is where that default is applied.
         tooltip: Option<String>,
     },
@@ -282,7 +282,7 @@ pub enum Node {
     },
     /// A raster image: a `width`×`height` block of **RGBA8** pixels
     /// (`data`, row-major, 4 bytes/pixel `[R, G, B, A]`, non-premultiplied,
-    /// length `width * height * 4`), materialized by a [`crate::pixels`]
+    /// length `width * height * 4`), materialized by a `crate::pixels`
     /// `PixelSurface` and scaled up with **nearest-neighbor** filtering for
     /// crisp "LCD"-style pixels. `scale` (#358) is an integer upscale hint:
     /// the surface's natural size becomes `width*scale` × `height*scale`
@@ -435,7 +435,7 @@ pub enum Node {
     ///
     /// `value` is a **mutable prop** updated in place — but suppressed while the
     /// user is actively dragging, so a plugin echoing the value back can't fight
-    /// the grab (see [`update_in_place`]). Events are wired via the `change-value`
+    /// the grab (see `update_in_place`). Events are wired via the `change-value`
     /// signal (user-only) rather than `value-changed`, so a programmatic
     /// `set_value` never re-enters the event path — the `bind_two_way`
     /// feedback-loop problem, avoided structurally.
@@ -505,7 +505,7 @@ pub enum Node {
         classes: Vec<String>,
         /// Hover text for the **header button**, `None` for none (#961) — not
         /// for the outer box, which also holds the revealed body. See
-        /// [the tooltip section](Node#tooltips) and [`tooltip_target`].
+        /// [the tooltip section](Node#tooltips) and `tooltip_target`.
         tooltip: Option<String>,
     },
     /// A single-line text input — a `gtk::Entry` (#357). `id` is **required**
@@ -924,7 +924,7 @@ fn list_row_of(child: &gtk::Widget) -> Option<gtk::ListBoxRow> {
     child.parent().and_downcast::<gtk::ListBoxRow>()
 }
 
-/// The CSS class [`apply_dense_rows`] marks a dense list's auto-created
+/// The CSS class `apply_dense_rows` marks a dense list's auto-created
 /// `GtkListBoxRow` wrappers with. The rule that gives it meaning
 /// (`min-height: 0; padding: 0`) ships in the **library** stylesheet
 /// (`assets/hytte-ui/style.css`), because `dense` is part of the node

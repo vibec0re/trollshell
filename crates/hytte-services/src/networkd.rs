@@ -15,7 +15,7 @@
 //! At startup we probe (via [`crate::wifi_backend::probe_backend`]-style
 //! `ListNames`/`ListActivatableNames`) whether networkd is actually present and
 //! produces links; if it isn't and **`NetworkManager` is**, the link list is
-//! sourced from NM over D-Bus instead (see [`crate::networkd_nm`]), feeding the
+//! sourced from NM over D-Bus instead (see `crate::networkd_nm`), feeding the
 //! *same* [`Link`] list the panel already renders. This mirrors the #96 Wi-Fi
 //! `NetworkManager` backend. No `/sys` scraping (rejected on #80/#91).
 //!
@@ -30,11 +30,11 @@
 //!
 //! # A transient startup failure is not an absent daemon (issue #621)
 //!
-//! Once the probe has elected [`LinkBackend::Networkd`], a first `refresh` that
+//! Once the probe has elected `LinkBackend::Networkd`, a first `refresh` that
 //! fails cannot mean "networkd isn't here" — the probe just established that it
 //! is. It means the bus hiccuped in the microseconds since. That failure is
 //! therefore retried, unboundedly and audibly, rather than ending the task:
-//! see [`STARTUP_REFRESH_RETRY`].
+//! see `STARTUP_REFRESH_RETRY`.
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
@@ -142,7 +142,7 @@ pub struct RouteSummary {
 /// the signal the switch already bound to because there was exactly one
 /// consumer; here there are several, and most of them do not care.
 ///
-/// It is also **not** [`LinkBackend`]. That is the *decision* of which daemon to
+/// It is also **not** `LinkBackend`. That is the *decision* of which daemon to
 /// run a watcher against, and it is deliberately optimistic: an inconclusive
 /// probe still picks `NetworkManager` so the watcher can self-heal (#607). This
 /// is the *observation*, and it only names a source once that source has

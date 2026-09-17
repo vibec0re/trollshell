@@ -18,7 +18,7 @@
 //!
 //! # Toggle feedback (#599)
 //!
-//! "The next poll picks it up" is up to [`POLL_INTERVAL`] away, and the panel
+//! "The next poll picks it up" is up to `POLL_INTERVAL` away, and the panel
 //! rebuilds its rows from every emission — so without help the switch the user
 //! just flipped gets rebuilt from a reading that predates their toggle and moves
 //! back on its own. [`Output::enabled`] is therefore a
@@ -33,17 +33,17 @@
 //! the user's position indefinitely. #599 retired it for the model
 //! `nightlight` already used.
 //!
-//! [`reconcile`] owns the whole lifecycle, on the poller's own tick, so the echo
+//! `reconcile` owns the whole lifecycle, on the poller's own tick, so the echo
 //! and the give-up are one decision in one place:
 //!
 //! - niri's reading agrees with the intent ⇒ the write landed; retire it.
 //! - the connector is gone ⇒ there is nothing left to wait for; retire it.
-//! - neither, for longer than [`TOGGLE_GRACE`] ⇒ give up and retire it, so the
+//! - neither, for longer than `TOGGLE_GRACE` ⇒ give up and retire it, so the
 //!   switch falls back to niri's reading and the failure becomes visible.
 //!
 //! Polling (vs subscribing to a niri event stream) is the v1 choice for
 //! simplicity — niri 26.4 pushes no output event on its IPC event stream — and
-//! the lag is fine for a passive page. Swap [`poll_loop`]'s body to upgrade;
+//! the lag is fine for a passive page. Swap `poll_loop`'s body to upgrade;
 //! that one edit now covers both consumers.
 //!
 //! Kept separate from `niri.rs` because that module owns the long-lived
@@ -303,8 +303,8 @@ pub fn outputs() -> impl Signal<Item = Vec<Output>> {
 ///
 /// The request is *also* recorded as an intent on [`Output::enabled`] before the
 /// IPC round-trip, so the switch stays where the user put it across the row
-/// rebuilds that happen in between (#599). [`reconcile`] retires it — on niri's
-/// echo, or on [`TOGGLE_GRACE`] if that echo never comes.
+/// rebuilds that happen in between (#599). `reconcile` retires it — on niri's
+/// echo, or on `TOGGLE_GRACE` if that echo never comes.
 ///
 /// Call from the GTK main thread: the intent is recorded through the
 /// thread-local registry. Off-thread (or unregistered) the toggle still fires,

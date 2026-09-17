@@ -156,8 +156,8 @@ pub fn set_scroll_target(monitor: &Monitor, section: StatsSection) {
     });
 }
 
-/// Drop every [`PENDING_SCROLL`] entry whose connector isn't in `connectors`
-/// (#1177). Unlike this file's other per-monitor stashes, [`PENDING_SCROLL`]
+/// Drop every `PENDING_SCROLL` entry whose connector isn't in `connectors`
+/// (#1177). Unlike this file's other per-monitor stashes, `PENDING_SCROLL`
 /// had no `close_all`/`install` pair to re-key it on a `monitors_changed`
 /// hot-plug — a resource chip's [`set_scroll_target`] is the only writer, and
 /// a monitor that never clicks a chip again never gets its entry looked at,
@@ -183,8 +183,8 @@ pub fn prune_pending_scroll(connectors: &[String]) {
 /// #84 pattern) so five stacked cards can't push the drawer past screen
 /// height. A `"stats"`-prefixed `gio::SimpleActionGroup` carrying a `"scroll"`
 /// and a `"max-height"` action is inserted on the returned page widget by
-/// [`install_stats_actions`]: `"scroll"` re-applies the [`StatsSection`]
-/// pending in [`PENDING_SCROLL`] for the monitor named by its string parameter
+/// `install_stats_actions`: `"scroll"` re-applies the [`StatsSection`]
+/// pending in `PENDING_SCROLL` for the monitor named by its string parameter
 /// (#542), and `"max-height"` sets the viewport cap from the live per-monitor
 /// budget `crate::modal` measures (#701). Routing both through widget-local
 /// actions (rather than a cross-module registry keyed by monitor) is what lets
@@ -237,20 +237,20 @@ pub fn panel_stats() -> gtk::Widget {
 }
 
 /// The multicolumn stats flyout (#508) — the same five cards as [`panel_stats`]
-/// laid out in a 2-column [`page_grid`]: CPU | Memory, GPU | Disks, then
-/// Services spanning the last row. See [`attach_stats_cards`] for why that is
+/// laid out in a 2-column `page_grid`: CPU | Memory, GPU | Disks, then
+/// Services spanning the last row. See `attach_stats_cards` for why that is
 /// the arrangement.
 /// Opened from the resource chips when `TROLLSHELL_STATS_LAYOUT` is
 /// `multicolumn` (default) or unset; the chips still target the single
 /// `Page::Stats` (this replaces [`panel_stats`] for that page in multicolumn
 /// mode — see `crate::modal::build_page`).
 ///
-/// Uses a wider Stats-specific clamp ([`DRAWER_MAX_WIDTH_WIDE`]) via
-/// [`finish_page_clamped`] so two side-by-side history graphs each keep a usable
+/// Uses a wider Stats-specific clamp (`DRAWER_MAX_WIDTH_WIDE`) via
+/// `finish_page_clamped` so two side-by-side history graphs each keep a usable
 /// width instead of squeezing to ~330px inside the global `DRAWER_MAX_WIDTH`
 /// (680) cap — the answer to #508's "the panel got *smaller*" complaint.
 ///
-/// The #516 scroll-to-section deep-links survive: [`install_stats_actions`]
+/// The #516 scroll-to-section deep-links survive: `install_stats_actions`
 /// takes the `gtk::Grid` as its `compute_bounds` coordinate parent (the
 /// mechanism is container-agnostic), so a chip click still lands its card at the
 /// top of the shared `ScrolledWindow`.

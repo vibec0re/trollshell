@@ -11,7 +11,7 @@
 //! empty label, since apps expect it to be invoked rather than shown)
 //! burns a slot as a literal or blank "ghost" button. The toast overlay
 //! additionally wires the `default` action to the card's body-click
-//! gesture via [`default_action`].
+//! gesture via `default_action`.
 
 use hytte::services::notifications::Action;
 

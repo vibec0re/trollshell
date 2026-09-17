@@ -16,11 +16,11 @@
 //! - Otherwise (no standing grant) `auth` **parks** the socket request and fires
 //!   a consent prompt at the human (`Effect::RequestConsent` via the plugin,
 //!   #487). The decision resolves the parked request per
-//!   [`BrokerState::apply_consent`]: `AllowAlways`/`Deny` persist to grants.toml,
+//!   `BrokerState::apply_consent`: `AllowAlways`/`Deny` persist to grants.toml,
 //!   `AllowSession` mints a session-scoped token, `AllowOnce` a single-fetch
 //!   token. An unanswered prompt (a pre-1b / wedged host, or a genuinely ignored
 //!   one) times out to a **transient** deny + the 1a toast — the phase-1a
-//!   fallback ([`BrokerState::on_consent_timeout`]).
+//!   fallback (`BrokerState::on_consent_timeout`).
 //! - `get <datasource>` requires a valid token whose data-access authority
 //!   ([`TokenScope`]) — durable grant, session, or a single once — covers the
 //!   datasource; a spent/uncovered token is denied *without* a toast (re-auth to
@@ -349,7 +349,7 @@ pub enum Cmd {
     Allow { agent: String, datasource: String },
     /// The human's answer to a parked consent knock (#487 phase 1b), keyed by the
     /// `request_id` the broker minted for it. Routed to the matching parked
-    /// request rather than through [`BrokerState::apply_cmd`].
+    /// request rather than through `BrokerState::apply_cmd`.
     Decision {
         request_id: u64,
         decision: ConsentDecision,
@@ -1392,7 +1392,7 @@ async fn accept_or_park(
 /// client connections and panel commands until the command lane closes (the
 /// plugin session tearing down). The `BrokerState` — and so every in-memory
 /// token — is built fresh here, which is what drops session tokens on a shell
-/// restart; the *socket* is not, see [`SOCKET`].
+/// restart; the *socket* is not, see `SOCKET`.
 ///
 /// "Take", not "bind", in two senses (#995). A session that finds this process
 /// already owns the socket keeps it and never probes — probing would mean

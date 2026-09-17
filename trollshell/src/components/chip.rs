@@ -7,9 +7,9 @@
 //! 2. **Close** — wire `connect_clicked` to
 //!    [`crate::modal::toggle`]`(monitor, page, btn)`.
 //!
-//! [`indicator`] covers both steps; chips call it instead of repeating the
-//! boilerplate inline. [`indicator`] *always* wires a click-through to some
-//! drawer `Page`, so [`action_indicator`] covers the chip whose click is a
+//! `indicator` covers both steps; chips call it instead of repeating the
+//! boilerplate inline. `indicator` *always* wires a click-through to some
+//! drawer `Page`, so `action_indicator` covers the chip whose click is a
 //! one-shot command with no page to open — same CSS scaffold, but
 //! `connect_clicked` runs a caller-supplied closure (#578: the screencast
 //! privacy chip stopping the cast).
@@ -20,9 +20,9 @@
 //! from git history if a genuinely inert chip ever turns up.
 //!
 //! For the bar chips that display a small vertical fill bar (cpu / memory /
-//! gpu / disk), [`vertical_bar`] builds the `gtk::ProgressBar` with the
+//! gpu / disk), `vertical_bar` builds the `gtk::ProgressBar` with the
 //! standard orientation, inversion and alignment. The disk chip creates its
-//! bars dynamically inside a bind closure and calls [`vertical_bar`] there.
+//! bars dynamically inside a bind closure and calls `vertical_bar` there.
 
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;

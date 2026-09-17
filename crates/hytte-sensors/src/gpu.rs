@@ -247,7 +247,7 @@ fn read_nvidia_gpu() -> Option<GpuState> {
 }
 
 /// How long a successful Nvidia reading stays valid before
-/// [`read_nvidia_with_cache_at`] forks `nvidia-smi` again.
+/// `read_nvidia_with_cache_at` forks `nvidia-smi` again.
 ///
 /// The samplers that drive [`read_gpu_with_cache`] tick at 1 Hz (#1249), so
 /// this is picked against that tick, not against how fast the GPU's own
@@ -281,7 +281,7 @@ pub const NVIDIA_READING_TTL: Duration = Duration::from_millis(500);
 /// Per-tick GPU cache state threaded through the poll loop.
 ///
 /// Carried alongside each GPU tick so readers never need `Mutex` or `Arc`.
-/// Not [`Copy`] — [`nvidia_last`](Self::nvidia_last) carries a [`GpuState`],
+/// Not [`Copy`] — `nvidia_last` carries a [`GpuState`],
 /// which owns a `String`; callers that previously relied on `Copy` move the
 /// value out with [`std::mem::take`] instead (see
 /// `hytte-services::sensors::mod::poll_loop`, the existing precedent this

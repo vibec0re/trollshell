@@ -7,7 +7,7 @@
 //!
 //! # Why this exists
 //!
-//! `hytte_bus::own_name` has always published an [`OwnState`] per owned name,
+//! `hytte_bus::own_name` has always published an [`OwnState`](hytte::bus::OwnState) per owned name,
 //! and until #747 every caller in the tree dropped it as `_ownership`. So the
 //! one failure mode these two services actually have in the field — someone
 //! else got the name first — had no user-visible expression at all. Running
@@ -32,8 +32,10 @@
 //!
 //! # Which states get a tell
 //!
-//! Only [`OwnState::PermanentlyTaken`] and [`OwnState::Denied`].
-//! [`OwnState::Acquiring`] and [`OwnState::Lost`] are in-flight by design —
+//! Only [`OwnState::PermanentlyTaken`](hytte::bus::OwnState::PermanentlyTaken) and
+//! [`OwnState::Denied`](hytte::bus::OwnState::Denied).
+//! [`OwnState::Acquiring`](hytte::bus::OwnState::Acquiring) and
+//! [`OwnState::Lost`](hytte::bus::OwnState::Lost) are in-flight by design —
 //! `own_name` re-requests 250 ms after a loss and only latches
 //! `PermanentlyTaken` after several consecutive losses to the *same* holder, so
 //! every ordinary reconnect blip passes through them. Warning on those would

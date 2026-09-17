@@ -66,7 +66,7 @@
 //!   edit into a live reload. Adds `tokio` and `futures-signals`, because the
 //!   loop sleeps and publishes into a `Mutable`. The shell's dependency line
 //!   enables it; the control center's does not.
-//! - **`test-support`** — [`test_support`], the process-wide tracing global
+//! - **`test-support`** — `test_support`, the process-wide tracing global
 //!   default plus the capture, scratch-overlay and scratch-`$HOME` harnesses.
 //!   A cargo feature rather than `#[cfg(test)]` because `#[cfg(test)]` is
 //!   per-crate, and the tree had grown three incompatible copies of the same

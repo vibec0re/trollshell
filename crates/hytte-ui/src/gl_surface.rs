@@ -225,7 +225,7 @@ pub enum GlDraw {
 /// One shader pass.
 #[derive(Clone, Copy, Debug)]
 pub struct GlPass {
-    /// Vertex shader body, **without** a `#version` line — see [`GLSL_HEADER`].
+    /// Vertex shader body, **without** a `#version` line — see `GLSL_HEADER`.
     pub vertex: &'static str,
     /// Fragment shader body, without a `#version` line.
     pub fragment: &'static str,
@@ -335,12 +335,12 @@ thread_local! {
 /// Call **once per program at host startup**, on the GTK main thread, before
 /// any [`Node::GlSurface`](crate::widget_tree::Node::GlSurface) naming it is
 /// reconciled. A surface whose program is unregistered keeps whatever it last
-/// successfully drew and says so once (see [`PROGRAM_UNREGISTERED_REFUSED`]),
+/// successfully drew and says so once (see `PROGRAM_UNREGISTERED_REFUSED`),
 /// rather than failing the render.
 ///
 /// **A later call replaces the entry in this table, but it does not retract a
 /// refusal any surface has already latched against that name** (PR #1199
-/// review, LOW 6). A surface's [`BuildKey`] is `((cols, rows), GlProgram)` —
+/// review, LOW 6). A surface's `BuildKey` is `((cols, rows), GlProgram)` —
 /// the program *name*, not the pipeline behind it — so a pipeline that was
 /// refused, fixed, and re-registered under the same name is never handed back
 /// to the driver: the surface still believes that key will not build.

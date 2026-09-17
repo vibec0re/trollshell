@@ -77,7 +77,7 @@
 //!
 //! Each meter carries its own tooltip — `Session (5 h): 80% — resets in 2 h
 //! 15 min` — on the [`Node::Box`] wrapping it, since
-//! [`Node::Preem`](hytte_plugin::proto::Node::Preem) carries no tooltip field of
+//! [`Node::Preem`] carries no tooltip field of
 //! its own. GTK resolves a hover against the deepest widget under the pointer,
 //! so a meter's hover wins over the root's wherever the pointer is actually on
 //! one.
@@ -96,7 +96,7 @@
 //! footer rather than replacing it (see [`failure_footer`]).
 //!
 //! This is why the manifest now requests
-//! [`Capability::OpenPage`](hytte_plugin::proto::Capability::OpenPage) — the one
+//! [`Capability::OpenPage`] — the one
 //! capability it asks for. It still brokers no other effect, subscribes to no
 //! host state, and provides no datasource.
 //!
@@ -633,7 +633,7 @@ fn meter_tooltip(limit: &Limit, now: i64) -> String {
 }
 
 /// One chip meter: a level strip, wrapped in a box that can carry the tooltip
-/// [`Node::Preem`](hytte_plugin::proto::Node::Preem) has no field for.
+/// [`Node::Preem`] has no field for.
 ///
 /// The strip is built here rather than held in the model on purpose: this one
 /// drives no animation the shell owns — no peak-hold is declared, so its entire

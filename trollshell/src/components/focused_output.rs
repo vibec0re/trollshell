@@ -7,10 +7,10 @@
 //! hand-roll the same shape — a `thread_local! { static FOCUSED_OUTPUT:
 //! RefCell<Option<String>> }` plus its own `niri::focused_output()`
 //! subscription writing into it. This module is the one shared cache:
-//! [`install`] wires the subscription exactly once for the process
+//! `install` wires the subscription exactly once for the process
 //! lifetime (idempotent — there's no single boot-order-guaranteed call
 //! site, so every consumer calls it from its own setup path), and
-//! [`current`] reads the latest known value.
+//! `current` reads the latest known value.
 //!
 //! No bootstrap suppression: unlike the OSD's media/brightness/battery
 //! signals, callers want the latest known focused output even before the

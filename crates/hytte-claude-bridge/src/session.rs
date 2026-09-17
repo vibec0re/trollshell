@@ -125,7 +125,7 @@ const USER_DOMAIN: &str = "identity";
 /// second copy of the number that would be free to drift.
 pub const KEY_HEX_LEN: usize = 16;
 
-/// The status [`crate::backend::map_error`] gives `hive_claude::Error::PromptTooLong`
+/// The status `crate::backend::map_error` gives `hive_claude::Error::PromptTooLong`
 /// — i.e. the one failure a rotation can fix.
 ///
 /// Shared between the mapping and [`rotation_for`] (rather than written `413`
@@ -351,7 +351,7 @@ pub enum Rotation {
 ///
 /// It keys on the [`Failure`] rather than on `hive_claude::Error` because the
 /// typed sentinel is already funnelled through exactly one mapping
-/// ([`crate::backend::map_error`], via [`OVERFLOW_STATUS`]) and because the
+/// (`crate::backend::map_error`, via [`OVERFLOW_STATUS`]) and because the
 /// caller of this decision must sit *above* the backend — see
 /// `Bridge::retire`'s docs for why the pin has to outlive a cancelled retry.
 #[must_use]

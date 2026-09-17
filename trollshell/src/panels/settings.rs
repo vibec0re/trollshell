@@ -2,7 +2,7 @@
 //!
 //! - Dark mode — delegated to `hytte::services::theme`, which fans out across
 //!   GTK4/libadwaita, legacy GTK (gsettings + settings.ini), and Qt
-//!   (qt[56]ct.conf). The switch **binds** `theme::current_signal()` rather
+//!   (`qt[56]ct.conf`). The switch **binds** `theme::current_signal()` rather
 //!   than reading a snapshot at page mount: the service's value is seeded by
 //!   an async `gsettings get`, so a one-shot read taken while building the
 //!   page is `None` by construction, and `modal::ensure_page` caches this

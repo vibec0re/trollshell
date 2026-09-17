@@ -10,12 +10,12 @@
 //!
 //! Two fixes; pick per call site rather than uniformly:
 //!
-//! - [`plain_text`] flips the property off. Prefer it when the row wants no
+//! - `plain_text` flips the property off. Prefer it when the row wants no
 //!   markup at all: it covers title *and* subtitle in one call, and it keeps
 //!   covering them when a later `set_title` / `set_subtitle` (typically from a
 //!   `bind`) replaces the text — escaping only ever covers the one string you
 //!   remembered to wrap.
-//! - [`escape`] escapes a single string. Needed where markup *is* wanted
+//! - `escape` escapes a single string. Needed where markup *is* wanted
 //!   elsewhere in the same row (as `widgets/calendar.rs` does), and it is the
 //!   **only** option for `AdwPreferencesGroup`: its title and description
 //!   labels are hardcoded `use-markup="True"` in libadwaita's

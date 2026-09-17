@@ -37,11 +37,11 @@
 //! # Module layout
 //!
 //! The untrusted-input metadata parsers (the pure functions that pull fields
-//! out of an arbitrary player's `a{sv}` `Metadata` map) live in [`parse`],
+//! out of an arbitrary player's `a{sv}` `Metadata` map) live in `parse`,
 //! which is free of I/O and hermetically unit-tested. This file keeps the
 //! service, D-Bus, per-player-task, and signal-emit logic — including the
 //! bus-touching `read_metadata` orchestrator that fetches the map and hands
-//! it to [`parse::parse_metadata`].
+//! it to `parse::parse_metadata`.
 
 mod parse;
 
@@ -231,7 +231,7 @@ pub fn players() -> impl Signal<Item = Vec<Player>> {
 /// When a player has been pinned via [`select_player`] *and* it is still
 /// present in [`players`], that player (with fresh metadata cloned from the
 /// live list) wins. Otherwise we fall back to the Playing > Paused > first
-/// heuristic ([`pick_active`]). This means a pinned player that closes
+/// heuristic (`pick_active`). This means a pinned player that closes
 /// (vanishes from `players`) automatically reverts to the heuristic — the
 /// user is never stuck on a dead player.
 ///

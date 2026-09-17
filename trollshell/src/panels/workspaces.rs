@@ -7,7 +7,7 @@
 //!
 //! ## Where the cards come from
 //!
-//! Three sources, joined in [`model`], and the join is the substance of phase 2:
+//! Three sources, joined in `model`, and the join is the substance of phase 2:
 //!
 //! * **`workspaces.toml`** ([`crate::config::workspaces`]) decides which cards
 //!   exist and in what order. A saved stack is a card whether or not it is on a
@@ -16,7 +16,7 @@
 //!   lit, and which unnamed workspaces get an **ephemeral** card. §3.7 settles
 //!   that an unnamed workspace is a card like any other, with Edit → Save
 //!   creating its entry — so there is deliberately **no `+` button**.
-//! * **systemd** ([`crate::workspace_stacks::slices_up`]) is the other half of
+//! * **systemd** (`crate::workspace_stacks::slices_up`) is the other half of
 //!   the Active derivation (§3.3): a stack whose windows are all gone but whose
 //!   units linger is still Active, and still has something for Stop to do.
 //!
@@ -32,7 +32,7 @@
 //! Column **order**, since #1110, is the outputs' logical position — `(x, y)`
 //! as niri reports it, left-to-right then top-to-bottom, connector only the
 //! tie-break for two outputs at the same point. That position is not on
-//! `Workspace`, so [`model`] takes a second snapshot,
+//! `Workspace`, so `model` takes a second snapshot,
 //! `hytte::services::displays::outputs()`, purely for `Output::x`/`::y`; a
 //! connector the position snapshot hasn't (yet) caught up with falls back to
 //! `(0, 0)`, which degrades to the old connector-lexical order rather than
@@ -50,7 +50,7 @@
 //!
 //! The columns box is **homogeneous**, so the page's width divided by the number
 //! of columns *is* a column. Since #1219 the page therefore sizes itself from that
-//! count — [`crate::components::layout::workspaces_page_width`], 680 for one
+//! count — `crate::components::layout::workspaces_page_width`, 680 for one
 //! column, 732 for two, **960 for three** (Annika's number on #1219) and 1080 from
 //! four — rather than sitting at the widest supported layout whatever it renders,
 //! which drew a single 1080-px column around ~340 px of card on a one-monitor box.
@@ -62,18 +62,18 @@
 //! sort order (#1110) and can lag or be empty while niri already reports
 //! workspaces on two screens.
 //!
-//! [`bind_columns`] is the **only** writer of that width: it applies it to this
+//! `bind_columns` is the **only** writer of that width: it applies it to this
 //! page's own clamp on every model revision, so a monitor hot-plugged while the
 //! drawer is open resizes it. `modal::apply_workspaces_width_cap` re-floors the
 //! page on every show by reading that clamp's `maximum_size` straight back out
-//! ([`crate::components::layout::fill_page_to_its_cap`]) rather than a number
+//! (`crate::components::layout::fill_page_to_its_cap`) rather than a number
 //! published next to it — one place for the number, and no way for a reader to be
 //! a revision behind the writer.
 //!
 //! The Edit sub-page no longer follows this width at all. #1108 had tied the two
 //! together so the drawer would not jump on ✎, but a 680-px page makes a form with
 //! a ~150-px app list, which is what #1220 was filed about; since #1220 the form
-//! takes [`crate::components::layout::EDIT_FORM_WIDTH`] (960) at every screen
+//! takes `crate::components::layout::EDIT_FORM_WIDTH` (960) at every screen
 //! count and the jump on ✎ is accepted (Annika, #1219, 2026-09-13: *"Slight jump
 //! in edit form is ok."*).
 //!
@@ -82,9 +82,9 @@
 //! A card's screen is set by **dragging it into another monitor's column** —
 //! there is no monitor field anywhere in the UI, by design (Annika, on the epic
 //! thread) — and its place in the order by **dragging it onto another card**.
-//! A saved card carries a [`card_drag_source`] and a [`card_drop_target`]; every
-//! *connected* monitor's column carries a [`monitor_drop_target`]. One
-//! [`drop_plan`] decides both halves, so a drop on a card in another column
+//! A saved card carries a `card_drag_source` and a `card_drop_target`; every
+//! *connected* monitor's column carries a `monitor_drop_target`. One
+//! `drop_plan` decides both halves, so a drop on a card in another column
 //! records the screen **and** the position. Phase 3 shipped the screen half;
 //! the order half is phase 4, which is where §5 puts it.
 //!
@@ -98,8 +98,8 @@
 //!
 //! ## Testability seam
 //!
-//! [`panel_workspaces`] only supplies the signals; [`build_panel`] takes them
-//! generically and [`model`] is a pure function of one snapshot. Every accessor
+//! [`panel_workspaces`] only supplies the signals; `build_panel` takes them
+//! generically and `model` is a pure function of one snapshot. Every accessor
 //! it wraps `.expect()`s a registered `Registry`, so this split is what lets the
 //! page be driven from a bare `#[gtk::test]` with plain `Mutable`s — the same
 //! seam `widgets::workspaces::bind_workspace_pills` and

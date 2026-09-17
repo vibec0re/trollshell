@@ -17,13 +17,13 @@
 //! lazily on first use).
 //!
 //! Both the init and the caches are resilient (#432, shared machinery in
-//! [`crate::eds_retry`]): a failed worker init retries with backoff (the
+//! `crate::eds_retry`): a failed worker init retries with backoff (the
 //! boot race against evolution-data-server's own activation; user writes
 //! queued meanwhile are replayed), a cached client that errors is evicted —
 //! together with its live view — and reconnected (EDS restart / list
 //! removed), and repeated all-lists failures rebuild the whole session.
 //!
-//! Public functions enqueue [`Op`] variants onto the worker's channel
+//! Public functions enqueue `Op` variants onto the worker's channel
 //! and return immediately. Writes are fire-and-forget — errors are
 //! logged via `tracing::warn`. Reads are pushed to a `Mutable<Vec<Task>>`
 //! signal that subscribers (the sidebar widget) bind to.
@@ -37,7 +37,7 @@
 //! worker re-reads and updates the signal on each push, so external edits
 //! surface in ~instantly rather than on a poll boundary (issue #33).
 //!
-//! [`POLL_INTERVAL`] (5 min) remains only as a cheap safety net — a backend
+//! `POLL_INTERVAL` (5 min) remains only as a cheap safety net — a backend
 //! whose view stalls (transient D-Bus hiccup, a source added at runtime
 //! before its watch is wired) still reconciles within five minutes. It's
 //! deliberately long so the idle path stays quiet (no per-minute wakeups);

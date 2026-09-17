@@ -65,7 +65,7 @@
 //! * **Scales.** Mutter wants a discrete `supported_scales` list per mode; niri
 //!   does *true* fractional scaling. We offer `1.0` plus the 0.25-steps up to
 //!   `3.0` whose resulting logical size stays above a sane floor
-//!   ([`MIN_LOGICAL_PX`]) — a list niri can honor for real. We intentionally
+//!   (`MIN_LOGICAL_PX`) — a list niri can honor for real. We intentionally
 //!   relax Mutter's integer-logical-size constraint (niri isn't bound by it)
 //!   but never advertise a scale niri can't apply.
 //! * **Transform** maps 1:1 by index: both niri's `Transform` and Mutter's `u`
@@ -85,7 +85,7 @@
 //! read (niri socket blip) is ignored so it can't flip-flop the serial.
 //!
 //! The two request-driven paths — `GetCurrentState` and `ApplyMonitorsConfig` —
-//! still do their own [`crate::displays::query_outputs_raw`] round-trip: they
+//! still do their own `crate::displays::query_outputs_raw` round-trip: they
 //! must answer from niri's state *now*, not from an up-to-2 s-old snapshot.
 //!
 //! # Live-verify

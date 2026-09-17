@@ -1,6 +1,6 @@
 //! Current-weather service. Fetches Open-Meteo for the location resolved by
 //! [`crate::places`], maps WMO weather codes to freedesktop symbolic icons,
-//! and refreshes every [`POLL_INTERVAL`] (plus on demand via [`refresh`] and
+//! and refreshes every `POLL_INTERVAL` (plus on demand via [`refresh`] and
 //! whenever the location changes).
 //!
 //! `places::service()` MUST be registered before `weather::service()` in the
@@ -16,8 +16,8 @@
 //! which can name a different, nearby locality than the one
 //! [`crate::places`] (and the control-center's Place tab, over `GetPlace`)
 //! resolve for the exact same fix, showing two disagreeing place names for
-//! one location. [`fetch_weather`] now reuses `places`' own resolved name
-//! (see [`choose_location_label`]) in that case, so the two never diverge;
+//! one location. `fetch_weather` now reuses `places`' own resolved name
+//! (see `choose_location_label`) in that case, so the two never diverge;
 //! reverse-geocoding is kept only as a last-resort fallback.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};

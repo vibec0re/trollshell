@@ -50,15 +50,15 @@
 //! The recorded reason this was deferred — "it resolves asynchronously, so
 //! seeding at unit-start races the first fix" — is handled by resolving on the
 //! async side: a [`LocationState::Resolving`] state means the first fix is
-//! still in flight, and we simply *await* it (bounded by [`FIX_WAIT`], so a
+//! still in flight, and we simply *await* it (bounded by `FIX_WAIT`, so a
 //! wedged `GeoClue` degrades to step 2 rather than hanging the toggle).
 //!
 //! That await can outlast the user's patience, so every toggle is
-//! generation-stamped ([`Generation`]): a request that arrives while an earlier
+//! generation-stamped (`Generation`): a request that arrives while an earlier
 //! one is still parked supersedes it, and the superseded task drops its result
 //! instead of applying it over the newer state (#594).
 //!
-//! Correct is not the same as bearable, though, and up to [`FIX_WAIT`] of
+//! Correct is not the same as bearable, though, and up to `FIX_WAIT` of
 //! nothing-happening is what provokes that second toggle in the first place. So
 //! the wait is also *announced*: the toggle publishes a [`Pending<bool>`]
 //! rather than a bare bool — the unit's `ActiveState` plus, while a start is
@@ -350,7 +350,7 @@ pub fn enabled() -> impl Signal<Item = bool> {
 ///
 /// Turning it **on** first resolves coordinates (see the module docs:
 /// configured static coordinates → live fix → nothing), writes them to
-/// [`ARGS_FILE`], and
+/// `ARGS_FILE`, and
 /// only then runs `systemctl --user start wlsunset.service`. With no
 /// coordinates the unit is deliberately *not* started — starting it would just
 /// print a hint and exit 0, which is the silent no-op this whole path exists to
@@ -358,7 +358,7 @@ pub fn enabled() -> impl Signal<Item = bool> {
 ///
 /// Turning it **off** is an unconditional `systemctl --user stop`.
 ///
-/// Every call claims a [`Generation`], so a toggle-on that is still parked on a
+/// Every call claims a `Generation`, so a toggle-on that is still parked on a
 /// location fix when the next toggle arrives is superseded and drops out
 /// without starting the unit or touching `state` (#594). A toggle-on that has
 /// to park first publishes a pending state, so the row can say what it is

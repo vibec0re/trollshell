@@ -26,7 +26,7 @@ use zbus::object_server::Interface;
 /// connection, so callers can retire an agent (e.g. `NetworkManager`'s secret
 /// agent) without leaking a registration that a daemon might still call back
 /// on. Hold this for as long as the object should be served. Teardown is
-/// push-based (via [`HandleTracker`]): no polling.
+/// push-based (via `HandleTracker`): no polling.
 pub struct ExportHandle {
     tracker: Arc<HandleTracker>,
 }

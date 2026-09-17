@@ -339,7 +339,7 @@ pub const MIN_DOT_PX: u32 = 2;
 /// multiplies **both** axes. `clamp_strip_text` derives the dot matrix's
 /// character budget against the *clamped* pitch rather than against a fixed 24
 /// px (see [`MAX_STRIP_DIM`]) — capping the pitch and the character count
-/// independently would bound neither, the same trap [`fit_scale`] exists for.
+/// independently would bound neither, the same trap `fit_scale` exists for.
 pub const MAX_DOT_PX: u32 = 8;
 
 /// Cap on the magnitude of [`MarqueeConfig::speed_dots_per_sec`].
@@ -1395,7 +1395,7 @@ pub struct FlipBoardState {
 /// a placeholder and warn, never drop the session — but note that the
 /// negotiation contract (see the module docs) means it should not be able to:
 /// a plugin only emits `Preem` at all once the host advertised
-/// [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB) or better.
+/// [`PREEM_VOCAB`] or better.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PreemWidget {
     /// Static 5×7 dot-matrix text.
@@ -1488,7 +1488,7 @@ impl PreemWidget {
         }
     }
 
-    /// Enforce every [wire limit](crate::preem#wire-limits), returning the
+    /// Enforce every [wire limit](mod@crate::preem#wire-limits), returning the
     /// normalized widget.
     ///
     /// This is the shared enforcement point, deliberately in the protocol crate

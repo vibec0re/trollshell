@@ -7,7 +7,7 @@
 //! that mounts [`Mount::BarCenter`] renders its `view()` chip tree as a bar
 //! chip (where v1 dropped it), and its `HH:MM` chip is a clickable
 //! [`Node::Button`] that opens the drawer panel carried on the same
-//! [`View`](hytte_plugin::View) via [`Effect::OpenPage(Page::PluginSelf)`]. It links
+//! [`View`] via `Effect::OpenPage(Page::PluginSelf)`. It links
 //! **no GTK** (only [`hytte_plugin`]) and drives a real bar widget over the Unix
 //! socket — the bar-side twin of `hytte-plugin-clock-demo` (which mounts a
 //! sidebar card). A clock belongs in a bar, so it renders a compact `HH:MM` chip
@@ -148,7 +148,7 @@ impl Plugin for BarClock {
 
     /// Subscribes to `Clock`, mounts [`Mount::BarCenter`] — the center bar group.
     /// Requests [`Capability::OpenPage`] (#349 PR2) so its click can open its own
-    /// drawer panel via [`Effect::OpenPage(Page::PluginSelf)`]. `Manifest::new`
+    /// drawer panel via `Effect::OpenPage(Page::PluginSelf)`. `Manifest::new`
     /// stamps `proto = PROTO_VERSION`, exact-matched at the handshake.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::BarCenter);

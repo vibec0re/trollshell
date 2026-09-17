@@ -3,7 +3,7 @@
 //!
 //! The backend is probed at startup via [`crate::wifi_backend::probe_backend`],
 //! inside the service's own supervised task and retried while the probe is
-//! *inconclusive* (see [`probe_until_conclusive`]), so a system bus that is
+//! *inconclusive* (see `probe_until_conclusive`), so a system bus that is
 //! still coming up no longer latches "no wireless backend" for the process
 //! lifetime (#613). Widgets are backend-agnostic — they only see the public
 //! types and signal accessors exported from this module.
@@ -22,12 +22,12 @@
 //! - **A way to stop a supervised task.** `spawn_supervised` returns `()`, so
 //!   the outgoing watcher could not be stopped and would race the incoming one
 //!   to write the same `Mutable`s. [`hytte_reactive::spawn_supervised_handle`]
-//!   is the primitive #633 added for this; [`tear_down`] uses it and *waits*
+//!   is the primitive #633 added for this; `tear_down` uses it and *waits*
 //!   for the watcher to unwind before clearing anything.
-//! - **One place to reset per-backend state.** See [`IwdPaths`] on why the iwd
+//! - **One place to reset per-backend state.** See `IwdPaths` on why the iwd
 //!   path caches moved out of process-global `OnceLock`s and into the
-//!   [`WifiBackend`] payload, where NM's device path already lived.
-//! - **A rule for when to switch at all.** See [`switch_needed`]; the short
+//!   `WifiBackend` payload, where NM's device path already lived.
+//! - **A rule for when to switch at all.** See `switch_needed`; the short
 //!   version is that only a verdict naming a *different* daemon acts, so a
 //!   daemon restart is not mistaken for a backend change.
 //!
@@ -1276,7 +1276,7 @@ pub fn wired_forget(connection_path: &str) {
 
 /// Fire-and-forget: activate the saved VPN profile at `connection_path`
 /// (NM `ActivateConnection` with `"/"` for device + specific-object — a VPN
-/// rides the primary connection, see [`crate::wifi_nm::nm_activate_vpn`]).
+/// rides the primary connection, see `crate::wifi_nm::nm_activate_vpn`).
 ///
 /// NM-only: VPN profiles are surfaced solely by the `NetworkManager` backend, so
 /// this is a no-op on iwd / no backend. If the profile needs credentials NM

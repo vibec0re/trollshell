@@ -5,16 +5,16 @@
 //! private helper of either:
 //!
 //! * [`crate::workspace_stacks`] resolves a stack app's desktop-entry id to the
-//!   command that starts it ([`launchable`], [`exec_words`],
-//!   [`strip_field_codes`]). Until phase 4 an app with no `exec` override was
+//!   command that starts it (`launchable`, `exec_words`,
+//!   `strip_field_codes`). Until phase 4 an app with no `exec` override was
 //!   launched by running its **id** as a command, so `id = "org.mozilla.firefox"`
 //!   started nothing at all (#1106's own body says so).
 //! * [`crate::components::app_picker`] lists the entries the Edit sub-page's
-//!   **Add app** offers ([`installed`], [`filtered`]).
+//!   **Add app** offers (`installed`, `filtered`).
 //!
 //! ## Why the lookup is exact, unlike `app_meta`'s
 //!
-//! [`crate::components::app_meta::resolve_app_meta`] resolves an `app_id` to an
+//! `crate::components::app_meta::resolve_app_meta` resolves an `app_id` to an
 //! icon through three layers, two of them fuzzy — case-insensitive containment
 //! and an executable-basename match — because a *wrong* icon is a cosmetic
 //! problem and no icon at all is worse. Launching is the opposite: starting
@@ -39,7 +39,7 @@
 //! lets `workspace_stacks`' Start transaction resolve an entry from the tokio
 //! runtime without hopping to the GTK thread. Only the *activation* of a
 //! `DBusActivatable` entry needs the main thread, because that one really does
-//! go through `gio::AppInfo::launch` — see [`crate::workspace_stacks::Live`].
+//! go through `gio::AppInfo::launch` — see `crate::workspace_stacks::Live`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

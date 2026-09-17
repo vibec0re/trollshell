@@ -25,7 +25,7 @@
 //! On submit the form latches into a busy state — every entry insensitive,
 //! Connect insensitive, a spinner shown — so a click visibly registers and a
 //! second submit can't race the first. **Cancel stays live throughout** and the
-//! latch is bounded by [`SUBMIT_TIMEOUT`], so the prompt can never strand the
+//! latch is bounded by `SUBMIT_TIMEOUT`, so the prompt can never strand the
 //! user in a permanently busy window.
 //!
 //! What the latch deliberately does *not* claim is that the connection is being

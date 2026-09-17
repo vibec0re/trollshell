@@ -182,7 +182,7 @@ pub fn deny(id: i64) -> Request {
 ///
 /// `visible` is this window's only visibility source — **the compositor's own
 /// `GdkToplevelState::SUSPENDED`**, plus the map/unmap edges, wired in
-/// [`crate::window::watch_presentation`] — the mirror of
+/// `crate::window::watch_presentation` — the mirror of
 /// `hytte_plugin_agents::poll`'s `SlotVisible` gate for a surface that has no
 /// host to push one to it. Each tick this poll makes since #1146 is two round
 /// trips (`AgentStatus` then `Pending`), so a window nobody is being shown

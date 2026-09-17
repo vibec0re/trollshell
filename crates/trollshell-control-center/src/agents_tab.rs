@@ -19,7 +19,7 @@
 //!
 //! # It is the plugin's client, not a second one
 //!
-//! Everything on the wire — [`Request`](hytte_plugin_agents::hive::wire::Request),
+//! Everything on the wire — [`Request`],
 //! the row, the version check, the one-connection-per-request round trip, the
 //! `Status` precedence collapse, the `group` ordering and `agents.toml` itself
 //! — comes from `hytte-plugin-agents`, which exposes `hive`, `model`, `config`

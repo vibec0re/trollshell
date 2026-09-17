@@ -61,7 +61,7 @@ pub fn bytes(b: u64) -> String {
 ///
 /// A negative rate cannot happen (`hytte_sensors::compute_disk_io` sums
 /// non-negative deltas), but `.max(0.0)` is one clause cheaper than trusting
-/// that forever, and matches [`crate::sample::finite_or_zero`]'s "never draw
+/// that forever, and matches `crate::sample::finite_or_zero`'s "never draw
 /// a number that cannot be a real reading" rule.
 #[must_use]
 pub fn rate(bps: f64) -> String {

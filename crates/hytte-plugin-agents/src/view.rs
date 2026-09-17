@@ -29,7 +29,7 @@
 //! | `deployed` / `parent` / `status set` | dropped outright — the three rows she listed by name |
 //! | the `agent page` link | the drawer page keeps it, as the "open it in the browser instead" fallback to #950's `WebView` |
 //! | the pause/resume button | the drawer page; the mock has two buttons and `[startstop]` is the one she drew |
-//! | the status line's **wrapping** | its own hover — @kaesaecracker's second retest (2026-09-11) caught it making rows different heights; see [`status_caption`] |
+//! | the status line's **wrapping** | its own hover — @kaesaecracker's second retest (2026-09-11) caught it making rows different heights; see `status_caption` |
 //!
 //! **The row itself is deliberately not clickable.** Her spec is "click on
 //! agent opens agent page in trollshell-webview", which is
@@ -57,7 +57,7 @@
 //!    live except the enclosing row's `Box`, which put one legend over every
 //!    glyph in the row. Now the string that got cut carries its own hover —
 //!    which is what lets line 2 be a single ellipsized line without losing the
-//!    tail (see [`status_caption`]), and why the hover stays on that `Text`
+//!    tail (see `status_caption`), and why the hover stays on that `Text`
 //!    rather than moving back up to the row.
 //! 3. **[`Node::ListBox`] can be `dense`** (#966/#969). The host materializes a
 //!    `ListBox` as a real `GtkListBox`, which auto-wraps every child in a
@@ -303,7 +303,7 @@ const GROUP_CHARS: i32 = 22;
 ///   (`crates/hytte-plugin-proto/src/wire.rs`) keeping the prefix, with one
 ///   `tracing::warn!` per plugin per shell run — i.e. a silently short roster
 ///   on exactly the runaway hive the bound exists for. At ~7 nodes per
-///   [`panel_roster_row`] that ceiling is around 580 rows, so 200 sits well
+///   `panel_roster_row` that ceiling is around 580 rows, so 200 sits well
 ///   under it with the rest of the page's nodes to spare, and far enough above
 ///   any real hive that the `+N more` line is a statement about the hive rather
 ///   than about this plugin.

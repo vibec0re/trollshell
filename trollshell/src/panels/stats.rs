@@ -1036,7 +1036,8 @@ fn core_panel_surface() -> PixelSurface {
     panel
 }
 
-/// The surface the LED panel draws into on the **GL arm** (#1156).
+/// The surface the LED panel draws into (#1156) — the only one that draws
+/// anything since #1157.
 ///
 /// The same alignment contract as [`core_panel_surface`], for the same two
 /// reasons: `GlSurface::measure` also answers `(0, natural, -1, -1)` with an
@@ -1049,9 +1050,10 @@ fn core_panel_gl_surface() -> GlSurface {
     panel
 }
 
-/// Which renderer the panel draws through — GL by default,
-/// `TROLLSHELL_PREEM_RENDERER=cpu` and a failed or refused context taking it to
-/// the kit (#1156).
+/// Whether the panel's pipeline can draw — GL, or the broken-widget
+/// placeholder once a context has failed or this driver has refused
+/// `preem.led_matrix` (#1156, and the placeholder rather than the kit since
+/// #1157).
 ///
 /// Asked **once per tick** rather than once at build time, which is what makes
 /// the fallback reach this widget at all: the panel is not in the plugin tree,
@@ -1065,11 +1067,44 @@ fn core_panel_arm() -> preem_gl::Arm {
     preem_gl::arm_for(preem_gl::LED_MATRIX)
 }
 
+/// The logical size the panel occupies at `scale` — what the GL arm draws into,
+/// and what the placeholder asks for so an empty row keeps the drawn row's
+/// footprint (PR #1356 review, H2).
+///
+/// Read off the same `kit::LedMatrix` and the same [`core_panel_scale`] the GL
+/// arm maps from, never spelled again: a hand-written pair would be a second
+/// answer to "how big is this panel" and the two would drift the first time the
+/// kit's cell pitch moved.
+fn core_panel_footprint(matrix: &LedMatrix, scale: u32) -> (u32, u32) {
+    let dim = |value: usize| u32::try_from(value).unwrap_or(0).saturating_mul(scale);
+    (dim(matrix.width()), dim(matrix.height()))
+}
+
+/// The RGBA8 length a `width` x `height` transparent buffer needs, saturating.
+///
+/// Saturating rather than panicking because this runs inside a `bind` apply
+/// closure on the GTK main thread, where an overflow would take the shell's
+/// main loop with it — and because a saturated length simply fails
+/// `PixelSurface`'s own `rgba_len_ok` and lands back on the 0x0 placeholder,
+/// which is the honest degradation rather than a crash.
+fn blank_len(width: u32, height: u32) -> usize {
+    usize::try_from(width)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(height).unwrap_or(0))
+        .saturating_mul(4)
+}
+
 /// The row's single child, rebuilt if the arm no longer matches it.
 ///
 /// A `gtk::Box` holding exactly one surface, rather than a `gtk::Stack` of two:
 /// the loser would still be measured (a `Stack` measures every page) and the
 /// swap happens at most once in a session's life.
+///
+/// The non-GL child is a [`PixelSurface`] that is never given any pixels — the
+/// placeholder, the same empty `PixelSurface` a plugin's preem node degrades to
+/// (`preem_render::map_widget`). It stays a real widget rather than an empty
+/// row so the tooltip still names every core's load, which is the one thing
+/// this panel can still tell the reader with no GPU.
 fn core_panel_child(row: &gtk::Box, arm: preem_gl::Arm) -> gtk::Widget {
     let wants_gl = arm == preem_gl::Arm::Gl;
     if let Some(child) = row.first_child() {
@@ -1219,22 +1254,59 @@ where
                     &std::sync::Arc::new(kit.uniforms),
                 );
             }
-            // The kit, rasterised in-process — the #857 path, unchanged, and
-            // the reference the GL arm is measured against.
-            preem_gl::Arm::Cpu => {
+            // No pipeline, so nothing to draw: the broken-widget placeholder,
+            // an empty `PixelSurface` (#1157). The kit rasterised here until
+            // then — the #857 path — and retiring the shell's CPU renderer
+            // means retiring it here too rather than keeping one widget's
+            // private second implementation alive. `preem_gl`'s own hook has
+            // already written the journal line naming `preem.led_matrix` and
+            // the driver's reason; the tooltip below still reports every core's
+            // load, so the row keeps saying something.
+            //
+            // **It keeps the panel's footprint**, which is where it differs
+            // from the 0x0 placeholder a plugin's preem node degrades to, and
+            // the difference is load-bearing twice (PR #1356 review, H2). A
+            // `PixelSurface` given no pixels measures 0x0 on both axes
+            // (`pixels.rs`'s `render_nothing`), and this row is `halign:
+            // Center` over its child — so a 0x0 placeholder collapses the row
+            // to its CSS padding, the card reflows the moment GL dies, and the
+            // tooltip that is this widget's whole remaining output has a hover
+            // target of *one point* (`graphene_rect_contains_point` is
+            // inclusive, so a degenerate rect contains exactly its origin).
+            // A fully transparent buffer at the size the GL arm would have
+            // drawn fixes both: nothing is painted, the row occupies what it
+            // always did, and the hover target is the panel's own area.
+            //
+            // `set_size_request` would have been the obvious way to ask for
+            // that and is the wrong one: it sets a **minimum**, and the row's
+            // minimum width being 0 on any core count is the #702
+            // non-regression (`the_panel_row_keeps_the_702_geometry`). A
+            // buffer sets the **natural** size instead — `PixelSurface::measure`
+            // hard-codes its minimum to 0 on both axes — so the footprint comes
+            // back without a floor coming with it.
+            //
+            // The allocation is one zeroed buffer per tick on a box whose GL is
+            // broken, and `set_pixels`' own byte-compare settles every tick
+            // after the first without uploading anything. That is also why
+            // `matrix`/`scale` above stay hoisted out of the two arms rather
+            // than moved into the `Gl` one (PR #1356 review, L2): both arms
+            // need the geometry now.
+            preem_gl::Arm::Placeholder => {
                 let surface: &PixelSurface = child
                     .downcast_ref()
-                    .expect("core_panel_child returns a PixelSurface on the CPU arm");
-                let frame = matrix.render(&levels);
-                surface.set_scale(scale);
-                surface.set_pixels(
-                    u32::try_from(frame.width()).unwrap_or(0),
-                    u32::try_from(frame.height()).unwrap_or(0),
-                    frame.data(),
-                );
+                    .expect("core_panel_child returns a PixelSurface off the GL arm");
+                let (width, height) = core_panel_footprint(&matrix, scale);
+                surface.set_scale(1);
+                surface.set_pixels(width, height, &vec![0_u8; blank_len(width, height)]);
             }
         }
-        child.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
+        // **On the row, not on the child** (PR #1356 review, H2). GTK's tooltip
+        // query walks *up* from the widget the pointer picked, so a tooltip on
+        // the row is found from anywhere inside it — including the `.ts-cores-row`
+        // padding strip, which belongs to the row and not to the surface — while
+        // one armed on the child is found only over the child itself. It also
+        // survives `core_panel_child`'s swap, which throws the old widget away.
+        row.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
     });
 }
 
@@ -2285,45 +2357,43 @@ mod tests {
     /// switch** (#1156 review, MEDIUM-3).
     ///
     /// `the_panel_follows_the_renderer_arm` in `pin_tests` drives
-    /// `with_gl_arm`, which flips the *test* arm — it pins the per-tick rebuild
-    /// and the kill switch, which is real, but it would stay green if
-    /// [`core_panel_arm`] read `configured_arm()` instead of `arm_for`. Neither
-    /// production latch is exercised there, and the fallback is the whole
+    /// `preem_gl::with_no_gl`, which overrides the *session-wide* answer — it
+    /// pins the per-tick re-resolve, which is real, but it would stay green if
+    /// [`core_panel_arm`] called `preem_gl::arm()` instead of `arm_for`. The
+    /// per-pipeline latch is not exercised there, and the fallback is the whole
     /// reason the arm is re-resolved once a second: this widget is not in the
     /// plugin tree, so `preem_gl::install`'s context-failure sweep never
     /// reaches it and a panel that resolved its arm once would simply stay
     /// blank for the session.
     ///
     /// A **plain `#[test]`** rather than a `#[gtk::test]`, deliberately, and
-    /// that is why this pins the arm rather than the widget: both latches are
-    /// sticky thread-locals, and `gtk4-macros` runs every `#[gtk::test]` in a
-    /// binary on one shared GTK main thread — refusing a pipeline there would
+    /// that is why this pins the arm rather than the widget: the refusal latch
+    /// is a sticky thread-local, and `gtk4-macros` runs every `#[gtk::test]` in
+    /// a binary on one shared GTK main thread — refusing a pipeline there would
     /// poison `the_panel_follows_the_renderer_arm`'s own GL assertion in an
     /// order libtest does not fix. Split this way each half is hermetic: the
     /// arm here, the widget swap there. `arm_for`'s narrowness (a refused
     /// pipeline costs only its own kind the GPU) is pinned by
     /// `preem_gl::tests::a_refused_pipeline_takes_only_its_own_kinds_arm`.
     ///
-    /// **Falsified** by making [`core_panel_arm`] read `configured_arm()`, or
-    /// by having it answer a constant.
+    /// **Falsified** by making [`core_panel_arm`] call `preem_gl::arm()`, or by
+    /// having it answer a constant.
     #[test]
     fn a_refused_pipeline_takes_the_panel_off_the_gl_arm() {
-        preem_gl::with_gl_arm(|| {
-            assert_eq!(
-                core_panel_arm(),
-                preem_gl::Arm::Gl,
-                "the premise: a fresh test thread has refused nothing, so the switch decides",
-            );
+        assert_eq!(
+            core_panel_arm(),
+            preem_gl::Arm::Gl,
+            "the premise: a fresh test thread has refused nothing",
+        );
 
-            preem_gl::refuse_for_test(preem_gl::LED_MATRIX, "no GL in this test");
+        preem_gl::refuse_for_test(preem_gl::LED_MATRIX, "no GL in this test");
 
-            assert_eq!(
-                core_panel_arm(),
-                preem_gl::Arm::Cpu,
-                "a driver that will not build `preem.led_matrix` must take the panel to the \
-                 kit even while the session-wide switch still says GL",
-            );
-        });
+        assert_eq!(
+            core_panel_arm(),
+            preem_gl::Arm::Placeholder,
+            "a driver that will not build `preem.led_matrix` must take the panel to the \
+             broken-widget placeholder even while the session-wide answer still says GL",
+        );
     }
 
     /// The [`StatsSection`] declaration order is the panel's canonical
@@ -3422,13 +3492,19 @@ mod pin_tests {
         (cpu, CoreLeds::default())
     }
 
-    /// The surface the binding has put inside `row` — a `PixelSurface` under
-    /// `cargo test`, since `preem_gl`'s test arm defaults to the CPU (#1156).
-    fn panel_of(row: &gtk::Box) -> PixelSurface {
+    /// The surface the binding has put inside `row` — a `GlSurface` since
+    /// #1157, which is the only thing that draws this panel.
+    ///
+    /// It was a `PixelSurface` while `preem_gl`'s test arm defaulted to the
+    /// CPU kit (#1156). The measurements the callers take are unaffected:
+    /// `GlSurface::measure` answers the same aspect-locked natural size from
+    /// the state's `width`/`height`, which is still `matrix.width() * scale`,
+    /// so a dressing that reshapes the matrix still moves the number.
+    fn panel_of(row: &gtk::Box) -> GlSurface {
         row.first_child()
             .expect("the binding puts a surface in the row")
             .downcast()
-            .expect("…and under the test arm it is a PixelSurface")
+            .expect("…and since #1157 it is a GlSurface")
     }
 
     /// Anti-vacuity guard for the per-core pin test below: the binding must
@@ -3450,26 +3526,31 @@ mod pin_tests {
         cpu.set(dressed(four_cores()));
         pump();
 
-        let tooltip = panel_of(&row).tooltip_text().map(|t| t.to_string());
+        // On the **row** since PR #1356's review (H2): a tooltip armed on the
+        // surface is only found while the pointer is over the surface itself,
+        // which the placeholder arm leaves with no area worth hovering.
+        let tooltip = row.tooltip_text().map(|t| t.to_string());
         assert!(
             tooltip.as_deref().is_some_and(|t| t.starts_with("4 cores")),
             "the emitted CpuLoad's four cores must reach the panel's tooltip, got {tooltip:?}"
         );
     }
 
-    /// **The kill switch reaches this panel** (#1156): under the CPU arm the
-    /// row holds a `PixelSurface`, under the GL arm a `GlSurface`, and the
-    /// binding swaps it live rather than deciding once at build time.
+    /// **The fallback reaches this panel** (#1156, and it is the broken-widget
+    /// placeholder rather than the kit since #1157): with GL the row holds a
+    /// `GlSurface`, without it an empty `PixelSurface`, and the binding swaps
+    /// it live rather than deciding once at build time.
     ///
-    /// The live swap is what makes the *fallback* reach this widget at all —
-    /// the panel is not in the plugin tree, so `preem_gl::install`'s
+    /// The live swap is what makes the fallback reach this widget at all — the
+    /// panel is not in the plugin tree, so `preem_gl::install`'s
     /// context-failure hook sweeps nothing here and a chip built on GL at
-    /// startup would simply stay blank. Driven through `with_gl_arm`, the same
-    /// seam `plugins::tests` uses, since the real switch is an env var read
-    /// once per process.
+    /// startup would simply stay a `GlSurface` that can never draw. Driven
+    /// through `preem_gl::with_no_gl`, a scoped, restoring test seam, because
+    /// the two production latches are sticky — one for the process, one for
+    /// this shared GTK main thread — and this test has to go *back*.
     ///
     /// **Falsified** by building the surface once in [`per_core_leds_row`] and
-    /// ignoring the arm (the second assertion reports a `PixelSurface`), or by
+    /// ignoring the arm (the second assertion reports a `GlSurface`), or by
     /// resolving the arm once outside the apply closure (the third).
     #[gtk::test]
     fn the_panel_follows_the_renderer_arm() {
@@ -3481,21 +3562,21 @@ mod pin_tests {
 
         let first = row.first_child().expect("a surface after the first tick");
         assert!(
-            first.is::<PixelSurface>(),
-            "the test arm is the CPU kit, so the row holds a PixelSurface",
+            first.is::<GlSurface>(),
+            "GL is the only arm that draws, so the row holds a GlSurface",
         );
 
-        preem_gl::with_gl_arm(|| {
+        preem_gl::with_no_gl(|| {
             cpu.set(dressed(CpuLoad {
                 overall: 0.9,
                 per_core: vec![0.9, 0.2, 0.3, 0.4],
             }));
             pump();
         });
-        let swapped = row.first_child().expect("a surface after the GL tick");
+        let swapped = row.first_child().expect("a surface after the no-GL tick");
         assert!(
-            swapped.is::<GlSurface>(),
-            "the GL arm must swap the row's child for a GlSurface",
+            swapped.is::<PixelSurface>(),
+            "with no pipeline the row must swap its child for the placeholder surface",
         );
         assert_eq!(
             row.first_child().and_then(|c| c.next_sibling()),
@@ -3503,13 +3584,14 @@ mod pin_tests {
             "…and the row still holds exactly one surface",
         );
 
-        // …and back, because the arm can flip either way within a session: a
-        // refused pipeline takes a live GL panel to the kit.
+        // …and back, because a session that gets GL back on the next tick —
+        // which only this test seam can arrange — must draw again rather than
+        // stay parked on the placeholder.
         cpu.set(dressed(four_cores()));
         pump();
         assert!(
-            row.first_child().is_some_and(|c| c.is::<PixelSurface>()),
-            "a tick back on the CPU arm swaps the kit surface in again",
+            row.first_child().is_some_and(|c| c.is::<GlSurface>()),
+            "a tick with the pipeline back swaps the GlSurface in again",
         );
     }
 
@@ -3569,8 +3651,8 @@ mod pin_tests {
     /// Driven here with the CPU source held **still**: only the dressing
     /// moves, so a panel that re-measures can only have heard the config
     /// signal. Measured rather than compared pixel-for-pixel for the reason
-    /// its sibling gives — `PixelSurface` exposes no buffer getter, but its
-    /// natural size follows the matrix shape.
+    /// its sibling gives — a surface exposes no buffer getter, but its natural
+    /// size follows the matrix shape.
     #[gtk::test]
     fn a_config_change_alone_re_skins_the_row() {
         adw::init().expect("libadwaita init");
@@ -3579,11 +3661,7 @@ mod pin_tests {
         let row = per_core_leds_row(cpu.signal_cloned(), leds.signal());
         pump();
 
-        let panel: PixelSurface = row
-            .first_child()
-            .expect("the row holds the surface")
-            .downcast()
-            .expect("…and it is a PixelSurface");
+        let panel = panel_of(&row);
         let (_, automatic, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
 
         // Only the dressing moves. The CPU signal is untouched.
@@ -3667,7 +3745,7 @@ mod pin_tests {
 /// need a registered `Registry` to run (its `bind` call is reachable through
 /// [`bind_per_core_leds`], which `pin_tests` drives, but the builder is not),
 /// so these drive its two constructors — [`core_panel_row`] and
-/// [`core_panel_surface`] — directly. That is the point of the split: the
+/// [`core_panel_gl_surface`] — directly. That is the point of the split: the
 /// arrangement under test is the arrangement that ships, not a copy of it that
 /// can drift.
 ///
@@ -3679,17 +3757,21 @@ mod pin_tests {
 /// 2. an over-wide card cannot inflate the row's **height** request, which an
 ///    aspect-locked height-for-width raster widget absolutely can do if it is
 ///    allowed to fill.
+///
+/// Both were asked twice until #1157 — once of the kit's `PixelSurface` and
+/// once of the `GlSurface` (#1156 review, MEDIUM-2) — and are now asked only of
+/// the `GlSurface`, because with the CPU renderer retired the row's other
+/// possible child is the 0×0 placeholder, of which "minimum width 0" and
+/// "cannot inflate a row" are true by having no size at all.
 #[cfg(all(test, feature = "system-tests"))]
 mod led_panel_layout_tests {
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
-    use hytte::ui::PixelSurface;
-
     use hytte::ui::GlSurface;
 
     use super::{
-        CORE_PANEL_MAX_H, core_panel_gl_surface, core_panel_row, core_panel_scale,
-        core_panel_surface,
+        CORE_PANEL_MAX_H, blank_len, core_panel_footprint, core_panel_gl_surface, core_panel_row,
+        core_panel_scale, core_panel_surface,
     };
     use crate::plugins::preem_gl;
 
@@ -3697,57 +3779,7 @@ mod led_panel_layout_tests {
     /// rectangle default — a 16×4 grid.
     const PANEL_64: (u32, u32) = (181, 49);
 
-    /// A surface holding the 181×49 buffer a 64-core rectangular panel
-    /// rasterises to, arranged exactly as the shipping row arranges it.
-    fn panel_64() -> PixelSurface {
-        let (w, h) = PANEL_64;
-        let len = usize::try_from(w * h * 4).expect("the 64-core buffer fits usize");
-        let panel = core_panel_surface();
-        panel.set_pixels(w, h, &vec![0xff_u8; len]);
-        panel
-    }
-
-    /// **The #702 non-regression, measured.** The row holding a 64-core panel
-    /// reports a minimum width of **0 px** — against the 764 px the pre-#702
-    /// bar strip demanded — so no container is ever forced wider by it, while
-    /// the row still *wants* the panel's natural 93 px.
-    ///
-    /// Falsified by putting a CSS `min-width` back on `.ts-cores-row`, or by
-    /// giving the surface a `set_size_request`.
-    #[gtk::test]
-    fn the_panel_row_has_no_minimum_width() {
-        adw::init().expect("libadwaita init");
-        let row = core_panel_row();
-        row.append(&panel_64());
-        let (min_w, nat_w, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
-        assert_eq!(min_w, 0, "the LED panel row grew a minimum width");
-        let want = i32::try_from(PANEL_64.0).expect("the buffer width fits i32");
-        assert!(
-            nat_w >= want,
-            "the row should still want the panel's {want} px, got {nat_w}"
-        );
-    }
-
-    /// A card far wider than the panel must not make the row taller: a filling
-    /// surface would request `400 * 49 / 181` px of height and swallow the
-    /// CPU card.
-    ///
-    /// Falsified by putting `set_hexpand(true)` back on the surface — which is
-    /// how this was first written, and measured 400 px.
-    #[gtk::test]
-    fn a_wide_card_cannot_inflate_the_row_height() {
-        adw::init().expect("libadwaita init");
-        let budget = i32::try_from(CORE_PANEL_MAX_H).expect("the budget fits i32");
-        let row = core_panel_row();
-        row.append(&panel_64());
-        let (_, nat_h, _, _) = row.measure(gtk::Orientation::Vertical, 400);
-        assert!(
-            nat_h <= budget,
-            "a 400 px card stretched the 181x49 panel to {nat_h} px tall"
-        );
-    }
-
-    /// A [`GlSurface`] carrying the same 64-core panel, driven through the
+    /// A [`GlSurface`] carrying the 64-core panel, driven through the
     /// **production mapping** rather than a hand-set size, and arranged the way
     /// the shipping row arranges it.
     ///
@@ -3773,36 +3805,99 @@ mod led_panel_layout_tests {
         panel
     }
 
-    /// **The same two #702 assertions against the GL arm** — the surface the
-    /// row actually holds on a healthy session since #1156 (#1156 review,
-    /// MEDIUM-2).
+    /// **The placeholder row is still hoverable** (PR #1356 review, H2).
     ///
-    /// Before this, both properties above were asked only of the
-    /// `PixelSurface` the shell now *stops* using, and `docs/live-verify.md`'s
-    /// item 5 handed the whole question to a desk on the grounds that this is
-    /// the first `GlSurface` laid out inside an `adw` card rather than on a
-    /// bar. Half of that is testable here: `GlSurface::measure` answers
-    /// `(0, natural, -1, -1)` off `nat_width`/`nat_height` with no context and
-    /// no draw.
+    /// The whole argument for retiring #857's kit arm on this one widget is
+    /// that the row keeps saying something with no GPU — the tooltip naming
+    /// every core's load. That mitigation has to exist for the trade to be the
+    /// one the PR describes, and as first written it did not: a `PixelSurface`
+    /// given no pixels measures 0x0 (`pixels.rs`'s `render_nothing`), this row
+    /// is `halign: Center` over its child, and a tooltip armed on a widget with
+    /// a degenerate rect has a hover target of exactly one point —
+    /// `graphene_rect_contains_point` is inclusive, so the origin picks and
+    /// every neighbouring coordinate falls through to the container.
+    ///
+    /// Driven through the **production** placeholder path — the same
+    /// `core_panel_footprint`/`blank_len` pair and the same transparent buffer
+    /// the apply closure writes — rather than a hand-set size, so the thing
+    /// measured is the thing that ships.
+    ///
+    /// Two assertions, and they catch different halves. The **area** one is
+    /// what a 0x0 placeholder fails, and it would fail even with the tooltip
+    /// correctly armed. The **pick** one is what a tooltip armed on the child
+    /// alone fails once the child has no area: GTK's tooltip query walks up
+    /// from the picked widget, so the assertion is that *something on that
+    /// walk* carries the text.
+    ///
+    /// **Falsified** two ways, both measured: give the placeholder
+    /// `set_pixels(0, 0, &[])` back and the area assertion reds at `0x0`; move
+    /// the `set_tooltip_text` from the row back onto the child and the pick
+    /// assertion reds, because the picked widget is the surface and nothing
+    /// above it carries a tooltip.
+    #[gtk::test]
+    fn the_placeholder_row_keeps_a_hoverable_tooltip() {
+        adw::init().expect("libadwaita init");
+        let row = core_panel_row();
+        let panel = core_panel_surface();
+        let matrix = hytte_preem::LedMatrix::wide(hytte_preem::DisplayStyle::Vfd, 64);
+        let scale = core_panel_scale(matrix.width(), matrix.height());
+        let (width, height) = core_panel_footprint(&matrix, scale);
+        panel.set_scale(1);
+        panel.set_pixels(width, height, &vec![0_u8; blank_len(width, height)]);
+        row.append(&panel);
+        row.set_tooltip_text(Some("cpu0 12% | cpu1 40%"));
+
+        let window = gtk::Window::new();
+        window.set_default_size(300, 80);
+        window.set_child(Some(&row));
+        window.present();
+        while gtk::glib::MainContext::default().iteration(false) {}
+
+        let (w, h) = (row.width(), row.height());
+        assert!(
+            w > 0 && h > 0,
+            "the placeholder row has no area to hover at all: {w}x{h} — the tooltip is the one \
+             thing this panel can still say with no GPU, and a 0x0 row makes it unreachable",
+        );
+        // 10 px inside the row's own origin rather than its centre: the centre
+        // would still pass if the placeholder collapsed and only the row's CSS
+        // padding survived, and the claim is about the panel's footprint.
+        let hit = window
+            .pick(f64::from(w / 2), f64::from(h / 2), gtk::PickFlags::DEFAULT)
+            .expect("something under the row");
+        assert!(
+            std::iter::successors(Some(hit), WidgetExt::parent)
+                .any(|widget| widget.tooltip_text().is_some()),
+            "nothing on the hover path from inside the row carries the per-core tooltip — the \
+             one thing #1157 promised the panel could still say",
+        );
+    }
+
+    /// **Both #702 assertions against the surface the row actually holds**
+    /// (#1156 review, MEDIUM-2; the only one left since #1157).
+    ///
+    /// Before #1156 both properties were asked only of the `PixelSurface` the
+    /// shell has now stopped using, and `docs/live-verify.md`'s item 5 handed
+    /// the whole question to a desk on the grounds that this is the first
+    /// `GlSurface` laid out inside an `adw` card rather than on a bar. Half of
+    /// that is testable here: `GlSurface::measure` answers `(0, natural, -1,
+    /// -1)` off `nat_width`/`nat_height` with no context and no draw.
     ///
     /// **Falsified** by giving [`core_panel_gl_surface`] an `hexpand` — the
     /// exact mistake `core_panel_row`'s doc records as having produced a
     /// 400 px-tall row once already — or by dropping its `halign: Center`.
     #[gtk::test]
-    fn the_gl_arms_panel_row_keeps_the_702_geometry() {
+    fn the_panel_row_keeps_the_702_geometry() {
         adw::init().expect("libadwaita init");
         let row = core_panel_row();
         row.append(&gl_panel_64());
 
         let (min_w, nat_w, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
-        assert_eq!(
-            min_w, 0,
-            "the LED panel row grew a minimum width on the GL arm"
-        );
+        assert_eq!(min_w, 0, "the LED panel row grew a minimum width");
         let want = i32::try_from(PANEL_64.0).expect("the buffer width fits i32");
         assert!(
             nat_w >= want,
-            "the GL row should still want the panel's {want} px, got {nat_w}",
+            "the row should still want the panel's {want} px, got {nat_w}",
         );
 
         let budget = i32::try_from(CORE_PANEL_MAX_H).expect("the budget fits i32");

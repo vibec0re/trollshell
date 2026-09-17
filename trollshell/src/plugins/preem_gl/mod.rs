@@ -9,8 +9,8 @@
 //! (#1153), [`seven_seg`] for the readout (#1154), [`flip_board`] for the
 //! split-flap board and the nixie readout (#1155) — each referencing nothing
 //! above it, so the parity harness can `#[path]`-include the same code the
-//! shell runs. Everything that needs the *shell* — the kill switch, the
-//! fallback latch — is here, and it is deliberately kind-agnostic. #1143
+//! shell runs. Everything that needs the *shell* — the two fallback latches —
+//! is here, and it is deliberately kind-agnostic. #1143
 //! predicted "a third kind is a module, a `register` line and a `preem_render`
 //! arm, with nothing in this file to change"; #1144 was exactly that, #1152
 //! was exactly that twice, and #1153, #1154 and #1155 once more each, so the
@@ -21,7 +21,7 @@
 //! registers `dot_matrix`'s pipeline under its own name and drives `site_at`'s
 //! three grid uniforms with a continuous matrix's numbers. See its module docs.
 //!
-//! # The switch: GL is the default, `TROLLSHELL_PREEM_RENDERER=cpu` is the kill switch
+//! # One arm, and what a chip does when it cannot draw (#1157)
 //!
 //! GL was Annika's call on #893 (`--areas 3` layer-shell, jank 0, p95 16.77 ms
 //! against a 16.67 ms idle baseline) — but that call assumed the GL loader
@@ -46,50 +46,45 @@
 //! under llvmpipe. The default is GL again, and the numbers are in
 //! `docs/live-verify.md`.
 //!
-//! So: unset — or anything but the exact word `cpu` — a `Scope` renders on a
-//! `GtkGLArea` running the pipeline this module registers; `cpu` forces the
-//! kit. `RUST_LOG=hytte_gl=debug` names which loader route resolved the entry
+//! From there the arms landed kind by kind — #1143 the gauge, #1144 the dot
+//! matrix, #1152 the two text kinds on Annika's word for the rest of #865,
+//! #1153 the meter, #1154 the readout, #1155 the board, #1156 the shell's own
+//! LED panel — until every kind had one, and **#1157 then retired the CPU
+//! renderer and the `TROLLSHELL_PREEM_RENDERER=cpu` kill switch with it**
+//! (Annika on #865: *"CPU renderer gone soon? ❤️"*).
+//!
+//! So [`Arm`] no longer answers *which renderer a widget takes*, because there
+//! is only one: it answers **whether this pipeline can draw at all**, and the
+//! other answer is the broken-widget placeholder — the degradation
+//! `Node::Shader` has taken by design since #893, now the whole preem seam's.
+//! `RUST_LOG=hytte_gl=debug` names which loader route resolved the entry
 //! points.
 //!
-//! Read **once**, at the first `Scope` build, and memoized: a shell whose
-//! renderer changed under it mid-session would be far more confusing than one
-//! that needs a restart, and the value is a debugging switch rather than a
-//! setting.
+//! Two things take a kit widget off the GPU, and only these:
 //!
-//! The CPU arm is used in three cases, and only these:
+//! 1. **a GL context could not be created**, which `hytte-ui` latches
+//!    (`gl_abandoned`) and reports through the hook installed in [`install`];
+//! 2. **this driver refused this pipeline** (#1232) — a compile or link
+//!    failure for one program, which says nothing about the seven others.
 //!
-//! 1. the switch names `cpu`;
-//! 2. the widget kind has no GL arm — everything but `Scope`, `Gauge`,
-//!    `DotMatrix`, `Marquee`, `TextBox`, `LedStrip`, `SevenSeg` and
-//!    `FlipBoard` today
-//!    (#1143 added the second, #1144 the third, #1152 the two text kinds on
-//!    Annika's word for the rest of #865, #1153 the meter, #1154 the
-//!    readout and #1155 the board);
-//! 3. **a GL context could not be created**, which `hytte-ui` latches and
-//!    reports through the hook installed in [`install`]. Falling back is free
-//!    here in a way it is not for #893's shader widget: a kit widget *has* a
-//!    CPU implementation, and it is the reference the GL arm is measured
-//!    against, so a blank chip would be strictly worse than drawing it.
-//!
-//! The switch is **unconditional**, and since #978 that includes the widget
-//! that has no CPU arm: `shader_map::refusal` reads [`shader_arm`] and refuses
-//! every plugin shader when the switch names `cpu`, drawing the broken-widget
-//! placeholder rather than compiling a plugin's GLSL behind an operator's back
-//! — an operator who set the switch because GL was wedging the session meant
-//! *that* too.
+//! Both are sticky for the session, both are folded in by [`arm_for`], and
+//! both end in the same picture: an empty surface where the chip was, with one
+//! journal line naming the cause. That is what "gone" costs, and it is the
+//! trade #1157 states out loud — `hytte-preem` is still in the tree (it is the
+//! parity oracle the harness measures against, and the rasteriser every
+//! plugin's own `Frame::into_node` still runs in *its* process), but the shell
+//! no longer carries a second renderer to keep a chip alive on a box whose GL
+//! is broken.
 //!
 //! # What this module does not do
 //!
-//! It does not touch `pump.rs`. `Renderer::ScopeGl` carries the same
-//! `pending`/`idle`/`fades`/`settle_steps` fields as the CPU arm and answers
-//! `animates()` with the same expression, so #926's frame-clock park and unpark
-//! behave identically and the animation half of the host needed no change at
-//! all. That is a deliberate property of the seam, not a coincidence — and
-//! #1143's `Renderer::GaugeGl` takes it further by holding the very same
-//! `kit::Gauge` the CPU arm does: the needle's spring is closed-form and
-//! frame-rate independent, so the two gauge arms share their `update`,
-//! `advance` and `animates` arms outright and differ only in what they hand
-//! the reconciler.
+//! It does not touch `pump.rs`. That was true when `Renderer::Scope` had to
+//! carry the CPU arm's `pending`/`idle`/`fades`/`settle_steps` fields verbatim
+//! and answer `animates()` with the same expression so #926's frame-clock park
+//! behaved identically across a kill-switch flip; with the switch gone the
+//! property is simply inherited, because those fields and that expression are
+//! the ones that stayed. The animation half of the host has never had a line
+//! changed by this seam.
 
 use hytte::ui::gl_surface::GlProgram;
 
@@ -159,102 +154,29 @@ pub(super) use cases::{Case, cases_for};
 #[cfg(test)]
 pub(super) use parity::Kind;
 
-/// The renderer switch. `cpu` forces the kit; unset, `gl`, or anything else
-/// takes the GL arm — see the module docs for the parity numbers behind that
-/// default (#1072).
-pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
-
-/// Which renderer a kit widget takes.
+/// Whether a kit widget's pipeline can draw at all.
 ///
-/// **Per kind, not per widget** — one answer for the whole preem renderer, and
-/// `preem_render::build` consults it in each arm that *has* a GL pipeline.
-/// Since #1155 that is the `Scope`, the `Gauge`, the `DotMatrix`, the
-/// `Marquee`, the `TextBox`, the `LedStrip`, the `SevenSeg` and the
-/// `FlipBoard`; every other kind takes [`Arm::Cpu`] because there is nothing
-/// else to take.
+/// **Per pipeline, not per widget** — one answer for every chip naming that
+/// program. `preem_render::build` asks [`arm_for`] once, up front, about the
+/// pipeline its widget's kind names (`preem_render::program_for`): since #1155
+/// that is every wire kind there is — the `Scope`, the `Gauge`, the
+/// `DotMatrix`, the `Marquee`, the `TextBox`, the `LedStrip`, the `SevenSeg`
+/// and the `FlipBoard` — plus the shell's own `LedMatrix` (#1156), which is not
+/// on the wire and asks from `panels::stats` instead.
+///
+/// It used to answer "which of the two renderers" and its second variant was
+/// named `Cpu`. #1157 retired that renderer, so the question narrowed and the
+/// variant is named for what now happens instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arm {
     /// A `GtkGLArea` running one of the pipelines [`install`] registers — the
-    /// default.
+    /// only way a kit widget reaches the screen since #1157.
     Gl,
-    /// The `hytte-preem` kit, rasterised in-process into a `PixelSurface` —
-    /// the kill switch's arm, the fallback for a failed context, and what
-    /// every kind without a GL arm takes.
-    Cpu,
-}
-
-/// Parse [`RENDERER_ENV`].
-///
-/// **GL is the default again** (#1072 closed): the variable is back to being a
-/// kill switch, so only the exact word `cpu` (case- and whitespace-insensitive)
-/// forces the kit and every other value — a typo, an empty string, unset —
-/// takes GL.
-///
-/// #1072 briefly inverted this. That inversion was not a judgement about the
-/// shader math: `preem_gl_diff` had just run for the first time with a working
-/// loader (#1067) and reported 12/12 cases over the ceiling, and switching
-/// every preem chip's renderer on an unclassified disagreement was not a trade
-/// worth taking. Classified, all twelve turned out to be the **harness**
-/// reading the wrong framebuffer — `gtk_gl_area_snapshot` hands its texture to
-/// GSK and the next `attach_buffers` takes a different one out of the area's
-/// pool, so a post-hoc readback scored each case against its *predecessor's*
-/// picture. With the readback taken after the pool has settled and proved
-/// stable across two renders, the two arms are **byte-identical**: max |Δ| 0
-/// of 255 on every channel of all twelve cases, under llvmpipe. So the parse
-/// goes back to the shape #893 shipped, with the numbers behind it this time.
-///
-/// Split from [`arm`] so the decision is testable without touching the
-/// process environment, which is what makes the default a hermetic assertion
-/// rather than a live-verify note.
-fn arm_from_env(value: Option<&str>) -> Arm {
-    match value {
-        Some(value) if value.trim().eq_ignore_ascii_case("cpu") => Arm::Cpu,
-        _ => Arm::Gl,
-    }
-}
-
-thread_local! {
-    /// The arm under `cargo test`, defaulting to the **CPU**.
-    ///
-    /// CI has no GL, so every byte-parity assertion in `plugins::tests` — the
-    /// ones that hold the CPU arm to the kit — has to run against the CPU arm
-    /// to mean anything. That reasoning predates #1072 and does not depend on
-    /// it: this test default was already decoupled from whatever
-    /// [`arm_from_env`] answers in production, and stays `Cpu` regardless of
-    /// which way that default currently points. The GL arm's own tests opt in
-    /// with [`with_gl_arm`], and the *production* default itself is covered by
-    /// [`arm_from_env`]'s own tests, which is where that decision actually
-    /// lives.
-    #[cfg(test)]
-    static TEST_ARM: std::cell::Cell<Arm> = const { std::cell::Cell::new(Arm::Cpu) };
-
-    /// The arm the **shader** path sees under `cargo test`, defaulting to
-    /// **GL** — deliberately decoupled from production the same way
-    /// [`TEST_ARM`] is, and for the mirror-image reason.
-    ///
-    /// Production's default is GL again now that #1072 has closed, so this
-    /// constant happens to match it — but it is pinned rather than inherited,
-    /// and the pinning is the point: [`TEST_ARM`] pins `Cpu` so the
-    /// byte-parity suite always measures the kit whichever way the shipped
-    /// default points, and this pins `Gl` so the shader test suite always
-    /// exercises compilation. Defaulting *this* one to `Cpu` would
-    /// make [`shader_arm`] answer `Cpu` for the whole test binary and every
-    /// mapped shader in the suite would take the kill switch's refusal,
-    /// proving nothing about the paths those tests exist to cover. A test that
-    /// wants the switch on says so with [`with_cpu_kill_switch`].
-    #[cfg(test)]
-    static TEST_SHADER_ARM: std::cell::Cell<Arm> = const { std::cell::Cell::new(Arm::Gl) };
-}
-
-/// Run `body` with the GL arm selected — the seam the `ScopeGl` state-machine
-/// tests use, since building a `Renderer::ScopeGl` needs no GL at all (only
-/// *drawing* one does).
-#[cfg(test)]
-pub(crate) fn with_gl_arm<T>(body: impl FnOnce() -> T) -> T {
-    let previous = TEST_ARM.replace(Arm::Gl);
-    let out = body();
-    TEST_ARM.set(previous);
-    out
+    /// No GL for this pipeline: the context failed, or this driver refused
+    /// this program. There is nothing to fall back *to* since #1157, so the
+    /// widget draws the broken-widget placeholder — an empty surface keeping
+    /// its id and classes, the same degradation `Node::Shader` takes.
+    Placeholder,
 }
 
 /// Record `program` as refused by this driver, through the **production**
@@ -279,21 +201,57 @@ pub(crate) fn refuse_for_test(program: GlProgram, reason: &str) {
     on_build_refused(program, (0, 0), reason);
 }
 
-/// The arm a `Scope` built now should take.
+thread_local! {
+    /// A scoped override of [`arm`]'s answer, for the tests that must see
+    /// **both** of them — see [`with_no_gl`].
+    #[cfg(test)]
+    static TEST_ARM: std::cell::Cell<Option<Arm>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` as if this session had no GL at all — the seam a test uses to
+/// watch a widget take the placeholder and then take the GPU back.
 ///
-/// [`hytte::ui::gl_surface::gl_abandoned`] wins over the env: once a context
-/// has failed there is nothing to fall back *to*, and a `ScopeGl` that can
-/// never draw would leave a blank chip where the kit would have drawn a trace.
+/// #1157 retired the kill switch, and with it the only **non-sticky** way to
+/// ask what the shell does without GL: `hytte-ui`'s `abandon_gl` latches for
+/// the *process* and [`refuse_for_test`] latches for the *thread*, so neither
+/// can run inside a `#[gtk::test]` without poisoning every sibling that shares
+/// `gtk4-macros`' one main thread — which is exactly the constraint #1156 split
+/// the Stats panel's two fallback tests along.
 ///
-/// **The session-wide half of the answer**, and the whole of it only for a
-/// caller with no pipeline in hand: [`arm_for`] is what `preem_render::build`
-/// asks, because a driver that refuses one pipeline (#1232) may build every
-/// other one.
+/// It is a **test seam, not the knob that was deleted**: scoped, restoring, and
+/// with no `cfg(not(test))` counterpart, so nothing a shipped build runs can
+/// reach it. The two sticky latches stay the right instrument for asserting
+/// that a *failure* is sticky —
+/// `an_abandoned_context_takes_every_kit_widget_to_the_placeholder` below
+/// deliberately does not use this.
+#[cfg(test)]
+pub(crate) fn with_no_gl<T>(body: impl FnOnce() -> T) -> T {
+    let previous = TEST_ARM.replace(Some(Arm::Placeholder));
+    let out = body();
+    TEST_ARM.set(previous);
+    out
+}
+
+/// The **session-wide** half of the answer: has GL itself gone?
+///
+/// [`hytte::ui::gl_surface::gl_abandoned`] is the whole of it since #1157 took
+/// the kill switch away — a context that failed once has failed for the
+/// process, and a renderer built onto a pipeline that can never draw would
+/// leave a blank chip with nothing saying why. Building the placeholder
+/// instead is what puts a journal line and an empty surface on the record.
+///
+/// Only for a caller with no pipeline in hand: [`arm_for`] is what
+/// `preem_render::build` asks, because a driver that refuses one pipeline
+/// (#1232) may build every other one.
 pub(super) fn arm() -> Arm {
-    if hytte::ui::gl_surface::gl_abandoned() {
-        return Arm::Cpu;
+    #[cfg(test)]
+    if let Some(forced) = TEST_ARM.get() {
+        return forced;
     }
-    configured_arm()
+    if hytte::ui::gl_surface::gl_abandoned() {
+        return Arm::Placeholder;
+    }
+    Arm::Gl
 }
 
 thread_local! {
@@ -326,8 +284,14 @@ thread_local! {
     /// as each surface asks for itself. The one case it over-reaches is a
     /// genuinely grid-dependent refusal (an allocation the driver will not
     /// make at a large grid), where a small chip loses the GPU for a refusal
-    /// that was not about it — and a kit chip is a far better outcome there
-    /// than a blank one.
+    /// that was not about it. That used to cost it a kit render and costs it
+    /// its picture since #1157, which is a real worsening of the over-reach
+    /// and **still** the right side of the trade: the alternative is asking a
+    /// driver that has already refused this source once per surface per
+    /// re-parent, and a chip that flickers between blank and drawn diagnoses
+    /// nothing. If that case is ever actually observed the fix is to key this
+    /// record by `(grid, program)`, the way `hytte-ui`'s per-surface latch
+    /// already does — not to widen it.
     ///
     /// Thread-local, like every other latch this module and `hytte-ui` keep:
     /// the GTK main thread is the only one that builds renderers, and a
@@ -336,7 +300,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The arm a kit widget drawn by `program` should take: [`arm`], plus the one
+/// Whether the kit widget drawn by `program` can draw: [`arm`], plus the one
 /// thing that is per pipeline rather than per session (#1232).
 ///
 /// A `GtkGLArea` can come up with a perfectly good context and still be
@@ -344,21 +308,24 @@ thread_local! {
 /// latches per surface (#1180 item 2) so the driver is asked exactly once.
 /// Before this, nothing in the shell heard about that: the chip drew nothing
 /// at all for the life of the context while `arm()` kept answering `Gl`,
-/// because neither of the two failures it folds in had happened.
+/// because neither of the failures it folds in had happened.
 ///
 /// Narrower than a second `gl_abandoned`, deliberately: a refused
 /// `preem.scope` says nothing about `preem.gauge`, and a session that loses
-/// one pipeline keeps the GPU arm for every other kind on the bar.
+/// one pipeline keeps the GPU for every other kind on the bar. That narrowness
+/// is worth *more* since #1157, not less — the kind that loses its pipeline
+/// now loses its picture, so condemning its neighbours with it would empty a
+/// bar over one driver's opinion of one shader.
 pub(crate) fn arm_for(program: GlProgram) -> Arm {
     if REFUSED.with_borrow(|refused| refused.contains(&program)) {
-        return Arm::Cpu;
+        return Arm::Placeholder;
     }
     arm()
 }
 
 /// The host's half of `hytte-ui`'s build-refusal hook (#1232): record the
-/// pipeline as refused, rebuild the chips that were drawing with it onto the
-/// CPU kit, say so once, and ask for one re-map.
+/// pipeline as refused, take the chips that were drawing with it to the
+/// placeholder, say so once, and ask for one re-map.
 ///
 /// Registered by [`install`]; also the function a test drives, through
 /// `hytte::ui::gl_surface::refuse_build` — the same entry point `GlSurface`
@@ -370,8 +337,8 @@ pub(crate) fn arm_for(program: GlProgram) -> Arm {
 /// its arm through [`arm_for`], which reads that record. Reverse the two
 /// statements and every rebuilt chip lands back on the GL arm — the function
 /// silently accomplishes nothing, which is exactly the shape
-/// `preem_render::rebuild_gl_renderers_on_cpu` documents for the context
-/// hook.
+/// `preem_render::rebuild_gl_renderers_as_placeholders` documents for the
+/// context hook.
 ///
 /// **Idempotent per program**, which matters because the hook fires once per
 /// *surface*, not once per program: `hytte-ui`'s latch is per instance, so
@@ -416,16 +383,17 @@ pub(super) fn on_build_refused(program: GlProgram, grid: (u32, u32), reason: &st
     }
     // Only the instances actually drawing with this pipeline, unlike the
     // context hook's wholesale sweep: a gauge rebuilt for a scope's refusal
-    // would answer with the same `GaugeGl` it already had and restart its
+    // would answer with the same `Gauge` it already had and restart its
     // needle's spring for nothing.
-    let chips = super::preem_render::rebuild_refused_gl_renderers_on_cpu(program);
+    let chips = super::preem_render::rebuild_refused_gl_renderers_as_placeholders(program);
     tracing::warn!(
         program = program.0,
         grid = format!("{}x{}", grid.0, grid.1),
         reason,
         chips,
-        "this driver will not build that preem GL pipeline; its chips fall back to the CPU kit \
-         for the rest of this session (restart the shell to offer it GL again)",
+        "this driver will not build that preem GL pipeline; since #1157 there is no CPU kit to \
+         fall back to, so its chips draw nothing for the rest of this session (restart the shell \
+         to offer it GL again)",
     );
     // The re-map is the other half, for the context hook's reason: a chip
     // whose plugin has gone quiet gets no mapping pass of its own — a
@@ -442,70 +410,10 @@ pub(super) fn on_build_refused(program: GlProgram, grid: (u32, u32), reason: &st
     // in the shared callee both this hook and the context hook above call:
     // `pump::request_preem_repaint_all_when_live`'s `#[cfg(test)]` counter,
     // asserted alongside the builds probe in `preem_render`'s
-    // `a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl`
+    // `a_refused_pipeline_puts_that_chip_on_the_placeholder_and_leaves_the_others_on_gl`
     // (PR #1243 review, NEW LOW B) — which is also where the *rebuild* half
     // is pinned, so what is unasserted narrows to the mailbox write alone.
     super::pump::request_preem_repaint_all_when_live();
-}
-
-/// The arm the **shader widget** takes — the kill switch, and only the kill
-/// switch (#978).
-///
-/// Deliberately *not* [`arm`]: that one folds the context-failure latch in
-/// because a kit widget wants one answer ("draw on the CPU"), while
-/// `shader_map` wants the two apart. A shader has no CPU arm at all, so both
-/// answers are "the placeholder", but they are different diagnoses pointing at
-/// different fixes — *unset the variable* against *restart the shell* — and
-/// `shader_map::refusal` keeps its own [`GlAvailability`] input for the
-/// latch. Folding them here would hand it one `Cpu` for two causes and the
-/// journal would name the wrong one roughly half the time.
-///
-/// The spec is unambiguous that the switch reaches here at all:
-/// `docs/superpowers/specs/2026-09-06-preem-gl-renderer-design.md` calls
-/// `TROLLSHELL_PREEM_RENDERER=cpu` "the kill switch, forcing CPU regardless of
-/// GL availability", and before #978 the one widget in the shell that runs a
-/// *plugin's* GPU code was the one widget that ignored it — an operator who
-/// set it because GL was wedging the session still had plugin shaders
-/// compiling and drawing, with the whole shell as the blast radius.
-///
-/// #1072 briefly inverted [`configured_arm`]'s default, which inverted this
-/// function's production answer with it and no code here changing at all. With
-/// #1072 closed on 12/12 byte-identical cases the default is GL again, so a
-/// plugin shader compiles unless the operator says `cpu`.
-///
-/// [`GlAvailability`]: super::shader_map::GlAvailability
-pub(super) fn shader_arm() -> Arm {
-    #[cfg(test)]
-    {
-        TEST_SHADER_ARM.get()
-    }
-    #[cfg(not(test))]
-    {
-        configured_arm()
-    }
-}
-
-/// Run `body` with the kill switch on, as far as [`shader_arm`] is concerned —
-/// the seam `shader_map`'s refusal tests use, since the real switch is an env
-/// var read once per process.
-#[cfg(test)]
-pub(super) fn with_cpu_kill_switch<T>(body: impl FnOnce() -> T) -> T {
-    let previous = TEST_SHADER_ARM.replace(Arm::Cpu);
-    let out = body();
-    TEST_SHADER_ARM.set(previous);
-    out
-}
-
-/// The configured arm, before the context-failure latch is consulted.
-#[cfg(not(test))]
-fn configured_arm() -> Arm {
-    static ARM: std::sync::OnceLock<Arm> = std::sync::OnceLock::new();
-    *ARM.get_or_init(|| arm_from_env(std::env::var(RENDERER_ENV).ok().as_deref()))
-}
-
-#[cfg(test)]
-fn configured_arm() -> Arm {
-    TEST_ARM.get()
 }
 
 /// Register every kit pipeline and the context-failure hook.
@@ -539,14 +447,17 @@ pub(super) fn install() {
         // stay blank until the plugin sent another frame, which a settled
         // widget may never do.
         //
-        // 1. Rebuild every `ScopeGl` instance onto the kit right now, the way
-        //    `invalidate_cached_frames` rebuilds a `TextBox`. Also drops the
-        //    caches, so a *non*-GL widget re-renders too.
-        super::preem_render::rebuild_gl_renderers_on_cpu();
+        // 1. Rebuild every GL instance right now, the way
+        //    `invalidate_cached_frames` rebuilds a `TextBox`. Since #1157 a
+        //    rebuild with the latch set yields no renderer at all, which is
+        //    how the chip becomes the placeholder. Also drops the caches, so
+        //    the `Cached::Gl` uniforms an instance was last mapped with cannot
+        //    keep a blank `GlSurface` on screen.
+        super::preem_render::rebuild_gl_renderers_as_placeholders();
         super::preem_render::invalidate_cached_frames();
         // 2. Ask for one full re-map, so the reconciler swaps the on-screen
-        //    `GlSurface` node for the `Pixels` one the rebuilt instance now
-        //    produces. Guarded (a context can fail with no live host) and
+        //    `GlSurface` node for the empty `Pixels` one the rebuilt instance
+        //    now produces. Guarded (a context can fail with no live host) and
         //    deferred to idle (we are inside a `GtkGLArea` realize/render
         //    handler, and reconciling a widget tree from there would create and
         //    destroy widgets mid-render).
@@ -562,22 +473,18 @@ pub(super) fn install() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Arm, GAUGE, REFUSED, RENDERER_ENV, SCOPE, arm, arm_for, arm_from_env, on_build_refused,
-        shader_arm, with_cpu_kill_switch, with_gl_arm,
-    };
+    use super::{Arm, GAUGE, REFUSED, SCOPE, arm, arm_for, on_build_refused, with_no_gl};
 
-    /// **A failed GL context beats the switch, and keeps beating it** — the one
-    /// branch that stands between a session with broken GL and a blank chip.
+    /// **A failed GL context takes every kit widget off the GPU, and keeps
+    /// doing it** — since #1157 the one branch that stands between a session
+    /// with broken GL and a bar of blank chips nothing explains.
     ///
-    /// It is not new code; what #1072 changed is what rests on it. While the
-    /// shipped default was CPU, a regression in this branch was **masked**:
-    /// [`configured_arm`](super::configured_arm) answered `Cpu` anyway, so a
-    /// session whose context failed still got the kit by the other route. With
-    /// GL the default again, `if gl_abandoned() { return Arm::Cpu; }` is the
-    /// only thing left — and #1072's review found it was the one decision in
-    /// this module with no test at all (the four here drove `arm_from_env` and
-    /// `shader_arm`; none drove [`arm`]).
+    /// It is not new code, but what rests on it has grown twice. While the
+    /// shipped default was CPU (#1072), a regression here was **masked**: the
+    /// configured arm answered `Cpu` anyway, so a session whose context failed
+    /// still got the kit by the other route. #1072's restoration of the GL
+    /// default made this the only thing left, and #1157's retirement of the
+    /// kill switch made it the only thing in [`arm`] at all.
     ///
     /// Driven through the **real** latch, not a fake: `hytte-ui`'s `abandon_gl`
     /// is documented as exactly this seam — "a display server with no GL is not
@@ -591,108 +498,63 @@ mod tests {
     /// **Falsified** by deleting the `gl_abandoned` branch from [`arm`]: the
     /// second assertion reports `Gl`.
     #[test]
-    fn an_abandoned_context_forces_the_cpu_arm_over_the_configured_gl_default() {
+    fn an_abandoned_context_takes_every_kit_widget_to_the_placeholder() {
         assert!(
             !hytte::ui::gl_surface::gl_abandoned(),
             "the premise: a fresh test thread has not abandoned GL",
         );
-        with_gl_arm(|| {
-            assert_eq!(arm(), Arm::Gl, "the premise: the switch says GL");
+        assert_eq!(arm(), Arm::Gl, "the premise: GL is the only arm there is");
 
-            hytte::ui::gl_surface::abandon_gl("no GL in this test");
+        hytte::ui::gl_surface::abandon_gl("no GL in this test");
 
+        assert_eq!(
+            arm(),
+            Arm::Placeholder,
+            "a context that failed leaves the kit widgets nothing to draw with",
+        );
+        // Sticky, and that is the property a *session* depends on: the
+        // verdict has to hold for every later mount, not just the one that
+        // observed the failure.
+        assert_eq!(
+            arm(),
+            Arm::Placeholder,
+            "…and keeps holding on the next mount",
+        );
+    }
+
+    /// [`with_no_gl`] overrides the session-wide answer and **puts it back**.
+    ///
+    /// The seam's own pin, and the successor of the switch-seam test #1157
+    /// deleted (`the_shader_arm_defaults_to_gl_and_the_seam_turns_it_off`).
+    /// Both halves matter: a seam that did not restore would leave every later
+    /// test on this thread believing the session has no GL, and `panels::stats`'
+    /// `the_panel_follows_the_renderer_arm` — the one consumer — depends on
+    /// going back, since it asserts the surface swaps *both* ways.
+    ///
+    /// **Falsified** by dropping the `TEST_ARM.set(previous)` line (the third
+    /// assertion), or by having [`arm`] ignore the override (the second).
+    #[test]
+    fn the_no_gl_seam_overrides_the_session_answer_and_restores_it() {
+        assert_eq!(arm(), Arm::Gl, "the premise: this thread has GL");
+        with_no_gl(|| {
+            assert_eq!(arm(), Arm::Placeholder, "the seam takes GL away");
             assert_eq!(
-                arm(),
-                Arm::Cpu,
-                "a context that failed wins over the switch",
+                arm_for(SCOPE),
+                Arm::Placeholder,
+                "…for every pipeline, since it stands in for the session-wide latch",
             );
-            // Sticky, and that is the property a *session* depends on: the
-            // fallback has to hold for every later mount, not just the one
-            // that observed the failure.
-            assert_eq!(arm(), Arm::Cpu, "…and keeps winning on the next mount");
         });
+        assert_eq!(arm(), Arm::Gl, "…and puts it back");
     }
 
-    /// The shader path's test default is **GL**, and [`with_cpu_kill_switch`]
-    /// is the seam that turns it off and puts it back.
-    ///
-    /// The default matters as much as the seam, and it is a *test* default,
-    /// pinned rather than inherited from production — `TEST_SHADER_ARM` stays
-    /// `Gl` whichever way `configured_arm` currently points, so every other
-    /// test in the suite that maps a shader node keeps exercising the compile
-    /// path rather than the refusal. Flipping this `const` initialiser to
-    /// `Arm::Cpu` turns roughly a dozen `shader_map` and `pump` assertions
-    /// red, which is the intended tripwire.
-    ///
-    /// **Falsified** by making [`with_cpu_kill_switch`] not restore the
-    /// previous value (the third assertion), or by defaulting
-    /// `TEST_SHADER_ARM` to `Arm::Cpu` (the first).
-    #[test]
-    fn the_shader_arm_defaults_to_gl_and_the_seam_turns_it_off() {
-        assert_eq!(shader_arm(), Arm::Gl, "the test default, pinned here");
-        with_cpu_kill_switch(|| {
-            assert_eq!(shader_arm(), Arm::Cpu, "the seam turns the switch on");
-        });
-        assert_eq!(shader_arm(), Arm::Gl, "…and puts it back");
-    }
-
-    /// The switch keeps the name the module docs, `docs/live-verify.md` and the
-    /// journal all quote. A rename that misses one of those leaves an operator
-    /// setting a variable nothing reads, with no diagnostic — the switch just
-    /// silently stops working.
-    #[test]
-    fn the_kill_switch_keeps_its_documented_name() {
-        assert_eq!(RENDERER_ENV, "TROLLSHELL_PREEM_RENDERER");
-    }
-
-    /// **GL is the default and `cpu` is the kill switch** — #893's original
-    /// call, restored by #1072 on 12/12 byte-identical parity cases (max |Δ| 0
-    /// of 255 per channel, llvmpipe; see the module docs).
-    ///
-    /// This is the hermetic half of that contract — the pixels are
-    /// live-verify, but which arm the shell *chooses* is a pure function and
-    /// is gated here.
-    ///
-    /// **Falsified** by flipping the match's default arm to `Arm::Cpu`, which
-    /// is exactly what #1072 did while the disagreement was unclassified.
-    #[test]
-    fn gl_is_the_default_and_cpu_is_the_kill_switch() {
-        assert_eq!(arm_from_env(None), Arm::Gl, "unset is GL");
-        assert_eq!(arm_from_env(Some("gl")), Arm::Gl, "the redundant spelling");
-        assert_eq!(arm_from_env(Some("cpu")), Arm::Cpu);
-        assert_eq!(arm_from_env(Some("CPU")), Arm::Cpu, "case-insensitive");
-        assert_eq!(arm_from_env(Some("  cpu \n")), Arm::Cpu, "trimmed");
-    }
-
-    /// The kill switch is the **only** thing that turns GL off: anything that
-    /// is not the word `cpu` leaves GL on, including a typo and an empty
-    /// string.
-    ///
-    /// It is deliberately the weaker of the two directions to get wrong. A
-    /// mistyped kill switch leaves the operator on a renderer that is
-    /// byte-identical to the kit (#1072), and the shell says which arm it took
-    /// under `RUST_LOG=hytte_gl=debug`; the context-failure latch in [`arm`]
-    /// is what actually protects a session whose GL is broken, and no spelling
-    /// of this variable can disable that.
-    #[test]
-    fn an_unrecognised_value_leaves_gl_on() {
-        for value in ["", " ", "cpu!", "cpus", "software", "0", "true", "no-gl"] {
-            assert_eq!(
-                arm_from_env(Some(value)),
-                Arm::Gl,
-                "{value:?} does not name the kill switch"
-            );
-        }
-    }
-
-    /// **#1232.** A refused pipeline takes **its own** kind's arm to the kit
+    /// **#1232.** A refused pipeline takes **its own** kind to the placeholder
     /// and nobody else's.
     ///
-    /// The third failure, and the first one that is not session-wide: the two
-    /// [`arm`] folds in — the kill switch and the context-failure latch — are
-    /// each an answer about the whole process, so before this the shell had
-    /// no way to say "this driver builds four of my five pipelines". It said
-    /// nothing at all instead, and the fifth kind's chips stayed blank.
+    /// The third failure, and the only one that is not session-wide: what
+    /// [`arm`] folds in is an answer about the whole process, so before this
+    /// the shell had no way to say "this driver builds seven of my eight
+    /// pipelines". It said nothing at all instead, and the eighth kind's chips
+    /// stayed blank.
     ///
     /// Driven through [`on_build_refused`] rather than by poking the latch,
     /// because the record and the rebuild sweep are one decision: a version
@@ -706,52 +568,50 @@ mod tests {
     #[test]
     fn a_refused_pipeline_takes_only_its_own_kinds_arm() {
         let _ink = crate::plugins::tests::preem_ink_lock();
-        with_gl_arm(|| {
-            assert_eq!(arm_for(SCOPE), Arm::Gl, "the premise: the switch says GL");
-            assert_eq!(arm_for(GAUGE), Arm::Gl);
+        assert_eq!(arm_for(SCOPE), Arm::Gl, "the premise: GL is available");
+        assert_eq!(arm_for(GAUGE), Arm::Gl);
 
-            on_build_refused(SCOPE, (48, 24), "fragment shader failed to compile");
+        on_build_refused(SCOPE, (48, 24), "fragment shader failed to compile");
 
-            assert_eq!(
-                arm_for(SCOPE),
-                Arm::Cpu,
-                "a pipeline this driver refused is not offered to it again",
-            );
-            assert_eq!(
-                arm_for(GAUGE),
-                Arm::Gl,
-                "…and every other pipeline keeps the GPU: the refusal is per program, not a \
-                 second `gl_abandoned`",
-            );
-            assert_eq!(
-                arm(),
-                Arm::Gl,
-                "…which is exactly what the session-wide answer still says",
-            );
+        assert_eq!(
+            arm_for(SCOPE),
+            Arm::Placeholder,
+            "a pipeline this driver refused is not offered to it again",
+        );
+        assert_eq!(
+            arm_for(GAUGE),
+            Arm::Gl,
+            "…and every other pipeline keeps the GPU: the refusal is per program, not a second \
+             `gl_abandoned`",
+        );
+        assert_eq!(
+            arm(),
+            Arm::Gl,
+            "…which is exactly what the session-wide answer still says",
+        );
 
-            // The record is a **set**, which is the observable half of the
-            // idempotence guard (PR #1243 review, LOW 2). The hook fires once
-            // per *surface* — `hytte-ui`'s latch is per instance — so a bar
-            // with four scope chips calls this four times in one frame, and a
-            // record that appended per call would grow for the life of the
-            // session and lengthen every `arm_for` scan with it.
-            //
-            // Measured: dropping the `contains` check reds this (`left: 2`);
-            // deleting `if !first { return; }` does **not** red anything, and
-            // `on_build_refused`'s doc says so rather than claiming coverage
-            // it has not got.
-            on_build_refused(SCOPE, (96, 32), "the same driver, a second chip");
-            assert_eq!(
-                REFUSED.with_borrow(Vec::len),
-                1,
-                "a program already known refused is recorded once, not once per surface",
-            );
-            assert_eq!(
-                arm_for(SCOPE),
-                Arm::Cpu,
-                "…and a second refusal of the same pipeline does not un-refuse it",
-            );
-        });
+        // The record is a **set**, which is the observable half of the
+        // idempotence guard (PR #1243 review, LOW 2). The hook fires once
+        // per *surface* — `hytte-ui`'s latch is per instance — so a bar
+        // with four scope chips calls this four times in one frame, and a
+        // record that appended per call would grow for the life of the
+        // session and lengthen every `arm_for` scan with it.
+        //
+        // Measured: dropping the `contains` check reds this (`left: 2`);
+        // deleting `if !first { return; }` does **not** red anything, and
+        // `on_build_refused`'s doc says so rather than claiming coverage
+        // it has not got.
+        on_build_refused(SCOPE, (96, 32), "the same driver, a second chip");
+        assert_eq!(
+            REFUSED.with_borrow(Vec::len),
+            1,
+            "a program already known refused is recorded once, not once per surface",
+        );
+        assert_eq!(
+            arm_for(SCOPE),
+            Arm::Placeholder,
+            "…and a second refusal of the same pipeline does not un-refuse it",
+        );
     }
 
     /// **#1253** (PR #1243 review, NEW LOW A). The idempotence guard's

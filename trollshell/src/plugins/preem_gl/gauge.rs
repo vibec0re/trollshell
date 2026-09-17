@@ -99,7 +99,7 @@
 //! One render is four passes, and **no step passes at all** — unlike the scope,
 //! a gauge carries no cross-frame GPU state. Its one piece of state is the
 //! needle's spring, which stays on the CPU in a `kit::Gauge` (see
-//! `preem_render`'s `Renderer::GaugeGl`): it is closed-form, frame-rate
+//! `preem_render`'s `Renderer::Gauge`): it is closed-form, frame-rate
 //! independent, and costs a handful of multiplies a tick, so there is nothing
 //! to win by moving it and a `Needle` accessor to lose.
 //!

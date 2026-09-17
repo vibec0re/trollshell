@@ -18,10 +18,10 @@
 //! `$XDG_RUNTIME_DIR`, so anything that can send a frame already runs as the
 //! user, and a shader is exactly as trusted as the plugin's own native code.
 //!
-//! So what lives here is a capability check, two "does this session run plugin
-//! shaders at all" checks — the context-failure latch, and #978's
-//! `TROLLSHELL_PREEM_RENDERER=cpu` kill switch, which the one widget in the
-//! shell that runs a plugin's GPU code used to ignore — and five cheap shape
+//! So what lives here is a capability check, one "does this session run plugin
+//! shaders at all" check — the context-failure latch; #978's
+//! `TROLLSHELL_PREEM_RENDERER=cpu` kill switch was the second until #1157
+//! retired it along with the CPU renderer it named — and five cheap shape
 //! checks, the fifth being #977's per-axis grid extent. There
 //! is **no source validator**, and that is a measured absence rather than a
 //! todo: naga — the one Rust GLSL frontend in reach — cannot parse the ES
@@ -52,7 +52,6 @@ use hytte_plugin_proto::wire::{
 use hytte_plugin_proto::{Capability, Manifest};
 use hytte_preem as kit;
 
-use super::preem_gl;
 use super::preem_render::{self, Scope, Warned};
 
 /// What a plugin's connection is allowed to render, as far as the mapping pass
@@ -174,41 +173,28 @@ pub(super) enum Refusal {
         /// The grid that was claimed, in texels.
         size: (u32, u32),
     },
-    /// `TROLLSHELL_PREEM_RENDERER=cpu` is set for this session (#978).
-    ///
-    /// The kill switch is documented as unconditional — the design spec calls
-    /// it "the kill switch, forcing CPU regardless of GL availability" — and
-    /// the shader widget is the one widget in the shell that runs a *plugin's*
-    /// GPU code, so it is the one where "GL is off" has to mean something. It
-    /// has no CPU arm to fall back to (see [`NoGl`](Refusal::NoGl)), so "off"
-    /// means the placeholder.
-    ///
-    /// Its own variant rather than a second [`NoGl`](Refusal::NoGl) because the
-    /// fix is the opposite kind of thing: *unset a variable and restart*, not
-    /// *this session's GL is gone*. They share a warn slot
-    /// ([`Warned::ShaderNoGpu`]) because they are the same fact about the
-    /// session reached two ways; they do not share a journal line, because
-    /// telling an operator who deliberately turned GL off that their context
-    /// failed is a false diagnosis.
-    CpuForced,
     /// GL has been abandoned for this process — a context failed to create, and
     /// `hytte-ui` latched it.
     ///
-    /// The one refusal here that is nobody's mistake, and the one with **no
-    /// fallback**: a kit widget has a CPU implementation to fall back to and the
-    /// shader widget has none by design (Annika, #893: "EGL should be available
-    /// for all targets"). So the node takes the placeholder rather than mounting
-    /// a `GtkGLArea` that can never draw — which would also pay for a fresh
-    /// failed context per shader node, per monitor, per frame.
+    /// The one refusal here that is nobody's mistake. It was for a long time
+    /// also the one with **no fallback** — a kit widget had a CPU
+    /// implementation to fall back to and the shader widget had none by design
+    /// (Annika, #893: "EGL should be available for all targets") — and since
+    /// #1157 retired that implementation it is simply what every preem node
+    /// does too. The node takes the placeholder rather than mounting a
+    /// `GtkGLArea` that can never draw, which would also pay for a fresh failed
+    /// context per shader node, per monitor, per frame.
     ///
     /// # It is **sticky for the process**, and that is a decision (#968 L3)
     ///
     /// `hytte_ui::gl_surface`'s `ABANDONED` latch is set once and never cleared
-    /// (`gl_surface.rs`, inherited from #954). For a kit widget a stale latch
-    /// costs a CPU render — the picture is still right. For a shader widget it
-    /// costs **the widget, permanently**: one transient context failure (a
+    /// (`gl_surface.rs`, inherited from #954). Until #1157 a stale latch cost a
+    /// kit widget a CPU render — the picture was still right — and a shader
+    /// widget **the widget, permanently**: one transient context failure (a
     /// hot-plug race, a resume, a startup before `/dev/dri` is ready) blanks
-    /// every shader in the session until the shell is restarted.
+    /// every shader in the session until the shell is restarted. It now costs
+    /// both of them the same thing, which raises the stake on the paragraph
+    /// below rather than changing its answer.
     ///
     /// Kept sticky anyway, for one reason: **there is nothing to re-try on.**
     /// Clearing the latch needs an event that says a context might now succeed,
@@ -282,7 +268,7 @@ impl Refusal {
     /// same as its four siblings — but [`warn`] does not call
     /// [`preem_render::warn_once`] with it: `Warned` is out of bits (all
     /// eight spoken for since #981, same as the section above), so a *ninth*
-    /// slot the way `NoGl`/`CpuForced` got a *third* was not available. Its
+    /// slot the way `NoGl` got its own *third* was not available. Its
     /// gating instead claims [`WARNED_GRID_TOO_LARGE`], its own per-scope
     /// latch, so a tree that already claimed `ShaderCap` for one of the other
     /// four shape refusals still gets this one's line — the diagnosis #977
@@ -296,30 +282,35 @@ impl Refusal {
             | Self::MalformedData { .. }
             | Self::EmptyGrid
             | Self::GridTooLarge { .. } => Warned::ShaderCap,
-            Self::NoGl | Self::CpuForced => Warned::ShaderNoGpu,
+            Self::NoGl => Warned::ShaderNoGpu,
         }
     }
 }
 
 /// Whether this node may be drawn, and if not, why.
 ///
-/// Pure — `gl` and `arm` are passed in rather than read from
-/// [`gl_abandoned`](hytte::ui::gl_surface::gl_abandoned) and
-/// [`preem_gl::shader_arm`] here — so the whole policy is testable without GTK,
-/// without GL, without a socket and without touching the process environment,
-/// which matters because every one of these paths ends in "the same empty
+/// Pure — `gl` is passed in rather than read from
+/// [`gl_abandoned`](hytte::ui::gl_surface::gl_abandoned) here — so the whole
+/// policy is testable without GTK, without GL and without a socket, which
+/// matters because every one of these paths ends in "the same empty
 /// placeholder" and the pixels cannot tell them apart.
+///
+/// It took an `arm` beside `gl` until #1157: #978's
+/// `TROLLSHELL_PREEM_RENDERER=cpu` kill switch had to reach the one widget in
+/// the shell that runs a *plugin's* GPU code, and it was its own refusal rather
+/// than a second `NoGl` because the fix was the opposite kind of thing (*unset
+/// a variable* against *this session's GL is gone*). #1157 retired the switch
+/// with the CPU renderer it named, so that parameter and that refusal went with
+/// it and one session-wide check is left.
 ///
 /// Order is deliberate, and it is **who can fix it** before **how cheap it is**:
 ///
 /// 1. the capability, because a plugin that may not draw shaders at all should
 ///    be told *that* rather than told its buffer is the wrong length, and
 ///    because it is the refusal its author can fix in one line;
-/// 2. the two session-wide refusals, because a node that was never going to
-///    draw in this shell run should not have its buffer measured and reported
-///    — there is nothing to read the buffer *with*. `gl` before `arm`: a
-///    context that already failed is the more final fact of the two, and
-///    unsetting the env var would not bring it back;
+/// 2. the session-wide refusal, because a node that was never going to draw in
+///    this shell run should not have its buffer measured and reported — there
+///    is nothing to read the buffer *with*;
 /// 3. the shape checks, cheapest and most fundamental first — the length
 ///    invariant, then a zero side, then the per-axis extent. A grid whose
 ///    length does not match it is a more basic mistake than a grid that is
@@ -328,7 +319,6 @@ impl Refusal {
 pub(super) fn refusal(
     grants: Grants,
     gl: GlAvailability,
-    arm: preem_gl::Arm,
     node: &ShaderNode<'_>,
 ) -> Option<Refusal> {
     if !grants.shader {
@@ -336,9 +326,6 @@ pub(super) fn refusal(
     }
     if gl == GlAvailability::Abandoned {
         return Some(Refusal::NoGl);
-    }
-    if arm == preem_gl::Arm::Cpu {
-        return Some(Refusal::CpuForced);
     }
     if node.fragment.len() > MAX_SHADER_SOURCE_BYTES {
         return Some(Refusal::SourceTooLarge {
@@ -372,12 +359,7 @@ pub(super) fn refusal(
 /// Map one shader node, applying [`refusal`] and — where it says yes — building
 /// the [`ShaderState`] the widget draws from.
 pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -> UiNode {
-    if let Some(refused) = refusal(
-        grants,
-        GlAvailability::current(),
-        preem_gl::shader_arm(),
-        node,
-    ) {
+    if let Some(refused) = refusal(grants, GlAvailability::current(), node) {
         warn(scope, node, refused);
         return placeholder(node);
     }
@@ -596,8 +578,8 @@ thread_local! {
     /// Per-scope latch for [`Refusal::GridTooLarge`] (#1023 item 2), kept
     /// apart from [`Warned`]/`WARN_COUNTS` because that table is out of bits
     /// after #981 (`Warned::slot`'s own doc: "all eight are spoken for") —
-    /// there is no ninth slot to give this refusal the way #981's
-    /// `NoGl`/`CpuForced` split got its own.
+    /// there is no ninth slot to give this refusal the way #981's `NoGl`
+    /// split got its own.
     ///
     /// Before this, `GridTooLarge` rode `Warned::ShaderCap` with the other
     /// four shape refusals, so a tree that had already claimed that slot for
@@ -720,23 +702,11 @@ fn warn(scope: &Scope, node: &ShaderNode<'_>, refused: Refusal) {
             tree = ?scope.role(),
             node = ?node.id,
             "no OpenGL context in this session, so this plugin's Shader nodes render the \
-             broken-widget placeholder — unlike a preem widget there is no CPU arm to fall \
-             back to, by design, and the latch is sticky for the life of this process, so \
-             this needs a shell restart rather than a reconnect. hytte-ui has already \
-             logged the context failure itself (further occurrences in this tree are \
-             silenced)",
-        ),
-        Refusal::CpuForced => tracing::warn!(
-            plugin = scope.plugin_id(),
-            tree = ?scope.role(),
-            node = ?node.id,
-            switch = preem_gl::RENDERER_ENV,
-            "the preem renderer kill switch is set to `cpu`, so this plugin's Shader nodes \
-             render the broken-widget placeholder — the switch is unconditional and the \
-             shader widget is GPU-only by design, so unlike a preem widget there is no CPU \
-             arm to fall back to. Unset TROLLSHELL_PREEM_RENDERER in the unit's environment \
-             and restart the shell to get them back; the variable is read once at startup \
-             (further occurrences in this tree are silenced)",
+             broken-widget placeholder — there is no CPU arm to fall back to, by design here \
+             and since #1157 for every preem widget too, and the latch is sticky for the life \
+             of this process, so this needs a shell restart rather than a reconnect. hytte-ui \
+             has already logged the context failure itself (further occurrences in this tree \
+             are silenced)",
         ),
     }
 }
@@ -821,7 +791,6 @@ mod tests {
         WARNED_GRID_TOO_LARGE, Warned, begin_pass, cached_states, end_pass, forget_scope,
         map_shader, refusal, theme_values, warn_once_grid_too_large,
     };
-    use crate::plugins::preem_gl::{Arm, with_cpu_kill_switch};
     use crate::plugins::preem_render::{self, Scope};
     use crate::plugins::tests::{preem_ink_lock, role_ink_reset};
     use hytte::ui::Node as UiNode;
@@ -874,11 +843,11 @@ mod tests {
         let data = [1u8, 2, 3, 4];
         let node = ok_node("void main() { fragColor = u_fg; }", &data);
         assert_eq!(
-            refusal(Grants::none(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(Grants::none(), GlAvailability::Available, &node),
             Some(Refusal::NoCapability)
         );
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "granted, it draws"
         );
@@ -889,7 +858,7 @@ mod tests {
         let mut broken = ok_node("void main() {}", &data);
         broken.data_size = (99, 99);
         assert_eq!(
-            refusal(Grants::none(), GlAvailability::Available, Arm::Gl, &broken),
+            refusal(Grants::none(), GlAvailability::Available, &broken),
             Some(Refusal::NoCapability)
         );
     }
@@ -907,7 +876,6 @@ mod tests {
             refusal(
                 granted(),
                 GlAvailability::Available,
-                Arm::Gl,
                 &ok_node(&at_cap, &data)
             ),
             None
@@ -915,12 +883,7 @@ mod tests {
 
         let over = "x".repeat(MAX_SHADER_SOURCE_BYTES + 1);
         assert_eq!(
-            refusal(
-                granted(),
-                GlAvailability::Available,
-                Arm::Gl,
-                &ok_node(&over, &data)
-            ),
+            refusal(granted(), GlAvailability::Available, &ok_node(&over, &data)),
             Some(Refusal::SourceTooLarge {
                 bytes: MAX_SHADER_SOURCE_BYTES + 1
             }),
@@ -963,16 +926,13 @@ mod tests {
             "…and inside that cap: {side} texels a side",
         );
         node.data_size = (side, side);
-        assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
-            None
-        );
+        assert_eq!(refusal(granted(), GlAvailability::Available, &node), None);
 
         let over = vec![0u8; MAX_SHADER_DATA_BYTES + 1];
         let mut node = ok_node("void main() {}", &over);
         node.data_size = (u32::try_from(MAX_SHADER_DATA_BYTES + 1).unwrap(), 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::DataTooLarge {
                 bytes: MAX_SHADER_DATA_BYTES + 1
             }),
@@ -1003,13 +963,13 @@ mod tests {
         let mut node = ok_node("void main() {}", &at_cap);
         node.data_size = (MAX_SHADER_DATA_EXTENT, 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "exactly at the cap draws",
         );
         node.data_size = (1, MAX_SHADER_DATA_EXTENT);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "…on either axis",
         );
@@ -1018,7 +978,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &over);
         node.data_size = (MAX_SHADER_DATA_EXTENT + 1, 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::GridTooLarge {
                 size: (MAX_SHADER_DATA_EXTENT + 1, 1)
             }),
@@ -1026,7 +986,7 @@ mod tests {
         );
         node.data_size = (1, MAX_SHADER_DATA_EXTENT + 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::GridTooLarge {
                 size: (1, MAX_SHADER_DATA_EXTENT + 1)
             }),
@@ -1039,7 +999,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &issue);
         node.data_size = (32_768, 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::GridTooLarge { size: (32_768, 1) }),
         );
 
@@ -1053,86 +1013,6 @@ mod tests {
             Refusal::GridTooLarge { size: (32_768, 1) }.slot(),
             Warned::ShaderCap,
         );
-    }
-
-    /// **#978: the kill switch refuses every plugin shader.**
-    ///
-    /// `TROLLSHELL_PREEM_RENDERER=cpu` is documented as unconditional — the
-    /// design spec calls it "the kill switch, forcing CPU regardless of GL
-    /// availability" — and the shader widget was the one widget in the shell
-    /// that ignored it. An operator who set it *because* GL was wedging the
-    /// session still had the shell compiling and running a plugin's own GLSL,
-    /// with the whole shell as the blast radius.
-    ///
-    /// Checked **after** the capability, so a plugin missing it is still told
-    /// the thing its author can fix, and **after** `gl`, because a context that
-    /// already failed is the more final fact of the two — unsetting the
-    /// variable would not bring it back.
-    ///
-    /// **Falsified** by deleting the `arm == Arm::Cpu` guard: the first two
-    /// assertions become `None`, and the shader mounts a `GtkGLArea` and
-    /// compiles plugin GPU code in a session that was told not to.
-    #[test]
-    fn the_kill_switch_refuses_every_shader() {
-        let data = [1u8, 2, 3, 4];
-        let node = ok_node("void main() { fragColor = u_fg; }", &data);
-
-        assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Cpu, &node),
-            Some(Refusal::CpuForced),
-        );
-        assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
-            None,
-            "with the switch unset it draws",
-        );
-        assert_eq!(
-            refusal(Grants::none(), GlAvailability::Available, Arm::Cpu, &node),
-            Some(Refusal::NoCapability),
-            "the plugin-fixable refusal still wins",
-        );
-        assert_eq!(
-            refusal(granted(), GlAvailability::Abandoned, Arm::Cpu, &node),
-            Some(Refusal::NoGl),
-            "a failed context is the more final fact, and it is reported as itself",
-        );
-
-        // A malformed node under the switch reports the switch: the buffer was
-        // never going to be read in this session.
-        let mut broken = ok_node("void main() {}", &data);
-        broken.data_size = (99, 99);
-        assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Cpu, &broken),
-            Some(Refusal::CpuForced),
-        );
-    }
-
-    /// **#978, at the live seam.** [`map_shader`] itself must consult the
-    /// switch, not merely be *able* to — the whole defect was a pure predicate
-    /// nobody called with the right input.
-    ///
-    /// **Falsified** by passing `Arm::Gl` (or dropping the argument) at
-    /// `map_shader`'s call into [`refusal`]: the node maps to a `UiNode::Shader`
-    /// under the switch and the first assertion goes red.
-    #[test]
-    fn map_shader_reads_the_kill_switch_and_not_only_the_gl_latch() {
-        let data = [1u8, 2, 3, 4];
-        let node = ok_node("void main() { fragColor = u_fg; }", &data);
-        let scope = Scope::detached("shader-kill-switch-seam");
-        forget_scope(&scope);
-
-        let killed = with_cpu_kill_switch(|| map_shader(&scope, granted(), &node));
-        assert!(
-            matches!(killed, UiNode::Pixels { width: 0, .. }),
-            "under the kill switch the node takes the placeholder, got {killed:?}",
-        );
-
-        let live = map_shader(&scope, granted(), &node);
-        assert!(
-            matches!(live, UiNode::Shader { .. }),
-            "…and draws with the switch unset, got {live:?}",
-        );
-        forget_scope(&scope);
     }
 
     /// The `len == w * h * bytes_per_texel` invariant, per format — the check
@@ -1151,13 +1031,13 @@ mod tests {
         node.format = ShaderData::Rgba8;
         node.data_size = (1, 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "1 Rgba8 texel is 4 bytes"
         );
         node.data_size = (2, 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::MalformedData { bytes: 4 }),
             "2 Rgba8 texels want 8",
         );
@@ -1166,13 +1046,13 @@ mod tests {
         node.format = ShaderData::R32f;
         node.data_size = (4, 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "4 f32 texels are 16 bytes"
         );
         node.data_size = (4, 2);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::MalformedData { bytes: 16 }),
         );
     }
@@ -1187,7 +1067,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &empty);
         node.data_size = (0, 0);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid)
         );
 
@@ -1195,7 +1075,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &data);
         node.width = 0;
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid)
         );
     }
@@ -1227,7 +1107,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &data);
         node.width = 0;
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid),
             "width == 0",
         );
@@ -1236,7 +1116,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &data);
         node.height = 0;
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid),
             "height == 0",
         );
@@ -1248,7 +1128,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &empty);
         node.data_size = (0, 4);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid),
             "data_size.0 == 0",
         );
@@ -1257,7 +1137,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &empty);
         node.data_size = (4, 0);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid),
             "data_size.1 == 0",
         );
@@ -1290,7 +1170,7 @@ mod tests {
         let one_texel = [0u8];
         let node = ok_node("void main() {}", &one_texel);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "1x1 grid over a 144x48 surface",
         );
@@ -1301,7 +1181,7 @@ mod tests {
         node.width = 1;
         node.height = 1;
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "1x1 surface over a 4x1 grid",
         );
@@ -1327,7 +1207,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &three);
         node.data_size = (0, 4);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::MalformedData { bytes: 3 }),
             "a zero-sided grid whose buffer also mismatches is MalformedData",
         );
@@ -1340,7 +1220,7 @@ mod tests {
         let mut node = ok_node("void main() {}", &empty);
         node.data_size = (0, MAX_SHADER_DATA_EXTENT + 1);
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::EmptyGrid),
             "a zero-sided grid whose other axis is over the extent cap is EmptyGrid",
         );
@@ -1363,16 +1243,16 @@ mod tests {
         let data = [1u8, 2, 3, 4];
         let node = ok_node("void main() { fragColor = u_fg; }", &data);
         assert_eq!(
-            refusal(granted(), GlAvailability::Abandoned, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Abandoned, &node),
             Some(Refusal::NoGl),
         );
         assert_eq!(
-            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            refusal(granted(), GlAvailability::Available, &node),
             None,
             "with a context it draws",
         );
         assert_eq!(
-            refusal(Grants::none(), GlAvailability::Abandoned, Arm::Gl, &node),
+            refusal(Grants::none(), GlAvailability::Abandoned, &node),
             Some(Refusal::NoCapability),
             "the plugin-fixable refusal still wins",
         );
@@ -1382,7 +1262,7 @@ mod tests {
         let mut broken = ok_node("void main() {}", &data);
         broken.data_size = (99, 99);
         assert_eq!(
-            refusal(granted(), GlAvailability::Abandoned, Arm::Gl, &broken),
+            refusal(granted(), GlAvailability::Abandoned, &broken),
             Some(Refusal::NoGl),
         );
     }
@@ -1992,17 +1872,24 @@ mod tests {
     /// blank; `hytte-ui`'s own line saying only "no OpenGL context for a
     /// `GlSurface`"; nothing anywhere naming the fix.
     ///
-    /// The session-wide refusal used here is [`Refusal::CpuForced`], not
-    /// [`Refusal::NoGl`], and that is deliberate rather than a dodge: they are
-    /// the *same slot* (asserted below), and reaching `NoGl` through
-    /// [`map_shader`] would mean latching `hytte-ui`'s process-wide
-    /// `gl_abandoned` flag, which is sticky by design and would blank every
-    /// other shader test in the binary. The kill switch is the same slot
-    /// reachable through a scoped, restoring seam.
+    /// The session-wide refusal is reached through [`warn`] **directly**, not
+    /// through [`map_shader`], and that is deliberate rather than a dodge.
+    /// Until #1157 it was reached through `Refusal::CpuForced` — #978's kill
+    /// switch, the same slot behind a scoped, restoring seam — because
+    /// reaching [`Refusal::NoGl`] the live way means latching `hytte-ui`'s
+    /// process-wide `gl_abandoned` flag, which is sticky by design and would
+    /// blank every other shader test in the binary. #1157 retired that switch
+    /// with the CPU renderer, leaving `NoGl` as the only session-wide refusal
+    /// there is, so the one seam left that does not poison the binary is the
+    /// emitter itself. What the second call therefore does not exercise —
+    /// that `map_shader` reaches `refusal` and `refusal` answers `NoGl` — is
+    /// covered by `an_abandoned_gl_session_refuses_every_shader`; what it
+    /// *does* exercise is the whole of what #981 is about, the latch and the
+    /// slot.
     ///
-    /// **Falsified** by mapping `Refusal::NoGl | Refusal::CpuForced` back onto
-    /// `Warned::ShaderCap` in [`Refusal::slot`]: the count drops to 1, which is
-    /// exactly the pre-#981 reading.
+    /// **Falsified** by mapping `Refusal::NoGl` back onto `Warned::ShaderCap`
+    /// in [`Refusal::slot`]: the count drops to 1, which is exactly the
+    /// pre-#981 reading.
     #[test]
     fn two_different_refusal_kinds_each_cost_their_own_journal_line() {
         // The slot split itself, stated where a reader can see it: a code fix
@@ -2011,11 +1898,6 @@ mod tests {
             Refusal::NoGl.slot(),
             Warned::ShaderNoGpu,
             "#981: no GL is not a shape mistake",
-        );
-        assert_eq!(
-            Refusal::CpuForced.slot(),
-            Warned::ShaderNoGpu,
-            "…and the kill switch is the same fact about the session",
         );
         assert_ne!(
             Refusal::SourceTooLarge { bytes: 1 }.slot(),
@@ -2030,10 +1912,8 @@ mod tests {
         let emitted = counting_events("shader-two-refusal-kinds", |scope| {
             // A plugin ships one over-cap source at startup…
             let _ = map_shader(scope, granted(), &big);
-            // …and, later in the same run, the session stops running shaders.
-            with_cpu_kill_switch(|| {
-                let _ = map_shader(scope, granted(), &fine);
-            });
+            // …and, later in the same run, the session loses its GL.
+            super::warn(scope, &fine, Refusal::NoGl);
         });
         assert_eq!(
             emitted, 2,

@@ -103,8 +103,8 @@ pub(crate) const TEXTBOX_PIPELINE: GlPipeline = GlPipeline {
 /// has and the bits for them.
 ///
 /// Built once per text (or palette) change and shared by every monitor's
-/// mapping pass, the way `Renderer::ScopeGl`'s `samples` and
-/// `Renderer::DotMatrixGl`'s glyph strip are (#911's rule, for uniforms): the
+/// mapping pass, the way `Renderer::Scope`'s `samples` and
+/// `Renderer::DotMatrix`'s glyph strip are (#911's rule, for uniforms): the
 /// `Arc` makes a repeat mapping's dedup a pointer compare rather than a
 /// re-encode of the whole block.
 #[derive(Clone, Debug, PartialEq)]

@@ -50,10 +50,13 @@
 //! surface finds out when it realizes, latches
 //! [`gl_abandoned`], and calls the host's
 //! [`set_context_failure_handler`] hook exactly once. The host — which is the
-//! only party that knows whether a CPU implementation exists — decides what to
-//! do about it; `trollshell`'s preem renderer rebuilds every GL scope onto the
-//! CPU kit inside the hook and asks for one re-map, rather than waiting for a
-//! mapping pass that a settled widget's parked clock may never deliver.
+//! only party that knows what it has left — decides what to do about it;
+//! `trollshell`'s preem renderer rebuilds every GL renderer inside the hook and
+//! asks for one re-map, rather than waiting for a mapping pass that a settled
+//! widget's parked clock may never deliver. Since trollshell#1157 that rebuild
+//! produces no renderer at all, because its CPU arm is gone: the chip becomes
+//! that host's broken-widget placeholder. This crate takes no view on which it
+//! is — that is the point of the hook.
 //!
 //! The latch is process-wide (thread-local on the GTK thread) once the *first*
 //! failure is observed, which is one word narrower than the spec's "per
@@ -66,8 +69,8 @@
 //!
 //! That is a **third** failure, and it is neither of the two above (#1232).
 //! [`abandon_gl`] covers a failed context and a missing [`GlPipeline`] covers
-//! "this kind has no GL arm" — the two cases #893 says the CPU kit exists for
-//! — but a context that comes up fine and then will not *compile or link* one
+//! "this kind has no GL arm" — the two cases #893 wrote a host-side fallback
+//! for — but a context that comes up fine and then will not *compile or link* one
 //! particular pipeline is neither. #1180 item 2 made that refusal permanent
 //! for the surface rather than a per-frame recompile, which is the right
 //! answer for the driver and the wrong one for the widget: a build asked once
@@ -365,9 +368,11 @@ pub fn register(program: GlProgram, pipeline: GlPipeline) {
 /// reason the first time any surface cannot get a GL context, and never again.
 ///
 /// The hook is where a host decides what a failure *means*, which this crate
-/// cannot: `trollshell` uses it to rebuild every GL `Scope` renderer onto the
-/// CPU kit there and then, and to ask for one re-map — because a settled
-/// widget's parked clock never delivers a mapping pass to do it on.
+/// cannot: `trollshell` uses it to rebuild every GL renderer there and then,
+/// and to ask for one re-map — because a settled widget's parked clock never
+/// delivers a mapping pass to do it on. What those rebuilds land on is the
+/// host's business and has changed once already (trollshell#1157 retired the
+/// CPU kit they used to land on, so they now land on a placeholder).
 pub fn set_context_failure_handler(handler: impl Fn(&str) + 'static) {
     ON_CONTEXT_FAILURE.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
 }
@@ -398,10 +403,10 @@ pub fn set_context_failure_handler(handler: impl Fn(&str) + 'static) {
 ///
 /// Exactly what it does for a failed context, narrowed to the one pipeline:
 /// `trollshell`'s `plugins::preem_gl` records the program as refused so
-/// `preem_render::build` stops choosing its GL arm, rebuilds the chips already
-/// on it onto the CPU kit, and asks for one re-map — because a settled
-/// widget's parked clock will never deliver a mapping pass to do it on. The
-/// chips of *other* kinds keep their GPU arm.
+/// `preem_render::build` stops choosing it, rebuilds the chips already on it,
+/// and asks for one re-map — because a settled widget's parked clock will never
+/// deliver a mapping pass to do it on. The chips of *other* kinds keep their
+/// GPU arm, which is the whole point of the refusal being per program.
 pub fn set_build_refusal_handler(handler: impl Fn(GlProgram, (u32, u32), &str) + 'static) {
     ON_BUILD_REFUSAL.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
 }
@@ -452,21 +457,50 @@ pub fn gl_abandoned() -> bool {
     ABANDONED.with_borrow(Option::is_some)
 }
 
+/// The **one sentence an operator on a GL-less box reads**, emitted once per
+/// process by [`abandon_gl`].
+///
+/// A named constant rather than a literal inside the `warn!`, on the precedent
+/// trollshell's `preem_gl::RENDERER_ENV` set: a string a *document* tells a
+/// human to grep for has two places to keep in step, and only one of them is
+/// compiled. `docs/live-verify.md`'s #1157 item 3 sends a verifier at this line
+/// by hand, so [`tests::the_context_failure_line_does_not_promise_a_cpu_fallback`]
+/// holds it to the property that matters.
+///
+/// It promised "falling back to the CPU renderer for the rest of this session"
+/// until PR #1356's review (H1). That was true while a host had a CPU arm to
+/// fall back to and false the moment trollshell#1157 deleted trollshell's — and
+/// the failure mode of a stale promise here is specific and expensive: an
+/// operator reads it, sees an empty bar rather than a kit-drawn one, and goes
+/// hunting a second bug that does not exist.
+///
+/// What it does **not** say is what any particular widget shows instead, which
+/// is deliberate and is this crate's whole posture about the hook (see
+/// [`set_context_failure_handler`]): that is the host's decision, and it has
+/// already changed once. What this crate can state — and all it states — is
+/// that no `GlSurface` in this process will draw again, that the latch is
+/// sticky, and therefore that the remedy is a restart. trollshell's own answer
+/// is named as an example rather than as a promise.
+const CONTEXT_FAILURE_MESSAGE: &str = "no OpenGL context for a GlSurface; no GlSurface in this \
+     process will draw again for the rest of this session, and the host decides what each one \
+     shows instead (in trollshell: the broken-widget placeholder). Restart the shell to try GL \
+     again (further occurrences are silenced)";
+
 /// Abandon the GL path for this process, running the host's hook if this is the
 /// first time.
 ///
 /// Called by [`GlSurface`] itself when a context fails to create. Public
-/// because it is also the seam a host tests its own CPU fallback through: a
-/// display server with no GL is not something a hermetic test can arrange, but
-/// "behave as if the context had failed" is exactly one call.
+/// because it is also the seam a host tests its own fallback through: a display
+/// server with no GL is not something a hermetic test can arrange, but "behave
+/// as if the context had failed" is exactly one call.
 ///
 /// **The latch is set before the hook runs, and that ordering is load-bearing
 /// — do not reverse it.** A host's handler will typically rebuild whatever it
 /// had on GL, and it decides what to rebuild *onto* by asking
 /// [`gl_abandoned`]. If the flag were only set afterwards, every one of those
 /// rebuilds would resolve back to GL and the handler would silently accomplish
-/// nothing. `trollshell`'s `preem_render::rebuild_gl_renderers_on_cpu` is
-/// exactly that shape.
+/// nothing. `trollshell`'s `preem_render::rebuild_gl_renderers_as_placeholders`
+/// is exactly that shape.
 pub fn abandon_gl(reason: &str) {
     let first = ABANDONED.with_borrow_mut(|slot| {
         if slot.is_some() {
@@ -478,11 +512,7 @@ pub fn abandon_gl(reason: &str) {
     if !first {
         return;
     }
-    tracing::warn!(
-        reason,
-        "no OpenGL context for a GlSurface; falling back to the CPU renderer for the rest of \
-         this session (further occurrences are silenced)"
-    );
+    tracing::warn!(reason, "{CONTEXT_FAILURE_MESSAGE}");
     // Taken out of the slot for the duration of the call: a hook is arbitrary
     // host code and may (legitimately) re-enter this module.
     let handler = ON_CONTEXT_FAILURE.with_borrow_mut(Option::take);
@@ -2659,16 +2689,65 @@ impl Default for GlSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildKey, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue,
-        MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, REFUSED_BUILDS,
-        RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
-        framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after, program_key,
-        refuse_build, refuse_data_strip, report_build_refusal, resources_reusable,
-        set_build_refusal_handler, steps_owed, warn_on_data_failure, warn_on_target_failure,
+        BuildKey, CONTEXT_FAILURE_MESSAGE, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms,
+        GlValue, MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
+        REFUSED_BUILDS, RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch,
+        abandon_gl, fit_rect, framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl,
+        last_drawn_after, program_key, refuse_build, refuse_data_strip, report_build_refusal,
+        resources_reusable, set_build_refusal_handler, steps_owed, warn_on_data_failure,
+        warn_on_target_failure,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    /// **PR #1356 review, H1.** The context-failure line must not promise a
+    /// renderer that no longer exists.
+    ///
+    /// It is the only sentence an operator on a GL-less box reads, and
+    /// `docs/live-verify.md`'s trollshell#1157 item 3 sends a verifier at it by
+    /// hand. It said "falling back to the CPU renderer for the rest of this
+    /// session" until that PR deleted the CPU renderer, at which point the line
+    /// described a fallback that does not happen — so an operator seeing an
+    /// empty bar would read it as a broken fallback and hunt a second bug.
+    ///
+    /// **Asserted against the constant, not against captured output**, and the
+    /// trade is worth stating. This crate has no WARN-capture harness and no
+    /// `hytte-config` dev-dependency to borrow one from, and taking a
+    /// dependency for one assertion would be the wrong price. What the
+    /// constant *cannot* drift from is the emission, because
+    /// [`abandon_gl`](super::abandon_gl) interpolates this very constant — the
+    /// same reason trollshell's `preem_gl::tests::the_kill_switch_keeps_its_documented_name`
+    /// asserted `RENDERER_ENV` rather than reading the environment. What is
+    /// therefore *not* pinned here is that `abandon_gl` emits at WARN at all,
+    /// which `abandoning_gl_latches_once` next door covers.
+    ///
+    /// The forbidden words are `cpu` and `fall`, both of which the old line
+    /// carried. `fall` is deliberately broad — "falls back", "fallback" and
+    /// "falling back" are all the same false promise.
+    ///
+    /// **Falsified** by restoring the old text: both `assert!`s red, naming it.
+    #[test]
+    fn the_context_failure_line_does_not_promise_a_cpu_fallback() {
+        let lower = CONTEXT_FAILURE_MESSAGE.to_lowercase();
+        assert!(
+            !lower.contains("cpu"),
+            "the context-failure line still names a CPU renderer that trollshell#1157 deleted: \
+             {CONTEXT_FAILURE_MESSAGE}",
+        );
+        assert!(
+            !lower.contains("fall"),
+            "the context-failure line still offers a fallback this crate cannot promise — what \
+             a widget shows instead is the host's decision: {CONTEXT_FAILURE_MESSAGE}",
+        );
+        // Anti-vacuity: an empty or gutted message would satisfy both checks
+        // above while telling the operator nothing. The remedy is the half a
+        // verifier actually needs, since both latches are sticky.
+        assert!(
+            lower.contains("restart"),
+            "…and it must still name the one thing that can bring GL back: {CONTEXT_FAILURE_MESSAGE}",
+        );
+    }
 
     /// What a test's [`set_build_refusal_handler`] hook recorded, per call.
     type Refusals = Rc<RefCell<Vec<(&'static str, (u32, u32), String)>>>;
@@ -3162,8 +3241,8 @@ mod tests {
         );
     }
 
-    /// The abandon latch is one-way and idempotent — the property the host's
-    /// CPU fallback is written against.
+    /// The abandon latch is one-way and idempotent — the property every host's
+    /// context-failure handling is written against, whatever it falls back to.
     ///
     /// Thread-local, and `cargo test` gives each test its own thread, so this
     /// cannot reach another test's view of it.

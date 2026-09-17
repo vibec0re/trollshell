@@ -3525,49 +3525,98 @@ fn preem_node(id: Option<&str>, widget: vocab::PreemWidget) -> wire::Node {
     }
 }
 
-/// Map `node` through the real host path and take the RGBA8 surface out of it,
+/// Map `node` through the real host path and take the GL payload out of it,
 /// asserting the invariants every preem node must satisfy on the way.
 ///
-/// Returns owned bytes so the parity assertions below read against a kit frame
-/// unchanged; [`mapped_frame`] is the one that keeps the shared buffer's
-/// identity, which is what the #911 sharing tests are about.
-fn mapped_pixels(scope: &Scope, node: &wire::Node) -> (u32, u32, Vec<u8>) {
-    let (width, height, data) = mapped_frame(scope, node);
-    (width, height, data.to_vec())
-}
-
-/// [`mapped_pixels`] without flattening the buffer: the `Arc<[u8]>` the host
-/// actually handed out, so a test can ask whether two mapping passes shared one
-/// allocation (#911).
-fn mapped_frame(scope: &Scope, node: &wire::Node) -> (u32, u32, Arc<[u8]>) {
+/// The successor of `mapped_pixels`/`mapped_frame`, which read the RGBA8 buffer
+/// the CPU renderer produced until #1157 retired it. Everything those two were
+/// used for that survives the retirement survives verbatim: the returned tuple
+/// is comparable (`GlUniforms: PartialEq`), so "these two mappings agree" and
+/// "these two mappings differ" read the same, and the `Arc` is the one the host
+/// handed out, so #911's "every monitor's pass shares one allocation" is still
+/// an `Arc::ptr_eq` away. What does **not** survive is comparing a mapping
+/// against a kit raster: the shell no longer produces one, and that comparison
+/// now lives in `preem_gl_diff` (on a real context) and in each
+/// `preem_gl::<kind>` module's own golden mapping table (hermetic).
+fn mapped_state(
+    scope: &Scope,
+    node: &wire::Node,
+) -> (u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>) {
     match to_ui_node(scope, Grants::none(), node) {
-        UiNode::Pixels {
+        UiNode::GlSurface {
             width,
             height,
-            data,
-            scale,
+            state,
             classes,
             ..
         } => {
-            assert_eq!(
-                scale, 1,
-                "the kit bakes its own upscale into the buffer, so the host must not scale again",
-            );
             assert_eq!(
                 classes,
                 vec!["ts-preem".to_owned()],
                 "the preem arm keeps the node's classes, like every other arm",
             );
-            assert_eq!(
-                data.len(),
-                usize::try_from(width).expect("width fits usize")
-                    * usize::try_from(height).expect("height fits usize")
-                    * 4,
-                "a preem surface must honor the same RGBA8 size invariant as Node::Pixels",
-            );
-            (width, height, data)
+            (width, height, state)
         }
-        other => panic!("a Node::Preem must map to Pixels, got {other:?}"),
+        other => panic!("a drawable Node::Preem must map to a GlSurface, got {other:?}"),
+    }
+}
+
+/// Whether any colour uniform in `state` is **exactly** `rgba`.
+///
+/// The successor of `buffer.chunks_exact(4).any(|px| px == rgba)`, which is how
+/// every palette assertion below read a resolved colour until #1157: the shell
+/// rasterised the widget, so the colour it resolved was a pixel. It no longer
+/// rasterises, so the colour is read where it now goes — the `Vec4` uniforms
+/// the shader is handed.
+///
+/// That is the **stronger** of the two readings, not a weaker stand-in. A
+/// colour in the bag is one the shell resolved and told the shader to paint
+/// with; a colour in a buffer might have been two others compositing, which is
+/// why those assertions all had to say "a *fully lit* dot" to mean anything.
+///
+/// The comparison is exact on purpose and the bits really are exact: every
+/// colour on this path is a `u8` widened with `f32::from`, which is lossless,
+/// so `float_cmp` is allowed here rather than worked around with an epsilon
+/// that would let a neighbouring shade satisfy "*exactly* this colour".
+#[allow(clippy::float_cmp)]
+fn carries_color(state: &hytte::ui::gl_surface::GlUniforms, rgba: [u8; 4]) -> bool {
+    use hytte::ui::gl_surface::GlValue;
+    let want = rgba.map(f32::from);
+    state
+        .values
+        .iter()
+        .any(|(_, value)| matches!(value, GlValue::Vec4(got) if *got == want))
+}
+
+/// Assert `node` maps to the **broken-widget placeholder** — the empty `Pixels`
+/// node a preem widget degrades to when it has no renderer: a kind this build
+/// predates, a node past the instance cap, or (since #1157) a pipeline this
+/// session cannot draw.
+///
+/// The id and the classes are asserted too, because keeping them is the whole
+/// reason the placeholder is a node rather than nothing: CSS chrome stays and a
+/// later valid frame updates the same surface in place.
+fn assert_placeholder(scope: &Scope, node: &wire::Node, id: &str) {
+    match to_ui_node(scope, Grants::none(), node) {
+        UiNode::Pixels {
+            id: got_id,
+            width,
+            height,
+            data,
+            scale,
+            classes,
+        } => {
+            assert_eq!(got_id.as_deref(), Some(id), "the placeholder keeps the id");
+            assert_eq!((width, height), (0, 0), "…and has no size at all");
+            assert!(data.is_empty(), "…and no bytes");
+            assert_eq!(scale, 1, "…and the preem seam's one scale value");
+            assert_eq!(
+                classes,
+                vec!["ts-preem".to_owned()],
+                "…and the node's classes, so CSS chrome survives the degradation",
+            );
+        }
+        other => panic!("expected the placeholder, got {other:?}"),
     }
 }
 
@@ -3597,35 +3646,40 @@ fn gauge_row<'a>(gauges: impl IntoIterator<Item = (Option<&'a str>, f32)>) -> wi
     }
 }
 
-/// The `(width, height, data)` of each `Pixels` child of a mapped row, in order
-/// — how the sibling-keying tests read one node's frame out of a multi-node
-/// render.
-fn mapped_row_pixels(scope: &Scope, node: &wire::Node) -> Vec<(u32, u32, Vec<u8>)> {
+/// The `(width, height, uniforms)` of each child of a mapped row, in order, or
+/// `None` for a child that mapped to the placeholder — how the sibling-keying
+/// and instance-cap tests read one node's payload out of a multi-node render.
+///
+/// A row can hold both since #1157 (the instance cap withholds a renderer from
+/// the nodes past it, and a node with no renderer is the placeholder), so the
+/// `Option` is the shape of the question rather than an error channel.
+fn mapped_row_states(
+    scope: &Scope,
+    node: &wire::Node,
+) -> Vec<Option<(u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>)>> {
     match to_ui_node(scope, Grants::none(), node) {
         UiNode::Box { children, .. } => children
             .into_iter()
             .map(|child| match child {
-                UiNode::Pixels {
+                UiNode::GlSurface {
                     width,
                     height,
-                    data,
+                    state,
                     ..
-                } => (width, height, data.to_vec()),
-                other => panic!("a preem child must map to Pixels, got {other:?}"),
+                } => Some((width, height, state)),
+                UiNode::Pixels {
+                    width: 0,
+                    height: 0,
+                    ref data,
+                    ..
+                } if data.is_empty() => None,
+                other => panic!(
+                    "a preem child must map to a GlSurface or the placeholder, got {other:?}"
+                ),
             })
             .collect(),
         other => panic!("expected the row's Box, got {other:?}"),
     }
-}
-
-/// A kit frame in the same `(w, h, bytes)` shape [`mapped_pixels`] returns — the
-/// parity oracle's side of every comparison below.
-fn kit_pixels(frame: &kit::Frame) -> (u32, u32, Vec<u8>) {
-    (
-        u32::try_from(frame.width()).expect("kit width fits u32"),
-        u32::try_from(frame.height()).expect("kit height fits u32"),
-        frame.data().to_vec(),
-    )
 }
 
 /// The kit skin a wire [`vocab::StyleName`] names. Spelled out here rather than
@@ -3640,52 +3694,88 @@ fn kit_style(style: vocab::StyleName) -> kit::DisplayStyle {
     }
 }
 
-/// Visual parity, `DotMatrix`: the shell's renderer must produce byte-identical
-/// pixels to the kit call a plugin would have made itself — in **every** skin,
-/// which also exercises the by-name `StyleName` → `DisplayStyle` resolution and
-/// (because the node id is reused) the config-change rebuild.
+/// **Every wire skin name resolves to its own kit palette** — the by-name
+/// `StyleName` → `DisplayStyle` scan `display_style` does, which is #397's
+/// payoff: one skin implementation, shell-side, serving every plugin's widgets.
+///
+/// It rode the eight byte-parity tests until #1157 — each looped over
+/// `StyleName::ALL` and compared the shell's raster to a kit call in that skin,
+/// so a resolver that answered one skin for all four reddened everywhere. With
+/// the CPU renderer retired there is no raster to compare and the palette
+/// reaches a shader as uniforms instead, so the same question is put to those,
+/// against the same independent oracle: [`kit_style`], a hand-written match
+/// that borrows nothing from the resolver under test.
+///
+/// The oracle is the *mapping* run against the oracle's palette, not a golden
+/// table: which colors a skin resolves to is `hytte-preem`'s to say and its own
+/// tests say it. What this file owns is that the wire name picked the right
+/// skin out.
+///
+/// **Falsified** by making `display_style` return a constant, or by swapping
+/// two of its arms: the four uniform bags stop matching their oracles.
 #[test]
-fn dot_matrix_renders_at_parity_with_the_kit() {
+fn every_skin_name_resolves_to_its_own_kit_palette() {
     let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-dot-matrix");
+    let scope = Scope::detached("skin-resolution");
+    let mut bags = Vec::new();
     for style in vocab::StyleName::ALL {
+        let config = vocab::DotMatrixConfig {
+            style: vocab::StyleRef::new(style),
+            ..vocab::DotMatrixConfig::default()
+        };
         let node = preem_node(
             Some("dm"),
             vocab::PreemWidget::DotMatrix {
-                config: vocab::DotMatrixConfig {
-                    style: vocab::StyleRef::new(style),
-                    ..vocab::DotMatrixConfig::default()
-                },
+                config,
                 state: vocab::DotMatrixState {
                     text: "PREEM 42".into(),
                 },
             },
         );
+        let (_, _, state) = mapped_gl_for(&scope, &node, super::preem_gl::DOT_MATRIX);
+        let oracle = super::preem_gl::dot_matrix_surface(
+            config,
+            &super::preem_gl::encode_glyphs("PREEM 42"),
+            &kit::palette_snapshot(kit_style(style)),
+        );
         assert_eq!(
-            mapped_pixels(&scope, &node),
-            kit_pixels(&kit::dot_matrix("PREEM 42", kit_style(style))),
-            "dot-matrix parity in the {} skin",
+            state.values,
+            oracle.uniforms.values,
+            "the {} skin's name did not reach the kit's own palette",
             style.name(),
         );
+        bags.push(state.values.clone());
     }
+    assert_eq!(
+        bags.len(),
+        4,
+        "the premise: four skins were actually mapped"
+    );
+    // Anti-vacuity: four skins that all resolved to one palette would satisfy
+    // every assertion above if `kit_style` were broken the same way.
+    bags.dedup();
+    assert_eq!(bags.len(), 4, "four skins must not share one palette");
 }
 
-/// #1091: the wire's `dot_px` reaches the kit on **both** dot surfaces, and
-/// the resulting chip is the height the issue asked for — 18 px at pitch 2,
+/// #1091: the wire's `dot_px` reaches the renderer on **both** dot surfaces,
+/// and the resulting chip is the height the issue asked for — 18 px at pitch 2,
 /// which is what fits the 32 px bar.
 ///
-/// Parity against a kit oracle built at the same pitch, not just a height
-/// assertion: a host that ignored `dot_px` and rendered at the default would
-/// still produce *a* frame, so the height is the tell and the bytes are the
-/// proof.
+/// The height *is* the tell: a host that ignored `dot_px` and drew at the
+/// default would still produce a chip, and it would be 36 px tall. Until #1157
+/// this also compared the shell's raster against a kit oracle built at the same
+/// pitch; with the CPU renderer retired the picture is the shader's, and
+/// `preem_gl::dot_matrix`/`preem_gl::marquee`'s own golden tables are where the
+/// pitch's effect on what is *drawn* is pinned. What is left here is the
+/// pass-through itself, which is what #1091 was.
 ///
-/// **Falsified** by dropping either pass-through — `Renderer::DotMatrix`'s
-/// `dot_px` field or `marquee_strip`'s `.dot_px(…)` — in which case the shell
-/// renders 36 px where the plugin asked for 18.
+/// **Falsified** by dropping either pass-through — `DotMatrix`'s `config`
+/// (which carries `dot_px` into the mapping) or `marquee_strip`'s `.dot_px(…)`
+/// — in which case the shell draws 36 px where the plugin asked for 18.
 #[test]
-fn a_moved_dot_pitch_reaches_the_kit_on_both_dot_surfaces() {
+fn a_moved_dot_pitch_reaches_both_dot_surfaces() {
     let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-dot-pitch");
+    let scope = Scope::detached("pitch-dot-surfaces");
     for (px, height) in [(2_u32, 18_u32), (3, 27), (4, 36), (8, 72)] {
         let dm = preem_node(
             Some("dm"),
@@ -3699,12 +3789,8 @@ fn a_moved_dot_pitch_reaches_the_kit_on_both_dot_surfaces() {
                 },
             },
         );
-        let oracle = kit::DotMatrix::new(kit::DisplayStyle::Vfd)
-            .dot_px(usize::try_from(px).expect("pitch fits usize"))
-            .render("12:34");
-        let mapped = mapped_pixels(&scope, &dm);
-        assert_eq!(mapped.1, height, "dot matrix at dot_px {px} is {height} px");
-        assert_eq!(mapped, kit_pixels(&oracle), "dot-matrix parity at {px}");
+        let (_, mapped_h, _) = mapped_gl_for(&scope, &dm, super::preem_gl::DOT_MATRIX);
+        assert_eq!(mapped_h, height, "dot matrix at dot_px {px} is {height} px");
 
         let text = "SCROLLING MARQUEE TEST";
         let mq = preem_node(
@@ -3720,25 +3806,15 @@ fn a_moved_dot_pitch_reaches_the_kit_on_both_dot_surfaces() {
                 state: vocab::MarqueeState { text: text.into() },
             },
         );
-        let oracle = kit::Marquee::new(kit::DisplayStyle::Vfd)
-            .window_px(192)
-            .gap_dots(6)
-            .dot_px(usize::try_from(px).expect("pitch fits usize"))
-            .render(text);
-        let mapped = mapped_pixels(&scope, &mq);
-        assert_eq!(mapped.1, height, "marquee at dot_px {px} is {height} px");
-        assert_eq!(mapped.0, 192, "…and still the window width it asked for");
-        assert_eq!(
-            mapped,
-            kit_pixels(&oracle.window(0)),
-            "marquee parity at {px}"
-        );
+        let (mapped_w, mapped_h, _) = mapped_gl_for(&scope, &mq, super::preem_gl::MARQUEE);
+        assert_eq!(mapped_h, height, "marquee at dot_px {px} is {height} px");
+        assert_eq!(mapped_w, 192, "…and still the window width it asked for");
     }
 }
 
 /// A pitch change is a **config** change, so it rebuilds the renderer rather
 /// than being folded in as new state — which is what the vocabulary's per-config
-/// doc promises and what keeps a 36 px instance from drawing an 18 px frame.
+/// doc promises and what keeps a 36 px instance from drawing an 18 px chip.
 ///
 /// **Falsified** by hand-writing `config_eq`'s dot arms field by field and
 /// forgetting `dot_px`: the shell would keep the old renderer and the chip would
@@ -3759,273 +3835,19 @@ fn a_pitch_change_rebuilds_the_instance() {
             },
         )
     };
-    let wide = mapped_pixels(&scope, &at(4));
-    let narrow = mapped_pixels(&scope, &at(2));
+    let wide = mapped_gl_for(&scope, &at(4), super::preem_gl::DOT_MATRIX);
+    let narrow = mapped_gl_for(&scope, &at(2), super::preem_gl::DOT_MATRIX);
     assert_eq!(wide.1, 36);
     assert_eq!(
         narrow.1, 18,
-        "the same node id at a new pitch must re-render, not reuse the 36 px instance",
+        "the same node id at a new pitch must re-map, not reuse the 36 px instance",
     );
     // …and back up again, so the rebuild is not one-way.
-    assert_eq!(mapped_pixels(&scope, &at(4)), wide);
-}
-
-/// Visual parity, `SevenSeg`, in every skin.
-#[test]
-fn seven_seg_renders_at_parity_with_the_kit() {
-    let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-seven-seg");
-    for style in vocab::StyleName::ALL {
-        let node = preem_node(
-            Some("ss"),
-            vocab::PreemWidget::SevenSeg {
-                config: vocab::SevenSegConfig {
-                    style: vocab::StyleRef::new(style),
-                },
-                state: vocab::SevenSegState {
-                    text: "12:34".into(),
-                },
-            },
-        );
-        assert_eq!(
-            mapped_pixels(&scope, &node),
-            kit_pixels(&kit::seven_seg("12:34", kit_style(style))),
-            "seven-segment parity in the {} skin",
-            style.name(),
-        );
-    }
-}
-
-/// Visual parity, `TextBox` — the widget with the most config, so the oracle
-/// spells the whole builder chain out and a mis-ordered or dropped knob shows
-/// up as different bytes.
-#[test]
-fn text_box_renders_at_parity_with_the_kit() {
-    let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-text-box");
-    let config = vocab::TextBoxConfig {
-        style: vocab::StyleRef::new(vocab::StyleName::Lcd),
-        width: vocab::TextBoxWidth::Cols(12),
-        max_lines: 2,
-        pad: 4,
-        corner: 3,
-        scale: 2,
-        fixed_width: true,
-        notdef: None,
-    };
-    let text = "the quick brown fox jumps";
-    let node = preem_node(
-        Some("tb"),
-        vocab::PreemWidget::TextBox {
-            config,
-            state: vocab::TextBoxState { text: text.into() },
-        },
-    );
-    let oracle = kit::TextBox::styled(kit::DisplayStyle::Lcd)
-        .cols(12)
-        .max_lines(2)
-        .pad(4)
-        .corner(3)
-        .scale(2)
-        .fixed_width(true);
+    let again = mapped_gl_for(&scope, &at(4), super::preem_gl::DOT_MATRIX);
+    assert_eq!((again.0, again.1), (wide.0, wide.1));
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.render(text)),
-        "text-box parity across the whole builder chain",
-    );
-
-    // The other width spec is a different kit method, so it gets its own case.
-    let fit = vocab::TextBoxConfig {
-        width: vocab::TextBoxWidth::FitPx(160),
-        ..config
-    };
-    let fit_node = preem_node(
-        Some("tb"),
-        vocab::PreemWidget::TextBox {
-            config: fit,
-            state: vocab::TextBoxState { text: text.into() },
-        },
-    );
-    let fit_oracle = kit::TextBox::styled(kit::DisplayStyle::Lcd)
-        .fit_px(160)
-        .max_lines(2)
-        .pad(4)
-        .corner(3)
-        .scale(2)
-        .fixed_width(true);
-    assert_eq!(
-        mapped_pixels(&scope, &fit_node),
-        kit_pixels(&fit_oracle.render(text)),
-        "text-box parity with a FitPx width",
-    );
-}
-
-/// Visual parity, `LedStrip`, in the three peak configurations the vocabulary
-/// distinguishes: no peak at all, a shell-held one, and the plugin's own
-/// explicit override.
-#[test]
-fn led_strip_renders_at_parity_with_the_kit() {
-    let _ink = preem_ink_lock();
-    let style = vocab::StyleRef::new(vocab::StyleName::Oled);
-    let strip = kit::LedStrip::new(kit::DisplayStyle::Oled).leds(32);
-
-    // 1. No peak-hold and no explicit peak: the kit's "no peak dot" reading.
-    let plain = preem_node(
-        Some("vu"),
-        vocab::PreemWidget::LedStrip {
-            config: vocab::LedStripConfig {
-                style,
-                leds: 32,
-                peak_hold: None,
-            },
-            state: vocab::LedStripState {
-                level: 0.6,
-                peak: None,
-            },
-        },
-    );
-    assert_eq!(
-        mapped_pixels(&Scope::detached("parity-led-plain"), &plain),
-        kit_pixels(&strip.render(0.6, 0.0)),
-        "a strip with neither peak source renders with no peak dot",
-    );
-
-    // 2. Shell-held peak: the level is folded into a `PeakHold` at build time.
-    let held = preem_node(
-        Some("vu"),
-        vocab::PreemWidget::LedStrip {
-            config: vocab::LedStripConfig {
-                style,
-                leds: 32,
-                peak_hold: Some(vocab::PeakHoldConfig { rate: 0.1 }),
-            },
-            state: vocab::LedStripState {
-                level: 0.6,
-                peak: None,
-            },
-        },
-    );
-    let mut oracle_hold = kit::PeakHold::new(0.1);
-    oracle_hold.push(0.6);
-    assert_eq!(
-        mapped_pixels(&Scope::detached("parity-led-held"), &held),
-        kit_pixels(&strip.render(0.6, oracle_hold.value())),
-        "a declared peak-hold rides the level the shell was given",
-    );
-
-    // 3. An explicit peak wins for the render it arrives on.
-    let explicit = preem_node(
-        Some("vu"),
-        vocab::PreemWidget::LedStrip {
-            config: vocab::LedStripConfig {
-                style,
-                leds: 32,
-                peak_hold: Some(vocab::PeakHoldConfig { rate: 0.1 }),
-            },
-            state: vocab::LedStripState {
-                level: 0.6,
-                peak: Some(0.95),
-            },
-        },
-    );
-    assert_eq!(
-        mapped_pixels(&Scope::detached("parity-led-explicit"), &explicit),
-        kit_pixels(&strip.render(0.6, 0.95)),
-        "an explicit peak overrides the held one for that render",
-    );
-}
-
-/// Visual parity, `Marquee`, at rest **and** after one advance — the pair that
-/// proves the shell's dots-per-second integration lands on the same whole-dot
-/// window the kit would have been asked for.
-#[test]
-fn marquee_renders_at_parity_with_the_kit_before_and_after_a_scroll() {
-    let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-marquee");
-    let text = "SCROLLING MARQUEE TEST";
-    let node = preem_node(
-        Some("mq"),
-        vocab::PreemWidget::Marquee {
-            config: vocab::MarqueeConfig {
-                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
-                window_px: 192,
-                gap_dots: 6,
-                speed_dots_per_sec: 20.0,
-                ..vocab::MarqueeConfig::default()
-            },
-            state: vocab::MarqueeState { text: text.into() },
-        },
-    );
-    let oracle = kit::Marquee::new(kit::DisplayStyle::Vfd)
-        .window_px(192)
-        .gap_dots(6)
-        .render(text);
-    assert!(
-        oracle.scrolls(),
-        "the fixture must be long enough to scroll, or the advance below proves nothing",
-    );
-
-    assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(0)),
-        "a fresh marquee starts at the left edge",
-    );
-
-    // Half a second at 20 dots/s is exactly ten whole dots — the offset the kit
-    // would have been handed by a plugin stepping one dot per 20 Hz beat.
-    assert!(
-        advanced(0.5),
-        "advancing a scrolling marquee must report that it moved",
-    );
-    assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(10)),
-        "0.5 s at 20 dots/s is a ten-dot window",
-    );
-}
-
-/// Visual parity, `Scope`, at the debut batch and after one identical advance —
-/// the phosphor decay is a per-*call* step in the kit, so this also pins that
-/// one animation tick issues exactly one of them.
-#[test]
-fn scope_renders_at_parity_with_the_kit_before_and_after_a_decay() {
-    let _ink = preem_ink_lock();
-    let scope_key = Scope::detached("parity-scope");
-    let samples: Vec<f32> = (0..64_u8).map(|i| f32::from(i % 9) / 4.0 - 1.0).collect();
-    let node = preem_node(
-        Some("sc"),
-        vocab::PreemWidget::Scope {
-            config: vocab::ScopeConfig {
-                style: vocab::StyleRef::new(vocab::StyleName::Crt),
-                cols: 48,
-                rows: 24,
-                scale: 1,
-                persistence: 184,
-            },
-            state: vocab::ScopeState {
-                samples: samples.clone(),
-            },
-        },
-    );
-    let mut oracle = kit::Scope::with_size(48, 24).scale(1).persistence(184);
-    oracle.advance(&samples);
-    assert_eq!(
-        mapped_pixels(&scope_key, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-        "the debut sample batch is stamped before the first frame reaches the screen",
-    );
-
-    // One animation step with nothing new to stamp: the trail decays, exactly
-    // as an empty batch does in the kit.
-    assert!(
-        advanced(preem_render::ANIM_STEP_SECS),
-        "a fading phosphor trail must report that it moved",
-    );
-    oracle.advance(&[]);
-    assert_eq!(
-        mapped_pixels(&scope_key, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-        "one animation step is exactly one phosphor decay",
+        again.2.values, wide.2.values,
+        "…and the rebuilt renderer maps to the same uniforms it did the first time",
     );
 }
 
@@ -4040,7 +3862,7 @@ fn scope_renders_at_parity_with_the_kit_before_and_after_a_decay() {
 // (`docs/live-verify.md`).
 
 /// Map `node` and take the GL surface out of it, asserting the invariants every
-/// `Node::GlSurface` must satisfy — the mirror of [`mapped_frame`] for the GPU
+/// `Node::GlSurface` must satisfy — [`mapped_state`]'s stricter sibling for the
 /// arm.
 fn mapped_gl(
     scope: &Scope,
@@ -4096,135 +3918,100 @@ fn gl_scope_widget(samples: Vec<f32>) -> vocab::PreemWidget {
     }
 }
 
-/// **The kill switch restores today's bytes exactly.**
+/// The `Scope` emits a `GlSurface` node at `cols * scale` × `rows * scale` —
+/// exactly the buffer `Frame::upscale` would have produced — carrying the
+/// batch, the step counters and the resolved palette.
 ///
-/// GL is the default (#893, Annika's call), so this is the contract that keeps
-/// `TROLLSHELL_PREEM_RENDERER=cpu` a real escape hatch rather than a
-/// nearly-the-same second renderer: under the CPU arm the host emits a
-/// `Node::Pixels` whose buffer is byte-identical to the kit's own frame — the
-/// same assertion `scope_renders_at_parity_with_the_kit_before_and_after_a_decay`
-/// makes, restated here as the *switch's* promise and with the node kind
-/// pinned too.
-///
-/// The whole preem test suite runs on the CPU arm by default (see
-/// `preem_gl`'s `TEST_ARM`), precisely so every byte-parity assertion in this
-/// file keeps measuring the kit rather than a shader CI cannot run.
+/// The size is asserted against the **literal**, which is what makes it an
+/// assertion at all. It was stated as "the same natural size on both arms"
+/// until PR #1356's review (M1): with one arm left, `mapped_state` and
+/// `mapped_gl` are the same `to_ui_node` → `map_widget` path mapped into two
+/// scopes, so the two sides moved together and no mutation of the size mapping
+/// could separate them. The property that paragraph protected — a node-kind
+/// flip must not resize the widget and reflow the card — is real and is what
+/// the literal still pins.
 #[test]
-fn the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node() {
-    let _ink = preem_ink_lock();
-    let key = Scope::detached("kill-switch-cpu");
-    let samples: Vec<f32> = (0..64_u8).map(|i| f32::from(i % 9) / 4.0 - 1.0).collect();
-    let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
-
-    assert!(
-        matches!(
-            to_ui_node(&key, Grants::none(), &node),
-            UiNode::Pixels { .. }
-        ),
-        "with the kill switch on, a Scope is a raster surface",
-    );
-    let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
-    oracle.advance(&samples);
-    assert_eq!(
-        mapped_pixels(&key, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-        "the CPU arm is the kit, byte for byte",
-    );
-}
-
-/// The GL arm emits a `GlSurface` node the CPU arm would have sized
-/// **identically** — `cols * scale` × `rows * scale`, exactly what
-/// `Frame::upscale` produces — so flipping the kill switch changes no layout.
-///
-/// That is not cosmetic: the two nodes are different `NodeKind`s under the same
-/// id, so a flip rebuilds the widget, and a rebuild that also resized would
-/// reflow the whole card.
-#[test]
-fn the_gl_arm_emits_a_gl_surface_the_cpu_arm_would_have_sized_identically() {
+fn the_gl_scope_emits_its_own_pipeline_at_the_pre_upscale_grid() {
     let _ink = preem_ink_lock();
     let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0];
     let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
 
-    let cpu = Scope::detached("gl-size-cpu");
-    let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
-
-    super::preem_gl::with_gl_arm(|| {
-        let gl = Scope::detached("gl-size-gl");
-        let (gl_w, gl_h, uniforms) = mapped_gl(&gl, &node);
-        assert_eq!(
-            (gl_w, gl_h),
-            (cpu_w, cpu_h),
-            "same natural size on both arms"
-        );
-        assert_eq!((gl_w, gl_h), (96, 48), "cols * scale by rows * scale");
-        assert_eq!(
-            uniforms.grid,
-            (48, 24),
-            "the shader's offscreen passes run at the pre-upscale grid",
-        );
-        assert_eq!(
-            uniforms.step_seq, 1,
-            "the debut batch is stamped as step 0, so the counter starts at 1",
-        );
-        assert!(
-            uniforms
-                .data
-                .as_ref()
-                .is_some_and(|held| held.as_ref() == samples.as_slice()),
-            "the batch travels as the data strip",
-        );
-    });
+    let gl = Scope::detached("gl-size-gl");
+    let (gl_w, gl_h, uniforms) = mapped_gl(&gl, &node);
+    assert_eq!((gl_w, gl_h), (96, 48), "cols * scale by rows * scale");
+    assert_eq!(
+        uniforms.grid,
+        (48, 24),
+        "the shader's offscreen passes run at the pre-upscale grid",
+    );
+    assert_eq!(
+        uniforms.step_seq, 1,
+        "the debut batch is stamped as step 0, so the counter starts at 1",
+    );
+    assert!(
+        uniforms
+            .data
+            .as_ref()
+            .is_some_and(|held| held.as_ref() == samples.as_slice()),
+        "the batch travels as the data strip",
+    );
 }
 
-/// **`animates()` is the same expression on both arms**, so #926's frame-clock
-/// park and unpark behave identically and `pump.rs` needed no change at all.
+/// **A scope keeps the frame clock awake while its trail fades and parks when
+/// it is black** — so #926's frame-clock park and unpark behave the way
+/// `pump.rs` assumes, without `pump.rs` knowing anything about a renderer.
 ///
-/// Driven through the whole settle sequence rather than spot-checked: a scope
-/// animates while a batch is pending, keeps animating while the trail fades,
-/// and goes quiet after exactly `scope_settle_steps(persistence)` idle steps.
-/// The two arms are stepped in lockstep and compared at every step, so a
-/// divergence anywhere in the sequence — not just at the ends — fails.
+/// Stated as "both arms animate and park in lockstep" until #1157, because a
+/// kill-switch flip must not change when the shell parks; with one arm left it
+/// is the sequence itself — a scope animates while a batch is pending, keeps
+/// animating while the trail fades, and goes quiet after exactly
+/// `scope_settle_steps(persistence)` idle steps — walked step by step so a
+/// divergence anywhere fails rather than only at the ends.
 ///
-/// **Falsified** by changing either arm's `animates()` expression, or by
-/// dropping the `idle` bookkeeping from `ScopeGl`'s `advance`.
+/// **Falsified** by changing `Scope`'s `animates()` expression, or by
+/// dropping the `idle` bookkeeping from `scope_steps`: the trail then never
+/// goes quiet and the final assertion reds.
 #[test]
-fn both_scope_arms_animate_and_park_in_lockstep() {
+fn a_scope_animates_while_it_fades_and_then_parks() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("sc"), gl_scope_widget(vec![0.0, 1.0, -1.0]));
-    let cpu = Scope::detached("park-cpu");
-    let gl = Scope::detached("park-gl");
+    let key = Scope::detached("scope-park");
+    let _ = to_ui_node(&key, Grants::none(), &node);
 
-    let _ = to_ui_node(&cpu, Grants::none(), &node);
-    super::preem_gl::with_gl_arm(|| {
-        let _ = to_ui_node(&gl, Grants::none(), &node);
-    });
-
-    // `persistence: 184` settles in 17 steps; walk past that so the parked tail
-    // is compared too.
-    for step in 0..40 {
-        let cpu_animates = preem_render::any_animating_in(std::slice::from_ref(&cpu));
-        let gl_animates = preem_render::any_animating_in(std::slice::from_ref(&gl));
-        assert_eq!(
-            cpu_animates, gl_animates,
-            "step {step}: the two arms disagree about whether the scope animates",
-        );
-        let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
-        assert_eq!(
-            moved.contains(&cpu),
-            moved.contains(&gl),
-            "step {step}: the two arms disagree about whether the scope moved",
-        );
-    }
+    let only = std::slice::from_ref(&key);
     assert!(
-        !preem_render::any_animating_in(std::slice::from_ref(&gl)),
-        "a fully faded GL trail stops asking for repaints",
+        preem_render::any_animating_in(only),
+        "the premise: a fresh batch has a trail to fade",
+    );
+    // `persistence: 184` settles in 17 steps; walk well past that so the
+    // parked tail is walked too.
+    let mut parked_at = None;
+    for step in 0..40 {
+        let animates = preem_render::any_animating_in(only);
+        let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS).contains(&key);
+        match parked_at {
+            None if !animates => parked_at = Some(step),
+            Some(at) => assert!(
+                !animates && !moved,
+                "step {step}: the trail parked at step {at} and woke up again with no new batch",
+            ),
+            None => {}
+        }
+    }
+    // 17 steps for `persistence: 184`, plus the step that stamps the debut
+    // batch — the exact bound is
+    // `the_phosphor_settle_bound_follows_the_configured_persistence`'s subject;
+    // what this one holds is that the park happens at all and holds.
+    assert!(
+        parked_at.is_some(),
+        "a fading trail never went quiet, so the park was never observed",
     );
 }
 
 /// **A second wire frame re-arms a parked GL scope.**
 ///
 /// This is the arm the design spec singled out as the PR's review checklist:
-/// `Renderer::update` ends in a `_ => {}` catch-all, so a missing `ScopeGl`
+/// `Renderer::update` ends in a `_ => {}` catch-all, so a missing `Scope`
 /// pattern there is not a compile error — it is a scope that queues nothing,
 /// never wakes up, and shows its debut batch for the rest of the session.
 ///
@@ -4236,55 +4023,53 @@ fn both_scope_arms_animate_and_park_in_lockstep() {
 /// re-map of an unchanged frame. Only a *different* batch goes through it, and
 /// only after the trail has parked is the difference observable.
 ///
-/// **Falsified** by dropping `Self::ScopeGl` from `Renderer::update`'s `Scope`
+/// **Falsified** by dropping `Self::Scope` from `Renderer::update`'s `Scope`
 /// arm: the scope stays parked and the assertion below goes red.
 #[test]
 fn a_new_batch_re_arms_a_parked_gl_scope() {
     let _ink = preem_ink_lock();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("gl-requeue");
-        let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
-        let (_, _, debut) = mapped_gl(&key, &node);
-        assert_eq!(debut.step_seq, 1, "the debut batch");
+    let key = Scope::detached("gl-requeue");
+    let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
+    let (_, _, debut) = mapped_gl(&key, &node);
+    assert_eq!(debut.step_seq, 1, "the debut batch");
 
-        // Past the 17-step settle at persistence 184, so the trail is black and
-        // the renderer has stopped asking for repaints.
-        for _ in 0..40 {
-            let _ = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
-        }
-        assert!(
-            !preem_render::any_animating_in(std::slice::from_ref(&key)),
-            "the premise: a faded trail parks",
-        );
-        let (_, _, parked) = mapped_gl(&key, &node);
+    // Past the 17-step settle at persistence 184, so the trail is black and
+    // the renderer has stopped asking for repaints.
+    for _ in 0..40 {
+        let _ = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
+    }
+    assert!(
+        !preem_render::any_animating_in(std::slice::from_ref(&key)),
+        "the premise: a faded trail parks",
+    );
+    let (_, _, parked) = mapped_gl(&key, &node);
 
-        // A *different* batch — the only thing that reaches `Renderer::update`.
-        let second = vec![-0.25f32, 0.75, 0.25];
-        let next = preem_node(Some("sc"), gl_scope_widget(second.clone()));
-        let _ = mapped_gl(&key, &next);
-        assert!(
-            preem_render::any_animating_in(std::slice::from_ref(&key)),
-            "a new batch wakes the scope back up",
-        );
+    // A *different* batch — the only thing that reaches `Renderer::update`.
+    let second = vec![-0.25f32, 0.75, 0.25];
+    let next = preem_node(Some("sc"), gl_scope_widget(second.clone()));
+    let _ = mapped_gl(&key, &next);
+    assert!(
+        preem_render::any_animating_in(std::slice::from_ref(&key)),
+        "a new batch wakes the scope back up",
+    );
 
-        assert!(
-            advanced(preem_render::ANIM_STEP_SECS),
-            "the queued batch is stamped by the next step",
-        );
-        let (_, _, after) = mapped_gl(&key, &next);
-        assert_eq!(
-            after.step_seq,
-            parked.step_seq + 1,
-            "one step ran, and the counter did not restart",
-        );
-        assert!(
-            after
-                .data
-                .as_ref()
-                .is_some_and(|held| held.as_ref() == second.as_slice()),
-            "the new batch reaches the shader as the data strip",
-        );
-    });
+    assert!(
+        advanced(preem_render::ANIM_STEP_SECS),
+        "the queued batch is stamped by the next step",
+    );
+    let (_, _, after) = mapped_gl(&key, &next);
+    assert_eq!(
+        after.step_seq,
+        parked.step_seq + 1,
+        "one step ran, and the counter did not restart",
+    );
+    assert!(
+        after
+            .data
+            .as_ref()
+            .is_some_and(|held| held.as_ref() == second.as_slice()),
+        "the new batch reaches the shader as the data strip",
+    );
 }
 
 /// `step_seq` is **monotonic** and advances one per animation step — the
@@ -4295,34 +4080,32 @@ fn a_new_batch_re_arms_a_parked_gl_scope() {
 #[test]
 fn step_seq_advances_once_per_step_and_never_on_a_mapping_pass() {
     let _ink = preem_ink_lock();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("step-seq");
-        let node = preem_node(Some("sc"), gl_scope_widget(vec![0.25, -0.25]));
+    let key = Scope::detached("step-seq");
+    let node = preem_node(Some("sc"), gl_scope_widget(vec![0.25, -0.25]));
 
-        let (_, _, first) = mapped_gl(&key, &node);
-        assert_eq!(first.step_seq, 1, "the debut batch is one step");
+    let (_, _, first) = mapped_gl(&key, &node);
+    assert_eq!(first.step_seq, 1, "the debut batch is one step");
 
-        // The second monitor's pass over the same wire frame: no advance, and
-        // the very same allocation.
-        let (_, _, again) = mapped_gl(&key, &node);
-        assert_eq!(again.step_seq, 1, "a mapping pass advances nothing");
-        assert!(
-            Arc::ptr_eq(&first, &again),
-            "a re-map shares the cached uniforms, so the surface settles on a pointer compare",
+    // The second monitor's pass over the same wire frame: no advance, and
+    // the very same allocation.
+    let (_, _, again) = mapped_gl(&key, &node);
+    assert_eq!(again.step_seq, 1, "a mapping pass advances nothing");
+    assert!(
+        Arc::ptr_eq(&first, &again),
+        "a re-map shares the cached uniforms, so the surface settles on a pointer compare",
+    );
+
+    let mut previous = 1;
+    for step in 0..5 {
+        assert!(advanced(preem_render::ANIM_STEP_SECS), "step {step} moved");
+        let (_, _, now) = mapped_gl(&key, &node);
+        assert_eq!(
+            now.step_seq,
+            previous + 1,
+            "step {step}: one animation step is one step_seq",
         );
-
-        let mut previous = 1;
-        for step in 0..5 {
-            assert!(advanced(preem_render::ANIM_STEP_SECS), "step {step} moved");
-            let (_, _, now) = mapped_gl(&key, &node);
-            assert_eq!(
-                now.step_seq,
-                previous + 1,
-                "step {step}: one animation step is one step_seq",
-            );
-            previous = now.step_seq;
-        }
-    });
+        previous = now.step_seq;
+    }
 }
 
 /// One tick carrying a long stall advances at most `MAX_CATCHUP_STEPS` — the
@@ -4336,69 +4119,30 @@ fn step_seq_advances_once_per_step_and_never_on_a_mapping_pass() {
 #[test]
 fn a_stalled_tick_advances_the_gl_arm_by_exactly_the_catch_up_clamp() {
     let _ink = preem_ink_lock();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("catch-up");
-        // A fading persistence with a 17-step settle, so none of the eight
-        // steps the clamp allows is cut short by the trail going quiet — the
-        // clamp is the only thing that bounds this, which is the point.
-        let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
-        let (_, _, debut) = mapped_gl(&key, &node);
-        assert_eq!(debut.step_seq, 1, "the debut batch");
-
-        // Ten seconds of `dt` in one tick — two hundred steps' worth, which is
-        // the shape of a resume from suspend.
-        assert!(advanced(10.0), "a stalled tick still advances the trail");
-        let (_, _, after) = mapped_gl(&key, &node);
-        assert_eq!(
-            after.step_seq,
-            1 + u64::from(preem_render::MAX_CATCHUP_STEPS),
-            "a stalled tick replays the clamp, never the stall's length",
-        );
-    });
-}
-
-/// The same clamp holds the **CPU** arm, so a stall costs the two arms the same
-/// amount of animation. Stated as a comparison rather than a second constant:
-/// the two arms diverging here would make a kill-switch flip change how a
-/// resume from suspend looks.
-#[test]
-fn both_scope_arms_take_the_same_catch_up_clamp() {
-    let _ink = preem_ink_lock();
+    let key = Scope::detached("catch-up");
+    // A fading persistence with a 17-step settle, so none of the eight
+    // steps the clamp allows is cut short by the trail going quiet — the
+    // clamp is the only thing that bounds this, which is the point.
     let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
-    let cpu = Scope::detached("catch-up-cpu");
-    let gl = Scope::detached("catch-up-gl");
-    let _ = to_ui_node(&cpu, Grants::none(), &node);
-    super::preem_gl::with_gl_arm(|| {
-        let _ = to_ui_node(&gl, Grants::none(), &node);
-    });
+    let (_, _, debut) = mapped_gl(&key, &node);
+    assert_eq!(debut.step_seq, 1, "the debut batch");
 
-    let moved = preem_render::advance_all(10.0);
-    assert!(moved.contains(&cpu) && moved.contains(&gl));
-    // The CPU arm has no counter to read, so the shared property is asserted
-    // through the one both arms expose: how much of the trail is left. Eight
-    // steps of `184/256` decay from a full-intensity beam, and the two arms
-    // agree about *that* because they run the same loop.
-    let (_, _, gl_state) = super::preem_gl::with_gl_arm(|| mapped_gl(&gl, &node));
+    // Ten seconds of `dt` in one tick — two hundred steps' worth, which is
+    // the shape of a resume from suspend.
+    assert!(advanced(10.0), "a stalled tick still advances the trail");
+    let (_, _, after) = mapped_gl(&key, &node);
     assert_eq!(
-        gl_state.step_seq,
+        after.step_seq,
         1 + u64::from(preem_render::MAX_CATCHUP_STEPS),
-    );
-    let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
-    oracle.advance(&[0.5, -0.5]);
-    for _ in 0..preem_render::MAX_CATCHUP_STEPS {
-        oracle.advance(&[]);
-    }
-    assert_eq!(
-        mapped_pixels(&cpu, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-        "the CPU arm replayed the same eight steps the GL arm counted",
+        "a stalled tick replays the clamp, never the stall's length",
     );
 }
 
-/// **A failed GL context drops the instance to the CPU kit** — per the spec's
-/// third fallback case, and the reason falling back is free for a kit widget:
-/// it *has* a CPU implementation, and that implementation is the reference the
-/// GL arm is measured against, so a blank chip would be strictly worse.
+/// **A failed GL context drops the instance to the broken-widget
+/// placeholder** — the spec's third fallback case, and what it costs since
+/// #1157 retired the CPU renderer that used to catch it. The chip goes empty
+/// rather than wrong, keeping its id and classes, and `hytte-ui` has already
+/// written the journal line naming the context failure.
 ///
 /// Driven through `hytte-ui`'s `abandon_gl`, which is the seam a host tests
 /// this through without a display server — "a GL-less display" is not something
@@ -4407,51 +4151,34 @@ fn both_scope_arms_take_the_same_catch_up_clamp() {
 /// thread is the blast radius.
 ///
 /// **Falsified** by dropping the `gl_lost` clause from `apply`: the instance
-/// keeps its `ScopeGl` renderer, `to_ui_node` keeps emitting a `GlSurface`
-/// node that can never draw, and the chip stays blank for the session.
+/// keeps its `Scope` renderer, `to_ui_node` keeps emitting a `GlSurface`
+/// node that can never draw, and the chip stays blank with nothing saying why
+/// — which is the outcome the placeholder exists to replace.
 #[test]
-fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
+fn a_failed_gl_context_drops_the_scope_to_the_placeholder() {
     let _ink = preem_ink_lock();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("context-lost");
-        let samples: Vec<f32> = vec![0.0, 0.75, -0.75];
-        let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
+    let key = Scope::detached("context-lost");
+    let samples: Vec<f32> = vec![0.0, 0.75, -0.75];
+    let node = preem_node(Some("sc"), gl_scope_widget(samples));
 
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::GlSurface { .. }
-            ),
-            "the GL arm is chosen while a context is still possible",
-        );
-        let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
+    assert!(
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::GlSurface { .. }
+        ),
+        "the GL arm is chosen while a context is still possible",
+    );
+    let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
 
-        hytte::ui::gl_surface::abandon_gl("no GL in this test");
+    hytte::ui::gl_surface::abandon_gl("no GL in this test");
 
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::Pixels { .. }
-            ),
-            "a lost context drops the scope to the raster arm",
-        );
-        let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
-        assert_eq!(
-            after.0,
-            before.0 + 1,
-            "the fallback is a rebuild, not a silent no-op",
-        );
-
-        // …and the raster it produces is the kit's, from a fresh phosphor —
-        // the GL arm never drew a trail there is anything to inherit.
-        let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
-        oracle.advance(&samples);
-        assert_eq!(
-            mapped_pixels(&key, &node),
-            kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-            "the fallback is the kit, byte for byte",
-        );
-    });
+    assert_placeholder(&key, &node, "sc");
+    let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
+    assert_eq!(
+        after.0,
+        before.0 + 1,
+        "the fallback is a rebuild, not a silent no-op",
+    );
 }
 
 /// **A scope that was never going to animate again still falls back.**
@@ -4468,93 +4195,78 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
 /// the animating case — is never re-entered, and the chip would stay blank
 /// until the plugin sent another frame, which a settled widget may never do.
 ///
-/// **Falsified** by dropping the `rebuild_gl_renderers_on_cpu()` call from
-/// `preem_gl::install`'s hook: the instance keeps its `ScopeGl` renderer with
-/// no rebuild, and the `builds` assertion goes red.
+/// **Falsified** by dropping the `rebuild_gl_renderers_as_placeholders()` call
+/// from `preem_gl::install`'s hook: the instance keeps its `Scope` renderer
+/// with no rebuild, and the `builds` assertion goes red.
 #[test]
 fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() {
     let _ink = preem_ink_lock();
     // The hook under test, installed the way `plugins::install` installs it.
     super::preem_gl::install();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("context-lost-settled");
-        let samples: Vec<f32> = vec![0.0, 0.6, -0.6];
-        let node = preem_node(
-            Some("sc"),
-            vocab::PreemWidget::Scope {
-                config: vocab::ScopeConfig {
-                    style: vocab::StyleRef::new(vocab::StyleName::Crt),
-                    cols: 48,
-                    rows: 24,
-                    scale: 2,
-                    // The kit's ceiling: an infinite-persistence phosphor.
-                    persistence: 256,
-                },
-                state: vocab::ScopeState {
-                    samples: samples.clone(),
-                },
+    let key = Scope::detached("context-lost-settled");
+    let node = preem_node(
+        Some("sc"),
+        vocab::PreemWidget::Scope {
+            config: vocab::ScopeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Crt),
+                cols: 48,
+                rows: 24,
+                scale: 2,
+                // The kit's ceiling: an infinite-persistence phosphor.
+                persistence: 256,
             },
-        );
+            state: vocab::ScopeState {
+                samples: vec![0.0, 0.6, -0.6],
+            },
+        },
+    );
 
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::GlSurface { .. }
-            ),
-            "the GL arm is chosen while a context is still possible",
-        );
-        // The premise, and the reason the animating path cannot save this one.
-        assert!(
-            !preem_render::any_animating_in(std::slice::from_ref(&key)),
-            "an infinite-persistence scope never animates, so nothing will \
-             re-map it on its own",
-        );
-        let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
+    assert!(
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::GlSurface { .. }
+        ),
+        "the GL arm is chosen while a context is still possible",
+    );
+    // The premise, and the reason the animating path cannot save this one.
+    assert!(
+        !preem_render::any_animating_in(std::slice::from_ref(&key)),
+        "an infinite-persistence scope never animates, so nothing will \
+         re-map it on its own",
+    );
+    let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
 
-        hytte::ui::gl_surface::abandon_gl("no GL in this test");
+    hytte::ui::gl_surface::abandon_gl("no GL in this test");
 
-        // The hook rebuilt it **without** a mapping pass — that is the half a
-        // parked clock would otherwise have withheld for ever.
-        let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
-        assert_eq!(
-            after.0,
-            before.0 + 1,
-            "the failure hook rebuilt the renderer itself, not the next re-map",
-        );
-        assert_eq!(
-            after.1, before.1,
-            "…and did it without an apply, so no widget state was touched",
-        );
+    // The hook rebuilt it **without** a mapping pass — that is the half a
+    // parked clock would otherwise have withheld for ever.
+    let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
+    assert_eq!(
+        after.0,
+        before.0 + 1,
+        "the failure hook rebuilt the renderer itself, not the next re-map",
+    );
+    assert_eq!(
+        after.1, before.1,
+        "…and did it without an apply, so no widget state was touched",
+    );
 
-        // …and what it now produces is the kit's own frame, from a fresh
-        // phosphor: the GL arm never drew a trail there was anything to inherit.
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::Pixels { .. }
-            ),
-            "a lost context drops even a settled scope to the raster arm",
-        );
-        let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(256);
-        oracle.advance(&samples);
-        assert_eq!(
-            mapped_pixels(&key, &node),
-            kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-            "the fallback is the kit, byte for byte",
-        );
-    });
+    // …and what it now produces is the placeholder: a lost context drops even
+    // a settled scope, which is the whole point of the hook doing the rebuild
+    // itself.
+    assert_placeholder(&key, &node, "sc");
 }
 
 /// An accent change re-tints a GL scope through the **uniforms**, with no
 /// renderer rebuild — the same live-re-tint contract (#396/#862) the CPU arm
 /// has, reached by the same `invalidate_cached_frames` call.
 ///
-/// `ScopeGl` resolves its palette at mapping time exactly as the CPU `Scope`
+/// `Scope` resolves its palette at mapping time exactly as the CPU `Scope`
 /// does, so it needs no entry in `invalidate_cached_frames`' `TextBox`
 /// special case — this is what says so.
 ///
 /// **Falsified** two ways, one per assertion. Baking the palette into
-/// `Renderer::ScopeGl` at build time stops the ink moving; adding `ScopeGl` to
+/// `Renderer::Scope` at build time stops the ink moving; adding `Scope` to
 /// `invalidate_cached_frames`' `TextBox` rebuild branch resets `step_seq` to
 /// `1` and wipes the trail.
 ///
@@ -4567,60 +4279,58 @@ fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() 
 #[test]
 fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
     let _ink = preem_ink_lock();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("gl-accent");
-        // A role-less style takes the session accent, which is what moves here.
-        let node = preem_node(
-            Some("sc"),
-            vocab::PreemWidget::Scope {
-                config: vocab::ScopeConfig {
-                    style: vocab::StyleRef::default(),
-                    cols: 16,
-                    rows: 8,
-                    scale: 1,
-                    persistence: 184,
-                },
-                state: vocab::ScopeState { samples: vec![0.5] },
+    let key = Scope::detached("gl-accent");
+    // A role-less style takes the session accent, which is what moves here.
+    let node = preem_node(
+        Some("sc"),
+        vocab::PreemWidget::Scope {
+            config: vocab::ScopeConfig {
+                style: vocab::StyleRef::default(),
+                cols: 16,
+                rows: 8,
+                scale: 1,
+                persistence: 184,
             },
-        );
+            state: vocab::ScopeState { samples: vec![0.5] },
+        },
+    );
 
-        tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
-        let (_, _, debut) = mapped_gl(&key, &node);
-        // Run the trail on, so `step_seq` is somewhere a rebuild could not
-        // land on by accident: a fresh `ScopeGl` starts at exactly 1.
-        for _ in 0..3 {
-            assert!(advanced(preem_render::ANIM_STEP_SECS));
-        }
-        let (_, _, green) = mapped_gl(&key, &node);
-        assert_eq!(green.step_seq, debut.step_seq + 3, "three steps ran");
-        let builds = preem_render::probe(&key, Some("sc"))
+    tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
+    let (_, _, debut) = mapped_gl(&key, &node);
+    // Run the trail on, so `step_seq` is somewhere a rebuild could not
+    // land on by accident: a fresh `Scope` starts at exactly 1.
+    for _ in 0..3 {
+        assert!(advanced(preem_render::ANIM_STEP_SECS));
+    }
+    let (_, _, green) = mapped_gl(&key, &node);
+    assert_eq!(green.step_seq, debut.step_seq + 3, "three steps ran");
+    let builds = preem_render::probe(&key, Some("sc"))
+        .expect("the instance exists")
+        .0;
+
+    tint_in_process_surfaces(Some([0xff, 0x00, 0xff, 0xff]));
+    let (_, _, magenta) = mapped_gl(&key, &node);
+
+    assert_ne!(
+        green.values, magenta.values,
+        "the accent reaches the shader as a uniform",
+    );
+    // The observable consequence of a rebuild, and the reason this is the
+    // assertion rather than the counter: a rebuilt `Scope` restarts its
+    // step count, which restarts the phosphor — a visible trail reset every
+    // time the desktop accent moves.
+    assert_eq!(
+        magenta.step_seq, green.step_seq,
+        "a re-tint keeps the animation state; a rebuild would restart it",
+    );
+    assert_eq!(
+        preem_render::probe(&key, Some("sc"))
             .expect("the instance exists")
-            .0;
-
-        tint_in_process_surfaces(Some([0xff, 0x00, 0xff, 0xff]));
-        let (_, _, magenta) = mapped_gl(&key, &node);
-
-        assert_ne!(
-            green.values, magenta.values,
-            "the accent reaches the shader as a uniform",
-        );
-        // The observable consequence of a rebuild, and the reason this is the
-        // assertion rather than the counter: a rebuilt `ScopeGl` restarts its
-        // step count, which restarts the phosphor — a visible trail reset every
-        // time the desktop accent moves.
-        assert_eq!(
-            magenta.step_seq, green.step_seq,
-            "a re-tint keeps the animation state; a rebuild would restart it",
-        );
-        assert_eq!(
-            preem_render::probe(&key, Some("sc"))
-                .expect("the instance exists")
-                .0,
-            builds,
-            "a re-tint is a cache drop, never a renderer rebuild",
-        );
-        tint_in_process_surfaces(None);
-    });
+            .0,
+        builds,
+        "a re-tint is a cache drop, never a renderer rebuild",
+    );
+    tint_in_process_surfaces(None);
 }
 
 // ── the `Gauge` GL arm (#1143) ───────────────────────────────────────────────
@@ -4691,78 +4401,6 @@ fn every_preem_widget() -> Vec<vocab::PreemWidget> {
     all
 }
 
-/// **Every renderer answers both halves of the GL seam the same way** —
-/// `Renderer::is_gl()` and `Renderer::gl_surface()` agree, on every widget kind,
-/// under both arms.
-///
-/// `Renderer::is_gl`'s doc has promised this test since #1143 and #1148's review
-/// found the promise was prose: `grep` returned the comment and nothing else.
-/// For the two GL kinds that exist today other tests happen to cover both
-/// directions, so nothing was broken — but #1144's dot matrix stacks on this
-/// branch and its author reads that sentence as a guarantee before adding a
-/// third arm.
-///
-/// The two halves are asked at different call sites and neither fails loudly on
-/// its own. An arm answering `true` here and `None` there hands the reconciler
-/// no node at all and is never rebuilt onto the kit by the context-failure hook:
-/// a permanently blank chip. The reverse — `false` here, `Some` there — draws on
-/// the GPU while `apply`'s `gl_lost` check believes it is a raster arm, so a
-/// lost context leaves it frozen on its last frame.
-///
-/// Driven off the *widget* vocabulary rather than off a hand list of `Renderer`
-/// variants, which is what makes it cover a new GL arm the day `build` starts
-/// returning one: there is nothing here for #1144 to remember to update.
-///
-/// **Falsified** three ways, each a one-line edit to `preem_render`: drop
-/// `GaugeGl` from `is_gl` (the first assertion goes red), drop the `GaugeGl` arm
-/// from `gl_surface` so it falls into the `_ => None` catch-all (the same
-/// assertion, the other way round), or make `build` never take the GL arm (the
-/// last assertion goes red, which is what stops this test from passing
-/// vacuously).
-#[test]
-fn every_gl_renderer_answers_both_halves_of_the_gl_seam() {
-    let _ink = preem_ink_lock();
-    let widgets = every_preem_widget();
-
-    for widget in &widgets {
-        let (is_gl, has_surface) =
-            preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
-        assert!(
-            !is_gl && !has_surface,
-            "{}: the CPU arm draws on neither half of the GL seam, got is_gl={is_gl} \
-             gl_surface={has_surface}",
-            widget.kind(),
-        );
-    }
-
-    let mut on_the_gpu = Vec::new();
-    super::preem_gl::with_gl_arm(|| {
-        for widget in &widgets {
-            let (is_gl, has_surface) =
-                preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
-            assert_eq!(
-                is_gl,
-                has_surface,
-                "{}: is_gl() says {is_gl} and gl_surface() says {has_surface} — an arm that \
-                 answers the two halves differently either draws nothing at all or is never \
-                 rebuilt onto the kit when the context goes",
-                widget.kind(),
-            );
-            if is_gl {
-                on_the_gpu.push(widget.kind());
-            }
-        }
-    });
-
-    assert!(
-        on_the_gpu.contains(&"scope")
-            && on_the_gpu.contains(&"gauge")
-            && on_the_gpu.contains(&"dot-matrix"),
-        "the premise: under the GL arm the three kinds that have one draw on the GPU, got \
-         {on_the_gpu:?}",
-    );
-}
-
 /// A `Gauge` widget at a known geometry, for the tests below. `scale = 1`, so
 /// the GL arm's native grid and the kit's logical one are the same number and
 /// a size assertion says something about the *mapping* rather than about the
@@ -4780,46 +4418,13 @@ fn gl_gauge_widget(target: f32) -> vocab::PreemWidget {
     }
 }
 
-/// **The kill switch reaches the gauge too**, and it restores the kit's own
-/// bytes exactly — the mirror of
-/// `the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, which is the
-/// `Scope`'s version of this contract.
-///
-/// The whole preem suite runs on the CPU arm by default (`preem_gl`'s
-/// `TEST_ARM`), which is why every other gauge parity assertion in this file
-/// keeps measuring the kit; this one pins the *node kind* as well, so a gauge
-/// that silently took the GL arm under the switch would be caught here rather
-/// than by a blank chip.
-///
-/// **Falsified** by dropping the `preem_gl::arm() == Arm::Gl` guard from
-/// `build`'s gauge arm: the first assertion reports a `GlSurface`.
-#[test]
-fn the_cpu_arm_still_emits_the_kits_own_gauge_bytes_as_a_pixels_node() {
-    let _ink = preem_ink_lock();
-    let key = Scope::detached("gauge-kill-switch-cpu");
-    let node = preem_node(Some("gg"), gl_gauge_widget(0.7));
-
-    assert!(
-        matches!(
-            to_ui_node(&key, Grants::none(), &node),
-            UiNode::Pixels { .. }
-        ),
-        "with the kill switch on, a Gauge is a raster surface",
-    );
-    let mut oracle = kit::Gauge::with_size(144, 64).scale(1);
-    oracle.set_target(0.7);
-    assert_eq!(
-        mapped_pixels(&key, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-        "the CPU arm is the kit, byte for byte",
-    );
-}
-
 /// The GL arm emits a `GlSurface` the CPU arm would have sized **identically**,
 /// naming the gauge's own pipeline, with the **native** buffer as its grid.
 ///
-/// The size agreement is the same layout argument the scope's version makes: a
-/// kill-switch flip is a node-kind change, so it rebuilds the widget, and a
+/// The size is asserted against the **literal** rather than against the
+/// other arm (PR #1356 review, M1): with one arm left the cross-arm
+/// comparison was `x == x`. The layout property it protected is real and is
+/// what the literal pins — a node-kind flip rebuilds the widget, and a
 /// rebuild that also resized would reflow the whole card.
 ///
 /// The *grid* is where the two kinds deliberately differ, and it is the whole of
@@ -4834,81 +4439,67 @@ fn the_gl_gauge_emits_its_own_pipeline_at_the_native_grid() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("gg"), gl_gauge_widget(0.7));
 
-    let cpu = Scope::detached("gauge-gl-size-cpu");
-    let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
-
-    super::preem_gl::with_gl_arm(|| {
-        let gl = Scope::detached("gauge-gl-size-gl");
-        let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::GAUGE);
-        assert_eq!(
-            (gl_w, gl_h),
-            (cpu_w, cpu_h),
-            "same natural size on both arms",
-        );
-        assert_eq!((gl_w, gl_h), (144, 64), "cols * scale by rows * scale");
-        assert_eq!(
-            uniforms.grid,
-            (144, 64),
-            "a gauge's offscreen passes run at the **native** buffer, not the \
-             pre-upscale grid the scope uses",
-        );
-        assert_eq!(
-            uniforms.step_seq, 0,
-            "a gauge carries no cross-frame GPU state, so nothing counts steps",
-        );
-        assert!(
-            uniforms.data.is_none(),
-            "and no data strip: every shape is analytic",
-        );
-    });
+    let gl = Scope::detached("gauge-gl-size-gl");
+    let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::GAUGE);
+    assert_eq!((gl_w, gl_h), (144, 64), "cols * scale by rows * scale");
+    assert_eq!(
+        uniforms.grid,
+        (144, 64),
+        "a gauge's offscreen passes run at the **native** buffer, not the \
+         pre-upscale grid the scope uses",
+    );
+    assert_eq!(
+        uniforms.step_seq, 0,
+        "a gauge carries no cross-frame GPU state, so nothing counts steps",
+    );
+    assert!(
+        uniforms.data.is_none(),
+        "and no data strip: every shape is analytic",
+    );
 }
 
-/// **`animates()` is the same expression on both gauge arms** — and here that
-/// is not a re-derivation but the same field: both hold the one `kit::Gauge`,
-/// so #926's frame-clock park cannot depend on which renderer drew the dial.
+/// **A gauge keeps the frame clock awake for its swing and parks after it** —
+/// the property #926's frame clock rests on, and the one `Gauge` gets for
+/// free rather than by construction: `animates()` reads the one `kit::Gauge`
+/// the renderer holds, and the needle's spring is CPU-side.
 ///
-/// Stepped in lockstep through a whole swing and compared at every step, so a
-/// divergence anywhere in the sequence fails rather than only at the ends.
+/// Stated as "both arms park in lockstep" until #1157, because a kill-switch
+/// flip must not change when the shell parks; with one arm left it is the
+/// sequence itself, walked step by step so a divergence anywhere fails rather
+/// than only at the ends.
 ///
-/// **Falsified** by giving `GaugeGl` its own `animates()` arm that answers
-/// `true` (or `false`) unconditionally.
+/// **Falsified** by giving `Gauge`'s `animates()` a constant answer, or by
+/// dropping its `is_settled()` guard in `advance` (the park is never observed).
 #[test]
-fn both_gauge_arms_animate_and_park_in_lockstep() {
+fn a_gauge_animates_through_its_swing_and_then_parks() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("gg"), gl_gauge_widget(0.9));
 
-    let cpu = Scope::detached("gauge-lockstep-cpu");
-    let _ = to_ui_node(&cpu, Grants::none(), &node);
-    let gl = Scope::detached("gauge-lockstep-gl");
-    super::preem_gl::with_gl_arm(|| {
-        let _ = to_ui_node(&gl, Grants::none(), &node);
-    });
+    let key = Scope::detached("gauge-park");
+    let _ = to_ui_node(&key, Grants::none(), &node);
 
-    let cpu_only = std::slice::from_ref(&cpu);
-    let gl_only = std::slice::from_ref(&gl);
+    let only = std::slice::from_ref(&key);
     assert!(
-        preem_render::any_animating_in(cpu_only),
+        preem_render::any_animating_in(only),
         "the premise: a needle pointed at 0.9 has somewhere to go",
     );
     // Long enough for a 2 Hz spring at 0.5 damping to arrive and stop, plus a
-    // tail past the park so the *parked* state is compared too.
+    // tail past the park so the *parked* state is walked too.
     let mut parked_at = None;
     for step in 0..240 {
-        let cpu_animates = preem_render::any_animating_in(cpu_only);
-        let gl_animates = preem_render::any_animating_in(gl_only);
-        assert_eq!(
-            cpu_animates, gl_animates,
-            "step {step}: the two arms disagree about whether the gauge animates",
-        );
-        if !cpu_animates && parked_at.is_none() {
-            parked_at = Some(step);
+        let animates = preem_render::any_animating_in(only);
+        let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS).contains(&key);
+        match parked_at {
+            None if !animates => parked_at = Some(step),
+            // Once parked it stays parked: a renderer that reported movement
+            // after settling would fan a pixel-identical repaint out at 20 Hz
+            // for the rest of the session.
+            Some(at) => assert!(
+                !animates && !moved,
+                "step {step}: the gauge parked at step {at} and woke up again with no new target",
+            ),
+            None => {}
         }
-        let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
-        assert_eq!(
-            moved.contains(&cpu),
-            moved.contains(&gl),
-            "step {step}: the two arms disagree about whether the gauge moved",
-        );
     }
     assert!(
         parked_at.is_some(),
@@ -4916,11 +4507,11 @@ fn both_gauge_arms_animate_and_park_in_lockstep() {
     );
 }
 
-/// A `Gauge` whose GL context fails is rebuilt onto the kit **by the hook**,
+/// A `Gauge` whose GL context fails is taken to the placeholder **by the hook**,
 /// without waiting for a mapping pass — the `Scope`'s
 /// `a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes`
-/// contract, and the reason `rebuild_gl_renderers_on_cpu` had to stop naming
-/// one renderer variant (#1143).
+/// contract, and the reason `rebuild_gl_renderers_as_placeholders` had to stop
+/// naming one renderer variant (#1143).
 ///
 /// A **settled** gauge is the case that needs it: a needle already on its
 /// target answers `animates()` with `false`, #926's clock parks, `apply`'s
@@ -4928,115 +4519,47 @@ fn both_gauge_arms_animate_and_park_in_lockstep() {
 /// the plugin sent a new target — which a gauge showing a steady reading may
 /// never do.
 ///
-/// **Falsified** by making `Renderer::is_gl` answer `false` for `GaugeGl` (the
-/// `builds` assertion goes red — the hook walks past the instance), or by
-/// dropping the `rebuild_gl_renderers_on_cpu()` call from `preem_gl::install`'s
-/// hook.
+/// **Falsified** by narrowing `rebuild_gl_renderers_as_placeholders`'s sweep so
+/// it walks past a live instance (the `builds` assertion goes red), or by
+/// dropping that call from `preem_gl::install`'s hook.
 #[test]
 fn a_settled_gl_gauge_falls_back_without_waiting_for_a_frame_that_never_comes() {
     let _ink = preem_ink_lock();
     super::preem_gl::install();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("gauge-context-lost-settled");
-        let node = preem_node(Some("gg"), gl_gauge_widget(0.0));
-
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::GlSurface { .. }
-            ),
-            "the GL arm is chosen while a context is still possible",
-        );
-        // The premise, and the reason the animating path cannot save this one:
-        // a needle built pointing at its own resting value never moves.
-        assert!(
-            !preem_render::any_animating_in(std::slice::from_ref(&key)),
-            "a settled gauge never animates, so nothing will re-map it",
-        );
-        let before = preem_render::probe(&key, Some("gg")).expect("the instance exists");
-
-        hytte::ui::gl_surface::abandon_gl("no GL in this test");
-
-        let after = preem_render::probe(&key, Some("gg")).expect("the instance survives");
-        assert_eq!(
-            after.0,
-            before.0 + 1,
-            "the failure hook rebuilt the renderer itself, not the next re-map",
-        );
-        assert_eq!(
-            after.1, before.1,
-            "…and did it without an apply, so no widget state was touched",
-        );
-
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::Pixels { .. }
-            ),
-            "a lost context drops even a settled gauge to the raster arm",
-        );
-        let mut oracle = kit::Gauge::with_size(144, 64).scale(1);
-        oracle.set_target(0.0);
-        assert_eq!(
-            mapped_pixels(&key, &node),
-            kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
-            "and what it draws is the kit's own frame, byte for byte",
-        );
-    });
-}
-
-/// Visual parity, `Gauge`, at the target's arrival and after one advance — the
-/// needle physics is closed-form, so the shell integrating it with the real
-/// frame `dt` must land on the same `f32` the kit would have.
-#[test]
-fn gauge_renders_at_parity_with_the_kit_before_and_after_a_swing() {
-    let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-gauge");
-    let node = preem_node(
-        Some("gg"),
-        vocab::PreemWidget::Gauge {
-            config: vocab::GaugeConfig {
-                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
-                cols: 64,
-                rows: 40,
-                scale: 1,
-                sweep_deg: 150.0,
-                divisions: 4,
-                subdivisions: 5,
-                range: vocab::GaugeRange {
-                    low: 0.0,
-                    high: 100.0,
-                },
-                frequency_hz: 2.0,
-                damping: 0.5,
-            },
-            state: vocab::GaugeState { target: 75.0 },
-        },
-    );
-    let mut oracle = kit::Gauge::with_size(64, 40)
-        .scale(1)
-        .sweep_deg(150.0)
-        .ticks(4, 5)
-        .range(0.0, 100.0)
-        .frequency(2.0)
-        .damping(0.5);
-    oracle.set_target(75.0);
-    assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
-        "a fresh gauge rests at the low end with its target set",
-    );
+    let key = Scope::detached("gauge-context-lost-settled");
+    let node = preem_node(Some("gg"), gl_gauge_widget(0.0));
 
     assert!(
-        advanced(preem_render::ANIM_STEP_SECS),
-        "an un-settled needle must report that it moved",
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::GlSurface { .. }
+        ),
+        "the GL arm is chosen while a context is still possible",
     );
-    oracle.advance(preem_render::ANIM_STEP_SECS);
+    // The premise, and the reason the animating path cannot save this one:
+    // a needle built pointing at its own resting value never moves.
+    assert!(
+        !preem_render::any_animating_in(std::slice::from_ref(&key)),
+        "a settled gauge never animates, so nothing will re-map it",
+    );
+    let before = preem_render::probe(&key, Some("gg")).expect("the instance exists");
+
+    hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+    let after = preem_render::probe(&key, Some("gg")).expect("the instance survives");
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
-        "the shell integrates the needle with the same dt the kit would have",
+        after.0,
+        before.0 + 1,
+        "the failure hook rebuilt the renderer itself, not the next re-map",
     );
+    assert_eq!(
+        after.1, before.1,
+        "…and did it without an apply, so no widget state was touched",
+    );
+
+    // A lost context drops even a settled gauge — and since #1157 that is all
+    // the way to the placeholder, with no needle drawn at all.
+    assert_placeholder(&key, &node, "gg");
 }
 
 // ── the `DotMatrix` GL arm (#1144) ───────────────────────────────────────────
@@ -5060,46 +4583,14 @@ fn gl_dot_matrix_widget(text: &str) -> vocab::PreemWidget {
     }
 }
 
-/// **The kill switch reaches the dot matrix too**, and it restores the kit's
-/// own bytes exactly — the mirror of
-/// `the_cpu_arm_still_emits_the_kits_own_gauge_bytes_as_a_pixels_node`.
-///
-/// The whole preem suite runs on the CPU arm by default (`preem_gl`'s
-/// `TEST_ARM`), which is why every other dot-matrix parity assertion in this
-/// file keeps measuring the kit; this one pins the *node kind* as well.
-///
-/// **Falsified** by dropping the `preem_gl::arm() == Arm::Gl` guard from
-/// `build`'s dot-matrix arm: the first assertion reports a `GlSurface`.
-#[test]
-fn the_cpu_arm_still_emits_the_kits_own_dot_matrix_bytes_as_a_pixels_node() {
-    let _ink = preem_ink_lock();
-    let key = Scope::detached("dot-matrix-kill-switch-cpu");
-    let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
-
-    assert!(
-        matches!(
-            to_ui_node(&key, Grants::none(), &node),
-            UiNode::Pixels { .. }
-        ),
-        "with the kill switch on, a DotMatrix is a raster surface",
-    );
-    assert_eq!(
-        mapped_pixels(&key, &node),
-        kit_pixels(
-            &kit::DotMatrix::new(kit::DisplayStyle::Crt)
-                .dot_px(4)
-                .render("PREEM")
-        ),
-        "the CPU arm is the kit, byte for byte",
-    );
-}
-
 /// The GL arm emits a `GlSurface` the CPU arm would have sized **identically**,
 /// naming the dot matrix's own pipeline, carrying the glyph strip, and counting
 /// no steps.
 ///
-/// The size agreement is the layout argument the other two kinds make: a
-/// kill-switch flip is a node-kind change, so it rebuilds the widget, and a
+/// The size is asserted against the **literal** rather than against the
+/// other arm (PR #1356 review, M1): with one arm left the cross-arm
+/// comparison was `x == x`. The layout property it protected is real and is
+/// what the literal pins — a node-kind flip rebuilds the widget, and a
 /// rebuild that also resized would reflow the whole card.
 ///
 /// Unlike the gauge, the grid here is trivially native — there is no `scale` on
@@ -5114,34 +4605,24 @@ fn the_gl_dot_matrix_emits_its_own_pipeline_with_the_glyph_strip() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
 
-    let cpu = Scope::detached("dot-matrix-gl-size-cpu");
-    let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
-
-    super::preem_gl::with_gl_arm(|| {
-        let gl = Scope::detached("dot-matrix-gl-size-gl");
-        let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::DOT_MATRIX);
-        assert_eq!(
-            (gl_w, gl_h),
-            (cpu_w, cpu_h),
-            "same natural size on both arms",
-        );
-        // `2*pad + n*6*dot - dot` by `9*dot`, at five characters and pitch 4.
-        assert_eq!((gl_w, gl_h), (124, 36));
-        assert_eq!(
-            uniforms.grid,
-            (124, 36),
-            "the offscreen passes run at the buffer the kit would have filled",
-        );
-        assert_eq!(
-            uniforms.step_seq, 0,
-            "a dot matrix carries no cross-frame GPU state at all",
-        );
-        assert_eq!(
-            uniforms.data.as_ref().map(|strip| strip.len()),
-            Some(5 * 5),
-            "one texel per glyph column of every character",
-        );
-    });
+    let gl = Scope::detached("dot-matrix-gl-size-gl");
+    let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::DOT_MATRIX);
+    // `2*pad + n*6*dot - dot` by `9*dot`, at five characters and pitch 4.
+    assert_eq!((gl_w, gl_h), (124, 36));
+    assert_eq!(
+        uniforms.grid,
+        (124, 36),
+        "the offscreen passes run at the buffer the kit would have filled",
+    );
+    assert_eq!(
+        uniforms.step_seq, 0,
+        "a dot matrix carries no cross-frame GPU state at all",
+    );
+    assert_eq!(
+        uniforms.data.as_ref().map(|strip| strip.len()),
+        Some(5 * 5),
+        "one texel per glyph column of every character",
+    );
 }
 
 /// **The glyph strip survives a cache drop** — a re-tint re-runs the mapping,
@@ -5160,24 +4641,22 @@ fn the_gl_dot_matrix_emits_its_own_pipeline_with_the_glyph_strip() {
 fn the_glyph_strip_is_shared_across_mapping_passes() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("dm"), gl_dot_matrix_widget("88:88"));
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("dot-matrix-strip-sharing");
-        let (_, _, first) = mapped_gl_for(&key, &node, super::preem_gl::DOT_MATRIX);
-        preem_render::invalidate_cached_frames();
-        let (_, _, second) = mapped_gl_for(&key, &node, super::preem_gl::DOT_MATRIX);
+    let key = Scope::detached("dot-matrix-strip-sharing");
+    let (_, _, first) = mapped_gl_for(&key, &node, super::preem_gl::DOT_MATRIX);
+    preem_render::invalidate_cached_frames();
+    let (_, _, second) = mapped_gl_for(&key, &node, super::preem_gl::DOT_MATRIX);
 
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "the premise: the cache really was dropped, so this is a fresh bag",
-        );
-        let (Some(before), Some(after)) = (first.data.as_ref(), second.data.as_ref()) else {
-            panic!("both passes carry a strip");
-        };
-        assert!(
-            Arc::ptr_eq(before, after),
-            "the line is encoded on a state change, not on a mapping pass",
-        );
-    });
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the premise: the cache really was dropped, so this is a fresh bag",
+    );
+    let (Some(before), Some(after)) = (first.data.as_ref(), second.data.as_ref()) else {
+        panic!("both passes carry a strip");
+    };
+    assert!(
+        Arc::ptr_eq(before, after),
+        "the line is encoded on a state change, not on a mapping pass",
+    );
 }
 
 /// …and a **state change** does re-encode it, to the new line.
@@ -5185,50 +4664,48 @@ fn the_glyph_strip_is_shared_across_mapping_passes() {
 /// The other half of the contract above: sharing that outlived a text change
 /// would freeze the display on its first message.
 ///
-/// **Falsified** by dropping the `DotMatrixGl` arm from `Renderer::update`,
+/// **Falsified** by dropping the `DotMatrix` arm from `Renderer::update`,
 /// which the catch-all would then swallow silently.
 #[test]
 fn a_new_line_re_encodes_the_glyph_strip() {
     let _ink = preem_ink_lock();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("dot-matrix-strip-update");
-        let (_, _, first) = mapped_gl_for(
-            &key,
-            &preem_node(Some("dm"), gl_dot_matrix_widget("AA")),
-            super::preem_gl::DOT_MATRIX,
-        );
-        let (_, _, second) = mapped_gl_for(
-            &key,
-            &preem_node(Some("dm"), gl_dot_matrix_widget("AB")),
-            super::preem_gl::DOT_MATRIX,
-        );
-        let (Some(before), Some(after)) = (first.data.as_ref(), second.data.as_ref()) else {
-            panic!("both passes carry a strip");
-        };
-        assert_ne!(
-            before.as_ref(),
-            after.as_ref(),
-            "a new message reaches the shader",
-        );
-        assert_eq!(
-            after.as_ref(),
-            super::preem_gl::encode_glyphs("AB")
-                .strip
-                .expect("a non-empty line carries a strip")
-                .as_ref(),
-            "…and it is the new line, encoded the one way",
-        );
-        // Both builds went through `update`, not a rebuild: the config never
-        // moved, so the instance is the same one.
-        assert_eq!(
-            preem_render::probe(&key, Some("dm")).expect("the instance exists"),
-            (1, 2),
-            "one build, two applies",
-        );
-    });
+    let key = Scope::detached("dot-matrix-strip-update");
+    let (_, _, first) = mapped_gl_for(
+        &key,
+        &preem_node(Some("dm"), gl_dot_matrix_widget("AA")),
+        super::preem_gl::DOT_MATRIX,
+    );
+    let (_, _, second) = mapped_gl_for(
+        &key,
+        &preem_node(Some("dm"), gl_dot_matrix_widget("AB")),
+        super::preem_gl::DOT_MATRIX,
+    );
+    let (Some(before), Some(after)) = (first.data.as_ref(), second.data.as_ref()) else {
+        panic!("both passes carry a strip");
+    };
+    assert_ne!(
+        before.as_ref(),
+        after.as_ref(),
+        "a new message reaches the shader",
+    );
+    assert_eq!(
+        after.as_ref(),
+        super::preem_gl::encode_glyphs("AB")
+            .strip
+            .expect("a non-empty line carries a strip")
+            .as_ref(),
+        "…and it is the new line, encoded the one way",
+    );
+    // Both builds went through `update`, not a rebuild: the config never
+    // moved, so the instance is the same one.
+    assert_eq!(
+        preem_render::probe(&key, Some("dm")).expect("the instance exists"),
+        (1, 2),
+        "one build, two applies",
+    );
 }
 
-/// A `DotMatrix` whose GL context fails is rebuilt onto the kit **by the hook**,
+/// A `DotMatrix` whose GL context fails is taken to the placeholder **by the hook**,
 /// without waiting for a mapping pass.
 ///
 /// This kind is the strongest case for the hook of the three: a gauge at least
@@ -5238,109 +4715,46 @@ fn a_new_line_re_encodes_the_glyph_strip() {
 /// is never re-entered. Without the hook the chip stays blank until the plugin
 /// sends a new line, which a static readout may never do.
 ///
-/// **Falsified** by making `Renderer::is_gl` answer `false` for `DotMatrixGl`
-/// (the `builds` assertion goes red — the hook walks past the instance), or by
-/// dropping the `rebuild_gl_renderers_on_cpu()` call from `preem_gl::install`'s
-/// hook.
+/// **Falsified** by narrowing `rebuild_gl_renderers_as_placeholders`'s sweep so
+/// it walks past a live instance (the `builds` assertion goes red), or by
+/// dropping that call from `preem_gl::install`'s hook.
 #[test]
 fn a_gl_dot_matrix_falls_back_without_waiting_for_a_frame_that_never_comes() {
     let _ink = preem_ink_lock();
     super::preem_gl::install();
-    super::preem_gl::with_gl_arm(|| {
-        let key = Scope::detached("dot-matrix-context-lost");
-        let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
-
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::GlSurface { .. }
-            ),
-            "the GL arm is chosen while a context is still possible",
-        );
-        // The premise, and it is stronger here than on either other kind.
-        assert!(
-            !preem_render::any_animating_in(std::slice::from_ref(&key)),
-            "a dot matrix never animates, so nothing will ever re-map it",
-        );
-        let before = preem_render::probe(&key, Some("dm")).expect("the instance exists");
-
-        hytte::ui::gl_surface::abandon_gl("no GL in this test");
-
-        let after = preem_render::probe(&key, Some("dm")).expect("the instance survives");
-        assert_eq!(
-            after.0,
-            before.0 + 1,
-            "the failure hook rebuilt the renderer itself, not the next re-map",
-        );
-        assert_eq!(
-            after.1, before.1,
-            "…and did it without an apply, so no widget state was touched",
-        );
-
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::Pixels { .. }
-            ),
-            "a lost context drops the display to the raster arm",
-        );
-        assert_eq!(
-            mapped_pixels(&key, &node),
-            kit_pixels(
-                &kit::DotMatrix::new(kit::DisplayStyle::Crt)
-                    .dot_px(4)
-                    .render("PREEM")
-            ),
-            "and what it draws is the kit's own frame, byte for byte",
-        );
-    });
-}
-
-/// Visual parity, `FlipBoard`, at the text's arrival and after one advance.
-#[test]
-fn flip_board_renders_at_parity_with_the_kit_before_and_after_a_flip() {
-    let _ink = preem_ink_lock();
-    let scope = Scope::detached("parity-flip-board");
-    let node = preem_node(
-        Some("fb"),
-        vocab::PreemWidget::FlipBoard {
-            config: vocab::FlipBoardConfig {
-                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
-                mechanism: vocab::Mechanism::SplitFlap,
-                cells: 8,
-                glyph_px: 2,
-                scale: 1,
-                // `None` on both means "the mechanism's own default", which the
-                // oracle reproduces by *not* calling the two builder methods.
-                duration_secs: None,
-                stagger_secs: None,
-            },
-            state: vocab::FlipBoardState {
-                text: "12:34:56".into(),
-            },
-        },
-    );
-    let mut oracle = kit::FlipBoard::new(kit::Mechanism::SplitFlap)
-        .cells(8)
-        .glyph_px(2)
-        .scale(1);
-    oracle.set_text("12:34:56");
-    assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
-        "a board that has just been given its text is mid-flip at t=0",
-    );
+    let key = Scope::detached("dot-matrix-context-lost");
+    let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
 
     assert!(
-        advanced(0.1),
-        "cards still in motion must report that they moved",
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::GlSurface { .. }
+        ),
+        "the GL arm is chosen while a context is still possible",
     );
-    oracle.advance(0.1);
+    // The premise, and it is stronger here than on either other kind.
+    assert!(
+        !preem_render::any_animating_in(std::slice::from_ref(&key)),
+        "a dot matrix never animates, so nothing will ever re-map it",
+    );
+    let before = preem_render::probe(&key, Some("dm")).expect("the instance exists");
+
+    hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+    let after = preem_render::probe(&key, Some("dm")).expect("the instance survives");
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
-        "the shell drives the flip clock with the same dt the kit would have",
+        after.0,
+        before.0 + 1,
+        "the failure hook rebuilt the renderer itself, not the next re-map",
     );
+    assert_eq!(
+        after.1, before.1,
+        "…and did it without an apply, so no widget state was touched",
+    );
+
+    // A lost context drops the display all the way to the placeholder since
+    // #1157 — an empty surface keeping its id and classes, not a kit raster.
+    assert_placeholder(&key, &node, "dm");
 }
 
 /// Acceptance criterion 1 (#895's B2 handoff): the renderer rasterises the
@@ -5348,9 +4762,14 @@ fn flip_board_renders_at_parity_with_the_kit_before_and_after_a_flip() {
 ///
 /// The config below asks for a 5000-column, 8× upscaled scope — a buffer the
 /// wire caps are there to refuse. The assertion is not merely "it didn't
-/// explode": the surface must be byte-identical to the kit rendering
-/// `PreemWidget::clamped()`'s output, which is what proves the clamp is on the
-/// path rather than merely available.
+/// explode": the mapped node must be the one the **clamped** widget produces,
+/// which is what proves the clamp is on the path rather than merely available.
+///
+/// The oracle is the mapping of `PreemWidget::clamped()`'s own output, run in a
+/// scope of its own. It was the kit's raster of that widget until #1157; the
+/// substance is unchanged — a raw widget reaching the renderer would blow both
+/// the size assertion and the equality, since 5000 × 8 is not 512 — and the
+/// grid the shader is handed is now where the clamp shows.
 #[test]
 fn an_absurd_preem_config_is_clamped_before_the_renderer_sees_it() {
     let _ink = preem_ink_lock();
@@ -5367,26 +4786,18 @@ fn an_absurd_preem_config_is_clamped_before_the_renderer_sees_it() {
             samples: vec![0.5; 128],
         },
     };
-    let (width, height, data) = mapped_pixels(&scope, &preem_node(Some("sc"), raw.clone()));
+    let (width, height, state) = mapped_state(&scope, &preem_node(Some("sc"), raw.clone()));
     assert!(
         width <= vocab::MAX_BUFFER_DIM && height <= vocab::MAX_BUFFER_DIM,
-        "the rasterised surface must respect the wire's buffer cap, got {width}x{height}",
+        "the mapped surface must respect the wire's buffer cap, got {width}x{height}",
     );
 
-    let vocab::PreemWidget::Scope { config, state } = raw.clamped() else {
-        panic!("clamping a Scope yields a Scope");
-    };
-    let mut oracle = kit::Scope::with_size(
-        usize::try_from(config.cols).expect("clamped cols fit usize"),
-        usize::try_from(config.rows).expect("clamped rows fit usize"),
-    )
-    .scale(usize::try_from(config.scale).expect("clamped scale fits usize"))
-    .persistence(config.persistence);
-    oracle.advance(&state.samples);
+    let oracle_key = Scope::detached("clamp-seam-oracle");
+    let oracle = mapped_state(&oracle_key, &preem_node(Some("sc"), raw.clamped()));
     assert_eq!(
-        (width, height, data),
-        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
-        "the renderer must rasterise the clamped widget, not the raw one",
+        (width, height, state),
+        oracle,
+        "the renderer must draw the clamped widget, not the raw one",
     );
 }
 
@@ -5437,10 +4848,10 @@ fn re_mapping_an_unchanged_widget_is_a_no_op() {
         },
     );
 
-    let first = mapped_pixels(&scope, &node);
+    let first = mapped_state(&scope, &node);
     assert_eq!(preem_render::probe(&scope, Some("dm")), Some((1, 1)));
 
-    let second = mapped_pixels(&scope, &node);
+    let second = mapped_state(&scope, &node);
     assert_eq!(
         preem_render::probe(&scope, Some("dm")),
         Some((1, 1)),
@@ -5478,11 +4889,11 @@ fn every_monitors_pass_shares_one_frame_allocation() {
         },
     );
 
-    let (width, height, first) = mapped_frame(&scope, &node);
-    let (again_w, again_h, second) = mapped_frame(&scope, &node);
+    let (width, height, first) = mapped_state(&scope, &node);
+    let (again_w, again_h, second) = mapped_state(&scope, &node);
     assert!(
-        !first.is_empty(),
-        "the fixture must really rasterise something, or the sharing claim is vacuous",
+        !first.values.is_empty(),
+        "the fixture must really map something, or the sharing claim is vacuous",
     );
     assert_eq!(
         (width, height),
@@ -5495,7 +4906,7 @@ fn every_monitors_pass_shares_one_frame_allocation() {
     );
     // Three monitors, a drawer, a blanket repaint — every further pass is the
     // same allocation until something invalidates the cache.
-    let (_, _, third) = mapped_frame(&scope, &node);
+    let (_, _, third) = mapped_state(&scope, &node);
     assert!(Arc::ptr_eq(&first, &third));
     assert_eq!(
         Arc::strong_count(&first),
@@ -5530,17 +4941,17 @@ fn a_moved_frame_is_a_new_allocation() {
         },
     );
 
-    let (_, _, before) = mapped_frame(&scope, &node);
+    let (_, _, before) = mapped_state(&scope, &node);
     assert!(advanced(0.5), "the marquee must actually have moved");
-    let (_, _, after) = mapped_frame(&scope, &node);
+    let (_, _, after) = mapped_state(&scope, &node);
     assert!(
         !Arc::ptr_eq(&before, &after),
         "a tick that moved the widget must produce a new buffer, not mutate the shared one",
     );
-    assert_ne!(*before, *after, "…and it must really be different pixels");
+    assert_ne!(*before, *after, "…and it must really be a different frame");
     // The pre-tick handle is still valid — the surfaces still holding it see
-    // the frame they were given, not a half-written one.
-    assert_eq!(before.len(), after.len());
+    // the state they were given, not a half-written one.
+    assert_eq!(before.values.len(), after.values.len());
 
     preem_render::forget_scope(&scope);
 }
@@ -5625,14 +5036,14 @@ fn a_gauge_resize_rebuilds_the_instance_at_the_new_size() {
             },
         )
     };
-    let pixels = |node: &UiNode| match node {
-        UiNode::Pixels { width, height, .. } => (*width, *height),
-        other => panic!("a gauge maps to a Pixels node, got {other:?}"),
+    let drawn = |node: &UiNode| match node {
+        UiNode::GlSurface { width, height, .. } => (*width, *height),
+        other => panic!("a gauge maps to a GlSurface node, got {other:?}"),
     };
 
     let wide = to_ui_node(&scope, Grants::none(), &dial(144, 64));
     assert_eq!(preem_render::probe(&scope, Some("g")), Some((1, 1)));
-    assert_eq!(pixels(&wide), (288, 128), "the default face, at ×2");
+    assert_eq!(drawn(&wide), (288, 128), "the default face, at ×2");
 
     let small = to_ui_node(&scope, Grants::none(), &dial(48, 48));
     assert_eq!(
@@ -5640,12 +5051,12 @@ fn a_gauge_resize_rebuilds_the_instance_at_the_new_size() {
         Some((2, 2)),
         "a size change is a config change, so it rebuilds rather than updating",
     );
-    assert_eq!(pixels(&small), (96, 96), "…at the square size it asked for");
+    assert_eq!(drawn(&small), (96, 96), "…at the square size it asked for");
 
     // And back again: nothing latches.
     let wide_again = to_ui_node(&scope, Grants::none(), &dial(144, 64));
     assert_eq!(preem_render::probe(&scope, Some("g")), Some((3, 3)));
-    assert_eq!(pixels(&wide_again), (288, 128));
+    assert_eq!(drawn(&wide_again), (288, 128));
 
     preem_render::forget_scope(&scope);
 }
@@ -5759,7 +5170,7 @@ fn id_d_gauges_keep_their_own_needles_when_a_sibling_is_removed() {
             "three un-settled needles must report that they moved",
         );
     }
-    let before = mapped_row_pixels(&scope, &three);
+    let before = mapped_row_states(&scope, &three);
     assert_eq!(before.len(), 3, "three gauges, three surfaces");
     assert_ne!(
         before[0], before[1],
@@ -5771,7 +5182,7 @@ fn id_d_gauges_keep_their_own_needles_when_a_sibling_is_removed() {
     // survivor that kept its own renderer instance renders byte-identically,
     // and one that inherited a sibling's cannot.
     let two = gauge_row([(Some("g1"), 0.5), (Some("g2"), 0.85)]);
-    let after = mapped_row_pixels(&scope, &two);
+    let after = mapped_row_states(&scope, &two);
     assert_eq!(after.len(), 2, "two gauges left");
     assert_eq!(
         after[0], before[1],
@@ -5824,7 +5235,7 @@ fn anonymous_gauges_transplant_a_needle_and_warn_once() {
     for _ in 0..4 {
         assert!(advanced(preem_render::ANIM_STEP_SECS));
     }
-    let before = mapped_row_pixels(&scope, &three);
+    let before = mapped_row_states(&scope, &three);
     assert_ne!(
         before[0], before[1],
         "the fixture must actually separate the needles",
@@ -5832,7 +5243,7 @@ fn anonymous_gauges_transplant_a_needle_and_warn_once() {
     assert_ne!(before[1], before[2], "…all three of them");
 
     let two = gauge_row([(None, 0.5), (None, 0.85)]);
-    let after = mapped_row_pixels(&scope, &two);
+    let after = mapped_row_states(&scope, &two);
     assert_eq!(
         after[0], before[0],
         "the transplant: the second gauge lands on the first's ordinal slot and renders the \
@@ -6051,27 +5462,29 @@ fn preem_nodes_past_the_instance_cap_render_the_placeholder_and_warn_once() {
     let row = |n: usize| gauge_row(ids.iter().take(n).map(|id| (Some(id.as_str()), 0.5)));
     let over = row(wire::MAX_PREEM_NODES_PER_TREE + 1);
 
-    let mapped = mapped_row_pixels(&scope, &over);
+    let mapped = mapped_row_states(&scope, &over);
     assert_eq!(
         mapped.len(),
         wire::MAX_PREEM_NODES_PER_TREE + 1,
         "every node still maps to a surface — the cap withholds a renderer, not a widget",
     );
-    for (i, (width, height, data)) in mapped
+    for (i, child) in mapped
         .iter()
         .take(wire::MAX_PREEM_NODES_PER_TREE)
         .enumerate()
     {
+        let (width, height, _) = child
+            .as_ref()
+            .unwrap_or_else(|| panic!("node {i} is inside the cap and must be drawn"));
         assert!(
-            *width > 0 && *height > 0 && !data.is_empty(),
-            "node {i} is inside the cap and must render for real",
+            *width > 0 && *height > 0,
+            "node {i} is inside the cap and must draw for real",
         );
     }
-    assert_eq!(
-        mapped[wire::MAX_PREEM_NODES_PER_TREE],
-        (0, 0, Vec::new()),
-        "the node past the cap renders the unknown-widget placeholder — the same empty \
-         surface an unrenderable kind degrades to, keeping its id and classes",
+    assert!(
+        mapped[wire::MAX_PREEM_NODES_PER_TREE].is_none(),
+        "the node past the cap renders the placeholder — the same empty surface an \
+         unrenderable kind degrades to, keeping its id and classes",
     );
     assert_eq!(
         preem_render::instance_count(&scope),
@@ -6108,11 +5521,11 @@ fn preem_nodes_past_the_instance_cap_render_the_placeholder_and_warn_once() {
     // it: a tree of *exactly* the cap is not over it.
     let at_cap = Scope::detached("preem-instance-cap-exact");
     let exact = row(wire::MAX_PREEM_NODES_PER_TREE);
-    let mapped = mapped_row_pixels(&at_cap, &exact);
+    let mapped = mapped_row_states(&at_cap, &exact);
     assert!(
         mapped
             .iter()
-            .all(|(width, _, data)| *width > 0 && !data.is_empty()),
+            .all(|child| child.as_ref().is_some_and(|(width, _, _)| *width > 0)),
         "every node of a tree exactly at the cap renders",
     );
     assert_eq!(
@@ -6253,16 +5666,15 @@ fn the_instance_cap_answers_the_same_for_every_monitor_pass() {
         .collect();
     let frame = gauge_row(swapped.iter().map(|id| (Some(id.as_str()), 0.5)));
 
-    let monitor1 = mapped_row_pixels(&scope, &frame);
-    let monitor2 = mapped_row_pixels(&scope, &frame);
+    let monitor1 = mapped_row_states(&scope, &frame);
+    let monitor2 = mapped_row_states(&scope, &frame);
     assert_eq!(
         monitor1, monitor2,
         "two monitors map ONE wire frame, so they must map it identically — the cap may not \
          answer differently on the second pass because the first pass's sweep freed a slot",
     );
-    assert_ne!(
-        monitor1[wire::MAX_PREEM_NODES_PER_TREE - 1],
-        (0, 0, Vec::new()),
+    assert!(
+        monitor1[wire::MAX_PREEM_NODES_PER_TREE - 1].is_some(),
         "…and neither pass may blank a node in a tree that is AT the cap and never over it",
     );
 
@@ -6295,15 +5707,14 @@ fn a_tree_at_the_instance_cap_that_rotates_one_id_never_blanks() {
             .chain(std::iter::once(rotating.as_str()))
             .collect();
         let row = gauge_row(ids.into_iter().map(|id| (Some(id), 0.5)));
-        let mapped = mapped_row_pixels(&scope, &row);
+        let mapped = mapped_row_states(&scope, &row);
         assert_eq!(
             mapped.len(),
             wire::MAX_PREEM_NODES_PER_TREE,
             "frame {frame}: every node still maps to a surface",
         );
-        assert_ne!(
-            mapped[wire::MAX_PREEM_NODES_PER_TREE - 1],
-            (0, 0, Vec::new()),
+        assert!(
+            mapped[wire::MAX_PREEM_NODES_PER_TREE - 1].is_some(),
             "frame {frame}: a tree of exactly the cap's worth of nodes is never over the cap, \
              however often its last id changes",
         );
@@ -6512,8 +5923,8 @@ fn two_preem_nodes_sharing_an_id_collapse_onto_one_instance_and_warn_once() {
     for _ in 0..4 {
         assert!(advanced(preem_render::ANIM_STEP_SECS));
     }
-    let both = mapped_row_pixels(&shared, &clash);
-    let apart = mapped_row_pixels(&distinct, &control);
+    let both = mapped_row_states(&shared, &clash);
+    let apart = mapped_row_states(&distinct, &control);
     assert_ne!(
         apart[0], apart[1],
         "the fixture must actually separate two gauges heading for 0.15 and 0.85",
@@ -6694,12 +6105,28 @@ fn an_unrenderable_preem_widget_degrades_to_an_empty_surface() {
         "an unrenderable widget keeps its id and classes so a later frame updates in place",
     );
 
-    // The instance is kept (so the warn stays latched at one) but rebuilds the
-    // moment the widget becomes renderable again.
-    let (_, _, data) = mapped_pixels(&scope, &node);
+    // The instance is kept (so the warn stays latched at one) and the **next
+    // frame** rebuilds it, which is what "updates in place" means: `apply`
+    // short-circuits an unchanged widget on an unchanged verdict, so the leg
+    // that recovers is a new frame rather than a re-map of the same one.
+    let later = preem_node(
+        Some("x"),
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState {
+                text: "hi there".into(),
+            },
+        },
+    );
+    let (width, height, _) = mapped_state(&scope, &later);
     assert!(
-        !data.is_empty(),
+        width > 0 && height > 0,
         "the same node recovers in place once its kind is renderable",
+    );
+    assert_eq!(
+        preem_render::probe(&scope, Some("x")).map(|(builds, _)| builds),
+        Some(2),
+        "…by rebuilding the instance it kept, not by minting a second one",
     );
 }
 
@@ -6769,24 +6196,38 @@ fn only_animated_widgets_keep_the_clock_awake() {
 /// `PeakHold::decay` takes no `dt` — it is one fixed fall per call — so the
 /// shell converts real seconds into whole steps. Three steps' worth of `dt`
 /// must be exactly three decays, and a `dt` worth hundreds must be capped.
+///
+/// The oracle is the kit's own `PeakHold`, replayed by hand and fed through the
+/// *mapping* — which is where the folded peak reaches the shader, and which is
+/// what `peak_for` computes on the production path. It went through the kit's
+/// raster until #1157; the peak under test is the same number either way.
 #[test]
 fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
     let _ink = preem_ink_lock();
-    let strip = kit::LedStrip::new(kit::DisplayStyle::Vfd).leds(16);
+    let config = vocab::LedStripConfig {
+        style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+        leds: 16,
+        peak_hold: Some(vocab::PeakHoldConfig { rate: 0.05 }),
+    };
     let node = preem_node(
         Some("vu"),
         vocab::PreemWidget::LedStrip {
-            config: vocab::LedStripConfig {
-                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
-                leds: 16,
-                peak_hold: Some(vocab::PeakHoldConfig { rate: 0.05 }),
-            },
+            config,
             state: vocab::LedStripState {
                 level: 1.0,
                 peak: None,
             },
         },
     );
+    let drawn_at = |peak: f32| {
+        let surface = super::preem_gl::led_strip_surface(
+            config,
+            1.0,
+            peak,
+            &kit::palette_snapshot(kit::DisplayStyle::Vfd),
+        );
+        (surface.width, surface.height, Arc::new(surface.uniforms))
+    };
 
     let three = Scope::detached("steps-three");
     let _ = to_ui_node(&three, Grants::none(), &node);
@@ -6797,8 +6238,8 @@ fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
         oracle.decay();
     }
     assert_eq!(
-        mapped_pixels(&three, &node),
-        kit_pixels(&strip.render(1.0, oracle.value())),
+        mapped_state(&three, &node),
+        drawn_at(oracle.value()),
         "three animation steps' worth of dt is exactly three decays",
     );
 
@@ -6815,9 +6256,17 @@ fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
         capped.value() > 0.0,
         "the fixture must not decay to zero at the cap, or the assertion below is vacuous",
     );
+    // Anti-vacuity: eight decays and three decays must land on different peaks,
+    // or the capping assertion below would be satisfied by the un-capped answer
+    // too. A strict inequality rather than an epsilon because what it rules out
+    // is the two replays being the *same* number of decays, which is exact.
+    assert!(
+        capped.value() < oracle.value(),
+        "…and the two replays must differ, or the capping assertion cannot discriminate",
+    );
     assert_eq!(
-        mapped_pixels(&stalled, &node),
-        kit_pixels(&strip.render(1.0, capped.value())),
+        mapped_state(&stalled, &node),
+        drawn_at(capped.value()),
         "a stall's worth of dt is capped instead of replayed step by step",
     );
 }
@@ -7117,7 +6566,7 @@ fn a_masked_peak_hold_does_not_ask_for_pixel_identical_repaints() {
 
     let scope = Scope::detached("masked-peak");
     let masked = strip(Some(0.9));
-    let before = mapped_pixels(&scope, &masked);
+    let before = mapped_state(&scope, &masked);
     assert!(
         !preem_render::any_animating(),
         "a hold nothing draws must not keep the animation clock awake",
@@ -7127,7 +6576,7 @@ fn a_masked_peak_hold_does_not_ask_for_pixel_identical_repaints() {
         "a hold masked by an explicit peak must report no movement",
     );
     assert_eq!(
-        mapped_pixels(&scope, &masked),
+        mapped_state(&scope, &masked),
         before,
         "the fixture must be pixel-identical across the advance, or the assertion above is \
          asserting the wrong thing",
@@ -7155,6 +6604,16 @@ fn a_masked_peak_hold_does_not_ask_for_pixel_identical_repaints() {
 /// down **permanently** (the bound ran out before the fade did, and `animates()`
 /// then went false), while a default `184` trail was long gone after ~17 steps
 /// but kept asking for repaints for 64.
+///
+/// **What is measured is the bound, not the blankness.** Until #1157 this also
+/// built an all-off kit frame and asserted the tile *was* it, because the shell
+/// rasterised the trail and could be asked what it looked like. The shader owns
+/// the phosphor now and never hands it back (`hytte_ui::gl_surface`), so the
+/// picture is `preem_gl_diff`'s to compare — its scope cases sample the fade at
+/// three points — and `docs/live-verify.md`'s to eyeball. What is left here is
+/// the sharper half anyway: **exactly** how many steps the renderer keeps
+/// asking for, which is what `scope_settle_steps` computes and the only thing
+/// #926's clock reads.
 #[test]
 fn the_phosphor_settle_bound_follows_the_configured_persistence() {
     let _ink = preem_ink_lock();
@@ -7173,43 +6632,22 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
         )
     };
 
-    // The all-off frame: the same tile with no signal ever traced into it —
-    // graticule on the field plus the flat axis every empty advance re-stamps,
-    // and nothing else lit. Built from the kit directly, so "blank" is an
-    // independent notion rather than the code under test grading its own work
-    // (#906 R8: `faded != lit` only proved the trail had *moved*, which a trail
-    // frozen half-way down also satisfies).
-    //
-    // Geometry read off the same `ScopeConfig::default()` the fixture builds
-    // from, never spelled out: a hardcoded `144 × 48 @ 2` would silently become
-    // a size mismatch the day those defaults move, and this assertion would then
-    // fail reading like a phosphor regression.
-    let all_off = {
-        let defaults = vocab::ScopeConfig::default();
-        let dim = |value: u32| usize::try_from(value).expect("a wire-capped dimension fits usize");
-        let mut off = kit::Scope::with_size(dim(defaults.cols), dim(defaults.rows))
-            .scale(dim(defaults.scale))
-            .persistence(255);
-        off.advance(&[]);
-        kit_pixels(&off.render(kit_style(defaults.style.style)))
-    };
-
-    // 1. A long phosphor must fade all the way to black rather than freezing.
+    // 1. A long phosphor must keep fading rather than freezing, and must stop
+    //    at its own bound rather than at a constant.
     let slow = Scope::detached("settle-slow");
     let slow_node = traced(255);
     let _ = to_ui_node(&slow, Grants::none(), &slow_node);
-    let lit = mapped_pixels(&slow, &slow_node);
-    assert_ne!(
-        lit, all_off,
-        "the debut batch must actually light the tile, or the blankness assertion below is \
-         vacuous",
+    let slow_only = std::slice::from_ref(&slow);
+    assert!(
+        preem_render::any_animating_in(slow_only),
+        "the debut batch must arm the fade, or everything below is vacuous",
     );
     // 64 steps: where the old constant stopped. The trail must still be moving.
     for _ in 0..64 {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
     }
     assert!(
-        preem_render::any_animating(),
+        preem_render::any_animating_in(slow_only),
         "a persistence-255 trail needs ~255 steps to reach black, so it must still be fading \
          after 64 — the old constant froze it here, permanently",
     );
@@ -7220,41 +6658,29 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
     for _ in 0..190 {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
     }
-    assert_ne!(
-        mapped_pixels(&slow, &slow_node),
-        all_off,
-        "254 decays is one short: the trail must still be on screen, so the step below is \
-         doing the work rather than the bound being loose",
-    );
-    // The 255th decay. Deliberately *not* asserted to have moved: `advanced` is
-    // global, and the assertion that matters is where this lands the tile, not
-    // that something somewhere reported motion.
-    let _ = advanced(preem_render::ANIM_STEP_SECS);
-    let faded = mapped_pixels(&slow, &slow_node);
-    assert_ne!(
-        faded, lit,
-        "it must actually have faded, not merely stopped being asked to",
-    );
-    // …and the strong form, deliberately asserted *after* the weak one so a
-    // mutation shows which of the two catches it (#906 R8): a trail frozen
-    // part-way down satisfies `faded != lit` perfectly well. Blankness is the
-    // property `scope_settle_steps` exists to guarantee.
-    assert_eq!(
-        faded, all_off,
-        "after the bound the tile IS the all-off frame — blank, not merely different from lit",
-    );
     assert!(
-        !preem_render::any_animating(),
-        "once black it must stop asking for ticks",
+        preem_render::any_animating_in(slow_only),
+        "254 decays is one short of the bound: the renderer must still be asking, so the step \
+         below is doing the work rather than the bound being loose",
     );
+    // The 255th decay.
+    let _ = advanced(preem_render::ANIM_STEP_SECS);
+    assert!(
+        !preem_render::any_animating_in(slow_only),
+        "at the bound the trail is black and the renderer stops asking for ticks — a bound that \
+         ran long would spend pixel-identical repaints here, and one that ran short would have \
+         gone quiet 64 steps ago with the trail still on screen",
+    );
+    preem_render::forget_scope(&slow);
 
     // 2. The default fades in ~17 steps and must stop asking soon after — well
     //    inside the 64 the old constant spent on pixel-identical repaints.
     let quick = Scope::detached("settle-quick");
     let quick_node = traced(184);
     let _ = to_ui_node(&quick, Grants::none(), &quick_node);
+    let quick_only = std::slice::from_ref(&quick);
     let mut spent = 0;
-    while preem_render::any_animating() && spent < 64 {
+    while preem_render::any_animating_in(quick_only) && spent < 64 {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
         spent += 1;
     }
@@ -7263,6 +6689,7 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
         "a default-persistence trail is gone in ~17 steps, so it must stop asking well before \
          the old constant's 64 — took {spent}",
     );
+    preem_render::forget_scope(&quick);
 }
 
 /// The animation clock's fan-out only wakes the mailboxes that actually hold an
@@ -7358,8 +6785,8 @@ fn marquee_scroll_direction_follows_the_speeds_sign() {
     let _ = to_ui_node(&forward, Grants::none(), &node(20.0));
     assert!(advanced(0.5));
     assert_eq!(
-        mapped_pixels(&forward, &node(20.0)),
-        kit_pixels(&oracle.window(10)),
+        mapped_state(&forward, &node(20.0)),
+        marquee_phase(&oracle, 10, kit::DisplayStyle::Vfd),
         "a positive speed raises the offset, which is the kit's own \
          monotonically-increasing-counter direction",
     );
@@ -7368,8 +6795,8 @@ fn marquee_scroll_direction_follows_the_speeds_sign() {
     let _ = to_ui_node(&backward, Grants::none(), &node(-20.0));
     assert!(advanced(0.5));
     assert_eq!(
-        mapped_pixels(&backward, &node(-20.0)),
-        kit_pixels(&oracle.window(period - 10)),
+        mapped_state(&backward, &node(-20.0)),
+        marquee_phase(&oracle, period - 10, kit::DisplayStyle::Vfd),
         "a negative speed of the same magnitude must scroll the other way, wrapping to \
          `period - 10` rather than parking at zero",
     );
@@ -7460,6 +6887,27 @@ fn tick_marquee_oracle() -> kit::MarqueeStrip {
         .window_px(192)
         .gap_dots(6)
         .render("A LONG SCROLLING MESSAGE")
+}
+
+/// The GL payload a marquee on `strip` maps to at whole-dot phase `dots` — the
+/// oracle every scroll-position assertion below reads a position out of.
+///
+/// It was `kit_pixels(&strip.window(dots))` until #1157: the shell rasterised
+/// the windowed strip, so a phase was a picture. The strip is still the
+/// **geometry oracle** the shell maps from (`Renderer::Marquee` holds one for
+/// exactly that reason) and a phase is still a different set of lit columns
+/// (#839 made a sub-dot position inexpressible), so the same question — "which
+/// dot is this ticker at" — is now asked of the encoded grid the shader reads.
+/// A shell that scrolled the wrong number of dots produces a different grid,
+/// which is the property these tests were always about.
+fn marquee_phase(
+    strip: &kit::MarqueeStrip,
+    dots: usize,
+    style: kit::DisplayStyle,
+) -> (u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>) {
+    let window = super::preem_gl::encode_window(strip, dots);
+    let surface = super::preem_gl::marquee_surface(strip, &window, &kit::palette_snapshot(style));
+    (surface.width, surface.height, Arc::new(surface.uniforms))
 }
 
 /// One animation step in microseconds — the unit the frame-time tests count in.
@@ -7600,13 +7048,13 @@ fn a_tick_leaves_scopes_its_mount_does_not_name_alone() {
 
     let oracle = tick_marquee_oracle();
     assert_eq!(
-        mapped_pixels(&mine, &node),
-        kit_pixels(&oracle.window(1)),
+        mapped_state(&mine, &node),
+        marquee_phase(&oracle, 1, kit::DisplayStyle::Vfd),
         "the named scope scrolled its one dot",
     );
     assert_eq!(
-        mapped_pixels(&theirs, &node),
-        kit_pixels(&oracle.window(0)),
+        mapped_state(&theirs, &node),
+        marquee_phase(&oracle, 0, kit::DisplayStyle::Vfd),
         "…and the other mount's scope did not move at all",
     );
 }
@@ -7644,8 +7092,8 @@ fn a_tick_after_a_long_gap_advances_the_resume_cap_not_the_gap() {
         "the first tick must only stamp the baseline",
     );
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(0)),
+        mapped_state(&scope, &node),
+        marquee_phase(&oracle, 0, kit::DisplayStyle::Vfd),
         "…so nothing has scrolled yet",
     );
 
@@ -7657,8 +7105,8 @@ fn a_tick_after_a_long_gap_advances_the_resume_cap_not_the_gap() {
         "the stalled tick still moves it"
     );
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(8)),
+        mapped_state(&scope, &node),
+        marquee_phase(&oracle, 8, kit::DisplayStyle::Vfd),
         "a five-second gap must be worth the 400 ms resume cap — 8 dots — not the 100 it \
          really spanned: a resume from suspend (or a re-arm minutes after a park) catches up \
          a bounded amount and moves on",
@@ -7712,8 +7160,8 @@ fn a_frame_clock_slower_than_the_step_rate_still_runs_at_the_right_speed() {
     }
 
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(20)),
+        mapped_state(&scope, &node),
+        marquee_phase(&oracle, 20, kit::DisplayStyle::Vfd),
         "one second at 20 dots/s is 20 dots at ANY refresh rate: a clamp of one step would \
          have truncated each 100 ms frame to 50 ms and landed on 10 — a sustained slowdown \
          no other test would see, because every frame here is a perfectly ordinary one",
@@ -7756,8 +7204,8 @@ fn two_mounts_showing_one_scope_advance_it_once_per_frame() {
     }
 
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(2)),
+        mapped_state(&scope, &node),
+        marquee_phase(&oracle, 2, kit::DisplayStyle::Vfd),
         "100 ms at 20 dots/s is 2 dots however many mounts are watching: a per-mount `dt` \
          would have advanced it 4 (each tick a full 25 ms from its own mount's last), and a \
          `frame_time`-equality dedup would have advanced it 0 for the second mount and 4 for \
@@ -7769,8 +7217,8 @@ fn two_mounts_showing_one_scope_advance_it_once_per_frame() {
     let _ = tick_decision(&mount_b, 5 * step / 2);
     let _ = tick_decision(&mount_a, 3 * step);
     assert_eq!(
-        mapped_pixels(&scope, &node),
-        kit_pixels(&oracle.window(3)),
+        mapped_state(&scope, &node),
+        marquee_phase(&oracle, 3, kit::DisplayStyle::Vfd),
         "150 ms is 3 dots — the rate is right, not merely slow",
     );
 }
@@ -7875,12 +7323,12 @@ fn an_accent_change_re_tints_a_role_widget_and_leaves_a_pinned_one_alone() {
     );
 
     tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
-    let role_teal = mapped_pixels(&scope, &role);
-    let pinned_teal = mapped_pixels(&scope, &pinned);
+    let role_teal = mapped_state(&scope, &role);
+    let pinned_teal = mapped_state(&scope, &pinned);
 
     tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
-    let role_rose = mapped_pixels(&scope, &role);
-    let pinned_rose = mapped_pixels(&scope, &pinned);
+    let role_rose = mapped_state(&scope, &role);
+    let pinned_rose = mapped_state(&scope, &pinned);
 
     tint_in_process_surfaces(None);
     preem_render::forget_scope(&scope);
@@ -7894,7 +7342,7 @@ fn an_accent_change_re_tints_a_role_widget_and_leaves_a_pinned_one_alone() {
         "a pinned widget is deliberately excluded from the re-tint — that is what pinning means",
     );
     assert!(
-        pinned_teal.2.chunks_exact(4).any(|px| px == violet),
+        carries_color(&pinned_teal.2, violet),
         "…and it is excluded *at its pinned color*, not merely frozen at whatever it first drew",
     );
     assert_ne!(
@@ -7931,14 +7379,14 @@ fn a_status_role_resolves_to_the_theme_color_not_the_accent() {
         error: None,
     });
 
-    let accent = mapped_pixels(
+    let accent = mapped_state(
         &scope,
         &ink_probe("accent", with(vocab::AccentRole::Accent)),
     );
-    let success = mapped_pixels(&scope, &ink_probe("ok", with(vocab::AccentRole::Success)));
-    let warning = mapped_pixels(&scope, &ink_probe("warn", with(vocab::AccentRole::Warning)));
-    let error = mapped_pixels(&scope, &ink_probe("err", with(vocab::AccentRole::Error)));
-    let neutral = mapped_pixels(
+    let success = mapped_state(&scope, &ink_probe("ok", with(vocab::AccentRole::Success)));
+    let warning = mapped_state(&scope, &ink_probe("warn", with(vocab::AccentRole::Warning)));
+    let error = mapped_state(&scope, &ink_probe("err", with(vocab::AccentRole::Error)));
+    let neutral = mapped_state(
         &scope,
         &ink_probe("plain", with(vocab::AccentRole::Neutral)),
     );
@@ -7946,7 +7394,7 @@ fn a_status_role_resolves_to_the_theme_color_not_the_accent() {
     // The same accent-role widget again, with no accent installed at all: the
     // kit's own hard-coded ink, which is where `Neutral` should have landed.
     tint_in_process_surfaces(None);
-    let unaccented = mapped_pixels(
+    let unaccented = mapped_state(
         &scope,
         &ink_probe("accent", with(vocab::AccentRole::Accent)),
     );
@@ -7958,7 +7406,7 @@ fn a_status_role_resolves_to_the_theme_color_not_the_accent() {
     );
     assert_ne!(warning, success, "…and each role to its own color");
     assert!(
-        success.2.chunks_exact(4).any(|px| px == green),
+        carries_color(&success.2, green),
         "a fully-lit dot carries the role's color exactly, not something derived from it",
     );
     assert_eq!(
@@ -8006,14 +7454,14 @@ fn a_pinned_text_box_survives_a_theme_change_though_it_bakes_at_construction() {
     );
 
     tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
-    let teal = mapped_pixels(&scope, &node);
+    let teal = mapped_state(&scope, &node);
     tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
-    let rose = mapped_pixels(&scope, &node);
+    let rose = mapped_state(&scope, &node);
     tint_in_process_surfaces(None);
     preem_render::forget_scope(&scope);
 
     assert!(
-        teal.2.chunks_exact(4).any(|px| px == violet),
+        carries_color(&teal.2, violet),
         "a pinned TextBox must draw its pinned color",
     );
     assert_eq!(teal, rose, "…and survive a theme change byte-identically");
@@ -8326,7 +7774,7 @@ fn the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes() {
     let admitted = LCD_ADMITTED_ROLE_INKS[0];
     inject_role_ink(role, color);
     let scope = Scope::detached("935-lcd-bytes");
-    let pixels = mapped_pixels(
+    let pixels = mapped_state(
         &scope,
         &ink_probe(
             "role",
@@ -8336,11 +7784,11 @@ fn the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes() {
     preem_render::forget_scope(&scope);
 
     assert!(
-        pixels.2.chunks_exact(4).any(|px| px == admitted),
+        carries_color(&pixels.2, admitted),
         "{label}: a fully-lit lcd dot must carry the admitted ink",
     );
     assert!(
-        !pixels.2.chunks_exact(4).any(|px| px == color),
+        !carries_color(&pixels.2, color),
         "{label}: …and the raw theme color must reach no pixel at all — it is the invisible one",
     );
 }
@@ -8388,10 +7836,10 @@ fn an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it() {
     );
 
     let scope = Scope::detached("935-pin-verbatim");
-    let pixels = mapped_pixels(&scope, &ink_probe("pin", pinned));
+    let pixels = mapped_state(&scope, &ink_probe("pin", pinned));
     preem_render::forget_scope(&scope);
     assert!(
-        pixels.2.chunks_exact(4).any(|px| px == illegible),
+        carries_color(&pixels.2, illegible),
         "…and the pinned color reaches the glass exactly as pinned",
     );
 }
@@ -8436,14 +7884,14 @@ fn a_role_renders_like_its_pin_exactly_where_the_theme_color_was_already_legible
             .zip(kit::DisplayStyle::ALL)
         {
             inject_role_ink(role, color);
-            let by_role = mapped_pixels(
+            let by_role = mapped_state(
                 &scope,
                 &ink_probe(
                     &format!("role-{index}-{}", skin.name()),
                     vocab::StyleRef::new(name).with_accent(role),
                 ),
             );
-            let by_pin = mapped_pixels(
+            let by_pin = mapped_state(
                 &scope,
                 &ink_probe(
                     &format!("pin-{index}-{}", skin.name()),
@@ -8522,18 +7970,19 @@ fn a_pinned_field_floods_the_ground_and_survives_a_theme_change() {
     );
 
     tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
-    let pinned_teal = mapped_pixels(&scope, &pinned);
-    let plain_teal = mapped_pixels(&scope, &plain);
-    let still_teal = mapped_pixels(&scope, &still);
+    let pinned_teal = mapped_state(&scope, &pinned);
+    let plain_teal = mapped_state(&scope, &plain);
+    let still_teal = mapped_state(&scope, &still);
 
     tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
-    let pinned_rose = mapped_pixels(&scope, &pinned);
-    let still_rose = mapped_pixels(&scope, &still);
+    let pinned_rose = mapped_state(&scope, &pinned);
+    let still_rose = mapped_state(&scope, &still);
 
     tint_in_process_surfaces(None);
     preem_render::forget_scope(&scope);
 
-    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+    let floods =
+        |state: &(u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>)| carries_color(&state.2, lilac);
     assert!(
         floods(&pinned_teal),
         "a pinned field must flood the widget's ground, exactly, not something derived from it",
@@ -8557,8 +8006,15 @@ fn a_pinned_field_floods_the_ground_and_survives_a_theme_change() {
 }
 
 /// The whole point of the widening, end to end on the state path: a `TextBox`
-/// carrying all three pins renders **byte-identically** to the kit call `pet`
-/// made before it migrated (`TextBox::new().…​.colors(field, ink, notdef)`).
+/// carrying all three pins maps **identically** to the kit call `pet` made
+/// before it migrated (`TextBox::new().…​.colors(field, ink, notdef)`).
+///
+/// The oracle is that kit box's own **layout** run through the mapping, which
+/// is exactly where a `TextBox`'s three colours go: the box bakes them at
+/// construction (it is the one kit widget that does) and `layout` hands them
+/// back, which is why `invalidate_cached_frames` rebuilds this renderer rather
+/// than only dropping its cache. It was the kit's raster of that box until
+/// #1157; the three colours under test are the same three either way.
 ///
 /// This is the shell's half of #884's compat promise. The plugin's half — that
 /// its *raster* arm still produces those same bytes against an old shell — is
@@ -8616,17 +8072,17 @@ fn a_fully_pinned_text_box_reproduces_the_plugins_own_palette() {
     // An accent is installed throughout: a pin that quietly fell through to the
     // session tint would then differ from the oracle rather than coincide with it.
     tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
-    let all = mapped_pixels(
+    let all = mapped_state(
         &scope,
         &node("all", config(Some(field), Some(ink), Some(notdef))),
     );
-    let no_field = mapped_pixels(&scope, &node("nf", config(None, Some(ink), Some(notdef))));
-    let no_ink = mapped_pixels(&scope, &node("ni", config(Some(field), None, Some(notdef))));
-    let no_notdef = mapped_pixels(&scope, &node("nn", config(Some(field), Some(ink), None)));
+    let no_field = mapped_state(&scope, &node("nf", config(None, Some(ink), Some(notdef))));
+    let no_ink = mapped_state(&scope, &node("ni", config(Some(field), None, Some(notdef))));
+    let no_notdef = mapped_state(&scope, &node("nn", config(Some(field), Some(ink), None)));
 
     // …and it survives the theme moving, like every pin.
     tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
-    let all_again = mapped_pixels(
+    let all_again = mapped_state(
         &scope,
         &node("all", config(Some(field), Some(ink), Some(notdef))),
     );
@@ -8643,10 +8099,19 @@ fn a_fully_pinned_text_box_reproduces_the_plugins_own_palette() {
         .scale(2)
         .fixed_width(true)
         .colors(field, ink, notdef);
+    let oracle_layout = oracle.layout(text);
+    let oracle_surface = super::preem_gl::textbox_surface(
+        &oracle_layout,
+        &super::preem_gl::encode_block(&oracle_layout),
+    );
     assert_eq!(
         all,
-        kit_pixels(&oracle.render(text)),
-        "a fully pinned TextBox must reproduce the plugin's own `colors()` bytes",
+        (
+            oracle_surface.width,
+            oracle_surface.height,
+            Arc::new(oracle_surface.uniforms),
+        ),
+        "a fully pinned TextBox must reproduce the plugin's own `colors()`",
     );
     assert_eq!(
         all, all_again,
@@ -8704,12 +8169,13 @@ fn a_pinned_field_survives_a_marquee_text_change() {
             },
         )
     };
-    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+    let floods =
+        |state: &(u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>)| carries_color(&state.2, lilac);
 
-    let first = mapped_pixels(&scope, &node("ONE LONG SCROLLING MESSAGE"));
+    let first = mapped_state(&scope, &node("ONE LONG SCROLLING MESSAGE"));
     // A text change only: `same_config` still agrees, so this takes the
     // in-place `update` path and re-rasterises the strip there.
-    let after = mapped_pixels(&scope, &node("ANOTHER LONG SCROLLING MESSAGE"));
+    let after = mapped_state(&scope, &node("ANOTHER LONG SCROLLING MESSAGE"));
     let builds = preem_render::probe(&scope, Some("mq"));
     preem_render::forget_scope(&scope);
 
@@ -8833,11 +8299,12 @@ fn a_pinned_field_survives_a_state_change_on_every_widget() {
     let lilac = [0x3a, 0x22, 0x50, 0xff];
     let vfd = vocab::StyleRef::new(vocab::StyleName::Vfd).with_field(lilac);
     let scope = Scope::detached("885-field-every-widget");
-    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+    let floods =
+        |state: &(u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>)| carries_color(&state.2, lilac);
 
     for id in ["dm", "seg", "tb", "led", "mq", "sc", "ga", "fb"] {
-        let before = mapped_pixels(&scope, &preem_node(Some(id), state_pair_of(id, vfd, false)));
-        let after = mapped_pixels(&scope, &preem_node(Some(id), state_pair_of(id, vfd, true)));
+        let before = mapped_state(&scope, &preem_node(Some(id), state_pair_of(id, vfd, false)));
+        let after = mapped_state(&scope, &preem_node(Some(id), state_pair_of(id, vfd, true)));
         assert_eq!(
             preem_render::probe(&scope, Some(id)).map(|(b, _)| b),
             Some(1),
@@ -8884,21 +8351,21 @@ fn a_theme_change_drops_the_memoized_role_colors() {
         warning: None,
         error: None,
     });
-    let first = mapped_pixels(&scope, &ok);
+    let first = mapped_state(&scope, &ok);
 
     // The theme moved and nothing re-injects, so a dropped memo re-resolves to
     // the hermetic "no theme" answer and the role degrades to the accent.
     tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
-    let second = mapped_pixels(&scope, &ok);
+    let second = mapped_state(&scope, &ok);
     tint_in_process_surfaces(None);
     preem_render::forget_scope(&scope);
 
     assert!(
-        first.2.chunks_exact(4).any(|px| px == green),
+        carries_color(&first.2, green),
         "the injected role color must reach the first render",
     );
     assert!(
-        !second.2.chunks_exact(4).any(|px| px == green),
+        !carries_color(&second.2, green),
         "the memo must be dropped on a theme change, so the stale role color cannot survive it",
     );
 }
@@ -9791,7 +9258,7 @@ mod text_kinds_gl {
     use super::super::preem_render::{self, Scope};
     use super::super::shader_map::Grants;
     use super::super::wire_map::to_ui_node;
-    use super::{kit_pixels, mapped_gl_for, mapped_pixels, preem_ink_lock, preem_node};
+    use super::{assert_placeholder, mapped_gl_for, preem_ink_lock, preem_node};
 
     /// The message every ticker case shows: long enough to overflow a 96 px
     /// window at the default pitch, so it actually scrolls.
@@ -9854,99 +9321,14 @@ mod text_kinds_gl {
             .fixed_width(true)
     }
 
-    /// **Both new arms answer the two halves of the GL seam**, and both are on
-    /// the GPU under the GL arm.
-    ///
-    /// The sibling above (`every_gl_renderer_answers_both_halves_of_the_gl_seam`)
-    /// already loops every vocabulary widget and asserts
-    /// `is_gl() == gl_surface().is_some()`, so a new arm that answered one half
-    /// is caught there whether or not anyone edits it. What it does *not*
-    /// assert is that these two kinds specifically reached the GPU at all — its
-    /// premise names the first three — so that is what this adds.
-    ///
-    /// **Falsified** by dropping either kind's `build` arm, or by forgetting it
-    /// in `Renderer::is_gl`.
-    #[test]
-    fn the_two_text_kinds_draw_on_the_gpu_under_the_gl_arm() {
-        let _ink = preem_ink_lock();
-        let widgets = [marquee_widget(LONG, 12.0), textbox_widget("mrrp!")];
-        for widget in &widgets {
-            let (is_gl, has_surface) =
-                preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
-            assert!(
-                !is_gl && !has_surface,
-                "{}: the CPU arm draws on neither half",
-                widget.kind(),
-            );
-        }
-        super::super::preem_gl::with_gl_arm(|| {
-            for widget in &widgets {
-                let (is_gl, has_surface) =
-                    preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
-                assert!(
-                    is_gl && has_surface,
-                    "{}: #1152's arm answers both halves",
-                    widget.kind(),
-                );
-            }
-        });
-    }
-
-    /// **The kill switch restores the kit's own marquee bytes**, at the offset
-    /// the renderer is sitting at.
-    ///
-    /// The mirror of `the_cpu_arm_still_emits_the_kits_own_dot_matrix_bytes…`
-    /// for this kind. The whole preem suite runs on the CPU arm by default
-    /// (`preem_gl`'s `TEST_ARM`), so this also pins the *node kind*: a ticker
-    /// that silently took the GL arm under the switch would be caught here
-    /// rather than by a blank chip.
-    #[test]
-    fn the_cpu_arm_still_emits_the_kits_own_marquee_bytes_as_a_pixels_node() {
-        let _ink = preem_ink_lock();
-        let key = Scope::detached("marquee-kill-switch-cpu");
-        let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
-
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::Pixels { .. }
-            ),
-            "with the kill switch on, a Marquee is a raster surface",
-        );
-        assert_eq!(
-            mapped_pixels(&key, &node),
-            kit_pixels(&kit_strip(LONG).window(0)),
-            "the CPU arm is the kit, byte for byte",
-        );
-    }
-
-    /// …and the same for the text box, whose builder bakes its palette.
-    #[test]
-    fn the_cpu_arm_still_emits_the_kits_own_textbox_bytes_as_a_pixels_node() {
-        let _ink = preem_ink_lock();
-        let key = Scope::detached("textbox-kill-switch-cpu");
-        let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
-
-        assert!(
-            matches!(
-                to_ui_node(&key, Grants::none(), &node),
-                UiNode::Pixels { .. }
-            ),
-            "with the kill switch on, a TextBox is a raster surface",
-        );
-        assert_eq!(
-            mapped_pixels(&key, &node),
-            kit_pixels(&kit_box().render("mrrp mrrp")),
-            "the CPU arm is the kit, byte for byte",
-        );
-    }
-
     /// **The GL ticker emits its own pipeline at the kit's own window**, with
     /// one texel per grid column.
     ///
-    /// The size agreement is the layout argument every kind on this seam makes:
-    /// a kill-switch flip is a node-kind change, so it rebuilds the widget, and
-    /// a rebuild that also resized would reflow the whole card.
+    /// The size is asserted against the **literal** rather than against the
+    /// other arm (PR #1356 review, M1): with one arm left the cross-arm
+    /// comparison was `x == x`. The layout property it protected is real and is
+    /// what the literal pins — a node-kind flip rebuilds the widget, and a
+    /// rebuild that also resized would reflow the whole card.
     ///
     /// The strip length is what separates this arm from the dot matrix's: a
     /// ticker uploads the **visible grid**, `cols` texels, not `5 × chars` —
@@ -9960,39 +9342,29 @@ mod text_kinds_gl {
         let _ink = preem_ink_lock();
         let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
 
-        let cpu = Scope::detached("marquee-gl-size-cpu");
-        let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
-
-        super::super::preem_gl::with_gl_arm(|| {
-            let gl = Scope::detached("marquee-gl-size-gl");
-            let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::MARQUEE);
-            assert_eq!(
-                (gl_w, gl_h),
-                (cpu_w, cpu_h),
-                "same natural size on both arms",
-            );
-            // The window as asked for, by `9*dot`.
-            assert_eq!((gl_w, gl_h), (96, 36));
-            assert_eq!(uniforms.grid, (96, 36));
-            assert_eq!(
-                uniforms.step_seq, 0,
-                "the scroll is a texture upload, not GPU state",
-            );
-            let strip = kit_strip(LONG);
-            assert_eq!(
-                uniforms.data.as_ref().map(|grid| grid.len()),
-                Some(strip.cols()),
-                "one texel per grid column — not per character of the message",
-            );
-            assert!(
-                strip.cols() < LONG.chars().count() * kit::font::GLYPH_W,
-                "the premise: the message is much longer than the grid ({} \
-                 columns against {} texels for a per-character strip), so \
-                 encoding the bitmap instead would be visibly bigger",
-                strip.cols(),
-                LONG.chars().count() * kit::font::GLYPH_W,
-            );
-        });
+        let gl = Scope::detached("marquee-gl-size-gl");
+        let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::MARQUEE);
+        // The window as asked for, by `9*dot`.
+        assert_eq!((gl_w, gl_h), (96, 36));
+        assert_eq!(uniforms.grid, (96, 36));
+        assert_eq!(
+            uniforms.step_seq, 0,
+            "the scroll is a texture upload, not GPU state",
+        );
+        let strip = kit_strip(LONG);
+        assert_eq!(
+            uniforms.data.as_ref().map(|grid| grid.len()),
+            Some(strip.cols()),
+            "one texel per grid column — not per character of the message",
+        );
+        assert!(
+            strip.cols() < LONG.chars().count() * kit::font::GLYPH_W,
+            "the premise: the message is much longer than the grid ({} \
+             columns against {} texels for a per-character strip), so \
+             encoding the bitmap instead would be visibly bigger",
+            strip.cols(),
+            LONG.chars().count() * kit::font::GLYPH_W,
+        );
     }
 
     /// **The GL box emits its own pipeline at the kit's own final buffer**,
@@ -10010,37 +9382,27 @@ mod text_kinds_gl {
         let _ink = preem_ink_lock();
         let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
 
-        let cpu = Scope::detached("textbox-gl-size-cpu");
-        let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
-
-        super::super::preem_gl::with_gl_arm(|| {
-            let gl = Scope::detached("textbox-gl-size-gl");
-            let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::TEXTBOX);
-            assert_eq!(
-                (gl_w, gl_h),
-                (cpu_w, cpu_h),
-                "same natural size on both arms",
-            );
-            assert_eq!(uniforms.grid, (gl_w, gl_h));
-            let layout = kit_box().layout("mrrp mrrp");
-            assert_eq!(
-                (gl_w as usize, gl_h as usize),
-                layout.buffer(),
-                "the **final** buffer, upscale included",
-            );
-            assert_eq!(
-                uniforms.data.as_ref().map(|block| block.len()),
-                Some(layout.lines().len() * layout.content_cols() * kit::font::GLYPH_W),
-                "a rectangle of cells, five texels each",
-            );
-            assert_eq!(uniforms.step_seq, 0, "no cross-frame GPU state");
-        });
+        let gl = Scope::detached("textbox-gl-size-gl");
+        let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::TEXTBOX);
+        assert_eq!(uniforms.grid, (gl_w, gl_h));
+        let layout = kit_box().layout("mrrp mrrp");
+        assert_eq!(
+            (gl_w as usize, gl_h as usize),
+            layout.buffer(),
+            "the **final** buffer, upscale included",
+        );
+        assert_eq!(
+            uniforms.data.as_ref().map(|block| block.len()),
+            Some(layout.lines().len() * layout.content_cols() * kit::font::GLYPH_W),
+            "a rectangle of cells, five texels each",
+        );
+        assert_eq!(uniforms.step_seq, 0, "no cross-frame GPU state");
     }
 
     /// **A scroll step re-uploads the grid, and a mapping pass never does** —
     /// the #911 rule for a widget whose GPU state moves on a clock.
     ///
-    /// This is the property `Renderer::MarqueeGl`'s `window` field exists for
+    /// This is the property `Renderer::Marquee`'s `window` field exists for
     /// and the only one that can distinguish it from encoding inside
     /// `gl_surface`: two mapping passes between two steps must hand out the
     /// *same allocation*, and one `advance` past a whole dot must mint a new
@@ -10050,91 +9412,87 @@ mod text_kinds_gl {
     ///
     /// **Falsified** by calling `preem_gl::encode_window` from
     /// `Renderer::gl_surface` (the `ptr_eq` goes red), or by dropping the
-    /// re-encode from `advance`'s `MarqueeGl` arm (the `assert_ne` does).
+    /// re-encode from `advance`'s `Marquee` arm (the `assert_ne` does).
     #[test]
     fn the_window_grid_is_shared_until_the_scroll_moves_a_whole_dot() {
         let _ink = preem_ink_lock();
         let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
-        super::super::preem_gl::with_gl_arm(|| {
-            let key = Scope::detached("marquee-window-sharing");
-            let (_, _, first) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
-            preem_render::invalidate_cached_frames();
-            let (_, _, second) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
-            assert!(
-                !Arc::ptr_eq(&first, &second),
-                "the premise: the cache really was dropped, so this is a fresh bag",
-            );
-            let before = first.data.clone().expect("a grid");
-            let after = second.data.clone().expect("a grid");
-            assert!(
-                Arc::ptr_eq(&before, &after),
-                "a repeat mapping pass costs a refcount, not a re-encode",
-            );
+        let key = Scope::detached("marquee-window-sharing");
+        let (_, _, first) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
+        preem_render::invalidate_cached_frames();
+        let (_, _, second) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the premise: the cache really was dropped, so this is a fresh bag",
+        );
+        let before = first.data.clone().expect("a grid");
+        let after = second.data.clone().expect("a grid");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a repeat mapping pass costs a refcount, not a re-encode",
+        );
 
-            // 12 dots/s for 0.2 s is 2.4 dots: past the first whole one.
-            assert!(
-                preem_render::advance_all(0.2).contains(&key),
-                "the premise: the ticker reported movement",
-            );
-            let (_, _, stepped) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
-            let moved = stepped.data.clone().expect("a grid");
-            assert!(
-                !Arc::ptr_eq(&before, &moved),
-                "a whole-dot step mints a new grid",
-            );
-            assert_ne!(&before[..], &moved[..], "…and it is a different picture");
-            let want: Vec<f32> = kit_strip(LONG)
-                .window_columns(2)
-                .into_iter()
-                .map(f32::from)
-                .collect();
-            assert_eq!(
-                &moved[..],
-                &want[..],
-                "…and it is the kit's own window at the phase the offset reached",
-            );
-        });
+        // 12 dots/s for 0.2 s is 2.4 dots: past the first whole one.
+        assert!(
+            preem_render::advance_all(0.2).contains(&key),
+            "the premise: the ticker reported movement",
+        );
+        let (_, _, stepped) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
+        let moved = stepped.data.clone().expect("a grid");
+        assert!(
+            !Arc::ptr_eq(&before, &moved),
+            "a whole-dot step mints a new grid",
+        );
+        assert_ne!(&before[..], &moved[..], "…and it is a different picture");
+        let want: Vec<f32> = kit_strip(LONG)
+            .window_columns(2)
+            .into_iter()
+            .map(f32::from)
+            .collect();
+        assert_eq!(
+            &moved[..],
+            &want[..],
+            "…and it is the kit's own window at the phase the offset reached",
+        );
     }
 
     /// **A new message re-encodes the block**, and a re-tint reproduces the
     /// same one — the text box's half of the rule above.
     ///
-    /// **Falsified** by dropping the `TextBoxGl` arm from `update`, which
+    /// **Falsified** by dropping the `TextBox` arm from `update`, which
     /// `update`'s catch-all would otherwise swallow, freezing the bubble's text
     /// for ever.
     #[test]
     fn a_new_message_re_encodes_the_glyph_block() {
         let _ink = preem_ink_lock();
-        super::super::preem_gl::with_gl_arm(|| {
-            let key = Scope::detached("textbox-block-sharing");
-            let first_node = preem_node(Some("tb"), textbox_widget("mrrp"));
-            let (_, _, first) = mapped_gl_for(&key, &first_node, super::super::preem_gl::TEXTBOX);
-            preem_render::invalidate_cached_frames();
-            let (_, _, again) = mapped_gl_for(&key, &first_node, super::super::preem_gl::TEXTBOX);
-            // `invalidate_cached_frames` **rebuilds** a TextBox renderer rather
-            // than only dropping its bytes — the builder bakes its palette — so
-            // the block is legitimately a fresh allocation here. What must hold
-            // is that it is the same *picture*.
-            assert_eq!(
-                first.data.as_deref(),
-                again.data.as_deref(),
-                "a re-tint reproduces the same block byte for byte",
-            );
+        let key = Scope::detached("textbox-block-sharing");
+        let first_node = preem_node(Some("tb"), textbox_widget("mrrp"));
+        let (_, _, first) = mapped_gl_for(&key, &first_node, super::super::preem_gl::TEXTBOX);
+        preem_render::invalidate_cached_frames();
+        let (_, _, again) = mapped_gl_for(&key, &first_node, super::super::preem_gl::TEXTBOX);
+        // `invalidate_cached_frames` **rebuilds** a TextBox renderer rather
+        // than only dropping its bytes — the builder bakes its palette — so
+        // the block is legitimately a fresh allocation here. What must hold
+        // is that it is the same *picture*.
+        assert_eq!(
+            first.data.as_deref(),
+            again.data.as_deref(),
+            "a re-tint reproduces the same block byte for byte",
+        );
 
-            let second_node = preem_node(Some("tb"), textbox_widget("purr purr"));
-            let (_, _, second) = mapped_gl_for(&key, &second_node, super::super::preem_gl::TEXTBOX);
-            assert_ne!(
-                first.data.as_deref(),
-                second.data.as_deref(),
-                "a new message is a new block",
-            );
-            let layout = kit_box().layout("purr purr");
-            assert_eq!(
-                second.data.as_ref().map(|b| b.len()),
-                Some(layout.lines().len() * layout.content_cols() * kit::font::GLYPH_W),
-                "…laid out on the new text's own wrap",
-            );
-        });
+        let second_node = preem_node(Some("tb"), textbox_widget("purr purr"));
+        let (_, _, second) = mapped_gl_for(&key, &second_node, super::super::preem_gl::TEXTBOX);
+        assert_ne!(
+            first.data.as_deref(),
+            second.data.as_deref(),
+            "a new message is a new block",
+        );
+        let layout = kit_box().layout("purr purr");
+        assert_eq!(
+            second.data.as_ref().map(|b| b.len()),
+            Some(layout.lines().len() * layout.content_cols() * kit::font::GLYPH_W),
+            "…laid out on the new text's own wrap",
+        );
     }
 
     /// **An accent change re-tints a GL text box** — the live-re-tint contract
@@ -10143,13 +9501,13 @@ mod text_kinds_gl {
     ///
     /// This is the mirror image of
     /// `an_accent_change_re_tints_a_gl_scope_without_rebuilding_it`: a
-    /// `ScopeGl` resolves its palette per mapping pass and so must **not** be
-    /// rebuilt, while a `TextBoxGl` bakes bg/ink/notdef into its builder and its
+    /// `Scope` resolves its palette per mapping pass and so must **not** be
+    /// rebuilt, while a `TextBox` bakes bg/ink/notdef into its builder and its
     /// `layout`, and so **must** be — exactly as the CPU `TextBox` is. Dropping
     /// its bytes is not enough, because the uniforms are mapped from the layout
     /// and the layout is where the old ink lives.
     ///
-    /// **Falsified** by removing `Renderer::TextBoxGl` from
+    /// **Falsified** by removing `Renderer::TextBox` from
     /// `invalidate_cached_frames`' rebuild branch, which was measured to ship
     /// green against every other test in this module: the block's glyph bits do
     /// not move on a re-tint, so a test that only compared those saw nothing.
@@ -10158,48 +9516,46 @@ mod text_kinds_gl {
     #[test]
     fn an_accent_change_re_tints_a_gl_textbox() {
         let _ink = preem_ink_lock();
-        super::super::preem_gl::with_gl_arm(|| {
-            let key = Scope::detached("textbox-accent");
-            // A role-less style takes the session accent, which is what moves
-            // here — `kit_box`'s `Crt` skin tints its ink from it.
-            let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
+        let key = Scope::detached("textbox-accent");
+        // A role-less style takes the session accent, which is what moves
+        // here — `kit_box`'s `Crt` skin tints its ink from it.
+        let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
 
-            super::tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
-            let (_, _, green) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
-            super::tint_in_process_surfaces(Some([0xff, 0x00, 0xff, 0xff]));
-            let (_, _, magenta) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
+        super::tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
+        let (_, _, green) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
+        super::tint_in_process_surfaces(Some([0xff, 0x00, 0xff, 0xff]));
+        let (_, _, magenta) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
 
-            assert_ne!(
-                green.values, magenta.values,
-                "the accent reaches the shader as a uniform",
-            );
-            assert_eq!(
-                green.data.as_deref(),
-                magenta.data.as_deref(),
-                "…and only the colors moved: the glyph block is the same bits",
-            );
-            // The bytes it re-tints *to* are the kit's own, which is the half a
-            // uniform comparison alone cannot say.
-            super::tint_in_process_surfaces(None);
-            let (_, _, plain) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
-            let want = kit_box().layout("mrrp mrrp").colors();
-            let ink = plain
-                .values
-                .iter()
-                .find(|(name, _)| *name == "u_ink")
-                .expect("u_ink is mapped")
-                .1;
-            assert_eq!(
-                ink,
-                hytte::ui::gl_surface::GlValue::Vec4([
-                    f32::from(want.1[0]),
-                    f32::from(want.1[1]),
-                    f32::from(want.1[2]),
-                    f32::from(want.1[3]),
-                ]),
-                "the re-tinted ink is the one the kit's own builder baked",
-            );
-        });
+        assert_ne!(
+            green.values, magenta.values,
+            "the accent reaches the shader as a uniform",
+        );
+        assert_eq!(
+            green.data.as_deref(),
+            magenta.data.as_deref(),
+            "…and only the colors moved: the glyph block is the same bits",
+        );
+        // The bytes it re-tints *to* are the kit's own, which is the half a
+        // uniform comparison alone cannot say.
+        super::tint_in_process_surfaces(None);
+        let (_, _, plain) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
+        let want = kit_box().layout("mrrp mrrp").colors();
+        let ink = plain
+            .values
+            .iter()
+            .find(|(name, _)| *name == "u_ink")
+            .expect("u_ink is mapped")
+            .1;
+        assert_eq!(
+            ink,
+            hytte::ui::gl_surface::GlValue::Vec4([
+                f32::from(want.1[0]),
+                f32::from(want.1[1]),
+                f32::from(want.1[2]),
+                f32::from(want.1[3]),
+            ]),
+            "the re-tinted ink is the one the kit's own builder baked",
+        );
     }
 
     /// **A GL text box falls back without waiting for a frame that never
@@ -10210,63 +9566,60 @@ mod text_kinds_gl {
     /// own and the chip would stay blank until the plugin sent another message.
     /// The premise assertion says so out loud rather than leaving it implied.
     ///
-    /// **Falsified** by dropping `TextBoxGl` from `Renderer::is_gl`, which
-    /// leaves `rebuild_gl_renderers_on_cpu` walking past it.
+    /// **Falsified** by narrowing `rebuild_gl_renderers_as_placeholders`'s
+    /// sweep so it walks past a live instance.
     #[test]
     fn a_gl_textbox_falls_back_without_waiting_for_a_frame_that_never_comes() {
         let _ink = preem_ink_lock();
         super::super::preem_gl::install();
-        super::super::preem_gl::with_gl_arm(|| {
-            let key = Scope::detached("textbox-context-lost");
-            let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
+        let key = Scope::detached("textbox-context-lost");
+        let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
 
-            assert!(
-                matches!(
-                    to_ui_node(&key, Grants::none(), &node),
-                    UiNode::GlSurface { .. }
-                ),
-                "the GL arm is chosen while a context is still possible",
-            );
-            assert!(
-                !preem_render::any_animating_in(std::slice::from_ref(&key)),
-                "a text box never animates, so nothing will ever re-map it",
-            );
-            let before = preem_render::probe(&key, Some("tb")).expect("the instance exists");
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
+            "the GL arm is chosen while a context is still possible",
+        );
+        assert!(
+            !preem_render::any_animating_in(std::slice::from_ref(&key)),
+            "a text box never animates, so nothing will ever re-map it",
+        );
+        let before = preem_render::probe(&key, Some("tb")).expect("the instance exists");
 
-            hytte::ui::gl_surface::abandon_gl("no GL in this test");
+        hytte::ui::gl_surface::abandon_gl("no GL in this test");
 
-            let after = preem_render::probe(&key, Some("tb")).expect("the instance survives");
-            assert_eq!(
-                after.0,
-                before.0 + 1,
-                "the failure hook rebuilt the renderer itself, not the next re-map",
-            );
-            assert_eq!(
-                after.1, before.1,
-                "…and did it without an apply, so no widget state was touched",
-            );
-            assert_eq!(
-                mapped_pixels(&key, &node),
-                kit_pixels(&kit_box().render("mrrp mrrp")),
-                "a lost context drops the bubble to the kit, byte for byte",
-            );
-        });
+        let after = preem_render::probe(&key, Some("tb")).expect("the instance survives");
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "the failure hook rebuilt the renderer itself, not the next re-map",
+        );
+        assert_eq!(
+            after.1, before.1,
+            "…and did it without an apply, so no widget state was touched",
+        );
+        // A lost context drops the bubble all the way to the placeholder
+        // since #1157 — there is no kit arm left to catch it.
+        assert_placeholder(&key, &node, "tb");
     }
 
-    /// **Both marquee arms park the animation clock on the same predicate** —
-    /// the property #926's frame clock rests on.
+    /// **The marquee parks the animation clock on the scroll predicate** — the
+    /// property #926's frame clock rests on.
     ///
-    /// `animates()` is one shared expression for the two arms, so this cannot
-    /// drift by construction; what it *can* do is stop being shared, and then a
-    /// kill-switch flip would change when the shell parks. Driven through the
-    /// real renderers rather than by reading the source.
+    /// It was stated as "both arms park on the same predicate" until #1157,
+    /// because a kill-switch flip must not change when the shell parks; with
+    /// one arm left it is simply the predicate, driven through the real
+    /// renderer rather than read out of the source.
     ///
-    /// **Falsified** by giving `MarqueeGl` its own `animates` arm.
+    /// **Falsified** by making `Marquee`'s `animates` answer a constant, or
+    /// by dropping either of its three guards (`scrolls`, finite, non-zero).
     #[test]
-    fn both_marquee_arms_park_the_clock_on_the_same_predicate() {
+    fn a_marquee_parks_the_clock_on_the_scroll_predicate() {
         let _ink = preem_ink_lock();
         // A message that fits the grid holds static; a parked or non-finite
-        // speed never moves. None must keep the clock awake, on either arm.
+        // speed never moves. None must keep the clock awake.
         for (widget, animates) in [
             (marquee_widget(LONG, 12.0), true),
             (marquee_widget(LONG, 0.0), false),
@@ -10274,22 +9627,14 @@ mod text_kinds_gl {
             (marquee_widget(LONG, f32::NAN), false),
         ] {
             let node = preem_node(Some("mq"), widget);
-            let cpu = Scope::detached("marquee-clock-cpu");
-            let _ = to_ui_node(&cpu, Grants::none(), &node);
+            let key = Scope::detached("marquee-clock");
+            let _ = to_ui_node(&key, Grants::none(), &node);
             assert_eq!(
-                preem_render::any_animating_in(std::slice::from_ref(&cpu)),
+                preem_render::any_animating_in(std::slice::from_ref(&key)),
                 animates,
-                "the CPU arm",
+                "the ticker's park predicate",
             );
-            super::super::preem_gl::with_gl_arm(|| {
-                let gl = Scope::detached("marquee-clock-gl");
-                let _ = to_ui_node(&gl, Grants::none(), &node);
-                assert_eq!(
-                    preem_render::any_animating_in(std::slice::from_ref(&gl)),
-                    animates,
-                    "…and the GL arm, on the same predicate",
-                );
-            });
+            preem_render::forget_scope(&key);
         }
     }
 }
@@ -11370,7 +10715,8 @@ mod containment_r2 {
 ///   (`preem_gl::mod::install` loops over it and `Kind::gl_seam`), so there is
 ///   nothing left here to test — a variant missing from `Kind::gl_seam`'s
 ///   `match` fails to compile.
-/// - `matches_kind`/`is_gl`/`invalidate_cached_frames` are now exhaustive
+/// - `matches_kind`/`gl_program`/`gl_surface`/`invalidate_cached_frames` are
+///   now exhaustive
 ///   `match`es over `Renderer` with no catch-all (`preem_render.rs`), so a
 ///   Renderer variant added without an arm there fails to compile too —
 ///   again nothing left to test here.
@@ -11386,7 +10732,7 @@ mod containment_r2 {
 mod kind_enumeration {
     use hytte_preem as kit;
 
-    use super::super::preem_gl::{self, Case, Kind, cases_for};
+    use super::super::preem_gl::{Case, Kind, cases_for};
     use super::super::preem_render;
     use super::{every_preem_widget, preem_ink_lock};
 
@@ -11413,22 +10759,24 @@ mod kind_enumeration {
     ///
     /// `every_preem_widget()`'s exhaustive `match` is the wire vocabulary's
     /// forcing function; `gl_kind_for`'s is `Kind`'s. Together they say: a
-    /// widget kind has a GL arm if and only if it names a `Kind`, and that
-    /// kind's renderer, under the GL arm, both claims `is_gl()` and produces
-    /// a surface (the two halves `gl_seam_for` reports) — and every `Kind`
-    /// is reachable from some widget kind, so `gl_kind_for` cannot drop one
-    /// from its `Some` arms unnoticed.
+    /// widget kind has a GL arm if and only if it names a `Kind`, and every
+    /// `Kind` is reachable from some widget kind, so `gl_kind_for` cannot drop
+    /// one from its `Some` arms unnoticed.
     ///
-    /// **Falsified** by adding a sixth `Kind` variant with no
-    /// `gl_kind_for` arm answering `Some` for it (`gl_kind_for` stops being
-    /// exhaustive and this file does not compile), or by pointing an
-    /// existing widget's `gl_kind_for` arm at the wrong `Kind` (`install`
-    /// registers that kind's pipeline under a different name than the one
-    /// `gl_surface` produces, so the first assertion reds — not because the
-    /// booleans disagree, but because `gl_seam_for` reads both off the *same*
-    /// renderer and neither answer can lie about the other independently;
-    /// what actually catches a swapped `Kind` is the second loop, since the
-    /// swapped-away `Kind` then reports no widget reaching it).
+    /// It also read `gl_seam_for` until #1157 — `is_gl()` and `gl_surface()`
+    /// both answering for the renderer the GL arm builds. Both halves are now
+    /// structural: `Renderer` has only GL arms, `gl_program` and `gl_surface`
+    /// are exhaustive over it with no catch-all and neither can answer
+    /// "nothing", so an arm that forgets either does not compile. What a test
+    /// can still say is that the **mapping** produces a GPU node, and that is
+    /// asserted here through `to_ui_node`, i.e. the production path rather than
+    /// a test-only accessor.
+    ///
+    /// **Falsified** by adding a ninth `Kind` variant with no `gl_kind_for` arm
+    /// answering `Some` for it (`gl_kind_for` stops being exhaustive and this
+    /// file does not compile), or by pointing an existing widget's
+    /// `gl_kind_for` arm at the wrong `Kind`: the swapped-away `Kind` then
+    /// reports no widget reaching it in the second loop.
     ///
     /// **Also falsified** (#1216 fix round, MEDIUM-1) by removing a variant
     /// from [`Kind::ALL`] — a variant a widget still reaches via
@@ -11445,8 +10793,10 @@ mod kind_enumeration {
 
         for widget in &widgets {
             let kind = preem_render::gl_kind_for(widget);
-            let seam = preem_gl::with_gl_arm(|| preem_render::gl_seam_for(widget))
-                .expect("every vocabulary widget builds");
+            let key = super::Scope::detached("kind-enumeration");
+            let node = super::preem_node(Some("w"), widget.clone());
+            let mapped = super::to_ui_node(&key, super::Grants::none(), &node);
+            preem_render::forget_scope(&key);
             match kind {
                 Some(k) => {
                     // #1216 fix round, MEDIUM-1: `gl_kind_for` is exhaustive
@@ -11455,30 +10805,23 @@ mod kind_enumeration {
                     // list `install()` actually derives its registrations
                     // from. Before this assertion, removing a variant from
                     // `ALL` (so `install()` stops registering its pipeline)
-                    // left this whole suite green, because `gl_seam_for`
-                    // reads `is_gl()`/`gl_surface()` off the *renderer*, not
-                    // off the registry `ALL` feeds.
+                    // left this whole suite green.
                     assert!(
                         Kind::ALL.contains(&k),
                         "{k:?} is reachable from a PreemWidget but missing \
                          from Kind::ALL — install() never registers its \
                          pipeline",
                     );
-                    assert_eq!(
-                        seam,
-                        (true, true),
-                        "{k:?} is in Kind::ALL, so its widget must take the \
-                         GL arm and produce a surface",
+                    assert!(
+                        matches!(mapped, super::UiNode::GlSurface { .. }),
+                        "{k:?} is in Kind::ALL, so its widget must map to a GL node, got \
+                         {mapped:?}",
                     );
                 }
                 None => assert!(
-                    // #1216 fix round, NIT-1: was `!seam.0` alone, which
-                    // missed a renderer that answered `is_gl() == false` but
-                    // still produced a `gl_surface` — the other half of the
-                    // failure mode `is_gl`'s own doc names.
-                    !seam.0 && !seam.1,
-                    "a widget kind absent from Kind::ALL took the GL arm \
-                     anyway: {seam:?}",
+                    matches!(mapped, super::UiNode::Pixels { width: 0, .. }),
+                    "a widget kind absent from Kind::ALL has no pipeline, so it must map to \
+                     the placeholder, got {mapped:?}",
                 ),
             }
         }

@@ -160,7 +160,7 @@ const COLON_BIT: u8 = 7;
 /// and where each one starts and what it lights.
 ///
 /// Built once per text change and shared by every monitor's mapping pass, the
-/// way `Renderer::DotMatrixGl`'s `glyphs` is (#911's rule, for uniforms): the
+/// way `Renderer::DotMatrix`'s `glyphs` is (#911's rule, for uniforms): the
 /// `Arc` makes a repeat mapping's dedup a pointer compare rather than a
 /// re-encode of the whole readout.
 #[derive(Clone, Debug, PartialEq)]
@@ -521,7 +521,7 @@ mod tests {
     }
 
     /// **The encoded readout travels as one allocation** — #911's rule, the
-    /// same one `Renderer::DotMatrixGl`'s strip follows: a repeat mapping pass
+    /// same one `Renderer::DotMatrix`'s strip follows: a repeat mapping pass
     /// clones an `Arc` instead of walking the text again.
     #[test]
     fn the_strip_travels_as_the_callers_allocation() {

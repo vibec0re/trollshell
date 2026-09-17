@@ -2803,6 +2803,9 @@ mod gtk_tests {
             ..render_of("shader-leaver", &tx)
         };
         reconcile_region(&container, &cards, &[render], "ts-plugin-chip", None);
+        if skip_without_gl("card_leaving_its_region_releases_its_shader_states") {
+            return;
+        }
         assert_eq!(
             shader_map::cached_states(&scope),
             1,
@@ -2884,6 +2887,46 @@ mod gtk_tests {
         preem_render::MAX_TICK_DT_US / i64::from(preem_render::MAX_CATCHUP_STEPS)
     }
 
+    /// `true` when this thread has lost GL, so the caller should skip — and a
+    /// `SKIPPED` line naming why.
+    ///
+    /// **Call it after the mount, never before.** `hytte-ui`'s `gl_abandoned`
+    /// latch is only set once something has actually asked for a context and
+    /// been refused, so the honest moment to ask is between the mapping pass
+    /// and the assertion that depends on it.
+    ///
+    /// The five tests that call this mount a **real** preem or shader card and
+    /// measure something the card only does when it can draw — a tick callback
+    /// armed, a cached shader state. Since #1157 a widget whose context failed
+    /// has no renderer at all (it renders the broken-widget placeholder), so it
+    /// asks for no ticks; before then it fell back to the CPU kit and animated
+    /// regardless, which is why these tests never needed GL until now.
+    /// `#[gtk::test]`s share one main thread (`gtk4-macros`), so one realised
+    /// `GlSurface` that cannot get a context latches this for every one of
+    /// them, whichever ran first.
+    ///
+    /// Honours `TROLLSHELL_REQUIRE_GL` exactly as `hytte-ui`'s
+    /// `real_gl_or_skip` does, and for its reason: CI's `system-tests` check
+    /// carries llvmpipe and sets the variable (`nix/checks/system-tests.nix`),
+    /// so a missing context **fails** there rather than skipping quietly — a
+    /// skip is indistinguishable from a pass in captured output. A bare
+    /// `xvfb-run cargo test --features system-tests` outside that check still
+    /// skips, because failing a run that could never have answered the question
+    /// helps nobody.
+    fn skip_without_gl(test_name: &str) -> bool {
+        if !hytte::ui::gl_surface::gl_abandoned() {
+            return false;
+        }
+        let required = std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+        assert!(
+            !required,
+            "TROLLSHELL_REQUIRE_GL=1, but this thread has no GL context for {test_name}: a \
+             preem card with no pipeline draws the placeholder and never animates (#1157)"
+        );
+        eprintln!("SKIPPED {test_name}: no GL context on this thread");
+        true
+    }
+
     /// Drive the GTK main loop for `ms` of wall clock, so a **real**
     /// `GdkFrameClock` gets to deliver ticks.
     ///
@@ -2937,6 +2980,9 @@ mod gtk_tests {
 
         let _window = mount_region(&renders);
         pump();
+        if skip_without_gl("a_mount_arms_parks_and_re_arms_its_frame_clock") {
+            return;
+        }
 
         assert_eq!(
             animation_arms(),
@@ -3047,6 +3093,9 @@ mod gtk_tests {
 
         let _window = mount_panel_child(&panels, &active);
         pump();
+        if skip_without_gl("the_drawer_panel_mount_arms_parks_and_re_arms_its_frame_clock") {
+            return;
+        }
 
         assert_eq!(
             animation_arms(),
@@ -3117,6 +3166,9 @@ mod gtk_tests {
 
         let _window = mount_region(&renders);
         pump();
+        if skip_without_gl("an_armed_mount_re_reads_its_scopes_so_a_late_card_animates_too") {
+            return;
+        }
         let animators = live_animators();
         let animator = &animators[0];
         assert_eq!(animation_arms(), 1, "the first card arms the mount");
@@ -3216,6 +3268,9 @@ mod gtk_tests {
         window.set_child(Some(&revealer));
         window.present();
         pump_for(200);
+        if skip_without_gl("a_hidden_mount_stops_ticking_and_resumes_when_shown") {
+            return;
+        }
 
         let animators = live_animators();
         assert_eq!(animators.len(), 1, "one mount, one animation driver");

@@ -19,14 +19,14 @@
 //!
 //! The implementation is split across four submodules:
 //!
-//! - [`types`] — all internal data types (`AudioRole`, `NodeEntry`,
+//! - `types` — all internal data types (`AudioRole`, `NodeEntry`,
 //!   `AudioState`, `Command`, etc.)
-//! - [`pod`] — pure `SPA` pod serialization/parsing helpers
+//! - `pod` — pure `SPA` pod serialization/parsing helpers
 //!   (`build_props_pod`, `decode_props`, `avg_volume`,
 //!   `parse_default_name`, `pick_app_name`)
-//! - [`graph`] — link-edge routing helpers (`resolve_link_dest`,
+//! - `graph` — link-edge routing helpers (`resolve_link_dest`,
 //!   `resolve_link_source`)
-//! - [`loop_`] — the `PipeWire` mainloop thread, registry walker, command
+//! - `loop_` — the `PipeWire` mainloop thread, registry walker, command
 //!   dispatcher, and `emit_snapshots`
 
 mod graph;

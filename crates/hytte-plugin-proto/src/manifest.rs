@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// is the rule that keeps a new push additive — an older binary that never asked
 /// for it never receives (and never fails to decode) the new variant (#305).
 ///
-/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437): a plugin
+/// Appending a variant here ⇒ **bump [`VOCAB`]** (#437): a plugin
 /// declares these in its manifest, so the counter keeps a faithful census of the
 /// whole wire vocabulary (a subscription's push is separately #305-gated).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +73,7 @@ pub enum StateKey {
     /// signal-driven, not polled). Like [`AudioSpectrum`](StateKey::AudioSpectrum)
     /// this is the #305 opt-in gate, **and** — because a calendar is personal data
     /// — the push additionally requires
-    /// [`Capability::Calendar`](Capability::Calendar): the host sends the
+    /// [`Capability::Calendar`]: the host sends the
     /// (name-tagged, additive) variant only to a plugin that both subscribes this
     /// key *and* declares that capability, so a pre-#484 binary never meets it. The
     /// motivating consumers are caw's morning briefing and the infobroker's
@@ -85,7 +85,7 @@ pub enum StateKey {
     /// so a plugin can fire a "first unlock" action (caw's briefing) or **blank
     /// sensitive content while locked** (the infobroker's privacy note). The #305
     /// opt-in gate, additionally gated on
-    /// [`Capability::SessionState`](Capability::SessionState) — the same
+    /// [`Capability::SessionState`] — the same
     /// subscribe-**and**-capability rule as [`CalendarUpcoming`](StateKey::CalendarUpcoming).
     SessionLocked,
     /// Opt-in to the now-playing push
@@ -94,7 +94,7 @@ pub enum StateKey {
     /// [`NowPlaying`](crate::state::NowPlaying) (title / artist / playing) and
     /// pushes it on change (latest-wins), exactly the way #405 projected the
     /// spectrum. The #305 opt-in gate, additionally gated on
-    /// [`Capability::NowPlaying`](Capability::NowPlaying). The motivating consumer
+    /// [`Capability::NowPlaying`]. The motivating consumer
     /// is the audio widget's dot-matrix track marquee.
     NowPlaying,
 }
@@ -172,7 +172,7 @@ pub enum Capability {
     Consent,
     /// Receive the upcoming-calendar push (#484). Unlike the effect-gating caps
     /// above, this gates a **host→plugin push**: paired with a
-    /// [`StateKey::CalendarUpcoming`](StateKey::CalendarUpcoming) subscription, it
+    /// [`StateKey::CalendarUpcoming`] subscription, it
     /// is what lets a plugin receive
     /// [`HostMsg::CalendarUpcoming`](crate::msg::HostMsg::CalendarUpcoming). A
     /// calendar is personal data, so the host requires the capability on top of the
@@ -181,13 +181,13 @@ pub enum Capability {
     /// briefing and the infobroker's `get calendar` datasource.
     Calendar,
     /// Receive the session-locked push (#484): paired with a
-    /// [`StateKey::SessionLocked`](StateKey::SessionLocked) subscription, gates
+    /// [`StateKey::SessionLocked`] subscription, gates
     /// [`HostMsg::SessionLocked`](crate::msg::HostMsg::SessionLocked). The lock
     /// state doubles as a privacy signal, so it is capability-gated like
     /// [`Calendar`](Capability::Calendar).
     SessionState,
     /// Receive the now-playing push (#528): paired with a
-    /// [`StateKey::NowPlaying`](StateKey::NowPlaying) subscription, gates
+    /// [`StateKey::NowPlaying`] subscription, gates
     /// [`HostMsg::NowPlaying`](crate::msg::HostMsg::NowPlaying).
     NowPlaying,
     /// Emit datasource queries ([`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery),
@@ -251,7 +251,7 @@ pub enum Capability {
     /// compatibility with a pre-#1045 host, which cannot decode the variant and
     /// drops the connection at `Register`; see
     /// [`OPEN_URI_VOCAB`](crate::effect::OPEN_URI_VOCAB), where that fact is also
-    /// what keeps [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) still.
+    /// what keeps [`VOCAB_UNCONDITIONAL`] still.
     OpenUri,
 }
 
@@ -281,7 +281,7 @@ pub enum Capability {
 /// an externally-tagged **unit** enum, so every variant rides the wire as its
 /// bare *name* (`"SidebarTop"`, …). A new name-tagged variant leaves every
 /// existing variant's encoding untouched, so
-/// [`PROTO_VERSION`](crate::PROTO_VERSION) stays the same.
+/// [`PROTO_VERSION`] stays the same.
 ///
 /// It does bump the census ([`SIDEBAR_RIGHT_VOCAB`], generation 6) — but note
 /// what the counter can and cannot do for *this* enum. A `Mount` rides inside
@@ -416,7 +416,7 @@ impl Mount {
     }
 }
 
-/// The [`VOCAB`](crate::VOCAB) generation that appended the **right sidebar's**
+/// The [`VOCAB`] generation that appended the **right sidebar's**
 /// three mounts ([`Mount::SidebarRightLead`] / [`SidebarRightTop`](Mount::SidebarRightTop) /
 /// [`SidebarRightBottom`](Mount::SidebarRightBottom), #1158/#1159).
 ///
@@ -450,7 +450,7 @@ pub const SIDEBAR_RIGHT_VOCAB: u16 = 6;
 /// naming a scope not listed here with
 /// [`DatasourceError::ScopeDenied`](crate::effect::DatasourceError::ScopeDenied)).
 /// A provider declaring this must ALSO hold
-/// [`Capability::DatasourceProvider`](Capability::DatasourceProvider). The
+/// [`Capability::DatasourceProvider`]. The
 /// request/response payloads are opaque JSON at the proto layer — their schema is
 /// the provider↔requester contract, documented per-datasource (e.g. in a
 /// `SKILL.md`), so the wire vocabulary stays stable as datasources multiply.
@@ -560,7 +560,7 @@ pub struct Manifest {
     pub order: Option<i32>,
     /// The datasources this plugin serves (#509) — empty for a non-provider (the
     /// default, and what a pre-#509 manifest decodes to). A provider must also
-    /// declare [`Capability::DatasourceProvider`](Capability::DatasourceProvider);
+    /// declare [`Capability::DatasourceProvider`];
     /// the host then registers each listed [`ProvidedDatasource::id`] as routable to
     /// this connection and pushes it
     /// [`HostMsg::DatasourceQuery`](crate::msg::HostMsg::DatasourceQuery) for matching

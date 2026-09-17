@@ -33,7 +33,7 @@
 //! # Battery-aware cadence
 //!
 //! Independent of panel-gating, the poll period itself stretches from
-//! [`POLL`] to [`BATTERY_POLL`] (4x) while [`crate::upower::on_battery`]
+//! `POLL` to `BATTERY_POLL` (4x) while [`crate::upower::on_battery`]
 //! reports the system on battery power — the heaviest of the always-on
 //! pollers gets the biggest cadence cut (#505).
 //!

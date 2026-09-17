@@ -119,7 +119,7 @@ impl LedMatrix {
     /// Annika asked for on the second pass of #857 ("rectangle for led view
     /// would be still more preem tho").
     ///
-    /// Takes the fewest rows whose [`WIDE_ASPECT`]-times-wider grid still covers
+    /// Takes the fewest rows whose `WIDE_ASPECT`-times-wider grid still covers
     /// `cells` (`rows = ⌈√cells / √WIDE_ASPECT⌉`), then the fewest columns that
     /// fit (`cols = ⌈cells / rows⌉`). Like [`rect`](Self::rect) it never loses a
     /// lamp and never leaves a wholly empty trailing row; unlike it, the result
@@ -270,7 +270,7 @@ impl LedMatrix {
         }
     }
 
-    /// The [`Emission`] intensity (`0..=255`) of every **slot**, row-major from
+    /// The `Emission` intensity (`0..=255`) of every **slot**, row-major from
     /// the top-left — `cols * rows` of them, `0` past `levels.len()`.
     ///
     /// The per-lamp brightness the shell's GL arm uploads as a texture (#1156),
@@ -296,7 +296,7 @@ impl LedMatrix {
     ///
     /// Two rules the colour axis states elsewhere and this bakes in, so the GL
     /// arm reads them rather than restating them: the sweep position is
-    /// [`sweep_pos`]'s half-open `i / used`, and a slot past the last real lamp
+    /// `sweep_pos`'s half-open `i / used`, and a slot past the last real lamp
     /// takes that lamp's ink (a neighbour's halo spilling into a spare slot is
     /// the lamp's light, not the slot's). With no lamps at all — or under
     /// [`ColorMap::Style`], the identity on this path — every slot is `ink`.
@@ -398,7 +398,7 @@ fn sweep_pos(index: usize, count: usize) -> f32 {
     index as f32 / count as f32
 }
 
-/// How brightly a `0.0..=1.0` level lights its lamp, as an [`Emission`]
+/// How brightly a `0.0..=1.0` level lights its lamp, as an `Emission`
 /// intensity in `0..=255`.
 ///
 /// `1.0` is full, `0.0` is dark, and the mapping is monotone in between — the

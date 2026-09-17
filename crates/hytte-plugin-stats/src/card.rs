@@ -371,7 +371,7 @@ pub struct Widgets {
     /// but their pitch.
     lamps: DotMatrix,
     /// The drawer page's disk-lamp row, fitted to [`PAGE_PX`] like
-    /// [`page_cores`] — #1295 review LOW 4: at the bar's fixed [`CHIP_DOT_PX`]
+    /// `page_cores` — #1295 review LOW 4: at the bar's fixed [`CHIP_DOT_PX`]
     /// floor a two-mount row is `2*(6*2+1) = 26 px` wide sitting under a
     /// per-core row six times that pitch, the same "fit the row to the
     /// surface it is on" argument [`PAGE_PX`]'s own doc makes.

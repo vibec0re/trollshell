@@ -327,7 +327,7 @@ pub enum Page {
     /// The read-only workspace-stacks page (#1071 phase 1): one column per
     /// monitor, a card per *named* niri workspace. A unit variant like every
     /// other, deliberately — #1071 §5 settles that the edit sub-page phase 4
-    /// adds rides [`Active::Plugin`]'s keyed shape rather than a
+    /// adds rides `Active::Plugin`'s keyed shape rather than a
     /// payload-carrying `Page`, so this enum stays `Copy` at its ~60 by-value
     /// call sites.
     Workspaces,
@@ -419,7 +419,7 @@ impl Page {
         }
     }
 
-    /// Reverse of [`Page::stack_name`]: resolve a `Page` from its stable
+    /// Reverse of `Page::stack_name`: resolve a `Page` from its stable
     /// stack-name token (e.g. `"power-menu"`). The command surface's
     /// `open-page` `GAction` uses this to turn a niri keybind's string argument
     /// into a `Page`. Returns `None` for an unknown token.
@@ -618,7 +618,7 @@ fn recompute_gates() {
 }
 
 /// Signal that emits `true` while a netconn-backed drawer page
-/// ([`Page::uses_netconn`]: Connections / Network) is visible on any monitor.
+/// (`Page::uses_netconn`: Connections / Network) is visible on any monitor.
 /// Wired in `main.rs` to `netconn::set_active` so the always-on `ss` poller
 /// parks when those panels are hidden (#50).
 pub fn netconn_visible_signal() -> impl Signal<Item = bool> + 'static {
@@ -626,7 +626,7 @@ pub fn netconn_visible_signal() -> impl Signal<Item = bool> + 'static {
 }
 
 /// Signal that emits `true` while the Stats drawer page
-/// ([`Page::uses_app_usage`]) is visible on any monitor. Wired in `main.rs` to
+/// (`Page::uses_app_usage`) is visible on any monitor. Wired in `main.rs` to
 /// `app_usage::set_active` so the always-on `/proc` poller parks when that panel
 /// is hidden (#50, item 5 of #42).
 pub fn stats_visible_signal() -> impl Signal<Item = bool> + 'static {
@@ -634,7 +634,7 @@ pub fn stats_visible_signal() -> impl Signal<Item = bool> + 'static {
 }
 
 /// Signal that emits `true` while the Media drawer page
-/// ([`Page::uses_mpris_position`]) is visible on any monitor. Wired in
+/// (`Page::uses_mpris_position`) is visible on any monitor. Wired in
 /// `main.rs` to `mpris::set_active` so the always-on per-player `Position`
 /// pollers park when that panel is hidden (#228).
 pub fn media_visible_signal() -> impl Signal<Item = bool> + 'static {
@@ -1321,7 +1321,7 @@ fn reset_drawer_open_states() {
 /// the choice as primary-vs-pointer-focus; the codebase settles it. GTK4 has no
 /// primary monitor to ask for — `gdk_display_get_primary_monitor` did not
 /// survive GTK3 — so "primary" would have to be *invented* here, as the first
-/// entry of `app.monitors()` or the first key of [`PANELS`] (i.e. `HashMap`
+/// entry of `app.monitors()` or the first key of `PANELS` (i.e. `HashMap`
 /// iteration order). Both are arbitrary and neither is stable across a hot-plug.
 /// niri, by contrast, *tells us* which output is focused, and
 /// [`crate::components::focused_output`] is already the shell's single cache of
@@ -1375,7 +1375,7 @@ pub fn switch_active(target: Page) {
 /// seeded by a card nobody is looking at.
 ///
 /// The draft itself is published by `panels::workspace_edit::open` before this
-/// is called; `key` is the drawer's own bookkeeping — see [`Active::WorkspaceEdit`].
+/// is called; `key` is the drawer's own bookkeeping — see `Active::WorkspaceEdit`.
 pub fn switch_to_workspace_edit(key: &str) {
     // Snapshot the handles first, then act with no `PANELS` borrow live (#643) —
     // the same discipline `switch_active` documents: these are runs of GTK calls
@@ -1979,7 +1979,7 @@ fn clamp_card_height(monitor_height: i32, bar_reserved: i32, chrome: i32) -> i32
 
 /// Signal that emits `true` while the drawer on `monitor` is open (the
 /// retract animation hasn't completed yet), and `false` when it's closed.
-/// Backed by [`DRAWER_OPEN`] so callers can subscribe before `install` has
+/// Backed by `DRAWER_OPEN` so callers can subscribe before `install` has
 /// run for this monitor — needed because the OSD and bar both wire up
 /// during synchronous boot, while modal panels are built later inside the
 /// `monitors_changed` task.

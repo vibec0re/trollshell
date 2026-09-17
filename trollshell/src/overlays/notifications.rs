@@ -24,7 +24,7 @@
 //!
 //! # Queue cap
 //!
-//! Up to [`MAX_VISIBLE_NONCRITICAL`] non-critical toasts render
+//! Up to `MAX_VISIBLE_NONCRITICAL` non-critical toasts render
 //! individually. Additional non-critical toasts collapse into a
 //! synthetic "+N more" card that opens the Notifications drawer on
 //! click. Critical-urgency toasts always render individually and don't
@@ -34,16 +34,16 @@
 //! # Card lifetime
 //!
 //! A mounted card is reused across emissions unless the notification it
-//! renders actually changed ([`card_content_eq`]), and a card that must be
-//! swapped carries its hover hold to the replacement ([`replace_card`]).
+//! renders actually changed (`card_content_eq`), and a card that must be
+//! swapped carries its hover hold to the replacement (`replace_card`).
 //! Both exist because destroying a card releases the hover-pause hold
-//! [`attach_hover_pause`] took, and a pointer that never moves generates no
+//! `attach_hover_pause` took, and a pointer that never moves generates no
 //! crossing event to take it again (#593).
 //!
 //! # Hover holds
 //!
 //! Which toast is hovered is a fact the overlay observes (GTK crossing events)
-//! and the service records (a per-id hover count). [`HoldState`] is the whole of
+//! and the service records (a per-id hover count). `HoldState` is the whole of
 //! the overlay's half, and the rule that keeps the two from drifting is stated
 //! there: a card's claim on the count is **renewed against the entry as it
 //! stands now** at the end of every emission, so entry identity never enters the
@@ -132,7 +132,7 @@ thread_local! {
 // ── Public entry-point ────────────────────────────────────────────────────────
 
 /// Build the toast layer-shell window for `monitor`, register it in
-/// [`TOAST_WINDOWS`] keyed by the monitor's connector name, and lazily
+/// `TOAST_WINDOWS` keyed by the monitor's connector name, and lazily
 /// install module-level subscriptions on the first call. Subsequent
 /// calls register additional per-monitor surfaces; subscriptions wire
 /// exactly once.
@@ -166,7 +166,7 @@ pub fn install(monitor: &Monitor) {
 
 /// Close every toast surface and drop the per-monitor entries. Called before
 /// rebuilding on monitor hot-plug so a vanished output's `ToastView` doesn't
-/// linger in [`TOAST_WINDOWS`] — otherwise `route_emission`'s
+/// linger in `TOAST_WINDOWS` — otherwise `route_emission`'s
 /// `map.values().next()` fallback could route every toast into a dead surface.
 ///
 /// The module-level subscriptions (focused-output + the combined toast signal)

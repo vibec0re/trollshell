@@ -197,7 +197,7 @@ pub enum HostMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
-    /// The result of a brokered [`Effect::RunCommand`](crate::effect::Effect::RunCommand),
+    /// The result of a brokered [`Effect::RunCommand`],
     /// keyed by the command's `id`.
     EffectResult { id: u64, outcome: EffectOutcome },
     /// The plugin's mount surface became visible or hidden — e.g. the sidebar
@@ -249,7 +249,7 @@ pub enum HostMsg {
     /// plugin opts in explicitly, and the host only runs the capture while a
     /// subscriber is present.
     AudioSpectrum { spectrum: AudioSpectrum },
-    /// The human's answer to an [`Effect::RequestConsent`](crate::effect::Effect::RequestConsent)
+    /// The human's answer to an [`Effect::RequestConsent`]
     /// prompt (#487 phase 1b), keyed by the same `request_id` the plugin chose.
     /// The request/response mate of `RequestConsent`, exactly as
     /// [`EffectResult`](HostMsg::EffectResult) is `RunCommand`'s. Surfaced to the
@@ -299,13 +299,13 @@ pub enum HostMsg {
     NowPlaying { now_playing: NowPlaying },
     /// A datasource query forwarded to the **provider** plugin (#509),
     /// host→provider. The host routes a requester's
-    /// [`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery) here after
+    /// [`Effect::DatasourceQuery`] here after
     /// confirming this connection provides `datasource` (in
     /// [`Manifest::provides`](crate::manifest::Manifest::provides)) and declared
     /// `scope`. `request_id` is an **opaque host correlation**, not the requester's
     /// token — the host rewrites it on both legs so provider and requester id-spaces
     /// never collide; the provider echoes it verbatim in its
-    /// [`Effect::DatasourceResult`](crate::effect::Effect::DatasourceResult). `params`
+    /// [`Effect::DatasourceResult`]. `params`
     /// is the requester's opaque JSON request (the provider↔requester contract).
     ///
     /// **Opt-in (#305) + capability:** sent only to a connection that declares
@@ -321,7 +321,7 @@ pub enum HostMsg {
     },
     /// The result of a datasource query the plugin issued (#509), host→requester —
     /// the answer to its
-    /// [`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery), keyed by
+    /// [`Effect::DatasourceQuery`], keyed by
     /// the same `request_id` the requester chose. Carries either the provider's
     /// answer or a host-synthesized error (no provider / denied scope / 10 s
     /// timeout). The request/response mate of `DatasourceQuery`, exactly as
@@ -356,9 +356,9 @@ pub enum HostMsg {
     /// can decode. The plugin resolves the agreed generation with
     /// [`Manifest::negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab)
     /// and enables the negotiated features at or below it — today that means
-    /// emitting [`Node::Preem`](crate::wire::Node::Preem) once the agreed
+    /// emitting [`Node::Preem`] once the agreed
     /// generation reaches [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB), and
-    /// CPU-rasterising to [`Node::Pixels`](crate::wire::Node::Pixels) otherwise.
+    /// CPU-rasterising to [`Node::Pixels`] otherwise.
     ///
     /// **Opt-in (#305) — structural, by vocabulary.** The host sends this
     /// *only* to a plugin whose manifest carries a
@@ -367,7 +367,7 @@ pub enum HostMsg {
     /// plugin can only set that field if it was built against the proto that
     /// added it — the same proto that added this variant — so a pre-#882 binary
     /// never meets a `Hello` it couldn't decode. That is the
-    /// [`EventKind::ValueChanged`](crate::wire::EventKind::ValueChanged)
+    /// [`EventKind::ValueChanged`]
     /// argument rather than a new [`StateKey`](crate::manifest::StateKey): the
     /// opt-in is the declaration itself, so nothing new is subscribable.
     ///

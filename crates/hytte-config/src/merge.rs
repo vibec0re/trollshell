@@ -516,7 +516,7 @@ impl fmt::Display for MalformedUnset {
 ///
 /// [`MalformedUnset::key`] is a dotted path, so a quoted TOML key containing a
 /// literal `.` reads as a nesting separator here — the same ambiguity
-/// [`crate::subsystem::collect_paths`] documents. It is diagnostic-only in
+/// `crate::subsystem::collect_paths` documents. It is diagnostic-only in
 /// this direction: the worst case is a warning that points at a slightly wrong
 /// path, never a key acted on that should not have been.
 #[must_use]

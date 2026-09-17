@@ -34,7 +34,7 @@
 //!
 //! # Public API
 //!
-//! ```ignore
+//! ```text
 //! // Register once at startup:
 //! .with(screensaver::service())
 //!

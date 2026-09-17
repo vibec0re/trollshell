@@ -89,7 +89,7 @@ pub enum Msg {
     /// clears the badges without touching `prompted` or the in-flight prompt,
     /// so a one-tick blip costs a badge rather than a duplicate prompt.
     ///
-    /// Only sent when the *status* call succeeded — see [`poll_once`].
+    /// Only sent when the *status* call succeeded — see `poll_once`.
     Pending(Result<Vec<Approval>, HiveError>),
     /// A [`Cmd::Send`] the hive did not accept.
     ///
@@ -162,7 +162,7 @@ fn stamp(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// The I/O task behind [`crate::plugin::Agents::sources`].
+/// The I/O task behind `crate::plugin::Agents::sources`.
 ///
 /// Owns both directions: it drains the command lane and re-emits every poll as
 /// a [`Msg`] on the message stream. Returns when the lane closes, which is the

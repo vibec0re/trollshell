@@ -132,10 +132,10 @@ const LOWER_Y: usize = MID + THICK + 1;
 /// …and how far it runs.
 const LOWER_LEN: usize = DIGIT_H - 1 - LOWER_Y;
 
-/// The seven segments of a digit cell, **in the bit order of [`SEG_A`] …
-/// [`SEG_G`]** — index `i` is the bar lit by bit `i` of a cell's mask.
+/// The seven segments of a digit cell, **in the bit order of `SEG_A` …
+/// `SEG_G`** — index `i` is the bar lit by bit `i` of a cell's mask.
 ///
-/// The order is load-bearing: [`stamp_cell`] and the shell's shader both
+/// The order is load-bearing: `stamp_cell` and the shell's shader both
 /// index it by bit, so a reordering would light the wrong bars on both sides
 /// at once.
 pub const BARS: [Bar; 7] = [

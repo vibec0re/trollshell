@@ -133,7 +133,7 @@ impl GrantStore {
     /// error rather than silently dropped, so a typo doesn't quietly grant/deny.
     ///
     /// Also sweeps stale temp siblings left by a crash mid-write (#1074 review
-    /// M5) — see [`sweep_stale_tmp`].
+    /// M5) — see `sweep_stale_tmp`.
     ///
     /// # Errors
     /// If the file exists but can't be read or parsed as the grant schema.
@@ -201,7 +201,7 @@ impl GrantStore {
 
     /// Add (or upgrade an existing row to) an `always` grant for
     /// `(agent, datasource)` and persist (off the caller's thread — see
-    /// [`save`](GrantStore::save)). Idempotent: a matching row is updated in
+    /// `save`). Idempotent: a matching row is updated in
     /// place rather than duplicated.
     pub fn grant_always(&mut self, agent: &str, datasource: &str) {
         if let Some(g) = self
@@ -219,7 +219,7 @@ impl GrantStore {
 
     /// Add (or downgrade an existing row to) a `deny` grant for
     /// `(agent, datasource)` and persist (off the caller's thread — see
-    /// [`save`](GrantStore::save)) — the durable half of an `AllowAlways`
+    /// `save`) — the durable half of an `AllowAlways`
     /// decision's opposite: a deliberate `Deny` consent (#487 phase 1b). Idempotent
     /// (a matching row is updated in place), mirroring [`grant_always`](GrantStore::grant_always).
     pub fn grant_deny(&mut self, agent: &str, datasource: &str) {
@@ -242,7 +242,7 @@ impl GrantStore {
     }
 
     /// Remove the grant for `(agent, datasource)` and persist (off the
-    /// caller's thread — see [`save`](GrantStore::save)). Returns whether a
+    /// caller's thread — see `save`). Returns whether a
     /// row was actually removed (so the caller only kills tokens on a real
     /// revoke).
     pub fn revoke(&mut self, agent: &str, datasource: &str) -> bool {

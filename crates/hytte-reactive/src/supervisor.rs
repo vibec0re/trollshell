@@ -23,7 +23,7 @@
 //! there is nothing for it to do. There the return is reported at `debug!` and
 //! the health row is released, because a browser closing media tabs is not
 //! news. The difference is declared by the caller at the spawn site rather than
-//! inferred here; see [`Intent`].
+//! inferred here; see `Intent`.
 //!
 //! [`spawn_supervised_blocking`] is the same supervisor over a
 //! `spawn_blocking` closure, for the services whose client library is
@@ -63,7 +63,7 @@
 //! Every supervisor publishes what it knows about its task — runs, panics,
 //! current backoff — to [`crate::health`], which is where a diagnostics view
 //! reads "the niri connection has panicked four times in the last minute" from.
-//! The bookkeeping lives in [`supervise_runs`], the one loop every spawn
+//! The bookkeeping lives in `supervise_runs`, the one loop every spawn
 //! function funnels through, so it covers all five variants and any future
 //! entry point that reuses that loop (#238, #690, #691, #1196).
 //!
@@ -121,9 +121,9 @@
 //! points could one day hand back the same type without a single call site
 //! changing meaning. Do not add either property to it.
 //!
-//! All five funnel through [`supervise_runs`], which is how the cancellable
+//! All five funnel through `supervise_runs`, which is how the cancellable
 //! variant inherits [`crate::health`] tracking for free — including releasing
-//! its row via [`crate::health::stopped`] when a cancelled supervisor unwinds,
+//! its row via `crate::health::stopped` when a cancelled supervisor unwinds,
 //! without which every backend switch would leak one.
 //!
 //! # The process panic hook

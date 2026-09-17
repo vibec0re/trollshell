@@ -329,7 +329,7 @@ pub struct FlipMetrics {
 ///
 /// `pub` since #1155 for [`FlipMetrics`]' reason. `progress` is the closed form
 /// the module docs describe — `0.0` before the cell's stagger has elapsed,
-/// `1.0` once it has landed — read through [`FlipBoard::progress`], so a GL arm
+/// `1.0` once it has landed — read through `FlipBoard::progress`, so a GL arm
 /// and the CPU kit cannot disagree about where in a flip a frame is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlipCellState {
@@ -388,7 +388,7 @@ pub struct FlipBoard {
 }
 
 impl FlipBoard {
-    /// A board of [`DEFAULT_CELLS`] blank cells driven by `mechanism`, at the
+    /// A board of `DEFAULT_CELLS` blank cells driven by `mechanism`, at the
     /// kit's default metrics and the mechanism's own default timings.
     #[must_use]
     pub fn new(mechanism: Mechanism) -> Self {
@@ -416,7 +416,7 @@ impl FlipBoard {
     }
 
     /// Set the logical pixels per font pixel, clamped to
-    /// [`MIN_GLYPH_PX`]`..=`[`MAX_GLYPH_PX`] and rounded **down to an even
+    /// `MIN_GLYPH_PX``..=``MAX_GLYPH_PX` and rounded **down to an even
     /// number**.
     ///
     /// Even is load-bearing, not fussiness: the hinge cuts a 7-row glyph
@@ -431,7 +431,7 @@ impl FlipBoard {
     }
 
     /// Set the integer upscale baked into the output, clamped to
-    /// `1..=`[`MAX_SCALE`] — the kit bakes chunkiness into the buffer rather
+    /// `1..=``MAX_SCALE` — the kit bakes chunkiness into the buffer rather
     /// than leaning on shell CSS (the `.caw-lcd` lesson, #313). A consuming
     /// builder.
     #[must_use]
@@ -441,7 +441,7 @@ impl FlipBoard {
     }
 
     /// Set the per-cell transition length in seconds, clamped to
-    /// [`MIN_DURATION_SECS`]`..=`[`MAX_DURATION_SECS`]; a non-finite value keeps
+    /// `MIN_DURATION_SECS``..=``MAX_DURATION_SECS`; a non-finite value keeps
     /// the current one. Defaults to the
     /// [mechanism's](Mechanism::default_duration_secs). A consuming builder.
     #[must_use]
@@ -453,7 +453,7 @@ impl FlipBoard {
     }
 
     /// Set the per-cell left-to-right stagger in seconds, clamped to
-    /// `0.0..=`[`MAX_STAGGER_SECS`]; a non-finite value keeps the current one.
+    /// `0.0..=``MAX_STAGGER_SECS`; a non-finite value keeps the current one.
     /// `0.0` makes the whole row move together. Defaults to the
     /// [mechanism's](Mechanism::default_stagger_secs). A consuming builder.
     #[must_use]
@@ -1009,7 +1009,7 @@ fn blank_cell() -> Cell {
 }
 
 /// Normalize `c` onto the board's [`CHARSET`] drum: uppercase (a real drum has
-/// no lowercase), or the single [`NOTDEF_CARD`] for anything the drum does not
+/// no lowercase), or the single `NOTDEF_CARD` for anything the drum does not
 /// carry.
 #[must_use]
 pub fn drum(c: char) -> char {

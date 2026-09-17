@@ -92,24 +92,24 @@
 //!
 //! "Appending a name-tagged variant is additive" only holds while old code never
 //! *receives* the new variant. A host that pushes a freshly-added
-//! [`HostMsg`](msg::HostMsg) variant to **every** connection breaks exactly that:
+//! [`HostMsg`] variant to **every** connection breaks exactly that:
 //! a plugin built against the older proto can't decode the unknown variant, its
 //! session dies, and (with an SDK that redials) it crash-loops — and the
 //! [`PROTO_VERSION`] exact-match can't catch it, since both sides are the same
 //! version. So a new push must be **gated on an opt-in the plugin declares in its
-//! [`Manifest`](manifest::Manifest)** — a [`StateKey`](manifest::StateKey)
-//! subscription or a [`Capability`](manifest::Capability). The host serializes
+//! [`Manifest`]** — a [`StateKey`]
+//! subscription or a [`Capability`]. The host serializes
 //! only what a connection subscribed to, so an old binary that never declared the
 //! opt-in never receives the variable it can't decode. (Visibility, #288, was
-//! retrofitted onto [`StateKey::SlotVisible`](manifest::StateKey::SlotVisible)
+//! retrofitted onto [`StateKey::SlotVisible`]
 //! for this reason.)
 //!
 //! ### The wire-vocabulary counter must be bumped on every appended variant (#437)
 //!
 //! The #305 rule guards **host→plugin** pushes. The mirror hazard is
 //! **plugin→host**: a plugin built against a *newer* proto (same
-//! [`PROTO_VERSION`], one appended [`Node`](wire::Node) / [`EventKind`](wire::EventKind) /
-//! [`Effect`](effect::Effect) variant) can *render* that variant in its
+//! [`PROTO_VERSION`], one appended [`Node`] / [`EventKind`] /
+//! [`Effect`] variant) can *render* that variant in its
 //! [`Render`](msg::PluginMsg::Render) tree. An older host's `rmp-serde` then fails
 //! to decode the frame, the host treats it as an ordinary disconnect, the SDK
 //! redials and re-sends the identical tree — a permanent, near-silent 5 s
@@ -118,7 +118,7 @@
 //!
 //! [`VOCAB`] closes that gap. It is a **monotonic generation counter of the wire
 //! vocabulary**, independent of [`PROTO_VERSION`]. Every plugin stamps its
-//! build-time [`VOCAB`] into its [`Manifest`](manifest::Manifest) automatically —
+//! build-time [`VOCAB`] into its [`Manifest`] automatically —
 //! [`Manifest::new`](manifest::Manifest::new) does it, like `proto` — and the host
 //! rejects a `Register` whose `vocab` exceeds its own at the handshake
 //! ([`Manifest::check_vocab`](manifest::Manifest::check_vocab)), turning the silent
@@ -127,8 +127,8 @@
 //! passes.
 //!
 //! **The rule: appending a wire variant ⇒ bump [`VOCAB`].** Any new
-//! [`Node`](wire::Node), [`EventKind`](wire::EventKind), [`Effect`](effect::Effect),
-//! [`StateKey`](manifest::StateKey), or [`HostMsg`](msg::HostMsg) variant a peer
+//! [`Node`], [`EventKind`], [`Effect`],
+//! [`StateKey`], or [`HostMsg`] variant a peer
 //! can put on the wire grows the vocabulary the other side must understand;
 //! bumping [`VOCAB`] is what lets an older host detect (and cleanly refuse) a
 //! plugin that speaks the newer one. (A purely host→plugin addition — a new
@@ -155,12 +155,12 @@
 //! Refusal is the right answer for a variant a plugin emits on sight, because
 //! the host has no other way to stop it. It is the wrong answer when the plugin
 //! is willing to ask first. #882's preem vocabulary is the first of those: the
-//! host advertises its own generation in [`HostMsg::Hello`](msg::HostMsg::Hello)
+//! host advertises its own generation in [`HostMsg::Hello`]
 //! (sent only to a plugin that declared a
 //! [`vocab_max`](manifest::Manifest::vocab_max), which is the #305 opt-in), and
-//! the plugin emits [`Node::Preem`](wire::Node::Preem) only if that
-//! advertisement reached [`PREEM_VOCAB`](preem::PREEM_VOCAB) — otherwise it
-//! CPU-rasterises to [`Node::Pixels`](wire::Node::Pixels), exactly as it did
+//! the plugin emits [`Node::Preem`] only if that
+//! advertisement reached [`PREEM_VOCAB`] — otherwise it
+//! CPU-rasterises to [`Node::Pixels`], exactly as it did
 //! before. An old host therefore *cannot* receive the variant it can't decode,
 //! so refusing the handshake would only break a plugin that was already safe.
 //!
@@ -186,61 +186,61 @@ pub const PROTO_VERSION: u16 = 1;
 /// The **wire-vocabulary generation** — a monotonic counter of how many times the
 /// on-the-wire vocabulary has grown, independent of [`PROTO_VERSION`] (#437).
 ///
-/// Every plugin stamps this into its [`Manifest`](manifest::Manifest) at build
+/// Every plugin stamps this into its [`Manifest`] at build
 /// time (automatically, via [`Manifest::new`](manifest::Manifest::new)); the host
 /// refuses a `Register` whose `vocab` exceeds its own
 /// ([`Manifest::check_vocab`](manifest::Manifest::check_vocab)), so a plugin built
-/// against a newer vocabulary — one that can render a [`Node`](wire::Node) /
-/// [`Effect`](effect::Effect) variant this host can't decode — fails loud at the
+/// against a newer vocabulary — one that can render a [`Node`] /
+/// [`Effect`] variant this host can't decode — fails loud at the
 /// handshake instead of silently crash-looping (see the crate root's
 /// wire-vocabulary section).
 ///
-/// **Bump this by 1 whenever you append a wire variant** — a [`Node`](wire::Node),
-/// [`EventKind`](wire::EventKind), [`Effect`](effect::Effect),
-/// [`StateKey`](manifest::StateKey), or [`HostMsg`](msg::HostMsg) case. The counter
+/// **Bump this by 1 whenever you append a wire variant** — a [`Node`],
+/// [`EventKind`], [`Effect`],
+/// [`StateKey`], or [`HostMsg`] case. The counter
 /// started at `1`; generation `0` is reserved for an older, pre-`vocab`
 /// manifest, which decodes to `0` (`#[serde(default)]`) and so always clears a
 /// host's check — a pre-counter plugin is treated as the oldest generation.
 ///
 /// Generation `2` is #882's preem vocabulary
-/// ([`Node::Preem`](wire::Node::Preem) + [`HostMsg::Hello`](msg::HostMsg::Hello)),
+/// ([`Node::Preem`] + [`HostMsg::Hello`]),
 /// which is **negotiated** — see [`VOCAB_UNCONDITIONAL`].
 ///
-/// Generation `3` is #893's shader widget ([`Node::Shader`](wire::Node::Shader),
-/// [`ShaderData`](wire::ShaderData), and
-/// [`Capability::Shader`](manifest::Capability::Shader)), negotiated the same
-/// way against [`SHADER_VOCAB`](wire::SHADER_VOCAB).
+/// Generation `3` is #893's shader widget ([`Node::Shader`],
+/// [`ShaderData`], and
+/// [`Capability::Shader`]), negotiated the same
+/// way against [`SHADER_VOCAB`].
 ///
 /// Generation `4` is #966's bounded viewport
-/// ([`Node::Scrolled`](wire::Node::Scrolled)), negotiated against
-/// [`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB). (#966 also added
-/// [`Node::Row`](wire::Node::Row)'s `spacing` and
-/// [`Node::ListBox`](wire::Node::ListBox)'s `dense`, which are optional
+/// ([`Node::Scrolled`]), negotiated against
+/// [`SCROLLED_VOCAB`]. (#966 also added
+/// [`Node::Row`]'s `spacing` and
+/// [`Node::ListBox`]'s `dense`, which are optional
 /// **fields** and so bump nothing — only the variant moves this counter.)
 ///
 /// Generation `5` is #1045's open-a-link intent
-/// ([`Effect::OpenUri`](effect::Effect::OpenUri) +
-/// [`Capability::OpenUri`](manifest::Capability::OpenUri)), marked by
-/// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB). It is census-only like the three
+/// ([`Effect::OpenUri`] +
+/// [`Capability::OpenUri`]), marked by
+/// [`OPEN_URI_VOCAB`]. It is census-only like the three
 /// before it, but for a different reason — its **capability**, not a `Hello`
 /// advertisement, is what keeps the variant away from a host that can't decode
 /// it, and that holds for a plugin which declares the capability it emits (an
 /// undeclared emit is a plugin bug with a named residual). It is also the first
-/// appended [`Effect`](effect::Effect) variant since this counter existed. See
-/// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB).
+/// appended [`Effect`] variant since this counter existed. See
+/// [`OPEN_URI_VOCAB`].
 ///
 /// Generation `6` is #1158's right sidebar — the three
-/// [`Mount`](manifest::Mount) variants `SidebarRightLead` / `SidebarRightTop` /
+/// [`Mount`] variants `SidebarRightLead` / `SidebarRightTop` /
 /// `SidebarRightBottom`, marked by
-/// [`SIDEBAR_RIGHT_VOCAB`](manifest::SIDEBAR_RIGHT_VOCAB). Census-only like the
-/// four before it, and the first appended [`Mount`](manifest::Mount) variant
+/// [`SIDEBAR_RIGHT_VOCAB`]. Census-only like the
+/// four before it, and the first appended [`Mount`] variant
 /// since this counter existed — which is also the one case where the counter's
 /// *mechanism* cannot fire: a `Mount` rides inside the `Register` frame that
 /// carries [`vocab`](manifest::Manifest::vocab), so an older host fails the frame
 /// decode and drops the connection before
 /// [`check_vocab`](manifest::Manifest::check_vocab) is reached. The census is
 /// bumped anyway — it is a census — and
-/// [`SIDEBAR_RIGHT_VOCAB`](manifest::SIDEBAR_RIGHT_VOCAB) carries the full
+/// [`SIDEBAR_RIGHT_VOCAB`] carries the full
 /// argument for why the *unconditional* ceiling still must not move.
 pub const VOCAB: u16 = 6;
 
@@ -254,12 +254,12 @@ pub const VOCAB: u16 = 6;
 /// exact-checks at the handshake.
 ///
 /// The two diverge because #882 added a *negotiated* generation; #893's shader
-/// widget ([`SHADER_VOCAB`](wire::SHADER_VOCAB)) is the second and #966's bounded
-/// viewport ([`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB)) the third. (#1045's
-/// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB) is the fourth to leave this const
+/// widget ([`SHADER_VOCAB`]) is the second and #966's bounded
+/// viewport ([`SCROLLED_VOCAB`]) the third. (#1045's
+/// [`OPEN_URI_VOCAB`] is the fourth to leave this const
 /// alone, on a capability argument rather than a `Hello` one, and #1158's
-/// [`SIDEBAR_RIGHT_VOCAB`](manifest::SIDEBAR_RIGHT_VOCAB) the fifth, on a third
-/// argument again: a [`Mount`](manifest::Mount) rides inside the `Register` frame
+/// [`SIDEBAR_RIGHT_VOCAB`] the fifth, on a third
+/// argument again: a [`Mount`] rides inside the `Register` frame
 /// that carries the counter, so a handshake refusal is not reachable and bumping
 /// this would only refuse every plugin that never leaves the left sidebar. Read the rule
 /// below against it before appending the next `Effect`: a plugin *may* emit
@@ -267,14 +267,14 @@ pub const VOCAB: u16 = 6;
 /// plugin having declared the gating capability, which nothing enforces. #1045
 /// weighed the residual against refusing every rebuilt plugin and chose to name
 /// it; its docs carry the reasoning and the test that pins it.) A plugin emits
-/// [`Node::Preem`](wire::Node::Preem) only after the host advertised
-/// [`PREEM_VOCAB`](preem::PREEM_VOCAB) in [`HostMsg::Hello`](msg::HostMsg::Hello),
+/// [`Node::Preem`] only after the host advertised
+/// [`PREEM_VOCAB`] in [`HostMsg::Hello`],
 /// so an old host — which never advertises — can never receive one, and the
 /// #437 crash-loop hazard the counter exists to catch cannot occur. Declaring
 /// generation 2 as unconditional would therefore buy no safety and cost the
 /// whole compat story: every plugin rebuilt on the new SDK would be *refused* by
 /// an older shell instead of quietly falling back to
-/// [`Node::Pixels`](wire::Node::Pixels).
+/// [`Node::Pixels`].
 ///
 /// **The rule for a new variant:**
 ///
@@ -282,7 +282,7 @@ pub const VOCAB: u16 = 6;
 /// - Bump this **too** only if a plugin may emit the variant with no
 ///   advertisement. If it is gated behind a `Hello` generation check, leave this
 ///   alone — and give the feature its own generation marker const (as
-///   [`PREEM_VOCAB`](preem::PREEM_VOCAB) does) so both ends compare against one
+///   [`PREEM_VOCAB`] does) so both ends compare against one
 ///   number.
 pub const VOCAB_UNCONDITIONAL: u16 = 1;
 

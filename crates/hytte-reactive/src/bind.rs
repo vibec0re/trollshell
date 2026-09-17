@@ -154,7 +154,7 @@ fn drag_suppresses(
 /// whose value a poller keeps writing while the user can also drag it.
 ///
 /// Identical to [`bind_two_way`] but adds *grab suppression*: while the user is
-/// actively dragging the widget — and for a short [`DRAG_SETTLE`] window after
+/// actively dragging the widget — and for a short `DRAG_SETTLE` window after
 /// they let go — signal-driven `apply` calls are dropped. Without this, a
 /// continuous poller (e.g. the mpris ~250 ms position poll bound to a seek
 /// slider) writes the widget's value mid-drag and yanks the thumb back out from

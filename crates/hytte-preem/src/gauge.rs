@@ -175,7 +175,7 @@ impl Needle {
 
     /// Set the undamped natural frequency in Hz — how *fast* the needle swings
     /// (its free period is `1/hz`), independent of how much it overshoots.
-    /// Clamped to [`MIN_FREQ_HZ`]`..=`[`MAX_FREQ_HZ`]; a non-finite value keeps
+    /// Clamped to `MIN_FREQ_HZ``..=``MAX_FREQ_HZ`; a non-finite value keeps
     /// the current one. A consuming builder; call it at construction.
     #[must_use]
     pub fn frequency(mut self, hz: f32) -> Self {
@@ -188,7 +188,7 @@ impl Needle {
     /// Set the damping ratio `ζ` — how much the needle *overshoots*: below
     /// `1.0` it bounces past the reading (the first overshoot is
     /// `exp(-πζ/√(1-ζ²))` of the step), at `1.0` it arrives without overshoot,
-    /// above `1.0` it creeps. Clamped to [`MIN_DAMPING`]`..=`[`MAX_DAMPING`]
+    /// above `1.0` it creeps. Clamped to `MIN_DAMPING``..=``MAX_DAMPING`
     /// (the floor keeps an undamped needle, which never settles, off the face);
     /// a non-finite value keeps the current one. A consuming builder.
     #[must_use]
@@ -349,8 +349,8 @@ impl Needle {
         self.velocity
     }
 
-    /// Whether the needle has arrived: within [`SETTLE_EPS`] of the target and
-    /// moving slower than [`SETTLE_VEL`].
+    /// Whether the needle has arrived: within `SETTLE_EPS` of the target and
+    /// moving slower than `SETTLE_VEL`.
     ///
     /// Worth polling — a plugin can drop its frame timer while this is true and
     /// re-arm it when a new target arrives, since a settled needle renders the
@@ -717,7 +717,7 @@ pub struct Dial {
     /// Needle tip radius.
     pub tip: f32,
     /// Counterweight radius, behind the pivot — `0.0` when the face is too
-    /// small to draw one (see [`MIN_TAIL`]).
+    /// small to draw one (see `MIN_TAIL`).
     pub tail: f32,
     /// Hub radius.
     pub hub: f32,
@@ -741,7 +741,7 @@ pub struct Dial {
     centred: bool,
     /// Minor ticks per major division **as the face can actually draw them**:
     /// the configured count, pulled down until adjacent ticks clear
-    /// [`MIN_TICK_SPACING`]. Resolved here rather than in
+    /// `MIN_TICK_SPACING`. Resolved here rather than in
     /// [`Gauge::ticks`](Gauge::ticks) because it is a function of the arc's
     /// radius, which only the resolved geometry knows.
     ///
@@ -789,8 +789,8 @@ pub struct Gauge {
 }
 
 impl Gauge {
-    /// A gauge at the default geometry ([`DEFAULT_COLS`]×[`DEFAULT_ROWS`] at
-    /// [`DEFAULT_SCALE`]) and sweep, its needle at rest at the low end of a
+    /// A gauge at the default geometry (`DEFAULT_COLS`×`DEFAULT_ROWS` at
+    /// `DEFAULT_SCALE`) and sweep, its needle at rest at the low end of a
     /// `0.0..=1.0` scale.
     #[must_use]
     pub fn new() -> Self {
@@ -798,7 +798,7 @@ impl Gauge {
     }
 
     /// A gauge with an explicit **logical** buffer size (pre-upscale), each
-    /// dimension clamped to `1..=`[`MAX_BUFFER_DIM`]. The rendered frame is
+    /// dimension clamped to `1..=``MAX_BUFFER_DIM`. The rendered frame is
     /// `width`×`scale` by `height`×`scale` px — keep it within the ~296 px
     /// sidebar card (the default is 288 px wide).
     #[must_use]
@@ -815,7 +815,7 @@ impl Gauge {
     }
 
     /// Set the integer upscale baked into the output, clamped to
-    /// `1..=`[`MAX_SCALE`] — the kit bakes chunkiness into the buffer rather
+    /// `1..=``MAX_SCALE` — the kit bakes chunkiness into the buffer rather
     /// than leaning on shell CSS (the `.caw-lcd` lesson). A consuming
     /// builder; call it at construction.
     #[must_use]
@@ -825,8 +825,8 @@ impl Gauge {
     }
 
     /// Set the total sweep of the scale in degrees, clamped to
-    /// [`MIN_SWEEP_DEG`]`..=`[`MAX_SWEEP_DEG`]; a non-finite value keeps the
-    /// current one. Default: [`DEFAULT_SWEEP_DEG`]. A consuming builder.
+    /// `MIN_SWEEP_DEG``..=``MAX_SWEEP_DEG`; a non-finite value keeps the
+    /// current one. Default: `DEFAULT_SWEEP_DEG`. A consuming builder.
     #[must_use]
     pub fn sweep_deg(mut self, degrees: f32) -> Self {
         if degrees.is_finite() {
@@ -836,9 +836,9 @@ impl Gauge {
     }
 
     /// Set the tick layout: `divisions` major intervals (clamped to
-    /// `1..=`[`MAX_DIVISIONS`]), each cut into `subdivisions` minor steps
-    /// (clamped to `1..=`[`MAX_SUBDIVISIONS`]). Defaults: [`DEFAULT_DIVISIONS`]
-    /// and [`DEFAULT_SUBDIVISIONS`]. A consuming builder.
+    /// `1..=``MAX_DIVISIONS`), each cut into `subdivisions` minor steps
+    /// (clamped to `1..=``MAX_SUBDIVISIONS`). Defaults: `DEFAULT_DIVISIONS`
+    /// and `DEFAULT_SUBDIVISIONS`. A consuming builder.
     #[must_use]
     pub fn ticks(mut self, divisions: usize, subdivisions: usize) -> Self {
         self.divisions = divisions.clamp(1, MAX_DIVISIONS);
@@ -1113,8 +1113,8 @@ impl Gauge {
     ///
     /// A 150° sweep is about twice as wide as it is tall, so on the default
     /// 144×64 buffer the **height** binds: the arc is as tall as the rows allow,
-    /// its apex sits exactly [`EDGE`] under the top, and the pivot is seated on
-    /// the [`BASE_FRAC`] rows kept for the counterweight. That is the classic
+    /// its apex sits exactly `EDGE` under the top, and the pivot is seated on
+    /// the `BASE_FRAC` rows kept for the counterweight. That is the classic
     /// panel-meter face and nothing below changes it.
     ///
     /// On a **square** buffer — a 48×48 or 64×64 small dial — the width binds
@@ -1127,7 +1127,7 @@ impl Gauge {
     /// moving the pivot up only ever grows the height's.
     ///
     /// The budget counts the **halo** [`render`](Self::render) adds afterwards
-    /// ([`bloom_cap`] logical px at each end), because a face centred on its ink
+    /// (`bloom_cap` logical px at each end), because a face centred on its ink
     /// alone can still have its glow cut off at the top — and asymmetrically, on
     /// the side the centring moved toward. Adding the same amount at both ends
     /// leaves the pivot exactly where it was on every face with room to spare,
@@ -1421,15 +1421,15 @@ fn bloom_cap(radius: f32) -> usize {
 }
 
 /// The bloom radius the gauge actually spends, in logical pixels: the radius
-/// its skin asks for, halved ([`BLOOM_RADIUS_DIV`], #930), then ceilinged by
-/// what a face with this arc radius may afford ([`bloom_cap`], #931).
+/// its skin asks for, halved (`BLOOM_RADIUS_DIV`, #930), then ceilinged by
+/// what a face with this arc radius may afford (`bloom_cap`, #931).
 ///
 /// **The one place** those two rules meet. They do not commute; see
-/// [`BLOOM_RADIUS_DIV`]'s "Composing with the cap" for the divergent cell and
+/// `BLOOM_RADIUS_DIV`'s "Composing with the cap" for the divergent cell and
 /// why this order is the principled one.
 ///
 /// [`Gauge::dial`] deliberately reserves its halo margin against
-/// [`bloom_cap`] alone and not against this: the reservation only has to be an
+/// `bloom_cap` alone and not against this: the reservation only has to be an
 /// upper bound, and re-deriving the placement from a taste knob would move
 /// every centred face's geometry — #930 is a blur change, not a layout one.
 #[must_use]

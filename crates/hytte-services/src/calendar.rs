@@ -20,7 +20,7 @@
 //! opened lazily on first use).
 //!
 //! Both the init and the cache are resilient (#432, shared machinery in
-//! [`crate::eds_retry`]): a failed worker init retries with backoff (the
+//! `crate::eds_retry`): a failed worker init retries with backoff (the
 //! boot race against evolution-data-server's own activation), a cached
 //! client that errors is evicted and reconnected (EDS restart / calendar
 //! removed), and repeated all-sources failures rebuild the whole session.

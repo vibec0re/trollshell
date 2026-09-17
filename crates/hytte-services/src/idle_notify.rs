@@ -36,7 +36,7 @@
 //!
 //! This module is the **only** dim/lock/suspend path in the system, and lock
 //! is a security function — so no arm of it may die permanently on a single
-//! error. The observer thread reruns [`run`] with capped exponential backoff
+//! error. The observer thread reruns `run` with capped exponential backoff
 //! whenever it exits with an error (connect failure, protocol/dispatch
 //! error), resetting the published state to `Active` and restoring a pending
 //! native dim before each retry. The `PrepareForSleep` relock arm is

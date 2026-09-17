@@ -10,8 +10,8 @@
 //! diverged in subtle ways (separate vs in-`Vec` placeholder, different
 //! placeholder text), which made them a bug farm (#174).
 //!
-//! This module collapses that idiom into a single [`reactive_list`] call. The
-//! container is abstracted by [`RowContainer`] so the same binder drives both a
+//! This module collapses that idiom into a single `reactive_list` call. The
+//! container is abstracted by `RowContainer` so the same binder drives both a
 //! `PreferencesGroup` (`add`/`remove`) and an `ExpanderRow` (`add_row`/`remove`).
 //!
 //! Empty-state model (single, explicit): when the emitted `Vec` is empty **and**

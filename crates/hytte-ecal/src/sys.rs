@@ -323,7 +323,7 @@ unsafe extern "C" {
 /// return any of ~28 libical kinds, and materialising an out-of-range
 /// value as this 8-variant enum is undefined behaviour. For that path,
 /// [`i_cal_component_isa`] returns a raw `c_int` matched against the
-/// [`I_CAL_*_COMPONENT`] constants below.
+/// `I_CAL_*_COMPONENT` constants below.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ICalComponentKind {

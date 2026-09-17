@@ -26,17 +26,17 @@
 //! Both horizontal insets follow a sidebar: the left edge the left sidebar's
 //! visible width, the right edge the right one's (#1158/#1160). Each side is
 //! read from its own surface through `sidebar::current_visible_width(side, …)`
-//! and both are redrawn from **one** tick loop, armed by [`redraw_arming_signal`]
+//! and both are redrawn from **one** tick loop, armed by `redraw_arming_signal`
 //! — a `map_ref!` over the two open signals **and** the right sidebar's
 //! content flag (`plugins::sidebar_right_non_empty`, `.dedupe()`d) — and
-//! broken only when [`all_settled`] says neither revealer is still moving.
+//! broken only when `all_settled` says neither revealer is still moving.
 //! The content flag is its own input rather than folded into a rewritten
 //! `open_signal_on` because on the right it is a `Mutable` independent of the
 //! raw open intent — a card arriving or leaving moves the revealer, the
 //! exclusive zone and `current_visible_width` without the intent ever
 //! changing, so the two open signals alone would arm nothing for it (#1247
 //! review finding 1). A side
-//! that is closed, empty or never installed reports [`FRAME_THICKNESS_I32`],
+//! that is closed, empty or never installed reports `FRAME_THICKNESS_I32`,
 //! which is the plain strut — so a shell with no right-mounted plugin draws
 //! exactly the frame it drew before this existed.
 
@@ -106,7 +106,7 @@ const CUTOUT_RADIUS: f64 = 10.0;
 
 /// Mount one frame overlay on `monitor`. `bar` is the bar built for this
 /// monitor (built just before this in `main.rs`'s per-monitor loop); its
-/// window is read live for the frame's top inset (#441) — see [`bar_height`].
+/// window is read live for the frame's top inset (#441) — see `bar_height`.
 pub fn install(monitor: &Monitor, bar: &BarHandle) {
     // No `Some(c) if !c.is_empty()` guard needed any more (#1177):
     // `Monitor::connector()` itself folds `Some("")` to `None` since #1180

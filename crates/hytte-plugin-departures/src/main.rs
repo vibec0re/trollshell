@@ -20,7 +20,7 @@
 //! pattern for every future gated plugin — **`update` → command lane →
 //! I/O task**:
 //!
-//! 1. [`update`](Board::update) folds each [`Input::SlotVisible(visible)`] and
+//! 1. [`update`](Board::update) folds each `Input::SlotVisible(visible)` and
 //!    forwards it **down the command lane** as [`Cmd::SetVisible`] (the
 //!    sanctioned outbound path, #280 — `update` is sync and can't do I/O).
 //! 2. The [`feed::poll_task`] the [`sources`](Board::sources) spawn owns the
@@ -318,7 +318,7 @@ fn safe_line(line: &str) -> String {
         .collect()
 }
 
-/// The error-row text. `feed`'s own [`feed::fetch_once`]-level errors already
+/// The error-row text. `feed`'s own `feed::fetch_once`-level errors already
 /// carry their actionable framing by the time they land here: a
 /// `"can't reach <backend>: …"` prefix for a network fault (#1124 moved that
 /// wrapping into `feed`, which is the one place that knows which backend was

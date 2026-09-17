@@ -23,7 +23,7 @@ pub enum Edge {
 }
 
 /// Builder for a layer-shell status bar. Start from [`Bar::new`], set the
-/// edge / margin / widget groups, then [`Bar::build`] to present it.
+/// edge / margin / widget groups, then `Bar::build` to present it.
 pub struct Bar {
     monitor: Monitor,
     edge: Edge,

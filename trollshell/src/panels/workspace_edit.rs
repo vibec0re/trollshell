@@ -6,14 +6,14 @@
 //! switch, and a right column — most of the form's width — for the stack's
 //! apps as a list, each with a drag handle and, behind a per-row "override the
 //! launch command" toggle, an editable command (#1134 change 2; see
-//! [`resolved_command`] for what the toggle pre-fills). **Add app** goes
+//! `resolved_command` for what the toggle pre-fills). **Add app** goes
 //! through the desktop-entry picker. **No monitor field** — a card's screen is
 //! set by dragging it between the page's columns (Annika, on the epic
 //! thread), and phase 3 built that.
 //!
 //! ## How wide the form is
 //!
-//! [`crate::components::layout::EDIT_FORM_WIDTH`] (960), always — the same number
+//! `crate::components::layout::EDIT_FORM_WIDTH` (960), always — the same number
 //! `modal::apply_workspace_edit_width_cap` floors the drawer slot at, so the two
 //! halves of the sub-page agree.
 //!
@@ -34,7 +34,7 @@
 //! becoming `Active::WorkspaceEdit` — a drawer child keyed by a string, outside
 //! the `Page` enum. §5 fixes exactly that, and phase 1's PR body promised it.
 //!
-//! ## Why the form takes a whole [`Draft`] rather than reading the world
+//! ## Why the form takes a whole `Draft` rather than reading the world
 //!
 //! Two reasons, one of them a bug this page would otherwise ship with.
 //!
@@ -50,14 +50,14 @@
 //!   them here would be a second join that can disagree with the one the user is
 //!   looking at.
 //!
-//! So [`open`] publishes a `Draft` and the form is a pure function of it. The
+//! So `open` publishes a `Draft` and the form is a pure function of it. The
 //! consequence to know about: with drawers open on two monitors at once, both
 //! show a form seeded from the same `Draft` and each holds its own edits — the
 //! same shape the plugin panel's single global selection already has.
 //!
 //! ## What is pure here
 //!
-//! [`plan_save`], [`move_app`] and [`ephemeral_apps`] are the three decisions,
+//! `plan_save`, `move_app` and `ephemeral_apps` are the three decisions,
 //! and none of them touches GTK, the filesystem or niri. That is what makes
 //! §7's phase-4 rows falsifiable: the validator's refusal, the drag's rewrite
 //! and §3.7's "an `app_id` with no entry becomes an app with `exec` = the

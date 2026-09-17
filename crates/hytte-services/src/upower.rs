@@ -10,9 +10,9 @@
 //! parallel `for_each` tasks that each update only their slice of the state
 //! (same pattern as `power_profiles`).
 //!
-//! `WarningLevel` additionally drives a self-toast: [`spawn_warning_level_watcher`]
+//! `WarningLevel` additionally drives a self-toast: `spawn_warning_level_watcher`
 //! watches for a rising severity edge (entering `Low` or `Critical`/`Action`)
-//! and posts via [`crate::notifications::post_local`] — see [`warning_toast`]
+//! and posts via [`crate::notifications::post_local`] — see `warning_toast`
 //! for the crossing/dedup rules (#237). [`is_critical`] exposes that same
 //! `Critical`/`Action` severity split so other `WarningLevel` consumers (the
 //! `trollshell` battery chip's emergency pulse) agree with the toast instead
@@ -312,7 +312,7 @@ fn warning_tier(level: WarningLevel) -> u8 {
 }
 
 /// Whether `level` sits at the same "critical" severity tier that drives the
-/// critical-urgency "Battery critical" toast in [`warning_toast`] (i.e.
+/// critical-urgency "Battery critical" toast in `warning_toast` (i.e.
 /// `Critical` or `Action`). Exposed so other consumers of `WarningLevel` —
 /// e.g. the battery chip's emergency pulse in `trollshell` — key off the
 /// exact same severity split the toast uses instead of inventing a second,
@@ -445,7 +445,7 @@ pub(crate) fn on_battery_snapshot() -> bool {
     shared::get::<UpowerShared>().is_some_and(|s| s.on_battery.get())
 }
 
-/// [`on_battery_snapshot`], reachable from outside this crate.
+/// `on_battery_snapshot`, reachable from outside this crate.
 ///
 /// `on_battery_snapshot` stays `pub(crate)` — its own doc above is the single
 /// source of truth for the contract (degrades to AC on every unknown case,

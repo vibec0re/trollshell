@@ -1,4 +1,4 @@
-//! The **spectrum scope tile**: the 16-band [`AudioSpectrum`] drawn as a bar
+//! The **spectrum scope tile**: the 16-band `AudioSpectrum` drawn as a bar
 //! spectrum via the preem [`Frame`] primitives (#506).
 //!
 //! Plugin-local rather than a kit widget: the kit's skin palettes

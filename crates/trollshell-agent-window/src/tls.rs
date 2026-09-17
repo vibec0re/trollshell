@@ -52,7 +52,7 @@
 //! certificate with the rest as its issuer chain. `trust-bundle.pem` starts
 //! with the hive CA — so handing *that* here produces a value that never
 //! matches what the gateway sends, and the load fails anyway;
-//! [`a_bundle_is_not_the_certificate_the_gateway_presents`] pins the difference
+//! `a_bundle_is_not_the_certificate_the_gateway_presents` pins the difference
 //! against real PEMs. hyperhive's `gateway.pem` starts with the **leaf** (it is
 //! built `cat leaf-only ca.pem`), which is exactly why route 3 can read it
 //! straight into the pin.
@@ -75,8 +75,6 @@
 //! override cannot weaken the session it is added to. A failure renders
 //! [`failure_message`] in place, naming the file this launch actually tried,
 //! what happened to it, and every route in order.
-//!
-//! [`a_bundle_is_not_the_certificate_the_gateway_presents`]: tests::a_bundle_is_not_the_certificate_the_gateway_presents
 
 use std::path::{Path, PathBuf};
 

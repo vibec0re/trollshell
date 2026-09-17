@@ -80,7 +80,7 @@
 //! `position_us` is sampled by a 250 ms `Position` poller in the shell's mpris
 //! service, gated since #228 on "is a consumer on screen". This card is now a
 //! second consumer, so the shell ORs the sidebar-open aggregate into that gate
-//! (`trollshell/src/main.rs`) — the sidebar's own [`SlotVisible`] signal, the
+//! (`trollshell/src/main.rs`) — the sidebar's own `SlotVisible` signal, the
 //! same one this card parks on below. Closing the sidebar therefore parks both
 //! ends at once: no polling, and no digest pushes to render.
 //!

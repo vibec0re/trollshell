@@ -45,7 +45,7 @@
 //! memory. The set in memory is the user's config only when the file could be
 //! read: a malformed one leaves memory on the built-in default indefinitely
 //! (the load happens once, the watcher is mtime-gated), and rewriting that
-//! would replace a hand-written config with one default place. See [`edit`].
+//! would replace a hand-written config with one default place. See `edit`.
 //!
 //! A save is a **format-preserving patch, not a re-render**: `places.toml` has
 //! two permanent authors (the operator editing it by hand, which #703 asked to
@@ -65,7 +65,7 @@
 //! to agree byte for byte on how it is validated and written, so they share one
 //! copy rather than each keeping their own (#640). What stays here is the part
 //! that needs a runtime: resolution, the service, the live-reload task, and
-//! [`edit`]'s republish-under-lock.
+//! `edit`'s republish-under-lock.
 
 use std::collections::HashSet;
 use std::sync::Arc;

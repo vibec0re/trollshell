@@ -1,7 +1,7 @@
 //! Bundled asset path resolution.
 //!
 //! Resolution order, highest priority first — the same three-tier shape
-//! [`crate::revision`] uses:
+//! `crate::revision` uses:
 //!
 //! 1. `TROLLSHELL_DATA_DIR` env at runtime (override, e.g. for testing).
 //! 2. `TROLLSHELL_DATA_DIR` env at compile time (set by the Nix derivation
@@ -11,7 +11,7 @@
 //!    relative to this crate's `Cargo.toml`).
 //!
 //! An empty value at either env tier is treated as unset rather than
-//! propagated, mirroring [`crate::revision`]'s "never empty" contract.
+//! propagated, mirroring `crate::revision`'s "never empty" contract.
 
 use std::path::PathBuf;
 

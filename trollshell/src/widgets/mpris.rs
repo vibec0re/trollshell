@@ -17,14 +17,14 @@
 //! the supported migration path work. libadwaita points `AdwSqueezer` users at
 //! `AdwBreakpointBin`, whose breakpoints fire on a **constant** `max-width`
 //! condition — previously useless here, because the full row's width moved with
-//! the track title. Pin the label to [`TITLE_CHARS`] and the row's width becomes
+//! the track title. Pin the label to `TITLE_CHARS` and the row's width becomes
 //! a constant, so the threshold becomes a constant too, and the supported widget
 //! fits the problem.
 //!
 //! The decision still happens inside GTK's allocation pass, which is the only
 //! place the true available width has ever existed. Nothing here watches, damps
 //! or re-measures anything at runtime: the threshold is measured **once** from
-//! the built row (see [`build_bin`]) and then frozen into the breakpoint.
+//! the built row (see `build_bin`) and then frozen into the breakpoint.
 //!
 //! ### The one non-obvious part: freezing the child's size request
 //!
@@ -38,8 +38,8 @@
 //! So the request the bar sees has to be the same whichever rendition shows:
 //! **minimum** the mini chip's width, so the bar may squeeze the slot;
 //! **natural** the full row's, so the bar keeps offering enough room to expand
-//! back into. That is all [`FrozenSize`] is — a `GtkLayoutManager` holding
-//! those two constants, installed by [`build_bin`] on an `AdwBin` between the
+//! back into. That is all `FrozenSize` is — a `GtkLayoutManager` holding
+//! those two constants, installed by `build_bin` on an `AdwBin` between the
 //! breakpoint bin and the renditions box. It is a declaration, not a
 //! computation, which is what separates it from the four iterations that tried
 //! to reconstruct the fit from outside the layout pass. Request stability is
@@ -48,12 +48,12 @@
 //!
 //! The one thing that does move the numbers is the **text scale**, because the
 //! renditions themselves get bigger — and the shell changes that live, without
-//! rebuilding a bar. [`Refreeze`] re-derives all three constants on the two
+//! rebuilding a bar. `Refreeze` re-derives all three constants on the two
 //! `GtkSettings` signals `main.rs` already hooks for exactly that, and nothing
 //! else: its inputs are the widget's own two children, never a sibling's
 //! geometry, never a parent-chain walk, never a scheduler. So "reacts to
 //! nothing" is now "reacts to the font settings, nothing else" — see
-//! [`Refreeze`] for why a frozen natural without that is strictly worse than
+//! `Refreeze` for why a frozen natural without that is strictly worse than
 //! the pin it replaced.
 //!
 //! ### Why a layout manager and not `set_size_request` (#838, #851, #854)
@@ -97,7 +97,7 @@
 //! (`adw-breakpoint-bin-private.h:30`), `measure()` really does honour it
 //! (`if (priv->natural_width >= 0) nat = MAX (min, priv->natural_width);`,
 //! lines 381–382), and it is **private** — absent from the Rust bindings.
-//! [`FrozenSize`] is the public-API stand-in, not an approximation of one.
+//! `FrozenSize` is the public-API stand-in, not an approximation of one.
 //!
 //! With it, the bin's child reports a `mini_px` minimum, which is never above
 //! the bin's own allocation, so `allocate_child()`'s `MAX` is a no-op and the

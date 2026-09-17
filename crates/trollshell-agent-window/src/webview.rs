@@ -279,7 +279,7 @@ fn failure_state() -> adw::StatusPage {
 
 /// What the page slot shows **while the launch-time TLS probe runs** — #1246.
 ///
-/// The same inline-state widget the failure card is ([`failure_state`], an
+/// The same inline-state widget the failure card is (`failure_state`, an
 /// `adw::StatusPage` in the same slot), so the window has one place where it
 /// explains itself instead of the page and a second, differently-shaped
 /// "loading" thing. Which one is showing is the whole difference between

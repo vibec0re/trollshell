@@ -194,7 +194,7 @@ impl Slot {
 /// per-output override to be an additive field rather than a migration.
 ///
 /// [`Self::as_swaybg_arg`] is the single spelling both the render
-/// ([`swaybg_args`]) and (de)serialization read from, so the wire word and the
+/// (`swaybg_args`) and (de)serialization read from, so the wire word and the
 /// state-file word can never drift apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -751,7 +751,7 @@ pub fn mode() -> impl Signal<Item = Mode> {
     state().map(|s| s.mode)
 }
 
-/// Whether a custom wallpaper backend — a [`RELOAD_CMD_ENV`] reload command
+/// Whether a custom wallpaper backend — a `RELOAD_CMD_ENV` reload command
 /// (e.g. `awww`) — is configured for this session.
 ///
 /// Such a backend is single-image and driven only by "here's the new image":

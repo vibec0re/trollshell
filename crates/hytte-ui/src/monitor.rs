@@ -88,7 +88,7 @@ impl Monitor {
     ///
     /// A resolution/mode switch (e.g. a kanshi profile change) updates the
     /// *existing* `gdk::Monitor`'s geometry in place — it does **not** emit a
-    /// `monitors`-model `items_changed`, so [`App::monitors_changed`] never
+    /// `monitors`-model `items_changed`, so `App::monitors_changed` never
     /// fires and a size snapshotted at overlay-install time goes stale (#442).
     /// Long-lived per-monitor sizing should subscribe here (or re-read
     /// [`Monitor::size`] at the point of use) rather than capture once.

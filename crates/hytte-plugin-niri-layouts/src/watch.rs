@@ -71,7 +71,7 @@
 //!
 //! # Lifetime — one watcher per **session**, not per process
 //!
-//! [`crate::plugin::NiriLayouts::sources`] spawns this, and the SDK calls
+//! `crate::plugin::NiriLayouts::sources` spawns this, and the SDK calls
 //! `sources` inside `session()` (`hytte-plugin`'s `runtime.rs`), which
 //! `reconnect_loop` re-enters after **every** host `Shutdown` or transport
 //! error. A plugin unit is `PartOf=graphical-session.target`, so it outlives
@@ -87,7 +87,7 @@
 //! exactly this session"*), so the moment the session's stream drops, this
 //! thread's sends stop being deliverable. [`Verdicts::send`] and
 //! [`Verdicts::open`] report that, [`drive`] returns on it, and
-//! [`live_watchers`] lets a test measure that the thread really did end.
+//! `live_watchers` lets a test measure that the thread really did end.
 //!
 //! Noticing requires the blocking read to be interruptible, which is why this
 //! module dials the socket itself instead of using

@@ -5,7 +5,7 @@
 //! byte-for-byte identical bar the doc comments, one of which literally said
 //! "kept in sync with the pet's bubble rule" — before rendering the result
 //! through [`super::TextBox`]. This lives here rather than in
-//! `hytte-ai-providers` on purpose: [`hytte_ai_providers::chat`] documents
+//! `hytte-ai-providers` on purpose: `hytte_ai_providers::chat` documents
 //! itself as holding "no opinion about the text" a caller gets back, and
 //! these two functions are squarely an opinion about text — specifically,
 //! what reads as noise in a *pixel-font bubble* (an emoji renders as a blank

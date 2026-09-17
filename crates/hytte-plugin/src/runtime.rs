@@ -162,9 +162,9 @@ fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
 }
 
 /// The **resolved** mount this process would register on: [`Plugin::manifest`]'s
-/// own mount, overlaid by [`MOUNT_ENV`] when the launch set one — the exact
+/// own mount, overlaid by `MOUNT_ENV` when the launch set one — the exact
 /// resolution [`run`] applies to every `Register` frame, through the same
-/// parser ([`mount_override`], via [`effective_mount_from`]).
+/// parser (`mount_override`, via [`effective_mount_from`]).
 ///
 /// Graduated into the SDK by #1317, out of two hand copies that had each
 /// re-implemented this decision because [`run`] deliberately never shows a
@@ -175,12 +175,12 @@ fn mount_override_from_env() -> Result<Option<Mount>, MountOverrideError> {
 /// `hytte-plugin-stats`'s `mount::effective` (#1250, picking `stats.toml`'s
 /// `[bar]` vs `[sidebar]` table) and `hytte-claude-bridge`'s
 /// `plugin::effective_mount` (#1315, picking a bar chip vs. a sidebar card).
-/// Both parsed [`MOUNT_ENV`] a second time by hand; a third plugin needing the
+/// Both parsed `MOUNT_ENV` a second time by hand; a third plugin needing the
 /// same family would have copied it again.
 ///
 /// **The one honest difference from [`run`]:** `run` treats an unparseable
-/// [`MOUNT_ENV`] value as a **startup failure**, refusing the launch before
-/// the first dial (see [`mount_override_from_env`]). This function must
+/// `MOUNT_ENV` value as a **startup failure**, refusing the launch before
+/// the first dial (see `mount_override_from_env`). This function must
 /// not — a library function cannot exit its caller's process — so it falls
 /// back to `manifest`, the same way the two hand copies it replaces always
 /// did. Reachability of that arm is a property of *when* a plugin asks:
@@ -206,7 +206,7 @@ pub fn effective_mount(manifest: Mount) -> Mount {
 }
 
 /// [`effective_mount`] over an injected `lookup` rather than the real process
-/// environment — the seam a plugin's own tests need, for [`mount_override_from`]'s
+/// environment — the seam a plugin's own tests need, for `mount_override_from`'s
 /// reason: `unsafe_code = "forbid"` rules out `std::env::set_var` (an `unsafe
 /// fn` in edition 2024), so nothing here can drive the real environment from a
 /// test at all.
@@ -214,7 +214,7 @@ pub fn effective_mount(manifest: Mount) -> Mount {
 /// Adapts `lookup`'s `Option<String>` shape — a missing variable and a
 /// non-UTF-8 one are the same "nothing usable" to a caller that only wants a
 /// [`Mount`] back — into the `Result<String, VarError>` shape
-/// [`mount_override_from`] takes, so the actual decision (trim, match against
+/// `mount_override_from` takes, so the actual decision (trim, match against
 /// [`Mount::from_wire_name`]) is made in exactly the one place `run` also
 /// reaches: there is no second parser here, only a different fallback for a
 /// value that one refuses.
@@ -1158,11 +1158,11 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// exiting into systemd's start-limit), and drives one session per
 /// connection. Exits the process (status 1) only on unrecoverable setup:
 /// `XDG_RUNTIME_DIR` unset (then there is nothing to dial, ever), the
-/// tokio runtime failing to build, or a [`MOUNT_ENV`] value that is not a wire
+/// tokio runtime failing to build, or a `MOUNT_ENV` value that is not a wire
 /// mount name.
 ///
 /// **Placement is a launch argument** (#1159, epic #1158). Before the first dial,
-/// `run` reads [`MOUNT_ENV`] (`HYTTE_PLUGIN_MOUNT`); a value naming one of the
+/// `run` reads `MOUNT_ENV` (`HYTTE_PLUGIN_MOUNT`); a value naming one of the
 /// nine wire [`Mount`](hytte_plugin_proto::Mount)s replaces
 /// [`Plugin::manifest`]'s own `mount` in every `Register` this process sends,
 /// including after a reconnect. An unknown or empty value is a **startup
@@ -1172,9 +1172,9 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// `manifest()` is called exactly as before.
 ///
 /// **Identity is a launch argument too** (#1250, epic #1248). `run` also reads
-/// [`ID_ENV`] (`HYTTE_PLUGIN_ID`); a value matching the launcher's id rule
+/// `ID_ENV` (`HYTTE_PLUGIN_ID`); a value matching the launcher's id rule
 /// (1..=[`MAX_PLUGIN_ID_BYTES`] bytes of ASCII letters, digits, `-` or `_` —
-/// see [`is_valid_plugin_id`]) replaces [`Plugin::manifest`]'s own `id` in every
+/// see `is_valid_plugin_id`) replaces [`Plugin::manifest`]'s own `id` in every
 /// `Register` this process sends, reconnects included, and prefixes every line
 /// this process logs. That is what lets **one binary run twice at once**: the
 /// host allows a single live connection per id and drops a duplicate, so two
@@ -1188,7 +1188,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// Also installs the `SIGTERM`/`SIGINT` listener for the shutdown lifecycle
 /// (#1079, crate docs' "Process shutdown" section): on either signal a
 /// process-wide flag flips, the live session (if any) finishes its in-flight
-/// frame and runs [`Plugin::shutdown`] under [`SHUTDOWN_GRACE`] — which
+/// frame and runs [`Plugin::shutdown`] under `SHUTDOWN_GRACE` — which
 /// bounds an `.await`ing hook only, not a thread-blocking one; see that
 /// constant's doc — and this function exits the process with status 0
 /// instead of reconnecting. Systemd's own `TimeoutStopSec` on the transient

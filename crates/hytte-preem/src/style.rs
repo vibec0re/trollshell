@@ -51,7 +51,7 @@ fn unpack_accent(packed: u32) -> Option<Rgba> {
 /// re-export it — `style` itself is a private module.
 ///
 /// Installing an accent is a *request*, not an assignment: each skin decides
-/// how far it can follow one against its own field ([`AccentPolicy`], #928), so
+/// how far it can follow one against its own field (`AccentPolicy`, #928), so
 /// a light accent does not erase the reflective LCD's dark ink.
 pub fn set_accent(color: Option<Rgba>) {
     ACCENT.store(pack_accent(color), Ordering::Relaxed);
@@ -84,7 +84,7 @@ pub enum Ink {
     /// caller's (#928): a dark-panel skin takes it verbatim, while the
     /// reflective [`Lcd`](DisplayStyle::Lcd) admits it only as far as its light
     /// field can carry it. This is the one ink variant a skin may adjust — see
-    /// [`AccentPolicy`].
+    /// `AccentPolicy`.
     #[default]
     Default,
     /// The skin's own hard-coded ink, **ignoring** any installed accent — the
@@ -374,8 +374,8 @@ pub enum DisplayStyle {
     ///
     /// The kit's one skin whose **field is lighter than its ink**, which makes
     /// it the only one that has to defend itself against the desktop accent
-    /// (#928): its [`AccentPolicy`] is
-    /// [`TintToLegible`](AccentPolicy::TintToLegible), so an accent is admitted
+    /// (#928): its `AccentPolicy` is
+    /// `TintToLegible`, so an accent is admitted
     /// as a *darkened* tint rather than replacing the ink outright. A pinned
     /// [`Ink::Fixed`] still wins — pin white here and you get white.
     Lcd,
@@ -384,7 +384,7 @@ pub enum DisplayStyle {
     Oled,
     /// Phosphor CRT: P31-green on a near-black tube face, a broad phosphor
     /// bloom, and the raster itself — a scanline comb plus a curved-glass
-    /// vignette ([`Mask`]) multiplied into the lit layer at composite time
+    /// vignette (`Mask`) multiplied into the lit layer at composite time
     /// (#397).
     ///
     /// This is the kit's one **pass**: nothing about it is per-skin, so the
@@ -518,7 +518,7 @@ impl DisplayStyle {
     /// passing through [`Pins::field`].
     ///
     /// This is the accent question and *only* the accent question — it runs the
-    /// skin's [`AccentPolicy`], which is about identity. A host resolving a
+    /// skin's `AccentPolicy`, which is about identity. A host resolving a
     /// **status role** asks
     /// [`admit_role_ink`](Self::admit_role_ink) instead, which is about
     /// legibility and holds on every skin; the two seams are the two halves of
@@ -527,14 +527,14 @@ impl DisplayStyle {
     /// Either way the host has to *ask*, because both a role color and an
     /// author's `.ink(…)` reach the kit as [`Ink::Fixed`], which is deliberately
     /// unconditional (guarding a stated color is the worse failure — see
-    /// [`AccentPolicy`]). Pair either seam with
+    /// `AccentPolicy`). Pair either seam with
     /// [`contrast_ratio`](crate::contrast_ratio) and
     /// [`field`](Self::field) to decide whether asking is even necessary.
     ///
     /// Nothing in the kit calls this — it is a seam, not a step: the render path
     /// reaches the same policy through the private
-    /// [`admit_ink_against`](Self::admit_ink_against), which
-    /// [`palette_with`](Self::palette_with) calls directly.
+    /// `admit_ink_against`, which
+    /// `palette_with` calls directly.
     ///
     /// **Since #940 nothing in the workspace calls it either.** #939's single
     /// call site was `preem_render::ink_for`'s role arm, and #940 moved that to
@@ -561,7 +561,7 @@ impl DisplayStyle {
     /// `None` for the skin's own ground, `Some(rgba)` to match a
     /// [`Pins::field`] pin — and a different question, which is the whole point
     /// of the second entry. The accent seam runs the skin's
-    /// [`AccentPolicy`] and so returns three of the four skins' answer
+    /// `AccentPolicy` and so returns three of the four skins' answer
     /// unchanged, because a phosphor's identity *is* its accent. A role has no
     /// identity to protect: a warning that cannot be read is a failed warning,
     /// on a VFD exactly as on an LCD. So this one holds
@@ -569,7 +569,7 @@ impl DisplayStyle {
     /// pick.
     ///
     /// **Direction is read off the ground, never hard-coded.** The ramp ends at
-    /// [`role_pole`](Self::role_pole), which is the skin's own ink whenever that
+    /// `role_pole`, which is the skin's own ink whenever that
     /// ink can be read on this ground — light on the three dark panels, dark on
     /// the [`Lcd`](Self::Lcd) — so "tint to legible" *is* "lighten" on a
     /// phosphor and "darken" on the reflective skin without either word
@@ -577,22 +577,22 @@ impl DisplayStyle {
     /// keeps the result looking like the skin it is on, which is the half of
     /// #940's option B that is about taste rather than about the bar.
     ///
-    /// **Total.** Every ground has a legible pole (see [`BLACK`]), and the
-    /// ramp's last stop is that pole, so the scan in [`admit`] always finds a
+    /// **Total.** Every ground has a legible pole (see `BLACK`), and the
+    /// ramp's last stop is that pole, so the scan in `admit` always finds a
     /// stop — the answer is `≥ 4.5:1` against `field`, unconditionally. An ink
     /// that already clears the bar is stop 0 and comes back **byte-identical**:
     /// libadwaita's dark-theme trio passes straight through on all three dark
     /// panels, and `preem-demo`'s pinned lilac ground keeps its 9.238:1 success
     /// green exactly as #939 left it. Nothing is ever made *less* legible than
-    /// it arrived, which is [`admit`]'s own guarantee.
+    /// it arrived, which is `admit`'s own guarantee.
     ///
     /// # What the bar is measured on
     ///
     /// The **flat palette pair** — this ink against that ground — which is the
-    /// scope [`contrast`] states and the only thing a color-resolution seam can
+    /// scope `contrast` states and the only thing a color-resolution seam can
     /// answer. It is *not* a claim about every pixel of the finished frame: a
     /// skin's post-passes run after the palette is chosen, and one of them
-    /// takes light away. The [`Mask`] the `Crt` carries keeps `150/256` of the
+    /// takes light away. The `Mask` the `Crt` carries keeps `150/256` of the
     /// lit layer on one scanline row in four and `115/256` at the far corner,
     /// so on the
     /// [`Crt`](Self::Crt) an ink admitted to exactly 4.5:1 reads about
@@ -605,8 +605,8 @@ impl DisplayStyle {
     /// This is newly *reachable* rather than new: the `Crt`'s own ink is
     /// 15.516:1 flat and still 5.561:1 on a comb row, chosen with the headroom
     /// to survive its own mask, and until #940 nothing on that skin was ever
-    /// tinted **to** the bar (its [`AccentPolicy`] is
-    /// [`AsGiven`](AccentPolicy::AsGiven)). Raising the constant here would be
+    /// tinted **to** the bar (its `AccentPolicy` is
+    /// `AsGiven`). Raising the constant here would be
     /// the wrong lever — it would move every skin to fix one, and the ramp would
     /// keep walking toward the same green. If the `Crt` needs more, it needs
     /// #940's option **C**: role inks the skin owns, chosen with the mask in
@@ -788,10 +788,10 @@ pub(crate) struct Bloom {
 
 // ── the palette as plain data (#893 stage B) ────────────────────────────────
 
-/// A resolved [`Palette`] as **plain, public data** — every number a renderer
+/// A resolved `Palette` as **plain, public data** — every number a renderer
 /// outside this crate needs to reproduce what the kit's composite does.
 ///
-/// [`Palette`] itself is `pub(crate)` and stays that way: it is the kit's own
+/// `Palette` itself is `pub(crate)` and stays that way: it is the kit's own
 /// internal currency, and widening it would make every field a compatibility
 /// promise. What #893's GPU renderer needs is narrower and honest as a
 /// snapshot — the ink and field it composites toward, plus the two post-pass
@@ -799,15 +799,15 @@ pub(crate) struct Bloom {
 /// [`palette_snapshot`].
 ///
 /// **Additive only.** Nothing in the kit reads this type; no render path
-/// changed to produce it. It is a projection of [`Palette`] and the tests
+/// changed to produce it. It is a projection of `Palette` and the tests
 /// beside it assert that projection is byte-exact, so the two cannot drift
 /// without going red.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteSnapshot {
-    /// The screen field every widget floods first ([`Palette::bg`]).
+    /// The screen field every widget floods first (`Palette::bg`).
     pub bg: Rgba,
     /// Lit ink at full intensity; partial intensity mixes toward it
-    /// ([`Palette::ink`]).
+    /// (`Palette::ink`).
     pub ink: Rgba,
     /// Unlit elements, painted flat; `None` skips the ghost pass (the OLED
     /// case). Carried for completeness — the `Scope` has no ghost pass, but a
@@ -819,7 +819,7 @@ pub struct PaletteSnapshot {
     pub mask: Option<MaskSnapshot>,
 }
 
-/// [`Bloom`] as plain data: a `radius` box blur of the lit layer, scaled by
+/// `Bloom` as plain data: a `radius` box blur of the lit layer, scaled by
 /// `strength`/256 and max-combined under the original intensities.
 ///
 /// The blur is **separable and truncating** — a horizontal pass then a vertical
@@ -835,11 +835,11 @@ pub struct BloomSnapshot {
     pub strength: u16,
 }
 
-/// [`Mask`] as plain data: the CRT pass's scanline comb and vignette.
+/// `Mask` as plain data: the CRT pass's scanline comb and vignette.
 ///
 /// Both are pure functions of `(x, y, width, height)` and these four numbers —
 /// no state, no clock — which is exactly what makes them reproducible in a
-/// fragment shader. See [`Mask`] for what each one means and why it is the
+/// fragment shader. See `Mask` for what each one means and why it is the
 /// value it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaskSnapshot {
@@ -855,7 +855,7 @@ pub struct MaskSnapshot {
 
 /// The palette `style` would render with **right now**, as plain data.
 ///
-/// Resolved **through [`DisplayStyle::palette`]**, deliberately and not by
+/// Resolved **through `DisplayStyle::palette`**, deliberately and not by
 /// reimplementing the precedence: the `with_pins` scope beats the [`set_accent`]
 /// session accent beats the skin's own ink, the pinned field is chosen before
 /// the ink policy is evaluated against it, and the ghost/bloom/mask stay the
@@ -913,7 +913,7 @@ pub fn palette_snapshot(style: DisplayStyle) -> PaletteSnapshot {
 // root; nothing about the values or the pass changed.
 
 /// Fixed-point one for a mask factor, in 256ths — the same convention
-/// [`Bloom::strength`] uses, so the kit's two post-passes read alike and both
+/// `Bloom::strength` uses, so the kit's two post-passes read alike and both
 /// stay inside `u32`.
 pub const MASK_ONE: u32 = 256;
 

@@ -40,7 +40,7 @@
 //!
 //! [`init`](Plugin::init) runs on every (re)connect: a disconnect drops the
 //! model and the next session re-derives it from the host's initial
-//! [`StateSnapshot`](proto::StateSnapshot). That is the design's crash stance
+//! [`StateSnapshot`]. That is the design's crash stance
 //! (#195: the host persists nothing, the plugin's transient UI state is
 //! re-derivable) applied symmetrically to the plugin side.
 //!
@@ -106,7 +106,7 @@
 //!
 //! [`update`](Plugin::update) returns shell [`Effect`]s — actions the *host*
 //! brokers (open a page, drive niri/media, run a command, post a notification
-//! toast via [`Effect::Notify`](proto::Effect::Notify) once the manifest grants
+//! toast via [`Effect::Notify`] once the manifest grants
 //! [`Capability::Notify`](proto::Capability::Notify), #406). The whole effect
 //! vocabulary is the re-exported [`proto::Effect`] enum — a plugin names its
 //! variants directly, and the host is the one that brokers **and cap-checks**
@@ -161,7 +161,7 @@
 //! ([`preem::font`], promoted from the pet's speech bubble), and predefined
 //! widgets — [`preem::dot_matrix`], [`preem::seven_seg`], and the
 //! [`preem::TextBox`] 8bit textbox — all rendering into
-//! [`Node::Pixels`](proto::Node::Pixels) buffers in the VFD / LCD / OLED
+//! [`Node::Pixels`] buffers in the VFD / LCD / OLED
 //! [`preem::DisplayStyle`] skins. See that module's docs; the
 //! `hytte-plugin-preem-demo` crate is the reference consumer.
 //!
@@ -172,8 +172,8 @@
 //! shape — [`display::Gauge`], [`display::Marquee`], [`display::FlipBoard`], …
 //! — but decide **at render time**, from the generation the host advertised in
 //! [`HostMsg::Hello`](proto::HostMsg::Hello), whether the widget goes out as a
-//! typed [`Node::Preem`](proto::Node::Preem) the shell draws and animates, or
-//! as the CPU-rasterised [`Node::Pixels`](proto::Node::Pixels) it is today.
+//! typed [`Node::Preem`] the shell draws and animates, or
+//! as the CPU-rasterised [`Node::Pixels`] it is today.
 //!
 //! One `update`/`view` pair serves both hosts: state setters always take
 //! effect, and `advance(dt)` — the plugin-side animation tick — is a no-op
@@ -280,7 +280,7 @@
 //! hand-rolling a button + chevron + revealer. It renders a flat, full-width
 //! header (your `header` node, with a trailing disclosure chevron) over a
 //! revealer holding `children`. Clicking the header fires an
-//! [`EventKind::Click`](proto::EventKind::Click) addressed by the expander's `id`
+//! [`EventKind::Click`] addressed by the expander's `id`
 //! — fold that into your model, flip `expanded`, and re-render; the host reveals
 //! the body and rotates the chevron. Because the toggle round-trips as a plain
 //! click a plugin already opts into by rendering the node, `Expander` needs no
@@ -443,7 +443,7 @@
 //! Set `tooltip: None` when you have nothing to say; it costs no wire bytes
 //! (`skip_serializing_if`), and an older host that predates the field skips the
 //! key rather than failing the frame, so using it is safe against any shell.
-//! [`nodes::row`](crate::nodes::row) defaults it for you —
+//! [`nodes::row`] defaults it for you —
 //! `nodes::row(children).tooltip("argus · running").build()`.
 //!
 //! ## The list-card three (#961)
@@ -709,8 +709,8 @@ pub enum Input<M> {
         output: Option<String>,
     },
     /// The outcome of a brokered
-    /// [`Effect::RunCommand`](proto::Effect::RunCommand) or
-    /// [`Effect::OpenUri`](proto::Effect::OpenUri), keyed by the effect's `id`.
+    /// [`Effect::RunCommand`] or
+    /// [`Effect::OpenUri`], keyed by the effect's `id`.
     ///
     /// Three things reply here, and they mean different things:
     ///
@@ -769,7 +769,7 @@ pub enum Input<M> {
     /// receive, never assume you saw every intermediate edge.
     SlotVisible(bool),
     /// The latest audio-reactive spectrum off the default sink's monitor (#405):
-    /// the host [`AudioSpectrum`](proto::AudioSpectrum) push, delivered only to a
+    /// the host [`AudioSpectrum`] push, delivered only to a
     /// plugin that subscribes
     /// [`StateKey::AudioSpectrum`](proto::StateKey::AudioSpectrum). A `{peak,
     /// bins}` frame arrives ~20 Hz **latest-wins** — fold it into the model and
@@ -777,7 +777,7 @@ pub enum Input<M> {
     /// than 20 Hz just sees the freshest frame each time; there is no backlog to
     /// drain. Ignoring it costs nothing.
     AudioSpectrum(AudioSpectrum),
-    /// The human's answer to an [`Effect::RequestConsent`](proto::Effect::RequestConsent)
+    /// The human's answer to an [`Effect::RequestConsent`]
     /// this plugin raised (#487 phase 1b), the host
     /// [`ConsentDecision`](proto::HostMsg::ConsentDecision) push. Keyed by the
     /// `request_id` the plugin chose on the originating `RequestConsent`, so a
@@ -860,10 +860,10 @@ pub enum Input<M> {
     /// plugin that declares [`Capability::DatasourceProvider`](proto::Capability::DatasourceProvider)
     /// and lists `datasource` in [`Manifest::provides`](proto::Manifest::provides).
     /// Answer it by returning an
-    /// [`Effect::DatasourceResult`](proto::Effect::DatasourceResult) from
+    /// [`Effect::DatasourceResult`] from
     /// [`update`](Plugin::update), echoing `request_id` **verbatim** (it is an opaque
     /// host correlation the host maps back to the original requester — do not
-    /// interpret or reuse it) and carrying the [`DatasourceOutcome`](proto::DatasourceOutcome).
+    /// interpret or reuse it) and carrying the [`DatasourceOutcome`].
     /// `params` is the requester's opaque JSON request (the provider↔requester
     /// contract); a provider that serves one scope can usually ignore `scope`.
     DatasourceQuery {
@@ -881,7 +881,7 @@ pub enum Input<M> {
     /// The result of a datasource query this **requester** plugin issued (#509): the
     /// host [`DatasourceResult`](proto::HostMsg::DatasourceResult) push, keyed by the
     /// `request_id` the plugin chose on the originating
-    /// [`Effect::DatasourceQuery`](proto::Effect::DatasourceQuery). Delivered only to
+    /// [`Effect::DatasourceQuery`]. Delivered only to
     /// a plugin that declared [`Capability::DatasourceQuery`](proto::Capability::DatasourceQuery).
     /// Carries either the provider's answer or a host-synthesized error (no provider
     /// / denied scope / timeout), so a query always eventually resolves — the

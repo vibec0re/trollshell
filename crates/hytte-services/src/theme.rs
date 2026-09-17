@@ -12,9 +12,9 @@
 //! 3. **Qt** — `~/.config/qt[56]ct/qt[56]ct.conf [Appearance]` keys
 //!    `style`, `custom_palette`, `color_scheme_path`. Sets `style=Fusion`
 //!    (Qt built-in, always present) and toggles a dark palette via
-//!    qt[56]ct's bundled `darker.conf`. Effective when `qt[56]ct` is
+//!    `qt[56]ct`'s bundled `darker.conf`. Effective when `qt[56]ct` is
 //!    installed and `QT_QPA_PLATFORMTHEME=qt[56]ct` is exported. The conf
-//!    is written unconditionally; with no qt[56]ct platform theme loaded
+//!    is written unconditionally; with no `qt[56]ct` platform theme loaded
 //!    it costs nothing.
 //!
 //! Every subprocess and every ini-file write runs on the `hytte_reactive`
@@ -130,7 +130,7 @@ fn unseeded_handle() -> Mutable<Option<Theme>> {
 
 /// Current theme as last known by this process, or `None` while the seed
 /// read is still in flight. Never blocks and never spawns a subprocess
-/// itself — see [`current_handle`] for how the value is seeded and kept in
+/// itself — see `current_handle` for how the value is seeded and kept in
 /// sync. On any `gsettings` error, or a `default` value (externally set,
 /// "follow system" — trollshell sessions don't have a system to follow),
 /// the seed read resolves to `Theme::Dark`, matching
@@ -228,7 +228,7 @@ async fn read_current_from(program: &str) -> Theme {
 /// sees the new value even though the actual fan-out is still running on the
 /// tokio runtime. That optimistic update is **corrected** if the
 /// authoritative `color-scheme` write turns out to have failed — see
-/// [`do_set`].
+/// `do_set`.
 pub fn set(theme: Theme) {
     current_handle().set(Some(theme));
     runtime::handle().spawn(async move {

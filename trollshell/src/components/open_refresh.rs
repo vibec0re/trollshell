@@ -4,7 +4,7 @@
 //! The sidebar calendar and tasks widgets each want a fresh data scan the
 //! moment the user opens the sidebar, so they never show up-to-60-second-stale
 //! data on open. Both subscribe to the per-monitor
-//! [`sidebar::open_signal`](crate::overlays::sidebar::open_signal), which is
+//! [`sidebar::open_signal`], which is
 //! backed by a *persistent* per-connector `Mutable` that outlives any single
 //! widget. The widgets themselves are rebuilt on every `monitors_changed`
 //! emission (`sidebar::build_card` runs on each `install`, after `close_all`
@@ -12,7 +12,7 @@
 //! the widget accumulates one dead loop — and one redundant `refresh()` per
 //! open — for every dock/undock cycle (#439).
 //!
-//! [`on_open`] routes the subscription through [`bind`], whose apply-loop holds
+//! `on_open` routes the subscription through [`bind()`], whose apply-loop holds
 //! only a `WeakRef` to the anchor. When the card is torn down the anchor's last
 //! strong ref drops, the next open-state emission upgrades to `None`, and the
 //! loop breaks — releasing the subscription. This is the same weak-ref safety

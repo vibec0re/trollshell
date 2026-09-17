@@ -187,7 +187,7 @@ impl Default for AgentsConfig {
 impl AgentsConfig {
     /// The poll cadence as a [`Duration`], clamped to the validated range.
     ///
-    /// Clamps rather than trusting the field, because [`load_or_default`]
+    /// Clamps rather than trusting the field, because `load_or_default`
     /// degrades to the built-in default on a validation failure but a caller
     /// holding a hand-built value has bypassed [`Self::validate`] entirely.
     #[must_use]
@@ -336,7 +336,7 @@ impl Subsystem for AgentsConfig {
 /// Load `agents.toml` from the process environment's XDG search path,
 /// degrading to the documented default (with a loud `error!`) on any failure.
 ///
-/// `None` only when [`DEFAULT_TOML`] itself does not parse or validate — a bug
+/// `None` only when `DEFAULT_TOML` itself does not parse or validate — a bug
 /// in this crate, not in anyone's config — and the caller then falls back to
 /// [`AgentsConfig::default`], which is the same values expressed in Rust.
 #[must_use]

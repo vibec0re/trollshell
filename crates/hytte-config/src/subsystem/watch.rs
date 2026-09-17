@@ -55,7 +55,7 @@
 //! "lcd"`, is byte-identical in length, and that is exactly the shape a
 //! `core-leds.toml`-style option's own values take (`"spare"` → `"blank"` is
 //! the other one). A content hash catches both — mtime-frozen or not,
-//! same-length or not, any byte that changes moves it — which is why [`stamp`]
+//! same-length or not, any byte that changes moves it — which is why `stamp`
 //! reads the whole file rather than a bare `stat`: one extra read, negligible
 //! for a config file this size, in exchange for the base layer being able to
 //! reload live at all.
@@ -104,7 +104,7 @@ pub type Stamp = Option<(SystemTime, u64)>;
 pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// How often [`poll_loop`] re-checks its layers, re-read on **every**
-/// [`RECHECK`] tick rather than fixed once at the start of a wait.
+/// `RECHECK` tick rather than fixed once at the start of a wait.
 ///
 /// A boxed `Fn` rather than a bare `Duration` so a subsystem's cadence can
 /// depend on live state — `core_leds`' battery split is the reason this
@@ -352,7 +352,7 @@ pub fn boot<S: Subsystem>(
 /// most subsystems have no reason to vary it and pass [`constant`], but
 /// `core_leds`' battery-aware split needs the *current* power state read live
 /// on every recheck, not a value frozen at the call site — see
-/// [`wait_cadence`], which is what actually re-reads it.
+/// `wait_cadence`, which is what actually re-reads it.
 pub async fn poll_loop<S: Subsystem>(
     values: Mutable<S::Resolved>,
     mut watcher: Watcher<S>,

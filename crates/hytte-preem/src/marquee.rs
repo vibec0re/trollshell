@@ -138,7 +138,7 @@ fn rasterize(text: &str) -> Vec<Column> {
 /// **once-per-message** work — rasterizing the glyphs into font space and
 /// painting the window's fixed ghost matrix — into a reusable [`MarqueeStrip`]
 /// that [`window`](MarqueeStrip::window) then lights per frame. Defaults: a
-/// [`DEFAULT_WINDOW_PX`]-wide window and a [`DEFAULT_GAP_DOTS`] seam gap.
+/// `DEFAULT_WINDOW_PX`-wide window and a `DEFAULT_GAP_DOTS` seam gap.
 ///
 /// Every knob is a consuming builder method, matching [`TextBox`](super::TextBox);
 /// the builder is a value, so one `Marquee` renders many messages.
@@ -178,7 +178,7 @@ impl Marquee {
     /// the two things a bar ticker meets first:
     ///
     /// - **A message that scrolls at one pitch can hold static at a finer
-    ///   one.** The [hold rule](self#short-text-holds) compares the message
+    ///   one.** The hold rule compares the message
     ///   against the *grid*, so a 10-char title that scrolls in a 192 px window
     ///   at pitch 4 fits the grid at 3 and at 2, and stops moving. That is the
     ///   rule working, not a dropped pitch.
@@ -195,7 +195,7 @@ impl Marquee {
     /// The visible window width in **final** buffer pixels — the width of the
     /// [`Frame`] each [`window`](MarqueeStrip::window) hands back, so size it
     /// to the surface (the `Pixels` node's natural size *is* the buffer, per
-    /// the kit's sizing docs). Capped at [`MAX_WINDOW_PX`] (`0` is left
+    /// the kit's sizing docs). Capped at `MAX_WINDOW_PX` (`0` is left
     /// alone — it resolves to a zero-width but still valid buffer).
     ///
     /// The dot grid inside is as many whole dot cells as fit between the
@@ -212,7 +212,7 @@ impl Marquee {
     /// the seam that separates the end of the message from its restart. In
     /// dots, not pixels, so the seam is a whole number of grid columns like
     /// everything else the offset can reach (#839). Capped at
-    /// [`MAX_GAP_DOTS`] (`0` is left alone — no gap at all is valid).
+    /// `MAX_GAP_DOTS` (`0` is left alone — no gap at all is valid).
     #[must_use]
     pub fn gap_dots(mut self, dots: usize) -> Self {
         self.gap_dots = dots.min(MAX_GAP_DOTS);
@@ -349,7 +349,7 @@ impl MarqueeStrip {
     /// data, additive, and the *same code* rather than a copy: `window` is
     /// written in terms of this, so the two cannot drift and a test can assert
     /// the published columns against the rendered pixels. The offset wrap, the
-    /// loop gap and the [hold rule](self#short-text-holds) are all resolved
+    /// loop gap and the hold rule are all resolved
     /// here, so a caller never re-implements `(offset + col) % period`.
     ///
     /// [`dot_cell`]: super::dot_cell

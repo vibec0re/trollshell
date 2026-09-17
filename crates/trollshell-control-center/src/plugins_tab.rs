@@ -1241,7 +1241,7 @@ fn probe_plugins_json(env: &hytte_config::xdg::Env) -> Option<PluginsJson> {
     probe_candidates(&plugins_json_candidates(env))
 }
 
-/// The filesystem half of [`probe_plugins_json`]: stat every candidate path
+/// The filesystem half of `probe_plugins_json`: stat every candidate path
 /// in order and return the first that exists, with its stamp.
 ///
 /// Split out of what used to be `probe_plugins_json` itself so
@@ -1271,7 +1271,7 @@ fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
 /// the GTK main thread on every 2 s tick, for the window's whole life and
 /// regardless of which tab was showing — for a file that is a nix-rendered
 /// store symlink and changes only on a rebuild. The cache keeps the parse and
-/// leaves only the [`probe_plugins_json`] stat behind, which is the shape
+/// leaves only the `probe_plugins_json` stat behind, which is the shape
 /// `hytte_config::subsystem::watch` already polls config layers with.
 ///
 /// Caching "there is no file" is deliberate too: that is the common case on a
@@ -1279,7 +1279,7 @@ fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
 /// search path's every candidate any more often than a hit does.
 #[derive(Default)]
 struct DeclaredMounts {
-    /// What the last [`probe_plugins_json`] found — see [`Seen`].
+    /// What the last `probe_plugins_json` found — see [`Seen`].
     seen: Seen,
     /// The last parse. Handed out by `Rc` so a poll's completion closure can
     /// hold it without re-cloning the map.
@@ -1908,7 +1908,7 @@ fn runtime_overlay(
 }
 
 /// A human label for one of the nine wire names
-/// [`hytte_plugin_proto::manifest::Mount::wire_name`] carries, or a stand-in
+/// `hytte_plugin_proto::manifest::Mount::wire_name` carries, or a stand-in
 /// when the host didn't report one. An unrecognised, non-empty wire name (a
 /// future tenth mount this build predates) falls back to the wire name
 /// itself — never "unknown" — the same forward-compat call the wire's own

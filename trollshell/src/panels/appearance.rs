@@ -18,8 +18,8 @@
 //! swaybg's `-m` mode (Fill / Fit / Center / Tile / Stretch) — one mode for
 //! every screen, insensitive with nothing configured to scale (which
 //! `default`/`outputs`/`rotation` can each make true — see
-//! [`anything_configured_to_scale`]) or under a custom reload backend, same
-//! as the Clear button above. See [`scaling_row`].
+//! `anything_configured_to_scale`) or under a custom reload backend, same
+//! as the Clear button above. See `scaling_row`.
 //!
 //! The user picks a file with `gtk::FileDialog`; the service rewrites its state
 //! file, re-derives the swaybg arguments, and restarts (or, on clear, stops)
@@ -31,7 +31,7 @@
 //! configured coordinates the toggle resolves them from a live location fix,
 //! which can take seconds, so the row renders the service's `Pending<bool>`
 //! (`nightlight::state()`) rather than a bare bool: see
-//! [`build_display_group`].
+//! `build_display_group`.
 
 use std::rc::Rc;
 

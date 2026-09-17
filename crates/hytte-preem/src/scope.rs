@@ -133,8 +133,8 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// A scope at the default geometry ([`DEFAULT_COLS`]×[`DEFAULT_ROWS`] at
-    /// [`DEFAULT_SCALE`]) and default [`persistence`](Self::persistence), its
+    /// A scope at the default geometry (`DEFAULT_COLS`×`DEFAULT_ROWS` at
+    /// `DEFAULT_SCALE`) and default [`persistence`](Self::persistence), its
     /// phosphor at rest (a dark screen).
     #[must_use]
     pub fn new() -> Self {
@@ -142,7 +142,7 @@ impl Scope {
     }
 
     /// A scope with an explicit **logical** buffer size (pre-upscale), each
-    /// dimension clamped to `1..=`[`MAX_BUFFER_DIM`]. The rendered frame is
+    /// dimension clamped to `1..=``MAX_BUFFER_DIM`. The rendered frame is
     /// `width`×`scale` by `height`×`scale` px — keep it within the ~296 px
     /// sidebar card (the default is 288 px wide).
     #[must_use]
@@ -159,7 +159,7 @@ impl Scope {
     }
 
     /// Set the integer upscale baked into the output, clamped to
-    /// `1..=`[`MAX_SCALE`] — the kit bakes chunkiness into the buffer rather
+    /// `1..=``MAX_SCALE` — the kit bakes chunkiness into the buffer rather
     /// than leaning on shell CSS (the `.caw-lcd` lesson). A consuming builder;
     /// call it at construction.
     #[must_use]
@@ -171,7 +171,7 @@ impl Scope {
     /// Set the phosphor persistence: 256ths of beam intensity **retained** each
     /// [`advance`](Self::advance) tick (clamped to `0..=256`). Higher is a
     /// longer beam trail; `256` never fades, `0` clears every tick. Default:
-    /// [`DEFAULT_PERSISTENCE`] (`≈0.72`). A consuming builder.
+    /// `DEFAULT_PERSISTENCE` (`≈0.72`). A consuming builder.
     #[must_use]
     pub fn persistence(mut self, retained_256ths: u16) -> Self {
         self.persistence = retained_256ths.min(MAX_PERSISTENCE);

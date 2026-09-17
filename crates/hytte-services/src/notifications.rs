@@ -521,10 +521,10 @@ impl LocalAction {
 /// screenshot toast's Open/Copy callbacks do.
 ///
 /// The `Send` bound exists for **storage**, not dispatch: registered
-/// callbacks live in [`NotificationsShared::local_actions`], a static also
+/// callbacks live in `NotificationsShared::local_actions`, a static also
 /// reached from hytte-tokio worker threads (the auto-expire timer, the
 /// D-Bus `close_notification` method), both of which only ever *drop* an
-/// unclicked callback via [`clear_local_actions`] — never call it. `Send`
+/// unclicked callback via `clear_local_actions` — never call it. `Send`
 /// makes that cross-thread drop legal; it does not promise (and nothing
 /// requires) that the closure itself is safe to *run* off the GTK thread.
 /// A useful corollary: since GTK/GDK objects are not `Send`, a `Send`
@@ -859,7 +859,7 @@ pub fn pause_expiry(id: u32) {
 
 /// Resume notification `id`'s auto-expiry when the pointer leaves its toast
 /// (#567). Only the last hover leaving re-arms the countdown — with the
-/// recorded remainder, floored at [`MIN_RESUME`] so the toast doesn't vanish
+/// recorded remainder, floored at `MIN_RESUME` so the toast doesn't vanish
 /// the instant the pointer leaves. A sticky notification releases its hold with
 /// nothing armed (#619). See [`pause_expiry`] for the threading.
 pub fn resume_expiry(id: u32) {
@@ -952,7 +952,7 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 /// # Rate-limiting
 ///
 /// Identical `(app_name, summary, body)` toasts within
-/// [`POST_LOCAL_RATE_LIMIT`] are dropped so a flapping daemon can't spam the
+/// `POST_LOCAL_RATE_LIMIT` are dropped so a flapping daemon can't spam the
 /// surface.
 ///
 /// No-op if the notifications service isn't registered (e.g. headless tests) —
@@ -976,7 +976,7 @@ pub fn post_local(app_name: &str, summary: &str, body: &str, urgency: Urgency) {
 /// skipped entirely rather than also firing.
 ///
 /// Registered callbacks are swept if the toast closes unclicked (expiry,
-/// dismiss, …) — see [`NotificationsShared::local_actions`].
+/// dismiss, …) — see `NotificationsShared::local_actions`.
 ///
 /// No-op (actions dropped) if the notifications service isn't registered,
 /// mirroring [`post_local`].

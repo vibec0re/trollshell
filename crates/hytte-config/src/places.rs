@@ -819,7 +819,7 @@ fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     Some((meta.modified().ok()?, std::hash::Hasher::finish(&hasher)))
 }
 
-/// Watches `places.toml` for live reload by polling its [`stamp`] — mtime plus
+/// Watches `places.toml` for live reload by polling its `stamp` — mtime plus
 /// a content hash. Remembers the last-seen stamp so a poll only re-reads the
 /// file when it actually moved, and content-checks the reparse so a `touch`
 /// or no-op save doesn't churn a re-resolve.
@@ -1695,7 +1695,7 @@ pub fn check_base(path: &Path, base: &[Place]) -> Result<(), PlacesError> {
 /// i.e. one whose `base` came out of the **layered** reader (#1227 item 2).
 ///
 /// The only difference is the units a zero-places overlay is reported in: see
-/// [`OnDisk::Places`] and [`layered_fallback`]. Everything else, including the
+/// `OnDisk::Places` and `layered_fallback`. Everything else, including the
 /// two data-loss arguments on [`check_base`], is identical.
 ///
 /// # Errors

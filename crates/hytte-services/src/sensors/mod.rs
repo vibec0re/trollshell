@@ -435,7 +435,7 @@ fn per_core_history_of(
     })
 }
 
-/// CPU-load history (fraction 0..=1), `HISTORY_CAP` samples. See [`history_of`].
+/// CPU-load history (fraction 0..=1), `HISTORY_CAP` samples. See `history_of`.
 pub fn cpu_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
     history_of(|h| &h.cpu_hist)
 }

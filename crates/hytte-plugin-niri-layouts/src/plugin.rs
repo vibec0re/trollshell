@@ -232,8 +232,8 @@ pub(crate) fn apply_and_report(
 /// (#1050).
 ///
 /// Built here rather than inline, and delivered through
-/// [`Transport::log`](crate::niri::Transport::log) rather than `eprintln!`
-/// (#1083 review, LOW-2): the log seam is what [`crate::niri::fake::Fake`]
+/// [`Transport::log`] rather than `eprintln!`
+/// (#1083 review, LOW-2): the log seam is what `crate::niri::fake::Fake`
 /// captures, so this line has a test instead of being the only diagnostic in
 /// the call path with no seam — its sibling in
 /// [`crate::niri::apply`] already goes the same way. In production both land on

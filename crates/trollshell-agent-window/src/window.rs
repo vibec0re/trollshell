@@ -7,7 +7,7 @@
 //! half-typed message twice a second, the exact thing the latch exists for —
 //! changed no test. The same hole covered the `NO_PAGE` hint, the banner, the
 //! tab forwarding and the refusal path. `main.rs` is now the command line, the
-//! application and one call into here; [`gtk_tests`] drives [`Window::update`]
+//! application and one call into here; `gtk_tests` drives [`Window::update`]
 //! and asserts what it did.
 
 use std::cell::RefCell;
@@ -285,7 +285,7 @@ impl Window {
     ///
     /// The trust decision is always [`tls::resolve`] here — the only spelling
     /// anything outside `cfg(test)` can produce, since
-    /// [`Window::assemble_with_trust`] is private to this module.
+    /// `Window::assemble_with_trust` is private to this module.
     #[must_use]
     pub fn assemble(
         app: &adw::Application,

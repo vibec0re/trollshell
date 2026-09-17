@@ -90,7 +90,7 @@ enum GrantsAction {
 }
 
 /// `get`'s datasource argument — the three the broker serves. Variant names
-/// map to [`wire`]'s `DATASOURCE_*` constants via [`Datasource::as_wire`],
+/// map to `wire`'s `DATASOURCE_*` constants via [`Datasource::as_wire`],
 /// spelled out explicitly rather than leaned on clap's kebab-case renderer
 /// agreeing by coincidence, the same "written out, not derived" call the
 /// golden-layout proportions make elsewhere in this workspace.

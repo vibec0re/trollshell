@@ -1,5 +1,5 @@
 //! The shader widget's plugin side (#893): a builder for
-//! [`Node::Shader`](crate::proto::Node::Shader), and the negotiation gate that
+//! [`Node::Shader`], and the negotiation gate that
 //! decides whether this host can draw one at all.
 //!
 //! # What a shader widget is
@@ -11,7 +11,7 @@
 //! temperature — is a small array pushed on a timer.
 //!
 //! The interface a body is written against is stated in full on
-//! [`Node::Shader`](crate::proto::Node::Shader) and is the versioned contract:
+//! [`Node::Shader`] and is the versioned contract:
 //! the plugin writes the body **only** (no `#version`, no `in`/`out`, no
 //! `uniform` declarations — the shell prepends all of that), reads `v_uv`,
 //! `u_time`, `u_resolution`, `u_scale`, `u_data`, `u_data_size` and the six
@@ -161,7 +161,7 @@ pub enum ShaderCapRefusal {
         bytes: usize,
     },
     /// `data.len()` is not `width * height * format.bytes_per_texel()` — the
-    /// same invariant a malformed [`Node::Pixels`](crate::proto::Node::Pixels)
+    /// same invariant a malformed [`Node::Pixels`]
     /// buffer trips.
     MalformedData {
         /// What was given.
@@ -247,7 +247,7 @@ impl Shader {
     }
 
     /// The integer upscale hint: the natural size becomes `width*scale` ×
-    /// `height*scale`, exactly as for [`Node::Pixels`](crate::proto::Node::Pixels).
+    /// `height*scale`, exactly as for [`Node::Pixels`].
     /// The value also reaches the shader as `u_scale`.
     #[must_use]
     pub fn scale(mut self, scale: u32) -> Self {
@@ -282,7 +282,7 @@ impl Shader {
     }
 
     /// Hover text (plain, not markup) — see the tooltip section on
-    /// [`Node`](crate::proto::Node).
+    /// [`Node`].
     ///
     /// Honoured: the host puts it on the surface with `set_tooltip_text`, on
     /// build and on change, and a re-render dropping it clears the hover. (It

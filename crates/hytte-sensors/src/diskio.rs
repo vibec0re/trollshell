@@ -22,7 +22,7 @@ const SECTOR_BYTES: u64 = 512;
 /// Read `/proc/diskstats` and return `(name, read_bytes, write_bytes)` —
 /// cumulative-since-boot byte counters — for every **physical whole-disk**
 /// block device. Partitions, loop/ram/zram/device-mapper and other virtual
-/// devices are filtered out (see [`is_physical_disk`]).
+/// devices are filtered out (see `is_physical_disk`).
 pub fn read_proc_diskstats() -> Result<Vec<(String, u64, u64)>, std::io::Error> {
     let text = std::fs::read_to_string("/proc/diskstats")?;
     Ok(parse_diskstats(&text))

@@ -411,7 +411,7 @@ pub fn parse_response(text: &str) -> Result<String, Failure> {
 /// Map a non-2xx onto the status the client should see, with the endpoint's own
 /// message in the text.
 ///
-/// The statuses line up with [`crate::backend::map_error`]'s so a plugin sees
+/// The statuses line up with `crate::backend::map_error`'s so a plugin sees
 /// one failure vocabulary whichever backend answered: 429 stays 429, an
 /// overflow is [`OVERFLOW_STATUS`], and everything the operator has to fix is a
 /// 502 that names the fix.

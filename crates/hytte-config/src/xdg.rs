@@ -23,7 +23,7 @@
 //!
 //! # Precedence, and why the base dirs are reversed
 //!
-//! The XDG spec orders `XDG_CONFIG_DIRS` **most important first**. [`merge_all`]
+//! The XDG spec orders `XDG_CONFIG_DIRS` **most important first**. `merge_all`
 //! (see [`crate::merge`]) applies layers left to right with the later one
 //! winning, so [`Env::config_layers`] hands back the search path *reversed* —
 //! lowest precedence first — with the overlay last. Getting that backwards
@@ -128,7 +128,7 @@ impl Env {
 
     /// `$XDG_CONFIG_HOME`, else `$HOME/.config`. `None` when neither is set.
     ///
-    /// A relative `$XDG_CONFIG_HOME` (or `$HOME`, via [`Env::home`]) is
+    /// A relative `$XDG_CONFIG_HOME` (or `$HOME`, via `Env::home`) is
     /// invalid per spec and falls back to the default the same as an unset
     /// one (#985).
     #[must_use]
@@ -143,7 +143,7 @@ impl Env {
 
     /// `$XDG_STATE_HOME`, else `$HOME/.local/state`. `None` when neither is set.
     ///
-    /// A relative `$XDG_STATE_HOME` (or `$HOME`, via [`Env::home`]) is
+    /// A relative `$XDG_STATE_HOME` (or `$HOME`, via `Env::home`) is
     /// invalid per spec and falls back to the default the same as an unset
     /// one (#985).
     #[must_use]
@@ -168,7 +168,7 @@ impl Env {
     ///
     /// If every entry is dropped this way — an all-relative or all-blank
     /// `$XDG_CONFIG_DIRS` — the result falls back to
-    /// [`DEFAULT_CONFIG_DIRS`] rather than an empty search path: the
+    /// `DEFAULT_CONFIG_DIRS` rather than an empty search path: the
     /// nix-written base layer must not silently vanish just because the rest
     /// of the variable was garbage, the same principle behind treating an
     /// empty variable as unset.

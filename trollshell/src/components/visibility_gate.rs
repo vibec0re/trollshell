@@ -5,7 +5,7 @@
 //! `Mutable<bool>` per gate, a recompute step that walks live state and calls
 //! `set` only when the value actually changed (so subscribers — typically a
 //! service's `set_active`, parking an always-on poller — don't get redundant
-//! wakeups), and a signal for the wiring site (via [`GateRegistry::mutable`]'s
+//! wakeups), and a signal for the wiring site (via `GateRegistry::mutable`'s
 //! `.signal()`). `modal.rs` used to hand-roll this three times over
 //! (`NETCONN_VISIBLE`/`STATS_VISIBLE`/
 //! `MEDIA_VISIBLE`, each with its own `recompute_*_visible` function) — this

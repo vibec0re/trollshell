@@ -5,18 +5,18 @@
 //!
 //! | caller | what it launches |
 //! | --- | --- |
-//! | [`plugin_launcher`](crate::plugin_launcher) | a widget plugin, supervised, `PartOf=` the session target (#419) |
-//! | [`plugins::effects`](crate::plugins::effects) | a plugin's detached `RunCommand`, in `trollshell-launch.slice` (#953) |
+//! | `plugin_launcher` | a widget plugin, supervised, `PartOf=` the session target (#419) |
+//! | `plugins::effects` | a plugin's detached `RunCommand`, in `trollshell-launch.slice` (#953) |
 //! | [`panels::workspaces`](crate::panels::workspaces) | an app of a workspace stack, in `trollshell-ws-<name>.slice` (#1071) |
 //!
 //! Annika's call on #1071 (2026-09-10): *"You should consider generalizing on
 //! this. Looks like this will be launching more than plugins."* So the flag
-//! vocabulary lives here once, in [`Launch`], and the two pre-existing callers
+//! vocabulary lives here once, in `Launch`, and the two pre-existing callers
 //! render through it rather than beside it.
 //!
 //! # The one invariant this module exists to enforce (#984)
 //!
-//! **[`args`] is private and [`command`] is the only way out.**
+//! **`args` is private and `command` is the only way out.**
 //!
 //! A secret must never reach `systemd-run`'s argv: `/proc/<pid>/cmdline` is
 //! `0444` (any local user) while `/proc/<pid>/environ` is `0400` (owner only).
@@ -36,7 +36,7 @@
 //! is a compile error rather than a passing test.
 //!
 //! Generalising had to carry that rule across intact, not merely re-describe
-//! it. It does: [`args`] has no visibility modifier, so it is private to this
+//! it. It does: `args` has no visibility modifier, so it is private to this
 //! module, and `plugin_launcher`'s old `mod invocation` is gone rather than
 //! duplicated.
 //!
@@ -55,7 +55,7 @@
 //!
 //! The plugin launcher passes no slice and, since #1098, four properties
 //! (three at the #1071 phase 2 move, plus `TimeoutStopSec` — see
-//! [`PLUGIN_TIMEOUT_STOP`]); the detached launcher passes a slice and no
+//! `PLUGIN_TIMEOUT_STOP`); the detached launcher passes a slice and no
 //! properties; neither carries both, so the two old orders are the same order
 //! with one of the optional groups empty.
 

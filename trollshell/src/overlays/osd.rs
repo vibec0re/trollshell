@@ -190,7 +190,7 @@ pub fn install(monitor: &Monitor) {
 /// Close every OSD surface, abort its per-monitor `drawer_open_signal`
 /// subscription, cancel any pending hide/fade timers, and drop the
 /// per-monitor entries. Called before rebuilding on monitor hot-plug so a
-/// vanished output's `OsdView` doesn't linger in [`OSDS`] — otherwise
+/// vanished output's `OsdView` doesn't linger in `OSDS` — otherwise
 /// `route_show`'s `map.values().next()` fallback could pop an OSD on a dead
 /// surface, and the un-aborted drawer subscription would leak per rebuild.
 ///
@@ -450,7 +450,7 @@ fn route_show(state: &State) {
 /// (any plugin, via the host effect broker) computes the display strings and
 /// the shell just shows them. `title`
 /// fills the bold `.ts-osd-label` line, `body` the `.ts-osd-value` readout, and
-/// `icon` names a symbolic icon (defaulting to [`LEAVE_BY_ICON`] when `None`).
+/// `icon` names a symbolic icon (defaulting to `LEAVE_BY_ICON` when `None`).
 /// Routed onto the focused output like every other kind, with the longer
 /// leave-by dwell. GTK-main-thread-only (the effect broker runs there).
 pub fn nudge(title: &str, body: &str, icon: Option<&str>) {

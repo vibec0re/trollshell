@@ -9,7 +9,7 @@
 //!
 //! * [`history()`] — `Signal<Vec<ClipEntry>>`, the most-recent N entries
 //!   from `cliphist list`. Empty until [`refresh()`] is called.
-//! * [`paste_entry(id)`] — fire-and-forget. Pipes `cliphist decode <id>`
+//! * `paste_entry(id)` — fire-and-forget. Pipes `cliphist decode <id>`
 //!   into `wl-copy` so the entry becomes the active clipboard payload.
 //! * [`refresh()`] — re-runs `cliphist list` and updates the signal.
 //!
@@ -24,7 +24,7 @@
 //!
 //! Delete by id is supported via [`delete`]. Implementation pipes the
 //! bare id into `cliphist delete` — one subprocess call per delete (see
-//! [`run_delete_by_id`] for why a bare id is sufficient; #742 has the
+//! `run_delete_by_id` for why a bare id is sufficient; #742 has the
 //! full writeup).
 //!
 //! No clip pinning, no search/filter UI, no multi-select, no rich-format
@@ -155,7 +155,7 @@ pub fn paste_entry(id: u64) {
 }
 
 /// Delete a history entry by id. Pipes the bare id into `cliphist
-/// delete` (see [`run_delete_by_id`]), and updates the [`history()`]
+/// delete` (see `run_delete_by_id`), and updates the [`history()`]
 /// signal so the row disappears from an open drawer.
 ///
 /// # Why this doesn't just call [`refresh()`]
@@ -181,7 +181,7 @@ pub fn paste_entry(id: u64) {
 ///    reflects ground truth, and self-heals: if the delete actually
 ///    failed, the entry reappears rather than staying optimistically gone.
 ///
-/// Phase 1 is safe to do from a GTK callback: [`bind`](hytte_reactive::bind)
+/// Phase 1 is safe to do from a GTK callback: [`bind`](hytte_reactive::bind())
 /// drives subscribers from a `glib::MainContext` task, so `set()` wakes the
 /// apply-loop rather than polling it inline — the row rebuild lands on a
 /// later main-loop iteration, after the click handler has returned.

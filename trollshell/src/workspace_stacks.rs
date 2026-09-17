@@ -6,7 +6,7 @@
 //! None of it is GTK. A Start runs on the tokio runtime — it opens niri sockets,
 //! calls the user manager and waits out a grace window — and the registry the
 //! page's signals live in is thread-local to the GTK main thread, so a
-//! transaction cannot read them. It publishes into [`starting`] instead, a
+//! transaction cannot read them. It publishes into `starting` instead, a
 //! process-global `Mutable` the page binds to, which is the ordinary
 //! handles-from-work split (`hytte-reactive`'s module doc) with the handle
 //! living here rather than in a service, because in-flight Starts are the
@@ -14,11 +14,11 @@
 //!
 //! # The seam
 //!
-//! Everything the transactions need from the world is [`Ops`], and every
-//! *decision* is a pure function over a snapshot ([`plan_start`],
-//! [`stop_plan`], [`state_of`], [`stray_moves`]). That split is what lets
+//! Everything the transactions need from the world is `Ops`, and every
+//! *decision* is a pure function over a snapshot (`plan_start`,
+//! `stop_plan`, `state_of`, `stray_moves`). That split is what lets
 //! #1071 §7's Start and Stop mutations be falsified without a compositor: the
-//! pure planners answer "what would this do", and [`start`]/[`stop`] over a
+//! pure planners answer "what would this do", and `start`/`stop` over a
 //! scripted `Ops` answer "and in what order, and what did it check first".
 
 use std::cell::RefCell;

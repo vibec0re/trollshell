@@ -68,7 +68,7 @@ struct ProxyInner {
 
 /// Handle on a live proxy that survives bus reconnects. Cloning is cheap and
 /// does not cancel; dropping the last clone tears down the background watcher
-/// task (push-based, via [`HandleTracker`]).
+/// task (push-based, via `HandleTracker`).
 pub struct BusProxy {
     inner: Arc<ProxyInner>,
     tracker: Arc<HandleTracker>,

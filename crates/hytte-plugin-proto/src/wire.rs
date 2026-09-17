@@ -245,18 +245,18 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 ///
 /// - **[`Row`](Node::Row) had no `spacing`**, so its children butted up against
 ///   each other (`⚙argus`) unless the plugin padded with [`Spacer`](Node::Spacer)s.
-///   Fixed by [`Row::spacing`](Node::Row#structfield.spacing), an additive
+///   Fixed by [`Row::spacing`](Node::Row), an additive
 ///   `u16` (`0` = the old behaviour), mapped to `gtk_box_set_spacing`.
 ///   [`Box`](Node::Box) already carried a `spacing`, so it is untouched.
 /// - **[`ListBox`](Node::ListBox) auto-wraps every child** in a `GtkListBoxRow`,
 ///   which carries libadwaita's row min-height — most of the ~700 px a 12-row
-///   card took. Fixed by [`ListBox::dense`](Node::ListBox#structfield.dense), an
+///   card took. Fixed by [`ListBox::dense`](Node::ListBox), an
 ///   additive `bool` that has the host drop that floor.
 /// - **There was no viewport at all.** See the next section.
 ///
 /// # `Box { scroll }` is an event target, **not** a viewport
 ///
-/// [`Box::scroll`](Node::Box#structfield.scroll) makes the box a *source of
+/// [`Box::scroll`](Node::Box) makes the box a *source of
 /// scroll events*: the host attaches a `GtkEventControllerScroll` and forwards
 /// raw wheel deltas as [`EventKind::Scroll`], for a plugin that wants to treat
 /// the wheel as an input (step a value, page a list it re-renders itself). It
@@ -275,7 +275,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// stay put — the crate root's rules put an optional field
 /// (`#[serde(default)]` + `#[serde(skip_serializing_if = …)]`) on the
 /// same-version side, and the `VOCAB` rule is scoped to *appending a wire
-/// variant*. Their `skip_serializing_if` ([`is_default`]) keeps the pre-#966
+/// variant*. Their `skip_serializing_if` (`is_default`) keeps the pre-#966
 /// value off the wire entirely, which is why every committed golden fixture that
 /// predates them is byte-identical.
 ///
@@ -384,7 +384,7 @@ pub enum Node {
     ///
     /// This is the vocabulary's only way for a plugin to bound its own card.
     /// GTK CSS has no `max-height`, and
-    /// [`Box::scroll`](Node::Box#structfield.scroll) is an *event target* that
+    /// [`Box::scroll`](Node::Box) is an *event target* that
     /// neither clips nor scrolls — so before this variant a long list inside a
     /// card grew without limit and pushed everything below it off the surface.
     ///
@@ -464,7 +464,7 @@ pub enum Node {
     ///   `GtkScrolledWindow`'s own minimum — changing how existing cards behave
     ///   under pressure;
     /// - put a scroll-**consuming** widget in front of
-    ///   [`Box::scroll`](Node::Box#structfield.scroll)'s controller, i.e. break
+    ///   [`Box::scroll`](Node::Box)'s controller, i.e. break
     ///   the one meaning that flag has.
     ///
     /// A separate variant costs an old shell nothing (above) and names the thing
@@ -786,7 +786,7 @@ pub enum Node {
     },
     /// A **preem retro-display widget** rendered shell-side from typed state
     /// rather than shipped as pixels (#882, epic #881) — see the
-    /// [`preem`](crate::preem) module for the whole vocabulary, the
+    /// [`preem`](mod@crate::preem) module for the whole vocabulary, the
     /// config-vs-state contract, and the animation-ownership rules.
     ///
     /// One wrapper variant carrying a [`PreemWidget`], not eight flat `Node`
@@ -852,7 +852,7 @@ pub enum Node {
     /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello), and rasterises to
     /// [`Pixels`](Node::Pixels) otherwise. That is what makes a preem-capable
     /// plugin work unchanged against a shell that has never heard of preem
-    /// nodes — see the [`preem` module docs](crate::preem#compat-contract) for
+    /// nodes — see the [`preem` module docs](mod@crate::preem#compat-contract) for
     /// the full compat matrix.
     ///
     /// Additive: a brand-new name-tagged variant, so every existing frame

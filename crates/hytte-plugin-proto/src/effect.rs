@@ -2,7 +2,7 @@
 //!
 //! An [`Effect`] is something a plugin *requests* on its render frame; the host
 //! matches each to a real `do_thing` command and gates it on the plugin's
-//! granted [`Capability`](crate::manifest::Capability) set. The plugin never
+//! granted [`Capability`] set. The plugin never
 //! touches D-Bus / niri directly. These are wire-side mirrors of the host's
 //! command surfaces; the host maps them (PR 2) — this crate stays GTK-free and
 //! host-free.
@@ -305,11 +305,11 @@ pub enum Effect {
     /// For a plugin that **declares the capability it emits**, that never
     /// happens, and the reason is the capability rather than the counter: the
     /// host drops any effect whose gating capability the manifest did not name
-    /// (see [`Capability`](crate::manifest::Capability)), and
+    /// (see [`Capability`]), and
     /// `Capability::OpenUri` is *itself* a variant a pre-#1045 host cannot
     /// decode — so such a plugin is dropped at `Register` with a handshake-read
     /// warn, before it can send a render frame. **Declare
-    /// [`Capability::OpenUri`](crate::manifest::Capability::OpenUri) whenever
+    /// [`Capability::OpenUri`] whenever
     /// you emit this**: emitting it without declaring it is a plugin bug that
     /// costs you a silently-dead click on a current host and the #437
     /// crash-loop on an older one. See [`OPEN_URI_VOCAB`] for why that residual
@@ -566,7 +566,7 @@ mod tests {
 }
 
 /// The [`VOCAB`](crate::VOCAB) generation that carries the open-a-link intent
-/// ([`Effect::OpenUri`] + [`Capability::OpenUri`](crate::manifest::Capability::OpenUri))
+/// ([`Effect::OpenUri`] + [`Capability::OpenUri`])
 /// — #1045.
 ///
 /// **Census-only**, like [`SHADER_VOCAB`](crate::wire::SHADER_VOCAB),
@@ -590,7 +590,7 @@ mod tests {
 /// unconditional counter exists to catch — an old host silently failing to
 /// decode a *render* frame, redialing, and crash-looping — cannot arise. An
 /// [`Effect`] only reaches a host's broker from a plugin that declared the
-/// gating [`Capability`](crate::manifest::Capability) (the host drops every
+/// gating [`Capability`] (the host drops every
 /// other effect), and `Capability::OpenUri` is itself a variant a pre-#1045 host
 /// cannot decode — so that plugin's `Register` frame fails to decode and the
 /// connection is dropped at the handshake, loudly, before any render frame
@@ -629,7 +629,7 @@ mod tests {
 ///
 /// The price for a *correct* plugin is the one every appended capability has
 /// paid since the first (stated on
-/// [`Capability::Shader`](crate::manifest::Capability::Shader)): declaring
+/// [`Capability::Shader`]): declaring
 /// `OpenUri` costs compatibility with a pre-#1045 host, which drops the
 /// connection with a `plugin handshake read failed` warn naming the undecodable
 /// variant.

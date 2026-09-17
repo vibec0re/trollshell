@@ -64,7 +64,7 @@
 //!
 //! `ureq::Config::default()` resolves `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`
 //! (`NO_PROXY` respected) the same way every other `ureq` call in this crate
-//! does — [`fetch`] sets no proxy of its own and does nothing to opt out. TLS
+//! does — `fetch` sets no proxy of its own and does nothing to opt out. TLS
 //! to `api.anthropic.com` stays end-to-end under rustls, so a configured proxy
 //! sees a `CONNECT` and never the bearer: the same position
 //! [`crate::envguard`] already takes for `HTTPS_PROXY` on the `claude` child.
@@ -77,7 +77,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-/// The API host the usage endpoint lives on. A parameter of [`fetch`] rather
+/// The API host the usage endpoint lives on. A parameter of `fetch` rather
 /// than a constant it reaches for, so a test can point it at a
 /// `std::net::TcpListener` serving a canned body — there is deliberately **no**
 /// environment override, because an env knob on an endpoint that spends a bearer
@@ -297,11 +297,11 @@ pub enum UsageError {
     /// 401 or 403 — the token expired (they last hours) or was revoked. **Not**
     /// a signal to refresh: `claude` owns that rotation.
     Unauthorized,
-    /// Any other non-2xx. [`fetch`] reports a 429 through this arm too — it
+    /// Any other non-2xx. `fetch` reports a 429 through this arm too — it
     /// carries no schedule of its own, so this is what a raw fetch call sees.
     Http(u16),
     /// A 429, **after** [`next_wait`] has picked how long to wait before
-    /// trying again. Never constructed by [`fetch`] (which reports a 429 as
+    /// trying again. Never constructed by `fetch` (which reports a 429 as
     /// plain [`Http`](Self::Http)) — only [`advance`] promotes one to this,
     /// since it is the one place that knows the wait. Carries the **deadline**
     /// it actually chose (`at + wait`, Unix seconds) rather than the wait
@@ -467,7 +467,7 @@ pub fn fetch(base_url: &str, credentials_path: &Path) -> Result<Usage, UsageErro
     fetch_with_retry_after(base_url, credentials_path).0
 }
 
-/// [`fetch`]'s logic, also returning the response's `Retry-After` header
+/// `fetch`'s logic, also returning the response's `Retry-After` header
 /// (#1283) parsed to a [`Duration`] when the server sent one — read
 /// regardless of status, though only [`poll_forever`] ever looks at it, and
 /// only for a 429.

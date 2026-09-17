@@ -108,7 +108,7 @@ pub fn cell_x0(i: usize) -> usize {
 }
 
 /// The peak-hold dot's **cap colour** for a palette ink: the ink mixed
-/// [`CAP_MIX`]/255 of the way toward white, so the dot reads brighter than the
+/// `CAP_MIX`/255 of the way toward white, so the dot reads brighter than the
 /// lit level even on a glow-free skin.
 ///
 /// `render` calls it, so this is the definition and not a copy (#1153).

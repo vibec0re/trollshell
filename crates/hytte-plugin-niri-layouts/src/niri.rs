@@ -11,7 +11,7 @@
 //! column's *width*, not anything niri reflows the workspace layout for, so a
 //! column sitting flush against the old edge is left exactly where it was —
 //! partly off screen once the widths around it change. All the deciding lives
-//! in [`layout`](crate::layout); this module only moves bytes (plus one debug
+//! in [`layout`]; this module only moves bytes (plus one debug
 //! line, #1052, for when the width resolution comes back empty).
 //!
 //! The [`Transport`] indirection is what makes the whole path testable: the
@@ -33,7 +33,7 @@ pub(crate) trait Transport {
     fn send(&mut self, request: Request) -> Result<Reply, String>;
 
     /// Where a diagnostic that isn't a niri error goes — real stderr for
-    /// [`SocketTransport`], captured into [`fake::Fake::logs`] for the tests
+    /// [`SocketTransport`], captured into `fake::Fake::logs` for the tests
     /// below (#1056 review, LOW-1). The only diagnostic today is
     /// [`apply`]'s Golden missing-width fallback; this seam is what lets a
     /// test assert it was emitted without piping the process's real stderr

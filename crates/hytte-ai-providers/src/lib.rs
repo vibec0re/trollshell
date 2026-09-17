@@ -35,7 +35,7 @@
 //!
 //! A base URL may also name a **Unix socket** (`unix://…`, #993) — that is how
 //! `hytte-claude-bridge` is reached since it stopped listening on a uid-blind
-//! loopback port. Same HTTP, same request bytes, different socket; see [`unix`]
+//! loopback port. Same HTTP, same request bytes, different socket; see `unix`
 //! for the URL shape and [`BRIDGE_BASE_URL`] for the canonical value.
 
 mod unix;
@@ -253,7 +253,7 @@ struct ChatChoiceMessage {
 /// TCP socket — everything above the socket, request bytes included, is
 /// unchanged. A socket URL that cannot be resolved is an `Err` naming why;
 /// there is deliberately **no** fall back to a loopback port, because that is
-/// the uid-blind reachability #993 closed. See [`unix`].
+/// the uid-blind reachability #993 closed. See `unix`.
 ///
 /// [`UnixStream`]: std::os::unix::net::UnixStream
 ///

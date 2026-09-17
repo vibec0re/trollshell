@@ -10,7 +10,7 @@
 //!
 //! - **Face** (`face.rs`): a procedural 128×128 LCD corvid — 7 moods, glowing
 //!   chaos eyes scaled by her `chaos_level`, drawn as a
-//!   [`Node::Pixels`](hytte_plugin::proto::Node::Pixels) the host upscales for the
+//!   [`Node::Pixels`] the host upscales for the
 //!   8-bit look.
 //! - **Speech** (`speech.rs`): rendered in the **preem** raster kit's pixel
 //!   font (#368) — a [`Node::Pixels`] in caw's violet palette, so her line
@@ -25,7 +25,7 @@
 //!   the host shares it), composed through [`hytte_ai_providers`] in her voice
 //!   (or a plain template, keyless), delivered sticky in the bubble until
 //!   poked and mirrored as a toast
-//!   ([`Effect::Notify`](hytte_plugin::proto::Effect::Notify)).
+//!   ([`Effect::Notify`]).
 //!
 //! Environment: `CAW_EXPRESSION_PATH` (default
 //! `~/.local/state/caw/expression.json`) — the file opencaw writes; plus the

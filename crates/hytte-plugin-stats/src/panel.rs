@@ -44,9 +44,9 @@
 //! | "Clock" row (`fmt_hz`) | a plain reading, `hytte_sensors::read_cpu_freq`; hidden with no `cpufreq` governor, same as native |
 //! | memory / swap `GtkProgressBar` | a [`LedStrip`](hytte_plugin::display::LedStrip) apiece, with the exact `used / total (pct%)` text beside it |
 //! | GPU load (a text suffix natively) | a [`Gauge`](hytte_plugin::display::Gauge) — the one place this page is *more* than the native one, and P1's own choice |
-//! | "GPU VRAM" history row | a [`Scope`]; hidden unless both used+total VRAM are reported, same as native |
+//! | "GPU VRAM" history row | a `Scope`; hidden unless both used+total VRAM are reported, same as native |
 //! | per-mount `GtkProgressBar` | [`Node::Progress`] with the shell's own `ts-stat-progress` class |
-//! | "Disk I/O" history row | a [`Scope`], auto-scaled against the peak rate this session has seen rather than the native row's windowed max (a named simplification, `card::Widgets::disk_io`'s doc) |
+//! | "Disk I/O" history row | a `Scope`, auto-scaled against the peak rate this session has seen rather than the native row's windowed max (a named simplification, `card::Widgets::disk_io`'s doc) |
 //! | Top apps · CPU / RAM | **not drawn** — shell-only, see above |
 //!
 //! **Why the mounts are `Node::Progress` and not a strip each.** #1251 asks for

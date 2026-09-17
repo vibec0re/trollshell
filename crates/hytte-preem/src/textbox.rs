@@ -104,7 +104,7 @@ impl TextBox {
         Self::new().colors(p.bg, p.ink, notdef)
     }
 
-    /// Wrap width in glyph cells, clamped to `1..=`[`MAX_TEXT_COLS`].
+    /// Wrap width in glyph cells, clamped to `1..=``MAX_TEXT_COLS`.
     #[must_use]
     pub fn cols(mut self, cols: usize) -> Self {
         self.width = WidthSpec::Cols(cols.clamp(1, MAX_TEXT_COLS));
@@ -114,7 +114,7 @@ impl TextBox {
     /// Pick the widest wrap width whose rendered box — padding included —
     /// still fits `px` **final** pixels, i.e. after [`scale`](Self::scale)
     /// (order-independent: the budget is resolved at render time). Capped at
-    /// [`MAX_BUFFER_DIM`] (`0` is left alone — it resolves to the narrowest
+    /// `MAX_BUFFER_DIM` (`0` is left alone — it resolves to the narrowest
     /// wrap, not an error).
     #[must_use]
     pub fn fit_px(mut self, px: usize) -> Self {
@@ -122,7 +122,7 @@ impl TextBox {
         self
     }
 
-    /// Hard cap on wrapped lines, clamped to `1..=`[`MAX_TEXT_LINES`];
+    /// Hard cap on wrapped lines, clamped to `1..=``MAX_TEXT_LINES`;
     /// overflow is truncated with a trailing `…`.
     #[must_use]
     pub fn max_lines(mut self, lines: usize) -> Self {
@@ -131,7 +131,7 @@ impl TextBox {
     }
 
     /// Field padding around the text block, in pre-scale pixels, capped at
-    /// [`MAX_PAD`] (`0` is left alone — it is added to **both** dimensions, so
+    /// `MAX_PAD` (`0` is left alone — it is added to **both** dimensions, so
     /// an uncapped pad would inflate the buffer quadratically all on its own).
     #[must_use]
     pub fn pad(mut self, pad: usize) -> Self {
@@ -140,7 +140,7 @@ impl TextBox {
     }
 
     /// Radius of the rounded-corner cut (to transparent), in pre-scale
-    /// pixels, capped at [`MAX_CORNER`]; `0` keeps the box fully opaque to its
+    /// pixels, capped at `MAX_CORNER`; `0` keeps the box fully opaque to its
     /// square corners.
     #[must_use]
     pub fn corner(mut self, corner: usize) -> Self {
@@ -148,7 +148,7 @@ impl TextBox {
         self
     }
 
-    /// Integer upscale baked into the buffer, clamped to `1..=`[`MAX_SCALE`]
+    /// Integer upscale baked into the buffer, clamped to `1..=``MAX_SCALE`
     /// (chunkier pixels; see the `preem` docs on sizing).
     #[must_use]
     pub fn scale(mut self, scale: usize) -> Self {

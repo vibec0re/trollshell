@@ -555,7 +555,7 @@ impl PixelSurface {
     /// **A frame identical to the one already displayed does nothing at all**
     /// (#902) — no `Bytes`, no texture, no `queue_draw` — and so does a repeat
     /// of an empty or inconsistent buffer once the surface is already rendering
-    /// nothing. See the [module docs](self) for what "identical" means and what
+    /// nothing. See the module docs for what "identical" means and what
     /// the guard costs on the changed path. `data` is copied once into a shared
     /// allocation; a caller that already has one should use
     /// [`set_pixels_shared`](Self::set_pixels_shared) instead.

@@ -105,7 +105,7 @@
 //!   [`crate::merge::malformed_locked`] finds it and [`assemble`] warns
 //!   **naming the layer file** ([`FindingKind::MalformedLocked`]);
 //! * an override the lock refused is warned about once, naming the subsystem,
-//!   the key and the file to go and edit ([`shadowed_message`],
+//!   the key and the file to go and edit (`shadowed_message`,
 //!   [`FindingKind::ShadowedLockedKey`]) — a *value* being dropped, which is
 //!   the one thing here that is not a marker doing nothing, so it is the one
 //!   with a sentence of its own.
@@ -255,7 +255,7 @@ pub trait Subsystem: serde::de::DeserializeOwned {
     ///
     /// One [`env::key`] call per migrated variable, so a set variable wins and
     /// announces once and an unusable one costs exactly one line. See
-    /// [`env`]'s module doc for why this is a hand-written fan-out rather than
+    /// [`mod@env`]'s module doc for why this is a hand-written fan-out rather than
     /// a table of homogeneous triples.
     ///
     /// The default is "there is no environment to layer" — the right answer for
@@ -454,7 +454,7 @@ pub enum FindingKind {
 /// [`crate::merge`] never sees a file name (its module docs lean on that), so
 /// this type — not [`crate::merge::MalformedUnset`]/[`crate::merge::InertUnset`]
 /// themselves — is where the layer is attached: `assemble` already has the
-/// `Option<&Path>` in hand at both push sites (it only needs [`layer_name`]'s
+/// `Option<&Path>` in hand at both push sites (it only needs `layer_name`'s
 /// rendering for the `warn!` field), and hands the same value to `Finding`.
 ///
 /// `#[non_exhaustive]`: every construction site is inside this crate; use
@@ -469,7 +469,7 @@ pub struct Finding {
     /// `"the built-in default"` was type-identical to a real path, so a
     /// caller had no way back to a `PathBuf` and no way to tell "our bug"
     /// from "your file" without matching on English). `Option<PathBuf>`
-    /// mirrors [`layer_name`]'s own parameter type and lets a settings UI
+    /// mirrors `layer_name`'s own parameter type and lets a settings UI
     /// compare this against [`Loaded::sources`] or open the file directly.
     pub layer: Option<PathBuf>,
     /// Dotted path: the marker's own path for [`FindingKind::MalformedUnset`]
@@ -531,7 +531,7 @@ pub struct Loaded<S> {
     /// on `unknown_keys` (#1018).
     ///
     /// Named for what it actually holds, not for "everything `assemble`
-    /// diagnoses" (#1018 review L-2): [`REQUIRED_TABLE_MESSAGE`] (#1088, a
+    /// diagnoses" (#1018 review L-2): `REQUIRED_TABLE_MESSAGE` (#1088, a
     /// table the schema refuses to drop) and [`warn_rejected_value`] (#1040,
     /// a per-key value rejection, raised one level up in the load path) are
     /// warned exactly the same way and are **not** in this `Vec`. Add a field
@@ -583,7 +583,7 @@ impl<S> Loaded<S> {
     /// would take the locked leaf with it. The two predicates therefore
     /// disagree about a table, deliberately, and the save path is right to use
     /// this one: [`render_overlay_locking`] filters *per path* through
-    /// [`locked_here`], so it writes the unlocked subset key by key and never
+    /// `locked_here`, so it writes the unlocked subset key by key and never
     /// emits the whole-table scalar the merge would refuse.
     #[must_use]
     pub fn is_locked(&self, path: &str) -> bool {
@@ -802,7 +802,7 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 ///
 /// Rule 2's reader-side corollary — a table carrying no key the schema owns
 /// reads as absent, so an `Option<Table>` over it is `None` (#1025) — is
-/// applied here, by [`read_merged`], which carries the argument.
+/// applied here, by `read_merged`, which carries the argument.
 ///
 /// # Errors
 /// [`ConfigError::Parse`] for a layer that is not TOML, [`ConfigError::Schema`]
@@ -1842,7 +1842,7 @@ fn patch(
 /// A [`crate::merge::UNSET_KEY`] marker survives a save. Not because
 /// [`serde_ignored`] reports it as a key the schema does not know — it cannot,
 /// the merge eats the marker before the schema is ever shown the table — but
-/// because [`collect_paths`] excludes it by name, so the stale sweep never
+/// because `collect_paths` excludes it by name, so the stale sweep never
 /// counts it as schema-owned (#990).
 ///
 /// It also stays *correct*, in both of the two cases there are. When the value
@@ -1855,7 +1855,7 @@ fn patch(
 /// next load.
 ///
 /// **The two shapes that used to lose it (#1008), and what they do now.** Both
-/// were about [`patch`] losing the *table* rather than the marker:
+/// were about `patch` losing the *table* rather than the marker:
 ///
 /// 1. **The table spelled inline.** `patch` used to recurse only into
 ///    [`toml_edit::Item::is_table`], which is false for
@@ -1869,7 +1869,7 @@ fn patch(
 ///    and a writer whose whole argument is "do not rewrite bytes you were not
 ///    asked to" has no business promoting it.
 /// 2. **A schema field of type `Option<Table>` gone to `None`.** The stale
-///    sweep matched the *table's* own path, which [`collect_paths`] correctly
+///    sweep matched the *table's* own path, which `collect_paths` correctly
 ///    still inserts (the table is schema-owned even though the marker inside it
 ///    is not), so `doc.remove` took the whole `[core]` block. It now sweeps the
 ///    keys the schema owns *out of* that table — recursively — and keeps
@@ -1897,7 +1897,7 @@ fn patch(
 /// save after that reload wrote `brightness = 0, color = ""` into the file.
 ///
 /// That was a **reader** hole, not a writer one, which is why the fix is
-/// [`read_merged`]'s rule (#1025) and not a patch here: a table carrying no
+/// `read_merged`'s rule (#1025) and not a patch here: a table carrying no
 /// key the schema owns reads as absent. With both halves in place a `None`
 /// round-trips — the second save of an erased table is byte-identical to the
 /// first, which
@@ -2107,7 +2107,7 @@ pub fn save_overlay_to<S: Subsystem + serde::Serialize>(
 /// A not-yet-existing file is seeded with [`Subsystem::DEFAULT_TOML`] as
 /// [`save_overlay_to`] documents, but — unlike that plain spelling, which has
 /// no lock set to consult — the seed is filtered through
-/// [`seed_without_locked`] first: a locked key's default line has no business
+/// `seed_without_locked` first: a locked key's default line has no business
 /// in a file the operator never typed at all (#1333).
 ///
 /// # Errors

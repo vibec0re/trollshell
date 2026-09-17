@@ -109,11 +109,11 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// above the built-in weather/calendar/tasks cards, so a plugin here leads the
 /// sidebar (#301).
 ///
-/// Every [`build_region`] call site here passes `monitor.connector()`
+/// Every `build_region` call site here passes `monitor.connector()`
 /// straight through (no more `named_connector` fold, #1177):
 /// `hytte_ui::Monitor::connector` itself folds an empty connector name to
 /// `None` since #1180 item 6, so a region can no longer see `Some("")` — the
-/// exact case this module's own doc on [`build_region`] and
+/// exact case this module's own doc on `build_region` and
 /// [`HostMsg::Event::output`]'s wire doc in `hytte-plugin-proto` promise
 /// plugins a clean `None` for.
 #[must_use]
@@ -790,7 +790,7 @@ fn empty_panel() -> UiNode {
 /// The per-monitor plugin drawer child (#349 PR2): a `.ts-plugin-panel` root
 /// `gtk::Box` over an inner `.ts-plugin-canvas` box — *two* boxes, since #903 —
 /// whose content is the **active** plugin's `panel` tree. The reconciler mounts
-/// into the inner one so the root stays freeable; see [`build_panel_child`] for
+/// into the inner one so the root stays freeable; see `build_panel_child` for
 /// why that level of indirection is load-bearing. One instance
 /// lives in each monitor's drawer stack under the fixed `PLUGIN_STACK_CHILD`
 /// name (see `modal.rs`); all mirror the same active panel — exactly how sidebar
@@ -800,7 +800,7 @@ fn empty_panel() -> UiNode {
 ///
 /// Panel events (button / slider / entry) route to the **live** connection of
 /// whichever plugin is active, via the same swapped-`outbound` cell as
-/// [`MountedCard`], so a fast plugin reconnect redirects panel events without a
+/// `MountedCard`, so a fast plugin reconnect redirects panel events without a
 /// dangling send.
 #[must_use]
 pub fn plugin_panel_slot() -> gtk::Widget {
@@ -4337,21 +4337,21 @@ pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
 }
 
 /// Whether **any** card shows on the right sidebar **for this monitor** (#1160):
-/// the OR of [`any_card_shows_here`] across the three right mailboxes, evaluated
+/// the OR of `any_card_shows_here` across the three right mailboxes, evaluated
 /// with this monitor's connector.
 ///
 /// The right sidebar is hidden entirely while its three regions are empty
 /// (#1158), and this is the signal that decides it. Three properties are
 /// load-bearing:
 ///
-/// * It reads **[`card_shows_here`]**, the same predicate each region's own
+/// * It reads **`card_shows_here`**, the same predicate each region's own
 ///   collapse rule reads, so "the surface has something to show" and "a region
-///   maps rather than collapses" cannot disagree — see [`any_card_shows_here`].
+///   maps rather than collapses" cannot disagree — see `any_card_shows_here`.
 /// * It is **per monitor**, like everything else keyed off `connector` in this
 ///   module (#1050): a plugin whose frame carries `hidden_on: ["DP-2"]` leaves
 ///   the right sidebar empty on DP-2 while it paints on DP-1, so DP-2's surface
 ///   must stay hidden. The render list is shared; the connector is the only
-///   per-monitor input, exactly as in [`build_region`].
+///   per-monitor input, exactly as in `build_region`.
 /// * An **empty-tree** card (#1039/#1042 — a plugin's way of saying "nothing to
 ///   show right now") counts as absent here too, so a right sidebar holding one
 ///   plugin that has gone quiet is empty, not a blank 320 px slab.

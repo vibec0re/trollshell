@@ -65,9 +65,9 @@
 //! `GdkGLAPI::GLES` so the dialect is deterministic rather than
 //! driver-dependent. Every function this crate calls is therefore restricted
 //! to the **GL 4.x ∩ GLES 3.2** intersection, where the names and enum values
-//! are identical; glvnd's dispatch (the route [`loader`] uses first, #1067)
+//! are identical; glvnd's dispatch (the route `loader` uses first, #1067)
 //! serves both families from one process-wide table, with libepoxy's own
-//! `epoxy_<name>` variables as the fallback — see [`loader`] for which route
+//! `epoxy_<name>` variables as the fallback — see `loader` for which route
 //! actually wins on this platform. Shaders are compiled with an explicit version
 //! header the caller supplies ([`Program::compile`]) rather than one baked into
 //! the source, so the same GLSL body can be re-targeted without editing it.
@@ -85,7 +85,7 @@ use gl::types::{GLenum, GLint, GLsizei, GLuint};
 /// Anything that can go wrong on the way into GL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// The GL entry points could not be resolved — see [`loader`]. Every
+    /// The GL entry points could not be resolved — see `loader`. Every
     /// attempted path is named, because "no GL here" and "the soname moved"
     /// are different problems with different fixes.
     Load {
@@ -257,7 +257,7 @@ impl Gl {
     /// which drivers answer with an error at best.
     ///
     /// The load is process-wide and memoized: a second area realizing replays
-    /// the first one's verdict. See [`loader`] for why one load serves every
+    /// the first one's verdict. See `loader` for why one load serves every
     /// context.
     pub fn current() -> Result<Self, Error> {
         loader::load()?;
@@ -855,7 +855,7 @@ impl Texture {
     /// than a read past the end.
     ///
     /// The unpack pixel store is put into a known position first — see
-    /// [`Texture::reset_unpack_state`] for which five knobs that is and why
+    /// `Texture::reset_unpack_state` for which five knobs that is and why
     /// setting `UNPACK_ALIGNMENT` alone (all this used to do) was not enough.
     pub fn upload_u8(&self, _gl: &Gl, bytes: &[u8]) {
         debug_assert_ne!(

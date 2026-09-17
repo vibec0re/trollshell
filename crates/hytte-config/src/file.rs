@@ -132,7 +132,7 @@ pub enum Durability {
 /// Absolute path to `~/.config/trollshell/<file>`. `None` if `$HOME` is
 /// unset, empty, or itself relative.
 ///
-/// Goes through [`Env::home`] — the same gate [`crate::xdg`] applies to the
+/// Goes through `Env::home` — the same gate [`crate::xdg`] applies to the
 /// layered config paths — rather than reading `$HOME` here a second time, so
 /// this older, pre-layering helper and `xdg` can't drift apart on what
 /// counts as a usable `$HOME` (#985 fixed `xdg`; #1009 is this module
@@ -206,17 +206,17 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// a regular file (#739). That is also what keeps the temp file on the target's
 /// own filesystem — `rename(2)` is only atomic within one. A target that
 /// doesn't exist at all (no file, no symlink) can't be canonicalised, and
-/// needs no resolving — [`resolve_dangling_target`] returns `path` unchanged
+/// needs no resolving — `resolve_dangling_target` returns `path` unchanged
 /// for that case. A target that exists **as a symlink whose destination
 /// hasn't been created yet** also can't be canonicalised — `canonicalize`
 /// requires every component including the last to exist — but *does* need
 /// resolving: the old fallback of `path` itself `rename(2)`d a regular file
 /// over the link and permanently broke a "link first, populate later"
 /// dotfiles setup (stow/chezmoi) on its first save (#986).
-/// [`resolve_dangling_target`] walks that chain by hand instead — and, since
+/// `resolve_dangling_target` walks that chain by hand instead — and, since
 /// a genuine symlink cycle can never be "resolved" at any bound, returns an
 /// error rather than another guess when the chain doesn't end within
-/// [`MAX_SYMLINK_HOPS`]; this function propagates it, so every link in a
+/// `MAX_SYMLINK_HOPS`; this function propagates it, so every link in a
 /// cycle is left exactly as it was rather than one of them being replaced.
 ///
 /// **Permission-safe:** an existing target's mode is carried over at `open`
@@ -232,7 +232,7 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// leaves the target untouched. From the point `target` is resolved onward,
 /// every returned error names that *resolved* target, not just the original
 /// `path` — for a symlinked `path` those can differ, and a caller logging
-/// `path.display()` alongside the error (e.g. [`write_path`]'s `warn!`)
+/// `path.display()` alongside the error (e.g. `write_path`'s `warn!`)
 /// would otherwise have no way to tell which directory actually failed. The
 /// error's [`std::io::ErrorKind`] is preserved (only the message is
 /// rewritten), so a caller matching on it still can. The `create_dir_all`

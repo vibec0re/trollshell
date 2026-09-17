@@ -489,7 +489,7 @@ impl Drop for Deadline {
 /// # What bounds it
 ///
 /// `io_timeout_secs` is GIO's own per-read knob and bounds nothing on its own
-/// (see [`PROBE_IO_TIMEOUT_SECS`]). `budget` is the real one: a [`Deadline`]
+/// (see [`PROBE_IO_TIMEOUT_SECS`]). `budget` is the real one: a `Deadline`
 /// is armed before the first blocking call and its cancellable is handed to
 /// every one of them, so name resolution, the connect and the whole handshake
 /// together cannot exceed it. Only [`gio::TlsFileDatabase::new`] sits outside,

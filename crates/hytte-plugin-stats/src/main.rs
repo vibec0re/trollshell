@@ -21,7 +21,7 @@
 //! - [`card`] — the geometry, the per-core lamp ramp, the sidebar card and the
 //!   bar chips.
 //! - [`panel`] — the drawer page a chip click opens (#1251).
-//! - [`format`] — the byte and `used / total` strings the native Stats page
+//! - [`mod@format`] — the byte and `used / total` strings the native Stats page
 //!   prints, mirrored.
 //! - [`plugin`] — the TEA core: manifest, `update`, `view`.
 //!

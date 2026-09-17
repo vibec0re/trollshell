@@ -561,7 +561,7 @@ pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Resul
 ///
 /// `previous` is the name the form opened on: `None` for an ephemeral card
 /// (§3.7, where Save is what creates the entry) and `Some(old)` for a saved one.
-/// When `old` differs from `name` this is a **rename** — see [`rename_within`]
+/// When `old` differs from `name` this is a **rename** — see `rename_within`
 /// for what moves.
 ///
 /// Writing the whole `[workspace.<name>]` table is right here, and is exactly
@@ -847,7 +847,7 @@ pub fn set_stack_monitor(name: &str, monitor: &str) -> Result<(), ConfigError> {
 ///
 /// Two reasons, and both are about *not writing keys nobody asked about*.
 ///
-/// * `save_stack_to` writes [`stack_value`] — the **whole** stack. Handed the
+/// * `save_stack_to` writes `stack_value` — the **whole** stack. Handed the
 ///   merged view of a stack a home-manager base pinned, it would copy that
 ///   base's `apps`, `layout` and `autostart` down into the overlay, where they
 ///   stop tracking the base forever. Dragging a card is not a statement about

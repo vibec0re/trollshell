@@ -453,7 +453,7 @@ pub fn screenshot_captured() -> impl Signal<Item = Option<CapturedShot>> {
 const EDGE_TOL: f64 = 4.0;
 
 /// Signal: `true` when the active workspace on `connector` contains a
-/// window whose tile width spans the full output (within [`EDGE_TOL`]).
+/// window whose tile width spans the full output (within `EDGE_TOL`).
 /// That covers fullscreen, niri's `MaximizeWindowToEdges`, and any
 /// floating window manually sized to `mon_w` — every state where a
 /// window touches the L/R edges of the output.
@@ -512,7 +512,7 @@ fn has_edge_window(
 
 /// Signal: `true` when the active (visible) workspace on `connector` contains
 /// a window that is **fullscreen** — its tile spans the full output in *both*
-/// dimensions (within [`EDGE_TOL`]).
+/// dimensions (within `EDGE_TOL`).
 ///
 /// Distinct from [`edge_window_on`], which is width-only and therefore also
 /// fires for niri's `MaximizeWindowToEdges` and edge-stretched floating
@@ -660,7 +660,7 @@ fn send_action(action: Action) {
 /// It also keeps `niri-ipc` out of the shell binary, the same way the crate
 /// graph keeps `gtk` out — the binary names `WorkspaceAction`, never `Action`.
 ///
-/// Lowered to real niri actions by [`lower`], which is the one place a target
+/// Lowered to real niri actions by `lower`, which is the one place a target
 /// could be dropped and is unit-tested for exactly that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceAction {
@@ -711,7 +711,7 @@ pub enum WorkspaceAction {
     ///
     /// Same no-id shape as [`Self::MoveColumnToIndex`]: a preceding
     /// [`Self::FocusWindow`] in the same batch is the target. The single
-    /// producer is [`reflow_batch`] (#1129) — moving a column to an end and
+    /// producer is `reflow_batch` (#1129) — moving a column to an end and
     /// back is a change niri reflows the workspace for, unlike a change in
     /// the space *around* the columns (closing the sidebar, an
     /// out-of-process layout applying `SetWindowWidth`), which niri does not
@@ -1015,7 +1015,7 @@ pub(crate) fn reflow_batch(workspace: u64, windows: &[Window]) -> Vec<WorkspaceA
 ///
 /// Reads the current window list out of the registry's cached [`windows()`]
 /// (so, like every other free-function accessor here, must run on the GTK
-/// main thread the registry lives on), builds [`reflow_batch`], and — when
+/// main thread the registry lives on), builds `reflow_batch`, and — when
 /// it's non-empty — sends it over one [`send_actions`] connection on the
 /// tokio runtime. Callers (`overlays::sidebar`'s post-close settle,
 /// `hytte-plugin-niri-layouts`'s own mirrored chain over its own

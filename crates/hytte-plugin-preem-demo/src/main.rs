@@ -245,9 +245,7 @@ const TICKER: &str = "PREEM RASTER KIT ~ VFD / LCD / OLED / CRT ~ 7SEG DOT 8BIT 
 /// widest that fits the ~296 px sidebar card.
 const TICKER_WINDOW: usize = 11;
 /// The marquee's message — wider than the window, so it scrolls (every char is
-/// font-covered; see the [`demo_copy_is_fully_covered_by_the_font`] test).
-///
-/// [`demo_copy_is_fully_covered_by_the_font`]: tests::demo_copy_is_fully_covered_by_the_font
+/// font-covered; see the `demo_copy_is_fully_covered_by_the_font` test).
 const MARQUEE_MSG: &str = "SCROLLING MARQUEE ~ DOT-MATRIX PIXEL TICKER ~ ";
 /// The marquee window width in pixels — a wide bar-chip ticker that stays
 /// within the ~296 px sidebar card.
@@ -368,11 +366,11 @@ struct PreemDemo {
     /// restart, no frame on the wire.
     role: DotMatrix,
     /// The **ink-pinned** third: the same widget with an explicit
-    /// [`PIN_INK`](crate::PIN_INK), which is deliberately excluded from that
+    /// [`PIN_INK`], which is deliberately excluded from that
     /// re-tint.
     pin: DotMatrix,
     /// The **field-pinned** third (#884/#885): the same widget again, with its
-    /// *ground* pinned to [`FIELD_PIN`](crate::FIELD_PIN) and its ink left on
+    /// *ground* pinned to [`FIELD_PIN`] and its ink left on
     /// the accent path.
     ///
     /// Deliberately half-pinned, because that is the property the palette

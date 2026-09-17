@@ -235,7 +235,7 @@ fn parse_response(body: &str, now_unix: i64) -> Result<Vec<Row>, String> {
 const ENDPOINT_NAMES: [&str; 3] = ["bvg", "vbb", "db"];
 
 /// Resolve a configured `[departures].endpoint` into `(base_url,
-/// display_label)`. The label feeds the "can't reach <label>" reachability
+/// display_label)`. The label feeds the "can't reach `<label>`" reachability
 /// text a fetch failure renders.
 ///
 /// * `None`, or blank — the key absent, or present but empty — → BVG's URL.
@@ -277,7 +277,7 @@ struct StationConfig {
     /// `[departures].endpoint` (#1124).
     base_url: String,
     /// Human-readable name of [`Self::base_url`]'s backend, for the "can't
-    /// reach <label>" reachability text.
+    /// reach `<label>`" reachability text.
     backend_label: String,
 }
 

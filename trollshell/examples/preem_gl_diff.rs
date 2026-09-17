@@ -194,7 +194,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use hytte::gtk::{self, glib, prelude::*};
-use hytte::ui::gl_surface::GlSurface;
+use hytte::ui::gl_surface::{GlProgram, GlSurface};
 use hytte_plugin_proto::preem as vocab;
 use hytte_preem as kit;
 
@@ -1335,7 +1335,66 @@ fn activate_once(latch: &Cell<bool>) -> bool {
     !latch.replace(true)
 }
 
+thread_local! {
+    /// Pipelines this run's driver has refused to compile or link — the
+    /// harness's own record of what [`install_build_refusal_reporter`]'s
+    /// handler has already printed, and what [`verdict_label`] reads back to
+    /// relabel that pipeline's cases (#1325 item 2).
+    ///
+    /// A `Vec` and a linear scan, not a `HashSet`: `kind::Kind::ALL` names
+    /// nine programs total and this fires at most once per program per run,
+    /// the same trade `preem_gl::mod`'s own `REFUSED` latch documents for the
+    /// shell's build-refusal record.
+    static REPORTED_REFUSALS: RefCell<Vec<GlProgram>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Install this harness's own build-refusal reporter (#1325 item 2).
+///
+/// Without this, a driver that refuses to compile or link a pipeline is
+/// invisible here: `hytte-ui`'s own diagnostic
+/// (`gl_surface.rs`'s `report_build_refusal`) is a `tracing::warn!` this
+/// binary never subscribes to, and [`hytte::ui::gl_surface::refuse_build`]'s
+/// host hook — the one place the driver's info log actually reaches Rust —
+/// has nothing installed here to receive it (`trollshell`'s shell binary
+/// installs its own handler in `plugins::preem_gl::install`, and that is a
+/// different process). Every case of the refused pipeline then read back an
+/// untouched, transparent framebuffer and reported `FAIL(nothing)` with
+/// nothing in the log to say why — the whole cost #1325 measured building
+/// #1155: a run of 44 cases to bisect down to one reserved GLSL identifier.
+///
+/// Printed **once per program**, not once per `(grid, program)` refusal
+/// [`hytte::ui::gl_surface`]'s own latch is keyed on: a compile or link
+/// failure is a fact about the source, so a pipeline this driver refuses at
+/// one grid it refuses at every grid this run asks for (a stretched or
+/// supersampled case shares its kind's program under a different grid), and
+/// repeating the same info log once per case would bury the one line worth
+/// reading. And it prints **synchronously**, from inside the render callback
+/// that first hits the refusal — which runs before [`capture`] returns to the
+/// case that triggered it — so it lands ahead of that case's own verdict
+/// line, named by program.
+fn install_build_refusal_reporter() {
+    hytte::ui::gl_surface::set_build_refusal_handler(|program, grid, reason| {
+        let first = REPORTED_REFUSALS.with_borrow_mut(|seen| {
+            if seen.contains(&program) {
+                false
+            } else {
+                seen.push(program);
+                true
+            }
+        });
+        if first {
+            println!(
+                "COMPILE REFUSED {} (first refused at {}x{}): {reason}",
+                program.0, grid.0, grid.1,
+            );
+        }
+    });
+}
+
 fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
+    // Installed before anything registers or draws a single pipeline, so it
+    // is armed for the very first case — see its own docs.
+    install_build_refusal_reporter();
     // The same registration `preem_gl::install` does in the shell — since
     // #1211, both loop over `kind::Kind::ALL`, so this is the same code
     // rather than a second hand-kept copy of it.
@@ -1982,6 +2041,42 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
     Ok(Capture { raw, alloc, scale })
 }
 
+/// The word this harness prints for `verdict` on a case of `kind`.
+///
+/// [`parity::Verdict::label`], unless `kind`'s own pipeline is one this run's
+/// driver has already refused to compile or link
+/// ([`install_build_refusal_reporter`] has printed that refusal's info log,
+/// once, ahead of every case it touches) — in which case the transcript says
+/// `FAIL(compile)` rather than `FAIL(nothing)`, so a reader does not have to
+/// work out on their own that a run of blank-frame failures is one cause
+/// repeated rather than N independently blank draws (#1325 item 2).
+///
+/// Deliberately **not** a new [`parity::Verdict`] variant: the comparison
+/// itself still reports [`parity::Verdict::RendersNothing`] — an all-zero
+/// readback is exactly that, whatever caused it — so the pass/fail count, the
+/// evidence dump and every test that pins `RendersNothing` against a
+/// synthetic all-zero capture stay exactly as they were. Only the
+/// transcript's word for it changes, and only for the one verdict a refused
+/// pipeline can actually produce: a surface the driver refused to build keeps
+/// "whatever it last successfully drew" (`hytte-ui`'s own words — nothing,
+/// before a first successful frame), never a non-black flat fill, so
+/// `UndrawnFramebuffer` and every other `Verdict` are left untouched here.
+fn verdict_label(verdict: parity::Verdict, kind: kind::Kind) -> &'static str {
+    if verdict == parity::Verdict::RendersNothing && pipeline_refused(kind) {
+        "FAIL(compile)"
+    } else {
+        verdict.label()
+    }
+}
+
+/// Whether this run's driver has refused to build `kind`'s own pipeline —
+/// [`install_build_refusal_reporter`]'s record, read back by
+/// [`verdict_label`].
+fn pipeline_refused(kind: kind::Kind) -> bool {
+    let (program, _) = kind.gl_seam();
+    REPORTED_REFUSALS.with_borrow(|seen| seen.contains(&program))
+}
+
 /// Build the CPU reference, compare, print the per-channel deltas and the
 /// worst pixel, and write the evidence images. Returns whether the case passed
 /// — see [`parity::Verdict`] for the five ways it can fail.
@@ -2149,7 +2244,7 @@ fn measure(
     println!(
         "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
          over {} px; peak-row mismatches {}/{}",
-        verdict.label(),
+        verdict_label(verdict, case.kind()),
         stats.worst_mean(),
         stats.worst_p99(),
         stats.worst_max(),

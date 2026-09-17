@@ -6173,8 +6173,28 @@ brightness = 5
     /// substring checks.
     #[test]
     fn a_leaf_save_moves_one_key_and_keeps_every_comment() {
-        let (_dir, path) = scratch(HAND_EDITED);
+        // The key that actually *has* a comment block above it goes first, so
+        // the comment half is what reds when the writer stops carrying decor
+        // across — and the stale annotation beside the old value goes, which
+        // is [`set_value`]'s own documented rule (#641: a comment describing a
+        // value that no longer exists is worse than none).
+        let (_dir, commented) = scratch(HAND_EDITED);
+        save_leaf_to_locked::<Leds>(
+            &commented,
+            "core.color",
+            Some(toml_edit::Value::from("cyan")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
 
+        assert_eq!(
+            read(&commented),
+            HAND_EDITED.replace("color = \"amber\" # warm", "color = \"cyan\""),
+            "the block above the key documents the field and survives; the one \
+             beside the value described the old value and must not"
+        );
+
+        let (_dir, path) = scratch(HAND_EDITED);
         save_leaf_to_locked::<Leds>(
             &path,
             "core.brightness",
@@ -6185,7 +6205,8 @@ brightness = 5
 
         assert_eq!(
             read(&path),
-            HAND_EDITED.replace("brightness = 3", "brightness = 7")
+            HAND_EDITED.replace("brightness = 3", "brightness = 7"),
+            "and a key in the middle of a table stays where the operator put it"
         );
     }
 

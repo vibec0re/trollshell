@@ -179,7 +179,7 @@ let
   # least one non-null field, `null`s filtered out first (TOML has no null,
   # and an omitted key here just means "no opinion", left to the layer below).
   # `cfg.config` is a fixed attrset of typed submodules (`core-leds`,
-  # `agents`), not an `attrsOf`, so this stays a plain `mapAttrs` over its
+  # `agents`, `places`), not an `attrsOf`, so this stays a plain `mapAttrs` over its
   # known keys rather than the `attrsOf`-keyed-by-id shape `pluginsState`
   # above uses.
   #

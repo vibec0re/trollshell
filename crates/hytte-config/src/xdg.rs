@@ -374,7 +374,10 @@ mod tests {
             state_home: None,
         };
 
-        assert_eq!(env.config_layers("places"), env.base_config_layers("places"));
+        assert_eq!(
+            env.config_layers("places"),
+            env.base_config_layers("places")
+        );
         assert_eq!(env.overlay_path("places"), None);
     }
 

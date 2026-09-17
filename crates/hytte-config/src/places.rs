@@ -476,7 +476,11 @@ pub fn assemble_places(
     // The last layer is the overlay when there is one — the split #1331's rule
     // is stated over, handed over as two arguments rather than guessed from a
     // position.
-    let overlay_table = if overlay.is_some() { tables.pop() } else { None };
+    let overlay_table = if overlay.is_some() {
+        tables.pop()
+    } else {
+        None
+    };
     let merged = merge::merge_all_locked(tables, overlay_table);
     lock_findings.extend(subsystem::shadowed_findings(
         SUBSYSTEM,
@@ -630,6 +634,12 @@ pub fn load_places() -> Vec<Place> {
             if base_declares_places(&bases) {
                 None
             } else if let Some(migrated) = migrate_legacy_departures(&path) {
+                // Returned unmerged, and that is exact rather than a shortcut:
+                // this arm is only reached when no base layer declares
+                // `[[place]]`, so the overlay's array (which the legacy file
+                // has just become) replaces `DEFAULT_CONFIG`'s and *is* the
+                // merged list. The endpoint is not this function's to return,
+                // and `load_departures_endpoint` merges it normally.
                 return migrated;
             } else {
                 write_default_config();
@@ -648,9 +658,9 @@ pub fn load_places() -> Vec<Place> {
 }
 
 /// Whether any base layer sets `[[place]]` itself — the question
-/// [`load_places`]' first-run write and [`read_on_disk`]'s empty arm both ask,
-/// and the one thing that distinguishes "nix has an opinion about the list"
-/// from "nix set only `[departures]`".
+/// [`load_places`]' first-run write and [`layered_fallback`] both ask, and the
+/// one thing that distinguishes "nix has an opinion about the list" from "nix
+/// set only `[departures]`".
 fn base_declares_places(bases: &[(PathBuf, String)]) -> bool {
     bases.iter().any(|(_, body)| {
         body.parse::<toml::Table>()
@@ -775,8 +785,7 @@ impl ConfigWatcher {
         if self.paths.is_empty() {
             return None;
         }
-        let now: Vec<Option<(SystemTime, u64)>> =
-            self.paths.iter().map(|p| stamp(p)).collect();
+        let now: Vec<Option<(SystemTime, u64)>> = self.paths.iter().map(|p| stamp(p)).collect();
         if now == self.last {
             return None;
         }
@@ -2789,14 +2798,21 @@ mine = true
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("places.toml");
 
-        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Absent));
+        assert!(matches!(
+            read_on_disk(&target, &builtin_default()),
+            OnDisk::Absent
+        ));
 
         // A config that yields no places is reported in the same units memory
         // holds it in — what `load_places` makes of it, i.e. the default.
         std::fs::write(&target, "place = []\n").expect("seed");
-        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p == builtin_default()));
+        assert!(
+            matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p == builtin_default())
+        );
         std::fs::write(&target, "# only comments\n").expect("seed");
-        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p == builtin_default()));
+        assert!(
+            matches!(read_on_disk(&target, &builtin_default()), OnDisk::Places(p) if p == builtin_default())
+        );
 
         // A real config comes back as itself.
         std::fs::write(
@@ -2811,9 +2827,15 @@ mine = true
         // And the two `load_places` collapses into a silent fallback stay
         // distinguishable here: unparseable, and undecodable.
         std::fs::write(&target, "[[place]]\nname = \"Home\"\nlat = \n").expect("seed");
-        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Unknown(_)));
+        assert!(matches!(
+            read_on_disk(&target, &builtin_default()),
+            OnDisk::Unknown(_)
+        ));
         std::fs::write(&target, [0xff, 0xfe]).expect("seed");
-        assert!(matches!(read_on_disk(&target, &builtin_default()), OnDisk::Unknown(_)));
+        assert!(matches!(
+            read_on_disk(&target, &builtin_default()),
+            OnDisk::Unknown(_)
+        ));
     }
 
     /// Four hand-configured places and a typo. Neither editor can parse that,
@@ -3193,7 +3215,10 @@ mine = true
     /// `(path, body)` for a layer, without touching the filesystem — what
     /// [`assemble_places`] takes.
     fn layer(name: &str, body: &str) -> (PathBuf, String) {
-        (PathBuf::from(format!("/nix/store/{name}.toml")), body.to_owned())
+        (
+            PathBuf::from(format!("/nix/store/{name}.toml")),
+            body.to_owned(),
+        )
     }
 
     /// Write `body` to `<dir>/trollshell/places.toml` and hand back `dir`, so a
@@ -3245,12 +3270,17 @@ lon = 13.5
         let loaded = assemble_places(&[layer("base", NIX_TWO)], None);
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Werkstatt", "Bahnhof"],
             "the nix base layer's array, not the built-in default's"
         );
         assert_ne!(
-            loaded.places, builtin_default(),
+            loaded.places,
+            builtin_default(),
             "if this passes trivially the fixture stopped differing from the default"
         );
     }
@@ -3270,7 +3300,11 @@ lon = 13.5
         let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(&overlay));
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Zuhause"],
             "replace, never append (rule 3) — and never the base's two"
         );
@@ -3287,7 +3321,11 @@ lon = 13.5
         let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(&overlay));
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Werkstatt", "Bahnhof"]
         );
         assert_eq!(loaded.endpoint.as_deref(), Some("vbb"));
@@ -3329,7 +3367,11 @@ lon = 13.5
         );
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Werkstatt", "Bahnhof"],
             "nix has precedence per key (#866, 2026-09-15)"
         );
@@ -3369,7 +3411,11 @@ lon = 13.5
         );
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Werkstatt", "Bahnhof"]
         );
         assert_ne!(loaded.places, builtin_default());
@@ -3393,7 +3439,11 @@ lon = 13.5
 
         assert_eq!(loaded.endpoint.as_deref(), Some("db"), "the nix endpoint");
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Zuhause"],
             "…and the list is still the operator's"
         );
@@ -3433,10 +3483,17 @@ lon = 13.5
             )),
         );
 
-        assert!(loaded.locked.is_empty(), "there is no layer above the overlay");
+        assert!(
+            loaded.locked.is_empty(),
+            "there is no layer above the overlay"
+        );
         assert!(!loaded.places_are_locked());
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Zuhause"]
         );
     }
@@ -3466,7 +3523,11 @@ lon = 13.5
             loaded.lock_findings
         );
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Zuhause"],
             "a marker that pins nothing does not pin anything"
         );
@@ -3500,7 +3561,11 @@ lon = 13.5
         );
 
         assert_eq!(
-            loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            loaded
+                .places
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             ["Werkstatt", "Bahnhof"],
             "the nix base layer still applies"
         );
@@ -3517,8 +3582,10 @@ lon = 13.5
     /// `remove_place`'s doc in `hytte-services` leans on.
     #[test]
     fn an_emptied_overlay_array_still_reads_back_as_the_default() {
-        let loaded =
-            assemble_places(&[layer("base", BASE_TWO)], Some(&layer("overlay", "place = []\n")));
+        let loaded = assemble_places(
+            &[layer("base", BASE_TWO)],
+            Some(&layer("overlay", "place = []\n")),
+        );
 
         assert_eq!(loaded.places, builtin_default());
     }
@@ -3562,7 +3629,10 @@ lon = 13.5
                 ],
                 "XDG order reversed (lowest precedence first), overlay last"
             );
-            assert_eq!(config_path(), Some(home.join(".config/trollshell/places.toml")));
+            assert_eq!(
+                config_path(),
+                Some(home.join(".config/trollshell/places.toml"))
+            );
         });
     }
 
@@ -3591,11 +3661,15 @@ lon = 13.5
         // …and with no base layer the first-run write still happens, so the
         // suppression above is about nix rather than about the write going
         // away.
-        let bare = std::env::temp_dir().join(format!("places-firstrun-bare-{}", std::process::id()));
+        let bare =
+            std::env::temp_dir().join(format!("places-firstrun-bare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bare);
         with_layers(&bare, &[], || {
             assert_eq!(load_places(), builtin_default());
-            assert!(config_path().expect("$HOME").exists(), "the seed still happens");
+            assert!(
+                config_path().expect("$HOME").exists(),
+                "the seed still happens"
+            );
         });
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3611,14 +3685,20 @@ lon = 13.5
     fn an_overlay_with_no_places_is_classified_as_the_base_layers_list() {
         let root = std::env::temp_dir().join(format!("places-ondisk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let dir = base_dir(&root.join("xdg"), "[[place]]\nname = \"W\"\nlat = 1.0\nlon = 2.0\n");
+        let dir = base_dir(
+            &root.join("xdg"),
+            "[[place]]\nname = \"W\"\nlat = 1.0\nlon = 2.0\n",
+        );
         let overlay = root.join(".config/trollshell/places.toml");
         std::fs::create_dir_all(overlay.parent().expect("parent")).expect("mkdir");
         std::fs::write(&overlay, "[departures]\nendpoint = \"vbb\"\n").expect("write");
 
         with_layers(&root, &[dir.as_path()], || {
             let merged = load_places();
-            assert_eq!(merged.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["W"]);
+            assert_eq!(
+                merged.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+                ["W"]
+            );
             assert_eq!(
                 check_base_layered(&overlay, &merged),
                 Ok(()),
@@ -3688,7 +3768,8 @@ lon = 13.5
     /// its own write path and calls this rather than `save`.
     #[test]
     fn check_unlocked_answers_for_each_key_separately() {
-        let root = std::env::temp_dir().join(format!("places-checkunlocked-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("places-checkunlocked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = base_dir(&root.join("xdg"), NIX_TWO);
 

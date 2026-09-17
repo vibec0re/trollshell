@@ -182,16 +182,14 @@ impl Locks {
 }
 
 /// What the list's description says when the set is the operator's own.
-const LIST_DESCRIPTION: &str =
-    "Somewhere you frequent, how the shell recognises it, and what departures to show there. \
+const LIST_DESCRIPTION: &str = "Somewhere you frequent, how the shell recognises it, and what departures to show there. \
      Saved straight to ~/.config/trollshell/places.toml, which the shell re-reads within a few \
      seconds — so this works whether or not trollshell is running, and hand edits to that file \
      are preserved.";
 
 /// What it says when nix owns the set — the sentence the operator needs,
 /// naming the option they have to edit instead.
-const NIX_MANAGED_PLACES: &str =
-    "Set in nix: these places come from programs.trollshell.config.places.place, which cannot be \
+const NIX_MANAGED_PLACES: &str = "Set in nix: these places come from programs.trollshell.config.places.place, which cannot be \
      overridden from ~/.config/trollshell/places.toml. Edit them there and rebuild.";
 
 /// Everything the tab's handlers share. Cheap to clone (all handles), which is
@@ -1509,7 +1507,10 @@ mod gtk_tests {
             2,
             "one place row plus the 'Add a place' row"
         );
-        assert_eq!(unlocked.list.description().as_deref(), Some(super::LIST_DESCRIPTION));
+        assert_eq!(
+            unlocked.list.description().as_deref(),
+            Some(super::LIST_DESCRIPTION)
+        );
 
         let (_toasts, editor) = build_editor_with(Locks {
             places: true,
@@ -1529,7 +1530,10 @@ mod gtk_tests {
 
         editor.open(0);
         pump();
-        let page = editor.nav.visible_page().expect("the detail page was pushed");
+        let page = editor
+            .nav
+            .visible_page()
+            .expect("the detail page was pushed");
         let prefs: Vec<adw::PreferencesPage> = descendants(page.upcast_ref());
         assert_eq!(prefs.len(), 1, "one AdwPreferencesPage per detail page");
         assert!(
@@ -1561,7 +1565,10 @@ mod gtk_tests {
         editor.open(0);
         pump();
 
-        let page = editor.nav.visible_page().expect("the detail page was pushed");
+        let page = editor
+            .nav
+            .visible_page()
+            .expect("the detail page was pushed");
         let prefs: Vec<adw::PreferencesPage> = descendants(page.upcast_ref());
         assert_eq!(prefs.len(), 1);
         assert!(prefs[0].is_sensitive());

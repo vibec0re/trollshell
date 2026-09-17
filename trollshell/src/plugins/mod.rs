@@ -189,6 +189,14 @@ pub use region::{
     bar_center_slot, bar_left_slot, bar_right_slot, plugin_panel_slot, set_active_panel,
     sidebar_bottom_slot, sidebar_lead_slot, sidebar_top_slot,
 };
+// The dialog overlay's half of the panel machinery (#1010): the same body the
+// drawer mounts, over the dialog's own selection. `overlays::dialog` is the only
+// caller of both.
+pub use region::{plugin_dialog_slot, set_dialog_panel};
+// The dialog's contribution to the slot-visibility aggregates (#1010 §4), so a
+// sidebar plugin whose page is up in the dialog with the sidebar closed is still
+// told its slot is visible.
+pub use pump::set_dialog_visibility;
 // The right sidebar's three region builders (#1158/#1159) plus the "has this
 // output anything to show on that side?" signal #1160 hides the surface by.
 // `overlays::sidebar` mounts all four since #1160, so P1's scoped
@@ -425,6 +433,18 @@ struct SlotRender {
 struct BrokeredEffect {
     plugin_id: String,
     effect: Effect,
+    /// Where the producing plugin is mounted (#1010 §3) — the *source* of the
+    /// click, which is what decides which surface its own page opens on: a bar
+    /// chip hangs off the bar, so its page belongs in the drawer beneath it; a
+    /// sidebar card does not.
+    ///
+    /// Carried on the effect rather than looked up on the GTK side for the
+    /// reason `SlotRender::grants` is: the mount lives on the tokio connection
+    /// task (it is `route_render`'s own placement decision), and the broker runs
+    /// on the GTK thread. Stamped from the same value that picked the render's
+    /// region mailbox, so a chip and its page cannot disagree about where the
+    /// plugin is.
+    mount: Mount,
     outbound: mpsc::Sender<HostMsg>,
 }
 
@@ -466,6 +486,17 @@ pub struct PluginHandles {
     /// open/switch, cleared on close. Combined with `panels`, it drives which
     /// panel tree each per-monitor plugin drawer child renders.
     active_panel_id: Mutable<Option<String>>,
+    /// The plugin id whose panel is currently shown in the **dialog overlay**
+    /// (#1010 §2.1), or `None`. The dialog's own selection, deliberately *not*
+    /// `active_panel_id`: the drawer writes that one from three sites
+    /// (`modal.rs`'s open, close and teardown), so a dialog sharing it would be
+    /// hijacked by the first and blanked by the other two. GTK-thread-only, set
+    /// by [`set_dialog_panel`] on dialog open/swap and cleared on dismiss.
+    ///
+    /// Read alongside `active_panel_id` — as a **union** — by the two
+    /// `pump.rs` sites that ask "is any panel on screen": a plugin whose page is
+    /// up only in the dialog must still have its preem repaints pumped.
+    dialog_panel_id: Mutable<Option<String>>,
     clock_tx: watch::Sender<Option<ClockState>>,
     /// Aggregate slot visibility (OR of every monitor's sidebar open flag),
     /// written on the GTK thread ([`set_sidebar_visibility`]) and subscribed
@@ -625,6 +656,7 @@ impl Service for PluginsService {
             bar_right: Mutable::new(Vec::new()),
             panels: Mutable::new(Vec::new()),
             active_panel_id: Mutable::new(None),
+            dialog_panel_id: Mutable::new(None),
             clock_tx,
             visibility_tx,
             visibility_right_tx,
@@ -843,6 +875,7 @@ pub fn install() {
                 effects::broker_effect(
                     &brokered.plugin_id,
                     &brokered.effect,
+                    brokered.mount,
                     &brokered.outbound,
                     &datasource,
                 );

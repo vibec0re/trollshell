@@ -54,6 +54,8 @@ use crate::overlays::sidebar;
 /// - `toggle-sidebar` (no arg): flip the left sidebar.
 /// - `toggle-sidebar-right` (no arg): flip the right sidebar (#1160) — a no-op
 ///   while that output's right sidebar has no plugin card mounted.
+/// - `dialog-close` (no arg): dismiss the plugin dialog (#1010) — a no-op when
+///   none is up.
 /// - `toggle-recording` (no arg): start/stop a screen recording (#403).
 /// - `open-control-center` (no arg): start (or, if it's already running,
 ///   focus) the `trollshell-control-center` companion app — the same thing
@@ -123,6 +125,16 @@ fn entries() -> Vec<gio::ActionEntry<adw::Application>> {
         })
         .build();
 
+    // The plugin dialog (#1010). No `open`-shaped verb beside it: a dialog is
+    // raised by a plugin's own `OpenPage(PluginSelf)` and names a plugin, which
+    // a keybind has no way to pick — so the keyboard gets the half it is short
+    // of. `Esc` already dismisses while the dialog holds the keyboard
+    // exclusively; this reaches it from a bind regardless of focus, and is an
+    // inert no-op when nothing is up.
+    let dialog_close = gio::ActionEntry::builder("dialog-close")
+        .activate(|_app, _action, _param| crate::overlays::dialog::close())
+        .build();
+
     // Screen recording (#403): start if idle, stop if recording. A niri
     // keybind binds this like the others; the region is picked via `slurp`
     // when starting. No monitor resolution needed — the recorder is global.
@@ -143,6 +155,7 @@ fn entries() -> Vec<gio::ActionEntry<adw::Application>> {
         power_menu,
         toggle_sidebar,
         toggle_sidebar_right,
+        dialog_close,
         toggle_recording,
         open_control_center,
     ]
@@ -186,6 +199,7 @@ mod tests {
             "power-menu",
             "toggle-sidebar",
             "toggle-sidebar-right",
+            "dialog-close",
             "toggle-recording",
             "open-control-center",
         ] {

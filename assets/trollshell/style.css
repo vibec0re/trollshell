@@ -1205,6 +1205,40 @@ label.ts-gpu-temp {
     opacity: 1;
 }
 
+/* ─── Plugin dialog (#1010) ─────────────────────────────────────── */
+
+/* The fullscreen surface itself paints nothing — the card is an overlay child
+ * above a transparent `.ts-modal-catcher`, which is how the drawer already gets
+ * "click outside dismisses" with no dimming. Same rule as `.ts-prompt`. */
+.ts-dialog {
+    background: transparent;
+}
+/* The card: the prompt's surface treatment (window background, hairline border,
+ * the same 12px radius and drop shadow), with the margin that keeps the shadow
+ * off the surface edge. */
+.ts-dialog-card {
+    margin: 40px;
+    background: @window_bg_color;
+    color: @window_fg_color;
+    border: 1px solid @borders;
+    border-radius: 12px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+    padding: 0.615em 0.615em 0.769em 0.615em;
+}
+/* Header row: the plugin id and the close button. The row carries the gap down
+ * to the page; the page owns its own inner spacing (the "no host padding" rule
+ * `.ts-plugin-card`/`.ts-plugin-panel` already follow). */
+.ts-dialog-header {
+    margin-bottom: 0.462em;
+}
+/* The plugin id, dim — §8's default. Deliberately quiet: it names the source of
+ * the page, it is not the page's title (the plugin's own tree carries that). */
+.ts-dialog-title {
+    opacity: 0.55;
+    font-size: 0.923em;
+    margin-left: 0.308em;
+}
+
 /* ─── Password prompt ───────────────────────────────────────────── */
 
 .ts-prompt {

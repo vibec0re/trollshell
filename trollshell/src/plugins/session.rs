@@ -150,6 +150,12 @@ fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Ve
         let _ = ctx.effects_tx.send(BrokeredEffect {
             plugin_id: render.plugin_id.clone(),
             effect,
+            // The same `mount` that picked the region mailbox above (#1010 §3):
+            // the broker routes `OpenPage(PluginSelf)` on it, so the surface a
+            // plugin's own page opens on is decided by the placement this very
+            // function just made rather than by a second lookup that could
+            // disagree with it.
+            mount,
             // The connection's outbound, so a two-way effect (consent, #487) can
             // send its reply frame back to this plugin.
             outbound: render.outbound.clone(),

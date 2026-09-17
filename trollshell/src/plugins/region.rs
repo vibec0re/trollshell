@@ -773,6 +773,40 @@ pub fn set_active_panel(plugin_id: Option<&str>) {
     });
 }
 
+/// The dialog overlay's own selection (#1010 §2.1) — the plugin whose panel the
+/// centered dialog shows, independent of [`active_panel_signal`].
+///
+/// A second reader of the **same** `panels` mailbox with a **different**
+/// selection, which is the whole point: `active_panel_id` is written by three
+/// `modal.rs` sites (drawer open, drawer close, drawer teardown), so a dialog
+/// mirroring it would be hijacked by the first and blanked by the other two with
+/// no new line written anywhere.
+fn dialog_panel_signal() -> impl Signal<Item = Option<String>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .dialog_panel_id
+            .signal_cloned()
+    })
+}
+
+/// Select which plugin's panel the **dialog overlay** shows (#1010). GTK thread.
+/// `Some(id)` when `overlays::dialog` opens or swaps a plugin's page; `None` when
+/// it closes.
+///
+/// The dialog's counterpart to [`set_active_panel`], deliberately writing its own
+/// handle: the drawer's three sites never touch this one and this one never
+/// touches theirs, so a drawer and a dialog can show two different plugins at
+/// once and neither close path blanks the other.
+pub fn set_dialog_panel(plugin_id: Option<&str>) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .dialog_panel_id
+            .set(plugin_id.map(str::to_owned));
+    });
+}
+
 /// An empty panel tree — the blank page a drawer plugin child shows when no
 /// plugin is active (or the active plugin left / has no panel).
 fn empty_panel() -> UiNode {
@@ -805,6 +839,26 @@ fn empty_panel() -> UiNode {
 #[must_use]
 pub fn plugin_panel_slot() -> gtk::Widget {
     build_panel_child(panels_render_signal(), active_panel_signal())
+}
+
+/// The **dialog overlay's** plugin child (#1010): the same body
+/// [`plugin_panel_slot`] builds — same reconciler, same event routing to the
+/// plugin's live connection, same #903 destroy story — over the dialog's own
+/// selection (`dialog_panel_id`, published by [`set_dialog_panel`]) instead of
+/// the drawer's.
+///
+/// One instance lives inside the single dialog window, built per show and
+/// destroyed with it (`overlays::dialog`), so its render subscription is aborted
+/// and its panel scope released on dismiss exactly the way a per-monitor drawer
+/// child's is on hot-plug teardown.
+///
+/// The panel *scope* it retains is `Scope::panel(plugin_id)` — the same key a
+/// drawer child showing that plugin holds — and the `PANEL_SCOPE_HOLDERS`
+/// refcount spans children, so a dialog closing over a plugin whose page is also
+/// up in a drawer leaves that drawer's renderer instances alone (#921).
+#[must_use]
+pub fn plugin_dialog_slot() -> gtk::Widget {
+    build_panel_child(panels_render_signal(), dialog_panel_signal())
 }
 
 /// [`plugin_panel_slot`]'s body, with the two registry-backed signals taken as

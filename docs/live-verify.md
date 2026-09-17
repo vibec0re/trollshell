@@ -1220,6 +1220,67 @@ opens what it claims.
       same park (this is the `SUSPENDED` half; on niri, see the
       companion-window entries above for whether that state arrives at all).
 
+## Plugin dialog (#1010)
+
+The centered overlay a **sidebar** card's own page opens in
+(`trollshell/src/overlays/dialog.rs`). Every item here needs a live Niri
+session: the surface is a `zwlr_layer_shell_v1` window, and nothing in CI can
+construct one (`gtk_layer_init_for_window` is a hard error under `xvfb`), so the
+four window properties below are pinned nowhere but here.
+
+- [ ] **(#1010)** **A sidebar card's page opens centered, on the focused
+      output.** With the agents card (or any sidebar-mounted plugin) in the
+      left sidebar, click the row/title that opens its page. It must appear as
+      a **centered card on the output you are looking at** — not as the drawer
+      sliding out of the bar's top-right corner, which is what Mara filed this
+      about. The header reads the **plugin id**, dim, with a close button on the
+      right. On a two-monitor box: focus the other output first (click a window
+      there), then open the page from the sidebar — the dialog must appear on
+      the focused one.
+- [ ] **(#1010)** **The three dismissals.** `Esc` closes it; the header's close
+      button closes it; a click anywhere **outside the card** closes it. After
+      each, keyboard focus returns to the window that had it. The niri-bindable
+      verb works too and is a no-op when nothing is up:
+      `busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell org.gtk.Actions Activate 'sava{sv}' dialog-close 0 0`.
+- [ ] **(#1010)** **No dimming, and the sidebar stays.** Nothing behind the card
+      darkens (Annika: _"no dimming <3"_), and the sidebar you clicked from stays
+      open underneath — the first outside click closes the **dialog only**, not
+      both (§8's default, her _"default 🤷‍♀️"_).
+- [ ] **(#1010)** **A bar chip still opens the drawer.** Click a bar-mounted
+      plugin's chip whose page is its own (the stats plugin's four chips,
+      `hytte-plugin-stats` on a bar mount): the drawer must slide out of the bar
+      as before. The routing is on the producing plugin's **mount**, so this is
+      the half that must not have moved.
+- [ ] **(#1010/#950)** **The agents pill still opens its own window.** With
+      `trollshell-agent-window` on `PATH`, clicking a pill (or its pen) must
+      still launch the per-agent companion window out of process — that route is
+      a `RunCommand`, not an `OpenPage`, and #1010 does not touch it. Its
+      drawer-page _fallback_ (the card's title row, or the pill with the binary
+      missing) is the thing that now lands in the dialog.
+- [ ] **(#1010)** **The window's own properties**, the ones no test reaches:
+      `niri msg -j layers` (or `wayland-info`) while the dialog is up must show a
+      surface in namespace **`hytte-dialog`** on the **overlay** layer with
+      keyboard interactivity **exclusive** and all four anchors set. Typing while
+      it is up must reach a plugin `Entry` inside the page (only `Esc` is taken),
+      and the surface must **not** reserve an exclusive zone (windows behind it
+      do not reflow).
+- [ ] **(#1010 §2.1)** **A drawer and a dialog coexist.** Open a bar chip's page
+      in the drawer on monitor A, then open a sidebar card's page in the dialog
+      on monitor B. Both must render **their own** plugin's tree at the same
+      time. Close the drawer: the dialog's content must stay exactly as it was
+      (and the reverse — dismissing the dialog must not blank the drawer).
+- [ ] **(#1010 §4)** **A parked poller un-parks for the dialog.** With every
+      sidebar **closed** and a sidebar plugin's page up in the dialog, that
+      plugin must keep updating (`RUST_LOG=trollshell=debug`: it is told
+      `SlotVisible = true`). Watch an animating page — anything with a preem
+      marquee, scope or gauge — and confirm it animates in the dialog with no
+      sidebar open; that is the #1010 union read in `pump.rs`, and its failure
+      mode is a frozen page rather than an error.
+- [ ] **(#1010)** **One dialog, never two.** With a page up, open a _different_
+      sidebar plugin's page: the card must swap content in place (the header
+      retitles) rather than stacking a second surface. Opening the same plugin's
+      page again is a no-op.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

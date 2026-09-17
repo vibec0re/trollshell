@@ -59,6 +59,15 @@
 //! file, so that dummy value is what stops a real cloud key being shipped to a
 //! local endpoint. It is a security control; treat it as one.
 //!
+//! **Do not confuse it with the variable of the same name on THIS daemon's own
+//! env.** Since #1347 the bridge reads `OPENROUTER_API_KEY` itself, as the key
+//! for the `OpenRouter` credits wallet ([`wallets::openrouter`]) — a real key,
+//! spent on two metadata `GET`s every five minutes, and nothing to do with the
+//! inbound route. `nix/hm-module.nix` therefore sets it **empty** on
+//! `plugins.claude-bridge` (absent, so the wallet stays off until an operator
+//! declares the `openrouter` secret slot) while still setting the dummy
+//! `local-bridge` on the *consuming* plugin, where the control above lives.
+//!
 //! # The authorization boundary is the SOCKET'S FILE MODE (#993)
 //!
 //! With no inbound auth, whoever can reach the endpoint is authorized — so the
@@ -157,6 +166,7 @@ mod session;
 mod socket;
 mod status;
 mod usage;
+mod wallets;
 mod wire;
 
 use std::path::PathBuf;
@@ -546,6 +556,24 @@ fn main() -> ExitCode {
             usage::DEFAULT_BASE_URL.to_owned(),
             usage::credentials_path(),
         ));
+
+        // The OpenRouter wallet (#1347) — the second card on the same drawer
+        // page, under the same gate and on the same runtime, for every reason
+        // the block above gives. `Poll::from_env` is the *whole* gate: with no
+        // `OPENROUTER_API_KEY` injected (or the wallet switched off) there is
+        // no task, nothing is ever published to its board, and `plugin`'s
+        // stack draws one card instead of two. One debug line, once, and then
+        // silence — an absent optional wallet is not a warning.
+        if let Some(poll) = wallets::openrouter::Poll::from_env() {
+            rt.spawn(poll.run());
+        } else {
+            tracing::debug!(
+                key = wallets::openrouter::KEY_ENV,
+                "no OpenRouter wallet — declare \
+                 programs.trollshell.plugins.claude-bridge.secrets = [ \"openrouter\" ] \
+                 to inject a key"
+            );
+        }
     }
 
     // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host

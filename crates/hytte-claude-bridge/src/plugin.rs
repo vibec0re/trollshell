@@ -141,6 +141,7 @@ use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_
 use crate::Mode;
 use crate::status::{self, Last, Startup, Status};
 use crate::usage::{self, ExtraUsage, Limit, Outcome, Report, Usage, UsageError};
+use crate::wallets::openrouter;
 
 /// Stable plugin id — the host's mount-slot key, and the `<id>` in the
 /// `trollshell-plugin-<id>.service` transient unit the launcher spawns.
@@ -154,9 +155,22 @@ const ROOT_ID: &str = "claude-bridge-root";
 /// chip was deliberately inert.
 const CHIP_BTN: &str = "claude-bridge-chip";
 
-/// The drawer panel's root — the tree's own top-level id, unchanged by the
-/// #1280 P1 card wrapper (see [`usage_card`]): the wrapper's one new node is
-/// nested *inside* this id, not above it.
+/// The drawer page's own top-level id (#1347) — the **stack** of wallet cards,
+/// which is what a page holding N cards is.
+///
+/// New in #1347 rather than a rename of [`PANEL_ROOT_ID`], which keeps its
+/// spelling on the Claude card below it: the host keys widget reconciliation
+/// off these ids, so renaming the node every existing reader calls "the panel's
+/// root" would rebuild that subtree for no behaviour change.
+const PANEL_STACK_ID: &str = "claude-bridge-panel-stack";
+
+/// The **Claude wallet card's** root on the drawer page.
+///
+/// Was the tree's own top-level id until #1347 stacked a second wallet card
+/// beside it (see [`wallets`]); it is now the stack's first child, with its own
+/// id, class and every id below it unchanged. The #1280 P1 invariant it was
+/// written for still holds exactly as written: [`PANEL_LIST_ID`], the one node
+/// that wrapper added, is nested *inside* this id and not above it.
 const PANEL_ROOT_ID: &str = "claude-bridge-panel";
 
 /// The list [`usage_card`] nests inside [`PANEL_ROOT_ID`] — the node the
@@ -165,9 +179,14 @@ const PANEL_ROOT_ID: &str = "claude-bridge-panel";
 /// with every one of *its own* ids untouched.
 const PANEL_LIST_ID: &str = "claude-bridge-panel-list";
 
-/// The sidebar card's root (#1280 P1) — the mount-family sibling of
-/// [`PANEL_ROOT_ID`], shown instead of the panel on a sidebar mount and never
-/// alongside it (see [`Plugin::view`]).
+/// A sidebar mount's own top-level id (#1347) — [`PANEL_STACK_ID`]'s
+/// mount-family sibling, and the same stack of the same wallet cards in the
+/// same order.
+const CARD_STACK_ID: &str = "claude-bridge-card-stack";
+
+/// The **Claude wallet card's** root on a sidebar mount (#1280 P1) — the
+/// mount-family sibling of [`PANEL_ROOT_ID`], shown instead of the panel on a
+/// sidebar mount and never alongside it (see [`Plugin::view`]).
 const CARD_ROOT_ID: &str = "claude-bridge-card";
 
 /// The list [`usage_card`] nests inside [`CARD_ROOT_ID`] — [`PANEL_LIST_ID`]'s
@@ -248,14 +267,28 @@ fn env_lookup(key: &str) -> Option<String> {
 /// test could miss (`hytte-plugin-stats::plugin`'s `settings_from` is the
 /// same shape, for the same reason — and, since #1317, calls the identical
 /// SDK function for its own mount half).
-fn resolve_settings(
-    manifest_mount: Mount,
-    lookup: &dyn Fn(&str) -> Option<String>,
-) -> (bool, String) {
-    (
-        hytte_plugin::effective_mount_from(manifest_mount, lookup).is_bar(),
-        card_title(lookup),
-    )
+fn resolve_settings(manifest_mount: Mount, lookup: &dyn Fn(&str) -> Option<String>) -> Settings {
+    Settings {
+        is_bar: hytte_plugin::effective_mount_from(manifest_mount, lookup).is_bar(),
+        title: card_title(lookup),
+        openrouter: openrouter::CardSettings::resolve(lookup),
+    }
+}
+
+/// [`resolve_settings`]'s answer — everything about a launch [`Plugin::init`]
+/// reads from the environment, in one value it destructures.
+///
+/// A struct rather than the tuple it was before #1347: three fields of which
+/// two are `String`-ish is exactly the shape a positional return starts getting
+/// silently wrong.
+#[derive(Clone, Debug, PartialEq)]
+struct Settings {
+    /// The launch's mount family (`true` on a bar mount).
+    is_bar: bool,
+    /// The Claude wallet card's title.
+    title: String,
+    /// The `OpenRouter` wallet card's render-time knobs.
+    openrouter: openrouter::CardSettings,
 }
 
 /// How often the chip re-reads [`crate::status`] and [`crate::usage`]'s board.
@@ -311,6 +344,17 @@ struct BridgeChip {
     /// The title both surfaces head with — [`card_title`]'s resolved value,
     /// read once for the same reason `is_bar` is.
     title: String,
+    /// The `OpenRouter` wallet's last report (#1347), or `None` — which is both
+    /// "no poll has completed yet" and, permanently, "no key was injected, so
+    /// there is no second wallet". [`wallets`] draws one card per `Some`, so
+    /// the absent-key case costs exactly nothing: no node, no title, no row.
+    openrouter: Option<openrouter::Report>,
+    /// The [`openrouter::version`] `openrouter` was read at — `usage_version`'s
+    /// sibling, for the same 59-ticks-in-60 reason.
+    openrouter_version: u64,
+    /// That wallet's two render-time knobs, resolved once from the launch for
+    /// the same reason `title` is.
+    openrouter_settings: openrouter::CardSettings,
 }
 
 impl BridgeChip {
@@ -321,6 +365,18 @@ impl BridgeChip {
         if version != self.usage_version {
             self.usage_version = version;
             self.usage = usage::latest();
+        }
+    }
+
+    /// [`refresh_usage`](Self::refresh_usage) for the `OpenRouter` board. A
+    /// separate version counter, not a shared one: the two wallets are polled
+    /// by two independent tasks at two different instants, and one publishing
+    /// must not make the other look like it has.
+    fn refresh_openrouter(&mut self) {
+        let version = openrouter::version();
+        if version != self.openrouter_version {
+            self.openrouter_version = version;
+            self.openrouter = openrouter::latest();
         }
     }
 
@@ -357,13 +413,20 @@ impl Plugin for BridgeChip {
     }
 
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
-        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &env_lookup);
+        let Settings {
+            is_bar,
+            title,
+            openrouter: openrouter_settings,
+        } = resolve_settings(DEFAULT_MOUNT, &env_lookup);
         Self {
             status: status::snapshot(),
             usage: usage::latest(),
             usage_version: usage::version(),
             is_bar,
             title,
+            openrouter: openrouter::latest(),
+            openrouter_version: openrouter::version(),
+            openrouter_settings,
         }
     }
 
@@ -379,6 +442,7 @@ impl Plugin for BridgeChip {
             Input::App(Tick) => {
                 self.status = status::snapshot();
                 self.refresh_usage();
+                self.refresh_openrouter();
             }
             Input::Event { node, kind, .. } => return Self::on_event(&node, &kind),
             _ => {}
@@ -386,23 +450,26 @@ impl Plugin for BridgeChip {
         Vec::new()
     }
 
-    /// The bar family renders the chip **and** publishes the drawer panel a
-    /// click opens; the sidebar family renders #1280 P1's card and publishes
-    /// no panel — a card nothing can click is not a surface the drawer would
-    /// ever show (`hytte-plugin-stats`'s `Stats::view` is the same split, for
-    /// the same reason).
+    /// The bar family renders the chip **and** publishes the drawer page a
+    /// click opens; the sidebar family renders that same page's content and
+    /// publishes no panel — a card nothing can click is not a surface the
+    /// drawer would ever show (`hytte-plugin-stats`'s `Stats::view` is the same
+    /// split, for the same reason).
+    ///
+    /// Since #1347 both of those are [`wallets`]'s stack rather than the Claude
+    /// card alone, and the chip is still only the Claude one — with the
+    /// `OpenRouter` number as a line in its hover.
     fn view(&self) -> View {
         let now = usage::now_unix();
         let report = self.usage.as_ref();
         if self.is_bar {
-            View::new(chip(&self.status, report, now)).panel(panel(
-                &self.title,
-                &self.status,
-                report,
+            View::new(chip(&self.status, report, self.openrouter.as_ref(), now)).panel(wallets(
+                Surface::Panel,
+                self,
                 now,
             ))
         } else {
-            View::new(card(&self.title, &self.status, report, now))
+            View::new(wallets(Surface::Sidebar, self, now))
         }
     }
 }
@@ -544,7 +611,19 @@ pub fn chip_limits(usage: &Usage) -> Vec<&Limit> {
 /// [`Report::is_stale`] is judged past [`usage::STALE_AFTER`], and not only a
 /// wedged poll reaches it: since #1283 a *healthy* poller backing off a
 /// sustained run of 429s can too.
-fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
+///
+/// Since #1347 a **third** line may follow all of that: the `OpenRouter` wallet's
+/// remaining credit ([`openrouter::hover_line`]), which is Annika's "the bar
+/// chip stays the Claude one, with the `OpenRouter` remaining credit as a second
+/// line in its hover". It goes **last** — the chip is the Claude chip, so the
+/// Claude state it is actually painting comes first — and it is absent
+/// entirely, not empty, when no key was injected.
+fn tooltip(
+    status: &Status,
+    report: Option<&Report>,
+    wallet: Option<&openrouter::Report>,
+    now: i64,
+) -> String {
     let head = match status.startup {
         // Same honesty as the `…` label: no mode has been settled yet, so name
         // none.
@@ -581,10 +660,10 @@ fn tooltip(status: &Status, report: Option<&Report>, now: i64) -> String {
         Some(report) => usage_failure_sentence(status, report, now),
         None => None,
     };
-    match second_line {
-        Some(line) => format!("{head}\n{line}"),
-        None => head,
-    }
+    let mut lines = vec![head];
+    lines.extend(second_line);
+    lines.extend(openrouter::hover_line(wallet, now));
+    lines.join("\n")
 }
 
 /// The failure line for the tooltip, one mode adjustment applied.
@@ -661,7 +740,7 @@ fn meter(index: usize, limit: &Limit, now: i64) -> Node {
 }
 
 /// A plain label node.
-fn label(text: &str, classes: &[&str]) -> Node {
+pub(crate) fn label(text: &str, classes: &[&str]) -> Node {
     Node::Label {
         id: None,
         text: text.to_owned(),
@@ -729,7 +808,7 @@ fn icon(name: &str, classes: &[&str]) -> Node {
 }
 
 /// A horizontal row with a right-pinned trailing child.
-fn titled_row(leading: Node, trailing: Node) -> Node {
+pub(crate) fn titled_row(leading: Node, trailing: Node) -> Node {
     Node::Row {
         id: None,
         classes: Vec::new(),
@@ -740,7 +819,7 @@ fn titled_row(leading: Node, trailing: Node) -> Node {
 }
 
 /// A full-width bar, `0.0..=1.0`, tinted by a severity class.
-fn bar(id: String, fraction: f64, class: &str) -> Node {
+pub(crate) fn bar(id: String, fraction: f64, class: &str) -> Node {
     Node::Progress {
         id: Some(id),
         fraction: fraction.clamp(0.0, 1.0),
@@ -757,7 +836,12 @@ fn bar(id: String, fraction: f64, class: &str) -> Node {
 /// ellipsis: the daemon is up but has not settled its backend yet, and inventing
 /// a mode for that window would be a lie the chip is specifically there to
 /// prevent.
-fn chip(status: &Status, report: Option<&Report>, now: i64) -> Node {
+fn chip(
+    status: &Status,
+    report: Option<&Report>,
+    wallet: Option<&openrouter::Report>,
+    now: i64,
+) -> Node {
     // Annika's ask on #957: lead with the Claude glyph, so the pill reads as
     // "the Claude thing" before anyone tries to parse `sub 18/0`.
     let mut children = vec![icon(CLAUDE_ICON, &[]), icon(health_icon(status.last), &[])];
@@ -797,7 +881,7 @@ fn chip(status: &Status, report: Option<&Report>, now: i64) -> Node {
         // On the inner box, so hovering anywhere on the pill that isn't a meter
         // answers the question — the glyphs are 16 px wide and nobody should
         // have to find the right one.
-        tooltip: Some(tooltip(status, report, now)),
+        tooltip: Some(tooltip(status, report, wallet, now)),
     };
     Node::Button {
         id: CHIP_BTN.to_owned(),
@@ -824,7 +908,19 @@ fn header(title: &str, report: Option<&Report>, now: i64) -> Node {
             usage::humanise_since(now, report.numbers_at().unwrap_or(report.at))
         ),
     };
-    titled_row(title_label(title), label(&freshness, &["dim-label"]))
+    wallet_header(title, &freshness)
+}
+
+/// [`header`]'s row, with the freshness phrase left to the caller — the shape
+/// **every** wallet card on this page heads with (#1347).
+///
+/// Split out for [`wallet_card`]'s reason: the `OpenRouter` wallet computes a
+/// different phrase (`stale · updated 2 min ago`, off its own report) and must
+/// not compute a different *row* — one place draws a title beside a
+/// right-pinned caption, so the two cards cannot end up with different title
+/// ellipsis rules or a different caption class.
+pub(crate) fn wallet_header(title: &str, freshness: &str) -> Node {
+    titled_row(title_label(title), label(freshness, &["dim-label"]))
 }
 
 /// One limit, as a drawer row: title + percent, a full-width bar, and a caption
@@ -1031,6 +1127,19 @@ fn usage_card(
 ) -> Node {
     let mut children = vec![header(title, report, now)];
     children.extend(usage_rows(status, report, now));
+    wallet_card(root_id, list_id, children)
+}
+
+/// [`usage_card`]'s container, with the contents left to the caller — the
+/// shape **every** wallet card on this page has (#1347): a `ts-usage-card`
+/// root carrying one list, which carries a header and some rows.
+///
+/// `root_id` becomes the returned subtree's own top-level id; `list_id` names
+/// the one node the wrapper adds. Split out of [`usage_card`] rather than
+/// copied into the `OpenRouter` wallet so the two cards cannot drift apart in
+/// class, nesting or spacing — the only thing a second wallet supplies is what
+/// goes inside.
+pub(crate) fn wallet_card(root_id: &str, list_id: &str, children: Vec<Node>) -> Node {
     let list = Node::Box {
         id: Some(list_id.to_owned()),
         dir: Dir::Vertical,
@@ -1051,20 +1160,95 @@ fn usage_card(
     }
 }
 
-/// The drawer page (#1236), now [`usage_card`]-wrapped (#1280 P1) so the
-/// panel reads as a card instead of a bare list. Opened by
-/// `Effect::OpenPage(Page::PluginSelf)` on a bar-family instance's chip
-/// click; a sidebar-family instance never publishes this (see [`Plugin::view`]).
+/// The Claude wallet's card on the drawer page (#1236), [`usage_card`]-wrapped
+/// (#1280 P1) so it reads as a card instead of a bare list. Since #1347 it is
+/// the **first** child of [`wallets`]'s stack rather than the page's whole
+/// tree; its own ids and class are untouched by that.
 fn panel(title: &str, status: &Status, report: Option<&Report>, now: i64) -> Node {
     usage_card(PANEL_ROOT_ID, PANEL_LIST_ID, title, status, report, now)
 }
 
-/// The sidebar card (#1280 P1): every row [`panel`] would show, in the same
-/// [`usage_card`] container, under its own title row and root id. Rendered
-/// **instead of** the chip on a sidebar-family mount — never alongside it,
-/// and never a click target (see [`Plugin::view`], [`Plugin::manifest`]).
+/// The Claude wallet's card on a sidebar mount (#1280 P1): every row [`panel`]
+/// would show, in the same [`usage_card`] container, under its own title row
+/// and root id. Rendered **instead of** the chip on a sidebar-family mount —
+/// never alongside it, and never a click target (see [`Plugin::view`],
+/// [`Plugin::manifest`]).
 fn card(title: &str, status: &Status, report: Option<&Report>, now: i64) -> Node {
     usage_card(CARD_ROOT_ID, CARD_LIST_ID, title, status, report, now)
+}
+
+/// Which of the two surfaces is being drawn (#1347). The pair differs only in
+/// which ids each wallet card carries — never in which wallets appear, nor in
+/// what order — which is exactly why it is one enum and not two render paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Surface {
+    /// The drawer page a bar-family instance publishes.
+    Panel,
+    /// The card a sidebar-family instance *is*.
+    Sidebar,
+}
+
+impl Surface {
+    /// The stack's own id — the tree's top-level node on this surface.
+    fn stack_id(self) -> &'static str {
+        match self {
+            Self::Panel => PANEL_STACK_ID,
+            Self::Sidebar => CARD_STACK_ID,
+        }
+    }
+
+    /// The Claude wallet's card here.
+    fn claude(self, title: &str, status: &Status, report: Option<&Report>, now: i64) -> Node {
+        match self {
+            Self::Panel => panel(title, status, report, now),
+            Self::Sidebar => card(title, status, report, now),
+        }
+    }
+
+    /// The `OpenRouter` wallet's ids here.
+    fn openrouter_ids(self) -> openrouter::Ids {
+        match self {
+            Self::Panel => openrouter::PANEL_IDS,
+            Self::Sidebar => openrouter::SIDEBAR_IDS,
+        }
+    }
+}
+
+/// **The wallet board** (#1347) — one card per wallet, stacked, in one fixed
+/// order: **Claude first, `OpenRouter` second**.
+///
+/// Annika's call on the thread ("I think we could stack the cards in the same
+/// drawer"). The order is not a preference the model carries: the Claude card
+/// is the one this plugin has always been, it is the one the bar chip paints,
+/// and it is the only one that is always there — so it leads, and a wallet that
+/// does not exist contributes no node at all rather than an empty placeholder.
+///
+/// Both surfaces go through here, so the drawer page and the sidebar can never
+/// disagree about which wallets are on the board.
+fn wallets(surface: Surface, model: &BridgeChip, now: i64) -> Node {
+    let mut children = vec![surface.claude(&model.title, &model.status, model.usage.as_ref(), now)];
+    if let Some(report) = model.openrouter.as_ref() {
+        children.push(openrouter::card(
+            surface.openrouter_ids(),
+            &model.openrouter_settings,
+            report,
+            now,
+        ));
+    }
+    Node::Box {
+        id: Some(surface.stack_id().to_owned()),
+        dir: Dir::Vertical,
+        // The gap *between* cards. Matches `wallet_card`'s own list spacing, so
+        // a two-card stack reads as evenly spaced as one card's rows do.
+        spacing: 12,
+        scroll: false,
+        // No class: a page that holds cards is not itself a card. `CARD_CLASS`
+        // stays on each child, which is where the padding and the surface
+        // treatment belong.
+        classes: Vec::new(),
+        children,
+        tooltip: None,
+    }
 }
 
 // ── Entry points used by `main` ──────────────────────────────────────────────
@@ -1086,10 +1270,11 @@ pub fn run() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeChip, CARD_CLASS, CARD_LIST_ID, CARD_ROOT_ID, CHIP_BTN, CLAUDE_ICON, DEFAULT_MOUNT,
-        DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, PANEL_LIST_ID, PANEL_ROOT_ID, TITLE_CHARS, Tick,
-        capped, card, card_title, chip, chip_limits, counts_label, health_icon, meter_tooltip,
-        mode_label, mode_name, panel, resolve_settings, severity_class, severity_role, tooltip,
+        BridgeChip, CARD_CLASS, CARD_LIST_ID, CARD_ROOT_ID, CARD_STACK_ID, CHIP_BTN, CLAUDE_ICON,
+        DEFAULT_MOUNT, DEFAULT_TITLE, LABEL_ENV, MAX_CHIP_METERS, PANEL_LIST_ID, PANEL_ROOT_ID,
+        PANEL_STACK_ID, Surface, TITLE_CHARS, Tick, capped, card, card_title, chip, chip_limits,
+        counts_label, health_icon, meter_tooltip, mode_label, mode_name, openrouter, panel,
+        resolve_settings, severity_class, severity_role, tooltip, wallets,
     };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
@@ -1299,9 +1484,54 @@ mod tests {
     /// The chip in **state** mode, where a meter is a `Node::Preem` — the mode a
     /// preem-speaking shell negotiates, and the one whose tree these tests read.
     fn chip_state(status: &Status, report: Option<&Report>) -> Node {
+        chip_state_with_wallet(status, report, None)
+    }
+
+    /// [`chip_state`] with an `OpenRouter` wallet on the board (#1347) — the only
+    /// thing it can change is the hover's last line.
+    fn chip_state_with_wallet(
+        status: &Status,
+        report: Option<&Report>,
+        wallet: Option<&openrouter::Report>,
+    ) -> Node {
         hytte_plugin::display::testing::with_render_mode(RenderMode::State, || {
-            chip(status, report, now())
+            chip(status, report, wallet, now())
         })
+    }
+
+    /// The #1347 wallet fields at their **no-key** values — the spread every
+    /// `BridgeChip` literal below ends with, so the ordinary "there is one
+    /// wallet" case is the default a test has to opt out of.
+    fn no_wallet() -> BridgeChip {
+        BridgeChip {
+            status: default_status(),
+            usage: None,
+            usage_version: 0,
+            is_bar: true,
+            title: DEFAULT_TITLE.to_owned(),
+            openrouter: None,
+            openrouter_version: 0,
+            openrouter_settings: openrouter::CardSettings::default(),
+        }
+    }
+
+    /// An `OpenRouter` report with numbers, anchored to this module's narrative
+    /// [`now`] so the stale/fresh branch is decided by the test and not by the
+    /// wall clock.
+    fn wallet_report() -> openrouter::Report {
+        let balance = openrouter::Balance {
+            credits: Some(openrouter::Credits {
+                total_credits: 100.5,
+                total_usage: 25.75,
+            }),
+            key: None,
+            needs_management_key: true,
+        };
+        openrouter::Report {
+            at: now(),
+            outcome: openrouter::Outcome::Ok(balance),
+            last_ok: Some((now(), balance)),
+        }
     }
 
     // ── The manifest ─────────────────────────────────────────────────────────
@@ -1340,6 +1570,7 @@ mod tests {
             usage_version: 0,
             is_bar: true,
             title: DEFAULT_TITLE.to_owned(),
+            ..no_wallet()
         };
         assert_eq!(
             model.update(Input::event(CHIP_BTN, EventKind::Click)),
@@ -1375,6 +1606,7 @@ mod tests {
                 usage_version: 0,
                 is_bar: true,
                 title: DEFAULT_TITLE.to_owned(),
+                ..no_wallet()
             };
             let view = model.view();
             assert!(view.panel.is_some());
@@ -1387,6 +1619,7 @@ mod tests {
             usage_version: 0,
             is_bar: true,
             title: DEFAULT_TITLE.to_owned(),
+            ..no_wallet()
         };
         let hover = root_tooltip(&model.view().tree).expect("a hover");
         assert!(
@@ -1417,19 +1650,34 @@ mod tests {
             usage_version: 0,
             is_bar: true,
             title: DEFAULT_TITLE.to_owned(),
+            ..no_wallet()
         };
         let view = model.view();
         let now = usage::now_unix();
         assert_eq!(
             view.tree,
-            chip(&model.status, Some(&report), now),
+            chip(&model.status, Some(&report), None, now),
             "a bar mount's tree is the chip, unmoved by the #1280 P1 switch"
         );
+        // Since #1347 the panel is the wallet **stack**, and with no OpenRouter
+        // key that stack is exactly one card: the Claude one, byte for byte
+        // what `panel()` has always produced, one box deeper.
         assert_eq!(
             view.panel,
-            Some(panel(DEFAULT_TITLE, &model.status, Some(&report), now)),
-            "…and it still publishes the drawer panel"
+            Some(wallets(Surface::Panel, &model, now)),
+            "…and it still publishes the drawer page"
         );
+        match view.panel.as_ref().expect("a panel") {
+            Node::Box { id, children, .. } => {
+                assert_eq!(id.as_deref(), Some(PANEL_STACK_ID));
+                assert_eq!(children.len(), 1, "one wallet, one card");
+                assert_eq!(
+                    children[0],
+                    panel(DEFAULT_TITLE, &model.status, Some(&report), now),
+                );
+            }
+            other => panic!("the drawer page must be a box, got {other:?}"),
+        }
     }
 
     /// **Golden — a sidebar mount's view is exactly the card, and it
@@ -1446,17 +1694,215 @@ mod tests {
             usage_version: 0,
             is_bar: false,
             title: "Home account".to_owned(),
+            ..no_wallet()
         };
         let view = model.view();
         let now = usage::now_unix();
         assert_eq!(
             view.tree,
-            card("Home account", &model.status, Some(&report), now),
-            "a sidebar mount's tree is the card"
+            wallets(Surface::Sidebar, &model, now),
+            "a sidebar mount's tree is the wallet stack"
         );
+        // …which, with no OpenRouter key, is exactly the one Claude card
+        // #1280 P1 shipped (#1347).
+        match &view.tree {
+            Node::Box { id, children, .. } => {
+                assert_eq!(id.as_deref(), Some(CARD_STACK_ID));
+                assert_eq!(children.len(), 1, "one wallet, one card");
+                assert_eq!(
+                    children[0],
+                    card("Home account", &model.status, Some(&report), now),
+                );
+            }
+            other => panic!("a sidebar mount's tree must be a box, got {other:?}"),
+        }
         assert!(
             view.panel.is_none(),
             "the card is not a click target — a sidebar instance publishes no panel"
+        );
+    }
+
+    // ── #1347: the wallet board (Claude first, OpenRouter second) ────────────
+
+    /// Ids and titles of the wallet cards on one surface, in the order they are
+    /// stacked.
+    fn stacked(tree: &Node) -> Vec<(String, String)> {
+        match tree {
+            Node::Box { children, .. } => children
+                .iter()
+                .map(|child| {
+                    let Node::Box { id, .. } = child else {
+                        panic!("a wallet card must be a box, got {child:?}");
+                    };
+                    (
+                        id.clone().unwrap_or_default(),
+                        texts(child).first().cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            other => panic!("the stack must be a box, got {other:?}"),
+        }
+    }
+
+    /// **The card list order** (#1347, Annika: "stack the cards in the same
+    /// drawer"): Claude first, `OpenRouter` second, on both surfaces.
+    ///
+    /// Falsify by pushing the `OpenRouter` card before the Claude one in
+    /// [`wallets`]: both `assert_eq!`s below red.
+    #[test]
+    fn two_wallets_stack_claude_first_and_openrouter_second() {
+        let model = BridgeChip {
+            usage: Some(captured_report()),
+            openrouter: Some(wallet_report()),
+            ..no_wallet()
+        };
+        for (surface, stack_id, claude_id, wallet_id) in [
+            (
+                Surface::Panel,
+                PANEL_STACK_ID,
+                PANEL_ROOT_ID,
+                openrouter::PANEL_IDS.root,
+            ),
+            (
+                Surface::Sidebar,
+                CARD_STACK_ID,
+                CARD_ROOT_ID,
+                openrouter::SIDEBAR_IDS.root,
+            ),
+        ] {
+            let tree = wallets(surface, &model, now());
+            match &tree {
+                Node::Box { id, classes, .. } => {
+                    assert_eq!(id.as_deref(), Some(stack_id));
+                    assert!(
+                        classes.is_empty(),
+                        "a page holding cards is not itself a card: {classes:?}"
+                    );
+                }
+                other => panic!("the stack must be a box, got {other:?}"),
+            }
+            assert_eq!(
+                stacked(&tree),
+                vec![
+                    (claude_id.to_owned(), DEFAULT_TITLE.to_owned()),
+                    (wallet_id.to_owned(), openrouter::DEFAULT_TITLE.to_owned()),
+                ],
+                "Claude first, OpenRouter second"
+            );
+            // Each card keeps the card class; the stack does not.
+            for child in match &tree {
+                Node::Box { children, .. } => children,
+                other => panic!("{other:?}"),
+            } {
+                let Node::Box { classes, .. } = child else {
+                    panic!("{child:?}");
+                };
+                assert_eq!(classes, &vec![CARD_CLASS.to_owned()]);
+            }
+        }
+    }
+
+    /// **The absent-key path** (#1347: off entirely when the key is absent).
+    /// With no `OpenRouter` report on the board there is exactly one card, and
+    /// nothing anywhere in the tree mentions the wallet.
+    ///
+    /// Falsify by pushing the `OpenRouter` card unconditionally in [`wallets`]
+    /// (rendering an empty one for `None`): the length assertion reds.
+    #[test]
+    fn one_wallet_draws_one_card_and_names_no_other() {
+        let model = BridgeChip {
+            usage: Some(captured_report()),
+            openrouter: None,
+            ..no_wallet()
+        };
+        for surface in [Surface::Panel, Surface::Sidebar] {
+            let tree = wallets(surface, &model, now());
+            assert_eq!(stacked(&tree).len(), 1, "{:?}", stacked(&tree));
+            let rendered = format!("{tree:?}");
+            assert!(
+                !rendered.contains("openrouter"),
+                "no key means no OpenRouter node anywhere: {rendered}"
+            );
+            assert!(
+                !rendered.contains(openrouter::DEFAULT_TITLE),
+                "…and no OpenRouter words either: {rendered}"
+            );
+        }
+    }
+
+    /// **The chip's hover line** (#1347): the chip itself is unchanged — same
+    /// glyphs, same meters — and the wallet shows up only as one more line of
+    /// its hover, **after** everything the chip is actually painting.
+    ///
+    /// Falsify by dropping the `hover_line` extend in [`tooltip`]: the second
+    /// assertion reds while the first (the chip's own nodes) stays green, which
+    /// is what makes the pair meaningful.
+    #[test]
+    fn the_chip_is_unchanged_and_carries_the_wallet_in_its_hover() {
+        let board = status(Mode::Subscription, false, 18, 0, Last::Ok);
+        let report = captured_report();
+        let without = chip_state(&board, Some(&report));
+        let with = chip_state_with_wallet(&board, Some(&report), Some(&wallet_report()));
+        assert_eq!(
+            texts(&without),
+            texts(&with),
+            "the chip's own labels are untouched by a second wallet"
+        );
+        assert_eq!(
+            preems(&without).len(),
+            preems(&with).len(),
+            "…and so are its meters"
+        );
+
+        let hover = root_tooltip(&with).expect("a hover");
+        assert!(
+            hover.lines().count() >= 2,
+            "the wallet adds a line: {hover:?}"
+        );
+        assert_eq!(
+            hover.lines().next_back(),
+            Some("OpenRouter · $74.75 left"),
+            "…last, after the chip's own state: {hover:?}"
+        );
+        assert!(
+            hover.starts_with("Claude bridge · "),
+            "…and the chip is still the Claude chip: {hover:?}"
+        );
+        assert!(
+            !root_tooltip(&without)
+                .expect("a hover")
+                .contains("OpenRouter"),
+            "no wallet, no line"
+        );
+    }
+
+    /// A tick re-reads **both** boards. Falsify by deleting the
+    /// `refresh_openrouter()` call in `update`: the wallet card never appears
+    /// on a live surface, and this reds.
+    #[test]
+    fn a_tick_re_reads_the_openrouter_board_too() {
+        let _guard = openrouter::BOARD_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut model = BridgeChip {
+            // A version the board cannot be at, so `refresh_openrouter` really
+            // re-reads rather than trusting the `None` seeded here.
+            openrouter_version: u64::MAX,
+            ..no_wallet()
+        };
+        openrouter::publish(wallet_report());
+        assert!(
+            model.update(Input::App(Tick)).is_empty(),
+            "a tick asks for nothing"
+        );
+        assert_ne!(
+            model.openrouter_version,
+            u64::MAX,
+            "the wallet board was not re-read"
+        );
+        assert!(
+            model.openrouter.is_some(),
+            "…and the report it published is now in hand"
         );
     }
 
@@ -1540,13 +1986,33 @@ mod tests {
             "CLAUDE_BRIDGE_LABEL" => Some("Home account".to_owned()),
             _ => None,
         };
-        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &overridden);
-        assert!(!is_bar, "a sidebar override must flip the family off bar");
-        assert_eq!(title, "Home account");
+        let settings = resolve_settings(DEFAULT_MOUNT, &overridden);
+        assert!(
+            !settings.is_bar,
+            "a sidebar override must flip the family off bar"
+        );
+        assert_eq!(settings.title, "Home account");
 
-        let (is_bar, title) = resolve_settings(DEFAULT_MOUNT, &|_| None);
-        assert!(is_bar, "no override keeps the manifest's own bar mount");
-        assert_eq!(title, DEFAULT_TITLE);
+        let settings = resolve_settings(DEFAULT_MOUNT, &|_| None);
+        assert!(
+            settings.is_bar,
+            "no override keeps the manifest's own bar mount"
+        );
+        assert_eq!(settings.title, DEFAULT_TITLE);
+        assert_eq!(
+            settings.openrouter,
+            openrouter::CardSettings::default(),
+            "…and an unset OpenRouter table is its documented defaults"
+        );
+
+        // The third field is threaded too, not merely defaulted (#1347).
+        let labelled = resolve_settings(DEFAULT_MOUNT, &|key| match key {
+            "CLAUDE_BRIDGE_OPENROUTER_LABEL" => Some("Work router".to_owned()),
+            "CLAUDE_BRIDGE_OPENROUTER_LOW_CREDIT" => Some("20".to_owned()),
+            _ => None,
+        });
+        assert_eq!(labelled.openrouter.title, "Work router");
+        assert!(labelled.openrouter.is_low(20.0) && !labelled.openrouter.is_low(21.0));
     }
 
     /// Set (to any value) only on the re-exec'd child that actually runs
@@ -1667,12 +2133,29 @@ mod tests {
                     Ok("Home account"),
                     "test setup: the override child sets both variables",
                 );
+                // Since #1347 a sidebar mount's tree is the wallet stack; with
+                // no `OPENROUTER_API_KEY` in this child's environment that
+                // stack holds exactly the one Claude card, which is where the
+                // card class and `CARD_ROOT_ID` live.
                 match &view.tree {
-                    Node::Box { id, classes, .. } => {
-                        assert_eq!(id.as_deref(), Some(CARD_ROOT_ID));
-                        assert_eq!(classes, &vec![CARD_CLASS.to_owned()]);
+                    Node::Box {
+                        id,
+                        classes,
+                        children,
+                        ..
+                    } => {
+                        assert_eq!(id.as_deref(), Some(CARD_STACK_ID));
+                        assert!(classes.is_empty(), "the stack is not itself a card");
+                        assert_eq!(children.len(), 1, "no key injected, one wallet");
+                        match &children[0] {
+                            Node::Box { id, classes, .. } => {
+                                assert_eq!(id.as_deref(), Some(CARD_ROOT_ID));
+                                assert_eq!(classes, &vec![CARD_CLASS.to_owned()]);
+                            }
+                            other => panic!("the wallet card must be a box, got {other:?}"),
+                        }
                     }
-                    other => panic!("the override child's view must be the card, got {other:?}"),
+                    other => panic!("the override child's view must be the stack, got {other:?}"),
                 }
                 assert!(
                     view.panel.is_none(),
@@ -2763,7 +3246,12 @@ mod tests {
     #[test]
     fn the_tooltip_says_nothing_served_yet_before_the_first_request() {
         assert_eq!(
-            tooltip(&status(Mode::Api, true, 0, 0, Last::None), None, now()),
+            tooltip(
+                &status(Mode::Api, true, 0, 0, Last::None),
+                None,
+                None,
+                now()
+            ),
             "Claude bridge · API key · nothing served yet"
         );
     }
@@ -2778,10 +3266,13 @@ mod tests {
             errors: 0,
             last: Last::None,
         };
-        assert_eq!(tooltip(&board, None, now()), "Claude bridge · starting up");
+        assert_eq!(
+            tooltip(&board, None, None, now()),
+            "Claude bridge · starting up"
+        );
         assert_eq!(
             root_tooltip(&chip_state(&board, None)).as_deref(),
-            Some(tooltip(&board, None, now()).as_str())
+            Some(tooltip(&board, None, None, now()).as_str())
         );
     }
 
@@ -2800,7 +3291,7 @@ mod tests {
             .for_each(|w| assert_ne!(w[0], w[1], "names must not collide"));
         for (mode, name) in modes.into_iter().zip(names) {
             let board = status(mode, false, 1, 0, Last::Ok);
-            let hover = tooltip(&board, None, now());
+            let hover = tooltip(&board, None, None, now());
             assert!(hover.contains(name), "{hover:?} must name {name}");
             // …and the chip is still printing the short form of that same mode.
             assert_eq!(texts(&chip_state(&board, None))[2], mode_label(mode));
@@ -2813,6 +3304,7 @@ mod tests {
     fn the_tooltip_reports_the_uncapped_counts() {
         let hover = tooltip(
             &status(Mode::Reprompt, false, 86_400, 12_345, Last::Error),
+            None,
             None,
             now(),
         );
@@ -2897,6 +3389,7 @@ mod tests {
                 usage_version: 1,
                 is_bar: true,
                 title: DEFAULT_TITLE.to_owned(),
+                ..no_wallet()
             }
             .view()
         });
@@ -2921,6 +3414,7 @@ mod tests {
             chip(
                 &status(Mode::Subscription, false, 1, 0, Last::Ok),
                 Some(&report),
+                None,
                 now(),
             )
         });

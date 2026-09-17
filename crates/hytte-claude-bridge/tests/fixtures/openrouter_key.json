@@ -1,0 +1,23 @@
+{
+  "data": {
+    "label": "sk-or-EXAMPLE-NOT-A-REAL-KEY-SEE-THE-TEST-THAT-READS-THIS",
+    "limit": 10.0,
+    "limit_reset": "monthly",
+    "limit_remaining": 4.25,
+    "include_byok_in_limit": false,
+    "usage": 5.75,
+    "usage_daily": 0.5,
+    "usage_weekly": 2.0,
+    "usage_monthly": 5.75,
+    "byok_usage": 0.0,
+    "byok_usage_daily": 0.0,
+    "byok_usage_weekly": 0.0,
+    "byok_usage_monthly": 0.0,
+    "is_free_tier": false,
+    "free_model_daily_requests": {
+      "used": 3,
+      "limit": 50,
+      "remaining": 47
+    }
+  }
+}

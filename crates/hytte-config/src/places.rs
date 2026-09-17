@@ -1534,9 +1534,25 @@ enum OnDisk {
 /// Filtering the seed through the lock set rather than skipping it wholesale
 /// keeps the documented preamble, which is the reason the seed exists: an
 /// operator whose places are nix's still gets a file that explains
-/// `[departures]` when the editor first writes one. The header is detached and
-/// put back with the same [`take_header`]/[`put_header`] pair a save uses, so
-/// removing the last `[[place]]` does not take the docs with it.
+/// `[departures]` when the editor first writes one.
+///
+/// The removal itself is [`crate::subsystem::strip_locked`] — #1333's, which
+/// landed for the `Subsystem` families while this was in review and is the
+/// better primitive: it recurses, it answers through
+/// [`crate::subsystem::Loaded::is_locked`]'s own predicate (so an ancestor lock
+/// removes its descendants), and it takes a removed key's **attached comment**
+/// with it instead of orphaning it. One walk for both families, so they cannot
+/// drift on what "with the locked keys taken out" means.
+///
+/// What is `places`-specific — and why [`take_header`]/[`put_header`] still
+/// wrap that call — is *where the file's own preamble lives*. In
+/// `places.toml` it is the prefix decor of the first `[[place]]` element, i.e.
+/// attached to the very key the lock removes, so the comment-aware removal
+/// that is right everywhere else would take the whole documented header with
+/// it. Detaching it first and putting it back afterwards is the same pair a
+/// save already uses for the same reason (`render_places` re-homes it when an
+/// edit removes the first place). Pinned by
+/// `the_seed_drops_exactly_the_locked_keys`.
 ///
 /// Removing the block leaves the comments that were attached *inside* it —
 /// the `lines`/`directions` and `[departures]` paragraphs — standing at the
@@ -1557,28 +1573,9 @@ fn seed_for(locked: &BTreeSet<String>) -> String {
         return DEFAULT_CONFIG.to_owned();
     };
     let header = take_header(&mut doc);
-    for path in locked {
-        remove_path(doc.as_table_mut(), path);
-    }
+    subsystem::strip_locked(doc.as_table_mut(), locked, "");
     put_header(&mut doc, &header);
     doc.to_string()
-}
-
-/// Remove the dotted `path` from `table`, if it is there. A path whose parents
-/// are not tables is simply not found — nothing to remove, and nothing to
-/// complain about, since [`seed_for`]'s input is a lock set that may well name
-/// keys [`DEFAULT_CONFIG`] does not set.
-fn remove_path(table: &mut toml_edit::Table, path: &str) {
-    match path.split_once('.') {
-        None => {
-            table.remove(path);
-        }
-        Some((head, rest)) => {
-            if let Some(nested) = table.get_mut(head).and_then(toml_edit::Item::as_table_mut) {
-                remove_path(nested, rest);
-            }
-        }
-    }
 }
 
 /// Classify the current `places.toml` for a writer — see [`OnDisk`].

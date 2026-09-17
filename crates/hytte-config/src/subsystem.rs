@@ -2023,7 +2023,19 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
 
 /// The `toml_edit`-document half of [`seed_without_locked`]: recurses through
 /// `doc`, removing every key [`locked_here`] answers for.
-fn strip_locked(doc: &mut dyn toml_edit::TableLike, locked: &BTreeSet<String>, prefix: &str) {
+///
+/// `pub(crate)` since #1227 item 2: `places` seeds a not-yet-existing overlay
+/// of its own and is layered without being a [`Subsystem`] (it keeps its own
+/// `DEFAULT_CONFIG` and its own writer — see `crate::places::seed_for`), so it
+/// needs this removal and not [`seed_without_locked`]'s `S::DEFAULT_TOML`
+/// wrapper around it. One walk, so the two families cannot drift on what "with
+/// the locked keys taken out" means — which is #1333's own argument against
+/// `without_locked` and this being two different rules.
+pub(crate) fn strip_locked(
+    doc: &mut dyn toml_edit::TableLike,
+    locked: &BTreeSet<String>,
+    prefix: &str,
+) {
     let keys: Vec<String> = doc.iter().map(|(key, _)| key.to_string()).collect();
     for key in keys {
         let path = format!("{prefix}{key}");

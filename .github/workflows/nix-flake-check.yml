@@ -5,10 +5,18 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel an in-flight run when new commits land on the same ref.
+# Cancel an in-flight run when new commits land on the same ref — except on
+# main, where a run is the combined-tree union audit after a merge burst,
+# and cancelling it is exactly what left one unchecked four times in a row
+# on 2026-09-17 (#1301). PR refs still cancel: one runner, and a force-push
+# supersedes the run it replaces. This is the opposite call from
+# options-doc.yml's Pages deploy, deliberately — that workflow cancels the
+# *holder* on every push because a deploy is idempotent and ~30s (#1326);
+# this one lets main's own run finish because it is the audit, not a
+# side effect of the push that triggered it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   flake-check:

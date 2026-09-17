@@ -8,6 +8,7 @@ members = [
   "crates/hytte",
   "crates/hytte-bus",
   "crates/hytte-config",
+  "crates/hytte-config-families",
   "crates/hytte-ecal",
   "crates/hytte-gl",
   "crates/hytte-ai-providers",
@@ -162,6 +163,15 @@ httparse = "1.10"
 # `hytte-plugin-stats` (#1250) reusing the same samplers without linking GTK,
 # D-Bus, or a reactive registry.
 hytte-sensors = { path = "crates/hytte-sensors" }
+# The shell's two config families as data — a documented default and a
+# `hytte_config::schema::Schema` each — in a GTK-free leaf so
+# `trollshell-control-center` can render a form for them without linking the
+# shell (#888 P0). A workspace-dependency `path` entry for `hytte-sensors`'
+# reason and not `hytte-config`'s: this crate has no features at all, so its
+# two consumers (the shell today, the control center in #888 P1) declare an
+# identical line and there is nothing per-consumer to diverge. Adds no
+# resolved package.
+hytte-config-families = { path = "crates/hytte-config-families" }
 # niri's IPC types + its blocking socket helper. Two consumers since #1019 —
 # `hytte-services`' shell-side client and `hytte-plugin-niri-layouts`, which
 # dials `$NIRI_SOCKET` in its own process so the same binary works as a niri

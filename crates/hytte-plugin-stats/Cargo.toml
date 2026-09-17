@@ -10,6 +10,19 @@ description = "System stats as an out-of-process trollshell plugin: the compact 
 [lints]
 workspace = true
 
+# The library half (#888 P0), on `hytte-plugin-agents`' precedent: everything
+# this plugin does lives here, so `trollshell-control-center` can read
+# `config::SCHEMA` (and the `DEFAULT_TOML` beside it) to render a settings form
+# without linking a binary. A plugin crate that links `hytte-config` cannot
+# have those consts moved down into `hytte-config-families` — that leaf would
+# then depend on a crate that depends on it — so they stay here and the
+# companion app composes them in at the top of the graph (#888's erratum to
+# §3). It also gives the tests a crate to `use` rather than a binary.
+[lib]
+name = "hytte_plugin_stats"
+path = "src/lib.rs"
+
+# The plugin binary. `main` is one line — the whole transport lives in the SDK.
 [[bin]]
 name = "hytte-plugin-stats"
 path = "src/main.rs"

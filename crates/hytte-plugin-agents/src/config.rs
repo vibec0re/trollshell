@@ -33,6 +33,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use hytte_config::schema::{Field, Kind, Schema};
 use hytte_config::subsystem::Subsystem;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +101,69 @@ poll_seconds = 2
 # An agent with no `project` falls into an "ungrouped" group rather than
 # vanishing, and with only one group the header is suppressed entirely.
 "#;
+
+// ── The schema (#888 P0 §2a/§3) ──────────────────────────────────────────────
+
+/// What the leaves of `agents.toml` are, for a settings form that has this
+/// crate as a library and the shell nowhere in sight.
+///
+/// It sits **here**, beside the [`DEFAULT_TOML`] it describes, rather than in
+/// `hytte-config-families` with the two shell-owned families: this crate links
+/// `hytte-config`, so the leaf crate cannot depend on it without a cycle
+/// (#888's erratum to §3). The control center already links this crate as a
+/// library (#947 P4) and composes the schema in there.
+///
+/// `display` is a [`Kind::Map`] — a table whose keys are hive agent names this
+/// schema cannot know — so it renders **read-only** in v1 and its three rows
+/// are checked per entry (spec §1; editing a map is P2). It is also why
+/// [`DEFAULT_TOML`] stating none of it is not a mismatch; see
+/// [`hytte_config::schema::verify`]'s collection exemption.
+pub const SCHEMA: Schema = Schema {
+    family: NAME,
+    fields: &[
+        Field {
+            path: "socket",
+            // "Absolute" is the half a `Kind` cannot carry, and `validate`
+            // still enforces it whole-file (`Invalid::Socket`). What this
+            // buys is the row refusing a *blank* before the save, which is
+            // the other half of the same rule.
+            kind: Kind::Text { blank_ok: false },
+            doc: "The hive's host admin socket — an absolute path.",
+        },
+        Field {
+            path: "poll_seconds",
+            kind: Kind::Int {
+                min: MIN_POLL_SECONDS.cast_signed(),
+                max: MAX_POLL_SECONDS.cast_signed(),
+            },
+            doc: "Seconds between AgentStatus polls while the sidebar is open.",
+        },
+        Field {
+            path: "display",
+            kind: Kind::Map(DISPLAY_FIELDS),
+            doc: "Per-agent display overrides, keyed exactly as the hive names the agent.",
+        },
+    ],
+};
+
+/// One `[display.<name>]` entry — [`Display`]'s three optional keys.
+const DISPLAY_FIELDS: &[Field] = &[
+    Field {
+        path: "label",
+        kind: Kind::Text { blank_ok: false },
+        doc: "What the row calls this agent; absent renders the hive's own name.",
+    },
+    Field {
+        path: "icon",
+        kind: Kind::Text { blank_ok: false },
+        doc: "The leading symbolic icon.",
+    },
+    Field {
+        path: "project",
+        kind: Kind::Text { blank_ok: false },
+        doc: "The group header this row sits under.",
+    },
+];
 
 /// One agent's display overrides — the `[display.<name>]` table.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -350,11 +414,93 @@ pub fn load() -> AgentsConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentsConfig, DEFAULT_RUNTIME_ICON, Display, Invalid, MAX_POLL_SECONDS, MIN_POLL_SECONDS,
+        AgentsConfig, DEFAULT_RUNTIME_ICON, DEFAULT_TOML, Display, Invalid, Kind, MAX_POLL_SECONDS,
+        MIN_POLL_SECONDS, SCHEMA,
     };
+    use hytte_config::schema;
     use hytte_config::subsystem::{Subsystem as _, assemble, assemble_base_layers};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    // ── The schema (#888 P0) ────────────────────────────────────────────────
+
+    /// **The walker.** Every leaf the documented default states has a `Field`,
+    /// every non-collection `Field` names a leaf it states, and every stated
+    /// value is inside its declared `Kind`.
+    #[test]
+    fn the_schema_matches_the_documented_default() {
+        schema::verify(&SCHEMA, DEFAULT_TOML)
+            .expect("agents' schema and its documented default must agree");
+    }
+
+    /// The schema's field set is the **serde surface**, both ways — top level
+    /// and inside a `[display.<name>]` entry.
+    ///
+    /// This is the direction the walker structurally cannot see: `DEFAULT_TOML`
+    /// leaves `[display.*]` commented out, so its keys are a strict subset of
+    /// the struct's, and a Rust field with no row would otherwise be invisible
+    /// to every gate. It is the same comparison `nix/lint-config-vocab.py`
+    /// makes textually against the nix option tree — measured there on a
+    /// planted `pub chat_url: Option<String>` that left every other gate green.
+    #[test]
+    fn the_schemas_fields_are_the_serde_surface() {
+        let config = toml::Value::try_from(AgentsConfig::default()).expect("serialises");
+        let mut top: Vec<&str> = config
+            .as_table()
+            .expect("a table")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        top.sort_unstable();
+        let mut declared: Vec<&str> = SCHEMA.fields.iter().map(|field| field.path).collect();
+        declared.sort_unstable();
+        assert_eq!(declared, top, "one Field per serde field, and no more");
+
+        // Every key of `Display` is optional and `skip_serializing_if`, so the
+        // entry has to be fully populated for its surface to show at all.
+        let entry = toml::Value::try_from(Display {
+            label: Some("l".to_owned()),
+            icon: Some("i".to_owned()),
+            project: Some("p".to_owned()),
+        })
+        .expect("serialises");
+        let mut keys: Vec<&str> = entry
+            .as_table()
+            .expect("a table")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+
+        let Some(Kind::Map(rows)) = SCHEMA.field("display").map(|field| field.kind) else {
+            panic!("`display` must be a map of per-agent entries");
+        };
+        let mut sub: Vec<&str> = rows.iter().map(|field| field.path).collect();
+        sub.sort_unstable();
+        assert_eq!(sub, keys, "one row per `Display` field, and no more");
+    }
+
+    /// `poll_seconds`' spin range is the range [`AgentsConfig::validate`]
+    /// enforces — the bound `nix/lint-config-vocab.py` already mirrors into
+    /// the nix option, now mirrored into the form as well.
+    #[test]
+    fn the_schemas_cadence_range_is_the_validators_own() {
+        let Some(Kind::Int { min, max }) = SCHEMA.field("poll_seconds").map(|field| field.kind)
+        else {
+            panic!("`poll_seconds` must be a bounded integer");
+        };
+        assert_eq!(min, MIN_POLL_SECONDS.cast_signed());
+        assert_eq!(max, MAX_POLL_SECONDS.cast_signed());
+
+        let at = |seconds: u64| AgentsConfig {
+            poll_seconds: seconds,
+            ..AgentsConfig::default()
+        };
+        assert!(at(MIN_POLL_SECONDS).validate().is_ok());
+        assert!(at(MAX_POLL_SECONDS).validate().is_ok());
+        assert!(at(MIN_POLL_SECONDS - 1).validate().is_err());
+        assert!(at(MAX_POLL_SECONDS + 1).validate().is_err());
+    }
 
     fn from_toml(body: &str) -> AgentsConfig {
         assemble::<AgentsConfig>(&[(PathBuf::from("overlay.toml"), body.to_owned())])

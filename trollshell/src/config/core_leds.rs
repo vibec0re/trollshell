@@ -91,6 +91,24 @@ use hytte_config::subsystem::{InvalidValue, Subsystem, keep, spelling};
 use hytte_config::xdg;
 use hytte_preem::{ColorMap, DisplayStyle, Fill};
 
+/// The documented default, moved down into the GTK-free
+/// `hytte-config-families` leaf by #888 P0 and re-exported here at its old
+/// path.
+///
+/// It moved because `trollshell-control-center` renders a settings form from
+/// the [`Schema`](hytte_config::schema::Schema) that describes it — which
+/// lives beside it, in the same leaf — and cannot link the shell. Nothing else
+/// about this subsystem moved: every `CoreLedsConfig::DEFAULT_TOML` in the
+/// tree still resolves, the `impl Subsystem` below points at the same bytes,
+/// and the parsing, the service and the live reload stay here.
+///
+/// The schema itself is deliberately **not** re-exported: it never had a path
+/// here to keep, and the shell has no use for it. What the shell does have is
+/// the `hytte-preem` link, which is why `the_schemas_vocabularies_are_the_parsers_own`
+/// below — not the leaf crate — is what holds its word lists to the kit's
+/// enums.
+pub use hytte_config_families::core_leds::DEFAULT_TOML;
+
 // ── Battery-aware reload cadence (#1041/#1081) ───────────────────────────────
 
 /// How often the running shell re-checks the config layers on AC power.
@@ -414,51 +432,9 @@ impl Default for CoreLedsConfig {
 impl Subsystem for CoreLedsConfig {
     const NAME: &'static str = "core-leds";
 
-    const DEFAULT_TOML: &'static str = r##"# The Stats drawer's per-core LED panel (#857): one lamp per CPU core, each
-# lit to that core's load. Every key here is look-and-feel — none of it
-# changes what is measured.
-#
-# This file is read live: save an edit and the panel re-skins within a few
-# seconds, with no shell restart. It is also layered — a nix-written base
-# under $XDG_CONFIG_DIRS, your own edits under $XDG_CONFIG_HOME — so a
-# rebuild never clobbers a hand edit and a hand edit never blocks a rebuild.
-# Delete a key to fall back to the value below; `_unset = ["style"]` erases a
-# key an underlying layer set (TOML has no null, so this is how it is spelt).
-#
-# A value no parser accepts costs its own key and nothing else: that key takes
-# the built-in default, one journal line names it, and every other key in the
-# file still applies.
-
-# The kit skin — the panel's physical character.
-#   vfd         near-black field with a phosphor halo off every lit lamp
-#   lcd         grey-green cells that ghost their unlit segments
-#   oled        pure black field, no ghost
-#   crt         scanline comb and a curved-glass vignette
-style = "vfd"
-
-# The colour axis, and it is *independent* of the skin: style = "crt" with
-# color = "heat" gives heat-mapped lamps through the tube's scanlines.
-#   heat        blue-to-red ramp by load — "which core is busy", at a glance
-#   style       the skin's own single ink (the pre-#857 look)
-#   rainbow     a hue sweep across the lamps
-#   transpride  the flag's bands across the lamps
-#   "#rrggbb"   one literal colour
-color = "heat"
-
-# Rows in the lamp matrix. 0 — or the word "rect", which is what the deprecated
-# TROLLSHELL_CORE_LEDS_ROWS took, and which this key accepts too — is the
-# automatic wide rectangle, picked from the core count (16x4 on a 64-thread
-# box, 4x1 at 4 cores). Any number from 1 to 64 pins the row count instead and
-# the columns fall out of it; past 64 a row is thinner than a pixel on screen,
-# so it is rejected as the typo it almost certainly is.
-rows = 0
-
-# What a ragged last row's leftover slots look like. Only visible when the row
-# count divides unevenly *and* the skin ghosts (vfd/lcd).
-#   spare       unlit lamps fill the tail
-#   blank       the tail is left bare
-fill = "spare"
-"##;
+    /// The documented default, re-exported at the top of this module from
+    /// `hytte-config-families` — see [`DEFAULT_TOML`].
+    const DEFAULT_TOML: &'static str = DEFAULT_TOML;
 
     /// **Nothing** can fail whole-file validation here, and the type says so.
     ///
@@ -687,14 +663,16 @@ pub fn signal() -> impl Signal<Item = CoreLeds> {
 mod tests {
     use super::{
         BATTERY_CONFIG_POLL_INTERVAL, COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig,
-        CoreLedsService, FILL, MAX_ROWS, ROWS, STYLE, Service, battery_cadence_source, cadence,
-        parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style,
-        parse_hex_rgb, rows_spelling,
+        CoreLedsService, DEFAULT_TOML, FILL, MAX_ROWS, ROWS, STYLE, Service,
+        battery_cadence_source, cadence, parse_core_leds_color, parse_core_leds_fill,
+        parse_core_leds_rows, parse_core_leds_style, parse_hex_rgb, rows_spelling,
     };
+    use hytte_config::schema::{self, Kind};
     use hytte_config::subsystem::env::{self, Deprecations, EnvKnob};
     use hytte_config::subsystem::watch;
     use hytte_config::subsystem::{self, InvalidValue, Subsystem};
     use hytte_config::test_support::Overlay;
+    use hytte_config_families::core_leds::SCHEMA;
     use hytte_preem::{ColorMap, DisplayStyle, Fill};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -704,6 +682,83 @@ mod tests {
     /// CoreLedsConfig`. Aliased so every test below reads exactly as it did
     /// before #1044 hoisted the type out of this file.
     type Watcher = watch::Watcher<CoreLedsConfig>;
+
+    // ── The schema (#888 P0) ────────────────────────────────────────────────
+
+    /// **The walker.** Every leaf the documented default states has a `Field`,
+    /// every `Field` names a leaf it states, and every stated value is inside
+    /// the `Kind` declared for it.
+    ///
+    /// Red if a `Field` is deleted from `SCHEMA` (the default's leaf is then
+    /// unclaimed), if one is added for a key the default does not document, or
+    /// if a range/vocabulary in the schema stops covering the default's own
+    /// value.
+    #[test]
+    fn the_schema_matches_the_documented_default() {
+        schema::verify(&SCHEMA, DEFAULT_TOML)
+            .expect("core-leds' schema and its documented default must agree");
+    }
+
+    /// The schema's word lists are **the parsers' own**, not a copy that
+    /// drifted.
+    ///
+    /// `SCHEMA` lives in `hytte-config-families`, which deliberately links
+    /// nothing but `hytte-config` and therefore spells each vocabulary as
+    /// literals (a `&'static [&'static str]` cannot be built from an array of
+    /// enums in a `const` anyway). This is the crate that *does* link
+    /// `hytte-preem`, so this is where the literals are held to the enums —
+    /// the `checks.config-vocab` argument (`nix/lint-config-vocab.py`) applied
+    /// to a second mirror of the same three vocabularies.
+    #[test]
+    fn the_schemas_vocabularies_are_the_parsers_own() {
+        let options = |path: &str| match SCHEMA.field(path).map(|field| field.kind) {
+            Some(Kind::Choice { options } | Kind::Color { options }) => options.to_vec(),
+            other => panic!("{path} is not a vocabulary field: {other:?}"),
+        };
+
+        assert_eq!(
+            options("style"),
+            DisplayStyle::ALL.map(DisplayStyle::name).to_vec(),
+            "`style` must offer exactly DisplayStyle::ALL, in ALL's order"
+        );
+        assert_eq!(
+            options("color"),
+            ColorMap::ALL.map(ColorMap::name).to_vec(),
+            "`color`'s named half must be exactly ColorMap::ALL — the `Rgb` \
+             literal arm is Kind::Color's own `#rrggbb` half, and is not in ALL"
+        );
+
+        // `Fill` has no `ALL` to read, so the pin is the other way round: every
+        // option parses, and the match below is **exhaustive**, so a third
+        // `Fill` variant fails to compile here until it has an option.
+        for option in options("fill") {
+            match parse_core_leds_fill(option).expect("every `fill` option must parse") {
+                Fill::Spare | Fill::Blank => {}
+            }
+        }
+        assert_eq!(
+            options("fill").len(),
+            2,
+            "one option per Fill variant, and no more"
+        );
+    }
+
+    /// `rows`' spin range is [`MAX_ROWS`], and its floor is the automatic
+    /// rectangle rather than a count — `0` is a legal value here and `1` is
+    /// the smallest pinned row count.
+    #[test]
+    fn the_schemas_row_range_is_the_parsers_own() {
+        let Some(Kind::Int { min, max }) = SCHEMA.field("rows").map(|field| field.kind) else {
+            panic!("`rows` must be a bounded integer");
+        };
+        assert_eq!(min, 0, "0 is the automatic wide rectangle");
+        assert_eq!(max, i64::try_from(MAX_ROWS).expect("MAX_ROWS fits an i64"));
+        assert!(parse_core_leds_rows(&max.to_string()).is_ok());
+        assert!(
+            parse_core_leds_rows(&(max + 1).to_string()).is_err(),
+            "one past the schema's ceiling is one past the parser's"
+        );
+    }
 
     /// [`watch::boot`] at this subsystem — stamp, load once, resolve
     /// announcing.

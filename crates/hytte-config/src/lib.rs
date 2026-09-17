@@ -54,6 +54,10 @@
 //! - [`subsystem`](mod@subsystem) — the schema shape: declare a type, a name
 //!   and a documented default; inherit the reader, the validator harness and
 //!   the format-preserving writer.
+//! - [`schema`](mod@schema) — what a family's individual **leaves** are
+//!   ([`schema::Field`] / [`schema::Kind`]) and the walker that holds the
+//!   declaration to the family's own `DEFAULT_TOML` ([`schema::verify`]), so a
+//!   settings UI can render one row per leaf without the shell (#888 P0).
 //! - [`state`](mod@state) — the `$XDG_STATE_HOME` writer.
 //!
 //! # The two cargo features (#1044)
@@ -77,6 +81,7 @@
 pub mod file;
 pub mod merge;
 pub mod places;
+pub mod schema;
 pub mod state;
 pub mod subsystem;
 pub mod xdg;

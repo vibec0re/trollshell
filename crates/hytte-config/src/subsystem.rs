@@ -1959,6 +1959,67 @@ fn without_locked(table: &toml::Table, locked: &BTreeSet<String>, prefix: &str) 
     out
 }
 
+/// [`Subsystem::DEFAULT_TOML`] with every path [`locked_here`] answers for
+/// removed — the key, its value **and** its own attached comment — for
+/// seeding a not-yet-existing overlay (#1333, a residue of #1331).
+///
+/// [`without_locked`] does the equivalent job on the *wanted* value, but that
+/// is a bare [`toml::Table`] with no comments to carry; the seed is still
+/// formatted TOML text a human is meant to read, so this walks a `toml_edit`
+/// document instead and deletes each locked key's whole decorated block with
+/// [`remove_keeping_closing_space`] — the same primitive [`patch`]'s stale
+/// sweep already uses to take a schema-owned key's bytes with it. Mirrors
+/// `without_locked`'s table rule too: a table a lock empties out is dropped
+/// whole, header included, rather than left behind as a bare `[section]`; a
+/// table that was already empty is left alone.
+///
+/// Without this, a first save under a lock wrote the *default* value at the
+/// locked key into the fresh file — a line the operator never typed — which
+/// the very next load then refused with "is set in nix and cannot be
+/// overridden", on every load until someone deleted it by hand.
+///
+/// # Errors
+/// [`ConfigError::Encode`] if [`Subsystem::DEFAULT_TOML`] is not valid TOML —
+/// that is our bug, the same case [`ConfigError::Parse`]'s `path: None` names.
+fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String, ConfigError> {
+    if locked.is_empty() {
+        return Ok(S::DEFAULT_TOML.to_string());
+    }
+    let mut doc: toml_edit::DocumentMut = S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
+        ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
+    })?;
+    strip_locked(doc.as_table_mut(), locked, "");
+    Ok(doc.to_string())
+}
+
+/// The `toml_edit`-document half of [`seed_without_locked`]: recurses through
+/// `doc`, removing every key [`locked_here`] answers for.
+fn strip_locked(doc: &mut dyn toml_edit::TableLike, locked: &BTreeSet<String>, prefix: &str) {
+    let keys: Vec<String> = doc.iter().map(|(key, _)| key.to_string()).collect();
+    for key in keys {
+        let path = format!("{prefix}{key}");
+        if locked_here(locked, &path) {
+            remove_keeping_closing_space(doc, &key);
+            continue;
+        }
+        let was_empty = doc
+            .get(&key)
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(toml_edit::TableLike::is_empty);
+        let Some(sub) = doc.get_mut(&key).and_then(toml_edit::Item::as_table_like_mut) else {
+            continue;
+        };
+        strip_locked(sub, locked, &format!("{path}."));
+        let now_empty = doc
+            .get(&key)
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(toml_edit::TableLike::is_empty);
+        if now_empty && !was_empty {
+            remove_keeping_closing_space(doc, &key);
+        }
+    }
+}
+
 /// Write `value` to `path` as this subsystem's overlay, atomically.
 ///
 /// Seeds a not-yet-existing file with [`Subsystem::DEFAULT_TOML`] before
@@ -1999,6 +2060,12 @@ pub fn save_overlay_to<S: Subsystem + serde::Serialize>(
 /// the case today). The day such an option is added, adding it is the review
 /// moment that should move that subsystem's save onto this function.
 ///
+/// A not-yet-existing file is seeded with [`Subsystem::DEFAULT_TOML`] as
+/// [`save_overlay_to`] documents, but — unlike that plain spelling, which has
+/// no lock set to consult — the seed is filtered through
+/// [`seed_without_locked`] first: a locked key's default line has no business
+/// in a file the operator never typed at all (#1333).
+///
 /// # Errors
 /// As [`save_overlay_to`].
 pub fn save_overlay_to_locked<S: Subsystem + serde::Serialize>(
@@ -2012,7 +2079,7 @@ pub fn save_overlay_to_locked<S: Subsystem + serde::Serialize>(
 
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => S::DEFAULT_TOML.to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_without_locked::<S>(locked)?,
         Err(e) => {
             return Err(ConfigError::Unreadable {
                 path: path.to_path_buf(),
@@ -4951,11 +5018,12 @@ kept = true
     /// [`Loaded::locked`], and every row it should have greyed is offered as
     /// editable on the machine where nobody has written an overlay yet.
     ///
-    /// The save half is deliberately not asserted here: a first save *seeds*
-    /// [`Subsystem::DEFAULT_TOML`] into the new file (see
-    /// [`save_overlay_to_locked`]'s own doc), so the fresh overlay carries the
-    /// documented default's line at every key, locked ones included. That is
-    /// the seeding rule, not the lock's, and it predates #1227.
+    /// The save half — a first save into the file this test finds missing —
+    /// is the sibling test below, [`a_first_save_under_a_lock_does_not_seed_the_locked_default`]:
+    /// since #1333 the seed [`save_overlay_to_locked`] writes is filtered by
+    /// the same lock set this test asserts [`load_from`] hands back, so the
+    /// documented default's line at a locked key never reaches the fresh
+    /// file in the first place.
     #[test]
     fn a_missing_overlay_file_still_leaves_the_base_locks_enforceable() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4969,6 +5037,65 @@ kept = true
         assert!(loaded.is_locked("core.brightness"), "{:?}", loaded.locked);
         assert_eq!(loaded.config.core.brightness, 3, "nix's value");
         assert_eq!(loaded.sources.len(), 1, "and only the base was read");
+    }
+
+    /// #1333, the residue #1331's own body flagged: a first save into a
+    /// not-yet-existing overlay must not seed a locked key's *default*
+    /// line — the operator never typed it, and the very next load would
+    /// refuse it as an override, on every load until someone deleted it by
+    /// hand. Locks `core.color`, which is exactly the key [`DEFAULT`]
+    /// attaches a leading comment to, so this also covers "and its own
+    /// attached comment".
+    ///
+    /// Red if [`save_overlay_to_locked`]'s seed stops going through
+    /// [`seed_without_locked`] (reverts to the bare `S::DEFAULT_TOML.to_string()`
+    /// it used before #1333): the fresh file gets `color = "amber"` plus its
+    /// comment, and the reload two lines down starts warning.
+    #[test]
+    fn a_first_save_under_a_lock_does_not_seed_the_locked_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("overlay.toml");
+        std::fs::write(&base, "_locked = [\"core.color\"]\n\n[core]\ncolor = \"lcd\"\n")
+            .expect("seed the base");
+        let paths = [base, overlay.clone()];
+
+        let loaded = load_from::<Leds>(&paths).expect("first load, no overlay yet");
+        assert!(loaded.is_locked("core.color"), "{:?}", loaded.locked);
+        assert_eq!(loaded.config.core.color, "lcd", "nix's value");
+
+        let mut value = loaded.config.clone();
+        value.core.brightness = 5; // an unlocked edit, so the save has something of the operator's to write
+        save_overlay_to_locked(&overlay, &value, &loaded.locked).expect("first save");
+
+        let written = std::fs::read_to_string(&overlay).expect("read the fresh file");
+        assert!(
+            !written.contains("color"),
+            "the locked default's line must not be seeded: {written}"
+        );
+        assert!(
+            !written.contains("Strip colour"),
+            "…nor the comment attached to it: {written}"
+        );
+        assert!(
+            written.contains("brightness = 5"),
+            "the unlocked edit still lands: {written}"
+        );
+
+        let (captured, _guard) = capture();
+        let reloaded = load_from::<Leds>(&paths).expect("reloads");
+        assert!(
+            shadow_warnings(&captured).is_empty(),
+            "no line was seeded, so there is nothing to refuse: {:?}",
+            shadow_warnings(&captured)
+        );
+        assert!(
+            reloaded.lock_findings.is_empty(),
+            "{:?}",
+            reloaded.lock_findings
+        );
+        assert_eq!(reloaded.config.core.color, "lcd", "still nix's value");
+        assert_eq!(reloaded.config.core.brightness, 5, "the edit round-trips");
     }
 
     /// The mirror of the test above, and the case that is *normal* rather than

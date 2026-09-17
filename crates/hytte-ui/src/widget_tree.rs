@@ -2462,12 +2462,16 @@ mod diff_tests {
     /// A `GlSurface` is its **own kind**, so an id reused across the
     /// `Pixels` ⇄ `GlSurface` boundary rebuilds instead of reusing the widget.
     ///
-    /// This is the arm that matters for the kill switch: with
-    /// `TROLLSHELL_PREEM_RENDERER=cpu` the shell emits `Pixels` for a `Scope`
-    /// and without it a `GlSurface`, under the *same node id*. If both mapped
-    /// to one `NodeKind`, `update_in_place` would downcast a `PixelSurface` to
-    /// a `GlSurface` and hit the `downcast` expect — the "kind invariant"
-    /// panic — on the first frame after a flip.
+    /// This is the arm that matters for the shell's preem fallback: a widget
+    /// whose pipeline can draw maps to a `GlSurface`, and one whose pipeline
+    /// cannot maps to the empty `Pixels` placeholder, under the *same node id*
+    /// — a flip a failed context or a refused pipeline produces mid-session.
+    /// (Until trollshell#1157 the flip was the `TROLLSHELL_PREEM_RENDERER=cpu`
+    /// kill switch's too, and the `Pixels` node carried the CPU kit's raster
+    /// rather than nothing; the boundary this crosses is the same either way.)
+    /// If both mapped to one `NodeKind`, `update_in_place` would downcast a
+    /// `PixelSurface` to a `GlSurface` and hit the `downcast` expect — the
+    /// "kind invariant" panic — on the first frame after a flip.
     ///
     /// **Falsified** by dropping the `&& prev[i].kind == nk.kind` clause from
     /// [`plan_diff`]'s keyed lookup: both directions then reuse.

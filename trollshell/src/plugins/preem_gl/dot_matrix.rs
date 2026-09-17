@@ -168,7 +168,7 @@ pub(crate) const DOT_MATRIX_PIPELINE: GlPipeline = GlPipeline {
 /// display has, and the glyph bits for them.
 ///
 /// Built once per text change and shared by every monitor's mapping pass, the
-/// way `Renderer::ScopeGl`'s `samples` is (#911's rule, for uniforms): the
+/// way `Renderer::Scope`'s `samples` is (#911's rule, for uniforms): the
 /// `Arc` makes a repeat mapping's dedup a pointer compare rather than a
 /// re-encode of the whole line.
 #[derive(Clone, Debug, PartialEq)]

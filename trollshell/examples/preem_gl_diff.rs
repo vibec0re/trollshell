@@ -1884,7 +1884,7 @@ fn drive(area: &GlSurface, case: &Case) {
         Case::Scope { style, idle_steps } => {
             let batch: std::sync::Arc<[f32]> = std::sync::Arc::from(&samples()[..]);
             // The debut batch is step 0; `idle_steps` more steps carry it into
-            // the fade, exactly as `Renderer::ScopeGl::advance` counts them.
+            // the fade, exactly as `Renderer::Scope::advance` counts them.
             let step_seq = 1 + u64::from(*idle_steps);
             let surface = program::scope_surface(
                 scope_config(*style),

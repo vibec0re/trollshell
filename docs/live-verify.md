@@ -2019,9 +2019,11 @@ systemd-run --user --unit=trollshell-plugin-stats-side \
 - [ ] **(#1250)** **It is drawn by the shell, on the GPU.** With
       `RUST_LOG=trollshell=debug` there should be no `Node::Pixels` traffic
       from this plugin at all — the widgets go out as typed `Node::Preem`
-      state once the host advertises the preem vocabulary. Compare against
-      `TROLLSHELL_PREEM_RENDERER=cpu` on the shell: the card must still render,
-      through the CPU kit, and look the same.
+      state once the host advertises the preem vocabulary. Since #1157 the GPU
+      is the only place they are drawn: there is no `TROLLSHELL_PREEM_RENDERER`
+      to compare against any more, and a chip whose pipeline this driver will
+      not build renders the broken-widget placeholder with a journal line
+      naming the program.
 - [ ] **(#1250)** **A closed sidebar costs nothing.** Close the right sidebar
       and watch the plugin's CPU in `top` for a minute: it should be flat zero
       — the sampler parks on `SlotVisible(false)` and does not read `/proc` at
@@ -2802,8 +2804,10 @@ session.
       after the pool settles, and required to be stable across two renders of
       the same state, the two arms are **byte-identical — max |Δ| 0 of 255 on
       every channel of all twelve cases, under llvmpipe + Xvfb** (Mesa 26.2.2).
-      So GL is the default and `TROLLSHELL_PREEM_RENDERER=cpu` is the kill
-      switch. This entry used to say nothing here could be gated in CI —
+      So GL became the default again, and `TROLLSHELL_PREEM_RENDERER=cpu` was
+      the kill switch until **#1157 retired it with the CPU renderer itself**
+      — every kind has a shader now, and a chip that cannot get one draws the
+      broken-widget placeholder. This entry used to say nothing here could be gated in CI —
       stale since #1077 put Mesa llvmpipe into `nix flake check`'s
       system-tests bucket, and wrong outright after #1080: that check now
       builds and runs `preem_gl_diff` itself under that same llvmpipe
@@ -2825,14 +2829,18 @@ session.
      names which loader route won (glvnd or libepoxy, #1067);
      `journalctl --user -u trollshell | grep -i 'GlSurface\|GL context'` should
      otherwise be silent — a line there names the fallback that fired.
-  2. **The kill switch still forces the kit.** Restart with
-     `TROLLSHELL_PREEM_RENDERER=cpu` in the unit's environment and confirm the
-     scope draws the CPU kit's own picture. That identity is byte-checked in
-     CI (`the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, plus
-     every existing `*_renders_at_parity_with_the_kit` test, which all run on
-     the CPU arm by default). What only glass can confirm is that the switch is
-     actually _read_: the variable is consumed once at the first `Scope`
-     build, so it has to be in the unit's environment, not just your shell's.
+  2. **(#1157) A session with no GL shows the placeholder, and says so.**
+     The kill switch used to hold this line ("restart with
+     `TROLLSHELL_PREEM_RENDERER=cpu` and confirm the scope draws the kit's own
+     picture"); with the CPU renderer retired there is nothing to fall back to,
+     so the thing to confirm is the _degradation_. Start the shell with GL
+     broken — `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=nonesuch`, or run it on a
+     seat with no render node — and check that every preem chip is **empty
+     rather than wrong**: the bar keeps its chip boxes and its CSS chrome, no
+     chip draws a stale or garbled frame, and
+     `journalctl --user -u trollshell | grep -i 'GL context\|preem GL pipeline'`
+     names the cause exactly once. Nothing else in the shell may go with it —
+     the clock, the icons and every non-preem widget must be untouched.
   3. **A bar's worth of scopes.**
      `cargo run -p hytte-ui --example gl_probe -- --layer --areas 8` (stage A's
      probe, on layer-shell): **jank 0**, and p95 within 0.5 ms of the 16.67 ms
@@ -2917,8 +2925,8 @@ session.
 
 - [ ] **(#1143 / #865 / #1090)** **`Gauge` renders on a `GtkGLArea`, at the
       surface's native resolution — and that is what #1090 is waiting on.**
-      Second kind on the `Scope` seam, same kill switch, same context-failure
-      fallback. The difference that matters is the **grid**: a scope's
+      Second kind on the `Scope` seam, same context-failure fallback (the kill
+      switch they shared went with the CPU renderer in #1157). The difference that matters is the **grid**: a scope's
       offscreen passes run at its pre-upscale `cols × rows`, a gauge's run at
       `cols * scale × rows * scale`, so the arc, the ticks and the needle are
       rasterised at the size they are shown at instead of at a logical 144 × 64
@@ -2932,8 +2940,8 @@ session.
       What CI already holds: the mapping (the golden uniform table, the dial
       geometry, the motion-blur fan collapsing exactly at rest, the overtravel
       stop, and — since #1148 — every constant `gauge.frag` shares with the kit,
-      parsed back out of the shipped GLSL), the node shape, the kill switch, the
-      lockstep park, the context-failure rebuild, and — under llvmpipe in
+      parsed back out of the shipped GLSL), the node shape, the park predicate,
+      the context-failure rebuild, and — under llvmpipe in
       `checks.system-tests` — **sixteen** gauge parity cases:
 
       - twelve at `scale = 1` (four skins × rest / mid-sweep / pegged), where the
@@ -2969,22 +2977,24 @@ session.
      the usage tiles). The needle should read as a thin, hard pointer with a
      tight glow, and the tick marks as separate marks rather than a soft band.
      Compare against #1090's screenshot: that is the "before".
-  2. **Side by side with the kit.** Restart with
-     `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's** environment (it is read
-     once, at the first widget build, so your shell's environment is not
-     enough) and screenshot the same dial. The GL one should differ **only** in
-     edge softness — the field, the flat tick/arc interiors and the lit cores
-     must read as identical, which is the `scale = 2` harness case's own
-     assertion (above) rather than a hope. If anything but the edges moved — a
-     different colour, a moved tick, a needle at another angle, a comb at
-     another pitch — that is a bug, not the improvement, and the harness will
-     say so as `FAIL(interior)`.
+  2. **Side by side with the kit.** This used to read "restart with
+     `TROLLSHELL_PREEM_RENDERER=cpu` and screenshot the same dial"; #1157
+     retired that switch with the CPU renderer, so the kit's side of the
+     comparison is now the parity harness's own evidence images — run
+     `preem_gl_diff` and open the `gates/` pair for a gauge case
+     (`pnmtopng` them). The GL one should differ **only** in edge softness — the
+     field, the flat tick/arc interiors and the lit cores must read as
+     identical, which is the `scale = 2` harness case's own assertion (above)
+     rather than a hope. If anything but the edges moved — a different colour, a
+     moved tick, a needle at another angle, a comb at another pitch — that is a
+     bug, not the improvement, and the harness will say so as `FAIL(interior)`.
   3. **The verdict is Annika's.** #1090 is the open report; this entry is what
-     closes it, and only she can say the dial now looks right. Both looks are
-     one restart apart (item 2), which is the point of keeping the kill switch.
+     closes it, and only she can say the dial now looks right. The "before" is
+     the harness's kit image (item 2) or #1090's own screenshot, not a second
+     shell.
   4. **The fallback, if you can provoke it.** Same as the scope's item 7: force
-     a context failure and confirm the dial falls back to the CPU kit with one
-     journal line rather than a blank chip. A gauge is the case that needs the
+     a context failure and confirm the dial goes to the broken-widget
+     placeholder with one journal line. A gauge is the case that needs the
      hook rather than the next mapping pass — a needle sitting on its target
      never animates, so no pass is coming.
   5. **A skin rotation.** Walk the four skins with a gauge on screen (the
@@ -3000,8 +3010,8 @@ session.
 
 - [ ] **(#1144 / #865)** **`DotMatrix` renders on a `GtkGLArea`, with the dot
       lattice drawn at the fragment's own resolution.** Third kind on the
-      `Scope` seam, same kill switch, same context-failure fallback — and the
-      last for now: Annika asked for the gauge and the dot matrix and then a
+      `Scope` seam, same context-failure fallback (the kill switch they shared
+      went with the CPU renderer in #1157) — and the last for now: Annika asked for the gauge and the dot matrix and then a
       stop (#865, "but lets pause after those"), so the remaining kinds
       (seven-seg, split flap, LED strip and matrix, marquee, textbox) still
       draw on the kit.
@@ -3024,7 +3034,7 @@ session.
       re-phase onto the dot grid, the glyph strip against the kit's own font
       including its `NOTDEF` fallback, the skin's un-halved halo), the node
       shape, the strip's sharing across mapping passes and its re-encode on a
-      new line, the kill switch, the context-failure rebuild, and — under
+      new line, the context-failure rebuild, and — under
       llvmpipe in `checks.system-tests` — **twenty** dot-matrix parity cases
       (four skins × blank / readout / notdef / dense / coarse). All twenty came
       out **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every
@@ -3097,13 +3107,13 @@ session.
      improvement, not a regression; the `x2` cases are what bound it.
   2. **The dots are round when the chip is stretched.** The improvement shows
      where CSS or layout gives the surface more room than its grid — widen the
-     card, or put a readout in a container that stretches it. The GL arm should
-     read as round dots with soft rims at the screen's resolution; the CPU arm
-     (restart with `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's**
-     environment — it is read once, at the first widget build) should read as
-     magnified square blocks. If they look the same, the surface was not
-     actually being stretched; check that the chip is not sized to exactly its
-     natural width.
+     card, or put a readout in a container that stretches it. The chip should
+     read as round dots with soft rims at the screen's resolution, where the
+     kit's magnified square blocks are what #1091's own screenshot shows (the
+     `TROLLSHELL_PREEM_RENDERER=cpu` restart this used to name went with the CPU
+     renderer in #1157). If it reads as blocks, the surface was not actually
+     being stretched; check that the chip is not sized to exactly its natural
+     width.
   3. **The halo behind a stretched display is still grid-resolution.** Known
      and deliberate: the bloom is sampled out of the blurred offscreen texture,
      which is grid-sized, so a stretched display has sharp dots over a blocky
@@ -3163,7 +3173,7 @@ session.
       bytes, the shader's four font metrics and its notdef bit read back out of
       the GLSL, the corner predicate against `TextBoxLayout::field_at` at every
       pixel of nine boxes, both node shapes, the shared `update`/`advance`
-      helpers, the kill switch, the context-failure rebuild — and, under
+      helpers, the context-failure rebuild — and, under
       llvmpipe in `checks.system-tests`, **twenty-four** marquee cases (four
       skins × empty / held / three scroll phases / one at a window width where
       the centred origin and the bezel diverge — #1209 review, MEDIUM-1, so
@@ -3225,10 +3235,11 @@ session.
      the corner's own width move in either direction (an unbranched drift that
      reds 12 of the 16 pinned 1:1 cases leaves all four supersampled ones
      green), so this eyeball comparison is the _only_ thing standing behind
-     the arc at scale > 1. Side by side with `TROLLSHELL_PREEM_RENDERER=cpu`
-     (in the **unit's** environment — it is read once, at the first widget
-     build): at the natural size on a 1× screen the two must be
-     indistinguishable, and on HiDPI or stretched the GL arm's arc should be a
+     the arc at scale > 1. Side by side with the harness's kit image (#1157
+     retired the `TROLLSHELL_PREEM_RENDERER=cpu` restart this used to name
+     along with the CPU renderer; run `preem_gl_diff` and open a textbox case's
+     `gates/` pair): at the natural size on a 1× screen the two must be
+     indistinguishable, and on HiDPI or stretched the shipped arc should be a
      smooth curve where the kit's is a stair. If the stretched one looks
      identical, the surface was not actually stretched.
   3. **The glyphs are still square.** The same comparison, on the text itself:
@@ -3350,24 +3361,17 @@ session.
      (`GDK_MEMORY_DEFAULT`), not off a screen. It is the claim in this PR with
      the least evidence behind it.
 
-  8. **(#978)** **The kill switch turns plugin shaders off too.** This is the
-     one item on this page that #893's own list carried and the page then lost:
-     the spec calls `TROLLSHELL_PREEM_RENDERER=cpu` "the kill switch, forcing
-     CPU regardless of GL availability", and until #978 the one widget in the
-     shell running a _plugin's_ GPU code was the one widget that ignored it.
-     Restart the shell with `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's**
-     environment (`systemctl --user edit trollshell`, not your login shell — the
-     variable is read once, at the first `Scope` build) and open the
-     preem-demo card. The `Scope` chip must still draw, on the CPU kit
-     (that is check 2 of the entry above). The spectrum tile directly under it
-     must be **empty** — the broken-widget placeholder — and
-     `journalctl --user -u trollshell | grep -i 'kill switch'` must carry
-     exactly one line naming `TROLLSHELL_PREEM_RENDERER`. The negative half is
-     the part only glass can show:
+  8. **(#978, closed out by #1157)** **~~The kill switch turns plugin shaders
+     off too.~~** Retired: #978 made `TROLLSHELL_PREEM_RENDERER=cpu` reach the
+     one widget in the shell that runs a _plugin's_ GPU code, and #1157 retired
+     the switch itself along with the CPU renderer it named. There is no
+     "turn GL off" setting to check any more; what replaces this item is item 2
+     of the entry above — a session whose GL is actually broken, where the
+     preem chips and the spectrum tile now take the **same** degradation
+     (the broken-widget placeholder), and
      `RUST_LOG=hytte_ui=debug journalctl --user -u trollshell | grep 'compiling a plugin shader'`
-     must be **empty** — no `GtkGLArea`, no GLES context, no plugin GLSL
-     compiled anywhere in the process. Unset it and restart: the tile comes
-     back and the line reappears.
+     is empty because there is no context to compile against rather than because
+     an operator said so.
   9. **(#977)** **A data grid too wide for the GPU is refused, loudly.** Only
      glass has a driver. Patch the demo plugin to send a 1-D grid over the
      per-axis cap — in `crates/hytte-plugin-preem-demo`, set the shader node's
@@ -3393,19 +3397,21 @@ session.
       whose on-glass check is a _drawer page_ rather than a plugin card.
 
       Open the drawer's **Stats** page and look at the "Blinken Lichten" row
-      under Per-core. Then restart with `TROLLSHELL_PREEM_RENDERER=cpu` in the
-      **unit's** environment (`systemctl --user edit trollshell`, not your login
-      shell) and look again.
+      under Per-core. The side-by-side this item used to ask for — a restart
+      with `TROLLSHELL_PREEM_RENDERER=cpu` — went with the CPU renderer in
+      #1157, so the kit's side of every comparison below is now the parity
+      harness's own evidence image (`preem_gl_diff`, the `panel` cases under
+      `gates/`) rather than a second shell.
 
-  1. **They must be the same picture.** Not just "both draw lamps": same lamp
-     positions, same bezel, same colours, same overall glow. CI pins them
-     byte-identical at 1:1 under llvmpipe, so a visible difference on a real
-     driver is this arm's first real-hardware finding.
+  1. **It must be the kit's picture.** Not just "it draws lamps": same lamp
+     positions, same bezel, same colours, same overall glow as the harness's kit
+     image. CI pins the two byte-identical at 1:1 under llvmpipe, so a visible
+     difference on a real driver is this arm's first real-hardware finding.
   2. **Where the improvement is, and where it is not.** `core_panel_scale`
      answers 6 at 1 core, 5 at 4, 3 at 8 and at 16, **2 at 32** and **1 from 64
      up**, so whether you can see anything at all depends on your core count.
-     On a box of 32 cores or fewer the GL frame's lamp edges and — much more visibly —
-     its **halo** should be smooth where the CPU one is a staircase of
+     On a box of 32 cores or fewer the panel's lamp edges and — much more
+     visibly — its **halo** should be smooth where the kit's are a staircase of
      `scale`-wide blocks. On a 64-core box the two are the same resolution and
      this check is vacuous by construction; say so rather than reporting "no
      difference" as a pass.
@@ -3413,11 +3419,11 @@ session.
      `style`, `color`, `rows` and `fill`, and the colour axis is this widget's
      alone — every other kit surface has one ink. Walk `color` through
      `heat` (the default), `style`, `rainbow`, `transpride` and an
-     `rgb` triple; the two arms must agree on each. Also walk `fill` with a
-     `rows` that leaves a ragged tail (`rows = 3` on a 64-core box: 22 columns,
-     two spare slots): `spare` ghosts all 66 slots and `blank` only the 64 that
-     hold a lamp, so the two must differ by exactly that unlit hardware and
-     agree with each other arm for arm.
+     `rgb` triple; each must match the harness's kit image for that dressing.
+     Also walk `fill` with a `rows` that leaves a ragged tail (`rows = 3` on a
+     64-core box: 22 columns, two spare slots): `spare` ghosts all 66 slots and
+     `blank` only the 64 that hold a lamp, so the two must differ by exactly
+     that unlit hardware.
 
      What this item deliberately does **not** ask for is the spare slots' ink
      clamp, which an earlier draft did (#1156 review, MEDIUM-1): with every
@@ -3428,16 +3434,19 @@ session.
      day that stops being true; until it reds, the clamp is pinned on the
      uploaded strip instead (`the_strip_carries_the_kits_own_lamp_amounts_and_inks`).
 
-     A save alone re-skins the panel with the shell up; that is #869's payoff
-     and it must survive the arm swap.
+     A save alone re-skins the panel with the shell up; that is #869's payoff.
 
   4. **The fallback, and it is this kind's sharpest edge.** The panel is not in
      the plugin tree, so `preem_gl::install`'s context-failure hook sweeps
      nothing here — the arm is re-resolved on every `sensors::cpu()` tick
      instead, which is once a second. Force a context failure and confirm the
-     panel is back on the kit **within about a second** rather than blank for
-     the rest of the session, with one journal line. A blank row here would be
-     the exact shape #1156 built the per-tick resolve to avoid.
+     row goes to the broken-widget placeholder **within about a second** and
+     stays a well-behaved empty row: the Stats page must not jump, the
+     surrounding cards must not reflow, and the row's tooltip must still report
+     every core's load, which is the one thing this panel can still say with no
+     GPU. It fell back to the kit here until #1157 retired it; what the
+     per-tick resolve now buys is that the swap happens at all rather than a
+     `GlSurface` sitting there drawing nothing for the session.
   5. **The row's geometry did not move.** The #702 non-regression: the Stats
      page's minimum width must not grow, and a wide card must not inflate the
      row's height. `GlSurface::measure` answers `(0, natural, -1, -1)` the same
@@ -3448,8 +3457,8 @@ session.
      What CI already holds: the golden uniform table against the kit's own
      `LED_MATRIX_CELL`/`GAP`/`PAD`, the strip encoding against
      `lamp_intensities`/`lamp_inks`, `ghost_slots`' two `Fill` arms, the
-     grid-and-scale relation, the kill switch and the live arm swap (both
-     directions) as a GTK test, the whole shader transcribed in Rust and
+     grid-and-scale relation, the per-pipeline refusal and the live surface swap
+     (both directions) as a GTK test, the whole shader transcribed in Rust and
      compared against the kit's bytes on every skin × every `ColorMap` × both
      `Fill` arms × five grid shapes — and, under llvmpipe in
      `checks.system-tests`, **twenty-eight** 1:1 cases (four skins × dark /
@@ -3505,6 +3514,57 @@ session.
      against a measured 77.9–84.2 %, where before this change they measured
      **100.0 %**: a bit-exact replication of the oracle, which no delta-based
      gate can ever red.
+
+- [ ] **(#1157 / #865)** **The CPU renderer is gone, and what "gone" looks
+      like.** The closer for the GL migration: every preem kind has a shader
+      (scope, gauge, dot matrix, marquee, text box, LED strip, seven-seg, flip
+      board, and the shell's own LED panel), so #1157 deleted the CPU arms and
+      the `TROLLSHELL_PREEM_RENDERER=cpu` kill switch with them. `hytte-preem`
+      stays: it is the parity oracle `preem_gl_diff` measures against, the
+      rasteriser every _plugin's_ own `Frame::into_node` still runs in its own
+      process, and where the shell reads its widgets' geometry and palette
+      from. What it no longer does in this process is rasterise. Every item
+      above that said "restart with `TROLLSHELL_PREEM_RENDERER=cpu` and compare"
+      has been rewritten to compare against the harness's kit evidence images
+      instead; these three are what is new.
+  1. **Nothing looks different.** The whole of the happy path: with GL working,
+     every chip on the bar and every preem widget in a drawer must look exactly
+     as it did before this PR. Nothing here changes what a shader draws — the
+     arms were already the ones drawing — so a visible change is a bug, and
+     the ones to look at first are the LED panel in the Stats drawer (its kit
+     arm is the one that went away) and any chip a layout stretches.
+  2. **The variable is inert, loudly enough.** Put
+     `Environment=TROLLSHELL_PREEM_RENDERER=cpu` back in the unit
+     (`systemctl --user edit trollshell`) and restart.
+     Nothing may change: every chip still draws on the GPU, and
+     `journalctl --user -u trollshell | grep -i 'preem'` must carry **no** line
+     about a renderer switch. An operator with that line still in a drop-in is
+     the realistic case, and the honest behaviour is to ignore it. Remove it
+     afterwards.
+  3. **A broken GL session degrades, it does not break.** The consequence this
+     PR states out loud. Start the shell with GL broken —
+     `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=nonesuch` in the unit's
+     environment, or a seat with no render node — and confirm:
+     - every preem chip is **empty rather than wrong**: the bar keeps its chip
+       boxes, their CSS chrome and their tooltips, and no chip shows a stale,
+       garbled or half-drawn frame;
+     - the bar's own geometry does not move — an empty chip measures 0×0, so
+       the neighbours close up, and that must read as tidy rather than as a
+       layout collapse;
+     - the Stats drawer's "Blinken Lichten" row is an empty row whose tooltip
+       still names every core's load;
+     - `journalctl --user -u trollshell | grep -i 'GL context'` carries the
+       context failure **once**, and nothing repeats it per chip per frame;
+     - everything that is not a preem widget is untouched: the clock, the
+       icons, the labels, every panel.
+
+     Then provoke the _narrow_ failure instead of the session-wide one, if you
+     can: a driver that builds seven pipelines and refuses one. That is
+     `journalctl --user -u trollshell | grep -i 'preem GL pipeline'` carrying
+     one line naming the program and the driver's own reason, that kind's chips
+     empty, and **every other kind still drawing** — which is the property
+     `arm_for` exists for and the one that would be worth the most if it ever
+     broke.
 
 ## Screen recording
 

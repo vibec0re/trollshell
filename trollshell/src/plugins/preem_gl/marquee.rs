@@ -80,8 +80,8 @@ pub(crate) const MARQUEE_PIPELINE: GlPipeline = DOT_MATRIX_PIPELINE;
 /// The visible grid at one scroll phase, as the shader consumes it.
 ///
 /// Built when the phase (or the message) moves and shared by every monitor's
-/// mapping pass, the way `Renderer::ScopeGl`'s `samples` and
-/// `Renderer::DotMatrixGl`'s `Glyphs` are (#911's rule, for uniforms): the
+/// mapping pass, the way `Renderer::Scope`'s `samples` and
+/// `Renderer::DotMatrix`'s `Glyphs` are (#911's rule, for uniforms): the
 /// `Arc` makes a repeat mapping's dedup a pointer compare rather than a second
 /// walk of the window.
 #[derive(Clone, Debug, PartialEq)]

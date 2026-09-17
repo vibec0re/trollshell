@@ -1,97 +1,66 @@
 //! Shell-side preem renderers (#883): the typed [`Node::Preem`](hytte_plugin_proto::wire::Node::Preem)
-//! widgets #882 put on the wire, rasterised **in this process** with
-//! `hytte-preem` — the same kit the Stats drawer's per-core LED panel already
-//! draws with (#857), into the same [`UiNode::Pixels`]/`PixelSurface` machinery
-//! the legacy `Node::Pixels` arm feeds.
+//! widgets #882 put on the wire, drawn **in this process** — since #1157 on the
+//! GPU and nowhere else, one shader pipeline per kit kind, emitted as a
+//! [`UiNode::GlSurface`] carrying the state a shader rasterises from.
 //!
-//! # …and one of them on the GPU (#893 stage B)
+//! # How it got here, and what is left (#893 → #1157)
 //!
-//! Since #893, a [`Scope`](vocab::PreemWidget::Scope) does **not** take that
-//! path by default. It takes [`Renderer::ScopeGl`], which emits a
-//! [`UiNode::GlSurface`] carrying the state a shader rasterises from — the
-//! uniforms, the sample batch, and a monotonic step count — instead of a
-//! rasterised buffer. The frame never leaves the GPU: rendering into an FBO and
-//! reading it back into an `Arc<[u8]>` would have reused every line of the
-//! machinery below and cost a pipeline stall per chip per frame, which is
-//! exactly the cost #863 set out to remove. `Scope` went first because it is
-//! the one kit widget with an inter-frame accumulation buffer, and a ping-pong
-//! FBO gets the phosphor decay and the bloom for free.
+//! #883 shipped this module as a CPU rasteriser: every widget went through
+//! `hytte-preem`, the same kit the Stats drawer's per-core LED panel draws with
+//! (#857), into the [`UiNode::Pixels`]/`PixelSurface` machinery the legacy
+//! `Node::Pixels` arm feeds. #893 stage B put the first kind on a shader and
+//! kept the kit beside it as both the fallback and the reference; #1143 (gauge),
+//! #1144 (dot matrix), #1152 (marquee + text box), #1153 (LED strip), #1154
+//! (seven-seg), #1155 (flip board) and #1156 (the shell's own LED panel, which
+//! is not on the wire) took the rest — and then **#1157 retired the CPU arm and
+//! the `TROLLSHELL_PREEM_RENDERER=cpu` kill switch with it** (Annika on #865:
+//! *"CPU renderer gone soon? ❤️"*).
 //!
-//! **What did *not* change is the point.** `ScopeGl` carries the same
-//! `pending`/`idle`/`fades`/`settle_steps`/`steps` fields as the CPU arm, runs
-//! them through the same [`scope_steps`] loop, and answers
-//! [`animates`](Renderer::animates) with the same expression — so #926's frame
-//! clock parks and unparks identically and `pump.rs` needed no change at all.
-//! Everything in this module's contract below — the instance lifecycle, the
-//! keying, the caps, the idempotence rule, the live re-tint — applies to both
-//! arms unchanged; the GL arm caches an `Arc<GlUniforms>` where the CPU arm
-//! caches an `Arc<[u8]>`, and both settle a re-map on an `Arc::ptr_eq`.
+//! So the frame never leaves the GPU. Rendering into an FBO and reading it back
+//! into an `Arc<[u8]>` would have reused every line of the machinery below and
+//! cost a pipeline stall per chip per frame, which is exactly the cost #863 set
+//! out to remove.
 //!
-//! # …and a second one, on the same seam (#1143)
+//! **What did *not* change is the point.** [`Renderer::Scope`] still carries
+//! the `pending`/`idle`/`fades`/`settle_steps`/`steps` fields the CPU arm had,
+//! runs them through the same [`scope_steps`] loop, and answers
+//! [`animates`](Renderer::animates) with the same expression — that agreement
+//! is what let #926's frame clock park and unpark identically across the whole
+//! migration, and `pump.rs` has never needed a line changed by it. Everything
+//! in this module's contract below — the instance lifecycle, the keying, the
+//! caps, the idempotence rule, the live re-tint — is unchanged too; what the
+//! cache holds is an `Arc<GlUniforms>` where it used to hold an `Arc<[u8]>`,
+//! and either settles a re-map on an `Arc::ptr_eq`.
 //!
-//! A [`Gauge`](vocab::PreemWidget::Gauge) takes [`Renderer::GaugeGl`] by the
-//! same rule, and it is the reason the seam is kind-generic rather than
-//! `Scope`-shaped: the arm decision, the context-failure rebuild
-//! ([`Renderer::is_gl`]) and the `Option` payload type
-//! ([`preem_gl::KitSurface`]) all stopped naming one widget, so #1144's dot
-//! matrix **was** one `build` arm and one pipeline — the prediction held.
+//! The kit is still linked, and still does three jobs: it is the **parity
+//! oracle** the `preem_gl_diff` harness measures each shader against, it is
+//! what every *plugin's* own `Frame::into_node` rasterises with in the plugin's
+//! process (the wire contract is untouched by any of this), and it is where the
+//! shell reads the widgets' **geometry and palette** from — `Gauge::dial`, the
+//! marquee's strip, `kit::palette_snapshot`, `kit::with_pins`. What it no
+//! longer does here is rasterise.
 //!
-//! Where it differs from `ScopeGl` is instructive: a gauge has **no**
-//! cross-frame GPU state, so `GaugeGl` holds the very `kit::Gauge` the CPU arm
-//! holds and the two share their `update`/`advance`/`animates` arms outright.
-//! What moves to the GPU is only the rasterisation — and that is the point,
-//! because doing it at the surface's native resolution instead of at a logical
-//! 144 × 64 replicated ×2 is what fixes #1090's smeared needle.
+//! Why each kind's GL arm is shaped the way it is stays on its own variant. The
+//! short version: a `Scope` is the only one with an inter-frame accumulation
+//! buffer, so its phosphor lives in a ping-pong FBO and its state machine is
+//! the one that had to be re-derived; a `Gauge`, a `FlipBoard` and a `LedStrip`
+//! keep the very kit object the CPU arm kept, because a spring, a clock and a
+//! peak-hold are closed-form CPU state; the three text kinds keep an
+//! **encoded** strip minted on a state change rather than per mapping pass
+//! (#911's rule, for uniforms); and the `Marquee` has no shader of its own at
+//! all — a ticker is the same dot hardware on a continuous grid, so it
+//! registers `dot_matrix`'s pipeline under its own name.
 //!
-//! # …and a third, which pays for itself differently (#1144)
+//! # …and when a pipeline cannot draw
 //!
-//! A [`DotMatrix`](vocab::PreemWidget::DotMatrix) takes
-//! [`Renderer::DotMatrixGl`] — the last kind on this seam until Annika says
-//! otherwise (#865: "lets pause after those"). It is the *simplest* of the
-//! three: no animation at all, so it shares its `advance`/`animates` arm with
-//! the other text widgets, and its only per-instance GPU state is the line
-//! encoded as a glyph strip.
-//!
-//! Its improvement is not the gauge's. There is no `scale` on a dot matrix —
-//! the dot pitch is the size knob (#1091) — so the kit already rasterises at
-//! the buffer it ships. What is resolution-*dependent* is the **dot**: the kit
-//! replicates each font pixel into a `dot_px`×`dot_px` block out of a fixed
-//! table, so a chip that layout scales above its natural size magnifies those
-//! blocks. The GL arm evaluates the kit's falloff law at the fragment's own
-//! position instead, and snaps to the pixel centre at 1:1 so the two arms draw
-//! the same picture where the harness measures them.
-//!
-//! # …and the two text kinds (#1152)
-//!
-//! A [`Marquee`](vocab::PreemWidget::Marquee) takes
-//! [`Renderer::MarqueeGl`] and a [`TextBox`](vocab::PreemWidget::TextBox)
-//! takes [`Renderer::TextBoxGl`], on Annika's word for the rest of #865.
-//!
-//! The ticker needs **no shader of its own**: it is the same dot hardware as
-//! the static display on a continuous grid rather than a row of character
-//! cells, so it registers `dot_matrix`'s pipeline under its own name and
-//! drives three grid uniforms differently. Its animation is the one thing new
-//! here, and it is not a uniform: #839 made a sub-dot position inexpressible,
-//! so a scroll step is a *different set of lit columns* and the arm re-uploads
-//! the grid exactly when the whole-dot phase moves. Both arms integrate that
-//! phase through one [`marquee_step`], so `animates()` is the same expression
-//! on both and #926's clock parks identically.
-//!
-//! The text box is the *smallest* GL arm in the tree — one pass, no aux
-//! textures, no step passes, because the widget has no emission at all — and
-//! its improvement is one shape: the rounded corner, evaluated as a distance at
-//! the fragment's own resolution instead of replicated out of a logical-pixel
-//! mask. Its glyphs stay deliberately square. It is also the one arm whose
-//! mapping takes **no palette**: a `TextBox` bakes its colors at construction,
-//! so [`invalidate_cached_frames`] rebuilds this renderer exactly as it rebuilds
-//! the CPU one.
-//!
-//! The CPU arm is still the reference and is still gated byte-exactly. It is
-//! taken when `TROLLSHELL_PREEM_RENDERER=cpu` is set (the kill switch — read
-//! once at the first build), when the widget kind has no GL arm (everything but
-//! `Scope`, `Gauge`, `DotMatrix`, `Marquee` and `TextBox` today), or when a GL
-//! context could not be created. See [`preem_gl`](super::preem_gl) for all
-//! three.
+//! Two things take a widget off the GPU, both sticky for the session and both
+//! folded in by [`preem_gl::arm_for`]: a **failed `GdkGLContext`**, and a
+//! **pipeline this driver refused to build** (#1232). There is nothing to fall
+//! back to since #1157, so [`build`] answers `None` and the node renders as the
+//! broken-widget placeholder — an empty surface keeping its id and classes, the
+//! degradation `Node::Shader` has taken by design since #893 and the one this
+//! module already used for an unrenderable kind and an over-cap node. The
+//! journal line naming the cause comes from `preem_gl`'s hooks.
 //!
 //! # What this module owns
 //!
@@ -619,91 +588,87 @@ impl Steps {
     }
 }
 
-/// One live preem widget's shell-side renderer: the kit objects plus the
-/// animation state the wire deliberately doesn't carry.
+/// One live preem widget's shell-side renderer: the per-instance GPU state plus
+/// the animation state the wire deliberately doesn't carry.
+///
+/// **Every variant is a GL arm** since #1157 retired the CPU renderer. The `Gl`
+/// suffix stays because that is what [`gl_program`](Self::gl_program) and
+/// [`gl_surface`](Self::gl_surface) answer for — which pipeline this instance
+/// draws with, and so which chips a refusal of that pipeline takes down — not
+/// because there is a second arm left to tell it apart from.
 #[derive(Debug)]
 enum Renderer {
-    /// Pure — no instance state; re-rendered from the text on change.
+    /// The `DotMatrix` (#1144), the third kind onto a shader and the one whose
+    /// payoff is not the gauge's.
     ///
-    /// The pitch is kept because the kit resolves it at *construction*
-    /// (`kit::DotMatrix::dot_px`) while this arm re-renders from the text, so
-    /// there is no builder here to hold it — and the wire's `dot_px` is config,
-    /// so it can only change through a rebuild (#1091).
-    DotMatrix {
-        text: String,
-        dot_px: usize,
-    },
-    /// The **GPU** arm of [`DotMatrix`](Self::DotMatrix) (#1144), the third and
-    /// (for now) last kind on the [`ScopeGl`](Self::ScopeGl) seam — #865's
-    /// "start with the dotmatrix and gauge … but lets pause after those".
+    /// Pure: the whole state is the line of text, so there is no animation here
+    /// and [`advance`](Self::advance) / [`animates`](Self::animates) share
+    /// their arm with every other text widget.
     ///
-    /// Pure, like the CPU arm: the whole state is the line of text, so there is
-    /// no animation here and [`advance`](Self::advance) /
-    /// [`animates`](Self::animates) share their arm with every other text
-    /// widget.
+    /// There is no `scale` on a dot matrix — the dot pitch is the size knob
+    /// (#1091) — so the kit already rasterised at the buffer it shipped. What
+    /// is resolution-*dependent* is the **dot**: the kit replicates each font
+    /// pixel into a `dot_px`×`dot_px` block out of a fixed table, so a chip
+    /// that layout scales above its natural size magnifies those blocks. The
+    /// shader evaluates the kit's falloff law at the fragment's own position
+    /// instead, and snaps to the pixel centre at 1:1 so the two agree where the
+    /// parity harness measures them.
     ///
-    /// It keeps the line **encoded** rather than as a `String`, which is the
-    /// one thing it has that the CPU arm does not. The shader reads the glyph
-    /// grid out of a data strip, and a mapping pass that re-encoded the display
-    /// would do it once per monitor and again on every re-tint; here
-    /// [`update`](Self::update) rebuilds it (that is the *only* time it can
-    /// move — [`apply`] short-circuits an unchanged widget before `update` is
-    /// reached) and every mapping pass after that clones an `Arc`. #911's rule,
-    /// the same one `ScopeGl`'s shared batch follows.
+    /// It keeps the line **encoded** rather than as a `String`. The shader
+    /// reads the glyph grid out of a data strip, and a mapping pass that
+    /// re-encoded the display would do it once per monitor and again on every
+    /// re-tint; here [`update`](Self::update) rebuilds it (that is the *only*
+    /// time it can move — [`apply`] short-circuits an unchanged widget before
+    /// `update` is reached) and every mapping pass after that clones an `Arc`.
+    /// #911's rule, the same one `Scope`'s shared batch follows.
     ///
     /// The config rides along because the pitch and the skin are both config
     /// and the mapping needs them every pass.
-    DotMatrixGl {
+    DotMatrix {
         /// The already-clamped config the uniforms are rebuilt from.
         config: vocab::DotMatrixConfig,
         /// The line as the shader consumes it — see `preem_gl::dot_matrix`.
         glyphs: preem_gl::Glyphs,
     },
-    /// Pure.
-    SevenSeg {
-        text: String,
-    },
-    /// The **GPU** arm of [`SevenSeg`](Self::SevenSeg) (#1154).
+    /// The `SevenSeg` (#1154).
     ///
-    /// Pure, like the CPU arm — `kit::seven_seg` is a pure function of
-    /// `(text, style)`, so there is no builder, no clock and no animation on
-    /// either side.
+    /// Pure — `kit::seven_seg` is a pure function of `(text, style)`, so there
+    /// is no builder, no clock and no animation.
     ///
-    /// What it adds is the **encoded readout**, and it is here rather than in
-    /// the mapping for #911's reason: the cell layout and the segment masks are
-    /// a function of the text alone, so re-deriving them per mapping pass would
-    /// walk the readout once per monitor and again on every re-tint.
+    /// What it carries is the **encoded readout**, and it is here rather than
+    /// in the mapping for #911's reason: the cell layout and the segment masks
+    /// are a function of the text alone, so re-deriving them per mapping pass
+    /// would walk the readout once per monitor and again on every re-tint.
     /// [`update`](Self::update) rebuilds it — the only time it can move, since
     /// [`apply`] short-circuits an unchanged widget before `update` is reached
     /// — and every pass after that clones an `Arc`.
-    SevenSegGl {
+    SevenSeg {
         /// The readout as the shader consumes it — see `preem_gl::seven_seg`.
         readout: preem_gl::Readout,
     },
-    /// Pure, but the builder is worth keeping: it *is* the config, pre-parsed
-    /// (and, uniquely in the kit, with the skin's palette already baked in — see
-    /// [`invalidate_cached_frames`]).
+    /// The `TextBox` (#1152) — the *smallest* GL arm in the tree: one pass, no
+    /// aux textures, no step passes, because the widget has no emission at all.
+    ///
+    /// Its improvement is one shape: the rounded corner, evaluated as a
+    /// distance at the fragment's own resolution instead of replicated out of a
+    /// logical-pixel mask. Its glyphs stay deliberately square.
+    ///
+    /// It keeps a `kit::TextBox` builder, and that builder *is* the config,
+    /// pre-parsed — and, uniquely in the kit, with the skin's palette already
+    /// baked in, which is why this is the one arm whose mapping takes **no**
+    /// palette snapshot and the one renderer [`invalidate_cached_frames`]
+    /// rebuilds outright rather than only dropping bytes for.
+    ///
+    /// What it adds beside that is the **resolved layout** and the **encoded
+    /// block**, both here rather than in the mapping for #911's reason: the
+    /// wrap, the width rule and the glyph bits are a function of the text
+    /// alone, so re-deriving them per mapping pass would wrap the message once
+    /// per monitor and again on every re-tint. [`update`](Self::update)
+    /// rebuilds them — the only time they can move, since [`apply`]
+    /// short-circuits an unchanged widget before `update` is reached — and
+    /// every pass after that clones an `Arc`.
     TextBox {
-        boxed: kit::TextBox,
-        text: String,
-    },
-    /// The **GPU** arm of [`TextBox`](Self::TextBox) (#1152).
-    ///
-    /// Pure, like the CPU arm, and it keeps the same `kit::TextBox` builder for
-    /// the same reason — it *is* the config, with the palette baked in, so
-    /// [`invalidate_cached_frames`] rebuilds this arm exactly as it rebuilds
-    /// that one.
-    ///
-    /// What it adds is the **resolved layout** and the **encoded block**, and
-    /// both are here rather than in the mapping for #911's reason: the wrap,
-    /// the width rule and the glyph bits are a function of the text alone, so
-    /// re-deriving them per mapping pass would wrap the message once per
-    /// monitor and again on every re-tint. [`update`](Self::update) rebuilds
-    /// them — the only time they can move, since [`apply`] short-circuits an
-    /// unchanged widget before `update` is reached — and every pass after that
-    /// clones an `Arc`.
-    TextBoxGl {
-        /// The builder, with its palette baked — see [`TextBox`](Self::TextBox).
+        /// The builder, with its palette baked — see above.
         boxed: kit::TextBox,
         text: String,
         /// The wrap, the buffer and the baked colors this text resolved to.
@@ -711,34 +676,22 @@ enum Renderer {
         /// The glyph block as the shader consumes it — see `preem_gl::textbox`.
         block: preem_gl::Block,
     },
-    /// The **GPU** arm of [`LedStrip`](Self::LedStrip) (#1153).
+    /// The `LedStrip` (#1153) — smaller still than the text box: one pass, no
+    /// aux textures and **no inputs at all**, because the kit's bloom over a
+    /// union of axis-aligned rectangles has a closed form, so the halo is
+    /// *computed* at the fragment rather than box-blurred into a
+    /// grid-resolution texture and read back.
     ///
-    /// It keeps the `kit::LedStrip` builder the CPU arm keeps — not to draw
-    /// with, but because it *is* the clamped config, and the mapping needs the
-    /// segment count `LedStrip::leds` resolved rather than the wire's raw one.
-    /// Every other field is the CPU arm's, verbatim: the peak-hold is CPU-side
-    /// on both arms (the kit's `PeakHold` is a pure two-float value the pump
-    /// folds), so this arm shares its `update`, `advance` and `animates`
-    /// outright, the way `GaugeGl` shares the needle's spring — and the shader
-    /// is handed the *folded* level and peak, with no decay logic crossing into
-    /// it.
-    LedStripGl {
+    /// The peak-hold is CPU-side: the kit's `PeakHold` is a pure two-float
+    /// value the shell's own pump folds, exactly as `Gauge`'s spring is, so
+    /// the shader is handed the **folded** level and peak with no decay logic
+    /// crossing into it.
+    LedStrip {
         /// The already-clamped config the uniforms are rebuilt from.
         config: vocab::LedStripConfig,
         level: f32,
-        /// The plugin's own inter-frame peak — see [`LedStrip`](Self::LedStrip).
-        explicit_peak: Option<f32>,
-        /// Shell-owned peak-hold, present iff the config declared one.
-        hold: Option<kit::PeakHold>,
-        /// The declared fall rate — see [`LedStrip`](Self::LedStrip).
-        hold_rate: f32,
-        steps: Steps,
-    },
-    LedStrip {
-        strip: kit::LedStrip,
-        level: f32,
-        /// The plugin's own inter-frame peak, when it computes one. Wins for the
-        /// render it arrives on and never disturbs `hold`.
+        /// The plugin's own inter-frame peak, when it computes one. Wins for
+        /// the render it arrives on and never disturbs `hold`.
         explicit_peak: Option<f32>,
         /// Shell-owned peak-hold, present iff the config declared one.
         hold: Option<kit::PeakHold>,
@@ -749,80 +702,55 @@ enum Renderer {
         hold_rate: f32,
         steps: Steps,
     },
-    Marquee {
-        strip: kit::MarqueeStrip,
-        text: String,
-        /// Scroll position in **dots**, fractional so a slow speed still moves.
-        offset: f32,
-        speed_dots_per_sec: f32,
-    },
-    /// The **GPU** arm of [`Marquee`](Self::Marquee) (#1152), on the
-    /// [`ScopeGl`](Self::ScopeGl) seam.
+    /// The `Marquee` (#1152) — the one kind with **no shader of its own**: it
+    /// is the same dot hardware as the static display on a continuous grid
+    /// rather than a row of character cells, so it registers `dot_matrix`'s
+    /// pipeline under its own name and drives three `site_at` grid uniforms
+    /// with a continuous matrix's numbers.
     ///
-    /// It holds the **same `kit::MarqueeStrip`** the CPU arm holds, the way
-    /// [`GaugeGl`](Self::GaugeGl) holds the same `kit::Gauge` — and for a
-    /// sharper reason than the gauge's. The strip is not just state: it is the
+    /// It holds a **`kit::MarqueeStrip`**, and for a sharper reason than
+    /// `Gauge` holds its gauge. The strip is not just state: it is the
     /// *geometry oracle*. Its `cols`, `origin_x` and `dot_px` are what the
     /// uniforms are mapped from, and its `window_columns` is what the shader's
-    /// glyph grid is encoded from, so the two arms cannot end up drawing on
-    /// different lattices. The cost is the strip's baked backdrop frame — one
-    /// window of RGBA the GL arm never reads, ~27 KiB at the kit's defaults —
-    /// paid once per message rather than per frame, which is the right side of
-    /// that trade.
+    /// glyph grid is encoded from, so the shader and the kit cannot end up
+    /// drawing on different lattices. The cost is the strip's baked backdrop
+    /// frame — one window of RGBA nothing ever reads, ~27 KiB at the kit's
+    /// defaults — paid once per message rather than per frame, which is the
+    /// right side of that trade.
     ///
     /// The scroll is a **texture upload**, not a uniform: #839 made a sub-dot
     /// position inexpressible, so a step is a different set of lit columns and
     /// [`window`](preem_gl::Window) is re-encoded exactly when the whole-dot
     /// offset moves — in [`advance`](Self::advance), the only place it can.
-    MarqueeGl {
+    Marquee {
         /// The rasterised message, shared with nothing — see above.
         strip: kit::MarqueeStrip,
         text: String,
-        /// Scroll position in **dots**, fractional so a slow speed still moves
-        /// — identical to the CPU arm's, and advanced by the same
-        /// [`marquee_step`].
+        /// Scroll position in **dots**, fractional so a slow speed still moves,
+        /// integrated by [`marquee_step`].
         offset: f32,
         speed_dots_per_sec: f32,
         /// The grid at the current whole-dot phase, as the shader consumes it.
         window: preem_gl::Window,
     },
-    Scope {
-        scope: kit::Scope,
-        /// The newest sample batch, stamped by the next animation step rather
-        /// than at apply time — one decay + stamp per step is the kit's model,
-        /// and it keeps a two-monitor mapping pass from double-stamping.
-        pending: Option<Vec<f32>>,
-        /// Steps since the last batch, so a fully-faded trail stops asking for
-        /// repaints. Saturates.
-        idle: u32,
-        /// `256` never fades, so a scope at that persistence is static once its
-        /// pending batch is stamped.
-        fades: bool,
-        /// Idle steps this trail needs to reach black, from the configured
-        /// persistence — see [`scope_settle_steps`]. Per instance, because it is
-        /// a function of the config: a constant was both too low (freezing a
-        /// long phosphor mid-fade, permanently) and too high (dozens of
-        /// pixel-identical repaints after a default one went quiet).
-        settle_steps: u32,
-        steps: Steps,
-    },
-    /// The **GPU** arm of [`Scope`](Self::Scope) (#893 stage B) — the default
-    /// since Annika's call on #893, with `TROLLSHELL_PREEM_RENDERER=cpu` as the
-    /// kill switch and [`preem_gl::arm`] as the decision.
+    /// The `Scope` (#893 stage B) — the **first** kind onto a shader, and the
+    /// only one with an inter-frame accumulation buffer: a ping-pong FBO gets
+    /// the phosphor decay and the bloom for free.
     ///
-    /// The animation bookkeeping is **verbatim** from the CPU arm — the same
+    /// The animation bookkeeping is the CPU renderer's, verbatim — the same
     /// `pending`/`idle`/`fades`/`settle_steps`/`steps` fields, advanced by the
-    /// same loop with the same break condition, and [`animates`](Self::animates)
-    /// answers with the *same expression*. That is what let #926's frame-clock
-    /// park and unpark, and `pump.rs` entirely, go untouched by this change.
+    /// same [`scope_steps`] loop with the same break condition, and
+    /// [`animates`](Self::animates) answering with the same expression. That is
+    /// what let #926's frame-clock park and unpark, and `pump.rs` entirely, go
+    /// untouched by #893 and by every arm after it.
     ///
     /// What is gone is the `kit::Scope`: no `Vec<u16>` phosphor, no per-step
     /// decay pass, no polyline stamping and no `box_blur`. That is #863's
-    /// retirement rather than an optimisation of it. `scope_settle_steps` stays
-    /// as the CPU integer replay of the kit's recurrence — nothing ever reads
-    /// back from the GPU to ask whether a trail is still fading, and the
+    /// retirement rather than an optimisation of it. [`scope_settle_steps`]
+    /// stays as the CPU integer replay of the kit's recurrence — nothing ever
+    /// reads back from the GPU to ask whether a trail is still fading, and the
     /// clamped `u32` arithmetic that answers it is cheaper than the question.
-    ScopeGl {
+    Scope {
         /// The already-clamped config the uniforms are rebuilt from every
         /// mapping pass. Kept because there is no kit object to read it out of.
         config: vocab::ScopeConfig,
@@ -837,10 +765,10 @@ enum Renderer {
         /// `samples`/`batch_step` slot, so if two animation steps carrying
         /// *different* batches elapse between two renders, only the newer one
         /// is on the wire and the older step flatlines on the axis in the
-        /// shader instead of stamping what it stamped on the CPU. Unreachable
-        /// while renders keep up with the 20 Hz step rate — `queue_render`
-        /// rides the same frame clock the tick does, so a step and a render
-        /// alternate — but it is the mechanism behind
+        /// shader instead of stamping what the kit would have stamped.
+        /// Unreachable while renders keep up with the 20 Hz step rate —
+        /// `queue_render` rides the same frame clock the tick does, so a step
+        /// and a render alternate — but it is the mechanism behind
         /// `hytte_ui::gl_surface::fresh_last_drawn`: a surface replaying steps
         /// whose batches have scrolled out of this slot is exactly the case
         /// that made a hot-plugged monitor flash a bright axis band.
@@ -849,76 +777,85 @@ enum Renderer {
         /// the surface's idempotence key: it replays exactly the steps it has
         /// not drawn yet, and zero on a repeat render.
         step_seq: u64,
-        // ── verbatim from `Renderer::Scope` ──────────────────────────────────
-        /// The newest sample batch, stamped by the next animation step.
+        /// The newest sample batch, stamped by the next animation step rather
+        /// than at apply time — one decay + stamp per step is the kit's model,
+        /// and it keeps a two-monitor mapping pass from double-stamping.
         pending: Option<Vec<f32>>,
-        /// Steps since the last batch; saturates.
+        /// Steps since the last batch, so a fully-faded trail stops asking for
+        /// repaints. Saturates.
         idle: u32,
-        /// `256` never fades.
+        /// `256` never fades, so a scope at that persistence is static once its
+        /// pending batch is stamped.
         fades: bool,
-        /// Idle steps this trail needs to reach black.
+        /// Idle steps this trail needs to reach black, from the configured
+        /// persistence — see [`scope_settle_steps`]. Per instance, because it
+        /// is a function of the config: a constant was both too low (freezing a
+        /// long phosphor mid-fade, permanently) and too high (dozens of
+        /// pixel-identical repaints after a default one went quiet).
         settle_steps: u32,
         steps: Steps,
     },
-    Gauge {
-        gauge: kit::Gauge,
-    },
-    /// The **GPU** arm of [`Gauge`](Self::Gauge) (#1143), on the
-    /// [`ScopeGl`](Self::ScopeGl) seam and the default since #865's "start with
-    /// the dotmatrix and gauge", with the same kill switch and the same
-    /// context-failure fallback.
+    /// The `Gauge` (#1143), the second kind onto a shader and the one that made
+    /// the seam kind-generic rather than `Scope`-shaped: the arm decision, the
+    /// context-failure rebuild and the payload type ([`preem_gl::KitSurface`])
+    /// all stopped naming one widget, so #1144's dot matrix **was** one `build`
+    /// arm and one pipeline — the prediction held, six more times.
     ///
-    /// **It holds the same `kit::Gauge` the CPU arm does**, and that is the
+    /// **It holds the very `kit::Gauge` the CPU arm held**, and that is the
     /// whole of its animation story: a gauge's only state is its needle's
     /// spring, which is closed-form, frame-rate independent and costs a handful
     /// of multiplies a tick. There is nothing to win by moving it to the GPU
-    /// and a `Needle` accessor to lose — so `update`, `advance` and `animates`
-    /// share one arm with the CPU renderer rather than carrying a verbatim
-    /// copy the way the two `Scope` arms must (a phosphor *is* GPU state).
+    /// and a `Needle` accessor to lose.
+    ///
+    /// What moved to the GPU is only the rasterisation — and that is the point,
+    /// because doing it at the surface's native resolution instead of at a
+    /// logical 144 × 64 replicated ×2 is what fixes #1090's smeared needle.
     ///
     /// The config rides along because the uniform mapping needs the dial's
     /// dimensions every pass and `kit::Gauge` exposes no accessor for them.
-    GaugeGl {
+    Gauge {
         /// The already-clamped config the uniforms are rebuilt from.
         config: vocab::GaugeConfig,
-        /// The needle's physics — the CPU arm's field, unchanged.
+        /// The needle's physics — CPU-side, exactly as it always was.
         gauge: kit::Gauge,
     },
-    FlipBoard {
-        board: kit::FlipBoard,
-    },
-    /// The **GPU** arm of [`FlipBoard`](Self::FlipBoard) (#1155).
+    /// The `FlipBoard` (#1155), split-flap and nixie.
     ///
-    /// It holds the very same `kit::FlipBoard` the CPU arm does, exactly as the
-    /// two `Gauge` arms share one `kit::Gauge`: a board's whole animation is a
-    /// closed-form function of its own clock, so the clock is CPU-side on both
-    /// arms and the two share their `update`, `advance` and `animates` arms
-    /// outright. A board whose renderer flips mid-fall keeps falling.
+    /// It holds the very `kit::FlipBoard` the CPU arm held, exactly as
+    /// [`Gauge`](Self::Gauge) holds its gauge: a board's whole animation is
+    /// a closed-form function of its own clock, so the clock stays CPU-side.
     ///
     /// It carries **no encoded strip**, and that is the one place it departs
-    /// from `DotMatrixGl`/`SevenSegGl`/`TextBoxGl`. #911's rule caches what a
+    /// from `DotMatrix`/`SevenSeg`/`TextBox`. #911's rule caches what a
     /// state change mints; this widget's per-cell payload — the fold's band,
     /// the shading, the free edge, the two cathode levels — moves with the
     /// clock rather than with the text, so a cached strip would be a stale
     /// frame. `preem_gl::encode_cards` runs in the mapping pass instead.
-    FlipBoardGl {
-        /// The board's clock and cards — the CPU arm's field, unchanged.
+    FlipBoard {
+        /// The board's clock and cards — CPU-side, exactly as it always was.
         board: kit::FlipBoard,
     },
 }
 
 /// What an instance last produced, cached so a second monitor's mapping pass
-/// costs a refcount rather than a rasterisation (#911) — and, for the GL arm,
-/// so the surface's `Arc::ptr_eq` guard actually fires.
+/// costs a refcount rather than a re-mapping (#911) — and so the surface's
+/// `Arc::ptr_eq` guard actually fires.
 ///
-/// Two shapes because the two arms hand the reconciler different things: the
-/// CPU arm hands it **pixels**, the GL arm hands it the **state a shader
-/// rasterises from**. See `hytte_ui::gl_surface` for why the GL frame never
-/// comes back across the bus as bytes.
+/// Two shapes, and since #1157 they are no longer two *arms*: a renderer hands
+/// the reconciler the state a shader rasterises from, and a node with no
+/// renderer hands it the placeholder. See `hytte_ui::gl_surface` for why the GL
+/// frame never comes back across the bus as bytes.
 #[derive(Clone, Debug)]
 enum Cached {
-    /// `(width, height, RGBA8)` for a [`UiNode::Pixels`].
-    Pixels(u32, u32, Arc<[u8]>),
+    /// Nothing to draw: the broken-widget placeholder, an empty
+    /// [`UiNode::Pixels`] keeping the node's id and classes.
+    ///
+    /// Three nodes reach it — a pipeline that cannot draw (#1157), a widget
+    /// kind this build predates, and a node past
+    /// [`MAX_PREEM_NODES_PER_TREE`] — each with its own journal line. It was
+    /// `Pixels(u32, u32, Arc<[u8]>)` while a CPU arm could fill those fields;
+    /// nothing has filled them with anything but `(0, 0, nothing())` since.
+    Placeholder,
     /// `(program, width, height, uniforms)` for a [`UiNode::GlSurface`].
     ///
     /// The program travels with the payload rather than being re-derived at
@@ -1053,10 +990,11 @@ pub(super) enum Warned {
     /// is a manifest fix and this one is a code fix. Raised by
     /// [`shader_map`](super::shader_map).
     ShaderCap,
-    /// This session will not run **any** plugin shader (#981): either the GL
-    /// context failed and `hytte-ui` latched it, or
-    /// `TROLLSHELL_PREEM_RENDERER=cpu` is set (#978). Every `Node::Shader` in
-    /// every tree renders the broken-widget placeholder.
+    /// This session will not run **any** plugin shader (#981): the GL context
+    /// failed and `hytte-ui` latched it. Every `Node::Shader` in every tree
+    /// renders the broken-widget placeholder. #978's
+    /// `TROLLSHELL_PREEM_RENDERER=cpu` was the second way in until #1157
+    /// retired it with the CPU renderer.
     ///
     /// # Why it is not [`ShaderCap`](Warned::ShaderCap)
     ///
@@ -1064,8 +1002,8 @@ pub(super) enum Warned {
     /// widgets back (#981). The two other slots are split on *who fixes it* —
     /// `ShaderDenied` is a manifest edit, `ShaderCap` is a code edit — and this
     /// is neither: it is a **shell restart** (the `gl_abandoned` latch is
-    /// sticky for the process by design, and an env var is read once at
-    /// startup). Sharing a slot with a plugin-side mistake meant a plugin that
+    /// sticky for the process by design). Sharing a slot with a plugin-side
+    /// mistake meant a plugin that
     /// shipped one over-cap source at startup claimed the slot for the shell's
     /// run, and a context failure an hour later went entirely unreported —
     /// every shader on screen blank, `hytte-ui`'s own line saying only "no
@@ -1401,11 +1339,11 @@ pub(super) fn map_widget(
         // its in-cap siblings.
         if !state.instances.contains_key(&key) && state.touched.len() >= MAX_PREEM_NODES_PER_TREE {
             return Mapped {
-                // Always the raster placeholder, on either arm: an over-cap
-                // node has no renderer at all, so there is nothing to draw with
-                // and an empty `PixelSurface` is the cheapest way to say so
-                // while keeping the node's id and classes.
-                surface: Cached::Pixels(0, 0, nothing()),
+                // The placeholder: an over-cap node has no renderer at all, so
+                // there is nothing to draw with and an empty `PixelSurface` is
+                // the cheapest way to say so while keeping the node's id and
+                // classes.
+                surface: Cached::Placeholder,
                 unsupported: false,
                 anonymous_key,
                 duplicate_of: None,
@@ -1444,7 +1382,13 @@ pub(super) fn map_widget(
             _ => None,
         };
         apply(instance, widget);
-        let unsupported = instance.renderer.is_none();
+        // `renderer: None` has two causes since #1157 and they earn different
+        // diagnoses. A pipeline this session cannot draw has already been named
+        // once by `preem_gl`'s own hook — the program, the driver's reason, the
+        // chips it took down — so reporting it *again* here as an unrenderable
+        // *kind* would be a false diagnosis pointing at the plugin. Only a kind
+        // this build has no pipeline for at all is this module's to report.
+        let unsupported = instance.renderer.is_none() && !no_pipeline_for(widget);
         Mapped {
             surface: instance.surface(),
             unsupported,
@@ -1456,23 +1400,27 @@ pub(super) fn map_widget(
     report(scope, id, widget, &mapped);
 
     match mapped.surface {
-        Cached::Pixels(width, height, data) => UiNode::Pixels {
+        // The broken-widget placeholder: an empty `Pixels` node, which keeps
+        // the id and the classes so CSS chrome stays and a later frame updates
+        // the same surface in place.
+        Cached::Placeholder => UiNode::Pixels {
             id: id.map(str::to_owned),
-            width,
-            height,
-            data,
-            // The kit bakes its own upscale into the buffer (`Frame::upscale`,
-            // and every widget's `scale` knob), so the host must not scale
-            // again — exactly what `Frame::into_node` hard-codes for the
-            // plugin-side path.
+            width: 0,
+            height: 0,
+            data: nothing(),
+            // Nothing to scale, and `1` is what every `Pixels` node the preem
+            // seam emits says: the kit bakes its own upscale into a buffer
+            // (`Frame::upscale`, and every widget's `scale` knob), so the host
+            // must not scale again — exactly what `Frame::into_node`
+            // hard-codes for the plugin-side path.
             scale: 1,
             classes: classes.to_vec(),
         },
-        // The GL arm's node carries **state**, not pixels: `width`/`height` are
-        // the same `cols * scale` × `rows * scale` the CPU arm's buffer would
-        // have been, so the two measure identically and a kill-switch flip
-        // changes no layout — but the frame is rasterised in a shader against
-        // the phosphor the surface owns, and never crosses back.
+        // A drawn widget's node carries **state**, not pixels: `width`/`height`
+        // are the `cols * scale` × `rows * scale` a kit buffer would have been,
+        // so a chip measures the same as it always did — but the frame is
+        // rasterised in a shader against the phosphor the surface owns, and
+        // never crosses back.
         Cached::Gl(program, width, height, state) => UiNode::GlSurface {
             id: id.map(str::to_owned),
             width,
@@ -1563,30 +1511,38 @@ fn report(scope: &Scope, id: Option<&str>, widget: &vocab::PreemWidget, mapped: 
 /// update state otherwise, and no-op when nothing moved (the multi-monitor
 /// case).
 fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
-    // **The CPU fallback** (#893, per kind since #1143, per *pipeline* since
-    // #1232). A GL renderer whose `GtkGLArea` could not get a context — or
-    // whose pipeline this driver will not build — can never draw anything, so
-    // it is rebuilt onto the kit, which `build` does on its own because
-    // `preem_gl::arm_for` consults the same two latches. Checked here rather
-    // than in the short-circuit below because neither failure changes the
-    // *widget*: without this the `same_widget` early return would keep a dead
-    // renderer forever on a scope whose plugin has gone quiet.
+    // **The fallback** (#893, per kind since #1143, per *pipeline* since #1232,
+    // and the broken-widget placeholder rather than the kit since #1157). A
+    // renderer whose `GtkGLArea` could not get a context — or whose pipeline
+    // this driver will not build — can never draw anything, so it is rebuilt,
+    // and `build` then answers `None` on its own because `preem_gl::arm_for`
+    // consults the same two latches. Checked here rather than in the
+    // short-circuit below because neither failure changes the *widget*: without
+    // this the `same_widget` early return would keep a dead renderer forever on
+    // a scope whose plugin has gone quiet.
     //
     // Asked per program rather than per session, which is the whole of what
     // #1232 added here: a refused `preem.scope` must not take the gauge beside
     // it off the GPU.
-    //
-    // The phosphor restarts from black. That is the honest outcome: the GL arm
-    // never drew a trail to inherit.
     let gl_lost = instance
         .renderer
         .as_ref()
-        .and_then(Renderer::gl_program)
-        .is_some_and(|program| preem_gl::arm_for(program) == Arm::Cpu);
+        .is_some_and(|renderer| preem_gl::arm_for(renderer.gl_program()) != Arm::Gl);
     // `same_widget`, not `==`: derived `PartialEq` is not reflexive over a
     // non-finite float, and a short-circuit that never fires is a permanent
     // 20 Hz loop rather than a missed optimisation. See `sanitize_in_place`.
-    if !gl_lost && instance.renderer.is_some() && same_widget(&instance.applied, widget) {
+    //
+    // **`applies > 0`, not `renderer.is_some()`** (#1157). The guard exists so
+    // the *first* apply is never short-circuited — a freshly inserted instance
+    // carries `applied: widget.clone()` already, so `same_widget` agrees before
+    // anything has been built — and `applies` says that directly where
+    // `renderer.is_some()` said it by proxy. The proxy was exact while every
+    // renderable widget produced a renderer; since #1157 a widget whose
+    // pipeline cannot draw produces `None` too, and re-deriving that verdict on
+    // every pass on every monitor would clone the widget and bump `builds` 20
+    // times a second for a chip that is not on screen. Both latches behind the
+    // verdict are one-way and sticky, so there is nothing to re-derive.
+    if !gl_lost && instance.applies > 0 && same_widget(&instance.applied, widget) {
         return;
     }
     let rebuild = gl_lost
@@ -1607,71 +1563,42 @@ fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
 }
 
 impl Instance {
-    /// The instance's current surface — rasterised pixels for a CPU arm, a
-    /// uniform bag for the GL one — produced only when the cache is cold.
-    /// `Cached::Pixels(0, 0, empty)` is the unsupported-widget placeholder.
+    /// The instance's current surface — the uniform bag a shader draws from,
+    /// or [`Cached::Placeholder`] for an instance with no renderer — produced
+    /// only when the cache is cold.
     ///
     /// **A warm cache costs a refcount, not a copy** (#911). This runs once per
     /// monitor per mapping pass — the instance table is keyed by scope and
-    /// shared across mounts — so returning an owned `Vec` here was a full RGBA
-    /// clone per screen per tick, and a second one for every unchanged chip a
-    /// blanket repaint walked past. The `Arc` travels all the way into
-    /// `hytte_ui`'s `PixelSurface`, which adopts it for the texture upload and
-    /// settles an unchanged frame with an `Arc::ptr_eq` (#907). The GL arm is
-    /// the same argument with a different payload: the second monitor's
-    /// `GlSurface` gets the very same `Arc<GlUniforms>` and settles on the same
-    /// pointer compare, queueing no render at all.
+    /// shared across mounts — so the second monitor's `GlSurface` gets the very
+    /// same `Arc<GlUniforms>` and settles on an `Arc::ptr_eq`, queueing no
+    /// render at all. That was the argument for caching pixels here too before
+    /// #1157 (a full RGBA clone per screen per tick, and a second one for every
+    /// unchanged chip a blanket repaint walked past); the placeholder has
+    /// nothing to copy, so the cache is pure bookkeeping on that arm.
     fn surface(&mut self) -> Cached {
         if let Some(cached) = self.cached.as_ref() {
             return cached.clone();
         }
         let style = display_style(self.applied.style());
-        // The palette is resolved here, per rasterisation, never baked into the
+        // The palette is resolved here, per mapping, never baked into the
         // instance — which is what makes a theme change a cache drop rather than
         // a rebuild (#396). A pin resolves to the same colors every time, so a
-        // pinned widget re-rasterises to identical bytes.
+        // pinned widget maps to identical uniforms.
         //
-        // The GL arm resolves it through the *same* scope, into
-        // `hytte_preem::palette_snapshot` rather than into a rasterisation, so
-        // the accent / role / pin precedence is the kit's one implementation on
-        // both arms and an accent change is a cache drop on both.
+        // It is resolved through `hytte_preem::palette_snapshot` rather than
+        // into a rasterisation, so the accent / role / pin precedence stays the
+        // kit's one implementation and an accent change stays a cache drop.
         let pins = pins_for(self.applied.style());
         let produced = match self.renderer.as_ref() {
-            None => Cached::Pixels(0, 0, nothing()),
+            None => Cached::Placeholder,
             Some(renderer) => kit::with_pins(pins, || {
-                if let Some((program, surface)) = renderer.gl_surface(style) {
-                    return Cached::Gl(
-                        program,
-                        surface.width,
-                        surface.height,
-                        Arc::new(surface.uniforms),
-                    );
-                }
-                renderer
-                    .render(style)
-                    .map_or(Cached::Pixels(0, 0, nothing()), |frame| {
-                        // Both dimensions or neither: a lone `unwrap_or(0)`
-                        // could pair a zero dimension with a non-empty buffer
-                        // and break the `len == w * h * 4` invariant every
-                        // `Node::Pixels` consumer (and `mapped_pixels`) relies
-                        // on. The wire caps put this far out of reach; the seam
-                        // is here so it cannot be reached at all.
-                        match (
-                            u32::try_from(frame.width()),
-                            u32::try_from(frame.height()),
-                            u32::try_from(frame.data().len()),
-                        ) {
-                            // One copy out of the kit's frame, exactly what
-                            // `to_vec` was — an `Arc<[u8]>` carries its refcount
-                            // inline ahead of the bytes, so it can never adopt a
-                            // `Vec`'s allocation and there is nothing to be
-                            // saved by going through one.
-                            (Ok(width), Ok(height), Ok(_)) => {
-                                Cached::Pixels(width, height, Arc::from(frame.data()))
-                            }
-                            _ => Cached::Pixels(0, 0, nothing()),
-                        }
-                    })
+                let (program, surface) = renderer.gl_surface(style);
+                Cached::Gl(
+                    program,
+                    surface.width,
+                    surface.height,
+                    Arc::new(surface.uniforms),
+                )
             }),
         };
         // A clone of two `u32`s and a refcount — the cache and the caller share
@@ -1841,32 +1768,36 @@ fn state_animates(state: &ScopeState) -> bool {
         .any(|instance| instance.renderer.as_ref().is_some_and(Renderer::animates))
 }
 
-/// Rebuild every GL instance onto the CPU kit, now — the GL
-/// context-failure path (#893; kind-generic since #1143, via
-/// [`Renderer::is_gl`]).
+/// Rebuild every live instance now that GL is gone — the context-failure path
+/// (#893; kind-generic since #1143, and landing on the broken-widget
+/// placeholder rather than the kit since #1157).
 ///
 /// [`apply`]'s `gl_lost` already does this on the next mapping pass, which is
 /// enough for an *animating* scope because a pass is coming. A settled one gets
 /// no pass at all: `persistence: 256` is the kit's own legal
 /// infinite-persistence value, `build` then gives the renderer `fades: false`,
 /// [`Renderer::animates`] is `false` from birth, #926's clock parks, and the
-/// chip would stay blank until a plugin frame that may never arrive. So the
-/// rebuild happens here instead, exactly as [`invalidate_cached_frames`]
-/// rebuilds a `TextBox`, and for the same reason it is free: the fallback
-/// restarts the phosphor from black either way. Swapping the on-screen node for
-/// the `Pixels` one is the other half, and is `preem_gl`'s hook's job.
+/// chip would stay a `GlSurface` that can never draw until a plugin frame that
+/// may never arrives. So the rebuild happens here instead, exactly as
+/// [`invalidate_cached_frames`] rebuilds a `TextBox`. Swapping the on-screen
+/// node for the empty `Pixels` one is the other half, and is `preem_gl`'s
+/// hook's job.
+///
+/// Every instance is a GL instance since #1157, so there is no longer a
+/// predicate to check before rebuilding one — and nothing to check it *with*,
+/// which is what retired `Renderer::is_gl`.
 ///
 /// **Ordering, load-bearing:** `build` resolves the arm through
 /// `preem_gl::arm()`, which consults `hytte_ui::gl_surface::gl_abandoned()`.
 /// That latch is set *before* the failure handler is invoked
-/// (`gl_surface::abandon_gl`), which is the only reason this mints a
-/// `Renderer::Scope` rather than another `ScopeGl`. Reverse those two
-/// statements and this function silently becomes a no-op.
-pub(super) fn rebuild_gl_renderers_on_cpu() {
+/// (`gl_surface::abandon_gl`), which is the only reason this leaves the
+/// instance with `None` rather than with another live renderer. Reverse those
+/// two statements and this function silently becomes a no-op.
+pub(super) fn rebuild_gl_renderers_as_placeholders() {
     STORE.with_borrow_mut(|store| {
         for state in store.values_mut() {
             for instance in state.instances.values_mut() {
-                if instance.renderer.as_ref().is_some_and(Renderer::is_gl) {
+                if instance.renderer.is_some() {
                     instance.renderer = build(&instance.applied);
                     instance.builds = instance.builds.saturating_add(1);
                     instance.cached = None;
@@ -1876,15 +1807,15 @@ pub(super) fn rebuild_gl_renderers_on_cpu() {
     });
 }
 
-/// [`rebuild_gl_renderers_on_cpu`], narrowed to the instances drawing with one
-/// **refused pipeline** — the host's half of `hytte-ui`'s build-refusal hook
-/// (#1232). Answers how many chips it moved.
+/// [`rebuild_gl_renderers_as_placeholders`], narrowed to the instances drawing
+/// with one **refused pipeline** — the host's half of `hytte-ui`'s
+/// build-refusal hook (#1232). Answers how many chips it moved.
 ///
-/// The wholesale sweep above is right for a failed context, where every GL
+/// The wholesale sweep above is right for a failed context, where every
 /// renderer in the process is dead. A refused *pipeline* kills only the chips
 /// naming that program, and rebuilding the rest would be worse than useless:
-/// `build` would answer with the very same GL arm they already had, and a
-/// `GaugeGl` rebuilt for a scope's refusal restarts its needle's spring
+/// `build` would answer with the very same renderer they already had, and a
+/// `Gauge` rebuilt for a scope's refusal restarts its needle's spring
 /// mid-swing — exactly the thing #1143 took care to keep across a flip.
 ///
 /// **The caller records the program as refused first**, because `build` here
@@ -1893,16 +1824,21 @@ pub(super) fn rebuild_gl_renderers_on_cpu() {
 /// same ordering rule stated for `gl_abandoned`. Reverse the two and every
 /// instance rebuilds straight back onto the pipeline that will not build.
 ///
-/// Caches are dropped with the renderer, so the next mapping pass rasterises
-/// the kit rather than re-serving the `Cached::Gl` uniforms this instance was
-/// last mapped with — which would keep a `UiNode::GlSurface` (and a blank
-/// chip) on screen no matter what the renderer underneath now is.
-pub(super) fn rebuild_refused_gl_renderers_on_cpu(program: GlProgram) -> usize {
+/// Caches are dropped with the renderer, so the next mapping pass emits the
+/// placeholder rather than re-serving the `Cached::Gl` uniforms this instance
+/// was last mapped with — which would keep a `UiNode::GlSurface` (and a blank
+/// chip with nothing saying why) on screen no matter what the instance
+/// underneath now holds.
+pub(super) fn rebuild_refused_gl_renderers_as_placeholders(program: GlProgram) -> usize {
     STORE.with_borrow_mut(|store| {
         let mut moved = 0;
         for state in store.values_mut() {
             for instance in state.instances.values_mut() {
-                if instance.renderer.as_ref().and_then(Renderer::gl_program) == Some(program) {
+                if instance
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.gl_program() == program)
+                {
                     instance.renderer = build(&instance.applied);
                     instance.builds = instance.builds.saturating_add(1);
                     instance.cached = None;
@@ -1950,27 +1886,22 @@ pub(super) fn invalidate_cached_frames() {
                 // needed" — the answer that is right for every kind today but
                 // must be *stated*, not assumed, for the next one.
                 let needs_rebuild = match &instance.renderer {
-                    // Both arms: the GL one holds the same baked builder, and
-                    // its uniforms are mapped from the layout that builder
-                    // resolved, so dropping bytes it does not have would leave
-                    // the old palette on screen (#1152).
-                    Some(Renderer::TextBox { .. } | Renderer::TextBoxGl { .. }) => true,
+                    // The box holds a baked builder and its uniforms are mapped
+                    // from the layout that builder resolved, so dropping a
+                    // cache it does not fill would leave the old palette on
+                    // screen (#1152).
+                    Some(Renderer::TextBox { .. }) => true,
                     Some(
                         Renderer::DotMatrix { .. }
-                        | Renderer::DotMatrixGl { .. }
                         | Renderer::SevenSeg { .. }
-                        | Renderer::SevenSegGl { .. }
                         | Renderer::LedStrip { .. }
-                        | Renderer::LedStripGl { .. }
                         | Renderer::Marquee { .. }
-                        | Renderer::MarqueeGl { .. }
                         | Renderer::Scope { .. }
-                        | Renderer::ScopeGl { .. }
                         | Renderer::Gauge { .. }
-                        | Renderer::GaugeGl { .. }
-                        | Renderer::FlipBoard { .. }
-                        | Renderer::FlipBoardGl { .. },
+                        | Renderer::FlipBoard { .. },
                     )
+                    // An instance with no renderer has no palette either: the
+                    // placeholder is empty on every theme.
                     | None => false,
                 };
                 if needs_rebuild {
@@ -2408,115 +2339,132 @@ fn dim(value: u32) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
-/// Build a renderer for `widget`, or `None` for a kind this build cannot draw.
+/// The registered pipeline `widget`'s kind draws with, or `None` for a kind
+/// this build has no pipeline for at all.
 ///
-/// The match is exhaustive over today's vocabulary, so `None` is unreachable as
-/// this file stands — the return type is the seam that keeps it *representable*
-/// (a future `PreemWidget` variant whose kit widget this build predates), which
-/// is what makes the unknown-widget placeholder in [`map_widget`] a real path
-/// rather than dead code to be deleted. The instance is kept either way, so a
-/// plugin that keeps sending it costs one warn, not one per frame.
-// `unnecessary_wraps` is exactly right about today's body and exactly wrong
-// about the contract: the `Option` *is* the placeholder seam, and collapsing it
-// would delete the unknown-widget path #883 is required to keep (and that
-// `an_unrenderable_preem_widget_degrades_to_an_empty_surface` covers).
-//
-// `too_many_lines` is [`Renderer::advance`]'s allow, for its reason and with
-// its history: this is one flat arm per widget kind with no nesting between
-// them, and it crossed the ceiling when #1152 gave two more kinds a second arm
-// each. Splitting it would put half the **construction** table somewhere else,
-// which is worse to read and worse to review than a long match — and this
-// function is also the one place a reader can see which kinds consult
-// [`preem_gl::arm`] at all.
-#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
+/// The **one** place the wire vocabulary is mapped to a program, and the seam
+/// that lets [`map_widget`] tell [`build`]'s two `None`s apart: a kind this
+/// build predates is diagnosed *here*, once per tree, while a pipeline this
+/// session cannot draw has already been named by `preem_gl`'s own hook and must
+/// not be reported a second time as an unrenderable *kind*.
+///
+/// Exhaustive with no catch-all, so a widget kind added to the wire vocabulary
+/// does not compile until it says which pipeline draws it. It is exhaustive
+/// over today's vocabulary in the other direction too — every kind names one —
+/// which is exactly why the `Option` has to be spelled out rather than
+/// inferred: the return type is what keeps "a kind with no pipeline" sayable,
+/// and that is the unknown-widget placeholder #883 is required to keep.
+#[allow(clippy::unnecessary_wraps)]
+fn program_for(widget: &vocab::PreemWidget) -> Option<GlProgram> {
+    use vocab::PreemWidget as W;
+    Some(match widget {
+        W::DotMatrix { .. } => preem_gl::DOT_MATRIX,
+        W::SevenSeg { .. } => preem_gl::SEVEN_SEG,
+        W::TextBox { .. } => preem_gl::TEXTBOX,
+        W::LedStrip { .. } => preem_gl::LED_STRIP,
+        W::Marquee { .. } => preem_gl::MARQUEE,
+        W::Scope { .. } => preem_gl::SCOPE,
+        W::Gauge { .. } => preem_gl::GAUGE,
+        W::FlipBoard { .. } => preem_gl::FLIP_BOARD,
+    })
+}
+
+/// Whether `widget`'s pipeline exists but **cannot draw in this session** — a
+/// failed `GdkGLContext`, or a program this driver refused to build (#1232).
+///
+/// The discriminator [`map_widget`] uses, and the reason it is a separate
+/// question from [`build`]'s answer rather than a field on it: both failures
+/// are already diagnosed once each by `preem_gl`'s hooks, naming the program
+/// and the driver's own reason, so a per-tree "this shell cannot render that
+/// preem widget kind" line on top of them would be a *false* diagnosis — the
+/// kind is fine, the GL is gone.
+///
+/// One `Vec` scan against a list that is empty on every healthy session, on the
+/// mapping path only for a node that already failed to build.
+fn no_pipeline_for(widget: &vocab::PreemWidget) -> bool {
+    program_for(widget).is_some_and(|program| preem_gl::arm_for(program) != Arm::Gl)
+}
+
+/// Build a renderer for `widget`, or `None` for a widget this build cannot
+/// draw — which the caller renders as the broken-widget placeholder.
+///
+/// `None` has **two** causes since #1157, and [`no_pipeline_for`] is what tells
+/// them apart for the caller's diagnosis:
+///
+/// 1. **This pipeline cannot draw** — a failed `GdkGLContext`, or a program
+///    this driver refused to build (#1232). [`preem_gl::arm_for`] is the whole
+///    decision and it is consulted per *build*, so an instance rebuilt after
+///    either failure lands on the placeholder (see [`apply`], and
+///    `preem_gl::on_build_refused` for the ordering rule the rebuild rests on).
+///    Before #1157 this answered with the kit instead.
+/// 2. **A widget kind this build predates** — [`program_for`] has no pipeline
+///    for it. Unreachable as the file stands; the seam is what keeps the
+///    unknown-widget placeholder in [`map_widget`] a real path rather than dead
+///    code to be deleted.
+///
+/// The instance is kept either way, so a plugin that keeps sending an
+/// unrenderable widget costs one warn, not one per frame.
+///
+/// **The palette scope is opened around the whole match** because `TextBox` is
+/// the one kit widget that resolves its palette at *construction* — see
+/// [`invalidate_cached_frames`]. Every other arm resolves at render time and is
+/// unaffected by the scope being open, so scoping the build wholesale costs
+/// nothing and cannot miss a future widget that bakes.
+///
+/// The `too_many_lines` allow is the vocabulary's, not this function's: it is
+/// one flat arm per widget kind with no nesting between them. #1157 deleted
+/// eight CPU arms out of it and the construction table for the eight kinds that
+/// remain still crosses the ceiling. Splitting it would put half that table
+/// somewhere else, which is worse to read and worse to review than a long
+/// match.
+#[allow(clippy::too_many_lines)]
 fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
     use vocab::PreemWidget as W;
     #[cfg(test)]
     if force_unsupported() {
         return None;
     }
+    // Both `None`s, in one guard and before any construction work: a widget
+    // that is about to render the placeholder must not pay for a wrapped
+    // message or a rasterised marquee strip on the way there.
+    let program = program_for(widget)?;
+    if preem_gl::arm_for(program) != Arm::Gl {
+        return None;
+    }
     let style = display_style(widget.style());
-    // The whole build runs inside the widget's palette scope, because `TextBox`
-    // is the one kit widget that resolves its palette at *construction* — see
-    // `invalidate_cached_frames`. Every other arm resolves at render time and is
-    // unaffected by the scope being open here, so scoping the build wholesale
-    // costs nothing and cannot miss a future widget that bakes.
     let pins = pins_for(widget.style());
     Some(kit::with_pins(pins, || match widget {
-        W::DotMatrix { config, state } => {
-            // GL by default (#1144), the CPU kit under the kill switch, once
-            // a context has failed, or once this driver has refused *this*
-            // pipeline (#1232) — the same `preem_gl::arm_for` decision the
-            // `Scope` and the `Gauge` below take, consulted per *build* so an
-            // instance rebuilt after either failure lands on the CPU arm (see
-            // `apply`).
-            if preem_gl::arm_for(preem_gl::DOT_MATRIX) == Arm::Gl {
-                return Renderer::DotMatrixGl {
-                    config: *config,
-                    glyphs: preem_gl::encode_glyphs(&state.text),
-                };
-            }
-            Renderer::DotMatrix {
-                text: state.text.clone(),
-                dot_px: dim(config.dot_px),
-            }
-        }
-        W::SevenSeg { state, .. } => {
-            // GL by default (#1154), the CPU kit under the kill switch, once a
-            // context has failed, or once this driver has refused this pipeline
-            // (#1232) — the same `preem_gl::arm_for` decision every other arm
-            // on this seam takes.
-            if preem_gl::arm_for(preem_gl::SEVEN_SEG) == Arm::Gl {
-                return Renderer::SevenSegGl {
-                    readout: preem_gl::encode_readout(&state.text),
-                };
-            }
-            Renderer::SevenSeg {
-                text: state.text.clone(),
-            }
-        }
+        W::DotMatrix { config, state } => Renderer::DotMatrix {
+            config: *config,
+            glyphs: preem_gl::encode_glyphs(&state.text),
+        },
+        W::SevenSeg { state, .. } => Renderer::SevenSeg {
+            readout: preem_gl::encode_readout(&state.text),
+        },
         W::TextBox { config, state } => {
-            // GL by default (#1152), the CPU kit under the kill switch, once a
-            // context has failed, or once this driver has refused this
-            // pipeline (#1232) — the same `preem_gl::arm_for` decision every
-            // other arm on this seam takes.
+            // Built inside the palette scope: `TextBox::styled` bakes the
+            // skin's colors in, which is why this is the one renderer
+            // `invalidate_cached_frames` rebuilds rather than only dropping
+            // bytes for.
             let boxed = text_box(*config, style);
-            if preem_gl::arm_for(preem_gl::TEXTBOX) == Arm::Gl {
-                let layout = boxed.layout(&state.text);
-                return Renderer::TextBoxGl {
-                    block: preem_gl::encode_block(&layout),
-                    layout,
-                    boxed,
-                    text: state.text.clone(),
-                };
-            }
+            let layout = boxed.layout(&state.text);
             Renderer::TextBox {
+                block: preem_gl::encode_block(&layout),
+                layout,
                 boxed,
                 text: state.text.clone(),
             }
         }
         W::LedStrip { config, state } => {
+            // The peak-hold is CPU-side — the kit's `PeakHold` is a pure value
+            // this module's own pump folds — so it is built here and the shader
+            // is handed the folded number.
             let mut hold = config.peak_hold.map(|p| kit::PeakHold::new(p.rate));
             if let Some(hold) = hold.as_mut() {
                 hold.push(state.level);
             }
-            // GL by default (#1153), the CPU kit under the kill switch, once a
-            // context has failed, or once this driver has refused this pipeline
-            // (#1232) — the same `preem_gl::arm_for` decision every other arm
-            // on this seam takes. The peak-hold is built *above* the branch
-            // because it is CPU-side on both arms.
-            if preem_gl::arm_for(preem_gl::LED_STRIP) == Arm::Gl {
-                return Renderer::LedStripGl {
-                    config: *config,
-                    level: state.level,
-                    explicit_peak: state.peak,
-                    hold,
-                    hold_rate: config.peak_hold.map_or(0.0, |p| p.rate),
-                    steps: Steps::default(),
-                };
-            }
             Renderer::LedStrip {
-                strip: kit::LedStrip::new(style).leds(dim(config.leds)),
+                config: *config,
                 level: state.level,
                 explicit_peak: state.peak,
                 hold,
@@ -2525,65 +2473,31 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             }
         }
         W::Marquee { config, state } => {
-            // GL by default (#1152). Both arms rasterise the *same* strip: on
-            // the GPU it is the geometry oracle rather than a picture — see
-            // `Renderer::MarqueeGl`.
+            // The strip is the *geometry oracle* the uniforms are mapped from
+            // rather than a picture anything reads — see `Renderer::Marquee`.
             let strip = marquee_strip(*config, style, &state.text);
-            if preem_gl::arm_for(preem_gl::MARQUEE) == Arm::Gl {
-                return Renderer::MarqueeGl {
-                    window: preem_gl::encode_window(&strip, 0),
-                    strip,
-                    text: state.text.clone(),
-                    offset: 0.0,
-                    speed_dots_per_sec: config.speed_dots_per_sec,
-                };
-            }
             Renderer::Marquee {
+                window: preem_gl::encode_window(&strip, 0),
                 strip,
                 text: state.text.clone(),
                 offset: 0.0,
                 speed_dots_per_sec: config.speed_dots_per_sec,
             }
         }
-        W::Scope { config, state } => {
-            // GL by default, the CPU kit under the kill switch, once a context
-            // has failed, or once this driver has refused this pipeline
-            // (#1232) — `preem_gl::arm_for` is the whole decision, and it is
-            // consulted per *build* so an instance rebuilt after either
-            // failure lands on the CPU arm (see `apply`).
-            if preem_gl::arm_for(preem_gl::SCOPE) == Arm::Gl {
-                return Renderer::ScopeGl {
-                    config: *config,
-                    // The debut batch is stamped now rather than queued —
-                    // `step_seq: 1` with the batch at step `0` — so the first
-                    // frame a plugin sends is on screen before the clock's
-                    // first tick, exactly as the CPU arm's eager
-                    // `scope.advance(&state.samples)` below arranges.
-                    samples: Arc::from(&state.samples[..]),
-                    batch_step: Some(0),
-                    step_seq: 1,
-                    pending: None,
-                    idle: 0,
-                    fades: config.persistence < KIT_MAX_PERSISTENCE,
-                    settle_steps: scope_settle_steps(config.persistence),
-                    steps: Steps::default(),
-                };
-            }
-            let mut scope = kit::Scope::with_size(dim(config.cols), dim(config.rows))
-                .scale(dim(config.scale))
-                .persistence(config.persistence);
-            // The debut batch is stamped now rather than queued, so the first
-            // frame a plugin sends is on screen before the clock's first tick.
-            scope.advance(&state.samples);
-            Renderer::Scope {
-                scope,
-                pending: None,
-                idle: 0,
-                fades: config.persistence < KIT_MAX_PERSISTENCE,
-                settle_steps: scope_settle_steps(config.persistence),
-                steps: Steps::default(),
-            }
-        }
+        W::Scope { config, state } => Renderer::Scope {
+            config: *config,
+            // The debut batch is stamped now rather than queued —
+            // `step_seq: 1` with the batch at step `0` — so the first frame a
+            // plugin sends is on screen before the clock's first tick.
+            samples: Arc::from(&state.samples[..]),
+            batch_step: Some(0),
+            step_seq: 1,
+            pending: None,
+            idle: 0,
+            fades: config.persistence < KIT_MAX_PERSISTENCE,
+            settle_steps: scope_settle_steps(config.persistence),
+            steps: Steps::default(),
+        },
         W::Gauge { config, state } => {
             // `cols`/`rows` are the whole of the gauge's size story, small
             // square dials included (#931): the kit's `dial()` resolves a
@@ -2602,37 +2516,14 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
                 .frequency(config.frequency_hz)
                 .damping(config.damping);
             gauge.set_target(state.target);
-            // GL by default (#1143), the CPU kit under the kill switch, once a
-            // context has failed, or once this driver has refused this
-            // pipeline (#1232) — the same `preem_gl::arm_for` decision the
-            // `Scope` above takes, consulted per *build* so an instance
-            // rebuilt after either failure lands on the CPU arm (see `apply`).
-            //
-            // The needle is built either way and handed straight over: the
-            // spring is the state, it is CPU-side on both arms, and a gauge
-            // whose renderer flips must not restart mid-swing.
-            if preem_gl::arm_for(preem_gl::GAUGE) == Arm::Gl {
-                return Renderer::GaugeGl {
-                    config: *config,
-                    gauge,
-                };
+            Renderer::Gauge {
+                config: *config,
+                gauge,
             }
-            Renderer::Gauge { gauge }
         }
         W::FlipBoard { config, state } => {
-            // GL by default (#1155), the CPU kit under the kill switch, once a
-            // context has failed, or once this driver has refused this pipeline
-            // (#1232) — the same `preem_gl::arm_for` decision every other arm
-            // on this seam takes.
-            //
-            // The board is built and pointed at its text either way, and handed
-            // straight over: the clock is the state, it is CPU-side on both
-            // arms, and a board whose renderer flips must not restart mid-fall.
             let mut board = flip_board(*config, style);
             board.set_text(&state.text);
-            if preem_gl::arm_for(preem_gl::FLIP_BOARD) == Arm::Gl {
-                return Renderer::FlipBoardGl { board };
-            }
             Renderer::FlipBoard { board }
         }
     }))
@@ -2801,92 +2692,41 @@ impl Renderer {
     fn matches_kind(&self, widget: &vocab::PreemWidget) -> bool {
         use vocab::PreemWidget as W;
         match self {
-            // …and the same for the two `DotMatrix` arms (#1144).
-            Self::DotMatrix { .. } | Self::DotMatrixGl { .. } => {
-                matches!(widget, W::DotMatrix { .. })
-            }
-            // …and the same for the two `SevenSeg` arms (#1154).
-            Self::SevenSeg { .. } | Self::SevenSegGl { .. } => {
-                matches!(widget, W::SevenSeg { .. })
-            }
-            // …and the same for the two `TextBox` and `Marquee` arms (#1152).
-            Self::TextBox { .. } | Self::TextBoxGl { .. } => matches!(widget, W::TextBox { .. }),
-            // …and the same for the two `LedStrip` arms (#1153).
-            Self::LedStrip { .. } | Self::LedStripGl { .. } => matches!(widget, W::LedStrip { .. }),
-            Self::Marquee { .. } | Self::MarqueeGl { .. } => matches!(widget, W::Marquee { .. }),
-            // Both `Scope` arms answer for the same wire kind: which one an
-            // instance holds is the host's choice (`preem_gl::arm`), not
-            // the plugin's, so a kind mismatch here would rebuild every
-            // frame rather than never.
-            Self::Scope { .. } | Self::ScopeGl { .. } => matches!(widget, W::Scope { .. }),
-            // …and the same for the two `Gauge` arms (#1143).
-            Self::Gauge { .. } | Self::GaugeGl { .. } => matches!(widget, W::Gauge { .. }),
-            // …and the same for the two `FlipBoard` arms (#1155).
-            Self::FlipBoard { .. } | Self::FlipBoardGl { .. } => {
-                matches!(widget, W::FlipBoard { .. })
-            }
+            Self::DotMatrix { .. } => matches!(widget, W::DotMatrix { .. }),
+            Self::SevenSeg { .. } => matches!(widget, W::SevenSeg { .. }),
+            Self::TextBox { .. } => matches!(widget, W::TextBox { .. }),
+            Self::LedStrip { .. } => matches!(widget, W::LedStrip { .. }),
+            Self::Marquee { .. } => matches!(widget, W::Marquee { .. }),
+            Self::Scope { .. } => matches!(widget, W::Scope { .. }),
+            Self::Gauge { .. } => matches!(widget, W::Gauge { .. }),
+            Self::FlipBoard { .. } => matches!(widget, W::FlipBoard { .. }),
         }
     }
 
-    /// Whether this renderer draws on the **GPU**, and so hands the reconciler
-    /// a [`UiNode::GlSurface`] instead of pixels.
+    /// The registered pipeline this renderer draws with (#1232).
     ///
-    /// The kind-generic spelling of what was `matches!(…, Renderer::ScopeGl)`
-    /// at two call sites before #1143 — [`apply`]'s `gl_lost` check and
-    /// [`rebuild_gl_renderers_on_cpu`]. Both are asking "can this instance
-    /// still draw if GL is gone", which is a question about the *arm*, and a
-    /// second kind answering it by being named in two `matches!` patterns is
-    /// exactly how the third kind gets missed in one of them.
-    ///
-    /// Kept in lockstep with [`gl_surface`](Self::gl_surface) by
-    /// `every_gl_renderer_answers_both_halves_of_the_gl_seam` in
-    /// `plugins::tests`: an arm that answers `true` here and `None` there would
-    /// rasterise nothing and never be rebuilt onto the kit — a permanently
-    /// blank chip.
-    ///
-    /// Delegated to [`gl_program`](Self::gl_program) rather than keeping a
-    /// second hand-written list of the same five variants (#1232). The
-    /// exhaustive-`match` property #1211 wanted here is unchanged — it moved
-    /// one function down, where a new `Renderer` variant still has to answer
-    /// `Some`/`None` to compile at all — and the two lists can no longer
-    /// disagree, which they would have done in the worst possible direction:
-    /// an arm that `is_gl` counts and `gl_program` does not is a chip nothing
-    /// ever falls back.
-    fn is_gl(&self) -> bool {
-        self.gl_program().is_some()
-    }
-
-    /// The registered pipeline this renderer draws with, or `None` for a
-    /// renderer that rasterises on the CPU (#1232).
-    ///
-    /// The **one** list of which arms are GL arms, and of which program each
-    /// one names — [`is_gl`](Self::is_gl) reads it, so does
-    /// [`rebuild_refused_gl_renderers_on_cpu`], and
+    /// The **one** list of which program each arm names —
+    /// [`rebuild_refused_gl_renderers_as_placeholders`] reads it, and
     /// [`gl_surface`](Self::gl_surface) produces the same constants beside its
-    /// uniforms. Exhaustive with no catch-all, unlike `gl_surface`'s: there
-    /// the honest answer for a renderer that does not draw on the GPU is
-    /// `None` and a forgotten arm renders nothing *loudly*, while a forgotten
-    /// arm here would answer "this chip is not on the GPU" about one that is,
-    /// and the refused pipeline would keep it blank in silence — which is
-    /// #1232 itself.
-    fn gl_program(&self) -> Option<GlProgram> {
+    /// uniforms, which `every_gl_arm_names_one_program_in_both_places` holds
+    /// them to. Exhaustive with no catch-all: a variant added without an arm
+    /// here does not compile, where a forgotten one would answer about the
+    /// wrong pipeline and a refusal would leave its chips blank in silence —
+    /// which is #1232 itself.
+    ///
+    /// It returned an `Option` until #1157, because a CPU arm named no
+    /// pipeline; with the CPU arm retired the `None` had no inhabitant left and
+    /// its one consumer, `is_gl`, had no question left to ask.
+    fn gl_program(&self) -> GlProgram {
         match self {
-            Self::ScopeGl { .. } => Some(preem_gl::SCOPE),
-            Self::GaugeGl { .. } => Some(preem_gl::GAUGE),
-            Self::DotMatrixGl { .. } => Some(preem_gl::DOT_MATRIX),
-            Self::MarqueeGl { .. } => Some(preem_gl::MARQUEE),
-            Self::TextBoxGl { .. } => Some(preem_gl::TEXTBOX),
-            Self::LedStripGl { .. } => Some(preem_gl::LED_STRIP),
-            Self::SevenSegGl { .. } => Some(preem_gl::SEVEN_SEG),
-            Self::FlipBoardGl { .. } => Some(preem_gl::FLIP_BOARD),
-            Self::DotMatrix { .. }
-            | Self::SevenSeg { .. }
-            | Self::TextBox { .. }
-            | Self::LedStrip { .. }
-            | Self::Marquee { .. }
-            | Self::Scope { .. }
-            | Self::Gauge { .. }
-            | Self::FlipBoard { .. } => None,
+            Self::Scope { .. } => preem_gl::SCOPE,
+            Self::Gauge { .. } => preem_gl::GAUGE,
+            Self::DotMatrix { .. } => preem_gl::DOT_MATRIX,
+            Self::Marquee { .. } => preem_gl::MARQUEE,
+            Self::TextBox { .. } => preem_gl::TEXTBOX,
+            Self::LedStrip { .. } => preem_gl::LED_STRIP,
+            Self::SevenSeg { .. } => preem_gl::SEVEN_SEG,
+            Self::FlipBoard { .. } => preem_gl::FLIP_BOARD,
         }
     }
 
@@ -2896,40 +2736,25 @@ impl Renderer {
     fn update(&mut self, widget: &vocab::PreemWidget) {
         use vocab::PreemWidget as W;
         match (self, widget) {
-            (Self::DotMatrix { text, .. }, W::DotMatrix { state, .. }) => {
-                // The pitch is config, so `same_config` already agreed it is
-                // unchanged — only the text can move here.
-                text.clone_from(&state.text);
-            }
-            // The GL arm re-encodes the glyph strip instead of keeping the
-            // `String`. This is reached **only** on a real state change —
-            // `apply` returns early on an unchanged widget — so it is the one
-            // place a new strip can be minted, and every mapping pass between
-            // two of them clones the `Arc` rather than walking the line again.
-            (Self::DotMatrixGl { glyphs, .. }, W::DotMatrix { state, .. }) => {
+            // The glyph strip is re-encoded instead of a `String` being kept.
+            // This is reached **only** on a real state change — `apply` returns
+            // early on an unchanged widget — so it is the one place a new strip
+            // can be minted, and every mapping pass between two of them clones
+            // the `Arc` rather than walking the line again (#911's rule).
+            (Self::DotMatrix { glyphs, .. }, W::DotMatrix { state, .. }) => {
                 *glyphs = preem_gl::encode_glyphs(&state.text);
             }
-            (Self::SevenSeg { text }, W::SevenSeg { state, .. }) => text.clone_from(&state.text),
-            // The GL arm re-encodes the cell strip instead of keeping the
-            // `String`. Reached **only** on a real state change — `apply`
-            // returns early on an unchanged widget — so it is the one place a
-            // new strip can be minted, and every mapping pass between two of
-            // them clones the `Arc` rather than walking the readout again.
-            (Self::SevenSegGl { readout }, W::SevenSeg { state, .. }) => {
+            // …and the same for the readout's cell strip.
+            (Self::SevenSeg { readout }, W::SevenSeg { state, .. }) => {
                 *readout = preem_gl::encode_readout(&state.text);
             }
-            (Self::TextBox { text, .. }, W::TextBox { state, .. }) => text.clone_from(&state.text),
-            // The GL arm re-wraps and re-encodes instead of keeping the
-            // `String` alone. Reached **only** on a real state change — `apply`
-            // returns early on an unchanged widget — so it is the one place a
-            // new block can be minted, and every mapping pass between two of
-            // them clones the `Arc` rather than wrapping the message again
-            // (#911's rule). No palette scope is needed: the builder baked its
-            // colors at construction and `layout` hands those back, which is
-            // exactly why `invalidate_cached_frames` rebuilds this renderer
-            // rather than only dropping its bytes.
+            // …and the same for the text box, which re-wraps first. No palette
+            // scope is needed: the builder baked its colors at construction and
+            // `layout` hands those back, which is exactly why
+            // `invalidate_cached_frames` rebuilds this renderer rather than
+            // only dropping its bytes.
             (
-                Self::TextBoxGl {
+                Self::TextBox {
                     boxed,
                     text,
                     layout,
@@ -2941,18 +2766,8 @@ impl Renderer {
                 *layout = boxed.layout(text);
                 *block = preem_gl::encode_block(layout);
             }
-            // **One arm for both `LedStrip` renderers** (#1153). The peak-hold
-            // is CPU-side on both — the kit's `PeakHold` is a pure value the
-            // shell folds on its own pump — so there is nothing for the GL arm
-            // to do differently, exactly as for the gauge's spring.
             (
                 Self::LedStrip {
-                    level,
-                    explicit_peak,
-                    hold,
-                    ..
-                }
-                | Self::LedStripGl {
                     level,
                     explicit_peak,
                     hold,
@@ -2969,17 +2784,12 @@ impl Renderer {
                     hold.push(state.level);
                 }
             }
-            (Self::Marquee { strip, text, .. }, W::Marquee { config, state }) => {
-                remarquee(strip, text, *config, &state.text);
-            }
-            // **One helper for both arms**, so the palette scope below cannot
-            // exist on one of them only. What the GL arm adds is the grid: the
-            // offset is deliberately not reset, and `window_columns` wraps it
-            // modulo the *new* period, so the shader's columns have to be
+            // The offset is deliberately not reset, and `window_columns` wraps
+            // it modulo the *new* period, so the shader's columns have to be
             // re-encoded against the new strip even though the phase did not
             // move.
             (
-                Self::MarqueeGl {
+                Self::Marquee {
                     strip,
                     text,
                     offset,
@@ -2992,34 +2802,21 @@ impl Renderer {
                     *window = preem_gl::encode_window(strip, dots(*offset, strip.period()));
                 }
             }
-            (Self::Scope { pending, idle, .. }, W::Scope { state, .. })
-            // The GL arm queues a batch exactly as the CPU arm does — the
-            // stamping happens in `advance`, one batch per step, so a
-            // two-monitor mapping pass cannot double-stamp either of them.
-            // **This arm is the one `update`'s `_ => {}` catch-all would have
-            // swallowed**: without it a GL scope would queue nothing, never
-            // animate, and show its debut batch for ever.
-            | (Self::ScopeGl { pending, idle, .. }, W::Scope { state, .. }) => {
+            // A batch is **queued**, not stamped: the stamping happens in
+            // `advance`, one batch per step, so a two-monitor mapping pass
+            // cannot double-stamp it.
+            (Self::Scope { pending, idle, .. }, W::Scope { state, .. }) => {
                 *pending = Some(state.samples.clone());
                 *idle = 0;
             }
-            // **One arm for both gauge renderers.** The spring is the state and
-            // it is CPU-side on both, so there is nothing for the GL arm to do
-            // differently — unlike `Scope`, whose GPU arm has to record which
-            // step consumes a batch.
-            (Self::Gauge { gauge } | Self::GaugeGl { gauge, .. }, W::Gauge { state, .. }) => {
+            // The spring is the state and it is CPU-side, so there is nothing
+            // to do here but retarget it — unlike `Scope`, whose arm has to
+            // record which step consumes a batch.
+            (Self::Gauge { gauge, .. }, W::Gauge { state, .. }) => {
                 gauge.set_target(state.target);
             }
-            // **Both arms, one expression** — the GL one holds the very same
-            // `kit::FlipBoard`, because a board's whole animation is a
-            // closed-form function of its own clock and that clock is CPU-side
-            // either way. A board whose renderer flips must not restart
-            // mid-fall, and this is what makes that true by construction rather
-            // than by two arms agreeing.
-            (
-                Self::FlipBoard { board } | Self::FlipBoardGl { board },
-                W::FlipBoard { state, .. },
-            ) => board.set_text(&state.text),
+            // …and the board's clock, for the same reason.
+            (Self::FlipBoard { board }, W::FlipBoard { state, .. }) => board.set_text(&state.text),
             // Unreachable: `apply` rebuilds on a kind mismatch rather than
             // calling this. Dropping the update is the harmless outcome if that
             // ever stops being true.
@@ -3032,35 +2829,15 @@ impl Renderer {
     /// for).
     ///
     /// The two kit primitives that step per *call* rather than per elapsed
-    /// second — `Scope::advance` and `PeakHold::decay` — are driven through a
-    /// [`Steps`] accumulator so their cadence is anchored to wall-clock time.
-    /// The rest take `dt` straight: the needle's spring and the flip board's
-    /// clock are closed-form and frame-rate independent by construction, and the
-    /// marquee's speed is stated in dots *per second*.
-    ///
-    /// The `too_many_lines` allow is the vocabulary's, not this function's: it
-    /// is one flat arm per widget kind with no nesting between them, and it
-    /// crossed the ceiling by three lines when #1144 added a second arm for a
-    /// kind that already had one. Splitting it would put half the animation
-    /// table somewhere else, which is worse to read and worse to review than a
-    /// long match.
-    #[allow(clippy::too_many_lines)]
+    /// second — the scope's stamp cadence and `PeakHold::decay` — are driven
+    /// through a [`Steps`] accumulator so their cadence is anchored to
+    /// wall-clock time. The rest take `dt` straight: the needle's spring and
+    /// the flip board's clock are closed-form and frame-rate independent by
+    /// construction, and the marquee's speed is stated in dots *per second*.
     fn advance(&mut self, dt: f32) -> bool {
         match self {
-            Self::DotMatrix { .. }
-            | Self::DotMatrixGl { .. }
-            | Self::SevenSeg { .. }
-            | Self::SevenSegGl { .. }
-            | Self::TextBox { .. }
-            | Self::TextBoxGl { .. } => false,
-            // Both arms, one expression — see `update`.
+            Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
             Self::LedStrip {
-                hold,
-                steps,
-                explicit_peak,
-                ..
-            }
-            | Self::LedStripGl {
                 hold,
                 steps,
                 explicit_peak,
@@ -3087,20 +2864,12 @@ impl Renderer {
                 }
                 changed(before, hold.value())
             }
-            // Both `Marquee` arms integrate through [`marquee_step`] — see
-            // there for the sign convention and why it is shared.
+            // The grid is re-uploaded exactly when the whole-dot phase moved,
+            // which is the entire animation of this widget on the GPU: #839
+            // made a sub-dot position inexpressible, so there is no phase
+            // uniform to interpolate and a step *is* a different set of lit
+            // columns. See [`marquee_step`] for the sign convention.
             Self::Marquee {
-                strip,
-                offset,
-                speed_dots_per_sec,
-                ..
-            } => marquee_step(strip, offset, *speed_dots_per_sec, dt),
-            // …and the GL arm re-uploads the grid exactly when the whole-dot
-            // phase moved, which is the entire animation of this widget on the
-            // GPU: #839 made a sub-dot position inexpressible, so there is no
-            // phase uniform to interpolate and a step *is* a different set of
-            // lit columns.
-            Self::MarqueeGl {
                 strip,
                 offset,
                 speed_dots_per_sec,
@@ -3113,41 +2882,20 @@ impl Renderer {
                 *window = preem_gl::encode_window(strip, dots(*offset, strip.period()));
                 true
             }
-            Self::Scope {
-                scope,
-                pending,
-                idle,
-                fades,
-                settle_steps,
-                steps,
-            } => scope_steps(
-                ScopeClock {
-                    steps,
-                    pending,
-                    idle,
-                    fades: *fades,
-                    settle_steps: *settle_steps,
-                },
-                dt,
-                // An empty batch flatlines on the axis while the existing trail
-                // keeps decaying — the kit's documented behaviour, and what
-                // lets a plugin with nothing to say simply stop.
-                |batch| scope.advance(batch.unwrap_or(&[])),
-            ),
-            // **The same loop with the kit call replaced by bookkeeping** — and
+            // **The kit's loop with the kit call replaced by bookkeeping** —
             // literally so since it moved into [`scope_steps`], which is what
-            // makes "the two arms agree about *when* a scope advances"
-            // structural rather than a comment. That agreement is what let
-            // #926's clock park and `pump.rs` go untouched by this change.
+            // made "the two arms agree about *when* a scope advances"
+            // structural rather than a comment through the whole of #893's
+            // migration, and is what #926's clock still rests on.
             //
-            // What the CPU arm spends on a `Vec<u16>` decay and a polyline
-            // stamp, this spends on incrementing a counter: the decay and the
-            // stamp happen in the shader, once per step the surface has not
-            // drawn yet. `batch_step` records *which* step consumes the batch,
-            // because the kit stamps a batch on the first step of an advance
-            // and flatlines on the axis for the rest — and the shader has to
-            // reproduce that, not stamp the same batch eight times.
-            Self::ScopeGl {
+            // What a CPU decay pass and a polyline stamp used to spend, this
+            // spends on incrementing a counter: the decay and the stamp happen
+            // in the shader, once per step the surface has not drawn yet.
+            // `batch_step` records *which* step consumes the batch, because the
+            // kit stamps a batch on the first step of an advance and flatlines
+            // on the axis for the rest — and the shader has to reproduce that,
+            // not stamp the same batch eight times.
+            Self::Scope {
                 pending,
                 idle,
                 fades,
@@ -3185,16 +2933,14 @@ impl Renderer {
             // scope's first tick** (the `None` baseline branch of
             // [`advance_scopes`]) and on every duplicate `frame_time` two
             // in-phase mounts hand it. Found by the #926 review, probes P2/P4.
-            // Both gauge arms, one expression — see `update`.
-            Self::Gauge { gauge } | Self::GaugeGl { gauge, .. } => {
+            Self::Gauge { gauge, .. } => {
                 if gauge.is_settled() || !advances(dt) {
                     return false;
                 }
                 gauge.advance(dt);
                 true
             }
-            // Both board arms, one expression — see `update`.
-            Self::FlipBoard { board } | Self::FlipBoardGl { board } => {
+            Self::FlipBoard { board } => {
                 if board.is_settled() || !advances(dt) {
                     return false;
                 }
@@ -3209,28 +2955,13 @@ impl Renderer {
     /// all.
     fn animates(&self) -> bool {
         match self {
-            Self::DotMatrix { .. }
-            | Self::DotMatrixGl { .. }
-            | Self::SevenSeg { .. }
-            | Self::SevenSegGl { .. }
-            | Self::TextBox { .. }
-            | Self::TextBoxGl { .. } => false,
+            Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
             // A peak dot only moves while it is above the floor, has a fall
             // rate, and is actually the value being drawn: the kit clamps a
             // negative or non-finite rate to `0.0` ("never falls"), and an
             // explicit peak masks the held one at render time — neither must
             // keep the clock awake.
-            // **The same expression on both arms**, for #926's reason: whether
-            // a meter keeps its mount's tick callback armed must not depend on
-            // which renderer drew it, or a kill-switch flip would change when
-            // the shell parks.
             Self::LedStrip {
-                hold,
-                hold_rate,
-                explicit_peak,
-                ..
-            }
-            | Self::LedStripGl {
                 hold,
                 hold_rate,
                 explicit_peak,
@@ -3241,110 +2972,45 @@ impl Renderer {
                     && *hold_rate > 0.0
                     && hold.as_ref().is_some_and(|hold| hold.value() > 0.0)
             }
-            // **The same expression on both arms**, and for #926's reason:
-            // whether a ticker keeps its mount's tick callback armed must not
-            // depend on which renderer drew it, or a kill-switch flip would
-            // change when the shell parks.
             Self::Marquee {
                 strip,
                 speed_dots_per_sec,
                 ..
-            }
-            | Self::MarqueeGl {
-                strip,
-                speed_dots_per_sec,
-                ..
             } => strip.scrolls() && speed_dots_per_sec.is_finite() && *speed_dots_per_sec != 0.0,
-            // **The same expression on both arms**, and that is the property
-            // #926's frame clock rests on: whether a scope keeps its mount's
-            // tick callback armed must not depend on which renderer drew it, or
-            // a kill-switch flip would change when the shell parks. Asserted in
-            // `plugins::tests`.
             Self::Scope {
                 pending,
                 idle,
                 fades,
                 settle_steps,
                 ..
-            }
-            | Self::ScopeGl {
-                pending,
-                idle,
-                fades,
-                settle_steps,
-                ..
             } => pending.is_some() || (*fades && *idle < *settle_steps),
-            // …and the same property for the gauge, for free rather than by
-            // construction: both arms read the one `kit::Gauge` they share.
-            Self::Gauge { gauge } | Self::GaugeGl { gauge, .. } => !gauge.is_settled(),
-            Self::FlipBoard { board } | Self::FlipBoardGl { board } => !board.is_settled(),
+            Self::Gauge { gauge, .. } => !gauge.is_settled(),
+            Self::FlipBoard { board } => !board.is_settled(),
         }
     }
 
-    /// Rasterise the current frame in `style`, or `None` for a renderer that
-    /// does not rasterise at all.
-    ///
-    /// The `Option` is the GL seam and nothing else: a GL arm draws in
-    /// a shader from uniforms, so there is no CPU frame to hand back and
-    /// inventing an empty one would make it render as a blank chip
-    /// rather than fail loudly. [`Instance::surface`] asks
-    /// [`gl_surface`](Self::gl_surface) first and only falls through to here.
-    fn render(&self, style: kit::DisplayStyle) -> Option<kit::Frame> {
-        Some(match self {
-            Self::DotMatrix { text, dot_px } => {
-                kit::DotMatrix::new(style).dot_px(*dot_px).render(text)
-            }
-            Self::SevenSeg { text } => kit::seven_seg(text, style),
-            // The box baked its palette at construction, so it takes no style
-            // here — see `invalidate_cached_frames`.
-            Self::TextBox { boxed, text } => boxed.render(text),
-            Self::LedStrip {
-                strip,
-                level,
-                explicit_peak,
-                hold,
-                ..
-            } => strip.render(*level, peak_for(*explicit_peak, hold.as_ref())),
-            Self::Marquee { strip, offset, .. } => strip.window(dots(*offset, strip.period())),
-            Self::Scope { scope, .. } => scope.render(style),
-            Self::ScopeGl { .. }
-            | Self::GaugeGl { .. }
-            | Self::DotMatrixGl { .. }
-            | Self::MarqueeGl { .. }
-            | Self::TextBoxGl { .. }
-            | Self::LedStripGl { .. }
-            | Self::SevenSegGl { .. }
-            | Self::FlipBoardGl { .. } => return None,
-            Self::Gauge { gauge } => gauge.render(style),
-            Self::FlipBoard { board } => board.render(style),
-        })
-    }
-
-    /// The program and node payload for a renderer that draws on the GPU, or
-    /// `None` for every CPU arm.
+    /// The program and node payload this renderer draws from.
     ///
     /// **Call it inside this widget's `with_pins` scope** — see
     /// [`Instance::surface`], the only caller. The palette is resolved *here*,
     /// through `hytte_preem::palette_snapshot`, so the accent / role / pin
-    /// precedence stays the kit's single implementation across both arms: the
-    /// GL arm reads the very palette the CPU arm would have composited toward
-    /// rather than re-deriving one. Resolving it inside the `Some` arm also
-    /// keeps a CPU rasterisation from paying for a snapshot it never reads.
+    /// precedence stays the kit's single implementation: the shader reads the
+    /// very palette the kit would have composited toward rather than
+    /// re-deriving one.
     ///
-    /// The `_ => None` catch-all is deliberate and safe in a way this module's
-    /// other catch-alls are not: the question is "does this renderer draw on
-    /// the GPU", and the honest answer for an arm that does not is `None`. A
-    /// new GPU arm that forgot to answer here would render nothing at all —
-    /// loudly — rather than render subtly wrongly.
-    fn gl_surface(&self, style: kit::DisplayStyle) -> Option<(GlProgram, preem_gl::KitSurface)> {
+    /// Exhaustive with no catch-all, and infallible since #1157. It answered
+    /// `Option` while a CPU arm existed, which meant a new GPU arm that forgot
+    /// to answer here rendered nothing at all — loudly, which was the best
+    /// available outcome. It now cannot be forgotten: the arm does not compile.
+    fn gl_surface(&self, style: kit::DisplayStyle) -> (GlProgram, preem_gl::KitSurface) {
         match self {
-            Self::ScopeGl {
+            Self::Scope {
                 config,
                 samples,
                 batch_step,
                 step_seq,
                 ..
-            } => Some((
+            } => (
                 preem_gl::SCOPE,
                 preem_gl::scope_surface(
                     *config,
@@ -3353,12 +3019,12 @@ impl Renderer {
                     *step_seq,
                     &kit::palette_snapshot(style),
                 ),
-            )),
+            ),
             // The needle's deflection and velocity are the two numbers the
             // whole picture is a function of; the mapping takes them and no
             // `kit::Gauge` at all, which is what keeps it pure and hermetically
             // testable (`preem_gl::gauge`).
-            Self::GaugeGl { config, gauge } => Some((
+            Self::Gauge { config, gauge } => (
                 preem_gl::GAUGE,
                 preem_gl::gauge_surface(
                     *config,
@@ -3366,45 +3032,45 @@ impl Renderer {
                     gauge.needle().velocity(),
                     &kit::palette_snapshot(style),
                 ),
-            )),
+            ),
             // The line is handed over **already encoded** — the strip is built
             // on a text change, not on a mapping pass, so a second monitor's
             // pass costs a refcount rather than a re-encode of the display
-            // (#911's rule, and the same reason `ScopeGl` shares its batch).
-            Self::DotMatrixGl { config, glyphs, .. } => Some((
+            // (#911's rule, and the same reason `Scope` shares its batch).
+            Self::DotMatrix { config, glyphs, .. } => (
                 preem_gl::DOT_MATRIX,
                 preem_gl::dot_matrix_surface(*config, glyphs, &kit::palette_snapshot(style)),
-            )),
+            ),
             // The strip is the **geometry oracle** as well as the message: the
             // window width, the dot pitch, the grid's column count and its
-            // centred origin all come off it, which is what keeps the two arms
-            // drawing on one lattice. The grid at this phase was encoded when
-            // the phase moved, not here.
-            Self::MarqueeGl { strip, window, .. } => Some((
+            // centred origin all come off it, which is what keeps the shader
+            // and the kit on one lattice. The grid at this phase was encoded
+            // when the phase moved, not here.
+            Self::Marquee { strip, window, .. } => (
                 preem_gl::MARQUEE,
                 preem_gl::marquee_surface(strip, window, &kit::palette_snapshot(style)),
-            )),
+            ),
             // The **one** arm that takes no palette snapshot, and the `style`
             // argument goes unread for it: a `TextBox` bakes its colors at
-            // construction, so `layout` already carries the ones the CPU arm
-            // would paint with — a pinned field, a pinned ink and the plugin's
-            // own `.notdef` included. Re-resolving here would silently drop all
+            // construction, so `layout` already carries the ones it would paint
+            // with — a pinned field, a pinned ink and the plugin's own
+            // `.notdef` included. Re-resolving here would silently drop all
             // three.
-            Self::TextBoxGl { layout, block, .. } => {
-                Some((preem_gl::TEXTBOX, preem_gl::textbox_surface(layout, block)))
+            Self::TextBox { layout, block, .. } => {
+                (preem_gl::TEXTBOX, preem_gl::textbox_surface(layout, block))
             }
             // The level and the **already-folded** peak are the two numbers the
             // whole picture is a function of — `peak_for` is the shell's one
             // rule for which of the plugin's explicit value and the held one is
-            // being drawn, shared with the CPU arm's `render` above, so the
-            // shader is handed a number rather than a decay policy.
-            Self::LedStripGl {
+            // being drawn, so the shader is handed a number rather than a decay
+            // policy.
+            Self::LedStrip {
                 config,
                 level,
                 explicit_peak,
                 hold,
                 ..
-            } => Some((
+            } => (
                 preem_gl::LED_STRIP,
                 preem_gl::led_strip_surface(
                     *config,
@@ -3412,27 +3078,26 @@ impl Renderer {
                     peak_for(*explicit_peak, hold.as_ref()),
                     &kit::palette_snapshot(style),
                 ),
-            )),
+            ),
             // The readout is entirely a function of its text and its skin —
             // `kit::seven_seg` is pure — so the encoded strip and the palette
             // are the whole payload. No clock, no folded value, nothing to
             // decay.
-            Self::SevenSegGl { readout } => Some((
+            Self::SevenSeg { readout } => (
                 preem_gl::SEVEN_SEG,
                 preem_gl::seven_seg_surface(readout, &kit::palette_snapshot(style)),
-            )),
+            ),
             // The board's per-cell payload is a function of its **clock**, not
             // of its text, so it is encoded here rather than cached on a state
-            // change — see `FlipBoardGl`'s own docs on why #911's rule does not
+            // change — see `FlipBoard`'s own docs on why #911's rule does not
             // reach this widget.
-            Self::FlipBoardGl { board } => Some((
+            Self::FlipBoard { board } => (
                 preem_gl::FLIP_BOARD,
                 preem_gl::flip_board_surface(
                     &preem_gl::encode_cards(board),
                     &kit::palette_snapshot(style),
                 ),
-            )),
-            _ => None,
+            ),
         }
     }
 }
@@ -3659,26 +3324,6 @@ fn dots(offset: f32, period: usize) -> usize {
     (offset.floor() as usize) % period
 }
 
-/// Both halves of the **GL seam** for one widget, built the way [`apply`]
-/// builds it: `(is_gl, gl_surface(..).is_some())`.
-///
-/// Test-only and here rather than in `plugins::tests` because [`Renderer`] and
-/// both of its methods are private to this module. The test that reads it —
-/// `every_gl_renderer_answers_both_halves_of_the_gl_seam` — is what
-/// [`Renderer::is_gl`]'s doc promises, and #1148's review found that promise
-/// was prose and nothing else. An arm answering `true` to the first and `None`
-/// to the second rasterises nothing and is never rebuilt onto the kit: a
-/// permanently blank chip, with no warning and no fallback.
-///
-/// `None` when `build` declines the widget (the `force_unsupported` test
-/// knob).
-#[cfg(test)]
-pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
-    let renderer = build(widget)?;
-    let style = display_style(widget.style());
-    Some((renderer.is_gl(), renderer.gl_surface(style).is_some()))
-}
-
 /// Which [`preem_gl::Kind`] `widget`'s wire kind takes a GL arm for, if any
 /// (#1211).
 ///
@@ -3686,13 +3331,14 @@ pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
 /// production-adjacent half of the enumeration `plugins::tests`'
 /// `kind_enumeration` module ties together: a widget kind added to the wire
 /// vocabulary does not compile here until it says whether it has a GL arm,
-/// which is exactly the question [`preem_gl::Kind::ALL`] answers for the five
-/// that do.
+/// which is exactly the question [`preem_gl::Kind::ALL`] answers.
 ///
-/// Test-only for [`gl_seam_for`]'s reason: [`preem_gl::Kind`] is itself
-/// `cfg(test)`-only, since nothing outside a test needs a widget's *kind* —
-/// only whether its renderer draws on the GPU, which [`Renderer::is_gl`]
-/// answers without naming one.
+/// It is [`program_for`]'s test-side twin, and deliberately a second list
+/// rather than a derivation of it: `program_for` maps a kind to the pipeline
+/// the shell draws it with, this maps it to the **parity harness's** kind, and
+/// the two agreeing is what `kind_enumeration` checks. Test-only because
+/// [`preem_gl::Kind`] is itself `cfg(test)`-only — nothing outside a test needs
+/// a widget's harness kind.
 ///
 /// **`unnecessary_wraps` is allowed deliberately**, and #1155 is when it
 /// started firing: with the flip board's arm, *every* wire kind names a
@@ -3720,13 +3366,13 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
 #[cfg(test)]
 mod tests {
     use super::{
-        Arm, Renderer, Scope, UiNode, any_animating_in, begin_pass, build, display_style, end_pass,
-        map_widget, preem_gl, probe, vocab,
+        Arm, Scope, UiNode, any_animating_in, begin_pass, build, display_style, end_pass,
+        map_widget, preem_gl, probe, program_for, vocab,
     };
 
-    /// The `Scope` the two arms are compared through — the shape
-    /// `plugins::tests`' **context-failure** tests use, so a reader comparing
-    /// the two files is looking at one widget.
+    /// The `Scope` the fallback is watched through — the shape `plugins::tests`'
+    /// **context-failure** tests use, so a reader comparing the two files is
+    /// looking at one widget.
     ///
     /// `persistence: 256` is the kit's own infinite-phosphor ceiling and it is
     /// load-bearing, not decoration: `build` gives such a scope `fades: false`,
@@ -3749,52 +3395,44 @@ mod tests {
         }
     }
 
-    /// Assert `got` is a raster node carrying exactly `want`'s pixels.
+    /// Assert `got` is the broken-widget placeholder: an **empty raster** node,
+    /// which is what a preem widget with no pipeline degrades to since #1157.
     ///
-    /// Both halves matter and neither is enough alone: the node **kind** is
-    /// what a blank `GlSurface` would fail, and the **bytes** are what a
-    /// fallback that produced an empty or differently-sized buffer would fail.
-    /// The non-empty check is there so the comparison cannot be satisfied by
-    /// two placeholders agreeing with each other.
-    fn assert_same_raster(got: &UiNode, want: &UiNode) {
-        let (
-            UiNode::Pixels {
-                width,
-                height,
-                data,
-                ..
-            },
-            UiNode::Pixels {
-                width: want_w,
-                height: want_h,
-                data: want,
-                ..
-            },
-        ) = (got, want)
+    /// Both halves matter and neither is enough alone. The node **kind** is
+    /// what a `GlSurface` that kept its dead pipeline would fail — the shipped
+    /// behaviour #1232 existed to fix, a chip drawing nothing with nothing
+    /// saying why. The **zero size and empty buffer** are what a fallback that
+    /// somehow produced a real buffer would fail; before #1157 that was the
+    /// kit's own raster and this helper compared it byte for byte against an
+    /// oracle, which is the assertion the retirement replaces rather than
+    /// weakens: there is now exactly one right answer here and it is spelled
+    /// out, where the oracle version could be satisfied by any renderer that
+    /// happened to agree with the kit.
+    fn assert_placeholder(got: &UiNode) {
+        let UiNode::Pixels {
+            width,
+            height,
+            data,
+            scale,
+            ..
+        } = got
         else {
-            panic!("expected two raster chips, got a GL one — the fallback did not engage");
+            panic!("expected the placeholder, got a GL chip — the fallback did not engage");
         };
         assert_eq!(
-            (width, height),
-            (want_w, want_h),
-            "the fallback chip is the size the kit arm would have produced",
+            (*width, *height),
+            (0, 0),
+            "the placeholder has no size at all",
         );
-        assert_eq!(
-            data.as_ref(),
-            want.as_ref(),
-            "…and it is the kit's raster, byte for byte — not a blank buffer",
-        );
-        assert!(
-            !data.is_empty(),
-            "…which is not empty, so this cannot pass vacuously",
-        );
+        assert!(data.is_empty(), "…and no bytes");
+        assert_eq!(*scale, 1, "…and the preem seam's one scale value");
     }
 
-    /// One widget per kind that **has** a GL arm, at its vocabulary defaults.
+    /// One widget per kind that has a pipeline, at its vocabulary defaults.
     ///
     /// Length-checked against [`preem_gl::Kind::ALL`], the #1211 enumeration
-    /// every other per-kind list in the tree is tied to, so a sixth GL kind
-    /// cannot land here unnoticed.
+    /// every other per-kind list in the tree is tied to, so a ninth kind cannot
+    /// land here unnoticed.
     fn gl_capable_widgets() -> Vec<vocab::PreemWidget> {
         use vocab::PreemWidget as W;
         let all = vec![
@@ -3819,18 +3457,12 @@ mod tests {
                 config: vocab::LedStripConfig::default(),
                 state: vocab::LedStripState::default(),
             },
-            // Not the vocabulary default, which is the empty string: a readout
-            // with no cells draws a bare field, so a fallback comparison
-            // against it would pass on any renderer that fills the background.
             W::SevenSeg {
                 config: vocab::SevenSegConfig::default(),
                 state: vocab::SevenSegState {
                     text: "12:34".into(),
                 },
             },
-            // Not the vocabulary default either, for the readout's reason: a
-            // blank board is a bezel and eight ghost cards, which a renderer
-            // that only painted the fixture would match.
             W::FlipBoard {
                 config: vocab::FlipBoardConfig::default(),
                 state: vocab::FlipBoardState {
@@ -3844,20 +3476,21 @@ mod tests {
                 .into_iter()
                 .filter(|kind| kind.on_the_wire())
                 .count(),
-            "a kit widget gained a GL arm without a sample here",
+            "a kit widget gained a pipeline without a sample here",
         );
         all
     }
 
-    /// **#1232.** A pipeline this driver will not build takes **that** chip to
-    /// the CPU kit — and leaves every other kind on the GPU.
+    /// **#1232, as #1157 leaves it.** A pipeline this driver will not build
+    /// takes **that** chip to the broken-widget placeholder — and leaves every
+    /// other kind on the GPU.
     ///
     /// This is the bug end to end, from the host's side of the seam. Shipped,
     /// `hytte-ui` latched the refusal (#1180 item 2, so the driver is asked
     /// once), wrote one journal line, and told nobody: `preem_gl::arm` kept
-    /// answering `Gl` because neither of the two failures it folds in had
-    /// happened, the mapping pass kept emitting a `UiNode::GlSurface`, and the
-    /// chip drew nothing at all for the life of the context.
+    /// answering `Gl` because neither of the failures it folds in had happened,
+    /// the mapping pass kept emitting a `UiNode::GlSurface`, and the chip drew
+    /// nothing at all for the life of the context.
     ///
     /// Driven through `hytte::ui::gl_surface::refuse_build` — the very entry
     /// point `GlSurface::ensure_resources` calls on a real refusal, public for
@@ -3868,51 +3501,51 @@ mod tests {
     /// `a_refused_pipeline_calls_the_hosts_fallback_hook_once`, under
     /// llvmpipe.
     ///
-    /// The oracle is the **CPU arm's own output** for the same widget, which
-    /// is the kit's bytes by
-    /// `the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`'s
-    /// contract — so "renders the kit's raster" is asserted as bytes rather
-    /// than as a node kind, and a fallback that produced an empty or
-    /// differently sized buffer would fail here rather than look right.
+    /// The oracle was the CPU arm's own output for the same widget until #1157
+    /// retired it; the assertion is now [`assert_placeholder`], which is the
+    /// narrower statement of the same thing — a chip that came back a
+    /// `GlSurface`, or one carrying any surface at all, fails here rather than
+    /// looking right.
     ///
     /// **The probe before the mapping pass is the load-bearing assertion**
     /// (PR #1243 review, MEDIUM 1). Every *other* assertion here — the node
-    /// kind, the kit's bytes, the gauge still on GL — is satisfied by
-    /// `apply`'s `gl_lost` alone on the `begin_pass` that follows, so with the
-    /// probe taken afterwards the sweep this whole fix exists for survived
-    /// being replaced by `return 0` with the entire suite green. Taken before
-    /// any mapping pass, it can only be the hook's own rebuild.
+    /// kind, the gauge still on GL — is satisfied by `apply`'s `gl_lost` alone
+    /// on the `begin_pass` that follows, so with the probe taken afterwards the
+    /// sweep this whole fix exists for survived being replaced by `return 0`
+    /// with the entire suite green. Taken before any mapping pass, it can only
+    /// be the hook's own rebuild.
     ///
-    /// **Falsified** three ways, all measured:
+    /// **Falsified** three ways, all measured (the first two on #1232, the
+    /// third re-measured here):
     ///
-    /// - `rebuild_refused_gl_renderers_on_cpu`'s body replaced by `return 0`
-    ///   (the `REFUSED` record kept): the builds probe above `begin_pass`
-    ///   reads `1` where `2` is due — nothing rebuilt the parked chip, which
-    ///   is #1232 for the one widget that can never re-map itself.
+    /// - `rebuild_refused_gl_renderers_as_placeholders`'s body replaced by
+    ///   `return 0` (the `REFUSED` record kept): the builds probe above
+    ///   `begin_pass` reads `1` where `2` is due — nothing rebuilt the parked
+    ///   chip, which is #1232 for the one widget that can never re-map itself.
     /// - the `set_build_refusal_handler` line dropped from `preem_gl::install`:
     ///   the chip is still a `GlSurface` afterwards, i.e. the shipped
     ///   behaviour, blank on glass.
-    /// - `rebuild_refused_gl_renderers_on_cpu` widened to every GL instance:
-    ///   reds the gauge's **builds** assertion rather than the node-kind one,
-    ///   because `build` answers with the same `GaugeGl` (`arm_for(GAUGE)`
-    ///   still says `Gl`) after restarting its needle's spring mid-swing
-    ///   (#1143). Asserting only the node kind would have missed it.
+    /// - `rebuild_refused_gl_renderers_as_placeholders` widened to every
+    ///   instance: reds the gauge's **builds** assertion rather than the
+    ///   node-kind one, because `build` answers with the same `Gauge`
+    ///   (`arm_for(GAUGE)` still says `Gl`) after restarting its needle's
+    ///   spring mid-swing (#1143). Asserting only the node kind would have
+    ///   missed it.
     ///
     /// **Also pins the re-map nudge** (#1253; PR #1243 review, NEW LOW B),
     /// beside the builds probe: `pump::request_preem_repaint_all_when_live`
     /// is the callee both this hook and the pre-existing context-failure hook
-    /// call to put an already-rebuilt renderer on screen, and until now
+    /// call to put an already-rebuilt renderer on screen, and until #1253
     /// nothing in the tree asserted the call happened at all — deleting it
     /// from either hook left the whole suite green. The counter lives in the
     /// shared callee rather than at either call site (`pump.rs`,
     /// `#[cfg(test)]`-only), which is what pins both hooks at once instead of
-    /// giving the new one a bespoke seam its older twin does not share.
-    /// **Falsified** by deleting the
-    /// `super::pump::request_preem_repaint_all_when_live();` line from
-    /// `on_build_refused`: the counter assertion below reds at
+    /// giving one a bespoke seam its twin does not share. **Falsified** by
+    /// deleting the `super::pump::request_preem_repaint_all_when_live();` line
+    /// from `on_build_refused`: the counter assertion below reds at
     /// `left: 0, right: 1`.
     #[test]
-    fn a_refused_pipeline_puts_that_chip_on_the_kit_and_leaves_the_others_on_gl() {
+    fn a_refused_pipeline_puts_that_chip_on_the_placeholder_and_leaves_the_others_on_gl() {
         let _ink = crate::plugins::tests::preem_ink_lock();
         // Registers the pipelines *and* both hooks — the context-failure one
         // and #1232's build-refusal one.
@@ -3924,178 +3557,190 @@ mod tests {
             state: vocab::GaugeState::default(),
         };
 
-        // The oracle: the same scope on the kit, in a scope of its own. The
-        // test arm defaults to `Cpu` (`preem_gl::TEST_ARM`), so this is the
-        // plain kit path with nothing to opt into.
-        let oracle_key = Scope::detached("refused-oracle");
-        begin_pass(&oracle_key);
-        let oracle = map_widget(&oracle_key, Some("sc"), &[], &scope);
-        end_pass(&oracle_key);
-
         let key = Scope::detached("refused-fallback");
-        preem_gl::with_gl_arm(|| {
-            begin_pass(&key);
-            let scope_before = map_widget(&key, Some("sc"), &[], &scope);
-            let gauge_before = map_widget(&key, Some("ga"), &[], &gauge);
-            end_pass(&key);
-            assert!(
-                matches!(scope_before, UiNode::GlSurface { .. }),
-                "the premise: both chips start on the GPU",
-            );
-            assert!(matches!(gauge_before, UiNode::GlSurface { .. }));
-            // The premise that makes the sweep load-bearing, stated rather
-            // than implied (the sibling context-hook tests in
-            // `plugins::tests` state it the same way): an
-            // infinite-persistence scope answers `animates()` with `false`
-            // from birth, #926's clock parks it, and **no mapping pass is
-            // coming**. Whatever puts the kit on screen has to be the hook
-            // itself.
-            assert!(
-                !any_animating_in(std::slice::from_ref(&key)),
-                "neither chip animates, so nothing will re-map this scope on its own",
-            );
-            let scope_before_counts = probe(&key, Some("sc")).expect("the scope instance exists");
-            let gauge_builds = probe(&key, Some("ga"))
+        begin_pass(&key);
+        let scope_before = map_widget(&key, Some("sc"), &[], &scope);
+        let gauge_before = map_widget(&key, Some("ga"), &[], &gauge);
+        end_pass(&key);
+        assert!(
+            matches!(scope_before, UiNode::GlSurface { .. }),
+            "the premise: both chips start on the GPU",
+        );
+        assert!(matches!(gauge_before, UiNode::GlSurface { .. }));
+        // The premise that makes the sweep load-bearing, stated rather than
+        // implied (the sibling context-hook tests in `plugins::tests` state it
+        // the same way): an infinite-persistence scope answers `animates()`
+        // with `false` from birth, #926's clock parks it, and **no mapping pass
+        // is coming**. Whatever puts the placeholder on screen has to be the
+        // hook itself.
+        assert!(
+            !any_animating_in(std::slice::from_ref(&key)),
+            "neither chip animates, so nothing will re-map this scope on its own",
+        );
+        let scope_before_counts = probe(&key, Some("sc")).expect("the scope instance exists");
+        let gauge_builds = probe(&key, Some("ga"))
+            .expect("the gauge instance exists")
+            .0;
+        let repaints_before = crate::plugins::pump::repaint_requests();
+
+        // The driver refuses the scope's pipeline, once, exactly as a realised
+        // `GlSurface` reports it.
+        hytte::ui::gl_surface::refuse_build(
+            preem_gl::SCOPE,
+            (48, 24),
+            "fragment shader failed to compile: 0:1(1): error: syntax error",
+        );
+
+        // **Before any mapping pass**, which is the whole point of the sweep
+        // and the one assertion `apply`'s `gl_lost` cannot satisfy on the
+        // hook's behalf (PR #1243 review, MEDIUM 1): the rebuild has already
+        // happened, here, inside the hook.
+        let scope_after_hook = probe(&key, Some("sc")).expect("the scope instance survives");
+        assert_eq!(
+            scope_after_hook.0,
+            scope_before_counts.0 + 1,
+            "the refusal hook rebuilt the renderer itself, not the next re-map — the half a \
+             parked clock would otherwise withhold for ever",
+        );
+        // A forward guard, not the `gl_lost` discriminator a fix-round comment
+        // once credited it with being: taken at a probe before any mapping
+        // pass, `apply` cannot have run yet on this path, so
+        // `scope_after_hook.1` is `scope_before_counts.1` by construction of
+        // the code path — `x == x` — and the `builds` assertion above is the
+        // one doing all the discriminating here (#1253).
+        assert_eq!(
+            scope_after_hook.1, scope_before_counts.1,
+            "…and did it without an apply, so no widget state was touched",
+        );
+        // The re-map nudge (PR #1243 review, NEW LOW B): the hook asks for
+        // exactly one re-map per refused program, through the same shared
+        // callee the context-failure hook uses.
+        assert_eq!(
+            crate::plugins::pump::repaint_requests(),
+            repaints_before + 1,
+            "the hook asked for one re-map, so the placeholder reaches the screen",
+        );
+
+        begin_pass(&key);
+        let scope_after = map_widget(&key, Some("sc"), &[], &scope);
+        let gauge_after = map_widget(&key, Some("ga"), &[], &gauge);
+        end_pass(&key);
+
+        assert_placeholder(&scope_after);
+
+        assert!(
+            matches!(gauge_after, UiNode::GlSurface { .. }),
+            "a refused `preem.scope` says nothing about `preem.gauge`: the fallback is per \
+             pipeline, not per session",
+        );
+        assert_eq!(
+            probe(&key, Some("sc"))
+                .expect("the scope instance exists")
+                .0,
+            scope_before_counts.0 + 1,
+            "the refused chip is rebuilt exactly once — by the sweep, not again by the mapping \
+             pass that follows it",
+        );
+        assert_eq!(
+            probe(&key, Some("ga"))
                 .expect("the gauge instance exists")
-                .0;
-            let repaints_before = crate::plugins::pump::repaint_requests();
-
-            // The driver refuses the scope's pipeline, once, exactly as a
-            // realised `GlSurface` reports it.
-            hytte::ui::gl_surface::refuse_build(
-                preem_gl::SCOPE,
-                (48, 24),
-                "fragment shader failed to compile: 0:1(1): error: syntax error",
-            );
-
-            // **Before any mapping pass**, which is the whole point of the
-            // sweep and the one assertion `apply`'s `gl_lost` cannot satisfy
-            // on the hook's behalf (PR #1243 review, MEDIUM 1): the rebuild
-            // has already happened, here, inside the hook.
-            let scope_after_hook = probe(&key, Some("sc")).expect("the scope instance survives");
-            assert_eq!(
-                scope_after_hook.0,
-                scope_before_counts.0 + 1,
-                "the refusal hook rebuilt the renderer itself, not the next re-map — the half a \
-                 parked clock would otherwise withhold for ever",
-            );
-            // A forward guard, not the `gl_lost` discriminator a fix-round
-            // comment once credited it with being: taken at a probe before
-            // any mapping pass, `apply` cannot have run yet on this path, so
-            // `scope_after_hook.1` is `scope_before_counts.1` by construction
-            // of the code path — `x == x` — and the `builds` assertion above
-            // is the one doing all the discriminating here (#1253).
-            assert_eq!(
-                scope_after_hook.1, scope_before_counts.1,
-                "…and did it without an apply, so no widget state was touched",
-            );
-            // The re-map nudge (PR #1243 review, NEW LOW B): the hook asks
-            // for exactly one re-map per refused program, through the same
-            // shared callee the context-failure hook uses.
-            assert_eq!(
-                crate::plugins::pump::repaint_requests(),
-                repaints_before + 1,
-                "the hook asked for one re-map, so the rebuilt kit renderer reaches the screen",
-            );
-
-            begin_pass(&key);
-            let scope_after = map_widget(&key, Some("sc"), &[], &scope);
-            let gauge_after = map_widget(&key, Some("ga"), &[], &gauge);
-            end_pass(&key);
-
-            assert_same_raster(&scope_after, &oracle);
-
-            assert!(
-                matches!(gauge_after, UiNode::GlSurface { .. }),
-                "a refused `preem.scope` says nothing about `preem.gauge`: the fallback is per \
-                 pipeline, not per session",
-            );
-            assert_eq!(
-                probe(&key, Some("sc"))
-                    .expect("the scope instance exists")
-                    .0,
-                scope_before_counts.0 + 1,
-                "the refused chip is rebuilt exactly once — by the sweep, not again by the \
-                 mapping pass that follows it",
-            );
-            assert_eq!(
-                probe(&key, Some("ga"))
-                    .expect("the gauge instance exists")
-                    .0,
-                gauge_builds,
-                "…and the gauge is not rebuilt at all. A sweep over every GL instance would \
-                 answer with the same `GaugeGl` it already had and restart the needle's spring \
-                 mid-swing for a refusal that was never about it (#1143)",
-            );
-        });
+                .0,
+            gauge_builds,
+            "…and the gauge is not rebuilt at all. A sweep over every instance would answer with \
+             the same `Gauge` it already had and restart the needle's spring mid-swing for a \
+             refusal that was never about it (#1143)",
+        );
     }
 
-    /// **#1232.** `Renderer::gl_program` and `Renderer::gl_surface` name the
-    /// **same** program for every GL arm.
+    /// **#1232, widened by #1157.** [`program_for`], `Renderer::gl_program` and
+    /// `Renderer::gl_surface` name the **same** program for every arm.
     ///
-    /// The two are the only places a renderer variant is mapped to a
-    /// registered pipeline: `gl_surface` decides what the reconciler draws
-    /// with, `gl_program` decides which chips a refusal of that pipeline falls
-    /// back. A pair that disagreed would send the refusal to the wrong kind —
-    /// the refused chip staying blank while an innocent one loses the GPU —
-    /// and both halves would still look right on their own.
+    /// The three are the only places a widget or a renderer is mapped to a
+    /// registered pipeline, and each decides something different with it:
+    /// `program_for` decides which pipeline [`build`] *asks about* before it
+    /// builds anything, `gl_surface` decides what the reconciler draws with,
+    /// and `gl_program` decides which chips a refusal of that pipeline takes to
+    /// the placeholder. Any pair disagreeing is a silent, narrow bug — `build`
+    /// gating on a program the renderer does not name means the refusal sweep
+    /// and `apply`'s `gl_lost` watch a *different* pipeline than the one that
+    /// was checked, so the refused chip stays on a dead program while an
+    /// innocent one loses the GPU — and all three look right on their own.
     ///
-    /// `plugins::tests`' `every_gl_renderer_answers_both_halves_of_the_gl_seam`
-    /// already pins that the two agree on *whether* an arm is a GL arm; what
-    /// it cannot see is which program each names.
+    /// Since #1157 the compiler holds the *shape* of the seam: both functions
+    /// are exhaustive over `Renderer` with no catch-all and neither can answer
+    /// "nothing", so an arm that forgets one does not build. What it cannot
+    /// hold is **which constant** each names, which is exactly what this reads.
+    /// `every_gl_renderer_answers_both_halves_of_the_gl_seam` in
+    /// `plugins::tests` used to pin the shape half and was retired with the CPU
+    /// arm: with a `Renderer` that is GL by construction, the booleans it
+    /// compared are both `true` by construction too.
     ///
     /// **Falsified** by swapping any arm's constant in `gl_program` (say
-    /// `GaugeGl => SCOPE`): this goes red naming the kind.
+    /// `Gauge => SCOPE`) or in [`program_for`]: this goes red naming the kind.
     #[test]
-    fn every_gl_arm_names_one_program_in_both_places() {
+    fn every_gl_arm_names_one_program_in_all_three_places() {
         let _ink = crate::plugins::tests::preem_ink_lock();
-        preem_gl::with_gl_arm(|| {
-            for widget in gl_capable_widgets() {
-                let renderer = build(&widget).expect("every GL-capable widget builds");
-                let style = display_style(widget.style());
-                let drawn = renderer.gl_surface(style).map(|(program, _)| program);
-                assert_eq!(
-                    renderer.gl_program(),
-                    drawn,
-                    "{}: gl_program() and gl_surface() name different pipelines",
-                    widget.kind(),
-                );
-                assert!(
-                    renderer.gl_program().is_some(),
-                    "{}: the premise — this kind is supposed to have a GL arm",
-                    widget.kind(),
-                );
-            }
-        });
+        for widget in gl_capable_widgets() {
+            let renderer = build(&widget).expect("every widget with a pipeline builds");
+            let style = display_style(widget.style());
+            let (drawn, _) = renderer.gl_surface(style);
+            assert_eq!(
+                renderer.gl_program(),
+                drawn,
+                "{}: gl_program() and gl_surface() name different pipelines",
+                widget.kind(),
+            );
+            assert_eq!(
+                program_for(&widget),
+                Some(drawn),
+                "{}: `build` gated on a different pipeline than the renderer it built",
+                widget.kind(),
+            );
+        }
     }
 
-    /// **#1232.** A renderer the host has moved to the CPU kit answers `None`
-    /// to [`Renderer::gl_program`], so the refusal sweep cannot count it twice
-    /// and `apply`'s `gl_lost` cannot re-fire on it for ever.
+    /// **#1157.** A widget whose pipeline this session cannot draw builds **no
+    /// renderer at all**, which is what makes the placeholder the outcome.
     ///
-    /// **Falsified** by giving any CPU arm a `Some(…)` in `gl_program`: the
-    /// second assertion goes red.
+    /// The hermetic half of the retirement, and the one a reader of `build`
+    /// wants stated: `arm_for` is consulted per build, so the answer is a
+    /// property of the session rather than of the widget, and the same widget
+    /// that built a `Scope` a moment ago builds nothing once its pipeline is
+    /// refused.
+    ///
+    /// Driven through the production refusal wire (`refuse_for_test`, which
+    /// forwards to `on_build_refused`) rather than by poking the latch, and a
+    /// plain `#[test]` so the sticky thread-local it sets is this thread's
+    /// blast radius — see `preem_gl::refuse_for_test`'s own doc for why a
+    /// `#[gtk::test]` could not do this.
+    ///
+    /// **Falsified** by dropping the `arm_for` guard from `build`: the second
+    /// assertion reports a renderer, and the chip goes back to being a
+    /// `GlSurface` on a pipeline that will not build — the shipped behaviour
+    /// #1232 fixed.
     #[test]
-    fn a_cpu_renderer_names_no_pipeline() {
+    fn a_widget_whose_pipeline_cannot_draw_builds_no_renderer() {
         let _ink = crate::plugins::tests::preem_ink_lock();
-        let widget = scope_widget();
-        let gl = preem_gl::with_gl_arm(|| build(&widget)).expect("the GL arm builds");
+        let widget = vocab::PreemWidget::Gauge {
+            config: vocab::GaugeConfig::default(),
+            state: vocab::GaugeState::default(),
+        };
         assert_eq!(
-            gl.gl_program(),
-            Some(preem_gl::SCOPE),
-            "the premise: the GL arm draws with the scope's pipeline",
+            preem_gl::arm_for(preem_gl::GAUGE),
+            Arm::Gl,
+            "the premise: a fresh test thread has refused nothing",
         );
-        let cpu = build(&widget).expect("the kit arm builds");
-        assert_eq!(
-            cpu.gl_program(),
-            None,
-            "a kit renderer draws with no registered pipeline at all",
+        assert!(
+            build(&widget).is_some(),
+            "…so the gauge builds the renderer that draws it",
         );
-        assert!(!Renderer::is_gl(&cpu) && Renderer::is_gl(&gl));
-        assert_eq!(
-            preem_gl::arm_for(preem_gl::SCOPE),
-            Arm::Cpu,
-            "…and the test default really is the kit arm, so the line above measured something",
+
+        preem_gl::refuse_for_test(preem_gl::GAUGE, "no GL in this test");
+
+        assert!(
+            build(&widget).is_none(),
+            "a widget whose pipeline was refused builds nothing — there is no second arm to \
+             build since #1157, and `Instance::surface` then answers with the placeholder",
         );
     }
 }

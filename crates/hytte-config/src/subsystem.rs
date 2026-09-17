@@ -661,6 +661,42 @@ pub enum ConfigError {
         /// would otherwise have to go and un-write the line from.
         path: PathBuf,
     },
+    /// The `key_path` handed to [`save_leaf_to_locked`] does not name a leaf
+    /// this writer may replace (#1360 review, HIGH 1): it is not a `Field` of
+    /// the family's schema, it is a collection, it is spelled with an empty
+    /// segment, or the document already has a **table** there.
+    ///
+    /// A refusal rather than a write, because the write would not have been a
+    /// leaf edit — it would have replaced a whole `[display.<name>]` or
+    /// `[workspace.<name>]` block, taking with it every key the schema does
+    /// not know. That is the one outcome the sibling writer's own docs name as
+    /// unacceptable, and a generic form's *reset* button is one click from it.
+    NotALeaf {
+        /// [`Subsystem::NAME`].
+        subsystem: String,
+        /// The path as it was asked for.
+        key: String,
+        /// Which of the refusals this is, as a sentence.
+        reason: String,
+    },
+    /// The value handed to [`save_leaf_to_locked`] is outside the
+    /// [`crate::schema::Kind`] declared for that key (#1360 review, MEDIUM 1).
+    ///
+    /// Refused rather than written, because a leaf of the wrong type is a
+    /// [`ConfigError::Schema`] on the next load and [`load_or_default`] then
+    /// discards the **whole** merged file back to
+    /// [`Subsystem::DEFAULT_TOML`]. The blast radius of one bad row is every
+    /// key in the file.
+    Rejected {
+        /// [`Subsystem::NAME`].
+        subsystem: String,
+        /// The key the value was for.
+        key: String,
+        /// The value, as it would have been written.
+        found: String,
+        /// [`crate::schema::Kind::expected`].
+        expected: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -700,6 +736,23 @@ impl std::fmt::Display for ConfigError {
                 key,
                 &layer_name(Some(path.as_path())),
             )),
+            Self::NotALeaf {
+                subsystem,
+                key,
+                reason,
+            } => write!(
+                f,
+                "{subsystem}.{key} is not a leaf this editor may write: {reason}"
+            ),
+            Self::Rejected {
+                subsystem,
+                key,
+                found,
+                expected,
+            } => write!(
+                f,
+                "{subsystem}.{key} = {found} is not a value this key accepts; expected {expected}"
+            ),
         }
     }
 }
@@ -1584,10 +1637,13 @@ pub struct Raw {
     pub locked: BTreeSet<String>,
     /// Where each **leaf** of [`Self::table`] came from.
     ///
-    /// Leaves only: a table is not a value a row shows, and its children may
-    /// well come from different layers (rule 2 deep-merges). A key an
-    /// `_unset` erased is in neither this map nor `table` — there is no value
-    /// to show and no layer it survives in.
+    /// Leaves only, and an **empty** table is not one — it contributes
+    /// nothing rather than a row with no value to show (#1360 review, MEDIUM
+    /// 2; see `leaf_paths` for why that shape is what nix renders). A table
+    /// is not a value a row shows, and its children may well come from
+    /// different layers (rule 2 deep-merges). A key an `_unset` erased is in
+    /// neither this map nor `table` — there is no value to show and no layer
+    /// it survives in.
     pub origins: BTreeMap<String, Origin>,
     /// Layer files that existed and contributed, lowest precedence first —
     /// [`Loaded::sources`]'s twin.
@@ -1688,6 +1744,21 @@ pub fn load_raw<S: Subsystem>(layers: &[PathBuf]) -> Result<Raw, ConfigError> {
 /// Every dotted path in `table` that holds a **value** rather than a nested
 /// table — arrays included (rule 3 replaces them whole, so an array is one
 /// leaf), markers excluded at every depth.
+///
+/// **An empty table contributes nothing**, which is what makes
+/// [`Raw::origins`]' "leaves only" true rather than nearly true (#1360 review,
+/// MEDIUM 2). It is not a hypothetical shape: `nix/module-common.nix` renders
+/// an `agents.display.<name>` entry whose every option is null as an empty
+/// `[display.<name>]` table, so a stock nix base would otherwise put a path
+/// into the map that is not a row and has no value to show.
+///
+/// **Why this walk and not [`merge`]'s own.** `merge_all_locked` enumerates
+/// each layer's paths too, to build the provenance a refused override names
+/// ([`merge::Shadowed::source`]) — and it deliberately includes *tables*,
+/// because a whole-table write is one of the things a lock refuses and the
+/// refusal has to name where the kept value lives. This one answers a
+/// different question — *which paths does a form draw a row for* — and a table
+/// is not a row. Same layers, two questions, two answers.
 fn leaf_paths(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
     for (key, value) in table {
         if key == merge::UNSET_KEY || key == merge::LOCKED_KEY {
@@ -1695,9 +1766,7 @@ fn leaf_paths(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
         }
         let path = format!("{prefix}{key}");
         match value {
-            toml::Value::Table(nested) if !nested.is_empty() => {
-                leaf_paths(nested, &format!("{path}."), out);
-            }
+            toml::Value::Table(nested) => leaf_paths(nested, &format!("{path}."), out),
             _ => {
                 out.insert(path);
             }
@@ -1928,15 +1997,26 @@ fn remove_keeping_closing_space(table: &mut dyn toml_edit::TableLike, key: &str)
     }
 }
 
-/// `toml::Value` as a `toml_edit::Value`.
+/// `toml::Value` as a `toml_edit::Value` — the bridge between the read side
+/// and the write side.
+///
+/// `pub` since #1360's HIGH 3: a settings form reads a row's current value out
+/// of [`Raw::value`] (a `toml::Value`), asks
+/// [`crate::schema::Kind::accepts`] whether it is legal and hands it to
+/// [`save_leaf_to_locked`] (both `toml_edit::Value`), so the conversion is in
+/// the middle of its main loop. Leaving it private meant the one consumer
+/// would have written a second copy of it, which is precisely what the
+/// paragraph below argues against.
 ///
 /// Hand-written rather than routed through `toml_edit::ser::ValueSerializer`:
 /// that module is behind `toml_edit`'s `serde` feature, and turning the
 /// feature on to convert between two representations of the same TOML would
 /// widen the crate's dependency surface for nothing. Tables become *inline*
 /// tables, which is the only thing a value position can hold; a `want` entry
-/// that is a table is recursed into by [`patch`] and never reaches here.
-fn to_edit(value: &toml::Value) -> toml_edit::Value {
+/// that is a table is recursed into by `patch`, this crate's own whole-value
+/// writer, and never reaches here.
+#[must_use]
+pub fn to_edit(value: &toml::Value) -> toml_edit::Value {
     match value {
         toml::Value::String(v) => v.as_str().into(),
         toml::Value::Integer(v) => (*v).into(),
@@ -2070,6 +2150,12 @@ fn patch(
 /// unrelated tables, and any key the schema does not know about. What moves:
 /// only the keys whose value actually changed, plus schema-owned keys the
 /// value no longer carries.
+///
+/// One exception to "keeps its bytes", and it predates this function:
+/// **`\r\n` line endings are normalised to `\n` across the whole file**,
+/// untouched lines included. A bare [`toml_edit::DocumentMut`] round trip
+/// already drops the `\r`, so every writer in this module has always done it
+/// and no fixture in the tree has CRLF (#1360 review, LOW 5).
 ///
 /// A [`crate::merge::UNSET_KEY`] marker survives a save. Not because
 /// [`serde_ignored`] reports it as a key the schema does not know — it cannot,
@@ -2509,8 +2595,9 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 
 // ── The form's write side: exactly one leaf ─────────────────────────────────
 
-/// Write **one** leaf into the overlay at `path`, format-preserving (#888 P0
-/// §2d).
+/// Write **one** leaf into the overlay at `path`, format-preserving, checked
+/// against the [`crate::schema::Schema`] that describes the family (#888 P0
+/// §2d, hardened by #1360's HIGH 1 / MEDIUM 1).
 ///
 /// [`save_overlay_to_locked`] takes a whole `S` and is therefore the wrong
 /// shape for a form: a row toggled by hand knows one key, and re-serialising
@@ -2521,18 +2608,47 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 /// * **`Some(value)`** sets the leaf. Everything else in the file keeps its
 ///   bytes — the comment block above the key, the key order, the unrelated
 ///   tables, the keys the schema does not know. A leaf that already holds this
-///   value is not rewritten at all, so a save that changes nothing changes no
-///   bytes.
+///   value is not rewritten at all, and a save that produces the bytes already
+///   on disk does not even open the file.
 /// * **`None`** removes it — the row's *reset*, which means "fall back to the
 ///   base layer or the built-in default". Deliberately **not** an
 ///   [`merge::UNSET_KEY`] marker: that spelling erases the inherited value
 ///   too, which is what a script or a nix base wants and the opposite of what
 ///   a person clicking *reset* means (spec §5).
-/// * A **locked** `key_path` — itself, or one under a locked table
-///   ([`Loaded::is_locked`]) — is refused up front with
-///   [`ConfigError::Locked`], rather than written and reverted by the next
-///   load. `places` refuses the same way for the same reason
-///   ([`crate::places::PlacesError::Locked`], #1338).
+///
+/// # A form cannot destroy structure, and cannot write a value the loader will refuse
+///
+/// Four refusals, all before a byte is written:
+///
+/// 1. **Not a `Field` of `schema`** — [`ConfigError::NotALeaf`]. `schema` must
+///    also be this family's own ([`crate::schema::Schema::family`] equal to
+///    [`Subsystem::NAME`]), so handing over the wrong family's schema is an
+///    error rather than a silent write against the wrong rules.
+/// 2. **A collection `Field`** — [`crate::schema::Kind::Map`] or
+///    [`crate::schema::Kind::List`] whose value in the file is a table.
+///    Spec §1 renders those rows *read-only* in v1, but a generic form
+///    iterating `Schema::fields` gives every row a *reset* (§4), and before
+///    #1360 a reset on `agents.display` or `workspaces.workspace` removed
+///    every entry under it — including the un-schema'd keys the sibling
+///    writer goes to documented lengths never to touch. The structural check
+///    below refuses a table or an array-of-tables at the target whatever the
+///    schema says, so the guarantee does not rest on the schema being right.
+/// 3. **A value outside the `Field`'s [`crate::schema::Kind`]** —
+///    [`ConfigError::Rejected`]. This is not politeness: a leaf of the wrong
+///    *type* is a [`ConfigError::Schema`] on the next load, and
+///    [`load_or_default`] turns that into *discard the entire merged file back
+///    to `DEFAULT_TOML`*. One bad write does not cost its row, it costs every
+///    key in the file (#1360 review, MEDIUM 1) — the #1040 V1 anti-pattern,
+///    reached through the softest key on the page.
+/// 4. **A locked `key_path`** — itself, or one under a locked table
+///    ([`Loaded::is_locked`]) — [`ConfigError::Locked`], rather than written
+///    and reverted by the next load. `places` refuses the same way for the
+///    same reason ([`crate::places::PlacesError::Locked`], #1338).
+///
+/// A leaf **inside** a [`crate::schema::Kind::Map`] entry —
+/// `display.argus.label`, whose path is per-entry and therefore is not a
+/// `Field` path — is what [`save_leaf_to_locked_unchecked`] is for (#888 P2).
+/// It keeps every structural refusal and drops only the schema ones.
 ///
 /// A not-yet-existing file is seeded with [`Subsystem::DEFAULT_TOML`] through
 /// `seed_without_locked`, exactly as [`save_overlay_to_locked`] seeds one —
@@ -2540,29 +2656,102 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 /// with no locked key's default line in it (#1333/#1344).
 ///
 /// **A missing intermediate table is created**, as a `[table]` header. **An
-/// emptied one is pruned only if the seed does not document it**: `[bar]` is
-/// part of `stats.toml`'s documented shape and stays behind its last removed
-/// key, while a `[display.argus]` the operator added is not and goes with it.
-///
-/// There is no typed validation here, on purpose: the value's rule is its
-/// [`crate::schema::Kind`], checked by the form before it ever calls this, and
-/// a second opinion from `S::validate` would need an `S` this call does not
-/// have.
+/// emptied one is pruned only if [`Subsystem::DEFAULT_TOML`] does not document
+/// it**: `[bar]` is part of `stats.toml`'s documented shape and stays behind
+/// its last removed key, while a `[display.argus]` the operator added is not
+/// and goes with it.
 ///
 /// # Errors
-/// [`ConfigError::Locked`] for a pinned `key_path`, [`ConfigError::Unreadable`]
-/// if the existing file cannot be read (refusing rather than overwriting bytes
-/// we cannot account for), [`ConfigError::Encode`] for an empty `key_path` or
-/// a file that is not valid TOML, and [`ConfigError::Write`] for the replace.
+/// [`ConfigError::NotALeaf`], [`ConfigError::Rejected`] and
+/// [`ConfigError::Locked`] for the four refusals above, plus anything
+/// [`save_leaf_to_locked_unchecked`] returns.
 pub fn save_leaf_to_locked<S: Subsystem>(
+    path: &Path,
+    schema: &crate::schema::Schema,
+    key_path: &str,
+    value: Option<toml_edit::Value>,
+    locked: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    let not_a_leaf = |reason: &str| ConfigError::NotALeaf {
+        subsystem: S::NAME.to_owned(),
+        key: key_path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if schema.family != S::NAME {
+        return Err(not_a_leaf(&format!(
+            "that is {}'s schema, not this subsystem's",
+            schema.family
+        )));
+    }
+    let Some(field) = schema.field(key_path) else {
+        return Err(not_a_leaf(
+            "no Field of this family's schema names it; \
+             use save_leaf_to_locked_unchecked for a key inside a map entry",
+        ));
+    };
+    if field.kind.is_collection() {
+        return Err(not_a_leaf(
+            "it is a list or a table of entries, which v1 renders read-only \
+             — writing it whole would take every entry under it with it",
+        ));
+    }
+    if let Some(value) = &value
+        && !field.kind.accepts(value)
+    {
+        return Err(ConfigError::Rejected {
+            subsystem: S::NAME.to_owned(),
+            key: key_path.to_owned(),
+            found: value.to_string().trim().to_owned(),
+            expected: field.kind.expected(),
+        });
+    }
+
+    save_leaf_to_locked_unchecked::<S>(path, key_path, value, locked)
+}
+
+/// [`save_leaf_to_locked`] without the schema half — for a key the family's
+/// [`crate::schema::Schema`] structurally cannot name.
+///
+/// There is exactly one such shape today and it is the reason this spelling
+/// exists rather than the checked one being the only entry point: a leaf
+/// *inside* a [`crate::schema::Kind::Map`] entry (`display.argus.label`,
+/// `workspace.chat.layout`) has a path that is per entry, so it is not a
+/// `Field` path and never will be. Editing those is #888 P2.
+///
+/// **Every structural refusal still applies** — that is the invariant #1360's
+/// HIGH 1 asked for, and it is deliberately enforced here rather than in the
+/// checked wrapper, so the escape hatch cannot be used to destroy structure:
+///
+/// * an empty `key_path`, or one with an empty segment (`core.`, `.color`) —
+///   before #1360 the latter answered `Ok` and wrote `"" = 1` into `[core]`;
+/// * a `key_path` whose target in the file **or** in the seed is a table, an
+///   inline table or an array of tables;
+/// * a `key_path` whose parent exists and is *not* a table — `core = 5` plus a
+///   write to `core.brightness` used to replace the `5` with a `[core]` block
+///   and answer `Ok`;
+/// * a locked `key_path`, itself or under a locked table.
+///
+/// # Errors
+/// [`ConfigError::NotALeaf`] for the structural refusals,
+/// [`ConfigError::Locked`] for a pinned key, [`ConfigError::Unreadable`] if
+/// the existing file cannot be read (refusing rather than overwriting bytes we
+/// cannot account for), [`ConfigError::Encode`] for a file — or a
+/// [`Subsystem::DEFAULT_TOML`] — that is not valid TOML, and
+/// [`ConfigError::Write`] for the replace.
+pub fn save_leaf_to_locked_unchecked<S: Subsystem>(
     path: &Path,
     key_path: &str,
     value: Option<toml_edit::Value>,
     locked: &BTreeSet<String>,
 ) -> Result<(), ConfigError> {
-    if key_path.is_empty() {
-        return Err(ConfigError::Encode(
-            "a key path names a leaf; it cannot be empty".into(),
+    let not_a_leaf = |reason: &str| ConfigError::NotALeaf {
+        subsystem: S::NAME.to_owned(),
+        key: key_path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if key_path.is_empty() || key_path.split('.').any(str::is_empty) {
+        return Err(not_a_leaf(
+            "a key path is one or more non-empty dotted segments",
         ));
     }
     if locked_here(locked, key_path) {
@@ -2573,10 +2762,13 @@ pub fn save_leaf_to_locked<S: Subsystem>(
         });
     }
 
-    let seed = seed_without_locked::<S>(locked)?;
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed.clone(),
+        // The seed is resolved **here**, on the one path that reads it, rather
+        // than up front: a family whose `DEFAULT_TOML` stopped parsing should
+        // not fail a save into a file that already exists and has nothing to
+        // do with it (#1360 review, LOW 7).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_without_locked::<S>(locked)?,
         Err(e) => {
             return Err(ConfigError::Unreadable {
                 path: path.to_path_buf(),
@@ -2589,20 +2781,76 @@ pub fn save_leaf_to_locked<S: Subsystem>(
         ConfigError::Encode(format!("the file being replaced is not valid TOML: {e}"))
     })?;
 
+    // What the documented shape states as a table, for the structural refusal
+    // and for the prune rule. `DEFAULT_TOML` rather than the lock-stripped
+    // seed (#1360 review, LOW 3): with `[core]`'s every documented key locked,
+    // `strip_locked` drops the header from the seed, and resetting the
+    // operator's *own* key under it would then prune a table the documented
+    // shape does have.
+    let default_doc: toml_edit::DocumentMut =
+        S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
+            ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
+        })?;
+    let mut documented = BTreeSet::new();
+    table_paths(default_doc.as_table(), "", &mut documented);
+
+    if let Some(reason) =
+        structural_refusal(&doc, key_path).or_else(|| structural_refusal(&default_doc, key_path))
+    {
+        return Err(not_a_leaf(reason));
+    }
+
     if let Some(value) = value {
         set_leaf(doc.as_table_mut(), key_path, value);
     } else {
-        let seed_doc: toml_edit::DocumentMut =
-            seed.parse().map_err(|e: toml_edit::TomlError| {
-                ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
-            })?;
-        let mut documented = BTreeSet::new();
-        table_paths(seed_doc.as_table(), "", &mut documented);
         remove_leaf(doc.as_table_mut(), key_path, "", &documented);
     }
 
-    file::write_atomic(path, &doc.to_string(), Durability::FsyncParent)
+    let body = doc.to_string();
+    // Nothing moved — so nothing is written. The byte pin is about content;
+    // this is about the *file*, and `watch::poll_loop` stamps `(mtime, len)`,
+    // so a rewrite with identical bytes still wakes the shell's reload — once
+    // per settled keystroke, under §4's 300 ms debounce (#1360 review, LOW 2).
+    if body == existing {
+        return Ok(());
+    }
+
+    file::write_atomic(path, &body, Durability::FsyncParent)
         .map_err(|e| ConfigError::Write(e.to_string()))
+}
+
+/// Why `key_path` does not name a leaf of `doc`, or `None` when it does — the
+/// structural half of [`save_leaf_to_locked`]'s refusals, asked of the file
+/// being edited **and** of [`Subsystem::DEFAULT_TOML`].
+///
+/// Both, because either one alone has a hole: the documented shape knows
+/// `[core]` is a table even when the operator's overlay has not created it
+/// yet, and the operator's file knows about a `[display.argus]` the documented
+/// shape has never heard of.
+///
+/// A path that exists nowhere is fine — that is an append, which is most of
+/// what a form does. An **array** is fine too: rule 3 replaces one whole, so
+/// an array *is* a leaf (`workspaces`' `order`, `core-leds`' `palette`).
+fn structural_refusal(doc: &toml_edit::DocumentMut, key_path: &str) -> Option<&'static str> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    let mut segments = key_path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        // A path that exists nowhere is an append, which is most of what a
+        // form does — so the walk stopping short is `None`, not a refusal.
+        let item = table.get(segment)?;
+        if segments.peek().is_none() {
+            return (item.is_table_like() || item.is_array_of_tables()).then_some(
+                "it names a table, not a leaf; replacing it would take everything under it",
+            );
+        }
+        let Some(sub) = item.as_table_like() else {
+            return Some(
+                "a table on the way to it is a plain value; writing through it would replace that value",
+            );
+        };
+        table = sub;
+    }
+    None
 }
 
 /// Assign `value` at a dotted `key_path` under `table`, creating the
@@ -2629,14 +2877,16 @@ fn set_leaf(table: &mut dyn toml_edit::TableLike, key_path: &str, value: toml_ed
         return;
     };
 
-    if !table.get(head).is_some_and(toml_edit::Item::is_table_like) {
-        // An append takes the same inline-table fix-up `patch` applies;
-        // replacing a key that is already here must not touch a neighbour's
-        // bytes. A `toml_edit::Table` is not implicit, so it renders its own
-        // `[head]` header once it carries the leaf.
-        if table.get(head).is_none() {
-            close_up_for_append(table);
-        }
+    if table.get(head).is_none() {
+        // An append takes the same inline-table fix-up `patch` applies. A
+        // `toml_edit::Table` is not implicit, so it renders its own `[head]`
+        // header once it carries the leaf.
+        //
+        // Only an *absent* parent is created: a parent that exists and is not
+        // a table is refused by `structural_refusal` before this runs, so
+        // there is no branch here that replaces somebody's value with a block
+        // (#1360 review, LOW 4).
+        close_up_for_append(table);
         table.insert(head, toml_edit::Item::Table(toml_edit::Table::new()));
     }
     if let Some(sub) = table
@@ -2650,12 +2900,18 @@ fn set_leaf(table: &mut dyn toml_edit::TableLike, key_path: &str, value: toml_ed
 /// Remove the leaf at a dotted `key_path`, then drop any table the removal
 /// emptied **unless** `documented` names it.
 ///
-/// The asymmetry is the point. A table the seed documents is part of the
-/// file's shape — `stats.toml`'s `[bar]` exists whether or not any key under
-/// it is currently set — and taking its header away on the last reset would
-/// make the next edit re-add it somewhere else in the file. A table the seed
-/// does *not* document is one the operator (or a form) added to hold entries,
-/// and an empty `[display.argus]` left behind is a row that decorates nothing.
+/// The asymmetry is the point. A table the documented shape states is part of
+/// the file's shape — `stats.toml`'s `[bar]` exists whether or not any key
+/// under it is currently set — and taking its header away on the last reset
+/// would make the next edit re-add it somewhere else in the file. A table it
+/// does *not* state is one the operator (or a form) added to hold entries, and
+/// an empty `[display.argus]` left behind is a row that decorates nothing.
+///
+/// `documented` comes from [`Subsystem::DEFAULT_TOML`] itself, **not** from
+/// the lock-stripped seed: a lock that empties `[core]` out of the seed does
+/// not make `[core]` undocumented, and resetting a key the operator wrote
+/// under it would otherwise prune a header the documented shape has (#1360
+/// review, LOW 3).
 fn remove_leaf(
     table: &mut dyn toml_edit::TableLike,
     key_path: &str,
@@ -6127,6 +6383,61 @@ brightness = 5
         std::fs::read_to_string(path).expect("read back")
     }
 
+    /// The fixture family's [`crate::schema::Schema`] — what the checked
+    /// writer looks a key up in.
+    ///
+    /// Deliberately **not** a `verify` fixture (those live in
+    /// `crate::schema`'s own tests): `core.label` is an `Option` the
+    /// documented default does not state, which is exactly the shape a
+    /// removal test needs and exactly what `verify` would call `Invented`.
+    const LEDS_FIELDS: &[crate::schema::Field] = &[
+        crate::schema::Field {
+            path: "enabled",
+            kind: crate::schema::Kind::Bool,
+            doc: "the strip",
+        },
+        crate::schema::Field {
+            path: "core.color",
+            kind: crate::schema::Kind::Text { blank_ok: false },
+            doc: "a CSS colour name",
+        },
+        crate::schema::Field {
+            path: "core.brightness",
+            kind: crate::schema::Kind::Int {
+                min: 0,
+                max: 8,
+                also: &[],
+            },
+            doc: "how bright",
+        },
+        crate::schema::Field {
+            path: "core.palette",
+            kind: crate::schema::Kind::List(&crate::schema::Kind::Text { blank_ok: false }),
+            doc: "the inks",
+        },
+        crate::schema::Field {
+            path: "core.label",
+            kind: crate::schema::Kind::Text { blank_ok: false },
+            doc: "what to call it",
+        },
+    ];
+
+    const LEDS_SCHEMA: crate::schema::Schema = crate::schema::Schema {
+        family: "core-leds",
+        fields: LEDS_FIELDS,
+    };
+
+    /// [`save_leaf_to_locked`] at the fixture family, so the tests below read
+    /// as they did before #1360 gave the checked entry point a schema.
+    fn save_leaf(
+        path: &Path,
+        key_path: &str,
+        value: Option<toml_edit::Value>,
+        locked: &BTreeSet<String>,
+    ) -> Result<(), ConfigError> {
+        save_leaf_to_locked::<Leds>(path, &LEDS_SCHEMA, key_path, value, locked)
+    }
+
     /// **The byte pin.** A save that writes the value already there rewrites
     /// nothing at all.
     ///
@@ -6136,7 +6447,7 @@ brightness = 5
     #[test]
     fn a_leaf_save_that_changes_nothing_changes_no_bytes() {
         let (_dir, path) = scratch(HAND_EDITED);
-        save_leaf_to_locked::<Leds>(
+        save_leaf(
             &path,
             "core.brightness",
             Some(toml_edit::Value::from(3_i64)),
@@ -6150,7 +6461,7 @@ brightness = 5
         );
 
         let (_dir, spaced) = scratch("[core]\nbrightness   =   3\n");
-        save_leaf_to_locked::<Leds>(
+        save_leaf(
             &spaced,
             "core.brightness",
             Some(toml_edit::Value::from(3_i64)),
@@ -6179,7 +6490,7 @@ brightness = 5
         // is [`set_value`]'s own documented rule (#641: a comment describing a
         // value that no longer exists is worse than none).
         let (_dir, commented) = scratch(HAND_EDITED);
-        save_leaf_to_locked::<Leds>(
+        save_leaf(
             &commented,
             "core.color",
             Some(toml_edit::Value::from("cyan")),
@@ -6195,7 +6506,7 @@ brightness = 5
         );
 
         let (_dir, path) = scratch(HAND_EDITED);
-        save_leaf_to_locked::<Leds>(
+        save_leaf(
             &path,
             "core.brightness",
             Some(toml_edit::Value::from(7_i64)),
@@ -6221,7 +6532,7 @@ brightness = 5
         let (_dir, path) = scratch(HAND_EDITED);
         let locked = BTreeSet::from(["core.brightness".to_owned()]);
 
-        let err = save_leaf_to_locked::<Leds>(
+        let err = save_leaf(
             &path,
             "core.brightness",
             Some(toml_edit::Value::from(7_i64)),
@@ -6248,7 +6559,7 @@ brightness = 5
         let (_dir, path) = scratch(HAND_EDITED);
         let locked = BTreeSet::from(["core".to_owned()]);
 
-        let err = save_leaf_to_locked::<Leds>(
+        let err = save_leaf(
             &path,
             "core.color",
             Some(toml_edit::Value::from("cyan")),
@@ -6267,7 +6578,7 @@ brightness = 5
     fn a_leaf_save_of_none_removes_the_key_and_writes_no_marker() {
         let (_dir, path) = scratch(HAND_EDITED);
 
-        save_leaf_to_locked::<Leds>(&path, "core.label", None, &BTreeSet::new()).expect("saves");
+        save_leaf(&path, "core.label", None, &BTreeSet::new()).expect("saves");
 
         let out = read(&path);
         assert!(!out.contains("label"), "the leaf is gone: {out}");
@@ -6290,20 +6601,49 @@ brightness = 5
     #[test]
     fn a_leaf_save_prunes_only_a_table_the_seed_does_not_document() {
         let (_dir, documented) = scratch("[core]\nbrightness = 3\n");
-        save_leaf_to_locked::<Leds>(&documented, "core.brightness", None, &BTreeSet::new())
-            .expect("saves");
+        save_leaf(&documented, "core.brightness", None, &BTreeSet::new()).expect("saves");
         assert_eq!(
             read(&documented),
             "[core]\n",
             "`[core]` is part of the documented shape and stays"
         );
 
+        // A table the documented shape never states holds only what the
+        // operator (or a map row) put there, so its keys are not `Field`s and
+        // the unchecked spelling is what reaches them — #888 P2's shape.
         let (_dir, invented) = scratch("[extra]\nx = 1\n");
-        save_leaf_to_locked::<Leds>(&invented, "extra.x", None, &BTreeSet::new()).expect("saves");
+        save_leaf_to_locked_unchecked::<Leds>(&invented, "extra.x", None, &BTreeSet::new())
+            .expect("saves");
         assert_eq!(
             read(&invented),
             "",
-            "a table the seed never states is the operator's container and goes with its contents"
+            "a table the documented shape never states is the operator's container \
+             and goes with its contents"
+        );
+    }
+
+    /// The prune rule reads [`Subsystem::DEFAULT_TOML`], **not** the
+    /// lock-stripped seed (#1360 review, LOW 3).
+    ///
+    /// Red if `documented` is rebuilt from `seed_without_locked`: with every
+    /// documented key of `[core]` locked, `strip_locked` drops the header from
+    /// the seed, and resetting the operator's *own* key under it then prunes a
+    /// table the documented shape does have.
+    #[test]
+    fn a_lock_that_empties_a_table_out_of_the_seed_does_not_make_it_undocumented() {
+        let (_dir, path) = scratch("[core]\nlabel = \"desk\"\n");
+        let locked = BTreeSet::from([
+            "core.color".to_owned(),
+            "core.brightness".to_owned(),
+            "core.palette".to_owned(),
+        ]);
+
+        save_leaf(&path, "core.label", None, &locked).expect("saves");
+
+        assert_eq!(
+            read(&path),
+            "[core]\n",
+            "`[core]` is documented whatever the lock does to the seed"
         );
     }
 
@@ -6313,7 +6653,7 @@ brightness = 5
     fn a_leaf_save_creates_a_missing_intermediate_table() {
         let (_dir, path) = scratch("enabled = true\n");
 
-        save_leaf_to_locked::<Leds>(
+        save_leaf(
             &path,
             "core.brightness",
             Some(toml_edit::Value::from(7_i64)),
@@ -6347,7 +6687,7 @@ brightness = 5
         let path = dir.path().join("core-leds.toml");
         let locked = BTreeSet::from(["enabled".to_owned()]);
 
-        save_leaf_to_locked::<Leds>(
+        save_leaf(
             &path,
             "core.brightness",
             Some(toml_edit::Value::from(7_i64)),
@@ -6371,15 +6711,289 @@ brightness = 5
     /// The one shape that cannot name a leaf.
     #[test]
     fn a_leaf_save_refuses_an_empty_key_path() {
+        // Through the *unchecked* spelling, which is where the structural
+        // refusals live — the checked one would refuse `""` earlier still, as
+        // a path no `Field` names, and would say nothing about the spelling.
+        for spelling in ["", "core.", ".color", "core..color"] {
+            let (_dir, path) = scratch(HAND_EDITED);
+            let err = save_leaf_to_locked_unchecked::<Leds>(
+                &path,
+                spelling,
+                Some(toml_edit::Value::from(1_i64)),
+                &BTreeSet::new(),
+            )
+            .expect_err("a key path is non-empty dotted segments");
+            assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+            assert_eq!(read(&path), HAND_EDITED, "{spelling:?} wrote something");
+        }
+    }
+
+    // ── A form cannot destroy structure (#1360 review, HIGH 1) ──────────────
+
+    /// **The reviewer's reproduction.** A `Kind::Map`/`Kind::List` row is
+    /// read-only in v1 — but a generic form iterating `Schema::fields` has a
+    /// *reset* per row, and a reset on `agents.display` or
+    /// `workspaces.workspace` is one click from here. A table is not a leaf,
+    /// and this function's whole contract is "one leaf".
+    ///
+    /// Measured on `f33415b3`: both calls answered `Ok`, the set wrote
+    /// `core= 1` over the whole table and the remove took `[core]` away —
+    /// `mystery = 42` included, the un-schema'd key the sibling writer goes to
+    /// documented lengths never to touch.
+    ///
+    /// Red if either guard goes: `schema.field(key_path)` returning `None`
+    /// here, or `structural_refusal`'s table arm.
+    #[test]
+    fn a_leaf_save_refuses_a_key_path_that_names_a_table() {
         let (_dir, path) = scratch(HAND_EDITED);
-        let err = save_leaf_to_locked::<Leds>(
+
+        let err = save_leaf(
             &path,
-            "",
+            "core",
             Some(toml_edit::Value::from(1_i64)),
             &BTreeSet::new(),
         )
-        .expect_err("an empty key path names nothing");
-        assert!(matches!(err, ConfigError::Encode(_)), "got {err:?}");
+        .expect_err("a table is not a leaf");
+        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED, "and nothing was written");
+
+        let err = save_leaf(&path, "core", None, &BTreeSet::new())
+            .expect_err("nor does removing one remove a table");
+        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED);
+
+        // And the escape hatch does not open it either: the structural
+        // refusals are enforced there, deliberately, so `_unchecked` buys a
+        // map entry's key and never a way to replace a block.
+        let err = save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "core",
+            Some(toml_edit::Value::from(1_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("the escape hatch is not an escape from structure");
+        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED);
+    }
+
+    /// A collection `Field` is refused **by its `Kind`**, before the document
+    /// is even read — so a family whose overlay does not have the table yet is
+    /// refused exactly as one whose overlay does.
+    #[test]
+    fn a_leaf_save_refuses_a_collection_field_even_on_an_absent_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+
+        let err = save_leaf(
+            &path,
+            "core.palette",
+            Some(toml_edit::Value::from("teal")),
+            &BTreeSet::new(),
+        )
+        .expect_err("a list row is read-only in v1");
+
+        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        assert!(!path.exists(), "and no file was seeded on the way");
+    }
+
+    /// A key the family's schema does not name is refused by the checked
+    /// spelling and reachable through the unchecked one — which is the whole
+    /// of what the escape hatch buys (#888 P2's `display.<name>.label`).
+    #[test]
+    fn a_leaf_save_refuses_a_key_no_field_names_and_says_where_to_go() {
+        let (_dir, path) = scratch(HAND_EDITED);
+
+        let err = save_leaf(
+            &path,
+            "core.mystery",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("no Field names it");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(
+            reason.contains("save_leaf_to_locked_unchecked"),
+            "the refusal names the way through: {reason}"
+        );
+        assert_eq!(read(&path), HAND_EDITED);
+
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "core.mystery",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("and the unchecked spelling writes it");
+        assert_eq!(
+            read(&path),
+            HAND_EDITED.replace("mystery = 42", "mystery = 7")
+        );
+    }
+
+    /// Another family's schema is not this family's, and handing one over is
+    /// an error rather than a write judged by the wrong rules.
+    #[test]
+    fn a_leaf_save_refuses_a_schema_that_is_not_this_familys() {
+        const OTHER: crate::schema::Schema = crate::schema::Schema {
+            family: "agents",
+            fields: LEDS_FIELDS,
+        };
+        let (_dir, path) = scratch(HAND_EDITED);
+
+        let err = save_leaf_to_locked::<Leds>(
+            &path,
+            &OTHER,
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("that is another family's schema");
+
+        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED);
+    }
+
+    /// A parent that exists as a plain value is not written through (#1360
+    /// review, LOW 4) — before the guard, `core = 5` plus a write to
+    /// `core.brightness` replaced the `5` with a `[core]` block and answered
+    /// `Ok`.
+    #[test]
+    fn a_leaf_save_refuses_to_write_through_a_scalar_parent() {
+        let (_dir, path) = scratch("core = 5\n");
+
+        let err = save_leaf(
+            &path,
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("the parent is somebody's value");
+
+        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        assert_eq!(read(&path), "core = 5\n");
+    }
+
+    // ── A value the loader would refuse is not written (MEDIUM 1) ───────────
+
+    /// A leaf outside its `Kind` is refused, naming the key and what the key
+    /// takes.
+    ///
+    /// The cost of getting this wrong is not the row: `enabled = 5` is a
+    /// `ConfigError::Schema` on the next load, and `load_or_default` discards
+    /// the **whole** merged file back to `DEFAULT_TOML`. Measured on
+    /// `f33415b3`: the write landed and the next load answered *"config does
+    /// not fit the schema: invalid type: integer `5`, expected a boolean"*.
+    ///
+    /// Red if the `kind.accepts` gate goes: the write lands and the assertion
+    /// on the file's bytes fails.
+    #[test]
+    fn a_leaf_save_refuses_a_value_the_loader_would_reject() {
+        let (_dir, path) = scratch(HAND_EDITED);
+
+        let err = save_leaf(
+            &path,
+            "enabled",
+            Some(toml_edit::Value::from(5_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("5 is not a boolean");
+
+        assert!(matches!(err, ConfigError::Rejected { .. }), "got {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "core-leds.enabled = 5 is not a value this key accepts; expected true or false"
+        );
+        assert_eq!(read(&path), HAND_EDITED, "and nothing was written");
+
+        // The bound half, on the key that has one.
+        let err = save_leaf(
+            &path,
+            "core.brightness",
+            Some(toml_edit::Value::from(9_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("9 is above the maximum");
+        assert!(matches!(err, ConfigError::Rejected { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED);
+    }
+
+    // ── The round trip a form makes on every row (HIGH 3) ───────────────────
+
+    /// Read the row's current value, ask the schema whether it is legal, hand
+    /// it back to the writer — with no second `toml` ⇄ `toml_edit` converter
+    /// and no second dependency in the caller's manifest.
+    ///
+    /// Red if `to_edit` goes back to being private, or if `Raw::value` and
+    /// `Kind::accepts` stop agreeing about what a value is.
+    #[test]
+    fn a_raw_value_goes_straight_back_into_the_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = raw_layers(dir.path(), &[Some("[core]\nbrightness = 5\n"), None]);
+        let raw = load_raw::<Leds>(&paths).expect("loads");
+
+        let edit = to_edit(raw.value("core.brightness").expect("a value"));
+        let field = LEDS_SCHEMA.field("core.brightness").expect("a field");
+        assert!(field.kind.accepts(&edit));
+
+        save_leaf(&paths[1], "core.brightness", Some(edit), &raw.locked).expect("saves");
+
+        assert_eq!(
+            load_raw::<Leds>(&paths)
+                .expect("reloads")
+                .origin("core.brightness"),
+            Some(&Origin::Overlay),
+            "and the provenance flips to `yours`, which is what §4 re-reads for"
+        );
+    }
+
+    // ── What a row is, and is not (MEDIUM 2, LOW 2) ─────────────────────────
+
+    /// An **empty** table is not a leaf and gets no provenance — the shape
+    /// `programs.trollshell.config.agents.display.<name> = { }` renders.
+    ///
+    /// Red if `leaf_paths`' table arm goes back to treating an empty table as
+    /// a value: `core.sub` reappears in a map documented as leaves only, with
+    /// nothing for a row to show.
+    #[test]
+    fn an_empty_table_is_not_a_leaf_and_gets_no_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = raw_layers(dir.path(), &[Some("[core.sub]\n"), None]);
+        let raw = load_raw::<Leds>(&paths).expect("loads");
+        assert_eq!(raw.origin("core.sub"), None, "{:?}", raw.origins);
+        assert!(
+            raw.origins.keys().all(|key| key != "core"),
+            "nor does the table above it: {:?}",
+            raw.origins
+        );
+    }
+
+    /// A save that changes nothing does not touch the **file** either (#1360
+    /// review, LOW 2): `watch::poll_loop` stamps `(mtime, len)`, so a rewrite
+    /// with identical bytes wakes the shell's reload for nothing — once per
+    /// settled keystroke under §4's 300 ms debounce.
+    ///
+    /// Red if the `body == existing` early return goes: the mtime moves.
+    #[test]
+    fn a_no_op_leaf_save_does_not_rewrite_the_file() {
+        let (_dir, path) = scratch(HAND_EDITED);
+        let before = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+
+        save_leaf(
+            &path,
+            "core.brightness",
+            Some(toml_edit::Value::from(3_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+
+        let after = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        assert_eq!(before, after, "the file was replaced for nothing");
         assert_eq!(read(&path), HAND_EDITED);
     }
 }

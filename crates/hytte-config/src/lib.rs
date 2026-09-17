@@ -86,6 +86,23 @@ pub mod state;
 pub mod subsystem;
 pub mod xdg;
 
+// The two TOML crates this one's public API is written in, re-exported so a
+// consumer needs neither in its own manifest (#1360 review, HIGH 3).
+//
+// The seam is unavoidable and it is in the *middle* of what a settings form
+// does on every row: [`subsystem::Raw::value`] hands back a `toml::Value`,
+// [`schema::Kind::accepts`] and [`subsystem::save_leaf_to_locked`] take a
+// `toml_edit::Value`, and [`subsystem::to_edit`] is the one conversion between
+// them. Without these lines `trollshell-control-center` would have had to add
+// two direct dependencies and hand-write a second `to_edit` — which is exactly
+// the drift that function's own doc argues against.
+//
+// A re-export rather than a wrapper type: the values are the caller's own
+// data, and a newtype over `toml::Value` would be a third representation to
+// convert through.
+pub use toml;
+pub use toml_edit;
+
 // Test-only plumbing (#1022/#1043/#1044/#1233): the process-wide tracing global
 // default, the capture harness, the scratch-overlay helper and the scratch
 // `$HOME`. `cfg(test)` as

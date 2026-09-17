@@ -1,10 +1,12 @@
-//! The **shell's** config families as data: a name, a documented default and
-//! a [`Schema`] each, reachable without linking the shell (#888 P0 §3).
+//! The **shell's** config families as data: a name, a documented default and a
+//! [`Schema`](hytte_config::schema::Schema) each, reachable without linking
+//! the shell (#888 P0 §3).
 //!
 //! # Why this is its own crate
 //!
 //! `trollshell-control-center` renders one row per config leaf from a
-//! [`Schema`] (#888 P1). It cannot link `trollshell` — the shell is a binary,
+//! [`Schema`](hytte_config::schema::Schema) (#888 P1). It cannot link
+//! `trollshell` — the shell is a binary,
 //! and linking it would drag GTK's whole service layer into a settings app —
 //! so the two shell-owned families' `DEFAULT_TOML` and `SCHEMA` consts live
 //! here instead, in a GTK-free leaf that depends on nothing but
@@ -31,36 +33,19 @@
 //! [`FAMILIES`] is therefore *the shell's* families, and its doc says so
 //! rather than pretending to be a registry of everything.
 
-use hytte_config::schema::{Mismatch, Schema};
-
 pub mod core_leds;
 pub mod workspaces;
 
-/// One config family, as the form reads it.
+/// One config family, as a form reads it.
 ///
-/// Not `#[non_exhaustive]`: every `Family` in the tree is a `const` struct
-/// literal, written here and (for the two plugin families) in the plugin
-/// crates, so sealing the literal would seal the feature.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Family {
-    /// [`hytte_config::subsystem::Subsystem::NAME`] — the config file's stem.
-    pub name: &'static str,
-    /// What the family's leaves are.
-    pub schema: &'static Schema,
-    /// [`hytte_config::subsystem::Subsystem::DEFAULT_TOML`] — the documented
-    /// default, whose comments are what a form shows as a row's tooltip.
-    pub default_toml: &'static str,
-}
-
-impl Family {
-    /// [`hytte_config::schema::verify`] over this family's own two halves.
-    ///
-    /// # Errors
-    /// As [`hytte_config::schema::verify`].
-    pub fn verify(&self) -> Result<(), Vec<Mismatch>> {
-        hytte_config::schema::verify(self.schema, self.default_toml)
-    }
-}
+/// Re-exported rather than declared: #888 P0 first put this type here, and
+/// #1360's MEDIUM 4 moved it down into [`hytte_config::schema`] beside
+/// [`Schema`](hytte_config::schema::Schema) so the two **plugin**-owned
+/// families can export a `Family` of their own. They cannot depend on this
+/// crate the other way round — it is the leaf — and with the type living here
+/// the control center would have had to hand-write two struct literals nothing
+/// sweeps.
+pub use hytte_config::schema::Family;
 
 /// The **shell-owned** config families — see the crate docs for why the two
 /// plugin-owned ones are not here and cannot be.

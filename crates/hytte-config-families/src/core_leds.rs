@@ -51,11 +51,20 @@ const FIELDS: &[Field] = &[
     },
     Field {
         path: "rows",
-        // `0` is the automatic wide rectangle — the same shape the word
-        // `"rect"` names, which `parse_core_leds_rows` also accepts and a spin
-        // row has no way to offer. `64` is `MAX_ROWS`.
-        kind: Kind::Int { min: 0, max: 64 },
-        doc: "Rows in the lamp matrix; 0 is the automatic wide rectangle.",
+        // `0` is the automatic wide rectangle and `64` is `MAX_ROWS` — but the
+        // word `"rect"` names the same shape as `0`, and that is not a
+        // curiosity of the parser: `ROWS.file_accepts` documents it and
+        // `nix/module-common.nix` renders it (`either (ints.between 0 64)
+        // (enum [ "rect" ])`), so a base layer can put the word in front of
+        // this row. Without the `also` arm `Kind::accepts` — the form's
+        // validator — would disagree with the loader on the one value a nix
+        // base actually writes (#1360 review, HIGH 2).
+        kind: Kind::Int {
+            min: 0,
+            max: 64,
+            also: &["rect"],
+        },
+        doc: "Rows in the lamp matrix; 0 or \"rect\" is the automatic wide rectangle.",
     },
     Field {
         path: "fill",

@@ -37,25 +37,34 @@
 //! adding a key to a `DEFAULT_TOML` without adding its `Field` is a red test
 //! rather than a row the form silently cannot draw.
 //!
-//! # Two things the walker deliberately does not do
+//! # A collection may be absent, but only from a default that documents it
 //!
-//! **A collection's absence is not [`Mismatch::Invented`].** [`Kind::Map`] and
-//! [`Kind::List`] describe keys whose *contents* are the operator's, and the
-//! only way a `DEFAULT_TOML` could state "there are none" is an empty literal —
-//! a value the format-preserving writer would then have to round-trip.
-//! `workspaces.toml`'s default is comments only for exactly that reason, and
-//! `agents.toml` leaves its whole `[display.<name>]` block commented out. Both
-//! would otherwise have every one of their fields reported as invented. The
-//! cost is that a *typo* in a collection field's path is not caught here; §6
-//! P3 (the vocabulary lint reading these schemas) is what closes that, because
-//! it compares against the nix option tree rather than against the default.
+//! [`Kind::Map`] and [`Kind::List`] describe keys whose *contents* are the
+//! operator's, and the only way a `DEFAULT_TOML` could state "there are none"
+//! is an empty literal — a value the format-preserving writer would then have
+//! to round-trip. `workspaces.toml`'s default is comments only for exactly
+//! that reason, and `agents.toml` leaves its whole `[display.<name>]` block
+//! commented out. So a collection `Field` the default does not *state* is not
+//! [`Mismatch::Invented`] — **provided the default mentions every segment of
+//! its path in a comment**, which those two do
+//! (`#     order = ["chat", "dev"]`, `#     [workspace.chat]`,
+//! `#   [display.trollshell-choom]`).
 //!
-//! **It reads a file, not a Rust type.** `verify` says the schema and the
-//! documented default agree; it cannot say either agrees with `S`'s serde
-//! fields. Each family already pins *that* half with its own
-//! `the_shipped_default_parses_and_matches_the_rust_default` test, which is
-//! why the three tests together are a closed loop and none of them is
-//! redundant.
+//! That proviso is #1360's MEDIUM 3. Without it the exemption was by `Kind`
+//! alone, so `order` → `ordre` was caught by *no* `verify` call anywhere and
+//! only by two bespoke per-family tests a fifth family would have had to
+//! remember to write — while this walker, the one sweep that exists for
+//! exactly that case, could not see it by construction.
+//!
+//! # What the walker still does not do: read a Rust type
+//!
+//! `verify` says the schema and the documented default agree; it cannot say
+//! either agrees with `S`'s serde fields. Each family already pins *that* half
+//! with its own `the_shipped_default_parses_and_matches_the_rust_default`
+//! test, and the two plugin families pin the schema against the serde surface
+//! directly (`the_schemas_fields_are_the_serde_surface`) — which is the
+//! direction this walker structurally cannot see, since a default may
+//! legitimately state a strict subset of the type's keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -119,17 +128,32 @@ pub struct Field {
 pub enum Kind {
     /// `true` / `false` — a switch row.
     Bool,
-    /// A whole number in `min..=max`, both ends inclusive — a spin row.
+    /// A whole number in `min..=max`, both ends inclusive — a spin row —
+    /// plus, when `also` is non-empty, a handful of **word** spellings the
+    /// same key accepts instead of a number.
     ///
     /// The bounds are the *parser's* bounds restated so a form can refuse a
     /// value before writing it; `verify` checks the documented default against
     /// them, and each family's own test checks them against its parser's
     /// constants.
+    ///
+    /// `also` exists for [`Kind::Color`]'s reason, one row down: `core-leds`'
+    /// `rows` takes `0..=64` **or** the word `"rect"` — `parse_core_leds_rows`
+    /// accepts it, `ROWS.file_accepts` documents it, and
+    /// `nix/module-common.nix` renders it (`either (ints.between 0 64) (enum
+    /// [ "rect" ])`), so a base layer can put that word in front of a row. A
+    /// plain `Int` would have made [`Kind::accepts`] — *"P1's row validator"* —
+    /// disagree with the loader on the one value a nix base can actually
+    /// write (#1360 review, HIGH 2).
     Int {
         /// Lowest accepted value, inclusive.
         min: i64,
         /// Highest accepted value, inclusive.
         max: i64,
+        /// Word spellings this key takes beside a number. Empty for an
+        /// ordinary spin row, which is every `Int` field but `core-leds`'
+        /// `rows`.
+        also: &'static [&'static str],
     },
     /// One of a fixed vocabulary — a combo row.
     Choice {
@@ -201,7 +225,10 @@ impl Kind {
     pub fn expected(&self) -> String {
         match self {
             Self::Bool => "true or false".to_owned(),
-            Self::Int { min, max } => format!("a whole number, {min}..={max}"),
+            Self::Int { min, max, also: [] } => format!("a whole number, {min}..={max}"),
+            Self::Int { min, max, also } => {
+                format!("a whole number, {min}..={max}, or {}", quoted_list(also))
+            }
             Self::Choice { options } => format!("one of {}", options.join(", ")),
             Self::Text { blank_ok: true } => "any text".to_owned(),
             Self::Text { blank_ok: false } => "text that is not blank".to_owned(),
@@ -328,14 +355,51 @@ pub fn verify(schema: &Schema, default_toml: &str) -> Result<(), Vec<Mismatch>> 
     // the order a reviewer would check them: what the file has that the schema
     // does not, then what the schema has that the file does not.
     for field in schema.fields {
-        if !claimed.contains(field.path) && !field.kind.is_collection() {
-            out.push(Mismatch::Invented {
-                path: field.path.to_owned(),
-            });
+        if claimed.contains(field.path) {
+            continue;
         }
+        if field.kind.is_collection() && mentioned_in_comments(default_toml, field.path) {
+            continue;
+        }
+        out.push(Mismatch::Invented {
+            path: field.path.to_owned(),
+        });
     }
 
     if out.is_empty() { Ok(()) } else { Err(out) }
+}
+
+/// Whether every segment of a dotted `path` appears as a **whole word** in
+/// `default_toml`'s comment lines — what makes a collection's absence
+/// deliberate rather than a typo (#1360 review, MEDIUM 3).
+///
+/// A [`Kind::List`]/[`Kind::Map`] may legitimately be absent from a documented
+/// default (see the module docs), but only from one that documents its shape
+/// where a person reads it: `workspaces.toml` spells `order = [...]` and
+/// `[workspace.chat]` in its commented example, `agents.toml` spells
+/// `[display.trollshell-choom]` in its. A path no line of the file mentions at
+/// all is a typo, and before this rule it was caught only by two bespoke
+/// per-family tests that a fifth family would have had to remember to write —
+/// while [`verify`], the one sweep that exists for exactly that, could not see
+/// it by construction.
+///
+/// Whole **word**, splitting on everything that is not an identifier
+/// character, so `[workspace.chat]` mentions `workspace` and `#   order = […]`
+/// mentions `order`, and a segment that merely occurs inside a longer name
+/// does not count. Comment lines only: a path the file *states* is `claimed`
+/// already and never reaches here.
+fn mentioned_in_comments(default_toml: &str, path: &str) -> bool {
+    let comments: Vec<&str> = default_toml
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with('#'))
+        .collect();
+    path.split('.').all(|segment| {
+        comments.iter().any(|line| {
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|word| word == segment)
+        })
+    })
 }
 
 /// One table level of [`verify`]'s walk over the documented default.
@@ -451,9 +515,12 @@ fn check_record(path: &str, fields: &[Field], item: &toml_edit::Item, out: &mut 
 fn fits(kind: &Kind, value: &toml_edit::Value) -> bool {
     match kind {
         Kind::Bool => value.as_bool().is_some(),
-        Kind::Int { min, max } => value
-            .as_integer()
-            .is_some_and(|n| (*min..=*max).contains(&n)),
+        Kind::Int { min, max, also } => {
+            value
+                .as_integer()
+                .is_some_and(|n| (*min..=*max).contains(&n))
+                || value.as_str().is_some_and(|s| also.contains(&s))
+        }
         Kind::Choice { options } => value.as_str().is_some_and(|s| options.contains(&s)),
         Kind::Text { blank_ok } => value
             .as_str()
@@ -488,6 +555,52 @@ fn spell(item: &toml_edit::Item) -> String {
         || "a table".to_owned(),
         |value| value.to_string().trim().to_owned(),
     )
+}
+
+/// `["rect"]` as `"rect"`, `["a", "b"]` as `"a" or "b"` — for
+/// [`Kind::expected`]'s word half.
+fn quoted_list(words: &[&str]) -> String {
+    let quoted: Vec<String> = words.iter().map(|word| format!("\"{word}\"")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+/// One config family, as a form reads it: a name, the [`Schema`] that says
+/// what its leaves are, and the documented default whose comments are what a
+/// row shows as its tooltip.
+///
+/// It lives **here**, beside [`Schema`], rather than in `hytte-config-families`
+/// where #888 P0 first put it (#1360 review, MEDIUM 4). The leaf crate carries
+/// only the two *shell* families — the two plugin-owned ones link
+/// `hytte-config` themselves, so it cannot depend on them — and with `Family`
+/// down there they had nowhere to publish one, leaving the control center to
+/// hand-write two struct literals nothing sweeps. Here, every family that has
+/// a `Schema` can export a `Family` beside it, and `hytte-config-families`
+/// re-exports this type so its own `FAMILIES` reads unchanged.
+///
+/// Not `#[non_exhaustive]`, for [`Schema`]'s reason: every one is a `const`
+/// struct literal written outside this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Family {
+    /// [`crate::subsystem::Subsystem::NAME`] — the config file's stem.
+    pub name: &'static str,
+    /// What the family's leaves are.
+    pub schema: &'static Schema,
+    /// [`crate::subsystem::Subsystem::DEFAULT_TOML`].
+    pub default_toml: &'static str,
+}
+
+impl Family {
+    /// [`verify`] over this family's own two halves.
+    ///
+    /// # Errors
+    /// As [`verify`].
+    pub fn verify(&self) -> Result<(), Vec<Mismatch>> {
+        verify(self.schema, self.default_toml)
+    }
 }
 
 #[cfg(test)]
@@ -526,7 +639,11 @@ inner = false
         },
         Field {
             path: "count",
-            kind: Kind::Int { min: 1, max: 10 },
+            kind: Kind::Int {
+                min: 1,
+                max: 10,
+                also: &[],
+            },
             doc: "a bounded integer",
         },
         Field {
@@ -692,7 +809,11 @@ inner = false
         const WITH_GHOST: &[Field] = &[
             Field {
                 path: "count",
-                kind: Kind::Int { min: 1, max: 10 },
+                kind: Kind::Int {
+                    min: 1,
+                    max: 10,
+                    also: &[],
+                },
                 doc: "a bounded integer",
             },
             Field {
@@ -725,28 +846,175 @@ inner = false
 
     // ── The collection kinds ─────────────────────────────────────────────────
 
+    const COLLECTIONS: &[Field] = &[
+        Field {
+            path: "order",
+            kind: Kind::List(&Kind::Text { blank_ok: false }),
+            doc: "a list",
+        },
+        Field {
+            path: "nest",
+            kind: Kind::Map(NEST_FIELDS),
+            doc: "a map",
+        },
+    ];
+
+    /// `workspaces.toml`'s shape: a comments-only default that documents its
+    /// collections in a commented example, and a `List` and a `Map` declared
+    /// over it.
     #[test]
-    fn a_collection_the_default_does_not_state_is_not_invented() {
-        // `workspaces.toml`'s shape: a comments-only default, a `List` and a
-        // `Map` declared over it.
-        const COLLECTIONS: &[Field] = &[
-            Field {
-                path: "order",
-                kind: Kind::List(&Kind::Text { blank_ok: false }),
-                doc: "a list",
-            },
-            Field {
-                path: "nest",
-                kind: Kind::Map(NEST_FIELDS),
-                doc: "a map",
-            },
-        ];
+    fn a_collection_the_default_documents_in_comments_is_not_invented() {
         const SCHEMA: Schema = Schema {
             family: "fixture",
             fields: COLLECTIONS,
         };
-        verify(&SCHEMA, "# nothing but comments\n")
-            .expect("an absent collection is not an invented field");
+        verify(
+            &SCHEMA,
+            "# the shape:\n#\n#     order = [\"a\", \"b\"]\n#\n#     [nest.one]\n#     inner = true\n",
+        )
+        .expect("a collection the default documents is not an invented field");
+    }
+
+    /// …and one it does **not** mention at all is a typo, which is the whole
+    /// of #1360's MEDIUM 3: before this, the exemption was by `Kind` alone, so
+    /// `order` → `ordre` was caught by no `verify` call anywhere.
+    ///
+    /// Red if `mentioned_in_comments` stops being consulted (nothing is
+    /// invented), or if it matches a substring rather than a whole word
+    /// (`dispaly` would match nothing either way, but `order` inside
+    /// `reorder` would).
+    #[test]
+    fn a_collection_path_the_default_never_mentions_is_still_invented() {
+        const TYPO: &[Field] = &[Field {
+            path: "dispaly",
+            kind: Kind::Map(NEST_FIELDS),
+            doc: "a map nobody documented",
+        }];
+        const SCHEMA: Schema = Schema {
+            family: "fixture",
+            fields: TYPO,
+        };
+        assert_eq!(
+            verify_err(
+                &SCHEMA,
+                "# the shape:\n#   [display.<name>]\n#   inner = true\n"
+            ),
+            vec![Mismatch::Invented {
+                path: "dispaly".to_owned()
+            }],
+        );
+    }
+
+    /// The mention has to be a **word**, not a substring — otherwise a schema
+    /// declaring `order` would be waved through by a comment about `reorder`,
+    /// and the rule would be decoration.
+    #[test]
+    fn a_mention_inside_a_longer_word_does_not_count() {
+        const FIELDS: &[Field] = &[Field {
+            path: "order",
+            kind: Kind::List(&Kind::Text { blank_ok: false }),
+            doc: "a list",
+        }];
+        const SCHEMA: Schema = Schema {
+            family: "fixture",
+            fields: FIELDS,
+        };
+        assert_eq!(
+            verify_err(&SCHEMA, "# you may reorder the stacks\n"),
+            vec![Mismatch::Invented {
+                path: "order".to_owned()
+            }],
+        );
+        verify(&SCHEMA, "# `order` lists the stacks\n").expect("a whole word mentions it");
+    }
+
+    /// A **scalar** `Field` gets no such grace: a comment naming it is not a
+    /// documented default, and the walker must still say the key is missing.
+    #[test]
+    fn a_scalar_mentioned_only_in_a_comment_is_still_invented() {
+        const FIELDS: &[Field] = &[Field {
+            path: "ghost",
+            kind: Kind::Bool,
+            doc: "a scalar nobody states",
+        }];
+        const SCHEMA: Schema = Schema {
+            family: "fixture",
+            fields: FIELDS,
+        };
+        assert_eq!(
+            verify_err(&SCHEMA, "# ghost = true\n"),
+            vec![Mismatch::Invented {
+                path: "ghost".to_owned()
+            }],
+        );
+    }
+
+    /// `Int`'s word arm (#1360 HIGH 2): `rows` takes `0..=64` **or**
+    /// `"rect"`, and both halves have to be inside the one `Kind`.
+    #[test]
+    fn an_int_with_a_word_arm_takes_the_number_and_the_word() {
+        const ROWS: Kind = Kind::Int {
+            min: 0,
+            max: 64,
+            also: &["rect"],
+        };
+        const FIELDS: &[Field] = &[Field {
+            path: "rows",
+            kind: ROWS,
+            doc: "rows, or the automatic rectangle",
+        }];
+        const SCHEMA: Schema = Schema {
+            family: "fixture",
+            fields: FIELDS,
+        };
+
+        assert!(ROWS.accepts(&toml_edit::Value::from(0_i64)));
+        assert!(ROWS.accepts(&toml_edit::Value::from(64_i64)));
+        assert!(ROWS.accepts(&toml_edit::Value::from("rect")));
+        assert!(!ROWS.accepts(&toml_edit::Value::from(65_i64)));
+        assert!(
+            !ROWS.accepts(&toml_edit::Value::from("square")),
+            "only the words the parser takes"
+        );
+        assert_eq!(
+            ROWS.expected(),
+            "a whole number, 0..=64, or \"rect\"",
+            "and the sentence says so, so a schema-driven rejection names the word"
+        );
+
+        verify(&SCHEMA, "rows = 0\n").expect("the number half");
+        verify(&SCHEMA, "rows = \"rect\"\n").expect("the word half — what a nix base renders");
+        assert_eq!(
+            verify_err(&SCHEMA, "rows = \"square\"\n"),
+            vec![Mismatch::BadDefault {
+                path: "rows".to_owned(),
+                found: "\"square\"".to_owned(),
+                expected: "a whole number, 0..=64, or \"rect\"".to_owned(),
+            }],
+        );
+    }
+
+    /// The type a form composes its list out of (#1360 MEDIUM 4).
+    #[test]
+    fn a_family_verifies_its_own_two_halves() {
+        const SCHEMA: Schema = Schema {
+            family: "fixture",
+            fields: FIELDS,
+        };
+        const GOOD: Family = Family {
+            name: "fixture",
+            schema: &SCHEMA,
+            default_toml: FIXTURE_TOML,
+        };
+        const BAD: Family = Family {
+            name: "fixture",
+            schema: &SCHEMA,
+            default_toml: "flag = true\n",
+        };
+
+        GOOD.verify()
+            .expect("the fixture family agrees with itself");
+        assert!(BAD.verify().is_err(), "and says so when it does not");
     }
 
     #[test]
@@ -874,7 +1142,11 @@ inner = false
 
     #[test]
     fn accepts_answers_exactly_what_verify_would() {
-        let kind = Kind::Int { min: 1, max: 60 };
+        let kind = Kind::Int {
+            min: 1,
+            max: 60,
+            also: &[],
+        };
         assert!(kind.accepts(&toml_edit::Value::from(1_i64)));
         assert!(kind.accepts(&toml_edit::Value::from(60_i64)));
         assert!(!kind.accepts(&toml_edit::Value::from(0_i64)));

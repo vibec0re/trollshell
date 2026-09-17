@@ -66,6 +66,10 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
+// `schema::Family` is spelled through the module: this crate already has a
+// `Family` of its own — the **mount** family, `[bar]` versus `[sidebar]` —
+// and the two are different questions that happen to share a word.
+use hytte_config::schema;
 use hytte_config::schema::{Field, Kind, Schema};
 use hytte_config::subsystem::env::EnvKnob;
 use hytte_config::subsystem::{InvalidValue, Subsystem, keep, spelling};
@@ -207,12 +211,10 @@ poll_seconds = 1
 /// than a thing sixteen hand-written entries could quietly stop obeying.
 /// `[sidebar]` comes first because [`DEFAULT_TOML`] documents it first, and a
 /// form reads down in the order the file does.
-/// The eight leaves of one `[table]`, for each table named.
-///
-/// `concat!` is what makes `bar.cpu` and `sidebar.cpu` two `&'static str`
-/// literals — the same constraint that makes [`BAR_KNOBS`] and
-/// [`SIDEBAR_KNOBS`] two consts — without the eight `doc` sentences being
-/// written twice and drifting.
+/// The eight leaves of one `[table]`, for each table named — `concat!` is what
+/// makes `bar.cpu` and `sidebar.cpu` two `&'static str` literals, the same
+/// constraint that makes [`BAR_KNOBS`] and [`SIDEBAR_KNOBS`] two consts,
+/// without the eight `doc` sentences being written twice and drifting.
 macro_rules! card_fields {
     ($($table:literal),*) => {
         &[$(
@@ -266,6 +268,8 @@ macro_rules! card_fields {
 const POLL_SECONDS: Kind = Kind::Int {
     min: MIN_POLL_SECONDS.cast_signed(),
     max: MAX_POLL_SECONDS.cast_signed(),
+    // A plain spin row: `parse_poll` takes a number and nothing else.
+    also: &[],
 };
 
 /// What the sixteen leaves of `stats.toml` are, for a settings form that has
@@ -286,6 +290,19 @@ const POLL_SECONDS: Kind = Kind::Int {
 pub const SCHEMA: Schema = Schema {
     family: NAME,
     fields: card_fields!("sidebar", "bar"),
+};
+
+/// This family, for a settings form to compose into its list (#1360 review,
+/// MEDIUM 4).
+///
+/// [`Family`] lives in `hytte_config::schema`, not in `hytte-config-families`,
+/// precisely so this line can exist: that leaf carries only the two *shell*
+/// families and cannot depend on this crate. Without it the control center
+/// would hand-write the same three fields as a struct literal nothing sweeps.
+pub const FAMILY: schema::Family = schema::Family {
+    name: NAME,
+    schema: &SCHEMA,
+    default_toml: DEFAULT_TOML,
 };
 
 // ── The resolved form ────────────────────────────────────────────────────────
@@ -716,9 +733,9 @@ pub fn load() -> Stats {
 #[cfg(test)]
 mod tests {
     use super::{
-        BAR_KNOBS, BOOL, Card, CardFile, CardKnobs, DEFAULT_POLL_SECONDS, DEFAULT_TOML, Family,
-        Kind, MAX_POLL_SECONDS, MIN_POLL_SECONDS, SCHEMA, SECONDS, SIDEBAR_KNOBS, Stats,
-        StatsConfig, knob, parse_bool, parse_poll,
+        BAR_KNOBS, BOOL, Card, CardFile, CardKnobs, DEFAULT_POLL_SECONDS, DEFAULT_TOML, FAMILY,
+        Family, Kind, MAX_POLL_SECONDS, MIN_POLL_SECONDS, NAME, SCHEMA, SECONDS, SIDEBAR_KNOBS,
+        Stats, StatsConfig, knob, parse_bool, parse_poll,
     };
     use hytte_config::schema;
     use hytte_config::subsystem::{Subsystem as _, assemble, load_from};
@@ -727,6 +744,19 @@ mod tests {
     use std::time::Duration;
 
     // ── The schema (#888 P0) ────────────────────────────────────────────────
+
+    /// The exported [`FAMILY`] is this family, and it verifies — so a form
+    /// composing it into its list gets the same sweep
+    /// `hytte-config-families`' own `FAMILIES` gets (#1360 review, MEDIUM 4).
+    #[test]
+    fn the_exported_family_is_this_one_and_verifies() {
+        assert_eq!(FAMILY.name, NAME);
+        assert_eq!(FAMILY.schema, &SCHEMA);
+        assert_eq!(FAMILY.default_toml, DEFAULT_TOML);
+        FAMILY
+            .verify()
+            .expect("the exported family agrees with itself");
+    }
 
     /// **The walker.** Every leaf `DEFAULT_TOML` states has a `Field`, every
     /// `Field` names a leaf it states, and every stated value is inside its
@@ -828,9 +858,14 @@ mod tests {
     fn the_schemas_cadence_range_is_the_parsers_own() {
         for table in ["sidebar", "bar"] {
             let path = format!("{table}.poll_seconds");
-            let Some(Kind::Int { min, max }) = SCHEMA.field(&path).map(|field| field.kind) else {
+            let Some(Kind::Int { min, max, also }) = SCHEMA.field(&path).map(|field| field.kind)
+            else {
                 panic!("{path} must be a bounded integer");
             };
+            assert!(
+                also.is_empty(),
+                "a plain spin row: parse_poll takes a number"
+            );
             assert_eq!(min, MIN_POLL_SECONDS.cast_signed());
             assert_eq!(max, MAX_POLL_SECONDS.cast_signed());
             assert!(parse_poll(&min.to_string()).is_ok() && parse_poll(&max.to_string()).is_ok());

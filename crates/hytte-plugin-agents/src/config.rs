@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hytte_config::schema::{Field, Kind, Schema};
+use hytte_config::schema::{Family, Field, Kind, Schema};
 use hytte_config::subsystem::Subsystem;
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +135,8 @@ pub const SCHEMA: Schema = Schema {
             kind: Kind::Int {
                 min: MIN_POLL_SECONDS.cast_signed(),
                 max: MAX_POLL_SECONDS.cast_signed(),
+                // A plain spin row: `validate` takes a number and nothing else.
+                also: &[],
             },
             doc: "Seconds between AgentStatus polls while the sidebar is open.",
         },
@@ -146,7 +148,29 @@ pub const SCHEMA: Schema = Schema {
     ],
 };
 
+/// This family, for a settings form to compose into its list (#1360 review,
+/// MEDIUM 4).
+///
+/// [`Family`] lives in `hytte_config::schema`, not in `hytte-config-families`,
+/// precisely so this line can exist: that leaf carries only the two *shell*
+/// families and cannot depend on this crate. Without it the control center —
+/// which already links this crate as a library (#947 P4) — would hand-write
+/// the same three fields as a struct literal nothing sweeps.
+pub const FAMILY: Family = Family {
+    name: NAME,
+    schema: &SCHEMA,
+    default_toml: DEFAULT_TOML,
+};
+
 /// One `[display.<name>]` entry — [`Display`]'s three optional keys.
+///
+/// All three are `blank_ok: false`, which is a **deliberate narrowing** rather
+/// than a mirror of the reader (#1360 review, LOW 8): `label_for`/`icon_for`/
+/// `project_for` each `.filter(|s| !s.trim().is_empty())`, so a blank loads
+/// as absent, and nix's `nullOr str` will happily render one. A *row* that
+/// accepted a blank would be offering the operator a value that means "unset"
+/// and does not look like it — the row's own **reset** is how you spell that,
+/// and it removes the key instead of writing an empty string nobody can see.
 const DISPLAY_FIELDS: &[Field] = &[
     Field {
         path: "label",
@@ -414,8 +438,8 @@ pub fn load() -> AgentsConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentsConfig, DEFAULT_RUNTIME_ICON, DEFAULT_TOML, Display, Invalid, Kind, MAX_POLL_SECONDS,
-        MIN_POLL_SECONDS, SCHEMA,
+        AgentsConfig, DEFAULT_RUNTIME_ICON, DEFAULT_TOML, Display, FAMILY, Invalid, Kind,
+        MAX_POLL_SECONDS, MIN_POLL_SECONDS, NAME, SCHEMA,
     };
     use hytte_config::schema;
     use hytte_config::subsystem::{Subsystem as _, assemble, assemble_base_layers};
@@ -423,6 +447,19 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     // ── The schema (#888 P0) ────────────────────────────────────────────────
+
+    /// The exported [`FAMILY`] is this family, and it verifies — so a form
+    /// composing it into its list gets the same sweep
+    /// `hytte-config-families`' own `FAMILIES` gets (#1360 review, MEDIUM 4).
+    #[test]
+    fn the_exported_family_is_this_one_and_verifies() {
+        assert_eq!(FAMILY.name, NAME);
+        assert_eq!(FAMILY.schema, &SCHEMA);
+        assert_eq!(FAMILY.default_toml, DEFAULT_TOML);
+        FAMILY
+            .verify()
+            .expect("the exported family agrees with itself");
+    }
 
     /// **The walker.** Every leaf the documented default states has a `Field`,
     /// every non-collection `Field` names a leaf it states, and every stated
@@ -485,10 +522,15 @@ mod tests {
     /// the nix option, now mirrored into the form as well.
     #[test]
     fn the_schemas_cadence_range_is_the_validators_own() {
-        let Some(Kind::Int { min, max }) = SCHEMA.field("poll_seconds").map(|field| field.kind)
+        let Some(Kind::Int { min, max, also }) =
+            SCHEMA.field("poll_seconds").map(|field| field.kind)
         else {
             panic!("`poll_seconds` must be a bounded integer");
         };
+        assert!(
+            also.is_empty(),
+            "a plain spin row: the validator takes a number"
+        );
         assert_eq!(min, MIN_POLL_SECONDS.cast_signed());
         assert_eq!(max, MAX_POLL_SECONDS.cast_signed());
 

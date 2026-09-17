@@ -672,6 +672,10 @@ mod tests {
     use hytte_config::subsystem::watch;
     use hytte_config::subsystem::{self, InvalidValue, Subsystem};
     use hytte_config::test_support::Overlay;
+    // Through `hytte-config`'s own re-export (#1360 review, HIGH 3) rather
+    // than a direct dependency: this crate has no `toml_edit` line and should
+    // not grow one to compare a value against a `Kind`.
+    use hytte_config::toml_edit;
     use hytte_config_families::core_leds::SCHEMA;
     use hytte_preem::{ColorMap, DisplayStyle, Fill};
     use std::collections::HashMap;
@@ -748,7 +752,8 @@ mod tests {
     /// the smallest pinned row count.
     #[test]
     fn the_schemas_row_range_is_the_parsers_own() {
-        let Some(Kind::Int { min, max }) = SCHEMA.field("rows").map(|field| field.kind) else {
+        let Some(Kind::Int { min, max, also }) = SCHEMA.field("rows").map(|field| field.kind)
+        else {
             panic!("`rows` must be a bounded integer");
         };
         assert_eq!(min, 0, "0 is the automatic wide rectangle");
@@ -758,6 +763,49 @@ mod tests {
             parse_core_leds_rows(&(max + 1).to_string()).is_err(),
             "one past the schema's ceiling is one past the parser's"
         );
+        assert_eq!(
+            also,
+            ["rect"],
+            "`rows`' word arm is the one `parse_core_leds_rows` spells out"
+        );
+    }
+
+    /// **The form's validator and the loader must take the same set of
+    /// values** (#1360 review, HIGH 2).
+    ///
+    /// `rows` is the one key in the tree whose file vocabulary has a *word* in
+    /// it, and `nix/module-common.nix` renders that word today
+    /// (`either (ints.between 0 64) (enum [ "rect" ])`), so a base layer can
+    /// put it in front of a row that declares `Kind::Int`. The probe goes
+    /// through `rows_spelling` because that is the file's own translation
+    /// point — `parse_core_leds_rows("0")` is itself an `Err`, and only
+    /// `rows_spelling` makes the integer `0` legal.
+    ///
+    /// Red on `f33415b3` for the `"rect"` case, which is the whole finding.
+    #[test]
+    fn every_rows_value_the_loader_takes_is_inside_the_schemas_kind() {
+        let kind = SCHEMA.field("rows").expect("`rows` is a field").kind;
+        for (raw, edit) in [
+            (toml::Value::Integer(0), toml_edit::Value::from(0_i64)),
+            (toml::Value::Integer(1), toml_edit::Value::from(1_i64)),
+            (toml::Value::Integer(64), toml_edit::Value::from(64_i64)),
+            (toml::Value::Integer(65), toml_edit::Value::from(65_i64)),
+            (
+                toml::Value::String("rect".into()),
+                toml_edit::Value::from("rect"),
+            ),
+            (
+                toml::Value::String("square".into()),
+                toml_edit::Value::from("square"),
+            ),
+        ] {
+            assert_eq!(
+                parse_core_leds_rows(&rows_spelling(&raw)).is_ok(),
+                kind.accepts(&edit),
+                "{raw} — the loader and the row must agree; the row expects {}",
+                kind.expected(),
+            );
+        }
     }
 
     /// [`watch::boot`] at this subsystem — stamp, load once, resolve

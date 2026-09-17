@@ -213,6 +213,15 @@ struct Editor {
     /// fresh every time); the widget's own text is the state, so there's no
     /// separate cell to keep in sync the way `base` needs one.
     departures_endpoint_row: adw::EntryRow,
+    /// `[departures].endpoint` **as the merged config last read back** — what
+    /// [`Self::base`] is for the place list, and the thing
+    /// [`Self::apply_view`] compares against.
+    ///
+    /// Separate from the row's own text on purpose: that text is the
+    /// operator's draft until they press apply, and a refresh that compared
+    /// the widget would treat a half-typed backend as a difference and
+    /// overwrite it with the file's value.
+    endpoint: Rc<RefCell<Option<String>>>,
     /// The stack detail pages are pushed onto.
     nav: adw::NavigationView,
     /// The root page's list of places, rebuilt whenever the set changes.
@@ -369,15 +378,24 @@ impl Editor {
     /// (`ConfigWatcher::moved`) and this says *whether it mattered*, over all
     /// three things the tab renders.
     fn apply_view(&self, places: Vec<Place>, endpoint: Option<String>, locks: Locks) -> bool {
-        let endpoint = endpoint.unwrap_or_default();
-        let changed = *self.base.borrow() != places
-            || self.locked.get() != locks
-            || self.departures_endpoint_row.text() != endpoint;
+        // Compared against **the endpoint the file last said**, never against
+        // the row's own text: that text is the operator's *draft* until they
+        // press apply, and this now runs on every layer move (including the
+        // tab's own place save), so comparing the widget would overwrite a
+        // half-typed backend with the file's value two seconds after they
+        // started typing it.
+        let endpoint_moved = *self.endpoint.borrow() != endpoint;
+        let changed =
+            *self.base.borrow() != places || self.locked.get() != locks || endpoint_moved;
 
         *self.base.borrow_mut() = places;
         self.locked.set(locks);
-        self.departures_endpoint_row.set_text(&endpoint);
         self.departures_endpoint_row.set_sensitive(!locks.endpoint);
+        if endpoint_moved {
+            self.departures_endpoint_row
+                .set_text(endpoint.as_deref().unwrap_or_default());
+            *self.endpoint.borrow_mut() = endpoint;
+        }
         changed
     }
 
@@ -1029,6 +1047,7 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
     let editor = Editor {
         base: Rc::new(RefCell::new(seeded)),
         locked: Rc::new(Cell::new(locks)),
+        endpoint: Rc::new(RefCell::new(loaded.endpoint.clone())),
         departures_endpoint_row: departures_endpoint_row.clone(),
         nav: nav.clone(),
         list: list.clone(),
@@ -1355,6 +1374,7 @@ mod gtk_tests {
         let editor = Editor {
             base: Rc::new(RefCell::new(vec![Place::new("Home", 52.4556, 13.5085)])),
             locked: Rc::new(Cell::new(locks)),
+            endpoint: Rc::new(RefCell::new(None)),
             // No file I/O here either (see the doc comment above) — a detached
             // row, never read back.
             departures_endpoint_row: adw::EntryRow::builder().title("Endpoint").build(),
@@ -1732,5 +1752,38 @@ mod gtk_tests {
 
         assert!(editor.apply_view(same_list, Some("vbb".to_owned()), Locks::default()));
         assert!(editor.departures_endpoint_row.is_sensitive());
+    }
+
+    /// The refresh now runs on **every** layer move rather than only when the
+    /// list changed, which puts it in reach of a row the operator is still
+    /// typing into. A draft must survive an unrelated refresh — otherwise the
+    /// backend they are halfway through entering is replaced by the file's two
+    /// seconds after they started.
+    ///
+    /// **Mutation:** compare `self.departures_endpoint_row.text()` instead of
+    /// `*self.endpoint.borrow()` in `apply_view` and this reds.
+    #[gtk::test]
+    fn a_half_typed_endpoint_survives_an_unrelated_refresh() {
+        adw::init().expect("libadwaita init");
+        let (_toasts, editor) = build_editor();
+        editor.apply_view(editor.places(), Some("bvg".to_owned()), Locks::default());
+
+        // The operator starts typing a new backend and has not pressed apply.
+        editor.departures_endpoint_row.set_text("vb");
+
+        // Something else moves a layer — their own place save, say — and the
+        // poll refreshes. The file still says `bvg`.
+        let mut next = editor.places();
+        next.push(Place::new("Office", 1.0, 2.0));
+        assert!(
+            editor.apply_view(next, Some("bvg".to_owned()), Locks::default()),
+            "the list moved, so the tab does re-render"
+        );
+
+        assert_eq!(
+            editor.departures_endpoint_row.text(),
+            "vb",
+            "…but the draft is theirs until they press apply"
+        );
     }
 }

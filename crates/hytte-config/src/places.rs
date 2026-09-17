@@ -4170,9 +4170,10 @@ lon = 13.5
     /// say nothing, and `moved` (the editors') must say something.
     #[test]
     fn a_lock_that_vanishes_without_moving_the_list_is_still_seen() {
+        const LIST: &str = "[[place]]\nname = \"Eins\"\nlat = 1.0\nlon = 2.0\n";
+
         let root = std::env::temp_dir().join(format!("places-lockmove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        const LIST: &str = "[[place]]\nname = \"Eins\"\nlat = 1.0\nlon = 2.0\n";
         let dir = base_dir(&root.join("xdg"), &format!("_locked = [\"place\"]\n{LIST}"));
 
         with_layers(&root, &[dir.as_path()], || {

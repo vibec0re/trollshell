@@ -587,9 +587,16 @@ mod tests {
         // What `hytte-ui`'s `GlSurface` supplies itself, before the host's bag
         // is applied — see `gl_surface::imp::Resources::run`. A shader may
         // declare these; the mapping must not.
-        const HOST_SUPPLIED: [&str; 8] = [
+        // `u_px_step` is the ninth (#1090's second round found both copies of
+        // this list stale against `Resources::run`, which has set it since
+        // #1298). None of the scope's own shaders declares it today, so this
+        // entry is inert here — and it is written down anyway, because the
+        // omission is only invisible until one does, and the list in `gauge.rs`
+        // is the same fact written twice.
+        const HOST_SUPPLIED: [&str; 9] = [
             "u_grid",
             "u_viewport",
+            "u_px_step",
             "u_data_len",
             "u_step_back",
             "u_tex0",

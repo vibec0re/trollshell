@@ -6,8 +6,9 @@
 //!
 //! Five kinds since #1152, each four skins wide: the `Scope` (three fade
 //! depths), the `Gauge` (three needle positions, plus one at the **shipping**
-//! upscale), the `DotMatrix` (five displays, plus one stretched), the `Marquee`
-//! (five scroll phases, plus one stretched, plus one per skin at a window
+//! upscale and one **stretched**), the `DotMatrix` (five displays, plus one
+//! stretched), the `Marquee` (five scroll phases, plus one stretched, plus one
+//! per skin at a window
 //! width where the centred origin and the bezel diverge — #1209 review,
 //! MEDIUM-1) and the `TextBox` (four configurations, plus one stretched) —
 //! **100** cases. Every case but the stretched and shipping-upscale ones runs
@@ -40,6 +41,13 @@
 //!   asks for a minimum of `0` on purpose) — and what a `scale_factor >= 2`
 //!   screen does to every chip on it, since `GlSurface`'s allocation is in
 //!   **device** pixels. See [`STRETCH`].
+//! * The **fifth gauge case per skin** (#1090's second report) is that same
+//!   stretch applied to a dial: the grid held at `GAUGE_SCALE` and the area
+//!   asked for at twice it, so the *only* thing between the kit's picture and
+//!   the readback is the blit. It is the one case shape that measures a blit's
+//!   own resampling in isolation, and until it existed the gauge's answer to it
+//!   was a bit-exact nearest-neighbour replication — `max |Δ| 0` against the
+//!   oracle, 100.0 % flat blocks, and a stair-stepped arc on the glass.
 //!
 //! None can be compared naively — the GL arm is rasterising at twice the
 //! density *on purpose*, which is the whole of #1090's, #1144's and #1152's fix
@@ -111,6 +119,12 @@
 //! pixel's coordinates and channel and an **edge / field / lit** region split
 //! of the deltas — which is what turns a bare `max 141` into a
 //! classification. See [`print_regions`].
+//!
+//! All three are at the **reference** grid, after `box_downsample`. With
+//! `PREEM_GL_DIFF_NATIVE` set it also writes `<case>.native.ppm`, the readback
+//! at the size it was really rendered — off by default because it is a
+//! duplicate for a 1:1 case, and the only way to *look at* a defect that lives
+//! in the extra resolution. See [`write_native_frame`].
 //!
 //! Two differences are expected and are what the ceiling is for:
 //!
@@ -422,7 +436,8 @@ fn main() -> glib::ExitCode {
     println!(
         "scope {SCOPE_COLS}x{SCOPE_ROWS} scale {SCOPE_SCALE} persistence {PERSISTENCE}; \
          gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE} and {GAUGE_SUPERSAMPLE} \
-         (box-averaged down); \
+         (box-averaged down), one dial at s{STRETCH} (the grid held at \
+         {GAUGE_SCALE}, the area {STRETCH}x it); \
          dot matrix pitch {DOT_PX} (and {DENSE_DOT_PX}, {COARSE_DOT_PX}, \
          one readout at x{STRETCH}); \
          ceiling mean {} / p99 {} / max {} per channel",
@@ -1106,15 +1121,18 @@ impl Case {
     /// exact pin cannot apply to.
     fn sampling(&self) -> parity::Sampling {
         match self {
+            // The gauge is the one kind carrying both knobs, so its factor is
+            // the **product**: `scale` denser grid × `stretch` bigger
+            // allocation, either of which puts the readback above the kit's
+            // logical grid. Every other kind uses exactly one of the two.
+            Self::Gauge { scale, stretch, .. } if scale * stretch > 1 => {
+                parity::Sampling::Supersampled(scale * stretch)
+            }
             // The two kinds the **kit** renders at two resolutions: their
             // `scale` is `Frame::upscale`'s, so a `scale > 1` case is the kit
             // rasterising once and replicating against the GL arm resolving the
             // same geometry at every device pixel.
-            Self::Gauge { scale, .. }
-            | Self::FlipBoard { scale, .. }
-            | Self::LedMatrix { scale, .. }
-                if *scale > 1 =>
-            {
+            Self::FlipBoard { scale, .. } | Self::LedMatrix { scale, .. } if *scale > 1 => {
                 parity::Sampling::Supersampled(*scale)
             }
             Self::DotMatrix { stretch, .. }
@@ -1140,7 +1158,12 @@ impl Case {
     fn geometry(&self) -> (u32, u32, u32) {
         match self {
             Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
-            Self::Gauge { scale, .. } => (GAUGE_COLS, GAUGE_ROWS, *scale),
+            // The third element is what `natural` multiplies the logical grid
+            // by to size the **area**, and for this kind that is both knobs:
+            // `scale` is already inside the grid the offscreen passes run at
+            // (`gauge_surface` multiplies it in), and `stretch` is the extra
+            // room layout gives the chip on top of it.
+            Self::Gauge { scale, stretch, .. } => (GAUGE_COLS, GAUGE_ROWS, scale * stretch),
             Self::DotMatrix {
                 style,
                 display,
@@ -1718,21 +1741,41 @@ fn dot_matrix_config(style: kit::DisplayStyle, dot_px: u32) -> vocab::DotMatrixC
 }
 
 /// One case's name in the transcript and on its evidence files.
+///
+/// The `too_many_lines` allow is `cases_for`'s, for its reason: this is one
+/// flat `match` arm per case shape, nothing nested, and it crossed the ceiling
+/// when #1090's second round added the stretched gauge's. Splitting it would
+/// put half the naming scheme somewhere else, which is worse to read and worse
+/// to review than a long `match` — and the one property that matters here is
+/// that no two shapes can name the same evidence file, which only a reader
+/// seeing every arm at once can check.
+#[allow(clippy::too_many_lines)]
 fn label(case: &Case) -> String {
     match case {
         Case::Scope { style, idle_steps } => format!("scope.{}.idle{idle_steps}", style.name()),
         // The upscale is in the name only where it is not the 1:1 comparison,
         // so the pinned cases keep the labels #1143's and #1144's transcripts
-        // carry.
+        // carry — and the stretched case names its factor with an `s` rather
+        // than that `x`, because the two knobs are different resolutions (see
+        // `cases::Case::Gauge`) and at `STRETCH == GAUGE_SUPERSAMPLE` an `x` on
+        // both would collide on the evidence files.
+        Case::Gauge {
+            style,
+            needle,
+            stretch,
+            ..
+        } if *stretch > 1 => format!("gauge.{}.{}.s{stretch}", style.name(), needle.name()),
         Case::Gauge {
             style,
             needle,
             scale,
+            ..
         } if *scale == GAUGE_SCALE => format!("gauge.{}.{}", style.name(), needle.name()),
         Case::Gauge {
             style,
             needle,
             scale,
+            ..
         } => format!("gauge.{}.{}.x{scale}", style.name(), needle.name()),
         Case::DotMatrix {
             style,
@@ -1861,6 +1904,7 @@ fn drive(area: &GlSurface, case: &Case) {
             style,
             needle,
             scale,
+            ..
         } => {
             let config = gauge_config(*style, *scale);
             let dial = gauge_state(config, *needle);
@@ -2197,6 +2241,7 @@ fn measure(
     // here that never looks at the oracle, and the only one that can see a
     // halo read at the kit's grid — see `parity::flat_block_fraction`.
     let flatness = parity::flat_block_fraction(&shot.raw, shot.alloc, case.sampling(), shot.scale);
+    write_native_frame(&label, shot);
     let (gl_raw, gl_alloc, device_scale) = match case.sampling() {
         parity::Sampling::OneToOne => (
             std::borrow::Cow::Borrowed(&shot.raw[..]),
@@ -2547,6 +2592,45 @@ fn should_dump_frames(passed: bool, dumped: &Cell<u32>, skipped: &Cell<u32>) -> 
     } else {
         skipped.set(skipped.get() + 1);
         false
+    }
+}
+
+/// Write the **readback at the size it was actually rendered**, as
+/// `<case>.native.ppm` beside the other evidence — only when
+/// `PREEM_GL_DIFF_NATIVE` is set, since for a 1:1 case it is a duplicate of
+/// `<case>.gl.ppm` and for a supersampled one it is `factor²` times the bytes.
+///
+/// **The one buffer the evidence files otherwise never carry**, and the reason
+/// this exists: every statistic and every image above is computed *after*
+/// `box_downsample` has brought the readback onto the kit's grid, so a defect
+/// that lives entirely in the extra resolution is reported as a number
+/// (`flat_block_fraction`) and nothing a reader can look at. #1090's second
+/// round is exactly that shape — a stretched dial came back bit-identical to
+/// the oracle on every gate while being a visibly stair-stepped replication on
+/// the glass, and the staircase is only in *these* bytes.
+///
+/// Bottom-up RGBA8 in, top-down RGB `P6` out — the flip every consumer would
+/// otherwise have to know about (`magick <f> -flip …`).
+fn write_native_frame(label: &str, shot: &Capture) {
+    if std::env::var_os("PREEM_GL_DIFF_NATIVE").is_none() {
+        return;
+    }
+    let (width, height) = shot.alloc;
+    let stride = (width as usize).saturating_mul(4);
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for row in (0..height as usize).rev() {
+        let start = row.saturating_mul(stride);
+        let Some(line) = shot.raw.get(start..start + stride) else {
+            return;
+        };
+        for texel in line.chunks_exact(4) {
+            ppm.extend_from_slice(&texel[..3]);
+        }
+    }
+    let mut path = out_dir();
+    path.push(format!("{label}.native.ppm"));
+    if let Err(error) = std::fs::write(&path, &ppm) {
+        println!("INFO {label}: could not write {}: {error}", path.display());
     }
 }
 

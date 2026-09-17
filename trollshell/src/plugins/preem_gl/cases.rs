@@ -64,6 +64,19 @@ pub(crate) enum Case {
         /// pixel against pixel; [`GAUGE_SUPERSAMPLE`] compares a box-averaged
         /// native frame against the kit's logical one.
         scale: u32,
+        /// How many times the **area's** size request exceeds the grid the
+        /// offscreen passes run at — the same [`STRETCH`] the lattice and text
+        /// kinds carry, arriving on this one with #1090's second report. `1`
+        /// for every case but the stretched one.
+        ///
+        /// The gauge is the one kind that carries *both* knobs, and they are
+        /// different resolutions: `scale` moves the **grid** (the dial is
+        /// rasterised denser), `stretch` moves only the **allocation** (the
+        /// same grid is shown bigger). Until #1090's follow-up nothing ever
+        /// rendered a dial whose allocation was not exactly its grid, so the
+        /// blit's own resampling — a nearest-neighbour replication, which is
+        /// what a stair-stepped arc on a big dial is — had no case at all.
+        stretch: u32,
     },
     /// A `DotMatrix` showing one line at one pitch (#1144).
     DotMatrix {
@@ -229,10 +242,48 @@ impl Case {
     /// four. A reversion raises flatness; a drift inside the branch raises the
     /// edge delta. Neither gate alone covers both.
     ///
-    /// **Falsified** by returning the kind's answer for a split flap or for a
-    /// blooming panel, which puts the matching `snapped := true` probe back to
-    /// `PASS all 236`; or by dropping the lcd carve-out, which reds the
-    /// shipping lcd frame at 100.0 %.
+    /// **The gauge is the third**, and it is the exception in its *other*
+    /// direction (#1090, second report): the kind's answer is `None` because
+    /// the gauge's `scale > 1` cases render a denser **grid**, where flatness
+    /// measures the geometry rather than the blit — but its `stretch > 1` cases
+    /// hold the grid at `1` and move only the allocation, so their flatness is
+    /// a statement about the blit and nothing else. Before #1090's second round
+    /// the four `gauge.*.sweep.s2` frames measured **100.0 % on every skin** —
+    /// a perfect nearest-neighbour replication, carrying exactly the kit's own
+    /// 216 distinct colours and `max |Δ| 0` against it — which is what a
+    /// stair-stepped arc on a big dial *is*. With the continuous branch they
+    /// measure **79.4 / 84.2 / 79.8 / 77.9 %** (vfd / lcd / oled / crt).
+    ///
+    /// `0.92` is calibrated against the same reversion probe the other two use:
+    /// `bool snapped = true;` in `gauge.frag`'s `main`, which is the whole of
+    /// that change undone. Under it all four go back to **100.0 %** — and, the
+    /// finding that makes this ceiling load-bearing, *every other gate stays
+    /// green*: the four cases come back `mean 0.000 / max 0` on every bin, i.e.
+    /// bit-identical to the oracle and so scored as **better** than the
+    /// shipping render, with `interior_max()` at `0`, the edge budget
+    /// unreached and `TROLLSHELL_PARITY_EXACT=1` satisfied. The 1:1 cases
+    /// cannot see it by construction (`snapped` is already `true` there), the
+    /// `x2` shipping-upscale cases cannot either (their viewport *is* their
+    /// grid, so they take the snapped branch on both sides of the change and
+    /// their numbers do not move by a single digit), and nothing that *runs*
+    /// the shader can, since no Rust in this tree transcribes the gauge's blit.
+    /// The hermetic half is a source scan instead —
+    /// `gauge::tests::the_blit_resolves_the_dial_per_fragment_off_the_grid`,
+    /// which reds on this same probe without a driver, and which covers the one
+    /// mutation this ceiling cannot see (a *face-only* fix leaves the needle
+    /// replicated and measures 81.6–90.9 %, comfortably under `0.92`).
+    ///
+    /// Unlike the LED panel's, the gauge's carve-out needs **no per-skin arm**:
+    /// its lcd blooms at radius `0` too, but a dial's face is analytic geometry
+    /// rather than a lamp lattice, so that skin resolves per fragment exactly
+    /// like the other three (84.2 % against 77.9–79.8 %) instead of collapsing
+    /// onto replication. `0.92` sits ~8 points either side of the 15.8-point
+    /// separation between the worst measured frame and the reversion.
+    ///
+    /// **Falsified** by returning the kind's answer for a split flap, for a
+    /// blooming panel or for a stretched gauge, which puts the matching
+    /// `snapped := true` probe back to `PASS all 240`; or by dropping the lcd
+    /// carve-out, which reds the shipping lcd panel frame at 100.0 %.
     pub(crate) fn flat_block_ceiling(&self) -> Option<f64> {
         match self {
             Self::FlipBoard {
@@ -244,6 +295,7 @@ impl Case {
             {
                 Some(0.80)
             }
+            Self::Gauge { stretch, .. } if *stretch > 1 => Some(0.92),
             other => other.kind().flat_block_ceiling(),
         }
     }
@@ -758,6 +810,7 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                     style: *style,
                     needle,
                     scale: GAUGE_SCALE,
+                    stretch: 1,
                 });
             // One supersampled case per skin, at the needle position that puts
             // the most anti-aliased edge on the face: the blade is at an
@@ -768,6 +821,20 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 style: *style,
                 needle: NeedleAt::Sweeping,
                 scale: GAUGE_SUPERSAMPLE,
+                stretch: 1,
+            });
+            // …and the same dial given more room than its grid, which is
+            // #1090's second report (a big dial's arc stair-steps) and the one
+            // place the *blit's* own resampling is measured. Deliberately at
+            // `GAUGE_SCALE`, not at the shipping upscale: with the grid at 1:1
+            // the only thing between the kit's picture and the readback is the
+            // blit, so a flatness number here is a statement about that pass
+            // and nothing else. See [`Case::Gauge`]'s `stretch`.
+            let stretched_gauge = std::iter::once(Case::Gauge {
+                style: *style,
+                needle: NeedleAt::Sweeping,
+                scale: GAUGE_SCALE,
+                stretch: STRETCH,
             });
             let displays = [
                 DisplayAt::Blank,
@@ -991,6 +1058,7 @@ pub(crate) fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
             scopes
                 .chain(gauges)
                 .chain(shipping)
+                .chain(stretched_gauge)
                 .chain(displays)
                 .chain(stretched)
                 .chain(tickers)

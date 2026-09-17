@@ -36,6 +36,34 @@
 // which is the entire fix. At `scale == 1` the two arms draw the same picture
 // at the same resolution, which is where the parity harness measures them.
 //
+// # …and why the grid alone was not enough (#1090, second report)
+//
+// A denser grid only helps while the grid is what the screen shows. `u_grid` is
+// the buffer the offscreen passes run at; `u_viewport` is the **allocation**,
+// in device pixels, and layout is free to make it bigger — a card wider than
+// the dial's own buffer does it, and so does a `scale_factor >= 2` monitor,
+// which doubles it for every chip on the screen. Until this change the blit
+// point-sampled the grid into whatever it got, so a dial shown at twice its
+// buffer was a nearest-neighbour **replication**: measured, the whole frame came
+// back 100.0 % flat `2 x 2` blocks and bit-identical to the kit's own 144 x 64
+// picture. That is the stair-stepped arc and the uneven ticks Annika reported
+// on the big dial, and it is what #1148's sharper geometry made visible — the
+// kit's own smear used to hide it.
+//
+// So, on the `dot_matrix.frag` / `flip_board.frag` precedent: when
+// `u_viewport != u_grid` the face **and** the lit layer are evaluated at the
+// **fragment's own** position rather than at the grid cell it lands in, and the
+// halo is read with a bilinear tap (#1186's, which this file does take — a
+// gauge's bloom sits under a single long needle rather than under a lattice, so
+// a grid-resolution staircase in it is exactly as visible as one in the
+// geometry). Everything the kit resolves against the *buffer* rather than
+// against the picture stays snapped: the CRT comb and vignette keep their
+// logical pitch, as they already did.
+//
+// At `u_viewport == u_grid` the branch is the arithmetic that shipped before —
+// the same `texelFetch` into the lit layer, the same integer sample point — and
+// that is the branch every bit-exact parity case takes.
+//
 // Every composite step is **integer**, for the reason `scope_blit.frag` gives
 // at length: the kit's `mix` is `(a * (255 - t) + b * t + 127) / 255`, so a
 // float composite would differ in the last bit almost everywhere.
@@ -84,6 +112,9 @@ in vec2 v_uv;
 uniform sampler2D u_tex0;   // blit: the lit layer, 0..255
 uniform sampler2D u_tex1;   // blit: the separably-blurred lit layer
 uniform ivec2 u_grid;       // the **native** grid, (cols * scale, rows * scale)
+uniform ivec2 u_viewport;   // the pass's viewport — equal to the grid at 1:1
+uniform vec2 u_px_step;     // `vec2(u_grid) / vec2(max(u_viewport, 1))`, the
+                            // buffer units one device fragment covers
 uniform float u_upscale;    // `scale`: logical lengths are already multiplied
                             // by it, the constants above are multiplied here
 uniform float u_pivot_x;    // the dial's pivot, in native grid coordinates …
@@ -279,6 +310,36 @@ int texel(sampler2D tex, ivec2 p) {
     return int(texelFetch(tex, p, 0).r * 255.0 + 0.5);
 }
 
+// The blurred lit layer read at the **fragment's** resolution rather than at the
+// grid's — #1186's bilinear tap, on the `u_viewport != u_grid` branch only.
+//
+// The halo is the one thing on this surface that cannot be recomputed per
+// fragment: it is a box blur of the lit layer, i.e. a grid-resolution quantity
+// by construction, and `blur.frag` produces it at `u_grid`. So it is *read*
+// smoothly instead. `texelFetch` takes integer texels and has no sampler state
+// to lean on, so the clamp to the grid's edge is spelled out here.
+//
+// `p` is the **kit's** coordinate, where buffer pixel `i` sits at `i` (not at
+// `i + 0.5`) — `Grid::arc`/`Grid::segment` sample at `(fx(x), fx(y))`. So the
+// weights come straight off its fraction, and at an integer `p` the mix
+// collapses onto `texel(u_tex1, ivec2(p))`: the snapped branch's single fetch.
+//
+// Kit rows throughout, like every other index into `u_tex1`: row 0 is the top
+// of the image, and the blit's single flip has already happened in the caller.
+int halo_at(vec2 p) {
+    vec2 base = floor(p);
+    vec2 f = p - base;
+    ivec2 lo = ivec2(0, 0);
+    ivec2 hi = u_grid - 1;
+    ivec2 a = clamp(ivec2(base), lo, hi);
+    ivec2 b = clamp(ivec2(base) + 1, lo, hi);
+    float v00 = float(texel(u_tex1, ivec2(a.x, a.y)));
+    float v10 = float(texel(u_tex1, ivec2(b.x, a.y)));
+    float v01 = float(texel(u_tex1, ivec2(a.x, b.y)));
+    float v11 = float(texel(u_tex1, ivec2(b.x, b.y)));
+    return int(mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y) + 0.5);
+}
+
 // `hytte-preem/src/style.rs`'s `mix`: `a` toward `b` by `t`/255, channel-wise,
 // with the same `+ 127` rounding.
 ivec4 mix_kit(ivec4 a, ivec4 b, int t) {
@@ -360,20 +421,56 @@ void main() {
 
     int cols = u_grid.x;
     int rows = u_grid.y;
-    // Point sampling into the letterboxed fit rect, exactly as
-    // `scope_blit.frag` does it, and with the same honest caveat when the
-    // allocation is not an integer multiple of the grid. At the natural size —
-    // what the reconciler requests and what the parity harness measures — the
-    // fit rect *is* the grid and this is the identity.
+    // The fragment's **grid cell**, point-sampled into the letterboxed fit rect
+    // exactly as `scope_blit.frag` does it. At the natural size — what the
+    // reconciler requests and what the parity harness pins — the fit rect *is*
+    // the grid and this is the identity.
+    //
+    // Two things still read the picture here rather than at the fragment, and
+    // both are grid-resolution quantities by definition rather than a caveat:
+    // the CRT mask (`MaskRow` is a row of the *buffer*) and the snapped
+    // branch's `texelFetch`es.
     int col = clamp(int(v_uv.x * float(cols)), 0, cols - 1);
     int row = clamp(int((1.0 - v_uv.y) * float(rows)), 0, rows - 1);
-    vec2 p = vec2(float(col), float(row));
+
+    // **Which branch a real screen takes.** `u_viewport` is the allocation in
+    // *device* pixels (`GlSurface`'s `alloc` multiplies by `scale_factor`), so
+    // `u_viewport == u_grid` holds only on a scale-1 display showing the dial at
+    // exactly its buffer. On a `scale_factor >= 2` monitor, or in any container
+    // wider than the dial's own grid, the continuous branch below is the
+    // shipping path — which is the whole of #1090's second round. The snapped
+    // one is what the bit-exact parity cases measure, and what the stretched
+    // case (`gauge.*.sweep.s2`, one per skin) was added to stop measuring.
+    bool snapped = (u_viewport == u_grid);
+    // The fragment's own centre in **buffer** units, built from its integer
+    // index rather than from the interpolant's value — `flip_board.frag`'s
+    // #1298 shape, and for that file's reason: a driver whose `v_uv`
+    // interpolation is not exact at a pixel centre must not move the sample.
+    // `gl_FragCoord` cannot stand in, since the screen pass narrows the
+    // viewport to the letterbox fit rect and this file has no uniform for its
+    // origin.
+    vec2 vp = vec2(max(u_viewport.x, 1), max(u_viewport.y, 1));
+    vec2 fi = clamp(floor(v_uv * vp), vec2(0.0), vp - 1.0);
+    // …the same fragment as a **top-down** device-pixel centre (the kit's row
+    // order; `v_uv` runs bottom-up and this is the one flip in the pipeline),
+    // then in buffer units by one multiply against a uniform the CPU divided.
+    vec2 px = vec2(fi.x, vp.y - 1.0 - fi.y) + 0.5;
+    // …and finally onto the **kit's** coordinate, where buffer pixel `i` is
+    // sampled *at* `i` rather than at its centre (`Grid::arc`/`Grid::segment`
+    // read `(fx(x), fx(y))`). At 1:1 that is exactly `vec2(col, row)`, which is
+    // the whole reason the snap below is arithmetically redundant on a driver
+    // whose interpolation is exact — and insurance on one whose is not.
+    vec2 pc = px * u_px_step - 0.5;
+    vec2 p = snapped ? vec2(float(col), float(row)) : pc;
 
     ivec4 bg = ivec4(u_bg + 0.5);
     ivec4 ink = ivec4(u_ink + 0.5);
 
     // The face, redrawn flat every frame so it never picks up the lit layer's
     // bloom — the kit paints it under the emission for exactly that reason.
+    // Analytic on either branch: it is the one layer that was already resolved
+    // here rather than read out of a texture, so a stretched dial has always
+    // paid for it and the only change is *where* it is asked.
     ivec4 under = bg;
     int face = face_intensity(p, pivot);
     if (face > 0) {
@@ -382,9 +479,16 @@ void main() {
 
     // `Emission::bloom`: the blurred grid scaled by strength/256 and
     // max-combined under the original.
+    //
+    // The lit layer is analytic too — `lit_intensity` is the very function the
+    // offscreen pass wrote into `u_tex0` — so off the snapped branch it is
+    // **recomputed** at the fragment rather than magnified out of that texture.
+    // The aux pass still runs: the blur needs a grid-resolution lit layer to
+    // work from, and that is what feeds `halo_at` below.
     ivec2 q = ivec2(col, row);
-    int lit = texel(u_tex0, q);
-    int halo = min(texel(u_tex1, q) * u_bloom_strength / 256, 255);
+    int lit = snapped ? texel(u_tex0, q) : lit_intensity(p, pivot);
+    int blurred = snapped ? texel(u_tex1, q) : halo_at(p);
+    int halo = min(blurred * u_bloom_strength / 256, 255);
     lit = min(max(lit, halo), 255);
 
     // `Emission::composite`: unlit pixels are skipped *before* the mask is

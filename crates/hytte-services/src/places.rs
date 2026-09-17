@@ -979,6 +979,26 @@ mine = true
     /// Bytes rather than `&str` because two of the cases are files that aren't
     /// valid UTF-8.
     fn with_seeded_config(seed: &[u8], f: impl FnOnce(&Path, &Mutable<Arc<Vec<Place>>>)) {
+        with_seeded_config_and_base(seed, None, |cfg, handle| f(cfg, handle));
+    }
+
+    /// [`with_seeded_config`] with a nix base layer under the overlay (#1227
+    /// item 2). `base` is the body of `<scratch>/xdg/trollshell/places.toml`;
+    /// `None` renders no base layer at all.
+    ///
+    /// `$XDG_CONFIG_DIRS` is pinned either way, and that is not optional:
+    /// since #1227 item 2 both `load_places` and `edit`'s `check_unlocked`
+    /// read it, so a box that actually uses `programs.trollshell.config.places`
+    /// would otherwise feed every test in this module a base layer it never
+    /// asked for (#1101's rule, one directory over). "No base layer" is a
+    /// scratch directory that does not exist, because an *empty*
+    /// `$XDG_CONFIG_DIRS` reads as unset per the XDG spec and falls back to
+    /// `/etc/xdg`.
+    fn with_seeded_config_and_base(
+        seed: &[u8],
+        base: Option<&str>,
+        f: impl FnOnce(&Path, &Mutable<Arc<Vec<Place>>>),
+    ) {
         let _guard = hytte_reactive::test_lock::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -987,17 +1007,30 @@ mine = true
         let cfg = dir.path().join(".config/trollshell/places.toml");
         std::fs::write(&cfg, seed).expect("seed");
 
-        // `temp_env` serializes $HOME mutation across tests and restores it.
-        temp_env::with_var("HOME", Some(dir.path().as_os_str()), || {
-            let handle = Mutable::new(Arc::new(load_places()));
-            shared::insert(Shared {
-                place: Mutable::default(),
-                location: Mutable::default(),
-                configured: handle.clone(),
-            });
-            f(&cfg, &handle);
-            hytte_reactive::shared::reset_for_tests();
-        });
+        let xdg = dir.path().join("xdg");
+        if let Some(body) = base {
+            std::fs::create_dir_all(xdg.join("trollshell")).expect("mkdir base layer");
+            std::fs::write(xdg.join("trollshell/places.toml"), body).expect("write base layer");
+        }
+
+        // `temp_env` serializes the mutation across tests and restores it.
+        temp_env::with_vars(
+            [
+                ("HOME", Some(dir.path().as_os_str().to_owned())),
+                ("XDG_CONFIG_HOME", None),
+                ("XDG_CONFIG_DIRS", Some(xdg.as_os_str().to_owned())),
+            ],
+            || {
+                let handle = Mutable::new(Arc::new(load_places()));
+                shared::insert(Shared {
+                    place: Mutable::default(),
+                    location: Mutable::default(),
+                    configured: handle.clone(),
+                });
+                f(&cfg, &handle);
+                hytte_reactive::shared::reset_for_tests();
+            },
+        );
     }
 
     /// The requirement that makes the write path usable from a running shell:
@@ -1455,5 +1488,85 @@ mine = true
             rows, 1,
             "a parent restart must not spawn another forwarder: {rows} rows named {FORWARD}"
         );
+    }
+
+    /// #1338 review, M1: the shell's own write path refuses a locked list, and
+    /// writes nothing.
+    ///
+    /// `edit` cannot go through `hytte_config::places::save` — it has to
+    /// publish on the reactive handle inside the same critical section, which
+    /// is why it composes `check_base_layered`/`persist_to` itself — so it
+    /// cannot inherit that function's refusal either. It states it, and before
+    /// this test deleting that one line left `cargo test -p hytte-services
+    /// places` at **31 passed, 0 failed**: the seam had tests, two of its
+    /// three call sites shipped unpinned.
+    ///
+    /// **Mutation:** delete `model::check_unlocked(model::PLACE_KEY)?;` from
+    /// `edit` and this reds on the first assertion.
+    #[test]
+    fn the_shells_edit_path_refuses_a_place_list_nix_owns() {
+        const NIX_BASE: &str = "_locked = [\"place\"]\n\
+             [[place]]\nname = \"Werkstatt\"\nlat = 52.5\nlon = 13.4\n";
+
+        with_seeded_config_and_base(b"", Some(NIX_BASE), |cfg, handle| {
+            let before = std::fs::read_to_string(cfg).expect("readable");
+            assert_eq!(
+                handle.get_cloned().iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                ["Werkstatt"],
+                "the shell reads the nix list"
+            );
+
+            assert_eq!(
+                add_place(full_place("Zuhause")),
+                Err(PlacesError::Locked {
+                    key: "place".to_owned()
+                }),
+                "a `Control` caller is told, rather than acknowledged and reverted \
+                 one poll tick later"
+            );
+            assert_eq!(
+                save_places(vec![full_place("Zuhause")]),
+                Err(PlacesError::Locked {
+                    key: "place".to_owned()
+                }),
+                "…and so is the whole-set path the control center drives"
+            );
+            assert_eq!(
+                remove_place("Werkstatt"),
+                Err(PlacesError::Locked {
+                    key: "place".to_owned()
+                })
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(cfg).expect("readable"),
+                before,
+                "a refused edit writes nothing at all"
+            );
+            assert_eq!(
+                handle.get_cloned().iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                ["Werkstatt"],
+                "and publishes nothing either"
+            );
+        });
+    }
+
+    /// The control, in the same shape, so a mutation that simply made every
+    /// edit fail cannot pass: with the base layer present but **unlocked**,
+    /// the same edit lands.
+    #[test]
+    fn an_unlocked_base_layer_does_not_refuse_the_shells_edit_path() {
+        const BASE: &str = "[[place]]\nname = \"Werkstatt\"\nlat = 52.5\nlon = 13.4\n";
+
+        with_seeded_config_and_base(b"", Some(BASE), |_cfg, handle| {
+            assert_eq!(add_place(full_place("Zuhause")), Ok(()));
+            assert!(
+                handle
+                    .get_cloned()
+                    .iter()
+                    .any(|p| p.name == "Zuhause"),
+                "the edit landed and was republished"
+            );
+        });
     }
 }

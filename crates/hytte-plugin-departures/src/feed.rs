@@ -20,19 +20,28 @@
 //!
 //! # Station config
 //!
-//! [`load_station_config`] reads the **first `[[place]]`** of
-//! `~/.config/trollshell/places.toml` (the exact path + schema the native
-//! `places` service owns and writes a documented default for). Re-read on every
-//! fetch, so an edit saved while the board is open is picked up on the next
-//! poll — the live-reload the native service does via mtime polling. Without
-//! D-Bus this plugin can't run the native Wi-Fi/`GeoClue` place *resolution*, so
-//! it always shows that first place (home) — matching the provisional-home the
-//! native resolver falls back to before its first sensor fix.
+//! [`load_station_config`] reads the **first `[[place]]`** of the *merged*
+//! `places.toml` — `hytte_config::places::load_layered`, which folds the
+//! built-in default, every `$XDG_CONFIG_DIRS/trollshell/places.toml` nix wrote
+//! and the operator's own overlay. Re-read on every fetch, so an edit saved
+//! while the board is open is picked up on the next poll — the live-reload the
+//! native service does via mtime polling. Without D-Bus this plugin can't run
+//! the native Wi-Fi/`GeoClue` place *resolution*, so it always shows that first
+//! place (home) — matching the provisional-home the native resolver falls back
+//! to before its first sensor fix.
+//!
+//! It goes through that crate rather than porting the schema (#1338 review,
+//! H3, on the `hytte-plugin-agents` precedent: a GTK-free leaf library, #640's
+//! argument). The port it replaced resolved `$HOME/.config/trollshell/places.toml`
+//! alone, and `programs.trollshell.config.places` (#1227 item 2) deliberately
+//! writes no such file — so the flagship "put your places in nix" case left
+//! this board with no station and an instruction the merge refuses. There are
+//! **three** readers of this file, not two, and they have to agree.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use hytte_config::places::{self, Place};
 use hytte_plugin::{CmdReceiver, poll};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -63,8 +72,10 @@ const DISPLAY_COUNT: usize = 8;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the station config lives, relative to `$HOME`. Same file the native
-/// `places` service reads/writes.
+/// The **overlay** layer's path relative to `$HOME` — the one file the
+/// operator edits, and the only one this names in a message. The layers
+/// themselves are resolved by `hytte_config::places`; this constant survives
+/// only as the fallback spelling for [`config_hint`] when `$HOME` is unset.
 const CONFIG_REL_PATH: &str = ".config/trollshell/places.toml";
 
 // ── Row model ────────────────────────────────────────────────────────────────
@@ -270,98 +281,107 @@ struct StationConfig {
     backend_label: String,
 }
 
-#[derive(Deserialize, Default)]
-struct DeparturesCfg {
-    #[serde(default)]
-    endpoint: Option<String>,
-}
+// The `[[place]]` schema port that used to live here — `ConfigFile`,
+// `PlaceCfg`, `DeparturesCfg` and `nonblank` — is gone (#1338 review, H3).
+// `hytte_config::places` is the schema now, and the same crate's layered
+// reader is how this board finds the file: `programs.trollshell.config.places`
+// puts the list on the `XDG_CONFIG_DIRS` base layer and writes no overlay, so
+// a port that resolved `$HOME/.config/trollshell/places.toml` by hand saw
+// nothing at all there.
+//
+// The port was deliberately *more tolerant* than the file's real schema — it
+// defaulted `name`/`lat`/`lon` away, which `hytte_config`'s reader requires.
+// That tolerance was a disagreement, not a feature: a `[[place]]` with no
+// coordinates makes the shell discard the whole file and fall back to its
+// built-in default, so the board was boarding a station the shell was not at.
+// Two readers of one file now answer identically, which is the point.
 
-#[derive(Deserialize)]
-struct ConfigFile {
-    #[serde(default)]
-    place: Vec<PlaceCfg>,
-    #[serde(default)]
-    departures: DeparturesCfg,
-}
-
-/// A forward-compatible subset of the native `places.toml` `[[place]]` — only
-/// the departures-relevant fields; the resolver's `lat`/`lon`/`ssids`/… are
-/// simply ignored (serde skips unknown fields).
-#[derive(Deserialize)]
-struct PlaceCfg {
-    #[serde(default)]
-    station: Option<String>,
-    #[serde(default)]
-    walk_minutes: u32,
-    #[serde(default)]
-    lines: Vec<String>,
-    #[serde(default)]
-    directions: Vec<String>,
-}
-
-/// Drop empty/whitespace-only entries (a stray `""` would be an accidental
-/// allow-all, since an empty needle is a substring of everything). Ported from
-/// the native `places::nonblank`.
-fn nonblank(items: Vec<String>) -> Vec<String> {
-    items.into_iter().filter(|s| !s.trim().is_empty()).collect()
-}
-
-fn config_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(CONFIG_REL_PATH))
-}
-
-/// Parse the first place's station config (plus the whole-shell departures
-/// endpoint) out of a `places.toml` body. Pure, so the schema port is
-/// unit-testable. `Ok(None)` = no place, or the first place has no (non-blank)
-/// `station` — checked *after* the endpoint resolves, so a bad
-/// `[departures].endpoint` is reported even before a station exists to fetch.
-fn parse_station_config(toml_text: &str) -> Result<Option<StationConfig>, String> {
-    let cfg: ConfigFile = toml::from_str(toml_text).map_err(|e| format!("config: {e}"))?;
-    let (base_url, backend_label) = resolve_endpoint(cfg.departures.endpoint.as_deref())?;
-    let Some(first) = cfg.place.into_iter().next() else {
+/// The first place's station config, plus the whole-shell departures endpoint.
+/// Pure over an already-read set, so the schema is unit-testable and the
+/// layered loader below has nothing of its own to get wrong.
+///
+/// `Ok(None)` = no place, or the first place has no (non-blank) `station` —
+/// checked *after* the endpoint resolves, so a bad `[departures].endpoint` is
+/// reported even before a station exists to fetch.
+fn station_config_from(
+    places: Vec<Place>,
+    endpoint: Option<&str>,
+) -> Result<Option<StationConfig>, String> {
+    let (base_url, backend_label) = resolve_endpoint(endpoint)?;
+    let Some(first) = places.into_iter().next() else {
         return Ok(None);
     };
     let Some(station) = first.station.filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
     };
+    // `lines`/`directions` are already blank-filtered by `parse_places`, which
+    // is where `nonblank` lives now.
     Ok(Some(StationConfig {
         station,
         walk_minutes: first.walk_minutes,
         filter: Filter {
-            lines: nonblank(first.lines),
-            directions: nonblank(first.directions),
+            lines: first.lines,
+            directions: first.directions,
         },
         base_url,
         backend_label,
     }))
 }
 
-/// Load the station config from disk. `Err` carries an actionable, prefix-free
-/// message (rendered plainly, not under "can't reach <backend>") when there's
-/// no file/place/station, or the configured endpoint is invalid; a real read
-/// error is surfaced as-is.
+/// [`station_config_from`] over one `places.toml` body — the single-file
+/// reading, kept for the schema tests and for nothing else, hence
+/// `#[cfg(test)]`. The board itself goes through [`load_station_config`],
+/// which reads every layer; a production caller that resolved one file by hand
+/// is exactly the defect #1338's review found (H3).
+#[cfg(test)]
+fn parse_station_config(toml_text: &str) -> Result<Option<StationConfig>, String> {
+    let places = places::parse_places(toml_text)?;
+    let endpoint = places::parse_departures_endpoint(toml_text)?;
+    station_config_from(places, endpoint.as_deref())
+}
+
+/// Load the station config through the **layered** reader (#1338 review, H3).
+///
+/// `hytte_config::places::load_layered` folds the built-in default, every
+/// `$XDG_CONFIG_DIRS/trollshell/places.toml` nix wrote, and the operator's own
+/// overlay — the same answer the shell resolves, which is the property that
+/// makes a board and a shell able to disagree impossible rather than merely
+/// unlikely. Before it, this read `$HOME/.config/trollshell/places.toml`
+/// directly, and `programs.trollshell.config.places` deliberately creates no
+/// such file.
+///
+/// `Err` carries an actionable, prefix-free message (rendered plainly, not
+/// under "can't reach &lt;backend&gt;") when there is no place/station or the
+/// configured endpoint is invalid. It names **where to go**, and that depends
+/// on the layering: with the list pinned by nix, `~/.config/trollshell/places.toml`
+/// is the one place editing it does nothing — the merge refuses an overlay
+/// array and both editors refuse to write one — so saying so would be an
+/// instruction the operator cannot follow.
 fn load_station_config() -> Result<StationConfig, String> {
-    let Some(path) = config_path() else {
-        return Err("no departures station configured (HOME unset)".to_owned());
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "no departures station configured — add a [[place]] with a `station` to {}",
-                path.display()
-            ));
-        }
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
-    };
-    match parse_station_config(&text)? {
+    let loaded = places::load_layered();
+    let locked = loaded.places_are_locked();
+    match station_config_from(loaded.places, loaded.endpoint.as_deref())? {
         Some(cfg) => Ok(cfg),
         None => Err(format!(
             "no departures station configured — set `station` on the first [[place]] in {} \
              (outside Berlin, also set [departures].endpoint)",
-            path.display()
+            config_hint(locked)
         )),
     }
+}
+
+/// Where to go and set a station: the nix option when the list is nix's, the
+/// operator's own overlay otherwise.
+fn config_hint(locked: bool) -> String {
+    if locked {
+        return "programs.trollshell.config.places.place (your places are set in nix, so \
+                editing places.toml by hand cannot change them)"
+            .to_owned();
+    }
+    places::config_path().map_or_else(
+        || format!("~/{CONFIG_REL_PATH}"),
+        |p| p.display().to_string(),
+    )
 }
 
 // ── Fetch ────────────────────────────────────────────────────────────────────
@@ -718,13 +738,23 @@ mod tests {
 
     #[test]
     fn config_uses_the_first_place_and_drops_blank_filter_entries() {
+        // `lat`/`lon` are required — they were optional while this file
+        // carried its own tolerant port of the schema (#1338 review, H3), and
+        // that tolerance was a *disagreement* with the shell rather than a
+        // feature: a `[[place]]` with no coordinates makes `hytte-config`
+        // discard the whole file and fall back to its built-in default, so the
+        // board was boarding a station the shell was not at.
         let toml = "\
             [[place]]\n\
             name = \"Home\"\n\
+            lat = 1.0\n\
+            lon = 2.0\n\
             station = \"111\"\n\
             lines = [\"S1\", \"\", \"  \"]\n\
             [[place]]\n\
             name = \"Office\"\n\
+            lat = 3.0\n\
+            lon = 4.0\n\
             station = \"999\"\n";
         let cfg = parse_station_config(toml).unwrap().unwrap();
         assert_eq!(cfg.station, "111", "the first place wins");
@@ -737,8 +767,126 @@ mod tests {
         let no_station = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n";
         assert!(parse_station_config(no_station).unwrap().is_none());
         // A blank/whitespace station is treated as unset.
-        let blank = "[[place]]\nname = \"Home\"\nstation = \"  \"\n";
+        let blank = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\nstation = \"  \"\n";
         assert!(parse_station_config(blank).unwrap().is_none());
+    }
+
+    /// #1338 review, H3: `programs.trollshell.config.places` puts the list on
+    /// the XDG base layer and deliberately writes **no** overlay, so a loader
+    /// that only knew `$HOME/.config` saw no station at all and rendered
+    /// *"add a `[[place]]` with a `station` to ~/.config/trollshell/places.toml"* —
+    /// an instruction the merge then refuses.
+    ///
+    /// **Mutation:** point `load_station_config` back at
+    /// `$HOME/.config/trollshell/places.toml` and this reds.
+    #[test]
+    fn a_nix_base_layer_supplies_the_station_when_there_is_no_overlay() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path().join("xdg/trollshell/places.toml");
+        std::fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &base,
+            "_locked = [\"place\"]\n\
+             [departures]\nendpoint = \"vbb\"\n\
+             [[place]]\nname = \"Werkstatt\"\nlat = 52.5\nlon = 13.4\n\
+             station = \"900192001\"\nwalk_minutes = 7\n",
+        )
+        .expect("write base layer");
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(root.path().join("home").into_os_string())),
+                ("XDG_CONFIG_HOME", None),
+                (
+                    "XDG_CONFIG_DIRS",
+                    Some(root.path().join("xdg").into_os_string()),
+                ),
+            ],
+            || {
+                let cfg = load_station_config().expect("the nix base layer is a layer too");
+                assert_eq!(cfg.station, "900192001");
+                assert_eq!(cfg.walk_minutes, 7);
+                assert_eq!(
+                    cfg.base_url, "https://v6.vbb.transport.rest",
+                    "…and the merged [departures].endpoint comes with it"
+                );
+            },
+        );
+    }
+
+    /// The error text has to name somewhere the operator can actually act.
+    /// With the list pinned by nix, `~/.config/trollshell/places.toml` is the
+    /// one place editing does nothing — the merge refuses an overlay array and
+    /// both editors refuse to write one.
+    #[test]
+    fn the_no_station_message_names_the_nix_option_when_the_list_is_locked() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path().join("xdg/trollshell/places.toml");
+        std::fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
+        // A nix-declared list with no `station` on the first place.
+        std::fs::write(
+            &base,
+            "_locked = [\"place\"]\n[[place]]\nname = \"Werkstatt\"\nlat = 52.5\nlon = 13.4\n",
+        )
+        .expect("write base layer");
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(root.path().join("home").into_os_string())),
+                ("XDG_CONFIG_HOME", None),
+                (
+                    "XDG_CONFIG_DIRS",
+                    Some(root.path().join("xdg").into_os_string()),
+                ),
+            ],
+            || {
+                let err = load_station_config().unwrap_err();
+                assert!(
+                    err.contains("programs.trollshell.config.places.place"),
+                    "the message must point at the file that decides, got: {err}"
+                );
+                assert!(
+                    !err.contains(".config/trollshell/places.toml"),
+                    "…and must not send them to the one that cannot, got: {err}"
+                );
+            },
+        );
+    }
+
+    /// The control: with no base layer the message is still the overlay's own
+    /// path, so the fix above did not just reword every error.
+    #[test]
+    fn the_no_station_message_names_the_overlay_when_the_list_is_the_operators() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".config/trollshell")).expect("mkdir");
+        std::fs::write(
+            home.join(CONFIG_REL_PATH),
+            "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n",
+        )
+        .expect("overlay");
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.clone().into_os_string())),
+                ("XDG_CONFIG_HOME", None),
+                (
+                    "XDG_CONFIG_DIRS",
+                    // A base directory that does not exist: an EMPTY value
+                    // reads as unset per the XDG spec and falls back to
+                    // /etc/xdg, which is the developer's real machine.
+                    Some(root.path().join("no-base-layer").into_os_string()),
+                ),
+            ],
+            || {
+                let err = load_station_config().unwrap_err();
+                assert!(
+                    err.contains(".config/trollshell/places.toml"),
+                    "got: {err}"
+                );
+                assert!(!err.contains("programs.trollshell"), "got: {err}");
+            },
+        );
     }
 
     #[test]

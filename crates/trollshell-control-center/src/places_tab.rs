@@ -160,7 +160,7 @@ impl ListField {
 /// surface #1331 had nowhere to build (that PR's own note: "the control-center
 /// has no editable surface for any `Subsystem` family today … Places is item
 /// 2's own writer").
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Locks {
     /// `_locked = ["place"]` — the whole `[[place]]` array is nix's. Atomic,
     /// because rule 3 replaces arrays whole: there is no "nix set two places
@@ -171,9 +171,8 @@ struct Locks {
 }
 
 impl Locks {
-    /// Read the base layers and ask what they pinned.
-    fn read() -> Self {
-        let layered = places::load_layered();
+    /// What a load actually enforced.
+    fn of(layered: &places::Layered) -> Self {
         Self {
             places: layered.places_are_locked(),
             endpoint: layered.endpoint_is_locked(),
@@ -260,8 +259,10 @@ impl Editor {
         let base = self.places();
         match places::save(&base, next) {
             Ok(()) => {
-                *self.base.borrow_mut() = places::load_places();
-                self.locked.set(Locks::read());
+                // #1338 review, L3: `apply_view` rather than a hand-rolled
+                // `load_places()` + `Locks::read()` pair, so this site keeps
+                // the endpoint row's sensitivity in step like the other three.
+                self.refresh_from_disk();
                 self.rebuild();
                 true
             }
@@ -295,9 +296,11 @@ impl Editor {
     fn save_departures_endpoint(&self, next: Option<&str>) -> bool {
         match places::save_departures_endpoint(next) {
             Ok(()) => {
-                let reloaded = places::load_departures_endpoint();
-                self.departures_endpoint_row
-                    .set_text(reloaded.as_deref().unwrap_or_default());
+                // The whole view, not just this row's text: the endpoint save
+                // creates the overlay when there is none, and under a nix base
+                // layer the seed it creates is a filtered one (#1338 review,
+                // H1) — so the list can legitimately have moved too.
+                self.refresh_from_disk();
                 true
             }
             Err(err) => {
@@ -331,17 +334,51 @@ impl Editor {
     /// Pops back to the root first: a detail page addresses its place by index,
     /// and the reload may have removed or reordered it.
     fn reload(&self) {
-        *self.base.borrow_mut() = places::load_places();
-        self.locked.set(Locks::read());
-        self.departures_endpoint_row.set_text(
-            places::load_departures_endpoint()
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        self.departures_endpoint_row
-            .set_sensitive(!self.locked.get().endpoint);
+        self.refresh_from_disk();
         while self.nav.pop() {}
         self.rebuild();
+    }
+
+    /// Re-read every layer and push the result into the model and the widgets
+    /// that [`Self::rebuild`] does not own. Returns whether anything the tab
+    /// shows actually moved.
+    ///
+    /// One read for all three answers (#1338 review, H2/L3): before this, each
+    /// refresh site composed its own `load_places()` + `Locks::read()` +
+    /// `load_departures_endpoint()`, which is three passes over the search
+    /// path that can disagree with each other, and three places to forget the
+    /// endpoint row's sensitivity — which three of four sites did.
+    fn refresh_from_disk(&self) -> bool {
+        let loaded = places::load_layered();
+        let locks = Locks::of(&loaded);
+        self.apply_view(loaded.places, loaded.endpoint, locks)
+    }
+
+    /// [`Self::refresh_from_disk`]'s pure-ish half: apply an already-read view.
+    ///
+    /// Split out so the GTK tests can drive the refresh with a fabricated view
+    /// instead of the real `$HOME`/`$XDG_CONFIG_DIRS` — the same argument the
+    /// `gtk_tests` module doc makes for seeding `base` directly.
+    ///
+    /// **The return value is the whole point.** The poll below used to sit
+    /// behind `ConfigWatcher::poll`, which dedups on the merged *list*; a lock
+    /// is not a list, so a `nixos-rebuild` that adds or drops
+    /// `programs.trollshell.config.places` while the overlay already holds the
+    /// same list reported nothing and the greyed rows outlived the option that
+    /// greyed them. The watcher now only says *a layer moved*
+    /// (`ConfigWatcher::moved`) and this says *whether it mattered*, over all
+    /// three things the tab renders.
+    fn apply_view(&self, places: Vec<Place>, endpoint: Option<String>, locks: Locks) -> bool {
+        let endpoint = endpoint.unwrap_or_default();
+        let changed = *self.base.borrow() != places
+            || self.locked.get() != locks
+            || self.departures_endpoint_row.text() != endpoint;
+
+        *self.base.borrow_mut() = places;
+        self.locked.set(locks);
+        self.departures_endpoint_row.set_text(&endpoint);
+        self.departures_endpoint_row.set_sensitive(!locks.endpoint);
+        changed
     }
 
     /// Read the shell's resolved place (`GetPlace`) into the status line, the
@@ -976,16 +1013,21 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
         .description(LIST_DESCRIPTION)
         .build();
 
-    let locks = Locks::read();
+    // One read for the list, the endpoint and the lock set — `load_places` on
+    // top of it only for its first-run seed, which `load_layered` deliberately
+    // does not do.
+    let seeded = places::load_places();
+    let loaded = places::load_layered();
+    let locks = Locks::of(&loaded);
     let departures_endpoint_row = adw::EntryRow::builder()
         .title("Endpoint")
-        .text(places::load_departures_endpoint().unwrap_or_default())
+        .text(loaded.endpoint.clone().unwrap_or_default())
         .show_apply_button(true)
         .sensitive(!locks.endpoint)
         .build();
 
     let editor = Editor {
-        base: Rc::new(RefCell::new(places::load_places())),
+        base: Rc::new(RefCell::new(seeded)),
         locked: Rc::new(Cell::new(locks)),
         departures_endpoint_row: departures_endpoint_row.clone(),
         nav: nav.clone(),
@@ -1047,16 +1089,13 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
         let editor = editor.clone();
         let mut watcher = places::ConfigWatcher::new();
         glib::timeout_add_local(CONFIG_POLL_INTERVAL, move || {
-            let current = editor.places();
-            if let Some(reloaded) = watcher.poll(&current) {
-                *editor.base.borrow_mut() = reloaded;
-                // The watcher stamps the nix base layer too since #1227 item 2,
-                // so a `nixos-rebuild` under a running window lands here — and
-                // what it most likely changed is exactly the lock.
-                editor.locked.set(Locks::read());
-                editor
-                    .departures_endpoint_row
-                    .set_sensitive(!editor.locked.get().endpoint);
+            // `moved()`, not `poll(&current)` (#1338 review, H2): the watcher
+            // stamps the nix base layer too since #1227 item 2, and the most
+            // likely thing a `nixos-rebuild` changed is the **lock** — which
+            // `poll`'s list dedup cannot see, because a lock is not a list.
+            // `refresh_from_disk` does the comparing, over everything the tab
+            // actually renders.
+            if watcher.moved() && editor.refresh_from_disk() {
                 while editor.nav.pop() {}
                 editor.rebuild();
             }
@@ -1582,5 +1621,116 @@ mod gtk_tests {
                 .any(|b| b.icon_name().as_deref() == Some("user-trash-symbolic")),
             "Delete is there when the place is yours"
         );
+    }
+
+    /// #1338 review, H2, the GTK half: a lock that appears or vanishes without
+    /// moving the place list has to reach the running window.
+    ///
+    /// This drives the poll closure's body — `apply_view`, which is what
+    /// `refresh_from_disk` hands the freshly-read view to — with the *same*
+    /// list and a changed lock, in both directions, and asserts both that it
+    /// reports the change and that a rebuild then renders the other surface.
+    /// Before the fix the poll sat behind `ConfigWatcher::poll`, whose dedup
+    /// is on the list, so neither direction ever got here at all.
+    ///
+    /// **Mutation:** drop `|| self.locked.get() != locks` from `apply_view`'s
+    /// `changed` and this reds on the first assertion.
+    #[gtk::test]
+    fn a_lock_that_changes_without_moving_the_list_re_renders_the_tab() {
+        adw::init().expect("libadwaita init");
+        let (_toasts, editor) = build_editor();
+        let same_list = editor.places();
+
+        // The lock appears. Not one place moved.
+        assert!(
+            editor.apply_view(
+                same_list.clone(),
+                None,
+                Locks {
+                    places: true,
+                    endpoint: false,
+                },
+            ),
+            "a lock that appears is a change the tab must render"
+        );
+        editor.rebuild();
+        assert_eq!(
+            editor.rows.borrow().len(),
+            same_list.len(),
+            "…and 'Add a place' is gone"
+        );
+        assert_eq!(
+            editor.list.description().as_deref(),
+            Some(super::NIX_MANAGED_PLACES)
+        );
+
+        // Idempotent: the same view again is not a change.
+        assert!(
+            !editor.apply_view(
+                same_list.clone(),
+                None,
+                Locks {
+                    places: true,
+                    endpoint: false,
+                },
+            ),
+            "nothing moved, so nothing to re-render — otherwise the poll would \
+             pop the user back to the root list every two seconds"
+        );
+
+        // And the lock vanishes again — the `nixos-rebuild` that drops the
+        // option while the overlay already holds the same list.
+        assert!(editor.apply_view(same_list.clone(), None, Locks::default()));
+        editor.rebuild();
+        assert_eq!(
+            editor.rows.borrow().len(),
+            same_list.len() + 1,
+            "the greyed row must not outlive the option that greyed it"
+        );
+        assert_eq!(
+            editor.list.description().as_deref(),
+            Some(super::LIST_DESCRIPTION)
+        );
+    }
+
+    /// The endpoint half of the same defect, and the common one: a
+    /// `[departures]`-only base layer never renders a `[[place]]`, so adding it
+    /// moves no place at all — and the row it governs is the one left
+    /// deliberately sensitive while the list is nix's.
+    ///
+    /// Also L3: the row's *sensitivity* is now applied wherever the view is,
+    /// which is what `apply_view` being the single site buys.
+    #[gtk::test]
+    fn an_endpoint_lock_flips_the_rows_sensitivity_without_touching_the_list() {
+        adw::init().expect("libadwaita init");
+        let (_toasts, editor) = build_editor();
+        let same_list = editor.places();
+        assert!(editor.departures_endpoint_row.is_sensitive());
+
+        assert!(editor.apply_view(
+            same_list.clone(),
+            Some("vbb".to_owned()),
+            Locks {
+                places: false,
+                endpoint: true,
+            },
+        ));
+        assert!(
+            !editor.departures_endpoint_row.is_sensitive(),
+            "the backend is nix's now"
+        );
+        assert_eq!(
+            editor.departures_endpoint_row.text(),
+            "vbb",
+            "…and showing nix's value, not the stale one"
+        );
+        assert_eq!(
+            editor.places(),
+            same_list,
+            "not one place moved, which is why `poll` could not see this"
+        );
+
+        assert!(editor.apply_view(same_list, Some("vbb".to_owned()), Locks::default()));
+        assert!(editor.departures_endpoint_row.is_sensitive());
     }
 }

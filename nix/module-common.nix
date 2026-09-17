@@ -1641,6 +1641,18 @@ self:
               nix" rather than offering a save the next load would refuse.
               Leave it `null` (the default) to keep the list yours — the
               `[departures]` backend below can still be nix's either way.
+
+              `[ ]` is **not** the same as `null` (#1338 review, M2). An
+              empty list is still a list: it renders `place = []`, locks it,
+              and — because arrays replace whole — means *"no places at
+              all"*. That is a usable configuration (the shell resolves to
+              "away", weather uses your raw location and departures shows
+              the nearest station), but it is a different thing from `null`,
+              which sets no key and leaves the list to your overlay or to
+              the built-in default. The distinction only exists for a
+              **base** layer: an empty `place = []` in your own overlay
+              still reads as the built-in default, because that is how the
+              editor spells "I deleted my last place" (#640).
             '';
           };
 

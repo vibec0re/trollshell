@@ -133,15 +133,29 @@ fn an_overlay_over_the_fixture_is_refused_and_reported() {
 /// `[departures]` table this model barely knows about. What it does **not**
 /// preserve is that table's *position*: `toml_edit` re-emits a standalone
 /// table after an array-of-tables that was declared below it, so nix's
-/// alphabetical `[departures]`-then-`[[place]]` comes back as
-/// `[[place]]`-then-`[departures]`.
+/// alphabetical `[departures]`-then-`[[place]]` comes back with
+/// `[departures]` one `[[place]]` further down.
 ///
-/// That relocation is pre-existing writer behaviour, not something the base
-/// layer introduced — the shipped `DEFAULT_CONFIG` already puts `[departures]`
-/// last, which is why no test had met it — and it is cosmetic: nothing reads
-/// `places.toml` positionally. It is pinned as a *sorted-line* equality rather
-/// than waved at, so a change that actually dropped or rewrote a line still
-/// reds here.
+/// **One block per save, not one move** (#1338 review, L2). Measured over this
+/// fixture's two places:
+///
+/// ```text
+/// round 1: changed=true    [departures] now sits after 1 place
+/// round 2: changed=true    …after 2 places
+/// round 3: changed=false   settled
+/// ```
+///
+/// So a `[departures]`-first document costs **N** byte-churning saves (N = the
+/// number of places) before it settles at the end, and each one moves the
+/// content hash `ConfigWatcher` polls — one spurious reload apiece for the
+/// shell and for the control center. Still cosmetic (nothing reads
+/// `places.toml` positionally) and still pre-existing — the shipped
+/// `DEFAULT_CONFIG` puts `[departures]` last, which is why no test had met it —
+/// and in production this writer never runs over *these* bytes at all, because
+/// the `_locked` line above makes `check_unlocked` refuse first. Tracked on
+/// #1339; the sorted-line assertion below is green through all three of those
+/// documents, which is why the measurement is written down here rather than
+/// left to the test to imply.
 ///
 /// It is deliberately not a claim that `pkgs.formats.toml` and `toml_edit`
 /// agree about rendering a document from scratch. They do not, which is

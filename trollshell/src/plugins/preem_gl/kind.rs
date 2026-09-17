@@ -15,9 +15,10 @@
 //! [`Kind::ALL`] is what the others now derive from or are tested against:
 //! [`super::install`] loops over it and [`Kind::gl_seam`] to build its
 //! registration list, so a new variant is registered the moment it answers
-//! there; `plugins::tests`' `kind_enumeration` module walks it to assert a
-//! `gl_seam_for` result, an `invalidate_cached_frames` decision and at least
-//! one harness case per skin exist for every kind, and that the harness's
+//! there; `plugins::tests`' `kind_enumeration` module walks it to assert that
+//! every kind's widget maps to a GL node (`gl_seam_for` was how it asked until
+//! #1157 made that structural), that an `invalidate_cached_frames` decision and
+//! at least one harness case per skin exist for every kind, and that the harness's
 //! computed case count matches `nix/checks/system-tests.nix`'s literal; and
 //! `parity.rs`'s own tests pair it with the exhaustive `pinned_exact`/
 //! `checks_peak_rows`/`edge_budget` matches, as they did before this file

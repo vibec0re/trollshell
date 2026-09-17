@@ -2887,14 +2887,6 @@ mod gtk_tests {
         preem_render::MAX_TICK_DT_US / i64::from(preem_render::MAX_CATCHUP_STEPS)
     }
 
-    /// Drive the GTK main loop for `ms` of wall clock, so a **real**
-    /// `GdkFrameClock` gets to deliver ticks.
-    ///
-    /// `iteration(true)` blocks until a source is ready, which is what makes the
-    /// counting honest — a spin on `iteration(false)` would starve the frame
-    /// clock and measure the test's own loop instead. The timeout is what
-    /// guarantees it terminates even in the case the test is *hoping* for, where
-    /// no frame ever arrives.
     /// `true` when this thread has lost GL, so the caller should skip — and a
     /// `SKIPPED` line naming why.
     ///
@@ -2935,6 +2927,14 @@ mod gtk_tests {
         true
     }
 
+    /// Drive the GTK main loop for `ms` of wall clock, so a **real**
+    /// `GdkFrameClock` gets to deliver ticks.
+    ///
+    /// `iteration(true)` blocks until a source is ready, which is what makes the
+    /// counting honest — a spin on `iteration(false)` would starve the frame
+    /// clock and measure the test's own loop instead. The timeout is what
+    /// guarantees it terminates even in the case the test is *hoping* for, where
+    /// no frame ever arrives.
     fn pump_for(ms: u64) {
         let done = Rc::new(std::cell::Cell::new(false));
         let flag = done.clone();

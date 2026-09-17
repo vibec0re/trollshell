@@ -1067,6 +1067,33 @@ fn core_panel_arm() -> preem_gl::Arm {
     preem_gl::arm_for(preem_gl::LED_MATRIX)
 }
 
+/// The logical size the panel occupies at `scale` — what the GL arm draws into,
+/// and what the placeholder asks for so an empty row keeps the drawn row's
+/// footprint (PR #1356 review, H2).
+///
+/// Read off the same `kit::LedMatrix` and the same [`core_panel_scale`] the GL
+/// arm maps from, never spelled again: a hand-written pair would be a second
+/// answer to "how big is this panel" and the two would drift the first time the
+/// kit's cell pitch moved.
+fn core_panel_footprint(matrix: &LedMatrix, scale: u32) -> (u32, u32) {
+    let dim = |value: usize| u32::try_from(value).unwrap_or(0).saturating_mul(scale);
+    (dim(matrix.width()), dim(matrix.height()))
+}
+
+/// The RGBA8 length a `width` x `height` transparent buffer needs, saturating.
+///
+/// Saturating rather than panicking because this runs inside a `bind` apply
+/// closure on the GTK main thread, where an overflow would take the shell's
+/// main loop with it — and because a saturated length simply fails
+/// `PixelSurface`'s own `rgba_len_ok` and lands back on the 0x0 placeholder,
+/// which is the honest degradation rather than a crash.
+fn blank_len(width: u32, height: u32) -> usize {
+    usize::try_from(width)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(height).unwrap_or(0))
+        .saturating_mul(4)
+}
+
 /// The row's single child, rebuilt if the arm no longer matches it.
 ///
 /// A `gtk::Box` holding exactly one surface, rather than a `gtk::Stack` of two:
@@ -1235,15 +1262,51 @@ where
             // already written the journal line naming `preem.led_matrix` and
             // the driver's reason; the tooltip below still reports every core's
             // load, so the row keeps saying something.
+            //
+            // **It keeps the panel's footprint**, which is where it differs
+            // from the 0x0 placeholder a plugin's preem node degrades to, and
+            // the difference is load-bearing twice (PR #1356 review, H2). A
+            // `PixelSurface` given no pixels measures 0x0 on both axes
+            // (`pixels.rs`'s `render_nothing`), and this row is `halign:
+            // Center` over its child — so a 0x0 placeholder collapses the row
+            // to its CSS padding, the card reflows the moment GL dies, and the
+            // tooltip that is this widget's whole remaining output has a hover
+            // target of *one point* (`graphene_rect_contains_point` is
+            // inclusive, so a degenerate rect contains exactly its origin).
+            // A fully transparent buffer at the size the GL arm would have
+            // drawn fixes both: nothing is painted, the row occupies what it
+            // always did, and the hover target is the panel's own area.
+            //
+            // `set_size_request` would have been the obvious way to ask for
+            // that and is the wrong one: it sets a **minimum**, and the row's
+            // minimum width being 0 on any core count is the #702
+            // non-regression (`the_panel_row_keeps_the_702_geometry`). A
+            // buffer sets the **natural** size instead — `PixelSurface::measure`
+            // hard-codes its minimum to 0 on both axes — so the footprint comes
+            // back without a floor coming with it.
+            //
+            // The allocation is one zeroed buffer per tick on a box whose GL is
+            // broken, and `set_pixels`' own byte-compare settles every tick
+            // after the first without uploading anything. That is also why
+            // `matrix`/`scale` above stay hoisted out of the two arms rather
+            // than moved into the `Gl` one (PR #1356 review, L2): both arms
+            // need the geometry now.
             preem_gl::Arm::Placeholder => {
                 let surface: &PixelSurface = child
                     .downcast_ref()
                     .expect("core_panel_child returns a PixelSurface off the GL arm");
+                let (width, height) = core_panel_footprint(&matrix, scale);
                 surface.set_scale(1);
-                surface.set_pixels(0, 0, &[]);
+                surface.set_pixels(width, height, &vec![0_u8; blank_len(width, height)]);
             }
         }
-        child.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
+        // **On the row, not on the child** (PR #1356 review, H2). GTK's tooltip
+        // query walks *up* from the widget the pointer picked, so a tooltip on
+        // the row is found from anywhere inside it — including the `.ts-cores-row`
+        // padding strip, which belongs to the row and not to the surface — while
+        // one armed on the child is found only over the child itself. It also
+        // survives `core_panel_child`'s swap, which throws the old widget away.
+        row.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
     });
 }
 
@@ -3463,7 +3526,10 @@ mod pin_tests {
         cpu.set(dressed(four_cores()));
         pump();
 
-        let tooltip = panel_of(&row).tooltip_text().map(|t| t.to_string());
+        // On the **row** since PR #1356's review (H2): a tooltip armed on the
+        // surface is only found while the pointer is over the surface itself,
+        // which the placeholder arm leaves with no area worth hovering.
+        let tooltip = row.tooltip_text().map(|t| t.to_string());
         assert!(
             tooltip.as_deref().is_some_and(|t| t.starts_with("4 cores")),
             "the emitted CpuLoad's four cores must reach the panel's tooltip, got {tooltip:?}"
@@ -3703,7 +3769,10 @@ mod led_panel_layout_tests {
     use hytte::gtk;
     use hytte::ui::GlSurface;
 
-    use super::{CORE_PANEL_MAX_H, core_panel_gl_surface, core_panel_row, core_panel_scale};
+    use super::{
+        CORE_PANEL_MAX_H, blank_len, core_panel_footprint, core_panel_gl_surface, core_panel_row,
+        core_panel_scale, core_panel_surface,
+    };
     use crate::plugins::preem_gl;
 
     /// The buffer dimensions a 64-core panel rasterises to under the #857
@@ -3734,6 +3803,74 @@ mod led_panel_layout_tests {
             &std::sync::Arc::new(kit.uniforms),
         );
         panel
+    }
+
+    /// **The placeholder row is still hoverable** (PR #1356 review, H2).
+    ///
+    /// The whole argument for retiring #857's kit arm on this one widget is
+    /// that the row keeps saying something with no GPU — the tooltip naming
+    /// every core's load. That mitigation has to exist for the trade to be the
+    /// one the PR describes, and as first written it did not: a `PixelSurface`
+    /// given no pixels measures 0x0 (`pixels.rs`'s `render_nothing`), this row
+    /// is `halign: Center` over its child, and a tooltip armed on a widget with
+    /// a degenerate rect has a hover target of exactly one point —
+    /// `graphene_rect_contains_point` is inclusive, so the origin picks and
+    /// every neighbouring coordinate falls through to the container.
+    ///
+    /// Driven through the **production** placeholder path — the same
+    /// `core_panel_footprint`/`blank_len` pair and the same transparent buffer
+    /// the apply closure writes — rather than a hand-set size, so the thing
+    /// measured is the thing that ships.
+    ///
+    /// Two assertions, and they catch different halves. The **area** one is
+    /// what a 0x0 placeholder fails, and it would fail even with the tooltip
+    /// correctly armed. The **pick** one is what a tooltip armed on the child
+    /// alone fails once the child has no area: GTK's tooltip query walks up
+    /// from the picked widget, so the assertion is that *something on that
+    /// walk* carries the text.
+    ///
+    /// **Falsified** two ways, both measured: give the placeholder
+    /// `set_pixels(0, 0, &[])` back and the area assertion reds at `0x0`; move
+    /// the `set_tooltip_text` from the row back onto the child and the pick
+    /// assertion reds, because the picked widget is the surface and nothing
+    /// above it carries a tooltip.
+    #[gtk::test]
+    fn the_placeholder_row_keeps_a_hoverable_tooltip() {
+        adw::init().expect("libadwaita init");
+        let row = core_panel_row();
+        let panel = core_panel_surface();
+        let matrix = hytte_preem::LedMatrix::wide(hytte_preem::DisplayStyle::Vfd, 64);
+        let scale = core_panel_scale(matrix.width(), matrix.height());
+        let (width, height) = core_panel_footprint(&matrix, scale);
+        panel.set_scale(1);
+        panel.set_pixels(width, height, &vec![0_u8; blank_len(width, height)]);
+        row.append(&panel);
+        row.set_tooltip_text(Some("cpu0 12% | cpu1 40%"));
+
+        let window = gtk::Window::new();
+        window.set_default_size(300, 80);
+        window.set_child(Some(&row));
+        window.present();
+        while gtk::glib::MainContext::default().iteration(false) {}
+
+        let (w, h) = (row.width(), row.height());
+        assert!(
+            w > 0 && h > 0,
+            "the placeholder row has no area to hover at all: {w}x{h} — the tooltip is the one \
+             thing this panel can still say with no GPU, and a 0x0 row makes it unreachable",
+        );
+        // 10 px inside the row's own origin rather than its centre: the centre
+        // would still pass if the placeholder collapsed and only the row's CSS
+        // padding survived, and the claim is about the panel's footprint.
+        let hit = window
+            .pick(f64::from(w / 2), f64::from(h / 2), gtk::PickFlags::DEFAULT)
+            .expect("something under the row");
+        assert!(
+            std::iter::successors(Some(hit), WidgetExt::parent)
+                .any(|widget| widget.tooltip_text().is_some()),
+            "nothing on the hover path from inside the row carries the per-core tooltip — the \
+             one thing #1157 promised the panel could still say",
+        );
     }
 
     /// **Both #702 assertions against the surface the row actually holds**

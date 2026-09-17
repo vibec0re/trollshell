@@ -284,8 +284,14 @@ thread_local! {
     /// as each surface asks for itself. The one case it over-reaches is a
     /// genuinely grid-dependent refusal (an allocation the driver will not
     /// make at a large grid), where a small chip loses the GPU for a refusal
-    /// that was not about it — and a kit chip is a far better outcome there
-    /// than a blank one.
+    /// that was not about it. That used to cost it a kit render and costs it
+    /// its picture since #1157, which is a real worsening of the over-reach
+    /// and **still** the right side of the trade: the alternative is asking a
+    /// driver that has already refused this source once per surface per
+    /// re-parent, and a chip that flickers between blank and drawn diagnoses
+    /// nothing. If that case is ever actually observed the fix is to key this
+    /// record by `(grid, program)`, the way `hytte-ui`'s per-surface latch
+    /// already does — not to widen it.
     ///
     /// Thread-local, like every other latch this module and `hytte-ui` keep:
     /// the GTK main thread is the only one that builds renderers, and a

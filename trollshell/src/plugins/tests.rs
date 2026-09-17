@@ -3862,7 +3862,7 @@ fn a_pitch_change_rebuilds_the_instance() {
 // (`docs/live-verify.md`).
 
 /// Map `node` and take the GL surface out of it, asserting the invariants every
-/// `Node::GlSurface` must satisfy — the mirror of [`mapped_frame`] for the GPU
+/// `Node::GlSurface` must satisfy — [`mapped_state`]'s stricter sibling for the
 /// arm.
 fn mapped_gl(
     scope: &Scope,
@@ -3918,29 +3918,26 @@ fn gl_scope_widget(samples: Vec<f32>) -> vocab::PreemWidget {
     }
 }
 
-/// The GL arm emits a `GlSurface` node the CPU arm would have sized
-/// **identically** — `cols * scale` × `rows * scale`, exactly what
-/// `Frame::upscale` produces — so flipping the kill switch changes no layout.
+/// The `Scope` emits a `GlSurface` node at `cols * scale` × `rows * scale` —
+/// exactly the buffer `Frame::upscale` would have produced — carrying the
+/// batch, the step counters and the resolved palette.
 ///
-/// That is not cosmetic: the two nodes are different `NodeKind`s under the same
-/// id, so a flip rebuilds the widget, and a rebuild that also resized would
-/// reflow the whole card.
+/// The size is asserted against the **literal**, which is what makes it an
+/// assertion at all. It was stated as "the same natural size on both arms"
+/// until PR #1356's review (M1): with one arm left, `mapped_state` and
+/// `mapped_gl` are the same `to_ui_node` → `map_widget` path mapped into two
+/// scopes, so the two sides moved together and no mutation of the size mapping
+/// could separate them. The property that paragraph protected — a node-kind
+/// flip must not resize the widget and reflow the card — is real and is what
+/// the literal still pins.
 #[test]
-fn the_gl_arm_emits_a_gl_surface_the_cpu_arm_would_have_sized_identically() {
+fn the_gl_scope_emits_its_own_pipeline_at_the_pre_upscale_grid() {
     let _ink = preem_ink_lock();
     let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0];
     let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
 
-    let cpu = Scope::detached("gl-size-cpu");
-    let (cpu_w, cpu_h, _) = mapped_state(&cpu, &node);
-
     let gl = Scope::detached("gl-size-gl");
     let (gl_w, gl_h, uniforms) = mapped_gl(&gl, &node);
-    assert_eq!(
-        (gl_w, gl_h),
-        (cpu_w, cpu_h),
-        "same natural size on both arms"
-    );
     assert_eq!((gl_w, gl_h), (96, 48), "cols * scale by rows * scale");
     assert_eq!(
         uniforms.grid,
@@ -4424,8 +4421,10 @@ fn gl_gauge_widget(target: f32) -> vocab::PreemWidget {
 /// The GL arm emits a `GlSurface` the CPU arm would have sized **identically**,
 /// naming the gauge's own pipeline, with the **native** buffer as its grid.
 ///
-/// The size agreement is the same layout argument the scope's version makes: a
-/// kill-switch flip is a node-kind change, so it rebuilds the widget, and a
+/// The size is asserted against the **literal** rather than against the
+/// other arm (PR #1356 review, M1): with one arm left the cross-arm
+/// comparison was `x == x`. The layout property it protected is real and is
+/// what the literal pins — a node-kind flip rebuilds the widget, and a
 /// rebuild that also resized would reflow the whole card.
 ///
 /// The *grid* is where the two kinds deliberately differ, and it is the whole of
@@ -4440,16 +4439,8 @@ fn the_gl_gauge_emits_its_own_pipeline_at_the_native_grid() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("gg"), gl_gauge_widget(0.7));
 
-    let cpu = Scope::detached("gauge-gl-size-cpu");
-    let (cpu_w, cpu_h, _) = mapped_state(&cpu, &node);
-
     let gl = Scope::detached("gauge-gl-size-gl");
     let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::GAUGE);
-    assert_eq!(
-        (gl_w, gl_h),
-        (cpu_w, cpu_h),
-        "same natural size on both arms",
-    );
     assert_eq!((gl_w, gl_h), (144, 64), "cols * scale by rows * scale");
     assert_eq!(
         uniforms.grid,
@@ -4516,11 +4507,11 @@ fn a_gauge_animates_through_its_swing_and_then_parks() {
     );
 }
 
-/// A `Gauge` whose GL context fails is rebuilt onto the kit **by the hook**,
+/// A `Gauge` whose GL context fails is taken to the placeholder **by the hook**,
 /// without waiting for a mapping pass — the `Scope`'s
 /// `a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes`
-/// contract, and the reason `rebuild_gl_renderers_on_cpu` had to stop naming
-/// one renderer variant (#1143).
+/// contract, and the reason `rebuild_gl_renderers_as_placeholders` had to stop
+/// naming one renderer variant (#1143).
 ///
 /// A **settled** gauge is the case that needs it: a needle already on its
 /// target answers `animates()` with `false`, #926's clock parks, `apply`'s
@@ -4596,8 +4587,10 @@ fn gl_dot_matrix_widget(text: &str) -> vocab::PreemWidget {
 /// naming the dot matrix's own pipeline, carrying the glyph strip, and counting
 /// no steps.
 ///
-/// The size agreement is the layout argument the other two kinds make: a
-/// kill-switch flip is a node-kind change, so it rebuilds the widget, and a
+/// The size is asserted against the **literal** rather than against the
+/// other arm (PR #1356 review, M1): with one arm left the cross-arm
+/// comparison was `x == x`. The layout property it protected is real and is
+/// what the literal pins — a node-kind flip rebuilds the widget, and a
 /// rebuild that also resized would reflow the whole card.
 ///
 /// Unlike the gauge, the grid here is trivially native — there is no `scale` on
@@ -4612,16 +4605,8 @@ fn the_gl_dot_matrix_emits_its_own_pipeline_with_the_glyph_strip() {
     let _ink = preem_ink_lock();
     let node = preem_node(Some("dm"), gl_dot_matrix_widget("PREEM"));
 
-    let cpu = Scope::detached("dot-matrix-gl-size-cpu");
-    let (cpu_w, cpu_h, _) = mapped_state(&cpu, &node);
-
     let gl = Scope::detached("dot-matrix-gl-size-gl");
     let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::DOT_MATRIX);
-    assert_eq!(
-        (gl_w, gl_h),
-        (cpu_w, cpu_h),
-        "same natural size on both arms",
-    );
     // `2*pad + n*6*dot - dot` by `9*dot`, at five characters and pitch 4.
     assert_eq!((gl_w, gl_h), (124, 36));
     assert_eq!(
@@ -4720,7 +4705,7 @@ fn a_new_line_re_encodes_the_glyph_strip() {
     );
 }
 
-/// A `DotMatrix` whose GL context fails is rebuilt onto the kit **by the hook**,
+/// A `DotMatrix` whose GL context fails is taken to the placeholder **by the hook**,
 /// without waiting for a mapping pass.
 ///
 /// This kind is the strongest case for the hook of the three: a gauge at least
@@ -9273,7 +9258,7 @@ mod text_kinds_gl {
     use super::super::preem_render::{self, Scope};
     use super::super::shader_map::Grants;
     use super::super::wire_map::to_ui_node;
-    use super::{assert_placeholder, mapped_gl_for, mapped_state, preem_ink_lock, preem_node};
+    use super::{assert_placeholder, mapped_gl_for, preem_ink_lock, preem_node};
 
     /// The message every ticker case shows: long enough to overflow a 96 px
     /// window at the default pitch, so it actually scrolls.
@@ -9339,9 +9324,11 @@ mod text_kinds_gl {
     /// **The GL ticker emits its own pipeline at the kit's own window**, with
     /// one texel per grid column.
     ///
-    /// The size agreement is the layout argument every kind on this seam makes:
-    /// a kill-switch flip is a node-kind change, so it rebuilds the widget, and
-    /// a rebuild that also resized would reflow the whole card.
+    /// The size is asserted against the **literal** rather than against the
+    /// other arm (PR #1356 review, M1): with one arm left the cross-arm
+    /// comparison was `x == x`. The layout property it protected is real and is
+    /// what the literal pins — a node-kind flip rebuilds the widget, and a
+    /// rebuild that also resized would reflow the whole card.
     ///
     /// The strip length is what separates this arm from the dot matrix's: a
     /// ticker uploads the **visible grid**, `cols` texels, not `5 × chars` —
@@ -9355,16 +9342,8 @@ mod text_kinds_gl {
         let _ink = preem_ink_lock();
         let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
 
-        let cpu = Scope::detached("marquee-gl-size-cpu");
-        let (cpu_w, cpu_h, _) = mapped_state(&cpu, &node);
-
         let gl = Scope::detached("marquee-gl-size-gl");
         let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::MARQUEE);
-        assert_eq!(
-            (gl_w, gl_h),
-            (cpu_w, cpu_h),
-            "same natural size on both arms",
-        );
         // The window as asked for, by `9*dot`.
         assert_eq!((gl_w, gl_h), (96, 36));
         assert_eq!(uniforms.grid, (96, 36));
@@ -9403,16 +9382,8 @@ mod text_kinds_gl {
         let _ink = preem_ink_lock();
         let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
 
-        let cpu = Scope::detached("textbox-gl-size-cpu");
-        let (cpu_w, cpu_h, _) = mapped_state(&cpu, &node);
-
         let gl = Scope::detached("textbox-gl-size-gl");
         let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::TEXTBOX);
-        assert_eq!(
-            (gl_w, gl_h),
-            (cpu_w, cpu_h),
-            "same natural size on both arms",
-        );
         assert_eq!(uniforms.grid, (gl_w, gl_h));
         let layout = kit_box().layout("mrrp mrrp");
         assert_eq!(
@@ -10744,7 +10715,8 @@ mod containment_r2 {
 ///   (`preem_gl::mod::install` loops over it and `Kind::gl_seam`), so there is
 ///   nothing left here to test — a variant missing from `Kind::gl_seam`'s
 ///   `match` fails to compile.
-/// - `matches_kind`/`is_gl`/`invalidate_cached_frames` are now exhaustive
+/// - `matches_kind`/`gl_program`/`gl_surface`/`invalidate_cached_frames` are
+///   now exhaustive
 ///   `match`es over `Renderer` with no catch-all (`preem_render.rs`), so a
 ///   Renderer variant added without an arm there fails to compile too —
 ///   again nothing left to test here.

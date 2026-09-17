@@ -2839,8 +2839,10 @@ session.
      rather than wrong**: the bar keeps its chip boxes and its CSS chrome, no
      chip draws a stale or garbled frame, and
      `journalctl --user -u trollshell | grep -i 'GL context\|preem GL pipeline'`
-     names the cause exactly once. Nothing else in the shell may go with it —
-     the clock, the icons and every non-preem widget must be untouched.
+     names the cause exactly once — and names it _correctly_: the line must
+     offer a restart rather than a CPU fallback (PR #1356 review, H1). Nothing
+     else in the shell may go with it — the clock, the icons and every
+     non-preem widget must be untouched.
   3. **A bar's worth of scopes.**
      `cargo run -p hytte-ui --example gl_probe -- --layer --areas 8` (stage A's
      probe, on layer-shell): **jank 0**, and p95 within 0.5 ms of the 16.67 ms
@@ -3554,7 +3556,13 @@ session.
      - the Stats drawer's "Blinken Lichten" row is an empty row whose tooltip
        still names every core's load;
      - `journalctl --user -u trollshell | grep -i 'GL context'` carries the
-       context failure **once**, and nothing repeats it per chip per frame;
+       context failure **once**, and nothing repeats it per chip per frame.
+       Read the line, do not just count it: since PR #1356's review (H1) it
+       says no `GlSurface` will draw again this session, that the host shows
+       the broken-widget placeholder, and that a **restart** is the remedy. If
+       it still offers to fall back to "the CPU renderer", the binary predates
+       that fix and everything below it is being read against the wrong
+       expectation — `hytte-ui`'s `CONTEXT_FAILURE_MESSAGE` is the string;
      - everything that is not a preem widget is untouched: the clock, the
        icons, the labels, every panel.
 

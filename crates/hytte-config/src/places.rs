@@ -1211,6 +1211,19 @@ pub fn render_places(existing: &str, places: &[Place]) -> Result<String, PlacesE
         (Vec::new(), Vec::new())
     };
 
+    // This array's OWN document positions from the parse of `existing`,
+    // ascending by construction (`tables` is in file order, and every
+    // `[[place]]` header bumps the same document-wide counter `toml_edit`
+    // orders top-level tables by — see `space_tables`). `None` for any
+    // element (shouldn't happen for a freshly parsed table, but a writer
+    // guards it) falls back to the empty list, i.e. "no reusable positions",
+    // same as the `tables`/`parsed` length-mismatch arm above.
+    let orig_positions: Vec<isize> = tables
+        .iter()
+        .map(toml_edit::Table::position)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+
     let source = align(&parsed, places);
     let mut array = toml_edit::ArrayOfTables::new();
     for (want, from) in places.iter().zip(&source) {
@@ -1223,7 +1236,7 @@ pub fn render_places(existing: &str, places: &[Place]) -> Result<String, PlacesE
             None => array.push(new_table(want)),
         }
     }
-    space_tables(&mut array, &source);
+    space_tables(&mut array, &source, &orig_positions);
     doc.as_table_mut()
         .insert("place", toml_edit::Item::ArrayOfTables(array));
     put_header(&mut doc, &header);
@@ -1420,9 +1433,55 @@ fn same_f64(a: f64, b: f64) -> bool {
 ///
 /// A table that stayed put keeps its own spacing untouched, so the common case
 /// — editing one entry in place — changes nothing but the value.
-fn space_tables(array: &mut toml_edit::ArrayOfTables, source: &[Option<usize>]) {
+///
+/// # Positions are reused, never invented (#1339)
+///
+/// `toml_edit::Table::position` is a *document-wide* counter — every top-level
+/// header, `[[place]]` or not, bumps the same one at parse time — not an
+/// index into this one array. The previous version of this function restated
+/// every rebuilt table's position as its own index in `array` (`0, 1, 2, …`),
+/// which only ever coincided with the real document order when nothing else
+/// in the file had a lower position than the array's first entry. A
+/// standalone table declared *above* `[[place]]` (a hand-written
+/// `[departures]`, say) parses with a lower position than the array's own —
+/// forcing the array back down to `0` put it below that table's position on
+/// every single save, one `[[place]]` block further each time (#1339): a
+/// `[departures]`-first file never settles into a fixed shape, it just walks.
+///
+/// `orig_positions` is this array's own positions from the parse that
+/// produced `existing` (`render_places`'s `tables`, in file order — already
+/// ascending, since each of its headers bumped the same counter in that
+/// order). A rebuilt entry that reuses an original table (`source[j] =
+/// Some(_)`) is handed the next-smallest of those, in *this* call's — i.e.
+/// the new — order: a save that reorders nothing hands every entry back
+/// exactly its own original position (a byte-for-byte no-op), and an actual
+/// reorder (see `reordering_rewrites_the_order_and_keeps_each_block_intact`)
+/// permutes who gets which slot, which is the "restate the positions" the
+/// first doc comment above describes — but the *set* of slots is always the
+/// array's own, so it never encroaches on a sibling table's position.
+///
+/// A brand-new entry (`None` — nothing to reuse) has no original slot of its
+/// own, so it borrows its nearest already-assigned neighbour: the previous
+/// entry's position in the new order, or, for a new entry with no earlier
+/// neighbour yet (it leads the array), the next reused position still
+/// waiting to be claimed. Two tables sharing one position value is fine —
+/// `toml_edit` breaks the tie by where each sits within this same array (push
+/// order), which is already this call's final order. With no original
+/// positions at all (every entry is brand new — a freshly created array, or
+/// the `tables`/`parsed` length mismatch above), nothing is set and the whole
+/// array falls back to wherever the `place` key already sits among its
+/// siblings, `toml_edit`'s own carry-forward — the same placement an
+/// all-fresh document has always had.
+fn space_tables(
+    array: &mut toml_edit::ArrayOfTables,
+    source: &[Option<usize>],
+    orig_positions: &[isize],
+) {
+    let mut next_reused = 0usize;
+    let mut last_position: Option<isize> = None;
     for (j, table) in array.iter_mut().enumerate() {
-        let stayed = source.get(j).copied().flatten() == Some(j);
+        let matched = source.get(j).copied().flatten();
+        let stayed = matched == Some(j);
         if j == 0 {
             if !stayed {
                 table.decor_mut().set_prefix("");
@@ -1430,7 +1489,18 @@ fn space_tables(array: &mut toml_edit::ArrayOfTables, source: &[Option<usize>]) 
         } else if decor_prefix(table.decor()).is_empty() {
             table.decor_mut().set_prefix("\n");
         }
-        table.set_position(Some(isize::try_from(j).unwrap_or(isize::MAX)));
+
+        let position = if matched.is_some() {
+            let pos = orig_positions.get(next_reused).copied();
+            next_reused += 1;
+            pos
+        } else {
+            last_position.or_else(|| orig_positions.get(next_reused).copied())
+        };
+        if let Some(pos) = position {
+            last_position = Some(pos);
+            table.set_position(Some(pos));
+        }
     }
 }
 

@@ -241,6 +241,33 @@ inline in `flake.nix` as one-liners.
   build's own output carries them. No new closure inputs — it runs through
   the same `mesa`/`xvfb-run` the GL tests already pulled in.
 
+Since #1231 the workflow (`.github/workflows/nix-flake-check.yml`) does not
+run `nix flake check` itself any more. Five of the checks above are each a
+full workspace compile (`packages.trollshell`'s release build off the bin-only
+deps cache; `workspace-tests`, `system-tests`, `clippy` and `rustdoc` off the
+dev-graph one), and running three of them concurrently on one 4-core runner
+made the wall time their _sum_ — 51, 73 and 86+ min against the 75-minute
+bound #1012 sized and #1230 had to raise. So each heavy check now
+`nix build`s on its own runner: `packages` (every shipped binary is a slice
+of the one `workspace` compile, so one job builds all 19 plus
+`shell-has-no-web-engine` and `workspace-ships-no-probes`), `workspace-tests`,
+`system-tests`, `clippy`, `rustdoc`, and `nixos-tests` (both VMs in one job —
+they share the single `probes` compile, which is the cost; the VMs themselves
+are ~2 min each). Everything else — treefmt, the five source scans,
+`options-doc`, the 26 module evals — is one `cheap` job. **The required check
+is the aggregate job named `flake-check`**, which `needs:` every job above and
+is red if any failed, was cancelled or was skipped; that name is what branch
+protection and the merge poller read, so it does not move. A step in the
+`cheap` job guards the layout against rot: it diffs `nix flake show`'s check
+list against every `checks.<system>.<name>` installable the workflow actually
+builds and fails on any difference in either direction — so a new check nobody
+adds to a job cannot silently go untested — and since that command forces
+every output leaf on both systems it doubles as the whole-flake eval sweep
+`nix flake check` used to give. What the split costs is CPU, not wall time:
+runners share no Nix store, so each job compiles the deps closure it needs
+rather than one run compiling it once (#1268). A cross-run binary cache
+(#1231 item 2) is what turns those into hits, and it needs a token.
+
 ### Lint — strict, treat as the gate
 
 The workspace lint config (`Cargo.toml`) is deliberately severe; a violation fails `cargo check`, not just clippy:

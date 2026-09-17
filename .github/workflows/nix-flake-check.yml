@@ -14,51 +14,170 @@ on:
 # *holder* on every push because a deploy is idempotent and ~30s (#1326);
 # this one lets main's own run finish because it is the audit, not a
 # side effect of the push that triggered it.
+#
+# The group is the whole workflow, so one cancel takes every job below with
+# it — which is why the aggregate job treats `cancelled` as red rather than
+# letting a cancelled required check read as anything but a verdict.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# WHY THIS IS NOT ONE `nix flake check` ANY MORE (#1231 item 1)
+#
+# It was, until 2026-09-17, and the shape of that run was the problem
+# (#1231, measured off run 34750265932's timestamps): three *full workspace
+# compiles* — the release build behind `packages.trollshell`, the
+# `system-tests` bucket, and the hermetic `workspace-tests` suite — ran
+# concurrently on one 4-core `ubuntu-latest` VM with ~7 GB, from the same
+# deps closure. They contend for cores and memory (`kswapd0` had 23 s of CPU
+# at one kill), so the wall time was the *sum*: 51, 73 and 86+ min against
+# the 35-52 min band #1012's bound was sized to, and #1230 had to raise the
+# bound so the slow tail stopped reading as red.
+#
+# So each heavy check gets its own runner now, `nix build`ing exactly the
+# derivations it owns. Wall time is max(job) instead of the sum, a hang is
+# attributable to one check instead of one 86-minute log, and a red names
+# its check in the job title.
+#
+# What this costs, honestly: runners do not share a Nix store, so the deps
+# stage each job needs (`trollshell-deps` for the four cargo checks and the
+# probe examples, `trollshell-workspace-bin-deps` for the package slices —
+# two caches on purpose, #1268/#1115) is compiled once *per job* rather than
+# once per run.
+# That is CPU, not wall time, and it is what #1231 item 2 (a cross-run
+# binary cache — Cachix or the Actions cache, needs a token from Annika)
+# turns into a cache hit on every run whose `Cargo.lock` has not moved.
+# Until then the duplication is the price of the parallelism, deliberately.
+#
+# THE REQUIRED CHECK IS THE `flake-check` JOB AT THE BOTTOM. Branch
+# protection and the local merge poller both key on a check run named
+# exactly `flake-check` being `completed/success`, so that name and that
+# semantics do not move: it `needs:` every job here and goes red if any of
+# them failed, was cancelled, or was skipped.
 jobs:
-  flake-check:
+  # One job per heavy check. A matrix rather than N copy-pasted jobs so the
+  # #1011 forensics below are written once and every leg gets them; `name:`
+  # is the matrix entry's own, so the check run reads `packages` /
+  # `system-tests` / … and not `heavy (1)`.
+  heavy:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # Bounded on purpose (#1011): three times now `nix flake check` has gone
-    # silent after its last derivation finished — every check green, then
-    # nothing — and the third time nobody cancelled it, so GitHub's default
-    # 360-minute limit did, six hours later, leaving main without a verdict
-    # for two days. The measured band for a full run was 35-52 min when this
-    # was written; on 2026-09-13 it is 51-86 min (three full workspace
-    # compiles — release, workspace-tests, system-tests — run concurrently on
-    # the 4-core runner from the same deps closure, and the doctest tail of
-    # workspace-tests now lands after the 75-minute mark on a slow VM), so
-    # 120 is
-    # headroom, not a squeeze.
-    timeout-minutes: 120
+    # Bounded per job on the #1012/#1230 precedent, scaled to what one job
+    # now does: at most ONE full workspace compile plus its deps stage,
+    # measured at 44-59 min while three of them were contending for the same
+    # four cores. The old 105-min inner bound covered all three at once, so
+    # these are not a squeeze — and the point of the bound is unchanged
+    # (#1011): three times `nix flake check` went silent after its last
+    # derivation finished, and the third time GitHub's default 360-minute
+    # limit was what eventually killed it, two days late.
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # Never cancel the siblings: a red in one check must not turn the
+      # other five into `cancelled`, which is the whole point of splitting
+      # them up — and `cancelled` is red at the aggregate.
+      fail-fast: false
+      matrix:
+        include:
+          # Every shipped binary is a *slice* of the one `workspace` crane
+          # compile (#587/#572 — see CLAUDE.md "Packaging"), so building all
+          # 19 of them plus the two closure/derivation assertions that read
+          # that same output costs exactly one compile. Splitting them
+          # further would buy nothing and pay for the compile twice.
+          - name: packages
+            timeout: 105
+            soft: 90
+            checks: >-
+              .#checks.x86_64-linux.trollshell
+              .#checks.x86_64-linux.trollshell-control-center
+              .#checks.x86_64-linux.trollshell-agent-window
+              .#checks.x86_64-linux.hytte-claude-bridge
+              .#checks.x86_64-linux.hytte-infobroker
+              .#checks.x86_64-linux.hytte-plugin-agents
+              .#checks.x86_64-linux.hytte-plugin-audio-widget
+              .#checks.x86_64-linux.hytte-plugin-bar-clock-demo
+              .#checks.x86_64-linux.hytte-plugin-caw
+              .#checks.x86_64-linux.hytte-plugin-clock-demo
+              .#checks.x86_64-linux.hytte-plugin-departures
+              .#checks.x86_64-linux.hytte-plugin-infobroker
+              .#checks.x86_64-linux.hytte-plugin-niri-layouts
+              .#checks.x86_64-linux.hytte-plugin-pet
+              .#checks.x86_64-linux.hytte-plugin-preem-demo
+              .#checks.x86_64-linux.hytte-plugin-stats
+              .#checks.x86_64-linux.hytte-plugin-terminal
+              .#checks.x86_64-linux.hytte-plugin-timer
+              .#checks.x86_64-linux.hytte-plugin-weather
+              .#checks.x86_64-linux.shell-has-no-web-engine
+              .#checks.x86_64-linux.workspace-ships-no-probes
+          # The hermetic internals suite (#1115): its own `--workspace`
+          # compile off the dev-graph deps cache, and the one whose doctest
+          # tail was landing after the 75-minute mark on a slow VM.
+          - name: workspace-tests
+            timeout: 105
+            soft: 90
+            checks: .#checks.x86_64-linux.workspace-tests
+          # The real-system bucket (#1102): its own compile again, this one
+          # with `--features system-tests`, under xvfb + dbus-daemon +
+          # llvmpipe.
+          - name: system-tests
+            timeout: 105
+            soft: 90
+            checks: .#checks.x86_64-linux.system-tests
+          # `cargo clippy --workspace --all-targets --features system-tests`
+          # is a third full check-compile of the same graph — the lint gate,
+          # not a cheap linter, which is why it is here and not with the
+          # python scripts below.
+          - name: clippy
+            timeout: 105
+            soft: 90
+            checks: .#checks.x86_64-linux.clippy
+          # `cargoDoc` over the workspace (#1328/#1343): same deps cache,
+          # its own compile.
+          - name: rustdoc
+            timeout: 90
+            soft: 75
+            checks: .#checks.x86_64-linux.rustdoc
+          # The two nixosTest VMs share one compile and are therefore one
+          # job: both take their binary out of the SAME `probes` derivation
+          # (nix/package.nix's second crane call, #1257), so running them on
+          # separate runners would compile the probe examples twice to save
+          # ~2 minutes of VM. The VMs themselves are ~2 min each — KVM is
+          # available on the hosted runner and nothing here has to enable
+          # it; the cost is the compile in front of them.
+          - name: nixos-tests
+            timeout: 75
+            soft: 60
+            checks: >-
+              .#checks.x86_64-linux.eds-nixos-test
+              .#checks.x86_64-linux.wifi-nm-nixos-test
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      # Runs everything the flake exposes as a check: treefmt formatting, the
-      # NixOS + home-manager module evals, and the package build (which runs the
-      # hermetic internals test suite via doCheck). No binary cache is wired up,
-      # so the first cold build of the GTK/crane closure is slow — add a Cachix
-      # or FlakeHub cache step here to speed CI up if it becomes a bottleneck.
+      # No binary cache is wired up (#1231 item 2 — it needs a token), so
+      # every job pays its own cold build of the GTK/crane closure.
+      #
       # `timeout` (rather than only `timeout-minutes`) so a hang fails the
-      # step from *inside* the job, where we can still print diagnostics: the
-      # fourth occurrence (2026-09-13, run 34760575142) showed every builder
-      # and both VM test drivers already gone at the 105-minute kill — the
-      # only live nix process was a per-client `nix-daemon` worker sitting in
-      # kernel state `Ds` (uninterruptible sleep) with barely a minute of CPU
-      # time over the whole run, blocked in some post-build syscall a bare
-      # `ps auxf` cannot name. So before the process tree, dump each
-      # `nix-daemon` pid's `/proc` state (stat/wchan/syscall/stack/fd) plus
-      # system pressure (PSI, disk, memory, dmesg) — the evidence that
-      # decides whether it is stuck on fsync of one output, a store-wide
-      # walk, or a sandbox-mount teardown, and thus what the actual fix is
-      # (#1011). 105 min leaves the job-level bound as the backstop for
-      # everything else.
-      - run: |
+      # step from *inside* the job, where we can still print diagnostics:
+      # the fourth occurrence (2026-09-13, run 34760575142) showed every
+      # builder and both VM test drivers already gone at the 105-minute
+      # kill — the only live nix process was a per-client `nix-daemon`
+      # worker sitting in kernel state `Ds` (uninterruptible sleep) with
+      # barely a minute of CPU time over the whole run, blocked in some
+      # post-build syscall a bare `ps auxf` cannot name. So before the
+      # process tree, dump each `nix-daemon` pid's `/proc` state
+      # (stat/wchan/syscall/stack/fd) plus system pressure (PSI, disk,
+      # memory, dmesg) — the evidence that decides whether it is stuck on
+      # fsync of one output, a store-wide walk, or a sandbox-mount
+      # teardown, and thus what the actual fix is (#1011). The job-level
+      # bound above stays the backstop for everything else.
+      - name: nix build
+        env:
+          NAME: ${{ matrix.name }}
+          CHECKS: ${{ matrix.checks }}
+          SOFT: ${{ matrix.soft }}
+        run: |
           # Baseline so the *next* hang has a before/after on disk and memory
           # (#1011) — the runner starts this job carrying the GTK/WebKitGTK/
           # Mesa/QEMU/toolchain closure plus dep caches, and the log has
@@ -133,11 +252,145 @@ jobs:
             cat /proc/loadavg || true
           }
 
-          timeout 105m nix flake check -L || rc=$?
+          # shellcheck disable=SC2086  # $CHECKS is a deliberate list of installables
+          timeout "${SOFT}m" nix build -L --no-link $CHECKS || rc=$?
           if [ "${rc:-0}" = 124 ]; then
-            echo '::error::nix flake check did not exit within 105 min (#1011); process tree follows'
+            echo "::error::${NAME} did not finish within ${SOFT} min (#1011); process tree follows"
             dump_stuck_nix || true
             ps auxf
             exit 1
           fi
           exit "${rc:-0}"
+
+  # Everything that is not a compile: treefmt, the five python source scans
+  # (bind-pins, bridge-socket, config-vocab, glsl, lints-tables), the docs
+  # render, and the 26 module-eval checks (each a `runCommand` over a stub
+  # package, deliberately never forcing a Rust build — flake.nix says why).
+  # All of it together is minutes, so it is one job and one runner.
+  cheap:
+    name: cheap-checks
+    runs-on: ubuntu-latest
+    # No compile here at all; anything approaching this bound is a hang, not
+    # a slow build.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # `nix flake check` itself is still here — it is the *builds* that
+      # moved out to the jobs above, not the evaluation. `--no-build` keeps
+      # everything that never needed a runner-hour: every output leaf on
+      # BOTH systems is forced (so an eval error in something no job builds
+      # — a package, a devShell, the aarch64 instantiation — still fails
+      # here), plus the per-output-type checks nothing else does, including
+      # `checking NixOS module 'nixosModules.default'`. Measured at 37 s
+      # warm / 174 checked outputs. Verified by falsification rather than
+      # assumed: a scratch flake with a `throw` in one unbuilt output exits
+      # 1 naming it.
+      - name: Whole-flake evaluation
+        run: nix flake check --no-build --all-systems
+      # THE GUARD (#1231 item 1). Splitting the *builds* into named `nix
+      # build` invocations trades "everything in `checks` is built" for "a
+      # hand-written list is built", and a list rots silently: a new check
+      # that nobody adds to a job would simply never run, and nothing would
+      # say so — `nix flake check --no-build` above evaluates it but does
+      # not build it. So compare the two sets on every run.
+      #
+      # The covered set is read out of THIS FILE — every
+      # `checks.<system>.<name>` installable any job above actually builds —
+      # rather than from a second hand-maintained list, so it cannot drift
+      # from what the jobs run. Consequence: do not write that spelling in a
+      # comment, or the guard will count the check as covered when nothing
+      # builds it. (The grep pattern below cannot match its own source line:
+      # the bracket-escaped `[.]` and the `${sys}` expansion are literal
+      # characters in the file and match nothing the regex asks for.)
+      - name: Every flake check is claimed by a job
+        run: |
+          sys=x86_64-linux
+          # Scratch files go to the runner's temp dir, not the checkout: the
+          # step after this one builds `.#checks…` out of this very tree.
+          out="${RUNNER_TEMP}"
+          nix flake show --json > "$out/flake-show.json"
+          jq -r --arg s "$sys" '.checks[$s] | keys[]' "$out/flake-show.json" | sort > "$out/declared.txt"
+          grep -ohE "[.]#checks[.]${sys}[.][A-Za-z0-9_.-]+" .github/workflows/nix-flake-check.yml \
+            | sed "s|^[.]#checks[.]${sys}[.]||" | sort -u > "$out/covered.txt"
+          echo "declared in the flake: $(wc -l < "$out/declared.txt"); built by a job: $(wc -l < "$out/covered.txt")"
+          if ! diff -u "$out/declared.txt" "$out/covered.txt"; then
+            echo '::error::the job layout no longer covers the flake checks exactly — a line marked - is a check no job builds (add it to a heavy job, or to the cheap list below), a line marked + names a check that no longer exists (drop it)'
+            exit 1
+          fi
+      - name: Build the cheap checks
+        run: |
+          nix build -L --no-link \
+            .#checks.x86_64-linux.formatting \
+            .#checks.x86_64-linux.options-doc \
+            .#checks.x86_64-linux.bind-pins \
+            .#checks.x86_64-linux.bridge-socket \
+            .#checks.x86_64-linux.config-vocab \
+            .#checks.x86_64-linux.glsl \
+            .#checks.x86_64-linux.lints-tables \
+            .#checks.x86_64-linux.hm-module \
+            .#checks.x86_64-linux.hm-module-agents-fixture \
+            .#checks.x86_64-linux.hm-module-claude-bridge-api \
+            .#checks.x86_64-linux.hm-module-core-leds \
+            .#checks.x86_64-linux.hm-module-core-leds-composes-with-xdg-systemdirs \
+            .#checks.x86_64-linux.hm-module-places-fixture \
+            .#checks.x86_64-linux.hm-module-plugin-id \
+            .#checks.x86_64-linux.hm-module-plugin-id-conflict-unconditional \
+            .#checks.x86_64-linux.hm-module-plugin-mount \
+            .#checks.x86_64-linux.hm-module-plugin-target-default \
+            .#checks.x86_64-linux.modules-agents-absent-when-unset \
+            .#checks.x86_64-linux.modules-places-absent-when-unset \
+            .#checks.x86_64-linux.nixos-module \
+            .#checks.x86_64-linux.nixos-module-agents-display-dotted-name \
+            .#checks.x86_64-linux.nixos-module-agents-fixture \
+            .#checks.x86_64-linux.nixos-module-agents-relative-socket \
+            .#checks.x86_64-linux.nixos-module-core-leds \
+            .#checks.x86_64-linux.nixos-module-core-leds-unknown-key \
+            .#checks.x86_64-linux.nixos-module-nightlight \
+            .#checks.x86_64-linux.nixos-module-places-fixture \
+            .#checks.x86_64-linux.nixos-module-plugin-id \
+            .#checks.x86_64-linux.nixos-module-plugin-id-conflict \
+            .#checks.x86_64-linux.nixos-module-plugin-id-conflict-unconditional \
+            .#checks.x86_64-linux.nixos-module-plugin-mount \
+            .#checks.x86_64-linux.nixos-module-plugin-mount-conflict \
+            .#checks.x86_64-linux.nixos-module-plugin-removed-1200
+
+  # The required check. Branch protection and the merge poller read a check
+  # run named exactly `flake-check` and require `completed/success`, so this
+  # job's name is load-bearing: it is the one thing about this workflow that
+  # the outside world knows.
+  #
+  # `if: always()` rather than the default, so a cancelled run still produces
+  # a verdict: a skipped required check is treated as satisfied by branch
+  # protection, which would be a false green. Anything that is not `success`
+  # — `failure`, `cancelled`, `skipped` — is red here.
+  flake-check:
+    name: flake-check
+    runs-on: ubuntu-latest
+    needs:
+      - heavy
+      - cheap
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Every job must have succeeded
+        env:
+          # For a matrix job this is the aggregate of every leg: `failure`
+          # if any leg failed, `cancelled` if any was cancelled.
+          HEAVY: ${{ needs.heavy.result }}
+          CHEAP: ${{ needs.cheap.result }}
+        run: |
+          echo "heavy=${HEAVY} cheap=${CHEAP}"
+          rc=0
+          for result in "${HEAVY}" "${CHEAP}"; do
+            if [ "${result}" != success ]; then
+              rc=1
+            fi
+          done
+          if [ "${rc}" -ne 0 ]; then
+            echo '::error::at least one flake check job did not succeed (see the job list above; cancelled and skipped are red here on purpose)'
+          fi
+          exit "${rc}"

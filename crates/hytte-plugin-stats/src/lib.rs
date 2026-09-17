@@ -16,12 +16,12 @@
 //! - [`plugin::settings_from`] — this instance's effective mount
 //!   (`hytte_plugin::effective_mount_from`, graduated into the SDK by #1317)
 //!   decides which of the two tables above it reads.
-//! - [`sample`] — the `/proc` and `/sys` reads (through `hytte-sensors`, the
+//! - `sample` — the `/proc` and `/sys` reads (through `hytte-sensors`, the
 //!   shell's own samplers) and the visibility-gated task that drives them.
-//! - [`card`] — the geometry, the per-core lamp ramp, the sidebar card and the
+//! - `card` — the geometry, the per-core lamp ramp, the sidebar card and the
 //!   bar chips.
-//! - [`panel`] — the drawer page a chip click opens (#1251).
-//! - [`mod@format`] — the byte and `used / total` strings the native Stats page
+//! - `panel` — the drawer page a chip click opens (#1251).
+//! - `format` — the byte and `used / total` strings the native Stats page
 //!   prints, mirrored.
 //! - [`plugin`] — the TEA core: manifest, `update`, `view`.
 //!
@@ -59,9 +59,15 @@
 //! The split is `hytte-plugin-agents`' exactly: everything is here, and
 //! `main.rs` is the subscriber plus one call into the SDK.
 
-pub mod card;
+// Only what a *consumer* of this library needs is public: `config` for #888
+// P1's settings form, `plugin` for the binary beside this file. The four
+// rendering modules stay crate-private, which is exactly what they were while
+// this crate was bin-only — publishing them would export a plugin's internal
+// geometry as API, and rustdoc would then (rightly) complain about every doc
+// link they make to a private helper.
+mod card;
 pub mod config;
-pub mod format;
-pub mod panel;
+mod format;
+mod panel;
 pub mod plugin;
-pub mod sample;
+mod sample;

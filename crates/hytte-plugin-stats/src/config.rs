@@ -102,7 +102,7 @@ const SECONDS: &str = "a whole number of seconds, 1..=60";
 /// an operator sees when they first open their overlay, and it is parsed on
 /// every load — so a syntax error in it fails any test that loads the
 /// subsystem rather than surfacing in production.
-const DEFAULT_TOML: &str = r#"# trollshell — system stats as a plugin (issue #1250, epic #1248).
+pub const DEFAULT_TOML: &str = r#"# trollshell — system stats as a plugin (issue #1250, epic #1248).
 #
 # ONE file, TWO instances. The same binary can run twice — the full thing in
 # the top bar, a compact CPU + GPU card in the right sidebar — and each launch

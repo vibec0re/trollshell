@@ -66,7 +66,7 @@ pub const MAX_POLL_SECONDS: u64 = 3600;
 /// an operator sees when they first open their overlay, and it is parsed on
 /// every load — so a syntax error in it fails any test that loads the
 /// subsystem rather than surfacing in production.
-const DEFAULT_TOML: &str = r#"# trollshell — the hyperhive agents sidebar (issue #947).
+pub const DEFAULT_TOML: &str = r#"# trollshell — the hyperhive agents sidebar (issue #947).
 #
 # This file is the WHOLE desktop-side surface. Everything about a cage lives
 # in the hive; everything inside a cage lives in that agent's own config

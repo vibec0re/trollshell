@@ -244,6 +244,20 @@ struct PluginRow {
     status: gtk::Label,
 }
 
+/// One plugin's config form, mounted in the detail pane (#888 P1).
+///
+/// Which family a plugin owns is decided by the **binary** its unit runs, so
+/// the mounted form is keyed by the plugin id it was built for and rebuilt
+/// only when the selection moves to a plugin with a different one. Dropping
+/// it stops the form's own re-read poll.
+struct MountedForm {
+    /// The plugin id this form was built for.
+    plugin: String,
+    /// The form. Its groups are in [`PluginDetail::plugin_page`] until this
+    /// is dropped.
+    form: crate::config_form::Form,
+}
+
 /// The detail pane's live widgets. Built once and retargeted at the selected
 /// plugin — see the module docs on why there is exactly one of these.
 #[derive(Clone)]
@@ -251,8 +265,16 @@ struct PluginDetail {
     /// The content `AdwNavigationPage`; its title is the selected plugin's id,
     /// which is also what the collapsed push shows in the header.
     page: adw::NavigationPage,
-    /// `"empty"` (nothing selected) ⇄ `"plugin"` (the controls).
+    /// `"empty"` (nothing selected) ⇄ `"plugin"` (the controls) ⇄ `"shell"`
+    /// (the shell-owned config families, #888 P1).
     stack: gtk::Stack,
+    /// The plugin page itself, so a *Configuration* group can be added to and
+    /// removed from it as the selection moves (#888 P1).
+    plugin_page: adw::PreferencesPage,
+    /// The selected plugin's config form, when its binary owns a family.
+    /// `None` for a plugin with no config file of its own — which is most of
+    /// them.
+    config: Rc<RefCell<Option<MountedForm>>>,
     /// The relocated on/off control: start+enable, or stop+disable.
     switch: adw::SwitchRow,
     /// The unit's own state — [`plugin_subtitle`]'s wording, unchanged.
@@ -393,6 +415,31 @@ struct PluginsState {
     split: adw::NavigationSplitView,
     /// The sidebar list.
     list: gtk::ListBox,
+    /// The pinned **Shell** entry above it (#888 P1): the config families the
+    /// shell itself owns (`core-leds`, `workspaces`), which have no plugin to
+    /// hang off.
+    ///
+    /// A second `GtkListBox` rather than a row in [`list`](Self::list): that
+    /// list is torn down and rebuilt on every membership change and replaced
+    /// wholesale by a placeholder when the shell is unreachable, and the one
+    /// thing this entry must do is keep working while the shell is down —
+    /// it edits files, exactly as the Places tab does. Selection is
+    /// coordinated by hand (each list deselects the other), which is what
+    /// [`shell_selected`](Self::shell_selected) is for.
+    shell_list: gtk::ListBox,
+    /// Whether the **Shell** entry is what the detail pane is showing.
+    ///
+    /// Not folded into [`selected`](Self::selected): that field is a *plugin
+    /// id*, every path that reads it means "which plugin", and widening it to
+    /// an enum would touch every one of them for a page that is not a plugin
+    /// at all.
+    shell_selected: Rc<Cell<bool>>,
+    /// The shell-owned families' forms, built once with the tab.
+    ///
+    /// Held for their lifetime, not their widgets': dropping a
+    /// `config_form::Form` is what stops its re-read poll, and these live as
+    /// long as the tab does.
+    shell_forms: Rc<Vec<crate::config_form::Form>>,
     /// The one detail pane.
     detail: PluginDetail,
     /// Every child currently in [`list`](Self::list) (plugin rows or a single
@@ -493,6 +540,9 @@ struct PluginsState {
 struct WeakPluginsState {
     split: glib::WeakRef<adw::NavigationSplitView>,
     list: glib::WeakRef<gtk::ListBox>,
+    shell_list: glib::WeakRef<gtk::ListBox>,
+    shell_selected: Rc<Cell<bool>>,
+    shell_forms: Rc<Vec<crate::config_form::Form>>,
     detail: WeakPluginDetail,
     rows: Rc<RefCell<Vec<gtk::Widget>>>,
     by_id: Rc<RefCell<HashMap<String, PluginRow>>>,
@@ -515,6 +565,13 @@ struct WeakPluginsState {
 struct WeakPluginDetail {
     page: glib::WeakRef<adw::NavigationPage>,
     stack: glib::WeakRef<gtk::Stack>,
+    plugin_page: glib::WeakRef<adw::PreferencesPage>,
+    /// Strongly, like the other `Rc` cells: a mounted form holds
+    /// `AdwPreferencesGroup`s that are *children* of `plugin_page`, and a
+    /// child does not hold its parent — so this closes no cycle, and holding
+    /// it strongly is what lets a handler firing during teardown still see
+    /// coherent bookkeeping.
+    config: Rc<RefCell<Option<MountedForm>>>,
     switch: glib::WeakRef<adw::SwitchRow>,
     unit_row: glib::WeakRef<adw::ActionRow>,
     conn_row: glib::WeakRef<adw::ActionRow>,
@@ -527,9 +584,14 @@ impl PluginsState {
         WeakPluginsState {
             split: self.split.downgrade(),
             list: self.list.downgrade(),
+            shell_list: self.shell_list.downgrade(),
+            shell_selected: self.shell_selected.clone(),
+            shell_forms: self.shell_forms.clone(),
             detail: WeakPluginDetail {
                 page: self.detail.page.downgrade(),
                 stack: self.detail.stack.downgrade(),
+                plugin_page: self.detail.plugin_page.downgrade(),
+                config: self.detail.config.clone(),
                 switch: self.detail.switch.downgrade(),
                 unit_row: self.detail.unit_row.downgrade(),
                 conn_row: self.detail.conn_row.downgrade(),
@@ -563,9 +625,14 @@ impl WeakPluginsState {
         Some(PluginsState {
             split: self.split.upgrade()?,
             list: self.list.upgrade()?,
+            shell_list: self.shell_list.upgrade()?,
+            shell_selected: self.shell_selected.clone(),
+            shell_forms: self.shell_forms.clone(),
             detail: PluginDetail {
                 page: self.detail.page.upgrade()?,
                 stack: self.detail.stack.upgrade()?,
+                plugin_page: self.detail.plugin_page.upgrade()?,
+                config: self.detail.config.clone(),
                 switch: self.detail.switch.upgrade()?,
                 unit_row: self.detail.unit_row.upgrade()?,
                 conn_row: self.detail.conn_row.upgrade()?,
@@ -637,6 +704,30 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     // the list inside an `AdwNavigationSplitView` sidebar.
     list.add_css_class("navigation-sidebar");
 
+    // ── Sidebar: the pinned Shell entry (#888 P1) ───────────────────────────
+    //
+    // Above the plugin list and outside it, so `clear_rows`' teardown and the
+    // "shell unavailable" placeholder — both of which replace the plugin
+    // list's every row — cannot take it with them. Editing `core-leds.toml`
+    // is the Places tab's argument exactly: the file is the state store and
+    // the shell is a client of it, so the editor has to keep working while
+    // the shell is down.
+    let shell_list = gtk::ListBox::new();
+    shell_list.set_selection_mode(gtk::SelectionMode::Single);
+    shell_list.add_css_class("navigation-sidebar");
+    shell_list.append(
+        &adw::ActionRow::builder()
+            .title("Shell")
+            .subtitle("Settings the shell itself owns")
+            .activatable(true)
+            .build(),
+    );
+
+    let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_box.append(&shell_list);
+    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    sidebar_box.append(&list);
+
     // `Automatic`, not `Never`: a `Never` horizontal policy makes the scrolled
     // window's minimum width its child's, which would push the split view's
     // minimum past the bin's floor and buy the #856 warning on every collapsed
@@ -644,7 +735,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let list_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vexpand(true)
-        .child(&list)
+        .child(&sidebar_box)
         .build();
 
     let sidebar_toolbar = adw::ToolbarView::new();
@@ -653,7 +744,8 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "Plugins");
 
     // ── Content: the one detail pane ────────────────────────────────────────
-    let detail = build_detail();
+    let env = Rc::new(hytte_config::xdg::Env::from_process());
+    let (detail, shell_forms) = build_detail(&env);
 
     // ── The split view + the breakpoint that collapses it ───────────────────
     let split = adw::NavigationSplitView::new();
@@ -682,6 +774,9 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let state = PluginsState {
         split,
         list,
+        shell_list,
+        shell_selected: Rc::new(Cell::new(false)),
+        shell_forms: Rc::new(shell_forms),
         detail,
         rows: Rc::new(RefCell::new(Vec::new())),
         by_id: Rc::new(RefCell::new(HashMap::new())),
@@ -695,11 +790,12 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
         declared: Rc::new(RefCell::new(DeclaredMounts::default())),
-        env: Rc::new(hytte_config::xdg::Env::from_process()),
+        env,
         search_path: Rc::new(OnceCell::new()),
     };
 
     connect_selection(&state);
+    connect_shell_entry(&state);
     connect_switch(&state);
     show_empty_detail(&state);
 
@@ -729,9 +825,14 @@ pub(crate) fn tab_header_bar() -> adw::HeaderBar {
         .build()
 }
 
-/// Build the detail pane once: an empty state and the per-plugin controls, in a
-/// stack under a header bar that grows a back button when collapsed.
-fn build_detail() -> PluginDetail {
+/// Build the detail pane once: an empty state, the per-plugin controls and the
+/// shell-owned config page, in a stack under a header bar that grows a back
+/// button when collapsed.
+///
+/// Returns the shell families' forms beside it: their groups are in the
+/// `"shell"` page, but a form's *handle* is what owns its re-read poll, so the
+/// tab holds them for its own lifetime.
+fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::config_form::Form>) {
     // The empty state carries what the old `AdwPreferencesGroup` description
     // said, because it is the only place that blurb still has. It is *not*
     // where a fresh tab lands: `apply_plugins` settles the sidebar on the
@@ -776,9 +877,24 @@ fn build_detail() -> PluginDetail {
     plugin_page.add(&controls);
     plugin_page.add(&status_group);
 
+    // The shell-owned families (#888 P1). Built once, with the tab: unlike a
+    // plugin's, this page's content does not depend on a selection.
+    let shell_page = adw::PreferencesPage::new();
+    let shell_forms: Vec<crate::config_form::Form> = crate::config_form::shell_families()
+        .into_iter()
+        .map(|ops| {
+            let form = crate::config_form::build(ops, env);
+            for group in form.groups() {
+                shell_page.add(group);
+            }
+            form
+        })
+        .collect();
+
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&plugin_page, Some("plugin"));
+    stack.add_named(&shell_page, Some("shell"));
 
     let toolbar = adw::ToolbarView::new();
     // No explicit back button: inside a collapsed `AdwNavigationSplitView` the
@@ -788,14 +904,88 @@ fn build_detail() -> PluginDetail {
     toolbar.set_content(Some(&stack));
 
     let page = adw::NavigationPage::new(&toolbar, "Plugin");
-    PluginDetail {
-        page,
-        stack,
-        switch,
-        unit_row,
-        conn_row,
-        conn_badge,
+    (
+        PluginDetail {
+            page,
+            stack,
+            plugin_page,
+            config: Rc::new(RefCell::new(None)),
+            switch,
+            unit_row,
+            conn_row,
+            conn_badge,
+        },
+        shell_forms,
+    )
+}
+
+/// Wire the pinned **Shell** entry (#888 P1).
+///
+/// Selecting it clears the plugin selection and shows the shell page;
+/// selecting a plugin clears this one ([`connect_selection`] does the mirror
+/// image). Both sides run under the tab's existing `selecting` guard, so
+/// deselecting one list does not drive the other's user-selection path.
+fn connect_shell_entry(state: &PluginsState) {
+    let weak = state.downgrade();
+    state.shell_list.connect_row_selected(move |_, row| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.selecting.get() || row.is_none() {
+            return;
+        }
+        state.shell_selected.set(true);
+        // Whatever plugin was shown is not shown any more, so no plugin's
+        // intent is "for" the detail pane — the rule `clear_selection` and
+        // `refresh_detail` both apply (#944).
+        state.pending.borrow_mut().take();
+        // And a selection parked behind an "unavailable" placeholder (#943)
+        // is retired here rather than left to be restored: it exists so a
+        // transient failure does not move the user, and this *is* the user
+        // moving. Without this, the next good poll would put the plugin page
+        // back over the page they just opened.
+        state.parked.borrow_mut().take();
+        *state.selected.borrow_mut() = None;
+        state.selecting.set(true);
+        state.list.select_row(None::<&gtk::ListBoxRow>);
+        state.selecting.set(false);
+        refresh_shell_forms(&state);
+        show_shell_detail(&state);
+    });
+
+    let weak = state.downgrade();
+    state.shell_list.connect_row_activated(move |_, _| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        // Collapsed, this *is* the push; uncollapsed the split view already
+        // satisfies it.
+        state.split.set_show_content(true);
+    });
+}
+
+/// Show the shell-owned config page and title the detail pane for it.
+fn show_shell_detail(state: &PluginsState) {
+    state.detail.page.set_title("Shell");
+    state.detail.stack.set_visible_child_name("shell");
+}
+
+/// Re-read every shell family now, so opening the page shows what the files
+/// say rather than what they said up to one poll tick ago.
+fn refresh_shell_forms(state: &PluginsState) {
+    for form in state.shell_forms.iter() {
+        form.refresh_from_disk();
     }
+}
+
+/// Drop the **Shell** selection, because a plugin row was picked instead.
+fn clear_shell_selection(state: &PluginsState) {
+    if !state.shell_selected.replace(false) {
+        return;
+    }
+    state.selecting.set(true);
+    state.shell_list.select_row(None::<&gtk::ListBoxRow>);
+    state.selecting.set(false);
 }
 
 /// Wire the two halves of drill-down: `row-selected` retargets the detail pane
@@ -819,6 +1009,13 @@ fn connect_selection(state: &PluginsState) {
                 return;
             }
             let id = row.and_then(|row| id_for_row(&state, row));
+            // A plugin row is what the pane shows now, not the Shell entry
+            // (#888 P1). `row == None` is the user ctrl-clicking the
+            // selection away, which is not a reason to hand the pane back to
+            // a Shell page they left.
+            if id.is_some() {
+                clear_shell_selection(&state);
+            }
             *state.selected.borrow_mut() = id;
             refresh_detail(&state);
         });
@@ -832,6 +1029,7 @@ fn connect_selection(state: &PluginsState) {
             let Some(id) = id_for_row(&state, row) else {
                 return;
             };
+            clear_shell_selection(&state);
             *state.selected.borrow_mut() = Some(id);
             refresh_detail(&state);
             // Collapsed, this *is* the push. Uncollapsed it is a no-op the
@@ -1493,6 +1691,12 @@ fn apply_plugins(
         // once at the end, so letting the `row-selected` handler run would
         // re-enter that path mid-rebuild and, worse, make a poll look like the
         // user navigating.
+        // The **Shell** entry is a selection too (#888 P1), and it survives
+        // every membership change: it is not one of these units. Settling the
+        // sidebar on the first plugin here would drag the operator off a page
+        // they are editing, two seconds after a `systemctl --user` elsewhere
+        // added a unit.
+        _ if state.shell_selected.get() => {}
         _ => {
             state.split.set_show_content(false);
             if let Some((first, ..)) = units.first() {
@@ -1547,6 +1751,14 @@ fn clear_selection(state: &PluginsState) {
     state.selecting.set(true);
     state.list.select_row(None::<&gtk::ListBoxRow>);
     state.selecting.set(false);
+    // The **Shell** entry is not a plugin, and losing every plugin — or the
+    // shell going unreachable, which is the case this runs in most often — is
+    // no reason to navigate away from a page that edits files and works with
+    // the shell down (#888 P1). `show_empty_detail` keeps it up for the same
+    // reason; only the plugin half of the pane is cleared here.
+    if state.shell_selected.get() {
+        return;
+    }
     state.split.set_show_content(false);
     show_empty_detail(state);
 }
@@ -1591,8 +1803,18 @@ fn resolve_pending(pending: &RefCell<Option<PendingToggle>>, id: &str, running: 
     }
 }
 
-/// Show the detail pane's empty state and reset its title.
+/// Show the detail pane's empty state and reset its title — unless the
+/// pinned **Shell** entry is what the pane is showing, in which case there is
+/// nothing empty about it (#888 P1).
+///
+/// The guard lives here rather than at each of the three call sites
+/// ([`clear_selection`], [`refresh_detail`]'s no-selection arm, and
+/// [`build_tab`]'s initial state) so a fourth cannot forget it.
 fn show_empty_detail(state: &PluginsState) {
+    if state.shell_selected.get() {
+        show_shell_detail(state);
+        return;
+    }
     state.detail.stack.set_visible_child_name("empty");
     state.detail.page.set_title("Plugin");
 }
@@ -1622,6 +1844,7 @@ fn refresh_detail(state: &PluginsState) {
 
     state.detail.page.set_title(&id);
     state.detail.stack.set_visible_child_name("plugin");
+    refresh_config(state, &id);
 
     state
         .detail
@@ -1649,6 +1872,98 @@ fn refresh_detail(state: &PluginsState) {
     state.syncing.set(true);
     state.detail.switch.set_active(show_running);
     state.syncing.set(false);
+}
+
+/// Mount (or leave alone, or tear down) the selected plugin's *Configuration*
+/// group — the schema-derived form for the config family its **binary** owns
+/// (#888 P1).
+///
+/// Keyed by plugin id and rebuilt only when the selection moves, so the 2 s
+/// poll — which calls [`refresh_detail`] on every tick — costs nothing here,
+/// and a form the operator is typing into is not rebuilt underneath them.
+fn refresh_config(state: &PluginsState, id: &str) {
+    let mounted_for = { state.detail.config.borrow().as_ref().map(|m| m.plugin.clone()) };
+    if mounted_for.as_deref() == Some(id) {
+        return;
+    }
+    // Take the old one out of the cell *before* removing its groups: a
+    // `PreferencesPage::remove` drives GTK, which can emit synchronously into
+    // a handler that re-enters this cell, and a `BorrowMutError` inside a glib
+    // callback aborts the process (#643).
+    let previous = state.detail.config.take();
+    if let Some(previous) = previous {
+        for group in previous.form.groups() {
+            state.detail.plugin_page.remove(group);
+        }
+        // Explicit, and load-bearing: dropping the handle is what stops the
+        // form's re-read poll.
+        drop(previous);
+    }
+
+    let Some(ops) = family_for_plugin(state, id) else {
+        return;
+    };
+    let form = crate::config_form::build(ops, &state.env);
+    for group in form.groups() {
+        state.detail.plugin_page.add(group);
+    }
+    let displaced = state.detail.config.replace(Some(MountedForm {
+        plugin: id.to_owned(),
+        form,
+    }));
+    drop(displaced);
+}
+
+/// Which config family the plugin listed as `id` owns, if any.
+///
+/// From the **binary** its unit runs, not from its id: `stats` and `stats-bar`
+/// are two launches of one `hytte-plugin-stats` reading one `stats.toml`
+/// (`docs/plugin-env.md`), so a rule over ids would either miss the second or
+/// guess. `plugins.json` carries each entry's `exec`, and
+/// [`manifest_id_of_exec`] is `nix/module-common.nix`'s own `inferManifestId`
+/// — the function that decides what the plugin calls itself in the first
+/// place.
+///
+/// Falls back to the id when there is no `plugins.json` entry (a
+/// hand-installed static unit, the legacy launch path `plugin_launcher.rs`
+/// still supports), which is right for the conventional case and reaches no
+/// family at all otherwise. Read on a **selection change**, not on the poll —
+/// see [`refresh_config`].
+fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_form::FamilyOps> {
+    let candidates = resolved_search_path(&state.search_path, &state.env);
+    let declared = probe_candidates(candidates)
+        .and_then(|found| manifest_id_at(&found.path, id));
+    crate::config_form::family(declared.as_deref().unwrap_or(id))
+}
+
+/// The manifest id `plugins.json` at `path` implies for the plugin `id`.
+fn manifest_id_at(path: &Path, id: &str) -> Option<String> {
+    manifest_id_from_json(&std::fs::read_to_string(path).ok()?, id)
+}
+
+/// [`manifest_id_at`]'s pure half: `{"plugins": {"<id>": {"exec": "…"}}}` →
+/// the manifest id of that binary. Split out so a test can drive it without
+/// touching the filesystem, exactly as [`declared_mounts_from_json`] is.
+fn manifest_id_from_json(text: &str, id: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let exec = value.get("plugins")?.get(id)?.get("exec")?.as_str()?;
+    Some(manifest_id_of_exec(exec))
+}
+
+/// `…/bin/hytte-plugin-stats` → `stats`; `…/bin/hytte-claude-bridge` →
+/// `claude-bridge`.
+///
+/// A transcription of `nix/module-common.nix`'s `inferManifestId`, which is
+/// what both platform modules use to decide whether an entry needs an explicit
+/// `HYTTE_PLUGIN_ID` — so this agrees with the launcher by construction rather
+/// than by coincidence.
+fn manifest_id_of_exec(exec: &str) -> String {
+    let binary = exec.rsplit('/').next().unwrap_or(exec);
+    binary
+        .strip_prefix("hytte-plugin-")
+        .or_else(|| binary.strip_prefix("hytte-"))
+        .unwrap_or(binary)
+        .to_owned()
 }
 
 /// Remove every currently-added child (plugin rows or a placeholder) from the

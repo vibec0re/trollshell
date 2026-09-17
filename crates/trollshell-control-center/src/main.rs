@@ -48,6 +48,7 @@ use hytte_bus::RetryPolicy;
 
 mod agents_tab;
 mod ai_keys_tab;
+mod config_form;
 mod places_tab;
 mod plugins_tab;
 #[cfg(all(test, feature = "system-tests"))]

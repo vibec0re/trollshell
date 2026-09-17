@@ -44,6 +44,15 @@ hytte-bus = { path = "../hytte-bus" }
 # this app can share it without linking `hytte-services` (and with it
 # libpipewire and evolution-data-server).
 hytte-config = { path = "../hytte-config" }
+# The two SHELL-owned config families as data — a name, a documented default
+# and a `Schema` each — for the generic config form (#888 P1). A GTK-free leaf
+# that depends on nothing but `hytte-config`, which exists precisely so this
+# app can render `core-leds.toml` and `workspaces.toml` without linking the
+# shell (a binary, and one that would drag its whole service layer in). The two
+# PLUGIN-owned families cannot live there — those crates link `hytte-config`
+# themselves — so they come from the plugin crates below and this app composes
+# all four at the top of the graph (#888's erratum to §3).
+hytte-config-families = { path = "../hytte-config-families" }
 # The Agents tab's whole data path (#947 P4, spec §10): the `host.sock` wire
 # mirror, the one-connection-per-request client, the `Status` precedence
 # collapse, the `group` ordering, `agents.toml` and the companion window's
@@ -58,7 +67,23 @@ hytte-config = { path = "../hytte-config" }
 # would pull libpipewire and evolution-data-server into a settings app) and no
 # web engine. `checks.shell-has-no-web-engine` still holds.
 hytte-plugin-agents = { path = "../hytte-plugin-agents" }
+# `stats.toml`'s `Schema` + `DEFAULT_TOML` + its `impl Subsystem`, for the
+# Plugins tab's Configuration group (#888 P1). Linked as a **library** on
+# exactly the `hytte-plugin-agents` precedent above — #1360 gave this crate a
+# `[lib]` target for it — and for the same reason: two readers of one file have
+# to agree byte for byte about what its keys are, and a hand-written copy of
+# sixteen `Field`s here would be a second thing to update. GTK-free: it drags
+# the plugin SDK's rlib (which `hytte-plugin-agents` already pulls in) plus
+# `hytte-sensors`, and no GUI closure — `checks.shell-has-no-web-engine` still
+# holds and `cargo tree | grep -c webkit` is still 0.
+hytte-plugin-stats = { path = "../hytte-plugin-stats" }
 hytte-reactive = { path = "../hytte-reactive" }
+# One hand-written `Deserialize` (#888 P1): `Subsystem: DeserializeOwned`, and
+# the two shell-owned families' `impl Subsystem` lives in the shell — so this
+# app brings its own inert `S` for them (see `config_form`'s `ShellSubsystem`).
+# Already resolved workspace-wide through `hytte-config`; an edge, not a new
+# `Cargo.lock` entry.
+serde.workspace = true
 # The Plugins tab's declared-mount override (#1161): `plugins.json` is read
 # straight off disk (the same file `nix/hm-module.nix`/`nix/nixos-module.nix`
 # render), and it's JSON rather than TOML, so this is the one leaf

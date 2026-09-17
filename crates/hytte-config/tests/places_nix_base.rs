@@ -94,7 +94,7 @@ fn the_fixtures_locked_line_names_exactly_the_two_keys_nix_set() {
 fn an_overlay_over_the_fixture_is_refused_and_reported() {
     let loaded = places::assemble_places(
         &base_layer(),
-        Some((
+        Some(&(
             PathBuf::from("/home/annika/.config/trollshell/places.toml"),
             "[departures]\nendpoint = \"db\"\n\
              [[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n"

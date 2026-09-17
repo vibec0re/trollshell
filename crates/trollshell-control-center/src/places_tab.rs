@@ -1282,7 +1282,7 @@ mod gtk_tests {
     use gtk::glib;
     use hytte_config::places::Place;
 
-    use super::Editor;
+    use super::{Editor, Locks};
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a
     /// queued push/allocation actually happens.
@@ -1290,10 +1290,26 @@ mod gtk_tests {
         while glib::MainContext::default().iteration(false) {}
     }
 
+    /// [`build_editor_with`] with nothing locked — the ordinary case, and what
+    /// every test written before #1227 item 2 wants.
+    fn build_editor() -> (adw::ToastOverlay, Editor) {
+        build_editor_with(Locks::default())
+    }
+
     /// Build the Places tab's `Editor` around one fabricated place, with no
     /// file I/O and no `Control` call — see the module doc above for why this
     /// doesn't call [`super::build_page`].
-    fn build_editor() -> (adw::ToastOverlay, Editor) {
+    ///
+    /// `locks` is injected rather than read from the environment for exactly
+    /// the reason the module doc gives for seeding `base` directly:
+    /// [`Locks::read`] goes through `hytte_config::places::load_layered`, which
+    /// resolves the **real** `$HOME` and `$XDG_CONFIG_DIRS`, and a test process
+    /// must not depend on (or be perturbed by) whether the developer's own box
+    /// declares `programs.trollshell.config.places`. What `Locks::read` itself
+    /// answers is pinned in `hytte-config` (`places_are_locked` /
+    /// `endpoint_is_locked`); what this file owns is the wiring, and that is
+    /// what these tests drive.
+    fn build_editor_with(locks: Locks) -> (adw::ToastOverlay, Editor) {
         let nav = adw::NavigationView::new();
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&nav));
@@ -1301,6 +1317,7 @@ mod gtk_tests {
         let list = adw::PreferencesGroup::new();
         let editor = Editor {
             base: Rc::new(RefCell::new(vec![Place::new("Home", 52.4556, 13.5085)])),
+            locked: Rc::new(Cell::new(locks)),
             // No file I/O here either (see the doc comment above) — a detached
             // row, never read back.
             departures_endpoint_row: adw::EntryRow::builder().title("Endpoint").build(),
@@ -1449,5 +1466,114 @@ mod gtk_tests {
             false
         }
         walk(page.upcast_ref())
+    }
+
+    /// Every widget under `root` of type `W`, at any depth — the generic form
+    /// of the two hand-rolled walks above, added for #1227 item 2's assertions
+    /// (a page's sensitivity, a banner's presence) rather than a third copy.
+    fn descendants<W: glib::object::IsA<gtk::Widget>>(root: &gtk::Widget) -> Vec<W> {
+        let mut found = Vec::new();
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Ok(matched) = widget.clone().downcast::<W>() {
+                found.push(matched);
+            }
+            found.extend(descendants::<W>(&widget));
+            child = widget.next_sibling();
+        }
+        found
+    }
+
+    /// #1227 item 2: when nix owns the `[[place]]` array, the tab says so and
+    /// offers nothing that would be refused.
+    ///
+    /// Three claims, each the consequence of a different line in `rebuild`
+    /// and `detail`, and each with the unlocked control asserted beside it so
+    /// a mutation that simply stopped building anything cannot pass:
+    ///
+    /// 1. no "Add a place" row (`rows` holds one widget per place and nothing
+    ///    else) — an overlay array would replace nix's whole and then be
+    ///    refused, so there is nothing to add to;
+    /// 2. the list's description is the "Set in nix" sentence naming the
+    ///    option, not the "saved straight to ~/.config" one;
+    /// 3. a place's detail page still opens (reading a nix-set place is the
+    ///    point of having it on screen) but is **insensitive**, and carries the
+    ///    banner.
+    #[gtk::test]
+    fn a_nix_locked_place_list_is_shown_read_only() {
+        adw::init().expect("libadwaita init");
+
+        let (_open, unlocked) = build_editor();
+        assert_eq!(
+            unlocked.rows.borrow().len(),
+            2,
+            "one place row plus the 'Add a place' row"
+        );
+        assert_eq!(unlocked.list.description().as_deref(), Some(super::LIST_DESCRIPTION));
+
+        let (_toasts, editor) = build_editor_with(Locks {
+            places: true,
+            endpoint: false,
+        });
+
+        assert_eq!(
+            editor.rows.borrow().len(),
+            1,
+            "the place row only — 'Add a place' must not be offered while the array is nix's"
+        );
+        assert_eq!(
+            editor.list.description().as_deref(),
+            Some(super::NIX_MANAGED_PLACES),
+            "the list has to say whose it is, right where the list is"
+        );
+
+        editor.open(0);
+        pump();
+        let page = editor.nav.visible_page().expect("the detail page was pushed");
+        let prefs: Vec<adw::PreferencesPage> = descendants(page.upcast_ref());
+        assert_eq!(prefs.len(), 1, "one AdwPreferencesPage per detail page");
+        assert!(
+            !prefs[0].is_sensitive(),
+            "every control on a nix-owned place must be insensitive — the merge keeps the nix \
+             value on the next load, so an editable row would be silently reverted"
+        );
+        assert_eq!(
+            descendants::<adw::Banner>(page.upcast_ref()).len(),
+            1,
+            "…and the page says why"
+        );
+        assert!(
+            descendants::<gtk::Button>(page.upcast_ref())
+                .iter()
+                .all(|b| b.icon_name().as_deref() != Some("user-trash-symbolic")),
+            "no Delete either: the whole array is nix's"
+        );
+    }
+
+    /// The control for the test above, as its own case so a mutation that
+    /// simply made *everything* read-only is caught rather than absorbed: with
+    /// nothing locked the detail page is sensitive and keeps its Delete button.
+    #[gtk::test]
+    fn an_unlocked_place_keeps_its_editable_detail_page() {
+        adw::init().expect("libadwaita init");
+
+        let (_toasts, editor) = build_editor();
+        editor.open(0);
+        pump();
+
+        let page = editor.nav.visible_page().expect("the detail page was pushed");
+        let prefs: Vec<adw::PreferencesPage> = descendants(page.upcast_ref());
+        assert_eq!(prefs.len(), 1);
+        assert!(prefs[0].is_sensitive());
+        assert!(
+            descendants::<adw::Banner>(page.upcast_ref()).is_empty(),
+            "nothing to announce when the set is the operator's own"
+        );
+        assert!(
+            descendants::<gtk::Button>(page.upcast_ref())
+                .iter()
+                .any(|b| b.icon_name().as_deref() == Some("user-trash-symbolic")),
+            "Delete is there when the place is yours"
+        );
     }
 }

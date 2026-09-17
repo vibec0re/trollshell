@@ -383,7 +383,10 @@ pub fn read_base_layers() -> Vec<(PathBuf, String)> {
 ///
 /// `#[non_exhaustive]` for [`crate::subsystem::Loaded`]'s reason: every
 /// construction site is in this crate and this is the type that grows a field.
-#[derive(Clone, Debug, Default)]
+/// Deliberately **not** `Default`: the one invariant this type has is that
+/// [`Self::places`] is never empty, and a derived `Default` would hand out the
+/// one value that breaks it.
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Layered {
     /// The merged set. Never empty: a merge that yields no `[[place]]` falls
@@ -447,7 +450,10 @@ impl Layered {
 /// not overwrite it") generalised one layer at a time: a typo in the overlay
 /// costs the overlay, not the nix base layer underneath it.
 #[must_use]
-pub fn assemble_places(bases: &[(PathBuf, String)], overlay: Option<(PathBuf, String)>) -> Layered {
+pub fn assemble_places(
+    bases: &[(PathBuf, String)],
+    overlay: Option<&(PathBuf, String)>,
+) -> Layered {
     // Two parallel vectors, `crate::subsystem::assemble_layers`' shape: the
     // diagnostics want the file name beside each table, and `merge`'s own
     // whole-stack questions want the tables as one slice.
@@ -460,7 +466,7 @@ pub fn assemble_places(bases: &[(PathBuf, String)], overlay: Option<(PathBuf, St
         tables.push(parse_layer(body, Some(path)));
         sources.push(path.clone());
     }
-    if let Some((path, body)) = overlay.as_ref() {
+    if let Some((path, body)) = overlay {
         paths.push(Some(path.as_path()));
         tables.push(parse_layer(body, Some(path)));
         sources.push(path.clone());
@@ -558,7 +564,7 @@ pub fn load_layered() -> Layered {
             }
         }
     });
-    assemble_places(&read_base_layers(), overlay)
+    assemble_places(&read_base_layers(), overlay.as_ref())
 }
 
 /// Drop empty/whitespace-only entries (a stray `""` would otherwise become an
@@ -638,7 +644,7 @@ pub fn load_places() -> Vec<Place> {
             None
         }
     };
-    assemble_places(&bases, overlay).places
+    assemble_places(&bases, overlay.as_ref()).places
 }
 
 /// Whether any base layer sets `[[place]]` itself — the question
@@ -3261,7 +3267,7 @@ lon = 13.5
             "[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
         );
 
-        let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(overlay));
+        let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(&overlay));
 
         assert_eq!(
             loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
@@ -3278,7 +3284,7 @@ lon = 13.5
     fn an_overlay_without_places_inherits_the_bases_array() {
         let overlay = layer("overlay", "[departures]\nendpoint = \"vbb\"\n");
 
-        let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(overlay));
+        let loaded = assemble_places(&[layer("base", BASE_TWO)], Some(&overlay));
 
         assert_eq!(
             loaded.places.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
@@ -3298,7 +3304,7 @@ lon = 13.5
 
         let overridden = assemble_places(
             std::slice::from_ref(&base),
-            Some(layer("overlay", "[departures]\nendpoint = \"bvg\"\n")),
+            Some(&layer("overlay", "[departures]\nendpoint = \"bvg\"\n")),
         );
         assert_eq!(
             overridden.endpoint.as_deref(),
@@ -3316,7 +3322,7 @@ lon = 13.5
 
         let loaded = assemble_places(
             &[layer("base", NIX_TWO)],
-            Some(layer(
+            Some(&layer(
                 "overlay",
                 "[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
             )),
@@ -3359,7 +3365,7 @@ lon = 13.5
     fn an_unset_cannot_erase_a_locked_place_array() {
         let loaded = assemble_places(
             &[layer("base", NIX_TWO)],
-            Some(layer("overlay", "_unset = [\"place\"]\n")),
+            Some(&layer("overlay", "_unset = [\"place\"]\n")),
         );
 
         assert_eq!(
@@ -3378,7 +3384,7 @@ lon = 13.5
                 "base",
                 "_locked = [\"departures.endpoint\"]\n[departures]\nendpoint = \"db\"\n",
             )],
-            Some(layer(
+            Some(&layer(
                 "overlay",
                 "[departures]\nendpoint = \"bvg\"\n\
                  [[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
@@ -3421,7 +3427,7 @@ lon = 13.5
     fn an_overlays_own_lock_is_absent_from_the_returned_set() {
         let loaded = assemble_places(
             &[],
-            Some(layer(
+            Some(&layer(
                 "overlay",
                 "_locked = [\"place\"]\n[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
             )),
@@ -3445,7 +3451,7 @@ lon = 13.5
                 "base",
                 "_locked = \"place\"\n[[place]]\nname = \"W\"\nlat = 1.0\nlon = 2.0\n",
             )],
-            Some(layer(
+            Some(&layer(
                 "overlay",
                 "[[place]]\nname = \"Zuhause\"\nlat = 1.0\nlon = 2.0\n",
             )),
@@ -3490,7 +3496,7 @@ lon = 13.5
     fn a_layer_that_is_not_toml_is_skipped_rather_than_fatal() {
         let loaded = assemble_places(
             &[layer("base", BASE_TWO)],
-            Some(layer("overlay", "this is not = = toml\n")),
+            Some(&layer("overlay", "this is not = = toml\n")),
         );
 
         assert_eq!(
@@ -3512,7 +3518,7 @@ lon = 13.5
     #[test]
     fn an_emptied_overlay_array_still_reads_back_as_the_default() {
         let loaded =
-            assemble_places(&[layer("base", BASE_TWO)], Some(layer("overlay", "place = []\n")));
+            assemble_places(&[layer("base", BASE_TWO)], Some(&layer("overlay", "place = []\n")));
 
         assert_eq!(loaded.places, builtin_default());
     }

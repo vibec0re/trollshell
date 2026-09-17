@@ -1695,7 +1695,7 @@ pub fn check_base(path: &Path, base: &[Place]) -> Result<(), PlacesError> {
 /// i.e. one whose `base` came out of the **layered** reader (#1227 item 2).
 ///
 /// The only difference is the units a zero-places overlay is reported in: see
-/// [`OnDisk::Places`] and [`layered_fallback`]. Everything else, including the
+/// `OnDisk::Places` and `layered_fallback`. Everything else, including the
 /// two data-loss arguments on [`check_base`], is identical.
 ///
 /// # Errors

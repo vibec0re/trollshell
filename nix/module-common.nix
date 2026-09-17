@@ -1574,5 +1574,40 @@ self:
         programs.trollshell.plugins.usage from your config.
       '';
     }
+    # `config.agents.display` is an `attrsOf` with no name validation of its
+    # own — nothing upstream needs one, since hyperhive agent names are
+    # `[a-z0-9-]` (the plugin's own `AgentName` parser already implies it) —
+    # but `_locked` (`lockedLeafPaths` above) spells a locked leaf as a
+    # DOTTED path, and `crates/hytte-config/src/merge.rs`'s `collect_locks`
+    # reads that path by splitting on `.` with no escaping. A name typed
+    # with a `.` in it, e.g. `display."a.b".icon`, renders
+    # `_locked = [ "display.a.b.icon" ]` indistinguishable from the
+    # three-segment name `a` nested under `b`: the merge locks
+    # `display → a → b → icon`, not the leaf the operator meant. Latent
+    # today (#1331 review) — refuse it here rather than let it silently
+    # lock the wrong key later.
+    (
+      let
+        dotted = builtins.filter (name: lib.hasInfix "." name) (
+          lib.attrNames config.programs.trollshell.config.agents.display
+        );
+      in
+      {
+        assertion = dotted == [ ];
+        # Lazy, as every assertion message is: only forced when the
+        # predicate above is false, so naming the offenders costs nothing on
+        # a clean config.
+        message = ''
+          programs.trollshell.config.agents.display has a "." in the name of:
+          ${lib.concatStringsSep ", " (map (name: "\"${name}\"") dotted)}.
+
+          `_locked` spells a locked path with dots
+          (`display.<name>.<field>`), so a dotted agent name is
+          indistinguishable from nested segments and would lock the wrong
+          key (#1333). Hyperhive agent names are `[a-z0-9-]` anyway — rename
+          the entry without the dot.
+        '';
+      }
+    )
   ];
 }

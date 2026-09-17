@@ -1290,13 +1290,13 @@ four window properties below are pinned nowhere but here.
       plugin `RequestConsent` (the infobroker's `get` route, or an agents
       approval) and, while the card is up, have a sidebar plugin emit
       `OpenPage(PluginSelf)` — click its card. **No dialog may appear**; the
-      journal says `plugin dialog refused: the shell is asking the user
-    something`. The card must stay clickable and keep the keyboard. Then the
-      other order: open a page, and while it is up trigger the consent card —
-      the page must **vanish** as the card goes up (`plugin dialog closed: the
-    shell is raising its own keyboard-exclusive prompt`), never end up over
-      it. `niri msg -j layers` is the check if it is ambiguous: `hytte-dialog`
-      and `hytte-consent` must never be mapped at once.
+      journal says the dialog was **refused** because the shell is asking the
+      user something. The card must stay clickable and keep the keyboard. Then
+      the other order: open a page, and while it is up trigger the consent card —
+      the page must **vanish** as the card goes up (the journal says it closed
+      because the shell is raising its own keyboard-exclusive prompt), never end
+      up over it. `niri msg -j layers` is the check if it is ambiguous:
+      `hytte-dialog` and `hytte-consent` must never be mapped at once.
 - [ ] **(#1010 HIGH-1)** **Same for the secret prompt.** Start a Wi-Fi connect
       so `hytte-prompt` is up, then click a sidebar card that opens a page: no
       dialog appears, and every character typed goes into the passphrase field.
@@ -1311,9 +1311,9 @@ four window properties below are pinned nowhere but here.
       on A holding A's keyboard where `Esc` no longer reaches it.
 - [ ] **(#1010 MEDIUM-3)** **Hot-plug with a page up.** Plug a second monitor in
       (and separately, unplug the one the dialog is on). The page is destroyed —
-      deliberate, matching the drawer — with one journal line (`the monitor set
-    changed`). Afterwards confirm the plugin is **not** left thinking its slot
-      is visible: with every sidebar closed it must park again (watch an
+      deliberate, matching the drawer — with one journal line saying the monitor
+      set changed. Afterwards confirm the plugin is **not** left thinking its
+      slot is visible: with every sidebar closed it must park again (watch an
       animating card stop, or `RUST_LOG=trollshell=debug`).
 - [ ] **(#1010 LOW)** **The plugin behind the page dies.** With a page up,
       `systemctl --user stop trollshell-plugin-<id>`. The dialog must close

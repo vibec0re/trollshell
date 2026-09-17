@@ -257,6 +257,28 @@ pub(crate) fn with_gl_arm<T>(body: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Record `program` as refused by this driver, through the **production**
+/// hook — the seam a consumer outside `plugins` needs to exercise the latch
+/// [`arm_for`] folds in (#1156 review, MEDIUM-3).
+///
+/// `panels::stats` is the first such consumer: the Stats drawer's LED panel is
+/// a kit widget the shell draws itself, so its fallback test lives beside it
+/// rather than in `plugins::tests`, where [`on_build_refused`]'s `pub(super)`
+/// would already be in scope. This is a one-line forward to that function
+/// rather than a stand-in for it, so a test still drives the real wire.
+///
+/// **Sticky and thread-local, like everything [`arm_for`] reads** — see
+/// [`REFUSED`]. A plain `#[test]` gets its own thread and so its own blast
+/// radius; a `#[gtk::test]` does **not** — `gtk4-macros` marshals every one of
+/// them onto a single shared GTK main thread ("creates a main thread for GTK
+/// and runs all tests on that thread"), so refusing a pipeline there would
+/// poison every other `#[gtk::test]` in the binary that expects the GL arm, in
+/// an order libtest does not fix. Callers must be plain `#[test]`s.
+#[cfg(test)]
+pub(crate) fn refuse_for_test(program: GlProgram, reason: &str) {
+    on_build_refused(program, (0, 0), reason);
+}
+
 /// The arm a `Scope` built now should take.
 ///
 /// [`hytte::ui::gl_surface::gl_abandoned`] wins over the env: once a context

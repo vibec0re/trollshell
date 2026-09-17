@@ -1063,6 +1063,45 @@ mod tests {
         }
     }
 
+    /// **No skin's halo can reach another lamp's pixels**, which is why
+    /// [`LedMatrix::lamp_inks`]' spare-slot clamp is unobservable in this
+    /// widget's output and why `the_rendered_bytes_are_pinned_by_digest` below
+    /// cannot falsify it (#1156 review, MEDIUM-1).
+    ///
+    /// [`index_table`] gives column `c` the pixels
+    /// `[cell_x0(c), cell_x0(c) + CELL + GAP - 1]`; lamp `c`'s emission after
+    /// `Emission::bloom(r)` is non-zero only on
+    /// `[cell_x0(c) - r, cell_x0(c) + CELL - 1 + r]`. So a neighbour's halo
+    /// enters another column's own pixels exactly when `r > GAP`, and every
+    /// shipped skin is under that (vfd 2, lcd 0, oled 1, crt 3). A spare slot
+    /// is always past the last lit lamp in row-major order, so
+    /// `composite_with`'s zero-skip means the ink closure is never called
+    /// there — on either arm, since the shader's `ink_at(index_at(…))` is the
+    /// same attribution. The review measured it rather than reasoning to it:
+    /// painting every spare slot magenta in `lamp_inks` leaves the digest, and
+    /// all 23 tests in this module, green.
+    ///
+    /// The rule *is* pinned, just not on pixels — `preem_gl/led_matrix.rs`'s
+    /// `the_strip_carries_the_kits_own_lamp_amounts_and_inks` asserts the
+    /// spare slots' ink bytes equal the last lamp's in the **uploaded strip**.
+    ///
+    /// **Falsified** by a skin growing a bloom radius above [`GAP`] — which is
+    /// the moment the clamp starts deciding pixels, and the moment
+    /// `docs/live-verify.md`'s panel item 3 and `cases::PanelAt::Ragged`'s doc
+    /// could honestly ask for it. Give it a pixel test then.
+    #[test]
+    fn no_skins_halo_can_reach_another_lamps_pixels() {
+        for style in DisplayStyle::ALL {
+            let radius = style.palette().bloom.map_or(0, |bloom| bloom.radius);
+            assert!(
+                radius <= GAP,
+                "{style:?} blooms {radius} px across a {GAP} px gutter: a halo now crosses \
+                 into the next cell's `index_table` column, so the spare-slot ink clamp has \
+                 become observable and needs a pixel test of its own",
+            );
+        }
+    }
+
     // ── The rendered bytes, pinned ───────────────────────────────────────────
 
     /// Every grid shape the digest sweeps: `(cells, pinned rows)`, `None` rows

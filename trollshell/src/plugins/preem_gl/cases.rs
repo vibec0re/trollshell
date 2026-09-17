@@ -162,9 +162,17 @@ impl Case {
 
     /// The native-frame flatness ceiling this case is held to —
     /// [`Kind::flat_block_ceiling`]'s, except where a kind's own answer cannot
-    /// be stated per kind (#1155 review, HIGH).
+    /// be stated per kind (#1155 review, HIGH; #1156 review, HIGH-1).
     ///
-    /// **The flip board is that exception, and it is why this method exists.**
+    /// **Two kinds are that exception**, for one reason wearing two shapes: a
+    /// kind whose case list mixes a surface with sub-pixel geometry and a
+    /// surface that is honestly pure replication has no single honest answer,
+    /// so the key has to be finer than the kind. The flip board splits on its
+    /// **mechanism** (nixie vs split flap) and the LED panel on its **skin**
+    /// (the bloomless lcd vs the three that halo).
+    ///
+    /// **The flip board is the original exception, and it is why this method
+    /// exists.**
     /// Its two mechanisms answer differently and honestly: a **nixie** *is*
     /// replication — it is a cross-fade between two 5×7 bitmap cathodes, has
     /// no sub-pixel geometry anywhere, and its native frame is exactly what
@@ -188,14 +196,54 @@ impl Case {
     /// future answer that moves further toward replication has to red
     /// somewhere.
     ///
-    /// **Falsified** by returning the kind's answer for a split flap, which
-    /// puts the `snapped := true` probe back to `PASS all 204`.
+    /// **The LED panel is the second exception, and for the same reason**
+    /// (#1156 review, HIGH-1): its **lcd** is this widget's nixie. That skin's
+    /// bloom radius is `0`, so it has no halo to resolve per fragment and its
+    /// native frame genuinely *is* `Frame::upscale` — measured **100.0 %** —
+    /// while the three skins that do bloom measure **56.8 / 64.7 / 58.7 %**
+    /// (vfd / oled / crt). A ceiling armed on the *kind* would red a correct
+    /// lcd render forever, exactly as one armed on `FlipBoard` would red a
+    /// correct nixie.
+    ///
+    /// `0.80` is calibrated against the same reversion probe, transplanted:
+    /// `bool snapped = true;` in `led_matrix.frag`'s `main`, which is the whole
+    /// of #1156 undone — no footprint integral, no closed-form halo at the
+    /// fragment, `PixelSurface`'s staircase reproduced on the GPU. Under it the
+    /// four `rampx2` frames go **56.8 / 100.0 / 64.7 / 58.7 % → 100.0 % on all
+    /// four**, and — this is the finding that makes the ceiling necessary —
+    /// *every other gate stays green*: the four cases come back `mean 0.000 /
+    /// max 0` on **every** bin, i.e. bit-identical to the oracle and so
+    /// *better* than the shipping render, `interior_max()` is `0`, the edge
+    /// budget is unreached and `TROLLSHELL_PARITY_EXACT=1` is satisfied. The
+    /// 1:1 cases cannot see it by construction (`snapped` is already `true`
+    /// there) and nothing hermetic can either, since `led_matrix.rs`'s
+    /// `shader_frame` transcribes the snapped branch only.
+    ///
+    /// `0.80` sits in a **~35-point** gap (64.7 → 100.0), far wider than the
+    /// 6.2 points `0.97` was cut from, so it is ~15 points clear on either
+    /// side. The **other** probe — #1153's half-native-pixel `p.x` shift — is
+    /// recorded beside it rather than instead of it, because the two catch
+    /// different things: it *keeps* the continuous branch and moves it
+    /// sideways, taking flatness **down** to 52.2 / 89.0 / 57.3 / 52.7 % (all
+    /// under this ceiling, correctly) while reddening the edge budget on all
+    /// four. A reversion raises flatness; a drift inside the branch raises the
+    /// edge delta. Neither gate alone covers both.
+    ///
+    /// **Falsified** by returning the kind's answer for a split flap or for a
+    /// blooming panel, which puts the matching `snapped := true` probe back to
+    /// `PASS all 236`; or by dropping the lcd carve-out, which reds the
+    /// shipping lcd frame at 100.0 %.
     pub(crate) fn flat_block_ceiling(&self) -> Option<f64> {
         match self {
             Self::FlipBoard {
                 mechanism: kit::Mechanism::SplitFlap,
                 ..
             } => Some(0.97),
+            Self::LedMatrix { style, scale, .. }
+                if *scale > 1 && !matches!(style, kit::DisplayStyle::Lcd) =>
+            {
+                Some(0.80)
+            }
             other => other.kind().flat_block_ceiling(),
         }
     }
@@ -325,12 +373,22 @@ pub(crate) enum PanelAt {
     Lonely,
     /// A **ragged** last row under [`kit::Fill::Blank`]: 64 lamps on a 22×3
     /// grid, so two slots hold no lamp at all. The case that reaches
-    /// `ghost_slots`' second arm on a driver, and the one where the spare
-    /// slots' ink clamp decides what colour a neighbour's halo takes there.
+    /// `ghost_slots`' second arm on a driver.
+    ///
+    /// It does **not** exercise the spare slots' ink clamp, although an
+    /// earlier draft of this doc said it did (#1156 review, MEDIUM-1). No
+    /// shipped skin blooms further than `GAP`, so no halo ever reaches another
+    /// lamp's `index_table` column and the ink closure is never called on a
+    /// spare slot at all — `hytte-preem`'s
+    /// `no_skins_halo_can_reach_another_lamps_pixels` reds the day that
+    /// changes. What pins the clamp today is the uploaded strip
+    /// (`led_matrix.rs`'s `the_strip_carries_the_kits_own_lamp_amounts_and_inks`).
     Ragged,
     /// The degenerate **1×1** panel — a single-core box. `cols - 1` and
     /// `rows - 1` are both `0`, so every index clamp in the shader collapses,
-    /// and it is the one panel `core_panel_scale` gives a scale above 2.
+    /// and it is the panel `core_panel_scale` blows up hardest — 6x, the top
+    /// of the ladder (6 / 5 / 3 / 3 / 2 / 1 at 1 / 4 / 8 / 16 / 32 / 64+
+    /// cores), so a 4-, 8- or 16-core box is above 2 as well.
     Single,
     /// The ramp again under [`kit::ColorMap::Style`] — the skin's single
     /// accent-tinted ink, which is the branch `LedMatrix::render` takes

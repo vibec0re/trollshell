@@ -11554,11 +11554,29 @@ mod kind_enumeration {
     /// later edit that drops the override — or arms the nixie by accident —
     /// reds here without a driver.
     ///
+    /// **The LED panel is the second kind that needs it** (#1156 review,
+    /// HIGH-1), and the review measured the same shape on it: `bool snapped =
+    /// true;` in `led_matrix.frag` (the whole of #1156 reverted) left `PASS all
+    /// 236` with the four `rampx2` cases at `mean 0.000 / max 0` on **every**
+    /// bin — bit-identical to the oracle, i.e. *better* than the shipping
+    /// render, so neither the exact pin nor the edge budget could ever see it.
+    /// Its key is the **skin** rather than a mechanism: the bloomless **lcd**
+    /// is honestly 100.0 % flat (radius 0, no halo to resolve), while the vfd,
+    /// oled and crt sit at 56.8 / 64.7 / 58.7 %.
+    ///
     /// **Falsified** by deleting `Case::flat_block_ceiling`'s `SplitFlap` arm
-    /// (the first assertion), or by extending it to `Mechanism::ALL` (the
-    /// second).
+    /// or its `LedMatrix` arm (the first assertion), by extending the former to
+    /// `Mechanism::ALL` or the latter to every skin (the second), or by arming
+    /// a panel's 1:1 cases, where `snapped` is already `true` and the statistic
+    /// is 100.0 % by construction.
+    /// `match_same_arms` is allowed for the reason `Kind::flat_block_ceiling`
+    /// allows it: the three `None`s are three separate findings that happen to
+    /// agree — a nixie is replication, a bloomless lcd is replication, and a
+    /// 1:1 panel renders through the snapped branch already — and collapsing
+    /// them would hide which one a later edit changed.
     #[test]
-    fn only_the_split_flaps_cases_arm_the_flatness_ceiling() {
+    #[allow(clippy::match_same_arms)]
+    fn only_the_split_flap_and_the_blooming_panels_arm_the_flatness_ceiling() {
         for case in cases_for(&kit::DisplayStyle::ALL) {
             let want = match &case {
                 Case::FlipBoard {
@@ -11569,6 +11587,14 @@ mod kind_enumeration {
                     mechanism: kit::Mechanism::Nixie,
                     ..
                 } => None,
+                // The lcd is this widget's nixie, and a 1:1 panel case renders
+                // through the snapped branch already, so neither is armed.
+                Case::LedMatrix {
+                    style: kit::DisplayStyle::Lcd,
+                    ..
+                } => None,
+                Case::LedMatrix { scale, .. } if *scale > 1 => Some(0.80),
+                Case::LedMatrix { .. } => None,
                 other => other.kind().flat_block_ceiling(),
             };
             assert_eq!(
@@ -11605,6 +11631,59 @@ mod kind_enumeration {
         assert!(
             REPLICATED > ceiling,
             "the `snapped := true` frame is {REPLICATED} and must red against {ceiling}",
+        );
+
+        // …and the same, for the panel's own separation (#1156 review,
+        // HIGH-1). Wider than the split flap's — 64.7 % to 100.0 % — because a
+        // panel is mostly flat field and solid lamps, so what the halo
+        // contributes to the statistic is a larger share of what is left.
+        let panel = cases_for(&kit::DisplayStyle::ALL)
+            .into_iter()
+            .find(|case| {
+                matches!(
+                    case,
+                    Case::LedMatrix {
+                        style: kit::DisplayStyle::Oled,
+                        scale: 2..,
+                        ..
+                    }
+                )
+            })
+            .expect("the case list carries a supersampled oled panel");
+        let ceiling = panel
+            .flat_block_ceiling()
+            .expect("a blooming skin's supersampled panel is armed");
+        for shipping in [0.568_f64, 0.647, 0.587] {
+            assert!(
+                shipping < ceiling,
+                "{shipping} is a shipping blooming-skin panel frame and must stay under \
+                 {ceiling}",
+            );
+        }
+        assert!(
+            REPLICATED > ceiling,
+            "the panel's `snapped := true` frame is {REPLICATED} and must red against {ceiling}",
+        );
+        // The lcd's *honest* frame is that same 100.0 %, which is the whole
+        // reason the key is the skin: armed on the kind, this number would red
+        // a correct render forever.
+        let lcd = cases_for(&kit::DisplayStyle::ALL)
+            .into_iter()
+            .find(|case| {
+                matches!(
+                    case,
+                    Case::LedMatrix {
+                        style: kit::DisplayStyle::Lcd,
+                        scale: 2..,
+                        ..
+                    }
+                )
+            })
+            .expect("the case list carries a supersampled lcd panel");
+        assert_eq!(
+            lcd.flat_block_ceiling(),
+            None,
+            "the bloomless lcd measures {REPLICATED} honestly and must not be armed",
         );
     }
 

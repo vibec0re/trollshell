@@ -697,6 +697,18 @@ impl Kind {
             // that takes all four to 100.0 %. That is the one gate in the suite
             // that can see a drift *inside* the continuous branch, so a reader
             // arriving here looking for this kind's detector should go there.
+            // The LED panel's `None` is the sixth and the **second that is
+            // overridden**, on exactly that precedent (#1156 review, HIGH-1):
+            // it is the *lcd*'s answer, not the kind's. That skin blooms at
+            // radius 0, so it has no halo to resolve per fragment and its
+            // native frame genuinely *is* `Frame::upscale` — 100.0 % flat,
+            // correctly — while the three skins that do bloom measure
+            // 56.8 / 64.7 / 58.7 % and *are* gated:
+            // `cases::Case::flat_block_ceiling` arms their `scale = 2` cases
+            // at `0.80`, calibrated against the same `snapped := true` probe,
+            // which takes all four to 100.0 % while leaving every other gate
+            // green. Same instruction as the flip board's: a reader looking
+            // for this kind's detector should go there.
             Self::Gauge
             | Self::TextBox
             | Self::Scope
@@ -2439,21 +2451,30 @@ mod tests {
                 // was a *per-case* key, since this kind carries two mechanisms
                 // with two honest answers.
                 Kind::FlipBoard => None,
-                // The LED panel's `None` is the meter's answer in this widget's
-                // shape, and for the same two reasons. A panel's frame is
-                // mostly flat field and solid lamps, so its blocks are constant
-                // almost everywhere for reasons that have nothing to do with
-                // the halo; and the halo it does have is **computed** per
-                // fragment rather than read from a grid-resolution texture, so
-                // there is no replicated read here for this gate to protect.
-                // See `Kind::edge_budget`'s `LedMatrix` arm for what does gate
-                // this kind's supersampled case — and note that this
-                // statistic moves the **wrong way** here, which is the
-                // strongest reason to leave it unarmed: its shipping frames
-                // measure 56.8 / 100.0 / 64.7 / 58.7 % and the `p.x` probe
-                // that reverts the improvement takes them *down* to 52.2 /
-                // 89.0 / 57.3 / 52.7 %. A ceiling reds when flatness is too
-                // **high**, so no value of it could catch that drift.
+                // **`None` here is the *lcd*'s answer, and the three blooming
+                // skins override it per case** (#1156 review, HIGH-1). The lcd
+                // is this widget's nixie: bloom radius 0, nothing to resolve
+                // per fragment, so its native frame *is* `Frame::upscale` —
+                // measured 100.0 %, correctly — and a ceiling armed on this
+                // kind would red a right render forever. The vfd, oled and crt
+                // are the opposite (56.8 / 64.7 / 58.7 %) and the detector for
+                // them is real: `cases::Case::flat_block_ceiling` arms their
+                // `scale = 2` cases at `0.80`, calibrated against a
+                // `snapped := true` probe that takes all four to 100.0 %.
+                //
+                // The earlier version of this comment claimed this statistic
+                // "moves the **wrong way** here, so no value of it could catch
+                // that drift", citing the `p.x` probe's 52.2 / 89.0 / 57.3 /
+                // 52.7 %. That reasoning was wrong, and the error is worth
+                // naming because it is easy to repeat: a half-native-pixel
+                // **shift** of the sample point is not a reversion. It keeps
+                // the continuous branch and moves it sideways, which is why it
+                // reds the *edge budget* and leaves flatness low. The
+                // reversion probe is `snapped := true`, it raises flatness to
+                // 100.0 %, and it is invisible to every other gate — including
+                // `TROLLSHELL_PARITY_EXACT=1`, since a replicated frame is
+                // bit-identical to the oracle. Two probes, two gates, recorded
+                // side by side in `cases::Case::flat_block_ceiling`.
                 Kind::LedMatrix => None,
             };
             assert_eq!(

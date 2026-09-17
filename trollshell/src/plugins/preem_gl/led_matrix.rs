@@ -641,6 +641,15 @@ mod tests {
     #[test]
     fn the_mirror_is_the_shipped_shaders_arithmetic() {
         for clause in [
+            // the footprint's own half-widths, which the mirror transcribes as
+            // `p.0 ± 0.5` at 1:1 (#1156 review, LOW 4). Without these four the
+            // whitelist has a hole exactly where a `0.5 -> 0.25` typo lives:
+            // the mirror is untouched by it, so the hermetic suite stays green
+            // and only the llvmpipe 1:1 pin in CI catches it.
+            "float lo_x = p.x - fp.x * 0.5;",
+            "float hi_x = p.x + fp.x * 0.5;",
+            "float lo_y = p.y - fp.y * 0.5;",
+            "float hi_y = p.y + fp.y * 0.5;",
             // the lattice
             "float advance() {",
             "return float(u_cell + u_gap);",
@@ -736,7 +745,12 @@ mod tests {
                     .min(255);
                 if lit > 0 {
                     if let Some(mask) = palette.mask {
-                        lit = lit * mask_keep(col, row, w, h, mask) / 256;
+                        // `kit::MASK_ONE`, not `256`: the shipped line spells
+                        // `/ MASK_ONE` and `mask_keep` below already scales to
+                        // the kit's item, so agreeing with it by reference is
+                        // the point (#1156 review, LOW 2).
+                        lit = lit * mask_keep(col, row, w, h, mask)
+                            / i32::try_from(kit::MASK_ONE).expect("MASK_ONE fits i32");
                     }
                     if lit > 0 {
                         let c = index_at(p.0, cells.0);

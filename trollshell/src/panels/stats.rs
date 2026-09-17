@@ -1149,6 +1149,15 @@ where
     L: Signal<Item = CoreLeds> + 'static,
 {
     let row = core_panel_row();
+    // Seed the row's surface at build time so the drawer never opens onto an
+    // empty row (#1156 review, LOW 1). `sensors::cpu()` ticks at 1 Hz, and
+    // before #1156 the surface was appended here rather than created inside
+    // the apply closure — without this line a cold drawer open could measure a
+    // 0 px-tall Blinken Lichten row for up to a second and then jump. The
+    // closure still owns the *choice*: `core_panel_child` returns this child
+    // untouched when the arm still matches and swaps it when it does not, so
+    // the per-tick re-resolve that the fallback depends on is unaffected.
+    let _seeded = core_panel_child(&row, core_panel_arm());
 
     let dressed = map_ref! {
         let cpu = cpu,
@@ -2266,9 +2275,56 @@ fn flapping_subtitle(
 mod tests {
     use super::{
         CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, CoreLeds, Duration, PENDING_SCROLL, StatsLayout,
-        StatsSection, TaskState, core_led_matrix_for, core_panel_scale, core_panel_tooltip,
-        flapping_subtitle, is_flapping, parse_stats_layout, prune_pending_scroll,
+        StatsSection, TaskState, core_led_matrix_for, core_panel_arm, core_panel_scale,
+        core_panel_tooltip, flapping_subtitle, is_flapping, parse_stats_layout,
+        prune_pending_scroll,
     };
+    use crate::plugins::preem_gl;
+
+    /// **The panel's arm folds in the per-pipeline refusal, not just the
+    /// switch** (#1156 review, MEDIUM-3).
+    ///
+    /// `the_panel_follows_the_renderer_arm` in `pin_tests` drives
+    /// `with_gl_arm`, which flips the *test* arm — it pins the per-tick rebuild
+    /// and the kill switch, which is real, but it would stay green if
+    /// [`core_panel_arm`] read `configured_arm()` instead of `arm_for`. Neither
+    /// production latch is exercised there, and the fallback is the whole
+    /// reason the arm is re-resolved once a second: this widget is not in the
+    /// plugin tree, so `preem_gl::install`'s context-failure sweep never
+    /// reaches it and a panel that resolved its arm once would simply stay
+    /// blank for the session.
+    ///
+    /// A **plain `#[test]`** rather than a `#[gtk::test]`, deliberately, and
+    /// that is why this pins the arm rather than the widget: both latches are
+    /// sticky thread-locals, and `gtk4-macros` runs every `#[gtk::test]` in a
+    /// binary on one shared GTK main thread — refusing a pipeline there would
+    /// poison `the_panel_follows_the_renderer_arm`'s own GL assertion in an
+    /// order libtest does not fix. Split this way each half is hermetic: the
+    /// arm here, the widget swap there. `arm_for`'s narrowness (a refused
+    /// pipeline costs only its own kind the GPU) is pinned by
+    /// `preem_gl::tests::a_refused_pipeline_takes_only_its_own_kinds_arm`.
+    ///
+    /// **Falsified** by making [`core_panel_arm`] read `configured_arm()`, or
+    /// by having it answer a constant.
+    #[test]
+    fn a_refused_pipeline_takes_the_panel_off_the_gl_arm() {
+        preem_gl::with_gl_arm(|| {
+            assert_eq!(
+                core_panel_arm(),
+                preem_gl::Arm::Gl,
+                "the premise: a fresh test thread has refused nothing, so the switch decides",
+            );
+
+            preem_gl::refuse_for_test(preem_gl::LED_MATRIX, "no GL in this test");
+
+            assert_eq!(
+                core_panel_arm(),
+                preem_gl::Arm::Cpu,
+                "a driver that will not build `preem.led_matrix` must take the panel to the \
+                 kit even while the session-wide switch still says GL",
+            );
+        });
+    }
 
     /// The [`StatsSection`] declaration order is the panel's canonical
     /// resource order and must agree with the always-visible bar chip order
@@ -3629,7 +3685,13 @@ mod led_panel_layout_tests {
     use hytte::gtk;
     use hytte::ui::PixelSurface;
 
-    use super::{CORE_PANEL_MAX_H, core_panel_row, core_panel_surface};
+    use hytte::ui::GlSurface;
+
+    use super::{
+        CORE_PANEL_MAX_H, core_panel_gl_surface, core_panel_row, core_panel_scale,
+        core_panel_surface,
+    };
+    use crate::plugins::preem_gl;
 
     /// The buffer dimensions a 64-core panel rasterises to under the #857
     /// rectangle default — a 16×4 grid.
@@ -3682,6 +3744,73 @@ mod led_panel_layout_tests {
         assert!(
             nat_h <= budget,
             "a 400 px card stretched the 181x49 panel to {nat_h} px tall"
+        );
+    }
+
+    /// A [`GlSurface`] carrying the same 64-core panel, driven through the
+    /// **production mapping** rather than a hand-set size, and arranged the way
+    /// the shipping row arranges it.
+    ///
+    /// No GL context is needed and none is created: `GlSurface::measure` reads
+    /// only the natural size the last `set_state` recorded. What cannot be
+    /// tested here is *drawing*, not *measuring*.
+    fn gl_panel_64() -> GlSurface {
+        let matrix = hytte_preem::LedMatrix::wide(hytte_preem::DisplayStyle::Vfd, 64);
+        let levels = vec![0.5_f32; 64];
+        let kit = preem_gl::led_matrix_surface(
+            &matrix,
+            &levels,
+            core_panel_scale(matrix.width(), matrix.height()),
+            &hytte_preem::palette_snapshot(hytte_preem::DisplayStyle::Vfd),
+        );
+        let panel = core_panel_gl_surface();
+        panel.set_state(
+            preem_gl::LED_MATRIX,
+            kit.width,
+            kit.height,
+            &std::sync::Arc::new(kit.uniforms),
+        );
+        panel
+    }
+
+    /// **The same two #702 assertions against the GL arm** — the surface the
+    /// row actually holds on a healthy session since #1156 (#1156 review,
+    /// MEDIUM-2).
+    ///
+    /// Before this, both properties above were asked only of the
+    /// `PixelSurface` the shell now *stops* using, and `docs/live-verify.md`'s
+    /// item 5 handed the whole question to a desk on the grounds that this is
+    /// the first `GlSurface` laid out inside an `adw` card rather than on a
+    /// bar. Half of that is testable here: `GlSurface::measure` answers
+    /// `(0, natural, -1, -1)` off `nat_width`/`nat_height` with no context and
+    /// no draw.
+    ///
+    /// **Falsified** by giving [`core_panel_gl_surface`] an `hexpand` — the
+    /// exact mistake `core_panel_row`'s doc records as having produced a
+    /// 400 px-tall row once already — or by dropping its `halign: Center`.
+    #[gtk::test]
+    fn the_gl_arms_panel_row_keeps_the_702_geometry() {
+        adw::init().expect("libadwaita init");
+        let row = core_panel_row();
+        row.append(&gl_panel_64());
+
+        let (min_w, nat_w, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+        assert_eq!(
+            min_w, 0,
+            "the LED panel row grew a minimum width on the GL arm"
+        );
+        let want = i32::try_from(PANEL_64.0).expect("the buffer width fits i32");
+        assert!(
+            nat_w >= want,
+            "the GL row should still want the panel's {want} px, got {nat_w}",
+        );
+
+        let budget = i32::try_from(CORE_PANEL_MAX_H).expect("the budget fits i32");
+        let (_, nat_h, _, _) = row.measure(gtk::Orientation::Vertical, 400);
+        assert!(
+            nat_h <= budget,
+            "a 400 px-wide card inflated the GL row to {nat_h} px — the #702 regression, which \
+             `a_wide_card_cannot_inflate_the_row_height` only ever asked of a PixelSurface",
         );
     }
 }

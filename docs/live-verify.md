@@ -3413,12 +3413,24 @@ session.
      `style`, `color`, `rows` and `fill`, and the colour axis is this widget's
      alone — every other kit surface has one ink. Walk `color` through
      `heat` (the default), `style`, `rainbow`, `transpride` and an
-     `rgb` triple; the two arms must agree on each. `fill = "blank"` with a
+     `rgb` triple; the two arms must agree on each. Also walk `fill` with a
      `rows` that leaves a ragged tail (`rows = 3` on a 64-core box: 22 columns,
-     two spare slots) is the one that separates them if the spare-slot ink
-     clamp is wrong — a neighbour's halo bleeding into a blank slot must take
-     the **lamp's** colour, not the field's. A save alone re-skins the panel
-     with the shell up; that is #869's payoff and it must survive the arm swap.
+     two spare slots): `spare` ghosts all 66 slots and `blank` only the 64 that
+     hold a lamp, so the two must differ by exactly that unlit hardware and
+     agree with each other arm for arm.
+
+     What this item deliberately does **not** ask for is the spare slots' ink
+     clamp, which an earlier draft did (#1156 review, MEDIUM-1): with every
+     shipped skin's bloom radius at or under `GAP`, no lamp's halo ever reaches
+     another lamp's `index_table` column, so nothing bleeds into a blank slot
+     and the check could neither pass nor fail. `hytte-preem`'s
+     `no_skins_halo_can_reach_another_lamps_pixels` is what will tell you the
+     day that stops being true; until it reds, the clamp is pinned on the
+     uploaded strip instead (`the_strip_carries_the_kits_own_lamp_amounts_and_inks`).
+
+     A save alone re-skins the panel with the shell up; that is #869's payoff
+     and it must survive the arm swap.
+
   4. **The fallback, and it is this kind's sharpest edge.** The panel is not in
      the plugin tree, so `preem_gl::install`'s context-failure hook sweeps
      nothing here — the arm is re-resolved on every `sensors::cpu()` tick

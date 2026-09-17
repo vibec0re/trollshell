@@ -227,6 +227,27 @@ own `HYTTE_PLUGIN_ID`) — the multi-subscription work itself (a per-instance
 socket, so a second account also gets its own API endpoint) is still open on
 #1280.
 
+Since #1347 the same surfaces are a **stack of wallet cards** rather than one
+card: the Claude usage card first, and — when a key is injected — an OpenRouter
+credits card second, on the drawer page and in a sidebar family alike. The bar
+chip is unchanged and stays the Claude one, with the OpenRouter remaining
+credit as one more line of its hover. That wallet's knobs are the crate's own
+`[openrouter]` table, spelled as env because this daemon has no config file
+(`crates/hytte-claude-bridge/src/wallets.rs` argues why):
+
+| Variable                              | Default                | Meaning                                                                                                                                                                                                                                                                              |
+| ------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `OPENROUTER_API_KEY`                  | unset                  | The key. **Injected from the login keyring** — `programs.trollshell.plugins.claude-bridge.secrets = [ "openrouter" ];` (#392) — and read from the environment only: there is deliberately no `~/.config/trollshell/openrouter.key` fallback here (#1330). Absent ⇒ no card, no poll. |
+| `CLAUDE_BRIDGE_OPENROUTER`            | unset (→ on)           | `[openrouter] enabled`. `0`/`false`/`off` keeps the wallet off with a key present; anything else leaves it on, since the key is the real gate.                                                                                                                                       |
+| `CLAUDE_BRIDGE_OPENROUTER_LOW_CREDIT` | `5` (dollars)          | `[openrouter] low_credit`. Remaining credit at or below this tints the card's headline `warning`. An unparseable value costs the threshold, not the card.                                                                                                                            |
+| `CLAUDE_BRIDGE_OPENROUTER_LABEL`      | `"OpenRouter credits"` | That card's title — `CLAUDE_BRIDGE_LABEL`'s sibling for the second wallet.                                                                                                                                                                                                           |
+
+Note the bridge's **own** `OPENROUTER_API_KEY` is a different thing from the
+dummy `local-bridge` value the module sets on a _consuming_ plugin (`pet`,
+`caw`) to stop a real cloud key reaching the local endpoint. `nix/hm-module.nix`
+sets the bridge's copy **empty**, so the wallet stays off until the secret slot
+is declared.
+
 ### clock-demo (`hytte-plugin-clock-demo`)
 
 No runtime knobs — configuration is entirely via the shell/wire protocol.

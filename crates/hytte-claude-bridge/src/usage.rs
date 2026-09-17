@@ -168,7 +168,12 @@ pub const SEVERITY_NORMAL: &str = "normal";
 /// non-`Option` field is still a hard error without this. The endpoint nulls
 /// fields freely (`scope`, `locked_reason`, half of `extra_usage`), so every
 /// non-`Option` field here goes through it.
-fn lenient<'de, D, T>(de: D) -> Result<T, D::Error>
+///
+/// `pub(crate)` since #1347: [`crate::wallets::openrouter`]'s wire has the same
+/// property (`limit`, `limit_remaining` and `limit_reset` are all documented
+/// nullable) and wants the same one-line answer to it rather than a second copy
+/// of this function.
+pub(crate) fn lenient<'de, D, T>(de: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -361,8 +366,10 @@ impl UsageError {
     }
 }
 
-/// Cut `text` to [`MAX_ERROR_CHARS`] on a char boundary.
-fn truncate(text: &str) -> String {
+/// Cut `text` to [`MAX_ERROR_CHARS`] on a char boundary. `pub(crate)` since
+/// #1347 — the `OpenRouter` wallet's error arms have the same tooltip-width
+/// problem and the same answer to it.
+pub(crate) fn truncate(text: &str) -> String {
     if text.chars().count() <= MAX_ERROR_CHARS {
         return text.to_owned();
     }
@@ -376,7 +383,11 @@ fn truncate(text: &str) -> String {
 /// an error, and none observed does. But this module's whole contract is that
 /// the token never leaves it, and a contract enforced by a pass over the string
 /// costs nothing next to one enforced by trusting three dependencies.
-fn scrub(text: &str, token: &str) -> String {
+///
+/// `pub(crate)` since #1347: the daemon now holds a **second** bearer
+/// ([`crate::wallets::openrouter`]'s key) with exactly the same contract, and
+/// one scrubber is one thing to get right.
+pub(crate) fn scrub(text: &str, token: &str) -> String {
     if token.is_empty() {
         return text.to_owned();
     }

@@ -906,14 +906,27 @@ in
               ANTHROPIC_FOUNDRY_AUTH_TOKEN = "";
               ANTHROPIC_FOUNDRY_API_KEY = "";
               ANTHROPIC_CUSTOM_HEADERS = "";
-              # Belt-and-braces dummy key. Nothing in the bridge reads it (it is
-              # keyless and validates no bearer at all); the copy that actually
-              # prevents a leak is the one on the CONSUMING plugin, because
-              # `hytte_ai_providers::load_key` runs in the plugin's process and
-              # checks $OPENROUTER_API_KEY before ~/.config/trollshell/
-              # openrouter.key. Set it there too:
-              # `plugins.pet.env.OPENROUTER_API_KEY = "local-bridge";`.
-              OPENROUTER_API_KEY = "local-bridge";
+              # EMPTY, not a dummy value — and since #1347 that matters. The
+              # bridge now READS this variable: it is the key for the
+              # OpenRouter credits wallet, the second card on its drawer page
+              # (crates/hytte-claude-bridge/src/wallets/openrouter.rs). The
+              # old `"local-bridge"` placeholder would be picked up as a real
+              # bearer and spend a poll every five minutes earning a 401.
+              #
+              # Empty reads as absent on both sides — the wallet is off, and
+              # `hytte_ai_providers::load_key` on a CONSUMING plugin falls
+              # through an empty value exactly as before — while still doing
+              # the one job this line was added for: `--setenv=K=` overrides
+              # whatever the user manager happened to have exported, so
+              # nothing here turns on by accident. The launcher appends
+              # injected secrets AFTER this env, so an operator who declares
+              # the slot still wins:
+              #
+              #   programs.trollshell.plugins.claude-bridge.secrets = [ "openrouter" ];
+              #
+              # (The copy that prevents a *leak* is still the one on the
+              # consuming plugin: `plugins.pet.env.OPENROUTER_API_KEY = "local-bridge";`.)
+              OPENROUTER_API_KEY = "";
             }
             // (lib.optionalAttrs (cb.model != null) { CLAUDE_BRIDGE_MODEL = cb.model; })
           );

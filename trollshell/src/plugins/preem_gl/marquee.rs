@@ -473,7 +473,7 @@ mod tests {
     /// It matters more here than on the static display: the marquee is the one
     /// kit widget whose *state* change re-bakes a palette (`preem_render`'s
     /// `update` opens a second `with_pins` scope for a new message), so an arm
-    /// that re-derived its own palette would disagree with the CPU arm only
+    /// that re-derived its own palette would disagree with the CPU kit only
     /// after a text change.
     ///
     /// **Falsified** by calling `kit::palette_snapshot` inside

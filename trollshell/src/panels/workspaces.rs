@@ -1478,6 +1478,9 @@ mod fixtures {
     pub(super) const RIGHT: &str = "HDMI-A-1";
     /// A third connector, for the cases that need three columns (#1219's
     /// three-screen width).
+    /// Only the GTK tests (`system-tests`) build a three-column case, so the
+    /// plain `cargo test` compile would otherwise warn `dead_code` here.
+    #[cfg(feature = "system-tests")]
     pub(super) const THIRD: &str = "DP-2";
 
     /// A [`DisplayOutput`] at logical position `(x, y)` — #1110's column

@@ -4,8 +4,9 @@
 //! everything it does about it is a fold into the model plus a re-projection —
 //! so the whole plugin is testable by handing [`Stats::update`] a snapshot
 //! literal, which is what the tests here do. No `/proc` is read in any of them;
-//! the one thing that touches the filesystem is [`crate::sample::Sampler`],
-//! which lives behind the command lane in [`Stats::sources`].
+//! the one thing that touches the filesystem is `sample::Sampler` (a
+//! crate-private module, so this is a plain name rather than a link), which
+//! lives behind the command lane in [`Stats::sources`].
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -308,7 +309,8 @@ impl Plugin for Stats {
     }
 
     /// The sampler task: one per session, owning the `/proc` reads and the
-    /// visibility gate. Its messages come back as [`Msg::Sampled`].
+    /// visibility gate. Its messages come back as `Msg::Sampled` (the message
+    /// type is crate-private, so this is a plain name rather than a link).
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = hytte_plugin::cmd_channel::<Msg>();
         let settings = settings();

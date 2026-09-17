@@ -1266,6 +1266,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-config-families"
+version = "0.1.0"
+dependencies = [
+ "hytte-config",
+]
+
+[[package]]
 name = "hytte-ecal"
 version = "0.1.0"
 dependencies = [
@@ -1307,6 +1314,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3111,6 +3119,7 @@ dependencies = [
  "clap_complete",
  "hytte",
  "hytte-config",
+ "hytte-config-families",
  "hytte-gl",
  "hytte-plugin-proto",
  "hytte-preem",

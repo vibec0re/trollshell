@@ -62,6 +62,17 @@ use hytte_config::subsystem::watch::{self, EnvLookup};
 use hytte_config::subsystem::{ConfigError, InvalidValue, Subsystem, keep};
 use hytte_config::xdg;
 
+/// The documented default, moved down into the GTK-free
+/// `hytte-config-families` leaf by #888 P0 and re-exported here at its old
+/// path — `core_leds`' own re-export carries the argument, including why the
+/// schema beside it is not re-exported too.
+///
+/// This family's default is **comments only**, so its schema's two fields —
+/// `order` and `workspace` — are the collection case
+/// [`hytte_config::schema::verify`] exempts from *invented*; see that module
+/// and `hytte_config_families::workspaces`.
+pub use hytte_config_families::workspaces::DEFAULT_TOML;
+
 /// The layout template applied once, after every app of a stack has launched
 /// (#1071 §3.4 step 4). The file has carried it since phase 2; phase 3 is what
 /// spawns `hytte-plugin-niri-layouts apply <layout>` at the end of a Start.
@@ -227,54 +238,9 @@ pub struct WorkspacesConfig {
 impl Subsystem for WorkspacesConfig {
     const NAME: &'static str = "workspaces";
 
-    const DEFAULT_TOML: &'static str = r#"# Saved workspace stacks (#1071).
-#
-# A *stack* is the apps of one named niri workspace, the screen it lives on, and
-# the layout template applied to it. The Workspaces drawer page writes this file
-# when you Save a workspace, and reads it live — an edit here shows up without
-# restarting the shell.
-#
-# This file is layered: a home-manager base under $XDG_CONFIG_DIRS, then your own
-# overlay in $XDG_CONFIG_HOME/trollshell/workspaces.toml. Tables deep-merge, so a
-# base can pin `chat` while this file adds `music`; arrays REPLACE, so stating
-# `apps` or `order` here replaces the layer below's entirely. To drop a stack a
-# base pinned, name it in an `_unset` array in the table that holds it:
-#
-#     [workspace]
-#     _unset = ["chat"]
-#
-# A value no parser accepts costs its own key and nothing else: that key takes
-# the built-in default, one journal line names it, and every other key — in this
-# stack and in every other — still applies. A stack whose *name* cannot be a
-# systemd slice is dropped whole, since it could never be started.
-#
-# The shell ships no stacks, so there is nothing to state below. The shape:
-#
-#     # Card order, top to bottom within a screen's column. A stack you leave
-#     # out still shows, after the ordered ones, by name.
-#     order = ["chat", "dev"]
-#
-#     [workspace.chat]
-#     # The connector this stack lives on, as `niri msg outputs` names it.
-#     # Leave it out to start on whichever screen is focused.
-#     monitor   = "DP-1"
-#     # Start this stack at login.
-#     autostart = true
-#     # Applied once, after every app has launched: equal | golden | split | none
-#     layout    = "golden"
-#     # In order — which is also the left-to-right column order in niri.
-#     # `id` is the app's desktop-entry id, the same string niri reports as a
-#     # window's app_id. `exec` overrides the entry's own command.
-#     apps = [
-#       { id = "org.mozilla.firefox" },
-#       { id = "Alacritty", exec = "alacritty -e weechat" },
-#     ]
-#
-# Names are also systemd slice names (`trollshell-ws-<name>.slice`), so they are
-# lowercase letters, digits and single interior dashes — no leading, trailing or
-# doubled dash, at most 32 characters. The Save field folds case for you and
-# refuses anything else rather than rewriting it.
-"#;
+    /// The documented default, re-exported at the top of this module from
+    /// `hytte-config-families` — see [`DEFAULT_TOML`].
+    const DEFAULT_TOML: &'static str = DEFAULT_TOML;
 
     type Error = std::convert::Infallible;
 
@@ -1016,13 +982,88 @@ pub fn current() -> Workspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigError, EditContext, Layout, Stack, StackApp, Workspaces, WorkspacesConfig,
-        save_edit_to, save_stack_to, set_order_to, set_stack_monitor_to, stack_value,
+        APP_KEYS, ConfigError, DEFAULT_TOML, EditContext, Layout, STACK_KEYS, Stack, StackApp,
+        Workspaces, WorkspacesConfig, save_edit_to, save_stack_to, set_order_to,
+        set_stack_monitor_to, stack_value,
     };
+    use hytte_config::schema::{self, Kind};
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_config::test_support::capture;
+    use hytte_config_families::workspaces::SCHEMA;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+
+    // ── The schema (#888 P0) ────────────────────────────────────────────────
+
+    /// **The walker.** Vacuous in the *forgotten leaf* direction here, because
+    /// this family's documented default states no values at all — which is the
+    /// case [`hytte_config::schema::verify`]'s collection exemption exists for,
+    /// and `hytte_config_families::workspaces`' own test covers the rest by
+    /// uncommenting the documented example and verifying that.
+    #[test]
+    fn the_schema_matches_the_documented_default() {
+        schema::verify(&SCHEMA, DEFAULT_TOML)
+            .expect("workspaces' schema and its documented default must agree");
+    }
+
+    /// The schema's key sets are the **parsers'** own: a stack's sub-fields are
+    /// [`STACK_KEYS`] and an app entry's are [`APP_KEYS`], which is what
+    /// `parse_stack`/`unknown_app_keys` report an unknown key against.
+    ///
+    /// Red if a key is added to either list without a `Field` beside it — the
+    /// form would silently not draw it — or vice versa.
+    #[test]
+    fn the_schemas_map_keys_are_the_parsers_own() {
+        let Some(Kind::Map(stack)) = SCHEMA.field("workspace").map(|field| field.kind) else {
+            panic!("`workspace` must be a map of stacks");
+        };
+        assert_eq!(
+            stack.iter().map(|field| field.path).collect::<Vec<_>>(),
+            STACK_KEYS,
+            "a stack's rows are exactly the keys `parse_stack` accepts"
+        );
+
+        let Some(Kind::List(&Kind::Map(app))) = stack
+            .iter()
+            .find(|field| field.path == "apps")
+            .map(|field| field.kind)
+        else {
+            panic!("`apps` must be a list of app records");
+        };
+        assert_eq!(
+            app.iter().map(|field| field.path).collect::<Vec<_>>(),
+            APP_KEYS,
+            "an app entry's rows are exactly the keys `unknown_app_keys` accepts"
+        );
+    }
+
+    /// `layout`'s vocabulary is [`Layout::parse`]'s own — every option parses,
+    /// and the match is **exhaustive**, so a fifth `Layout` variant fails to
+    /// compile here until it has an option.
+    #[test]
+    fn the_schemas_layout_vocabulary_is_the_parsers_own() {
+        let Some(Kind::Map(stack)) = SCHEMA.field("workspace").map(|field| field.kind) else {
+            panic!("`workspace` must be a map of stacks");
+        };
+        let Some(Kind::Choice { options }) = stack
+            .iter()
+            .find(|field| field.path == "layout")
+            .map(|field| field.kind)
+        else {
+            panic!("`layout` must be a fixed vocabulary");
+        };
+
+        let mut seen = Vec::new();
+        for option in options {
+            let parsed = Layout::parse(option).expect("every `layout` option must parse");
+            match parsed {
+                Layout::Equal | Layout::Golden | Layout::Split | Layout::None => {}
+            }
+            assert_eq!(parsed.name(), *option, "and must round-trip through `name`");
+            seen.push(parsed);
+        }
+        assert_eq!(seen.len(), 4, "one option per Layout variant, and no more");
+    }
 
     fn layers(bodies: &[(&str, &str)]) -> Vec<(PathBuf, String)> {
         bodies

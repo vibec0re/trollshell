@@ -63,3 +63,10 @@ tempfile.workspace = true
 # test asserts a 5 s budget, and paused virtual time makes that assertion
 # instant rather than a five-second stall in every `cargo test` run.
 tokio = { workspace = true, features = ["test-util"] }
+# #888 P0's `the_schemas_fields_are_the_serde_surface`: it serialises
+# `AgentsConfig`/`Display` and compares the key sets against `SCHEMA`, which is
+# the one direction the schema walker structurally cannot see (`DEFAULT_TOML`
+# leaves `[display.*]` commented out). A **dev**-dependency because nothing
+# this crate ships touches `toml` directly — the layering does — and it adds no
+# resolved package, since `hytte-config` already links it.
+toml.workspace = true

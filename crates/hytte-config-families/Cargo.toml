@@ -1,0 +1,21 @@
+[package]
+name = "hytte-config-families"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The shell's config families as data: a documented default and a schema each, without linking the shell"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The only dependency, and the reason this crate exists: the control center
+# links `hytte-config` already and must not link `trollshell`, so the shell's
+# two family descriptions live in a leaf that carries nothing else. Adding a
+# second dependency here is the review moment that should ask whether the
+# consts have stopped being data — in particular, the vocabularies below are
+# literals rather than `hytte_preem::DisplayStyle::ALL`, held to the enums by
+# the shell's own tests. Adds no resolved package: a workspace path member.
+hytte-config = { path = "../hytte-config" }

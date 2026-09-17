@@ -66,6 +66,11 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
+// `schema::Family` is spelled through the module: this crate already has a
+// `Family` of its own — the **mount** family, `[bar]` versus `[sidebar]` —
+// and the two are different questions that happen to share a word.
+use hytte_config::schema;
+use hytte_config::schema::{Field, Kind, Schema};
 use hytte_config::subsystem::env::EnvKnob;
 use hytte_config::subsystem::{InvalidValue, Subsystem, keep, spelling};
 use hytte_plugin::proto::Mount;
@@ -101,7 +106,7 @@ const SECONDS: &str = "a whole number of seconds, 1..=60";
 /// an operator sees when they first open their overlay, and it is parsed on
 /// every load — so a syntax error in it fails any test that loads the
 /// subsystem rather than surfacing in production.
-const DEFAULT_TOML: &str = r#"# trollshell — system stats as a plugin (issue #1250, epic #1248).
+pub const DEFAULT_TOML: &str = r#"# trollshell — system stats as a plugin (issue #1250, epic #1248).
 #
 # ONE file, TWO instances. The same binary can run twice — the full thing in
 # the top bar, a compact CPU + GPU card in the right sidebar — and each launch
@@ -188,6 +193,117 @@ poll_seconds = 1
 # shell's OWN task supervisor). Neither is reachable from a plugin process, so
 # the native `ts-services` chip stays — epic #1248's P3 already says so.
 "#;
+
+// ── The schema (#888 P0 §2a/§3) ──────────────────────────────────────────────
+
+/// What the sixteen leaves of `stats.toml` are, for a settings form that has
+/// this crate as a library and the shell nowhere in sight.
+///
+/// It sits **here**, beside the [`DEFAULT_TOML`] it describes, rather than in
+/// `hytte-config-families` with the two shell-owned families: this crate links
+/// `hytte-config`, so the leaf crate cannot depend on it without a cycle
+/// (#888's erratum to §3). The control center composes it in at the top of the
+/// graph, where it already links this crate as a library.
+///
+/// The fields are generated table by table with [`card_fields`], which is what
+/// makes this file's own rule — *no key is read by only one of the two
+/// surfaces* (see the module docs) — structurally true of the schema rather
+/// than a thing sixteen hand-written entries could quietly stop obeying.
+/// `[sidebar]` comes first because [`DEFAULT_TOML`] documents it first, and a
+/// form reads down in the order the file does.
+/// The eight leaves of one `[table]`, for each table named — `concat!` is what
+/// makes `bar.cpu` and `sidebar.cpu` two `&'static str` literals, the same
+/// constraint that makes [`BAR_KNOBS`] and [`SIDEBAR_KNOBS`] two consts,
+/// without the eight `doc` sentences being written twice and drifting.
+macro_rules! card_fields {
+    ($($table:literal),*) => {
+        &[$(
+            Field {
+                path: concat!($table, ".cpu"),
+                kind: Kind::Bool,
+                doc: "The CPU half: the lamp, the history trace and the temperature hang off it.",
+            },
+            Field {
+                path: concat!($table, ".per_core"),
+                kind: Kind::Bool,
+                doc: "Make the CPU lamp a row — one cell per logical core.",
+            },
+            Field {
+                path: concat!($table, ".history"),
+                kind: Kind::Bool,
+                doc: "A scope sweep of recent overall CPU load.",
+            },
+            Field {
+                path: concat!($table, ".temperature"),
+                kind: Kind::Bool,
+                doc: "The package temperature readout; `--` when no sensor answers.",
+            },
+            Field {
+                path: concat!($table, ".gpu"),
+                kind: Kind::Bool,
+                doc: "The GPU half. It hides itself when there is no GPU to read.",
+            },
+            Field {
+                path: concat!($table, ".memory"),
+                kind: Kind::Bool,
+                doc: "Memory: a chip on a bar, a row plus a meter on a card.",
+            },
+            Field {
+                path: concat!($table, ".disk"),
+                kind: Kind::Bool,
+                doc: "Disk usage — one lamp per mounted filesystem.",
+            },
+            Field {
+                path: concat!($table, ".poll_seconds"),
+                kind: POLL_SECONDS,
+                doc: "Seconds between samples while this surface is on screen.",
+            },
+        )*]
+    };
+}
+
+/// The cadence row's range, taken from the parser's own bounds rather than
+/// restated — `cast_signed` is `const`, so there is no second pair of numbers
+/// here to drift from [`MIN_POLL_SECONDS`] / [`MAX_POLL_SECONDS`].
+const POLL_SECONDS: Kind = Kind::Int {
+    min: MIN_POLL_SECONDS.cast_signed(),
+    max: MAX_POLL_SECONDS.cast_signed(),
+    // A plain spin row: `parse_poll` takes a number and nothing else.
+    also: &[],
+};
+
+/// What the sixteen leaves of `stats.toml` are, for a settings form that has
+/// this crate as a library and the shell nowhere in sight.
+///
+/// It sits **here**, beside the [`DEFAULT_TOML`] it describes, rather than in
+/// `hytte-config-families` with the two shell-owned families: this crate links
+/// `hytte-config`, so the leaf crate cannot depend on it without a cycle
+/// (#888's erratum to §3). The control center composes it in at the top of the
+/// graph, where it already links this crate as a library.
+///
+/// The fields are generated table by table with `card_fields!`, which is what
+/// makes this file's own rule — *no key is read by only one of the two
+/// surfaces* (see the module docs) — structurally true of the schema rather
+/// than a thing sixteen hand-written entries could quietly stop obeying.
+/// `[sidebar]` comes first because [`DEFAULT_TOML`] documents it first, and a
+/// form reads down in the order the file does.
+pub const SCHEMA: Schema = Schema {
+    family: NAME,
+    fields: card_fields!("sidebar", "bar"),
+};
+
+/// This family, for a settings form to compose into its list (#1360 review,
+/// MEDIUM 4).
+///
+/// [`Family`] lives in `hytte_config::schema`, not in `hytte-config-families`,
+/// precisely so this line can exist: that leaf carries only the two *shell*
+/// families and cannot depend on this crate. Without it the control center
+/// would hand-write the same three fields as a struct literal nothing sweeps.
+pub const FAMILY: schema::Family = schema::Family {
+    name: NAME,
+    schema: &SCHEMA,
+    default_toml: DEFAULT_TOML,
+};
 
 // ── The resolved form ────────────────────────────────────────────────────────
 
@@ -617,13 +733,149 @@ pub fn load() -> Stats {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOL, Card, CardFile, DEFAULT_POLL_SECONDS, Family, MAX_POLL_SECONDS, MIN_POLL_SECONDS,
-        SECONDS, Stats, StatsConfig, knob, parse_bool, parse_poll,
+        BAR_KNOBS, BOOL, Card, CardFile, CardKnobs, DEFAULT_POLL_SECONDS, DEFAULT_TOML, FAMILY,
+        Family, Kind, MAX_POLL_SECONDS, MIN_POLL_SECONDS, NAME, SCHEMA, SECONDS, SIDEBAR_KNOBS,
+        Stats, StatsConfig, knob, parse_bool, parse_poll,
     };
+    use hytte_config::schema;
     use hytte_config::subsystem::{Subsystem as _, assemble, load_from};
     use hytte_plugin::proto::Mount;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    // ── The schema (#888 P0) ────────────────────────────────────────────────
+
+    /// The exported [`FAMILY`] is this family, and it verifies — so a form
+    /// composing it into its list gets the same sweep
+    /// `hytte-config-families`' own `FAMILIES` gets (#1360 review, MEDIUM 4).
+    #[test]
+    fn the_exported_family_is_this_one_and_verifies() {
+        assert_eq!(FAMILY.name, NAME);
+        assert_eq!(FAMILY.schema, &SCHEMA);
+        assert_eq!(FAMILY.default_toml, DEFAULT_TOML);
+        FAMILY
+            .verify()
+            .expect("the exported family agrees with itself");
+    }
+
+    /// **The walker.** Every leaf `DEFAULT_TOML` states has a `Field`, every
+    /// `Field` names a leaf it states, and every stated value is inside its
+    /// declared `Kind`.
+    ///
+    /// Red if a key is added to either table without a `Field` beside it, if a
+    /// `Field` is deleted, or if `poll_seconds`' declared range stops covering
+    /// the default cadence.
+    #[test]
+    fn the_schema_matches_the_documented_default() {
+        schema::verify(&SCHEMA, DEFAULT_TOML)
+            .expect("stats' schema and its documented default must agree");
+    }
+
+    /// The schema's field set is the **serde surface**, both ways.
+    ///
+    /// The walker above compares the schema against `DEFAULT_TOML`; this
+    /// compares it against the type that actually reads the file, by
+    /// serialising a whole [`StatsConfig`] and taking its dotted leaf paths.
+    /// The two together close the loop — a field that exists in the struct and
+    /// in neither the schema nor the default would be invisible to both
+    /// otherwise, which is the hole `nix/lint-config-vocab.py` found in
+    /// `agents` (`pub chat_url`, every gate green).
+    #[test]
+    fn the_schemas_fields_are_the_serde_surface() {
+        let serialised =
+            toml::Value::try_from(StatsConfig::default()).expect("the config serialises");
+        let mut leaves = Vec::new();
+        collect_leaves(&serialised, "", &mut leaves);
+        leaves.sort_unstable();
+
+        let mut declared: Vec<String> = SCHEMA
+            .fields
+            .iter()
+            .map(|field| field.path.to_owned())
+            .collect();
+        declared.sort_unstable();
+
+        assert_eq!(declared, leaves, "one Field per serde leaf, and no more");
+    }
+
+    /// Dotted paths of every scalar in `value`.
+    fn collect_leaves(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+        let Some(table) = value.as_table() else {
+            out.push(prefix.trim_end_matches('.').to_owned());
+            return;
+        };
+        for (key, nested) in table {
+            collect_leaves(nested, &format!("{prefix}{key}."), out);
+        }
+    }
+
+    /// The eight rows of a table are the eight keys its [`CardKnobs`] names —
+    /// which is the spelling a journal line uses, so a row and the warning it
+    /// would produce cannot disagree.
+    ///
+    /// The destructuring is what makes this exhaustive: a ninth `CardKnobs`
+    /// field fails to compile here until it has a `Field`.
+    #[test]
+    fn the_schemas_rows_are_the_knob_keys() {
+        let keys = |knobs: &CardKnobs| {
+            let CardKnobs {
+                cpu,
+                per_core,
+                history,
+                temperature,
+                gpu,
+                memory,
+                disk,
+                poll_seconds,
+            } = knobs;
+            vec![
+                cpu.key,
+                per_core.key,
+                history.key,
+                temperature.key,
+                gpu.key,
+                memory.key,
+                disk.key,
+                poll_seconds.key,
+            ]
+        };
+        let declared = |table: &str| {
+            SCHEMA
+                .fields
+                .iter()
+                .filter(|field| field.path.starts_with(&format!("{table}.")))
+                .map(|field| field.path)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(declared("sidebar"), keys(&SIDEBAR_KNOBS));
+        assert_eq!(declared("bar"), keys(&BAR_KNOBS));
+    }
+
+    /// `poll_seconds`' spin range is [`MIN_POLL_SECONDS`]`..=`[`MAX_POLL_SECONDS`]
+    /// on **both** tables, and it is the range [`parse_poll`] enforces.
+    #[test]
+    fn the_schemas_cadence_range_is_the_parsers_own() {
+        for table in ["sidebar", "bar"] {
+            let path = format!("{table}.poll_seconds");
+            let Some(Kind::Int { min, max, also }) = SCHEMA.field(&path).map(|field| field.kind)
+            else {
+                panic!("{path} must be a bounded integer");
+            };
+            assert!(
+                also.is_empty(),
+                "a plain spin row: parse_poll takes a number"
+            );
+            assert_eq!(min, MIN_POLL_SECONDS.cast_signed());
+            assert_eq!(max, MAX_POLL_SECONDS.cast_signed());
+            assert!(parse_poll(&min.to_string()).is_ok() && parse_poll(&max.to_string()).is_ok());
+            assert!(
+                parse_poll(&(min - 1).to_string()).is_err()
+                    && parse_poll(&(max + 1).to_string()).is_err(),
+                "one past either end of the schema's range is one past the parser's"
+            );
+        }
+    }
 
     /// Assemble one overlay body over the built-in default — the seam every
     /// test here uses, which takes layer bodies as plain strings and so never

@@ -45,6 +45,13 @@ hytte = { path = "../crates/hytte" }
 # free leaf, and the other consumer of that leaf — `trollshell-control-center`
 # — must not grow a runtime it never drives.
 hytte-config = { path = "../crates/hytte-config", features = ["watch"] }
+# The shell's own two config families' `DEFAULT_TOML` + `SCHEMA` consts, moved
+# down into a GTK-free leaf by #888 P0 so `trollshell-control-center` can
+# render a form for them without linking this binary. `src/config/core_leds.rs`
+# and `src/config/workspaces.rs` re-export both from their old paths, so the
+# move is invisible to every reader. Adds no resolved package — a workspace
+# path member whose only dependency is `hytte-config`, already here.
+hytte-config-families.workspace = true
 # Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
 # framing helpers. GTK/adw/futures-signals still go through `hytte`'s
 # re-exports; tokio + the proto crate aren't re-exported, so they're direct.

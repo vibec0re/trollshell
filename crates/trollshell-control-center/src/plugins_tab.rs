@@ -697,6 +697,19 @@ pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
 /// only way to test either, since a test process has no session bus to answer
 /// `ListPlugins`.
 fn build_tab() -> (adw::BreakpointBin, PluginsState) {
+    build_tab_in(Rc::new(hytte_config::xdg::Env::from_process()))
+}
+
+/// [`build_tab`] against a stated config environment.
+///
+/// The environment is a parameter rather than a process read because since
+/// #888 P1 this tab **opens files**: [`build_detail`] builds the shell
+/// families' forms with the tab itself, and each one resolves its own search
+/// path and then re-reads it twice a second for as long as the tab lives. A
+/// test that took the process environment would therefore read — and poll —
+/// the operator's real `~/.config/trollshell`, which is the shape #1101 exists
+/// to stop, whether or not any assertion happens to write through it.
+fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, PluginsState) {
     // ── Sidebar: the plugin list ────────────────────────────────────────────
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
@@ -744,7 +757,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "Plugins");
 
     // ── Content: the one detail pane ────────────────────────────────────────
-    let env = Rc::new(hytte_config::xdg::Env::from_process());
+    // The env is the caller's (see `build_tab_in`), not this function's.
     let (detail, shell_forms) = build_detail(&env);
 
     // ── The split view + the breakpoint that collapses it ───────────────────
@@ -3293,10 +3306,45 @@ mod gtk_tests {
 
     use super::{
         BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, PENDING_TOGGLE_TIMEOUT, PendingToggle, PluginRuntime,
-        PluginsState, PollResult, apply_plugins, build_tab, on_poll_result, on_toggle_result,
+        PluginsState, PollResult, apply_plugins, build_tab_in, on_poll_result, on_toggle_result,
         refresh_detail,
     };
     use crate::test_support::captured_logs;
+
+    /// The config environment every test here builds its tab in — **not** the
+    /// operator's.
+    ///
+    /// Since #888 P1 a tab opens files: [`super::build_detail`] builds the
+    /// shell families' config forms with the tab itself, and each re-reads its
+    /// search path twice a second for as long as the tab lives. Taking the
+    /// process environment would point all of that at the real
+    /// `~/.config/trollshell` — the #1101 shape — so these point at one scratch
+    /// tree instead, held for the test binary's life because `TempDir` deletes
+    /// its directory when it drops and forty tabs share this one.
+    ///
+    /// The tree stays **empty**: nothing here asserts on a config row, and a
+    /// search path whose every layer is absent is the most hermetic one there
+    /// is (the form then renders `DEFAULT_TOML`, which is a compiled-in
+    /// constant). `config_form`'s own tests are where a populated one is
+    /// driven.
+    fn scratch_env() -> Rc<hytte_config::xdg::Env> {
+        static TREE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let root = TREE
+            .get_or_init(|| tempfile::tempdir().expect("a scratch config tree"))
+            .path();
+        Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(root.join("home").to_string_lossy().into_owned()),
+            config_dirs: Some(root.join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        })
+    }
+
+    /// [`super::build_tab`] in [`scratch_env`] — what every test below means by
+    /// `build_tab()`, shadowing the process-environment one on purpose.
+    fn build_tab() -> (adw::BreakpointBin, PluginsState) {
+        build_tab_in(scratch_env())
+    }
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a queued
     /// resize/allocation actually happens.

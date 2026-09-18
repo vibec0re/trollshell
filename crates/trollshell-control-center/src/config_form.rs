@@ -367,6 +367,21 @@ impl Drop for FormInner {
 /// The groups are ready to add to an `AdwPreferencesPage`; the returned
 /// handle owns the poll, so keep it for as long as the groups are shown.
 pub(crate) fn build(ops: FamilyOps, env: &Rc<xdg::Env>) -> Form {
+    // #1371 L6: `show_load_error` writes into `groups[0]`, which exists only
+    // because the loop below adds `banner` to the first group it builds —
+    // itself only reachable because every shipped family declares at least
+    // one field. A schema with none would build no group at all and leave
+    // the banner unparented, with `groups.last().expect(…)` a few lines down
+    // the thing that actually catches it. Catching it here, before any
+    // widget is built, is the smaller change and the honest one: a family
+    // with no fields is a schema bug, not a runtime state this form should
+    // degrade for.
+    debug_assert!(
+        !ops.family.schema.fields.is_empty(),
+        "{} declares no fields — this form has nowhere to put its load-error banner",
+        ops.family.name
+    );
+
     let layers = env.config_layers(ops.family.name);
     let overlay = env.overlay_path(ops.family.name);
 
@@ -519,6 +534,9 @@ impl FormInner {
         };
         let Some(overlay) = self.overlay.as_ref() else {
             row.show_error("nowhere to write: neither $XDG_CONFIG_HOME nor $HOME is set");
+            // #1371 L1: see the `Err` arm below — the same snap-back applies
+            // to this earlier refusal.
+            self.apply(&self.raw.borrow());
             return;
         };
         let locked = self.raw.borrow().locked.clone();
@@ -545,6 +563,15 @@ impl FormInner {
                     "a settings row's save was refused"
                 );
                 row.show_error(&err.to_string());
+                // #1371 L1: a refused save moves nothing, so `reload`'s own
+                // same-view fast path would never call `apply` again — and
+                // without that, a draft-less `Switch`/`Combo` would keep
+                // showing the operator's rejected pick for as long as the
+                // form lives, contradicting the file under an error that
+                // says exactly that. Re-applying the (unchanged) view here
+                // is what runs `Row::apply`'s own snap-back branch; `Text`
+                // and `Colour` are unaffected — they are drafts (#1338).
+                self.apply(&self.raw.borrow());
             }
         }
     }
@@ -670,6 +697,21 @@ enum Control {
     Text(adw::EntryRow),
     /// [`Kind::List`] / [`Kind::Map`] — a summary, read-only in v1.
     Collection(adw::ActionRow),
+}
+
+impl Control {
+    /// Whether this control's widget **is** the value a save would write,
+    /// with no independent operator draft to protect.
+    ///
+    /// `Switch`/`Spin`/`Combo` pick their value the moment they are touched
+    /// — there is nothing "half-typed" about a toggle or a selection — so a
+    /// refused save must snap them back to the file's own value rather than
+    /// leave them showing the rejected pick for as long as the form lives
+    /// (#1371 L1). `Text` and `Colour` stay on their draft: the operator may
+    /// be mid-correction (#1338), and `Collection` never saves at all.
+    const fn is_draftless(&self) -> bool {
+        matches!(self, Self::Switch(_) | Self::Spin { .. } | Self::Combo { .. })
+    }
 }
 
 /// Where a row's provenance line goes.
@@ -891,18 +933,55 @@ impl Row {
         let moved = { *self.seen.borrow() != value };
         if moved {
             self.push(value.as_ref());
-            *self.seen.borrow_mut() = value;
+        } else if self.failed.get() && self.control.is_draftless() {
+            // #1371 L1: a refused save leaves this row's error showing, and
+            // a draft-less control (`Switch`/`Spin`/`Combo`) has no draft to
+            // protect — its widget *is* what would have been saved, so
+            // leaving it on the operator's rejected pick would have it
+            // disagree with the file for as long as the form lives. Put the
+            // file's own (unmoved) value back; the error text below is
+            // untouched.
+            self.push(value.as_ref());
         }
 
-        if moved || !self.failed.get() {
+        // #1371 L4: an `Int` outside the schema's range is silently clamped
+        // by the `gtk::Adjustment` — nothing upstream ever refuses it — so
+        // this is the one place that can say so. Recomputed only when this
+        // key's own value moved: the same draft-guard shape the refusal
+        // above already has, so an unrelated key's reload cannot re-derive
+        // (and so clear) a clamp note this row is still showing.
+        let clamp = if moved { self.out_of_range(value.as_ref()) } else { None };
+
+        if let Some(message) = &clamp {
+            self.show_error(message);
+        } else if moved || !self.failed.get() {
             self.clear_error();
             self.note.set(&provenance(locked, origin, absent));
+        }
+
+        if moved {
+            *self.seen.borrow_mut() = value;
         }
         let writable = editable && !locked && !self.field.kind.is_collection();
         self.set_sensitive(writable);
         if let Some(reset) = &self.reset {
             reset.set_sensitive(writable && matches!(origin, Some(Origin::Overlay)));
         }
+    }
+
+    /// The clamp message for an `Int` whose file value lies outside the
+    /// schema's `[min, max]` — `None` for every other kind, for a value
+    /// inside its range, for the word half of an `Int` with `also` spellings
+    /// (`as_integer` answers `None` for those, which is correct: a word is
+    /// not subject to the numeric bound), and for a key no layer states at
+    /// all (#1371 L4).
+    fn out_of_range(&self, value: Option<&toml::Value>) -> Option<String> {
+        let Kind::Int { min, max, .. } = self.field.kind else {
+            return None;
+        };
+        let n = value.and_then(toml::Value::as_integer)?;
+        (!(min..=max).contains(&n))
+            .then(|| format!("file says {n}, the range is {min}–{max}"))
     }
 
     /// Fill the widgets from a merged value.
@@ -1679,6 +1758,22 @@ label = "fixture"
 #     [entry.one]
 #     name = "the first one"
 "#;
+
+    /// A schema with no fields at all — #1371 L6's fixture: nothing a real
+    /// family ships, but exactly the shape `build`'s `debug_assert!` exists
+    /// to catch before it becomes an unparented banner.
+    pub(super) const EMPTY_SCHEMA: Schema = Schema {
+        family: "form-fixture-empty",
+        fields: &[],
+    };
+
+    /// The family over [`EMPTY_SCHEMA`]. `default_toml` is irrelevant here —
+    /// `build` never reaches a read.
+    pub(super) const EMPTY_FAMILY: Family = Family {
+        name: "form-fixture-empty",
+        schema: &EMPTY_SCHEMA,
+        default_toml: "",
+    };
 }
 
 #[cfg(test)]
@@ -1705,6 +1800,32 @@ mod tests {
             Ok(()),
             "the fixture's schema and its documented default must agree"
         );
+    }
+
+    /// [`fixture::EMPTY_FAMILY`], as a [`ShellFamily`] — #1371 L6.
+    struct EmptyFixture;
+
+    impl ShellFamily for EmptyFixture {
+        const FAMILY: &'static Family = &fixture::EMPTY_FAMILY;
+    }
+
+    /// A schema with no fields is a schema bug, not a state this form
+    /// degrades for: `build`'s `debug_assert!` catches it before a single
+    /// widget is built — no display needed, which is what keeps this a plain
+    /// `#[test]` rather than a `#[gtk::test]`. **Red if the guard is
+    /// dropped**: `groups.last().expect(…)` would then be what panics
+    /// instead, and only once a caller reached `show_load_error`.
+    #[test]
+    #[should_panic(expected = "form-fixture-empty declares no fields")]
+    fn build_refuses_a_schema_with_no_fields() {
+        let ops = FamilyOps::of::<ShellSubsystem<EmptyFixture>>(&fixture::EMPTY_FAMILY, true, "");
+        let env = Rc::new(xdg::Env {
+            home: None,
+            config_home: None,
+            config_dirs: None,
+            state_home: None,
+        });
+        let _ = build(ops, &env);
     }
 
     /// The shim is only safe because it cannot say anything the family does
@@ -2472,6 +2593,103 @@ mod gtk_tests {
             "",
             "a locked key is refused before a byte moves"
         );
+    }
+
+    /// #1371 L1: `apply` pushes a value into a widget only when the file's
+    /// own value moved, and a refusal moves nothing — so before this, a
+    /// draft-less `Switch`/`Combo` kept showing the operator's rejected pick
+    /// for as long as the form lived, contradicting the file under an error
+    /// that said exactly that. `Text`/`Colour` are unaffected: they keep the
+    /// operator's draft (#1338), which is `a_text_row_refuses_a_blank…`'s
+    /// job to pin.
+    ///
+    /// **Red if the snap-back is dropped**: the switch stays `true` and the
+    /// combo stays on `"oled"` over a file that still says `false`/`"lcd"`.
+    #[gtk::test]
+    fn a_refused_save_snaps_a_switch_and_a_combo_back_to_the_files_value() {
+        let scratch = Scratch::new();
+        let form = fixture_form(
+            &scratch,
+            Some("_locked = [\"flag\", \"style\"]\nflag = false\nstyle = \"lcd\"\n"),
+        );
+
+        let Control::Switch(switch) = &row_of(&form, "flag").control else {
+            panic!("a Bool is a switch row");
+        };
+        switch.set_active(true);
+        settle_until("the switch's refusal to reach the row", || {
+            note_of(&form, "flag").contains("cannot be overridden")
+        });
+        assert!(
+            !switch.is_active(),
+            "a refused save snaps a draft-less switch back to the file's value"
+        );
+        assert!(
+            note_of(&form, "flag").contains("cannot be overridden"),
+            "and the refusal itself stays on screen: {}",
+            note_of(&form, "flag")
+        );
+
+        let Control::Combo { row, options, .. } = &row_of(&form, "style").control else {
+            panic!("a Choice is a combo row");
+        };
+        row.set_selected(2); // "oled" — `style`'s vocabulary is vfd/lcd/oled.
+        settle_until("the combo's refusal to reach the row", || {
+            note_of(&form, "style").contains("cannot be overridden")
+        });
+        assert_eq!(
+            options[usize::try_from(row.selected()).expect("in range")],
+            "lcd",
+            "a refused save snaps a draft-less combo back to the file's value"
+        );
+        assert!(
+            note_of(&form, "style").contains("cannot be overridden"),
+            "and the refusal itself stays on screen: {}",
+            note_of(&form, "style")
+        );
+    }
+
+    /// #1371 L4: the loader has no notion of a schema's `[min, max]` — only
+    /// the `gtk::Adjustment` clamps, so before this a file value outside it
+    /// was swapped for a number the file did not contain with no sign
+    /// anything happened. The row now says so, in the same slot a save
+    /// refusal uses, and clears it once the file is back in range.
+    ///
+    /// **Red if the range check is dropped**: the row shows `10` under a
+    /// subtitle claiming `Default`, over a file that says `300`.
+    #[gtk::test]
+    fn an_out_of_range_int_is_flagged_and_clears_once_the_file_is_fixed() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+
+        Scratch::write(&scratch.base("form-fixture"), "count = 300\n");
+        assert!(form.refresh_from_disk(), "the base layer moved");
+        assert!(
+            (row.value() - 10.0).abs() < f64::EPSILON,
+            "the adjustment clamps to the schema's own max"
+        );
+        assert_eq!(
+            note_of(&form, "count"),
+            "file says 300, the range is 0–10",
+            "the row names the file's value and the schema's range"
+        );
+        assert!(row_of(&form, "count").failed.get());
+
+        Scratch::write(&scratch.base("form-fixture"), "count = 7\n");
+        assert!(form.refresh_from_disk(), "the fixed value moved");
+        assert!(
+            (row.value() - 7.0).abs() < f64::EPSILON,
+            "the in-range value"
+        );
+        assert_eq!(
+            note_of(&form, "count"),
+            format!("From {}", scratch.base("form-fixture").display()),
+            "the clamp note clears and the ordinary provenance line comes back"
+        );
+        assert!(!row_of(&form, "count").failed.get());
     }
 
     /// *Reset* removes the operator's line — and deliberately does **not**

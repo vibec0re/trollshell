@@ -9,8 +9,10 @@
 //!   Endeavour — create and modify a task, pumping the [`MainContext`] and
 //!   asserting EDS pushes the `objects-added`/`-modified` notifications to the
 //!   view (issue #33). Prints `live view push count: N`.
-//! - **Calendar (RRULE expansion + EXDATE):** list every calendar source,
-//!   then on the first one, create a `FREQ=DAILY;COUNT=5` VEVENT and expand it
+//! - **Calendar (RRULE expansion + EXDATE):** list every calendar source
+//!   (each line carries the `[Calendar] Color=` the source keeps, as
+//!   `color=#rrggbb` or `color=(none)` — the #1223 read), then on the first
+//!   one, create a `FREQ=DAILY;COUNT=5` VEVENT and expand it
 //!   via [`CalClient::generate_instances`] over a one-month window — verifying
 //!   the recurrence-expansion path (issue #29). Prints
 //!   `recurring instance count: N`. It also seeds a second `COUNT=5` series
@@ -26,7 +28,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use hytte_ecal::{CalClient, MainContext, Registry, sys::ECalClientSourceType};
+use hytte_ecal::{CalClient, MainContext, Registry, Source, sys::ECalClientSourceType};
 
 fn main() -> anyhow::Result<()> {
     let registry = Registry::new()?;
@@ -185,6 +187,21 @@ fn probe_tasks(registry: &Registry) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print one line per configured calendar: display name, UID, and the
+/// `[Calendar] Color=` the source keeps, as [`Source::color`] reads it (#1223
+/// item 1) — `(none)` when the key is unset or isn't a hex triple.
+///
+/// A separate function (rather than a loop inside the caller) so the FFI colour
+/// read has a named home: the nixosTest's seeded fixture sets a colour, and
+/// this is the only place that read runs against a real source registry.
+fn print_calendars(cals: &[Source]) {
+    println!("\nfound {} calendar(s)", cals.len());
+    for src in cals {
+        let color = src.color().unwrap_or_else(|| "(none)".to_owned());
+        println!("  - {} ({}) color={color}", src.display_name(), src.uid());
+    }
+}
+
 /// Seed daily-recurring VEVENTs on the first calendar source and expand them
 /// into instances over a one-month window, exercising the RRULE-expansion
 /// binding — the fix for #29 — plus the EXDATE recurrence-set modifier (the
@@ -192,10 +209,7 @@ fn probe_tasks(registry: &Registry) -> anyhow::Result<()> {
 /// expansion must surface it as one fewer instance.
 fn probe_calendar_recurrence(registry: &Registry) -> anyhow::Result<()> {
     let cals = registry.calendars();
-    println!("\nfound {} calendar(s)", cals.len());
-    for src in &cals {
-        println!("  - {} ({})", src.display_name(), src.uid());
-    }
+    print_calendars(&cals);
     if cals.is_empty() {
         eprintln!("no calendars configured — skipping recurrence probe");
         return Ok(());

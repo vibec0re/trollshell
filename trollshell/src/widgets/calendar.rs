@@ -841,6 +841,155 @@ fn color_class_for_index(idx: usize) -> &'static str {
     }
 }
 
+// ── Per-source colour from EDS (#1223 item 1) ────────────────────────────────
+
+/// Class-name prefix for a source-supplied colour. The suffix is the parsed
+/// colour's own 8-digit hex, so two calendars that picked the same colour share
+/// one class and one CSS rule.
+const SOURCE_COLOR_CLASS_PREFIX: &str = "ts-cal-src-";
+
+thread_local! {
+    /// The one provider carrying every `.ts-cal-src-<rgba>` rule this session
+    /// has needed, plus the set of colour strings already reported as
+    /// unparseable.
+    ///
+    /// One provider for the whole shell rather than one per row: a dot is
+    /// rebuilt on every `rebuild_upcoming_list` (per drawer open, per monitor),
+    /// so a per-widget `CssProvider` would mint and install a provider per row
+    /// per render and never drop one. Distinct colours, by contrast, are
+    /// bounded by the number of configured calendars.
+    ///
+    /// Thread-local because it is only ever touched from the GTK main thread —
+    /// `gtk::CssProvider` is not [`Send`], and `build_calendar_row` runs
+    /// nowhere else.
+    static SOURCE_COLORS: RefCell<SourceColors> = RefCell::new(SourceColors::default());
+}
+
+/// The registry behind [`SOURCE_COLORS`]. `rules` is class → CSS colour text;
+/// `unparseable` is the debug-once set.
+#[derive(Default)]
+struct SourceColors {
+    provider: Option<gtk::CssProvider>,
+    /// Whether [`Self::provider`] has been handed to a `gdk::Display`. Tracked
+    /// separately from the `Option` because the two can legitimately disagree:
+    /// a provider built while `Display::default()` was `None` carries every
+    /// rule and paints nothing, and folding the install into the provider's
+    /// construction would cache that orphan for the rest of the session. The
+    /// install is retried on each reload until it lands (#1223 review, LOW-9).
+    installed: bool,
+    rules: BTreeMap<String, String>,
+    unparseable: std::collections::BTreeSet<String>,
+}
+
+/// Resolve `color` (an EDS `[Calendar] Color=` value) to a CSS class that paints
+/// a dot in it, registering the rule on the shared provider the first time that
+/// colour is seen. Returns `None` — so the caller falls back to the hash
+/// palette — when there is no colour, or when GTK itself can't parse the one
+/// EDS stored.
+///
+/// The class is keyed by the **parsed** RGBA, not the input string, so
+/// `#FF8800` and `#ff8800` are one rule; and the rule's value is written as
+/// `rgba(…)` from that same parse rather than by echoing the input, so nothing
+/// GTK's own parser rejected can ever reach the stylesheet.
+fn source_color_class(color: Option<&str>) -> Option<String> {
+    let color = color?;
+    let Ok(rgba) = gtk::gdk::RGBA::parse(color) else {
+        SOURCE_COLORS.with_borrow_mut(|state| {
+            if state.unparseable.insert(color.to_owned()) {
+                tracing::debug!(
+                    color,
+                    "calendar: source colour is not one GTK can parse; \
+                     falling back to the name-hashed palette"
+                );
+            }
+        });
+        return None;
+    };
+    let quad = rgba_quad(&rgba);
+    let class = source_color_class_name(quad);
+    SOURCE_COLORS.with_borrow_mut(|state| {
+        if !state.rules.contains_key(&class) {
+            state
+                .rules
+                .insert(class.clone(), source_color_css_value(quad));
+            reload_source_color_provider(state);
+        }
+    });
+    Some(class)
+}
+
+/// A `gdk::RGBA` (channels in `0.0..=1.0`) as an `[r, g, b, a]` byte quad —
+/// the single quantisation both the class name and the rule it names derive
+/// from, so the two cannot drift. Alpha is **kept**, unlike
+/// `plugins::pump`'s `rgba_to_bytes`: a calendar's `#rrggbbaa` may legitimately
+/// be translucent.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rgba_quad(rgba: &gtk::gdk::RGBA) -> [u8; 4] {
+    // Each channel is clamped to 0.0..=1.0 then ×255 → 0.0..=255.0 and rounded,
+    // so the cast is exact (the idiom `plugins::pump::rgba_to_bytes` uses).
+    let chan = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [
+        chan(rgba.red()),
+        chan(rgba.green()),
+        chan(rgba.blue()),
+        chan(rgba.alpha()),
+    ]
+}
+
+/// `ts-cal-src-rrggbbaa` for a quantised colour.
+fn source_color_class_name([r, g, b, a]: [u8; 4]) -> String {
+    format!("{SOURCE_COLOR_CLASS_PREFIX}{r:02x}{g:02x}{b:02x}{a:02x}")
+}
+
+/// The CSS colour text for a quantised colour: `rgba(r,g,b,a)` with the
+/// channels GTK itself parsed. Written out rather than echoing the source
+/// string, so an exotic (but parseable) spelling still lands as something GTK's
+/// CSS parser accepts — and so nothing EDS stored reaches the stylesheet
+/// verbatim.
+fn source_color_css_value([r, g, b, a]: [u8; 4]) -> String {
+    let alpha = f64::from(a) / 255.0;
+    format!("rgba({r},{g},{b},{alpha:.3})")
+}
+
+/// Rebuild the shared provider's sheet from `state.rules` and, until it lands,
+/// install it on the default display.
+///
+/// Installed at `STYLE_PROVIDER_PRIORITY_USER` — the same *priority* the
+/// shell's own `style.css` (and its `.ts-cal-color-N` palette) holds. Equal
+/// priority is not equal authority, though: GTK's cascade appends an
+/// equal-priority provider *after* the ones already installed and consults the
+/// list from the end, so this one — installed lazily, at the first coloured row,
+/// long after `app.rs` loads `style.css` — wins any property both declare
+/// (#1223 review, LOW-7). That is inert today and must stay a deliberate fact
+/// rather than an accident: a dot carries the palette class or a source class,
+/// never both, and nothing else in either sheet declares a background on
+/// `.ts-cal-src-*`. A future rule that *does* want to beat these (the month
+/// grid's `.ts-cal-day-selected .ts-cal-event-dot`, say) cannot rely on
+/// specificity alone — measure it.
+fn reload_source_color_provider(state: &mut SourceColors) {
+    use std::fmt::Write as _;
+
+    let mut sheet = String::new();
+    for (class, value) in &state.rules {
+        // Writing to a `String` is infallible; the `Result` exists only to
+        // satisfy the `fmt::Write` signature.
+        let _ = writeln!(sheet, ".{class} {{ background: {value}; }}");
+    }
+    let provider = state.provider.get_or_insert_with(gtk::CssProvider::new);
+    provider.load_from_string(&sheet);
+    // Not folded into the construction above: see `SourceColors::installed`.
+    if !state.installed
+        && let Some(display) = gtk::gdk::Display::default()
+    {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &*provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+        state.installed = true;
+    }
+}
+
 // ── Upcoming-list row builder + helpers ──────────────────────────────────────
 
 /// Format just the time portion of an event for the upcoming-list subtitle:
@@ -863,9 +1012,11 @@ fn format_time_subtitle(ev: &CalendarEvent) -> String {
 }
 
 /// Build an `adw::ActionRow` for a single calendar event. The prefix is a
-/// colored dot keyed by `calendar_name`; the subtitle shows the time only
-/// (no location — join-URLs are too noisy in this compact list). The row is
-/// activatable: clicking it launches `gnome-calendar` (graceful if absent).
+/// colored dot: the **source's own** colour when EDS has one for that calendar
+/// (`calendar_color`, #1223 item 1), else the palette class keyed by
+/// `calendar_name`. The subtitle shows the time only (no location — join-URLs
+/// are too noisy in this compact list). The row is activatable: clicking it
+/// launches `gnome-calendar` (graceful if absent).
 fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
     let subtitle = format_time_subtitle(ev);
 
@@ -885,7 +1036,13 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
 
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("ts-cal-source-dot");
-    dot.add_css_class(color_class_for_calendar(&ev.calendar_name));
+    // The source's own colour wins; the hash palette is what a calendar with no
+    // `[Calendar] Color=` (or one GTK can't parse) falls back to. Exactly one of
+    // the two classes is ever added, so their CSS rules never compete.
+    match source_color_class(ev.calendar_color.as_deref()) {
+        Some(class) => dot.add_css_class(&class),
+        None => dot.add_css_class(color_class_for_calendar(&ev.calendar_name)),
+    }
     dot.set_valign(gtk::Align::Center);
     dot.set_halign(gtk::Align::Center);
     row.add_prefix(&dot);
@@ -1033,6 +1190,7 @@ mod tests {
             location: None,
             all_day: false,
             calendar_name: "cal".into(),
+            calendar_color: None,
         }
     }
 
@@ -1053,6 +1211,7 @@ mod tests {
             location: None,
             all_day: false,
             calendar_name: "cal".into(),
+            calendar_color: None,
         }
     }
 
@@ -1080,6 +1239,7 @@ mod tests {
             location: None,
             all_day: true,
             calendar_name: "cal".into(),
+            calendar_color: None,
         }
     }
 
@@ -1412,6 +1572,7 @@ mod reentrancy_tests {
             location: None,
             all_day: false,
             calendar_name: "cal".to_owned(),
+            calendar_color: None,
         }
     }
 
@@ -1941,6 +2102,287 @@ mod lifetime_tests {
             "the timeout must still clear the class on a live row — if this fails the weak \
              handle is upgrading to `None` when it should not, and the highlight would stick \
              forever"
+        );
+    }
+}
+
+/// The per-source colour on a row's dot (#1223 item 1).
+///
+/// Needs a real display server: `adw::ActionRow` has to be constructible for
+/// `build_calendar_row`, and `gtk::style_context_add_provider_for_display` needs
+/// a `gdk::Display` — hence the `system-tests` gate, like the modules above.
+#[cfg(all(test, feature = "system-tests"))]
+mod source_color_tests {
+    use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::calendar::CalendarEvent;
+
+    use super::{
+        PALETTE_SIZE, SOURCE_COLOR_CLASS_PREFIX, SOURCE_COLORS, build_calendar_row,
+        color_class_for_calendar, color_class_for_index, source_color_class,
+    };
+
+    /// A one-hour event on a fixed day, with the source colour under test.
+    fn evt(color: Option<&str>) -> CalendarEvent {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 17).expect("valid date");
+        let start: DateTime<Local> = Local
+            .from_local_datetime(&day.and_hms_opt(9, 0, 0).expect("valid time"))
+            .single()
+            .expect("unambiguous local time");
+        CalendarEvent {
+            uid: "e1".to_owned(),
+            summary: "Standup".to_owned(),
+            start,
+            end: start + Duration::hours(1),
+            location: None,
+            all_day: false,
+            calendar_name: "Work".to_owned(),
+            calendar_color: color.map(str::to_owned),
+        }
+    }
+
+    /// The `ts-cal-source-dot` prefix `build_calendar_row` adds, found by
+    /// walking the row rather than by holding a handle the builder doesn't
+    /// return.
+    fn dot_of(row: &adw::ActionRow) -> gtk::Widget {
+        let mut stack = vec![row.clone().upcast::<gtk::Widget>()];
+        while let Some(w) = stack.pop() {
+            if w.has_css_class("ts-cal-source-dot") {
+                return w;
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        panic!("no .ts-cal-source-dot in the row");
+    }
+
+    /// Every palette class, so a test can assert none of them is present.
+    fn palette_classes() -> Vec<&'static str> {
+        (0..PALETTE_SIZE).map(color_class_for_index).collect()
+    }
+
+    /// The shared provider's current sheet, as **GTK re-serialises it** —
+    /// `CssProvider::to_str` returns the parsed rules expanded to longhand, not
+    /// the text we loaded, so a rule GTK refused simply isn't there. That makes
+    /// this a check on what the display will paint rather than on our own
+    /// `format!`.
+    fn provider_sheet() -> String {
+        SOURCE_COLORS.with_borrow(|state| {
+            state
+                .provider
+                .as_ref()
+                .expect("a provider once a colour has been registered")
+                .to_str()
+                .to_string()
+        })
+    }
+
+    /// A source with a colour paints the dot in it — and the hash palette class
+    /// is **not** also applied, so the two rules can never compete.
+    #[gtk::test]
+    fn a_source_colour_replaces_the_palette_class_on_the_dot() {
+        adw::init().expect("libadwaita init");
+        let row = build_calendar_row(&evt(Some("#ff8800")));
+        let dot = dot_of(&row);
+
+        assert!(
+            dot.has_css_class("ts-cal-src-ff8800ff"),
+            "the dot must carry the class for #ff8800 (opaque); classes were {:?}",
+            dot.css_classes()
+        );
+        for palette in palette_classes() {
+            assert!(
+                !dot.has_css_class(palette),
+                "the hash palette class {palette} must not also be applied"
+            );
+        }
+    }
+
+    /// …and the class actually paints: the shared provider carries a rule for
+    /// it, with the channels GTK parsed. Without this the assertion above would
+    /// pass on an inert string.
+    #[gtk::test]
+    fn the_shared_provider_carries_a_rule_for_that_colour() {
+        adw::init().expect("libadwaita init");
+        let class = source_color_class(Some("#ff8800")).expect("a parseable colour");
+        assert_eq!(class, "ts-cal-src-ff8800ff");
+
+        let sheet = provider_sheet();
+        assert!(
+            sheet.contains(".ts-cal-src-ff8800ff"),
+            "the provider's sheet must name the class: {sheet}"
+        );
+        // The first `background-color:` **after our own selector** — the sheet
+        // carries a block per colour any test in this module registered, and
+        // `#[gtk::test]` bodies share one thread (and so one `SOURCE_COLORS`),
+        // so scanning from the top would read whichever class sorts first. The
+        // `take_while` bounds the scan at this rule's own closing brace: without
+        // it, a block that lost its `background-color` would silently borrow a
+        // neighbouring colour's (#1223 review, LOW-8).
+        let background = sheet
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with(".ts-cal-src-ff8800ff"))
+            .take_while(|l| !l.contains('}'))
+            .find(|l| l.trim_start().starts_with("background-color:"))
+            .unwrap_or_else(|| panic!("the rule must set a background-color: {sheet}"));
+        assert!(
+            background.contains("255,136,0"),
+            "the rule must paint the channels GTK parsed — note an opaque alpha \
+             collapses `rgba(…)` back to `rgb(…)` in GTK's own re-serialisation: \
+             {background}"
+        );
+    }
+
+    /// A source with no colour keeps the name-hashed palette dot — the
+    /// pre-#1223 behaviour, unchanged.
+    #[gtk::test]
+    fn no_source_colour_keeps_the_hash_palette_class() {
+        adw::init().expect("libadwaita init");
+        let row = build_calendar_row(&evt(None));
+        let dot = dot_of(&row);
+
+        assert!(
+            dot.has_css_class(color_class_for_calendar("Work")),
+            "classes were {:?}",
+            dot.css_classes()
+        );
+        assert!(
+            !dot.css_classes()
+                .iter()
+                .any(|c| c.starts_with(SOURCE_COLOR_CLASS_PREFIX)),
+            "no source-colour class may appear without a source colour: {:?}",
+            dot.css_classes()
+        );
+    }
+
+    /// A stored value GTK's colour parser rejects falls back to the palette
+    /// rather than reaching the stylesheet. `hytte-ecal` already drops non-hex
+    /// spellings, so this is the belt to that braces — it guards the case where
+    /// the two ends of the contract disagree.
+    #[gtk::test]
+    fn an_unparseable_colour_falls_back_to_the_palette() {
+        adw::init().expect("libadwaita init");
+        assert!(source_color_class(Some("not-a-colour")).is_none());
+
+        let row = build_calendar_row(&evt(Some("not-a-colour")));
+        let dot = dot_of(&row);
+        assert!(
+            dot.has_css_class(color_class_for_calendar("Work")),
+            "classes were {:?}",
+            dot.css_classes()
+        );
+    }
+
+    /// …and the rule is not merely *built*, it is **installed on the display**,
+    /// so the class actually paints. This renders the dot and reads its pixels
+    /// back through cairo: it pins the whole chain at once — class on the
+    /// widget, rule in the provider, provider on the display, and GTK resolving
+    /// the three onto that node.
+    ///
+    /// Its own reason to exist: deleting
+    /// `style_context_add_provider_for_display` from
+    /// `reload_source_color_provider` leaves every other assertion in this
+    /// module green while every coloured dot draws literally nothing — the
+    /// sheet test reads the provider out of `SOURCE_COLORS`, so it cannot tell
+    /// an installed provider from an orphan (#1223 review, HIGH-1; the same
+    /// shape as #1321/#1322's "seam extraction leaves the wrapper unpinned").
+    #[gtk::test]
+    fn the_source_colour_actually_paints_the_dot() {
+        adw::init().expect("libadwaita init");
+        let row = build_calendar_row(&evt(Some("#ff8800")));
+        let dot = dot_of(&row);
+        dot.set_size_request(16, 16);
+
+        // A realized, allocated widget is what `WidgetPaintable` can snapshot;
+        // an unmapped one has no size and renders to nothing. The row goes into
+        // an `adw::PreferencesGroup` because that is what `rebuild_upcoming_list`
+        // parents it to — an `AdwActionRow` is a `GtkListBoxRow`, and one
+        // without a `GtkListBox` above it criticals on the focus grab
+        // `present()` performs.
+        let group = adw::PreferencesGroup::new();
+        group.add(&row);
+        let window = gtk::Window::new();
+        window.set_child(Some(&group));
+        window.present();
+        let ctx = hytte::gtk::glib::MainContext::default();
+        for _ in 0..200 {
+            if !ctx.iteration(false) {
+                break;
+            }
+        }
+
+        let paintable = gtk::WidgetPaintable::new(Some(&dot));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, f64::from(READBACK), f64::from(READBACK));
+        let node = snapshot
+            .to_node()
+            .expect("the dot must draw something — an uninstalled provider draws nothing at all");
+
+        let mut surface = hytte::gtk::cairo::ImageSurface::create(
+            hytte::gtk::cairo::Format::ARgb32,
+            READBACK,
+            READBACK,
+        )
+        .expect("image surface");
+        {
+            let cr = hytte::gtk::cairo::Context::new(&surface).expect("cairo context");
+            node.draw(&cr);
+        }
+        let stride = usize::try_from(surface.stride()).expect("a non-negative cairo stride");
+        let data = surface.data().expect("surface data");
+
+        // The dot carries a CSS margin, so its painted box is inset inside the
+        // 16×16 readback and off-centre; assert over every opaque pixel instead
+        // of guessing where the box landed. `#ff8800` is nothing the
+        // `.ts-cal-color-N` palette paints, so "opaque pixels exist and every
+        // one of them is this colour" is exactly the claim.
+        window.destroy();
+        let mut opaque = 0usize;
+        for y in 0..usize::try_from(READBACK).expect("positive") {
+            for x in 0..usize::try_from(READBACK).expect("positive") {
+                // ARGB32 is little-endian in memory: B, G, R, A.
+                let off = y * stride + x * 4;
+                let (b, g, r, a) = (data[off], data[off + 1], data[off + 2], data[off + 3]);
+                if a <= 200 {
+                    continue;
+                }
+                opaque += 1;
+                assert!(
+                    r > 230 && (120..=155).contains(&g) && b < 40,
+                    "every opaque pixel of the dot must be the source colour #ff8800, \
+                     got rgba({r},{g},{b},{a}) at ({x},{y})"
+                );
+            }
+        }
+        assert!(
+            opaque > 0,
+            "the dot must paint at least one opaque pixel — a provider that was \
+             built but never added to the display paints none"
+        );
+    }
+
+    /// Side length of the cairo readback in
+    /// [`the_source_colour_actually_paints_the_dot`], in pixels.
+    const READBACK: i32 = 16;
+
+    /// Two calendars that picked the same colour share one class and one rule —
+    /// the reason this is a registry and not a provider per row.
+    #[gtk::test]
+    fn the_same_colour_registers_one_rule_however_it_is_spelled() {
+        adw::init().expect("libadwaita init");
+        let lower = source_color_class(Some("#3584e4")).expect("parseable");
+        let upper = source_color_class(Some("#3584E4")).expect("parseable");
+        assert_eq!(lower, upper);
+
+        let sheet = provider_sheet();
+        assert_eq!(
+            sheet.matches(".ts-cal-src-3584e4ff").count(),
+            1,
+            "one rule per distinct colour: {sheet}"
         );
     }
 }

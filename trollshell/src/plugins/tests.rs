@@ -2332,6 +2332,9 @@ fn to_upcoming_events_windows_caps_and_maps() {
         location: None,
         all_day: false,
         calendar_name: cal.to_owned(),
+        // The wire digest carries `calendar_name` only (#542) — colour does
+        // not cross the socket, so this stays `None` here (#1223 item 1).
+        calendar_color: None,
     };
     // Sorted ascending by start, as the calendar service guarantees.
     let events = vec![

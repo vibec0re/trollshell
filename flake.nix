@@ -355,7 +355,8 @@
           stubLlamaCpp = pkgs.writeShellScriptBin "llama-server" "";
 
           # The hytte-ecal `probe` example binary + fixture sources (a
-          # task-list and a calendar), for the eds-nixos-test below. Since #588
+          # task-list and two calendars, one coloured and one not), for the
+          # eds-nixos-test below. Since #588
           # this is a slice — a `cp` + a GApps wrap, no cargo and no crane —
           # exactly like the plugin packages above; since #1257 the binary it
           # copies is `probes`' (the checks-universe compile), not
@@ -382,6 +383,27 @@
           calSource = pkgs.writeText "test-calendar.source" ''
             [Data Source]
             DisplayName=Test Calendar
+            Enabled=true
+
+            [Calendar]
+            BackendName=local
+            Color=#ff8800
+          '';
+          # The colourless twin (#1223 item 1 review, MED-5). With only the
+          # coloured fixture seeded, the VM's `color=#ff8800` assertion is
+          # satisfied by a `Source::color` that ignores the FFI read and returns
+          # that literal — measured: that mutation keeps all 44 hermetic tests
+          # AND the VM regex green. A second calendar that sets **no** `Color=`
+          # makes the pair discriminating: the same run must print `color=(none)`
+          # for this one, which no constant can do.
+          #
+          # `Uncoloured Calendar` sorts after `Test Calendar`, and the two
+          # assertions key off the distinct display names rather than off
+          # position, so neither the registry's ordering nor which calendar the
+          # recurrence probe picks to write into can flip them.
+          calSourceNoColor = pkgs.writeText "test-calendar-no-color.source" ''
+            [Data Source]
+            DisplayName=Uncoloured Calendar
             Enabled=true
 
             [Calendar]
@@ -2723,7 +2745,12 @@
           # script. This call passes the module fixtures the block used to
           # close over here (`pkgs` is auto-supplied by `callPackage`).
           eds-nixos-test = pkgs.callPackage ./nix/checks/eds-nixos-test.nix {
-            inherit probe taskSource calSource;
+            inherit
+              probe
+              taskSource
+              calSource
+              calSourceNoColor
+              ;
           };
 
           # The "lean heavy on nix" harness for the NetworkManager Wi-Fi

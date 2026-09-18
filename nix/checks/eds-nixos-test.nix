@@ -12,14 +12,16 @@
 # Split out of flake.nix (#1102) into its own `callPackage`-able file,
 # mirroring how `packages` already lives under `nix/*.nix`. Takes the
 # module fixtures the block closed over there: `probe` (nix/probe.nix's
-# slice of `workspace`) and the seeded `taskSource`/`calSource` — both
-# still built in flake.nix's own `let`, since they're plain `pkgs.writeText`
-# fixtures with no other consumer.
+# slice of `workspace`) and the seeded `taskSource` plus the two calendars —
+# `calSource` (with a `[Calendar] Color=`) and `calSourceNoColor` (without;
+# #1223 item 1 review, MED-5) — all still built in flake.nix's own `let`,
+# since they're plain `pkgs.writeText` fixtures with no other consumer.
 {
   pkgs,
   probe,
   taskSource,
   calSource,
+  calSourceNoColor,
 }:
 pkgs.testers.runNixOSTest {
   name = "eds-nixos-test";
@@ -50,6 +52,10 @@ pkgs.testers.runNixOSTest {
     machine.copy_from_host(
         "${calSource}",
         "/home/alice/.config/evolution/sources/test-calendar.source",
+    )
+    machine.copy_from_host(
+        "${calSourceNoColor}",
+        "/home/alice/.config/evolution/sources/test-calendar-no-color.source",
     )
     machine.succeed("chown -R alice:users /home/alice/.config")
     # Store-copied files land read-only (0444); EDS's source
@@ -113,6 +119,53 @@ pkgs.testers.runNixOSTest {
     # window. All 5 occurrences must materialise — the whole point
     # of the fix (the old master-only path would surface just 1).
     assert "Test Calendar" in output, output
+
+    # Per-source colour (#1223 item 1): the seeded fixtures are a pair —
+    # "Test Calendar" carries `[Calendar] Color=#ff8800`, "Uncoloured
+    # Calendar" carries the `[Calendar]` group with no `Color=` at all —
+    # and `Source::color` reads each off its own `ESourceSelectable`
+    # extension. This is the only place that FFI read runs against a real
+    # source registry; the hermetic tests cover only the decisions it
+    # applies to the string.
+    #
+    # BOTH lines are asserted, because either alone is satisfiable by a
+    # constant: measured on the review branch, a `Source::color` that
+    # discards the FFI result and returns `Some("#ff8800")` keeps all 44
+    # hermetic `hytte-ecal` tests green AND still matches the `#ff8800`
+    # regex. Only the `(none)` line makes the pair discriminating — no
+    # single constant can answer both.
+    #
+    # The `(none)` line carries a SECOND duty, and that one has already
+    # earned its keep. There is no "unset" colour at the FFI layer:
+    # `ESourceSelectable`'s `color` is a *construct* property with
+    # `default-value="#62a0ea"`, so an uncoloured calendar answers GNOME
+    # blue, not NULL. The first version of this assertion found that the
+    # hard way — run 35331529534 printed
+    #     - Uncoloured Calendar (test-calendar-no-color) color=#62a0ea
+    # which is why `hytte_ecal::EDS_DEFAULT_CALENDAR_COLOR` exists and why
+    # `Source::color` reports that exact value as `None`. So this line is
+    # also a deliberate **version tripwire**: an EDS release that changes
+    # the default reddens it here, which is the alarm we want — the
+    # alternative is the shell's whole hash-palette fallback silently
+    # dying and every unconfigured calendar on screen turning one colour.
+    # Read a failure here as "EDS moved, update the constant", never as a
+    # flake to retry.
+    #
+    # Keyed off the distinct display names rather than off position, so
+    # neither the registry's ordering nor which calendar the recurrence
+    # probe below happens to write into can flip them. ("Uncoloured
+    # Calendar" does not match the first regex either: after `- Test
+    # Calendar ` that line has an `N`, not the literal `(` the pattern
+    # requires.)
+    #
+    # EDS's own sources appear in this output too — the auto-provisioned
+    # `Personal` (#62a0ea, i.e. the default) and `Birthdays &
+    # Anniversaries` (#ffbe6f). Deliberately NOT asserted on: their
+    # colours are EDS's business, so pinning them would fail this test for
+    # reasons that say nothing about our read.
+    assert re.search(r"- Test Calendar \(.*\) color=#ff8800", output), output
+    assert re.search(r"- Uncoloured Calendar \(.*\) color=\(none\)", output), output
+
     assert "created recurring uid:" in output, output
     assert "recurring instance count: 5" in output, output
     assert "removed recurring" in output, output

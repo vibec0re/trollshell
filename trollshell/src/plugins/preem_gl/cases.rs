@@ -132,7 +132,7 @@ pub(crate) enum Case {
         /// `Frame` carries out — [`FLIP_SCALE`] compares pixel against pixel,
         /// [`FLIP_SUPERSAMPLE`] compares a box-averaged native frame against
         /// the kit's logical one. The `Gauge`'s arrangement, not the
-        /// `stretch` the four lattice kinds use, because here the *kit* is
+        /// `stretch` the five lattice kinds use, because here the *kit* is
         /// what renders at two resolutions.
         scale: u32,
     },
@@ -140,12 +140,13 @@ pub(crate) enum Case {
     LedMatrix {
         style: kit::DisplayStyle,
         panel: PanelAt,
-        /// The shell's own integer upscale — `core_panel_scale`'s answer, which
-        /// `PixelSurface::set_scale` replicates on the CPU arm.
+        /// The shell's own integer upscale — `core_panel_scale`'s answer.
+        /// Before #1157 this was what `PixelSurface::set_scale` replicated on
+        /// the CPU arm; the GL arm resolves it natively per fragment instead.
         /// [`PANEL_SCALE`] compares pixel against pixel,
         /// [`PANEL_SUPERSAMPLE`] compares a box-averaged native frame against
         /// the kit's logical one. The `Gauge`'s and the `FlipBoard`'s
-        /// arrangement, not the `stretch` the four lattice kinds use, because
+        /// arrangement, not the `stretch` the five lattice kinds use, because
         /// the panel's on-glass size *is* an integer multiple of its buffer.
         scale: u32,
     },

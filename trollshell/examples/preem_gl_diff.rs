@@ -4,18 +4,18 @@
 //! per-channel delta, so the ceiling the spec proposes — mean ≤ 2/255,
 //! p99 ≤ 8/255, max ≤ 32/255 — is a measurement rather than a hope.
 //!
-//! Five kinds since #1152, each four skins wide: the `Scope` (three fade
-//! depths), the `Gauge` (three needle positions, plus one at the **shipping**
-//! upscale and one **stretched**), the `DotMatrix` (five displays, plus one
-//! stretched), the `Marquee` (five scroll phases, plus one stretched, plus one
-//! per skin at a window
-//! width where the centred origin and the bezel diverge — #1209 review,
-//! MEDIUM-1) and the `TextBox` (four configurations, plus one stretched) —
-//! **100** cases. Every case but the stretched and shipping-upscale ones runs
-//! 1:1, where the GL arm's native grid and the kit's logical one are the same
-//! number and the two can be compared pixel against pixel; that is where
-//! `TROLLSHELL_PARITY_EXACT=1` pins all five
-//! kinds at zero.
+//! One entry per `Kind` (`parity`'s enum, one per kit widget the GL arm
+//! draws), each skin wide — not a fixed count of kinds or cases stated here,
+//! because both have grown with every arm since #1152 and will keep growing.
+//! `cases_for` (`cases.rs`) is what actually builds the list, and
+//! `the_nix_case_count_matches_the_harness` is what pins its length against
+//! nix's own copy (`nix/checks/system-tests.nix`'s `parityCases`); `cases.rs`'s
+//! own `Case` variants carry each kind's case shape in their own doc
+//! comments, kept honest by that same test rather than restated here. Every
+//! case but the stretched and shipping-upscale ones runs 1:1, where the GL
+//! arm's native grid and the kit's logical one are the same number and the
+//! two can be compared pixel against pixel; that is where
+//! `TROLLSHELL_PARITY_EXACT=1` pins every kind at zero.
 //!
 //! What each kind's 1:1 cases *vary* is its own arithmetic. The dot matrix has
 //! no `scale` on the widget at all — the dot pitch is its size knob (#1091) —
@@ -166,8 +166,8 @@
 //! the only value that has ever been measured — it is **not** set when running
 //! this by hand against real glass, where the ceiling is the real contract.
 //!
-//! Since #1148's review it pins every kind, not the scope alone — all five of
-//! them since #1152, each on its own llvmpipe measurement. The
+//! Since #1148's review it pins every kind, not the scope alone — each one
+//! added since #1152 got its own llvmpipe measurement. The
 //! supersampled cases are unaffected either way: their verdict is the region
 //! split above, which is already exact where exactness is meaningful and does
 //! not depend on this variable at all.
@@ -1261,10 +1261,13 @@ impl Case {
             }
             // The panel resolves its grid through the very mapping the shell
             // calls too, and — like the board — the third element is an
-            // **upscale** rather than a stretch: the kit rasterises into the
-            // grid and `PixelSurface::set_scale` replicates it, so the natural
-            // size is `grid × scale`. Reading it off `uniforms.grid` rather
-            // than off `surface.width` is what keeps that true.
+            // **upscale** rather than a stretch: the natural size is
+            // `grid × scale`, the same integer multiple the shell has always
+            // requested — before #1157 by rasterising into the grid and
+            // replicating it with `PixelSurface::set_scale`'s nearest
+            // neighbour, now by the GL arm resolving the panel natively at
+            // that size. Reading it off `uniforms.grid` rather than off
+            // `surface.width` is what keeps that true.
             Self::LedMatrix {
                 style,
                 panel,
@@ -2209,9 +2212,10 @@ fn measure(
         // The kit's own panel at this fixture grid — the *same* builder the
         // mapping resolved its grid from, so a disagreement here is a
         // disagreement between renderers and not between two panels. The
-        // `upscale` is `PixelSurface::set_scale`'s nearest-neighbour
-        // replication, which is what the CPU arm on the glass actually does
-        // with this frame, so the reference reproduces it with the kit's own
+        // `upscale` is the shell's own integer multiple — before #1157 what
+        // `PixelSurface::set_scale`'s nearest-neighbour replication produced
+        // on the glass, now what the GL arm resolves natively per fragment —
+        // so the reference reproduces the same geometry with the kit's own
         // `Frame::upscale` rather than with a second copy of that rule.
         Case::LedMatrix { style, panel, .. } => panel_grid(*style, *panel)
             .render(&panel.levels())

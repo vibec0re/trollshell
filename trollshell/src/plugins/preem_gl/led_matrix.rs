@@ -131,11 +131,12 @@ pub(crate) fn lamps(panel: &kit::LedMatrix, levels: &[f32], ink: kit::Rgba) -> A
 /// implementation — and passes it on to [`kit::LedMatrix::lamp_inks`], which is
 /// why that function takes an `ink` rather than reading `self.style.palette()`.
 ///
-/// `scale` is the shell's **integer upscale** — `core_panel_scale`'s answer,
-/// which is what `PixelSurface::set_scale` replicates on the CPU arm. It
-/// multiplies the natural size and leaves the grid alone (the scope's and the
-/// flip board's arrangement, not the dot matrix's), so a shipping panel always
-/// draws through the continuous branch, which is where the improvement is.
+/// `scale` is the shell's **integer upscale** — `core_panel_scale`'s answer.
+/// Before #1157 this was what `PixelSurface::set_scale` replicated on the CPU
+/// arm; the mapping here multiplies the natural size and leaves the grid
+/// alone instead (the scope's and the flip board's arrangement, not the dot
+/// matrix's), so a shipping panel always draws through the continuous branch,
+/// which is where the improvement is.
 pub(crate) fn led_matrix_surface(
     panel: &kit::LedMatrix,
     levels: &[f32],

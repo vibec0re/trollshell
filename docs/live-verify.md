@@ -2897,9 +2897,10 @@ session.
      across outputs even though the surfaces are not.
   7. **The fallback, if you can provoke it.** Force a context failure (a
      session with no GL, or a stack that refuses `LIBGL_ALWAYS_SOFTWARE`) and
-     confirm the scope falls back to the CPU kit with one journal line rather
-     than showing a blank chip. The phosphor restarts from black, which is the
-     honest outcome — the GL arm never drew a trail to inherit.
+     confirm the scope goes to the broken-widget placeholder with one journal
+     line — #1157 retired the CPU kit this item used to ask it to fall back
+     to, so an empty chip is the honest outcome now, not a phosphor trail
+     restarting from black.
   8. **(#1298/#1299) Whether GTK actually leaves the pixel store dirty.**
      `hytte-gl::Texture::reset_unpack_state`'s doc asserts "GTK4 may upload
      its own textures through PBOs on some paths, which is one way
@@ -3135,8 +3136,9 @@ session.
      pitches. A comb that is the same absolute pitch on both means the
      re-phase was dropped.
   6. **The fallback, if you can provoke it.** Force a context failure and
-     confirm the readout falls back to the CPU kit with one journal line rather
-     than a blank chip. This kind is the **strongest** case for the hook of the
+     confirm the readout goes to the broken-widget placeholder with one
+     journal line — #1157 retired the CPU kit this item used to ask it to
+     fall back to. This kind is the **strongest** case for the hook of the
      three: a gauge at least animates while its needle swings and a scope while
      its trail fades, but a dot matrix never animates at all, so no mapping
      pass is ever coming on its own.

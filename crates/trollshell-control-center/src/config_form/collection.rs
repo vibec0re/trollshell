@@ -250,7 +250,7 @@ fn map_page(
 
     let map = Rc::new(MapPage {
         form: Rc::downgrade(inner),
-        key: key.clone(),
+        key,
         fields,
         field,
         group,
@@ -337,18 +337,17 @@ impl MapPage {
             let page = Rc::clone(self);
             add.connect_apply(move |entry| {
                 let name = entry.text().trim().to_owned();
-                match check_name(&name, &page.key) {
-                    Err(why) => page.say(why),
-                    Ok(()) => {
-                        entry.set_text("");
-                        page.banner.set_revealed(false);
-                        // Deferred for `places_tab::add`'s reason: opening the
-                        // entry rebuilds this very group, and `entry` is a row
-                        // in it, mid-`apply`.
-                        let page = Rc::clone(&page);
-                        glib::idle_add_local_once(move || page.open(&name));
-                    }
+                if let Err(why) = check_name(&name, &page.key) {
+                    page.say(why);
+                    return;
                 }
+                entry.set_text("");
+                page.banner.set_revealed(false);
+                // Deferred for `places_tab::add`'s reason: opening the entry
+                // rebuilds this very group, and `entry` is a row in it,
+                // mid-`apply`.
+                let page = Rc::clone(&page);
+                glib::idle_add_local_once(move || page.open(&name));
             });
             self.group.add(&add);
             rows.push(add.upcast::<gtk::Widget>());
@@ -683,12 +682,16 @@ fn confirm_delete(
         name, inner.ops.family.name
     );
     if !inherited.is_empty() {
-        body.push_str(&format!(
+        use std::fmt::Write as _;
+        // Infallible into a `String`; the `Result` is the trait's, not this
+        // formatter's.
+        let _ = write!(
+            body,
             "\n\nA layer below still sets {}, so the entry stays — with those values instead \
              of yours. Removing it there means editing that file, or the nix option that \
              renders it.",
             inherited.join(", ")
-        ));
+        );
     }
 
     let dialog = adw::MessageDialog::new(
@@ -785,7 +788,7 @@ fn list_page(
 
     let list = Rc::new(ListPage {
         form: Rc::downgrade(inner),
-        key: key.clone(),
+        key,
         element,
         field,
         group,
@@ -844,7 +847,7 @@ impl ListPage {
                         } else if text.is_empty() {
                             items.remove(slot);
                         } else {
-                            items[slot] = text.clone();
+                            items[slot].clone_from(&text);
                         }
                     });
                 });
@@ -1006,7 +1009,7 @@ fn records_page(
 
     let records = Rc::new(RecordsPage {
         form: Rc::downgrade(inner),
-        key: key.clone(),
+        key,
         fields,
         field,
         group,

@@ -1551,74 +1551,8 @@ fn connect_rows(inner: &Rc<FormInner>) {
                 combo,
                 entry,
                 swatch,
-                ..
-            } => {
-                let options_len = match row.control {
-                    Control::Colour { options, .. } => u32::try_from(options.len()).unwrap_or(0),
-                    _ => 0,
-                };
-                {
-                    let weak = Rc::downgrade(inner);
-                    let entry = entry.downgrade();
-                    combo.connect_selected_notify(move |combo| {
-                        // Picking *custom* before typing anything is not a
-                        // value: the empty string is what the writer refuses
-                        // (`Kind::Color`'s own `accepts`), so writing it here
-                        // would greet the operator with a red row for
-                        // choosing the item that means "I'll type one"
-                        // (#1365 review, L3). The entry's apply button is
-                        // what saves a literal, as it does mid-typing.
-                        let nothing_typed = entry
-                            .upgrade()
-                            .is_none_or(|entry| entry.text().trim().is_empty());
-                        if combo.selected() >= options_len && nothing_typed {
-                            return;
-                        }
-                        save_from_row(&weak, index);
-                    });
-                }
-                {
-                    let weak = Rc::downgrade(inner);
-                    let swatch = swatch.clone();
-                    let combo = combo.clone();
-                    entry.connect_apply(move |_| {
-                        swatch.queue_draw();
-                        // Applying a literal means the operator wants the
-                        // literal — move the combo onto its *custom* item so
-                        // the two halves of one leaf cannot contradict each
-                        // other.
-                        if let Some(form) = weak.upgrade() {
-                            form.syncing.set(true);
-                            combo.set_selected(options_len);
-                            form.syncing.set(false);
-                        }
-                        save_from_row(&weak, index);
-                    });
-                }
-                {
-                    let swatch = swatch.clone();
-                    entry.connect_changed(move |_| swatch.queue_draw());
-                }
-                // **Weakly** (#1365 review, MED 2): the swatch is the entry's
-                // own prefix child, so a strong clone in its draw func closes
-                // a GObject cycle — entry owns swatch owns entry — and
-                // neither ever reaches refcount 0. That is the `WeakRef`
-                // contract `hytte-reactive`'s `bind` holds, and the one
-                // `nix/lint-bind-pins.py` structurally cannot see here,
-                // because the closure's own parameter is the *swatch* and the
-                // captured widget is a different one — its documented
-                // carve-out. The sibling `connect_changed` above is fine:
-                // that edge runs parent → child and closes no loop.
-                let entry = entry.downgrade();
-                swatch.set_draw_func(move |_, cr, width, height| {
-                    // Nothing to paint once the row is gone — which is only
-                    // reachable while the swatch outlives its entry, i.e.
-                    // during teardown.
-                    if let Some(entry) = entry.upgrade() {
-                        paint_swatch(cr, width, height, &entry.text());
-                    }
-                });
-            }
+                options,
+            } => connect_colour(inner, index, combo, entry, swatch, options),
             Control::Text(entry) => {
                 let weak = Rc::downgrade(inner);
                 entry.connect_apply(move |_| save_from_row(&weak, index));
@@ -1647,6 +1581,76 @@ fn connect_rows(inner: &Rc<FormInner>) {
             });
         }
     }
+}
+
+/// [`connect_rows`]' [`Kind::Color`] arm — the one control that is two
+/// widgets plus a painted prefix, and so four handlers rather than one.
+fn connect_colour(
+    inner: &Rc<FormInner>,
+    index: usize,
+    combo: &adw::ComboRow,
+    entry: &adw::EntryRow,
+    swatch: &gtk::DrawingArea,
+    options: &'static [&'static str],
+) {
+    let options_len = u32::try_from(options.len()).unwrap_or(0);
+    {
+        let weak = Rc::downgrade(inner);
+        let entry = entry.downgrade();
+        combo.connect_selected_notify(move |combo| {
+            // Picking *custom* before typing anything is not a
+            // value: the empty string is what the writer refuses
+            // (`Kind::Color`'s own `accepts`), so writing it here
+            // would greet the operator with a red row for
+            // choosing the item that means "I'll type one"
+            // (#1365 review, L3). The entry's apply button is
+            // what saves a literal, as it does mid-typing.
+            let nothing_typed = entry
+                .upgrade()
+                .is_none_or(|entry| entry.text().trim().is_empty());
+            if combo.selected() >= options_len && nothing_typed {
+                return;
+            }
+            save_from_row(&weak, index);
+        });
+    }
+    {
+        let weak = Rc::downgrade(inner);
+        let swatch = swatch.clone();
+        let combo = combo.clone();
+        entry.connect_apply(move |_| {
+            swatch.queue_draw();
+            // Applying a literal means the operator wants the literal — move
+            // the combo onto its *custom* item so the two halves of one leaf
+            // cannot contradict each other.
+            if let Some(form) = weak.upgrade() {
+                form.syncing.set(true);
+                combo.set_selected(options_len);
+                form.syncing.set(false);
+            }
+            save_from_row(&weak, index);
+        });
+    }
+    {
+        let swatch = swatch.clone();
+        entry.connect_changed(move |_| swatch.queue_draw());
+    }
+    // **Weakly** (#1365 review, MED 2): the swatch is the entry's own prefix
+    // child, so a strong clone in its draw func closes a GObject cycle —
+    // entry owns swatch owns entry — and neither ever reaches refcount 0.
+    // That is the `WeakRef` contract `hytte-reactive`'s `bind` holds, and the
+    // one `nix/lint-bind-pins.py` structurally cannot see here, because the
+    // closure's own parameter is the *swatch* and the captured widget is a
+    // different one — its documented carve-out. The sibling `connect_changed`
+    // above is fine: that edge runs parent → child and closes no loop.
+    let entry = entry.downgrade();
+    swatch.set_draw_func(move |_, cr, width, height| {
+        // Nothing to paint once the row is gone — which is only reachable
+        // while the swatch outlives its entry, i.e. during teardown.
+        if let Some(entry) = entry.upgrade() {
+            paint_swatch(cr, width, height, &entry.text());
+        }
+    });
 }
 
 /// Queue the save a control's own change implies.
@@ -1763,7 +1767,7 @@ fn index_of(options: &[&str], value: Option<&str>) -> u32 {
 /// What a read-only collection row says it holds.
 fn summarise(field: &Field, value: Option<&toml::Value>) -> String {
     let noun = leaf_of(field.path);
-    let body = match value {
+    match value {
         Some(toml::Value::Array(items)) => {
             let names: Vec<String> = items.iter().map(spell_value).collect();
             format!(
@@ -1784,8 +1788,7 @@ fn summarise(field: &Field, value: Option<&toml::Value>) -> String {
         }
         Some(other) => spell_value(other),
         None => format!("no {}", plural(noun, 0)),
-    };
-    body
+    }
 }
 
 /// A TOML scalar as one word.

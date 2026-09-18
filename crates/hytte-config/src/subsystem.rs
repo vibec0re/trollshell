@@ -2370,9 +2370,14 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
 /// reads for `places.toml`'s narrower shape, which is always an array of
 /// tables and never a plain key), and a document holding nothing but comments
 /// has no top-level item at all, so the block is
-/// [`toml_edit::DocumentMut::trailing`] instead.
+/// [`toml_edit::DocumentMut::trailing`] instead — the shape
+/// [`commented_default`] renders, and the reason
+/// [`save_leaf_to_locked_unchecked`] reaches for this pair too (#1370).
+///
+/// Which item is "first" is [`first_rendered_key`]'s answer, not
+/// `doc.iter().next()`'s; see there for the difference and when it bites.
 fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
-    let Some(first_key) = doc.iter().next().map(|(k, _)| k.to_owned()) else {
+    let Some(first_key) = first_rendered_key(doc) else {
         let header = doc.trailing().as_str().unwrap_or_default().to_owned();
         doc.set_trailing("");
         return header;
@@ -2407,13 +2412,19 @@ fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
 
 /// Put back what [`take_header`] detached, in front of whatever now sits
 /// first — the same item-kind dispatch, over the document as [`strip_locked`]
-/// left it. A no-op for an empty `header`, so a save with nothing locked (or
-/// nothing locked at the front) never touches decor it didn't take.
+/// (or a leaf write) left it. A no-op for an empty `header`, so a save with
+/// nothing locked (or nothing locked at the front) never touches decor it
+/// didn't take.
+///
+/// "First" is again [`first_rendered_key`]'s answer, which is what makes this
+/// put the preamble back *above* a key that was inserted between the take and
+/// the put — the whole point of the pair in
+/// [`save_leaf_to_locked_unchecked`].
 fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
     if header.is_empty() {
         return;
     }
-    let Some(first_key) = doc.iter().next().map(|(k, _)| k.to_owned()) else {
+    let Some(first_key) = first_rendered_key(doc) else {
         let rest = doc.trailing().as_str().unwrap_or_default().to_owned();
         doc.set_trailing(format!("{header}{rest}"));
         return;
@@ -2441,6 +2452,32 @@ fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
         let rest = decor_prefix(key.leaf_decor());
         key.leaf_decor_mut().set_prefix(format!("{header}{rest}"));
     }
+}
+
+/// The key of the top-level item `toml_edit` **renders first** — which is what
+/// the document's leading comment block is glued to, and therefore the only
+/// item [`take_header`] and [`put_header`] may touch.
+///
+/// Not `doc.iter().next()`, which is *insertion* order. The two agree for
+/// every document that was parsed and only had keys removed — TOML itself
+/// forbids a plain `key = value` after a `[section]` header at the same level,
+/// so a parsed root table always holds its values before its tables — and they
+/// disagree the moment a value is **inserted** into a document that already
+/// carries a table, because `Table`'s rendering writes every value before any
+/// sub-table regardless of when each arrived. Measured against `toml_edit`
+/// 0.25: inserting `enabled` into `<preamble>\n[core]\nbrightness = 7` renders
+/// `enabled = false` at the very top of the file, above the preamble
+/// `[core]` is holding.
+///
+/// That is exactly [`save_leaf_to_locked_unchecked`]'s second save on a family
+/// whose keys are a mix of top-level ones and table ones, so without this the
+/// operator's own line would sit above the documented preamble #1370 put in
+/// front of them.
+fn first_rendered_key(doc: &toml_edit::DocumentMut) -> Option<String> {
+    doc.iter()
+        .find(|(_, item)| item.is_value())
+        .or_else(|| doc.iter().next())
+        .map(|(key, _)| key.to_owned())
 }
 
 /// A decor prefix as an owned string, or empty when there is none. Mirrors
@@ -2732,14 +2769,16 @@ pub fn save_leaf_to_locked<S: Subsystem>(
 ///   and answer `Ok`;
 /// * a locked `key_path`, itself or under a locked table.
 ///
-/// # The first leaf into a file that does not exist (#1365 review, HIGH 1)
+/// # The first leaf into a file that does not exist (#1365 review, HIGH 1; #1370)
 ///
-/// It creates a file holding **that leaf and nothing else**. It deliberately
-/// does not seed [`Subsystem::DEFAULT_TOML`] first, although
-/// [`save_overlay_to_locked`] — which states the whole config by design —
-/// still does.
+/// It creates a file that **states** that leaf and nothing else — and that
+/// *reads* as [`Subsystem::DEFAULT_TOML`], because the leaf is written below
+/// [`commented_default`]'s preamble: the documented default with every value
+/// line commented out. It deliberately does not seed `DEFAULT_TOML` itself,
+/// although [`save_overlay_to_locked`] — which states the whole config by
+/// design — still does.
 ///
-/// Through #1360 it seeded the same way, and the consequence was that one
+/// Through #1360 it seeded the live default, and the consequence was that one
 /// click on any row of a settings form wrote the **whole documented default**
 /// into the operator's overlay. Every value in that copy is one they did not
 /// choose, landing at the *top* of the precedence order, so it
@@ -2752,14 +2791,23 @@ pub fn save_leaf_to_locked<S: Subsystem>(
 ///   nobody set — the exact failure [`Origin`]'s own doc names as the reason
 ///   provenance exists.
 ///
-/// The seed cannot be repaired by filtering, because *every* key it carries
+/// That seed cannot be repaired by filtering, because *every* key it carries
 /// is one a lower layer states: `DEFAULT_TOML` is the bottom layer of every
-/// fold, so the filtered seed is its comments, and `toml_edit` holds a
-/// comments-only document entirely as trailing decor — the first key written
-/// afterwards lands **above** the preamble (measured). So the honest first
-/// file is the small one: an overlay is a *diff* over the layers below, which
-/// is what the per-row reset already teaches, and the documented default is
-/// what a base layer and `--help`-shaped docs are for.
+/// fold. #1365 therefore wrote nothing at all, and #1370 puts the
+/// documentation back **without** the values: a commented preamble states no
+/// key, so an overlay stays a *diff* over the layers below while the file the
+/// operator opens is still the one that explains itself.
+///
+/// The header lift below is what makes that work. `toml_edit` holds a
+/// comments-only document entirely as
+/// [`toml_edit::DocumentMut::trailing`] decor (measured: 0 top-level items),
+/// so a key inserted into it lands **above** the preamble. [`take_header`]
+/// detaches the block before the write and [`put_header`] re-attaches it in
+/// front of whatever [`first_rendered_key`] now answers — the same pair
+/// `seed_without_locked` and `places` already use, for the same reason. It
+/// also covers the write's mirror image: without it, a reset of the key that
+/// happens to be carrying the preamble as its own prefix decor takes the
+/// whole preamble away with it, which is #1341's bug one function over.
 ///
 /// # Errors
 /// [`ConfigError::NotALeaf`] for the structural refusals,
@@ -2794,13 +2842,15 @@ pub fn save_leaf_to_locked_unchecked<S: Subsystem>(
 
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        // An empty document, not `DEFAULT_TOML` — a first leaf write creates a
-        // file holding that leaf and nothing else (#1365 review, HIGH 1; the
-        // argument is in this function's own doc). `structural_refusal` and
-        // the prune rule still consult `DEFAULT_TOML` below, so the
+        // The documented default with every value line commented out, not
+        // `DEFAULT_TOML` itself — a first leaf write creates a file that
+        // states that leaf and nothing else, under a preamble that explains
+        // every key and states none of them (#1365 review, HIGH 1; #1370 —
+        // the argument is in this function's own doc). `structural_refusal`
+        // and the prune rule still consult `DEFAULT_TOML` below, so the
         // documented shape is as load-bearing as it was; it is only the
-        // *values* that no longer land in a file the operator never typed.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // *values* that do not land in a file the operator never typed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => commented_seed::<S>(),
         Err(e) => {
             return Err(ConfigError::Unreadable {
                 path: path.to_path_buf(),
@@ -2832,11 +2882,19 @@ pub fn save_leaf_to_locked_unchecked<S: Subsystem>(
         return Err(not_a_leaf(reason));
     }
 
+    // The header lift, around both halves of the write: it is what puts a
+    // first leaf *below* the commented preamble instead of above it, and what
+    // keeps that preamble when a reset takes away the key it is glued to. See
+    // this function's doc; `take_header` is a no-op on a document whose first
+    // item carries no leading decor, and `put_header` is a no-op on the empty
+    // string it then returns.
+    let header = take_header(&mut doc);
     if let Some(value) = value {
         set_leaf(doc.as_table_mut(), key_path, value);
     } else {
         remove_leaf(doc.as_table_mut(), key_path, "", &documented);
     }
+    put_header(&mut doc, &header);
 
     let body = doc.to_string();
     // Nothing moved — so nothing is written. The byte pin is about content;
@@ -2849,6 +2907,83 @@ pub fn save_leaf_to_locked_unchecked<S: Subsystem>(
 
     file::write_atomic(path, &body, Durability::FsyncParent)
         .map_err(|e| ConfigError::Write(e.to_string()))
+}
+
+/// [`Subsystem::DEFAULT_TOML`] with **every value line commented out**: the
+/// documentation, stating nothing (#1370).
+///
+/// This is the file [`save_leaf_to_locked_unchecked`] creates when the
+/// operator has no overlay yet, with the leaf they just set written below it.
+/// The point is that it is *inert*: a commented key is not a key, so the
+/// document parses to no keys at all, nothing lands at the top of the
+/// precedence order, no row's [`Origin`] becomes [`Origin::Overlay`], and no
+/// value an unlocked base layer states is reverted — the #1365 failure — while
+/// the operator's first `~/.config/trollshell/<NAME>.toml` is still the
+/// documented file they can read and hand-edit rather than the single line
+/// #1365 left them.
+///
+/// # Every line, and why that is total
+///
+/// A line is passed through **unchanged** when it is blank or when its first
+/// non-whitespace character is already `#`; every other line gets `# ` in
+/// front of its content, keeping its indentation. So:
+///
+/// * a value line becomes a comment (`color = "heat"` → `# color = "heat"`);
+/// * a **table header** becomes one too (`[bar]` → `# [bar]`) — it has to, or
+///   the render would still declare an empty table, which is a key;
+/// * every continuation line of a multi-line array or string is an ordinary
+///   line by this rule and is commented individually, so the construct cannot
+///   survive half-open;
+/// * a line *inside* a multi-line string that happens to start with `#` is
+///   left alone, and is a comment in the render either way.
+///
+/// Hence the invariant the tests pin over every family in the tree: the
+/// output holds nothing but comments and blank lines, so it parses to an
+/// **empty** document — not by inspection of any particular default, but
+/// because there is no line shape that escapes the rule.
+///
+/// # Why text, not `toml_edit`
+///
+/// A commented-out key has no representation in `toml_edit`: a comment is
+/// *decor*, so turning a key into one means deleting the key and appending
+/// its rendered bytes onto a neighbour's prefix — the same text edit as this
+/// one, with the document's blank lines, the last item's trailing decor and
+/// the multi-line values to reassemble by hand, and one more place for the
+/// preamble to go missing (#1341). Rewriting lines is total over every value
+/// shape, including the ones `toml_edit` renders across several lines, and it
+/// keeps the round trip honest: uncomment what this commented and the bytes
+/// are `DEFAULT_TOML` again.
+#[must_use]
+pub fn commented_default(default_toml: &str) -> String {
+    let mut out = String::with_capacity(default_toml.len() + default_toml.len() / 8);
+    for line in default_toml.lines() {
+        let content = line.trim_start();
+        if content.is_empty() || content.starts_with('#') {
+            out.push_str(line);
+        } else {
+            let indent = line.len() - content.len();
+            out.push_str(&line[..indent]);
+            out.push_str("# ");
+            out.push_str(content);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// [`commented_default`] as [`save_leaf_to_locked_unchecked`] seeds it: the
+/// preamble, then one blank line, so the operator's own first line is visibly
+/// theirs rather than the next entry of a comment block.
+///
+/// Empty when the family documents nothing at all — there is no preamble to
+/// separate from anything, and a file of one blank line is worse than the
+/// empty one #1365 wrote.
+fn commented_seed<S: Subsystem>() -> String {
+    let preamble = commented_default(S::DEFAULT_TOML);
+    if preamble.trim().is_empty() {
+        return String::new();
+    }
+    format!("{preamble}\n")
 }
 
 /// Why `key_path` does not name a leaf of `doc`, or `None` when it does — the
@@ -6706,8 +6841,8 @@ brightness = 5
         );
     }
 
-    /// **A first leaf save writes the leaf and nothing else** (#1365 review,
-    /// HIGH 1).
+    /// **A first leaf save states the leaf and nothing else** (#1365 review,
+    /// HIGH 1), under the documented preamble (#1370).
     ///
     /// Through #1360 it seeded [`Subsystem::DEFAULT_TOML`] first, so one click
     /// on any row of a settings form wrote the whole documented default into
@@ -6718,10 +6853,16 @@ brightness = 5
     /// seed carries is stated by a lower layer: `DEFAULT_TOML` is the bottom
     /// layer of every fold.
     ///
-    /// Red if the seed comes back: the file holds `enabled`, `color` and
-    /// `palette` — values nobody typed — beside the one edit.
+    /// Red if the seed comes back live: the file would *state* `enabled`,
+    /// `color` and `palette` — values nobody typed — beside the one edit.
+    /// Red too if the preamble goes away, or if the leaf lands above it (the
+    /// #1370 header lift, which is what `toml_edit` does on its own with a
+    /// comments-only document).
+    ///
+    /// The name was `…_writes_the_leaf_and_nothing_else` through #1365; only
+    /// the *states* half survives #1370, and it is the half that was the bug.
     #[test]
-    fn a_first_leaf_save_writes_the_leaf_and_nothing_else() {
+    fn a_first_leaf_save_states_the_leaf_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("core-leds.toml");
 
@@ -6735,8 +6876,30 @@ brightness = 5
 
         assert_eq!(
             read(&path),
-            "[core]\nbrightness = 7\n",
-            "an overlay is a diff over the layers below, not a copy of them"
+            "# The per-core LED strip.\n\
+             # enabled = true\n\
+             \n\
+             # [core]\n\
+             # Strip colour, any CSS name.\n\
+             # color = \"amber\"\n\
+             # brightness = 3\n\
+             # palette = [\"amber\", \"rust\"]\n\
+             \n\
+             [core]\n\
+             brightness = 7\n",
+            "the documented default, stating nothing, then the one leaf"
+        );
+
+        let back: toml::Table = read(&path).parse().expect("the first file is TOML");
+        assert_eq!(
+            back.len(),
+            1,
+            "an overlay is a diff over the layers below, not a copy of them: {back:?}"
+        );
+        assert_eq!(
+            value_at(&back, "core.brightness"),
+            Some(&toml::Value::Integer(7)),
+            "and the one thing it states is the edit"
         );
     }
 
@@ -6770,9 +6933,15 @@ brightness = 5
         .expect("saves");
 
         let written = read(&paths[1]);
+        let stated: toml::Table = written.parse().expect("the overlay is TOML");
+        assert_eq!(
+            value_at(&stated, "core.color"),
+            None,
+            "a key the operator never touched is stated in their own file: {written}"
+        );
         assert!(
-            !written.contains("color"),
-            "a key the operator never touched is in their own file: {written}"
+            written.contains("# color = \"amber\""),
+            "…while the documented default is still in front of them, commented (#1370): {written}"
         );
         let reloaded = load_raw::<Leds>(&paths).expect("reloads");
         assert_eq!(
@@ -6790,6 +6959,275 @@ brightness = 5
             Some(&Origin::Overlay),
             "while the key they did edit is theirs"
         );
+    }
+
+    /// The preamble is the *file's*, not the first key's: a second leaf lands
+    /// under it, and the first one is still there (#1370).
+    #[test]
+    fn a_second_leaf_save_keeps_the_preamble_and_both_leaves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+
+        save_leaf(
+            &path,
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        save_leaf(
+            &path,
+            "core.color",
+            Some(toml_edit::Value::from("lcd")),
+            &BTreeSet::new(),
+        )
+        .expect("saves again");
+
+        assert_eq!(
+            read(&path),
+            "# The per-core LED strip.\n\
+             # enabled = true\n\
+             \n\
+             # [core]\n\
+             # Strip colour, any CSS name.\n\
+             # color = \"amber\"\n\
+             # brightness = 3\n\
+             # palette = [\"amber\", \"rust\"]\n\
+             \n\
+             [core]\n\
+             brightness = 7\n\
+             color = \"lcd\"\n",
+            "the preamble stays, and the second leaf joins the first below it"
+        );
+    }
+
+    /// A third save, of a key the file already states, moves **that value and
+    /// nothing else** — not the preamble, not the sibling leaf (#1370).
+    #[test]
+    fn a_third_save_of_a_leaf_already_there_moves_only_that_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+
+        for (key, value) in [
+            ("core.brightness", toml_edit::Value::from(7_i64)),
+            ("core.color", toml_edit::Value::from("lcd")),
+        ] {
+            save_leaf(&path, key, Some(value), &BTreeSet::new()).expect("saves");
+        }
+        let before = read(&path);
+
+        save_leaf(
+            &path,
+            "core.brightness",
+            Some(toml_edit::Value::from(2_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("saves the third time");
+        let after = read(&path);
+
+        assert_eq!(
+            before.lines().count(),
+            after.lines().count(),
+            "no line was added or dropped"
+        );
+        let moved: Vec<(&str, &str)> = before
+            .lines()
+            .zip(after.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(
+            moved,
+            vec![("brightness = 7", "brightness = 2")],
+            "exactly one line moved, and it is the value that was edited"
+        );
+    }
+
+    /// The header lift's mirror image: resetting the key the preamble happens
+    /// to be glued to keeps the preamble (#1370 — #1341's bug, one function
+    /// over).
+    ///
+    /// Red without the `take_header`/`put_header` pair around the write:
+    /// `remove_keeping_closing_space` takes the removed key's whole prefix
+    /// decor with it, and in `toml_edit` a file's leading comment block *is*
+    /// that prefix — so the operator's first reset would leave them an empty
+    /// file and the documentation would never come back, since the seed only
+    /// runs when the file does not exist.
+    #[test]
+    fn a_reset_of_the_only_leaf_keeps_the_documented_preamble() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+
+        save_leaf(
+            &path,
+            "enabled",
+            Some(toml_edit::Value::from(false)),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        save_leaf(&path, "enabled", None, &BTreeSet::new()).expect("resets");
+
+        let after = read(&path);
+        assert_eq!(
+            after,
+            commented_seed::<Leds>(),
+            "a reset of the last leaf leaves the documented file, not an empty one"
+        );
+        let back: toml::Table = after.parse().expect("still TOML");
+        assert!(back.is_empty(), "…and it states nothing: {back:?}");
+    }
+
+    /// A top-level leaf saved **after** a table one still lands below the
+    /// preamble (#1370).
+    ///
+    /// `toml_edit` renders every value of a table before any of its
+    /// sub-tables, whatever order they were inserted in, so the preamble has
+    /// to move onto the newly-first *rendered* item — which is what
+    /// [`first_rendered_key`] is for. Red with `doc.iter().next()` in its
+    /// place: the preamble stays on `[core]` and `enabled = false` renders
+    /// above it, at the very top of the operator's file.
+    #[test]
+    fn a_top_level_leaf_saved_after_a_table_one_still_lands_below_the_preamble() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+
+        save_leaf(
+            &path,
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("saves the table leaf");
+        save_leaf(
+            &path,
+            "enabled",
+            Some(toml_edit::Value::from(false)),
+            &BTreeSet::new(),
+        )
+        .expect("saves the top-level leaf");
+
+        assert_eq!(
+            read(&path),
+            "# The per-core LED strip.\n\
+             # enabled = true\n\
+             \n\
+             # [core]\n\
+             # Strip colour, any CSS name.\n\
+             # color = \"amber\"\n\
+             # brightness = 3\n\
+             # palette = [\"amber\", \"rust\"]\n\
+             \n\
+             enabled = false\n\
+             [core]\n\
+             brightness = 7\n",
+            "the operator's own line is below the documentation, not above it"
+        );
+    }
+
+    // ── `commented_default`: the render itself (#1370) ──────────────────────
+
+    /// Every value line gains a `# `, keeping its indentation; a blank line
+    /// and a line that is already a comment are passed through byte for byte.
+    #[test]
+    fn the_commented_default_comments_the_values_and_leaves_the_comments_alone() {
+        assert_eq!(
+            commented_default("# A doc line.\n\nkey = 1\n\n[table]\n\tindented = 2\n#already\n"),
+            "# A doc line.\n\n# key = 1\n\n# [table]\n\t# indented = 2\n#already\n"
+        );
+    }
+
+    /// **The invariant**: whatever the shape, the render states nothing.
+    ///
+    /// A table header has to be commented too, or the render still declares
+    /// an empty table — which is a key; `[t]` is the case that says so out
+    /// loud. A multi-line construct is commented line by line, so it cannot
+    /// survive half-open, and a line inside a multi-line string that already
+    /// starts with `#` is a comment in the render either way.
+    #[test]
+    fn the_commented_default_of_every_toml_shape_states_nothing() {
+        for src in [
+            "a = 1\n",
+            "[t]\n",
+            "[[arr]]\nx = 1\n",
+            "list = [\n  1,\n  2,\n]\n",
+            "s = \"\"\"\nkey = 2\n#hash\n\"\"\"\n",
+            "\tindented = true\n",
+            "no_trailing_newline = 1",
+            "inline = { a = 1, b = 2 }\n",
+        ] {
+            let stated: toml::Table = src.parse().expect("the fixture is TOML");
+            assert!(
+                !stated.is_empty(),
+                "the fixture states something to begin with: {src:?}"
+            );
+
+            let rendered = commented_default(src);
+            let back: toml::Table = rendered
+                .parse()
+                .unwrap_or_else(|e| panic!("the render of {src:?} is not TOML: {e}\n{rendered}"));
+            assert!(
+                back.is_empty(),
+                "the render of {src:?} states {back:?}:\n{rendered}"
+            );
+        }
+    }
+
+    /// The round trip: take the `# ` back off every line that was a value
+    /// line in the original and the bytes are the original again — so what
+    /// the operator reads is what was documented, indentation included.
+    ///
+    /// Driven from the *original's* classification rather than the render's,
+    /// which is what makes it an assertion rather than a restatement: the
+    /// `expect` below is "every value line came back commented".
+    #[test]
+    fn the_commented_default_round_trips_back_to_the_documented_default() {
+        let rendered = commented_default(DEFAULT);
+        assert_eq!(
+            rendered.lines().count(),
+            DEFAULT.lines().count(),
+            "line for line"
+        );
+
+        let back: String = DEFAULT
+            .lines()
+            .zip(rendered.lines())
+            .map(|(original, line)| {
+                let was = original.trim_start();
+                if was.is_empty() || was.starts_with('#') {
+                    return format!("{line}\n");
+                }
+                let content = line.trim_start();
+                let indent = &line[..line.len() - content.len()];
+                let bare = content
+                    .strip_prefix("# ")
+                    .unwrap_or_else(|| panic!("a value line was left uncommented: {line:?}"));
+                format!("{indent}{bare}\n")
+            })
+            .collect();
+        assert_eq!(back, DEFAULT);
+    }
+
+    /// A family that documents nothing gets no preamble — a file holding one
+    /// blank line is worse than the empty one #1365 wrote.
+    #[test]
+    fn a_family_that_documents_nothing_is_seeded_with_nothing() {
+        #[derive(serde::Deserialize)]
+        struct Blank {}
+
+        impl Subsystem for Blank {
+            const NAME: &'static str = "blank";
+            const DEFAULT_TOML: &'static str = "\n\n";
+            type Error = std::convert::Infallible;
+            type Resolved = ();
+            fn parsed(&self) -> ((), Vec<InvalidValue>) {
+                ((), Vec::new())
+            }
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        assert_eq!(commented_default(""), "");
+        assert_eq!(commented_seed::<Blank>(), "");
     }
 
     /// The one shape that cannot name a leaf.

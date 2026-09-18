@@ -376,23 +376,21 @@ fn every_documented_default_in_the_tree_round_trips_through_the_render() {
             "{name}: the render is line for line"
         );
 
-        let back: String = text
-            .lines()
-            .zip(rendered.lines())
-            .map(|(original, line)| {
-                let was = original.trim_start();
-                if was.is_empty() || was.starts_with('#') {
-                    assert_eq!(line, original, "{name}: a comment line was rewritten");
-                    return format!("{line}\n");
-                }
+        let mut back = String::new();
+        for (original, line) in text.lines().zip(rendered.lines()) {
+            let was = original.trim_start();
+            if was.is_empty() || was.starts_with('#') {
+                assert_eq!(line, original, "{name}: a comment line was rewritten");
+                back.push_str(line);
+            } else {
                 let content = line.trim_start();
-                let indent = &line[..line.len() - content.len()];
-                let bare = content.strip_prefix("# ").unwrap_or_else(|| {
+                back.push_str(&line[..line.len() - content.len()]);
+                back.push_str(content.strip_prefix("# ").unwrap_or_else(|| {
                     panic!("{name}: a value line was left uncommented: {line:?}")
-                });
-                format!("{indent}{bare}\n")
-            })
-            .collect();
+                }));
+            }
+            back.push('\n');
+        }
         assert_eq!(back, text, "{name}: uncommenting gives the original back");
     }
 }

@@ -7187,22 +7187,22 @@ brightness = 5
             "line for line"
         );
 
-        let back: String = DEFAULT
-            .lines()
-            .zip(rendered.lines())
-            .map(|(original, line)| {
-                let was = original.trim_start();
-                if was.is_empty() || was.starts_with('#') {
-                    return format!("{line}\n");
-                }
+        let mut back = String::new();
+        for (original, line) in DEFAULT.lines().zip(rendered.lines()) {
+            let was = original.trim_start();
+            if was.is_empty() || was.starts_with('#') {
+                back.push_str(line);
+            } else {
                 let content = line.trim_start();
-                let indent = &line[..line.len() - content.len()];
-                let bare = content
-                    .strip_prefix("# ")
-                    .unwrap_or_else(|| panic!("a value line was left uncommented: {line:?}"));
-                format!("{indent}{bare}\n")
-            })
-            .collect();
+                back.push_str(&line[..line.len() - content.len()]);
+                back.push_str(
+                    content
+                        .strip_prefix("# ")
+                        .unwrap_or_else(|| panic!("a value line was left uncommented: {line:?}")),
+                );
+            }
+            back.push('\n');
+        }
         assert_eq!(back, DEFAULT);
     }
 

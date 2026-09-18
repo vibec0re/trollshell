@@ -1600,8 +1600,10 @@ mod gtk_tests {
     /// `collection.rs`'s module doc works through for `MapPage`/`ListPage`/
     /// `RecordsPage`, one level up.
     ///
-    /// **Red if any capture converted to `self.downgrade()`/
-    /// `editor.downgrade()` in this file goes back to a strong `.clone()`**:
+    /// **Red if a capture on the root list or the open detail page goes back
+    /// to a strong `.clone()`** (the `build_page`-only rows — endpoint,
+    /// auto-switch, the override city — and the toast/confirm dialogs are not
+    /// built by this helper, so they are not pinned; #1101 keeps them out):
     /// that one widget's own handler alone reopens the loop through the
     /// field it carries, and `base`'s `Rc::strong_count` below never falls to
     /// one.
@@ -1619,8 +1621,6 @@ mod gtk_tests {
         // Exercise a pushed detail page and its own rows too, not just the
         // root list — those rows' closures carry `nav` back just as strongly.
         editor.open(0);
-        pump();
-        while editor.nav.pop() {}
         pump();
 
         let base = Rc::clone(&editor.base);

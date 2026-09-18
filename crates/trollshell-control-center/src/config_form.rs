@@ -4094,15 +4094,16 @@ mod gtk_tests {
     /// `connect_*` call is attached to is never the object its closure
     /// captures — which is why this is a test and not a lint.
     ///
-    /// **Red if any capture in `map_page`/`list_page`/`records_page` (or
-    /// their `rebuild`s) goes back to `Rc::clone(self)`**: that row alone
+    /// **Red if a capture on a row these three pages build here — a map entry,
+    /// a list item, a record, or their `rebuild`s — goes back to
+    /// `Rc::clone(self)`**: that row alone
     /// keeps its page's group permanently reachable, and the `WeakRef` below
     /// still upgrades after the pop.
     #[gtk::test]
     fn a_popped_collection_page_is_freed() {
         let scratch = Scratch::new();
 
-        let map = mounted(&scratch, None);
+        let map = mounted(&scratch, Some("[entry.one]\nname = \"the first\"\n"));
         map.open("entry");
         let map_group = map.group_weak();
         map.back();

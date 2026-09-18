@@ -355,7 +355,7 @@ impl MapPage {
                     let Some(page) = page.upgrade() else {
                         return;
                     };
-                    let (page, name) = (Rc::clone(&page), name.clone());
+                    let name = name.clone();
                     glib::idle_add_local_once(move || page.open(&name));
                 });
             }

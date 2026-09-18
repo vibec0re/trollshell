@@ -15,21 +15,26 @@ logind, niri-ipc, …), so persistent state lives in those daemons and a
 A top-edge bar on every Niri monitor — workspaces, window list, media
 controls, system tray, network/Wi-Fi/VPN, bluetooth, volume/mic/brightness,
 battery, CPU/memory/GPU/disk stats, clock, and notification/settings/power
-chips. Clicking a chip opens a slide-out **drawer** with a matching panel.
-Plus a left **sidebar**, on-screen displays (OSD), a notification daemon +
-toasts, password prompts, and out-of-process **widget plugins** (a clock, a
-kaomoji pet, a timer, a terminal, transit departures, weather, …) that mount
-into the bar and sidebar over a local socket. (Polkit authentication is
-delegated to a standalone agent — see the flake / `etc/`.)
+chips. Clicking a chip opens a slide-out **drawer** with a matching panel; a
+plugin card mounted in a **sidebar** instead opens its own page in a centered
+**dialog** rather than the drawer. Plus a left sidebar (calendar/tasks) and a
+second **right sidebar** that plugins mount cards into, on-screen displays
+(OSD), a notification daemon + toasts, password prompts, and out-of-process
+**widget plugins** (a clock, a kaomoji pet, a timer, a terminal, transit
+departures, weather, …) that mount into the bar and either sidebar over a
+local socket. (Polkit authentication is delegated to a standalone agent — see
+the flake / `etc/`.)
 
 trollshell ships **no in-shell lock screen**: an idle → dim → lock → suspend
 timeline runs natively in-process, but the actual locking is delegated to
 `swaylock` via logind's `Lock` signal (see `etc/README.md`).
 
 A separate windowed companion app, **`trollshell-control-center`**, handles
-heavier settings/management (picking the weather place, toggling plugin
-units, …) over a D-Bus link to the running shell — gnome-control-center-style,
-never linked into the shell itself.
+heavier settings/management — picking the weather place, toggling plugin
+units, editing a plugin's or the shell's own config file (`core-leds.toml`,
+`stats.toml`, …) through a schema-derived form — over a D-Bus link to the
+running shell, gnome-control-center-style, never linked into the shell
+itself.
 
 Design lives in GitHub discussions, epics and issues (since #1076) — a
 feature is specced on its thread, and a build issue links the epic or
@@ -175,7 +180,8 @@ standalone swaybg toggle (gently deprecated in favor of `backend = "swaybg"`).
   binary, not linked into the shell.
 - `trollshell/` — the binary: `widgets/` (bar chips), `panels/` (drawer
   pages), `overlays/` (frame, OSD, notifications, dialogs, sidebar),
-  `modal.rs` (the drawer), `plugins.rs` (the plugin host transport),
+  `modal.rs` (the drawer), `config/` (the shell's own config-file schemas,
+  e.g. `core-leds.toml`), `plugins/` (the plugin host transport),
   `control.rs` (the control-center's D-Bus endpoint), `commands.rs` (the
   keybind-facing command surface), `components/` (shared building blocks).
 

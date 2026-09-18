@@ -3976,13 +3976,24 @@ mod gtk_tests {
     /// that Add used to append blanked a working stack for as long as it was
     /// there, and going Back without typing left it in the file for good.
     ///
-    /// **Red before the fix**: the overlay comes back
-    /// `items = [{ id = "first" }, {}]`.
+    /// **Red before the fix**: the overlay's mtime moves twice — Add writes
+    /// `items = [{ id = "first" }, {}]` and the `on_pop` sweep writes it back
+    /// out again. The **mtime** is what this asserts for exactly that reason:
+    /// comparing content alone cannot tell "nothing was written" from
+    /// "something was written and then undone" (measured — with only the
+    /// content assertion, reverting `add` left this test green while its two
+    /// siblings reddened), and it is the window in between that blanks a
+    /// working stack, since `watch::poll_loop` stamps `(mtime, len)` and the
+    /// shell reads both writes.
     #[gtk::test]
     fn adding_a_record_and_going_back_writes_nothing() {
         let scratch = Scratch::new();
         let overlay = scratch.overlay("form-fixture");
         Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        let before = std::fs::metadata(&overlay)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+
         let page = mounted(&scratch, None);
         page.open("items");
         page.activate_row("Add an item");
@@ -3995,6 +4006,13 @@ mod gtk_tests {
             Scratch::read(&overlay),
             "items = [{ id = \"first\" }]\n",
             "a record nobody named reached the file"
+        );
+        assert_eq!(
+            std::fs::metadata(&overlay)
+                .and_then(|meta| meta.modified())
+                .expect("mtime"),
+            before,
+            "the file was rewritten for a record nobody named"
         );
     }
 

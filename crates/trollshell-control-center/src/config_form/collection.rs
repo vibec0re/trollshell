@@ -1383,7 +1383,8 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
     let Some(inner) = weak.upgrade() else {
         return;
     };
-    let empty = super::element_of(&inner.raw.borrow(), key, index).is_some_and(toml::Table::is_empty);
+    let empty =
+        super::element_of(&inner.raw.borrow(), key, index).is_some_and(toml::Table::is_empty);
     if !empty {
         return;
     }
@@ -1396,7 +1397,7 @@ fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
     }
     array.remove(index);
     let locked = inner.raw.borrow().locked.clone();
-    let array = (!array.is_empty()).then(|| array);
+    let array = (!array.is_empty()).then_some(array);
     if let Err(err) = inner.write_array(overlay, key, array, &locked) {
         tracing::warn!(
             family = inner.ops.family.name,

@@ -8395,7 +8395,9 @@ label = "Borealis"
         let seed = commented_seed(Leds::DEFAULT_TOML);
         assert_eq!(
             read(&path),
-            format!("{seed}[display.argus]\nlabel = \"Argus\"\n\n[display.borealis]\nlabel = \"Borealis\"\n"),
+            format!(
+                "{seed}[display.argus]\nlabel = \"Argus\"\n\n[display.borealis]\nlabel = \"Borealis\"\n"
+            ),
             "sanity: the preamble is on the first entry's own decor"
         );
 

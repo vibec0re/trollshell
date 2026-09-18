@@ -465,6 +465,22 @@ impl Subject {
     }
 }
 
+/// [`Subject::Element`]'s three fields, borrowed — what
+/// [`FormInner::write_element`] is addressed by.
+///
+/// A struct rather than three parameters because the three only ever travel
+/// together and the alternative is an eight-argument function, which is what
+/// `clippy::too_many_arguments` is for.
+#[derive(Clone, Copy)]
+struct ElementAt<'a> {
+    /// The array's own dotted path.
+    array: &'a str,
+    /// Which element — possibly one past the end; see [`Subject::Element`].
+    index: usize,
+    /// The field that names a record.
+    key_field: Option<&'static str>,
+}
+
 /// How a [`Form`] is built: what it draws, over what, and who re-reads for it.
 struct Spec {
     /// Where the rows read and write.
@@ -743,7 +759,17 @@ impl FormInner {
                 array,
                 index,
                 key_field,
-            } => self.write_element(overlay, array, *index, *key_field, row, value, &locked),
+            } => self.write_element(
+                overlay,
+                ElementAt {
+                    array,
+                    index: *index,
+                    key_field: *key_field,
+                },
+                row,
+                value,
+                &locked,
+            ),
         };
         match written {
             Ok(()) => {
@@ -831,13 +857,16 @@ impl FormInner {
     fn write_element(
         &self,
         overlay: &Path,
-        array_key: &str,
-        index: usize,
-        key_field: Option<&'static str>,
+        at: ElementAt<'_>,
         row: &Row,
         value: Option<toml_edit::Value>,
         locked: &BTreeSet<String>,
     ) -> Result<(), ConfigError> {
+        let ElementAt {
+            array: array_key,
+            index,
+            key_field,
+        } = at;
         if let Some(value) = &value {
             self.check(&row.key, row.field.kind, value)?;
         }

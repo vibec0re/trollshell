@@ -160,7 +160,8 @@ standalone swaybg toggle (gently deprecated in favor of `backend = "swaybg"`).
 - `crates/hytte-ecal/` — hand-written FFI to evolution-data-server (calendar);
   the only crate allowed `unsafe`.
 - `crates/hytte-ai-providers/` — shared OpenAI-compatible chat client +
-  key-file loader for the plugins that talk to an LLM (e.g. the pet plugin).
+  env-based provider-key loader for the plugins that talk to an LLM (e.g. the
+  pet plugin).
 - `crates/hytte/` — umbrella re-export crate (`bus`, `reactive`, `services`,
   `ui`) + a `prelude`.
 - `crates/hytte-plugin-proto/` + `crates/hytte-plugin/` — the plugin side

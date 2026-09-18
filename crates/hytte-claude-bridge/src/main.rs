@@ -47,17 +47,19 @@
 //! hytte_ai_providers::load_key("openrouter").or_else(|| env "PET_LLM_API_KEY")
 //! ```
 //!
-//! — the shared `openrouter` key file (and its `OPENROUTER_API_KEY` env
-//! override) is consulted **before** the pet's own variable. So a pet pointed
-//! at this bridge sends whatever key it happens to have, and a bridge demanding
-//! its *own* token would 401 every single request, forever. Keyless inbound is
-//! the only shape that works.
+//! — `OPENROUTER_API_KEY`, the only source `hytte_ai_providers::load_key` has
+//! had since #1330, is consulted **before** the pet's own variable. So a pet
+//! pointed at this bridge sends whatever key it happens to have, and a bridge
+//! demanding its *own* token would 401 every single request, forever. Keyless
+//! inbound is the only shape that works.
 //!
 //! The corresponding control lives in the plugin's declared env, not here: the
 //! home-manager module sets a dummy `OPENROUTER_API_KEY=local-bridge` on the
-//! *consuming* plugin. `load_key_from` checks the env override *before* the key
-//! file, so that dummy value is what stops a real cloud key being shipped to a
-//! local endpoint. It is a security control; treat it as one.
+//! *consuming* plugin. That declared env renders as `--setenv=K=V`, overriding
+//! whatever real key the user manager's own environment happens to carry under
+//! that name — `load_key` reads no on-disk file at all since #1330, so that
+//! dummy value is what stops a real cloud key being shipped to a local
+//! endpoint. It is a security control; treat it as one.
 //!
 //! **Do not confuse it with the variable of the same name on THIS daemon's own
 //! env.** Since #1347 the bridge reads `OPENROUTER_API_KEY` itself, as the key

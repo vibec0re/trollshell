@@ -1718,9 +1718,10 @@ title` in the stderr tail — worth a deliberate look on first run, since
      `~/.config/trollshell/plugins.json` plus `Control.ReloadPlugins`) and
      poke the cat. Confirm via
      `journalctl` that the pet never sends the real OpenRouter key — the
-     dummy env var winning is the whole point (`load_key_from` checks the
-     `OPENROUTER_API_KEY` env override before
-     `~/.config/trollshell/openrouter.key`).
+     dummy env var winning is the whole point (`load_key` reads the
+     `OPENROUTER_API_KEY` env override and, since #1330, nowhere else; the
+     declared `env` line renders as `--setenv=K=V`, overriding whatever the
+     user manager's own environment happens to carry under that name).
   7. **caw's briefing** composes calendar + weather + departures into a
      larger prompt than anything measured against the bridge. If it exceeds
      the 8s budget it 504s and caw falls back to canned output — that's the
@@ -1817,8 +1818,8 @@ title` in the stderr tail — worth a deliberate look on first run, since
       own notification daemon (`Effect::Notify`, `Capability::Notify`).
 - [ ] **(#483)** End-to-end trigger: let a real 07:00 fire, or set
       `CAW_BRIEFING_TIME=<now+1min>` and wait — check both with a configured
-      LLM (`CAW_LLM_URL` or `openrouter.key` + `CAW_LLM_MODEL`) and without
-      (deterministic template fallback).
+      LLM (`CAW_LLM_URL`, or `OPENROUTER_API_KEY` + `CAW_LLM_MODEL`) and
+      without (deterministic template fallback).
 - [ ] **(#483)** Confirm the open-meteo (weather) and HAFAS (departures)
       ingredients resolve correctly against Annika's actual `places.toml`
       (first `[[place]]`'s `lat`/`lon`/`station`).

@@ -32,13 +32,16 @@
 //! $XDG_CONFIG_DIRS/trollshell/<subsystem>.toml   base, nix-written, read-only
 //! $XDG_CONFIG_HOME/trollshell/<subsystem>.toml   overlay, yours
 //! $XDG_STATE_HOME/trollshell/<subsystem>.toml    state, the shell's
-//! $XDG_CONFIG_HOME/trollshell/*.key              secrets, unchanged
+//! $XDG_CONFIG_HOME/trollshell/anthropic.key      secrets, unchanged
 //! ```
 //!
 //! Secrets stay out of the TOML on purpose: #752 established that an API key
 //! in the environment is a hazard, and a key in a file the control center can
 //! edit would undo that. `*.key` files keep their own path (see
-//! `hytte-ai-providers`), and nothing here reads or writes one.
+//! `hytte-ai-providers`) — since #1330 retired the general per-provider
+//! `<name>.key` fallback, `anthropic.key` (`hytte-claude-bridge`'s own key,
+//! not a fallback) is the only one left — and nothing here reads or writes
+//! one.
 //!
 //! # Modules
 //!

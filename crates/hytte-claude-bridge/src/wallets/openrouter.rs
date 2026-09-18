@@ -44,10 +44,10 @@
 //! = [ "openrouter" ]` injects from the login keyring at spawn (#392,
 //! `trollshell/src/plugin_launcher.rs`'s `resolve_secret_env`). There is
 //! deliberately no `~/.config/trollshell/openrouter.key` fallback — not even
-//! through [`hytte_ai_providers::load_key`], which still has one today and is
-//! what #1330/PR #1351 is retiring ("no fallbacks", Annika on #866). Calling
-//! that loader here would quietly re-introduce the arm that is being removed,
-//! in a daemon that holds a second credential already.
+//! through [`hytte_ai_providers::load_key`], whose own on-disk fallback
+//! #1330/PR #1351 already retired ("no fallbacks", Annika on #866). Calling
+//! that loader here would have quietly re-introduced the arm that removal
+//! took out, in a daemon that holds a second credential already.
 //!
 //! With no key the wallet is **off end to end**: [`Poll::from_env`] answers
 //! `None`, nothing is ever published to [`latest`], and

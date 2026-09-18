@@ -500,11 +500,13 @@ fn api_error_message(body: &str) -> String {
 /// Load the Anthropic API key.
 ///
 /// Deliberately the **same** shape `hytte_ai_providers::load_key("anthropic")`
-/// would produce — `$XDG_CONFIG_HOME/trollshell/anthropic.key` (falling back to
+/// used to produce before #1330 retired that on-disk arm everywhere else —
+/// `$XDG_CONFIG_HOME/trollshell/anthropic.key` (falling back to
 /// `$HOME/.config/trollshell/anthropic.key`), trimmed, empty-is-unset, with an
 /// `ANTHROPIC_API_KEY` env override for testing, and (#1169) the same
-/// group/other permission refusal `hytte_ai_providers::load_key` applies to
-/// every other key file. The path/env-precedence logic stays mirrored rather
+/// group/other permission refusal
+/// `hytte_ai_providers::check_key_file_permissions` applies here, the one key
+/// file left in the tree. The path/env-precedence logic stays mirrored rather
 /// than called through — this crate's own load order (env override, then a
 /// path this crate resolves itself) doesn't line up with `load_key`'s
 /// `name`-keyed signature — but the permission check is the one piece with
@@ -543,12 +545,13 @@ fn config_dir() -> Option<PathBuf> {
 /// unit-testable without mutating the process environment (which is `unsafe`
 /// under edition 2024, and this workspace forbids `unsafe`).
 ///
-/// #1169: a key file readable or writable by group or other is refused
-/// exactly the way `hytte_ai_providers::load_key`'s twin loader refuses one,
-/// via the same [`hytte_ai_providers::check_key_file_permissions`] — before
-/// this, `anthropic.key` was the one key file in the tree the check did not
+/// #1169: a key file readable or writable by group or other is refused, via
+/// [`hytte_ai_providers::check_key_file_permissions`] — the same rule
+/// `hytte_ai_providers::load_key` used to apply to every provider's key file,
+/// before #1330 retired that file-reading arm there. Before this crate wired
+/// the call in too, `anthropic.key` was the one key file the check did not
 /// reach, so a `0644` copy loaded silently while its `openrouter.key` sibling
-/// was already refused.
+/// (back when that file still existed) was already refused.
 fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> Option<String> {
     if let Some(v) = env_override {
         let trimmed = v.trim();

@@ -24,7 +24,8 @@
 //!   same-uid socket rather than a loopback port and so is named
 //!   `unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`; a `Provider` is
 //!   still just a base URL, so nothing here changed — else the shared
-//!   `openrouter.key` + `$CAW_LLM_MODEL`),
+//!   `$OPENROUTER_API_KEY` (see [`hytte_ai_providers::load_key`]; since #1330
+//!   there is no `openrouter.key` file behind it) + `$CAW_LLM_MODEL`),
 //!   [`compose_llm`] asks for the same facts in caw's own voice — one
 //!   `chat()` call through [`hytte_ai_providers`]. Keyless and URL-less
 //!   resolves to the plain path up front: no doomed network round-trips
@@ -111,8 +112,10 @@ pub(crate) struct Cfg {
 impl Cfg {
     pub(crate) fn from_env() -> Self {
         let time = parse_time(std::env::var("CAW_BRIEFING_TIME").ok().as_deref());
-        // caw's key: the shared key file (`openrouter.key` / its
-        // `OPENROUTER_API_KEY` override) first, then the caw-specific env.
+        // caw's key: the shared `$OPENROUTER_API_KEY` (what the `secrets`
+        // slot injects from the keyring) first, then the caw-specific
+        // `$CAW_LLM_API_KEY`. #1330 retired the `openrouter.key` file that
+        // used to sit between them, so this is two steps rather than three.
         let key = hytte_ai_providers::load_key("openrouter").or_else(|| {
             std::env::var("CAW_LLM_API_KEY")
                 .ok()

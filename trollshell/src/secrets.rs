@@ -16,9 +16,10 @@
 //!
 //! [`env_var_for`] maps a slot to the env var the launcher injects at spawn:
 //! `"openrouter"` → `OPENROUTER_API_KEY`. That is *exactly* the `{NAME}_API_KEY`
-//! override `hytte_ai_providers::load_key(name)` checks before its key file — so
-//! an LLM-backed plugin (pet, caw) that already calls `load_key("openrouter")`
-//! picks the injected key up with **zero** plugin-side changes. A plugin opts in
+//! override `hytte_ai_providers::load_key(name)` reads — since #1330 the only
+//! source it has — so an LLM-backed plugin (pet, caw) that already calls
+//! `load_key("openrouter")` picks the injected key up with **zero**
+//! plugin-side changes. A plugin opts in
 //! by listing the slot in its `plugins.json` `secrets` allowlist; a plugin that
 //! doesn't list it never sees the key (secret hygiene — the terminal plugin
 //! shouldn't get the `OpenRouter` key in its environment).

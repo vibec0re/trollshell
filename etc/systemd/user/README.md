@@ -338,10 +338,13 @@ is right for every user. A hand-written `plugins.json` carries that same literal
 That second line is a **security control, not cosmetics**. The bridge is
 _keyless_ — it validates no bearer token at all, because `brain.rs` resolves
 `load_key("openrouter")` _before_ `PET_LLM_API_KEY`, so a bridge demanding its
-own token would 401 every request forever. `load_key` checks the
-`OPENROUTER_API_KEY` env override _before_ `~/.config/trollshell/openrouter.key`,
-so the dummy value is what stops the real cloud key being shipped to a local
-endpoint.
+own token would 401 every request forever. `load_key` reads the
+`OPENROUTER_API_KEY` env override and, since #1330, nowhere else — no on-disk
+`~/.config/trollshell/openrouter.key` fallback sits behind it any more. The
+declared `env` line above still matters: it renders as `--setenv=K=V`, which
+overrides whatever the user manager's own environment happens to carry under
+that name, so the dummy value is what stops a real cloud key from being
+shipped to a local endpoint.
 
 **Who can reach it (#993).** With no inbound auth, whoever can reach the
 endpoint is authorized, so that set has to be exactly one uid. It used to be

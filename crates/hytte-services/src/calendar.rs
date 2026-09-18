@@ -448,17 +448,13 @@ impl Worker {
                     continue;
                 }
             };
-            for inst in instances {
-                if let Some(ev) = instance_to_calendar_event(
-                    &inst,
-                    &calendar_name,
-                    calendar_color.as_deref(),
-                    scan_start,
-                    out.len(),
-                ) {
-                    out.push(ev);
-                }
-            }
+            out.extend(source_instances_to_events(
+                &instances,
+                &calendar_name,
+                calendar_color.as_deref(),
+                scan_start,
+                out.len(),
+            ));
         }
         // Every source failing repeatedly means the registry session itself
         // is likely dead — schedule a full rebuild (#432).
@@ -468,6 +464,45 @@ impl Worker {
         out.sort_by_key(|e| e.start);
         out
     }
+}
+
+/// Map one source's expanded instances to [`CalendarEvent`]s, every one of them
+/// carrying that source's display name and its `[Calendar] Color=` (#1223
+/// item 1). `base_index` is the number of events already collected this scan,
+/// so the synthesised UIDs [`instance_to_calendar_event`] mints for
+/// UID-less components stay unique across sources.
+///
+/// Hoisted out of [`Calendar::scan_all`]'s loop to give "the colour is read once
+/// per source per scan and threaded onto *every* event that source yields" a
+/// pure home a test can call: dropping `calendar_color` on the way in fails
+/// `every_event_of_a_source_carries_that_sources_colour`, where inside the loop
+/// it was green (#1223 review, MED-4).
+///
+/// What this deliberately does **not** pin is `src.color()` being *called* at
+/// all — that needs a seam over `hytte_ecal::Source`, i.e. a live EDS. The
+/// scan's own read is covered by the `eds-nixos-test` VM (which seeds one
+/// coloured and one uncoloured calendar, so a constant cannot satisfy it) and
+/// by the `docs/live-verify.md` entry, not by anything here.
+fn source_instances_to_events(
+    instances: &[EventInstance],
+    calendar_name: &str,
+    calendar_color: Option<&str>,
+    window_start: DateTime<Local>,
+    base_index: usize,
+) -> Vec<CalendarEvent> {
+    let mut out = Vec::with_capacity(instances.len());
+    for inst in instances {
+        if let Some(ev) = instance_to_calendar_event(
+            inst,
+            calendar_name,
+            calendar_color,
+            window_start,
+            base_index + out.len(),
+        ) {
+            out.push(ev);
+        }
+    }
+    out
 }
 
 /// Build a [`CalendarEvent`] from one libecal-expanded [`EventInstance`].
@@ -813,6 +848,65 @@ mod tests {
         )
         .expect("in-window");
         assert_eq!(plain.calendar_color, None);
+    }
+
+    /// Every event a source yields in one scan carries **that source's**
+    /// colour — the fan-out `scan_all` performs, with the colour read once per
+    /// source and threaded onto each instance. Dropping the argument on the way
+    /// through was green before this existed (#1223 review, MED-4); the
+    /// `base_index` assertion keeps the anon-UID counter honest across sources
+    /// at the same time.
+    #[test]
+    fn every_event_of_a_source_carries_that_sources_colour() {
+        let now = Local::now();
+        let day1 = now + Duration::days(1);
+        let day2 = now + Duration::days(2);
+        let instances = vec![
+            inst("series", "Daily", day1, day1 + Duration::hours(1)),
+            inst("series", "Daily", day2, day2 + Duration::hours(1)),
+        ];
+
+        let coloured = source_instances_to_events(&instances, "Work", Some("#ff8800"), now, 0);
+        assert_eq!(coloured.len(), 2, "both occurrences are in-window");
+        for ev in &coloured {
+            assert_eq!(
+                ev.calendar_color.as_deref(),
+                Some("#ff8800"),
+                "every event of a coloured source must carry its colour: {ev:?}"
+            );
+            assert_eq!(ev.calendar_name, "Work");
+        }
+
+        // A source with no `[Calendar] Color=` yields all-`None`, so the widget
+        // falls back to its name-hashed palette for the whole calendar.
+        let plain = source_instances_to_events(&instances, "Home", None, now, coloured.len());
+        assert_eq!(plain.len(), 2);
+        assert!(
+            plain.iter().all(|e| e.calendar_color.is_none()),
+            "a colourless source must yield no colours: {plain:?}"
+        );
+
+        // Two UID-less components in one scan must not collide on a synthesised
+        // UID — the reason `base_index` is threaded in rather than each call
+        // counting from zero. Same calendar name on both, so only `base_index`
+        // can tell them apart.
+        let anon = vec![EventInstance {
+            ical: "BEGIN:VEVENT\r\nSUMMARY:Anon\r\nEND:VEVENT\r\n".into(),
+            start_unix: day1.timestamp(),
+            end_unix: (day1 + Duration::hours(1)).timestamp(),
+            all_day: false,
+        }];
+        let first = source_instances_to_events(&anon, "Work", None, now, 0);
+        let second = source_instances_to_events(&anon, "Work", None, now, 7);
+        assert!(
+            first[0].uid.starts_with("anon:Work:0@"),
+            "uid was {}",
+            first[0].uid
+        );
+        assert_ne!(
+            first[0].uid, second[0].uid,
+            "a UID-less component must not synthesise the same uid twice in one scan"
+        );
     }
 
     #[test]

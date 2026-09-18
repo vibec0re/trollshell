@@ -12,14 +12,16 @@
 # Split out of flake.nix (#1102) into its own `callPackage`-able file,
 # mirroring how `packages` already lives under `nix/*.nix`. Takes the
 # module fixtures the block closed over there: `probe` (nix/probe.nix's
-# slice of `workspace`) and the seeded `taskSource`/`calSource` — both
-# still built in flake.nix's own `let`, since they're plain `pkgs.writeText`
-# fixtures with no other consumer.
+# slice of `workspace`) and the seeded `taskSource` plus the two calendars —
+# `calSource` (with a `[Calendar] Color=`) and `calSourceNoColor` (without;
+# #1223 item 1 review, MED-5) — all still built in flake.nix's own `let`,
+# since they're plain `pkgs.writeText` fixtures with no other consumer.
 {
   pkgs,
   probe,
   taskSource,
   calSource,
+  calSourceNoColor,
 }:
 pkgs.testers.runNixOSTest {
   name = "eds-nixos-test";
@@ -50,6 +52,10 @@ pkgs.testers.runNixOSTest {
     machine.copy_from_host(
         "${calSource}",
         "/home/alice/.config/evolution/sources/test-calendar.source",
+    )
+    machine.copy_from_host(
+        "${calSourceNoColor}",
+        "/home/alice/.config/evolution/sources/test-calendar-no-color.source",
     )
     machine.succeed("chown -R alice:users /home/alice/.config")
     # Store-copied files land read-only (0444); EDS's source
@@ -114,12 +120,29 @@ pkgs.testers.runNixOSTest {
     # of the fix (the old master-only path would surface just 1).
     assert "Test Calendar" in output, output
 
-    # Per-source colour (#1223 item 1): the seeded fixture carries
-    # `[Calendar] Color=#ff8800`, and `Source::color` reads it off the
-    # `ESourceSelectable` extension. This is the only place that FFI read
-    # runs against a real source registry — the hermetic tests cover only
-    # the shape check it applies to the string.
+    # Per-source colour (#1223 item 1): the seeded fixtures are a pair —
+    # "Test Calendar" carries `[Calendar] Color=#ff8800`, "Uncoloured
+    # Calendar" carries the `[Calendar]` group with no `Color=` at all —
+    # and `Source::color` reads each off its own `ESourceSelectable`
+    # extension. This is the only place that FFI read runs against a real
+    # source registry; the hermetic tests cover only the shape check it
+    # applies to the string.
+    #
+    # BOTH lines are asserted, because either alone is satisfiable by a
+    # constant: measured on the review branch, a `Source::color` that
+    # discards the FFI result and returns `Some("#ff8800")` keeps all 44
+    # hermetic `hytte-ecal` tests green AND still matches the `#ff8800`
+    # regex. Only the `(none)` line makes the pair discriminating — no
+    # single constant can answer both.
+    #
+    # Keyed off the distinct display names rather than off position, so
+    # neither the registry's ordering nor which calendar the recurrence
+    # probe below happens to write into can flip them. ("Uncoloured
+    # Calendar" does not match the first regex either: after `- Test
+    # Calendar ` that line has an `N`, not the literal `(` the pattern
+    # requires.)
     assert re.search(r"- Test Calendar \(.*\) color=#ff8800", output), output
+    assert re.search(r"- Uncoloured Calendar \(.*\) color=\(none\)", output), output
 
     assert "created recurring uid:" in output, output
     assert "recurring instance count: 5" in output, output

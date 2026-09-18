@@ -870,6 +870,13 @@ thread_local! {
 #[derive(Default)]
 struct SourceColors {
     provider: Option<gtk::CssProvider>,
+    /// Whether [`Self::provider`] has been handed to a `gdk::Display`. Tracked
+    /// separately from the `Option` because the two can legitimately disagree:
+    /// a provider built while `Display::default()` was `None` carries every
+    /// rule and paints nothing, and folding the install into the provider's
+    /// construction would cache that orphan for the rest of the session. The
+    /// install is retried on each reload until it lands (#1223 review, LOW-9).
+    installed: bool,
     rules: BTreeMap<String, String>,
     unparseable: std::collections::BTreeSet<String>,
 }
@@ -944,13 +951,21 @@ fn source_color_css_value([r, g, b, a]: [u8; 4]) -> String {
     format!("rgba({r},{g},{b},{alpha:.3})")
 }
 
-/// Rebuild the shared provider's sheet from `state.rules` and, on first use,
+/// Rebuild the shared provider's sheet from `state.rules` and, until it lands,
 /// install it on the default display.
 ///
-/// Installed at `STYLE_PROVIDER_PRIORITY_USER` — the same authority the shell's
-/// own `style.css` (and its `.ts-cal-color-N` palette) holds, so these rules sit
-/// beside that palette rather than above it. They never collide: a dot carries
-/// the palette class or a source class, never both.
+/// Installed at `STYLE_PROVIDER_PRIORITY_USER` — the same *priority* the
+/// shell's own `style.css` (and its `.ts-cal-color-N` palette) holds. Equal
+/// priority is not equal authority, though: GTK's cascade appends an
+/// equal-priority provider *after* the ones already installed and consults the
+/// list from the end, so this one — installed lazily, at the first coloured row,
+/// long after `app.rs` loads `style.css` — wins any property both declare
+/// (#1223 review, LOW-7). That is inert today and must stay a deliberate fact
+/// rather than an accident: a dot carries the palette class or a source class,
+/// never both, and nothing else in either sheet declares a background on
+/// `.ts-cal-src-*`. A future rule that *does* want to beat these (the month
+/// grid's `.ts-cal-day-selected .ts-cal-event-dot`, say) cannot rely on
+/// specificity alone — measure it.
 fn reload_source_color_provider(state: &mut SourceColors) {
     use std::fmt::Write as _;
 
@@ -960,18 +975,19 @@ fn reload_source_color_provider(state: &mut SourceColors) {
         // satisfy the `fmt::Write` signature.
         let _ = writeln!(sheet, ".{class} {{ background: {value}; }}");
     }
-    let provider = state.provider.get_or_insert_with(|| {
-        let provider = gtk::CssProvider::new();
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &provider,
-                gtk::STYLE_PROVIDER_PRIORITY_USER,
-            );
-        }
-        provider
-    });
+    let provider = state.provider.get_or_insert_with(gtk::CssProvider::new);
     provider.load_from_string(&sheet);
+    // Not folded into the construction above: see `SourceColors::installed`.
+    if !state.installed
+        && let Some(display) = gtk::gdk::Display::default()
+    {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &*provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+        state.installed = true;
+    }
 }
 
 // ── Upcoming-list row builder + helpers ──────────────────────────────────────
@@ -2203,10 +2219,14 @@ mod source_color_tests {
         // The first `background-color:` **after our own selector** — the sheet
         // carries a block per colour any test in this module registered, and
         // `#[gtk::test]` bodies share one thread (and so one `SOURCE_COLORS`),
-        // so scanning from the top would read whichever class sorts first.
+        // so scanning from the top would read whichever class sorts first. The
+        // `take_while` bounds the scan at this rule's own closing brace: without
+        // it, a block that lost its `background-color` would silently borrow a
+        // neighbouring colour's (#1223 review, LOW-8).
         let background = sheet
             .lines()
             .skip_while(|l| !l.trim_start().starts_with(".ts-cal-src-ff8800ff"))
+            .take_while(|l| !l.contains('}'))
             .find(|l| l.trim_start().starts_with("background-color:"))
             .unwrap_or_else(|| panic!("the rule must set a background-color: {sheet}"));
         assert!(
@@ -2256,6 +2276,98 @@ mod source_color_tests {
             dot.css_classes()
         );
     }
+
+    /// …and the rule is not merely *built*, it is **installed on the display**,
+    /// so the class actually paints. This renders the dot and reads its pixels
+    /// back through cairo: it pins the whole chain at once — class on the
+    /// widget, rule in the provider, provider on the display, and GTK resolving
+    /// the three onto that node.
+    ///
+    /// Its own reason to exist: deleting
+    /// `style_context_add_provider_for_display` from
+    /// `reload_source_color_provider` leaves every other assertion in this
+    /// module green while every coloured dot draws literally nothing — the
+    /// sheet test reads the provider out of `SOURCE_COLORS`, so it cannot tell
+    /// an installed provider from an orphan (#1223 review, HIGH-1; the same
+    /// shape as #1321/#1322's "seam extraction leaves the wrapper unpinned").
+    #[gtk::test]
+    fn the_source_colour_actually_paints_the_dot() {
+        adw::init().expect("libadwaita init");
+        let row = build_calendar_row(&evt(Some("#ff8800")));
+        let dot = dot_of(&row);
+        dot.set_size_request(16, 16);
+
+        // A realized, allocated widget is what `WidgetPaintable` can snapshot;
+        // an unmapped one has no size and renders to nothing. The row goes into
+        // an `adw::PreferencesGroup` because that is what `rebuild_upcoming_list`
+        // parents it to — an `AdwActionRow` is a `GtkListBoxRow`, and one
+        // without a `GtkListBox` above it criticals on the focus grab
+        // `present()` performs.
+        let group = adw::PreferencesGroup::new();
+        group.add(&row);
+        let window = gtk::Window::new();
+        window.set_child(Some(&group));
+        window.present();
+        let ctx = hytte::gtk::glib::MainContext::default();
+        for _ in 0..200 {
+            if !ctx.iteration(false) {
+                break;
+            }
+        }
+
+        let paintable = gtk::WidgetPaintable::new(Some(&dot));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, f64::from(READBACK), f64::from(READBACK));
+        let node = snapshot
+            .to_node()
+            .expect("the dot must draw something — an uninstalled provider draws nothing at all");
+
+        let mut surface = hytte::gtk::cairo::ImageSurface::create(
+            hytte::gtk::cairo::Format::ARgb32,
+            READBACK,
+            READBACK,
+        )
+        .expect("image surface");
+        {
+            let cr = hytte::gtk::cairo::Context::new(&surface).expect("cairo context");
+            node.draw(&cr);
+        }
+        let stride = usize::try_from(surface.stride()).expect("a non-negative cairo stride");
+        let data = surface.data().expect("surface data");
+
+        // The dot carries a CSS margin, so its painted box is inset inside the
+        // 16×16 readback and off-centre; assert over every opaque pixel instead
+        // of guessing where the box landed. `#ff8800` is nothing the
+        // `.ts-cal-color-N` palette paints, so "opaque pixels exist and every
+        // one of them is this colour" is exactly the claim.
+        window.destroy();
+        let mut opaque = 0usize;
+        for y in 0..usize::try_from(READBACK).expect("positive") {
+            for x in 0..usize::try_from(READBACK).expect("positive") {
+                // ARGB32 is little-endian in memory: B, G, R, A.
+                let off = y * stride + x * 4;
+                let (b, g, r, a) = (data[off], data[off + 1], data[off + 2], data[off + 3]);
+                if a <= 200 {
+                    continue;
+                }
+                opaque += 1;
+                assert!(
+                    r > 230 && (120..=155).contains(&g) && b < 40,
+                    "every opaque pixel of the dot must be the source colour #ff8800, \
+                     got rgba({r},{g},{b},{a}) at ({x},{y})"
+                );
+            }
+        }
+        assert!(
+            opaque > 0,
+            "the dot must paint at least one opaque pixel — a provider that was \
+             built but never added to the display paints none"
+        );
+    }
+
+    /// Side length of the cairo readback in
+    /// [`the_source_colour_actually_paints_the_dot`], in pixels.
+    const READBACK: i32 = 16;
 
     /// Two calendars that picked the same colour share one class and one rule —
     /// the reason this is a registry and not a provider per row.

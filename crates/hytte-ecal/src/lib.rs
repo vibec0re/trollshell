@@ -298,9 +298,12 @@ impl Source {
     /// on a malformed value.
     #[must_use]
     pub fn color(&self) -> Option<String> {
-        // A task list (or any non-events source) has no `[Calendar]` group;
-        // `e_source_get_extension` would return NULL for it anyway, but ask
-        // first so the common case never relies on that.
+        // This guard is **load-bearing**, not belt-and-braces.
+        // `e_source_get_extension` is not a query: EDS documents it as
+        // *creating* the extension when the source doesn't carry one, and its
+        // return is not nullable (see the `sys` declaration). Without asking
+        // first, `color()` would instantiate an `ESourceCalendar` on every task
+        // list, address book and memo source it is ever called on.
         if !self.has_extension_c(sys::E_SOURCE_EXTENSION_CALENDAR) {
             return None;
         }
@@ -311,19 +314,37 @@ impl Source {
         let ext = unsafe {
             sys::e_source_get_extension(self.raw, sys::E_SOURCE_EXTENSION_CALENDAR.as_ptr())
         };
+        // Defensive only, and unreachable here: `e_source_get_extension`
+        // answers NULL (after a `g_critical`) solely for an extension *name* no
+        // subclass registered, and `Calendar` is one libedataserver defines
+        // itself. It is **not** what covers "this source has no `[Calendar]`
+        // group" — the `has_extension_c` guard above is.
         if ext.is_null() {
             return None;
         }
-        // SAFETY: `ext` is the non-null borrowed extension just checked, alive
-        // for this borrow of `self` (P1/P3); the `Calendar` group instantiates
-        // an `ESourceSelectable`, so the cast names the subclass that accessor
-        // expects. It returns a borrowed `const gchar*` (or NULL) that
-        // `borrowed_cstr` copies within this same borrow and never frees.
-        let value = unsafe {
-            borrowed_cstr(sys::e_source_selectable_get_color(
-                ext.cast::<sys::ESourceSelectable>(),
-            ))
-        }?;
+        // SAFETY: `ext` is the non-null extension just checked, alive for this
+        // borrow of `self` (P1/P3); the `Calendar` group instantiates an
+        // `ESourceSelectable`, so the cast names the subclass that accessor
+        // expects. `_dup_color` copies the value under the extension's own
+        // property lock and **transfers the copy to us** — so the pointer below
+        // is ours alone, and freeing it is this function's job.
+        let raw =
+            unsafe { sys::e_source_selectable_dup_color(ext.cast::<sys::ESourceSelectable>()) };
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is non-null (checked) and NUL-terminated, as
+        // `_dup_color`'s `gchar*` is; the copy — including the replacement
+        // characters `to_string_lossy` allocates for a non-UTF-8 byte — is
+        // taken here, before the free below, and `raw` is never read after it.
+        let value = unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: the GLib-allocated copy `_dup_color` transferred to us,
+        // freed exactly once on every path out of this function (the two early
+        // returns above are both before the allocation exists) and never read
+        // after.
+        unsafe { sys::g_free(raw.cast::<c_void>()) }
         is_hex_color(&value).then_some(value)
     }
 

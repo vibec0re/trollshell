@@ -1861,9 +1861,15 @@ title` in the stderr tail — worth a deliberate look on first run, since
       one colour should look identical. The month-grid dots are deliberately
       **not** changed by this — they still hash by name, so a mismatch between
       a grid dot and a row dot for the same calendar is expected here, not a
-      bug (see the PR body for why). `RUST_LOG=trollshell=debug` shows one
-      "source colour is not one GTK can parse" line per bad value, and such a
-      calendar should fall back to the palette rather than lose its dot.
+      bug (see the PR body for why). A value GTK can't read as a colour —
+      `Color=red`, say — must leave that calendar on its palette dot rather
+      than lose the dot entirely; note there is **no** log line to look for
+      when you try it, because the two gates are layered and agree today:
+      `hytte-ecal` drops anything that isn't `#rrggbb`/`#rrggbbaa` before the
+      shell sees it, and every one of those parses. The widget's
+      `RUST_LOG=trollshell=debug` "source colour is not one GTK can parse"
+      line is reachable only if the two ends ever disagree, so seeing one at
+      all is the finding.
 
 ## Displays / compositor geometry & overlays
 

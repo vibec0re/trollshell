@@ -56,8 +56,9 @@ pub type ESourceExtension = c_void;
 
 /// `ESourceSelectable *` — the [`ESourceExtension`] subclass the `[Calendar]`
 /// and `[Task List]` groups instantiate. It carries the `Color=` / `Selected=`
-/// keys; [`e_source_selectable_get_color`] reads the first. Borrowed exactly
-/// like its base class — never unref one.
+/// keys; [`e_source_selectable_dup_color`] reads the first. Borrowed exactly
+/// like its base class — never unref one (the *string* that accessor hands
+/// back is owned, though; see its own note).
 pub type ESourceSelectable = c_void;
 
 /// `EClient *` / `ECalClient *` — calendar/task/memo client. Connect
@@ -247,11 +248,25 @@ unsafe extern "C" {
     pub fn e_source_has_extension(source: *mut ESource, extension_name: *const c_char) -> c_int;
 
     /// The named extension of `source` (e.g.
-    /// [`E_SOURCE_EXTENSION_CALENDAR`]), or `NULL` when the source carries no
-    /// such group. C signature returns `gpointer`; modelled as
-    /// [`ESourceExtension`] since every caller here knows which subclass it
-    /// asked for. The result is a **borrow** owned by `source` and valid for
-    /// its lifetime — never unref it.
+    /// [`E_SOURCE_EXTENSION_CALENDAR`]). C signature returns `gpointer`;
+    /// modelled as [`ESourceExtension`] since every caller here knows which
+    /// subclass it asked for. The result is a **borrow** owned by `source` and
+    /// valid for its lifetime — never unref it.
+    ///
+    /// **This is not a query, and its return is not nullable.** EDS's GIR is
+    /// explicit: "if no such instance exists within @source, one will be
+    /// created … if you just want to test for the existence of an extension
+    /// within @source without creating it, use `e_source_has_extension()`".
+    /// So calling this on a source that carries no such group *grows* one in
+    /// memory rather than answering `NULL` — a task list asked for
+    /// `Calendar` comes back with a freshly instantiated `ESourceCalendar`.
+    /// Every caller here must gate on [`e_source_has_extension`] first.
+    ///
+    /// The one way it does answer `NULL` is an extension *name* that no
+    /// `ESourceExtension` subclass ever registered, which libedataserver
+    /// reports with a `g_critical` on the way out. Every caller here passes an
+    /// `E_SOURCE_EXTENSION_*` constant libedataserver itself defines, so that
+    /// arm is unreachable and a null check on the result is defensive only.
     pub fn e_source_get_extension(
         source: *mut ESource,
         extension_name: *const c_char,
@@ -260,9 +275,20 @@ unsafe extern "C" {
     /// The `Color=` key of an [`ESourceSelectable`] — the colour Evolution /
     /// GNOME Calendar store for a calendar or task list, in whatever spelling
     /// GTK's colour parser accepted (`#rrggbb` in practice). Returns a
-    /// **borrowed** `const gchar*` owned by the extension (`NULL` when the key
-    /// is unset), so copy it out within the borrow and never free it.
-    pub fn e_source_selectable_get_color(selectable: *mut ESourceSelectable) -> *const c_char;
+    /// **newly allocated** `gchar*` transferred to us (`NULL` when the key is
+    /// unset), to release with [`g_free`] exactly once.
+    ///
+    /// Deliberately the `_dup_` twin rather than `e_source_selectable_get_color`:
+    /// EDS's own GIR calls this "the thread-safe variation of
+    /// `e_source_selectable_get_color()`. Use this function when accessing
+    /// @extension from multiple threads." `_get_` hands back the extension's
+    /// internal `color` pointer with no lock held, and
+    /// `e_source_selectable_set_color` — which EDS's own worker runs when a
+    /// user recolours the calendar, the very change #1223 re-reads per scan to
+    /// notice — takes the property lock and `g_free`s that exact buffer. A
+    /// borrowed read from our thread therefore has a real use-after-free
+    /// window; this one copies under that lock.
+    pub fn e_source_selectable_dup_color(selectable: *mut ESourceSelectable) -> *mut c_char;
 }
 
 // ── libecal: ECalClient ─────────────────────────────────────────────────────

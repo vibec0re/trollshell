@@ -63,7 +63,8 @@ use hytte_config::subsystem::{ConfigError, Origin, Raw};
 use hytte_config::{toml, toml_edit};
 
 use super::{
-    Control, Form, FormInner, Spec, Subject, build_form, humanise, leaf_of, plural, provenance,
+    Control, Form, FormInner, Spec, Subject, build_form, humanise, leaf_of, parse_scalar, plural,
+    provenance,
 };
 
 /// What the operator is told a collection page cannot be edited *for*.
@@ -342,9 +343,18 @@ impl MapPage {
                 .build();
             row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
             {
-                let page = Rc::clone(self);
+                // Weakly (#1384 item 2, the #224 `WeakRef` contract): `page`
+                // owns `self.group` owns `row` owns this closure, so a strong
+                // capture here closes a cycle no external drop ever breaks —
+                // `nix/lint-bind-pins.py` cannot see it, because the widget
+                // this closure is connected to (`row`) is not the object
+                // captured (`page`).
+                let page = Rc::downgrade(self);
                 let name = name.clone();
                 row.connect_activated(move |_| {
+                    let Some(page) = page.upgrade() else {
+                        return;
+                    };
                     let (page, name) = (Rc::clone(&page), name.clone());
                     glib::idle_add_local_once(move || page.open(&name));
                 });
@@ -362,9 +372,13 @@ impl MapPage {
                 "A name with no dots in it. The entry appears in the file once you give it a \
                  value.",
             ));
-            let page = Rc::clone(self);
+            // Weakly, for `row.connect_activated`'s reason just above.
+            let page = Rc::downgrade(self);
             let taken = names.clone();
             add.connect_apply(move |entry| {
+                let Some(page) = page.upgrade() else {
+                    return;
+                };
                 let name = entry.text().trim().to_owned();
                 if let Err(why) = check_name(&name, &page.key, &taken) {
                     page.say(why);
@@ -882,8 +896,14 @@ impl ListPage {
                 .sensitive(!locked)
                 .build();
             {
-                let page = Rc::clone(self);
+                // Weakly (#1384 item 2): `page` owns `self.group` owns `row`
+                // owns this closure — the same cycle `MapPage` closes without
+                // this, see its own row handler's comment.
+                let page = Rc::downgrade(self);
                 row.connect_apply(move |entry| {
+                    let Some(page) = page.upgrade() else {
+                        return;
+                    };
                     // A blank edit means *remove*, the `places_tab::list_group`
                     // rule — a list of blanks is not a thing this file can
                     // mean, and the alternative is a row nobody can get rid of.
@@ -906,8 +926,12 @@ impl ListPage {
                 .build();
             remove.add_css_class("flat");
             {
-                let page = Rc::clone(self);
+                // Weakly, for the row handler's reason just above.
+                let page = Rc::downgrade(self);
                 remove.connect_clicked(move |_| {
+                    let Some(page) = page.upgrade() else {
+                        return;
+                    };
                     page.write(|items| {
                         if slot < items.len() {
                             items.remove(slot);
@@ -925,8 +949,12 @@ impl ListPage {
                 .title(format!("Add {}", article(noun)))
                 .show_apply_button(true)
                 .build();
-            let page = Rc::clone(self);
+            // Weakly, for the row handler's reason above.
+            let page = Rc::downgrade(self);
             add.connect_apply(move |entry| {
+                let Some(page) = page.upgrade() else {
+                    return;
+                };
                 let text = entry.text().trim().to_owned();
                 if text.is_empty() {
                     return;
@@ -963,13 +991,9 @@ impl ListPage {
         let result = if items.is_empty() {
             inner.write_array(overlay, &self.key, None, &locked)
         } else {
-            let mut array = toml_edit::Array::new();
-            for item in &items {
-                array.push(item.as_str());
-            }
-            match check_items(&inner, &self.key, self.element, &array) {
+            match typed_array(&inner, &self.key, self.element, &items) {
                 Err(err) => Err(err),
-                Ok(()) => inner.write_array(overlay, &self.key, Some(array), &locked),
+                Ok(array) => inner.write_array(overlay, &self.key, Some(array), &locked),
             }
         };
         match result {
@@ -1003,21 +1027,45 @@ fn items_of(value: Option<&toml::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Each element against the list's own element [`Kind`].
+/// Every item's text, parsed through the list's own element [`Kind`] and
+/// checked against it — the typed array [`FormInner::write_array`] gets,
+/// rather than the string every element used to be pushed as (#1384 item 1).
 ///
-/// Per element rather than `Kind::List(..).accepts(array)`, so the refusal
-/// names what a row can act on — and so the message says *what an item may
-/// be*, not *what an array may be*.
-fn check_items(
+/// `items_of` stringifies every element for a row's own text — the one
+/// representation that works for a `Text`/`Choice`/`Color` row and every
+/// other kind's display alike — so this is the one place that has to undo it
+/// before the array reaches the writer. Before this, a `Kind::List(Kind::Int)`
+/// or `List(Bool)` field was rewritten as strings on the very first edit: a
+/// string is never what `Int`/`Bool`'s own [`Kind::accepts`] takes, so
+/// `check_items`' successor here — [`FormInner::check`] — refused every
+/// following save, **including a bare remove**, which re-emits the whole
+/// array the same way.
+///
+/// Per element rather than `Kind::List(..).accepts(array)` once built, so the
+/// refusal names *which* item (`key[slot]`, [`Subject::key_of`]'s own
+/// spelling for an array element) and *what an item may be*, not what an
+/// array may be — and so an item that will not even parse (`"abc"` against
+/// `Kind::Int`) is refused with the same wording as one that parses but is
+/// out of range, rather than silently becoming a string.
+fn typed_array(
     inner: &Rc<FormInner>,
     key: &str,
     element: &'static Kind,
-    array: &toml_edit::Array,
-) -> Result<(), ConfigError> {
-    for item in array {
-        inner.check(key, *element, item)?;
+    items: &[String],
+) -> Result<toml_edit::Array, ConfigError> {
+    let mut array = toml_edit::Array::new();
+    for (slot, text) in items.iter().enumerate() {
+        let at = format!("{key}[{slot}]");
+        let value = parse_scalar(*element, text).ok_or_else(|| ConfigError::Rejected {
+            subsystem: inner.ops.family.name.to_owned(),
+            key: at.clone(),
+            found: text.clone(),
+            expected: element.expected(),
+        })?;
+        inner.check(&at, *element, &value)?;
+        array.push(value);
     }
-    Ok(())
+    Ok(array)
 }
 
 // ── A List of records: rows in, a whole array out ────────────────────────────
@@ -1114,9 +1162,14 @@ impl RecordsPage {
                 .build();
             row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
             {
-                let page = Rc::clone(self);
+                // Weakly (#1384 item 2): `page` owns `self.group` owns `row`
+                // owns this closure — the same cycle `MapPage`'s own row
+                // handler closes.
+                let page = Rc::downgrade(self);
                 row.connect_activated(move |_| {
-                    let page = Rc::clone(&page);
+                    let Some(page) = page.upgrade() else {
+                        return;
+                    };
                     glib::idle_add_local_once(move || page.open(index));
                 });
             }
@@ -1127,8 +1180,12 @@ impl RecordsPage {
                     .valign(gtk::Align::Center)
                     .build();
                 remove.add_css_class("flat");
-                let page = Rc::clone(self);
+                // Weakly, for the row handler's reason above.
+                let page = Rc::downgrade(self);
                 remove.connect_clicked(move |_| {
+                    let Some(page) = page.upgrade() else {
+                        return;
+                    };
                     page.write(|array| {
                         if index < array.len() {
                             array.remove(index);
@@ -1148,9 +1205,12 @@ impl RecordsPage {
                 .activatable(true)
                 .build();
             add.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
-            let page = Rc::clone(self);
+            // Weakly, for the row handler's reason above.
+            let page = Rc::downgrade(self);
             add.connect_activated(move |_| {
-                let page = Rc::clone(&page);
+                let Some(page) = page.upgrade() else {
+                    return;
+                };
                 // `add` saves, and a save rebuilds this group — which would
                 // mean removing *this row* from inside its own emission.
                 glib::idle_add_local_once(move || page.add());

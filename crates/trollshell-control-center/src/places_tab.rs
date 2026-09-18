@@ -231,7 +231,18 @@ struct Editor {
     /// Never held borrowed across a `list.remove()`: GTK emits synchronously
     /// into handlers that re-enter these cells, and a `BorrowMutError` inside a
     /// glib callback aborts the process rather than failing gracefully (#643).
-    rows: Rc<RefCell<Vec<gtk::Widget>>>,
+    ///
+    /// Held **weakly** per entry (#1384 item 2): a place row's own
+    /// `connect_activated` closure captures a [`WeakEditor`] that carries
+    /// this very `Rc` strongly (it is bookkeeping, not a widget, so
+    /// `WeakEditor`'s own doc's "cloned strongly on purpose" applies) — so a
+    /// **strong** `gtk::Widget` here would have this row's own closure
+    /// reach back through `rows` to the row itself, a self-sustaining loop
+    /// with no external anchor, exactly the shape a strong `list`/`nav` had
+    /// before this. `list` still owns the row strongly (as its child); this
+    /// is only the second, bookkeeping-only reference, and it must not also
+    /// be a strong one.
+    rows: Rc<RefCell<Vec<glib::WeakRef<gtk::Widget>>>>,
     /// The place name the running shell currently resolves to, for the list's
     /// "you are here" badge. `None` when the shell isn't running.
     resolved: Rc<RefCell<Option<String>>>,
@@ -331,8 +342,16 @@ impl Editor {
         });
         if matches!(err, PlacesError::ChangedOnDisk) {
             toast.set_button_label(Some("Reload"));
-            let editor = self.clone();
-            toast.connect_button_clicked(move |_| editor.reload());
+            // Weakly (#1384 item 2): this toast's `timeout` is 0 (never
+            // auto-dismissed), so `toasts` owns it for as long as the
+            // operator leaves it up — a strong `Editor` here (carrying
+            // `toasts` itself) would close exactly that cycle.
+            let editor = self.downgrade();
+            toast.connect_button_clicked(move |_| {
+                if let Some(editor) = editor.upgrade() {
+                    editor.reload();
+                }
+            });
         }
         self.toasts.add_toast(toast);
     }
@@ -459,7 +478,9 @@ impl Editor {
         // across every `list.remove()`, which can emit synchronously into a
         // handler that re-enters this cell (#643).
         for row in self.rows.take() {
-            self.list.remove(&row);
+            if let Some(row) = row.upgrade() {
+                self.list.remove(&row);
+            }
         }
         let places = self.places();
         let resolved = self.resolved.borrow().clone();
@@ -491,10 +512,17 @@ impl Editor {
                 row.add_prefix(&badge);
             }
             row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-            let editor = self.clone();
-            row.connect_activated(move |_| editor.open(index));
+            // Weakly (#1384 item 2): `list` owns `row` owns this closure, and
+            // a strong `Editor` here carries `list` itself — the same cycle
+            // `WeakEditor`'s own doc names.
+            let editor = self.downgrade();
+            row.connect_activated(move |_| {
+                if let Some(editor) = editor.upgrade() {
+                    editor.open(index);
+                }
+            });
             self.list.add(&row);
-            rows.push(row.upcast::<gtk::Widget>());
+            rows.push(row.upcast::<gtk::Widget>().downgrade());
         }
 
         if !locked {
@@ -504,17 +532,20 @@ impl Editor {
                 .activatable(true)
                 .build();
             add.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
-            let editor = self.clone();
+            // Weakly, for the place row's reason above.
+            let editor = self.downgrade();
             // Deferred to an idle tick, unlike the place rows above. `add`
             // saves, and a save rebuilds this group — which would mean removing
             // *this row* from inside its own `row-activated` emission. The
             // place rows only push a page, so they can run inline.
             add.connect_activated(move |_| {
-                let editor = editor.clone();
+                let Some(editor) = editor.upgrade() else {
+                    return;
+                };
                 glib::idle_add_local_once(move || editor.add());
             });
             self.list.add(&add);
-            rows.push(add.upcast::<gtk::Widget>());
+            rows.push(add.upcast::<gtk::Widget>().downgrade());
         }
 
         *self.rows.borrow_mut() = rows;
@@ -584,8 +615,15 @@ impl Editor {
             delete.add_css_class("flat");
             delete.add_css_class("destructive-action");
             {
-                let (editor, name) = (self.clone(), place.name.clone());
-                delete.connect_clicked(move |btn| editor.confirm_delete(btn, index, &name));
+                // Weakly (#1384 item 2): this button lives on the pushed
+                // detail page, itself a child of `nav` while it is on
+                // screen — a strong `Editor` here carries `nav` right back.
+                let (editor, name) = (self.downgrade(), place.name.clone());
+                delete.connect_clicked(move |btn| {
+                    if let Some(editor) = editor.upgrade() {
+                        editor.confirm_delete(btn, index, &name);
+                    }
+                });
             }
             header.pack_end(&delete);
         }
@@ -617,8 +655,13 @@ impl Editor {
             .text(&place.name)
             .show_apply_button(true)
             .build();
-        let editor = self.clone();
+        // Weakly (#1384 item 2): `name` lives on a pushed detail page, a
+        // child of `nav` while it is on screen.
+        let editor = self.downgrade();
         name.connect_apply(move |entry| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             let text = entry.text().to_string();
             if editor.edit(index, |place| place.name = text) {
                 editor.refresh_detail_title(index);
@@ -659,8 +702,12 @@ impl Editor {
         radius.set_subtitle("How close counts as \"here\" when falling back to GeoClue");
         radius.set_digits(1);
         radius.set_value(place.radius_km);
-        let editor = self.clone();
+        // Weakly, for the identity row's reason above.
+        let editor = self.downgrade();
         radius.connect_value_notify(move |row| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             if editor.syncing.get() {
                 return;
             }
@@ -687,8 +734,12 @@ impl Editor {
             .text(format!("{value}"))
             .show_apply_button(true)
             .build();
-        let editor = self.clone();
+        // Weakly, for the identity row's reason above.
+        let editor = self.downgrade();
         row.connect_apply(move |entry| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             match entry.text().trim().parse::<f64>() {
                 Ok(parsed) if (-limit..=limit).contains(&parsed) => {
                     entry.remove_css_class("error");
@@ -715,8 +766,12 @@ impl Editor {
         row.set_subtitle("How many of the networks above have to be visible");
         row.set_value(to_f64(place.match_min.clamp(1, place.ssids.len().max(1))));
         row.set_sensitive(!place.ssids.is_empty());
-        let editor = self.clone();
+        // Weakly, for the identity row's reason above.
+        let editor = self.downgrade();
         row.connect_value_notify(move |row| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             if editor.syncing.get() {
                 return;
             }
@@ -751,8 +806,12 @@ impl Editor {
             .text(place.station.clone().unwrap_or_default())
             .show_apply_button(true)
             .build();
-        let editor = self.clone();
+        // Weakly, for the identity row's reason above.
+        let editor = self.downgrade();
         station.connect_apply(move |entry| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             let text = entry.text().trim().to_string();
             editor.edit(index, |place| {
                 place.station = (!text.is_empty()).then_some(text);
@@ -767,8 +826,12 @@ impl Editor {
                            no longer make",
         );
         walk.set_value(f64::from(place.walk_minutes));
-        let editor = self.clone();
+        // Weakly, for the identity row's reason above.
+        let editor = self.downgrade();
         walk.connect_value_notify(move |row| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             if editor.syncing.get() {
                 return;
             }
@@ -811,8 +874,12 @@ impl Editor {
                 .show_apply_button(true)
                 .build();
             {
-                let editor = self.clone();
+                // Weakly, for the identity row's reason above.
+                let editor = self.downgrade();
                 row.connect_apply(move |entry| {
+                    let Some(editor) = editor.upgrade() else {
+                        return;
+                    };
                     let text = entry.text().trim().to_string();
                     editor.edit(index, |place| {
                         let list = field.get_mut(place);
@@ -838,8 +905,12 @@ impl Editor {
                 .build();
             remove.add_css_class("flat");
             {
-                let editor = self.clone();
+                // Weakly, for the identity row's reason above.
+                let editor = self.downgrade();
                 remove.connect_clicked(move |_| {
+                    let Some(editor) = editor.upgrade() else {
+                        return;
+                    };
                     editor.edit(index, |place| {
                         let list = field.get_mut(place);
                         if slot < list.len() {
@@ -857,8 +928,12 @@ impl Editor {
             .title(add_title)
             .show_apply_button(true)
             .build();
-        let editor = self.clone();
+        // Weakly, for the identity row's reason above.
+        let editor = self.downgrade();
         add.connect_apply(move |entry| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             let text = entry.text().trim().to_string();
             if text.is_empty() {
                 return;
@@ -922,11 +997,18 @@ impl Editor {
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
-        let editor = self.clone();
+        // Weakly (#1384 item 2): the dialog is transient-for the window, not
+        // owned by `nav`, but it is still a widget on the pushed detail page's
+        // own tree (`anchor.root()` above resolves through it), so a strong
+        // `Editor` here carries `nav` right back the same way.
+        let editor = self.downgrade();
         dialog.connect_response(None, move |_, response| {
             if response != "delete" {
                 return;
             }
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             let mut next = editor.places();
             if index < next.len() {
                 next.remove(index);
@@ -936,6 +1018,98 @@ impl Editor {
             }
         });
         dialog.present();
+    }
+}
+
+/// [`Editor`] with its widget handles held **weakly** — what a widget's own
+/// handler captures, so a row cannot keep the tab it belongs to alive forever
+/// (#1384 item 2; `plugins_tab`'s `WeakPluginsState` is the same fix on the
+/// same shape).
+///
+/// GTK owns a signal handler for as long as it owns the widget it is
+/// connected to, so a handler that captures a strong [`Editor`] closes a
+/// cycle wherever that `Editor` carries a widget the handler's own widget
+/// descends from: `list` is the direct parent of every place row (and the
+/// "Add a place" row), `nav` of every pushed detail page and every widget on
+/// it, `toasts` of the one toast that shows a button, and
+/// `departures_endpoint_row`/`auto_switch` are their own handler's widget.
+/// Once that loop closes it has no external anchor left to break it — the
+/// same shape `collection.rs`'s module doc works through for
+/// `MapPage`/`ListPage`/`RecordsPage`, one level up: there, the page's own
+/// `Rc` holds the widget that (via a row's closure) holds it back; here, this
+/// tab's `toasts`/`nav`/`list`/etc. are never behind an `Rc` of their own, but
+/// a widget descending from one of them holding a *strong* `Editor` closes
+/// the identical loop through the `GObject` the field names.
+///
+/// The `Rc` cells are cloned strongly, as `WeakPluginsState`'s are and for
+/// the same reason: none of them is a widget, so none can be an ancestor of
+/// one — except `rows`, whose *content* is widgets, which is why its own
+/// field type carries a `WeakRef` per entry rather than the widget itself
+/// (#1384 item 2 review). A place row's own `connect_activated` closure
+/// captures this whole struct, `rows` included: a **strong** entry would
+/// have `rows` hold the very row whose closure holds `rows`, which is the
+/// identical self-sustaining loop the widget fields above are guarded
+/// against, just one field deeper — `rebuild`'s own `self.rows.take()` frees
+/// stale entries only on the *next* rebuild, which a tab that is simply
+/// closed never gets, so nothing else would ever break that one.
+#[derive(Clone)]
+struct WeakEditor {
+    base: Rc<RefCell<Vec<Place>>>,
+    locked: Rc<Cell<Locks>>,
+    departures_endpoint_row: glib::WeakRef<adw::EntryRow>,
+    endpoint: Rc<RefCell<Option<String>>>,
+    nav: glib::WeakRef<adw::NavigationView>,
+    list: glib::WeakRef<adw::PreferencesGroup>,
+    rows: Rc<RefCell<Vec<glib::WeakRef<gtk::Widget>>>>,
+    resolved: Rc<RefCell<Option<String>>>,
+    status_row: glib::WeakRef<adw::ActionRow>,
+    auto_switch: glib::WeakRef<adw::SwitchRow>,
+    toasts: glib::WeakRef<adw::ToastOverlay>,
+    syncing: Rc<Cell<bool>>,
+}
+
+impl Editor {
+    /// The handler-side view of this state — what every widget-owned closure
+    /// captures instead of `self.clone()`.
+    fn downgrade(&self) -> WeakEditor {
+        WeakEditor {
+            base: self.base.clone(),
+            locked: self.locked.clone(),
+            departures_endpoint_row: self.departures_endpoint_row.downgrade(),
+            endpoint: self.endpoint.clone(),
+            nav: self.nav.downgrade(),
+            list: self.list.downgrade(),
+            rows: self.rows.clone(),
+            resolved: self.resolved.clone(),
+            status_row: self.status_row.downgrade(),
+            auto_switch: self.auto_switch.downgrade(),
+            toasts: self.toasts.downgrade(),
+            syncing: self.syncing.clone(),
+        }
+    }
+}
+
+impl WeakEditor {
+    /// Rebuild the strong state for the duration of one callback, or `None`
+    /// once the tab has been torn down — in which case there is nothing to
+    /// update and the handler returns. All-or-nothing, `WeakPluginsState`'s
+    /// own reasoning: these widgets live and die as one tree, so a partial
+    /// upgrade would mean a torn tab, not a case worth handling.
+    fn upgrade(&self) -> Option<Editor> {
+        Some(Editor {
+            base: self.base.clone(),
+            locked: self.locked.clone(),
+            departures_endpoint_row: self.departures_endpoint_row.upgrade()?,
+            endpoint: self.endpoint.clone(),
+            nav: self.nav.upgrade()?,
+            list: self.list.upgrade()?,
+            rows: self.rows.clone(),
+            resolved: self.resolved.clone(),
+            status_row: self.status_row.upgrade()?,
+            auto_switch: self.auto_switch.upgrade()?,
+            toasts: self.toasts.upgrade()?,
+            syncing: self.syncing.clone(),
+        })
     }
 }
 
@@ -990,13 +1164,18 @@ fn build_override_group(editor: &Editor) -> adw::PreferencesGroup {
         .show_apply_button(true)
         .build();
     {
-        let editor = editor.clone();
+        // Weakly (#1384 item 2): `city` is a permanent part of the root
+        // page, itself a child of `nav` — a strong `Editor` here carries
+        // `nav` right back.
+        let editor = editor.downgrade();
         city.connect_apply(move |entry| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             let city = entry.text().trim().to_owned();
             if city.is_empty() {
                 return;
             }
-            let editor = editor.clone();
             spawn_on_runtime(crate::set_manual_city(city), move |res| {
                 if let Err(err) = res {
                     tracing::info!(%err, "SetManualCity failed");
@@ -1068,20 +1247,30 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
     // The departures backend entry → `save_departures_endpoint`; blank means
     // "use the default" (#1124), the same convention `station`'s row uses.
     {
-        let editor = editor.clone();
+        // Weakly (#1384 item 2): this row's own handler carries `Editor`,
+        // which carries `departures_endpoint_row` right back — a self-loop
+        // with no external anchor to break it, the same shape `WeakEditor`'s
+        // own doc names.
+        let editor = editor.downgrade();
         departures_endpoint_row.connect_apply(move |entry| {
-            editor.save_departures_endpoint(endpoint_from_entry(&entry.text()).as_deref());
+            if let Some(editor) = editor.upgrade() {
+                editor.save_departures_endpoint(endpoint_from_entry(&entry.text()).as_deref());
+            }
         });
     }
 
     // Auto/manual toggle → SetAutoLocation, then re-read the resolved place.
     {
-        let handler = editor.clone();
+        // Weakly, for the departures-endpoint row's reason above —
+        // `auto_switch` is its own handler's widget too.
+        let handler = editor.downgrade();
         editor.auto_switch.connect_active_notify(move |sw| {
+            let Some(handler) = handler.upgrade() else {
+                return;
+            };
             if handler.syncing.get() {
                 return;
             }
-            let handler = handler.clone();
             spawn_on_runtime(crate::set_auto_location(sw.is_active()), move |res| {
                 if let Err(err) = res {
                     tracing::info!(%err, "SetAutoLocation failed");
@@ -1395,6 +1584,59 @@ mod gtk_tests {
         nav.add(&adw::NavigationPage::new(&page, "Places"));
 
         (toasts, editor)
+    }
+
+    /// #1384 item 2: dropping the tab actually frees the `Editor`'s state.
+    ///
+    /// Before this, every widget-owned closure (`list`'s own place rows, the
+    /// pushed detail page's rows, `departures_endpoint_row`'s and
+    /// `auto_switch`'s own handlers, the "changed on disk" toast's button)
+    /// captured a strong `Editor` — and since `Editor` itself carries `list`/
+    /// `nav`/`departures_endpoint_row`/`auto_switch`/`toasts`, each of those
+    /// closures held a strong reference back to a widget that (directly or
+    /// transitively) owns it. That loop has no external anchor once `toasts`
+    /// (returned to the caller) and this test's own `editor` handle are both
+    /// dropped, so nothing ever reached refcount zero — the same shape
+    /// `collection.rs`'s module doc works through for `MapPage`/`ListPage`/
+    /// `RecordsPage`, one level up.
+    ///
+    /// **Red if any capture converted to `self.downgrade()`/
+    /// `editor.downgrade()` in this file goes back to a strong `.clone()`**:
+    /// that one widget's own handler alone reopens the loop through the
+    /// field it carries, and `base`'s `Rc::strong_count` below never falls to
+    /// one.
+    #[gtk::test]
+    fn dropping_the_tab_frees_the_editor() {
+        adw::init().expect("libadwaita init");
+        let (toasts, editor) = build_editor();
+
+        // A `WeakRef` to a place row itself — #1384 item 2's second finding:
+        // `rows`' own entries must not be held strongly either, or a row's
+        // own closure (capturing `WeakEditor`, which carries `rows`) reaches
+        // back through `rows`' content to the very row that closure is on.
+        let row_weak = editor.rows.borrow()[0].clone();
+
+        // Exercise a pushed detail page and its own rows too, not just the
+        // root list — those rows' closures carry `nav` back just as strongly.
+        editor.open(0);
+        pump();
+        while editor.nav.pop() {}
+        pump();
+
+        let base = Rc::clone(&editor.base);
+        drop(editor);
+        drop(toasts);
+        pump();
+
+        assert_eq!(
+            Rc::strong_count(&base),
+            1,
+            "every widget-owned closure should have dropped its captured Editor by now"
+        );
+        assert!(
+            row_weak.upgrade().is_none(),
+            "a place row is still reachable after the tab was dropped"
+        );
     }
 
     /// Every `GtkWindowControls` under `root`, at any depth — the same walk

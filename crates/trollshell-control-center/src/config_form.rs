@@ -565,12 +565,16 @@ enum Control {
     Combo {
         /// The combo.
         row: adw::ComboRow,
-        /// The vocabulary, by index — and the first `options.len()` items of
-        /// `model`.
+        /// The vocabulary, by index — which is also the combo's model, in the
+        /// same order, so a selected index *is* an option and an option is a
+        /// selected index.
+        ///
+        /// A value the vocabulary does **not** have shows as *no* selection
+        /// ([`index_of`]) rather than as an extra item appended to the model:
+        /// an item nothing in the schema names is a word this row would then
+        /// offer to save, and the one thing a fixed vocabulary must not do is
+        /// grow a member from whatever the file happened to say.
         options: &'static [&'static str],
-        /// The items themselves: the vocabulary, plus a transient item for a
-        /// value the vocabulary does not have (see [`Row::push`]).
-        model: gtk::StringList,
     },
     /// [`Kind::Color`] — the named options plus a literal.
     Colour {
@@ -709,21 +713,20 @@ fn widgets_for(
                 )
             }
             Kind::Choice { options } => {
-                let (row, model) = combo_row(title, options, None);
+                let row = combo_row(title, options, None);
                 let reset = reset_button(&row);
                 (
                     vec![row.clone().upcast()],
                     Control::Combo {
                         row: row.clone(),
                         options,
-                        model,
                     },
                     Note::Subtitle(row.upcast()),
                     Some(reset),
                 )
             }
             Kind::Color { options } => {
-                let (combo, _) = combo_row(title, options, Some(CUSTOM_COLOUR));
+                let combo = combo_row(title, options, Some(CUSTOM_COLOUR));
                 let entry = adw::EntryRow::builder()
                     .title(format!("{title} — #rrggbb"))
                     .show_apply_button(true)

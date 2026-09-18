@@ -565,8 +565,12 @@ enum Control {
     Combo {
         /// The combo.
         row: adw::ComboRow,
-        /// What its items mean, by index.
+        /// The vocabulary, by index — and the first `options.len()` items of
+        /// `model`.
         options: &'static [&'static str],
+        /// The items themselves: the vocabulary, plus a transient item for a
+        /// value the vocabulary does not have (see [`Row::push`]).
+        model: gtk::StringList,
     },
     /// [`Kind::Color`] — the named options plus a literal.
     Colour {
@@ -705,20 +709,21 @@ fn widgets_for(
                 )
             }
             Kind::Choice { options } => {
-                let row = combo_row(title, options, None);
+                let (row, model) = combo_row(title, options, None);
                 let reset = reset_button(&row);
                 (
                     vec![row.clone().upcast()],
                     Control::Combo {
                         row: row.clone(),
                         options,
+                        model,
                     },
                     Note::Subtitle(row.upcast()),
                     Some(reset),
                 )
             }
             Kind::Color { options } => {
-                let combo = combo_row(title, options, Some(CUSTOM_COLOUR));
+                let (combo, _) = combo_row(title, options, Some(CUSTOM_COLOUR));
                 let entry = adw::EntryRow::builder()
                     .title(format!("{title} — #rrggbb"))
                     .show_apply_button(true)
@@ -757,10 +762,17 @@ fn widgets_for(
             Kind::List(_) | Kind::Map(_) => {
                 let row = adw::ActionRow::builder().title(title).build();
                 row.set_activatable(false);
+                // The **summary** is what this row's subtitle is for, so its
+                // provenance goes in a suffix label — the same place an
+                // `AdwEntryRow`'s does, and for the same reason: one subtitle,
+                // two things to say.
+                let label = gtk::Label::builder().valign(gtk::Align::Center).build();
+                label.add_css_class("dim-label");
+                row.add_suffix(&label);
                 (
                     vec![row.clone().upcast()],
-                    Control::Collection(row.clone()),
-                    Note::Subtitle(row),
+                    Control::Collection(row),
+                    Note::Suffix(label),
                     None,
                 )
             }
@@ -1139,11 +1151,23 @@ fn spell_value(value: &toml::Value) -> String {
         .map_or_else(|| value.to_string(), std::borrow::ToOwned::to_owned)
 }
 
-/// `workspace` → `workspaces`, and `1 workspace` stays singular.
+/// `workspace` → `workspaces`, `entry` → `entries`, and `1 workspace` stays
+/// singular.
+///
+/// English, three rules deep, because the nouns are config **key names** and
+/// the four families' are `workspace`, `display`, `order` and `entry`. A
+/// fifth family's key that these rules get wrong costs a summary line a
+/// letter, not a save.
 fn plural(noun: &str, count: usize) -> String {
     if count == 1 {
-        noun.to_owned()
-    } else if noun.ends_with('s') {
+        return noun.to_owned();
+    }
+    let consonant_y = noun
+        .strip_suffix('y')
+        .is_some_and(|stem| stem.ends_with(|c| !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u')));
+    if consonant_y {
+        format!("{}ies", &noun[..noun.len() - 1])
+    } else if noun.ends_with(['s', 'x', 'z']) || noun.ends_with("ch") || noun.ends_with("sh") {
         format!("{noun}es")
     } else {
         format!("{noun}s")
@@ -1336,4 +1360,1091 @@ fn humanise(segment: &str) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().collect::<String>() + chars.as_str()
     })
+}
+
+// ── A fixture family, for the tests below ────────────────────────────────────
+
+/// A family that exists only for this module's tests: **one leaf of every
+/// [`Kind`]**.
+///
+/// The four real families between them have no editable [`Kind::Text`] in P1
+/// (`agents`, which owns the only one, is staged read-only) and none has all
+/// seven kinds at once, so a per-kind test written against real families would
+/// be both incomplete and hostage to a schema change somewhere else. It rides
+/// the very same [`ShellSubsystem`] the two shell families do, so the shim is
+/// exercised rather than bypassed — and `the_fixture_family_verifies` holds it
+/// to its own documented default with the same walker CI runs over the real
+/// four.
+#[cfg(test)]
+mod fixture {
+    use hytte_config::schema::{Family, Field, Kind, Schema};
+
+    /// The fixture's own file: `<config>/trollshell/form-fixture.toml`.
+    pub(super) const FAMILY: Family = Family {
+        name: "form-fixture",
+        schema: &SCHEMA,
+        default_toml: DEFAULT_TOML,
+    };
+
+    /// One leaf of every kind.
+    pub(super) const SCHEMA: Schema = Schema {
+        family: "form-fixture",
+        fields: &[
+            Field {
+                path: "flag",
+                kind: Kind::Bool,
+                doc: "A switch.",
+            },
+            Field {
+                path: "count",
+                kind: Kind::Int {
+                    min: 0,
+                    max: 10,
+                    also: &[],
+                },
+                doc: "A plain spin row.",
+            },
+            Field {
+                path: "rows",
+                kind: Kind::Int {
+                    min: 0,
+                    max: 64,
+                    also: &["rect"],
+                },
+                doc: "A spin row that also takes a word.",
+            },
+            Field {
+                path: "style",
+                kind: Kind::Choice {
+                    options: &["vfd", "lcd", "oled"],
+                },
+                doc: "A combo.",
+            },
+            Field {
+                path: "color",
+                kind: Kind::Color {
+                    options: &["heat", "style"],
+                },
+                doc: "A combo plus a literal.",
+            },
+            Field {
+                path: "label",
+                kind: Kind::Text { blank_ok: false },
+                doc: "An entry.",
+            },
+            Field {
+                path: "order",
+                kind: Kind::List(&Kind::Text { blank_ok: false }),
+                doc: "A read-only list.",
+            },
+            Field {
+                path: "entry",
+                kind: Kind::Map(ENTRY_FIELDS),
+                doc: "A read-only table of entries.",
+            },
+        ],
+    };
+
+    /// One `[entry.<name>]`.
+    const ENTRY_FIELDS: &[Field] = &[Field {
+        path: "name",
+        kind: Kind::Text { blank_ok: false },
+        doc: "What it is called.",
+    }];
+
+    /// The fixture's documented default — commented like a real one, because
+    /// the tooltip tests read comments back out of it.
+    pub(super) const DEFAULT_TOML: &str = r#"# A fixture family for the config form's own tests.
+#
+# It states one leaf of every scalar kind, so a per-kind test has somewhere to
+# write.
+
+# A switch.
+flag = true
+
+# A plain spin row.
+count = 3
+
+# A spin row that also takes a word.
+rows = 4
+
+# A combo.
+style = "vfd"
+
+# A combo plus a literal.
+color = "heat"
+
+# An entry.
+label = "fixture"
+
+# The two collections are the operator's, so the default states neither and
+# documents the shape instead — the same reason workspaces.toml is comments
+# only:
+#
+#     order = ["one", "two"]
+#
+#     [entry.one]
+#     name = "the first one"
+"#;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fixture family, as a [`ShellFamily`] — so its form goes through
+    /// the same [`ShellSubsystem`] `core-leds` does.
+    struct Fixture;
+
+    impl ShellFamily for Fixture {
+        const FAMILY: &'static Family = &fixture::FAMILY;
+    }
+
+    /// The fixture's ops, editable.
+    pub(super) fn fixture_ops() -> FamilyOps {
+        FamilyOps::of::<ShellSubsystem<Fixture>>(&fixture::FAMILY, true)
+    }
+
+    #[test]
+    fn the_fixture_family_verifies() {
+        assert_eq!(
+            fixture::FAMILY.verify(),
+            Ok(()),
+            "the fixture's schema and its documented default must agree"
+        );
+    }
+
+    /// The shim is only safe because it cannot say anything the family does
+    /// not: `NAME` decides which file is read and written, and `DEFAULT_TOML`
+    /// is both the bottom merge layer and the seed a first-ever save writes.
+    /// Both are read off [`Family`], so this reds only if someone restates
+    /// either by hand.
+    #[test]
+    fn the_shell_shims_are_the_familys_own_two_consts() {
+        assert_eq!(
+            <ShellSubsystem<CoreLeds> as Subsystem>::NAME,
+            hytte_config_families::core_leds::FAMILY.name
+        );
+        assert_eq!(
+            <ShellSubsystem<CoreLeds> as Subsystem>::DEFAULT_TOML,
+            hytte_config_families::core_leds::FAMILY.default_toml
+        );
+        assert_eq!(
+            <ShellSubsystem<Workspaces> as Subsystem>::NAME,
+            hytte_config_families::workspaces::FAMILY.name
+        );
+        assert_eq!(
+            <ShellSubsystem<Workspaces> as Subsystem>::DEFAULT_TOML,
+            hytte_config_families::workspaces::FAMILY.default_toml
+        );
+    }
+
+    /// Every family this app offers a form for agrees with its own documented
+    /// default — the sweep, so a fifth family gets this for free.
+    #[test]
+    fn every_family_this_app_renders_verifies() {
+        for ops in families() {
+            assert_eq!(
+                ops.family.verify(),
+                Ok(()),
+                "{} does not match its documented default",
+                ops.family.name
+            );
+        }
+    }
+
+    /// `save_leaf_to_locked` refuses outright when `schema.family` is not
+    /// `S::NAME`, so a mismatched pair here would be a form whose every save
+    /// answers `NotALeaf`.
+    #[test]
+    fn every_familys_schema_names_the_family_it_is_for() {
+        for ops in families() {
+            assert_eq!(
+                ops.family.schema.family, ops.family.name,
+                "{}'s schema names another family",
+                ops.family.name
+            );
+        }
+    }
+
+    /// The four are the two shell-owned plus the two plugin-owned — #888's
+    /// erratum to §3, asserted rather than assumed.
+    #[test]
+    fn the_four_families_are_composed_from_three_crates() {
+        let names: Vec<&str> = families().iter().map(|ops| ops.family.name).collect();
+        assert_eq!(names, ["core-leds", "workspaces", "stats", "agents"]);
+        let shell: Vec<&str> = shell_families().iter().map(|ops| ops.family.name).collect();
+        assert_eq!(shell, ["core-leds", "workspaces"]);
+        assert!(family("stats").is_some());
+        assert!(family("nothing-like-it").is_none());
+    }
+
+    /// Spec §4's staging: `stats` and `core-leds` are the two editable forms;
+    /// `agents` and `workspaces` render read-only until P2.
+    #[test]
+    fn only_the_two_first_forms_are_editable() {
+        let editable: Vec<&str> = families()
+            .iter()
+            .filter(|ops| ops.editable)
+            .map(|ops| ops.family.name)
+            .collect();
+        assert_eq!(editable, ["core-leds", "stats"]);
+    }
+
+    #[test]
+    fn a_row_title_is_its_leaf_segment_humanised() {
+        assert_eq!(humanise(leaf_of("bar.poll_seconds")), "Poll seconds");
+        assert_eq!(humanise(leaf_of("sidebar.cpu")), "CPU");
+        assert_eq!(humanise(leaf_of("sidebar.gpu")), "GPU");
+        assert_eq!(humanise(leaf_of("style")), "Style");
+        assert_eq!(humanise("core-leds"), "Core leds");
+    }
+
+    /// The tooltip's second half is the block **immediately** above the key —
+    /// not the file header, which a blank line separates from it and which
+    /// belongs to the file.
+    #[test]
+    fn the_tooltip_takes_the_block_above_the_key_and_not_the_file_header() {
+        let block = comment_above(hytte_config_families::core_leds::DEFAULT_TOML, "style")
+            .expect("core-leds documents `style`");
+        assert!(
+            block.starts_with("The kit skin"),
+            "expected the key's own block, got {block:?}"
+        );
+        assert!(
+            !block.contains("This file is read live"),
+            "the file header is not this key's comment: {block:?}"
+        );
+        assert!(
+            block.contains("vfd"),
+            "the indented value table is part of the block: {block:?}"
+        );
+    }
+
+    /// A dotted path reaches a key inside a table, and a table's own header
+    /// comment is read off the table rather than off a key.
+    #[test]
+    fn a_comment_is_found_for_a_nested_key_and_for_a_table_header() {
+        let leaf = comment_above(hytte_plugin_stats::config::DEFAULT_TOML, "bar.per_core")
+            .expect("stats documents `[bar] per_core`");
+        assert!(
+            leaf.contains("one cell per logical core"),
+            "expected the nested key's own block, got {leaf:?}"
+        );
+        let table = comment_above(hytte_plugin_stats::config::DEFAULT_TOML, "sidebar")
+            .expect("stats documents the `[sidebar]` header");
+        assert!(
+            table.contains("right-sidebar card"),
+            "expected the table's own block, got {table:?}"
+        );
+        assert!(
+            !table.contains("ONE file, TWO instances"),
+            "the file header is not the first table's comment: {table:?}"
+        );
+    }
+
+    /// A key the default does not state has no block, and the row falls back
+    /// to the field's one sentence.
+    #[test]
+    fn a_field_with_no_documented_block_keeps_its_one_sentence() {
+        assert_eq!(comment_above(fixture::DEFAULT_TOML, "order"), None);
+        let field = fixture::SCHEMA
+            .field("order")
+            .expect("the fixture declares `order`");
+        assert_eq!(tooltip_for(&fixture::FAMILY, field), "A read-only list.");
+    }
+
+    #[test]
+    fn provenance_names_the_layer_a_value_came_from() {
+        assert_eq!(provenance(false, Some(&Origin::Default), false), "Default");
+        assert_eq!(provenance(false, Some(&Origin::Overlay), false), "Yours");
+        assert_eq!(
+            provenance(
+                false,
+                Some(&Origin::Base(PathBuf::from(
+                    "/etc/xdg/trollshell/core-leds.toml"
+                ))),
+                false
+            ),
+            "From /etc/xdg/trollshell/core-leds.toml"
+        );
+    }
+
+    /// The locked line says *set in nix* first — the #1331 design's third
+    /// point — and names the base the kept value came from, which is the file
+    /// to go and edit.
+    #[test]
+    fn a_locked_row_says_set_in_nix_and_names_the_base() {
+        let line = provenance(
+            true,
+            Some(&Origin::Base(PathBuf::from(
+                "/etc/xdg/trollshell/core-leds.toml"
+            ))),
+            false,
+        );
+        assert!(line.starts_with("Set in nix"), "{line}");
+        assert!(line.contains("/etc/xdg/trollshell/core-leds.toml"), "{line}");
+    }
+
+    #[test]
+    fn a_collection_row_counts_what_it_holds_and_says_it_is_read_only() {
+        let field = fixture::SCHEMA
+            .field("entry")
+            .expect("the fixture declares `entry`");
+        let mut table = toml::Table::new();
+        table.insert("chat".to_owned(), toml::Value::Table(toml::Table::new()));
+        table.insert("dev".to_owned(), toml::Value::Table(toml::Table::new()));
+        let summary = summarise(field, Some(&toml::Value::Table(table)));
+        assert!(summary.starts_with("2 entries · chat, dev"), "{summary}");
+        assert!(summary.contains("#888 P2"), "{summary}");
+        assert_eq!(plural("workspace", 2), "workspaces");
+        assert_eq!(plural("display", 2), "displays");
+
+        let order = fixture::SCHEMA
+            .field("order")
+            .expect("the fixture declares `order`");
+        let array = toml::Value::Array(vec![toml::Value::String("one".to_owned())]);
+        assert!(
+            summarise(order, Some(&array)).starts_with("1 order · one"),
+            "a single entry stays singular"
+        );
+        assert!(
+            summarise(order, None).starts_with("no orders"),
+            "an absent collection says so"
+        );
+    }
+}
+
+/// The form on a real display: one test per [`Kind`] that the row renders
+/// what the layers say and that changing it writes **one leaf**, plus the
+/// four rules of §4–§5 that only a running form can show (a locked row, a
+/// reset, the poll, and a draft surviving it).
+///
+/// Every test here routes through a `TempDir` as `$XDG_CONFIG_HOME` /
+/// `$XDG_CONFIG_DIRS` — never the real `~/.config/trollshell`, which a test
+/// that saved through it would both pollute and then be perturbed by
+/// (#1101). That is what [`FormInner::layers`] being resolved from an
+/// injected [`xdg::Env`] buys, and it is the reason [`build`] takes one.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use std::time::Instant;
+
+    use super::tests::fixture_ops;
+    use super::*;
+
+    /// A scratch config tree: a `$XDG_CONFIG_HOME` and one `$XDG_CONFIG_DIRS`
+    /// entry, both inside one `TempDir`.
+    struct Scratch {
+        dir: tempfile::TempDir,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().expect("a scratch config tree"),
+            }
+        }
+
+        fn env(&self) -> Rc<xdg::Env> {
+            Rc::new(xdg::Env {
+                home: None,
+                config_home: Some(self.dir.path().join("home").to_string_lossy().into_owned()),
+                config_dirs: Some(self.dir.path().join("etc").to_string_lossy().into_owned()),
+                state_home: None,
+            })
+        }
+
+        /// The operator's own file for `family`.
+        fn overlay(&self, family: &str) -> PathBuf {
+            self.dir
+                .path()
+                .join("home")
+                .join("trollshell")
+                .join(format!("{family}.toml"))
+        }
+
+        /// The nix-written base layer for `family`.
+        fn base(&self, family: &str) -> PathBuf {
+            self.dir
+                .path()
+                .join("etc")
+                .join("trollshell")
+                .join(format!("{family}.toml"))
+        }
+
+        /// Write a layer, creating its directory.
+        fn write(path: &Path, text: &str) {
+            std::fs::create_dir_all(path.parent().expect("a layer has a directory"))
+                .expect("the scratch directory is writable");
+            std::fs::write(path, text).expect("the scratch layer is writable");
+        }
+
+        /// A layer's bytes, or `""` when it does not exist.
+        fn read(path: &Path) -> String {
+            std::fs::read_to_string(path).unwrap_or_default()
+        }
+    }
+
+    /// Run the main loop until `done`, or fail after five seconds.
+    ///
+    /// Not a fixed sleep: the save is debounced by
+    /// [`SAVE_DEBOUNCE`](super::SAVE_DEBOUNCE), so what a test waits for is
+    /// the *effect*, and waiting for it by polling keeps the suite as fast as
+    /// the debounce and no slower.
+    fn settle_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while glib::MainContext::default().iteration(false) {}
+            if done() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Drain whatever the main loop has pending, then let one debounce window
+    /// pass, so "nothing was written" is a claim about a save that had its
+    /// chance rather than one that had not fired yet.
+    fn settle_nothing() {
+        let deadline = Instant::now() + SAVE_DEBOUNCE + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The `(line before, line after)` pairs by which two files differ, by
+    /// position.
+    ///
+    /// This is what "**exactly one leaf**" is asserted with: a writer that
+    /// replaced the whole table would move or drop comment lines and blank
+    /// lines too, so the count would not be one. **Red if
+    /// `save_leaf_to_locked` stops writing a single leaf** — the #1359
+    /// falsification.
+    fn changed_lines(before: &str, after: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut a = before.lines();
+        let mut b = after.lines();
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return out,
+                (left, right) => {
+                    let left = left.unwrap_or("<missing>");
+                    let right = right.unwrap_or("<missing>");
+                    if left != right {
+                        out.push((left.to_owned(), right.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The form's row for `path`.
+    fn row_of<'a>(form: &'a Form, path: &str) -> &'a Row {
+        form.inner
+            .rows
+            .iter()
+            .find(|row| row.field.path == path)
+            .unwrap_or_else(|| panic!("the form has a row for {path}"))
+    }
+
+    /// That row's provenance line, read off the widget.
+    fn note_of(form: &Form, path: &str) -> String {
+        row_of(form, path).note.get()
+    }
+
+    /// Whether that row's widgets are editable.
+    fn sensitive(form: &Form, path: &str) -> bool {
+        row_of(form, path)
+            .widgets
+            .iter()
+            .all(gtk::prelude::WidgetExt::is_sensitive)
+    }
+
+    /// The fixture form over a scratch tree, with `base` written as the nix
+    /// layer when given.
+    fn fixture_form(scratch: &Scratch, base: Option<&str>) -> Form {
+        if let Some(base) = base {
+            Scratch::write(&scratch.base("form-fixture"), base);
+        }
+        build(fixture_ops(), &scratch.env())
+    }
+
+    // ── One test per Kind: it renders, and a change writes one leaf ─────────
+
+    #[gtk::test]
+    fn a_bool_row_renders_the_file_and_writes_one_leaf() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Switch(switch) = &row_of(&form, "flag").control else {
+            panic!("a Bool is a switch row");
+        };
+        assert!(switch.is_active(), "the row renders the documented default");
+        assert_eq!(note_of(&form, "flag"), "Default");
+
+        switch.set_active(false);
+        let overlay = scratch.overlay("form-fixture");
+        settle_until("the switch to be saved", || {
+            Scratch::read(&overlay).contains("flag = false")
+        });
+
+        // The overlay is seeded with the documented default and then **one**
+        // leaf is set, so the file is that default with exactly one line
+        // different — comments, blank lines and key order all intact.
+        let written = Scratch::read(&overlay);
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &written),
+            vec![("flag = true".to_owned(), "flag = false".to_owned())],
+            "exactly one leaf moved:\n{written}"
+        );
+        assert!(written.contains("# A switch."), "the comments survive");
+        assert_eq!(note_of(&form, "flag"), "Yours");
+    }
+
+    #[gtk::test]
+    fn an_int_row_renders_the_file_and_writes_one_leaf() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        assert!((row.value() - 3.0).abs() < f64::EPSILON, "the documented default");
+        assert_eq!(note_of(&form, "count"), "Default");
+
+        row.set_value(7.0);
+        let overlay = scratch.overlay("form-fixture");
+        settle_until("the spin row to be saved", || {
+            Scratch::read(&overlay).contains("count = 7")
+        });
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
+            vec![("count = 3".to_owned(), "count = 7".to_owned())],
+            "exactly one leaf moved"
+        );
+        assert_eq!(note_of(&form, "count"), "Yours");
+    }
+
+    /// `core-leds`' `rows` takes `0..=64` **or** the word `"rect"`
+    /// (`Kind::Int`'s `also`, #1360 HIGH 2). The word is one suffix toggle;
+    /// touching the number turns it back off, so the two halves of one leaf
+    /// cannot contradict each other.
+    #[gtk::test]
+    fn an_int_row_with_a_word_can_write_the_word_and_then_a_number() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("rows = \"rect\"\n"));
+        let Control::Spin { row, words } = &row_of(&form, "rows").control else {
+            panic!("an Int is a spin row");
+        };
+        let (_, rect) = words.first().expect("`rows` declares the word `rect`");
+        assert!(rect.is_active(), "the file's word is what the row shows");
+
+        let overlay = scratch.overlay("form-fixture");
+        row.set_value(9.0);
+        settle_until("the number to be saved", || {
+            Scratch::read(&overlay).contains("rows = 9")
+        });
+        assert!(
+            !rect.is_active(),
+            "dialling a number is choosing a number, so the word turns itself off"
+        );
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
+            vec![("rows = 4".to_owned(), "rows = 9".to_owned())],
+            "exactly one leaf moved"
+        );
+
+        rect.set_active(true);
+        settle_until("the word to be saved", || {
+            Scratch::read(&overlay).contains("rows = \"rect\"")
+        });
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
+            vec![("rows = 4".to_owned(), "rows = \"rect\"".to_owned())],
+            "and the word replaces the number in place"
+        );
+    }
+
+    #[gtk::test]
+    fn a_choice_row_renders_the_file_and_writes_one_leaf() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("style = \"lcd\"\n"));
+        let Control::Combo { row, options } = &row_of(&form, "style").control else {
+            panic!("a Choice is a combo row");
+        };
+        assert_eq!(
+            options[usize::try_from(row.selected()).expect("a selected index")],
+            "lcd",
+            "the row renders the base layer's word"
+        );
+
+        row.set_selected(2);
+        let overlay = scratch.overlay("form-fixture");
+        settle_until("the combo to be saved", || {
+            Scratch::read(&overlay).contains("style = \"oled\"")
+        });
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
+            vec![(
+                "style = \"vfd\"".to_owned(),
+                "style = \"oled\"".to_owned()
+            )],
+            "exactly one leaf moved"
+        );
+        assert_eq!(note_of(&form, "style"), "Yours");
+    }
+
+    /// A value no layer's vocabulary has — a hand edit, or a base layer from a
+    /// newer shell — shows **no** selection rather than the first option
+    /// presented as if it were the file's word.
+    #[gtk::test]
+    fn a_choice_row_shows_no_selection_for_a_word_it_does_not_know() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("style = \"plasma\"\n"));
+        let Control::Combo { row, .. } = &row_of(&form, "style").control else {
+            panic!("a Choice is a combo row");
+        };
+        assert_eq!(row.selected(), gtk::INVALID_LIST_POSITION);
+    }
+
+    /// `Kind::Color` is two rows for one leaf: the named palette, and the
+    /// `#rrggbb` literal beside a swatch.
+    #[gtk::test]
+    fn a_colour_row_writes_a_name_from_the_combo_and_a_literal_from_the_entry() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("color = \"#ff8800\"\n"));
+        let Control::Colour {
+            combo,
+            entry,
+            options,
+            ..
+        } = &row_of(&form, "color").control
+        else {
+            panic!("a Color is a combo plus an entry");
+        };
+        let custom = u32::try_from(options.len()).expect("a handful of options");
+        assert_eq!(
+            combo.selected(),
+            custom,
+            "a literal selects the trailing custom item"
+        );
+        assert_eq!(entry.text(), "#ff8800", "and the literal is in the entry");
+
+        let overlay = scratch.overlay("form-fixture");
+        combo.set_selected(1);
+        settle_until("the named colour to be saved", || {
+            Scratch::read(&overlay).contains("color = \"style\"")
+        });
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
+            vec![(
+                "color = \"heat\"".to_owned(),
+                "color = \"style\"".to_owned()
+            )],
+            "exactly one leaf moved"
+        );
+
+        entry.set_text("#102030");
+        glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
+        settle_until("the literal to be saved", || {
+            Scratch::read(&overlay).contains("color = \"#102030\"")
+        });
+        assert_eq!(
+            combo.selected(),
+            custom,
+            "applying a literal moves the combo onto its custom item"
+        );
+    }
+
+    #[gtk::test]
+    fn a_text_row_renders_the_file_and_writes_one_leaf_on_apply() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Text(entry) = &row_of(&form, "label").control else {
+            panic!("a Text is an entry row");
+        };
+        assert_eq!(entry.text(), "fixture");
+
+        let overlay = scratch.overlay("form-fixture");
+        entry.set_text("renamed");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "",
+            "typing is a draft: nothing is written until apply"
+        );
+
+        glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
+        settle_until("the entry to be saved", || {
+            Scratch::read(&overlay).contains("label = \"renamed\"")
+        });
+        assert_eq!(
+            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
+            vec![(
+                "label = \"fixture\"".to_owned(),
+                "label = \"renamed\"".to_owned()
+            )],
+            "exactly one leaf moved"
+        );
+    }
+
+    /// A blank is not "unset" — the row's own **reset** is how that is spelled
+    /// (#1360 LOW 8) — so the writer refuses it and the row says so instead of
+    /// writing an invisible empty string.
+    #[gtk::test]
+    fn a_text_row_refuses_a_blank_on_the_row_rather_than_writing_one() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Text(entry) = &row_of(&form, "label").control else {
+            panic!("a Text is an entry row");
+        };
+        entry.set_text("   ");
+        glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
+        settle_until("the refusal to reach the row", || {
+            note_of(&form, "label").contains("not blank")
+        });
+        assert_eq!(
+            Scratch::read(&scratch.overlay("form-fixture")),
+            "",
+            "a refused save writes nothing at all"
+        );
+        assert!(row_of(&form, "label").failed.get());
+    }
+
+    /// `List` and `Map` are read-only in v1 (spec §1): a summary row, no
+    /// controls, no reset.
+    #[gtk::test]
+    fn a_collection_row_is_a_read_only_summary() {
+        let scratch = Scratch::new();
+        let form = fixture_form(
+            &scratch,
+            Some("order = [\"one\", \"two\"]\n\n[entry.one]\nname = \"the first\"\n"),
+        );
+        let Control::Collection(row) = &row_of(&form, "order").control else {
+            panic!("a List is an action row");
+        };
+        assert!(
+            row.subtitle()
+                .expect("the summary")
+                .starts_with("2 orders · one, two"),
+            "{:?}",
+            row.subtitle()
+        );
+        assert!(!sensitive(&form, "order"), "a collection is read-only in v1");
+        assert!(
+            row_of(&form, "order").reset.is_none(),
+            "and has nothing to reset"
+        );
+        let Control::Collection(entry) = &row_of(&form, "entry").control else {
+            panic!("a Map is an action row");
+        };
+        assert!(
+            entry
+                .subtitle()
+                .expect("the summary")
+                .starts_with("1 entry · one"),
+            "{:?}",
+            entry.subtitle()
+        );
+    }
+
+    // ── §5: locks, reset, the poll, and a draft that survives it ────────────
+
+    /// The #1331 design's third point, finally on a row: a locked leaf is
+    /// insensitive, says *Set in nix*, and a change made anyway is refused
+    /// **before** a byte moves.
+    ///
+    /// **Red if the row builder stops reading the lock** — the #1359
+    /// falsification.
+    #[gtk::test]
+    fn a_locked_row_is_insensitive_and_a_change_is_refused() {
+        let scratch = Scratch::new();
+        let form = fixture_form(
+            &scratch,
+            Some("_locked = [\"flag\"]\nflag = false\n"),
+        );
+        assert!(!sensitive(&form, "flag"), "a locked leaf is not editable");
+        assert!(
+            note_of(&form, "flag").starts_with("Set in nix"),
+            "{}",
+            note_of(&form, "flag")
+        );
+        assert!(
+            !row_of(&form, "flag")
+                .reset
+                .as_ref()
+                .expect("a scalar row has a reset")
+                .is_sensitive(),
+            "and there is nothing of yours to reset"
+        );
+
+        let Control::Switch(switch) = &row_of(&form, "flag").control else {
+            panic!("a Bool is a switch row");
+        };
+        switch.set_active(true);
+        settle_until("the refusal to reach the row", || {
+            note_of(&form, "flag").contains("cannot be overridden")
+        });
+        assert_eq!(
+            Scratch::read(&scratch.overlay("form-fixture")),
+            "",
+            "a locked key is refused before a byte moves"
+        );
+    }
+
+    /// *Reset* removes the operator's line — and deliberately does **not**
+    /// write an `_unset` marker (spec §5), so the value falls back to the
+    /// layer below rather than being erased from it.
+    #[gtk::test]
+    fn reset_removes_the_leaf_and_falls_back_to_the_layer_below() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("count = 8\n"));
+        let overlay = scratch.overlay("form-fixture");
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        assert!((row.value() - 8.0).abs() < f64::EPSILON, "the base layer's value");
+
+        row.set_value(2.0);
+        settle_until("the spin row to be saved", || {
+            Scratch::read(&overlay).contains("count = 2")
+        });
+        assert_eq!(note_of(&form, "count"), "Yours");
+
+        row_of(&form, "count")
+            .reset
+            .as_ref()
+            .expect("a scalar row has a reset")
+            .emit_clicked();
+        settle_until("the leaf to be removed", || {
+            !Scratch::read(&overlay).contains("count = 2")
+        });
+        let written = Scratch::read(&overlay);
+        assert!(
+            !written.contains("count ="),
+            "the key is gone, not set to the default: {written}"
+        );
+        assert!(
+            !written.contains("_unset"),
+            "and a reset is not an _unset marker: {written}"
+        );
+        assert!(
+            (row.value() - 8.0).abs() < f64::EPSILON,
+            "the row falls back to the base layer"
+        );
+        assert_eq!(
+            note_of(&form, "count"),
+            format!("From {}", scratch.base("form-fixture").display())
+        );
+    }
+
+    /// A base layer that appears under a running form moves the row's
+    /// provenance on the next poll.
+    #[gtk::test]
+    fn the_poll_flips_provenance_when_a_base_layer_changes_underneath() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        assert_eq!(note_of(&form, "count"), "Default");
+
+        Scratch::write(&scratch.base("form-fixture"), "count = 5\n");
+        assert!(form.refresh_from_disk(), "the layer moved");
+        assert_eq!(
+            note_of(&form, "count"),
+            format!("From {}", scratch.base("form-fixture").display())
+        );
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        assert!((row.value() - 5.0).abs() < f64::EPSILON);
+    }
+
+    /// #1338's H2, on a row: a `nixos-rebuild` that pins a key the file
+    /// already held **moves no value at all**, and a poll that compared
+    /// values would leave the row editable over a value the next load
+    /// reverts.
+    ///
+    /// **Red if the poll compares values only** — the #1359 falsification.
+    #[gtk::test]
+    fn the_poll_sees_a_lock_appear_over_a_value_that_did_not_move() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("flag = false\n"));
+        assert!(sensitive(&form, "flag"), "not locked yet");
+
+        // The same value, now pinned. Nothing in `table` differs.
+        Scratch::write(
+            &scratch.base("form-fixture"),
+            "_locked = [\"flag\"]\nflag = false\n",
+        );
+        assert!(form.refresh_from_disk(), "the lock moved");
+        assert!(!sensitive(&form, "flag"), "the row greys itself");
+        assert!(
+            note_of(&form, "flag").starts_with("Set in nix"),
+            "{}",
+            note_of(&form, "flag")
+        );
+    }
+
+    /// The draft guard: a poll driven by **another** key's change must not
+    /// overwrite what the operator is halfway through typing, because a row's
+    /// text is their draft until they apply it.
+    #[gtk::test]
+    fn a_half_typed_entry_survives_a_poll_driven_by_another_key() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Text(entry) = &row_of(&form, "label").control else {
+            panic!("a Text is an entry row");
+        };
+        entry.set_text("half-typ");
+
+        Scratch::write(&scratch.base("form-fixture"), "count = 5\n");
+        assert!(form.refresh_from_disk(), "the other key moved");
+        assert_eq!(entry.text(), "half-typ", "the draft is untouched");
+
+        // …and the file's own word for that key still wins when it moves.
+        Scratch::write(&scratch.base("form-fixture"), "label = \"from-nix\"\n");
+        assert!(form.refresh_from_disk(), "this key moved");
+        assert_eq!(entry.text(), "from-nix");
+    }
+
+    /// A layer that exists and cannot be parsed is said out loud, and nothing
+    /// is offered for editing over a merged view that is not what the files
+    /// say.
+    #[gtk::test]
+    fn an_unparsable_layer_is_named_and_the_form_goes_read_only() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("this is not toml\n"));
+        assert!(form.inner.banner.is_visible(), "the banner is up");
+        assert!(
+            form.inner
+                .banner
+                .subtitle()
+                .expect("the banner says what happened")
+                .contains("form-fixture.toml"),
+            "naming the file: {:?}",
+            form.inner.banner.subtitle()
+        );
+        assert!(!sensitive(&form, "flag"), "nothing is offered for editing");
+    }
+
+    // ── The real families, as the tab mounts them ───────────────────────────
+
+    /// `stats.toml` is `[sidebar]` and `[bar]`, so its form is two groups of
+    /// eight — the issue's own shape for it.
+    #[gtk::test]
+    fn the_stats_form_is_two_groups_of_eight_rows() {
+        let scratch = Scratch::new();
+        let ops = family("stats").expect("stats is one of the four");
+        let form = build(ops, &scratch.env());
+        let titles: Vec<String> = form
+            .groups()
+            .iter()
+            .map(|group| group.title().to_string())
+            .collect();
+        assert_eq!(titles, ["Sidebar", "Bar"]);
+        assert_eq!(form.inner.rows.len(), 16);
+        assert!(
+            form.groups()[0]
+                .description()
+                .expect("the table's own comment block")
+                .contains("right-sidebar card"),
+            "{:?}",
+            form.groups()[0].description()
+        );
+        // Every row renders the documented default, with nothing on disk.
+        assert_eq!(note_of(&form, "bar.cpu"), "Default");
+        assert!(sensitive(&form, "bar.cpu"), "stats is editable in P1");
+    }
+
+    /// `core-leds` is the second form, and the one carrying the two kinds
+    /// `stats` has not got.
+    #[gtk::test]
+    fn the_core_leds_form_is_one_group_with_a_choice_a_colour_and_a_word_taking_int() {
+        let scratch = Scratch::new();
+        let ops = family("core-leds").expect("core-leds is one of the four");
+        let form = build(ops, &scratch.env());
+        assert_eq!(form.groups().len(), 1);
+        assert!(matches!(
+            row_of(&form, "style").control,
+            Control::Combo { .. }
+        ));
+        assert!(matches!(
+            row_of(&form, "color").control,
+            Control::Colour { .. }
+        ));
+        let Control::Spin { words, .. } = &row_of(&form, "rows").control else {
+            panic!("`rows` is a spin row");
+        };
+        assert_eq!(words.len(), 1, "with the word `rect` beside the number");
+
+        let overlay = scratch.overlay("core-leds");
+        let Control::Combo { row, .. } = &row_of(&form, "style").control else {
+            panic!("`style` is a combo row");
+        };
+        row.set_selected(2);
+        settle_until("the skin to be saved", || {
+            Scratch::read(&overlay).contains("style = \"oled\"")
+        });
+        assert_eq!(
+            changed_lines(
+                hytte_config_families::core_leds::DEFAULT_TOML,
+                &Scratch::read(&overlay)
+            ),
+            vec![(
+                "style = \"vfd\"".to_owned(),
+                "style = \"oled\"".to_owned()
+            )],
+            "exactly one leaf moved in the real family's file too"
+        );
+    }
+
+    /// The two families spec §4 stages as read-only render every row and
+    /// offer none of them.
+    #[gtk::test]
+    fn the_read_only_families_render_but_do_not_offer_an_edit() {
+        let scratch = Scratch::new();
+        for name in ["agents", "workspaces"] {
+            let ops = family(name).expect("one of the four");
+            let form = build(ops, &scratch.env());
+            assert!(!form.inner.rows.is_empty(), "{name} renders rows");
+            for row in &form.inner.rows {
+                assert!(
+                    !row.widgets
+                        .iter()
+                        .any(gtk::prelude::WidgetExt::is_sensitive),
+                    "{name}.{} is offered for editing in P1",
+                    row.field.path
+                );
+            }
+            assert!(
+                form.groups()[0]
+                    .description()
+                    .expect("a description")
+                    .contains("#888 P2"),
+                "{name} says why it is read-only"
+            );
+        }
+    }
+
+    /// **Nothing the form wires up holds the form.**
+    ///
+    /// Every row handler and the poll capture a `Weak<FormInner>` and upgrade
+    /// per callback ([`FormInner`]'s own doc, the Plugins tab's #943 lesson
+    /// applied to a state struct) — so the handle a caller holds is the only
+    /// strong reference, and dropping it is what stops the poll and frees the
+    /// widgets. A single strong clone captured anywhere would make this count
+    /// two and leak the form for the window's whole life.
+    #[gtk::test]
+    fn the_form_handle_is_the_only_strong_reference_to_it() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        assert_eq!(
+            Rc::strong_count(&form.inner),
+            1,
+            "a handler captured the form strongly"
+        );
+        // And `Drop` removes the live poll source, which `SourceId::remove`
+        // documents as a programmer error to get wrong in either direction.
+        drop(form);
+        while glib::MainContext::default().iteration(false) {}
+    }
 }

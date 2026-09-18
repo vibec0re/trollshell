@@ -1899,6 +1899,37 @@ fn spell_value(value: &toml::Value) -> String {
         .map_or_else(|| value.to_string(), std::borrow::ToOwned::to_owned)
 }
 
+/// [`spell_value`]'s inverse for a scalar [`Kind`]: what one list item's
+/// entered `text` means as a typed value, or `None` when it cannot mean one
+/// at all (#1384 item 1).
+///
+/// Shared with `collection::ListPage`: a scalar row reads its value straight
+/// off a typed widget (`Row::value`), but a list item is one `AdwEntryRow`'s
+/// text regardless of its element [`Kind`] — nothing else in this module ever
+/// had to turn text into a typed value, since `Bool`/`Int`/`Choice` rows read
+/// GTK widget state directly and `Text`/`Color` are already the string
+/// `Kind::accepts` judges. `Bool`/`Int` are the only arms that actually
+/// convert; the rest hand the string back unchanged, for
+/// `collection::typed_array`'s validator to judge.
+pub(super) fn parse_scalar(kind: Kind, text: &str) -> Option<toml_edit::Value> {
+    match kind {
+        Kind::Bool => text.parse::<bool>().ok().map(Into::into),
+        Kind::Int { also, .. } => {
+            if also.contains(&text) {
+                Some(text.into())
+            } else {
+                text.parse::<i64>().ok().map(Into::into)
+            }
+        }
+        Kind::Choice { .. } | Kind::Text { .. } | Kind::Color { .. } => Some(text.into()),
+        // Unreachable through a schema in the tree today — a list's element
+        // kind is never itself a collection — but total rather than a panic,
+        // since this is reached from a form built off `&'static` schema data
+        // this module does not control.
+        Kind::List(_) | Kind::Map(_) => None,
+    }
+}
+
 /// `workspace` → `workspaces`, `entry` → `entries`, and `1 workspace` stays
 /// singular.
 ///
@@ -2179,6 +2210,20 @@ mod fixture {
                 doc: "A read-only list.",
             },
             Field {
+                path: "order_ints",
+                kind: Kind::List(&Kind::Int {
+                    min: -5,
+                    max: 5,
+                    also: &[],
+                }),
+                doc: "A list of whole numbers (#1384 item 1).",
+            },
+            Field {
+                path: "flags",
+                kind: Kind::List(&Kind::Bool),
+                doc: "A list of switches (#1384 item 1).",
+            },
+            Field {
                 path: "entry",
                 kind: Kind::Map(ENTRY_FIELDS),
                 doc: "A table of named entries.",
@@ -2253,6 +2298,10 @@ label = "fixture"
 # only:
 #
 #     order = ["one", "two"]
+#
+#     order_ints = [1, -2]
+#
+#     flags = [true, false]
 #
 #     items = [{ id = "first", exec = "run" }]
 #
@@ -3663,6 +3712,27 @@ mod gtk_tests {
             while glib::MainContext::default().iteration(false) {}
             self.nav.navigation_stack().n_items()
         }
+
+        /// A `WeakRef` to the visible page's own `AdwPreferencesGroup` — what
+        /// #1384 item 2's tests observe a popped `MapPage`/`ListPage`/
+        /// `RecordsPage` through, since none of those types is reachable from
+        /// a test any other way (they live entirely behind
+        /// `collection::activate`, never returned).
+        fn group_weak(&self) -> glib::WeakRef<adw::PreferencesGroup> {
+            self.widgets::<adw::PreferencesGroup>()
+                .into_iter()
+                .next()
+                .expect("the visible page has a group")
+                .downgrade()
+        }
+
+        /// Pop the visible page — the same `AdwNavigationView::pop` a real
+        /// Back press calls — and wait for it to leave the stack.
+        fn back(&self) {
+            let before = self.depth();
+            self.nav.pop();
+            settle_until("the page to be popped", || self.depth() < before);
+        }
     }
 
     /// Every descendant of `root` of type `T`, in pre-order.
@@ -3897,6 +3967,167 @@ mod gtk_tests {
             Scratch::read(&overlay),
             subsystem::commented_seed(fixture::DEFAULT_TOML),
             "an emptied list is removed, not written as [] — and the documentation stays"
+        );
+    }
+
+    /// #1384 item 1: a `List(Int)` element writes, edits and removes **typed**
+    /// values. The whole-array write itself is unchanged from
+    /// `a_list_page_appends_removes_and_writes_the_whole_array`'s `List(Text)`
+    /// case above — what moved is that every element used to be stringified
+    /// first (`array.push(item.as_str())`), which `Kind::Int::accepts` then
+    /// refused, **including a bare remove**, since that re-emits the same
+    /// whole array (#1384's issue: refused forever from the first edit on).
+    ///
+    /// **Red if the push goes back to `item.as_str()`**: the byte pins below
+    /// would have to read `["1", "2", "3"]`, and in fact nothing would ever
+    /// be written at all — `Kind::Int::accepts` refuses a string outright, so
+    /// every `settle_until` here would time out instead.
+    #[gtk::test]
+    fn a_list_of_ints_writes_edits_and_removes_typed_values() {
+        let scratch = Scratch::new();
+        let page = mounted(&scratch, Some("order_ints = [1, 2]\n"));
+        let overlay = scratch.overlay("form-fixture");
+        page.open("order_ints");
+        assert_eq!(page.title(), "Order ints");
+
+        page.type_into("Add an order_int", "3");
+        settle_until("the appended int", || {
+            wrote(&Scratch::read(&overlay), "order_ints = [1, 2, 3]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "order_ints = [1, 2, 3]\n"),
+            "a real integer array, not [\"1\", \"2\", \"3\"]"
+        );
+
+        page.type_into("Order int 2", "-2");
+        settle_until("the typed edit", || {
+            wrote(&Scratch::read(&overlay), "order_ints = [1, -2, 3]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "order_ints = [1, -2, 3]\n")
+        );
+
+        // Remove re-emits the whole array too — the exact write #1384's
+        // issue names as refused forever once one element had been
+        // stringified.
+        page.type_into("Order int 1", "");
+        settle_until("the typed removal", || {
+            wrote(&Scratch::read(&overlay), "order_ints = [-2, 3]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "order_ints = [-2, 3]\n")
+        );
+
+        // Outside the schema's -5..=5 range: refused on its own row (named
+        // `order_ints[0]`), never written.
+        let before = Scratch::read(&overlay);
+        page.type_into("Order int 1", "99");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            before,
+            "an out-of-range int must not be written"
+        );
+
+        // Not a number at all: refused the same way.
+        page.type_into("Order int 1", "not-a-number");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            before,
+            "an unparsable entry must not be written"
+        );
+    }
+
+    /// #1384 item 1 again, for `List(Bool)` — the other kind the issue names.
+    #[gtk::test]
+    fn a_list_of_bools_writes_and_removes_typed_values() {
+        let scratch = Scratch::new();
+        let page = mounted(&scratch, Some("flags = [true]\n"));
+        let overlay = scratch.overlay("form-fixture");
+        page.open("flags");
+        assert_eq!(page.title(), "Flags");
+
+        page.type_into("Add a flag", "false");
+        settle_until("the appended bool", || {
+            wrote(&Scratch::read(&overlay), "flags = [true, false]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "flags = [true, false]\n"),
+            "a real bool array, not [\"true\", \"false\"]"
+        );
+
+        page.type_into("Flag 1", "");
+        settle_until("the typed removal", || {
+            wrote(&Scratch::read(&overlay), "flags = [false]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "flags = [false]\n")
+        );
+
+        let before = Scratch::read(&overlay);
+        page.type_into("Flag 1", "maybe");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            before,
+            "an unparsable bool must not be written"
+        );
+    }
+
+    /// #1384 item 2: popping a `Map`/`List`/`Records` page actually frees it.
+    ///
+    /// Before this, each of `MapPage`/`ListPage`/`RecordsPage`'s own rows
+    /// captured `Rc::clone(self)` — `self.group` is a field of the page
+    /// itself, so a row closure holding a strong clone of the page closes a
+    /// cycle with no external anchor: the page owns the group, the group
+    /// owns the row, the row's closure owns another strong reference to the
+    /// page. Popping releases the *external* anchor
+    /// ([`collection::SubPage`]'s own handle, held by the parent form), but
+    /// the self-loop through the page's own current rows survives that,
+    /// forever. `nix/lint-bind-pins.py` cannot see this shape — the widget a
+    /// `connect_*` call is attached to is never the object its closure
+    /// captures — which is why this is a test and not a lint.
+    ///
+    /// **Red if a capture on a row these three pages build here — a map entry,
+    /// a list item, a record, or their `rebuild`s — goes back to
+    /// `Rc::clone(self)`**: that row alone
+    /// keeps its page's group permanently reachable, and the `WeakRef` below
+    /// still upgrades after the pop.
+    #[gtk::test]
+    fn a_popped_collection_page_is_freed() {
+        let scratch = Scratch::new();
+
+        let map = mounted(&scratch, Some("[entry.one]\nname = \"the first\"\n"));
+        map.open("entry");
+        let map_group = map.group_weak();
+        map.back();
+        assert!(
+            map_group.upgrade().is_none(),
+            "the Map page's own group is still reachable after it was popped"
+        );
+
+        let list = mounted(&scratch, Some("order = [\"one\"]\n"));
+        list.open("order");
+        let list_group = list.group_weak();
+        list.back();
+        assert!(
+            list_group.upgrade().is_none(),
+            "the List page's own group is still reachable after it was popped"
+        );
+
+        let records = mounted(&scratch, Some("items = [{ id = \"first\" }]\n"));
+        records.open("items");
+        let records_group = records.group_weak();
+        records.back();
+        assert!(
+            records_group.upgrade().is_none(),
+            "the Records page's own group is still reachable after it was popped"
         );
     }
 

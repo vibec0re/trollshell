@@ -7369,7 +7369,8 @@ brightness = 5
     /// to `[core]`, where it is now a lie.
     #[test]
     fn a_comment_above_the_key_being_reset_goes_with_it() {
-        let (_dir, path) = scratch("# why I turned it off\nenabled = false\n\n[core]\nbrightness = 1\n");
+        let (_dir, path) =
+            scratch("# why I turned it off\nenabled = false\n\n[core]\nbrightness = 1\n");
 
         save_leaf(&path, "enabled", None, &BTreeSet::new()).expect("resets");
 

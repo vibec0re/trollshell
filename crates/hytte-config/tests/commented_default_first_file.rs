@@ -746,11 +746,7 @@ fn raw_string(src: &str) -> Option<(String, usize)> {
 /// Whether `src` starts with an identifier or `::` path that ends the
 /// statement — i.e. this declaration is another const under a new name.
 fn is_path_alias(src: &str) -> bool {
-    let path: &str = src
-        .split(';')
-        .next()
-        .map(str::trim_end)
-        .unwrap_or_default();
+    let path: &str = src.split(';').next().map(str::trim_end).unwrap_or_default();
     !path.is_empty()
         && src.len() > path.len() // a `;` really did follow
         && path

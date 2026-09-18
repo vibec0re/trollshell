@@ -113,6 +113,14 @@ pkgs.testers.runNixOSTest {
     # window. All 5 occurrences must materialise — the whole point
     # of the fix (the old master-only path would surface just 1).
     assert "Test Calendar" in output, output
+
+    # Per-source colour (#1223 item 1): the seeded fixture carries
+    # `[Calendar] Color=#ff8800`, and `Source::color` reads it off the
+    # `ESourceSelectable` extension. This is the only place that FFI read
+    # runs against a real source registry — the hermetic tests cover only
+    # the shape check it applies to the string.
+    assert re.search(r"- Test Calendar \(.*\) color=#ff8800", output), output
+
     assert "created recurring uid:" in output, output
     assert "recurring instance count: 5" in output, output
     assert "removed recurring" in output, output

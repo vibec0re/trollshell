@@ -1851,6 +1851,19 @@ title` in the stderr tail — worth a deliberate look on first run, since
       calendar should now show at that same local time in the sidebar
       Upcoming list — not shifted by the zone offset a second time (was
       showing +2h in CEST).
+- [ ] **(#1223 item 1)** Per-source calendar colour: pick a distinctive colour
+      for one calendar in GNOME Calendar (or set `Color=#ff8800` under
+      `[Calendar]` in its `~/.config/evolution/sources/<uid>.source` and
+      restart `evolution-source-registry`), then open the sidebar / drawer
+      calendar. Within one poll (60 s) that calendar's rows in the Upcoming
+      list should show **that** colour on their leading dot, while a calendar
+      with no colour set keeps its old hash-palette dot. Two calendars sharing
+      one colour should look identical. The month-grid dots are deliberately
+      **not** changed by this — they still hash by name, so a mismatch between
+      a grid dot and a row dot for the same calendar is expected here, not a
+      bug (see the PR body for why). `RUST_LOG=trollshell=debug` shows one
+      "source colour is not one GTK can parse" line per bad value, and such a
+      calendar should fall back to the palette rather than lose its dot.
 
 ## Displays / compositor geometry & overlays
 

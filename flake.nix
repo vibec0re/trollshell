@@ -386,6 +386,7 @@
 
             [Calendar]
             BackendName=local
+            Color=#ff8800
           '';
         in
         {

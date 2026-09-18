@@ -6,7 +6,7 @@
 //! aliases use opaque `c_void` for GObject pointers — we don't need
 //! field access, only pointer identity + the methods listed here.
 
-use std::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void};
+use std::ffi::{CStr, c_char, c_int, c_short, c_uint, c_ulong, c_void};
 
 /// `time_t` — POSIX calendar seconds since the Unix epoch. On every target
 /// we build for (Linux x86_64/aarch64, glibc/musl) this is a signed 64-bit
@@ -46,6 +46,19 @@ pub type ESourceRegistry = c_void;
 /// [`e_source_registry_list_sources`] and [`e_source_registry_ref_source`];
 /// release each with [`g_object_unref`].
 pub type ESource = c_void;
+
+/// `ESourceExtension *` — base class of the per-purpose key groups an
+/// [`ESource`] carries (`[Calendar]`, `[Task List]`, `[Authentication]`, …),
+/// one per group present in the `.source` keyfile.
+/// [`e_source_get_extension`] returns a **borrow**: the `ESource` owns the
+/// extension for its own lifetime, so it is never unref'd here.
+pub type ESourceExtension = c_void;
+
+/// `ESourceSelectable *` — the [`ESourceExtension`] subclass the `[Calendar]`
+/// and `[Task List]` groups instantiate. It carries the `Color=` / `Selected=`
+/// keys; [`e_source_selectable_get_color`] reads the first. Borrowed exactly
+/// like its base class — never unref one.
+pub type ESourceSelectable = c_void;
 
 /// `EClient *` / `ECalClient *` — calendar/task/memo client. Connect
 /// via [`e_cal_client_connect_sync`]; release with [`g_object_unref`].
@@ -204,6 +217,14 @@ pub const E_CAL_OPERATION_FLAG_NONE: c_uint = 0;
 
 // ── libedataserver: ESourceRegistry + ESource ────────────────────────────────
 
+/// Mirror of `E_SOURCE_EXTENSION_CALENDAR` (`e-source-calendar.h`), whose C
+/// definition is the literal string `"Calendar"` — the `.source` keyfile group
+/// an *events* source carries, and the [`ESourceSelectable`] that holds its
+/// `Color=`. Kept as a `&CStr` so it can be handed straight to
+/// [`e_source_has_extension`] / [`e_source_get_extension`] (and to
+/// [`e_source_registry_list_sources`]) with no `CString` round-trip.
+pub const E_SOURCE_EXTENSION_CALENDAR: &CStr = c"Calendar";
+
 #[link(name = "edataserver-1.2")]
 unsafe extern "C" {
     pub fn e_source_registry_new_sync(
@@ -224,6 +245,24 @@ unsafe extern "C" {
     pub fn e_source_get_uid(source: *mut ESource) -> *const c_char;
     pub fn e_source_get_display_name(source: *mut ESource) -> *const c_char;
     pub fn e_source_has_extension(source: *mut ESource, extension_name: *const c_char) -> c_int;
+
+    /// The named extension of `source` (e.g.
+    /// [`E_SOURCE_EXTENSION_CALENDAR`]), or `NULL` when the source carries no
+    /// such group. C signature returns `gpointer`; modelled as
+    /// [`ESourceExtension`] since every caller here knows which subclass it
+    /// asked for. The result is a **borrow** owned by `source` and valid for
+    /// its lifetime — never unref it.
+    pub fn e_source_get_extension(
+        source: *mut ESource,
+        extension_name: *const c_char,
+    ) -> *mut ESourceExtension;
+
+    /// The `Color=` key of an [`ESourceSelectable`] — the colour Evolution /
+    /// GNOME Calendar store for a calendar or task list, in whatever spelling
+    /// GTK's colour parser accepted (`#rrggbb` in practice). Returns a
+    /// **borrowed** `const gchar*` owned by the extension (`NULL` when the key
+    /// is unset), so copy it out within the borrow and never free it.
+    pub fn e_source_selectable_get_color(selectable: *mut ESourceSelectable) -> *const c_char;
 }
 
 // ── libecal: ECalClient ─────────────────────────────────────────────────────

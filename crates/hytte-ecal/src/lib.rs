@@ -147,7 +147,7 @@ impl Registry {
     /// queries VEVENTs regardless of where they actually live. As with
     /// task lists, disabled sources are still returned; caller filters.
     pub fn calendars(&self) -> Vec<Source> {
-        self.sources_by_extension(c"Calendar")
+        self.sources_by_extension(sys::E_SOURCE_EXTENSION_CALENDAR)
     }
 
     /// Look up a single source by UID. Returns `None` if EDS doesn't
@@ -268,14 +268,84 @@ impl Source {
         let Ok(c) = CString::new(extension_name) else {
             return false;
         };
-        // SAFETY: P1/P3, and `c` is a live `CString` outliving the call.
-        let r = unsafe { sys::e_source_has_extension(self.raw, c.as_ptr()) };
+        self.has_extension_c(&c)
+    }
+
+    /// [`has_extension`](Self::has_extension) for a name that is already
+    /// NUL-terminated — the form the `E_SOURCE_EXTENSION_*` constants take, so
+    /// an in-crate caller skips the `CString` round-trip. The single call site
+    /// of `e_source_has_extension`, so its `unsafe` block is written once.
+    fn has_extension_c(&self, extension_name: &CStr) -> bool {
+        // SAFETY: P1/P3, and `extension_name` is a live `&CStr` (NUL-terminated
+        // by construction) that outlives the call.
+        let r = unsafe { sys::e_source_has_extension(self.raw, extension_name.as_ptr()) };
         r != 0
+    }
+
+    /// The colour EDS keeps on this source's `Calendar` extension — the
+    /// `[Calendar] Color=` key of the `.source` keyfile, which Evolution and
+    /// GNOME Calendar write when a user picks a calendar's colour. The
+    /// shell tints its event rows with it instead of the hash-derived palette
+    /// (#1223 item 1).
+    ///
+    /// `None` when the source carries no `Calendar` extension, when the key is
+    /// unset or empty, **or** when the stored value isn't a `#rrggbb` /
+    /// `#rrggbbaa` hex triple. EDS stores whatever GTK's colour parser
+    /// accepted, so a named colour (`red`), a `rgb(…)` form, or a short
+    /// `#rgb` is possible and is deliberately dropped here rather than handed
+    /// to a caller that expects hex — the shell falls back to its own palette
+    /// for those, which is conservative but never wrong. Nothing here panics
+    /// on a malformed value.
+    #[must_use]
+    pub fn color(&self) -> Option<String> {
+        // A task list (or any non-events source) has no `[Calendar]` group;
+        // `e_source_get_extension` would return NULL for it anyway, but ask
+        // first so the common case never relies on that.
+        if !self.has_extension_c(sys::E_SOURCE_EXTENSION_CALENDAR) {
+            return None;
+        }
+        // SAFETY: P1/P3, and the name is a `'static` NUL-terminated `&CStr`.
+        // The returned `ESourceExtension*` is a borrow owned by this `ESource`
+        // (see its `sys` declaration) — valid for this `&self` borrow, and
+        // never unref'd here.
+        let ext = unsafe {
+            sys::e_source_get_extension(self.raw, sys::E_SOURCE_EXTENSION_CALENDAR.as_ptr())
+        };
+        if ext.is_null() {
+            return None;
+        }
+        // SAFETY: `ext` is the non-null borrowed extension just checked, alive
+        // for this borrow of `self` (P1/P3); the `Calendar` group instantiates
+        // an `ESourceSelectable`, so the cast names the subclass that accessor
+        // expects. It returns a borrowed `const gchar*` (or NULL) that
+        // `borrowed_cstr` copies within this same borrow and never frees.
+        let value = unsafe {
+            borrowed_cstr(sys::e_source_selectable_get_color(
+                ext.cast::<sys::ESourceSelectable>(),
+            ))
+        }?;
+        is_hex_color(&value).then_some(value)
     }
 
     pub(crate) fn raw(&self) -> *mut sys::ESource {
         self.raw
     }
+}
+
+/// The shape check behind [`Source::color`]: `true` only for a `#` followed by
+/// exactly 6 (`#rrggbb`) or 8 (`#rrggbbaa`) ASCII hex digits.
+///
+/// Pure and total — the FFI read above needs a live EDS, this does not, so it
+/// is where the "is this a colour?" decision is tested. Deliberately strict:
+/// the one consumer (the shell's calendar rows) parses the string as a colour
+/// and falls back to its palette for anything it can't use, and a value that
+/// only *some* parsers accept is better dropped at the source than carried to
+/// the surface that has to guess.
+fn is_hex_color(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix('#') else {
+        return false;
+    };
+    matches!(hex.len(), 6 | 8) && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl Drop for Source {
@@ -2096,6 +2166,44 @@ mod tests {
             sys::I_CAL_VTODO_COMPONENT,
             sys::ICalComponentKind::Vtodo as i32
         );
+    }
+
+    // ── Calendar source colour (#1223 item 1) ─────────────────────────────
+    //
+    // `Source::color` itself needs a live EDS (the nixosTest probe covers
+    // that end to end); the decision it makes about the string EDS hands
+    // back is pure, and lives here.
+
+    /// The two spellings EDS actually stores for a calendar colour.
+    #[test]
+    fn hex_color_accepts_rgb_and_rgba_triples() {
+        assert!(super::is_hex_color("#ff8800"));
+        assert!(super::is_hex_color("#FF8800"));
+        assert!(super::is_hex_color("#3584e4"));
+        assert!(super::is_hex_color("#ff8800ff"));
+        assert!(super::is_hex_color("#00000000"));
+    }
+
+    /// Everything else is dropped rather than passed on: EDS stores whatever
+    /// GTK's colour parser accepted, and the caller wants hex or nothing.
+    #[test]
+    fn hex_color_rejects_everything_else() {
+        for bad in [
+            "",           // key present but empty
+            "#",          // just the marker
+            "red",        // a named colour (GTK parses it; we don't)
+            "#f80",       // the short form
+            "#ff88",      // 4 digits
+            "#ff88000",   // 7 digits
+            "#ff8800fff", // 9 digits
+            "#gg8800",    // non-hex digits
+            "ff8800",     // no leading '#'
+            "rgb(255,0,0)",
+            " #ff8800", // leading space — EDS wrote it verbatim
+            "#ff8800 ", // trailing space
+        ] {
+            assert!(!super::is_hex_color(bad), "should have rejected {bad:?}");
+        }
     }
 
     /// `GError.domain` is a `GQuark` (`guint32`); the struct must mirror

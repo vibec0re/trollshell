@@ -110,6 +110,14 @@ pub struct CalendarEvent {
     /// (e.g. "Personal", "Work") rather than the UUID dir-name the old
     /// `.ics` poller was limited to.
     pub calendar_name: String,
+    /// The colour the user picked for this calendar, from the EDS source's
+    /// `[Calendar] Color=` key ([`hytte_ecal::Source::color`]) — a `#rrggbb`
+    /// or `#rrggbbaa` string, already shape-checked there. `None` when the
+    /// source carries no colour (or one in a spelling that isn't hex), in
+    /// which case the UI falls back to its hash-derived palette keyed by
+    /// [`calendar_name`](Self::calendar_name). Deliberately **not** on the
+    /// plugin wire — `plugins::pump` sends `calendar_name` only (#542).
+    pub calendar_color: Option<String>,
 }
 
 /// How far ahead to expand + surface events, as a rolling window from now.
@@ -421,6 +429,10 @@ impl Worker {
         for src in &sources {
             let source_uid = src.uid();
             let calendar_name = src.display_name();
+            // Read once per source per scan, not once per instance — the
+            // colour is a property of the source, and every event it yields
+            // carries the same one.
+            let calendar_color = src.color();
             // Ask libecal to EXPAND every component over the window: each
             // recurring event yields one instance per occurrence inside
             // [start_unix, end_unix), with authoritative per-instance
@@ -437,9 +449,13 @@ impl Worker {
                 }
             };
             for inst in instances {
-                if let Some(ev) =
-                    instance_to_calendar_event(&inst, &calendar_name, scan_start, out.len())
-                {
+                if let Some(ev) = instance_to_calendar_event(
+                    &inst,
+                    &calendar_name,
+                    calendar_color.as_deref(),
+                    scan_start,
+                    out.len(),
+                ) {
                     out.push(ev);
                 }
             }
@@ -469,10 +485,14 @@ impl Worker {
 /// event whose `end` is before `window_start` is dropped. An ongoing
 /// multi-day event that started before `window_start` but ends after it is
 /// kept. `anon_index` disambiguates a synthesised UID for components with
-/// no UID of their own.
+/// no UID of their own. `calendar_color` is the source's own `[Calendar]
+/// Color=` if it has one (#1223 item 1) — threaded through unchanged, so a
+/// source with no colour yields events with `calendar_color: None` and the UI
+/// falls back to its palette.
 fn instance_to_calendar_event(
     inst: &EventInstance,
     calendar_name: &str,
+    calendar_color: Option<&str>,
     window_start: DateTime<Local>,
     anon_index: usize,
 ) -> Option<CalendarEvent> {
@@ -522,6 +542,7 @@ fn instance_to_calendar_event(
         location: meta.location,
         all_day: inst.all_day,
         calendar_name: calendar_name.to_string(),
+        calendar_color: calendar_color.map(str::to_string),
     })
 }
 
@@ -695,6 +716,7 @@ mod tests {
             location: None,
             all_day,
             calendar_name: "c".into(),
+            calendar_color: None,
         }
     }
 
@@ -738,13 +760,59 @@ mod tests {
             all_day: false,
         };
         // window_start is now - 1h (simulates a past-covering window)
-        let ev = instance_to_calendar_event(&instance, "test-cal", now - Duration::hours(1), 0)
-            .expect("occurrence is in-window");
+        let ev =
+            instance_to_calendar_event(&instance, "test-cal", None, now - Duration::hours(1), 0)
+                .expect("occurrence is in-window");
         assert_eq!(ev.summary, "Standup");
         assert!(ev.uid.starts_with("daily-1@"), "uid was {}", ev.uid);
         // Within a second of the occurrence start, not the series origin.
         assert!((ev.start - occurrence).num_seconds().abs() <= 1);
         assert_eq!(ev.calendar_name, "test-cal");
+        // A source with no `[Calendar] Color=` yields no colour — the UI then
+        // falls back to its name-hashed palette (#1223 item 1).
+        assert_eq!(ev.calendar_color, None);
+    }
+
+    /// The source's own colour reaches the event unchanged, and only when the
+    /// source has one. Both occurrences of one series carry it, since it is a
+    /// property of the source rather than of the instance.
+    #[test]
+    fn instance_carries_the_sources_colour_when_it_has_one() {
+        let now = Local::now();
+        let day1 = now + Duration::days(1);
+        let day2 = now + Duration::days(2);
+
+        let coloured = instance_to_calendar_event(
+            &inst("series", "Daily", day1, day1 + Duration::hours(1)),
+            "cal",
+            Some("#ff8800"),
+            now,
+            0,
+        )
+        .expect("in-window");
+        assert_eq!(coloured.calendar_color.as_deref(), Some("#ff8800"));
+
+        let also_coloured = instance_to_calendar_event(
+            &inst("series", "Daily", day2, day2 + Duration::hours(1)),
+            "cal",
+            Some("#ff8800"),
+            now,
+            1,
+        )
+        .expect("in-window");
+        assert_eq!(also_coloured.calendar_color.as_deref(), Some("#ff8800"));
+
+        // Same instance, colourless source: `None` stays `None` — the whole
+        // fallback contract the widget relies on.
+        let plain = instance_to_calendar_event(
+            &inst("series", "Daily", day1, day1 + Duration::hours(1)),
+            "cal",
+            None,
+            now,
+            0,
+        )
+        .expect("in-window");
+        assert_eq!(plain.calendar_color, None);
     }
 
     #[test]
@@ -757,6 +825,7 @@ mod tests {
         let a = instance_to_calendar_event(
             &inst("series", "Daily", day1, day1 + Duration::hours(1)),
             "cal",
+            None,
             now,
             0,
         )
@@ -764,6 +833,7 @@ mod tests {
         let b = instance_to_calendar_event(
             &inst("series", "Daily", day2, day2 + Duration::hours(1)),
             "cal",
+            None,
             now,
             1,
         )
@@ -785,7 +855,7 @@ mod tests {
             end_unix: (start + Duration::hours(1)).timestamp(),
             all_day: false,
         };
-        assert!(instance_to_calendar_event(&instance, "cal", now, 0).is_none());
+        assert!(instance_to_calendar_event(&instance, "cal", None, now, 0).is_none());
     }
 
     #[test]
@@ -801,6 +871,7 @@ mod tests {
         let ev = instance_to_calendar_event(
             &inst("past-visible", "Old", start, end),
             "cal",
+            None,
             window_start,
             0,
         );
@@ -820,7 +891,8 @@ mod tests {
         let end = now - Duration::days(5) + Duration::hours(1);
         // window_start == now: event ended 5 days before the window start.
         assert!(
-            instance_to_calendar_event(&inst("past", "Old", start, end), "cal", now, 0).is_none(),
+            instance_to_calendar_event(&inst("past", "Old", start, end), "cal", None, now, 0)
+                .is_none(),
             "event before window_start must be dropped"
         );
     }
@@ -832,8 +904,9 @@ mod tests {
         let now = Local::now();
         let start = now - Duration::days(1);
         let end = now + Duration::days(1);
-        let ev = instance_to_calendar_event(&inst("ongoing", "Trip", start, end), "cal", now, 0)
-            .expect("still running");
+        let ev =
+            instance_to_calendar_event(&inst("ongoing", "Trip", start, end), "cal", None, now, 0)
+                .expect("still running");
         assert_eq!(ev.summary, "Trip");
     }
 
@@ -842,7 +915,7 @@ mod tests {
         // libecal can hand back end == start for a DATE-TIME with no DTEND.
         let now = Local::now();
         let start = now + Duration::days(1);
-        let ev = instance_to_calendar_event(&inst("z", "Ping", start, start), "cal", now, 0)
+        let ev = instance_to_calendar_event(&inst("z", "Ping", start, start), "cal", None, now, 0)
             .expect("in-window");
         assert_eq!(ev.end - ev.start, Duration::hours(1));
     }
@@ -864,7 +937,7 @@ mod tests {
             end_unix: midnight_utc.timestamp(),
             all_day: true,
         };
-        let ev = instance_to_calendar_event(&instance, "cal", now, 0).expect("in-window");
+        let ev = instance_to_calendar_event(&instance, "cal", None, now, 0).expect("in-window");
         assert!(ev.all_day);
         assert_eq!(ev.start.time(), NaiveTime::from_hms_opt(0, 0, 0).unwrap());
         assert_eq!(ev.start.date_naive(), date);
@@ -899,7 +972,7 @@ mod tests {
             end_unix: (start + Duration::hours(1)).timestamp(),
             all_day: false,
         };
-        let ev = instance_to_calendar_event(&instance, "cal", now, 0).unwrap();
+        let ev = instance_to_calendar_event(&instance, "cal", None, now, 0).unwrap();
         assert_eq!(ev.summary, "(no title)");
     }
 

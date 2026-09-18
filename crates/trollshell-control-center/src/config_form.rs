@@ -844,7 +844,7 @@ impl Row {
     fn push(&self, value: Option<&toml::Value>) {
         match &self.control {
             Control::Switch(row) => {
-                row.set_active(value.and_then(toml::Value::as_bool).unwrap_or(false))
+                row.set_active(value.and_then(toml::Value::as_bool).unwrap_or(false));
             }
             Control::Spin { row, words } => {
                 let word = value.and_then(toml::Value::as_str);
@@ -1079,7 +1079,7 @@ fn connect_rows(inner: &Rc<FormInner>) {
                 }
                 let entry = entry.clone();
                 swatch.set_draw_func(move |_, cr, width, height| {
-                    paint_swatch(cr, width, height, &entry.text())
+                    paint_swatch(cr, width, height, &entry.text());
                 });
             }
             Control::Text(entry) => {

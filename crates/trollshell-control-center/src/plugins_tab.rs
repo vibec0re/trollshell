@@ -984,6 +984,9 @@ fn connect_shell_entry(state: &PluginsState) {
         state.selecting.set(true);
         state.list.select_row(None::<&gtk::ListBoxRow>);
         state.selecting.set(false);
+        // The plugin page is not what is on screen any more, so its config
+        // form goes with the selection rather than polling behind this one.
+        unmount_config(&state);
         refresh_shell_forms(&state);
         show_shell_detail(&state);
         // Collapsed, this *is* the push; uncollapsed the split view already
@@ -1892,6 +1895,8 @@ fn refresh_detail(state: &PluginsState) {
         // the intent would silently steer whichever plugin gets selected
         // next.
         state.pending.borrow_mut().take();
+        // …and no plugin's *config form* is for it either (#888 P1).
+        unmount_config(state);
         show_empty_detail(state);
         return;
     };
@@ -1940,6 +1945,30 @@ fn refresh_detail(state: &PluginsState) {
 /// Keyed by plugin id and rebuilt only when the selection moves, so the 2 s
 /// poll — which calls [`refresh_detail`] on every tick — costs nothing here,
 /// and a form the operator is typing into is not rebuilt underneath them.
+/// Take whatever config form is mounted in the plugin page back out of it.
+///
+/// Called from [`refresh_config`] before it mounts the next one, and from every
+/// path that stops showing a plugin at all — deselecting one (a ctrl-click),
+/// and activating the **Shell** entry. Without the second kind, a form outlives
+/// the selection that opened it: its groups stay parented to a page nobody is
+/// looking at, and — the part that is not merely untidy — its own re-read poll
+/// keeps ticking against the files twice a second for the life of the tab.
+fn unmount_config(state: &PluginsState) {
+    // Take it out of the cell *before* removing its groups: a
+    // `PreferencesPage::remove` drives GTK, which can emit synchronously into a
+    // handler that re-enters this cell, and a `BorrowMutError` inside a glib
+    // callback aborts the process (#643).
+    let Some(previous) = state.detail.config.take() else {
+        return;
+    };
+    for group in previous.form.groups() {
+        state.detail.plugin_page.remove(group);
+    }
+    // Explicit, and load-bearing: dropping the handle is what stops the form's
+    // re-read poll.
+    drop(previous);
+}
+
 fn refresh_config(state: &PluginsState, id: &str) {
     let mounted_for = {
         state
@@ -1952,19 +1981,7 @@ fn refresh_config(state: &PluginsState, id: &str) {
     if mounted_for.as_deref() == Some(id) {
         return;
     }
-    // Take the old one out of the cell *before* removing its groups: a
-    // `PreferencesPage::remove` drives GTK, which can emit synchronously into
-    // a handler that re-enters this cell, and a `BorrowMutError` inside a glib
-    // callback aborts the process (#643).
-    let previous = state.detail.config.take();
-    if let Some(previous) = previous {
-        for group in previous.form.groups() {
-            state.detail.plugin_page.remove(group);
-        }
-        // Explicit, and load-bearing: dropping the handle is what stops the
-        // form's re-read poll.
-        drop(previous);
-    }
+    unmount_config(state);
 
     let Some(ops) = family_for_plugin(state, id) else {
         return;
@@ -5293,6 +5310,70 @@ mod gtk_tests {
                 .map(|n| n.to_string()),
             Some("shell".to_owned()),
             "the file editor keeps working with the shell down"
+        );
+
+        dismiss(&window);
+    }
+
+    /// A mounted config form does not outlive the selection that opened it.
+    ///
+    /// Driven with a fabricated `plugins.json` so a plugin id actually reaches
+    /// a family — without one, `family_for_plugin` mounts nothing and the
+    /// assertion below would be vacuous in both directions. It gets a tree of
+    /// its **own** rather than [`scratch_env`]'s shared one, because it is the
+    /// only test here that writes into the tree it reads.
+    ///
+    /// **Red if `unmount_config` stops being called from the paths that stop
+    /// showing a plugin**: the form's groups then sit in a page nobody is
+    /// looking at and its own re-read poll ticks against the files for the life
+    /// of the tab.
+    #[gtk::test]
+    fn a_config_form_is_unmounted_when_its_plugin_stops_being_shown() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"stats":{"exec":"/nix/store/x/bin/hytte-plugin-stats"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+
+        let (bin, state) = build_tab_in(env);
+        apply_state(&state, &["stats"], "active");
+        let window = present(&bin, 640);
+        assert!(
+            state.detail.config.borrow().is_some(),
+            "sanity: the stats plugin owns a family, so a form is mounted"
+        );
+
+        // Deselecting is one of the two paths that stop showing a plugin…
+        state.list.select_row(None::<&gtk::ListBoxRow>);
+        pump();
+        assert!(
+            state.detail.config.borrow().is_none(),
+            "the form goes with the selection"
+        );
+
+        // …and activating the Shell entry is the other.
+        let plugin_row = state.list.row_at_index(0).expect("the stats row");
+        state.list.select_row(Some(&plugin_row));
+        pump();
+        assert!(state.detail.config.borrow().is_some(), "sanity: back");
+        let shell_row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&shell_row]);
+        pump();
+        assert!(
+            state.detail.config.borrow().is_none(),
+            "a plugin's form does not poll behind the Shell page"
         );
 
         dismiss(&window);

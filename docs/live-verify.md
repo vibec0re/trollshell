@@ -1743,8 +1743,8 @@ title` in the stderr tail — worth a deliberate look on first run, since
       removes. Deleting the file by hand must also be harmless: the bridge
       starts clean and costs at most that one turn back.
 
-- [ ] **(#1169)** A world-readable `anthropic.key` is refused, same as
-      `openrouter.key`. `chmod 644 ~/.config/trollshell/anthropic.key` with
+- [ ] **(#1169)** A world-readable `anthropic.key` is refused.
+      `chmod 644 ~/.config/trollshell/anthropic.key` with
       `api` mode configured and no `ANTHROPIC_API_KEY` env set → restart the
       unit → `journalctl --user -u trollshell-plugin-claude-bridge` names the
       file and its mode and the bridge refuses to start (`missing_key_refusal`
@@ -2002,8 +2002,9 @@ live niri, because it is about where a layer surface actually lands and what
 niri does with the strip it reserves.
 
 The setup for every item: pick any bundled sidebar plugin and relaunch it with
-the placement env var #1159 added. #1161 turns this into a checked
-`programs.trollshell.plugins.<id>.mount` option; until then, by hand —
+the placement env var #1159 added — `programs.trollshell.plugins.<id>.mount`
+(#1161) is the checked nix option for this now; the quick, no-rebuild way to
+force a placement by hand is —
 
 ```sh
 systemctl --user stop trollshell-plugin-departures.service
@@ -2124,8 +2125,8 @@ systemd-run --user --unit=trollshell-plugin-departures \
 ### Stats as a plugin (#1248 P1 / #1250)
 
 The right sidebar's first real tenant, and the first binary in the tree meant
-to run **twice**. Launch it by hand (nix does not yet render
-`HYTTE_PLUGIN_ID` from the attribute name — follow-up):
+to run **twice**. Launch it by hand (nix renders `HYTTE_PLUGIN_ID` from the
+attribute name since #1284; by hand it is):
 
 ```sh
 systemd-run --user --unit=trollshell-plugin-stats-side \
@@ -3153,10 +3154,9 @@ session.
 - [ ] **(#1144 / #865)** **`DotMatrix` renders on a `GtkGLArea`, with the dot
       lattice drawn at the fragment's own resolution.** Third kind on the
       `Scope` seam, same context-failure fallback (the kill switch they shared
-      went with the CPU renderer in #1157) — and the last for now: Annika asked for the gauge and the dot matrix and then a
-      stop (#865, "but lets pause after those"), so the remaining kinds
-      (seven-seg, split flap, LED strip and matrix, marquee, textbox) still
-      draw on the kit.
+      went with the CPU renderer in #1157) — and the last for now: Annika asked
+      for the gauge and the dot matrix and then a stop (#865, "but lets pause
+      after those").
 
       **The improvement is not the gauge's, and that is the thing to look for.**
       There is no `scale` on a dot matrix — the dot pitch *is* the size knob
@@ -3285,8 +3285,7 @@ session.
 - [ ] **(#1152 / #865)** **The two text kinds on the GPU: the ticker and the
       speech bubble.** Fourth and fifth kinds on the `Scope` seam, same kill
       switch, same context-failure fallback. Annika's word for the rest of #865
-      after the pause she asked for; the kinds still on the kit are seven-seg,
-      split flap, LED strip, LED matrix and the flip board.
+      after the pause she asked for.
 
       **The `Marquee` has no shader of its own, and that is the claim to check
       first.** A ticker is the *same dot hardware* as a static dot matrix — the
@@ -3882,9 +3881,9 @@ session.
     first pass** — see the #857 rectangle entry below.
   - **The #702 check.** Drag the drawer / shrink the output as narrow as it
     goes. The panel must **letterbox down**, never force the drawer wider. Its
-    reported minimum width is 0 px at any core count (one `PixelSurface`, whose
-    `measure` hard-codes a 0 minimum, replaces 64 bars each with an 8 px CSS
-    floor). If the drawer's minimum width grew, this regressed.
+    reported minimum width is 0 px at any core count (`GlSurface::measure`
+    hard-codes a 0 minimum, replacing 64 bars each with an 8 px CSS floor).
+    If the drawer's minimum width grew, this regressed.
   - **The colour axis is orthogonal to the skin.** In
     `~/.config/trollshell/core-leds.toml` set `style = "crt"` **and**
     `color = "heat"` and save (or restart): expect heat-coloured lamps

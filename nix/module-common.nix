@@ -942,7 +942,7 @@ self:
 
                 The full inventory — swept from source, all 14 bundled
                 plugins including the ones with zero knobs — is published at
-                <https://vibec0re.github.io/trollshell/plugin-env.html>
+                <https://vibec0re.mov/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`). An absolute URL rather than a
                 relative one because this description is also rendered by
                 `nixos-option` and `man home-configuration.nix`, where a
@@ -979,7 +979,7 @@ self:
                 behind this option was retired in #1330 ("no fallbacks", #866);
                 a file left at that path is never read, and for one release the
                 plugin logs one line per startup naming it and pointing back
-                here. See <https://vibec0re.github.io/trollshell/plugin-env.html>
+                here. See <https://vibec0re.mov/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`) for the migration.
               '';
             };

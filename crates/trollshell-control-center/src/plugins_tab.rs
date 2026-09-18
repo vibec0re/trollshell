@@ -479,6 +479,11 @@ struct PluginsState {
     /// parsed at most once per change to the file — see [`DeclaredMounts`]
     /// for why the 2 s poll must not re-read it (#1260 review F7).
     declared: Rc<RefCell<DeclaredMounts>>,
+    /// The selected plugin's manifest id out of the same `plugins.json`,
+    /// remembered under the same stamp — see [`DeclaredManifestId`] for why
+    /// this is a second cache and not a column of the one above (#1365
+    /// review, MED 5).
+    manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     /// The process environment [`plugins_json_candidates`] resolves
     /// [`search_path`](Self::search_path) from, read once in [`build_tab`]
     /// and reused for the tab's whole life.
@@ -556,6 +561,7 @@ struct WeakPluginsState {
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
     declared: Rc<RefCell<DeclaredMounts>>,
+    manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
 }
@@ -609,6 +615,7 @@ impl PluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
         }
@@ -650,6 +657,7 @@ impl WeakPluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
         })
@@ -803,6 +811,7 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
         declared: Rc::new(RefCell::new(DeclaredMounts::default())),
+        manifest_ids: Rc::new(RefCell::new(DeclaredManifestId::default())),
         env,
         search_path: Rc::new(OnceCell::new()),
     };
@@ -1584,6 +1593,59 @@ impl DeclaredMounts {
     }
 }
 
+/// The manifest id `plugins.json` implies for **the selected plugin**,
+/// remembered per id and per file stamp (#1365 review, MED 5).
+///
+/// [`DeclaredMounts`] above, narrowed to one id. It is a second cache rather
+/// than a second column of that map because the two are asked different
+/// questions at different times: that one is asked for *every* row on every
+/// poll and so is worth parsing whole, this one is asked about the one
+/// selected plugin — and only when no form is mounted for it, i.e. when the
+/// answer is "no family", which is most plugins and which is precisely the
+/// case that repeated forever.
+///
+/// The key is the pair, not just the id: re-selecting the same plugin after a
+/// `nixos-rebuild` must re-read, and a plugin selected across a rebuild must
+/// too. That costs the same `probe_candidates` stat the tick already pays.
+#[derive(Default)]
+struct DeclaredManifestId {
+    /// The id, and the `plugins.json`, the answer below was read for.
+    /// `None` until the first lookup, which [`Seen::Unprobed`] cannot express
+    /// on its own here (that state means "no file", not "no question yet").
+    seen: Option<(String, Seen)>,
+    /// That answer — `None` is a real, cacheable one: no `plugins.json`, or
+    /// no entry in it for this id.
+    declared: Option<String>,
+}
+
+impl DeclaredManifestId {
+    /// The cached manifest id for `id`, re-reading through `read` **only**
+    /// when the id or the file's stamp differs from the last lookup.
+    ///
+    /// `read` is a parameter for [`DeclaredMounts::get`]'s reason: a test can
+    /// then count how often the blocking half runs, which is the property
+    /// this type exists for and the one a stamp comparison that stopped
+    /// working would break silently.
+    fn get<F>(&mut self, id: &str, probe: Option<PluginsJson>, read: F) -> Option<String>
+    where
+        F: FnOnce(&Path, &str) -> Option<String>,
+    {
+        let seen = probe.map_or(Seen::Missing, Seen::Found);
+        let asked_before = self
+            .seen
+            .as_ref()
+            .is_some_and(|(had, stamp)| had == id && *stamp == seen);
+        if !asked_before {
+            self.declared = match &seen {
+                Seen::Found(found) => read(&found.path, id),
+                Seen::Unprobed | Seen::Missing => None,
+            };
+            self.seen = Some((id.to_owned(), seen));
+        }
+        self.declared.clone()
+    }
+}
+
 /// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` out of the
 /// `plugins.json` at `path` (#1161) — the same file `nix/hm-module.nix` /
 /// `nix/nixos-module.nix` render.
@@ -2010,11 +2072,38 @@ fn refresh_config(state: &PluginsState, id: &str) {
 /// Falls back to the id when there is no `plugins.json` entry (a
 /// hand-installed static unit, the legacy launch path `plugin_launcher.rs`
 /// still supports), which is right for the conventional case and reaches no
-/// family at all otherwise. Read on a **selection change**, not on the poll —
-/// see [`refresh_config`].
+/// family at all otherwise.
+///
+/// **What this costs on the 2 s tick** (#1365 review, MED 5). [`refresh_config`]
+/// runs from [`refresh_detail`] on every tick and early-returns only when a
+/// form **is** mounted — so for a selected plugin that owns no family, which
+/// is most of them, this is reached every time. The read and the
+/// `serde_json` parse behind it are exactly the cost [`DeclaredMounts`]
+/// exists to keep off that tick (#1260 review F7), so the answer is
+/// remembered by [`DeclaredManifestId`] under the same
+/// [`probe_candidates`] stamp: the tick pays one `stat` plus one `realpath`,
+/// and "this plugin declares no manifest id" is as cacheable an answer as any
+/// other.
 fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_form::FamilyOps> {
+    family_for_plugin_reading(state, id, manifest_id_at)
+}
+
+/// [`family_for_plugin`] with the read half as a parameter, so a test can
+/// count how often it actually runs — [`DeclaredMounts::get`]'s shape, and
+/// the property the memo exists for.
+fn family_for_plugin_reading<F>(
+    state: &PluginsState,
+    id: &str,
+    read: F,
+) -> Option<crate::config_form::FamilyOps>
+where
+    F: FnOnce(&Path, &str) -> Option<String>,
+{
     let candidates = resolved_search_path(&state.search_path, &state.env);
-    let declared = probe_candidates(candidates).and_then(|found| manifest_id_at(&found.path, id));
+    let declared = {
+        let probe = probe_candidates(candidates);
+        state.manifest_ids.borrow_mut().get(id, probe, read)
+    };
     let ops = crate::config_form::family(declared.as_deref().unwrap_or(id))?;
     // A **shell**-owned family has no plugin to hang off — it renders under the
     // pinned Shell entry, once, and its form owns a poll of its own. A plugin
@@ -3322,8 +3411,9 @@ mod tests {
 /// the layout does not care where the rows came from.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -5377,6 +5467,86 @@ mod gtk_tests {
         );
 
         dismiss(&window);
+    }
+
+    /// A steady selection must cost **one** `plugins.json` read no matter how
+    /// many 2 s ticks land on it (#1365 review, MED 5) — the property
+    /// `family_for_plugin` violated by construction until
+    /// [`super::DeclaredManifestId`] arrived.
+    ///
+    /// The tick reaches it for a selected plugin that owns **no** family,
+    /// which is most of them: `refresh_config` early-returns only when a form
+    /// *is* mounted, so "there is nothing to mount" was re-derived — a
+    /// `read_to_string` plus a `serde_json::from_str` on the GTK main thread —
+    /// every two seconds, for the window's whole life. That is exactly the
+    /// cost [`super::DeclaredMounts`] exists to keep off this tick (#1260
+    /// review F7), added back on the same file.
+    ///
+    /// The reader is injected for that type's reason: the property is *how
+    /// often the blocking half runs*, which nothing observable from outside
+    /// reports and which a stamp comparison that stopped working would break
+    /// silently. **Falsify** by having `family_for_plugin_reading` call
+    /// `read` directly instead of going through the memo: the count becomes
+    /// one per tick.
+    #[gtk::test]
+    fn a_steady_selection_costs_exactly_one_plugins_json_read_across_many_ticks() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"clock":{"exec":"/nix/store/x/bin/hytte-plugin-clock-demo"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (_bin, state) = build_tab_in(env);
+
+        let reads = Cell::new(0_u32);
+        let counting = |path: &Path, id: &str| {
+            reads.set(reads.get() + 1);
+            super::manifest_id_at(path, id)
+        };
+
+        for _ in 0..8 {
+            assert!(
+                super::family_for_plugin_reading(&state, "clock", counting).is_none(),
+                "the clock demo declares no config family — the case that ticks forever"
+            );
+        }
+        assert_eq!(
+            reads.get(),
+            1,
+            "a steady selection must cost exactly one plugins.json read across every tick"
+        );
+
+        // A different selection is a different question, asked once.
+        for _ in 0..4 {
+            assert!(
+                super::family_for_plugin_reading(&state, "stats", counting).is_some(),
+                "and the memo must not answer one plugin's question with another's"
+            );
+        }
+        assert_eq!(reads.get(), 2, "the new selection reads once, then settles");
+
+        // The file moving is what un-caches it — the same `probe_candidates`
+        // stamp the tick already pays for.
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"stats":{"exec":"/nix/store/y/bin/hytte-plugin-stats"},"pad":{"exec":"/p"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let _ = super::family_for_plugin_reading(&state, "stats", counting);
+        assert_eq!(
+            reads.get(),
+            3,
+            "a rebuild under the same selection must be re-read, not remembered"
+        );
     }
 
     /// Picking a plugin is the mirror image: the Shell entry lets go.

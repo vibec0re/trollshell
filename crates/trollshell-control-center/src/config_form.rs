@@ -218,7 +218,11 @@ type SaveLeaf = fn(
 
 impl FamilyOps {
     /// The ops for a family read and written through `S`.
-    fn of<S: Subsystem>(family: &'static Family, editable: bool, reload: &'static str) -> Self {
+    const fn of<S: Subsystem>(
+        family: &'static Family,
+        editable: bool,
+        reload: &'static str,
+    ) -> Self {
         Self {
             family,
             editable,
@@ -230,7 +234,7 @@ impl FamilyOps {
 
     /// A family nothing may edit here yet, whose reload sentence is therefore
     /// never shown.
-    fn read_only<S: Subsystem>(family: &'static Family) -> Self {
+    const fn read_only<S: Subsystem>(family: &'static Family) -> Self {
         Self::of::<S>(family, false, "")
     }
 }
@@ -253,30 +257,41 @@ const RELOAD_AT_PLUGIN_START: &str = "The plugin reads it when it starts, so res
 /// #947 P4, `hytte-plugin-stats` since #1360 gave it a `[lib]` target). That
 /// leaf cannot carry the plugin two — they link `hytte-config`, so it would
 /// depend on crates that depend on it.
-pub(crate) fn families() -> Vec<FamilyOps> {
-    vec![
-        FamilyOps::of::<ShellSubsystem<CoreLeds>>(
-            &hytte_config_families::core_leds::FAMILY,
-            true,
-            RELOAD_LIVE,
-        ),
-        FamilyOps::read_only::<ShellSubsystem<Workspaces>>(
-            &hytte_config_families::workspaces::FAMILY,
-        ),
-        FamilyOps::of::<hytte_plugin_stats::config::StatsConfig>(
-            &hytte_plugin_stats::config::FAMILY,
-            true,
-            RELOAD_AT_PLUGIN_START,
-        ),
-        FamilyOps::read_only::<hytte_plugin_agents::config::AgentsConfig>(
-            &hytte_plugin_agents::config::FAMILY,
-        ),
-    ]
+///
+/// A `static` rather than a `Vec` built per call (#1365 review, N1): nothing
+/// about the table varies at runtime, [`family`] and [`shell_families`] each
+/// walk it, and [`FamilyOps`] is `Copy`, so a caller that wants one takes a
+/// copy of five words rather than four heap allocations — which is what made
+/// three of these per tick acceptable at all before the memo in
+/// `plugins_tab::family_for_plugin`.
+static FAMILIES: [FamilyOps; 4] = [
+    FamilyOps::of::<ShellSubsystem<CoreLeds>>(
+        &hytte_config_families::core_leds::FAMILY,
+        true,
+        RELOAD_LIVE,
+    ),
+    FamilyOps::read_only::<ShellSubsystem<Workspaces>>(&hytte_config_families::workspaces::FAMILY),
+    FamilyOps::of::<hytte_plugin_stats::config::StatsConfig>(
+        &hytte_plugin_stats::config::FAMILY,
+        true,
+        RELOAD_AT_PLUGIN_START,
+    ),
+    FamilyOps::read_only::<hytte_plugin_agents::config::AgentsConfig>(
+        &hytte_plugin_agents::config::FAMILY,
+    ),
+];
+
+/// Every config family this app can render a form for — [`FAMILIES`].
+pub(crate) fn families() -> &'static [FamilyOps] {
+    &FAMILIES
 }
 
 /// The family called `name`, or `None`.
 pub(crate) fn family(name: &str) -> Option<FamilyOps> {
-    families().into_iter().find(|ops| ops.family.name == name)
+    families()
+        .iter()
+        .copied()
+        .find(|ops| ops.family.name == name)
 }
 
 /// The **shell-owned** families, in the order the *Shell* entry renders them.
@@ -495,7 +510,9 @@ impl FormInner {
     /// [`ConfigError::Locked`], [`ConfigError::NotALeaf`], and the I/O ones)
     /// lands on the row it was for rather than in a toast: a form can have
     /// sixteen rows, and "which one did it refuse" is the first thing the
-    /// operator needs.
+    /// operator needs — and, since #1365's L2, it stays there until *that*
+    /// row's own value moves, rather than being wiped by the next successful
+    /// save on a different row (see [`Row::apply`]).
     fn save(&self, index: usize, value: Option<toml_edit::Value>) {
         let Some(row) = self.rows.get(index) else {
             return;
@@ -514,9 +531,10 @@ impl FormInner {
         ) {
             Ok(()) => {
                 row.clear_error();
-                // The whole view, not just this row: a first-ever save seeds
-                // the overlay from `DEFAULT_TOML`, which can move every
-                // other row's provenance in the same write.
+                // The whole view, not just this row: a save can move a key
+                // this row does not own — a removal falls back to whatever
+                // the layer below says — and the saved row's own provenance
+                // has to flip to *yours* in the same pass.
                 self.reload(true);
             }
             Err(err) => {
@@ -853,8 +871,17 @@ impl Row {
     /// Push `raw`'s answer for this key onto the screen.
     ///
     /// The **value** is pushed only when this key's own value moved; the
-    /// provenance and the sensitivity are set every time, because a lock can
-    /// appear over a value that did not change at all (#1338 H2).
+    /// sensitivity is set every time, because a lock can appear over a value
+    /// that did not change at all (#1338 H2).
+    ///
+    /// The **provenance line** is set every time too, with one exception: a
+    /// row currently showing a *refusal* whose own value did not move keeps
+    /// it (#1365 review, L2). A save is per row, and so is its refusal — but
+    /// a successful save on row B re-reads the whole view, and a blanket
+    /// `clear_error()` here then wiped the refusal the operator is still
+    /// looking at on row A, over a file that still holds the value they were
+    /// refused. The same draft-guard logic as the value itself, one field
+    /// along: what makes a refusal stale is *this key* moving in the file.
     fn apply(&self, raw: &Raw, editable: bool) {
         let value = raw.value(self.field.path).cloned();
         let locked = raw.is_locked(self.field.path);
@@ -867,8 +894,10 @@ impl Row {
             *self.seen.borrow_mut() = value;
         }
 
-        self.clear_error();
-        self.note.set(&provenance(locked, origin, absent));
+        if moved || !self.failed.get() {
+            self.clear_error();
+            self.note.set(&provenance(locked, origin, absent));
+        }
         let writable = editable && !locked && !self.field.kind.is_collection();
         self.set_sensitive(writable);
         if let Some(reset) = &self.reset {
@@ -1081,20 +1110,34 @@ fn connect_rows(inner: &Rc<FormInner>) {
                 swatch,
                 ..
             } => {
+                let options_len = match row.control {
+                    Control::Colour { options, .. } => u32::try_from(options.len()).unwrap_or(0),
+                    _ => 0,
+                };
                 {
                     let weak = Rc::downgrade(inner);
-                    combo.connect_selected_notify(move |_| save_from_row(&weak, index));
+                    let entry = entry.downgrade();
+                    combo.connect_selected_notify(move |combo| {
+                        // Picking *custom* before typing anything is not a
+                        // value: the empty string is what the writer refuses
+                        // (`Kind::Color`'s own `accepts`), so writing it here
+                        // would greet the operator with a red row for
+                        // choosing the item that means "I'll type one"
+                        // (#1365 review, L3). The entry's apply button is
+                        // what saves a literal, as it does mid-typing.
+                        let nothing_typed = entry
+                            .upgrade()
+                            .is_none_or(|entry| entry.text().trim().is_empty());
+                        if combo.selected() >= options_len && nothing_typed {
+                            return;
+                        }
+                        save_from_row(&weak, index);
+                    });
                 }
                 {
                     let weak = Rc::downgrade(inner);
                     let swatch = swatch.clone();
                     let combo = combo.clone();
-                    let options_len = match row.control {
-                        Control::Colour { options, .. } => {
-                            u32::try_from(options.len()).unwrap_or(0)
-                        }
-                        _ => 0,
-                    };
                     entry.connect_apply(move |_| {
                         swatch.queue_draw();
                         // Applying a literal means the operator wants the
@@ -1113,9 +1156,24 @@ fn connect_rows(inner: &Rc<FormInner>) {
                     let swatch = swatch.clone();
                     entry.connect_changed(move |_| swatch.queue_draw());
                 }
-                let entry = entry.clone();
+                // **Weakly** (#1365 review, MED 2): the swatch is the entry's
+                // own prefix child, so a strong clone in its draw func closes
+                // a GObject cycle — entry owns swatch owns entry — and
+                // neither ever reaches refcount 0. That is the `WeakRef`
+                // contract `hytte-reactive`'s `bind` holds, and the one
+                // `nix/lint-bind-pins.py` structurally cannot see here,
+                // because the closure's own parameter is the *swatch* and the
+                // captured widget is a different one — its documented
+                // carve-out. The sibling `connect_changed` above is fine:
+                // that edge runs parent → child and closes no loop.
+                let entry = entry.downgrade();
                 swatch.set_draw_func(move |_, cr, width, height| {
-                    paint_swatch(cr, width, height, &entry.text());
+                    // Nothing to paint once the row is gone — which is only
+                    // reachable while the swatch outlives its entry, i.e.
+                    // during teardown.
+                    if let Some(entry) = entry.upgrade() {
+                        paint_swatch(cr, width, height, &entry.text());
+                    }
                 });
             }
             Control::Text(entry) => {
@@ -1651,9 +1709,10 @@ mod tests {
 
     /// The shim is only safe because it cannot say anything the family does
     /// not: `NAME` decides which file is read and written, and `DEFAULT_TOML`
-    /// is both the bottom merge layer and the seed a first-ever save writes.
-    /// Both are read off [`Family`], so this reds only if someone restates
-    /// either by hand.
+    /// is the bottom merge layer, the documented shape the writer's
+    /// structural refusals are asked of, and the prune rule's answer to "is
+    /// this table documented". Both are read off [`Family`], so this reds
+    /// only if someone restates either by hand.
     #[test]
     fn the_shell_shims_are_the_familys_own_two_consts() {
         assert_eq!(
@@ -2066,16 +2125,16 @@ mod gtk_tests {
             Scratch::read(&overlay).contains("flag = false")
         });
 
-        // The overlay is seeded with the documented default and then **one**
-        // leaf is set, so the file is that default with exactly one line
-        // different — comments, blank lines and key order all intact.
-        let written = Scratch::read(&overlay);
+        // A first leaf write creates a file holding **that leaf and nothing
+        // else** (#1365 review, HIGH 1): the operator's overlay is a diff
+        // over the layers below, not a copy of the documented default with
+        // one line changed — which is what it was until this round, and what
+        // silently pinned every other key in the file.
         assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &written),
-            vec![("flag = true".to_owned(), "flag = false".to_owned())],
-            "exactly one leaf moved:\n{written}"
+            Scratch::read(&overlay),
+            "flag = false\n",
+            "the one leaf, and nothing the operator did not choose"
         );
-        assert!(written.contains("# A switch."), "the comments survive");
         assert_eq!(note_of(&form, "flag"), "Yours");
     }
 
@@ -2098,9 +2157,9 @@ mod gtk_tests {
             Scratch::read(&overlay).contains("count = 7")
         });
         assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![("count = 3".to_owned(), "count = 7".to_owned())],
-            "exactly one leaf moved"
+            Scratch::read(&overlay),
+            "count = 7\n",
+            "the one leaf, and nothing else"
         );
         assert_eq!(note_of(&form, "count"), "Yours");
     }
@@ -2128,20 +2187,20 @@ mod gtk_tests {
             !rect.is_active(),
             "dialling a number is choosing a number, so the word turns itself off"
         );
-        assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![("rows = 4".to_owned(), "rows = 9".to_owned())],
-            "exactly one leaf moved"
-        );
+        // A first write holds only what was written (#1365 review, HIGH 1),
+        // so the base layer's `rows = "rect"` is not copied into the
+        // operator's own file on the way past.
+        let after_number = Scratch::read(&overlay);
+        assert_eq!(after_number, "rows = 9\n", "the one leaf, and nothing else");
 
         rect.set_active(true);
         settle_until("the word to be saved", || {
             Scratch::read(&overlay).contains("rows = \"rect\"")
         });
         assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![("rows = 4".to_owned(), "rows = \"rect\"".to_owned())],
-            "and the word replaces the number in place"
+            changed_lines(&after_number, &Scratch::read(&overlay)),
+            vec![("rows = 9".to_owned(), "rows = \"rect\"".to_owned())],
+            "and the word replaces the number in place — exactly one leaf"
         );
     }
 
@@ -2163,12 +2222,23 @@ mod gtk_tests {
         settle_until("the combo to be saved", || {
             Scratch::read(&overlay).contains("style = \"oled\"")
         });
+        // A first write holds only what was written (#1365 review, HIGH 1).
+        let written = Scratch::read(&overlay);
         assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![("style = \"vfd\"".to_owned(), "style = \"oled\"".to_owned())],
-            "exactly one leaf moved"
+            written, "style = \"oled\"\n",
+            "the one leaf, and not the base layer's `lcd` copied along with it"
         );
         assert_eq!(note_of(&form, "style"), "Yours");
+
+        row.set_selected(0);
+        settle_until("the second choice to be saved", || {
+            Scratch::read(&overlay).contains("style = \"vfd\"")
+        });
+        assert_eq!(
+            changed_lines(&written, &Scratch::read(&overlay)),
+            vec![("style = \"oled\"".to_owned(), "style = \"vfd\"".to_owned())],
+            "exactly one leaf moved"
+        );
     }
 
     /// A value no layer's vocabulary has — a hand edit, or a base layer from a
@@ -2244,13 +2314,11 @@ mod gtk_tests {
         settle_until("the named colour to be saved", || {
             Scratch::read(&overlay).contains("color = \"style\"")
         });
+        // A first write holds only what was written (#1365 review, HIGH 1).
+        let after_name = Scratch::read(&overlay);
         assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![(
-                "color = \"heat\"".to_owned(),
-                "color = \"style\"".to_owned()
-            )],
-            "exactly one leaf moved"
+            after_name, "color = \"style\"\n",
+            "the one leaf, and not the base layer's literal copied along with it"
         );
 
         entry.set_text("#102030");
@@ -2258,6 +2326,14 @@ mod gtk_tests {
         settle_until("the literal to be saved", || {
             Scratch::read(&overlay).contains("color = \"#102030\"")
         });
+        assert_eq!(
+            changed_lines(&after_name, &Scratch::read(&overlay)),
+            vec![(
+                "color = \"style\"".to_owned(),
+                "color = \"#102030\"".to_owned()
+            )],
+            "exactly one leaf moved"
+        );
         assert_eq!(
             combo.selected(),
             custom,
@@ -2288,12 +2364,9 @@ mod gtk_tests {
             Scratch::read(&overlay).contains("label = \"renamed\"")
         });
         assert_eq!(
-            changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![(
-                "label = \"fixture\"".to_owned(),
-                "label = \"renamed\"".to_owned()
-            )],
-            "exactly one leaf moved"
+            Scratch::read(&overlay),
+            "label = \"renamed\"\n",
+            "the one leaf, and nothing else"
         );
     }
 
@@ -2597,12 +2670,9 @@ mod gtk_tests {
             Scratch::read(&overlay).contains("style = \"oled\"")
         });
         assert_eq!(
-            changed_lines(
-                hytte_config_families::core_leds::DEFAULT_TOML,
-                &Scratch::read(&overlay)
-            ),
-            vec![("style = \"vfd\"".to_owned(), "style = \"oled\"".to_owned())],
-            "exactly one leaf moved in the real family's file too"
+            Scratch::read(&overlay),
+            "style = \"oled\"\n",
+            "one leaf in the real family's file too, and nothing else"
         );
     }
 
@@ -2655,5 +2725,279 @@ mod gtk_tests {
         // documents as a programmer error to get wrong in either direction.
         drop(form);
         while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// The `Rc` count above is orthogonal to a **`GObject`** cycle, and a
+    /// `Kind::Color` row had one (#1365 review, MED 2): the swatch is the
+    /// entry's own prefix child, and the entry was captured *strongly* in
+    /// that swatch's draw func — entry owns swatch owns entry, neither ever
+    /// reaching refcount 0. `nix/lint-bind-pins.py` reports `0 pin(s)` here
+    /// because the closure's parameter is the swatch and the captured widget
+    /// is a different one, which is its documented carve-out, so nothing else
+    /// in the tree can see this.
+    ///
+    /// **Red before the `downgrade()`**: the switch is freed, the two colour
+    /// widgets are not.
+    #[gtk::test]
+    fn dropping_a_form_frees_its_colour_rows_widgets() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let Control::Colour { entry, swatch, .. } = &row_of(&form, "color").control else {
+            panic!("a Color is a combo plus an entry");
+        };
+        let Control::Switch(switch) = &row_of(&form, "flag").control else {
+            panic!("a Bool is a switch row");
+        };
+        let (entry, swatch, switch) = (entry.downgrade(), swatch.downgrade(), switch.downgrade());
+        drop(form);
+        while glib::MainContext::default().iteration(false) {}
+        assert!(
+            switch.upgrade().is_none(),
+            "control: an ordinary row's widget is freed with the form"
+        );
+        assert!(
+            swatch.upgrade().is_none(),
+            "the colour swatch outlived its form"
+        );
+        assert!(
+            entry.upgrade().is_none(),
+            "the colour entry outlived its form"
+        );
+    }
+
+    // ── What a save must not take with it (#1365 review, HIGH 1) ────────────
+
+    /// A save of **one** row must not revert a value an *unlocked* base layer
+    /// states.
+    ///
+    /// A first save used to seed the not-yet-existing overlay from
+    /// `DEFAULT_TOML`, and that seed is the bottom layer's values landing at
+    /// the **top** of the precedence order — so one click on any row
+    /// silently overrode every key a base layer set without `_locked`.
+    /// `nix/module-common.nix` renders `_locked` for the leaves the operator
+    /// actually set, so a nix base is safe by accident; a base layer that
+    /// states a value without locking it is a first-class state everywhere
+    /// else in this module ([`reset_removes_the_leaf_and_falls_back_to_the_layer_below`],
+    /// [`the_poll_flips_provenance_when_a_base_layer_changes_underneath`]) and
+    /// is what [`Origin::Base`] exists for.
+    ///
+    /// **Red on `b36db819`**: the overlay comes back holding the documented
+    /// `flag = true` and `style = "vfd"` over the base layer's own words.
+    #[gtk::test]
+    fn saving_one_leaf_does_not_revert_another_a_base_layer_set() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("style = \"lcd\"\nflag = false\n"));
+        let overlay = scratch.overlay("form-fixture");
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        row.set_value(7.0);
+        settle_until("the save", || Scratch::read(&overlay).contains("count = 7"));
+
+        let written = Scratch::read(&overlay);
+        let Control::Switch(flag) = &row_of(&form, "flag").control else {
+            panic!("a Bool is a switch row");
+        };
+        let Control::Combo {
+            row: combo,
+            options,
+            ..
+        } = &row_of(&form, "style").control
+        else {
+            panic!("a Choice is a combo row");
+        };
+        assert!(
+            !flag.is_active(),
+            "the base layer's `flag` survived; overlay:\n{written}"
+        );
+        assert_eq!(
+            options[usize::try_from(combo.selected()).expect("in range")],
+            "lcd",
+            "the base layer's `style` survived; overlay:\n{written}"
+        );
+    }
+
+    /// The half of the same defect that needs **no** base layer: after one
+    /// save, every row's `Origin` was `Overlay`, so every subtitle read
+    /// *Yours* and every reset button became sensitive over a value the
+    /// operator never chose — which is precisely the failure P0's own
+    /// [`Origin`] doc names as the reason provenance exists.
+    ///
+    /// **Red on `b36db819`**: `left: "Yours" right: "Default"`.
+    #[gtk::test]
+    fn saving_one_leaf_does_not_relabel_every_other_row_as_yours() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+        assert_eq!(note_of(&form, "label"), "Default", "sanity");
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        row.set_value(7.0);
+        settle_until("the save", || Scratch::read(&overlay).contains("count = 7"));
+        assert_eq!(note_of(&form, "label"), "Default");
+        assert!(
+            !row_of(&form, "label")
+                .reset
+                .as_ref()
+                .expect("a reset")
+                .is_sensitive(),
+            "it offers to reset a value the operator never set"
+        );
+    }
+
+    /// Spec §4's 300 ms debounce, pinned (#1365 review, MED 3).
+    ///
+    /// Every other save assertion here goes through [`settle_until`], which
+    /// waits for the *effect* and so cannot tell a coalesced burst from four
+    /// separate writes — measured: setting [`SAVE_DEBOUNCE`] to 0 ms left all
+    /// 228 tests green. Coalescing is the whole reason the constant exists (a
+    /// held-down `+` on a spin row otherwise writes, re-reads and re-renders
+    /// one file per step).
+    ///
+    /// **Red at `SAVE_DEBOUNCE = 0`**: the first `set_value` inside the
+    /// window is on disk before the loop's second iteration.
+    #[gtk::test]
+    fn a_burst_of_changes_writes_once_and_keeps_the_last_value() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        for v in [4.0, 5.0, 6.0, 7.0] {
+            row.set_value(v);
+            while glib::MainContext::default().iteration(false) {}
+            assert!(
+                !overlay.exists(),
+                "a change inside the debounce window was written at once ({v})"
+            );
+        }
+        settle_until("the one debounced save", || {
+            Scratch::read(&overlay).contains("count = 7")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            "count = 7\n",
+            "the last value, and exactly one leaf"
+        );
+    }
+
+    /// The `origins` third of [`same_view`], pinned (#1365 review, MED 4).
+    ///
+    /// [`the_poll_sees_a_lock_appear_over_a_value_that_did_not_move`] covers
+    /// the `locked` term; nothing moved provenance *without* also moving a
+    /// value, so dropping `&& a.origins == b.origins` left all 228 tests
+    /// green. The unpinned case is real: a base layer appearing that restates
+    /// the value the default already had leaves the row saying *Default* over
+    /// a file that now says otherwise — and leaves the reset button's
+    /// `Origin::Overlay` test reading a stale answer.
+    ///
+    /// **Red without the `origins` term**: the poll reports no change and the
+    /// subtitle still reads *Default*.
+    #[gtk::test]
+    fn the_poll_sees_a_base_layer_appear_restating_the_default() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        assert_eq!(note_of(&form, "count"), "Default");
+        Scratch::write(&scratch.base("form-fixture"), "count = 3\n"); // the same value
+        form.refresh_from_disk();
+        assert_eq!(
+            note_of(&form, "count"),
+            format!("From {}", scratch.base("form-fixture").display())
+        );
+    }
+
+    // ── The two LOWs this round took (#1365 review, L2 and L3) ──────────────
+
+    /// A refusal shown on row A is not wiped by a successful save on row B.
+    ///
+    /// A successful save re-reads the whole view (a removal falls back to
+    /// whatever the layer below says, which can move a row nobody touched),
+    /// and [`Row::apply`] used to call
+    /// `clear_error()` on **every** row — so the operator's refusal vanished
+    /// while the file still held the value they were refused. The form's own
+    /// argument for per-row errors ("a form can have sixteen rows") argues
+    /// against clearing sixteen of them.
+    ///
+    /// **Red if [`Row::apply`] clears unconditionally.**
+    #[gtk::test]
+    fn a_save_on_one_row_does_not_clear_another_rows_refusal() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+
+        // A blank `Text` is refused by the writer, on its own row.
+        let Control::Text(entry) = &row_of(&form, "label").control else {
+            panic!("a Text is an entry row");
+        };
+        entry.set_text("");
+        glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
+        settle_until("the refusal to reach the row", || {
+            row_of(&form, "label").failed.get()
+        });
+        let refusal = note_of(&form, "label");
+
+        // …and an unrelated row saves successfully.
+        let Control::Spin { row, .. } = &row_of(&form, "count").control else {
+            panic!("an Int is a spin row");
+        };
+        row.set_value(7.0);
+        settle_until("the other row's save", || {
+            Scratch::read(&overlay).contains("count = 7")
+        });
+
+        assert!(
+            row_of(&form, "label").failed.get(),
+            "the refusal was wiped by a save on another row"
+        );
+        assert_eq!(note_of(&form, "label"), refusal, "…and it still says why");
+    }
+
+    /// Choosing *custom (#rrggbb)* with nothing typed does not write
+    /// `color = ""` (#1365 review, L3).
+    ///
+    /// That is the one value the writer refuses for a `Color`, so the
+    /// operator got a red row for picking the item that means *"I'll type
+    /// one"*. Mid-typing is already gated behind the apply button; this was
+    /// the one path that wrote without one.
+    ///
+    /// **Red without the `nothing_typed` guard** in the combo's
+    /// `selected-notify` handler.
+    #[gtk::test]
+    fn picking_custom_with_an_empty_entry_writes_nothing() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+        let Control::Colour {
+            combo,
+            entry,
+            options,
+            ..
+        } = &row_of(&form, "color").control
+        else {
+            panic!("a Color is a combo plus an entry");
+        };
+        assert!(entry.text().is_empty(), "sanity: the default is a name");
+
+        combo.set_selected(u32::try_from(options.len()).expect("in range"));
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "",
+            "picking `custom` before typing wrote something"
+        );
+        assert!(
+            !row_of(&form, "color").failed.get(),
+            "…and refused it on the row: {}",
+            note_of(&form, "color")
+        );
+
+        // …and the apply button still writes the literal, as it always did.
+        entry.set_text("#ff00aa");
+        glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
+        settle_until("the literal to be saved", || {
+            Scratch::read(&overlay).contains("#ff00aa")
+        });
     }
 }

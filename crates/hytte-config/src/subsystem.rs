@@ -2650,10 +2650,11 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 /// `Field` path — is what [`save_leaf_to_locked_unchecked`] is for (#888 P2).
 /// It keeps every structural refusal and drops only the schema ones.
 ///
-/// A not-yet-existing file is seeded with [`Subsystem::DEFAULT_TOML`] through
-/// `seed_without_locked`, exactly as [`save_overlay_to_locked`] seeds one —
-/// so the operator's first edit leaves them the documented, commented file,
-/// with no locked key's default line in it (#1333/#1344).
+/// A not-yet-existing file is **created holding this leaf and nothing else**
+/// — deliberately *not* seeded with [`Subsystem::DEFAULT_TOML`] the way
+/// [`save_overlay_to_locked`] seeds one (#1365 review, HIGH 1). See
+/// [`save_leaf_to_locked_unchecked`]'s "The first leaf into a file that does
+/// not exist" for the whole argument.
 ///
 /// **A missing intermediate table is created**, as a `[table]` header. **An
 /// emptied one is pruned only if [`Subsystem::DEFAULT_TOML`] does not document
@@ -2731,6 +2732,35 @@ pub fn save_leaf_to_locked<S: Subsystem>(
 ///   and answer `Ok`;
 /// * a locked `key_path`, itself or under a locked table.
 ///
+/// # The first leaf into a file that does not exist (#1365 review, HIGH 1)
+///
+/// It creates a file holding **that leaf and nothing else**. It deliberately
+/// does not seed [`Subsystem::DEFAULT_TOML`] first, although
+/// [`save_overlay_to_locked`] — which states the whole config by design —
+/// still does.
+///
+/// Through #1360 it seeded the same way, and the consequence was that one
+/// click on any row of a settings form wrote the **whole documented default**
+/// into the operator's overlay. Every value in that copy is one they did not
+/// choose, landing at the *top* of the precedence order, so it
+///
+/// * silently overrode every key an unlocked base layer stated — locking is
+///   nix's, per key and optional, so `_locked` cannot be what protects a base
+///   value; and
+/// * turned every row's [`Origin`] into [`Origin::Overlay`], so every
+///   subtitle read *yours* and every reset button went live over a value
+///   nobody set — the exact failure [`Origin`]'s own doc names as the reason
+///   provenance exists.
+///
+/// The seed cannot be repaired by filtering, because *every* key it carries
+/// is one a lower layer states: `DEFAULT_TOML` is the bottom layer of every
+/// fold, so the filtered seed is its comments, and `toml_edit` holds a
+/// comments-only document entirely as trailing decor — the first key written
+/// afterwards lands **above** the preamble (measured). So the honest first
+/// file is the small one: an overlay is a *diff* over the layers below, which
+/// is what the per-row reset already teaches, and the documented default is
+/// what a base layer and `--help`-shaped docs are for.
+///
 /// # Errors
 /// [`ConfigError::NotALeaf`] for the structural refusals,
 /// [`ConfigError::Locked`] for a pinned key, [`ConfigError::Unreadable`] if
@@ -2764,11 +2794,13 @@ pub fn save_leaf_to_locked_unchecked<S: Subsystem>(
 
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        // The seed is resolved **here**, on the one path that reads it, rather
-        // than up front: a family whose `DEFAULT_TOML` stopped parsing should
-        // not fail a save into a file that already exists and has nothing to
-        // do with it (#1360 review, LOW 7).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_without_locked::<S>(locked)?,
+        // An empty document, not `DEFAULT_TOML` — a first leaf write creates a
+        // file holding that leaf and nothing else (#1365 review, HIGH 1; the
+        // argument is in this function's own doc). `structural_refusal` and
+        // the prune rule still consult `DEFAULT_TOML` below, so the
+        // documented shape is as load-bearing as it was; it is only the
+        // *values* that no longer land in a file the operator never typed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
             return Err(ConfigError::Unreadable {
                 path: path.to_path_buf(),
@@ -6674,38 +6706,90 @@ brightness = 5
         );
     }
 
-    /// A first save seeds the documented, commented default — through
-    /// `seed_without_locked`, so a locked key's default line never lands in a
-    /// file the operator has not typed a word of (#1333), and the file's own
-    /// preamble survives even when the locked key is the first one (#1344).
+    /// **A first leaf save writes the leaf and nothing else** (#1365 review,
+    /// HIGH 1).
     ///
-    /// Red if the seed is taken straight from `DEFAULT_TOML`: `enabled = true`
-    /// comes back, and the next load refuses it.
+    /// Through #1360 it seeded [`Subsystem::DEFAULT_TOML`] first, so one click
+    /// on any row of a settings form wrote the whole documented default into
+    /// the operator's overlay — every value in it one they did not choose,
+    /// landing at the top of the precedence order, reverting every key an
+    /// unlocked base layer stated and relabelling every row as theirs. The
+    /// lock filter (#1333) could not repair that, because *every* key the
+    /// seed carries is stated by a lower layer: `DEFAULT_TOML` is the bottom
+    /// layer of every fold.
+    ///
+    /// Red if the seed comes back: the file holds `enabled`, `color` and
+    /// `palette` — values nobody typed — beside the one edit.
     #[test]
-    fn a_first_leaf_save_seeds_the_documented_default_without_the_locked_lines() {
+    fn a_first_leaf_save_writes_the_leaf_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("core-leds.toml");
-        let locked = BTreeSet::from(["enabled".to_owned()]);
 
         save_leaf(
             &path,
             "core.brightness",
             Some(toml_edit::Value::from(7_i64)),
-            &locked,
+            &BTreeSet::new(),
         )
         .expect("saves");
 
-        let out = read(&path);
-        assert!(
-            out.starts_with("# The per-core LED strip."),
-            "the file's own preamble is not the first key's comment: {out}"
+        assert_eq!(
+            read(&path),
+            "[core]\nbrightness = 7\n",
+            "an overlay is a diff over the layers below, not a copy of them"
         );
-        assert!(
-            !out.contains("enabled"),
-            "a locked key has no business in a file the operator never typed: {out}"
+    }
+
+    /// The same rule stated the way the bug was reported: a key an
+    /// **unlocked** base layer states is not re-stated by the file a first
+    /// save creates, so saving one row cannot revert another (#1365 review,
+    /// HIGH 1). Locking is nix's, per key and optional, so `_locked` is not
+    /// what protects a base value — and here nothing is locked at all.
+    ///
+    /// Red with the old seed: `color = "amber"` — `DEFAULT_TOML`'s value —
+    /// lands in the overlay at the top of the precedence order and the base
+    /// layer's `"lcd"` stops being what the next load resolves.
+    #[test]
+    fn a_first_leaf_save_does_not_revert_a_key_an_unlocked_base_layer_states() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = raw_layers(dir.path(), &[Some("[core]\ncolor = \"lcd\"\n"), None]);
+
+        let raw = load_raw::<Leds>(&paths).expect("first load, no overlay yet");
+        assert_eq!(
+            raw.origin("core.color"),
+            Some(&Origin::Base(paths[0].clone())),
+            "sanity: the base states it, and nothing locks it"
         );
-        assert!(out.contains("# Strip colour, any CSS name."), "{out}");
-        assert!(out.contains("brightness = 7"), "{out}");
+
+        save_leaf(
+            &paths[1],
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &raw.locked,
+        )
+        .expect("saves");
+
+        let written = read(&paths[1]);
+        assert!(
+            !written.contains("color"),
+            "a key the operator never touched is in their own file: {written}"
+        );
+        let reloaded = load_raw::<Leds>(&paths).expect("reloads");
+        assert_eq!(
+            reloaded.value("core.color"),
+            Some(&toml::Value::String("lcd".to_owned())),
+            "the base layer's value survived a save of another key"
+        );
+        assert_eq!(
+            reloaded.origin("core.color"),
+            Some(&Origin::Base(paths[0].clone())),
+            "…and still says so, rather than claiming to be the operator's own"
+        );
+        assert_eq!(
+            reloaded.origin("core.brightness"),
+            Some(&Origin::Overlay),
+            "while the key they did edit is theirs"
+        );
     }
 
     /// The one shape that cannot name a leaf.

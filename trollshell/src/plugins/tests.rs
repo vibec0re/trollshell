@@ -883,6 +883,7 @@ fn effects_survive_region_coalescing() {
         .send(BrokeredEffect {
             plugin_id: "p".into(),
             effect: Effect::OpenPage(Page::PowerMenu),
+            mount: Mount::BarLeft,
             outbound: tx.clone(),
         })
         .expect("effect queued");
@@ -2768,6 +2769,7 @@ async fn datasource_query_routes_to_provider_and_result_back() {
             scope: "next".into(),
             params: r#"{"limit":3}"#.into(),
         },
+        Mount::BarLeft,
         &req_tx,
         &router,
     );
@@ -2798,6 +2800,7 @@ async fn datasource_query_routes_to_provider_and_result_back() {
             request_id: corr,
             outcome: DatasourceOutcome::Ready("rows".into()),
         },
+        Mount::BarLeft,
         &prov_tx,
         &router,
     );
@@ -2838,6 +2841,7 @@ async fn datasource_result_from_a_non_routed_provider_is_dropped() {
             scope: "next".into(),
             params: "{}".into(),
         },
+        Mount::BarLeft,
         &req_tx,
         &router,
     );
@@ -2857,6 +2861,7 @@ async fn datasource_result_from_a_non_routed_provider_is_dropped() {
             request_id: corr,
             outcome: DatasourceOutcome::Ready("forged".into()),
         },
+        Mount::BarLeft,
         &prov_tx,
         &router,
     );
@@ -2871,6 +2876,7 @@ async fn datasource_result_from_a_non_routed_provider_is_dropped() {
             request_id: corr,
             outcome: DatasourceOutcome::Ready("real".into()),
         },
+        Mount::BarLeft,
         &prov_tx,
         &router,
     );
@@ -10332,14 +10338,14 @@ mod containment_r2 {
         };
         // The burst is dispatched (no reply frame: the launch itself answers).
         for id in 0..4 {
-            broker_effect(plugin, &launch(id), &out_tx, &router);
+            broker_effect(plugin, &launch(id), Mount::BarLeft, &out_tx, &router);
         }
         assert!(
             out_rx.try_recv().is_err(),
             "a launch inside the budget is dispatched, not answered here",
         );
         // The next one is refused, with a reply the plugin can read.
-        broker_effect(plugin, &launch(99), &out_tx, &router);
+        broker_effect(plugin, &launch(99), Mount::BarLeft, &out_tx, &router);
         match out_rx.try_recv().expect("the refusal reaches the plugin") {
             HostMsg::EffectResult { id, outcome } => {
                 assert_eq!(id, 99, "keyed by the effect the plugin asked about");

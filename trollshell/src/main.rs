@@ -336,6 +336,7 @@ fn main() -> hytte::ui::Result<()> {
                         overlays::osd::close_all();
                         overlays::prompt::close_all();
                         overlays::consent::close_all();
+                        overlays::dialog::close_all();
                         // Abort the per-monitor fullscreen watchers (they pin
                         // their Monitor, so they can't self-terminate) before
                         // re-keying below (#404).
@@ -356,6 +357,11 @@ fn main() -> hytte::ui::Result<()> {
                             // Consent prompts (#487) route to the focused output,
                             // same per-monitor mount + focus-tracking as the OSD.
                             overlays::consent::install(monitor);
+                            // The plugin dialog (#1010) keeps the same kind of
+                            // connector map for the same reason: one window,
+                            // built on whichever output is focused when a
+                            // sidebar card opens its page.
+                            overlays::dialog::install(monitor);
                         }
 
                         // Fullscreen auto-inhibit (#404): one watcher per

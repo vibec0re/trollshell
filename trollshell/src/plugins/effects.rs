@@ -15,7 +15,7 @@ use hytte::gtk::gio::prelude::CancellableExt;
 use hytte::gtk::{gio, glib};
 use hytte::services::{mpris, niri, notifications, pipewire, systemd};
 use hytte_plugin_proto::{
-    AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, NiriAction, Page,
+    AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, Mount, NiriAction, Page,
 };
 use tokio::sync::mpsc;
 
@@ -25,7 +25,10 @@ use super::datasource::DatasourceRouter;
 use super::session::TokenBucket;
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
-/// (→ the modal drawer), [`Effect::Niri`] (→ niri's IPC actions), [`Effect::Media`]
+/// (→ the modal drawer for a built-in page or a bar chip's own page; → the
+/// centered dialog overlay for a **sidebar** card's own page, #1010 — which is
+/// why the broker takes the producing plugin's [`Mount`]),
+/// [`Effect::Niri`] (→ niri's IPC actions), [`Effect::Media`]
 /// (→ MPRIS transport on the active player), [`Effect::Audio`] (→ the default
 /// sink's volume/mute), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
 /// [`Effect::Notify`] (→ a local notification toast, #406), [`Effect::RunCommand`]
@@ -107,6 +110,7 @@ fn detached_launch_unit_for_audit(plugin_id: &str, effect: &Effect) -> Option<St
 pub(super) fn broker_effect(
     plugin_id: &str,
     effect: &Effect,
+    mount: Mount,
     outbound: &mpsc::Sender<HostMsg>,
     datasource: &DatasourceRouter,
 ) {
@@ -137,17 +141,21 @@ pub(super) fn broker_effect(
             // mounted drawer; passing the focused connector routes it to the screen
             // the user is on (the consent overlay wants the same routing). Sourced
             // from the shared `components::focused_output` cache (#496/#440).
+            //
+            // Since #1010 the *plugin's own* page additionally routes on the
+            // producing plugin's `mount`: a sidebar card's page opens in the
+            // centered dialog overlay, a bar chip's keeps the drawer. Built-in
+            // pages are untouched — they hang off the bar and that placement is
+            // right.
             let focused = crate::components::focused_output::current();
-            match resolve_open_page(*page) {
-                PageAction::OpenBuiltin(target) => {
-                    tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
-                    crate::modal::open_on_focused(focused.as_deref(), target);
-                }
-                PageAction::OpenPluginSelf => {
-                    tracing::info!(plugin = %plugin_id, "plugin effect: OpenPage(PluginSelf)");
-                    crate::modal::open_plugin_on_focused(focused.as_deref(), plugin_id);
-                }
-            }
+            broker_open_page_with(
+                plugin_id,
+                *page,
+                mount,
+                focused.as_deref(),
+                crate::modal::open_plugin_on_focused,
+                crate::overlays::dialog::open_on_focused,
+            );
         }
         Effect::Niri(action) => {
             // #648: the compositor leg, onto niri's existing fire-and-forget IPC
@@ -489,6 +497,84 @@ pub(super) fn resolve_open_page(page: Page) -> PageAction {
     match page {
         Page::PluginSelf => PageAction::OpenPluginSelf,
         other => PageAction::OpenBuiltin(map_page(other)),
+    }
+}
+
+/// Which shell surface a plugin's **own** page opens on (#1010 §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PageSurface {
+    /// The per-monitor drawer that hangs off the bar (`modal.rs`) — the v1
+    /// behaviour, kept for bar chips.
+    Drawer,
+    /// The centered dialog overlay on the focused output
+    /// (`crate::overlays::dialog`).
+    Dialog,
+}
+
+/// Which surface a plugin's own page opens on. Bar chips hang off the bar, so
+/// their page belongs in the drawer beneath it; sidebar cards do not, and a
+/// drawer opening top-right for a card the user clicked bottom-left reads as the
+/// wrong surface (#1010 — Mara live-verifying #963, twice: *"its very weird the
+/// panel opens in the top right after clicking bottom left"*).
+///
+/// A **total function over [`Mount`]**, matched variant by variant rather than
+/// through [`Mount::is_bar`], so a tenth mount is a compile error here and
+/// whoever adds it has to decide which surface its pages open on rather than
+/// silently inheriting one. Both sidebar families answer `Dialog`: the spec
+/// (revision 2, written before #1158 landed) enumerates six mounts, and the
+/// three `SidebarRight*` ones it does not name are sidebar cards by every
+/// argument it makes for the left three.
+pub(super) const fn page_surface(mount: Mount) -> PageSurface {
+    match mount {
+        Mount::SidebarLead
+        | Mount::SidebarTop
+        | Mount::SidebarBottom
+        | Mount::SidebarRightLead
+        | Mount::SidebarRightTop
+        | Mount::SidebarRightBottom => PageSurface::Dialog,
+        Mount::BarLeft | Mount::BarCenter | Mount::BarRight => PageSurface::Drawer,
+    }
+}
+
+/// [`broker_effect`]'s `OpenPage` arm, with the two plugin-page openers injected
+/// — the seam a hermetic test drives, so the routing rule can be pinned without
+/// a drawer, a layer surface or a registry (the [`broker_open_uri_with`] shape,
+/// #1045).
+///
+/// The built-in arm is deliberately *not* injected: nothing about it changed in
+/// #1010, and `modal::open_on_focused` is a no-op with no drawers mounted, which
+/// is what a test thread has.
+fn broker_open_page_with(
+    plugin_id: &str,
+    page: Page,
+    mount: Mount,
+    focused: Option<&str>,
+    open_drawer: impl FnOnce(Option<&str>, &str),
+    open_dialog: impl FnOnce(Option<&str>, &str, Mount),
+) {
+    match resolve_open_page(page) {
+        PageAction::OpenBuiltin(target) => {
+            tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
+            crate::modal::open_on_focused(focused, target);
+        }
+        PageAction::OpenPluginSelf => match page_surface(mount) {
+            PageSurface::Drawer => {
+                tracing::info!(
+                    plugin = %plugin_id,
+                    ?mount,
+                    "plugin effect: OpenPage(PluginSelf) → drawer",
+                );
+                open_drawer(focused, plugin_id);
+            }
+            PageSurface::Dialog => {
+                tracing::info!(
+                    plugin = %plugin_id,
+                    ?mount,
+                    "plugin effect: OpenPage(PluginSelf) → dialog",
+                );
+                open_dialog(focused, plugin_id, mount);
+            }
+        },
     }
 }
 
@@ -2390,19 +2476,26 @@ mod tests {
     use super::DatasourceRouter;
     use super::{
         AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, LaunchReport, MAX_URI_BYTES,
-        MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id,
-        audit_effect_uri, broker_effect, broker_open_uri_with, check_uri, clamp_volume,
-        command_outcome, effect_kind, filter_forwarded_env, format_audit_line, launch_outcome,
-        launch_with_timeout, open_uri_with, start_detached_with, truncate_on_char_boundary,
-        truncate_uri_for_log,
+        MAX_VOLUME, MIN_VOLUME, PageSurface, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id,
+        audit_effect_uri, broker_effect, broker_open_page_with, broker_open_uri_with, check_uri,
+        clamp_volume, command_outcome, effect_kind, filter_forwarded_env, format_audit_line,
+        launch_outcome, launch_with_timeout, open_uri_with, page_surface, start_detached_with,
+        truncate_on_char_boundary, truncate_uri_for_log,
     };
     use hytte_plugin_proto::{
-        AudioAction, ConsentChoices, ConsentDecision, Effect, HostMsg, MediaAction, NiriAction,
-        Page,
+        AudioAction, ConsentChoices, ConsentDecision, Effect, HostMsg, MediaAction, Mount,
+        NiriAction, Page,
     };
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
+
+    /// The mount a test stamps on a brokered effect whose arm does not route on
+    /// one (#1010). `BarLeft` deliberately: if an `OpenPage(PluginSelf)` ever
+    /// slipped into one of those tests it would take the *drawer* path — a
+    /// no-op with no drawers mounted on a test thread — rather than the dialog
+    /// one, which would want a layer surface.
+    const ANY_MOUNT: Mount = Mount::BarLeft;
 
     // #964 item 1: test-only capture of what `record_audit` and
     // `launch_detached` were each told, so a test can assert they agree on the
@@ -2786,6 +2879,7 @@ mod tests {
                 argv: vec!["true".to_owned()],
                 detached: true,
             },
+            ANY_MOUNT,
             &tx,
             &router,
         );
@@ -2889,6 +2983,7 @@ mod tests {
                 argv: vec!["true".to_owned()],
                 detached: true,
             },
+            ANY_MOUNT,
             &tx,
             &router,
         );
@@ -3315,6 +3410,7 @@ mod tests {
         broker_effect(
             "agents",
             &Effect::open_uri(12, "ssh://box.example/"),
+            ANY_MOUNT,
             &tx,
             &router,
         );
@@ -3415,6 +3511,7 @@ mod tests {
         broker_effect(
             "agents",
             &Effect::open_uri(8, "ssh://box.example/"),
+            ANY_MOUNT,
             &tx,
             &router,
         );
@@ -3738,6 +3835,7 @@ mod tests {
                 detail: "request #7".to_owned(),
                 choices: ConsentChoices::Approval,
             },
+            ANY_MOUNT,
             &tx,
             &router,
         );
@@ -3756,6 +3854,7 @@ mod tests {
                 detail: "next departures".to_owned(),
                 choices: ConsentChoices::Grant,
             },
+            ANY_MOUNT,
             &tx,
             &router,
         );
@@ -3768,6 +3867,162 @@ mod tests {
                 })
             ),
             "a grant card with no output still denies (#487)"
+        );
+    }
+
+    // ── The page-routing rule (#1010 §3) ─────────────────────────────────────
+
+    /// [`page_surface`] over **every** mount: the six sidebar ones open a
+    /// plugin's own page in the dialog, the three bar ones keep the drawer.
+    ///
+    /// A table over `Mount::ALL` rather than nine hand-written asserts, so a
+    /// tenth mount reaches this test the moment it reaches the enum — the match
+    /// in `page_surface` already refuses to compile, and this says what the new
+    /// arm has to be *decided* about.
+    ///
+    /// **Falsification:** route the bar mounts to `Dialog` (the brief's first
+    /// break) → the second half reds; route the sidebar ones to `Drawer` → the
+    /// first half does.
+    #[test]
+    fn a_sidebar_card_opens_a_dialog_and_a_bar_chip_the_drawer() {
+        for mount in Mount::ALL {
+            let expected = if mount.is_bar() {
+                PageSurface::Drawer
+            } else {
+                PageSurface::Dialog
+            };
+            assert_eq!(
+                page_surface(mount),
+                expected,
+                "{} routed to the wrong surface",
+                mount.wire_name(),
+            );
+        }
+        // Spelled out once as literals as well, so the loop's own oracle
+        // (`is_bar`) cannot be the thing that is wrong.
+        assert_eq!(page_surface(Mount::SidebarLead), PageSurface::Dialog);
+        assert_eq!(page_surface(Mount::SidebarRightBottom), PageSurface::Dialog);
+        assert_eq!(page_surface(Mount::BarCenter), PageSurface::Drawer);
+    }
+
+    /// The broker's `OpenPage(PluginSelf)` arm calls the **dialog** opener for a
+    /// sidebar-mounted plugin and the **drawer** opener for a bar-mounted one,
+    /// with the focused connector and the plugin id both carried through.
+    ///
+    /// Drives [`broker_open_page_with`], the injected-opener seam, for
+    /// [`broker_open_uri_with`]'s reason: the real openers want a mounted drawer
+    /// and a Wayland layer surface, and neither exists on a test thread.
+    ///
+    /// **Falsification:** swap the two arms in `broker_open_page_with` → both
+    /// halves red; drop the `mount` argument and always call the drawer → the
+    /// first half reds.
+    #[test]
+    fn the_broker_routes_plugin_self_by_the_producing_mount() {
+        let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+        broker_open_page_with(
+            "agents",
+            Page::PluginSelf,
+            Mount::SidebarBottom,
+            Some("DP-1"),
+            |_focused, plugin| calls.borrow_mut().push(format!("drawer:{plugin}")),
+            |focused, plugin, mount| {
+                calls
+                    .borrow_mut()
+                    .push(format!("dialog:{plugin}:{focused:?}:{}", mount.wire_name()));
+            },
+        );
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["dialog:agents:Some(\"DP-1\"):SidebarBottom".to_owned()],
+            "a sidebar card's own page opens in the dialog on the focused output"
+        );
+
+        calls.borrow_mut().clear();
+        broker_open_page_with(
+            "stats",
+            Page::PluginSelf,
+            Mount::BarRight,
+            Some("DP-1"),
+            |focused, plugin| {
+                calls
+                    .borrow_mut()
+                    .push(format!("drawer:{plugin}:{focused:?}"));
+            },
+            |_focused, plugin, _mount| calls.borrow_mut().push(format!("dialog:{plugin}")),
+        );
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["drawer:stats:Some(\"DP-1\")".to_owned()],
+            "a bar chip's own page still opens the drawer beneath the bar"
+        );
+    }
+
+    /// A **built-in** page is untouched by the routing rule, whatever the
+    /// producing plugin's mount: it hangs off the bar, and that placement is
+    /// right (§1). Neither injected opener is called — the arm goes to
+    /// `modal::open_on_focused`, which is a no-op with no drawers mounted.
+    ///
+    /// **Falsification:** route `OpenBuiltin` through `page_surface` too → one
+    /// of the two assertions reds.
+    #[test]
+    fn a_builtin_page_ignores_the_mount() {
+        for mount in [Mount::SidebarLead, Mount::BarLeft] {
+            let called = Cell::new(false);
+            broker_open_page_with(
+                "infobroker",
+                Page::Network,
+                mount,
+                None,
+                |_, _| called.set(true),
+                |_, _, _| called.set(true),
+            );
+            assert!(
+                !called.get(),
+                "{}: a built-in page must not reach either plugin-page opener",
+                mount.wire_name(),
+            );
+        }
+    }
+
+    /// The agents plugin's own-window route is a `RunCommand`, **not** an
+    /// `OpenPage`, so #1010's rule does not govern it — the pill keeps launching
+    /// `trollshell-agent-window` out of process (#950), and its own docs say so:
+    /// *"opening a separate GTK window is not `OpenPage(PluginSelf)`, which
+    /// names a page inside the shell"*.
+    ///
+    /// What #1010 *does* reach in that plugin is its in-shell page — the card's
+    /// title row and the no-window-binary fallback, both
+    /// `Effect::OpenPage(Page::PluginSelf)` from a `Sidebar*` mount — which
+    /// lands in the dialog per §5, with no plugin change. That claim belongs to
+    /// `the_broker_routes_plugin_self_by_the_producing_mount`, **not** to this
+    /// test (#1361 review, LOW): this one pins only that the window route is a
+    /// different effect kind and so cannot be swept up by the page rule at all.
+    ///
+    /// **Falsification:** have `effect_kind` collapse a detached `RunCommand`
+    /// into the plain one, or route the window launch through an `OpenPage`
+    /// spelling → this reds.
+    #[test]
+    fn the_agents_window_route_is_not_a_page() {
+        let window_launch = Effect::RunCommand {
+            id: 3,
+            argv: vec![
+                "trollshell-agent-window".to_owned(),
+                "--agent".to_owned(),
+                "argus".to_owned(),
+            ],
+            detached: true,
+        };
+        assert_eq!(
+            effect_kind(&window_launch),
+            "RunCommand(detached)",
+            "the per-agent window is launched, not opened as a page — so the #1010 \
+             routing rule, which takes a `Page`, has no spelling of it to act on"
+        );
+        assert_eq!(
+            window_launch.required_capability(),
+            Some(hytte_plugin_proto::Capability::RunCommand),
+            "…and it is gated on a different capability than a page is",
         );
     }
 }

@@ -1205,6 +1205,55 @@ label.ts-gpu-temp {
     opacity: 1;
 }
 
+/* ─── Plugin dialog (#1010) ─────────────────────────────────────── */
+
+/* The fullscreen surface itself paints nothing — the card is an overlay child
+ * above a transparent `.ts-modal-catcher`, which is how the drawer already gets
+ * "click outside dismisses" with no dimming. Same rule as `.ts-prompt`. */
+.ts-dialog {
+    background: transparent;
+}
+/* The card. Deliberately NOT the consent card's chrome (#1361 review, HIGH-1):
+ * `.ts-consent-root` and `.ts-prompt-root` are `@window_bg_color` + `@borders` +
+ * a 12px radius + `0 12px 48px rgba(0,0,0,0.55)`, and this used to be all four,
+ * byte for byte — a plugin page centered on the same output, at the same layer,
+ * wearing the exact frame the shell asks for a Wi-Fi passphrase in. It now has
+ * its own: a popover-toned surface (a different grey in both light and dark), a
+ * tighter radius, a shallower shadow, and a hairline drawn from the foreground
+ * rather than the system border colour.
+ *
+ * Usable width is `DIALOG_MAX_WIDTH` (640) less this margin: ~560. */
+.ts-dialog-card {
+    margin: 40px;
+    background: @popover_bg_color;
+    color: @popover_fg_color;
+    border: 1px solid alpha(currentColor, 0.14);
+    border-radius: 0.769em;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.42);
+    padding: 0.462em 0.615em 0.615em 0.615em;
+}
+/* Header row: the plugin id and the close button, over a rule. The rule is the
+ * second half of the de-spoof — no shell prompt has a ruled header — and the row
+ * carries the gap down to the page; the page owns its own inner spacing (the
+ * "no host padding" rule `.ts-plugin-card`/`.ts-plugin-panel` already follow). */
+.ts-dialog-header {
+    border-bottom: 1px solid alpha(currentColor, 0.12);
+    padding-bottom: 0.308em;
+    margin-bottom: 0.462em;
+}
+/* The plugin id, dim — §8's default — and **monospaced**, which nothing else in
+ * the shell's chrome is: it reads as an identifier the host is naming rather
+ * than as prose the card is telling you. Deliberately quiet either way: it names
+ * the source of the page, it is not the page's title (the plugin's own tree
+ * carries that). */
+.ts-dialog-title {
+    opacity: 0.55;
+    font-family: monospace;
+    font-size: 0.846em;
+    letter-spacing: 0.02em;
+    margin-left: 0.308em;
+}
+
 /* ─── Password prompt ───────────────────────────────────────────── */
 
 .ts-prompt {

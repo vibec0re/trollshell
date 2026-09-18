@@ -54,6 +54,8 @@ use crate::overlays::sidebar;
 /// - `toggle-sidebar` (no arg): flip the left sidebar.
 /// - `toggle-sidebar-right` (no arg): flip the right sidebar (#1160) — a no-op
 ///   while that output's right sidebar has no plugin card mounted.
+/// - `dialog-close` (no arg): dismiss the plugin dialog (#1010) — a no-op when
+///   none is up.
 /// - `toggle-recording` (no arg): start/stop a screen recording (#403).
 /// - `open-control-center` (no arg): start (or, if it's already running,
 ///   focus) the `trollshell-control-center` companion app — the same thing
@@ -123,6 +125,16 @@ fn entries() -> Vec<gio::ActionEntry<adw::Application>> {
         })
         .build();
 
+    // The plugin dialog (#1010). No `open`-shaped verb beside it: a dialog is
+    // raised by a plugin's own `OpenPage(PluginSelf)` and names a plugin, which
+    // a keybind has no way to pick — so the keyboard gets the half it is short
+    // of. `Esc` already dismisses while the dialog holds the keyboard
+    // exclusively; this reaches it from a bind regardless of focus, and is an
+    // inert no-op when nothing is up.
+    let dialog_close = gio::ActionEntry::builder("dialog-close")
+        .activate(|_app, _action, _param| crate::overlays::dialog::close())
+        .build();
+
     // Screen recording (#403): start if idle, stop if recording. A niri
     // keybind binds this like the others; the region is picked via `slurp`
     // when starting. No monitor resolution needed — the recorder is global.
@@ -143,6 +155,7 @@ fn entries() -> Vec<gio::ActionEntry<adw::Application>> {
         power_menu,
         toggle_sidebar,
         toggle_sidebar_right,
+        dialog_close,
         toggle_recording,
         open_control_center,
     ]
@@ -159,6 +172,7 @@ mod tests {
     use super::entries;
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
+    use hytte::reactive::registry;
 
     /// [`entries`]'s verbs actually register as named `GAction`s on a real
     /// `adw::Application`'s action map — the same auto-exported
@@ -186,6 +200,7 @@ mod tests {
             "power-menu",
             "toggle-sidebar",
             "toggle-sidebar-right",
+            "dialog-close",
             "toggle-recording",
             "open-control-center",
         ] {
@@ -194,5 +209,62 @@ mod tests {
                 "expected a registered action named {verb:?}"
             );
         }
+    }
+
+    /// `dialog-close` actually closes an open plugin dialog, and is a no-op when
+    /// none is up (#1361 review, MEDIUM-1).
+    ///
+    /// The test above enumerates action *names* only, so replacing this verb's
+    /// body with `()` left the whole suite green — the verb shipped registered
+    /// and inert, with nothing but a live-verify line behind it. This activates
+    /// the real entry against a seeded dialog.
+    ///
+    /// Everything except the layer surface is real: the window is a plain
+    /// `gtk::Window` (nothing in this tree can build a layer one in a test), but
+    /// the selection and the visibility contributor are published through the
+    /// shipped setters, so the assertion below is on what the shell's own state
+    /// says, not on a local flag.
+    ///
+    /// **Falsification:** replace the `activate` body with `()` — the review's
+    /// M3 mutation — → the first assertion reds.
+    #[gtk::test]
+    fn dialog_close_actually_closes_the_dialog() {
+        adw::init().expect("libadwaita init");
+        registry::reset_for_tests();
+        crate::plugins::install_test_handles();
+
+        let app = adw::Application::builder()
+            .application_id("mov.vibec0re.trollshell.commands-test-dialog")
+            .build();
+        app.add_action_entries(entries());
+
+        // Activated through the registered `GAction` itself rather than
+        // `GApplication::activate_action`, which asserts the application has
+        // been *registered* (a session-bus round trip this test has no business
+        // doing). `g_action_activate` runs the very closure `entries()` built.
+        let verb = app
+            .lookup_action("dialog-close")
+            .expect("dialog-close is registered");
+
+        // A no-op with nothing up: what makes the verb safe to bind blind.
+        verb.activate(None);
+
+        let window = crate::overlays::dialog::seed_for_test("DP-1", "demo");
+        assert!(crate::overlays::dialog::is_open(), "test setup");
+
+        verb.activate(None);
+
+        assert!(
+            !crate::overlays::dialog::is_open(),
+            "activating `dialog-close` must take the dialog down"
+        );
+        assert_eq!(
+            crate::plugins::dialog_panel(),
+            None,
+            "…and clear its selection, like every other dismissal"
+        );
+
+        window.destroy();
+        registry::reset_for_tests();
     }
 }

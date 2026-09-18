@@ -123,6 +123,7 @@ fn fixture_handles(
         bar_right: Mutable::new(Vec::new()),
         panels: Mutable::new(Vec::new()),
         active_panel_id: Mutable::new(None),
+        dialog_panel_id: Mutable::new(None),
         clock_tx: tokio::sync::watch::channel(None).0,
         visibility_tx: tokio::sync::watch::channel(false).0,
         visibility_right_tx: tokio::sync::watch::channel(false).0,
@@ -605,6 +606,284 @@ fn the_two_sidebars_publish_to_separate_aggregates() {
     assert!(*left.borrow_and_update());
     super::forget_sidebar_visibility("DP-1");
     assert!(!*left.borrow_and_update());
+
+    registry::reset_for_tests();
+}
+
+// ── The dialog overlay's half of the panel machinery (#1010) ─────────────────
+
+/// Clear both per-monitor sidebar maps and the dialog contributor, so a
+/// visibility test starts from "nothing is open" whatever an earlier test on
+/// this thread latched (the thread-locals outlive `registry::reset_for_tests`,
+/// and `the_two_sidebars_publish_to_separate_aggregates` leaves `DP-1` in both).
+fn clear_visibility_state() {
+    super::SLOT_VISIBILITY_BY_MONITOR.with(|m| m.borrow_mut().clear());
+    super::SLOT_VISIBILITY_RIGHT_BY_MONITOR.with(|m| m.borrow_mut().clear());
+    super::DIALOG_MOUNT.with(|m| m.set(None));
+    super::slot_visible_mutable().set(false);
+}
+
+/// §4: a plugin whose page is up in the dialog is told its slot is visible even
+/// with **every** sidebar closed — otherwise it parks the poller feeding the
+/// page the user is looking at — and the aggregate drops back to `false` when
+/// the dialog closes.
+///
+/// **Falsification:** drop the `|| dialog_feeds_left(mount)` from
+/// [`set_dialog_visibility`] (the "no dialog contributor" state) → the first
+/// assertion reds.
+#[test]
+fn a_dialog_holds_its_plugins_slot_visible_with_the_sidebar_closed() {
+    registry::reset_for_tests();
+    clear_visibility_state();
+
+    let handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    let mut left = handles.visibility_tx.subscribe();
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+    assert!(
+        !*left.borrow_and_update(),
+        "test setup: every sidebar starts closed"
+    );
+
+    super::set_dialog_visibility(Some(Mount::SidebarBottom));
+    assert!(
+        *left.borrow_and_update(),
+        "a sidebar plugin's page being up in the dialog is exactly the state its \
+         poller must not park in"
+    );
+
+    super::set_dialog_visibility(None);
+    assert!(
+        !*left.borrow_and_update(),
+        "dismissing the dialog with no sidebar open lowers the aggregate again"
+    );
+
+    registry::reset_for_tests();
+    clear_visibility_state();
+}
+
+/// …and it lands on the **side** the plugin mounts on (#1160's split): a
+/// right-mounted plugin's dialog does not tell every *left*-sidebar card it is
+/// on screen, and an open sidebar keeps the aggregate up when a dialog on the
+/// other side closes.
+///
+/// **Falsification:** make the contributor a single global bool (both
+/// `dialog_feeds_*` returning "any sidebar mount") → the second assertion reds.
+#[test]
+fn a_dialog_contributes_only_to_its_own_sides_aggregate() {
+    registry::reset_for_tests();
+    clear_visibility_state();
+
+    let handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    let mut left = handles.visibility_tx.subscribe();
+    let mut right = handles.visibility_right_tx.subscribe();
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+    assert!(!*left.borrow_and_update());
+    assert!(!*right.borrow_and_update());
+
+    super::set_dialog_visibility(Some(Mount::SidebarRightTop));
+    assert!(
+        *right.borrow_and_update(),
+        "a right-mounted plugin's page holds the RIGHT aggregate up"
+    );
+    assert!(
+        !*left.borrow_and_update(),
+        "…and not the left one: a left-sidebar card is not on screen because a \
+         right-hand card's page opened"
+    );
+
+    // An open left sidebar survives the dialog closing, since the aggregate is
+    // recomputed from the map rather than simply lowered.
+    super::set_sidebar_visibility("dlg-probe", true);
+    super::set_dialog_visibility(None);
+    assert!(
+        *left.borrow_and_update(),
+        "closing a dialog must not close an open sidebar's aggregate"
+    );
+
+    registry::reset_for_tests();
+    clear_visibility_state();
+}
+
+/// The nine-mount table behind that split, as pure functions — including the
+/// two states nix and the router cannot produce but the type can: `None`, and a
+/// bar mount (which contributes to neither side, because a bar chip's
+/// `SlotVisible` is a constant `true` anyway).
+#[test]
+fn only_the_matching_sidebar_family_is_fed_by_a_dialog() {
+    use super::{dialog_feeds_left, dialog_feeds_right};
+
+    assert!(!dialog_feeds_left(None));
+    assert!(!dialog_feeds_right(None));
+    for mount in Mount::ALL {
+        let left = matches!(
+            mount,
+            Mount::SidebarLead | Mount::SidebarTop | Mount::SidebarBottom
+        );
+        let right = matches!(
+            mount,
+            Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom
+        );
+        assert_eq!(dialog_feeds_left(Some(mount)), left, "{mount:?}");
+        assert_eq!(dialog_feeds_right(Some(mount)), right, "{mount:?}");
+        assert!(
+            !(mount.is_bar() && (left || right)),
+            "a bar mount feeds neither aggregate",
+        );
+    }
+}
+
+/// §2.1, the hole the spec's first draft had: the dialog's selection and the
+/// drawer's are **independent handles**. Neither setter touches the other's, so
+/// a drawer showing plugin X and a dialog showing plugin Y coexist, and the
+/// drawer's close path — `modal.rs`'s `set_active_panel(None)` on
+/// retract-finish, and again on monitor teardown — cannot blank the dialog.
+///
+/// The mechanism, not the surfaces: `modal.rs` reaches the drawer's selection
+/// through exactly one function ([`crate::plugins::set_active_panel`], three
+/// call sites) and `overlays::dialog` reaches its own through exactly one
+/// ([`crate::plugins::set_dialog_panel`]), so "the two close paths do not
+/// interfere" is a property of these two setters and is decided here.
+///
+/// **Falsification:** point `set_dialog_panel` at `active_panel_id` (i.e. the
+/// first draft's shared handle) → the first assertion reds; have the dialog's
+/// clear go through `set_active_panel(None)` → the last one does.
+#[test]
+fn the_dialog_and_the_drawer_hold_independent_panel_selections() {
+    registry::reset_for_tests();
+
+    let handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    let drawer = handles.active_panel_id.clone();
+    let dialog = handles.dialog_panel_id.clone();
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+
+    crate::plugins::set_active_panel(Some("drawer-plugin"));
+    crate::plugins::set_dialog_panel(Some("dialog-plugin"));
+    assert_eq!(drawer.get_cloned().as_deref(), Some("drawer-plugin"));
+    assert_eq!(
+        dialog.get_cloned().as_deref(),
+        Some("dialog-plugin"),
+        "two surfaces, two selections — a shared handle would show one plugin twice"
+    );
+
+    // The drawer closing (`modal.rs`'s retract-finish / teardown path).
+    crate::plugins::set_active_panel(None);
+    assert_eq!(
+        dialog.get_cloned().as_deref(),
+        Some("dialog-plugin"),
+        "closing the drawer must leave the dialog's page where it is"
+    );
+
+    // …and the dialog closing.
+    crate::plugins::set_dialog_panel(None);
+    crate::plugins::set_active_panel(Some("drawer-plugin"));
+    crate::plugins::set_dialog_panel(None);
+    assert_eq!(
+        drawer.get_cloned().as_deref(),
+        Some("drawer-plugin"),
+        "dismissing the dialog must not blank a drawer page on another monitor"
+    );
+
+    registry::reset_for_tests();
+}
+
+/// §2.1's two `pump.rs` readers, first one: [`request_preem_repaint`] nudges the
+/// panel mailbox for a plugin whose page is up **only in the dialog**, with the
+/// drawer's selection empty.
+///
+/// This is the ordinary case, not an edge one: a sidebar card's page opens in
+/// the dialog and `active_panel_id` is `None` throughout, so reading only the
+/// drawer's handle freezes every animation on every page this feature opens.
+///
+/// **Falsification:** narrow `panel_selections` back to `active_panel_id` alone
+/// → the wake assertion reds (`Pending`).
+#[test]
+fn a_dialog_only_panel_is_repainted_by_the_animation_tick() {
+    registry::reset_for_tests();
+
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let panel = Scope::panel("t1010-dialog");
+    let _ = to_ui_node(&panel, Grants::none(), &marquee_node("panel"));
+
+    let panels: Mutable<Vec<SlotRender>> =
+        Mutable::new(vec![slot("t1010-dialog", marquee_node("panel"), &tx)]);
+    let mut handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    handles.panels = panels.clone();
+    // The drawer is shut; only the dialog is showing this plugin's page.
+    handles.active_panel_id = Mutable::new(None);
+    handles.dialog_panel_id = Mutable::new(Some("t1010-dialog".to_owned()));
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+
+    let mut panels_sig = pin!(panels.signal_cloned());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        panels_sig.as_mut().poll_change(&mut cx),
+        Poll::Ready(Some(_))
+    ));
+
+    let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
+    assert_eq!(moved, vec![panel.clone()]);
+    request_preem_repaint(&moved);
+
+    assert!(
+        matches!(
+            panels_sig.as_mut().poll_change(&mut cx),
+            Poll::Ready(Some(_))
+        ),
+        "a panel on screen only in the dialog must still be repainted by the tick",
+    );
+
+    preem_render::forget_scope(&panel);
+    registry::reset_for_tests();
+}
+
+/// …and the second reader: [`request_preem_repaint_all`] — the accent/skin path
+/// — re-maps the panel mailbox for a dialog-only selection too.
+///
+/// **Falsification:** narrow `panel_selections` to `active_panel_id` → red.
+#[test]
+fn a_dialog_only_panel_is_re_mapped_by_the_accent_path() {
+    registry::reset_for_tests();
+
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let panels: Mutable<Vec<SlotRender>> =
+        Mutable::new(vec![slot("t1010-accent", static_node("panel"), &tx)]);
+    let mut handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    handles.panels = panels.clone();
+    handles.active_panel_id = Mutable::new(None);
+    handles.dialog_panel_id = Mutable::new(Some("t1010-accent".to_owned()));
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+
+    let mut panels_sig = pin!(panels.signal_cloned());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        panels_sig.as_mut().poll_change(&mut cx),
+        Poll::Ready(Some(_))
+    ));
+
+    super::request_preem_repaint_all();
+
+    assert!(
+        matches!(
+            panels_sig.as_mut().poll_change(&mut cx),
+            Poll::Ready(Some(_))
+        ),
+        "a re-tint must reach a page that is on screen only in the dialog",
+    );
 
     registry::reset_for_tests();
 }

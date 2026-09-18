@@ -189,7 +189,7 @@ impl Probe {
                 binary = BINARY,
                 searched_path = %searched_path(),
                 "the agent companion window is not on this plugin's PATH; agent pages open in \
-                 the browser and the pen opens the drawer page instead (install it with \
+                 the browser and the pen opens this plugin's own page instead (install it with \
                  programs.trollshell.agentWindow.enable). The launch would resolve it in the \
                  systemd user manager's environment, which is normally the same one — compare \
                  with `systemctl --user show-environment` if it is not"

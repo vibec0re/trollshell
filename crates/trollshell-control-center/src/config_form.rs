@@ -143,9 +143,8 @@ struct ShellSubsystem<F>(std::marker::PhantomData<F>);
 impl<'de, F> serde::Deserialize<'de> for ShellSubsystem<F> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Nothing in this app deserialises a family; see the type's docs.
-        serde::de::Deserialize::deserialize(deserializer).map(|serde::de::IgnoredAny| {
-            Self(std::marker::PhantomData)
-        })
+        serde::de::Deserialize::deserialize(deserializer)
+            .map(|serde::de::IgnoredAny| Self(std::marker::PhantomData))
     }
 }
 
@@ -466,9 +465,7 @@ impl FormInner {
             return;
         };
         let Some(overlay) = self.overlay.as_ref() else {
-            row.show_error(
-                "nowhere to write: neither $XDG_CONFIG_HOME nor $HOME is set",
-            );
+            row.show_error("nowhere to write: neither $XDG_CONFIG_HOME nor $HOME is set");
             return;
         };
         let locked = self.raw.borrow().locked.clone();
@@ -846,7 +843,9 @@ impl Row {
     /// Fill the widgets from a merged value.
     fn push(&self, value: Option<&toml::Value>) {
         match &self.control {
-            Control::Switch(row) => row.set_active(value.and_then(toml::Value::as_bool).unwrap_or(false)),
+            Control::Switch(row) => {
+                row.set_active(value.and_then(toml::Value::as_bool).unwrap_or(false))
+            }
             Control::Spin { row, words } => {
                 let word = value.and_then(toml::Value::as_str);
                 for (spelling, toggle) in words {
@@ -857,13 +856,19 @@ impl Row {
                     row.set_value(n as f64);
                 }
             }
-            Control::Combo { row, options, model } => {
+            Control::Combo {
+                row,
+                options,
+                model,
+            } => {
                 let word = value.and_then(toml::Value::as_str);
                 let known = index_of(options, word);
                 // The transient item first, so the index selected below always
                 // exists in the model. Truncating afterwards would deselect it.
                 let extra = u32::try_from(options.len()).unwrap_or(u32::MAX);
-                if known == gtk::INVALID_LIST_POSITION && let Some(word) = word {
+                if known == gtk::INVALID_LIST_POSITION
+                    && let Some(word) = word
+                {
                     if model.n_items() > extra {
                         model.splice(extra, model.n_items() - extra, &[word]);
                     } else {
@@ -924,7 +929,11 @@ impl Row {
                 #[allow(clippy::cast_possible_truncation)]
                 Some((row.value().round() as i64).into())
             }
-            Control::Combo { row, options, model } => {
+            Control::Combo {
+                row,
+                options,
+                model,
+            } => {
                 let selected = usize::try_from(row.selected()).unwrap_or(usize::MAX);
                 options.get(selected).map_or_else(
                     // The transient item — the word the file already holds.
@@ -1045,7 +1054,9 @@ fn connect_rows(inner: &Rc<FormInner>) {
                     let swatch = swatch.clone();
                     let combo = combo.clone();
                     let options_len = match row.control {
-                        Control::Colour { options, .. } => u32::try_from(options.len()).unwrap_or(0),
+                        Control::Colour { options, .. } => {
+                            u32::try_from(options.len()).unwrap_or(0)
+                        }
                         _ => 0,
                     };
                     entry.connect_apply(move |_| {
@@ -1067,7 +1078,9 @@ fn connect_rows(inner: &Rc<FormInner>) {
                     entry.connect_changed(move |_| swatch.queue_draw());
                 }
                 let entry = entry.clone();
-                swatch.set_draw_func(move |_, cr, width, height| paint_swatch(cr, width, height, &entry.text()));
+                swatch.set_draw_func(move |_, cr, width, height| {
+                    paint_swatch(cr, width, height, &entry.text())
+                });
             }
             Control::Text(entry) => {
                 let weak = Rc::downgrade(inner);
@@ -1111,7 +1124,11 @@ const CUSTOM_COLOUR: &str = "custom (#rrggbb)";
 /// The model is handed back beside the row because `AdwComboRow` does not give
 /// it back in the type we need it in (`model()` answers a `gio::ListModel`),
 /// and [`Control::Combo`] appends to and truncates it per refresh.
-fn combo_row(title: &str, options: &[&str], extra: Option<&str>) -> (adw::ComboRow, gtk::StringList) {
+fn combo_row(
+    title: &str,
+    options: &[&str],
+    extra: Option<&str>,
+) -> (adw::ComboRow, gtk::StringList) {
     let model = gtk::StringList::new(&[]);
     for option in options {
         model.append(option);
@@ -1202,7 +1219,12 @@ fn summarise(field: &Field, value: Option<&toml::Value>) -> String {
     let body = match value {
         Some(toml::Value::Array(items)) => {
             let names: Vec<String> = items.iter().map(spell_value).collect();
-            format!("{} {} · {}", names.len(), plural(noun, names.len()), names.join(", "))
+            format!(
+                "{} {} · {}",
+                names.len(),
+                plural(noun, names.len()),
+                names.join(", ")
+            )
         }
         Some(toml::Value::Table(table)) => {
             let names: Vec<&str> = table.keys().map(String::as_str).collect();
@@ -1405,7 +1427,11 @@ fn join_prose(lines: &[&str]) -> Option<String> {
     for line in lines {
         let indented = line.starts_with(' ');
         if !out.is_empty() {
-            out.push(if indented || out.ends_with(':') { '\n' } else { ' ' });
+            out.push(if indented || out.ends_with(':') {
+                '\n'
+            } else {
+                ' '
+            });
         }
         out.push_str(line.trim_end());
     }
@@ -1753,12 +1779,15 @@ mod tests {
         let line = provenance(
             true,
             Some(&Origin::Base(PathBuf::from(
-                "/etc/xdg/trollshell/core-leds.toml"
+                "/etc/xdg/trollshell/core-leds.toml",
             ))),
             false,
         );
         assert!(line.starts_with("Set in nix"), "{line}");
-        assert!(line.contains("/etc/xdg/trollshell/core-leds.toml"), "{line}");
+        assert!(
+            line.contains("/etc/xdg/trollshell/core-leds.toml"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -1984,7 +2013,10 @@ mod gtk_tests {
         let Control::Spin { row, .. } = &row_of(&form, "count").control else {
             panic!("an Int is a spin row");
         };
-        assert!((row.value() - 3.0).abs() < f64::EPSILON, "the documented default");
+        assert!(
+            (row.value() - 3.0).abs() < f64::EPSILON,
+            "the documented default"
+        );
         assert_eq!(note_of(&form, "count"), "Default");
 
         row.set_value(7.0);
@@ -2060,10 +2092,7 @@ mod gtk_tests {
         });
         assert_eq!(
             changed_lines(fixture::DEFAULT_TOML, &Scratch::read(&overlay)),
-            vec![(
-                "style = \"vfd\"".to_owned(),
-                "style = \"oled\"".to_owned()
-            )],
+            vec![("style = \"vfd\"".to_owned(), "style = \"oled\"".to_owned())],
             "exactly one leaf moved"
         );
         assert_eq!(note_of(&form, "style"), "Yours");
@@ -2083,7 +2112,12 @@ mod gtk_tests {
     fn a_choice_row_shows_a_word_its_vocabulary_does_not_have_rather_than_the_first_option() {
         let scratch = Scratch::new();
         let form = fixture_form(&scratch, Some("style = \"plasma\"\n"));
-        let Control::Combo { row, options, model } = &row_of(&form, "style").control else {
+        let Control::Combo {
+            row,
+            options,
+            model,
+        } = &row_of(&form, "style").control
+        else {
             panic!("a Choice is a combo row");
         };
         let transient = u32::try_from(options.len()).expect("a handful of options");
@@ -2103,7 +2137,10 @@ mod gtk_tests {
         Scratch::write(&scratch.base("form-fixture"), "style = \"lcd\"\n");
         assert!(form.refresh_from_disk(), "the base layer moved");
         assert_eq!(model.n_items(), transient, "the transient item is gone");
-        assert_eq!(options[usize::try_from(row.selected()).expect("in range")], "lcd");
+        assert_eq!(
+            options[usize::try_from(row.selected()).expect("in range")],
+            "lcd"
+        );
     }
 
     /// `Kind::Color` is two rows for one leaf: the named palette, and the
@@ -2229,7 +2266,10 @@ mod gtk_tests {
             "{:?}",
             row.subtitle()
         );
-        assert!(!sensitive(&form, "order"), "a collection is read-only in v1");
+        assert!(
+            !sensitive(&form, "order"),
+            "a collection is read-only in v1"
+        );
         assert!(
             row_of(&form, "order").reset.is_none(),
             "and has nothing to reset"
@@ -2258,10 +2298,7 @@ mod gtk_tests {
     #[gtk::test]
     fn a_locked_row_is_insensitive_and_a_change_is_refused() {
         let scratch = Scratch::new();
-        let form = fixture_form(
-            &scratch,
-            Some("_locked = [\"flag\"]\nflag = false\n"),
-        );
+        let form = fixture_form(&scratch, Some("_locked = [\"flag\"]\nflag = false\n"));
         assert!(!sensitive(&form, "flag"), "a locked leaf is not editable");
         assert!(
             note_of(&form, "flag").starts_with("Set in nix"),
@@ -2302,7 +2339,10 @@ mod gtk_tests {
         let Control::Spin { row, .. } = &row_of(&form, "count").control else {
             panic!("an Int is a spin row");
         };
-        assert!((row.value() - 8.0).abs() < f64::EPSILON, "the base layer's value");
+        assert!(
+            (row.value() - 8.0).abs() < f64::EPSILON,
+            "the base layer's value"
+        );
 
         row.set_value(2.0);
         settle_until("the spin row to be saved", || {
@@ -2488,10 +2528,7 @@ mod gtk_tests {
                 hytte_config_families::core_leds::DEFAULT_TOML,
                 &Scratch::read(&overlay)
             ),
-            vec![(
-                "style = \"vfd\"".to_owned(),
-                "style = \"oled\"".to_owned()
-            )],
+            vec![("style = \"vfd\"".to_owned(), "style = \"oled\"".to_owned())],
             "exactly one leaf moved in the real family's file too"
         );
     }

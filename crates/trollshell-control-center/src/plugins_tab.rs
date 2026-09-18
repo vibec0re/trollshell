@@ -1941,7 +1941,14 @@ fn refresh_detail(state: &PluginsState) {
 /// poll — which calls [`refresh_detail`] on every tick — costs nothing here,
 /// and a form the operator is typing into is not rebuilt underneath them.
 fn refresh_config(state: &PluginsState, id: &str) {
-    let mounted_for = { state.detail.config.borrow().as_ref().map(|m| m.plugin.clone()) };
+    let mounted_for = {
+        state
+            .detail
+            .config
+            .borrow()
+            .as_ref()
+            .map(|m| m.plugin.clone())
+    };
     if mounted_for.as_deref() == Some(id) {
         return;
     }
@@ -1990,8 +1997,7 @@ fn refresh_config(state: &PluginsState, id: &str) {
 /// see [`refresh_config`].
 fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_form::FamilyOps> {
     let candidates = resolved_search_path(&state.search_path, &state.env);
-    let declared = probe_candidates(candidates)
-        .and_then(|found| manifest_id_at(&found.path, id));
+    let declared = probe_candidates(candidates).and_then(|found| manifest_id_at(&found.path, id));
     let ops = crate::config_form::family(declared.as_deref().unwrap_or(id))?;
     // A **shell**-owned family has no plugin to hang off — it renders under the
     // pinned Shell entry, once, and its form owns a poll of its own. A plugin
@@ -3263,7 +3269,10 @@ mod tests {
             "clock":{"exec":"/nix/store/x/bin/hytte-plugin-clock-demo"},
             "claude-bridge":{"exec":"/nix/store/x/bin/hytte-claude-bridge"}
         }}"#;
-        assert_eq!(super::manifest_id_from_json(json, "stats").as_deref(), Some("stats"));
+        assert_eq!(
+            super::manifest_id_from_json(json, "stats").as_deref(),
+            Some("stats")
+        );
         assert_eq!(
             super::manifest_id_from_json(json, "stats-bar").as_deref(),
             Some("stats"),
@@ -5183,7 +5192,11 @@ mod gtk_tests {
             "the plugin selection survives the map"
         );
         assert_eq!(
-            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
             Some("plugin".to_owned()),
             "and the plugin page is what is shown"
         );
@@ -5212,12 +5225,18 @@ mod gtk_tests {
         });
 
         let row = state.shell_list.row_at_index(0).expect("the Shell row");
-        state.shell_list.emit_by_name::<()>("row-activated", &[&row]);
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&row]);
         pump();
 
         assert!(state.shell_selected.get());
         assert_eq!(
-            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
             Some("shell".to_owned())
         );
         assert_eq!(state.detail.page.title(), "Shell");
@@ -5245,13 +5264,19 @@ mod gtk_tests {
         let window = present(&bin, 640);
 
         let row = state.shell_list.row_at_index(0).expect("the Shell row");
-        state.shell_list.emit_by_name::<()>("row-activated", &[&row]);
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&row]);
         pump();
 
         // A `systemctl --user` elsewhere adds a unit.
         apply_state(&state, &["clock", "timer"], "active");
         assert_eq!(
-            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
             Some("shell".to_owned()),
             "a membership change must not navigate away from the Shell page"
         );
@@ -5261,7 +5286,11 @@ mod gtk_tests {
         on_poll_result(&state, state.polls.issue(), poll_err());
         pump();
         assert_eq!(
-            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
             Some("shell".to_owned()),
             "the file editor keeps working with the shell down"
         );
@@ -5278,7 +5307,9 @@ mod gtk_tests {
         let window = present(&bin, 640);
 
         let row = state.shell_list.row_at_index(0).expect("the Shell row");
-        state.shell_list.emit_by_name::<()>("row-activated", &[&row]);
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&row]);
         pump();
         assert!(state.shell_selected.get(), "sanity: the Shell page is up");
 
@@ -5290,7 +5321,11 @@ mod gtk_tests {
         assert!(state.shell_list.selected_row().is_none());
         assert_eq!(state.selected.borrow().as_deref(), Some("clock"));
         assert_eq!(
-            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
             Some("plugin".to_owned())
         );
 

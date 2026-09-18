@@ -224,12 +224,13 @@ inline in `flake.nix` as one-liners.
   hand-mirrored config vocabulary — `nix/lint-config-vocab.py` parses all
   four `Subsystem` families' own `SCHEMA` consts (two in
   `hytte-config-families`, one apiece in `hytte-plugin-agents` and
-  `hytte-plugin-stats`) and gates `programs.trollshell.config.{core-leds,
-  agents}`'s leaf set, bounds/enums and each option's `description` first
-  sentence against the two of those four that have a nix block today
-  (`workspaces`/`stats` are parsed and counted but have none yet, reported
-  `skipped: no nix surface`), plus the unrelated, unchanged `places` and
-  `plugins.<id>.mount` mirrors it also carries. Run it by hand with
+  `hytte-plugin-stats`) and gates the two of those four with a nix
+  `programs.trollshell.config.<family>` block today — `core-leds` and
+  `agents` — on leaf set, bounds/enums and each option's `description`
+  first sentence (`workspaces`/`stats` are parsed and counted but have
+  none yet, reported `skipped: no nix surface`), plus the unrelated,
+  unchanged `places` and `plugins.<id>.mount` mirrors it also carries. Run
+  it by hand with
   `nix shell nixpkgs#python3 --command python3 nix/lint-config-vocab.py`
   (`--self-test` runs just the fixture and mutation layers) — the `nix shell`
   is not optional, for the `bind-pins` reason above.

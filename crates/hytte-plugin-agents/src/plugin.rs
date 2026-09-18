@@ -665,6 +665,13 @@ impl Agents {
     }
 
     /// Select an agent and open this plugin's own panel.
+    ///
+    /// The roster's own way of picking an agent to look at ([`ids::SELECT`]) —
+    /// **not** a fallback any more. Before
+    /// [#1282](https://github.com/vibec0re/trollshell/issues/1282) item 3 this
+    /// was also what the pen fell back to when the companion window was not
+    /// installed; the pen is gone, and this is now the roster's own route,
+    /// unconditionally, whether or not that window exists.
     fn open_detail(&mut self, name: AgentName) -> Vec<Effect> {
         self.selected = Some(name);
         vec![Effect::OpenPage(Page::PluginSelf)]
@@ -695,10 +702,9 @@ impl Agents {
     ///
     /// `None` means "not this route" — either the window is not installed
     /// ([`window::Probe`], which also warns once) or the model no longer holds
-    /// the agent whose row was clicked. Every caller then takes its P1 route —
-    /// the browser for a terminal ([`Agents::open_agent_terminal`]), the drawer
-    /// page for the pen — so a desktop without the window keeps working exactly
-    /// as it did.
+    /// the agent whose row was clicked. The one caller,
+    /// [`Agents::open_agent_terminal`], then takes its P1 route — the browser —
+    /// so a desktop without the window keeps working exactly as it did.
     ///
     /// The launch carries **only the agent's name**: the window reads
     /// `host.sock` itself, so nothing the model holds — not the URL, not the
@@ -766,22 +772,6 @@ impl Agents {
             }
             return Vec::new();
         }
-        if let Some(rest) = node.strip_prefix(ids::EDIT) {
-            // Annika's `[optionsedit]` (2026-09-11). Its destination is the
-            // agent's companion window **on its settings tab** — her call on
-            // #947 at 07:43Z, so an agent has one surface. This plugin's own
-            // drawer page was the placeholder for that window and is now its
-            // fallback: a desktop without `trollshell-agent-window` still gets
-            // the P1 behaviour rather than a dead button. Still read-only
-            // either way until #952.
-            if let Some(name) = AgentName::parse(rest) {
-                if let Some(fx) = self.open_window(&name, window::Tab::Settings) {
-                    return fx;
-                }
-                return self.open_detail(name);
-            }
-            return Vec::new();
-        }
         if let Some(rest) = node.strip_prefix(ids::OPEN) {
             // The row Mara's 2026-09-10 retest could read but not follow
             // (#1045). Since #950 it opens the agent's companion window — our
@@ -799,9 +789,21 @@ impl Agents {
             // sidebar". The **same route** as the link above, by construction —
             // one call, not a second copy of the window/browser decision — so
             // the card row spawns nothing the panel's link could not already
-            // spawn, and the pen's `--tab settings` is untouched.
+            // spawn. Since #1282 item 3 the pill's pen (`edit:`, `--tab
+            // settings`) is gone and nothing on the pill replaced it — the
+            // window's own settings tab is reached inside the window now.
             if let Some(name) = AgentName::parse(rest) {
                 return self.open_agent_terminal(&name);
+            }
+            return Vec::new();
+        }
+        if let Some(rest) = node.strip_prefix(ids::SELECT) {
+            // The panel roster's own way of picking an agent — never the
+            // window: #1282 item 3 retired the pen's window-first attempt this
+            // id used to inherit by sharing the pen's own id, so the roster
+            // now goes straight to this plugin's own page, unconditionally.
+            if let Some(name) = AgentName::parse(rest) {
+                return self.open_detail(name);
             }
             return Vec::new();
         }

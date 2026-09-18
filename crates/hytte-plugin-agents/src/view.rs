@@ -11,20 +11,22 @@
 //! @kaesaecracker's second round of screenshots: *"the view still looks very
 //! cluttered … Maybe we should try one card / pill per agent … deployed…
 //! parent… agent page — too much information to display! Let's keep this slick
-//! two lines."* Her mock, verbatim:
+//! two lines."* Her mock, verbatim, minus one slot: `[optionsedit]` — the pen
+//! — is gone since [#1282](https://github.com/vibec0re/trollshell/issues/1282)
+//! item 3 (Annika's 👍, 2026-09-18):
 //!
 //! ```text
-//! [ [icon]  [Name] [Model]                    [startstop] [optionsedit] ]
-//! [ (oO) Clauding...                                                    ]
+//! [ [icon]  [Name] [Model]                    [startstop] ]
+//! [ (oO) Clauding...                                      ]
 //! ```
 //!
-//! So line 1 is the identity and exactly two controls, line 2 is the state
+//! So line 1 is the identity and exactly one control now, line 2 is the state
 //! glyph (her `(oO)`) and the harness's own status text. What went, and where
 //! it went:
 //!
 //! | gone from the card | why, and where it lives now |
 //! | --- | --- |
-//! | the chevron + the in-place details unfold | the clutter she named; the same content is the drawer page, which the **edit** button opens |
+//! | the chevron + the in-place details unfold | the clutter she named; the same content is the drawer page — unreachable from the card since #1282 item 3 retired its one door, the pen |
 //! | the flag chips (`failed` / `needs login` / `paused` / `needs update`) | the first two are already the line-2 glyph; all four stay on the drawer page |
 //! | `deployed` / `parent` / `status set` | dropped outright — the three rows she listed by name |
 //! | the `agent page` link | the drawer page keeps it, as the "open it in the browser instead" fallback to #950's `WebView` |
@@ -106,36 +108,14 @@ pub const BACK_ID: &str = "agents-back";
 /// The card's title is where a jump to the **hive-level** page belongs —
 /// @kaesaecracker, [#963](https://github.com/vibec0re/trollshell/pull/963):
 /// "its very weird the panel opens in the top right after clicking bottom
-/// left". A row's own jump is its [`ids::EDIT`] button, which opens that
-/// agent's page; this one opens the overview and the full roster.
+/// left". A row's own jump is its [`ids::ROW`] button, which opens that
+/// agent's companion window; this one opens the overview and the full roster.
 pub const OVERVIEW_ID: &str = "agents-overview";
 
 /// Button id prefixes. Each is `"<prefix><name>"`; the reducer strips the
 /// prefix and re-validates the remainder as an [`AgentName`] rather than
 /// trusting the round trip.
 pub mod ids {
-    /// The row's **edit** button — Annika's `[optionsedit]`, 2026-09-11 on
-    /// [#963](https://github.com/vibec0re/trollshell/pull/963).
-    ///
-    /// Today it opens this plugin's drawer page on that agent, which is a
-    /// **placeholder**. Its real destination is the agent's own companion
-    /// window on its **settings tab** —
-    /// [#950](https://github.com/vibec0re/trollshell/issues/950), settled by
-    /// Annika on #947 (2026-09-11 07:43Z): one surface per agent, so the same
-    /// window serves the row click (the agent page) and this button (its
-    /// settings). **Not**
-    /// [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s modal —
-    /// that stays the answer for every *other* plugin's page and is not this
-    /// crate's concern at all.
-    ///
-    /// So this arm **will** change when #950 lands: opening a separate GTK
-    /// window is not `OpenPage(PluginSelf)`, which names a page inside the
-    /// shell. The id is stable, the effect behind it is not.
-    ///
-    /// It replaces `chat:`, the old name button. That id's documented future
-    /// was a chat companion window, which is the same #950 window reached from
-    /// the **row click** rather than from a button — see the module doc.
-    pub const EDIT: &str = "edit:";
     /// The pause/resume toggle. **Panel only** since the card went to two
     /// lines: Annika's mock has exactly two buttons per row and start/stop is
     /// the one she named. `SetPaused` is a different hive verb from
@@ -176,6 +156,18 @@ pub mod ids {
     /// Nothing new becomes spawnable: the arm behind it emits exactly what
     /// [`OPEN`]'s emits, out of the same [`crate::window::argv`].
     pub const ROW: &str = "row:";
+    /// The panel roster's own name button — how the drawer's full "all
+    /// agents" overview picks one to look at.
+    ///
+    /// Before [#1282](https://github.com/vibec0re/trollshell/issues/1282)
+    /// item 3 this carried `edit:` — the pen's own id — because it led to the
+    /// same place the pen's Settings-tab-or-fallback route did when the
+    /// window was not installed. The pen is gone, and with it the
+    /// window-first attempt: this id now goes straight to this crate's own
+    /// page, unconditionally, whether or not the companion window exists.
+    /// A distinct id rather than [`OPEN`]/[`ROW`] reused: those two open the
+    /// companion window (or its browser fallback), this one never does.
+    pub const SELECT: &str = "select:";
     /// The hive dashboard link on the panel — the one link that names no
     /// agent, so it is a whole id rather than a prefix. Not `OPEN`-prefixed:
     /// `strip_prefix("open:")` must never match it by accident.
@@ -748,9 +740,9 @@ fn approval_badge(name: &str, count: usize) -> Option<Node> {
 /// One agent as a **pill**: two lines, nothing else (Annika, 2026-09-11 —
 /// see the module doc for her mock and for what each removed thing became).
 ///
-/// Line 1: `[runtime icon] [Name] [Model] … [approvals?] [start|stop] [edit]`.
-/// Line 2: the state glyph, the update badge if it is set, and the harness's
-/// own status text in full.
+/// Line 1: `[runtime icon] [Name] [Model] … [approvals?] [start|stop]`. Line
+/// 2: the state glyph, the update badge if it is set, and the harness's own
+/// status text in full.
 ///
 /// The name is a `Text`, not a `Button`: since #1282 item 2 the **whole pill**
 /// is the button ([`ids::ROW`], opening #950's window), so a second click
@@ -760,11 +752,11 @@ fn approval_badge(name: &str, count: usize) -> Option<Node> {
 ///
 /// # Buttons inside a button
 ///
-/// The pill's own controls (start/stop, the pen, the approvals badge) are
+/// The pill's own controls (start/stop, the approvals badge) are
 /// `Node::Button`s **nested inside** the row button, which is deliberate and
 /// which GTK resolves the way it has to: each `GtkButton` claims the click
 /// gesture at its own level, and a claim denies the gesture to every controller
-/// further up the propagation chain — so pressing the pen opens settings and
+/// further up the propagation chain — so pressing stop stops the agent and
 /// does **not** also open the agent page behind it. This is the first place a
 /// button sits inside another button in these goldens: the card's project
 /// headers (#963) are `Node::Expander`s whose header hytte-ui builds as a
@@ -804,12 +796,6 @@ fn agent_row(agent: &Agent, cfg: &AgentsConfig, approvals: usize) -> Node {
         format!("{lifecycle_id}{name}"),
         lifecycle_glyph,
         lifecycle_hover,
-        &["flat", "ts-agent-btn"],
-    ));
-    head.push(icon_button(
-        format!("{}{name}", ids::EDIT),
-        "document-edit-symbolic",
-        "edit this agent",
         &["flat", "ts-agent-btn"],
     ));
 
@@ -1143,10 +1129,11 @@ fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
         vec![
             icon(cfg.icon_for(name), &["ts-agent-runtime"]),
             // The roster is how the drawer picks an agent, so this one name
-            // stays a button — and it opens the same page the card's `edit`
-            // does, which is why it carries that id rather than a second one.
+            // stays a button — [`ids::SELECT`], its own id since #1282 item 3
+            // retired the pen and with it the window-first attempt this row
+            // used to inherit by sharing the pen's `edit:` id.
             button(
-                format!("{}{name}", ids::EDIT),
+                format!("{}{name}", ids::SELECT),
                 &["flat", "ts-agent-name"],
                 clipped_titled(
                     cfg.label_for(name),
@@ -1169,13 +1156,16 @@ fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
 /// The selected agent's page — **the edit page, for now** (Annika,
 /// 2026-09-11: "then opensedit can open edit dialog").
 ///
-/// The card's `edit` button opens it, as a **placeholder** for the agent's own
-/// companion window on its settings tab —
+/// Originally the card's `edit` button opened it, as a placeholder for the
+/// agent's own companion window on its settings tab —
 /// [#950](https://github.com/vibec0re/trollshell/issues/950), Annika's call on
-/// #947 (2026-09-11 07:43Z). When that window exists this tree is what its
-/// settings tab is built from, or is replaced by it; either way the button
-/// stops pointing here. It is **not** #1010's modal, which stays the answer
-/// for every other plugin's page.
+/// #947 (2026-09-11 07:43Z). Since [#1282](https://github.com/vibec0re/trollshell/issues/1282)
+/// item 3 retired that button, the **only** door left is the panel roster's
+/// own [`ids::SELECT`] — this page is no longer a Settings placeholder for
+/// anything, just the drawer's own per-agent detail, reached by browsing the
+/// full "all agents" overview rather than by a control on the compact pill.
+/// It is **not** #1010's modal, which stays the answer for every other
+/// plugin's page.
 ///
 /// Trimmed to the card's own two lines plus what the card gave up:
 ///
@@ -1589,27 +1579,31 @@ mod tests {
         );
     }
 
-    /// **The card row is a pill: two lines, and exactly two buttons.**
+    /// **The card row is a pill: two lines, and exactly one button.**
     ///
     /// Annika's v1 mock, asserted as a shape rather than as prose
-    /// (2026-09-11, #963):
+    /// (2026-09-11, #963), minus the `[optionsedit]` slot she dropped on
+    /// [#1282](https://github.com/vibec0re/trollshell/issues/1282) item 3
+    /// (2026-09-18):
     ///
     /// ```text
-    /// [ [icon]  [Name] [Model]              [startstop] [optionsedit] ]
-    /// [ (oO) Clauding...                                              ]
+    /// [ [icon]  [Name] [Model]              [startstop] ]
+    /// [ (oO) Clauding...                                ]
     /// ```
     ///
     /// The pill **itself** is the third click target, and the outermost one
-    /// (#1282 item 2) — so the ids are `[row, stop, edit]` in tree order, the
-    /// row's own first.
+    /// (#1282 item 2) — so the ids are `[row, stop]` in tree order, the row's
+    /// own first. **No `edit:`-prefixed id exists anywhere in the tree**: the
+    /// exact-list assertion below is exhaustive, so a pen that came back would
+    /// show up as a third id rather than slip past an `any()` check.
     ///
     /// Falsification: push a third child onto `agent_row`'s `vstack` and the
-    /// line count reds; put the chevron, the pause button or any of the removed
-    /// detail rows back and the button-id assertion reds; move the state glyph
-    /// back to line 1 and the last assertion does; drop the row button and the
-    /// first id goes.
+    /// line count reds; put the chevron, the pause button, the pen or any of
+    /// the removed detail rows back and the button-id assertion reds; move the
+    /// state glyph back to line 1 and the last assertion does; drop the row
+    /// button and the first id goes.
     #[test]
-    fn a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons() {
+    fn a_card_row_is_two_lines_with_exactly_the_mocks_one_button() {
         let mut a = running("argus", "Clauding…");
         a.row.active_model = Some("claude-opus-4-6".to_owned());
         a.row.url = Some("https://hive.local/agent/argus/".to_owned());
@@ -1624,17 +1618,13 @@ mod tests {
 
         assert_eq!(
             button_ids(&row),
-            vec![
-                "row:argus".to_owned(),
-                "stop:argus".to_owned(),
-                "edit:argus".to_owned()
-            ],
+            vec!["row:argus".to_owned(), "stop:argus".to_owned()],
             "the pill is itself a button, and it still carries exactly the \
-             mock's two controls, in her order"
+             mock's one remaining control — the pen is gone"
         );
         assert_eq!(
             button_ids(&body),
-            vec!["stop:argus".to_owned(), "edit:argus".to_owned()],
+            vec!["stop:argus".to_owned()],
             "…and nothing else was added inside it"
         );
 
@@ -1817,7 +1807,7 @@ mod tests {
 
         let ids = button_ids(&panel);
         for i in 0..MAX_ROWS + 7 {
-            let want = format!("edit:agent-{i}");
+            let want = format!("select:agent-{i}");
             assert!(ids.contains(&want), "the panel roster must list {want}");
         }
     }
@@ -1928,7 +1918,7 @@ mod tests {
         let ids = button_ids(&moved_on);
         assert!(ids.contains(&back));
         assert!(
-            ids.contains(&"edit:bosun".to_owned()),
+            ids.contains(&"select:bosun".to_owned()),
             "the overview's roster must render when the selection cannot: {ids:?}"
         );
 
@@ -1948,7 +1938,7 @@ mod tests {
         assert!(ids.contains(&"pause:argus".to_owned()), "{ids:?}");
         assert!(ids.contains(&back));
         assert!(
-            !ids.contains(&"edit:argus".to_owned()),
+            !ids.contains(&"select:argus".to_owned()),
             "the agent page replaces the roster, it does not double it: {ids:?}"
         );
     }
@@ -2087,7 +2077,7 @@ mod tests {
 
         let drawn = button_ids(&tree)
             .iter()
-            .filter(|id| id.starts_with(ids::EDIT))
+            .filter(|id| id.starts_with(ids::SELECT))
             .count();
         assert_eq!(drawn, PANEL_MAX_ROWS, "the panel roster must cap too");
         assert!(
@@ -2251,13 +2241,13 @@ mod tests {
     #[test]
     fn every_button_prefix_ends_in_a_colon() {
         for prefix in [
-            ids::EDIT,
             ids::PAUSE,
             ids::START,
             ids::STOP,
             ids::GROUP,
             ids::OPEN,
             ids::ROW,
+            ids::SELECT,
         ] {
             assert!(prefix.ends_with(':'), "{prefix}");
         }
@@ -2284,13 +2274,13 @@ mod tests {
         // routed by the first arm that matches, so one prefix being a prefix of
         // another would silently route a whole surface to the wrong place.
         let prefixes = [
-            ids::EDIT,
             ids::PAUSE,
             ids::START,
             ids::STOP,
             ids::GROUP,
             ids::OPEN,
             ids::ROW,
+            ids::SELECT,
             ids::APPROVALS,
         ];
         for (i, a) in prefixes.iter().enumerate() {

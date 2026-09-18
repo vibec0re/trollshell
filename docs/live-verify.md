@@ -471,9 +471,10 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       must not climb past the gate. Kill the background dials afterwards.
 - [ ] **(#1165)** Detached-launch budget. From the agents card, click through
       more than four agent-window launches inside a minute (or hold a key on
-      the `edit` button). The first four open windows; the fifth comes back to
-      the plugin as `ok: false` with _"refused: over the host's detached-launch
-      budget"_ and the journal logs the refusal. Confirm
+      the pill — the card's pen is gone since #1282 item 3, so the row itself
+      is the fast way to repeat a launch). The first four open windows; the
+      fifth comes back to the plugin as `ok: false` with _"refused: over the
+      host's detached-launch budget"_ and the journal logs the refusal. Confirm
       `systemctl --user list-units 'trollshell-launch-*'` shows exactly the
       launches that were allowed, and that after a minute a further click works
       again — this is a rate cap, not a lockout.
@@ -526,7 +527,8 @@ the reducer but cannot prove the hive agrees.
       caption treatment and the same inset as the `TASKS` card above it; and
       **one pill per agent, two lines and nothing else** (Annika's v1, #963
       2026-09-11) — line 1 `[runtime icon] [Name] [Model]` on the left with
-      `[start|stop] [edit]` on the right, line 2 the state glyph and the
+      `[start|stop]` on the right (the `[edit]` slot her mock also drew was
+      retired on #1282 item 3, 2026-09-18), line 2 the state glyph and the
       harness's status text **in full**, dim. A status long enough to be cut
       (past ~88 characters) must show the whole string on hover. **Note:** the
       padding, the caption treatment, the list fill and the compact buttons are
@@ -555,19 +557,24 @@ the reducer but cannot prove the hive agrees.
       confirm the agent really starts/stops hive-side (`hivectl list-agents`)
       within a poll or two. This is `Start`/`Stop`, a **different** hive verb
       from `SetPaused` — pause/resume is on the drawer page, not on the card.
-- [ ] **(#947 P1, #1010)** The plugin's own page is reached from the **title
-      row** or the **edit button**. The list button beside `up · N` opens it at
-      the hive overview — state, socket, last-poll age, a clickable `dashboard`
-      link, and the **full, uncapped** roster. A row's `edit` button opens that
-      agent's page instead. **Expect it centered on the focused output:** since
-      #1010 that page opens in the plugin dialog, not the drawer, because the
-      card is `Mount::Sidebar*` — `Esc`, the close button or a click outside
-      dismisses it. (Before #1010 it opened in the drawer, top right.) It is
-      still a **placeholder** — Annika settled on #947 (2026-09-11) that the
-      edit button's real destination is the agent's own #950 companion window on
-      its **settings tab**, the same window the row click opens on the agent
-      page; what #1010 does not govern is that `RunCommand` route. Nothing else
-      on a row leaves the sidebar.
+- [ ] **(#947 P1, #1010, #1282 item 3)** The plugin's own page is reached from
+      the **title row**. The list button beside `up · N` opens it at the hive
+      overview — state, socket, last-poll age, a clickable `dashboard` link,
+      and the **full, uncapped** roster. Click an agent's **name** in that
+      roster and confirm its own page opens instead — this is the roster's
+      own `select:` id, the one remaining door into this page since the
+      card's pen (an `edit` button per row) was retired on #1282 item 3; there
+      is no longer a per-row control on the compact card that reaches it.
+      **Expect it centered on the focused output:** since #1010 that page
+      opens in the plugin dialog, not the drawer, because the card is
+      `Mount::Sidebar*` — `Esc`, the close button or a click outside dismisses
+      it. (Before #1010 it opened in the drawer, top right.) It is still a
+      **placeholder** for the agent's own #950 companion window on its
+      **settings tab** — Annika settled that on #947 (2026-09-11) — but that
+      window's settings tab is now reached from *inside* the window (opened by
+      the card's row or the `agent page` link) rather than from this page's
+      own door; what #1010 does not govern is that `RunCommand` route. Nothing
+      on the card row itself leaves the sidebar for this page any more.
 - [ ] **(#947 P1)** The agent page is the same pill, plus what the card gave
       up. With an agent selected, confirm: a header with the runtime icon, the
       name at title size, the **model chip**, and `[start|stop]` + `[pause]` as
@@ -607,8 +614,9 @@ the reducer but cannot prove the hive agrees.
       or paused agent must show its state word instead, never a stale text from
       before the stop.
 - [ ] **(#947 P1)** **Pause actually parks a live agent.** Pause is on the
-      **agent's page** (the card's two buttons are start/stop and edit). Click
-      pause on a running agent; the row should flip immediately (optimistic) and stay
+      **agent's page** (the card's own button, since #1282 item 3, is
+      start/stop alone). Click pause on a running agent; the row should flip
+      immediately (optimistic) and stay
       paused after the next poll. Confirm hive-side that the harness pause
       marker exists (`hivectl list-agents` shows it paused) and that the agent
       drives no further turns. Click again to resume and confirm both ends
@@ -666,14 +674,18 @@ whole point of the window.
       browser tab. Then `systemctl --user list-units 'trollshell-launch-*'` and
       confirm it was started as a transient unit — it must be **outside** the
       shell's cgroup, so `systemctl --user restart trollshell` leaves it alive.
-- [ ] **(#950)** **The pen opens the settings tab.** Click `[edit]` on a card
-      pill and confirm the same window opens **on Settings**, not on the agent
-      page, and that no plugin page opens behind it — since #1010 that fallback
-      would be the centered dialog rather than the drawer, and the window route
-      must not raise either.
-- [ ] **(#950)** **A second launch focuses the first.** With the window open on
-      the agent page, click the pen: no second window appears, the existing one
-      is presented _and_ switches to Settings (that is the
+- [ ] **(#950/#1282 item 3)** **The window's own Settings tab.** The pill's
+      pen — the button that used to launch a window straight onto Settings —
+      is gone; the plugin never emits `--tab settings` any more. Confirm the
+      window still has a working Settings tab reached from *inside* it (its
+      own tab control), and that `trollshell-agent-window --agent <name>
+      --tab settings` from a terminal still opens straight onto it — the CLI
+      itself is unchanged, only the plugin stopped driving it.
+- [ ] **(#950)** **A second launch focuses the first.** With an agent's window
+      already open on the agent page, run
+      `trollshell-agent-window --agent <name> --tab settings` for the **same**
+      agent from a terminal: no second window appears, the existing one is
+      presented _and_ switches to Settings (that is the
       `HANDLES_COMMAND_LINE` forward — if it merely raises without switching,
       the remote command line is being dropped). Then open a **different**
       agent's window and confirm the two coexist.
@@ -881,10 +893,12 @@ openssl x509` produces it. Point it at a `trust-bundle.pem` instead and the
       window has no address bar to contradict a header that says "agent X".
 - [ ] **(#950)** **Without the window, nothing regresses.** Set
       `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
-      plugin, and confirm the card's link opens the **browser** again and the
-      pen opens the plugin's own page — since #1010 that is the centered
-      dialog, not the drawer — with exactly one journal line about the window
-      not being on `PATH` (not one per click).
+      plugin, and confirm the card's link and the pill's row both open the
+      **browser** again, with exactly one journal line about the window not
+      being on `PATH` (not one per click). The panel roster's own name button
+      (`select:`) is unaffected either way — since #1282 item 3 it never tried
+      the window — and still opens the plugin's own page: since #1010 that is
+      the centered dialog, not the drawer.
 - [ ] **(#950)** **niri rules.** The app-id carries the agent, so a rule for
       all of these windows matches the prefix — e.g.
       `match app-id="^mov\.vibec0re\.trollshell\.AgentWindow"`. Confirm a
@@ -913,14 +927,16 @@ it.
       (re-run the "**The view stays on the hive**" item above with input
       enabled). Typing changes nothing about `navigable_in_place`; this is
       here because it is the thing a reviewer will want to have seen.
-- [ ] **(#1282 item 2)** **The pill opens the window.** Click an agent row in
-      the sidebar card **on its text** — the name, the model word, the status
-      line, the empty space between them — and confirm that agent's companion
-      window opens on the **agent** tab. Then click the **pen** on the same
-      row and confirm it still opens on **Settings** and does **not** also
-      open the agent page behind it; same for start/stop and the approvals
-      badge, which must do their own job and nothing else. (GTK gives the
-      inner button the gesture; this is the item that proves it does.)
+- [ ] **(#1282 items 2-3)** **The pill opens the window.** Click an agent row
+      in the sidebar card **on its text** — the name, the model word, the
+      status line, the empty space between them — and confirm that agent's
+      companion window opens on the **agent** tab. Then click **start/stop**
+      and the **approvals badge** on the same row and confirm each does its
+      own job — starts/stops the agent, raises the approval card — and does
+      **not** also open the agent's window behind it. (GTK gives the inner
+      button the gesture; this is the item that proves it does.) There is no
+      third button any more: the pen (`[edit]`) was retired on item 3 — see
+      "**The pill still looks like a pill**" below for the row's own shape.
 - [ ] **(#1282 item 2)** **The pill still looks like a pill.** It is a
       `GtkButton` now, so check it did not grow: the row's height and inset
       must match what it was (it keeps the same `.ts-agent-row` padding and
@@ -1010,9 +1026,11 @@ and whether the two surfaces (sidebar card, companion window) ever disagree
 about the same queue.
 
 - [ ] **(#1141)** **The Settings tab, not a new surface.** Open an agent's
-      companion window (row click or the sidebar's edit pen), switch to the
-      Settings tab, and with an empty queue confirm there is **no** Approvals
-      group at all — not an empty one with just a description line.
+      companion window (a click on the sidebar row) and switch to its own
+      Settings tab — the sidebar's pen that used to jump straight there is
+      gone since #1282 item 3 — and with an empty queue confirm there is
+      **no** Approvals group at all — not an empty one with just a
+      description line.
 - [ ] **(#1141)** **A queued approval shows a row there**, within one poll
       interval of queuing it (`hivectl agent <name> request-create`, as in
       the section above): the kind in English, the manager's description,
@@ -1258,11 +1276,14 @@ four window properties below are pinned nowhere but here.
       as before. The routing is on the producing plugin's **mount**, so this is
       the half that must not have moved.
 - [ ] **(#1010/#950)** **The agents pill still opens its own window.** With
-      `trollshell-agent-window` on `PATH`, clicking a pill (or its pen) must
-      still launch the per-agent companion window out of process — that route is
-      a `RunCommand`, not an `OpenPage`, and #1010 does not touch it. Its
-      drawer-page _fallback_ (the card's title row, or the pill with the binary
-      missing) is the thing that now lands in the dialog.
+      `trollshell-agent-window` on `PATH`, clicking a pill must still launch
+      the per-agent companion window out of process — that route is a
+      `RunCommand`, not an `OpenPage`, and #1010 does not touch it. With the
+      binary **missing**, the same click falls back to the browser (an
+      `OpenUri`), which #1010 does not touch either — a pill's fallback has
+      never landed in the drawer or the dialog, pen or no pen. What #1010
+      *does* touch is the card's title row: its `OpenPage` (the hive overview)
+      is the thing that now lands in the dialog rather than the drawer.
 - [ ] **(#1010)** **The window's own properties**, the ones no test reaches:
       `niri msg -j layers` (or `wayland-info`) while the dialog is up must show a
       surface in namespace **`hytte-dialog`** on the **overlay** layer with

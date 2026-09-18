@@ -121,21 +121,6 @@ View {
                                                 ),
                                             },
                                         },
-                                        Button {
-                                            id: "edit:wedged",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
-                                                ),
-                                            },
-                                        },
                                     ],
                                     tooltip: None,
                                 },
@@ -236,21 +221,6 @@ View {
                                                 classes: [],
                                                 tooltip: Some(
                                                     "stop this agent",
-                                                ),
-                                            },
-                                        },
-                                        Button {
-                                            id: "edit:locked-out",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
                                                 ),
                                             },
                                         },
@@ -357,21 +327,6 @@ View {
                                                 ),
                                             },
                                         },
-                                        Button {
-                                            id: "edit:parked",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
-                                                ),
-                                            },
-                                        },
                                     ],
                                     tooltip: None,
                                 },
@@ -472,21 +427,6 @@ View {
                                                 classes: [],
                                                 tooltip: Some(
                                                     "start this agent",
-                                                ),
-                                            },
-                                        },
-                                        Button {
-                                            id: "edit:off",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
                                                 ),
                                             },
                                         },
@@ -617,21 +557,6 @@ View {
                                                 classes: [],
                                                 tooltip: Some(
                                                     "stop this agent",
-                                                ),
-                                            },
-                                        },
-                                        Button {
-                                            id: "edit:busy",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
                                                 ),
                                             },
                                         },
@@ -881,7 +806,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:wedged",
+                                                    id: "select:wedged",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",
@@ -945,7 +870,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:locked-out",
+                                                    id: "select:locked-out",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",
@@ -1009,7 +934,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:parked",
+                                                    id: "select:parked",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",
@@ -1073,7 +998,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:off",
+                                                    id: "select:off",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",
@@ -1137,7 +1062,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:busy",
+                                                    id: "select:busy",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",

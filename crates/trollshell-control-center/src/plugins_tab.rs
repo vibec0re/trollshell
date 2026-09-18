@@ -244,6 +244,20 @@ struct PluginRow {
     status: gtk::Label,
 }
 
+/// One plugin's config form, mounted in the detail pane (#888 P1).
+///
+/// Which family a plugin owns is decided by the **binary** its unit runs, so
+/// the mounted form is keyed by the plugin id it was built for and rebuilt
+/// only when the selection moves to a plugin with a different one. Dropping
+/// it stops the form's own re-read poll.
+struct MountedForm {
+    /// The plugin id this form was built for.
+    plugin: String,
+    /// The form. Its groups are in [`PluginDetail::plugin_page`] until this
+    /// is dropped.
+    form: crate::config_form::Form,
+}
+
 /// The detail pane's live widgets. Built once and retargeted at the selected
 /// plugin — see the module docs on why there is exactly one of these.
 #[derive(Clone)]
@@ -251,8 +265,16 @@ struct PluginDetail {
     /// The content `AdwNavigationPage`; its title is the selected plugin's id,
     /// which is also what the collapsed push shows in the header.
     page: adw::NavigationPage,
-    /// `"empty"` (nothing selected) ⇄ `"plugin"` (the controls).
+    /// `"empty"` (nothing selected) ⇄ `"plugin"` (the controls) ⇄ `"shell"`
+    /// (the shell-owned config families, #888 P1).
     stack: gtk::Stack,
+    /// The plugin page itself, so a *Configuration* group can be added to and
+    /// removed from it as the selection moves (#888 P1).
+    plugin_page: adw::PreferencesPage,
+    /// The selected plugin's config form, when its binary owns a family.
+    /// `None` for a plugin with no config file of its own — which is most of
+    /// them.
+    config: Rc<RefCell<Option<MountedForm>>>,
     /// The relocated on/off control: start+enable, or stop+disable.
     switch: adw::SwitchRow,
     /// The unit's own state — [`plugin_subtitle`]'s wording, unchanged.
@@ -393,6 +415,31 @@ struct PluginsState {
     split: adw::NavigationSplitView,
     /// The sidebar list.
     list: gtk::ListBox,
+    /// The pinned **Shell** entry above it (#888 P1): the config families the
+    /// shell itself owns (`core-leds`, `workspaces`), which have no plugin to
+    /// hang off.
+    ///
+    /// A second `GtkListBox` rather than a row in [`list`](Self::list): that
+    /// list is torn down and rebuilt on every membership change and replaced
+    /// wholesale by a placeholder when the shell is unreachable, and the one
+    /// thing this entry must do is keep working while the shell is down —
+    /// it edits files, exactly as the Places tab does. Selection is
+    /// coordinated by hand (each list deselects the other), which is what
+    /// [`shell_selected`](Self::shell_selected) is for.
+    shell_list: gtk::ListBox,
+    /// Whether the **Shell** entry is what the detail pane is showing.
+    ///
+    /// Not folded into [`selected`](Self::selected): that field is a *plugin
+    /// id*, every path that reads it means "which plugin", and widening it to
+    /// an enum would touch every one of them for a page that is not a plugin
+    /// at all.
+    shell_selected: Rc<Cell<bool>>,
+    /// The shell-owned families' forms, built once with the tab.
+    ///
+    /// Held for their lifetime, not their widgets': dropping a
+    /// `config_form::Form` is what stops its re-read poll, and these live as
+    /// long as the tab does.
+    shell_forms: Rc<Vec<crate::config_form::Form>>,
     /// The one detail pane.
     detail: PluginDetail,
     /// Every child currently in [`list`](Self::list) (plugin rows or a single
@@ -432,6 +479,11 @@ struct PluginsState {
     /// parsed at most once per change to the file — see [`DeclaredMounts`]
     /// for why the 2 s poll must not re-read it (#1260 review F7).
     declared: Rc<RefCell<DeclaredMounts>>,
+    /// The selected plugin's manifest id out of the same `plugins.json`,
+    /// remembered under the same stamp — see [`DeclaredManifestId`] for why
+    /// this is a second cache and not a column of the one above (#1365
+    /// review, MED 5).
+    manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     /// The process environment [`plugins_json_candidates`] resolves
     /// [`search_path`](Self::search_path) from, read once in [`build_tab`]
     /// and reused for the tab's whole life.
@@ -493,6 +545,9 @@ struct PluginsState {
 struct WeakPluginsState {
     split: glib::WeakRef<adw::NavigationSplitView>,
     list: glib::WeakRef<gtk::ListBox>,
+    shell_list: glib::WeakRef<gtk::ListBox>,
+    shell_selected: Rc<Cell<bool>>,
+    shell_forms: Rc<Vec<crate::config_form::Form>>,
     detail: WeakPluginDetail,
     rows: Rc<RefCell<Vec<gtk::Widget>>>,
     by_id: Rc<RefCell<HashMap<String, PluginRow>>>,
@@ -506,6 +561,7 @@ struct WeakPluginsState {
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
     declared: Rc<RefCell<DeclaredMounts>>,
+    manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
 }
@@ -515,6 +571,13 @@ struct WeakPluginsState {
 struct WeakPluginDetail {
     page: glib::WeakRef<adw::NavigationPage>,
     stack: glib::WeakRef<gtk::Stack>,
+    plugin_page: glib::WeakRef<adw::PreferencesPage>,
+    /// Strongly, like the other `Rc` cells: a mounted form holds
+    /// `AdwPreferencesGroup`s that are *children* of `plugin_page`, and a
+    /// child does not hold its parent — so this closes no cycle, and holding
+    /// it strongly is what lets a handler firing during teardown still see
+    /// coherent bookkeeping.
+    config: Rc<RefCell<Option<MountedForm>>>,
     switch: glib::WeakRef<adw::SwitchRow>,
     unit_row: glib::WeakRef<adw::ActionRow>,
     conn_row: glib::WeakRef<adw::ActionRow>,
@@ -527,9 +590,14 @@ impl PluginsState {
         WeakPluginsState {
             split: self.split.downgrade(),
             list: self.list.downgrade(),
+            shell_list: self.shell_list.downgrade(),
+            shell_selected: self.shell_selected.clone(),
+            shell_forms: self.shell_forms.clone(),
             detail: WeakPluginDetail {
                 page: self.detail.page.downgrade(),
                 stack: self.detail.stack.downgrade(),
+                plugin_page: self.detail.plugin_page.downgrade(),
+                config: self.detail.config.clone(),
                 switch: self.detail.switch.downgrade(),
                 unit_row: self.detail.unit_row.downgrade(),
                 conn_row: self.detail.conn_row.downgrade(),
@@ -547,6 +615,7 @@ impl PluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
         }
@@ -563,9 +632,14 @@ impl WeakPluginsState {
         Some(PluginsState {
             split: self.split.upgrade()?,
             list: self.list.upgrade()?,
+            shell_list: self.shell_list.upgrade()?,
+            shell_selected: self.shell_selected.clone(),
+            shell_forms: self.shell_forms.clone(),
             detail: PluginDetail {
                 page: self.detail.page.upgrade()?,
                 stack: self.detail.stack.upgrade()?,
+                plugin_page: self.detail.plugin_page.upgrade()?,
+                config: self.detail.config.clone(),
                 switch: self.detail.switch.upgrade()?,
                 unit_row: self.detail.unit_row.upgrade()?,
                 conn_row: self.detail.conn_row.upgrade()?,
@@ -583,6 +657,7 @@ impl WeakPluginsState {
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
             declared: self.declared.clone(),
+            manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
         })
@@ -630,12 +705,49 @@ pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
 /// only way to test either, since a test process has no session bus to answer
 /// `ListPlugins`.
 fn build_tab() -> (adw::BreakpointBin, PluginsState) {
+    build_tab_in(Rc::new(hytte_config::xdg::Env::from_process()))
+}
+
+/// [`build_tab`] against a stated config environment.
+///
+/// The environment is a parameter rather than a process read because since
+/// #888 P1 this tab **opens files**: [`build_detail`] builds the shell
+/// families' forms with the tab itself, and each one resolves its own search
+/// path and then re-reads it twice a second for as long as the tab lives. A
+/// test that took the process environment would therefore read — and poll —
+/// the operator's real `~/.config/trollshell`, which is the shape #1101 exists
+/// to stop, whether or not any assertion happens to write through it.
+fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, PluginsState) {
     // ── Sidebar: the plugin list ────────────────────────────────────────────
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     // libadwaita's own sidebar list styling — the same class GNOME apps put on
     // the list inside an `AdwNavigationSplitView` sidebar.
     list.add_css_class("navigation-sidebar");
+
+    // ── Sidebar: the pinned Shell entry (#888 P1) ───────────────────────────
+    //
+    // Above the plugin list and outside it, so `clear_rows`' teardown and the
+    // "shell unavailable" placeholder — both of which replace the plugin
+    // list's every row — cannot take it with them. Editing `core-leds.toml`
+    // is the Places tab's argument exactly: the file is the state store and
+    // the shell is a client of it, so the editor has to keep working while
+    // the shell is down.
+    let shell_list = gtk::ListBox::new();
+    shell_list.set_selection_mode(gtk::SelectionMode::Single);
+    shell_list.add_css_class("navigation-sidebar");
+    shell_list.append(
+        &adw::ActionRow::builder()
+            .title("Shell")
+            .subtitle("Settings the shell itself owns")
+            .activatable(true)
+            .build(),
+    );
+
+    let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_box.append(&shell_list);
+    sidebar_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    sidebar_box.append(&list);
 
     // `Automatic`, not `Never`: a `Never` horizontal policy makes the scrolled
     // window's minimum width its child's, which would push the split view's
@@ -644,7 +756,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let list_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vexpand(true)
-        .child(&list)
+        .child(&sidebar_box)
         .build();
 
     let sidebar_toolbar = adw::ToolbarView::new();
@@ -653,7 +765,8 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "Plugins");
 
     // ── Content: the one detail pane ────────────────────────────────────────
-    let detail = build_detail();
+    // The env is the caller's (see `build_tab_in`), not this function's.
+    let (detail, shell_forms) = build_detail(&env);
 
     // ── The split view + the breakpoint that collapses it ───────────────────
     let split = adw::NavigationSplitView::new();
@@ -682,6 +795,9 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     let state = PluginsState {
         split,
         list,
+        shell_list,
+        shell_selected: Rc::new(Cell::new(false)),
+        shell_forms: Rc::new(shell_forms),
         detail,
         rows: Rc::new(RefCell::new(Vec::new())),
         by_id: Rc::new(RefCell::new(HashMap::new())),
@@ -695,11 +811,13 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
         declared: Rc::new(RefCell::new(DeclaredMounts::default())),
-        env: Rc::new(hytte_config::xdg::Env::from_process()),
+        manifest_ids: Rc::new(RefCell::new(DeclaredManifestId::default())),
+        env,
         search_path: Rc::new(OnceCell::new()),
     };
 
     connect_selection(&state);
+    connect_shell_entry(&state);
     connect_switch(&state);
     show_empty_detail(&state);
 
@@ -729,9 +847,14 @@ pub(crate) fn tab_header_bar() -> adw::HeaderBar {
         .build()
 }
 
-/// Build the detail pane once: an empty state and the per-plugin controls, in a
-/// stack under a header bar that grows a back button when collapsed.
-fn build_detail() -> PluginDetail {
+/// Build the detail pane once: an empty state, the per-plugin controls and the
+/// shell-owned config page, in a stack under a header bar that grows a back
+/// button when collapsed.
+///
+/// Returns the shell families' forms beside it: their groups are in the
+/// `"shell"` page, but a form's *handle* is what owns its re-read poll, so the
+/// tab holds them for its own lifetime.
+fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::config_form::Form>) {
     // The empty state carries what the old `AdwPreferencesGroup` description
     // said, because it is the only place that blurb still has. It is *not*
     // where a fresh tab lands: `apply_plugins` settles the sidebar on the
@@ -776,9 +899,24 @@ fn build_detail() -> PluginDetail {
     plugin_page.add(&controls);
     plugin_page.add(&status_group);
 
+    // The shell-owned families (#888 P1). Built once, with the tab: unlike a
+    // plugin's, this page's content does not depend on a selection.
+    let shell_page = adw::PreferencesPage::new();
+    let shell_forms: Vec<crate::config_form::Form> = crate::config_form::shell_families()
+        .into_iter()
+        .map(|ops| {
+            let form = crate::config_form::build(ops, env);
+            for group in form.groups() {
+                shell_page.add(group);
+            }
+            form
+        })
+        .collect();
+
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&plugin_page, Some("plugin"));
+    stack.add_named(&shell_page, Some("shell"));
 
     let toolbar = adw::ToolbarView::new();
     // No explicit back button: inside a collapsed `AdwNavigationSplitView` the
@@ -788,14 +926,137 @@ fn build_detail() -> PluginDetail {
     toolbar.set_content(Some(&stack));
 
     let page = adw::NavigationPage::new(&toolbar, "Plugin");
-    PluginDetail {
-        page,
-        stack,
-        switch,
-        unit_row,
-        conn_row,
-        conn_badge,
+    (
+        PluginDetail {
+            page,
+            stack,
+            plugin_page,
+            config: Rc::new(RefCell::new(None)),
+            switch,
+            unit_row,
+            conn_row,
+            conn_badge,
+        },
+        shell_forms,
+    )
+}
+
+/// Wire the pinned **Shell** entry (#888 P1).
+///
+/// Activating it clears the plugin selection and shows the shell page;
+/// selecting a plugin clears this one ([`connect_selection`] does the mirror
+/// image). Both sides run under the tab's existing `selecting` guard, so
+/// deselecting one list does not drive the other's user-selection path.
+///
+/// # Why this one navigates on `row-activated` and the plugin list does not
+///
+/// [`connect_selection`] drives the plugin list from `row-selected`, because
+/// that is what keyboard arrows move and a wide layout needs nothing else. The
+/// same wiring here is a **bug**, and a measured one: a `GtkListBox` in
+/// `SelectionMode::Single` selects whichever row focus lands on, and this list
+/// is the first focusable thing in the sidebar — so mapping the window emitted
+/// `row-selected` on the one Shell row before the operator had touched
+/// anything, which retargeted the detail pane, dropped the plugin selection
+/// [`apply_plugins`] had just made and took the in-flight
+/// [`PendingToggle`] with it. The tab opened on the Shell page every time.
+///
+/// `row-activated` is the narrower signal — a click, or `Enter`/`Space` on the
+/// focused row — and it is not emitted by focus traversal, so it says *the
+/// operator picked this* rather than *the focus ring passed through here*.
+/// Nothing is lost by using it: arrows cannot move within a one-row list, so
+/// `row-selected` here was only ever going to fire for focus or for the click
+/// `row-activated` already reports.
+///
+/// The visual selection is then ours to state rather than GTK's to infer, which
+/// is what [`select_shell_row`] and [`clear_shell_selection`] do — and the
+/// `row-selected` handler below re-asserts it, so a highlight focus moved onto
+/// a row nobody activated does not sit there contradicting the page on screen.
+fn connect_shell_entry(state: &PluginsState) {
+    let weak = state.downgrade();
+    state.shell_list.connect_row_activated(move |_, _| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        state.shell_selected.set(true);
+        select_shell_row(&state);
+        // Whatever plugin was shown is not shown any more, so no plugin's
+        // intent is "for" the detail pane — the rule `clear_selection` and
+        // `refresh_detail` both apply (#944).
+        state.pending.borrow_mut().take();
+        // And a selection parked behind an "unavailable" placeholder (#943)
+        // is retired here rather than left to be restored: it exists so a
+        // transient failure does not move the user, and this *is* the user
+        // moving. Without this, the next good poll would put the plugin page
+        // back over the page they just opened.
+        state.parked.borrow_mut().take();
+        *state.selected.borrow_mut() = None;
+        state.selecting.set(true);
+        state.list.select_row(None::<&gtk::ListBoxRow>);
+        state.selecting.set(false);
+        // The plugin page is not what is on screen any more, so its config
+        // form goes with the selection rather than polling behind this one.
+        unmount_config(&state);
+        refresh_shell_forms(&state);
+        show_shell_detail(&state);
+        // Collapsed, this *is* the push; uncollapsed the split view already
+        // satisfies it.
+        state.split.set_show_content(true);
+    });
+
+    // The highlight follows the page, not the focus ring: a selection this tab
+    // did not ask for is put back the way it was. Terminates — the corrective
+    // call re-enters with the state it is correcting towards, which this
+    // predicate then finds nothing wrong with.
+    let weak = state.downgrade();
+    state.shell_list.connect_row_selected(move |_, row| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.selecting.get() || row.is_some() == state.shell_selected.get() {
+            return;
+        }
+        if state.shell_selected.get() {
+            select_shell_row(&state);
+        } else {
+            state.selecting.set(true);
+            state.shell_list.select_row(None::<&gtk::ListBoxRow>);
+            state.selecting.set(false);
+        }
+    });
+}
+
+/// Highlight the pinned **Shell** row, because that is the page on screen.
+fn select_shell_row(state: &PluginsState) {
+    let Some(row) = state.shell_list.row_at_index(0) else {
+        return;
+    };
+    state.selecting.set(true);
+    state.shell_list.select_row(Some(&row));
+    state.selecting.set(false);
+}
+
+/// Show the shell-owned config page and title the detail pane for it.
+fn show_shell_detail(state: &PluginsState) {
+    state.detail.page.set_title("Shell");
+    state.detail.stack.set_visible_child_name("shell");
+}
+
+/// Re-read every shell family now, so opening the page shows what the files
+/// say rather than what they said up to one poll tick ago.
+fn refresh_shell_forms(state: &PluginsState) {
+    for form in state.shell_forms.iter() {
+        form.refresh_from_disk();
     }
+}
+
+/// Drop the **Shell** selection, because a plugin row was picked instead.
+fn clear_shell_selection(state: &PluginsState) {
+    if !state.shell_selected.replace(false) {
+        return;
+    }
+    state.selecting.set(true);
+    state.shell_list.select_row(None::<&gtk::ListBoxRow>);
+    state.selecting.set(false);
 }
 
 /// Wire the two halves of drill-down: `row-selected` retargets the detail pane
@@ -819,6 +1080,13 @@ fn connect_selection(state: &PluginsState) {
                 return;
             }
             let id = row.and_then(|row| id_for_row(&state, row));
+            // A plugin row is what the pane shows now, not the Shell entry
+            // (#888 P1). `row == None` is the user ctrl-clicking the
+            // selection away, which is not a reason to hand the pane back to
+            // a Shell page they left.
+            if id.is_some() {
+                clear_shell_selection(&state);
+            }
             *state.selected.borrow_mut() = id;
             refresh_detail(&state);
         });
@@ -832,6 +1100,7 @@ fn connect_selection(state: &PluginsState) {
             let Some(id) = id_for_row(&state, row) else {
                 return;
             };
+            clear_shell_selection(&state);
             *state.selected.borrow_mut() = Some(id);
             refresh_detail(&state);
             // Collapsed, this *is* the push. Uncollapsed it is a no-op the
@@ -1324,6 +1593,59 @@ impl DeclaredMounts {
     }
 }
 
+/// The manifest id `plugins.json` implies for **the selected plugin**,
+/// remembered per id and per file stamp (#1365 review, MED 5).
+///
+/// [`DeclaredMounts`] above, narrowed to one id. It is a second cache rather
+/// than a second column of that map because the two are asked different
+/// questions at different times: that one is asked for *every* row on every
+/// poll and so is worth parsing whole, this one is asked about the one
+/// selected plugin — and only when no form is mounted for it, i.e. when the
+/// answer is "no family", which is most plugins and which is precisely the
+/// case that repeated forever.
+///
+/// The key is the pair, not just the id: re-selecting the same plugin after a
+/// `nixos-rebuild` must re-read, and a plugin selected across a rebuild must
+/// too. That costs the same `probe_candidates` stat the tick already pays.
+#[derive(Default)]
+struct DeclaredManifestId {
+    /// The id, and the `plugins.json`, the answer below was read for.
+    /// `None` until the first lookup, which [`Seen::Unprobed`] cannot express
+    /// on its own here (that state means "no file", not "no question yet").
+    seen: Option<(String, Seen)>,
+    /// That answer — `None` is a real, cacheable one: no `plugins.json`, or
+    /// no entry in it for this id.
+    declared: Option<String>,
+}
+
+impl DeclaredManifestId {
+    /// The cached manifest id for `id`, re-reading through `read` **only**
+    /// when the id or the file's stamp differs from the last lookup.
+    ///
+    /// `read` is a parameter for [`DeclaredMounts::get`]'s reason: a test can
+    /// then count how often the blocking half runs, which is the property
+    /// this type exists for and the one a stamp comparison that stopped
+    /// working would break silently.
+    fn get<F>(&mut self, id: &str, probe: Option<PluginsJson>, read: F) -> Option<String>
+    where
+        F: FnOnce(&Path, &str) -> Option<String>,
+    {
+        let seen = probe.map_or(Seen::Missing, Seen::Found);
+        let asked_before = self
+            .seen
+            .as_ref()
+            .is_some_and(|(had, stamp)| had == id && *stamp == seen);
+        if !asked_before {
+            self.declared = match &seen {
+                Seen::Found(found) => read(&found.path, id),
+                Seen::Unprobed | Seen::Missing => None,
+            };
+            self.seen = Some((id.to_owned(), seen));
+        }
+        self.declared.clone()
+    }
+}
+
 /// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` out of the
 /// `plugins.json` at `path` (#1161) — the same file `nix/hm-module.nix` /
 /// `nix/nixos-module.nix` render.
@@ -1493,6 +1815,12 @@ fn apply_plugins(
         // once at the end, so letting the `row-selected` handler run would
         // re-enter that path mid-rebuild and, worse, make a poll look like the
         // user navigating.
+        // The **Shell** entry is a selection too (#888 P1), and it survives
+        // every membership change: it is not one of these units. Settling the
+        // sidebar on the first plugin here would drag the operator off a page
+        // they are editing, two seconds after a `systemctl --user` elsewhere
+        // added a unit.
+        _ if state.shell_selected.get() => {}
         _ => {
             state.split.set_show_content(false);
             if let Some((first, ..)) = units.first() {
@@ -1547,6 +1875,14 @@ fn clear_selection(state: &PluginsState) {
     state.selecting.set(true);
     state.list.select_row(None::<&gtk::ListBoxRow>);
     state.selecting.set(false);
+    // The **Shell** entry is not a plugin, and losing every plugin — or the
+    // shell going unreachable, which is the case this runs in most often — is
+    // no reason to navigate away from a page that edits files and works with
+    // the shell down (#888 P1). `show_empty_detail` keeps it up for the same
+    // reason; only the plugin half of the pane is cleared here.
+    if state.shell_selected.get() {
+        return;
+    }
     state.split.set_show_content(false);
     show_empty_detail(state);
 }
@@ -1591,8 +1927,18 @@ fn resolve_pending(pending: &RefCell<Option<PendingToggle>>, id: &str, running: 
     }
 }
 
-/// Show the detail pane's empty state and reset its title.
+/// Show the detail pane's empty state and reset its title — unless the
+/// pinned **Shell** entry is what the pane is showing, in which case there is
+/// nothing empty about it (#888 P1).
+///
+/// The guard lives here rather than at each of the three call sites
+/// ([`clear_selection`], [`refresh_detail`]'s no-selection arm, and
+/// [`build_tab`]'s initial state) so a fourth cannot forget it.
 fn show_empty_detail(state: &PluginsState) {
+    if state.shell_selected.get() {
+        show_shell_detail(state);
+        return;
+    }
     state.detail.stack.set_visible_child_name("empty");
     state.detail.page.set_title("Plugin");
 }
@@ -1611,6 +1957,8 @@ fn refresh_detail(state: &PluginsState) {
         // the intent would silently steer whichever plugin gets selected
         // next.
         state.pending.borrow_mut().take();
+        // …and no plugin's *config form* is for it either (#888 P1).
+        unmount_config(state);
         show_empty_detail(state);
         return;
     };
@@ -1622,6 +1970,7 @@ fn refresh_detail(state: &PluginsState) {
 
     state.detail.page.set_title(&id);
     state.detail.stack.set_visible_child_name("plugin");
+    refresh_config(state, &id);
 
     state
         .detail
@@ -1649,6 +1998,151 @@ fn refresh_detail(state: &PluginsState) {
     state.syncing.set(true);
     state.detail.switch.set_active(show_running);
     state.syncing.set(false);
+}
+
+/// Mount (or leave alone, or tear down) the selected plugin's *Configuration*
+/// group — the schema-derived form for the config family its **binary** owns
+/// (#888 P1).
+///
+/// Keyed by plugin id and rebuilt only when the selection moves, so the 2 s
+/// poll — which calls [`refresh_detail`] on every tick — costs nothing here,
+/// and a form the operator is typing into is not rebuilt underneath them.
+/// Take whatever config form is mounted in the plugin page back out of it.
+///
+/// Called from [`refresh_config`] before it mounts the next one, and from every
+/// path that stops showing a plugin at all — deselecting one (a ctrl-click),
+/// and activating the **Shell** entry. Without the second kind, a form outlives
+/// the selection that opened it: its groups stay parented to a page nobody is
+/// looking at, and — the part that is not merely untidy — its own re-read poll
+/// keeps ticking against the files twice a second for the life of the tab.
+fn unmount_config(state: &PluginsState) {
+    // Take it out of the cell *before* removing its groups: a
+    // `PreferencesPage::remove` drives GTK, which can emit synchronously into a
+    // handler that re-enters this cell, and a `BorrowMutError` inside a glib
+    // callback aborts the process (#643).
+    let Some(previous) = state.detail.config.take() else {
+        return;
+    };
+    for group in previous.form.groups() {
+        state.detail.plugin_page.remove(group);
+    }
+    // Explicit, and load-bearing: dropping the handle is what stops the form's
+    // re-read poll.
+    drop(previous);
+}
+
+fn refresh_config(state: &PluginsState, id: &str) {
+    let mounted_for = {
+        state
+            .detail
+            .config
+            .borrow()
+            .as_ref()
+            .map(|m| m.plugin.clone())
+    };
+    if mounted_for.as_deref() == Some(id) {
+        return;
+    }
+    unmount_config(state);
+
+    let Some(ops) = family_for_plugin(state, id) else {
+        return;
+    };
+    let form = crate::config_form::build(ops, &state.env);
+    for group in form.groups() {
+        state.detail.plugin_page.add(group);
+    }
+    let displaced = state.detail.config.replace(Some(MountedForm {
+        plugin: id.to_owned(),
+        form,
+    }));
+    drop(displaced);
+}
+
+/// Which config family the plugin listed as `id` owns, if any.
+///
+/// From the **binary** its unit runs, not from its id: `stats` and `stats-bar`
+/// are two launches of one `hytte-plugin-stats` reading one `stats.toml`
+/// (`docs/plugin-env.md`), so a rule over ids would either miss the second or
+/// guess. `plugins.json` carries each entry's `exec`, and
+/// [`manifest_id_of_exec`] is `nix/module-common.nix`'s own `inferManifestId`
+/// — the function that decides what the plugin calls itself in the first
+/// place.
+///
+/// Falls back to the id when there is no `plugins.json` entry (a
+/// hand-installed static unit, the legacy launch path `plugin_launcher.rs`
+/// still supports), which is right for the conventional case and reaches no
+/// family at all otherwise.
+///
+/// **What this costs on the 2 s tick** (#1365 review, MED 5). [`refresh_config`]
+/// runs from [`refresh_detail`] on every tick and early-returns only when a
+/// form **is** mounted — so for a selected plugin that owns no family, which
+/// is most of them, this is reached every time. The read and the
+/// `serde_json` parse behind it are exactly the cost [`DeclaredMounts`]
+/// exists to keep off that tick (#1260 review F7), so the answer is
+/// remembered by [`DeclaredManifestId`] under the same
+/// [`probe_candidates`] stamp: the tick pays one `stat` plus one `realpath`,
+/// and "this plugin declares no manifest id" is as cacheable an answer as any
+/// other.
+fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_form::FamilyOps> {
+    family_for_plugin_reading(state, id, manifest_id_at)
+}
+
+/// [`family_for_plugin`] with the read half as a parameter, so a test can
+/// count how often it actually runs — [`DeclaredMounts::get`]'s shape, and
+/// the property the memo exists for.
+fn family_for_plugin_reading<F>(
+    state: &PluginsState,
+    id: &str,
+    read: F,
+) -> Option<crate::config_form::FamilyOps>
+where
+    F: FnOnce(&Path, &str) -> Option<String>,
+{
+    let candidates = resolved_search_path(&state.search_path, &state.env);
+    let declared = {
+        let probe = probe_candidates(candidates);
+        state.manifest_ids.borrow_mut().get(id, probe, read)
+    };
+    let ops = crate::config_form::family(declared.as_deref().unwrap_or(id))?;
+    // A **shell**-owned family has no plugin to hang off — it renders under the
+    // pinned Shell entry, once, and its form owns a poll of its own. A plugin
+    // whose manifest id happened to collide with one would otherwise mount a
+    // second, competing editor of the same file inside its detail page.
+    crate::config_form::shell_families()
+        .iter()
+        .all(|shell| shell.family.name != ops.family.name)
+        .then_some(ops)
+}
+
+/// The manifest id `plugins.json` at `path` implies for the plugin `id`.
+fn manifest_id_at(path: &Path, id: &str) -> Option<String> {
+    manifest_id_from_json(&std::fs::read_to_string(path).ok()?, id)
+}
+
+/// [`manifest_id_at`]'s pure half: `{"plugins": {"<id>": {"exec": "…"}}}` →
+/// the manifest id of that binary. Split out so a test can drive it without
+/// touching the filesystem, exactly as [`declared_mounts_from_json`] is.
+fn manifest_id_from_json(text: &str, id: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let exec = value.get("plugins")?.get(id)?.get("exec")?.as_str()?;
+    Some(manifest_id_of_exec(exec))
+}
+
+/// `…/bin/hytte-plugin-stats` → `stats`; `…/bin/hytte-claude-bridge` →
+/// `claude-bridge`.
+///
+/// A transcription of `nix/module-common.nix`'s `inferManifestId`, which is
+/// what both platform modules use to decide whether an entry needs an explicit
+/// `HYTTE_PLUGIN_ID` — so this agrees with the launcher by construction rather
+/// than by coincidence.
+fn manifest_id_of_exec(exec: &str) -> String {
+    let binary = exec.rsplit('/').next().unwrap_or(exec);
+    binary
+        .strip_prefix("hytte-plugin-")
+        .or_else(|| binary.strip_prefix("hytte-"))
+        .unwrap_or(binary)
+        .to_owned()
 }
 
 /// Remove every currently-added child (plugin rows or a placeholder) from the
@@ -2868,6 +3362,44 @@ mod tests {
         assert!(!same_plugin_set(&[], &ids(&["clock"])));
         assert!(same_plugin_set(&[], &[]));
     }
+
+    /// The plugin whose **binary** owns a config family gets a form; the rest
+    /// get none. `stats` and `stats-bar` are two launches of one
+    /// `hytte-plugin-stats` reading one `stats.toml`, which is why
+    /// [`family_for_plugin`] resolves the binary rather than the id.
+    #[test]
+    fn a_plugins_family_comes_from_its_binary_not_its_id() {
+        let json = r#"{"plugins":{
+            "stats":{"exec":"/nix/store/x/bin/hytte-plugin-stats"},
+            "stats-bar":{"exec":"/nix/store/x/bin/hytte-plugin-stats"},
+            "clock":{"exec":"/nix/store/x/bin/hytte-plugin-clock-demo"},
+            "claude-bridge":{"exec":"/nix/store/x/bin/hytte-claude-bridge"}
+        }}"#;
+        assert_eq!(
+            super::manifest_id_from_json(json, "stats").as_deref(),
+            Some("stats")
+        );
+        assert_eq!(
+            super::manifest_id_from_json(json, "stats-bar").as_deref(),
+            Some("stats"),
+            "the second launch of one binary owns the same file"
+        );
+        assert_eq!(
+            super::manifest_id_from_json(json, "clock").as_deref(),
+            Some("clock-demo")
+        );
+        assert_eq!(
+            super::manifest_id_from_json(json, "claude-bridge").as_deref(),
+            Some("claude-bridge"),
+            "the `hytte-` prefix too, which is what nix's inferManifestId strips"
+        );
+        assert_eq!(super::manifest_id_from_json(json, "nothing-like-it"), None);
+
+        // …and only a *plugin*-owned family is reachable this way: the shell's
+        // two have no plugin to hang off and render under the Shell entry.
+        assert!(crate::config_form::family("stats").is_some());
+        assert!(crate::config_form::family("clock-demo").is_none());
+    }
 }
 
 /// The layout half of #887, which is geometry and navigation state and so needs
@@ -2879,8 +3411,9 @@ mod tests {
 /// the layout does not care where the rows came from.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -2889,10 +3422,45 @@ mod gtk_tests {
 
     use super::{
         BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, PENDING_TOGGLE_TIMEOUT, PendingToggle, PluginRuntime,
-        PluginsState, PollResult, apply_plugins, build_tab, on_poll_result, on_toggle_result,
+        PluginsState, PollResult, apply_plugins, build_tab_in, on_poll_result, on_toggle_result,
         refresh_detail,
     };
     use crate::test_support::captured_logs;
+
+    /// The config environment every test here builds its tab in — **not** the
+    /// operator's.
+    ///
+    /// Since #888 P1 a tab opens files: [`super::build_detail`] builds the
+    /// shell families' config forms with the tab itself, and each re-reads its
+    /// search path twice a second for as long as the tab lives. Taking the
+    /// process environment would point all of that at the real
+    /// `~/.config/trollshell` — the #1101 shape — so these point at one scratch
+    /// tree instead, held for the test binary's life because `TempDir` deletes
+    /// its directory when it drops and forty tabs share this one.
+    ///
+    /// The tree stays **empty**: nothing here asserts on a config row, and a
+    /// search path whose every layer is absent is the most hermetic one there
+    /// is (the form then renders `DEFAULT_TOML`, which is a compiled-in
+    /// constant). `config_form`'s own tests are where a populated one is
+    /// driven.
+    fn scratch_env() -> Rc<hytte_config::xdg::Env> {
+        static TREE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let root = TREE
+            .get_or_init(|| tempfile::tempdir().expect("a scratch config tree"))
+            .path();
+        Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(root.join("home").to_string_lossy().into_owned()),
+            config_dirs: Some(root.join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        })
+    }
+
+    /// [`super::build_tab`] in [`scratch_env`] — what every test below means by
+    /// `build_tab()`, shadowing the process-environment one on purpose.
+    fn build_tab() -> (adw::BreakpointBin, PluginsState) {
+        build_tab_in(scratch_env())
+    }
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a queued
     /// resize/allocation actually happens.
@@ -4697,5 +5265,321 @@ mod gtk_tests {
             lines.is_empty(),
             "a superseded poll must be dropped before the transition guard: {lines:?}"
         );
+    }
+
+    // ── The pinned Shell entry (#888 P1) ────────────────────────────────────
+
+    /// **The bug that made this entry navigate on `row-activated` rather than
+    /// on `row-selected`** ([`connect_shell_entry`]'s own doc).
+    ///
+    /// A `GtkListBox` in `SelectionMode::Single` selects whichever row focus
+    /// lands on, and this one-row list is the first focusable thing in the
+    /// sidebar — so merely *mapping* the window emitted `row-selected` on the
+    /// Shell row. Wired to navigation, that retargeted the detail pane before
+    /// the operator had touched anything: the tab opened on the Shell page,
+    /// the plugin selection `apply_plugins` had just made was dropped, and any
+    /// in-flight [`PendingToggle`] went with it.
+    ///
+    /// **Red if `connect_shell_entry` goes back to navigating on
+    /// `row-selected`.**
+    #[gtk::test]
+    fn mapping_the_tab_does_not_let_the_shell_entry_steal_the_selection() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "active");
+        let window = present(&bin, 640);
+
+        assert!(
+            !state.shell_selected.get(),
+            "focus landing on the Shell row is not the operator picking it"
+        );
+        assert_eq!(
+            state.selected.borrow().as_deref(),
+            Some("clock"),
+            "the plugin selection survives the map"
+        );
+        assert_eq!(
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
+            Some("plugin".to_owned()),
+            "and the plugin page is what is shown"
+        );
+        assert!(
+            state.shell_list.selected_row().is_none(),
+            "the highlight follows the page, so it is put back too"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Activating it *is* the operator picking it: the shell page comes up,
+    /// the plugin selection goes, and so does any intent that was for it
+    /// (#944).
+    #[gtk::test]
+    fn activating_the_shell_entry_shows_its_page_and_drops_the_plugin_selection() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since: Instant::now(),
+        });
+
+        let row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&row]);
+        pump();
+
+        assert!(state.shell_selected.get());
+        assert_eq!(
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
+            Some("shell".to_owned())
+        );
+        assert_eq!(state.detail.page.title(), "Shell");
+        assert!(state.selected.borrow().is_none(), "no plugin is shown now");
+        assert!(
+            state.pending.borrow().is_none(),
+            "and no plugin's intent is for this pane any more"
+        );
+        assert!(
+            state.shell_list.selected_row().is_some(),
+            "the Shell row is highlighted because its page is up"
+        );
+
+        dismiss(&window);
+    }
+
+    /// …and a poll that changes the unit set does not drag the operator off
+    /// that page ([`apply_plugins`]' `shell_selected` arm), nor does the shell
+    /// going away ([`clear_selection`]'s).
+    #[gtk::test]
+    fn the_shell_page_survives_a_membership_change_and_an_unreachable_shell() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "active");
+        let window = present(&bin, 640);
+
+        let row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&row]);
+        pump();
+
+        // A `systemctl --user` elsewhere adds a unit.
+        apply_state(&state, &["clock", "timer"], "active");
+        assert_eq!(
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
+            Some("shell".to_owned()),
+            "a membership change must not navigate away from the Shell page"
+        );
+
+        // And the shell itself goes: the config files are still there, which
+        // is the whole reason this page does not need it.
+        on_poll_result(&state, state.polls.issue(), poll_err());
+        pump();
+        assert_eq!(
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
+            Some("shell".to_owned()),
+            "the file editor keeps working with the shell down"
+        );
+
+        dismiss(&window);
+    }
+
+    /// A mounted config form does not outlive the selection that opened it.
+    ///
+    /// Driven with a fabricated `plugins.json` so a plugin id actually reaches
+    /// a family — without one, `family_for_plugin` mounts nothing and the
+    /// assertion below would be vacuous in both directions. It gets a tree of
+    /// its **own** rather than [`scratch_env`]'s shared one, because it is the
+    /// only test here that writes into the tree it reads.
+    ///
+    /// **Red if `unmount_config` stops being called from the paths that stop
+    /// showing a plugin**: the form's groups then sit in a page nobody is
+    /// looking at and its own re-read poll ticks against the files for the life
+    /// of the tab.
+    #[gtk::test]
+    fn a_config_form_is_unmounted_when_its_plugin_stops_being_shown() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"stats":{"exec":"/nix/store/x/bin/hytte-plugin-stats"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+
+        let (bin, state) = build_tab_in(env);
+        apply_state(&state, &["stats"], "active");
+        let window = present(&bin, 640);
+        assert!(
+            state.detail.config.borrow().is_some(),
+            "sanity: the stats plugin owns a family, so a form is mounted"
+        );
+
+        // Deselecting is one of the two paths that stop showing a plugin…
+        state.list.select_row(None::<&gtk::ListBoxRow>);
+        pump();
+        assert!(
+            state.detail.config.borrow().is_none(),
+            "the form goes with the selection"
+        );
+
+        // …and activating the Shell entry is the other.
+        let plugin_row = state.list.row_at_index(0).expect("the stats row");
+        state.list.select_row(Some(&plugin_row));
+        pump();
+        assert!(state.detail.config.borrow().is_some(), "sanity: back");
+        let shell_row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&shell_row]);
+        pump();
+        assert!(
+            state.detail.config.borrow().is_none(),
+            "a plugin's form does not poll behind the Shell page"
+        );
+
+        dismiss(&window);
+    }
+
+    /// A steady selection must cost **one** `plugins.json` read no matter how
+    /// many 2 s ticks land on it (#1365 review, MED 5) — the property
+    /// `family_for_plugin` violated by construction until
+    /// [`super::DeclaredManifestId`] arrived.
+    ///
+    /// The tick reaches it for a selected plugin that owns **no** family,
+    /// which is most of them: `refresh_config` early-returns only when a form
+    /// *is* mounted, so "there is nothing to mount" was re-derived — a
+    /// `read_to_string` plus a `serde_json::from_str` on the GTK main thread —
+    /// every two seconds, for the window's whole life. That is exactly the
+    /// cost [`super::DeclaredMounts`] exists to keep off this tick (#1260
+    /// review F7), added back on the same file.
+    ///
+    /// The reader is injected for that type's reason: the property is *how
+    /// often the blocking half runs*, which nothing observable from outside
+    /// reports and which a stamp comparison that stopped working would break
+    /// silently. **Falsify** by having `family_for_plugin_reading` call
+    /// `read` directly instead of going through the memo: the count becomes
+    /// one per tick.
+    #[gtk::test]
+    fn a_steady_selection_costs_exactly_one_plugins_json_read_across_many_ticks() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"clock":{"exec":"/nix/store/x/bin/hytte-plugin-clock-demo"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (_bin, state) = build_tab_in(env);
+
+        let reads = Cell::new(0_u32);
+        let counting = |path: &Path, id: &str| {
+            reads.set(reads.get() + 1);
+            super::manifest_id_at(path, id)
+        };
+
+        for _ in 0..8 {
+            assert!(
+                super::family_for_plugin_reading(&state, "clock", counting).is_none(),
+                "the clock demo declares no config family — the case that ticks forever"
+            );
+        }
+        assert_eq!(
+            reads.get(),
+            1,
+            "a steady selection must cost exactly one plugins.json read across every tick"
+        );
+
+        // A different selection is a different question, asked once.
+        for _ in 0..4 {
+            assert!(
+                super::family_for_plugin_reading(&state, "stats", counting).is_some(),
+                "and the memo must not answer one plugin's question with another's"
+            );
+        }
+        assert_eq!(reads.get(), 2, "the new selection reads once, then settles");
+
+        // The file moving is what un-caches it — the same `probe_candidates`
+        // stamp the tick already pays for.
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"stats":{"exec":"/nix/store/y/bin/hytte-plugin-stats"},"pad":{"exec":"/p"}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let _ = super::family_for_plugin_reading(&state, "stats", counting);
+        assert_eq!(
+            reads.get(),
+            3,
+            "a rebuild under the same selection must be re-read, not remembered"
+        );
+    }
+
+    /// Picking a plugin is the mirror image: the Shell entry lets go.
+    #[gtk::test]
+    fn picking_a_plugin_releases_the_shell_entry() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "active");
+        let window = present(&bin, 640);
+
+        let row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state
+            .shell_list
+            .emit_by_name::<()>("row-activated", &[&row]);
+        pump();
+        assert!(state.shell_selected.get(), "sanity: the Shell page is up");
+
+        let plugin_row = state.list.row_at_index(0).expect("the clock row");
+        state.list.select_row(Some(&plugin_row));
+        pump();
+
+        assert!(!state.shell_selected.get());
+        assert!(state.shell_list.selected_row().is_none());
+        assert_eq!(state.selected.borrow().as_deref(), Some("clock"));
+        assert_eq!(
+            state
+                .detail
+                .stack
+                .visible_child_name()
+                .map(|n| n.to_string()),
+            Some("plugin".to_owned())
+        );
+
+        dismiss(&window);
     }
 }

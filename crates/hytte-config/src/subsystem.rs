@@ -2471,7 +2471,7 @@ fn put_header_in(table: &mut toml_edit::Table, header: &str) -> bool {
             return false;
         };
         let rest = decor_prefix(first.decor());
-        first.decor_mut().set_prefix(format!("{header}{rest}"));
+        first.decor_mut().set_prefix(under_header(header, &rest));
         return true;
     }
     if let Some(sub) = table
@@ -2482,15 +2482,40 @@ fn put_header_in(table: &mut toml_edit::Table, header: &str) -> bool {
             return put_header_in(sub, header);
         }
         let rest = decor_prefix(sub.decor());
-        sub.decor_mut().set_prefix(format!("{header}{rest}"));
+        sub.decor_mut().set_prefix(under_header(header, &rest));
         return true;
     }
     let Some((mut key, _)) = table.get_key_value_mut(&first_key) else {
         return false;
     };
     let rest = decor_prefix(key.leaf_decor());
-    key.leaf_decor_mut().set_prefix(format!("{header}{rest}"));
+    key.leaf_decor_mut().set_prefix(under_header(header, &rest));
     true
+}
+
+/// `header` joined to the decor it is going in front of, dropping decor that
+/// was only **separating** whatever used to be above.
+///
+/// Only a header that already **ends with a blank line** carries its own
+/// separation — [`commented_seed`]'s does, ending on its "your own settings go
+/// below" block — so joining it to a prefix that is nothing but whitespace
+/// doubles the gap, and keeps doubling it every time the item it was hanging
+/// on is deleted again. Reachable only since #1383: before it, nothing removed
+/// that item, so the decor underneath was always empty.
+///
+/// A header that ends on a single newline (a one-line file comment) is
+/// *followed* by the blank line in `rest`, which is therefore the file's own
+/// layout and is kept — `a_locked_first_key_still_keeps_the_documented_preamble`
+/// is exactly that shape.
+///
+/// A prefix carrying a **comment** is kept whole either way: that is the
+/// operator's note about the item it sits on, and the whole of #1380's "Whose
+/// header is it" is that those do not move.
+fn under_header(header: &str, rest: &str) -> String {
+    if header.ends_with("\n\n") && rest.chars().all(char::is_whitespace) {
+        return header.to_owned();
+    }
+    format!("{header}{rest}")
 }
 
 /// The **top-level** key of the item `toml_edit` renders first — which is
@@ -3163,10 +3188,14 @@ pub fn commented_seed(default_toml: &str) -> String {
 ///
 /// 1. **An empty `table_path`, or one with an empty segment** —
 ///    [`ConfigError::NotALeaf`], [`save_leaf_to_locked_unchecked`]'s rule.
-/// 2. **A locked `table_path`, itself or under a locked table** —
-///    [`ConfigError::Locked`], through the same [`Loaded::is_locked`]
-///    predicate the reader greys a row with. A lock on `display.argus` pins
-///    the entry; a lock on `display` pins the map.
+/// 2. **A locked `table_path` — itself, an ancestor, or a descendant** —
+///    [`ConfigError::Locked`]. A lock on `display.argus` pins the entry, a
+///    lock on `display` pins the map, and a lock on `display.argus.label`
+///    pins it too, which is the half [`Loaded::is_locked`] alone does not
+///    answer: that predicate walks *up*, because a row is a leaf and a lock
+///    above it covers it. This call takes a whole subtree, so it has to
+///    answer for what is underneath as well (#1383 review, LOW 2). The
+///    refusal names the pinned path, which is the line to go and find.
 /// 3. **A table [`Subsystem::DEFAULT_TOML`] documents** — the same set the
 ///    prune rule consults (`table_paths`). `[core]` is part of
 ///    `core-leds.toml`'s own shape and is not an entry anybody added, so it is
@@ -3206,10 +3235,21 @@ pub fn remove_entry_to_locked<S: Subsystem>(
             "a table path is one or more non-empty dotted segments",
         ));
     }
-    if locked_here(locked, table_path) {
+    // Itself, an ancestor — and, unlike every other refusal in this module, a
+    // **descendant** (#1383 review, LOW 2). `locked_here` walks up, which is
+    // the right predicate for a *leaf* write: `_locked = ["display.argus"]`
+    // pins `display.argus.label`. It is the wrong one for a write that takes a
+    // whole subtree with it, because a lock one level *down* —
+    // `_locked = ["display.argus.label"]`, which is exactly what
+    // `nix/module-common.nix` renders for an operator who set that one option
+    // — would let this call delete the overlay line the lock exists to hold.
+    // `merge::Locks::refuses` has the same asymmetry for the same reason and
+    // spells it out: rules 1 and 3 replace whole, so a whole-value write must
+    // answer for what is underneath it.
+    if let Some(pinned) = pinned_here_or_below(locked, table_path) {
         return Err(ConfigError::Locked {
             subsystem: S::NAME.to_owned(),
-            key: table_path.to_owned(),
+            key: pinned,
             path: path.to_path_buf(),
         });
     }
@@ -3248,11 +3288,37 @@ pub fn remove_entry_to_locked<S: Subsystem>(
         return Err(not_a_leaf(reason));
     }
 
+    // The header lift, exactly as [`save_leaf_to_locked_unchecked`] does it
+    // and for a sharper reason (#1383 review, HIGH 1). #1370's commented
+    // preamble is decor, and decor hangs off whatever item renders first —
+    // which, in a file whose only top-level item is a map, is the **first
+    // entry's** `[display.<name>]` header. Removing that entry bare therefore
+    // took the whole documentation with it, and removing the *only* entry left
+    // an empty file, unrecoverably: the seed runs on `NotFound`, and the file
+    // still exists.
+    //
+    // Ownership-gated for #1380's "Whose header is it" reason, unchanged
+    // here: a block this writer seeded belongs to the *file* and must survive
+    // whatever ends up first, while a comment the operator wrote above a key
+    // belongs to that key and goes with it —
+    // `remove_keeping_closing_space` is explicit that a comment describes the
+    // value that is going away.
+    let had_no_top_level_item = doc.iter().next().is_none();
+    let mut header = take_header(&mut doc);
+    if !header.is_empty()
+        && !had_no_top_level_item
+        && !commented_seed(S::DEFAULT_TOML).starts_with(&header)
+    {
+        put_header(&mut doc, &header);
+        header.clear();
+    }
+
     // The same walk the leaf writer's removal takes, which is what makes the
     // prune rule one rule rather than two: `remove_leaf`'s terminal step
     // removes whatever key is at the path — a table as readily as a value —
     // and its unwind then drops an emptied, undocumented ancestor.
     remove_leaf(doc.as_table_mut(), table_path, "", &documented);
+    put_header(&mut doc, &header);
 
     let body = doc.to_string();
     if body == existing {
@@ -3261,6 +3327,30 @@ pub fn remove_entry_to_locked<S: Subsystem>(
 
     file::write_atomic(path, &body, Durability::FsyncParent)
         .map_err(|e| ConfigError::Write(e.to_string()))
+}
+
+/// The pinned path that refuses a whole-subtree removal at `table_path` — the
+/// path itself, an ancestor of it, or a **descendant** — or `None`.
+///
+/// [`locked_here`]'s answer widened downwards, and only for this one caller
+/// (#1383 review, LOW 2). The reader's predicate deliberately walks *up* only,
+/// because a row is a leaf and a lock above it covers it; a call that deletes
+/// everything under a path has to answer for what is under it too, which is
+/// the same asymmetry `merge::Locks::refuses` documents on the merge side.
+///
+/// The **descendant** is what is reported, not the path that was asked for: a
+/// lock named `display.argus.label` is the line the operator has to go and
+/// find, and saying "display.argus is set in nix" when it is not would send
+/// them looking in the wrong place.
+fn pinned_here_or_below(locked: &BTreeSet<String>, table_path: &str) -> Option<String> {
+    if locked_here(locked, table_path) {
+        return Some(table_path.to_owned());
+    }
+    let under = format!("{table_path}.");
+    locked
+        .iter()
+        .find(|pinned| pinned.starts_with(&under))
+        .cloned()
 }
 
 /// Why `table_path` does not name an entry of `doc`, or `None` when it does
@@ -8229,6 +8319,174 @@ label = "Borealis"
             );
             assert_eq!(read(&path), WITH_ENTRIES, "{pin}: it wrote something");
         }
+    }
+
+    /// …and a lock one level **down** (#1383 review, LOW 2).
+    ///
+    /// `nix/module-common.nix` renders exactly this for an operator who set
+    /// one option of one agent: `_locked = [ "display.argus.label" ]`. The
+    /// reader's [`Loaded::is_locked`] walks *up* only — right for a row,
+    /// which is a leaf — so a delete of the whole entry answered `Ok` and
+    /// took the overlay line that lock exists to hold.
+    ///
+    /// **Red without `pinned_here_or_below`'s downward arm**: the call
+    /// succeeds and `[display.argus]` is gone, `label` and all.
+    #[test]
+    fn remove_entry_refuses_an_entry_with_a_locked_leaf_under_it() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let locked: BTreeSet<String> = ["display.argus.label".to_owned()].into_iter().collect();
+        let err = remove_entry_to_locked::<Leds>(&path, "display.argus", &locked)
+            .expect_err("a lock under the entry is still a lock on it");
+        assert!(
+            matches!(&err, ConfigError::Locked { key, .. } if key == "display.argus.label"),
+            "the refusal names the pinned line, not the path asked for: {err:?}"
+        );
+        assert_eq!(read(&path), WITH_ENTRIES);
+
+        // …and a lock on a *sibling* map entry is not a lock on this one.
+        let unrelated: BTreeSet<String> =
+            ["display.borealis.label".to_owned()].into_iter().collect();
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &unrelated)
+            .expect("a sibling's lock pins nothing here");
+        assert!(!read(&path).contains("argus"));
+    }
+
+    // ── The header lift, around a removal (#1383 review, HIGH 1) ────────────
+
+    /// A file as the writer itself leaves it: #1370's commented preamble,
+    /// then two entries the operator added through the form.
+    ///
+    /// Built by **saving through the public writer** rather than by hand, so
+    /// the preamble is where `put_header` really put it — which is the whole
+    /// point. With the map as the only top-level item, that is the *first
+    /// entry's* `[display.argus]` prefix decor, and a bare removal of that
+    /// entry took the documentation with it.
+    fn seeded_with_two_entries() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+        for (key, value) in [
+            ("display.argus.label", "Argus"),
+            ("display.borealis.label", "Borealis"),
+        ] {
+            save_leaf_to_locked_unchecked::<Leds>(
+                &path,
+                key,
+                Some(toml_edit::Value::from(value)),
+                &BTreeSet::new(),
+            )
+            .expect("saves");
+        }
+        (dir, path)
+    }
+
+    /// Deleting the **first** entry keeps the preamble, byte for byte.
+    ///
+    /// The two byte pins this PR already had miss it by construction: one
+    /// file's preamble hangs off a top-level leaf (`enabled`), the other has
+    /// no preamble at all. Only a seeded file whose *first item is the map*
+    /// puts the documentation on the entry being deleted.
+    ///
+    /// **Red without the lift in `remove_entry_to_locked`**: the file comes
+    /// back as `[display.borealis]\nlabel = "Borealis"\n` and every line of
+    /// the documentation is gone.
+    #[test]
+    fn removing_the_first_entry_of_a_seeded_file_keeps_the_preamble() {
+        let (_dir, path) = seeded_with_two_entries();
+        let seed = commented_seed(Leds::DEFAULT_TOML);
+        assert_eq!(
+            read(&path),
+            format!("{seed}[display.argus]\nlabel = \"Argus\"\n\n[display.borealis]\nlabel = \"Borealis\"\n"),
+            "sanity: the preamble is on the first entry's own decor"
+        );
+
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("the operator's own entry");
+        assert_eq!(
+            read(&path),
+            format!("{seed}[display.borealis]\nlabel = \"Borealis\"\n"),
+            "the documentation stays, and only the entry goes"
+        );
+    }
+
+    /// Deleting the **only** entry leaves the documentation rather than an
+    /// empty file — which would be unrecoverable, because the seed runs on
+    /// `NotFound` and the file still exists.
+    ///
+    /// **Red without the lift**: `after: ""`.
+    #[test]
+    fn removing_the_only_entry_of_a_seeded_file_leaves_the_documentation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "display.argus.label",
+            Some(toml_edit::Value::from("Argus")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("the operator's own entry");
+        assert_eq!(
+            read(&path),
+            commented_seed(Leds::DEFAULT_TOML),
+            "an emptied overlay is the documentation, not nothing"
+        );
+
+        // …and the next save still lands below it rather than above.
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "display.borealis.label",
+            Some(toml_edit::Value::from("Borealis")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        assert_eq!(
+            read(&path),
+            format!(
+                "{}[display.borealis]\nlabel = \"Borealis\"\n",
+                commented_seed(Leds::DEFAULT_TOML)
+            )
+        );
+    }
+
+    /// #1380's ownership gate, at depth: a comment the **operator** wrote
+    /// above `[core]` is theirs and does not move, on a nested-entry save or
+    /// on a removal.
+    ///
+    /// The nested variants of `the_lift_leaves_a_comment_the_operator_wrote`,
+    /// which #1380 could only write for a top-level key: before #1373 no
+    /// writer created a table two deep, so nothing could reach the arm where
+    /// the lift descends.
+    ///
+    /// **Red without the `commented_seed(…).starts_with(&header)` gate**: the
+    /// note ends up below `[display.argus]`, describing an entry it was never
+    /// about.
+    #[test]
+    fn the_lift_leaves_an_operators_comment_alone_on_a_nested_save_and_a_removal() {
+        const THEIRS: &str = "# I keep the strip dim on purpose.\n[core]\nbrightness = 1\n";
+
+        let (_dir, path) = scratch(THEIRS);
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "display.argus.label",
+            Some(toml_edit::Value::from("Argus")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        assert_eq!(
+            read(&path),
+            format!("{THEIRS}\n[display.argus]\nlabel = \"Argus\"\n"),
+            "the operator's note stays on the key it describes"
+        );
+
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("the operator's own entry");
+        assert_eq!(
+            read(&path),
+            THEIRS,
+            "…and the removal does not lift it either"
+        );
     }
 
     /// Refusal 3: `[core]` is part of `core-leds.toml`'s documented shape, so

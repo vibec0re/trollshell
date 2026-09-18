@@ -3053,8 +3053,10 @@ const SEED_SEPARATOR: &str = "\n\
      \n";
 
 /// [`commented_default`] as [`save_leaf_to_locked_unchecked`] seeds it: the
-/// preamble, then [`SEED_SEPARATOR`], so the operator's own first line is
-/// visibly theirs rather than the next entry of a comment block.
+/// preamble, then the separator — a blank line, the one sentence saying
+/// which half of the file is the operator's and why uncommenting a
+/// documented line is a trap, and another blank line — so their own first
+/// line is visibly theirs rather than the next entry of a comment block.
 ///
 /// Empty when the family documents nothing at all — there is no preamble to
 /// separate from anything, and a file holding only the separator is worse

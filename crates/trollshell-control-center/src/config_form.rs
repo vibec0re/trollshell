@@ -710,7 +710,10 @@ impl Control {
     /// (#1371 L1). `Text` and `Colour` stay on their draft: the operator may
     /// be mid-correction (#1338), and `Collection` never saves at all.
     const fn is_draftless(&self) -> bool {
-        matches!(self, Self::Switch(_) | Self::Spin { .. } | Self::Combo { .. })
+        matches!(
+            self,
+            Self::Switch(_) | Self::Spin { .. } | Self::Combo { .. }
+        )
     }
 }
 
@@ -950,7 +953,11 @@ impl Row {
         // key's own value moved: the same draft-guard shape the refusal
         // above already has, so an unrelated key's reload cannot re-derive
         // (and so clear) a clamp note this row is still showing.
-        let clamp = if moved { self.out_of_range(value.as_ref()) } else { None };
+        let clamp = if moved {
+            self.out_of_range(value.as_ref())
+        } else {
+            None
+        };
 
         if let Some(message) = &clamp {
             self.show_error(message);
@@ -980,8 +987,7 @@ impl Row {
             return None;
         };
         let n = value.and_then(toml::Value::as_integer)?;
-        (!(min..=max).contains(&n))
-            .then(|| format!("file says {n}, the range is {min}–{max}"))
+        (!(min..=max).contains(&n)).then(|| format!("file says {n}, the range is {min}–{max}"))
     }
 
     /// Fill the widgets from a merged value.

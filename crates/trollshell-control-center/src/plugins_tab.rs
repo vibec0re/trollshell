@@ -918,12 +918,53 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
     stack.add_named(&plugin_page, Some("plugin"));
     stack.add_named(&shell_page, Some("shell"));
 
+    // The drill-down a config form's collection rows push into (#888 P2,
+    // #1373 item 1). `config_form` finds it by walking **up** from the row
+    // that was activated, so it is enough that one exists above the stack —
+    // nothing is threaded through, and a form mounted somewhere without one
+    // degrades to a logged no-op rather than a panic.
+    //
+    // Inside the `AdwToolbarView`'s content rather than wrapping it, which is
+    // the placement that keeps the collapsed back button. `AdwHeaderBar`
+    // finds its nearest `AdwNavigationPage` ancestor and asks *that* page's
+    // navigation container whether anything precedes it: with the view here,
+    // the tab header below still sees `page` inside the split view and keeps
+    // its back-to-the-sidebar button, while a pushed sub-page's own header
+    // sees this view and grows its own. Wrapping the toolbar instead would
+    // have put the tab header inside this view's root page, where nothing
+    // precedes it, and the collapsed layout would have lost the way back.
+    let detail_nav = adw::NavigationView::new();
+    detail_nav.add(&adw::NavigationPage::new(&stack, "Settings"));
+
+    // Whatever the detail pane switches to, it switches to the **root** of
+    // that drill-down. A shell family's form lives as long as the tab does
+    // (unlike a plugin's, which `unmount_config` drops), so without this a
+    // collection sub-page opened from the Shell page would still be on the
+    // stack — and on screen — after the operator selected a plugin. Weakly,
+    // because the stack is this view's own descendant and a strong clone here
+    // would be a parent-child cycle neither end ever escapes.
+    {
+        let nav = detail_nav.downgrade();
+        stack.connect_visible_child_notify(move |_| {
+            let Some(nav) = nav.upgrade() else {
+                return;
+            };
+            if let Some(root) = nav
+                .navigation_stack()
+                .item(0)
+                .and_downcast::<adw::NavigationPage>()
+            {
+                nav.pop_to_page(&root);
+            }
+        });
+    }
+
     let toolbar = adw::ToolbarView::new();
     // No explicit back button: inside a collapsed `AdwNavigationSplitView` the
     // header bar is in a navigation stack with the sidebar beneath it, and
     // `AdwHeaderBar` grows the back button itself.
     toolbar.add_top_bar(&tab_header_bar());
-    toolbar.set_content(Some(&stack));
+    toolbar.set_content(Some(&detail_nav));
 
     let page = adw::NavigationPage::new(&toolbar, "Plugin");
     (

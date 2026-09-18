@@ -2384,37 +2384,50 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
 /// Which item is "first" is [`first_rendered_key`]'s answer, not
 /// `doc.iter().next()`'s; see there for the difference and when it bites.
 fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
-    let Some(first_key) = first_rendered_key(doc) else {
-        let header = doc.trailing().as_str().unwrap_or_default().to_owned();
-        doc.set_trailing("");
+    if let Some(header) = take_header_from(doc.as_table_mut()) {
         return header;
-    };
+    }
+    let header = doc.trailing().as_str().unwrap_or_default().to_owned();
+    doc.set_trailing("");
+    header
+}
 
-    if let Some(array) = doc
+/// [`take_header`]'s walk over one table level — `None` when there is nothing
+/// rendered here to take one off.
+///
+/// It descends through an **implicit** sub-table, which is the half #1373
+/// added and which is not an optimisation: an implicit table renders no header
+/// line of its own, so decor hung on it never reaches the file at all. A map
+/// entry — `[display.argus]` under a `[display]` that holds only sub-tables —
+/// is the first shape in the tree that produces one, and without this the
+/// documented preamble #1370 seeds would be silently **dropped** by the first
+/// save that creates one.
+fn take_header_from(table: &mut toml_edit::Table) -> Option<String> {
+    let first_key = first_rendered_key(table)?;
+    if let Some(array) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
-        let Some(table) = array.get_mut(0) else {
-            return String::new();
-        };
-        let header = decor_prefix(table.decor());
-        table.decor_mut().set_prefix("");
-        return header;
+        let first = array.get_mut(0)?;
+        let header = decor_prefix(first.decor());
+        first.decor_mut().set_prefix("");
+        return Some(header);
     }
-    if let Some(table) = doc
+    if let Some(sub) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_table_mut)
     {
-        let header = decor_prefix(table.decor());
-        table.decor_mut().set_prefix("");
-        return header;
+        if !renders_a_header(sub) {
+            return take_header_from(sub);
+        }
+        let header = decor_prefix(sub.decor());
+        sub.decor_mut().set_prefix("");
+        return Some(header);
     }
-    let Some((mut key, _)) = doc.get_key_value_mut(&first_key) else {
-        return String::new();
-    };
+    let (mut key, _) = table.get_key_value_mut(&first_key)?;
     let header = decor_prefix(key.leaf_decor());
     key.leaf_decor_mut().set_prefix("");
-    header
+    Some(header)
 }
 
 /// Put back what [`take_header`] detached, in front of whatever now sits
@@ -2431,34 +2444,53 @@ fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
     if header.is_empty() {
         return;
     }
-    let Some(first_key) = first_rendered_key(doc) else {
-        let rest = doc.trailing().as_str().unwrap_or_default().to_owned();
-        doc.set_trailing(format!("{header}{rest}"));
+    if put_header_in(doc.as_table_mut(), header) {
         return;
-    };
+    }
+    let rest = doc.trailing().as_str().unwrap_or_default().to_owned();
+    doc.set_trailing(format!("{header}{rest}"));
+}
 
-    if let Some(array) = doc
+/// [`put_header`]'s walk over one table level — `false` when there is nothing
+/// rendered here to hang it on, which is what sends the header to the
+/// document's trailing decor instead.
+///
+/// It descends through an **implicit** sub-table for
+/// [`take_header_from`]'s reason, and it is the direction that actually loses
+/// bytes: decor set on a table that renders no header line is simply not in
+/// the output.
+fn put_header_in(table: &mut toml_edit::Table, header: &str) -> bool {
+    let Some(first_key) = first_rendered_key(table) else {
+        return false;
+    };
+    if let Some(array) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
-        if let Some(table) = array.get_mut(0) {
-            let rest = decor_prefix(table.decor());
-            table.decor_mut().set_prefix(format!("{header}{rest}"));
-        }
-        return;
+        let Some(first) = array.get_mut(0) else {
+            return false;
+        };
+        let rest = decor_prefix(first.decor());
+        first.decor_mut().set_prefix(format!("{header}{rest}"));
+        return true;
     }
-    if let Some(table) = doc
+    if let Some(sub) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_table_mut)
     {
-        let rest = decor_prefix(table.decor());
-        table.decor_mut().set_prefix(format!("{header}{rest}"));
-        return;
+        if !renders_a_header(sub) {
+            return put_header_in(sub, header);
+        }
+        let rest = decor_prefix(sub.decor());
+        sub.decor_mut().set_prefix(format!("{header}{rest}"));
+        return true;
     }
-    if let Some((mut key, _)) = doc.get_key_value_mut(&first_key) {
-        let rest = decor_prefix(key.leaf_decor());
-        key.leaf_decor_mut().set_prefix(format!("{header}{rest}"));
-    }
+    let Some((mut key, _)) = table.get_key_value_mut(&first_key) else {
+        return false;
+    };
+    let rest = decor_prefix(key.leaf_decor());
+    key.leaf_decor_mut().set_prefix(format!("{header}{rest}"));
+    true
 }
 
 /// The **top-level** key of the item `toml_edit` renders first — which is
@@ -2493,10 +2525,26 @@ fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
 /// whose keys are a mix of top-level ones and table ones, so without this the
 /// operator's own line would sit above the documented preamble #1370 put in
 /// front of them.
-fn first_rendered_key(doc: &toml_edit::DocumentMut) -> Option<String> {
-    doc.iter()
+/// Whether `table` emits a `[header]` line of its own, and so has decor a
+/// header block would actually be printed in front of.
+///
+/// An **implicit** table that holds only sub-tables does not: `toml_edit`
+/// renders `[display.argus]` and nothing for the `[display]` above it, which
+/// is what a person writing the file by hand does too. Decor set there is
+/// simply absent from the output — which is why [`take_header_from`] and
+/// [`put_header_in`] descend past one rather than hanging #1370's preamble on
+/// a line that is never written. An implicit table that *does* hold a direct
+/// key still emits its header (`[core]` with `brightness = 7` under it), so
+/// the flag alone is not the question.
+fn renders_a_header(table: &toml_edit::Table) -> bool {
+    !table.is_implicit() || table.iter().any(|(_, item)| item.is_value())
+}
+
+fn first_rendered_key(table: &toml_edit::Table) -> Option<String> {
+    table
+        .iter()
         .find(|(_, item)| item.is_value())
-        .or_else(|| doc.iter().next())
+        .or_else(|| table.iter().next())
         .map(|(key, _)| key.to_owned())
 }
 
@@ -3313,16 +3361,26 @@ fn set_leaf(table: &mut dyn toml_edit::TableLike, key_path: &str, value: toml_ed
     };
 
     if table.get(head).is_none() {
-        // An append takes the same inline-table fix-up `patch` applies. A
-        // `toml_edit::Table` is not implicit, so it renders its own `[head]`
-        // header once it carries the leaf.
+        // An append takes the same inline-table fix-up `patch` applies.
         //
         // Only an *absent* parent is created: a parent that exists and is not
         // a table is refused by `structural_refusal` before this runs, so
         // there is no branch here that replaces somebody's value with a block
         // (#1360 review, LOW 4).
         close_up_for_append(table);
-        table.insert(head, toml_edit::Item::Table(toml_edit::Table::new()));
+        let mut created = toml_edit::Table::new();
+        // **Implicit** (#1373): `toml_edit` then renders `[head]` only when
+        // the table ends up carrying a key of its own, which is exactly the
+        // rule a person writing the file by hand follows. Writing
+        // `bar.poll_seconds` into an empty overlay still produces
+        // `[bar]\npoll_seconds = …`, because `[bar]` holds a value; writing
+        // `display.argus.label` produces `[display.argus]` alone, where a
+        // non-implicit parent would have emitted a bare `[display]` header
+        // above it decorating nothing. A map entry is the first shape in the
+        // tree with a parent that holds only sub-tables (#888 P2), which is
+        // why this never showed before.
+        created.set_implicit(true);
+        table.insert(head, toml_edit::Item::Table(created));
     }
     if let Some(sub) = table
         .get_mut(head)
@@ -7107,6 +7165,70 @@ brightness = 5
             value_at(&back, "core.brightness"),
             Some(&toml::Value::Integer(7))
         );
+    }
+
+    /// A created intermediate is **implicit**: it renders its own header only
+    /// when it carries a key of its own (#1373).
+    ///
+    /// Both directions, because the change is a behaviour change to the leaf
+    /// writer and the wrong one is invisible in the family shapes P1 had:
+    /// `[core]` holds `brightness` directly, so it renders either way, while
+    /// `[display]` — a #888 P2 map, the first shape in the tree whose parent
+    /// holds only sub-tables — would render a bare header decorating nothing.
+    ///
+    /// **Red without `set_implicit(true)`**: the second file comes back as
+    /// `[display]\n\n[display.argus]\nlabel = "Argus"\n`.
+    #[test]
+    fn a_created_intermediate_renders_its_header_only_when_it_holds_a_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let with_a_key = dir.path().join("a.toml");
+        save_leaf_to_locked_unchecked::<Leds>(
+            &with_a_key,
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        // The tail after #1370's commented preamble — what this writer
+        // *stated*, which is the half this test is about.
+        let with_a_key = read(&with_a_key);
+        assert!(
+            with_a_key.ends_with("[core]\nbrightness = 7\n"),
+            "a parent holding a key of its own still renders its header:\n{with_a_key}"
+        );
+
+        let only_sub_tables = dir.path().join("b.toml");
+        save_leaf_to_locked_unchecked::<Leds>(
+            &only_sub_tables,
+            "display.argus.label",
+            Some(toml_edit::Value::from("Argus")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        let only_sub_tables = read(&only_sub_tables);
+        assert!(
+            only_sub_tables.ends_with("[display.argus]\nlabel = \"Argus\"\n"),
+            "{only_sub_tables}"
+        );
+        assert!(
+            !only_sub_tables.contains("\n[display]\n"),
+            "a parent holding only sub-tables needs no header of its own:\n{only_sub_tables}"
+        );
+
+        // …and #1370's preamble is still at the **head** of both files.
+        //
+        // The second one is what the implicit parent nearly cost: the header
+        // lift hangs the seed on `first_rendered_key`, and decor set on a
+        // table that emits no header line of its own is simply not in the
+        // output — so before `renders_a_header`, this file came back as the
+        // one written leaf with the whole documentation silently gone.
+        for file in [&with_a_key, &only_sub_tables] {
+            assert!(
+                file.starts_with("# The per-core LED strip.\n"),
+                "the documented preamble was dropped:\n{file}"
+            );
+        }
     }
 
     /// **A first leaf save states the leaf and nothing else** (#1365 review,

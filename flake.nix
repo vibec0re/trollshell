@@ -566,15 +566,19 @@
           # `std::fs::read_to_string` instead). Widening the crane filter to
           # keep `*.nix` was rejected — every `.nix` edit would then
           # invalidate `workspace`'s source hash and force a full recompile.
-          # `nix/lint-config-vocab.py`'s own header has the full story —
-          # including why it is `lint-config-vocab.py` and `config-vocab`
-          # rather than the `core-leds` spelling both carried until #1237:
-          # `agents` (#1227 item 1) is the second
-          # `programs.trollshell.config.<subsystem>` family to hand-mirror a
-          # Rust vocabulary here, of nine expected, and the check now covers
-          # its `poll_seconds` bounds and the *set of keys itself* on both
-          # sides (a Rust field with no nix option leaf is drift the byte
-          # fixture cannot see).
+          # `nix/lint-config-vocab.py`'s own header has the full story: since
+          # #1375 it parses the FOUR `hytte-config` `Subsystem` families' own
+          # `SCHEMA` consts (`core-leds`, `workspaces`, `agents`, `stats`)
+          # and compares the two of them with a
+          # `programs.trollshell.config.<family>` block today (`core-leds`,
+          # `agents`) — the leaf set both directions, bounds/enums/type
+          # shape, and each nix `description`'s first sentence against the
+          # schema's own `doc` — retiring the parser-function scrape
+          # (`fill_parser_vocab`, `agents_option_levels`, `DisplayStyle::ALL`,
+          # …) the script read before. `workspaces`/`stats` are parsed and
+          # leaf-counted but have no nix surface yet (#1374 is the standing
+          # proposal to give them one); the retained `places`/
+          # `plugins.<id>.mount` mirrors (#1339 item 2, #1161) are untouched.
           config-vocab =
             pkgs.runCommand "trollshell-config-vocab-check" { nativeBuildInputs = [ pkgs.python3 ]; }
               ''

@@ -1220,12 +1220,13 @@ self:
             default = null;
             example = "crt";
             description = ''
-              The Stats drawer's per-core LED panel (#857) skin. `null`
-              (the default) sets no `style` key at all — the file layer
-              below (your own `core-leds.toml` overlay, if any) or the
-              built-in default (`vfd`) decides instead. See
+              The kit skin — the panel's physical character. `null` (the
+              default) sets no `style` key at all — the file layer below
+              (your own `core-leds.toml` overlay, if any) or the built-in
+              default (`vfd`) decides instead. See
               `trollshell/src/config/core_leds.rs`'s `DisplayStyle` for what
-              each value looks like.
+              each value looks like on the Stats drawer's per-core LED
+              panel (#857).
             '';
           };
 
@@ -1234,9 +1235,9 @@ self:
             default = null;
             example = "heat";
             description = ''
-              The per-core LED panel's colour axis: one of
-              style/rainbow/transpride/heat, or a `"#rrggbb"` literal. A
-              plain string rather than an enum because the accepted
+              The colour axis, independent of the skin. One of
+              style/rainbow/transpride/heat, or a `"#rrggbb"` literal. This
+              is a plain string rather than an enum because the accepted
               vocabulary is open-ended (any 6-digit hex triplet); an
               unrecognised word still fails the *file* schema per-key at
               load time (`core_leds.rs`'s `CoreLedsConfig::parsed`), not at
@@ -1252,13 +1253,14 @@ self:
             default = null;
             example = "rect";
             description = ''
-              A pinned row count for the LED panel (1-64), or `0` /
-              `"rect"` for the automatic wide rectangle picked from the
-              core count — both file spellings `core_leds.rs` accepts.
-              `null` (the default) sets no `rows` key at all, which is
-              *not* the same as `0`/`"rect"`: it lets a lower layer (the
-              overlay, or the built-in default) decide instead of pinning
-              the automatic shape at this layer.
+              Rows in the lamp matrix, or 0 / "rect" for the automatic wide
+              rectangle picked from the core count. Both `0` and `"rect"`
+              are file spellings `core_leds.rs` accepts; a pinned count
+              from 1 to 64 overrides the automatic shape instead. `null`
+              (the default) sets no `rows` key at all, which is *not* the
+              same as `0`/`"rect"`: it lets a lower layer (the overlay, or
+              the built-in default) decide instead of pinning the
+              automatic shape at this layer.
             '';
           };
 
@@ -1272,7 +1274,7 @@ self:
             default = null;
             example = "blank";
             description = ''
-              What a ragged last row's leftover slots look like: `spare`
+              What a ragged last row's leftover slots look like. `spare`
               fills them with unlit lamps, `blank` leaves the tail bare.
               Only visible when the row count divides unevenly and the
               skin ghosts (vfd/lcd). `null` (the default) sets no `fill`
@@ -1351,17 +1353,17 @@ self:
             default = null;
             example = "/run/hyperhive/host.sock";
             description = ''
-              The hive's host admin socket — an **absolute** path, checked
-              at nix eval (`lib.types.strMatching "^/.+"`) rather than left
-              to the file schema the way `core-leds.color` above is: a bad
-              `color` fails per-key at load time, but a bad `socket` fails
-              `AgentsConfig::validate` for the file as a WHOLE, and
-              `hytte-config`'s `load_or_default` then discards the entire
-              merged `agents.toml` back to the plugin's built-in default —
-              reverting `poll_seconds` and every `[display.*]` entry with
-              it. `null` (the default) sets no `socket` key at all, leaving
-              the overlay or the plugin's built-in default
-              (`config.rs`'s `DEFAULT_TOML`,
+              The hive's host admin socket — an **absolute** path.
+              Checked at nix eval (`lib.types.strMatching "^/.+"`) rather
+              than left to the file schema the way `core-leds.color`
+              above is: a bad `color` fails per-key at load time, but a
+              bad `socket` fails `AgentsConfig::validate` for the file as
+              a **whole**, and `hytte-config`'s `load_or_default` then
+              discards the entire merged `agents.toml` back to the
+              plugin's built-in default — reverting `poll_seconds` and
+              every `[display.*]` entry with it. `null` (the default)
+              sets no `socket` key at all, leaving the overlay or the
+              plugin's built-in default (`config.rs`'s `DEFAULT_TOML`,
               `/run/hyperhive/host.sock`) to decide.
             '';
           };
@@ -1371,8 +1373,8 @@ self:
             default = null;
             example = 5;
             description = ''
-              Seconds between `AgentStatus` polls while the agents sidebar
-              is open — `config.rs`'s `MIN_POLL_SECONDS`/`MAX_POLL_SECONDS`
+              Seconds between `AgentStatus` polls while the sidebar is
+              open. `config.rs`'s `MIN_POLL_SECONDS`/`MAX_POLL_SECONDS`
               bound it to 1..=3600. `null` (the default) sets no
               `poll_seconds` key at all, leaving the overlay or the
               plugin's built-in default (`DEFAULT_POLL_SECONDS`, 2) to
@@ -1389,9 +1391,10 @@ self:
                     default = null;
                     example = "choom";
                     description = ''
-                      What the sidebar row calls this agent. `null` (the
-                      default) sets no `label` key, so the row shows the
-                      hive's own agent name instead.
+                      What the row calls this agent; absent renders the
+                      hive's own name. `null` (the default) sets no
+                      `label` key, so the row shows the hive's own agent
+                      name instead.
                     '';
                   };
 
@@ -1400,9 +1403,9 @@ self:
                     default = null;
                     example = "starred-symbolic";
                     description = ''
-                      The row's leading symbolic icon name. `null` (the
-                      default) sets no `icon` key, so the row falls back
-                      to `config.rs`'s `DEFAULT_RUNTIME_ICON`
+                      The leading symbolic icon. `null` (the default)
+                      sets no `icon` key, so the row falls back to
+                      `config.rs`'s `DEFAULT_RUNTIME_ICON`
                       (`system-run-symbolic`).
                     '';
                   };
@@ -1412,7 +1415,7 @@ self:
                     default = null;
                     example = "viberoot";
                     description = ''
-                      The group header this agent's row sits under. `null`
+                      The group header this row sits under. `null`
                       (the default) leaves the agent in the ungrouped
                       bucket.
                     '';
@@ -1430,9 +1433,9 @@ self:
               }
             '';
             description = ''
-              Per-agent display overrides — `[display.<name>]` in
-              `agents.toml` — keyed EXACTLY as the hive reports the
-              agent's name; a key naming an agent the hive doesn't have
+              Per-agent display overrides, keyed **exactly** as the hive
+              names the agent. Corresponds to `[display.<name>]` in
+              `agents.toml`; a key naming an agent the hive doesn't have
               decorates nothing (`config.rs`: "the roster is the hive's,
               not the file's"). Every field of an entry defaults to
               `null` ("no opinion"); an entry holding only `null`s renders

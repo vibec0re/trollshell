@@ -64,7 +64,7 @@ const FIELDS: &[Field] = &[
             max: 64,
             also: &["rect"],
         },
-        doc: "Rows in the lamp matrix; 0 or \"rect\" is the automatic wide rectangle.",
+        doc: "Rows in the lamp matrix, or 0 / \"rect\" for the automatic wide rectangle picked from the core count.",
     },
     Field {
         path: "fill",

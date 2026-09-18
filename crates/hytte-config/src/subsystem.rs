@@ -162,6 +162,13 @@ pub trait Subsystem: serde::de::DeserializeOwned {
     /// a user sees when they first open their overlay, and it is parsed on
     /// every load, so a syntax error in it is caught by any test that loads
     /// the subsystem rather than in production.
+    ///
+    /// Which seed depends on which writer. [`save_overlay_to_locked`] states
+    /// the whole config by design and seeds this verbatim;
+    /// [`save_leaf_to_locked`] writes one key, so it seeds
+    /// [`commented_default`] of this — every value line commented out — and
+    /// puts the leaf below it, which is how the operator's first file can be
+    /// fully documented without *stating* a key they never set (#1370).
     const DEFAULT_TOML: &'static str;
 
     /// This subsystem's validation error. `std::convert::Infallible` when
@@ -2801,9 +2808,9 @@ pub fn save_leaf_to_locked<S: Subsystem>(
 /// The header lift below is what makes that work. `toml_edit` holds a
 /// comments-only document entirely as
 /// [`toml_edit::DocumentMut::trailing`] decor (measured: 0 top-level items),
-/// so a key inserted into it lands **above** the preamble. [`take_header`]
-/// detaches the block before the write and [`put_header`] re-attaches it in
-/// front of whatever [`first_rendered_key`] now answers — the same pair
+/// so a key inserted into it lands **above** the preamble. `take_header`
+/// detaches the block before the write and `put_header` re-attaches it in
+/// front of whatever `first_rendered_key` now answers — the same pair
 /// `seed_without_locked` and `places` already use, for the same reason. It
 /// also covers the write's mirror image: without it, a reset of the key that
 /// happens to be carrying the preamble as its own prefix decor takes the

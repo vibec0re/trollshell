@@ -176,21 +176,6 @@ View {
                                                 ),
                                             },
                                         },
-                                        Button {
-                                            id: "edit:trollshell-choom",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
-                                                ),
-                                            },
-                                        },
                                     ],
                                     tooltip: None,
                                 },
@@ -326,21 +311,6 @@ View {
                                                 ),
                                             },
                                         },
-                                        Button {
-                                            id: "edit:nixos-choom",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
-                                                ),
-                                            },
-                                        },
                                     ],
                                     tooltip: None,
                                 },
@@ -452,21 +422,6 @@ View {
                                                 classes: [],
                                                 tooltip: Some(
                                                     "start this agent",
-                                                ),
-                                            },
-                                        },
-                                        Button {
-                                            id: "edit:stray",
-                                            classes: [
-                                                "flat",
-                                                "ts-agent-btn",
-                                            ],
-                                            child: Icon {
-                                                id: None,
-                                                name: "document-edit-symbolic",
-                                                classes: [],
-                                                tooltip: Some(
-                                                    "edit this agent",
                                                 ),
                                             },
                                         },
@@ -716,7 +671,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:trollshell-choom",
+                                                    id: "select:trollshell-choom",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",
@@ -780,7 +735,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:nixos-choom",
+                                                    id: "select:nixos-choom",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",
@@ -844,7 +799,7 @@ View {
                                                     tooltip: None,
                                                 },
                                                 Button {
-                                                    id: "edit:stray",
+                                                    id: "select:stray",
                                                     classes: [
                                                         "flat",
                                                         "ts-agent-name",

@@ -136,21 +136,6 @@ Box {
                                             ),
                                         },
                                     },
-                                    Button {
-                                        id: "edit:trollshell-choom",
-                                        classes: [
-                                            "flat",
-                                            "ts-agent-btn",
-                                        ],
-                                        child: Icon {
-                                            id: None,
-                                            name: "document-edit-symbolic",
-                                            classes: [],
-                                            tooltip: Some(
-                                                "edit this agent",
-                                            ),
-                                        },
-                                    },
                                 ],
                                 tooltip: None,
                             },

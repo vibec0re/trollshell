@@ -273,7 +273,7 @@ Box {
                                                 tooltip: None,
                                             },
                                             Button {
-                                                id: "edit:trollshell-choom",
+                                                id: "select:trollshell-choom",
                                                 classes: [
                                                     "flat",
                                                     "ts-agent-name",
@@ -337,7 +337,7 @@ Box {
                                                 tooltip: None,
                                             },
                                             Button {
-                                                id: "edit:nixos-choom",
+                                                id: "select:nixos-choom",
                                                 classes: [
                                                     "flat",
                                                     "ts-agent-name",
@@ -401,7 +401,7 @@ Box {
                                                 tooltip: None,
                                             },
                                             Button {
-                                                id: "edit:stray",
+                                                id: "select:stray",
                                                 classes: [
                                                     "flat",
                                                     "ts-agent-name",

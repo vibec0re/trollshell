@@ -162,6 +162,9 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             m
         }),
         // The same roster with one agent selected — the §6.4 panel in full.
+        //
+        // Selected with a `select:` click — the panel roster's own id since
+        // #1282 item 3 retired the pen, which used to carry `edit:` here.
         ("panel_selected", {
             let mut m = seed(GOLDEN_NOW);
             m.update(Input::App(Msg::Status(Ok(roster(
@@ -175,7 +178,7 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
                 },
             ))));
             m.update(Input::event(
-                "edit:trollshell-choom",
+                "select:trollshell-choom",
                 hytte_plugin::proto::EventKind::Click,
             ));
             m

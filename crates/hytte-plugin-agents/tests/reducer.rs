@@ -293,7 +293,7 @@ fn a_click_on_an_unknown_or_illegal_agent_sends_nothing() {
     assert!(lines(&mut rx).is_empty());
 }
 
-// ── the card's two buttons ───────────────────────────────────────────────────
+// ── the card row ─────────────────────────────────────────────────────────────
 
 /// **The row's click target is `row:`, and nothing else.**
 ///
@@ -305,8 +305,8 @@ fn a_click_on_an_unknown_or_illegal_agent_sends_nothing() {
 /// cannot quietly reach the reducer. The old `chat:` prefix is the one that
 /// used to.
 ///
-/// Falsification: re-add a `chat:`/`details:` arm pointing at `open_detail` and
-/// the loop reds; drop `AgentName::parse`'s guard on the `ids::ROW` arm and the
+/// Falsification: re-add a `chat:`/`details:` arm (even a no-op one) and the
+/// loop reds; drop `AgentName::parse`'s guard on the `ids::ROW` arm and the
 /// bare-name case starts routing.
 #[test]
 fn only_the_row_prefix_routes_a_row_click() {
@@ -334,76 +334,76 @@ fn only_the_row_prefix_routes_a_row_click() {
     );
 }
 
-/// The **edit** button — Annika's `[optionsedit]` — opens the agent's
-/// companion window **on its settings tab**, and asks the hive nothing.
+/// **The pen is gone** ([#1282](https://github.com/vibec0re/trollshell/issues/1282)
+/// item 3, Annika's 👍 on 2026-09-18): an `edit:` click — stale host, stale
+/// golden, a half-reverted rename — reaches the reducer and does nothing at
+/// all, on both desktops. It used to open the companion window on its
+/// settings tab, with this plugin's own drawer page as the fallback when the
+/// window was not on `PATH`; both routes, and the id that reached them, are
+/// retired together — the window's settings tab is reached from inside the
+/// window now, not from a second button, and the panel roster's own way of
+/// reaching the drawer page moved to `select:` (see
+/// `the_panel_roster_still_picks_an_agent_without_the_pen` below).
 ///
-/// Her call on #947, 2026-09-11 07:43Z: the pen opens that window's settings
-/// tab, so an agent has one surface. The launch is **detached** (#953), so the
-/// window outlives a `trollshell.service` restart instead of dying with it.
-///
-/// Falsification: swap the tab word, drop `--tab settings`, or reorder the
-/// flags, and the argv assertion reds; point the arm back at `open_detail` and
-/// the effect kind does.
+/// Falsification: put the `ids::EDIT` arm back (pointing at either the window
+/// or `open_detail`) and either half reds.
 #[test]
-fn the_edit_button_opens_the_companion_window_on_its_settings_tab() {
-    let (mut m, mut rx) = model();
-    m.set_window_probe(Probe::fixed(true));
-    m.update(status(roster("agent_status_grouped.json")));
+fn a_stale_edit_click_opens_nothing_on_either_desktop() {
+    for installed in [true, false] {
+        let (mut m, mut rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
 
-    let fx = m.update(click("edit:stray"));
-    assert_eq!(
-        fx,
-        vec![Effect::RunCommand {
-            id: 0,
-            argv: vec![
-                "trollshell-agent-window".to_owned(),
-                "--agent".to_owned(),
-                "stray".to_owned(),
-                "--tab".to_owned(),
-                "settings".to_owned(),
-            ],
-            detached: true,
-        }]
-    );
-    assert_eq!(
-        m.selected, None,
-        "the window IS the settings surface now — no drawer page opens behind it"
-    );
-    assert!(
-        lines(&mut rx).is_empty(),
-        "opening a window is not a hive request"
-    );
+        assert_eq!(
+            m.update(click("edit:stray")),
+            vec![],
+            "window installed: {installed}"
+        );
+        assert_eq!(
+            m.selected, None,
+            "a stale edit click must not select an agent either: window installed: {installed}"
+        );
+        assert!(
+            lines(&mut rx).is_empty(),
+            "and it must ask the hive nothing: window installed: {installed}"
+        );
+    }
 }
 
-/// On a desktop with **no** companion window installed, the pen keeps P1's
-/// behaviour: this plugin's own drawer page, which was the placeholder for
-/// that window and is now its fallback.
+/// The panel roster still picks an agent — through `select:`, its own id
+/// since #1282 item 3 — and it goes straight to this plugin's own page,
+/// unconditionally, whether or not the companion window is installed. Before
+/// item 3 this id was `edit:` and tried the window first; it no longer does,
+/// on either desktop, because that window-first attempt was the pen's alone.
 ///
-/// Which of the two routes a click takes is a property of the *desktop*, not
-/// of the click, which is why every test in this section states which desktop
-/// it describes (`Agents::set_window_probe`) instead of inheriting the
-/// machine's `PATH`.
-///
-/// Falsification: drop the fallback (return `Vec::new()` when the window is
-/// absent) and this reds — such a desktop would have a dead pen.
+/// Falsification: point the `ids::SELECT` arm at `open_window` first (the
+/// pen's old shape) and the `installed: true` half reds with a `RunCommand`
+/// instead of `OpenPage`; drop the arm and both halves red.
 #[test]
-fn without_the_window_the_edit_button_still_opens_this_agents_page() {
-    let (mut m, mut rx) = model();
-    m.set_window_probe(Probe::fixed(false));
-    m.update(status(roster("agent_status_grouped.json")));
+fn the_panel_roster_still_picks_an_agent_without_the_pen() {
+    for installed in [true, false] {
+        let (mut m, mut rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
 
-    let fx = m.update(click("edit:stray"));
-    assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
-    assert_eq!(
-        m.selected
-            .as_ref()
-            .map(hytte_plugin_agents::model::AgentName::as_str),
-        Some("stray")
-    );
-    assert!(
-        lines(&mut rx).is_empty(),
-        "opening a page is not a hive request"
-    );
+        let fx = m.update(click("select:stray"));
+        assert_eq!(
+            fx,
+            vec![Effect::OpenPage(Page::PluginSelf)],
+            "window installed: {installed}"
+        );
+        assert_eq!(
+            m.selected
+                .as_ref()
+                .map(hytte_plugin_agents::model::AgentName::as_str),
+            Some("stray"),
+            "window installed: {installed}"
+        );
+        assert!(
+            lines(&mut rx).is_empty(),
+            "opening a page is not a hive request: window installed: {installed}"
+        );
+    }
 }
 
 /// The card's lifecycle button sends the hive's **own** `Start`/`Stop` verbs,
@@ -454,13 +454,18 @@ fn the_lifecycle_button_starts_a_stopped_agent_and_stops_a_running_one() {
 /// with an agent page open), so it needs coverage of its own rather than
 /// riding along inside another test's tail.
 ///
+/// The selection is seeded with a `select:` click — the panel roster's own
+/// id since #1282 item 3 retired the pen, which used to carry it — rather
+/// than reaching into the `pub` field directly, so this also stands as a
+/// second witness that `ids::SELECT` selects.
+///
 /// Falsification: drop the `node == view::BACK_ID` arm from `click` and this
 /// goes red.
 #[test]
 fn the_all_agents_button_clears_the_selection() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("edit:stray"));
+    m.update(click("select:stray"));
     assert!(m.selected.is_some());
 
     let fx = m.update(click("agents-back"));
@@ -472,13 +477,16 @@ fn the_all_agents_button_clears_the_selection() {
 /// The card's title row is the one thing that jumps to the drawer, and it lands
 /// on the **hive overview**, not on whatever agent was last selected.
 ///
+/// The selection is seeded with a `select:` click, for the reason given at
+/// `the_all_agents_button_clears_the_selection` above.
+///
 /// Falsification: drop the `view::OVERVIEW_ID` arm from `click` and this goes
 /// red.
 #[test]
 fn the_title_row_button_opens_the_drawer_at_the_hive_overview() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("edit:stray"));
+    m.update(click("select:stray"));
     assert!(m.selected.is_some());
 
     let fx = m.update(click("agents-overview"));
@@ -489,11 +497,14 @@ fn the_title_row_button_opens_the_drawer_at_the_hive_overview() {
 
 /// A selection whose agent leaves the roster falls back to the overview rather
 /// than pinning a page to something that no longer exists.
+///
+/// The selection is seeded with a `select:` click, for the reason given at
+/// `the_all_agents_button_clears_the_selection` above.
 #[test]
 fn a_selection_that_vanishes_falls_back_to_the_overview() {
     let (mut m, _rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("edit:stray"));
+    m.update(click("select:stray"));
     assert!(m.selected.is_some());
 
     m.update(status(roster("agent_status_precedence.json")));

@@ -3,7 +3,7 @@
 //! `docs/superpowers/specs/2026-09-07-agentic-desktop-design.md`).
 //!
 //! One **pill** per hyperhive agent, two lines and nothing else —
-//! `[icon] [Name] [Model]` with `[start|stop] [edit]` on the right, over the
+//! `[icon] [Name] [Model]` with `[start|stop]` on the right, over the
 //! harness's own status line — grouped by multi-repo project, plus a drawer
 //! page carrying the same pill for one agent, its flags, its link, and the
 //! hive overview with the full roster. The hive is the backend; trollshell is
@@ -24,27 +24,31 @@
 //!
 //! | spec row | what ships | why |
 //! | --- | --- | --- |
-//! | §6.1's row is `(icon) name (status) (pause) (chevron)` + details in place | `[icon] [Name] [Model]` + `[start\|stop] [edit]`, status glyph on line 2, no chevron and no unfold | her mock; the unfolded detail is the drawer page now |
+//! | §6.1's row is `(icon) name (status) (pause) (chevron)` + details in place | `[icon] [Name] [Model]` + `[start\|stop]`, status glyph on line 2, no chevron and no unfold | her mock; the unfolded detail was the drawer page, until #1282 item 3 retired its only door |
 //! | §6.1's row click opens something | the row is **not** a click target at all | her click target is #950's `WebView`, which does not exist yet; opening the drawer instead would train the wrong surface |
 //! | §6.4's page is "the selected agent's **full** detail" | the same pill, the flags, the agent's link — no `deployed` / `parent` / `status set` | the three rows she named; `model` survives as line 1's chip with the full id on its hover |
 //!
-//! **Both of the v1 destinations are [#950](https://github.com/vibec0re/trollshell/issues/950),
-//! and neither is in this crate.** Annika settled it on #947 (2026-09-11
+//! **The v1 destination is [#950](https://github.com/vibec0re/trollshell/issues/950),
+//! and it is not in this crate.** Annika settled it on #947 (2026-09-11
 //! 07:43Z): the agent's companion window — a `WebKitGTK` view in a window the
 //! shell owns, one per agent, with chrome that reads `host.sock` directly — is
 //! the single surface for an agent. The **row click** opens it on the agent
-//! page; the **edit button** opens it on its settings tab. This crate's drawer
-//! page is the placeholder for the second until that window exists.
+//! page; the window's own settings tab is reached inside it. This crate's
+//! drawer page was the placeholder for that settings tab, reached from the
+//! pill's **edit button**, until #950 shipped the window; since
+//! [#1282](https://github.com/vibec0re/trollshell/issues/1282) item 3 retired
+//! that button, the drawer page is no longer a Settings placeholder for
+//! anything — its one remaining door is the panel roster's own name button
+//! (`select:`), which goes straight to it, unconditionally, rather than
+//! trying the window first the way the pen did.
 //!
-//! So the edit arm **will** change when #950 lands — opening a separate GTK
-//! window is not `OpenPage(PluginSelf)`, which names a page inside the shell.
-//! [#1010](https://github.com/vibec0re/trollshell/issues/1010) shipped that
-//! distinction as the host's routing rule: this crate's **in-shell page** (the
-//! title row's hive overview, and the edit arm's fallback when the companion
-//! window is not on `PATH`) opens in the centered dialog rather than the drawer,
-//! because this card is `Mount::Sidebar*` — with no change here, since the host
-//! routes on the mount it already knew. What #1010 does **not** govern is the
-//! #950 `RunCommand` route above: a separate GTK window is not a page.
+//! [#1010](https://github.com/vibec0re/trollshell/issues/1010) shipped the
+//! host's routing rule for the destination that *is* still `OpenPage`: this
+//! crate's **in-shell page** (the title row's hive overview) opens in the
+//! centered dialog rather than the drawer, because this card is
+//! `Mount::Sidebar*` — with no change here, since the host routes on the mount
+//! it already knew. What #1010 does **not** govern is the #950 `RunCommand`
+//! route above: a separate GTK window is not a page.
 //!
 //! # What it links, and what it does not
 //!

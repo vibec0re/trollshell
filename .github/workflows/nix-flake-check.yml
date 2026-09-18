@@ -262,11 +262,12 @@ jobs:
           fi
           exit "${rc:-0}"
 
-  # Everything that is not a compile: treefmt, the five python source scans
-  # (bind-pins, bridge-socket, config-vocab, glsl, lints-tables), the docs
-  # render, and the 26 module-eval checks (each a `runCommand` over a stub
-  # package, deliberately never forcing a Rust build — flake.nix says why).
-  # All of it together is minutes, so it is one job and one runner.
+  # Everything that is not a compile: treefmt, the six python source scans
+  # (bind-pins, bridge-socket, config-vocab, glsl, lint-manifest-id,
+  # lints-tables), the docs render, and the 26 module-eval checks (each a
+  # `runCommand` over a stub package, deliberately never forcing a Rust
+  # build — flake.nix says why). All of it together is minutes, so it is one
+  # job and one runner.
   cheap:
     name: cheap-checks
     runs-on: ubuntu-latest
@@ -330,6 +331,7 @@ jobs:
             .#checks.x86_64-linux.bridge-socket \
             .#checks.x86_64-linux.config-vocab \
             .#checks.x86_64-linux.glsl \
+            .#checks.x86_64-linux.lint-manifest-id \
             .#checks.x86_64-linux.lints-tables \
             .#checks.x86_64-linux.hm-module \
             .#checks.x86_64-linux.hm-module-agents-fixture \

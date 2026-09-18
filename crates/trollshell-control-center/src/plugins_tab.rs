@@ -2132,10 +2132,19 @@ fn manifest_id_from_json(text: &str, id: &str) -> Option<String> {
 /// `…/bin/hytte-plugin-stats` → `stats`; `…/bin/hytte-claude-bridge` →
 /// `claude-bridge`.
 ///
-/// A transcription of `nix/module-common.nix`'s `inferManifestId`, which is
-/// what both platform modules use to decide whether an entry needs an explicit
-/// `HYTTE_PLUGIN_ID` — so this agrees with the launcher by construction rather
-/// than by coincidence.
+/// A transcription of `nix/module-common.nix`'s `inferManifestId` — what both
+/// platform modules use to decide whether an entry needs an explicit
+/// `HYTTE_PLUGIN_ID`. The two are gated against each other rather than left
+/// to drift silently (#1372, from the #1365 adversarial review's L5): both
+/// sides are graded against the SAME table, `nix/manifest-id-cases.txt` —
+/// `nix/lint-manifest-id.py` re-derives the nix answer for every row (run by
+/// `checks.lint-manifest-id`), and this module's own
+/// `manifest_id_of_exec_matches_the_shared_table` test (`mod tests`, below,
+/// test-only so not a real intra-doc link target) checks this function
+/// against the identical rows. A change to either rule, or to the table
+/// without updating the other side, fails one of the two the next
+/// `nix flake check` / `cargo test` — see that table's own header for how
+/// its "expected id" column was produced.
 fn manifest_id_of_exec(exec: &str) -> String {
     let binary = exec.rsplit('/').next().unwrap_or(exec);
     binary
@@ -2581,10 +2590,10 @@ mod tests {
 
     use super::{
         DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates,
-        declared_mounts_from_json, is_running, mount_display, mount_or_unknown, plugin_subtitle,
-        probe_candidates, probe_plugins_json, read_declared_mounts_at, resolved_search_path,
-        runtime_overlay, runtime_states, same_plugin_set, seen_suffix, status_cell,
-        violations_suffix,
+        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
+        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
+        read_declared_mounts_at, resolved_search_path, runtime_overlay, runtime_states,
+        same_plugin_set, seen_suffix, status_cell, violations_suffix,
     };
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -3399,6 +3408,56 @@ mod tests {
         // two have no plugin to hang off and render under the Shell entry.
         assert!(crate::config_form::family("stats").is_some());
         assert!(crate::config_form::family("clock-demo").is_none());
+    }
+
+    /// #1372: `manifest_id_of_exec` graded against nix's `inferManifestId`
+    /// through the one table both sides read —
+    /// `nix/manifest-id-cases.txt`'s own header has the provenance of its
+    /// "expected id" column and why it is a real evaluation of the nix
+    /// function, not a second hand transcription of it.
+    /// `nix/lint-manifest-id.py` runs the nix-side half of this same grading
+    /// (`checks.lint-manifest-id`) — it is NOT invoked from this test, which
+    /// is Rust-only and hermetic.
+    #[test]
+    fn manifest_id_of_exec_matches_the_shared_table() {
+        let table = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../nix/manifest-id-cases.txt"
+        ));
+        let mut checked = 0;
+        for (i, line) in table.lines().enumerate() {
+            // `.lines()` strips only the line terminator, never other
+            // whitespace — unlike `.trim_end()`, which would eat a
+            // legitimately-empty trailing field (the table's own header
+            // explains why an empty expected-id row doesn't survive a
+            // trailing-whitespace trim, which is exactly the bug this
+            // avoids).
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let lineno = i + 1;
+            let mut parts = line.splitn(2, '\t');
+            let exec = parts
+                .next()
+                .unwrap_or_else(|| panic!("nix/manifest-id-cases.txt:{lineno}: empty line"));
+            let expected = parts.next().unwrap_or_else(|| {
+                panic!(
+                    "nix/manifest-id-cases.txt:{lineno}: expected `exec<TAB>expected-id`, got {line:?}"
+                )
+            });
+            assert_eq!(
+                manifest_id_of_exec(exec),
+                expected,
+                "nix/manifest-id-cases.txt:{lineno}: manifest_id_of_exec({exec:?}) disagreed \
+                 with the table"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 12,
+            "expected at least 12 table rows (#1372's ask), found {checked} — did the table \
+             lose its data rows to a bad edit?"
+        );
     }
 }
 

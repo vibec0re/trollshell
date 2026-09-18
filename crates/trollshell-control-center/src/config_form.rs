@@ -2076,6 +2076,38 @@ mod gtk_tests {
         }
     }
 
+    /// What the writer leaves behind for a family the operator has never
+    /// configured: its documented default with every value line commented out
+    /// — so the file explains every key and **states** none — then `leaf`,
+    /// below that preamble (#1370).
+    ///
+    /// The render's own bytes are pinned in `hytte-config`
+    /// (`tests/commented_default_first_file.rs`); what the assertions below
+    /// are for is the other half — that one row's change writes **one** leaf,
+    /// and that it lands under the documentation rather than instead of it.
+    fn first_file(default_toml: &str, leaf: &str) -> String {
+        format!("{}\n{leaf}", subsystem::commented_default(default_toml))
+    }
+
+    /// The leaves an overlay actually states, dotted — as the loader sees it,
+    /// not as the file reads. A commented preamble mentions every key by
+    /// name, so "the reset removed it" is a question for the parser (#1370).
+    fn stated(body: &str) -> Vec<String> {
+        fn walk(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+            for (key, value) in table {
+                let path = format!("{prefix}{key}");
+                match value {
+                    toml::Value::Table(sub) => walk(sub, &format!("{path}."), out),
+                    _ => out.push(path),
+                }
+            }
+        }
+        let table: toml::Table = body.parse().expect("the overlay is TOML");
+        let mut out = Vec::new();
+        walk(&table, "", &mut out);
+        out
+    }
+
     /// The form's row for `path`.
     fn row_of<'a>(form: &'a Form, path: &str) -> &'a Row {
         form.inner
@@ -2125,14 +2157,16 @@ mod gtk_tests {
             Scratch::read(&overlay).contains("flag = false")
         });
 
-        // A first leaf write creates a file holding **that leaf and nothing
-        // else** (#1365 review, HIGH 1): the operator's overlay is a diff
-        // over the layers below, not a copy of the documented default with
-        // one line changed — which is what it was until this round, and what
-        // silently pinned every other key in the file.
+        // A first leaf write creates a file **stating** that leaf and nothing
+        // else (#1365 review, HIGH 1): the operator's overlay is a diff over
+        // the layers below, not a copy of the documented default with one
+        // line changed — which is what it was until that round, and what
+        // silently pinned every other key in the file. Since #1370 the
+        // documented default is still in front of them, with every value line
+        // commented out, so it states nothing.
         assert_eq!(
             Scratch::read(&overlay),
-            "flag = false\n",
+            first_file(fixture::DEFAULT_TOML, "flag = false\n"),
             "the one leaf, and nothing the operator did not choose"
         );
         assert_eq!(note_of(&form, "flag"), "Yours");
@@ -2158,7 +2192,7 @@ mod gtk_tests {
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "count = 7\n",
+            first_file(fixture::DEFAULT_TOML, "count = 7\n"),
             "the one leaf, and nothing else"
         );
         assert_eq!(note_of(&form, "count"), "Yours");
@@ -2187,11 +2221,16 @@ mod gtk_tests {
             !rect.is_active(),
             "dialling a number is choosing a number, so the word turns itself off"
         );
-        // A first write holds only what was written (#1365 review, HIGH 1),
+        // A first write states only what was written (#1365 review, HIGH 1),
         // so the base layer's `rows = "rect"` is not copied into the
-        // operator's own file on the way past.
+        // operator's own file on the way past — the documented default above
+        // it is commented out (#1370) and states nothing either.
         let after_number = Scratch::read(&overlay);
-        assert_eq!(after_number, "rows = 9\n", "the one leaf, and nothing else");
+        assert_eq!(
+            after_number,
+            first_file(fixture::DEFAULT_TOML, "rows = 9\n"),
+            "the one leaf, and nothing else"
+        );
 
         rect.set_active(true);
         settle_until("the word to be saved", || {
@@ -2222,10 +2261,11 @@ mod gtk_tests {
         settle_until("the combo to be saved", || {
             Scratch::read(&overlay).contains("style = \"oled\"")
         });
-        // A first write holds only what was written (#1365 review, HIGH 1).
+        // A first write states only what was written (#1365 review, HIGH 1).
         let written = Scratch::read(&overlay);
         assert_eq!(
-            written, "style = \"oled\"\n",
+            written,
+            first_file(fixture::DEFAULT_TOML, "style = \"oled\"\n"),
             "the one leaf, and not the base layer's `lcd` copied along with it"
         );
         assert_eq!(note_of(&form, "style"), "Yours");
@@ -2314,10 +2354,11 @@ mod gtk_tests {
         settle_until("the named colour to be saved", || {
             Scratch::read(&overlay).contains("color = \"style\"")
         });
-        // A first write holds only what was written (#1365 review, HIGH 1).
+        // A first write states only what was written (#1365 review, HIGH 1).
         let after_name = Scratch::read(&overlay);
         assert_eq!(
-            after_name, "color = \"style\"\n",
+            after_name,
+            first_file(fixture::DEFAULT_TOML, "color = \"style\"\n"),
             "the one leaf, and not the base layer's literal copied along with it"
         );
 
@@ -2365,7 +2406,7 @@ mod gtk_tests {
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "label = \"renamed\"\n",
+            first_file(fixture::DEFAULT_TOML, "label = \"renamed\"\n"),
             "the one leaf, and nothing else"
         );
     }
@@ -2505,8 +2546,11 @@ mod gtk_tests {
             !Scratch::read(&overlay).contains("count = 2")
         });
         let written = Scratch::read(&overlay);
+        // Asked of the parse, not of the text: since #1370 the file carries
+        // the documented default as comments, so `count` is *named* in it
+        // whether or not it is set.
         assert!(
-            !written.contains("count ="),
+            !stated(&written).iter().any(|key| key == "count"),
             "the key is gone, not set to the default: {written}"
         );
         assert!(
@@ -2671,7 +2715,10 @@ mod gtk_tests {
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "style = \"oled\"\n",
+            first_file(
+                hytte_config_families::core_leds::DEFAULT_TOML,
+                "style = \"oled\"\n"
+            ),
             "one leaf in the real family's file too, and nothing else"
         );
     }
@@ -2878,7 +2925,7 @@ mod gtk_tests {
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "count = 7\n",
+            first_file(fixture::DEFAULT_TOML, "count = 7\n"),
             "the last value, and exactly one leaf"
         );
     }

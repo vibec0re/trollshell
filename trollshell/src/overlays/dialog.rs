@@ -410,7 +410,10 @@ thread_local! {
 /// against.
 pub fn install(monitor: &Monitor) {
     let Some(connector) = monitor.connector() else {
-        tracing::debug!("dialog::install: monitor has no connector name; skipping");
+        tracing::warn!(
+            description = ?monitor.description(),
+            "dialog::install: monitor has no connector name; skipping"
+        );
         return;
     };
     // Tail-expression `insert` + an outer `drop`, the #643 shape the other four

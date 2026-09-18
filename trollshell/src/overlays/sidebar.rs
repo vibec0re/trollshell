@@ -461,15 +461,27 @@ pub fn toggle_right_on_focused(preferred: Option<&str>) {
 fn installed_key(side: Side, preferred: Option<&str>) -> Option<String> {
     PANELS.with(|panels| {
         let panels = panels.borrow();
-        preferred
-            .filter(|k| panels.contains_key(&(side, (*k).to_owned())))
-            .map(str::to_string)
-            .or_else(|| {
-                panels
-                    .keys()
-                    .find(|(s, _)| *s == side)
-                    .map(|(_, key)| key.clone())
-            })
+        let exact = preferred.filter(|k| panels.contains_key(&(side, (*k).to_owned())));
+        exact.map(str::to_string).or_else(|| {
+            let chosen = panels
+                .keys()
+                .find(|(s, _)| *s == side)
+                .map(|(_, key)| key.clone());
+            // #1368: `exact` is `None` here, so if `preferred` is `Some` it was
+            // looked up and missed — the keybind path (`toggle_on_focused`)
+            // is about to act on a monitor other than the one niri says is
+            // focused, silently (#1368's mechanism-A symptom: the sidebar
+            // "does not work" on the affected output).
+            if let (Some(preferred), Some(chosen)) = (preferred, &chosen) {
+                tracing::warn!(
+                    side = ?side,
+                    preferred,
+                    chosen = %chosen,
+                    "sidebar toggle: focused output has no installed panel; falling back to another monitor's"
+                );
+            }
+            chosen
+        })
     })
 }
 

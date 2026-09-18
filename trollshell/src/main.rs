@@ -323,6 +323,16 @@ fn main() -> hytte::ui::Result<()> {
                 let bars: RefCell<Vec<BarHandle>> = RefCell::new(Vec::new());
                 monitors_signal
                     .for_each(move |monitors| {
+                        // #1368: name the rebuild so a hot-plug outage (frame
+                        // gone, sidebar dead, everything else fine) is
+                        // diagnosable from the journal instead of a restart —
+                        // this trigger had zero `tracing` calls before.
+                        tracing::info!(
+                            count = monitors.len(),
+                            connectors = ?monitors.iter().map(Monitor::connector).collect::<Vec<_>>(),
+                            "monitors changed; rebuilding per-monitor surfaces"
+                        );
+
                         // Tear down every per-monitor surface before rebuilding.
                         // Order mirrors install: bars/drawers/sidebar first, then
                         // the overlays. Each `close_all` drains its per-connector

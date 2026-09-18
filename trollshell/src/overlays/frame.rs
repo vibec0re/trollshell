@@ -112,7 +112,10 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
     // `Monitor::connector()` itself folds `Some("")` to `None` since #1180
     // item 6, so this `let-else` already can't see the empty string.
     let Some(connector) = monitor.connector() else {
-        tracing::debug!("frame::install: monitor has no connector; skipping");
+        tracing::warn!(
+            description = ?monitor.description(),
+            "frame::install: monitor has no connector; skipping"
+        );
         return;
     };
     let window = layer_window(monitor)

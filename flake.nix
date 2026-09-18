@@ -633,6 +633,35 @@
                 touch $out
               '';
 
+          # `crates/trollshell-control-center/src/plugins_tab.rs`'s
+          # `manifest_id_of_exec` is a hand transcription of this file's own
+          # `inferManifestId` above — the rule that turns a plugin's `exec`
+          # basename into the id it registers under, which the control-center
+          # reads back off a plugin to decide which settings-form family (if
+          # any) that plugin owns. Nothing checked the two agreed (#1372, from
+          # the #1365 adversarial review's L5): a plugin whose family lookup
+          # depends on the id (e.g. `stats`) could silently stop mounting a
+          # form if either side drifted, with no error — "no family" is a
+          # legitimate answer. Same posture as `bind-pins` above: a
+          # source-level defect no compile in this flake can see, so a script
+          # rather than a test, with no cargoArtifacts so it goes red in
+          # seconds; the Rust side is graded separately, by
+          # `checks.workspace-tests`'
+          # `manifest_id_of_exec_matches_the_shared_table` test — both read
+          # the SAME table, `nix/manifest-id-cases.txt`, whose own header has
+          # that table's provenance. `nix/lint-manifest-id.py`'s own header
+          # has the full story, including why this re-parses the nix rule's
+          # literals out of source on every run (so a changed literal is
+          # caught as real per-row drift) rather than shelling out to `nix
+          # eval` from inside the sandbox (recursive Nix, not enabled here).
+          lint-manifest-id =
+            pkgs.runCommand "trollshell-lint-manifest-id-check" { nativeBuildInputs = [ pkgs.python3 ]; }
+              ''
+                cd ${self}
+                python3 nix/lint-manifest-id.py
+                touch $out
+              '';
+
           # Run the hermetic internals suite (#1115): `cargo test --workspace`
           # WITHOUT `--features system-tests` — the same command
           # `nix/package.nix`'s `workspace` derivation ran under its own

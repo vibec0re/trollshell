@@ -66,6 +66,24 @@ let
   #     are compiled with `SHADER_PREAMBLE` spliced in front because they do not
   #     compile alone.
   #
+  #   - nix/manifest-id-cases.txt (#1372) — `include_str!`'d by
+  #     `crates/trollshell-control-center/src/plugins_tab.rs`'s
+  #     `manifest_id_of_exec_matches_the_shared_table` test, on the same
+  #     #480/#446 trap `assets/hytte-ui/style.css` above is kept for: without
+  #     this the file compiles locally (a real checkout has it) and fails
+  #     every `nix build`/`nix flake check` that reaches that test —
+  #     `checks.workspace-tests`, `checks.clippy`, `checks.system-tests`,
+  #     `checks.rustdoc`, and `packages.trollshell` itself, since they all
+  #     share this `src`. Matched by a full relative-path suffix, same shape
+  #     as the style.css clause, rather than a bare `.txt` extension — this
+  #     repo has fifteen OTHER `.txt` files (`hytte-plugin-agents`'s
+  #     `tests/fixtures/*.txt`), already kept by the `/tests/fixtures/`
+  #     clause below, and a blanket extension would invalidate the compile on
+  #     an edit to any future `.txt` file anywhere in the tree, not just this
+  #     one the Rust build actually reads. This one *should* invalidate the
+  #     compile on edit — its content is exactly what the test asserts
+  #     against — unlike the `*.nix` files this filter deliberately excludes.
+  #
   #     **The lint's body scan is tree-wide, to match this clause exactly.** It
   #     took two tries to get there and both intermediate spellings shipped a
   #     hole: a literal one-directory list missed a second plugin's `shaders/`
@@ -96,7 +114,8 @@ let
     || (lib.hasInfix "/tests/fixtures/" path)
     || (lib.hasSuffix "assets/hytte-ui/style.css" path)
     || (lib.hasSuffix ".vert" path)
-    || (lib.hasSuffix ".frag" path);
+    || (lib.hasSuffix ".frag" path)
+    || (lib.hasSuffix "nix/manifest-id-cases.txt" path);
 
   # #1128: a directory belongs in the filtered source only if something
   # beneath it does. Without this, `lib.cleanSourceWith`/`builtins.path` keep

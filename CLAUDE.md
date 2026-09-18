@@ -200,6 +200,26 @@ inline in `flake.nix` as one-liners.
   `glslangValidator` alone cannot catch — proved by its own `--self-test` arm.
   A plugin's _runtime_ source is deliberately not validated anywhere; see the
   trust boundary below.
+- `lint-manifest-id` (#1372, from the #1365 adversarial review's L5): the
+  same shape for `crates/trollshell-control-center/src/plugins_tab.rs`'s
+  `manifest_id_of_exec`, a hand transcription of this file's own
+  `inferManifestId` (above) — the rule that turns a plugin's `exec` basename
+  into the id it registers under, which the control-center reads back to
+  decide which settings-form family (if any) a plugin owns. Nothing checked
+  the two agreed before this: a plugin whose family lookup depends on the id
+  (e.g. `stats`) could silently stop mounting a form if either side drifted,
+  with no error, since "no family" is a legitimate answer. Both sides are
+  graded against one shared table, `nix/manifest-id-cases.txt` (its own
+  header has the provenance of the "expected id" column — a real evaluation
+  of `inferManifestId`, not a second transcription): `nix/lint-manifest-id.py`
+  re-parses the rule's two prefix literals out of `nix/module-common.nix` on
+  every run (so a changed literal is caught as real per-row drift, not
+  silently absorbed) and checks every row, while the Rust side is graded
+  separately by `checks.workspace-tests`'
+  `manifest_id_of_exec_matches_the_shared_table` test reading the identical
+  file. Run the nix-side scan by hand with
+  `nix shell nixpkgs#python3 --command python3 nix/lint-manifest-id.py` — the
+  `nix shell` is not optional, for the `bind-pins` reason above.
 - `rustdoc` (#1328): `cargo doc --workspace --no-deps` with
   `RUSTDOCFLAGS="-D warnings"`, on the `workspace-tests` precedent above —
   its own leaf row, not folded into it, sharing `cargoArtifacts` rather than

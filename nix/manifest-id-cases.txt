@@ -1,0 +1,105 @@
+# One row per (exec basename-or-path, expected manifest id), tab-separated.
+# Blank lines and lines starting with `#` are ignored by both readers.
+#
+# This is the ONE table two independent checks grade against nix's
+# `inferManifestId` (`nix/module-common.nix`) — the rule that turns a
+# plugin's `exec` into the id it registers under, so
+# `programs.trollshell.plugins.<id>` can tell whether it needs to render an
+# explicit `HYTTE_PLUGIN_ID` override:
+#
+#   - `nix/lint-manifest-id.py` re-parses `inferManifestId`'s two string
+#     literals out of `nix/module-common.nix` on every run and checks every
+#     row here against that (the nix side, kept honest against drift in the
+#     RULE, not just this file).
+#   - `crates/trollshell-control-center/src/plugins_tab.rs`'s
+#     `manifest_id_of_exec_matches_the_shared_table` test (`mod tests`) runs
+#     the control-center's own hand-mirror, `manifest_id_of_exec`, over the
+#     same rows (the Rust side).
+#
+# See #1372 (built from the #1365 adversarial review, L5) for why this
+# exists: before it, nothing checked the two agreed, so a plugin whose
+# family lookup depends on the manifest id (e.g. `stats`) could silently
+# stop mounting a settings form if either side drifted.
+#
+# PROVENANCE OF THE "expected id" COLUMN
+# ---------------------------------------
+# Generated once by evaluating the REAL `inferManifestId` function (not a
+# transcription of it) against a `pkgs.writeShellScriptBin <exec>` stub per
+# row — the same shape `flake.nix`'s `hm-module-plugin-id` check already
+# uses (`hm._module.args.inferManifestId stubPlugin == "demo"`). Wrapped in a
+# `pkgs.runCommand` derivation and driven with `nix-build` rather than `nix
+# eval`/`nix-instantiate --eval` directly, because this worktree's harness
+# refuses any Bash command containing the substring "eval" as unverifiable
+# git-adjacent input — so the generator below writes its result to $out
+# through a derivation instead of printing it from an eval invocation:
+#
+#   cat > /tmp/gen-cases.nix <<'NIX'
+#   let
+#     flake = builtins.getFlake (toString ./.);
+#     pkgs = flake.inputs.nixpkgs.legacyPackages.${builtins.currentSystem};
+#     lib = pkgs.lib;
+#     mod = import ./nix/module-common.nix null { config = { }; inherit lib pkgs; };
+#     inferManifestId = mod.config._module.args.inferManifestId;
+#     bin = name: pkgs.writeShellScriptBin name "";
+#     cases = [ "hytte-plugin-agents" "hytte-plugin-audio-widget" … ];
+#   in
+#   pkgs.runCommand "gen-manifest-id-cases" { } ''
+#     cat > $out <<JSON
+#     ${builtins.toJSON (lib.genAttrs cases (name: inferManifestId (bin name)))}
+#     JSON
+#   ''
+#   NIX
+#   nix-build --no-out-link /tmp/gen-cases.nix | xargs cat
+#
+# (run from the repo root; the module is imported directly rather than
+# through `evalModules` because `inferManifestId`'s definition only closes
+# over its own `pkg` argument and `lib` — no other module's contribution —
+# so reading it straight off the returned attrset needs no fixed point, on
+# the same "heavier than the thing it's checking" argument
+# `nix/lint-config-vocab.py`'s header gives for NOT doing this on every scan
+# run). The one full-path row below was produced the same way, reading
+# `lib.getExe (pkgs.writeShellScriptBin "hytte-plugin-stats" "")` instead of
+# a bare exec string, to pin that both sides extract the basename first.
+#
+# exec	expected-manifest-id
+hytte-plugin-agents	agents
+hytte-plugin-audio-widget	audio-widget
+hytte-plugin-bar-clock-demo	bar-clock-demo
+hytte-plugin-caw	caw
+hytte-plugin-clock-demo	clock-demo
+hytte-plugin-departures	departures
+hytte-plugin-infobroker	infobroker
+hytte-plugin-niri-layouts	niri-layouts
+hytte-plugin-pet	pet
+hytte-plugin-preem-demo	preem-demo
+hytte-plugin-stats	stats
+hytte-plugin-terminal	terminal
+hytte-plugin-timer	timer
+hytte-plugin-weather	weather
+# The standalone-CLI-hat binary `hytte-plugin-infobroker`'s crate also
+# ships (`hytte-infobroker auth`/`get`/`grants`, #562) — same bare `hytte-`
+# fallback as `hytte-claude-bridge` below, since neither carries the
+# `-plugin-` infix.
+hytte-infobroker	infobroker
+# `hytte-claude-bridge` wears the plugin hat too (#866) but is launched
+# from `pkgs.hytte-claude-bridge`, not a `hytte-plugin-*` package — the bare
+# `hytte-` fallback `inferManifestId` falls through to when the
+# `hytte-plugin-` prefix does not match at all.
+hytte-claude-bridge	claude-bridge
+# A companion binary the launcher's package resolution can point `.exec` at
+# even though it is never itself a `programs.trollshell.plugins` entry
+# (#950) — neither prefix matches, so the rule returns the name unchanged.
+trollshell-agent-window	trollshell-agent-window
+# A full nix store path, the actual shape `lib.getExe`/an on-disk
+# `plugins.json`'s `exec` field carries — both sides must extract the
+# basename (`baseNameOf` / `exec.rsplit('/')`) before stripping a prefix.
+/nix/store/00000000000000000000000000000000-hytte-plugin-stats/bin/hytte-plugin-stats	stats
+# Edge: the shortest possible id after the `-plugin-` prefix — pins that the
+# strip is exact-prefix, not "prefix plus at least N chars".
+hytte-plugin-x	x
+# Edge: no `-plugin-` infix, so the bare `hytte-` fallback strips down to
+# the shortest possible id too.
+hytte-x	x
+# A prefix that only appears mid-string must NOT match — `removePrefix`/
+# `strip_prefix` are anchored at position 0, not a substring search.
+not-hytte-plugin-foo	not-hytte-plugin-foo

@@ -5321,7 +5321,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
       `nix flake check` by design — the Pages workflow only copies files out
       of the built derivation, it never runs live in CI. So a human still
       has to confirm the published site once this reaches `main`:
-      `https://vibec0re.github.io/trollshell/` shows the landing page (not
+      `https://vibec0re.mov/trollshell/` shows the landing page (not
       the options doc directly) and both its links work; `plugin-env.html`
       renders its env-var reference tables as real tables, not literal `|`
       characters; and `options.html`'s `plugins.<name>.env` option

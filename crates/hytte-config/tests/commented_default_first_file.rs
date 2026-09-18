@@ -98,9 +98,37 @@ fn report() -> String {
     // The seed is for a file that does not exist. One that does — a hand
     // written overlay, or the one-line file #1365 wrote — is patched as it
     // always was, and does not grow a preamble under the operator's feet.
+    // Its own comments are the operator's: the leading one belongs to the key
+    // it was written above and must not slide down past a new line, and the
+    // trailing one belongs to the value (#1380 review, MEDIUM 1).
     let hand_written = dir.path().join("hand-written.toml");
-    std::fs::write(&hand_written, "brightness = 1 # mine\n").expect("seed the overlay");
+    std::fs::write(
+        &hand_written,
+        "# I keep the strip dim on purpose\nbrightness = 1 # mine\n",
+    )
+    .expect("seed the overlay");
     let patched = save(&hand_written, "enabled", Some(true.into()));
+
+    // The same rule where it is easiest to get wrong: the comment sits above
+    // the *first* item, which is exactly where the seed's own preamble sits,
+    // so only the bytes can tell them apart.
+    let annotated = dir.path().join("annotated.toml");
+    std::fs::write(
+        &annotated,
+        "# I keep the strip dim on purpose\n[core]\nbrightness = 1\n",
+    )
+    .expect("seed the overlay");
+    let annotated_saved = save(&annotated, "enabled", Some(false.into()));
+
+    // …and on the removal path, where an unlifted removal correctly takes the
+    // comment with the key it described.
+    let annotated_reset = dir.path().join("annotated-reset.toml");
+    std::fs::write(
+        &annotated_reset,
+        "# why I turned it off\nenabled = false\n\n[core]\nbrightness = 1\n",
+    )
+    .expect("seed the overlay");
+    let annotated_after_reset = save(&annotated_reset, "enabled", None);
 
     let sections: Vec<(&str, String)> = vec![
         ("commented-default", commented_default(FIXTURE_TOML)),
@@ -112,6 +140,11 @@ fn report() -> String {
         ("reset-everything-else", reset_rest),
         ("reset-with-no-file-at-all", reset_into_nothing),
         ("a-file-that-already-exists", patched),
+        ("an-operators-comment-above-the-first-key", annotated_saved),
+        (
+            "an-operators-comment-above-the-key-being-reset",
+            annotated_after_reset,
+        ),
     ];
 
     let mut out = String::new();
@@ -158,6 +191,10 @@ const GOLDEN: &str = r#"═══ commented-default ═══
 # brightness = 3
 # palette = ["amber", "rust"]
 
+# Your own settings go below this line. Edit them there rather than
+# uncommenting the documentation above: a key stated twice is not valid
+# TOML, and every later save would fail on it.
+
 [core]
 brightness = 7
 
@@ -175,6 +212,10 @@ brightness = 7
 # color = "amber"
 # brightness = 3
 # palette = ["amber", "rust"]
+
+# Your own settings go below this line. Edit them there rather than
+# uncommenting the documentation above: a key stated twice is not valid
+# TOML, and every later save would fail on it.
 
 [core]
 brightness = 7
@@ -195,6 +236,10 @@ color = "lcd"
 # brightness = 3
 # palette = ["amber", "rust"]
 
+# Your own settings go below this line. Edit them there rather than
+# uncommenting the documentation above: a key stated twice is not valid
+# TOML, and every later save would fail on it.
+
 [core]
 brightness = 2
 color = "lcd"
@@ -213,6 +258,10 @@ color = "lcd"
 # color = "amber"
 # brightness = 3
 # palette = ["amber", "rust"]
+
+# Your own settings go below this line. Edit them there rather than
+# uncommenting the documentation above: a key stated twice is not valid
+# TOML, and every later save would fail on it.
 
 enabled = false
 [core]
@@ -234,6 +283,10 @@ color = "lcd"
 # brightness = 3
 # palette = ["amber", "rust"]
 
+# Your own settings go below this line. Edit them there rather than
+# uncommenting the documentation above: a key stated twice is not valid
+# TOML, and every later save would fail on it.
+
 enabled = false
 [core]
 color = "lcd"
@@ -253,19 +306,42 @@ color = "lcd"
 # brightness = 3
 # palette = ["amber", "rust"]
 
+# Your own settings go below this line. Edit them there rather than
+# uncommenting the documentation above: a key stated twice is not valid
+# TOML, and every later save would fail on it.
+
 [core]
 
 ═══ reset-with-no-file-at-all ═══
 <no file>
 
 ═══ a-file-that-already-exists ═══
+# I keep the strip dim on purpose
 brightness = 1 # mine
 enabled = true
+
+═══ an-operators-comment-above-the-first-key ═══
+enabled = false
+# I keep the strip dim on purpose
+[core]
+brightness = 1
+
+═══ an-operators-comment-above-the-key-being-reset ═══
+
+[core]
+brightness = 1
 
 "#;
 
 #[test]
 fn the_first_file_is_the_documented_default_with_every_value_commented_out() {
+    // `DUMP_REPORT=<path> cargo test …` writes what the writer actually
+    // produced, so a deliberate change to the fixture or the seed can be
+    // re-pinned by reading the new report rather than by hand-editing 170
+    // lines of expected text. It writes only where the caller points it.
+    if let Ok(path) = std::env::var("DUMP_REPORT") {
+        std::fs::write(path, report()).expect("the path DUMP_REPORT names is writable");
+    }
     assert_eq!(report(), GOLDEN);
 }
 
@@ -337,6 +413,12 @@ const REQUIRED: &[&str] = &[
     "crates/hytte-config-families/src/workspaces.rs",
     "crates/hytte-plugin-agents/src/config.rs",
     "crates/hytte-plugin-stats/src/config.rs",
+    // Not a shipped family — the control center's own fixture family, whose
+    // `Subsystem` impl goes through this same writer and whose documented
+    // default its `#[gtk::test]`s assert against. It is in the floor because
+    // it is one of the five the scan finds today, and a scan that quietly
+    // found four would be the failure this list exists to prevent.
+    "crates/trollshell-control-center/src/config_form.rs",
 ];
 
 #[test]
@@ -376,6 +458,13 @@ fn every_documented_default_in_the_tree_round_trips_through_the_render() {
             "{name}: the render is line for line"
         );
 
+        // Against the *normalised* source, which is what the render
+        // promises: one `\n` per line, no `\r`, a trailing newline whether
+        // or not the literal had one (#1380 review, LOW 3). Comparing
+        // against the literal's own bytes would red on a cosmetic
+        // difference that says nothing about commenting.
+        let text = normalised(&text);
+
         let mut back = String::new();
         for (original, line) in text.lines().zip(rendered.lines()) {
             let was = original.trim_start();
@@ -395,16 +484,97 @@ fn every_documented_default_in_the_tree_round_trips_through_the_render() {
     }
 }
 
+/// The scan's own classifier, over every spelling it must tell apart
+/// (#1380 review, MEDIUM 2).
+///
+/// Its whole job is to be **loud** about a family it cannot read, and the
+/// version this replaces was silent: `plain = "…"` below produced no entry
+/// and no complaint, so a fifth family spelt that way would have left the
+/// scan reporting four and passing. The `Unreadable` arms are the assertion.
+#[test]
+fn the_scan_tells_a_family_it_can_read_from_one_it_cannot() {
+    let source = concat!(
+        "pub const DEFAULT_TOML: &str = r#\"# raw\nkey = 1\n\"#;\n",
+        "pub const DEFAULT_TOML: &str = r##\"# hashed \"#\" inside\n\"##;\n",
+        "pub(super) const DEFAULT_TOML: &str = r#\"# scoped\n\"#;\n",
+        "pub const DEFAULT_TOML: &str = families::core_leds::DEFAULT_TOML;\n",
+        // Not published, so not a family: an `impl Subsystem` member, whether
+        // it aliases a real one or is a test fixture's inline string.
+        "    const DEFAULT_TOML: &'static str = DEFAULT_TOML;\n",
+        "    const DEFAULT_TOML: &'static str = F::FAMILY.default_toml;\n",
+        "    const DEFAULT_TOML: &'static str = \"enabled = true\\n\";\n",
+        // Published and unreadable: each of these must be reported.
+        "pub const DEFAULT_TOML: &str = \"# plain\\nkey = 1\\n\";\n",
+        "pub const DEFAULT_TOML: &str = concat!(HEAD, TAIL);\n",
+        "pub const DEFAULT_TOML: &str = include_str!(\"default.toml\");\n",
+        "/// A doc line mentioning DEFAULT_TOML: it is not a declaration.\n",
+    );
+
+    let decls = default_toml_decls(source);
+    let shapes: Vec<&str> = decls
+        .iter()
+        .map(|decl| match decl {
+            Decl::Text(_) => "text",
+            Decl::Alias => "alias",
+            Decl::Unreadable(_) => "unreadable",
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        vec![
+            "text",
+            "text",
+            "text",
+            "alias",
+            "unreadable",
+            "unreadable",
+            "unreadable"
+        ],
+        "classified: {decls:?}"
+    );
+
+    let Decl::Text(first) = &decls[0] else {
+        panic!("the first is a raw string")
+    };
+    assert_eq!(first, "# raw\nkey = 1\n");
+    let Decl::Text(hashed) = &decls[1] else {
+        panic!("the second is a `r##` raw string")
+    };
+    assert_eq!(
+        hashed, "# hashed \"#\" inside\n",
+        "the `\"#` inside an r## literal does not end it"
+    );
+}
+
 /// Every `DEFAULT_TOML` string literal in the workspace, as
 /// `(path relative to the workspace root, its text)`.
 ///
 /// Deliberately a source scan and not a dependency: see this file's own docs.
 /// It matches a `DEFAULT_TOML` **declaration** — the name, a type ascription
-/// and an `=` on one line, then a raw string, which is what every family
-/// writes (a documented default is full of quotes) — so it steps past both
-/// the `const DEFAULT_TOML: &'static str = DEFAULT_TOML;` re-exports and
-/// every mention of the name in prose without needing to know about either.
+/// and an `=` on one line — so it steps past every mention of the name in
+/// prose without needing to know about any of them.
+///
+/// **Every declaration it sees is accounted for** (#1380 review, MEDIUM 2):
+/// one that is not a raw string and not an alias is reported as unreadable
+/// and fails the caller by name, rather than being skipped in silence. The
+/// first cut recognised `r#"…"#` alone, so a family spelt with a plain
+/// `"…"` literal, a `concat!` or an `include_str!` would have left the scan
+/// finding four families, passing, and covering the new one not at all — a
+/// scan that can go quiet is worth less than no scan.
 fn documented_defaults() -> Vec<(String, String)> {
+    let (found, unreadable) = scan_workspace();
+    assert!(
+        unreadable.is_empty(),
+        "the scan found DEFAULT_TOML declarations it cannot read: {unreadable:?}\n\
+         Spell a documented default as a raw string literal (`r#\"…\"#`) — every family \
+         does — or teach `default_toml_decl` the spelling in the same commit, so this \
+         check keeps covering every family in the tree."
+    );
+    found
+}
+
+/// The walk: `(readable declarations, ones that could not be read)`.
+fn scan_workspace() -> (Vec<(String, String)>, Vec<String>) {
     let root = workspace_root();
     let mut sources = Vec::new();
     collect_rust_sources(&root, &mut sources);
@@ -416,18 +586,51 @@ fn documented_defaults() -> Vec<(String, String)> {
     );
 
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for source in sources {
         let body = std::fs::read_to_string(&source).expect("a Rust source this walk just listed");
-        for text in raw_default_tomls(&body) {
-            let name = source
-                .strip_prefix(&root)
-                .expect("the walk started at the root")
-                .to_string_lossy()
-                .into_owned();
-            out.push((name, text));
+        let name = source
+            .strip_prefix(&root)
+            .expect("the walk started at the root")
+            .to_string_lossy()
+            .into_owned();
+        for decl in default_toml_decls(&body) {
+            match decl {
+                Decl::Text(text) => out.push((name.clone(), text)),
+                // `const DEFAULT_TOML: &'static str = DEFAULT_TOML;` — the
+                // shell's families re-export the leaf crate's const, so the
+                // text is covered where it is written. Not a gap.
+                Decl::Alias => {}
+                Decl::Unreadable(line) => unreadable.push(format!("{name}: {line}")),
+            }
         }
     }
     out.sort();
+    (out, unreadable)
+}
+
+/// What one `DEFAULT_TOML` declaration's right-hand side turned out to be.
+#[derive(Debug)]
+enum Decl {
+    /// A raw string literal — the text of a documented default.
+    Text(String),
+    /// Another const by name or path: a re-export, whose text is scanned
+    /// wherever it is actually written.
+    Alias,
+    /// Anything else, carrying the line so the failure can name it.
+    Unreadable(String),
+}
+
+/// `text`'s lines, each terminated with exactly one `\n` — what
+/// [`commented_default`] normalises to, so the round trip above is a
+/// statement about commenting rather than about line endings (#1380 review,
+/// LOW 3).
+fn normalised(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 1);
+    for line in text.lines() {
+        out.push_str(line);
+        out.push('\n');
+    }
     out
 }
 
@@ -463,34 +666,94 @@ fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The raw-string values of every `DEFAULT_TOML` declaration in one source.
-fn raw_default_tomls(body: &str) -> Vec<String> {
+/// Every **published** `DEFAULT_TOML` declaration in one source, classified.
+///
+/// A declaration is `pub const DEFAULT_TOML: … = …`, at item position on one
+/// line. Three things follow from that shape, and each is deliberate:
+///
+/// * `pub` (or `pub(…)`) is what tells a *family* from a restatement. Every
+///   family publishes its documented default, because the schema walker, the
+///   control center and these tests all reach it by path; an
+///   `impl Subsystem`'s own `const DEFAULT_TOML` member is either an alias of
+///   one of those or a test fixture's inline string, and neither is a source
+///   of text this scan should be reading.
+/// * the visibility and `const` must be the whole of the line before the
+///   name, so a declaration quoted *inside a string* — as this file's own
+///   self-test does — is not mistaken for one.
+/// * whatever follows the `=` is **classified, not matched**, which is the
+///   #1380 MEDIUM 2 fix: a spelling this scan does not understand is
+///   reported rather than skipped.
+fn default_toml_decls(body: &str) -> Vec<Decl> {
+    const NAME: &str = "DEFAULT_TOML";
     let mut out = Vec::new();
     let mut rest = body;
-    while let Some(at) = rest.find("DEFAULT_TOML") {
-        rest = &rest[at + "DEFAULT_TOML".len()..];
-        // Only a declaration, and only on the name's own line: `: <type> =`
-        // then a raw string. Anything else — a re-export, a doc link, a
-        // sentence in a comment — is skipped.
-        let line = rest.split('\n').next().unwrap_or_default();
-        let Some(eq) = line.find('=') else { continue };
-        if !line[..eq].contains(':') || line[..eq].contains('"') {
+    while let Some(at) = rest.find(NAME) {
+        let line_start = rest[..at].rfind('\n').map_or(0, |nl| nl + 1);
+        let prefix = &rest[line_start..at];
+        let after_name = &rest[at + NAME.len()..];
+        rest = after_name;
+
+        if !is_published_const(prefix) {
             continue;
         }
-        let after = rest[eq + 1..].trim_start();
-        let Some(hashes) = after.strip_prefix('r') else {
+        let line = after_name.split('\n').next().unwrap_or_default();
+        let Some(eq) = line.find('=') else { continue };
+        if !line[..eq].contains(':') {
             continue;
-        };
-        let count = hashes.len() - hashes.trim_start_matches('#').len();
-        let Some(open) = hashes[count..].strip_prefix('"') else {
-            continue;
-        };
-        let close = format!("\"{}", "#".repeat(count));
-        let Some(end) = open.find(&close) else {
-            continue;
-        };
-        out.push(open[..end].to_owned());
-        rest = &open[end..];
+        }
+        let whole_line = format!("{prefix}{NAME}{line}");
+
+        let after = after_name[eq + 1..].trim_start();
+        match raw_string(after) {
+            Some((text, consumed)) => {
+                out.push(Decl::Text(text));
+                rest = &after[consumed..];
+            }
+            // A bare path (`other::DEFAULT_TOML;`) is a re-export, and the
+            // text is scanned where it is written. Anything else — a plain
+            // `"…"`, a `concat!`, an `include_str!` — this scan cannot read,
+            // and says so instead of going quiet.
+            None if is_path_alias(after) => out.push(Decl::Alias),
+            None => out.push(Decl::Unreadable(whole_line.trim().to_owned())),
+        }
     }
     out
+}
+
+/// Whether everything on the line before the name is exactly a visibility and
+/// `const` — `pub const `, `pub(super) const `, `pub(crate) const `.
+fn is_published_const(prefix: &str) -> bool {
+    let Some(head) = prefix.trim().strip_suffix("const") else {
+        return false;
+    };
+    let head = head.trim();
+    head == "pub" || (head.starts_with("pub(") && head.ends_with(')'))
+}
+
+/// A Rust raw string literal at the head of `src`, as `(contents, bytes
+/// consumed)`. Raw because a documented default is full of quotes; every
+/// family in the tree is spelt this way.
+fn raw_string(src: &str) -> Option<(String, usize)> {
+    let hashes = src.strip_prefix('r')?;
+    let count = hashes.len() - hashes.trim_start_matches('#').len();
+    let open = hashes[count..].strip_prefix('"')?;
+    let close = format!("\"{}", "#".repeat(count));
+    let end = open.find(&close)?;
+    let consumed = src.len() - open.len() + end + close.len();
+    Some((open[..end].to_owned(), consumed))
+}
+
+/// Whether `src` starts with an identifier or `::` path that ends the
+/// statement — i.e. this declaration is another const under a new name.
+fn is_path_alias(src: &str) -> bool {
+    let path: &str = src
+        .split(';')
+        .next()
+        .map(str::trim_end)
+        .unwrap_or_default();
+    !path.is_empty()
+        && src.len() > path.len() // a `;` really did follow
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
 }

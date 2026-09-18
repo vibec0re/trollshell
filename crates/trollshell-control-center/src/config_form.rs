@@ -2078,15 +2078,15 @@ mod gtk_tests {
 
     /// What the writer leaves behind for a family the operator has never
     /// configured: its documented default with every value line commented out
-    /// — so the file explains every key and **states** none — then `leaf`,
-    /// below that preamble (#1370).
+    /// — so the file explains every key and **states** none — then the line
+    /// saying which half is theirs, then `leaf` (#1370).
     ///
     /// The render's own bytes are pinned in `hytte-config`
     /// (`tests/commented_default_first_file.rs`); what the assertions below
     /// are for is the other half — that one row's change writes **one** leaf,
     /// and that it lands under the documentation rather than instead of it.
     fn first_file(default_toml: &str, leaf: &str) -> String {
-        format!("{}\n{leaf}", subsystem::commented_default(default_toml))
+        format!("{}{leaf}", subsystem::commented_seed(default_toml))
     }
 
     /// Whether the overlay **states** this line, as one whole line of it.
@@ -2568,7 +2568,7 @@ mod gtk_tests {
             "the key is gone, not set to the default: {written}"
         );
         assert!(
-            !written.contains("_unset"),
+            !stated(&written).iter().any(|key| key == "_unset"),
             "and a reset is not an _unset marker: {written}"
         );
         assert!(

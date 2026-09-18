@@ -434,8 +434,23 @@ enum Subject {
     Element {
         /// The array's own dotted path.
         array: String,
-        /// Which element these rows are.
+        /// Which element these rows are. May be **one past the end**: a
+        /// record the operator has asked to add does not exist in the file
+        /// until its name is written, exactly as a map entry does not
+        /// (#1383 review, MEDIUM 1).
         index: usize,
+        /// The field that **names** a record — the first [`Kind::Text`] of
+        /// the element's own fields, which is what the list titles its rows
+        /// by. `None` for a record shape with no text field at all.
+        ///
+        /// It is what brings a record into being, and the reason is not
+        /// tidiness: the shell reads `workspace.<name>.apps` through
+        /// `parse_apps`, which returns `Err` for any element without a
+        /// non-blank `id` — and `parse_stack` then drops the stack's
+        /// **whole** apps list. So an `{}` written on the way to a record
+        /// blanks a working stack for as long as it is there, which is the
+        /// state pressing *Add* used to create.
+        key_field: Option<&'static str>,
     },
 }
 
@@ -445,7 +460,7 @@ impl Subject {
     fn key_of(&self, field: &Field) -> String {
         match self {
             Self::Leaves { prefix } => format!("{prefix}{}", field.path),
-            Self::Element { array, index } => format!("{array}[{index}].{}", field.path),
+            Self::Element { array, index, .. } => format!("{array}[{index}].{}", field.path),
         }
     }
 }
@@ -662,7 +677,7 @@ impl FormInner {
                     );
                 }
             }
-            Subject::Element { array, index } => {
+            Subject::Element { array, index, .. } => {
                 // The **array** is the leaf the layering knows about, so its
                 // lock and its provenance are every row's: rule 3 replaces it
                 // whole, and there is no finer granularity to report.
@@ -724,9 +739,11 @@ impl FormInner {
         let locked = self.raw.borrow().locked.clone();
         let written = match &self.subject {
             Subject::Leaves { .. } => self.write_leaf(overlay, row, value, &locked),
-            Subject::Element { array, index } => {
-                self.write_element(overlay, array, *index, row, value, &locked)
-            }
+            Subject::Element {
+                array,
+                index,
+                key_field,
+            } => self.write_element(overlay, array, *index, *key_field, row, value, &locked),
         };
         match written {
             Ok(()) => {
@@ -796,11 +813,27 @@ impl FormInner {
     /// The array is taken from the last read rather than from the file, which
     /// is the same thing the 2 s poll guarantees for every other row here and
     /// the same window every other save has.
+    ///
+    /// **A record that is not there yet comes into being with its name, and
+    /// with nothing else** (#1383 review, MEDIUM 1) — the rule a map entry
+    /// already follows one level up. `index` may be one past the end, which
+    /// is what the records page's *Add* opens; the first write of
+    /// [`Subject::Element::key_field`] appends the record, and a write of any
+    /// other field before that is refused on its own row rather than
+    /// committing a nameless one. The cost of getting this wrong is not
+    /// cosmetic: `parse_apps` rejects an element with no `id` and
+    /// `parse_stack` then drops the stack's whole apps list, so an `{}` on
+    /// the way to a record blanks a working stack.
+    ///
+    /// The mirror image is refused too: the name cannot be *reset* out of an
+    /// existing record, because what that would leave is the same poison
+    /// value. The list's own **Remove** is how a record goes.
     fn write_element(
         &self,
         overlay: &Path,
         array_key: &str,
         index: usize,
+        key_field: Option<&'static str>,
         row: &Row,
         value: Option<toml_edit::Value>,
         locked: &BTreeSet<String>,
@@ -809,6 +842,45 @@ impl FormInner {
             self.check(&row.key, row.field.kind, value)?;
         }
         let mut array = self.array_at(array_key);
+        let naming = key_field == Some(row.field.path);
+        let creating = array.get(index).is_none();
+
+        if creating {
+            if value.is_none() {
+                // Nothing to remove from a record that was never written —
+                // and, crucially, nothing to write either: re-emitting the
+                // merged array here would copy a base layer's records into
+                // the overlay for a reset that changed nothing.
+                return Ok(());
+            }
+            if index != array.len() {
+                return Err(self.not_a_leaf(
+                    &row.key,
+                    "the array no longer has an entry there — it moved underneath this page",
+                ));
+            }
+            if !naming {
+                let name = key_field.map_or_else(
+                    || "a name".to_owned(),
+                    |field| format!("a {}", humanise(field).to_lowercase()),
+                );
+                return Err(self.not_a_leaf(
+                    &row.key,
+                    &format!(
+                        "give it {name} first — a record with no name is one the shell reads \
+                         as a broken list, so it is not written until it has one"
+                    ),
+                ));
+            }
+            array.push(toml_edit::InlineTable::new());
+        } else if naming && value.is_none() {
+            return Err(self.not_a_leaf(
+                &row.key,
+                "a record is named by this, and one without a name is a list the shell \
+                 refuses whole — remove the record from the list instead of clearing it",
+            ));
+        }
+
         let Some(element) = array
             .get_mut(index)
             .and_then(toml_edit::Value::as_inline_table_mut)
@@ -2008,14 +2080,13 @@ fn humanise(segment: &str) -> String {
 /// A family that exists only for this module's tests: **one leaf of every
 /// [`Kind`]**.
 ///
-/// The four real families between them have no editable [`Kind::Text`] in P1
-/// (`agents`, which owns the only one, is staged read-only) and none has all
-/// seven kinds at once, so a per-kind test written against real families would
-/// be both incomplete and hostage to a schema change somewhere else. It rides
-/// the very same [`ShellSubsystem`] the two shell families do, so the shim is
-/// exercised rather than bypassed — and `the_fixture_family_verifies` holds it
-/// to its own documented default with the same walker CI runs over the real
-/// four.
+/// None of the four real families has all seven kinds at once — `agents` owns
+/// the only [`Kind::Text`] and `workspaces` has no scalar leaf at all — so a
+/// per-kind test written against real families would be both incomplete and
+/// hostage to a schema change somewhere else. It rides the very same
+/// [`ShellSubsystem`] the two shell families do, so the shim is exercised
+/// rather than bypassed — and `the_fixture_family_verifies` holds it to its
+/// own documented default with the same walker CI runs over the real four.
 #[cfg(test)]
 mod fixture {
     use hytte_config::schema::{Family, Field, Kind, Schema};
@@ -2382,19 +2453,24 @@ mod tests {
     /// **Red if the dot check goes**: the second case is accepted.
     #[test]
     fn an_entry_name_is_one_undotted_segment() {
-        assert_eq!(collection::check_name("alpha", "display"), Ok(()));
+        let taken = [String::from("beta")];
+        assert_eq!(collection::check_name("alpha", "display", &taken), Ok(()));
         assert_eq!(
-            collection::check_name("trollshell-choom", "display"),
+            collection::check_name("trollshell-choom", "display", &taken),
             Ok(())
         );
-        assert!(collection::check_name("a.b", "display").is_err());
+        assert!(collection::check_name("a.b", "display", &taken).is_err());
         // Blank — what a trimmed empty entry row hands over.
-        assert!(collection::check_name("", "display").is_err());
+        assert!(collection::check_name("", "display", &taken).is_err());
         // `_locked` and `_unset` are the layering's own spellings, so a name
         // that could collide with one is refused rather than written and then
         // read back as a marker.
-        assert!(collection::check_name("_locked", "display").is_err());
-        assert!(collection::check_name("_unset", "display").is_err());
+        assert!(collection::check_name("_locked", "display", &taken).is_err());
+        assert!(collection::check_name("_unset", "display", &taken).is_err());
+        // #1383 review, LOW 3: *Add* and *open the row above* are two
+        // different things to have asked for, so a name the map already holds
+        // is refused rather than silently opening that entry.
+        assert!(collection::check_name("beta", "display", &taken).is_err());
     }
 
     #[test]
@@ -3873,14 +3949,142 @@ mod gtk_tests {
 
         page.activate_row("Add an item");
         settle_until("the new record's page", || page.title() == "Item 2");
+        // #1383 review, MEDIUM 1: Add opens a page and **writes nothing**.
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }]\n",
+            "Add wrote a nameless record"
+        );
+
         page.type_into("ID", "second");
         settle_until("the new record's id", || {
             Scratch::read(&overlay).contains("second")
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "items = [{ id = \"first\" }, { id = \"second\" }]\n"
+            "items = [{ id = \"first\" }, { id = \"second\" }]\n",
+            "exactly one record, and the sibling untouched"
         );
+    }
+
+    /// #1383 review, MEDIUM 1: **Add then Back writes nothing at all.**
+    ///
+    /// This is the half that was a live bug rather than an untidiness. The
+    /// shell's `parse_apps` returns `Err` for an element with no `id`, and
+    /// `parse_stack` then drops the stack's **whole** apps list — so the `{}`
+    /// that Add used to append blanked a working stack for as long as it was
+    /// there, and going Back without typing left it in the file for good.
+    ///
+    /// **Red before the fix**: the overlay comes back
+    /// `items = [{ id = "first" }, {}]`.
+    #[gtk::test]
+    fn adding_a_record_and_going_back_writes_nothing() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("Add an item");
+        settle_until("the new record's page", || page.title() == "Item 2");
+
+        page.nav.pop();
+        settle_until("the pop", || page.title() == "Items");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }]\n",
+            "a record nobody named reached the file"
+        );
+    }
+
+    /// …and the other field of a record that does not exist yet is refused on
+    /// its own row rather than committing a nameless one.
+    ///
+    /// **Red without `write_element`'s `naming` gate**: the overlay grows
+    /// `{ exec = "run" }` — the same poison value, by the other door.
+    #[gtk::test]
+    fn a_record_that_is_not_there_yet_takes_its_name_before_anything_else() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("Add an item");
+        settle_until("the new record's page", || page.title() == "Item 2");
+
+        page.type_into("Exec", "run");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }]\n",
+            "a nameless record was written"
+        );
+
+        // …and the name is what brings it into being, with the field that was
+        // refused still a draft the operator can apply afterwards.
+        page.type_into("ID", "second");
+        settle_until("the name", || Scratch::read(&overlay).contains("second"));
+        page.type_into("Exec", "run");
+        settle_until("the second field", || {
+            Scratch::read(&overlay).contains("run")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }, { id = \"second\", exec = \"run\" }]\n"
+        );
+    }
+
+    /// …and the name cannot be **reset** out of a record that has one: what
+    /// that leaves is the same value the shell refuses the whole list for.
+    ///
+    /// **Red without `write_element`'s `naming && value.is_none()` arm**: the
+    /// overlay comes back `items = [{ exec = "run" }]`.
+    #[gtk::test]
+    fn a_records_name_cannot_be_reset_out_of_it() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\", exec = \"run\" }]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("first");
+
+        let id: adw::EntryRow = page.find("ID").expect("the naming field");
+        let reset = page
+            .widgets::<gtk::Button>()
+            .into_iter()
+            .find(|button| button.icon_name().as_deref() == Some("edit-undo-symbolic"))
+            .expect("every row has a reset");
+        assert!(id.is_sensitive());
+        reset.emit_clicked();
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\", exec = \"run\" }]\n",
+            "the record lost its name"
+        );
+    }
+
+    /// #1383 review, MEDIUM 1's second half: a record carrying **nothing** is
+    /// swept up when its page is left — a hand-written `{}` is exactly what
+    /// `parse_apps` drops the whole list for, and the operator has just been
+    /// looking at it.
+    ///
+    /// **Red without `SubPage::on_pop`**: the `{}` is still there.
+    #[gtk::test]
+    fn an_empty_record_is_swept_up_when_its_page_is_left() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }, {}]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("Item 2");
+        assert_eq!(page.title(), "Item 2");
+
+        page.nav.pop();
+        settle_until("the empty record to be swept up", || {
+            Scratch::read(&overlay) == "items = [{ id = \"first\" }]\n"
+        });
     }
 
     /// Item 7: a record page whose element the file no longer has comes down

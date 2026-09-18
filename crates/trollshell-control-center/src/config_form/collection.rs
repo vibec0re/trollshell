@@ -80,9 +80,27 @@ pub(super) struct SubPage {
     /// Re-render from a fresh read. **`false` means the subject is gone** and
     /// this page (with everything pushed on top of it) must come down.
     refresh: Box<dyn Fn(&Raw) -> bool>,
+    /// Run when this page leaves the stack, however it leaves it — the
+    /// operator pressing Back, the poll popping it, or the form being
+    /// unmounted underneath it.
+    ///
+    /// One caller today: a record page sweeping up an element that carries
+    /// nothing (#1383 review, MEDIUM 1). It **must** defer its work to an
+    /// idle tick — `drop` runs from inside the `popped` handler, which holds
+    /// [`FormInner::open`] — and it must tolerate the form already being
+    /// gone.
+    on_pop: Option<Box<dyn FnOnce()>>,
     /// A sub-form's handle, when this page has one — held so its widgets and
     /// its row handlers live exactly as long as the page does.
     _form: Option<Form>,
+}
+
+impl Drop for SubPage {
+    fn drop(&mut self) {
+        if let Some(on_pop) = self.on_pop.take() {
+            on_pop();
+        }
+    }
 }
 
 /// Re-render every open sub-page from `raw`, popping the first whose subject
@@ -197,10 +215,19 @@ fn push(inner: &Rc<FormInner>, nav: &adw::NavigationView, page: SubPage) {
             // this form already forgot (because `pop_from` split it off
             // before navigating) is simply not found, which is the no-op it
             // should be.
-            let mut open = inner.open.borrow_mut();
-            if let Some(index) = open.iter().position(|sub| sub.page == *popped) {
-                open.truncate(index);
-            }
+            //
+            // Split off and dropped **outside** the borrow: a `SubPage`'s
+            // `on_pop` can reach back into this same cell, and `truncate`
+            // under a `borrow_mut` would be a `BorrowMutError` rather than a
+            // missed sweep.
+            let doomed: Vec<SubPage> = {
+                let mut open = inner.open.borrow_mut();
+                match open.iter().position(|sub| sub.page == *popped) {
+                    Some(index) => open.split_off(index),
+                    None => return,
+                }
+            };
+            drop(doomed);
         });
         *inner.nav.borrow_mut() = Some((nav.clone(), handler));
     }
@@ -276,6 +303,7 @@ fn map_page(
     SubPage {
         page: navigation,
         refresh,
+        on_pop: None,
         _form: None,
     }
 }
@@ -335,9 +363,10 @@ impl MapPage {
                  value.",
             ));
             let page = Rc::clone(self);
+            let taken = names.clone();
             add.connect_apply(move |entry| {
                 let name = entry.text().trim().to_owned();
-                if let Err(why) = check_name(&name, &page.key) {
+                if let Err(why) = check_name(&name, &page.key, &taken) {
                     page.say(why);
                     return;
                 }
@@ -454,9 +483,20 @@ fn deletable(raw: &Raw, path: &str, fields: &[Field]) -> bool {
 /// `display."a.b".icon` renders a lock indistinguishable from the nested
 /// segments `a → b → icon` — the nix module refuses it at eval for exactly
 /// this reason, and an editor that let one in would reintroduce it below nix.
-pub(super) fn check_name(name: &str, key: &str) -> Result<(), &'static str> {
+///
+/// `taken` is the names the map already holds. An existing name is **refused**
+/// rather than silently opening that entry (#1383 review, LOW 3): *Add* and
+/// *pick one of the rows above it* are two different things to have asked
+/// for, and a form that answers the first by doing the second leaves the
+/// operator editing a row they thought they had just created. `places_tab`
+/// sidesteps the question by generating a unique name (`unused_name`); here
+/// the name is the operator's to type, so the answer has to be said out loud.
+pub(super) fn check_name(name: &str, key: &str, taken: &[String]) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("Give it a name first.");
+    }
+    if taken.iter().any(|had| had == name) {
+        return Err("That name already exists — open its row above to edit it.");
     }
     if name.contains('.') {
         return Err(
@@ -618,6 +658,7 @@ fn entry_page(
     SubPage {
         page: navigation,
         refresh,
+        on_pop: None,
         _form: Some(form),
     }
 }
@@ -678,7 +719,9 @@ fn confirm_delete(
     drop(raw);
 
     let mut body = format!(
-        "Your own {} lines for it are removed from {}.toml, comments around them included.",
+        "Your own {} lines for it are removed from {}.toml, comments around them included. A \
+         list inside it goes whole — arrays replace rather than merge, so if a layer below \
+         states one, that layer's list is what comes back.",
         name, inner.ops.family.name
     );
     if !inherited.is_empty() {
@@ -778,7 +821,9 @@ fn list_page(
         .title(title.clone())
         .description(format!(
             "{} Arrays replace rather than merge, so this list is saved whole: your own file \
-             states all of it, or none of it.",
+             states all of it, or none of it. Changing one item therefore copies the items a \
+             layer below states into your own file too — reset the row to hand the whole list \
+             back.",
             field.doc
         ))
         .build();
@@ -809,6 +854,7 @@ fn list_page(
     SubPage {
         page: navigation,
         refresh,
+        on_pop: None,
         _form: None,
     }
 }
@@ -1030,6 +1076,7 @@ fn records_page(
     SubPage {
         page: navigation,
         refresh,
+        on_pop: None,
         _form: None,
     }
 }
@@ -1097,7 +1144,7 @@ impl RecordsPage {
         if !locked {
             let add = adw::ActionRow::builder()
                 .title(format!("Add {}", article(noun)))
-                .subtitle("Appended to the end of the list")
+                .subtitle("Appended to the end of the list once you name it")
                 .activatable(true)
                 .build();
             add.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
@@ -1117,8 +1164,19 @@ impl RecordsPage {
         let _ = self.field;
     }
 
-    /// Append an empty record and open it, so the first thing the operator
-    /// does is fill it in — `places_tab::add`'s shape.
+    /// Open a page for a record **one past the end**, so the first thing the
+    /// operator does is name it — and **write nothing** on the way (#1383
+    /// review, MEDIUM 1).
+    ///
+    /// This used to append an empty inline table and save it. That is the
+    /// `places_tab::add` shape, and it is wrong here for a reason that is
+    /// specific to what reads the file: the shell's `parse_apps` returns
+    /// `Err` for an element with no `id`, and `parse_stack` then drops the
+    /// stack's **whole** apps list — so pressing Add blanked a working
+    /// stack's apps until an id was typed, and going Back without typing left
+    /// the poison record in the file for good. A record comes into being with
+    /// its name, which is the rule a map entry already followed one level up
+    /// ([`MapPage`]'s Add writes nothing either).
     fn add(self: &Rc<Self>) {
         let at = self
             .form
@@ -1132,9 +1190,7 @@ impl RecordsPage {
                     .map_or(0, Vec::len)
             })
             .unwrap_or_default();
-        if self.write(|array| array.push(toml_edit::InlineTable::new())) {
-            self.open(at);
-        }
+        self.open(at);
     }
 
     /// Push one record's page.
@@ -1239,13 +1295,15 @@ fn record_page(
             subject: Subject::Element {
                 array: key.to_owned(),
                 index,
+                key_field: naming_field(fields),
             },
             fields,
             single_group: Some((
                 title.clone(),
                 format!(
                     "Entry {} of {}. Arrays replace rather than merge, so changing a row here \
-                     saves the whole list.",
+                     saves the whole list — including anything a layer below states, which is \
+                     copied into your own file the first time you save.",
                     index + 1,
                     humanise(leaf_of(key))
                 ),
@@ -1262,27 +1320,93 @@ fn record_page(
 
     let key = key.to_owned();
     let form_refresh = form.refresher();
-    let refresh = Box::new(move |raw: &Raw| {
-        // The element is this page's subject, so an array that shrank past it
-        // — a sibling deleted, a hand edit, a nix rebuild — pops the page
-        // rather than leaving a form writing into an index that moved.
-        if super::element_of(raw, &key, index).is_none() {
-            return false;
-        }
-        let locked = raw.is_locked(&key);
-        banner.set_revealed(locked);
-        if locked {
-            banner.set_title(SET_IN_NIX);
-        }
-        form_refresh();
-        true
-    }) as Box<dyn Fn(&Raw) -> bool>;
+    // A record the operator asked to **add** does not exist yet — `index` is
+    // one past the end until its name is written — so "it is not there"
+    // cannot mean "it went away" until it has been there once (#1383 review,
+    // MEDIUM 1). Seeded from the read this page was built against, the entry
+    // page's own shape.
+    let existed = Cell::new(super::element_of(&inner.raw.borrow(), &key, index).is_some());
+    let refresh = {
+        let key = key.clone();
+        Box::new(move |raw: &Raw| {
+            // The element is this page's subject, so an array that shrank past
+            // it — a sibling deleted, a hand edit, a nix rebuild — pops the
+            // page rather than leaving a form writing into an index that moved.
+            if super::element_of(raw, &key, index).is_some() {
+                existed.set(true);
+            } else if existed.get() {
+                return false;
+            }
+            let locked = raw.is_locked(&key);
+            banner.set_revealed(locked);
+            if locked {
+                banner.set_title(SET_IN_NIX);
+            }
+            form_refresh();
+            true
+        }) as Box<dyn Fn(&Raw) -> bool>
+    };
+
+    // A record carrying nothing at all is what `parse_apps` chokes on, taking
+    // the stack's whole apps list with it — so one that is on screen and gets
+    // left behind is swept up rather than kept (#1383 review, MEDIUM 1's
+    // second half). Only a wholly empty element: anything the operator or a
+    // layer actually states is theirs, and the list's Remove is how a record
+    // with content goes. Deferred to an idle tick because this runs from
+    // `SubPage::drop`, which fires from inside `open`'s own borrow on the
+    // `popped` path.
+    let weak = Rc::downgrade(inner);
+    let on_pop = Box::new(move || {
+        glib::idle_add_local_once(move || prune_empty_record(&weak, &key, index));
+    }) as Box<dyn FnOnce()>;
 
     SubPage {
         page: navigation,
         refresh,
+        on_pop: Some(on_pop),
         _form: Some(form),
     }
+}
+
+/// The field that **names** a record — the first [`Kind::Text`] of its own
+/// fields, which is what [`record_title`] titles the row by.
+fn naming_field(fields: &'static [Field]) -> Option<&'static str> {
+    fields
+        .iter()
+        .find(|field| matches!(field.kind, Kind::Text { .. }))
+        .map(|field| field.path)
+}
+
+/// Remove element `index` of the array at `key` when it carries nothing at
+/// all — see [`record_page`]'s `on_pop`.
+fn prune_empty_record(weak: &Weak<FormInner>, key: &str, index: usize) {
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let empty = super::element_of(&inner.raw.borrow(), key, index).is_some_and(toml::Table::is_empty);
+    if !empty {
+        return;
+    }
+    let Some(overlay) = inner.overlay.as_ref() else {
+        return;
+    };
+    let mut array = inner.array_at(key);
+    if index >= array.len() {
+        return;
+    }
+    array.remove(index);
+    let locked = inner.raw.borrow().locked.clone();
+    let array = (!array.is_empty()).then(|| array);
+    if let Err(err) = inner.write_array(overlay, key, array, &locked) {
+        tracing::warn!(
+            family = inner.ops.family.name,
+            key,
+            %err,
+            "an empty record could not be swept up"
+        );
+        return;
+    }
+    inner.reload(true);
 }
 
 // ── Furniture ────────────────────────────────────────────────────────────────

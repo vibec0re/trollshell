@@ -5335,6 +5335,63 @@ trollshell`. Expect the cards to come back Active and **no notification at
       subscriber; this bullet is the on-machine confirmation the #1035 PR
       body flagged as not yet run.
 
+### The config form's collections (#888 P2, #1373)
+
+The generic form's `Map` and `List` rows became editable with P2: a
+collection row pushes a sub-page, a map entry opens the **same form** over
+prefixed paths (`display.<name>.label`), and a list is written whole. None
+of the drill-down is verifiable against a real family on CI, because the
+one thing that makes it worth having — a live agent to relabel, a saved
+stack to reorder — is a hive and a compositor.
+
+- [ ] **(#1373 item 2)** **A map entry, end to end.** With a hive up and
+      the agents plugin running, open the control-center → **Plugins** →
+      the `agents` plugin → the **Display** row. It says how many entries
+      it holds and opens a page listing them. Type a hive agent's exact
+      name into **Add an entry** and apply: its page opens and
+      `~/.config/trollshell/agents.toml` is **unchanged** — an entry is not
+      a thing until it has a value. Now set **Label**: the file grows
+      `[display.<name>]` with that one key under the commented preamble
+      (#1370), and the sidebar pill relabels within one `agents.toml` poll
+      with no plugin restart. Set **Icon** too and confirm the file gains
+      exactly one more line. Then the header's **Delete**: confirm the
+      dialog, and both keys go with the table while every other byte of the
+      file stays.
+- [ ] **(#1373 item 5)** **A base layer's entry has no Delete.** Put
+      `programs.trollshell.config.agents.display.<name>.label = "From nix";`
+      in the system flake and rebuild, so `/etc/xdg/trollshell/agents.toml`
+      carries the entry **and** `_locked = [ "display.<name>.label" ]`. The
+      entry's page opens (reading a nix-set entry is the point of having it
+      on screen), its Label row is insensitive and says _Set in nix — …_,
+      and there is **no** Delete. Remove the lock but keep the value: the
+      row becomes editable, the page still offers no Delete — nothing of
+      the operator's is there to remove — and the moment you type a label
+      the Delete appears.
+- [ ] **(#1373 items 3–4)** **Workspaces' two collections.** Save a couple
+      of workspaces from the shell's Workspaces drawer page so
+      `~/.config/trollshell/workspaces.toml` has stacks. In the
+      control-center → **Plugins** → the pinned **Shell** entry →
+      **Workspaces**: the **Order** row opens a list of entry rows; add a
+      stack name, blank one out to remove it, and confirm each save rewrites
+      `order = [...]` **whole** (the file states the list or nothing —
+      arrays replace). Then **Workspace** → a stack → **Apps**: the records
+      page lists each app by its `id`, opening one edits `id`/`exec`, and a
+      change re-emits the whole `apps` array with the sibling records
+      untouched and their keys in the order the schema documents. Reopen the
+      shell's Workspaces drawer page and confirm it reads every edit back
+      within one poll.
+- [ ] **(#1373 item 7)** **A page whose subject goes away comes down.** With
+      an entry's page open in the control-center, delete that entry from
+      `agents.toml` in `$EDITOR`. Within ~2 s the page pops back to the list
+      on its own rather than sitting there editing a table that is gone. Do
+      the same with a record page and an `apps` array you shorten by hand.
+- [ ] **(#1373 item 1)** **The pushed page's chrome.** The sub-page carries
+      its own header bar with a back button, below the tab's own — and the
+      tab's back-to-the-sidebar button still appears when the window is
+      narrow enough to collapse the split view. Switching to another plugin,
+      or to the Shell entry, drops you back to that page's root rather than
+      leaving a collection page from the previous selection on screen.
+
 ## Documentation site (GitHub Pages)
 
 - [ ] **(#629)** `docs/plugin-env.md` is now published on the Pages

@@ -3149,7 +3149,8 @@ pub fn commented_seed(default_toml: &str) -> String {
 /// this writer refuses below is structure somebody else owns.
 ///
 /// It exists because until #1373 a removal was only ever a **side effect**:
-/// [`remove_leaf`] drops a table once its last key is reset out of it and
+/// `remove_leaf` — private to this module, hence the plain span — drops a
+/// table once its last key is reset out of it and
 /// [`Subsystem::DEFAULT_TOML`] does not document it, so deleting
 /// `[display.argus]` meant a form resetting each of its three keys in turn and
 /// trusting the prune rule to notice. That is three writes, three re-reads and
@@ -3166,8 +3167,8 @@ pub fn commented_seed(default_toml: &str) -> String {
 ///    [`ConfigError::Locked`], through the same [`Loaded::is_locked`]
 ///    predicate the reader greys a row with. A lock on `display.argus` pins
 ///    the entry; a lock on `display` pins the map.
-/// 3. **A table [`Subsystem::DEFAULT_TOML`] documents** — [`table_paths`], the
-///    same set [`remove_leaf`]'s prune rule consults. `[core]` is part of
+/// 3. **A table [`Subsystem::DEFAULT_TOML`] documents** — the same set the
+///    prune rule consults (`table_paths`). `[core]` is part of
 ///    `core-leds.toml`'s own shape and is not an entry anybody added, so it is
 ///    not one this call may take away.
 /// 4. **A scalar** — a path that exists and holds neither a table nor an

@@ -220,6 +220,17 @@ inline in `flake.nix` as one-liners.
   file. Run the nix-side scan by hand with
   `nix shell nixpkgs#python3 --command python3 nix/lint-manifest-id.py` — the
   `nix shell` is not optional, for the `bind-pins` reason above.
+- `config-vocab` (#1375, #888 P3): the same shape for `nix/module-common.nix`'s
+  hand-mirrored config vocabulary — `nix/lint-config-vocab.py` gates
+  `programs.trollshell.config.{core-leds,agents}`'s leaf set, bounds/enums and
+  each option's `description` first sentence against the four `Subsystem`
+  families' own `SCHEMA` consts (two in `hytte-config-families`, one apiece in
+  `hytte-plugin-agents` and `hytte-plugin-stats`), plus the unrelated,
+  unchanged `places` and `plugins.<id>.mount` mirrors it also carries. Run it
+  by hand with
+  `nix shell nixpkgs#python3 --command python3 nix/lint-config-vocab.py`
+  (`--self-test` runs just the fixture and mutation layers) — the `nix shell`
+  is not optional, for the `bind-pins` reason above.
 - `rustdoc` (#1328): `cargo doc --workspace --no-deps` with
   `RUSTDOCFLAGS="-D warnings"`, on the `workspace-tests` precedent above —
   its own leaf row, not folded into it, sharing `cargoArtifacts` rather than

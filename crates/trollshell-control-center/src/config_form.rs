@@ -16,7 +16,7 @@
 //! | [`Kind::Bool`] | `AdwSwitchRow` |
 //! | [`Kind::Int`] with an empty `also` | `AdwSpinRow::with_range` |
 //! | [`Kind::Int`] with words | the same spin row, plus one suffix toggle per word |
-//! | [`Kind::Choice`] | `AdwComboRow` over the options |
+//! | [`Kind::Choice`] | `AdwComboRow` over the options (plus a transient item when the file's word is not one of them) |
 //! | [`Kind::Color`] | an `AdwComboRow` of the named colours (plus a *custom* item) and an `AdwEntryRow` for the `#rrggbb` literal, with a swatch |
 //! | [`Kind::Text`] | `AdwEntryRow` with an apply button |
 //! | [`Kind::List`] / [`Kind::Map`] | a read-only `AdwActionRow` summarising the value — editing a collection is #888 P2 |
@@ -54,8 +54,11 @@
 //!    the layer that matters here: a nix-rendered base carries the frozen
 //!    mtime `1970-01-01 00:00:01`, so a rebuild that adds a lock can move
 //!    neither half of it. Re-reading three small TOML files twice a second,
-//!    only while the page is up, is cheaper than being wrong about a greyed
-//!    row.
+//!    for as long as a [`Form`] is held, is cheaper than being wrong about a
+//!    greyed row — and that lifetime is the caller's to keep short: the
+//!    Plugins tab builds a plugin's form when its row is selected and drops
+//!    it when the selection moves, so only the shell families' two forms,
+//!    which have no selection to hang off, tick for the tab's whole life.
 //!
 //! # What the poll compares
 //!
@@ -430,11 +433,21 @@ impl FormInner {
 
     /// A layer exists and could not be read or parsed: say which, and make
     /// every control insensitive until it can be.
+    ///
+    /// The journal line is written once per *distinct* failure, not once per
+    /// poll: an unparsable layer stays unparsable until someone fixes it, and
+    /// the read that finds it runs twice a second — so the honest report is
+    /// "this happened", not thirty lines a minute saying it is still true. The
+    /// banner is the durable surface, and it says it for as long as it is
+    /// true.
     fn show_load_error(&self, err: &ConfigError) {
-        tracing::warn!(family = self.ops.family.name, %err, "config layers could not be read");
-        self.banner.set_subtitle(&glib::markup_escape_text(
-            &err.to_string(),
-        ));
+        let text = glib::markup_escape_text(&err.to_string());
+        let already_saying_this =
+            self.banner.is_visible() && self.banner.subtitle().is_some_and(|shown| shown == text);
+        if !already_saying_this {
+            tracing::warn!(family = self.ops.family.name, %err, "config layers could not be read");
+        }
+        self.banner.set_subtitle(&text);
         self.banner.set_visible(true);
         for row in &self.rows {
             row.set_sensitive(false);
@@ -565,16 +578,31 @@ enum Control {
     Combo {
         /// The combo.
         row: adw::ComboRow,
-        /// The vocabulary, by index — which is also the combo's model, in the
-        /// same order, so a selected index *is* an option and an option is a
-        /// selected index.
-        ///
-        /// A value the vocabulary does **not** have shows as *no* selection
-        /// ([`index_of`]) rather than as an extra item appended to the model:
-        /// an item nothing in the schema names is a word this row would then
-        /// offer to save, and the one thing a fixed vocabulary must not do is
-        /// grow a member from whatever the file happened to say.
+        /// The vocabulary, by index — and the **first** `options.len()` items
+        /// of `model`.
         options: &'static [&'static str],
+        /// The combo's items: the vocabulary, plus — only while the file says
+        /// a word the vocabulary does not have — one trailing item carrying
+        /// that word ([`Row::push`]).
+        ///
+        /// That item exists because an `AdwComboRow` **cannot** show *no*
+        /// selection: it wraps whatever model it is given in a
+        /// `GtkSingleSelection` left on the default `autoselect = TRUE`
+        /// (`adw-combo-row.c`'s `adw_combo_row_set_model`), which refuses
+        /// `GTK_INVALID_LIST_POSITION` and snaps back to item 0. So the
+        /// alternative to carrying the file's own word is a row that silently
+        /// presents `options[0]` as though the file had said it — a form
+        /// lying about the file it exists to edit, on exactly the value a hand
+        /// edit or a base layer from a newer shell produces.
+        ///
+        /// It is transient in both directions: [`Row::push`] adds it only for
+        /// a value outside `options` and takes it away again the moment one
+        /// inside them arrives, so the vocabulary never permanently grows a
+        /// member from whatever the file happened to say. Re-picking it saves
+        /// that word and the writer refuses it against the schema
+        /// ([`Kind::accepts`]) — the refusal lands on the row, which is the
+        /// honest answer to *"put back the word that is already there"*.
+        model: gtk::StringList,
     },
     /// [`Kind::Color`] — the named options plus a literal.
     Colour {
@@ -713,20 +741,25 @@ fn widgets_for(
                 )
             }
             Kind::Choice { options } => {
-                let row = combo_row(title, options, None);
+                let (row, model) = combo_row(title, options, None);
                 let reset = reset_button(&row);
                 (
                     vec![row.clone().upcast()],
                     Control::Combo {
                         row: row.clone(),
                         options,
+                        model,
                     },
                     Note::Subtitle(row.upcast()),
                     Some(reset),
                 )
             }
             Kind::Color { options } => {
-                let combo = combo_row(title, options, Some(CUSTOM_COLOUR));
+                // A `Color`'s out-of-vocabulary value is not exceptional — it
+                // is the `#rrggbb` literal half of the kind — so its combo
+                // carries a permanent trailing *custom* item and needs no
+                // transient one.
+                let (combo, _) = combo_row(title, options, Some(CUSTOM_COLOUR));
                 let entry = adw::EntryRow::builder()
                     .title(format!("{title} — #rrggbb"))
                     .show_apply_button(true)
@@ -824,8 +857,30 @@ impl Row {
                     row.set_value(n as f64);
                 }
             }
-            Control::Combo { row, options } => {
-                row.set_selected(index_of(options, value.and_then(toml::Value::as_str)));
+            Control::Combo { row, options, model } => {
+                let word = value.and_then(toml::Value::as_str);
+                let known = index_of(options, word);
+                // The transient item first, so the index selected below always
+                // exists in the model. Truncating afterwards would deselect it.
+                let extra = u32::try_from(options.len()).unwrap_or(u32::MAX);
+                if known == gtk::INVALID_LIST_POSITION && let Some(word) = word {
+                    if model.n_items() > extra {
+                        model.splice(extra, model.n_items() - extra, &[word]);
+                    } else {
+                        model.append(word);
+                    }
+                    row.set_selected(extra);
+                } else {
+                    if model.n_items() > extra {
+                        model.splice(extra, model.n_items() - extra, &[]);
+                    }
+                    // `known` is `INVALID_LIST_POSITION` only when no layer
+                    // states the key at all, which `verify` makes unreachable
+                    // for a scalar: the documented default is the bottom
+                    // layer and must state every non-collection field. The
+                    // combo then keeps GTK's own answer, item 0.
+                    row.set_selected(known);
+                }
             }
             Control::Colour {
                 combo,
@@ -869,9 +924,20 @@ impl Row {
                 #[allow(clippy::cast_possible_truncation)]
                 Some((row.value().round() as i64).into())
             }
-            Control::Combo { row, options } => options
-                .get(usize::try_from(row.selected()).unwrap_or(usize::MAX))
-                .map(|option| (*option).into()),
+            Control::Combo { row, options, model } => {
+                let selected = usize::try_from(row.selected()).unwrap_or(usize::MAX);
+                options.get(selected).map_or_else(
+                    // The transient item — the word the file already holds.
+                    // Saving it is what the writer refuses, on the row
+                    // ([`Control::Combo`]'s own docs).
+                    || {
+                        model
+                            .string(row.selected())
+                            .map(|word| word.as_str().into())
+                    },
+                    |option| Some((*option).into()),
+                )
+            }
             Control::Colour {
                 combo,
                 entry,
@@ -1041,7 +1107,11 @@ fn save_from_row(weak: &Weak<FormInner>, index: usize) {
 const CUSTOM_COLOUR: &str = "custom (#rrggbb)";
 
 /// A combo row over `options`, with `extra` appended when there is one.
-fn combo_row(title: &str, options: &[&str], extra: Option<&str>) -> adw::ComboRow {
+///
+/// The model is handed back beside the row because `AdwComboRow` does not give
+/// it back in the type we need it in (`model()` answers a `gio::ListModel`),
+/// and [`Control::Combo`] appends to and truncates it per refresh.
+fn combo_row(title: &str, options: &[&str], extra: Option<&str>) -> (adw::ComboRow, gtk::StringList) {
     let model = gtk::StringList::new(&[]);
     for option in options {
         model.append(option);
@@ -1051,7 +1121,7 @@ fn combo_row(title: &str, options: &[&str], extra: Option<&str>) -> adw::ComboRo
     }
     let row = adw::ComboRow::builder().title(title).build();
     row.set_model(Some(&model));
-    row
+    (row, model)
 }
 
 /// The per-row *reset*: removes the operator's own line for this key, so the
@@ -1113,10 +1183,12 @@ fn paint_swatch(cr: &gtk::cairo::Context, width: i32, height: i32, text: &str) {
 }
 
 /// `options`' index for `value`, or [`gtk::INVALID_LIST_POSITION`] when the
-/// file holds something the vocabulary does not have — which is a thing a
-/// hand-edited or a stale base layer can legitimately do, and the row then
-/// shows no selection rather than silently presenting the first option as if
-/// it were the file's word.
+/// file holds something the vocabulary does not have — which is a thing a hand
+/// edit or a base layer from a newer shell can legitimately do.
+///
+/// What the row does about that is [`Control::Combo`]'s business (a transient
+/// item carrying the word) and [`Control::Colour`]'s (the permanent *custom*
+/// item); this only answers whether the vocabulary has it.
 fn index_of(options: &[&str], value: Option<&str>) -> u32 {
     value
         .and_then(|value| options.iter().position(|option| *option == value))
@@ -1972,7 +2044,7 @@ mod gtk_tests {
     fn a_choice_row_renders_the_file_and_writes_one_leaf() {
         let scratch = Scratch::new();
         let form = fixture_form(&scratch, Some("style = \"lcd\"\n"));
-        let Control::Combo { row, options } = &row_of(&form, "style").control else {
+        let Control::Combo { row, options, .. } = &row_of(&form, "style").control else {
             panic!("a Choice is a combo row");
         };
         assert_eq!(
@@ -1998,16 +2070,40 @@ mod gtk_tests {
     }
 
     /// A value no layer's vocabulary has — a hand edit, or a base layer from a
-    /// newer shell — shows **no** selection rather than the first option
-    /// presented as if it were the file's word.
+    /// newer shell — is shown as **itself**, on a transient trailing item,
+    /// rather than as `options[0]` presented as if it were the file's word.
+    ///
+    /// An `AdwComboRow` cannot show *no* selection (its `GtkSingleSelection`
+    /// is left autoselecting, so `INVALID_LIST_POSITION` snaps to 0), which is
+    /// what that item is for — see [`Control::Combo`].
+    ///
+    /// **Red if the transient item goes away**: the row then reads `vfd` over
+    /// a file that says `plasma`.
     #[gtk::test]
-    fn a_choice_row_shows_no_selection_for_a_word_it_does_not_know() {
+    fn a_choice_row_shows_a_word_its_vocabulary_does_not_have_rather_than_the_first_option() {
         let scratch = Scratch::new();
         let form = fixture_form(&scratch, Some("style = \"plasma\"\n"));
-        let Control::Combo { row, .. } = &row_of(&form, "style").control else {
+        let Control::Combo { row, options, model } = &row_of(&form, "style").control else {
             panic!("a Choice is a combo row");
         };
-        assert_eq!(row.selected(), gtk::INVALID_LIST_POSITION);
+        let transient = u32::try_from(options.len()).expect("a handful of options");
+        assert_eq!(
+            row.selected(),
+            transient,
+            "the file's own word is what is selected"
+        );
+        assert_eq!(
+            model.string(transient).map(|s| s.to_string()).as_deref(),
+            Some("plasma"),
+            "and the item carries that word"
+        );
+
+        // …and it is transient: a word the vocabulary *does* have takes it
+        // away again, so the combo never permanently grows a member.
+        Scratch::write(&scratch.base("form-fixture"), "style = \"lcd\"\n");
+        assert!(form.refresh_from_disk(), "the base layer moved");
+        assert_eq!(model.n_items(), transient, "the transient item is gone");
+        assert_eq!(options[usize::try_from(row.selected()).expect("in range")], "lcd");
     }
 
     /// `Kind::Color` is two rows for one leaf: the named palette, and the

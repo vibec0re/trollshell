@@ -921,20 +921,42 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
 
 /// Wire the pinned **Shell** entry (#888 P1).
 ///
-/// Selecting it clears the plugin selection and shows the shell page;
+/// Activating it clears the plugin selection and shows the shell page;
 /// selecting a plugin clears this one ([`connect_selection`] does the mirror
 /// image). Both sides run under the tab's existing `selecting` guard, so
 /// deselecting one list does not drive the other's user-selection path.
+///
+/// # Why this one navigates on `row-activated` and the plugin list does not
+///
+/// [`connect_selection`] drives the plugin list from `row-selected`, because
+/// that is what keyboard arrows move and a wide layout needs nothing else. The
+/// same wiring here is a **bug**, and a measured one: a `GtkListBox` in
+/// `SelectionMode::Single` selects whichever row focus lands on, and this list
+/// is the first focusable thing in the sidebar — so mapping the window emitted
+/// `row-selected` on the one Shell row before the operator had touched
+/// anything, which retargeted the detail pane, dropped the plugin selection
+/// [`apply_plugins`] had just made and took the in-flight
+/// [`PendingToggle`] with it. The tab opened on the Shell page every time.
+///
+/// `row-activated` is the narrower signal — a click, or `Enter`/`Space` on the
+/// focused row — and it is not emitted by focus traversal, so it says *the
+/// operator picked this* rather than *the focus ring passed through here*.
+/// Nothing is lost by using it: arrows cannot move within a one-row list, so
+/// `row-selected` here was only ever going to fire for focus or for the click
+/// `row-activated` already reports.
+///
+/// The visual selection is then ours to state rather than GTK's to infer, which
+/// is what [`select_shell_row`] and [`clear_shell_selection`] do — and the
+/// `row-selected` handler below re-asserts it, so a highlight focus moved onto
+/// a row nobody activated does not sit there contradicting the page on screen.
 fn connect_shell_entry(state: &PluginsState) {
     let weak = state.downgrade();
-    state.shell_list.connect_row_selected(move |_, row| {
+    state.shell_list.connect_row_activated(move |_, _| {
         let Some(state) = weak.upgrade() else {
             return;
         };
-        if state.selecting.get() || row.is_none() {
-            return;
-        }
         state.shell_selected.set(true);
+        select_shell_row(&state);
         // Whatever plugin was shown is not shown any more, so no plugin's
         // intent is "for" the detail pane — the rule `clear_selection` and
         // `refresh_detail` both apply (#944).
@@ -951,17 +973,41 @@ fn connect_shell_entry(state: &PluginsState) {
         state.selecting.set(false);
         refresh_shell_forms(&state);
         show_shell_detail(&state);
-    });
-
-    let weak = state.downgrade();
-    state.shell_list.connect_row_activated(move |_, _| {
-        let Some(state) = weak.upgrade() else {
-            return;
-        };
         // Collapsed, this *is* the push; uncollapsed the split view already
         // satisfies it.
         state.split.set_show_content(true);
     });
+
+    // The highlight follows the page, not the focus ring: a selection this tab
+    // did not ask for is put back the way it was. Terminates — the corrective
+    // call re-enters with the state it is correcting towards, which this
+    // predicate then finds nothing wrong with.
+    let weak = state.downgrade();
+    state.shell_list.connect_row_selected(move |_, row| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.selecting.get() || row.is_some() == state.shell_selected.get() {
+            return;
+        }
+        if state.shell_selected.get() {
+            select_shell_row(&state);
+        } else {
+            state.selecting.set(true);
+            state.shell_list.select_row(None::<&gtk::ListBoxRow>);
+            state.selecting.set(false);
+        }
+    });
+}
+
+/// Highlight the pinned **Shell** row, because that is the page on screen.
+fn select_shell_row(state: &PluginsState) {
+    let Some(row) = state.shell_list.row_at_index(0) else {
+        return;
+    };
+    state.selecting.set(true);
+    state.shell_list.select_row(Some(&row));
+    state.selecting.set(false);
 }
 
 /// Show the shell-owned config page and title the detail pane for it.
@@ -1933,7 +1979,15 @@ fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_for
     let candidates = resolved_search_path(&state.search_path, &state.env);
     let declared = probe_candidates(candidates)
         .and_then(|found| manifest_id_at(&found.path, id));
-    crate::config_form::family(declared.as_deref().unwrap_or(id))
+    let ops = crate::config_form::family(declared.as_deref().unwrap_or(id))?;
+    // A **shell**-owned family has no plugin to hang off — it renders under the
+    // pinned Shell entry, once, and its form owns a poll of its own. A plugin
+    // whose manifest id happened to collide with one would otherwise mount a
+    // second, competing editor of the same file inside its detail page.
+    crate::config_form::shell_families()
+        .iter()
+        .all(|shell| shell.family.name != ops.family.name)
+        .then_some(ops)
 }
 
 /// The manifest id `plugins.json` at `path` implies for the plugin `id`.
@@ -3182,6 +3236,41 @@ mod tests {
     fn the_first_load_is_a_change() {
         assert!(!same_plugin_set(&[], &ids(&["clock"])));
         assert!(same_plugin_set(&[], &[]));
+    }
+
+    /// The plugin whose **binary** owns a config family gets a form; the rest
+    /// get none. `stats` and `stats-bar` are two launches of one
+    /// `hytte-plugin-stats` reading one `stats.toml`, which is why
+    /// [`family_for_plugin`] resolves the binary rather than the id.
+    #[test]
+    fn a_plugins_family_comes_from_its_binary_not_its_id() {
+        let json = r#"{"plugins":{
+            "stats":{"exec":"/nix/store/x/bin/hytte-plugin-stats"},
+            "stats-bar":{"exec":"/nix/store/x/bin/hytte-plugin-stats"},
+            "clock":{"exec":"/nix/store/x/bin/hytte-plugin-clock-demo"},
+            "claude-bridge":{"exec":"/nix/store/x/bin/hytte-claude-bridge"}
+        }}"#;
+        assert_eq!(super::manifest_id_from_json(json, "stats").as_deref(), Some("stats"));
+        assert_eq!(
+            super::manifest_id_from_json(json, "stats-bar").as_deref(),
+            Some("stats"),
+            "the second launch of one binary owns the same file"
+        );
+        assert_eq!(
+            super::manifest_id_from_json(json, "clock").as_deref(),
+            Some("clock-demo")
+        );
+        assert_eq!(
+            super::manifest_id_from_json(json, "claude-bridge").as_deref(),
+            Some("claude-bridge"),
+            "the `hytte-` prefix too, which is what nix's inferManifestId strips"
+        );
+        assert_eq!(super::manifest_id_from_json(json, "nothing-like-it"), None);
+
+        // …and only a *plugin*-owned family is reachable this way: the shell's
+        // two have no plugin to hang off and render under the Shell entry.
+        assert!(crate::config_form::family("stats").is_some());
+        assert!(crate::config_form::family("clock-demo").is_none());
     }
 }
 
@@ -5012,5 +5101,151 @@ mod gtk_tests {
             lines.is_empty(),
             "a superseded poll must be dropped before the transition guard: {lines:?}"
         );
+    }
+
+    // ── The pinned Shell entry (#888 P1) ────────────────────────────────────
+
+    /// **The bug that made this entry navigate on `row-activated` rather than
+    /// on `row-selected`** ([`connect_shell_entry`]'s own doc).
+    ///
+    /// A `GtkListBox` in `SelectionMode::Single` selects whichever row focus
+    /// lands on, and this one-row list is the first focusable thing in the
+    /// sidebar — so merely *mapping* the window emitted `row-selected` on the
+    /// Shell row. Wired to navigation, that retargeted the detail pane before
+    /// the operator had touched anything: the tab opened on the Shell page,
+    /// the plugin selection `apply_plugins` had just made was dropped, and any
+    /// in-flight [`PendingToggle`] went with it.
+    ///
+    /// **Red if `connect_shell_entry` goes back to navigating on
+    /// `row-selected`.**
+    #[gtk::test]
+    fn mapping_the_tab_does_not_let_the_shell_entry_steal_the_selection() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "active");
+        let window = present(&bin, 640);
+
+        assert!(
+            !state.shell_selected.get(),
+            "focus landing on the Shell row is not the operator picking it"
+        );
+        assert_eq!(
+            state.selected.borrow().as_deref(),
+            Some("clock"),
+            "the plugin selection survives the map"
+        );
+        assert_eq!(
+            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            Some("plugin".to_owned()),
+            "and the plugin page is what is shown"
+        );
+        assert!(
+            state.shell_list.selected_row().is_none(),
+            "the highlight follows the page, so it is put back too"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Activating it *is* the operator picking it: the shell page comes up,
+    /// the plugin selection goes, and so does any intent that was for it
+    /// (#944).
+    #[gtk::test]
+    fn activating_the_shell_entry_shows_its_page_and_drops_the_plugin_selection() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since: Instant::now(),
+        });
+
+        let row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state.shell_list.emit_by_name::<()>("row-activated", &[&row]);
+        pump();
+
+        assert!(state.shell_selected.get());
+        assert_eq!(
+            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            Some("shell".to_owned())
+        );
+        assert_eq!(state.detail.page.title(), "Shell");
+        assert!(state.selected.borrow().is_none(), "no plugin is shown now");
+        assert!(
+            state.pending.borrow().is_none(),
+            "and no plugin's intent is for this pane any more"
+        );
+        assert!(
+            state.shell_list.selected_row().is_some(),
+            "the Shell row is highlighted because its page is up"
+        );
+
+        dismiss(&window);
+    }
+
+    /// …and a poll that changes the unit set does not drag the operator off
+    /// that page ([`apply_plugins`]' `shell_selected` arm), nor does the shell
+    /// going away ([`clear_selection`]'s).
+    #[gtk::test]
+    fn the_shell_page_survives_a_membership_change_and_an_unreachable_shell() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "active");
+        let window = present(&bin, 640);
+
+        let row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state.shell_list.emit_by_name::<()>("row-activated", &[&row]);
+        pump();
+
+        // A `systemctl --user` elsewhere adds a unit.
+        apply_state(&state, &["clock", "timer"], "active");
+        assert_eq!(
+            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            Some("shell".to_owned()),
+            "a membership change must not navigate away from the Shell page"
+        );
+
+        // And the shell itself goes: the config files are still there, which
+        // is the whole reason this page does not need it.
+        on_poll_result(&state, state.polls.issue(), poll_err());
+        pump();
+        assert_eq!(
+            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            Some("shell".to_owned()),
+            "the file editor keeps working with the shell down"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Picking a plugin is the mirror image: the Shell entry lets go.
+    #[gtk::test]
+    fn picking_a_plugin_releases_the_shell_entry() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "active");
+        let window = present(&bin, 640);
+
+        let row = state.shell_list.row_at_index(0).expect("the Shell row");
+        state.shell_list.emit_by_name::<()>("row-activated", &[&row]);
+        pump();
+        assert!(state.shell_selected.get(), "sanity: the Shell page is up");
+
+        let plugin_row = state.list.row_at_index(0).expect("the clock row");
+        state.list.select_row(Some(&plugin_row));
+        pump();
+
+        assert!(!state.shell_selected.get());
+        assert!(state.shell_list.selected_row().is_none());
+        assert_eq!(state.selected.borrow().as_deref(), Some("clock"));
+        assert_eq!(
+            state.detail.stack.visible_child_name().map(|n| n.to_string()),
+            Some("plugin".to_owned())
+        );
+
+        dismiss(&window);
     }
 }

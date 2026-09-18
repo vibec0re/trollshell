@@ -571,7 +571,7 @@ the reducer but cannot prove the hive agrees.
       it. (Before #1010 it opened in the drawer, top right.) It is still a
       **placeholder** for the agent's own #950 companion window on its
       **settings tab** — Annika settled that on #947 (2026-09-11) — but that
-      window's settings tab is now reached from *inside* the window (opened by
+      window's settings tab is now reached from _inside_ the window (opened by
       the card's row or the `agent page` link) rather than from this page's
       own door; what #1010 does not govern is that `RunCommand` route. Nothing
       on the card row itself leaves the sidebar for this page any more.
@@ -677,10 +677,11 @@ whole point of the window.
 - [ ] **(#950/#1282 item 3)** **The window's own Settings tab.** The pill's
       pen — the button that used to launch a window straight onto Settings —
       is gone; the plugin never emits `--tab settings` any more. Confirm the
-      window still has a working Settings tab reached from *inside* it (its
-      own tab control), and that `trollshell-agent-window --agent <name>
-      --tab settings` from a terminal still opens straight onto it — the CLI
-      itself is unchanged, only the plugin stopped driving it.
+      window still has a working Settings tab reached from _inside_ it (its
+      own tab control), and that
+      `trollshell-agent-window --agent <name> --tab settings` from a terminal
+      still opens straight onto it — the CLI itself is unchanged, only the
+      plugin stopped driving it.
 - [ ] **(#950)** **A second launch focuses the first.** With an agent's window
       already open on the agent page, run
       `trollshell-agent-window --agent <name> --tab settings` for the **same**
@@ -1282,7 +1283,7 @@ four window properties below are pinned nowhere but here.
       binary **missing**, the same click falls back to the browser (an
       `OpenUri`), which #1010 does not touch either — a pill's fallback has
       never landed in the drawer or the dialog, pen or no pen. What #1010
-      *does* touch is the card's title row: its `OpenPage` (the hive overview)
+      _does_ touch is the card's title row: its `OpenPage` (the hive overview)
       is the thing that now lands in the dialog rather than the drawer.
 - [ ] **(#1010)** **The window's own properties**, the ones no test reaches:
       `niri msg -j layers` (or `wayland-info`) while the dialog is up must show a

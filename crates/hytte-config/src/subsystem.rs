@@ -2681,15 +2681,27 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 ///    also be this family's own ([`crate::schema::Schema::family`] equal to
 ///    [`Subsystem::NAME`]), so handing over the wrong family's schema is an
 ///    error rather than a silent write against the wrong rules.
-/// 2. **A collection `Field`** — [`crate::schema::Kind::Map`] or
-///    [`crate::schema::Kind::List`] whose value in the file is a table.
-///    Spec §1 renders those rows *read-only* in v1, but a generic form
-///    iterating `Schema::fields` gives every row a *reset* (§4), and before
-///    #1360 a reset on `agents.display` or `workspaces.workspace` removed
-///    every entry under it — including the un-schema'd keys the sibling
-///    writer goes to documented lengths never to touch. The structural check
-///    below refuses a table or an array-of-tables at the target whatever the
-///    schema says, so the guarantee does not rest on the schema being right.
+/// 2. **A [`crate::schema::Kind::Map`] `Field`** — a table of named entries.
+///    Before #1360 a *reset* on `agents.display` or `workspaces.workspace`
+///    removed every entry under it — including the un-schema'd keys the
+///    sibling writer goes to documented lengths never to touch. The
+///    structural check below refuses a table or an array-of-tables at the
+///    target whatever the schema says, so the guarantee does not rest on the
+///    schema being right. An entry's own leaves go through
+///    [`save_leaf_to_locked_unchecked`] and a whole entry through
+///    [`remove_entry_to_locked`].
+///
+///    A [`crate::schema::Kind::List`] is **not** refused (#1373 item 3, a
+///    change from #1360's blanket collection refusal): rule 3 of the layering
+///    replaces an array whole, so an array *is* one leaf — the overlay states
+///    the list or it states nothing — and `structural_refusal` below already
+///    refuses a table or an array-of-tables at the target, so the only value
+///    that reaches the file here is an inline array whose every element
+///    [`crate::schema::Kind::accepts`] has judged. The alternative the issue
+///    offered — narrowing [`crate::schema::Kind::is_collection`] instead —
+///    would take `verify`'s [`crate::schema::Mismatch::Invented`] exemption
+///    with it, and `workspaces`' `order` would become a mismatch against a
+///    default that documents it in comments by design.
 /// 3. **A value outside the `Field`'s [`crate::schema::Kind`]** —
 ///    [`ConfigError::Rejected`]. This is not politeness: a leaf of the wrong
 ///    *type* is a [`ConfigError::Schema`] on the next load, and
@@ -2747,10 +2759,12 @@ pub fn save_leaf_to_locked<S: Subsystem>(
              use save_leaf_to_locked_unchecked for a key inside a map entry",
         ));
     };
-    if field.kind.is_collection() {
+    // A `Map` only — a `List` is one leaf under rule 3 (see refusal 2 above).
+    if matches!(field.kind, crate::schema::Kind::Map(_)) {
         return Err(not_a_leaf(
-            "it is a list or a table of entries, which v1 renders read-only \
-             — writing it whole would take every entry under it with it",
+            "it is a table of named entries — writing it whole would take every entry under \
+             it with it; an entry's own leaves go through save_leaf_to_locked_unchecked and \
+             a whole entry through remove_entry_to_locked",
         ));
     }
     if let Some(value) = &value
@@ -3073,6 +3087,171 @@ pub fn commented_seed(default_toml: &str) -> String {
         return String::new();
     }
     format!("{preamble}{SEED_SEPARATOR}")
+}
+
+// ── The form's write side: one whole entry, removed ─────────────────────────
+
+/// Remove **one whole entry** from the overlay at `path`, format-preserving
+/// and atomic (#888 P2, #1373 item 6).
+///
+/// An entry is a `[display.argus]` table — a named member of a
+/// [`crate::schema::Kind::Map`] — or the inline array a
+/// [`crate::schema::Kind::List`] leaf holds. Both are things the *operator*
+/// put in the file, which is exactly what makes them removable: everything
+/// this writer refuses below is structure somebody else owns.
+///
+/// It exists because until #1373 a removal was only ever a **side effect**:
+/// [`remove_leaf`] drops a table once its last key is reset out of it and
+/// [`Subsystem::DEFAULT_TOML`] does not document it, so deleting
+/// `[display.argus]` meant a form resetting each of its three keys in turn and
+/// trusting the prune rule to notice. That is three writes, three re-reads and
+/// a delete that silently does nothing if the entry happens to carry a key the
+/// schema does not know. This is the one-shot call, and it takes the
+/// un-schema'd keys with it on purpose — they are inside the entry the
+/// operator asked to delete.
+///
+/// # Four refusals, all before a byte is written
+///
+/// 1. **An empty `table_path`, or one with an empty segment** —
+///    [`ConfigError::NotALeaf`], [`save_leaf_to_locked_unchecked`]'s rule.
+/// 2. **A locked `table_path`, itself or under a locked table** —
+///    [`ConfigError::Locked`], through the same [`Loaded::is_locked`]
+///    predicate the reader greys a row with. A lock on `display.argus` pins
+///    the entry; a lock on `display` pins the map.
+/// 3. **A table [`Subsystem::DEFAULT_TOML`] documents** — [`table_paths`], the
+///    same set [`remove_leaf`]'s prune rule consults. `[core]` is part of
+///    `core-leds.toml`'s own shape and is not an entry anybody added, so it is
+///    not one this call may take away.
+/// 4. **A scalar** — a path that exists and holds neither a table nor an
+///    array. That is a leaf, and a leaf is removed by
+///    [`save_leaf_to_locked`] with no value, which is the row's own *reset*.
+///
+/// A `table_path` that exists **nowhere** is not a refusal: the state the
+/// caller asked for is the state on disk, so the answer is `Ok(())` with no
+/// file opened at all. So is a `path` that does not exist yet.
+///
+/// Like the leaf writer, a removal that would produce the bytes already on
+/// disk does not write, and an emptied parent table is pruned only when
+/// `DEFAULT_TOML` does not document it — so removing the last
+/// `[display.<name>]` takes `[display]` with it, while resetting the last key
+/// of `[core]` leaves the documented header standing.
+///
+/// # Errors
+/// [`ConfigError::NotALeaf`] for refusals 1, 3 and 4, [`ConfigError::Locked`]
+/// for 2, [`ConfigError::Unreadable`] if the existing file cannot be read
+/// (refusing rather than overwriting bytes we cannot account for),
+/// [`ConfigError::Encode`] for a file — or a [`Subsystem::DEFAULT_TOML`] —
+/// that is not valid TOML, and [`ConfigError::Write`] for the replace.
+pub fn remove_entry_to_locked<S: Subsystem>(
+    path: &Path,
+    table_path: &str,
+    locked: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    let not_a_leaf = |reason: &str| ConfigError::NotALeaf {
+        subsystem: S::NAME.to_owned(),
+        key: table_path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if table_path.is_empty() || table_path.split('.').any(str::is_empty) {
+        return Err(not_a_leaf(
+            "a table path is one or more non-empty dotted segments",
+        ));
+    }
+    if locked_here(locked, table_path) {
+        return Err(ConfigError::Locked {
+            subsystem: S::NAME.to_owned(),
+            key: table_path.to_owned(),
+            path: path.to_path_buf(),
+        });
+    }
+
+    let default_doc: toml_edit::DocumentMut =
+        S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
+            ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
+        })?;
+    let mut documented = BTreeSet::new();
+    table_paths(default_doc.as_table(), "", &mut documented);
+    if documented.contains(table_path) {
+        return Err(not_a_leaf(
+            "the documented default states it as a table of this file's own shape, so it is \
+             not an entry anybody added and not one this call may take away",
+        ));
+    }
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // Nothing to remove from a file that does not exist — which is the
+        // state the caller asked for, so it is `Ok` and not a write.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(ConfigError::Unreadable {
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            });
+        }
+    };
+
+    let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e: toml_edit::TomlError| {
+        ConfigError::Encode(format!("the file being replaced is not valid TOML: {e}"))
+    })?;
+
+    if let Some(reason) = removal_refusal(&doc, table_path) {
+        return Err(not_a_leaf(reason));
+    }
+
+    // The same walk the leaf writer's removal takes, which is what makes the
+    // prune rule one rule rather than two: `remove_leaf`'s terminal step
+    // removes whatever key is at the path — a table as readily as a value —
+    // and its unwind then drops an emptied, undocumented ancestor.
+    remove_leaf(doc.as_table_mut(), table_path, "", &documented);
+
+    let body = doc.to_string();
+    if body == existing {
+        return Ok(());
+    }
+
+    file::write_atomic(path, &body, Durability::FsyncParent)
+        .map_err(|e| ConfigError::Write(e.to_string()))
+}
+
+/// Why `table_path` does not name an entry of `doc`, or `None` when it does
+/// (or when nothing is there at all) — the structural half of
+/// [`remove_entry_to_locked`]'s refusals.
+///
+/// [`structural_refusal`]'s mirror image: that one refuses a table at the
+/// target because a *leaf* write would take everything under it; this one
+/// refuses a **scalar** at the target, because a removal that is one leaf is
+/// [`save_leaf_to_locked`]'s `None` and says so on the row rather than
+/// silently deleting a documented key through the delete button of an entry
+/// that is not there.
+///
+/// Asked only of the file being edited, not of [`Subsystem::DEFAULT_TOML`]:
+/// what the documented shape has to say is refusal 3, which is a different
+/// question (*is this structure ours*) asked over [`table_paths`] before the
+/// file is even opened.
+fn removal_refusal(doc: &toml_edit::DocumentMut, table_path: &str) -> Option<&'static str> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    let mut segments = table_path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        // Nothing there: already the state the caller asked for.
+        let item = table.get(segment)?;
+        if segments.peek().is_none() {
+            let is_entry = item.is_table_like()
+                || item.is_array_of_tables()
+                || item.as_value().is_some_and(toml_edit::Value::is_array);
+            return (!is_entry).then_some(
+                "it names a scalar, not an entry; one leaf is removed by save_leaf_to_locked \
+                 with no value, which is what a row's own reset does",
+            );
+        }
+        let Some(sub) = item.as_table_like() else {
+            return Some(
+                "a table on the way to it is a plain value, so there is no entry under it",
+            );
+        };
+        table = sub;
+    }
+    None
 }
 
 /// Why `key_path` does not name a leaf of `doc`, or `None` when it does — the
@@ -7530,13 +7709,45 @@ brightness = 5
         assert_eq!(read(&path), HAND_EDITED);
     }
 
-    /// A collection `Field` is refused **by its `Kind`**, before the document
+    /// A collection `Field` is judged **by its `Kind`**, before the document
     /// is even read — so a family whose overlay does not have the table yet is
-    /// refused exactly as one whose overlay does.
+    /// answered exactly as one whose overlay does, and neither leaves a file
+    /// behind.
+    ///
+    /// The two kinds answer differently since #1373 item 3, and that is the
+    /// point of asserting both here: a `Map` is [`ConfigError::NotALeaf`] —
+    /// it is structure, not a value — while a `List` *is* one leaf under rule
+    /// 3 and so gets the ordinary value judgement,
+    /// [`ConfigError::Rejected`], for a scalar where an array was declared.
     #[test]
-    fn a_leaf_save_refuses_a_collection_field_even_on_an_absent_table() {
+    fn a_collection_field_is_judged_by_its_kind_even_on_an_absent_table() {
+        const MAP_SCHEMA: crate::schema::Schema = crate::schema::Schema {
+            family: "core-leds",
+            fields: &[crate::schema::Field {
+                path: "core",
+                kind: crate::schema::Kind::Map(&[]),
+                doc: "pretend the whole table is a map of entries",
+            }],
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("core-leds.toml");
+
+        let err = save_leaf_to_locked::<Leds>(
+            &path,
+            &MAP_SCHEMA,
+            "core",
+            Some(toml_edit::Value::from(1_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("a table of named entries is never a leaf");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(
+            reason.contains("table of named entries"),
+            "the #1360 HIGH 1 guarantee, kept while its List sibling was let through: {reason}"
+        );
+        assert!(!path.exists(), "and no file was seeded on the way");
 
         let err = save_leaf(
             &path,
@@ -7544,9 +7755,8 @@ brightness = 5
             Some(toml_edit::Value::from("teal")),
             &BTreeSet::new(),
         )
-        .expect_err("a list row is read-only in v1");
-
-        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        .expect_err("a list takes an array, not a word");
+        assert!(matches!(err, ConfigError::Rejected { .. }), "got {err:?}");
         assert!(!path.exists(), "and no file was seeded on the way");
     }
 
@@ -7749,5 +7959,251 @@ brightness = 5
             .expect("mtime");
         assert_eq!(before, after, "the file was replaced for nothing");
         assert_eq!(read(&path), HAND_EDITED);
+    }
+
+    // ── A list is one leaf; a map is not (#1373 item 3) ─────────────────────
+
+    /// `workspaces`' `order` is a [`crate::schema::Kind::List`] of scalars,
+    /// and rule 3 replaces an array whole — so the overlay states the list or
+    /// it states nothing, and the **whole array** is one leaf write.
+    ///
+    /// **Red on `829add50`**, where the checked writer refused every
+    /// `is_collection()` field: `NotALeaf { reason: "it is a list or a table
+    /// of entries, which v1 renders read-only" }`, and a form editing a list
+    /// had to reach for the unchecked spelling and lose `Kind::accepts` over
+    /// the elements.
+    #[test]
+    fn a_list_leaf_is_written_and_reset_whole() {
+        let (_dir, path) = scratch(HAND_EDITED);
+        let mut array = toml_edit::Array::new();
+        array.push("cyan");
+        array.push("magenta");
+
+        save_leaf(
+            &path,
+            "core.palette",
+            Some(toml_edit::Value::Array(array)),
+            &BTreeSet::new(),
+        )
+        .expect("an array is one leaf");
+        let written = read(&path);
+        assert_eq!(
+            changed_lines(HAND_EDITED, &written),
+            vec![(
+                r#"palette = ["amber", "rust"]"#.to_owned(),
+                r#"palette = ["cyan", "magenta"]"#.to_owned()
+            )],
+            "exactly one line moved:\n{written}"
+        );
+
+        // …and the row's reset removes the array rather than emptying it, so
+        // the value falls back to the layer below (spec §5).
+        save_leaf(&path, "core.palette", None, &BTreeSet::new()).expect("a reset removes it");
+        let after = read(&path);
+        assert!(
+            !after.contains("palette"),
+            "the reset left an array behind:\n{after}"
+        );
+        assert!(
+            after.contains("mystery = 42") && after.contains("[unrelated]"),
+            "and took nothing else with it:\n{after}"
+        );
+    }
+
+    /// Every element is still judged by the field's own kind, which is the
+    /// half routing a list through the *unchecked* writer would have lost.
+    #[test]
+    fn a_list_leaf_refuses_an_element_outside_its_kind() {
+        let (_dir, path) = scratch(HAND_EDITED);
+        let mut array = toml_edit::Array::new();
+        array.push("amber");
+        array.push(7_i64); // `core.palette` is a list of non-blank text
+        let err = save_leaf(
+            &path,
+            "core.palette",
+            Some(toml_edit::Value::Array(array)),
+            &BTreeSet::new(),
+        )
+        .expect_err("an integer is not text");
+        assert!(matches!(err, ConfigError::Rejected { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED, "and wrote nothing");
+    }
+
+    // ── One whole entry, removed (#1373 item 6) ─────────────────────────────
+
+    /// A file shaped like an overlay that has grown entries: two undocumented
+    /// `[display.<name>]` tables beside the documented `[core]`.
+    const WITH_ENTRIES: &str = r#"# My LEDs.
+enabled = true
+
+[core]
+brightness = 3
+
+[display.argus]
+# What the row calls it.
+label = "Argus"
+mystery = 42
+
+[display.borealis]
+label = "Borealis"
+"#;
+
+    /// The call's whole point: one table goes, and **only** it — the
+    /// un-schema'd `mystery = 42` inside it included, because it is inside the
+    /// entry the operator asked to delete, while every byte outside is
+    /// untouched.
+    ///
+    /// **Red if `remove_leaf`'s prune rule is what does the work**: resetting
+    /// `display.argus.label` alone leaves `mystery = 42` and the header
+    /// standing, which is the three-write delete this call replaces.
+    #[test]
+    fn remove_entry_takes_one_table_and_nothing_else() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("an undocumented entry is removable");
+        let after = read(&path);
+        assert_eq!(
+            after,
+            r#"# My LEDs.
+enabled = true
+
+[core]
+brightness = 3
+
+[display.borealis]
+label = "Borealis"
+"#,
+            "the byte pin"
+        );
+    }
+
+    /// The last entry takes its **undocumented** parent with it — an empty
+    /// `[display]` is a header that decorates nothing — while the documented
+    /// `[core]` stays behind its own last key (`remove_leaf`'s asymmetry,
+    /// inherited rather than restated).
+    #[test]
+    fn removing_the_last_entry_prunes_its_undocumented_parent() {
+        let (_dir, path) = scratch("[display.argus]\nlabel = \"Argus\"\n");
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new()).expect("removes");
+        assert_eq!(read(&path), "", "the emptied `[display]` went with it");
+    }
+
+    /// Refusal 2: a locked entry, and a locked map above one.
+    ///
+    /// **Red without `locked_here`**: the entry the base layer pinned is
+    /// deleted out of the overlay, and the next load puts nix's value back
+    /// while the operator is looking at a row that says it is gone.
+    #[test]
+    fn remove_entry_refuses_a_locked_entry_or_a_locked_map() {
+        for pin in ["display.argus", "display"] {
+            let (_dir, path) = scratch(WITH_ENTRIES);
+            let locked: BTreeSet<String> = [pin.to_owned()].into_iter().collect();
+            let err = remove_entry_to_locked::<Leds>(&path, "display.argus", &locked)
+                .expect_err("a pinned entry is not the operator's to delete");
+            assert!(
+                matches!(&err, ConfigError::Locked { key, .. } if key == "display.argus"),
+                "{pin}: got {err:?}"
+            );
+            assert_eq!(read(&path), WITH_ENTRIES, "{pin}: it wrote something");
+        }
+    }
+
+    /// Refusal 3: `[core]` is part of `core-leds.toml`'s documented shape, so
+    /// it is not an entry anybody added.
+    ///
+    /// **Red without the `documented` check**: the delete button of a map
+    /// whose path collided with a documented table would take the table, its
+    /// comment block and every key under it.
+    #[test]
+    fn remove_entry_refuses_a_table_the_documented_default_states() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let err = remove_entry_to_locked::<Leds>(&path, "core", &BTreeSet::new())
+            .expect_err("the documented shape is not an entry");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(reason.contains("documented default"), "{reason}");
+        assert_eq!(read(&path), WITH_ENTRIES);
+    }
+
+    /// Refusal 4: a scalar is a leaf, and a leaf is `save_leaf_to_locked`'s
+    /// `None`. Refusing here rather than removing it is what keeps a delete
+    /// button from quietly becoming a second, unvalidated reset.
+    #[test]
+    fn remove_entry_refuses_a_scalar() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let err = remove_entry_to_locked::<Leds>(&path, "enabled", &BTreeSet::new())
+            .expect_err("a bool is not an entry");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(reason.contains("scalar"), "{reason}");
+        assert_eq!(read(&path), WITH_ENTRIES);
+    }
+
+    /// Refusal 1, and the two states that are not refusals at all: an entry
+    /// no layer holds, and a file that does not exist. Both are already what
+    /// the caller asked for, so neither writes.
+    #[test]
+    fn remove_entry_refuses_a_malformed_path_and_shrugs_at_an_absent_one() {
+        for spelling in ["", "display.", ".argus", "display..argus"] {
+            let (_dir, path) = scratch(WITH_ENTRIES);
+            let err = remove_entry_to_locked::<Leds>(&path, spelling, &BTreeSet::new())
+                .expect_err("a table path is non-empty dotted segments");
+            assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+            assert_eq!(read(&path), WITH_ENTRIES, "{spelling:?} wrote something");
+        }
+
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let before = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        remove_entry_to_locked::<Leds>(&path, "display.nobody", &BTreeSet::new())
+            .expect("an entry that is not there is already gone");
+        assert_eq!(read(&path), WITH_ENTRIES);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime"),
+            before,
+            "the file was replaced for nothing"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("core-leds.toml");
+        remove_entry_to_locked::<Leds>(&missing, "display.argus", &BTreeSet::new())
+            .expect("nothing to remove from a file that does not exist");
+        assert!(!missing.exists(), "it created a file to delete from");
+    }
+
+    /// An inline array is an entry too — [`crate::schema::Kind::List`]'s half
+    /// of item 6 — and removing it is not the same as emptying it.
+    #[test]
+    fn remove_entry_takes_a_whole_inline_array() {
+        let (_dir, path) = scratch("order = [\"chat\", \"dev\"]\nkept = true\n");
+        remove_entry_to_locked::<Leds>(&path, "order", &BTreeSet::new())
+            .expect("an array is one whole value");
+        assert_eq!(read(&path), "kept = true\n");
+    }
+
+    /// The `(line before, line after)` pairs by which two files differ, by
+    /// position — the same "exactly one leaf" assertion the form's own tests
+    /// make, so a writer that replaced a whole table would move comment and
+    /// blank lines too and the count would not be one.
+    fn changed_lines(before: &str, after: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut a = before.lines();
+        let mut b = after.lines();
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return out,
+                (left, right) => {
+                    let (left, right) = (left.unwrap_or("<missing>"), right.unwrap_or("<missing>"));
+                    if left != right {
+                        out.push((left.to_owned(), right.to_owned()));
+                    }
+                }
+            }
+        }
     }
 }

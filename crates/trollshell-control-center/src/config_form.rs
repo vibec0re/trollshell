@@ -2089,6 +2089,20 @@ mod gtk_tests {
         format!("{}\n{leaf}", subsystem::commented_default(default_toml))
     }
 
+    /// Whether the overlay **states** this line, as one whole line of it.
+    ///
+    /// What `settle_until` waits on, and line-exact rather than a substring
+    /// test since #1370: the commented preamble carries every key's
+    /// *documented* value (`# style = "vfd"`), so `contains` cannot tell "the
+    /// operator set it" from "the documentation mentions it" — and a
+    /// predicate that is already true waits for nothing, so the assertion
+    /// after it reads the file from before the save. Measured: that is
+    /// exactly what `a_choice_row_renders_the_file_and_writes_one_leaf` did
+    /// the first time this ran, comparing the file to itself.
+    fn wrote(body: &str, line: &str) -> bool {
+        body.lines().any(|had| had == line)
+    }
+
     /// The leaves an overlay actually states, dotted — as the loader sees it,
     /// not as the file reads. A commented preamble mentions every key by
     /// name, so "the reset removed it" is a question for the parser (#1370).
@@ -2154,7 +2168,7 @@ mod gtk_tests {
         switch.set_active(false);
         let overlay = scratch.overlay("form-fixture");
         settle_until("the switch to be saved", || {
-            Scratch::read(&overlay).contains("flag = false")
+            wrote(&Scratch::read(&overlay), "flag = false")
         });
 
         // A first leaf write creates a file **stating** that leaf and nothing
@@ -2188,7 +2202,7 @@ mod gtk_tests {
         row.set_value(7.0);
         let overlay = scratch.overlay("form-fixture");
         settle_until("the spin row to be saved", || {
-            Scratch::read(&overlay).contains("count = 7")
+            wrote(&Scratch::read(&overlay), "count = 7")
         });
         assert_eq!(
             Scratch::read(&overlay),
@@ -2215,7 +2229,7 @@ mod gtk_tests {
         let overlay = scratch.overlay("form-fixture");
         row.set_value(9.0);
         settle_until("the number to be saved", || {
-            Scratch::read(&overlay).contains("rows = 9")
+            wrote(&Scratch::read(&overlay), "rows = 9")
         });
         assert!(
             !rect.is_active(),
@@ -2234,7 +2248,7 @@ mod gtk_tests {
 
         rect.set_active(true);
         settle_until("the word to be saved", || {
-            Scratch::read(&overlay).contains("rows = \"rect\"")
+            wrote(&Scratch::read(&overlay), "rows = \"rect\"")
         });
         assert_eq!(
             changed_lines(&after_number, &Scratch::read(&overlay)),
@@ -2259,7 +2273,7 @@ mod gtk_tests {
         row.set_selected(2);
         let overlay = scratch.overlay("form-fixture");
         settle_until("the combo to be saved", || {
-            Scratch::read(&overlay).contains("style = \"oled\"")
+            wrote(&Scratch::read(&overlay), "style = \"oled\"")
         });
         // A first write states only what was written (#1365 review, HIGH 1).
         let written = Scratch::read(&overlay);
@@ -2272,7 +2286,7 @@ mod gtk_tests {
 
         row.set_selected(0);
         settle_until("the second choice to be saved", || {
-            Scratch::read(&overlay).contains("style = \"vfd\"")
+            wrote(&Scratch::read(&overlay), "style = \"vfd\"")
         });
         assert_eq!(
             changed_lines(&written, &Scratch::read(&overlay)),
@@ -2352,7 +2366,7 @@ mod gtk_tests {
         let overlay = scratch.overlay("form-fixture");
         combo.set_selected(1);
         settle_until("the named colour to be saved", || {
-            Scratch::read(&overlay).contains("color = \"style\"")
+            wrote(&Scratch::read(&overlay), "color = \"style\"")
         });
         // A first write states only what was written (#1365 review, HIGH 1).
         let after_name = Scratch::read(&overlay);
@@ -2365,7 +2379,7 @@ mod gtk_tests {
         entry.set_text("#102030");
         glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
         settle_until("the literal to be saved", || {
-            Scratch::read(&overlay).contains("color = \"#102030\"")
+            wrote(&Scratch::read(&overlay), "color = \"#102030\"")
         });
         assert_eq!(
             changed_lines(&after_name, &Scratch::read(&overlay)),
@@ -2402,7 +2416,7 @@ mod gtk_tests {
 
         glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
         settle_until("the entry to be saved", || {
-            Scratch::read(&overlay).contains("label = \"renamed\"")
+            wrote(&Scratch::read(&overlay), "label = \"renamed\"")
         });
         assert_eq!(
             Scratch::read(&overlay),
@@ -2533,7 +2547,7 @@ mod gtk_tests {
 
         row.set_value(2.0);
         settle_until("the spin row to be saved", || {
-            Scratch::read(&overlay).contains("count = 2")
+            wrote(&Scratch::read(&overlay), "count = 2")
         });
         assert_eq!(note_of(&form, "count"), "Yours");
 
@@ -2543,7 +2557,7 @@ mod gtk_tests {
             .expect("a scalar row has a reset")
             .emit_clicked();
         settle_until("the leaf to be removed", || {
-            !Scratch::read(&overlay).contains("count = 2")
+            !wrote(&Scratch::read(&overlay), "count = 2")
         });
         let written = Scratch::read(&overlay);
         // Asked of the parse, not of the text: since #1370 the file carries
@@ -2711,7 +2725,7 @@ mod gtk_tests {
         };
         row.set_selected(2);
         settle_until("the skin to be saved", || {
-            Scratch::read(&overlay).contains("style = \"oled\"")
+            wrote(&Scratch::read(&overlay), "style = \"oled\"")
         });
         assert_eq!(
             Scratch::read(&overlay),
@@ -2839,7 +2853,7 @@ mod gtk_tests {
             panic!("an Int is a spin row");
         };
         row.set_value(7.0);
-        settle_until("the save", || Scratch::read(&overlay).contains("count = 7"));
+        settle_until("the save", || wrote(&Scratch::read(&overlay), "count = 7"));
 
         let written = Scratch::read(&overlay);
         let Control::Switch(flag) = &row_of(&form, "flag").control else {
@@ -2881,7 +2895,7 @@ mod gtk_tests {
             panic!("an Int is a spin row");
         };
         row.set_value(7.0);
-        settle_until("the save", || Scratch::read(&overlay).contains("count = 7"));
+        settle_until("the save", || wrote(&Scratch::read(&overlay), "count = 7"));
         assert_eq!(note_of(&form, "label"), "Default");
         assert!(
             !row_of(&form, "label")
@@ -2921,7 +2935,7 @@ mod gtk_tests {
             );
         }
         settle_until("the one debounced save", || {
-            Scratch::read(&overlay).contains("count = 7")
+            wrote(&Scratch::read(&overlay), "count = 7")
         });
         assert_eq!(
             Scratch::read(&overlay),
@@ -2991,7 +3005,7 @@ mod gtk_tests {
         };
         row.set_value(7.0);
         settle_until("the other row's save", || {
-            Scratch::read(&overlay).contains("count = 7")
+            wrote(&Scratch::read(&overlay), "count = 7")
         });
 
         assert!(
@@ -3044,7 +3058,7 @@ mod gtk_tests {
         entry.set_text("#ff00aa");
         glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
         settle_until("the literal to be saved", || {
-            Scratch::read(&overlay).contains("#ff00aa")
+            wrote(&Scratch::read(&overlay), "color = \"#ff00aa\"")
         });
     }
 }

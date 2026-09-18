@@ -141,7 +141,10 @@ pub fn install(monitor: &Monitor) {
     // `Monitor::connector()` itself folds `Some("")` to `None` since #1180
     // item 6, so this `let-else` already can't see the empty string.
     let Some(connector) = monitor.connector() else {
-        tracing::debug!("notifications::install: monitor has no connector; skipping");
+        tracing::warn!(
+            description = ?monitor.description(),
+            "notifications::install: monitor has no connector; skipping"
+        );
         return;
     };
 

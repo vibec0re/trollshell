@@ -32,7 +32,10 @@ thread_local! {
 /// connector.
 pub fn install(monitor: &Monitor) {
     let Some(connector) = monitor.connector().filter(|c| !c.is_empty()) else {
-        tracing::debug!("fullscreen::install: monitor has no connector; skipping");
+        tracing::warn!(
+            description = ?monitor.description(),
+            "fullscreen::install: monitor has no connector; skipping"
+        );
         return;
     };
 

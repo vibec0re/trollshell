@@ -1903,14 +1903,14 @@ fn spell_value(value: &toml::Value) -> String {
 /// entered `text` means as a typed value, or `None` when it cannot mean one
 /// at all (#1384 item 1).
 ///
-/// Shared with [`collection::ListPage`]: a scalar row reads its value straight
+/// Shared with `collection::ListPage`: a scalar row reads its value straight
 /// off a typed widget (`Row::value`), but a list item is one `AdwEntryRow`'s
 /// text regardless of its element [`Kind`] — nothing else in this module ever
 /// had to turn text into a typed value, since `Bool`/`Int`/`Choice` rows read
 /// GTK widget state directly and `Text`/`Color` are already the string
 /// `Kind::accepts` judges. `Bool`/`Int` are the only arms that actually
 /// convert; the rest hand the string back unchanged, for
-/// [`collection::typed_array`]'s validator to judge.
+/// `collection::typed_array`'s validator to judge.
 pub(super) fn parse_scalar(kind: Kind, text: &str) -> Option<toml_edit::Value> {
     match kind {
         Kind::Bool => text.parse::<bool>().ok().map(Into::into),

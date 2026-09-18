@@ -1532,7 +1532,7 @@ struct PluginsJson {
     /// of syscalls instead of one — still nothing next to reading and
     /// parsing the file.
     link: Option<PathBuf>,
-    /// `(mtime, len)` — [`hytte_config::subsystem::watch`]'s original stamp,
+    /// `(mtime, len)` — `hytte_config::subsystem::watch`'s original stamp,
     /// and what actually discriminates a **hand-written** `plugins.json`
     /// (which has no link target and a real mtime).
     modified: Option<SystemTime>,

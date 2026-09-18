@@ -2203,6 +2203,52 @@ mod gtk_tests {
         }
     }
 
+    /// What the writer leaves behind for a family the operator has never
+    /// configured: its documented default with every value line commented out
+    /// — so the file explains every key and **states** none — then the line
+    /// saying which half is theirs, then `leaf` (#1370).
+    ///
+    /// The render's own bytes are pinned in `hytte-config`
+    /// (`tests/commented_default_first_file.rs`); what the assertions below
+    /// are for is the other half — that one row's change writes **one** leaf,
+    /// and that it lands under the documentation rather than instead of it.
+    fn first_file(default_toml: &str, leaf: &str) -> String {
+        format!("{}{leaf}", subsystem::commented_seed(default_toml))
+    }
+
+    /// Whether the overlay **states** this line, as one whole line of it.
+    ///
+    /// What `settle_until` waits on, and line-exact rather than a substring
+    /// test since #1370: the commented preamble carries every key's
+    /// *documented* value (`# style = "vfd"`), so `contains` cannot tell "the
+    /// operator set it" from "the documentation mentions it" — and a
+    /// predicate that is already true waits for nothing, so the assertion
+    /// after it reads the file from before the save. Measured: that is
+    /// exactly what `a_choice_row_renders_the_file_and_writes_one_leaf` did
+    /// the first time this ran, comparing the file to itself.
+    fn wrote(body: &str, line: &str) -> bool {
+        body.lines().any(|had| had == line)
+    }
+
+    /// The leaves an overlay actually states, dotted — as the loader sees it,
+    /// not as the file reads. A commented preamble mentions every key by
+    /// name, so "the reset removed it" is a question for the parser (#1370).
+    fn stated(body: &str) -> Vec<String> {
+        fn walk(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+            for (key, value) in table {
+                let path = format!("{prefix}{key}");
+                match value {
+                    toml::Value::Table(sub) => walk(sub, &format!("{path}."), out),
+                    _ => out.push(path),
+                }
+            }
+        }
+        let table: toml::Table = body.parse().expect("the overlay is TOML");
+        let mut out = Vec::new();
+        walk(&table, "", &mut out);
+        out
+    }
+
     /// The form's row for `path`.
     fn row_of<'a>(form: &'a Form, path: &str) -> &'a Row {
         form.inner
@@ -2249,17 +2295,19 @@ mod gtk_tests {
         switch.set_active(false);
         let overlay = scratch.overlay("form-fixture");
         settle_until("the switch to be saved", || {
-            Scratch::read(&overlay).contains("flag = false")
+            wrote(&Scratch::read(&overlay), "flag = false")
         });
 
-        // A first leaf write creates a file holding **that leaf and nothing
-        // else** (#1365 review, HIGH 1): the operator's overlay is a diff
-        // over the layers below, not a copy of the documented default with
-        // one line changed — which is what it was until this round, and what
-        // silently pinned every other key in the file.
+        // A first leaf write creates a file **stating** that leaf and nothing
+        // else (#1365 review, HIGH 1): the operator's overlay is a diff over
+        // the layers below, not a copy of the documented default with one
+        // line changed — which is what it was until that round, and what
+        // silently pinned every other key in the file. Since #1370 the
+        // documented default is still in front of them, with every value line
+        // commented out, so it states nothing.
         assert_eq!(
             Scratch::read(&overlay),
-            "flag = false\n",
+            first_file(fixture::DEFAULT_TOML, "flag = false\n"),
             "the one leaf, and nothing the operator did not choose"
         );
         assert_eq!(note_of(&form, "flag"), "Yours");
@@ -2281,11 +2329,11 @@ mod gtk_tests {
         row.set_value(7.0);
         let overlay = scratch.overlay("form-fixture");
         settle_until("the spin row to be saved", || {
-            Scratch::read(&overlay).contains("count = 7")
+            wrote(&Scratch::read(&overlay), "count = 7")
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "count = 7\n",
+            first_file(fixture::DEFAULT_TOML, "count = 7\n"),
             "the one leaf, and nothing else"
         );
         assert_eq!(note_of(&form, "count"), "Yours");
@@ -2308,21 +2356,26 @@ mod gtk_tests {
         let overlay = scratch.overlay("form-fixture");
         row.set_value(9.0);
         settle_until("the number to be saved", || {
-            Scratch::read(&overlay).contains("rows = 9")
+            wrote(&Scratch::read(&overlay), "rows = 9")
         });
         assert!(
             !rect.is_active(),
             "dialling a number is choosing a number, so the word turns itself off"
         );
-        // A first write holds only what was written (#1365 review, HIGH 1),
+        // A first write states only what was written (#1365 review, HIGH 1),
         // so the base layer's `rows = "rect"` is not copied into the
-        // operator's own file on the way past.
+        // operator's own file on the way past — the documented default above
+        // it is commented out (#1370) and states nothing either.
         let after_number = Scratch::read(&overlay);
-        assert_eq!(after_number, "rows = 9\n", "the one leaf, and nothing else");
+        assert_eq!(
+            after_number,
+            first_file(fixture::DEFAULT_TOML, "rows = 9\n"),
+            "the one leaf, and nothing else"
+        );
 
         rect.set_active(true);
         settle_until("the word to be saved", || {
-            Scratch::read(&overlay).contains("rows = \"rect\"")
+            wrote(&Scratch::read(&overlay), "rows = \"rect\"")
         });
         assert_eq!(
             changed_lines(&after_number, &Scratch::read(&overlay)),
@@ -2347,19 +2400,20 @@ mod gtk_tests {
         row.set_selected(2);
         let overlay = scratch.overlay("form-fixture");
         settle_until("the combo to be saved", || {
-            Scratch::read(&overlay).contains("style = \"oled\"")
+            wrote(&Scratch::read(&overlay), "style = \"oled\"")
         });
-        // A first write holds only what was written (#1365 review, HIGH 1).
+        // A first write states only what was written (#1365 review, HIGH 1).
         let written = Scratch::read(&overlay);
         assert_eq!(
-            written, "style = \"oled\"\n",
+            written,
+            first_file(fixture::DEFAULT_TOML, "style = \"oled\"\n"),
             "the one leaf, and not the base layer's `lcd` copied along with it"
         );
         assert_eq!(note_of(&form, "style"), "Yours");
 
         row.set_selected(0);
         settle_until("the second choice to be saved", || {
-            Scratch::read(&overlay).contains("style = \"vfd\"")
+            wrote(&Scratch::read(&overlay), "style = \"vfd\"")
         });
         assert_eq!(
             changed_lines(&written, &Scratch::read(&overlay)),
@@ -2439,19 +2493,20 @@ mod gtk_tests {
         let overlay = scratch.overlay("form-fixture");
         combo.set_selected(1);
         settle_until("the named colour to be saved", || {
-            Scratch::read(&overlay).contains("color = \"style\"")
+            wrote(&Scratch::read(&overlay), "color = \"style\"")
         });
-        // A first write holds only what was written (#1365 review, HIGH 1).
+        // A first write states only what was written (#1365 review, HIGH 1).
         let after_name = Scratch::read(&overlay);
         assert_eq!(
-            after_name, "color = \"style\"\n",
+            after_name,
+            first_file(fixture::DEFAULT_TOML, "color = \"style\"\n"),
             "the one leaf, and not the base layer's literal copied along with it"
         );
 
         entry.set_text("#102030");
         glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
         settle_until("the literal to be saved", || {
-            Scratch::read(&overlay).contains("color = \"#102030\"")
+            wrote(&Scratch::read(&overlay), "color = \"#102030\"")
         });
         assert_eq!(
             changed_lines(&after_name, &Scratch::read(&overlay)),
@@ -2488,11 +2543,11 @@ mod gtk_tests {
 
         glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
         settle_until("the entry to be saved", || {
-            Scratch::read(&overlay).contains("label = \"renamed\"")
+            wrote(&Scratch::read(&overlay), "label = \"renamed\"")
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "label = \"renamed\"\n",
+            first_file(fixture::DEFAULT_TOML, "label = \"renamed\"\n"),
             "the one leaf, and nothing else"
         );
     }
@@ -2716,7 +2771,7 @@ mod gtk_tests {
 
         row.set_value(2.0);
         settle_until("the spin row to be saved", || {
-            Scratch::read(&overlay).contains("count = 2")
+            wrote(&Scratch::read(&overlay), "count = 2")
         });
         assert_eq!(note_of(&form, "count"), "Yours");
 
@@ -2726,15 +2781,18 @@ mod gtk_tests {
             .expect("a scalar row has a reset")
             .emit_clicked();
         settle_until("the leaf to be removed", || {
-            !Scratch::read(&overlay).contains("count = 2")
+            !wrote(&Scratch::read(&overlay), "count = 2")
         });
         let written = Scratch::read(&overlay);
+        // Asked of the parse, not of the text: since #1370 the file carries
+        // the documented default as comments, so `count` is *named* in it
+        // whether or not it is set.
         assert!(
-            !written.contains("count ="),
+            !stated(&written).iter().any(|key| key == "count"),
             "the key is gone, not set to the default: {written}"
         );
         assert!(
-            !written.contains("_unset"),
+            !stated(&written).iter().any(|key| key == "_unset"),
             "and a reset is not an _unset marker: {written}"
         );
         assert!(
@@ -2891,11 +2949,14 @@ mod gtk_tests {
         };
         row.set_selected(2);
         settle_until("the skin to be saved", || {
-            Scratch::read(&overlay).contains("style = \"oled\"")
+            wrote(&Scratch::read(&overlay), "style = \"oled\"")
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "style = \"oled\"\n",
+            first_file(
+                hytte_config_families::core_leds::DEFAULT_TOML,
+                "style = \"oled\"\n"
+            ),
             "one leaf in the real family's file too, and nothing else"
         );
     }
@@ -3016,7 +3077,7 @@ mod gtk_tests {
             panic!("an Int is a spin row");
         };
         row.set_value(7.0);
-        settle_until("the save", || Scratch::read(&overlay).contains("count = 7"));
+        settle_until("the save", || wrote(&Scratch::read(&overlay), "count = 7"));
 
         let written = Scratch::read(&overlay);
         let Control::Switch(flag) = &row_of(&form, "flag").control else {
@@ -3058,7 +3119,7 @@ mod gtk_tests {
             panic!("an Int is a spin row");
         };
         row.set_value(7.0);
-        settle_until("the save", || Scratch::read(&overlay).contains("count = 7"));
+        settle_until("the save", || wrote(&Scratch::read(&overlay), "count = 7"));
         assert_eq!(note_of(&form, "label"), "Default");
         assert!(
             !row_of(&form, "label")
@@ -3098,11 +3159,11 @@ mod gtk_tests {
             );
         }
         settle_until("the one debounced save", || {
-            Scratch::read(&overlay).contains("count = 7")
+            wrote(&Scratch::read(&overlay), "count = 7")
         });
         assert_eq!(
             Scratch::read(&overlay),
-            "count = 7\n",
+            first_file(fixture::DEFAULT_TOML, "count = 7\n"),
             "the last value, and exactly one leaf"
         );
     }
@@ -3168,7 +3229,7 @@ mod gtk_tests {
         };
         row.set_value(7.0);
         settle_until("the other row's save", || {
-            Scratch::read(&overlay).contains("count = 7")
+            wrote(&Scratch::read(&overlay), "count = 7")
         });
 
         assert!(
@@ -3221,7 +3282,7 @@ mod gtk_tests {
         entry.set_text("#ff00aa");
         glib::prelude::ObjectExt::emit_by_name::<()>(entry, "apply", &[]);
         settle_until("the literal to be saved", || {
-            Scratch::read(&overlay).contains("#ff00aa")
+            wrote(&Scratch::read(&overlay), "color = \"#ff00aa\"")
         });
     }
 }

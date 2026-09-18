@@ -470,7 +470,7 @@ fn installed_key(side: Side, preferred: Option<&str>) -> Option<String> {
             // #1368: `exact` is `None` here, so if `preferred` is `Some` it was
             // looked up and missed — the keybind path (`toggle_on_focused`)
             // is about to act on a monitor other than the one niri says is
-            // focused, silently (#1368's mechanism-B symptom: the sidebar
+            // focused, silently (#1368's mechanism-A symptom: the sidebar
             // "does not work" on the affected output).
             if let (Some(preferred), Some(chosen)) = (preferred, &chosen) {
                 tracing::warn!(

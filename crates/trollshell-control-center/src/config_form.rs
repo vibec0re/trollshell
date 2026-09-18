@@ -184,6 +184,23 @@ pub(crate) struct FamilyOps {
     /// path on two families and prove it. `workspaces` has no scalar leaf to
     /// edit anyway: both of its fields are collections.
     pub(crate) editable: bool,
+    /// How a saved change reaches the thing that reads this file — the
+    /// sentence the form's first group puts under its description, phrased to
+    /// follow *"Saved to `<name>.toml` in your own config."*
+    ///
+    /// Per family rather than one sentence for all of them, because the two
+    /// editable families do not answer this the same way and a form that
+    /// promised the easier answer would be lying about the harder one.
+    /// `core-leds.toml` is read **live** — the shell's own `watch::poll_loop`
+    /// re-reads it every couple of seconds and the panel re-skins with no
+    /// restart. `stats.toml` is read **once**, at plugin start: `settings()`
+    /// is a `OnceLock` (`hytte-plugin-stats/src/plugin.rs`) precisely so a
+    /// card's cadence cannot change underneath its own poll gate, so a change
+    /// here needs the plugin restarting — which the switch at the top of this
+    /// very page does.
+    ///
+    /// Unused on a read-only family, which says why it is read-only instead.
+    reload: &'static str,
     /// [`subsystem::load_raw`] for this family's `S`.
     load: fn(&[PathBuf]) -> Result<Raw, ConfigError>,
     /// [`subsystem::save_leaf_to_locked`] for this family's `S`.
@@ -201,15 +218,31 @@ type SaveLeaf = fn(
 
 impl FamilyOps {
     /// The ops for a family read and written through `S`.
-    fn of<S: Subsystem>(family: &'static Family, editable: bool) -> Self {
+    fn of<S: Subsystem>(family: &'static Family, editable: bool, reload: &'static str) -> Self {
         Self {
             family,
             editable,
+            reload,
             load: subsystem::load_raw::<S>,
             save: subsystem::save_leaf_to_locked::<S>,
         }
     }
+
+    /// A family nothing may edit here yet, whose reload sentence is therefore
+    /// never shown.
+    fn read_only<S: Subsystem>(family: &'static Family) -> Self {
+        Self::of::<S>(family, false, "")
+    }
 }
+
+/// [`FamilyOps::reload`] for a file the **shell** re-reads on its own poll.
+const RELOAD_LIVE: &str = "The shell re-reads it within a few seconds, with no restart — and this works whether or not \
+     trollshell is running. Hand edits to that file are preserved.";
+
+/// [`FamilyOps::reload`] for a file a **plugin** reads once, at start.
+const RELOAD_AT_PLUGIN_START: &str = "The plugin reads it when it starts, so restart it with the switch above to apply a change — \
+     but the save itself works whether or not anything is running, and hand edits to that file \
+     are preserved.";
 
 /// Every config family this app can render a form for.
 ///
@@ -222,18 +255,21 @@ impl FamilyOps {
 /// depend on crates that depend on it.
 pub(crate) fn families() -> Vec<FamilyOps> {
     vec![
-        FamilyOps::of::<ShellSubsystem<CoreLeds>>(&hytte_config_families::core_leds::FAMILY, true),
-        FamilyOps::of::<ShellSubsystem<Workspaces>>(
+        FamilyOps::of::<ShellSubsystem<CoreLeds>>(
+            &hytte_config_families::core_leds::FAMILY,
+            true,
+            RELOAD_LIVE,
+        ),
+        FamilyOps::read_only::<ShellSubsystem<Workspaces>>(
             &hytte_config_families::workspaces::FAMILY,
-            false,
         ),
         FamilyOps::of::<hytte_plugin_stats::config::StatsConfig>(
             &hytte_plugin_stats::config::FAMILY,
             true,
+            RELOAD_AT_PLUGIN_START,
         ),
-        FamilyOps::of::<hytte_plugin_agents::config::AgentsConfig>(
+        FamilyOps::read_only::<hytte_plugin_agents::config::AgentsConfig>(
             &hytte_plugin_agents::config::FAMILY,
-            false,
         ),
     ]
 }
@@ -1329,10 +1365,8 @@ fn group_description(ops: FamilyOps, table: Option<&str>) -> String {
     if table.is_none() {
         parts.push(if ops.editable {
             format!(
-                "Saved to {}.toml under your own config, which the shell re-reads within a few \
-                 seconds — so this works whether or not trollshell is running, and hand edits to \
-                 that file are preserved.",
-                ops.family.name
+                "Saved to {}.toml in your own config. {}",
+                ops.family.name, ops.reload
             )
         } else {
             format!(
@@ -1603,7 +1637,7 @@ mod tests {
 
     /// The fixture's ops, editable.
     pub(super) fn fixture_ops() -> FamilyOps {
-        FamilyOps::of::<ShellSubsystem<Fixture>>(&fixture::FAMILY, true)
+        FamilyOps::of::<ShellSubsystem<Fixture>>(&fixture::FAMILY, true, RELOAD_LIVE)
     }
 
     #[test]
@@ -1690,6 +1724,45 @@ mod tests {
             .map(|ops| ops.family.name)
             .collect();
         assert_eq!(editable, ["core-leds", "stats"]);
+    }
+
+    /// Each editable family's first group says how a save actually reaches its
+    /// reader, and the two answers are different.
+    ///
+    /// `core-leds.toml` is re-read live by the shell's own `watch::poll_loop`;
+    /// `stats.toml` is read **once**, by `hytte-plugin-stats`' `settings()`
+    /// `OnceLock`, at plugin start. One sentence for both would have promised
+    /// the easier answer over the harder one — a settings page telling the
+    /// operator to wait a few seconds for a change that is never coming until
+    /// they restart the plugin.
+    #[test]
+    fn each_editable_family_says_how_its_save_reaches_its_reader() {
+        let core_leds = family("core-leds").expect("core-leds is one of the four");
+        let stats = family("stats").expect("stats is one of the four");
+        assert_ne!(
+            core_leds.reload, stats.reload,
+            "a live re-read and a read-at-start are not the same promise"
+        );
+
+        let live = group_description(core_leds, None);
+        assert!(live.contains("core-leds.toml"), "{live}");
+        assert!(live.contains("no restart"), "{live}");
+
+        let at_start = group_description(stats, None);
+        assert!(at_start.contains("stats.toml"), "{at_start}");
+        assert!(
+            at_start.contains("restart it"),
+            "a plugin's file is read at start: {at_start}"
+        );
+
+        // A read-only family says why it is read-only instead, and never
+        // promises anything about a save it will not take.
+        for name in ["workspaces", "agents"] {
+            let ops = family(name).expect("one of the four");
+            let said = group_description(ops, None);
+            assert!(said.contains("#888 P2"), "{name}: {said}");
+            assert!(!said.contains("Saved to"), "{name}: {said}");
+        }
     }
 
     #[test]

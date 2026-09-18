@@ -221,13 +221,15 @@ inline in `flake.nix` as one-liners.
   `nix shell nixpkgs#python3 --command python3 nix/lint-manifest-id.py` — the
   `nix shell` is not optional, for the `bind-pins` reason above.
 - `config-vocab` (#1375, #888 P3): the same shape for `nix/module-common.nix`'s
-  hand-mirrored config vocabulary — `nix/lint-config-vocab.py` gates
-  `programs.trollshell.config.{core-leds,agents}`'s leaf set, bounds/enums and
-  each option's `description` first sentence against the four `Subsystem`
-  families' own `SCHEMA` consts (two in `hytte-config-families`, one apiece in
-  `hytte-plugin-agents` and `hytte-plugin-stats`), plus the unrelated,
-  unchanged `places` and `plugins.<id>.mount` mirrors it also carries. Run it
-  by hand with
+  hand-mirrored config vocabulary — `nix/lint-config-vocab.py` parses all
+  four `Subsystem` families' own `SCHEMA` consts (two in
+  `hytte-config-families`, one apiece in `hytte-plugin-agents` and
+  `hytte-plugin-stats`) and gates `programs.trollshell.config.{core-leds,
+  agents}`'s leaf set, bounds/enums and each option's `description` first
+  sentence against the two of those four that have a nix block today
+  (`workspaces`/`stats` are parsed and counted but have none yet, reported
+  `skipped: no nix surface`), plus the unrelated, unchanged `places` and
+  `plugins.<id>.mount` mirrors it also carries. Run it by hand with
   `nix shell nixpkgs#python3 --command python3 nix/lint-config-vocab.py`
   (`--self-test` runs just the fixture and mutation layers) — the `nix shell`
   is not optional, for the `bind-pins` reason above.

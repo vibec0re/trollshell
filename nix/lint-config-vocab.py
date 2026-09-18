@@ -912,11 +912,11 @@ def option_leaves(body: str) -> list[str]:
 
 
 def bracket_list_after(src: str, anchor: str) -> list[str]:
-    """The quoted strings inside the first `[ … ]` found after `anchor` — one
-    bracket depth only, correct for the `nix fmt`-formatted enum lists this
-    reads. Unchanged from before #1375; the only remaining caller is the
-    `plugins.<id>.mount` ↔ `Mount::ALL` check, which is not a config family
-    (see the module docs)."""
+    """The quoted strings inside the first `[ … ]` found after `anchor`.
+
+    One bracket depth only — correct for the `nix fmt`-formatted enum lists
+    this reads, one item per line.
+    """
     start = src.find(anchor)
     if start < 0:
         raise LookupError(f"anchor {anchor!r} not found")
@@ -942,39 +942,55 @@ class NixOption:
     sub_options: dict[str, "NixOption"] | None
 
 
-def find_attr(body: str, name: str, start: int = 0) -> tuple[str, int] | None:
-    """`(raw_value_text, end_pos)` for the FIRST `name = <value>;` found at or
-    after `start` in `body`, or `None`. `end_pos` is where the caller should
-    resume searching for the NEXT attribute — see `leaf_attrs` for why that
-    matters: a `Kind::Map` option's own nested sub-options each carry a
-    `type =`/`description =` pair too, entirely inside the outer option's
-    `type` value, and a naive "first match anywhere in the body" for
-    `description` would find a NESTED one instead of the outer leaf's own."""
+def find_attr(body: str, name: str, start: int = 0) -> tuple[str, int, int] | None:
+    """`(raw_value_text, match_start, end_pos)` for the FIRST `name =
+    <value>;` found at or after `start` in `body`, or `None`. `match_start`
+    is where the `name` token itself begins — not `start` — so a caller can
+    test whether this particular match fell INSIDE another attribute's own
+    value span (`leaf_attrs` does, for exactly the reason below); `end_pos`
+    is where the caller should resume searching for the NEXT attribute."""
     m = re.search(rf"(?m)^\s*{re.escape(name)}\s*=\s*", body[start:])
     if not m:
         return None
-    return value_until_char(body, start + m.end(), ";")
+    match_start = start + m.start()
+    value, end = value_until_char(body, start + m.end(), ";")
+    return value, match_start, end
 
 
 def leaf_attrs(leaf_body: str) -> tuple[str, str | None]:
     """`(type_expr, description_raw)` for one `lib.mkOption { … }`'s own
-    body. `type` is always this option's OWN first attribute (nix-fmt's
-    convention every option in this file follows), so the first match is
-    right; `description`, several attributes later, is searched for only
-    AFTER the `type` value's own span ends — which is what keeps a nested
-    sub-option's `description` (inside `type`'s `attrsOf (submodule { options
-    = { … } })`) from being picked up as the outer leaf's own."""
+    body. A `Kind::Map` option's own nested sub-options each carry a
+    `type =`/`description =` pair too, entirely inside the outer option's
+    `type` value, and a naive "first match anywhere in the body" for
+    `description` would find a NESTED one instead of the outer leaf's own —
+    so every `description` match is checked against `type`'s own span
+    (`[type_start, type_end)`) and skipped if it falls inside, however many
+    there are and wherever `type` itself sits. This does NOT assume `type`
+    is the leaf's first attribute (nix-fmt's convention, but not one this
+    parser should be brittle against — #1378 review LOW 6: a `type` written
+    last used to make this function report "no description" on a leaf that
+    plainly has one, because the old skip-ahead started searching only
+    AFTER `type`'s span, which is empty of anything when `type` comes last)."""
     type_res = find_attr(leaf_body, "type", 0)
     if type_res is None:
         raise LookupError("a `lib.mkOption { … }` leaf has no `type =` attribute")
-    type_expr, after_type = type_res
-    desc_res = find_attr(leaf_body, "description", after_type)
+    type_expr, type_start, type_end = type_res
+
     description_raw = None
-    if desc_res is not None:
-        v = desc_res[0].strip()
+    pos = 0
+    while True:
+        desc_res = find_attr(leaf_body, "description", pos)
+        if desc_res is None:
+            break
+        desc_value, desc_start, desc_end = desc_res
+        if type_start <= desc_start < type_end:
+            pos = desc_end
+            continue
+        v = desc_value.strip()
         if not (v.startswith("''") and v.endswith("''") and len(v) >= 4):
             raise LookupError(f"a `description =` value is not a `''…''` string: {v[:60]!r}")
         description_raw = v[2:-2]
+        break
     return type_expr.strip(), description_raw
 
 
@@ -1036,6 +1052,32 @@ def parse_family_options(nix_src: str, anchor: str) -> dict[str, NixOption]:
     return parse_options_level(block[open_i + 1 : close_i - 1])
 
 
+def unexpected_nix_surface(
+    nix_src: str, family_names: list[str], known_anchors: dict[str, str]
+) -> list[str]:
+    """Every name in `family_names` that is NOT a key of `known_anchors`
+    (i.e. a family `run_real_scan` is about to call "skipped: no nix
+    surface") but for which `nix_src` actually contains a
+    `config.<family> = lib.mkOption {` block anyway — the exact anchor
+    shape `known_anchors`' own values spell (#1378 review, MEDIUM 1).
+
+    `FAMILY_NIX_ANCHORS` is a hardcoded allowlist: before this function
+    existed, a family gaining a REAL nix block (someone starting #1374,
+    or a typo'd anticipatory stub) was invisible to the scan — it still
+    was not in the allowlist, so `compare()` was never called on it, and
+    the success line printed "skipped: no nix surface" and exited 0 over
+    a block whose vocabulary nothing was checking. Proven by the
+    reviewer: adding a real `config.workspaces` block with a WRONG leaf
+    set to `nix/module-common.nix` left the scan green.
+
+    A plain substring search, not a brace-matched one: this only needs to
+    know a block with this anchor EXISTS, not what it says — the caller's
+    job on a hit is to refuse to run, in the same "the scan itself is
+    untrustworthy" register `self_test`'s own failures use, not to
+    attempt a comparison `FAMILY_NIX_ANCHORS` was never taught to run."""
+    return [name for name in family_names if name not in known_anchors and f"config.{name} = lib.mkOption {{" in nix_src]
+
+
 # ── Doc comparison: nix `description`'s first sentence vs. schema `doc` ─────
 
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
@@ -1057,6 +1099,9 @@ def normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_SENTENCE_ABBREVIATIONS = ("e.g.", "i.e.")
+
+
 def first_sentence(text: str) -> str:
     """Up to the first `.` followed by whitespace or end of string, after
     `strip_markdown` and whitespace normalisation — the exact rule the PR
@@ -1064,11 +1109,29 @@ def first_sentence(text: str) -> str:
     is one sentence by contract, but running it through this too costs
     nothing and means a doc that ever grew a second sentence by accident
     would compare against only its own first, not silently swallow the nix
-    side's remainder into the comparison)."""
+    side's remainder into the comparison).
+
+    A period ending `e.g.`/`i.e.` (case-insensitively) is not treated as a
+    sentence boundary — those abbreviations end in a period without ending
+    the sentence (#1378 review LOW 7). No `Field.doc` in the tree uses
+    either today EXCEPT `stats.{sidebar,bar}.gpu`'s ("The GPU half. It hides
+    itself when there is no GPU to read." — no `e.g.`/`i.e.` there either,
+    but it IS already two sentences, so it is the one doc in the tree this
+    matters for the day `stats` gains a nix surface (#1374): without this
+    fix `first_sentence` would silently truncate at "half." either way, and
+    a doc gate comparing full sentences would need this exemption to have a
+    chance at matching a hand-written nix description that also uses one."""
     stripped = strip_markdown(text)
-    m = re.search(r"\.(?=\s|$)", stripped)
-    sentence = stripped[: m.end()] if m else stripped
-    return normalize_ws(sentence)
+    pos = 0
+    while True:
+        m = re.search(r"\.(?=\s|$)", stripped[pos:])
+        if not m:
+            return normalize_ws(stripped)
+        end = pos + m.end()
+        if stripped[max(0, end - 4) : end].lower() in _SENTENCE_ABBREVIATIONS:
+            pos = end
+            continue
+        return normalize_ws(stripped[:end])
 
 
 def compact(type_expr: str) -> str:
@@ -1078,62 +1141,182 @@ def compact(type_expr: str) -> str:
 # ── The comparison ────────────────────────────────────────────────────────
 
 
+def strip_null_or(type_expr: str) -> str:
+    """`type_expr` with exactly one leading `lib.types.nullOr` wrapper
+    removed — the nix side's spelling of "no opinion, defer to a lower
+    layer" (#1227), allowed on every field regardless of `Kind` (see the
+    module docs). The parenthesised form (`lib.types.nullOr ( … )`) is
+    bracket-matched with `match_delim`, not a regex, so a Map/List option's
+    own nested parens inside the wrapped type can't make this stop early;
+    the bare form (`lib.types.nullOr lib.types.bool`, no parens) is
+    stripped by the next token instead. Only ONE layer is ever stripped —
+    "nothing but `nullOr` is transparent" (#1378 review, MEDIUM 4): a
+    double-wrapped or otherwise malformed type is handed back UNCHANGED
+    (still starting with `lib.types.nullOr`) for `top_level_shape` to
+    reject below, rather than peeled away as if it were a scalar."""
+    s = type_expr.strip()
+    m = re.match(r"lib\.types\.nullOr\s*", s)
+    if not m:
+        return s
+    rest = s[m.end() :]
+    if rest.startswith("("):
+        close = match_delim(rest, 0, "(", ")")
+        if close < 0:
+            return s
+        inner = rest[1 : close - 1].strip()
+        trailing = rest[close:].strip()
+        return inner if not trailing else s
+    return rest.strip() if rest.strip() else s
+
+
+def split_either_arms(core_raw: str) -> tuple[str, str] | None:
+    """The two `( … )` arms of a `lib.types.either ( … ) ( … )` expression,
+    bracket-matched with `match_delim` — never `(.*?)`, which would cut an
+    arm short at its OWN first nested `)` (neither arm this script compares
+    has one today, but a regex that only happens to work today is the same
+    trap `top_level_shape` exists to close). `None` if `core_raw` (already
+    `nullOr`-stripped, NOT yet whitespace-`compact`ed — the offsets this
+    walks are the raw file's own) isn't shaped like `either ( … ) ( … )` at
+    all, or carries trailing content after the second arm."""
+    s = core_raw.strip()
+    m = re.match(r"lib\.types\.either\s*", s)
+    if not m or not s[m.end() :].lstrip().startswith("("):
+        return None
+    rest = s[m.end() :].lstrip()
+    close1 = match_delim(rest, 0, "(", ")")
+    if close1 < 0:
+        return None
+    arm1 = rest[1 : close1 - 1].strip()
+    rest2 = rest[close1:].strip()
+    if not rest2.startswith("("):
+        return None
+    close2 = match_delim(rest2, 0, "(", ")")
+    if close2 < 0:
+        return None
+    arm2 = rest2[1 : close2 - 1].strip()
+    if rest2[close2:].strip():
+        return None
+    return arm1, arm2
+
+
+def top_level_shape(core: str) -> str:
+    """Which nix type constructor `core` — already `nullOr`-stripped and
+    `compact()`ed to one line — actually IS: a FULL-STRING match for the
+    scalar shapes (`bool`/`str`/`strMatching`/`enum`/`ints.between`), an
+    anchored PREFIX for the three combinators (`either`/`listOf`/
+    `attrsOf`) whose own arguments the caller re-descends into separately.
+    Returns `""` for anything else, which every caller treats as "does not
+    match" — never a wildcard pass.
+
+    This replaces the substring checks (`"lib.types.str" in t`, `"enum" in
+    t`, …) #1378 review MEDIUM 4 found: `agents.display.label`'s type is
+    `nullOr (listOf lib.types.str)`, and `"lib.types.str" in t` is TRUE for
+    it too — the substring sits right there inside `listOf`'s own argument
+    — so a `Kind::Text` leaf accidentally re-typed as a list of strings
+    read as agreeing. A `re.fullmatch`/exact-equality check against the
+    WHOLE remaining expression cannot have that hole: `listOf lib.types.str`
+    is not equal to, and does not fullmatch, `lib.types.str`."""
+    if core == "lib.types.bool":
+        return "bool"
+    if core == "lib.types.str":
+        return "str"
+    if re.fullmatch(r'lib\.types\.strMatching\s+".*"', core, re.S):
+        return "strMatching"
+    if re.fullmatch(r"lib\.types\.enum\s*\[.*\]", core, re.S):
+        return "enum"
+    if re.fullmatch(r"lib\.types\.ints\.between\s+-?\d+\s+-?\d+", core):
+        return "ints.between"
+    if re.match(r"lib\.types\.either\s*\(", core):
+        return "either"
+    if re.match(r"lib\.types\.listOf\s+", core):
+        return "listOf"
+    if re.match(r"lib\.types\.attrsOf\s*\(", core):
+        return "attrsOf"
+    return ""
+
+
 def check_kind_vs_nix_type(kind: Kind, opt: NixOption, rust_file: str) -> list[str]:
     """`opt.type_expr` against what `kind` says the nix type should be — see
     the module docs' comparison table for the full mapping, including why
     `Color` folds into `Text`'s rule and why `Text`/`Color` accept a stricter
     `strMatching` as well as a plain `str`. Every message names both files
     and both spellings so a real mismatch (or a `mutation_self_test` case)
-    never has to be traced back through the caller to know what disagreed."""
+    never has to be traced back through the caller to know what disagreed.
+
+    Works over `core` — `opt.type_expr` with exactly one `nullOr` wrapper
+    stripped (`strip_null_or`) and then whitespace-collapsed to one line
+    (`compact`) — and classifies its OUTER constructor with
+    `top_level_shape` before comparing anything, so a scalar Kind can never
+    be satisfied by a substring sitting inside a combinator's own argument
+    (#1378 review, MEDIUM 4)."""
     t = opt.type_expr
+    core_raw = strip_null_or(t)
+    core = compact(core_raw)
+    shape = top_level_shape(core)
     errs: list[str] = []
+
+    def wrong_shape(expect: str) -> str:
+        return (
+            f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
+            f"`Kind::{kind.variant}` expects `{expect}`"
+        )
+
     if kind.variant == "Bool":
-        if not re.search(r"lib\.types\.bool\b", t):
-            errs.append(
-                f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
-                "`Kind::Bool` expects `lib.types.bool`"
-            )
+        if shape != "bool":
+            errs.append(wrong_shape("lib.types.bool"))
     elif kind.variant == "Int":
-        m = re.search(r"ints\.between\s+(-?\d+)\s+(-?\d+)", t)
-        if not m:
-            errs.append(
-                f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
-                f"`Kind::Int` expects an `ints.between {kind.min} {kind.max}`"
-            )
+        if kind.also:
+            if shape != "either":
+                errs.append(
+                    f"{rust_file}'s `Kind::Int.also` is {list(kind.also)}, so "
+                    "nix/module-common.nix's type must be `lib.types.either (ints.between …) "
+                    f"(enum […])`, but its type is `{compact(t)}`"
+                )
+            else:
+                arms = split_either_arms(core_raw)
+                if arms is None:
+                    errs.append(
+                        f"nix/module-common.nix's `either` type could not be split into its "
+                        f"two `( … )` arms: `{compact(t)}`"
+                    )
+                else:
+                    arm1, arm2 = compact(arms[0]), compact(arms[1])
+                    m = re.fullmatch(r"lib\.types\.ints\.between\s+(-?\d+)\s+(-?\d+)", arm1)
+                    if not m:
+                        errs.append(
+                            f"nix/module-common.nix's `either`'s first arm is `{arm1}`, but "
+                            f"{rust_file}'s `Kind::Int` expects `ints.between {kind.min} {kind.max}`"
+                        )
+                    else:
+                        lo, hi = int(m.group(1)), int(m.group(2))
+                        if (lo, hi) != (kind.min, kind.max):
+                            errs.append(
+                                f"nix/module-common.nix bounds it {lo}..{hi} (`ints.between {lo} "
+                                f"{hi}`), but {rust_file}'s `Kind::Int` says {kind.min}..{kind.max}"
+                            )
+                    em = re.fullmatch(r"lib\.types\.enum\s*\[(.*)\]", arm2, re.S)
+                    got_also = [tok.strip('"') for tok in em.group(1).split() if tok.strip('"')] if em else []
+                    if got_also != list(kind.also):
+                        errs.append(
+                            f"nix/module-common.nix's `either`'s word enum is {got_also}, but "
+                            f"{rust_file}'s `Kind::Int.also` is {list(kind.also)}"
+                        )
         else:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if (lo, hi) != (kind.min, kind.max):
-                errs.append(
-                    f"nix/module-common.nix bounds it {lo}..{hi} (`ints.between {lo} {hi}`), "
-                    f"but {rust_file}'s `Kind::Int` says {kind.min}..{kind.max}"
-                )
-            if kind.also:
-                em = re.search(r"enum\s*\[([^\]]*)\]", t)
-                got_also = [tok.strip('"') for tok in em.group(1).split() if tok.strip('"')] if em else []
-                if got_also != list(kind.also):
+            if shape != "ints.between":
+                errs.append(wrong_shape(f"lib.types.ints.between {kind.min} {kind.max}"))
+            else:
+                m = re.fullmatch(r"lib\.types\.ints\.between\s+(-?\d+)\s+(-?\d+)", core)
+                lo, hi = int(m.group(1)), int(m.group(2))
+                if (lo, hi) != (kind.min, kind.max):
                     errs.append(
-                        f"nix/module-common.nix's word enum is {got_also}, but {rust_file}'s "
-                        f"`Kind::Int.also` is {list(kind.also)}"
+                        f"nix/module-common.nix bounds it {lo}..{hi} (`ints.between {lo} {hi}`), "
+                        f"but {rust_file}'s `Kind::Int` says {kind.min}..{kind.max}"
                     )
-                if "either" not in t:
-                    errs.append(
-                        f"{rust_file}'s `Kind::Int.also` is {list(kind.also)}, so "
-                        "nix/module-common.nix's type must wrap the bound in "
-                        "`lib.types.either (ints.between …) (enum […])`, but no `either` was found"
-                    )
-            elif "either" in t or re.search(r"\benum\b", t):
-                errs.append(
-                    "nix/module-common.nix's type wraps the bound in `either`/`enum`, but "
-                    f"{rust_file}'s `Kind::Int` carries no `also` words"
-                )
     elif kind.variant == "Choice":
-        em = re.search(r"enum\s*\[([^\]]*)\]", t)
-        if not em:
-            errs.append(
-                f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
-                "`Kind::Choice` expects an `enum [ … ]`"
-            )
+        if shape != "enum":
+            errs.append(wrong_shape("lib.types.enum [ … ]"))
         else:
+            em = re.fullmatch(r"lib\.types\.enum\s*\[(.*)\]", core, re.S)
             got = [tok.strip('"') for tok in em.group(1).split() if tok.strip('"')]
             if got != list(kind.options):
                 errs.append(
@@ -1141,17 +1324,19 @@ def check_kind_vs_nix_type(kind: Kind, opt: NixOption, rust_file: str) -> list[s
                     f"`Kind::Choice.options` is {list(kind.options)}"
                 )
     elif kind.variant in ("Text", "Color"):
-        if not re.search(r"lib\.types\.(str|strMatching)\b", t):
+        if shape not in ("str", "strMatching"):
             errs.append(
                 f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
                 f"`Kind::{kind.variant}` expects `lib.types.str` (or a stricter "
                 '`lib.types.strMatching "…"`)'
             )
     elif kind.variant == "Map":
-        if "attrsOf" not in t:
+        if shape != "attrsOf":
+            errs.append(wrong_shape("lib.types.attrsOf (lib.types.submodule …)"))
+        elif "lib.types.submodule" not in core:
             errs.append(
-                f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
-                "`Kind::Map` expects `lib.types.attrsOf (lib.types.submodule …)`"
+                f"{rust_file} declares this a `Kind::Map`, but nix/module-common.nix's "
+                f"`attrsOf` does not wrap a `lib.types.submodule`: `{compact(t)}`"
             )
         if opt.sub_options is None:
             errs.append(
@@ -1159,25 +1344,21 @@ def check_kind_vs_nix_type(kind: Kind, opt: NixOption, rust_file: str) -> list[s
                 "has no nested `options = { … }`"
             )
     elif kind.variant == "List":
-        if "listOf" not in t:
-            errs.append(
-                f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
-                "`Kind::List` expects `lib.types.listOf …`"
-            )
-        elif kind.elem is not None and kind.elem.variant == "Map" and opt.sub_options is None:
-            errs.append(
-                f"{rust_file}'s `Kind::List` elements are a `Kind::Map`, but "
-                "nix/module-common.nix's `listOf` has no nested `options = { … }`"
-            )
-        elif (
-            kind.elem is not None
-            and kind.elem.variant == "Text"
-            and not re.search(r"lib\.types\.(str|strMatching)\b", t)
-        ):
-            errs.append(
-                f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
-                "`Kind::List(Text)` expects a `listOf lib.types.str`"
-            )
+        if shape != "listOf":
+            errs.append(wrong_shape("lib.types.listOf …"))
+        else:
+            elem_core = core[len("lib.types.listOf ") :].strip()
+            elem_shape = top_level_shape(elem_core)
+            if kind.elem is not None and kind.elem.variant == "Map" and opt.sub_options is None:
+                errs.append(
+                    f"{rust_file}'s `Kind::List` elements are a `Kind::Map`, but "
+                    "nix/module-common.nix's `listOf` has no nested `options = { … }`"
+                )
+            elif kind.elem is not None and kind.elem.variant == "Text" and elem_shape not in ("str", "strMatching"):
+                errs.append(
+                    f"nix/module-common.nix's type is `{compact(t)}`, but {rust_file}'s "
+                    "`Kind::List(Text)` expects a `listOf lib.types.str`"
+                )
     return errs
 
 
@@ -1246,9 +1427,27 @@ def compare(
 
 def _enum_all_names(src: str, ty: str, fn: str, where: str) -> list[str]:
     """`<ty>::ALL`'s variants mapped through `fn <fn>(self) -> &'static str`.
-    Unchanged from before #1375 — `DisplayStyle::ALL` no longer goes through
-    this (core-leds' `style` enum now comes from its `Schema`, see the module
-    docs), so the only remaining caller is `mount_wire_names` below."""
+
+    Reads `pub const ALL: [Self; N] = [Self::Vfd, Self::Lcd, …];` (or the
+    `[Mount; N] = [Mount::…]` spelling — both appear in the tree) for the
+    variant *order*, then that function's match arms for the
+    variant -> string mapping, and composes the two. This is exactly what
+    `<ty>::ALL.iter().map(|v| v.<fn>())` computes at runtime, so the nix side
+    is checked against the same sequence the Rust schema itself would
+    resolve.
+
+    Originally two enums went through this — `DisplayStyle::ALL`/`name` in
+    `crates/hytte-preem/src/style.rs` and `Mount::ALL`/`wire_name` in
+    `crates/hytte-plugin-proto/src/manifest.rs` — kept as one function rather
+    than two near-copies because the only differences were the type's
+    spelling and the method's name. `DisplayStyle::ALL` no longer goes
+    through this: #1375 retired that scrape (core-leds' `style` enum now
+    comes from its `Schema` instead, see the module docs), so
+    `mount_wire_names` below is the only remaining caller — restored
+    unchanged rather than collapsed into `mount_wire_names` directly, since a
+    second enum reaching this shape again is exactly the case the original
+    "a second copy would be a second thing to fix" reasoning was for.
+    """
     qualified = rf"(?:Self|{ty})"
     m = re.search(rf"pub const ALL:\s*\[{qualified};\s*\d+\]\s*=\s*\[([^\]]*)\];", src)
     if not m:
@@ -1276,25 +1475,43 @@ def _enum_all_names(src: str, ty: str, fn: str, where: str) -> list[str]:
 
 
 def mount_wire_names(src: str) -> list[str]:
-    """`Mount`'s wire names, in `ALL`'s order (#1161, #1260 review F3) — the
-    vocabulary `programs.trollshell.plugins.<id>.mount`'s `types.enum`
-    hand-mirrors. Unchanged from before #1375."""
+    """`Mount`'s wire names, in `ALL`'s order (#1161, #1260 review F3).
+
+    The vocabulary `programs.trollshell.plugins.<id>.mount`'s `types.enum`
+    hand-mirrors, and the one the SDK matches `HYTTE_PLUGIN_MOUNT` against at
+    plugin startup — `Mount::from_wire_name` is `wire_name`'s exact inverse,
+    so a value outside this list is a launch failure rather than a card in
+    the wrong place.
+    """
     return _enum_all_names(src, "Mount", "wire_name", "crates/hytte-plugin-proto/src/manifest.rs")
 
 
 # ── Retained unchanged: `places` (#1339 item 2 — not a `Schema` family) ────
 
-# `config.places`' nix option leaves, paired with the Rust struct whose serde
-# fields they must equal. Unchanged from before #1375 — see the module docs'
-# "TWO ARMS THAT STAY EXACTLY AS THEY WERE".
+# `place` and `departures` are SIBLING leaves of `config.places`, not one
+# other — `place` is a `listOf (submodule { … })` whose own options are
+# `PlaceCfg`'s fields, `departures` is a plain `submodule` whose own options
+# are `DeparturesCfg`'s — so `places_option_levels` reads each independently,
+# with no block to lift out first. There is deliberately no third entry for
+# `config.places` itself: its own two leaves (`place`, `departures`) are not
+# the serde fields of any single Rust struct — `PlaceCfg` and `DeparturesCfg`
+# are two separate parse structs, both private (see the module docs' "TWO
+# ARMS THAT STAY EXACTLY AS THEY WERE"), so `struct_serde_fields` is called
+# for these two with `private=True`.
 PLACES_STRUCT_LEVELS = (
     ("place = lib.mkOption {", "PlaceCfg"),
     ("departures = lib.mkOption {", "DeparturesCfg"),
 )
 
 # The (struct, file) pairs `struct_serde_fields` may read without requiring a
-# `pub` on the declaration or on its fields (see that function's own
-# docstring). Unchanged from before #1375.
+# `pub` on the declaration or on its fields — see the module docs' "TWO ARMS
+# THAT STAY EXACTLY AS THEY WERE" for why these two stay private rather than
+# being made `pub` for this script's convenience. Keyed by struct name
+# (checked by `struct_serde_fields` itself, so no call site needs to opt in
+# by hand); the file is carried alongside for `main()` to read from and so
+# this table stays the one place that says both "which structs" and "from
+# where". Anything not named here still requires `pub struct` with `pub`
+# fields, the stricter default every other family is held to.
 PRIVATE_STRUCTS = {struct: PLACES_RS for _, struct in PLACES_STRUCT_LEVELS}
 
 
@@ -1304,25 +1521,42 @@ def _serde_attr_lists(text: str) -> list[str]:
 
 
 def _serde_has(text: str, pattern: str) -> bool:
-    """Whether `pattern` matches anywhere inside any `#[serde(...)]`
-    attribute list in `text`, scanned as a whole list rather than by
-    position (#1241)."""
+    """Whether `pattern` matches ANYWHERE inside any `#[serde(...)]`
+    attribute list in `text` — scanned as a whole list rather than by
+    position (#1241). The idiom `Display` itself uses,
+    `#[serde(default, skip_serializing_if = "…", rename = "glyph")]`, puts
+    `rename` third; a scan that only checked the first entry or two (the old
+    `"serde(rename" in body` / `"serde(default, rename" in body` prefixes)
+    scanned that green.
+    """
     return any(re.search(pattern, attrs) for attrs in _serde_attr_lists(text))
 
 
 def struct_serde_fields(src: str, struct: str) -> list[str]:
     """The serde-visible field names of `struct <struct>`, in source order.
+
     Requires a `pub struct` with `pub` fields UNLESS `struct` is one of
     `PRIVATE_STRUCTS`' keys (`places.rs`'s `PlaceCfg`/`DeparturesCfg`, #1339
     item 2) — those are read without either `pub`, since making a
     file-schema struct public just to satisfy this scan would widen a
-    published API for the lint's convenience. Unchanged from before #1375;
-    the only remaining caller is the `places` comparison."""
+    published API for the lint's convenience. The distinction is by struct
+    NAME, looked up here, so no call site has to remember to ask for it and
+    every family this table doesn't name keeps the stricter default.
+
+    Raises rather than guessing if the struct (or its container attributes)
+    uses a serde spelling this scan cannot follow — `rename`, `rename_all` and
+    `flatten` all make the wire name something other than the Rust field name,
+    and a scan that quietly ignored them would compare the nix side against
+    names that never appear in the TOML. An untrustworthy verdict is worth
+    exit 2, not a green.
+    """
     private = struct in PRIVATE_STRUCTS
     struct_kw = "struct" if private else "pub struct"
     m = re.search(rf"{struct_kw} {struct}\b[^{{]*\{{", src)
     if not m:
         raise LookupError(f"`{struct_kw} {struct}` not found")
+    # Container attributes sit between the doc comment and the struct keyword;
+    # 500 characters back covers the derive list and any `#[serde(...)]` line.
     head = src[max(0, m.start() - 500) : m.start()]
     if _serde_has(head, r"rename_all"):
         raise LookupError(f"`{struct}` carries a serde `rename_all` this scan cannot follow")
@@ -1345,8 +1579,17 @@ def struct_serde_fields(src: str, struct: str) -> list[str]:
 
 
 def places_option_levels(nix_src: str) -> dict[str, list[str]]:
-    """`config.places`' option leaves, one list per Rust struct (#1339 item
-    2). Unchanged from before #1375."""
+    """`config.places`' option leaves, one list per Rust struct (#1339 item 2).
+
+    `place` and `departures` are SIBLING leaves of `config.places` —
+    `PlaceCfg`'s fields live inside the `listOf (submodule { … })` under
+    `place`, `DeparturesCfg`'s inside the plain `submodule` under
+    `departures` — neither block sits inside the other, so each is read
+    independently with no "lift the nested block out first" step (the shape
+    the old `agents_option_levels` needed for `agents.display`'s sub-fields,
+    before #1375 retired that arm's own hand-mirror in favour of the schema
+    path).
+    """
     return {struct: option_leaves(option_block(nix_src, anchor)) for anchor, struct in PLACES_STRUCT_LEVELS}
 
 
@@ -1831,18 +2074,72 @@ def mutate_drop_enum_value(nix_src: str, option_anchor: str, value: str) -> str:
     return nix_src[:open_i] + new_block + nix_src[close_i:]
 
 
-def mutate_move_bound(nix_src: str, option_anchor: str) -> str:
+def mutate_move_bound(nix_src: str, option_anchor: str) -> tuple[str, str, str]:
     """The FIRST `ints.between lo hi`'s upper bound incremented by one —
     proves the `Kind::Int` bound comparison reds on a moved bound (ask #5,
-    case 2)."""
+    case 2). Returns `(mutated_nix, old_hi, new_hi)` — both read out of THIS
+    copy of the real file rather than assumed by the caller as a literal —
+    so a legitimate future change to the bound this anchor happens to point
+    at doesn't make the caller's own expectation stale (#1378 review,
+    MEDIUM 2)."""
     open_i, close_i = find_block_span(nix_src, option_anchor)
     block = nix_src[open_i:close_i]
     m = re.search(r"ints\.between\s+(-?\d+)\s+(-?\d+)", block)
     if not m:
         raise LookupError(f"no `ints.between` found after anchor {option_anchor!r}")
-    new_hi = str(int(m.group(2)) + 1)
+    old_hi = m.group(2)
+    new_hi = str(int(old_hi) + 1)
     new_block = block[: m.start(2)] + new_hi + block[m.end(2) :]
+    return nix_src[:open_i] + new_block + nix_src[close_i:], old_hi, new_hi
+
+
+def mutate_wrap_in_listof(nix_src: str, option_anchor: str) -> str:
+    """`option_anchor`'s own `type = …;` attribute rewritten from
+    `lib.types.nullOr X` to `lib.types.nullOr (lib.types.listOf X)` — proves
+    a scalar `Kind` (`Text` here) reds against a nix type that WRAPS its
+    expected shape in a combinator, rather than being satisfied by it the
+    way a substring search would be (#1378 review, MEDIUM 4: the reviewer
+    found `agents.display.label`'s real `nullOr str` silently accepted as
+    `nullOr (listOf str)`, because the retired check searched for the
+    substring `lib.types.str` ANYWHERE in the type expression, and that
+    substring sits right there inside `listOf`'s own argument). `X` is
+    read back out of THIS copy via `strip_null_or` rather than assumed, so
+    this works on whatever scalar type the anchor's field currently has."""
+    open_i, close_i = find_block_span(nix_src, option_anchor)
+    block = nix_src[open_i:close_i]
+    type_res = find_attr(block, "type", 0)
+    if type_res is None:
+        raise LookupError(f"no `type = …;` attribute found after anchor {option_anchor!r}")
+    type_text, _start, _end = type_res
+    core = strip_null_or(type_text.strip())
+    if core == type_text.strip():
+        raise LookupError(
+            f"the type after anchor {option_anchor!r} is not `nullOr`-wrapped, as this "
+            "mutation assumes"
+        )
+    new_type_text = f" lib.types.nullOr (lib.types.listOf {core})"
+    new_block = block.replace(type_text, new_type_text, 1)
     return nix_src[:open_i] + new_block + nix_src[close_i:]
+
+
+def mutate_add_unknown_family_block(nix_src: str, family: str) -> str:
+    """`nix_src` with a fake, syntactically-plausible
+    `config.<family> = lib.mkOption { … };` block appended at the very
+    end — proves `unexpected_nix_surface` actually flags a family that
+    gains a real nix block `FAMILY_NIX_ANCHORS` was never told about
+    (#1378 review, MEDIUM 1). A plain append, not an insert at a specific
+    nesting depth: `unexpected_nix_surface` only ever does a substring
+    search for the anchor text, so where in the file it sits does not
+    matter — only that the exact anchor shape `FAMILY_NIX_ANCHORS`' own
+    values use is present somewhere."""
+    fake = (
+        f"\n      config.{family} = lib.mkOption {{\n"
+        "        type = lib.types.attrsOf lib.types.str;\n"
+        "        default = { };\n"
+        '        description = "fake, for the self-test only";\n'
+        "      };\n"
+    )
+    return nix_src + fake
 
 
 def mutate_first_sentence(nix_src: str, option_anchor: str, needle: str, replacement: str) -> str:
@@ -1878,15 +2175,33 @@ def mutate_remove_leaf(nix_src: str, option_anchor: str, leaf_name: str) -> str:
 
 
 def mutation_self_test() -> list[str]:
-    """The four cases ask #5 requires, each against a real (mutated) copy of
-    `nix/module-common.nix` and the REAL, unmutated Rust schema — see the
-    module docs' "FALSIFYING THE COMPARISON" section."""
+    """The six cases ask #5 (plus #1378 review MEDIUM 1/MEDIUM 4) require,
+    each against a real (mutated) copy of `nix/module-common.nix` and the
+    REAL, unmutated Rust schema — see the module docs' "FALSIFYING THE
+    COMPARISON" section.
+
+    Every mutated VALUE (which enum member to drop, which bound to move to,
+    which sentence to reword, which sub-field to remove) is read back out of
+    the schema or the mutation's own return value — never a literal like
+    `"oled"`/`"3600"`/`"project"` baked in here — so a legitimate future
+    change to the schema (a new bound, a renamed sub-field, a reworded doc)
+    cannot itself make a case's own EXPECTATION stale and turn a healthy
+    self-test into a false "scan is broken" (#1378 review, MEDIUM 2:
+    `MAX_POLL_SECONDS` moving, or `display.project` being renamed, used to
+    fail this self-test with exit 2 and "fix the extraction functions" —
+    advice that was wrong, since the scan itself was fine). WHICH field a
+    case mutates is still a fixed choice (case 1 always targets
+    `core-leds.style`, case 4 always targets `agents.display`'s LAST
+    sub-field, …) — that is test design, not a value that drifts."""
     failures: list[str] = []
     real_nix = read(MODULE_COMMON_NIX)
     core_leds_src = read_rust_schema(CORE_LEDS_FAMILY_RS)
     agents_src = read_rust_schema(AGENTS_RS)
     core_leds_fields = parse_schema_fields(core_leds_src, CORE_LEDS_FAMILY_RS)
     agents_fields = parse_schema_fields(agents_src, AGENTS_RS)
+
+    def field(fields: list[Field], path: str) -> Field:
+        return next(f for f in fields if f.path == path)
 
     def run(name: str, family: str, rust_file: str, fields: list[Field], mutated_nix: str, expect: list[str]) -> None:
         mismatches: list[str] = []
@@ -1907,29 +2222,32 @@ def mutation_self_test() -> list[str]:
         else:
             print(f"  ok    self-test: {name} — {len(mismatches)} mismatch(es), as expected")
 
-    m1 = mutate_drop_enum_value(real_nix, "style = lib.mkOption {", "oled")
+    style_field = field(core_leds_fields, "style")
+    dropped = style_field.kind.options[-1]
+    m1 = mutate_drop_enum_value(real_nix, "style = lib.mkOption {", dropped)
     run(
-        "enum value dropped (core-leds.style loses \"oled\")",
+        f"enum value dropped (core-leds.style loses {dropped!r})",
         "core-leds",
         CORE_LEDS_FAMILY_RS,
         core_leds_fields,
         m1,
-        ["core-leds.style", "nix/module-common.nix", CORE_LEDS_FAMILY_RS, "oled"],
+        ["core-leds.style", "nix/module-common.nix", CORE_LEDS_FAMILY_RS, dropped],
     )
 
-    m2 = mutate_move_bound(real_nix, "poll_seconds = lib.mkOption {")
+    m2, old_hi, new_hi = mutate_move_bound(real_nix, "poll_seconds = lib.mkOption {")
     run(
-        "bound moved (agents.poll_seconds's upper bound 3600 -> 3601)",
+        f"bound moved (agents.poll_seconds's upper bound {old_hi} -> {new_hi})",
         "agents",
         AGENTS_RS,
         agents_fields,
         m2,
-        ["agents.poll_seconds", "nix/module-common.nix", AGENTS_RS, "3600", "3601"],
+        ["agents.poll_seconds", "nix/module-common.nix", AGENTS_RS, old_hi, new_hi],
     )
 
-    m3 = mutate_first_sentence(
-        real_nix, "fill = lib.mkOption {", "leftover slots look like", "leftover slots sound like"
-    )
+    fill_field = field(core_leds_fields, "fill")
+    needle = first_sentence(fill_field.doc)
+    replacement = (needle[:-1] if needle.endswith(".") else needle) + " (mutated for the self-test)."
+    m3 = mutate_first_sentence(real_nix, "fill = lib.mkOption {", needle, replacement)
     run(
         "description first sentence changed (core-leds.fill)",
         "core-leds",
@@ -1939,20 +2257,58 @@ def mutation_self_test() -> list[str]:
         ["core-leds.fill", "nix/module-common.nix", CORE_LEDS_FAMILY_RS],
     )
 
-    m4 = mutate_remove_leaf(real_nix, "display = lib.mkOption {", "project")
+    display_field = field(agents_fields, "display")
+    removed_leaf = display_field.kind.fields[-1].path
+    m4 = mutate_remove_leaf(real_nix, "display = lib.mkOption {", removed_leaf)
     run(
-        "Map sub-option removed (agents.display loses `project`)",
+        f"Map sub-option removed (agents.display loses `{removed_leaf}`)",
         "agents",
         AGENTS_RS,
         agents_fields,
         m4,
-        ["agents.display.project", "nix/module-common.nix", AGENTS_RS],
+        [f"agents.display.{removed_leaf}", "nix/module-common.nix", AGENTS_RS],
+    )
+
+    m5 = mutate_add_unknown_family_block(real_nix, "workspaces")
+    known = {"core-leds", "agents"}
+    surprising = unexpected_nix_surface(m5, ["core-leds", "agents", "workspaces", "stats"], FAMILY_NIX_ANCHORS)
+    name5 = "unknown nix surface (workspaces gains a real config.workspaces block)"
+    if surprising != ["workspaces"]:
+        failures.append(
+            f"self-test case {name5!r}: expected `unexpected_nix_surface` to flag exactly "
+            f"['workspaces'], got {surprising}"
+        )
+    elif set(FAMILY_NIX_ANCHORS) != known:
+        failures.append(
+            f"self-test case {name5!r}: FAMILY_NIX_ANCHORS's keys are {sorted(FAMILY_NIX_ANCHORS)}, "
+            f"not the {sorted(known)} this case assumes — update the fixture alongside the anchors table"
+        )
+    else:
+        print(f"  ok    self-test: {name5} — flagged, as expected")
+
+    m6 = mutate_wrap_in_listof(real_nix, "label = lib.mkOption {")
+    run(
+        "scalar type collision (agents.display.label's `str` wrapped in `listOf`)",
+        "agents",
+        AGENTS_RS,
+        agents_fields,
+        m6,
+        ["agents.display.label", "nix/module-common.nix", AGENTS_RS, "Kind::Text"],
     )
 
     return failures
 
 
+MUTATION_CASE_COUNT = 6
+
+
 def run_self_tests() -> int:
+    """Both self-test layers, `--self-test`'s own entrypoint: exits 2 on
+    EITHER layer's failure and runs no real scan — the `--self-test` flag
+    asked for just the self-test layers in isolation. `main()`'s default
+    (non-`--self-test`) path does NOT call this; see its own docstring for
+    why a mutation-layer failure there behaves differently (#1378 review,
+    MEDIUM 2)."""
     try:
         failures = self_test()
     except Exception as e:  # noqa: BLE001 - narrower than this would mask a bug in the fixtures themselves
@@ -1967,7 +2323,10 @@ def run_self_tests() -> int:
         return _self_test_failed([f"`mutation_self_test` raised {type(e).__name__}: {e}"])
     if mut_failures:
         return _self_test_failed(mut_failures)
-    print("config-vocab self-test: all four mutation cases reported red, as expected", flush=True)
+    print(
+        f"config-vocab self-test: all {MUTATION_CASE_COUNT} mutation cases reported red, as expected",
+        flush=True,
+    )
     return 0
 
 
@@ -2023,6 +2382,23 @@ def run_real_scan() -> int:
         print(
             f"config-vocab scan: {', '.join(zero)}'s SCHEMA parsed to zero fields — the "
             "parser is broken, or the schema really is empty and this guard needs revisiting",
+            file=sys.stderr,
+        )
+        return 2
+
+    surprising = unexpected_nix_surface(nix_src, list(counts), FAMILY_NIX_ANCHORS)
+    if surprising:
+        print(
+            f"config-vocab scan: {', '.join(surprising)} now ha"
+            f"{'s' if len(surprising) == 1 else 've'} a `config.<family> = lib.mkOption "
+            "{ … };` block in nix/module-common.nix, but FAMILY_NIX_ANCHORS does not know "
+            "about it — this scan would otherwise report it \"skipped: no nix surface\" and "
+            "exit 0 while that block's vocabulary drifts entirely unchecked",
+            file=sys.stderr,
+        )
+        print(
+            "  (add an anchor for it to FAMILY_NIX_ANCHORS in nix/lint-config-vocab.py, and "
+            "wire the family into the compare() calls below)",
             file=sys.stderr,
         )
         return 2
@@ -2086,11 +2462,59 @@ def run_real_scan() -> int:
 
 
 def main() -> int:
+    """`--self-test` runs both self-test layers in isolation
+    (`run_self_tests`) and stops there, exit 2 on either's failure — see
+    that function's docstring.
+
+    The default path is NOT "run_self_tests() then, if clean, run the real
+    scan": a UNIT-fixture failure (`self_test()`, the parsing primitives
+    against small hand-built fixtures) is self-contained — "the scan itself
+    is untrustworthy", exit 2, no real scan, same as before #1378. A
+    MUTATION-fixture failure (`mutation_self_test()`, the whole comparison
+    against a mutated copy of the REAL file) is different: it can mean the
+    scan is broken, but it can equally mean the schema legitimately moved
+    out from under one case's assumption in a way this self-test's own
+    dynamic derivation (see `mutation_self_test`'s docstring) didn't cover
+    — and in EITHER case, the real scan below is still answerable and its
+    answer is still useful, so it runs and prints its own verdict rather
+    than leaving the operator staring at a self-test failure with no idea
+    whether `nix/module-common.nix` itself is currently drifted (#1378
+    review, MEDIUM 2). The overall exit code is still 2 either way — the
+    self-test's own trustworthiness is what failed, not `nix/module-common.nix`."""
     if "--self-test" in sys.argv[1:]:
         return run_self_tests()
-    code = run_self_tests()
-    if code != 0:
-        return code
+
+    try:
+        unit_failures = self_test()
+    except Exception as e:  # noqa: BLE001 - narrower than this would mask a bug in the fixtures themselves
+        return _self_test_failed([f"a `self_test` fixture raised {type(e).__name__}: {e}"])
+    if unit_failures:
+        return _self_test_failed(unit_failures)
+    print("config-vocab self-test: unit fixtures ok", flush=True)
+
+    try:
+        mut_failures = mutation_self_test()
+    except Exception as e:  # noqa: BLE001
+        mut_failures = [f"`mutation_self_test` raised {type(e).__name__}: {e}"]
+
+    if mut_failures:
+        print("config-vocab scan: SELF-TEST FAILED (mutation layer)", file=sys.stderr)
+        for line in mut_failures:
+            print(f"  {line}", file=sys.stderr)
+        print(
+            "\nThe mutation self-test disagreed with its own fixtures. Unlike a unit-fixture\n"
+            "failure this is not necessarily self-contained — it can also mean the schema\n"
+            "legitimately moved out from under a mutation case's own assumption — so the real\n"
+            "scan below still ran; read its own verdict on its own merits.\n",
+            file=sys.stderr,
+        )
+        run_real_scan()
+        return 2
+
+    print(
+        f"config-vocab self-test: all {MUTATION_CASE_COUNT} mutation cases reported red, as expected",
+        flush=True,
+    )
     return run_real_scan()
 
 

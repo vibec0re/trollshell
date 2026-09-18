@@ -1236,8 +1236,8 @@ self:
             example = "heat";
             description = ''
               The colour axis, independent of the skin. One of
-              style/rainbow/transpride/heat, or a `"#rrggbb"` literal — a
-              plain string rather than an enum because the accepted
+              style/rainbow/transpride/heat, or a `"#rrggbb"` literal. This
+              is a plain string rather than an enum because the accepted
               vocabulary is open-ended (any 6-digit hex triplet); an
               unrecognised word still fails the *file* schema per-key at
               load time (`core_leds.rs`'s `CoreLedsConfig::parsed`), not at
@@ -1253,13 +1253,14 @@ self:
             default = null;
             example = "rect";
             description = ''
-              Rows in the lamp matrix; 0 or "rect" is the automatic wide
-              rectangle. It is picked from the core count — both file
-              spellings `core_leds.rs` accepts — while a pinned count from
-              1 to 64 overrides it. `null` (the default) sets no `rows`
-              key at all, which is *not* the same as `0`/`"rect"`: it lets
-              a lower layer (the overlay, or the built-in default) decide
-              instead of pinning the automatic shape at this layer.
+              Rows in the lamp matrix, or 0 / "rect" for the automatic wide
+              rectangle picked from the core count. Both `0` and `"rect"`
+              are file spellings `core_leds.rs` accepts; a pinned count
+              from 1 to 64 overrides the automatic shape instead. `null`
+              (the default) sets no `rows` key at all, which is *not* the
+              same as `0`/`"rect"`: it lets a lower layer (the overlay, or
+              the built-in default) decide instead of pinning the
+              automatic shape at this layer.
             '';
           };
 

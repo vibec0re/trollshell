@@ -376,7 +376,7 @@ pub(crate) fn build(ops: FamilyOps, env: &Rc<xdg::Env>) -> Form {
     // widget is built, is the smaller change and the honest one: a family
     // with no fields is a schema bug, not a runtime state this form should
     // degrade for.
-    debug_assert!(
+    assert!(
         !ops.family.schema.fields.is_empty(),
         "{} declares no fields — this form has nowhere to put its load-error banner",
         ops.family.name
@@ -1766,7 +1766,7 @@ label = "fixture"
 "#;
 
     /// A schema with no fields at all — #1371 L6's fixture: nothing a real
-    /// family ships, but exactly the shape `build`'s `debug_assert!` exists
+    /// family ships, but exactly the shape `build`'s `assert!` exists
     /// to catch before it becomes an unparented banner.
     pub(super) const EMPTY_SCHEMA: Schema = Schema {
         family: "form-fixture-empty",
@@ -1816,7 +1816,7 @@ mod tests {
     }
 
     /// A schema with no fields is a schema bug, not a state this form
-    /// degrades for: `build`'s `debug_assert!` catches it before a single
+    /// degrades for: `build`'s `assert!` catches it before a single
     /// widget is built — no display needed, which is what keeps this a plain
     /// `#[test]` rather than a `#[gtk::test]`. **Red if the guard is
     /// dropped**: `groups.last().expect(…)` would then be what panics

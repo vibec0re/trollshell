@@ -83,6 +83,8 @@ use hytte_config::schema::{Family, Field, Kind, Schema};
 use hytte_config::subsystem::{self, ConfigError, InvalidValue, Origin, Raw, Subsystem};
 use hytte_config::{toml, toml_edit, xdg};
 
+mod collection;
+
 /// How long a change sits before it is written (spec §4).
 ///
 /// A spin row fires `value-notify` per click of its `+`, and an operator
@@ -176,14 +178,6 @@ impl<F: ShellFamily> Subsystem for ShellSubsystem<F> {
 pub(crate) struct FamilyOps {
     /// The name, the schema and the documented default.
     pub(crate) family: &'static Family,
-    /// Whether this family's scalar rows may be edited **in this version**.
-    ///
-    /// `false` for `agents` and `workspaces`, which spec §4 stages as
-    /// read-only until P2 — not because a row could not be written (the
-    /// writer is the same one), but because P1's job is to ship the editable
-    /// path on two families and prove it. `workspaces` has no scalar leaf to
-    /// edit anyway: both of its fields are collections.
-    pub(crate) editable: bool,
     /// How a saved change reaches the thing that reads this file — the
     /// sentence the form's first group puts under its description, phrased to
     /// follow *"Saved to `<name>.toml` in your own config."*
@@ -198,13 +192,22 @@ pub(crate) struct FamilyOps {
     /// card's cadence cannot change underneath its own poll gate, so a change
     /// here needs the plugin restarting — which the switch at the top of this
     /// very page does.
-    ///
-    /// Unused on a read-only family, which says why it is read-only instead.
     reload: &'static str,
     /// [`subsystem::load_raw`] for this family's `S`.
     load: fn(&[PathBuf]) -> Result<Raw, ConfigError>,
     /// [`subsystem::save_leaf_to_locked`] for this family's `S`.
     save: SaveLeaf,
+    /// [`subsystem::save_leaf_to_locked_unchecked`] for this family's `S` —
+    /// the only way to write a key **inside** a [`Kind::Map`] entry, whose
+    /// path (`display.argus.label`) is per entry and therefore is not a
+    /// [`Field`] path and never will be (#888 P2). Every *structural* refusal
+    /// still applies there; what this spelling drops is the schema lookup, so
+    /// the sub-field's own [`Kind`] check is [`FormInner::write_leaf`]'s to
+    /// make.
+    save_unchecked: SaveLeafUnchecked,
+    /// [`subsystem::remove_entry_to_locked`] for this family's `S` — a whole
+    /// `[display.argus]` in one call (#1373 item 6).
+    remove_entry: RemoveEntry,
 }
 
 /// [`subsystem::save_leaf_to_locked`] with its `S` already chosen.
@@ -216,32 +219,41 @@ type SaveLeaf = fn(
     &BTreeSet<String>,
 ) -> Result<(), ConfigError>;
 
+/// [`subsystem::save_leaf_to_locked_unchecked`] with its `S` already chosen.
+type SaveLeafUnchecked =
+    fn(&Path, &str, Option<toml_edit::Value>, &BTreeSet<String>) -> Result<(), ConfigError>;
+
+/// [`subsystem::remove_entry_to_locked`] with its `S` already chosen.
+type RemoveEntry = fn(&Path, &str, &BTreeSet<String>) -> Result<(), ConfigError>;
+
 impl FamilyOps {
     /// The ops for a family read and written through `S`.
-    const fn of<S: Subsystem>(
-        family: &'static Family,
-        editable: bool,
-        reload: &'static str,
-    ) -> Self {
+    const fn of<S: Subsystem>(family: &'static Family, reload: &'static str) -> Self {
         Self {
             family,
-            editable,
             reload,
             load: subsystem::load_raw::<S>,
             save: subsystem::save_leaf_to_locked::<S>,
+            save_unchecked: subsystem::save_leaf_to_locked_unchecked::<S>,
+            remove_entry: subsystem::remove_entry_to_locked::<S>,
         }
-    }
-
-    /// A family nothing may edit here yet, whose reload sentence is therefore
-    /// never shown.
-    const fn read_only<S: Subsystem>(family: &'static Family) -> Self {
-        Self::of::<S>(family, false, "")
     }
 }
 
 /// [`FamilyOps::reload`] for a file the **shell** re-reads on its own poll.
 const RELOAD_LIVE: &str = "The shell re-reads it within a few seconds, with no restart — and this works whether or not \
      trollshell is running. Hand edits to that file are preserved.";
+
+/// [`FamilyOps::reload`] for a file a **plugin** re-reads on its own poll.
+///
+/// `agents.toml`'s reader is `hytte-plugin-agents`' `poll::ConfigSource`,
+/// which stamps every layer's mtime each tick and re-reads when one moves —
+/// the same live reload `core-leds` gets, one process over. Distinct from
+/// [`RELOAD_LIVE`] only in who does the re-reading, which is the half the
+/// operator acts on: the switch that restarts *this plugin* is on the same
+/// page, and it is not the answer here.
+const RELOAD_LIVE_PLUGIN: &str = "The plugin re-reads it within a few seconds, with no restart — and this works whether or \
+     not the plugin is running. Hand edits to that file are preserved.";
 
 /// [`FamilyOps::reload`] for a file a **plugin** reads once, at start.
 const RELOAD_AT_PLUGIN_START: &str = "The plugin reads it when it starts, so restart it with the switch above to apply a change — \
@@ -267,17 +279,19 @@ const RELOAD_AT_PLUGIN_START: &str = "The plugin reads it when it starts, so res
 static FAMILIES: [FamilyOps; 4] = [
     FamilyOps::of::<ShellSubsystem<CoreLeds>>(
         &hytte_config_families::core_leds::FAMILY,
-        true,
         RELOAD_LIVE,
     ),
-    FamilyOps::read_only::<ShellSubsystem<Workspaces>>(&hytte_config_families::workspaces::FAMILY),
+    FamilyOps::of::<ShellSubsystem<Workspaces>>(
+        &hytte_config_families::workspaces::FAMILY,
+        RELOAD_LIVE,
+    ),
     FamilyOps::of::<hytte_plugin_stats::config::StatsConfig>(
         &hytte_plugin_stats::config::FAMILY,
-        true,
         RELOAD_AT_PLUGIN_START,
     ),
-    FamilyOps::read_only::<hytte_plugin_agents::config::AgentsConfig>(
+    FamilyOps::of::<hytte_plugin_agents::config::AgentsConfig>(
         &hytte_plugin_agents::config::FAMILY,
+        RELOAD_LIVE_PLUGIN,
     ),
 ];
 
@@ -323,6 +337,20 @@ pub(crate) struct Form {
 struct FormInner {
     /// The family, and how to read and write it.
     ops: FamilyOps,
+    /// **What this form's rows address** — the family's own leaves, one map
+    /// entry's, or one element of an inline array (#888 P2).
+    ///
+    /// The same rows, the same debounce and the same refusal-on-the-row draw
+    /// all three, because all three are "a set of [`Field`]s over one
+    /// value"; what differs is where a row reads its value from and what one
+    /// save writes. See [`Subject`].
+    subject: Subject,
+    /// The config environment this form was built against — kept so a
+    /// collection sub-page builds its own form over **exactly** the same
+    /// layers, which is what keeps the drill-down off the operator's real
+    /// `~/.config/trollshell` in a test (#1101) with no `Env` threaded
+    /// through five page constructors.
+    env: Rc<xdg::Env>,
     /// The search path, lowest precedence first. Resolved once: the process
     /// environment cannot change under a running process (the Plugins tab's
     /// `search_path` argument, #1270).
@@ -347,8 +375,20 @@ struct FormInner {
     /// Guard so pushing a file value into a widget doesn't loop back into a
     /// save (the Places and Plugins tabs' `syncing`).
     syncing: Cell<bool>,
-    /// The re-read timer.
+    /// The re-read timer. `None` on a form a **parent** drives (a collection
+    /// sub-page's), so one poll serves the whole drill-down rather than one
+    /// per page on screen — #1373 item 7.
     poll: Cell<Option<glib::SourceId>>,
+    /// The collection sub-pages this form has pushed, outermost first.
+    ///
+    /// Held here rather than hung off the `AdwNavigationPage` because
+    /// attaching arbitrary data to a `GObject` needs `unsafe`, which this
+    /// workspace forbids — and because the poll has to walk them anyway.
+    open: RefCell<Vec<collection::SubPage>>,
+    /// The `AdwNavigationView` the sub-pages went onto, and this form's
+    /// `popped` handler on it, so a Back press shrinks [`Self::open`] and a
+    /// dropped form disconnects rather than leaving a handler behind.
+    nav: RefCell<Option<(adw::NavigationView, glib::SignalHandlerId)>>,
 }
 
 impl Drop for FormInner {
@@ -359,7 +399,103 @@ impl Drop for FormInner {
         for row in &self.rows {
             row.cancel_pending_save();
         }
+        // A form can be unmounted while one of its collection pages is on
+        // screen — `plugins_tab::unmount_config` drops the handle the moment
+        // the selection moves — and a page left on the stack would be a live
+        // editor of a file nothing is re-reading. Take them down first, then
+        // let go of the signal handler that would have watched them go.
+        let hooked = self.nav.borrow_mut().take();
+        if let Some((nav, handler)) = hooked {
+            collection::pop_all(&nav, &mut self.open.borrow_mut());
+            nav.disconnect(handler);
+        }
     }
+}
+
+/// What a [`Form`]'s rows address — see [`FormInner::subject`].
+enum Subject {
+    /// Leaves at `prefix` + each [`Field`]'s own path.
+    ///
+    /// `""` for a family's own form, `"display.argus."` for one map entry's
+    /// — and an entry page is then *the same form*, which is #1373 item 2's
+    /// whole shape: [`Raw::origins`] already keys leaves by full dotted path
+    /// and [`Raw::is_locked`] already walks ancestors, so provenance, locks,
+    /// reset and every refusal work at depth with no second implementation.
+    Leaves {
+        /// Dotted, with its trailing `.`, or empty.
+        prefix: String,
+    },
+    /// One element of the inline array at `array`.
+    ///
+    /// An array index is not a TOML path — nothing can address
+    /// `apps[0].id` — so rule 3 decides the write unit for us: a record edit
+    /// re-emits the **whole array** (#1373 item 4). Locks and provenance are
+    /// the array leaf's, because that is the granularity the layering has.
+    Element {
+        /// The array's own dotted path.
+        array: String,
+        /// Which element these rows are. May be **one past the end**: a
+        /// record the operator has asked to add does not exist in the file
+        /// until its name is written, exactly as a map entry does not
+        /// (#1383 review, MEDIUM 1).
+        index: usize,
+        /// The field that **names** a record — the first [`Kind::Text`] of
+        /// the element's own fields, which is what the list titles its rows
+        /// by. `None` for a record shape with no text field at all.
+        ///
+        /// It is what brings a record into being, and the reason is not
+        /// tidiness: the shell reads `workspace.<name>.apps` through
+        /// `parse_apps`, which returns `Err` for any element without a
+        /// non-blank `id` — and `parse_stack` then drops the stack's
+        /// **whole** apps list. So an `{}` written on the way to a record
+        /// blanks a working stack for as long as it is there, which is the
+        /// state pressing *Add* used to create.
+        key_field: Option<&'static str>,
+    },
+}
+
+impl Subject {
+    /// The full dotted path a row for `field` reads and writes, or — for
+    /// [`Self::Element`] — the spelling its refusals name it by.
+    fn key_of(&self, field: &Field) -> String {
+        match self {
+            Self::Leaves { prefix } => format!("{prefix}{}", field.path),
+            Self::Element { array, index, .. } => format!("{array}[{index}].{}", field.path),
+        }
+    }
+}
+
+/// [`Subject::Element`]'s three fields, borrowed — what
+/// [`FormInner::write_element`] is addressed by.
+///
+/// A struct rather than three parameters because the three only ever travel
+/// together and the alternative is an eight-argument function, which is what
+/// `clippy::too_many_arguments` is for.
+#[derive(Clone, Copy)]
+struct ElementAt<'a> {
+    /// The array's own dotted path.
+    array: &'a str,
+    /// Which element — possibly one past the end; see [`Subject::Element`].
+    index: usize,
+    /// The field that names a record.
+    key_field: Option<&'static str>,
+}
+
+/// How a [`Form`] is built: what it draws, over what, and who re-reads for it.
+struct Spec {
+    /// Where the rows read and write.
+    subject: Subject,
+    /// The fields to draw, in order.
+    fields: &'static [Field],
+    /// `None` groups by the fields' own top-level tables — the family form,
+    /// where `stats.toml`'s `[sidebar]` and `[bar]` are two groups. `Some`
+    /// puts every row in one group with this title and description, which is
+    /// what a sub-page wants: its fields are one entry's, and the entry is
+    /// the group.
+    single_group: Option<(String, String)>,
+    /// Whether this form owns a re-read timer. `false` on a sub-page, whose
+    /// parent drives it (#1373 item 7).
+    polls: bool,
 }
 
 /// Build a form for `ops`, reading its layers out of `env`.
@@ -382,6 +518,23 @@ pub(crate) fn build(ops: FamilyOps, env: &Rc<xdg::Env>) -> Form {
         ops.family.name
     );
 
+    build_form(
+        ops,
+        env,
+        Spec {
+            subject: Subject::Leaves {
+                prefix: String::new(),
+            },
+            fields: ops.family.schema.fields,
+            single_group: None,
+            polls: true,
+        },
+    )
+}
+
+/// [`build`] over an arbitrary [`Spec`] — the family's own form, one map
+/// entry's, or one array element's (#888 P2).
+fn build_form(ops: FamilyOps, env: &Rc<xdg::Env>, spec: Spec) -> Form {
     let layers = env.config_layers(ops.family.name);
     let overlay = env.overlay_path(ops.family.name);
 
@@ -394,20 +547,30 @@ pub(crate) fn build(ops: FamilyOps, env: &Rc<xdg::Env>) -> Form {
     let mut groups: Vec<adw::PreferencesGroup> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut table_of_group: Option<Option<&str>> = None;
-    for field in ops.family.schema.fields {
-        let table = field.path.split_once('.').map(|(head, _)| head);
-        if table_of_group != Some(table) {
-            let group = adw::PreferencesGroup::builder()
-                .title(group_title(ops.family, table))
-                .description(group_description(ops, table))
-                .build();
-            if groups.is_empty() {
-                group.add(&banner);
+    if let Some((title, description)) = &spec.single_group {
+        let group = adw::PreferencesGroup::builder()
+            .title(title.as_str())
+            .description(description.as_str())
+            .build();
+        group.add(&banner);
+        groups.push(group);
+    }
+    for field in spec.fields {
+        if spec.single_group.is_none() {
+            let table = field.path.split_once('.').map(|(head, _)| head);
+            if table_of_group != Some(table) {
+                let group = adw::PreferencesGroup::builder()
+                    .title(group_title(ops.family, table))
+                    .description(group_description(ops, table))
+                    .build();
+                if groups.is_empty() {
+                    group.add(&banner);
+                }
+                groups.push(group);
+                table_of_group = Some(table);
             }
-            groups.push(group);
-            table_of_group = Some(table);
         }
-        let row = Row::build(field, ops);
+        let row = Row::build(field, spec.subject.key_of(field), ops);
         let group = groups
             .last()
             .expect("a group was pushed before the first field");
@@ -417,8 +580,11 @@ pub(crate) fn build(ops: FamilyOps, env: &Rc<xdg::Env>) -> Form {
         rows.push(row);
     }
 
+    let polls = spec.polls;
     let inner = Rc::new(FormInner {
         ops,
+        subject: spec.subject,
+        env: Rc::clone(env),
         layers,
         overlay,
         groups,
@@ -427,20 +593,24 @@ pub(crate) fn build(ops: FamilyOps, env: &Rc<xdg::Env>) -> Form {
         raw: RefCell::new(Raw::default()),
         syncing: Cell::new(false),
         poll: Cell::new(None),
+        open: RefCell::new(Vec::new()),
+        nav: RefCell::new(None),
     });
 
     connect_rows(&inner);
     inner.reload(true);
 
-    let weak = Rc::downgrade(&inner);
-    let poll = glib::timeout_add_local(CONFIG_POLL_INTERVAL, move || {
-        let Some(inner) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        inner.reload(false);
-        glib::ControlFlow::Continue
-    });
-    inner.poll.set(Some(poll));
+    if polls {
+        let weak = Rc::downgrade(&inner);
+        let poll = glib::timeout_add_local(CONFIG_POLL_INTERVAL, move || {
+            let Some(inner) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            inner.reload(false);
+            glib::ControlFlow::Continue
+        });
+        inner.poll.set(Some(poll));
+    }
 
     Form { inner }
 }
@@ -461,6 +631,19 @@ impl Form {
     pub(crate) fn refresh_from_disk(&self) -> bool {
         self.inner.reload(false)
     }
+
+    /// [`Self::refresh_from_disk`] as a callable that does not hold the form
+    /// — what a **parent** form's poll drives a collection sub-page with, so
+    /// one timer serves a whole drill-down rather than one per page on screen
+    /// (#1373 item 7).
+    fn refresher(&self) -> Box<dyn Fn()> {
+        let weak = Rc::downgrade(&self.inner);
+        Box::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.reload(false);
+            }
+        })
+    }
 }
 
 impl FormInner {
@@ -478,10 +661,20 @@ impl FormInner {
         };
         let unchanged = !force && same_view(&self.raw.borrow(), &next);
         if unchanged {
+            // The **sub-pages are still refreshed**. A collection page can be
+            // pushed between two reads, so its first sight of a `Raw` may well
+            // arrive on a tick where nothing moved — and a page that had never
+            // been refreshed would never learn its subject was there, which is
+            // what tells it apart from one that went away (#1373 item 7). The
+            // cost is one gated comparison per open page: each refresh
+            // re-renders only what moved and a sub-form's own reload has this
+            // same fast path.
+            collection::refresh_open(self, &next);
             return false;
         }
         self.banner.set_visible(false);
         self.apply(&next);
+        collection::refresh_open(self, &next);
         *self.raw.borrow_mut() = next;
         true
     }
@@ -490,8 +683,28 @@ impl FormInner {
     /// provenance and its sensitivity.
     fn apply(&self, raw: &Raw) {
         self.syncing.set(true);
-        for row in &self.rows {
-            row.apply(raw, self.ops.editable);
+        match &self.subject {
+            Subject::Leaves { .. } => {
+                for row in &self.rows {
+                    row.apply(
+                        raw.value(&row.key).cloned(),
+                        raw.is_locked(&row.key),
+                        raw.origin(&row.key),
+                    );
+                }
+            }
+            Subject::Element { array, index, .. } => {
+                // The **array** is the leaf the layering knows about, so its
+                // lock and its provenance are every row's: rule 3 replaces it
+                // whole, and there is no finer granularity to report.
+                let locked = raw.is_locked(array);
+                let origin = raw.origin(array);
+                let element = element_of(raw, array, *index);
+                for row in &self.rows {
+                    let value = element.and_then(|table| table.get(row.field.path)).cloned();
+                    row.apply(value, locked, origin);
+                }
+            }
         }
         self.syncing.set(false);
     }
@@ -540,13 +753,25 @@ impl FormInner {
             return;
         };
         let locked = self.raw.borrow().locked.clone();
-        match (self.ops.save)(
-            overlay,
-            self.ops.family.schema,
-            row.field.path,
-            value,
-            &locked,
-        ) {
+        let written = match &self.subject {
+            Subject::Leaves { .. } => self.write_leaf(overlay, row, value, &locked),
+            Subject::Element {
+                array,
+                index,
+                key_field,
+            } => self.write_element(
+                overlay,
+                ElementAt {
+                    array,
+                    index: *index,
+                    key_field: *key_field,
+                },
+                row,
+                value,
+                &locked,
+            ),
+        };
+        match written {
             Ok(()) => {
                 row.clear_error();
                 // The whole view, not just this row: a save can move a key
@@ -558,7 +783,7 @@ impl FormInner {
             Err(err) => {
                 tracing::warn!(
                     family = self.ops.family.name,
-                    key = row.field.path,
+                    key = row.key.as_str(),
                     %err,
                     "a settings row's save was refused"
                 );
@@ -573,6 +798,209 @@ impl FormInner {
                 // and `Colour` are unaffected — they are drafts (#1338).
                 self.apply(&self.raw.borrow());
             }
+        }
+    }
+
+    /// One leaf at [`Row::key`] — the checked writer when the schema names
+    /// that path, the unchecked one plus our own [`Kind`] check when it
+    /// cannot.
+    ///
+    /// It cannot for a key **inside** a [`Kind::Map`] entry: `display.argus`
+    /// has no fixed spelling, so `display.argus.label` is not a [`Field`]
+    /// path and [`subsystem::save_leaf_to_locked`] would answer
+    /// [`ConfigError::NotALeaf`] by construction. What that spelling drops is
+    /// only the *schema lookup* — every structural refusal is enforced inside
+    /// the unchecked writer on purpose — so the one thing left to do here is
+    /// the value check, over the sub-field's own `Kind`, producing the same
+    /// [`ConfigError::Rejected`] the checked writer would have. Skipping it
+    /// would let a form write a leaf of the wrong type, and a wrong type is a
+    /// `ConfigError::Schema` on the next load, which `load_or_default`
+    /// degrades to *discard the whole file* — one bad row costing every key
+    /// in it (#1360 review, MEDIUM 1).
+    fn write_leaf(
+        &self,
+        overlay: &Path,
+        row: &Row,
+        value: Option<toml_edit::Value>,
+        locked: &BTreeSet<String>,
+    ) -> Result<(), ConfigError> {
+        if self.ops.family.schema.field(&row.key).is_some() {
+            return (self.ops.save)(overlay, self.ops.family.schema, &row.key, value, locked);
+        }
+        if let Some(value) = &value {
+            self.check(&row.key, row.field.kind, value)?;
+        }
+        (self.ops.save_unchecked)(overlay, &row.key, value, locked)
+    }
+
+    /// One field of one element of an inline array — read the array, patch
+    /// the element, write the array back whole (rule 3, #1373 item 4).
+    ///
+    /// The array is taken from the last read rather than from the file, which
+    /// is the same thing the 2 s poll guarantees for every other row here and
+    /// the same window every other save has.
+    ///
+    /// **A record that is not there yet comes into being with its name, and
+    /// with nothing else** (#1383 review, MEDIUM 1) — the rule a map entry
+    /// already follows one level up. `index` may be one past the end, which
+    /// is what the records page's *Add* opens; the first write of
+    /// [`Subject::Element::key_field`] appends the record, and a write of any
+    /// other field before that is refused on its own row rather than
+    /// committing a nameless one. The cost of getting this wrong is not
+    /// cosmetic: `parse_apps` rejects an element with no `id` and
+    /// `parse_stack` then drops the stack's whole apps list, so an `{}` on
+    /// the way to a record blanks a working stack.
+    ///
+    /// The mirror image is refused too: the name cannot be *reset* out of an
+    /// existing record, because what that would leave is the same poison
+    /// value. The list's own **Remove** is how a record goes.
+    fn write_element(
+        &self,
+        overlay: &Path,
+        at: ElementAt<'_>,
+        row: &Row,
+        value: Option<toml_edit::Value>,
+        locked: &BTreeSet<String>,
+    ) -> Result<(), ConfigError> {
+        let ElementAt {
+            array: array_key,
+            index,
+            key_field,
+        } = at;
+        if let Some(value) = &value {
+            self.check(&row.key, row.field.kind, value)?;
+        }
+        let mut array = self.array_at(array_key);
+        let naming = key_field == Some(row.field.path);
+        let creating = array.get(index).is_none();
+
+        if creating {
+            if value.is_none() {
+                // Nothing to remove from a record that was never written —
+                // and, crucially, nothing to write either: re-emitting the
+                // merged array here would copy a base layer's records into
+                // the overlay for a reset that changed nothing.
+                return Ok(());
+            }
+            if index != array.len() {
+                return Err(self.not_a_leaf(
+                    &row.key,
+                    "the array no longer has an entry there — it moved underneath this page",
+                ));
+            }
+            if !naming {
+                let name = key_field.map_or_else(
+                    || "a name".to_owned(),
+                    |field| format!("a {}", humanise(field).to_lowercase()),
+                );
+                return Err(self.not_a_leaf(
+                    &row.key,
+                    &format!(
+                        "give it {name} first — a record with no name is one the shell reads \
+                         as a broken list, so it is not written until it has one"
+                    ),
+                ));
+            }
+            array.push(toml_edit::InlineTable::new());
+        } else if naming && value.is_none() {
+            return Err(self.not_a_leaf(
+                &row.key,
+                "a record is named by this, and one without a name is a list the shell \
+                 refuses whole — remove the record from the list instead of clearing it",
+            ));
+        }
+
+        let Some(element) = array
+            .get_mut(index)
+            .and_then(toml_edit::Value::as_inline_table_mut)
+        else {
+            return Err(self.not_a_leaf(
+                &row.key,
+                "the array no longer has an entry there — it moved underneath this page",
+            ));
+        };
+        match value {
+            Some(value) => {
+                element.insert(row.field.path, value);
+            }
+            None => {
+                element.remove(row.field.path);
+            }
+        }
+        // The array this re-emits came out of the **merged** read, whose
+        // `toml::Table` is ordered by key rather than by the bytes any layer
+        // wrote — so without this, saving one field would silently
+        // alphabetise every record in a file the operator hand-edits. Schema
+        // order is what `DEFAULT_TOML` documents and what this page renders,
+        // so it is the order to write back.
+        let order: Vec<&str> = self.rows.iter().map(|row| row.field.path).collect();
+        let array = collection::in_field_order(&array, &order);
+        self.write_array(overlay, array_key, Some(array), locked)
+    }
+
+    /// Write a whole inline array at `key` — the write unit for **every**
+    /// collection edit on this page (rule 3: an overlay states the list or it
+    /// states nothing).
+    ///
+    /// Deliberately **not** `Kind::accepts`-checked on the unchecked arm. The
+    /// array being written is the one that was read, with one field of one
+    /// element changed, so it can legitimately carry a key the schema does
+    /// not know — and `Kind::accepts` over a `List(Map)` calls that
+    /// `Mismatch::Forgot` and would refuse the write, locking the operator
+    /// out of a record their own file describes. The per-field check at the
+    /// point of edit ([`Self::check`]) is what judges what this form writes;
+    /// what it read back is the sibling writer's documented promise never to
+    /// touch. The checked arm keeps the whole-array judgement, because there
+    /// the array *is* a `Field` and the writer makes it.
+    ///
+    /// `None` **removes** the array rather than writing `[]`. An empty array
+    /// is not "no items": it states *no items* at the top of the precedence
+    /// order, which rule 3 then makes permanent over whatever a base layer
+    /// says — and what an operator who emptied a list means is the row's own
+    /// reset, "fall back to the layer below" (spec §5).
+    fn write_array(
+        &self,
+        overlay: &Path,
+        key: &str,
+        array: Option<toml_edit::Array>,
+        locked: &BTreeSet<String>,
+    ) -> Result<(), ConfigError> {
+        let value = array.map(toml_edit::Value::Array);
+        if self.ops.family.schema.field(key).is_some() {
+            (self.ops.save)(overlay, self.ops.family.schema, key, value, locked)
+        } else {
+            (self.ops.save_unchecked)(overlay, key, value, locked)
+        }
+    }
+
+    /// The inline array the last read found at `key`, or an empty one.
+    fn array_at(&self, key: &str) -> toml_edit::Array {
+        match self.raw.borrow().value(key).map(subsystem::to_edit) {
+            Some(toml_edit::Value::Array(array)) => array,
+            _ => toml_edit::Array::new(),
+        }
+    }
+
+    /// [`Kind::accepts`], as the refusal the checked writer would have
+    /// produced — so a rejection reads the same wherever it was judged.
+    fn check(&self, key: &str, kind: Kind, value: &toml_edit::Value) -> Result<(), ConfigError> {
+        if kind.accepts(value) {
+            return Ok(());
+        }
+        Err(ConfigError::Rejected {
+            subsystem: self.ops.family.name.to_owned(),
+            key: key.to_owned(),
+            found: value.to_string().trim().to_owned(),
+            expected: kind.expected(),
+        })
+    }
+
+    /// [`ConfigError::NotALeaf`] for this family.
+    fn not_a_leaf(&self, key: &str, reason: &str) -> ConfigError {
+        ConfigError::NotALeaf {
+            subsystem: self.ops.family.name.to_owned(),
+            key: key.to_owned(),
+            reason: reason.to_owned(),
         }
     }
 
@@ -611,12 +1039,32 @@ fn same_view(a: &Raw, b: &Raw) -> bool {
     a.table == b.table && a.locked == b.locked && a.origins == b.origins
 }
 
+/// The `index`-th element of the inline array at `array`, when it is a table
+/// — what a [`Subject::Element`] form's rows read.
+///
+/// `None` for an element that is not a table (an array the schema calls
+/// `List(Map)` but the file spells with scalars in it) and for an index the
+/// array does not have, which is how a record page learns its subject went
+/// away underneath it.
+fn element_of<'a>(raw: &'a Raw, array: &str, index: usize) -> Option<&'a toml::Table> {
+    raw.value(array)?.as_array()?.get(index)?.as_table()
+}
+
 // ── One leaf's row ───────────────────────────────────────────────────────────
 
 /// A leaf's widgets, plus the two pieces of state a refresh needs.
 struct Row {
     /// The schema entry this row draws.
     field: &'static Field,
+    /// The **full** dotted path this row reads, writes and is refused under
+    /// — [`Subject::key_of`].
+    ///
+    /// Not `field.path`, which is relative to whatever the form is drawing:
+    /// a map's sub-field carries just `label`, and the row that draws it is
+    /// for `display.argus.label`. Every lookup here goes through this, so
+    /// `Raw`'s per-path provenance and its ancestor-walking lock answer the
+    /// same way at depth as they do at the root — #1373 item 2's whole claim.
+    key: String,
     /// Every widget this leaf contributes, in the order they are added to the
     /// group. One for all but [`Kind::Color`], which is a combo *and* an
     /// entry.
@@ -761,7 +1209,7 @@ impl Note {
 impl Row {
     /// Build the widgets for one field. No handlers yet — those need the
     /// [`FormInner`] that will own this row (see [`connect_rows`]).
-    fn build(field: &'static Field, ops: FamilyOps) -> Self {
+    fn build(field: &'static Field, key: String, ops: FamilyOps) -> Self {
         let title = humanise(leaf_of(field.path));
         let tooltip = tooltip_for(ops.family, field);
         let (widgets, control, note, reset) = widgets_for(field.kind, &title);
@@ -772,6 +1220,7 @@ impl Row {
 
         Self {
             field,
+            key,
             widgets,
             control,
             note,
@@ -893,7 +1342,9 @@ fn widgets_for(
             }
             Kind::List(_) | Kind::Map(_) => {
                 let row = adw::ActionRow::builder().title(title).build();
-                row.set_activatable(false);
+                // Activatable since #888 P2: the row is the way into the
+                // entries, so it pushes a sub-page (`collection::activate`).
+                row.set_activatable(true);
                 // The **summary** is what this row's subtitle is for, so its
                 // provenance goes in a suffix label — the same place an
                 // `AdwEntryRow`'s does, and for the same reason: one subtitle,
@@ -901,11 +1352,18 @@ fn widgets_for(
                 let label = gtk::Label::builder().valign(gtk::Align::Center).build();
                 label.add_css_class("dim-label");
                 row.add_suffix(&label);
+                // A **list** is one leaf under rule 3 — the overlay states
+                // the whole array or none of it — so a reset that removes it
+                // is exactly what the per-row reset means everywhere else
+                // (#1373 item 3). A **map** has no such write: its entries go
+                // one at a time, and `save_leaf_to_locked` refuses it whole.
+                let reset = matches!(kind, Kind::List(_)).then(|| reset_button(&row));
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
                 (
                     vec![row.clone().upcast()],
                     Control::Collection(row),
                     Note::Suffix(label),
-                    None,
+                    reset,
                 )
             }
         }
@@ -927,11 +1385,7 @@ impl Row {
     /// looking at on row A, over a file that still holds the value they were
     /// refused. The same draft-guard logic as the value itself, one field
     /// along: what makes a refusal stale is *this key* moving in the file.
-    fn apply(&self, raw: &Raw, editable: bool) {
-        let value = raw.value(self.field.path).cloned();
-        let locked = raw.is_locked(self.field.path);
-        let origin = raw.origin(self.field.path);
-
+    fn apply(&self, value: Option<toml::Value>, locked: bool, origin: Option<&Origin>) {
         let absent = value.is_none();
         let moved = { *self.seen.borrow() != value };
         if moved {
@@ -969,10 +1423,15 @@ impl Row {
         if moved {
             *self.seen.borrow_mut() = value;
         }
-        let writable = editable && !locked && !self.field.kind.is_collection();
-        self.set_sensitive(writable);
+        // A **collection** row stays sensitive even when locked: activating
+        // it opens the entries, and reading a nix-set map is the point of
+        // having it on screen — the Places tab's own argument for a locked
+        // detail page that still opens (#1227 item 2). It is the sub-page
+        // that greys, and its Add/Delete that go (#1373 item 5).
+        let collection = self.field.kind.is_collection();
+        self.set_sensitive(collection || !locked);
         if let Some(reset) = &self.reset {
-            reset.set_sensitive(writable && matches!(origin, Some(Origin::Overlay)));
+            reset.set_sensitive(!locked && matches!(origin, Some(Origin::Overlay)));
         }
     }
 
@@ -1193,79 +1652,23 @@ fn connect_rows(inner: &Rc<FormInner>) {
                 combo,
                 entry,
                 swatch,
-                ..
-            } => {
-                let options_len = match row.control {
-                    Control::Colour { options, .. } => u32::try_from(options.len()).unwrap_or(0),
-                    _ => 0,
-                };
-                {
-                    let weak = Rc::downgrade(inner);
-                    let entry = entry.downgrade();
-                    combo.connect_selected_notify(move |combo| {
-                        // Picking *custom* before typing anything is not a
-                        // value: the empty string is what the writer refuses
-                        // (`Kind::Color`'s own `accepts`), so writing it here
-                        // would greet the operator with a red row for
-                        // choosing the item that means "I'll type one"
-                        // (#1365 review, L3). The entry's apply button is
-                        // what saves a literal, as it does mid-typing.
-                        let nothing_typed = entry
-                            .upgrade()
-                            .is_none_or(|entry| entry.text().trim().is_empty());
-                        if combo.selected() >= options_len && nothing_typed {
-                            return;
-                        }
-                        save_from_row(&weak, index);
-                    });
-                }
-                {
-                    let weak = Rc::downgrade(inner);
-                    let swatch = swatch.clone();
-                    let combo = combo.clone();
-                    entry.connect_apply(move |_| {
-                        swatch.queue_draw();
-                        // Applying a literal means the operator wants the
-                        // literal — move the combo onto its *custom* item so
-                        // the two halves of one leaf cannot contradict each
-                        // other.
-                        if let Some(form) = weak.upgrade() {
-                            form.syncing.set(true);
-                            combo.set_selected(options_len);
-                            form.syncing.set(false);
-                        }
-                        save_from_row(&weak, index);
-                    });
-                }
-                {
-                    let swatch = swatch.clone();
-                    entry.connect_changed(move |_| swatch.queue_draw());
-                }
-                // **Weakly** (#1365 review, MED 2): the swatch is the entry's
-                // own prefix child, so a strong clone in its draw func closes
-                // a GObject cycle — entry owns swatch owns entry — and
-                // neither ever reaches refcount 0. That is the `WeakRef`
-                // contract `hytte-reactive`'s `bind` holds, and the one
-                // `nix/lint-bind-pins.py` structurally cannot see here,
-                // because the closure's own parameter is the *swatch* and the
-                // captured widget is a different one — its documented
-                // carve-out. The sibling `connect_changed` above is fine:
-                // that edge runs parent → child and closes no loop.
-                let entry = entry.downgrade();
-                swatch.set_draw_func(move |_, cr, width, height| {
-                    // Nothing to paint once the row is gone — which is only
-                    // reachable while the swatch outlives its entry, i.e.
-                    // during teardown.
-                    if let Some(entry) = entry.upgrade() {
-                        paint_swatch(cr, width, height, &entry.text());
-                    }
-                });
-            }
+                options,
+            } => connect_colour(inner, index, combo, entry, swatch, options),
             Control::Text(entry) => {
                 let weak = Rc::downgrade(inner);
                 entry.connect_apply(move |_| save_from_row(&weak, index));
             }
-            Control::Collection(_) => {}
+            Control::Collection(action) => {
+                let weak = Rc::downgrade(inner);
+                // Deferred to an idle tick, the `places_tab::add` shape: the
+                // push builds widgets and can re-enter this form's own state,
+                // and doing that from inside `row-activated`'s emission is
+                // what #643 is about.
+                action.connect_activated(move |_| {
+                    let weak = weak.clone();
+                    glib::idle_add_local_once(move || collection::activate(&weak, index));
+                });
+            }
         }
 
         if let Some(reset) = &row.reset {
@@ -1279,6 +1682,76 @@ fn connect_rows(inner: &Rc<FormInner>) {
             });
         }
     }
+}
+
+/// [`connect_rows`]' [`Kind::Color`] arm — the one control that is two
+/// widgets plus a painted prefix, and so four handlers rather than one.
+fn connect_colour(
+    inner: &Rc<FormInner>,
+    index: usize,
+    combo: &adw::ComboRow,
+    entry: &adw::EntryRow,
+    swatch: &gtk::DrawingArea,
+    options: &'static [&'static str],
+) {
+    let options_len = u32::try_from(options.len()).unwrap_or(0);
+    {
+        let weak = Rc::downgrade(inner);
+        let entry = entry.downgrade();
+        combo.connect_selected_notify(move |combo| {
+            // Picking *custom* before typing anything is not a
+            // value: the empty string is what the writer refuses
+            // (`Kind::Color`'s own `accepts`), so writing it here
+            // would greet the operator with a red row for
+            // choosing the item that means "I'll type one"
+            // (#1365 review, L3). The entry's apply button is
+            // what saves a literal, as it does mid-typing.
+            let nothing_typed = entry
+                .upgrade()
+                .is_none_or(|entry| entry.text().trim().is_empty());
+            if combo.selected() >= options_len && nothing_typed {
+                return;
+            }
+            save_from_row(&weak, index);
+        });
+    }
+    {
+        let weak = Rc::downgrade(inner);
+        let swatch = swatch.clone();
+        let combo = combo.clone();
+        entry.connect_apply(move |_| {
+            swatch.queue_draw();
+            // Applying a literal means the operator wants the literal — move
+            // the combo onto its *custom* item so the two halves of one leaf
+            // cannot contradict each other.
+            if let Some(form) = weak.upgrade() {
+                form.syncing.set(true);
+                combo.set_selected(options_len);
+                form.syncing.set(false);
+            }
+            save_from_row(&weak, index);
+        });
+    }
+    {
+        let swatch = swatch.clone();
+        entry.connect_changed(move |_| swatch.queue_draw());
+    }
+    // **Weakly** (#1365 review, MED 2): the swatch is the entry's own prefix
+    // child, so a strong clone in its draw func closes a GObject cycle —
+    // entry owns swatch owns entry — and neither ever reaches refcount 0.
+    // That is the `WeakRef` contract `hytte-reactive`'s `bind` holds, and the
+    // one `nix/lint-bind-pins.py` structurally cannot see here, because the
+    // closure's own parameter is the *swatch* and the captured widget is a
+    // different one — its documented carve-out. The sibling `connect_changed`
+    // above is fine: that edge runs parent → child and closes no loop.
+    let entry = entry.downgrade();
+    swatch.set_draw_func(move |_, cr, width, height| {
+        // Nothing to paint once the row is gone — which is only reachable
+        // while the swatch outlives its entry, i.e. during teardown.
+        if let Some(entry) = entry.upgrade() {
+            paint_swatch(cr, width, height, &entry.text());
+        }
+    });
 }
 
 /// Queue the save a control's own change implies.
@@ -1395,7 +1868,7 @@ fn index_of(options: &[&str], value: Option<&str>) -> u32 {
 /// What a read-only collection row says it holds.
 fn summarise(field: &Field, value: Option<&toml::Value>) -> String {
     let noun = leaf_of(field.path);
-    let body = match value {
+    match value {
         Some(toml::Value::Array(items)) => {
             let names: Vec<String> = items.iter().map(spell_value).collect();
             format!(
@@ -1416,8 +1889,7 @@ fn summarise(field: &Field, value: Option<&toml::Value>) -> String {
         }
         Some(other) => spell_value(other),
         None => format!("no {}", plural(noun, 0)),
-    };
-    format!("{body} — editable in #888 P2")
+    }
 }
 
 /// A TOML scalar as one word.
@@ -1506,18 +1978,10 @@ fn group_description(ops: FamilyOps, table: Option<&str>) -> String {
     );
     let mut parts: Vec<String> = documented.into_iter().collect();
     if table.is_none() {
-        parts.push(if ops.editable {
-            format!(
-                "Saved to {}.toml in your own config. {}",
-                ops.family.name, ops.reload
-            )
-        } else {
-            format!(
-                "Read-only here: editing {} is #888 P2. Every row still says where its value \
-                 comes from.",
-                ops.family.name
-            )
-        });
+        parts.push(format!(
+            "Saved to {}.toml in your own config. {}",
+            ops.family.name, ops.reload
+        ));
     }
     parts.join("\n\n")
 }
@@ -1645,14 +2109,13 @@ fn humanise(segment: &str) -> String {
 /// A family that exists only for this module's tests: **one leaf of every
 /// [`Kind`]**.
 ///
-/// The four real families between them have no editable [`Kind::Text`] in P1
-/// (`agents`, which owns the only one, is staged read-only) and none has all
-/// seven kinds at once, so a per-kind test written against real families would
-/// be both incomplete and hostage to a schema change somewhere else. It rides
-/// the very same [`ShellSubsystem`] the two shell families do, so the shim is
-/// exercised rather than bypassed — and `the_fixture_family_verifies` holds it
-/// to its own documented default with the same walker CI runs over the real
-/// four.
+/// None of the four real families has all seven kinds at once — `agents` owns
+/// the only [`Kind::Text`] and `workspaces` has no scalar leaf at all — so a
+/// per-kind test written against real families would be both incomplete and
+/// hostage to a schema change somewhere else. It rides the very same
+/// [`ShellSubsystem`] the two shell families do, so the shim is exercised
+/// rather than bypassed — and `the_fixture_family_verifies` holds it to its
+/// own documented default with the same walker CI runs over the real four.
 #[cfg(test)]
 mod fixture {
     use hytte_config::schema::{Family, Field, Kind, Schema};
@@ -1718,17 +2181,47 @@ mod fixture {
             Field {
                 path: "entry",
                 kind: Kind::Map(ENTRY_FIELDS),
-                doc: "A read-only table of entries.",
+                doc: "A table of named entries.",
+            },
+            Field {
+                path: "items",
+                kind: Kind::List(&Kind::Map(ITEM_FIELDS)),
+                doc: "A list of records.",
             },
         ],
     };
 
-    /// One `[entry.<name>]`.
-    const ENTRY_FIELDS: &[Field] = &[Field {
-        path: "name",
-        kind: Kind::Text { blank_ok: false },
-        doc: "What it is called.",
-    }];
+    /// One `[entry.<name>]` — two sub-fields, so a test can watch a save move
+    /// exactly one of them inside an entry.
+    const ENTRY_FIELDS: &[Field] = &[
+        Field {
+            path: "name",
+            kind: Kind::Text { blank_ok: false },
+            doc: "What it is called.",
+        },
+        Field {
+            path: "icon",
+            kind: Kind::Text { blank_ok: false },
+            doc: "Its symbolic icon.",
+        },
+    ];
+
+    /// One element of `items` — `workspaces`' `apps = [{ id, exec }]` shape,
+    /// which is the one collection in the tree nested two deep and therefore
+    /// the one a fixture has to carry for [`Subject::Element`] to be tested
+    /// at all (#1373's test list).
+    const ITEM_FIELDS: &[Field] = &[
+        Field {
+            path: "id",
+            kind: Kind::Text { blank_ok: false },
+            doc: "What the record is called.",
+        },
+        Field {
+            path: "exec",
+            kind: Kind::Text { blank_ok: false },
+            doc: "What it runs.",
+        },
+    ];
 
     /// The fixture's documented default — commented like a real one, because
     /// the tooltip tests read comments back out of it.
@@ -1755,14 +2248,17 @@ color = "heat"
 # An entry.
 label = "fixture"
 
-# The two collections are the operator's, so the default states neither and
-# documents the shape instead — the same reason workspaces.toml is comments
+# The three collections are the operator's, so the default states none of them
+# and documents the shape instead — the same reason workspaces.toml is comments
 # only:
 #
 #     order = ["one", "two"]
 #
+#     items = [{ id = "first", exec = "run" }]
+#
 #     [entry.one]
 #     name = "the first one"
+#     icon = "face-smile-symbolic"
 "#;
 
     /// A schema with no fields at all — #1371 L6's fixture: nothing a real
@@ -1796,7 +2292,7 @@ mod tests {
 
     /// The fixture's ops, editable.
     pub(super) fn fixture_ops() -> FamilyOps {
-        FamilyOps::of::<ShellSubsystem<Fixture>>(&fixture::FAMILY, true, RELOAD_LIVE)
+        FamilyOps::of::<ShellSubsystem<Fixture>>(&fixture::FAMILY, RELOAD_LIVE)
     }
 
     #[test]
@@ -1824,7 +2320,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "form-fixture-empty declares no fields")]
     fn build_refuses_a_schema_with_no_fields() {
-        let ops = FamilyOps::of::<ShellSubsystem<EmptyFixture>>(&fixture::EMPTY_FAMILY, true, "");
+        let ops = FamilyOps::of::<ShellSubsystem<EmptyFixture>>(&fixture::EMPTY_FAMILY, "");
         let env = Rc::new(xdg::Env {
             home: None,
             config_home: None,
@@ -1900,16 +2396,32 @@ mod tests {
         assert!(family("nothing-like-it").is_none());
     }
 
-    /// Spec §4's staging: `stats` and `core-leds` are the two editable forms;
-    /// `agents` and `workspaces` render read-only until P2.
+    /// P1's staging is over: all four families are editable, and each says
+    /// where a save lands rather than why it cannot take one.
+    ///
+    /// The two P1 staged read-only were `agents` and `workspaces`, and each
+    /// was staged for its collections — `workspaces` has no scalar leaf at
+    /// all, both of its fields being a `Map` and a `List`. #888 P2 is exactly
+    /// the phase that makes those editable, so the flag they were held behind
+    /// has nothing left to say and is gone with them.
+    ///
+    /// **Red if a family goes back to being read-only**: this list is the
+    /// whole of `families()`.
     #[test]
-    fn only_the_two_first_forms_are_editable() {
-        let editable: Vec<&str> = families()
-            .iter()
-            .filter(|ops| ops.editable)
-            .map(|ops| ops.family.name)
-            .collect();
-        assert_eq!(editable, ["core-leds", "stats"]);
+    fn every_family_is_editable_and_says_where_a_save_lands() {
+        for ops in families() {
+            let said = group_description(*ops, None);
+            assert!(
+                said.contains(&format!("Saved to {}.toml", ops.family.name)),
+                "{}: {said}",
+                ops.family.name
+            );
+            assert!(
+                !said.contains("#888 P2"),
+                "{} still says it is read-only: {said}",
+                ops.family.name
+            );
+        }
     }
 
     /// Each editable family's first group says how a save actually reaches its
@@ -1941,14 +2453,53 @@ mod tests {
             "a plugin's file is read at start: {at_start}"
         );
 
-        // A read-only family says why it is read-only instead, and never
-        // promises anything about a save it will not take.
-        for name in ["workspaces", "agents"] {
-            let ops = family(name).expect("one of the four");
-            let said = group_description(ops, None);
-            assert!(said.contains("#888 P2"), "{name}: {said}");
-            assert!(!said.contains("Saved to"), "{name}: {said}");
-        }
+        // `agents.toml` is the third answer, and the one #888 P2 added: a
+        // *plugin* re-reads it live (`poll::ConfigSource` stamps every layer
+        // each tick), so the restart switch on this very page is not what
+        // applies a change — and neither is the shell.
+        let agents = family("agents").expect("agents is one of the four");
+        let live_plugin = group_description(agents, None);
+        assert!(live_plugin.contains("agents.toml"), "{live_plugin}");
+        assert!(live_plugin.contains("no restart"), "{live_plugin}");
+        assert_ne!(
+            agents.reload, stats.reload,
+            "two plugin-owned files, two different promises"
+        );
+        assert_ne!(
+            agents.reload, core_leds.reload,
+            "who re-reads it is the half the operator acts on"
+        );
+    }
+
+    /// #1373 item 2's naming rule, which is `nix/module-common.nix`'s own for
+    /// `agents.display` — and is about the **lock**, not about TOML: a
+    /// `_locked` entry is a dotted path that `merge::collect_locks` splits
+    /// with no escaping, so `display."a.b".icon` renders a marker
+    /// indistinguishable from the three nested segments `a → b → icon` and
+    /// would pin a key nobody named. The nix module refuses it at eval; an
+    /// editor that let one in would put it back below nix.
+    ///
+    /// **Red if the dot check goes**: the second case is accepted.
+    #[test]
+    fn an_entry_name_is_one_undotted_segment() {
+        let taken = [String::from("beta")];
+        assert_eq!(collection::check_name("alpha", "display", &taken), Ok(()));
+        assert_eq!(
+            collection::check_name("trollshell-choom", "display", &taken),
+            Ok(())
+        );
+        assert!(collection::check_name("a.b", "display", &taken).is_err());
+        // Blank — what a trimmed empty entry row hands over.
+        assert!(collection::check_name("", "display", &taken).is_err());
+        // `_locked` and `_unset` are the layering's own spellings, so a name
+        // that could collide with one is refused rather than written and then
+        // read back as a marker.
+        assert!(collection::check_name("_locked", "display", &taken).is_err());
+        assert!(collection::check_name("_unset", "display", &taken).is_err());
+        // #1383 review, LOW 3: *Add* and *open the row above* are two
+        // different things to have asked for, so a name the map already holds
+        // is refused rather than silently opening that entry.
+        assert!(collection::check_name("beta", "display", &taken).is_err());
     }
 
     #[test]
@@ -2050,7 +2601,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collection_row_counts_what_it_holds_and_says_it_is_read_only() {
+    fn a_collection_row_counts_what_it_holds() {
         let field = fixture::SCHEMA
             .field("entry")
             .expect("the fixture declares `entry`");
@@ -2058,8 +2609,11 @@ mod tests {
         table.insert("chat".to_owned(), toml::Value::Table(toml::Table::new()));
         table.insert("dev".to_owned(), toml::Value::Table(toml::Table::new()));
         let summary = summarise(field, Some(&toml::Value::Table(table)));
-        assert!(summary.starts_with("2 entries · chat, dev"), "{summary}");
-        assert!(summary.contains("#888 P2"), "{summary}");
+        assert_eq!(summary, "2 entries · chat, dev");
+        assert!(
+            !summary.contains("#888 P2"),
+            "P1's read-only note outlived the phase it named: {summary}"
+        );
         assert_eq!(plural("workspace", 2), "workspaces");
         assert_eq!(plural("display", 2), "displays");
 
@@ -2578,7 +3132,7 @@ mod gtk_tests {
     /// `List` and `Map` are read-only in v1 (spec §1): a summary row, no
     /// controls, no reset.
     #[gtk::test]
-    fn a_collection_row_is_a_read_only_summary() {
+    fn a_collection_row_is_activatable_and_keeps_its_summary() {
         let scratch = Scratch::new();
         let form = fixture_form(
             &scratch,
@@ -2587,31 +3141,34 @@ mod gtk_tests {
         let Control::Collection(row) = &row_of(&form, "order").control else {
             panic!("a List is an action row");
         };
+        assert_eq!(
+            row.subtitle().map(|s| s.to_string()).as_deref(),
+            Some("2 orders · one, two"),
+            "P1's summary, minus the phase note"
+        );
+        // #1373 item 1: the row is the way into the entries.
+        assert!(row.is_activatable(), "a collection row must open its page");
         assert!(
-            row.subtitle()
-                .expect("the summary")
-                .starts_with("2 orders · one, two"),
-            "{:?}",
-            row.subtitle()
+            sensitive(&form, "order"),
+            "…which means it cannot be greyed out"
+        );
+        // #1373 item 3: an array is one leaf under rule 3, so it resets like
+        // one. A map is not, so it has nothing to reset.
+        assert!(
+            row_of(&form, "order").reset.is_some(),
+            "a list resets whole"
         );
         assert!(
-            !sensitive(&form, "order"),
-            "a collection is read-only in v1"
-        );
-        assert!(
-            row_of(&form, "order").reset.is_none(),
-            "and has nothing to reset"
+            row_of(&form, "entry").reset.is_none(),
+            "a map's entries go one at a time"
         );
         let Control::Collection(entry) = &row_of(&form, "entry").control else {
             panic!("a Map is an action row");
         };
-        assert!(
-            entry
-                .subtitle()
-                .expect("the summary")
-                .starts_with("1 entry · one"),
-            "{:?}",
-            entry.subtitle()
+        assert!(entry.is_activatable());
+        assert_eq!(
+            entry.subtitle().map(|s| s.to_string()).as_deref(),
+            Some("1 entry · one")
         );
     }
 
@@ -2961,10 +3518,14 @@ mod gtk_tests {
         );
     }
 
-    /// The two families spec §4 stages as read-only render every row and
-    /// offer none of them.
+    /// The two families P1 staged read-only are the two whose leaves are
+    /// collections, and #888 P2 is the phase that opens them: every row
+    /// renders, every row is offered, and the page no longer says otherwise.
+    ///
+    /// **Red on `829add50`**: every widget was insensitive and the first
+    /// group's description said *editing … is #888 P2*.
     #[gtk::test]
-    fn the_read_only_families_render_but_do_not_offer_an_edit() {
+    fn the_collection_families_render_every_row_and_offer_it() {
         let scratch = Scratch::new();
         for name in ["agents", "workspaces"] {
             let ops = family(name).expect("one of the four");
@@ -2972,21 +3533,649 @@ mod gtk_tests {
             assert!(!form.inner.rows.is_empty(), "{name} renders rows");
             for row in &form.inner.rows {
                 assert!(
-                    !row.widgets
+                    row.widgets
                         .iter()
-                        .any(gtk::prelude::WidgetExt::is_sensitive),
-                    "{name}.{} is offered for editing in P1",
+                        .all(gtk::prelude::WidgetExt::is_sensitive),
+                    "{name}.{} is still greyed out",
                     row.field.path
                 );
+                if let Control::Collection(action) = &row.control {
+                    assert!(
+                        action.is_activatable(),
+                        "{name}.{} has no way into its entries",
+                        row.field.path
+                    );
+                }
             }
+            let description = form.groups()[0].description().expect("a description");
             assert!(
-                form.groups()[0]
-                    .description()
-                    .expect("a description")
-                    .contains("#888 P2"),
-                "{name} says why it is read-only"
+                !description.contains("#888 P2"),
+                "{name} still calls itself read-only: {description}"
+            );
+            assert!(
+                description.contains(&format!("Saved to {name}.toml")),
+                "{name}: {description}"
             );
         }
+    }
+
+    // ── #888 P2: the collection sub-pages (#1373) ───────────────────────────
+
+    /// A fixture form **mounted in an `AdwNavigationView`**, which is what a
+    /// collection row needs above it to have somewhere to push (item 1).
+    ///
+    /// The whole page tree is built here rather than taken from
+    /// `plugins_tab`: what these tests exercise is the form's own drill-down,
+    /// and the tab's contribution to it is the one navigation view this
+    /// stands in for.
+    struct Mounted {
+        form: Form,
+        nav: adw::NavigationView,
+    }
+
+    fn mounted(scratch: &Scratch, base: Option<&str>) -> Mounted {
+        if let Some(base) = base {
+            Scratch::write(&scratch.base("form-fixture"), base);
+        }
+        let form = build(fixture_ops(), &scratch.env());
+        let page = adw::PreferencesPage::new();
+        for group in form.groups() {
+            page.add(group);
+        }
+        let nav = adw::NavigationView::new();
+        nav.add(&adw::NavigationPage::new(&page, "Fixture"));
+        Mounted { form, nav }
+    }
+
+    impl Mounted {
+        /// Activate the collection row for `path` and wait for its page.
+        fn open(&self, path: &str) {
+            let Control::Collection(row) = &row_of(&self.form, path).control else {
+                panic!("{path} is not a collection row");
+            };
+            // Before the emit: `depth` drains the main loop, so reading it
+            // afterwards would already have let the deferred push happen and
+            // the wait below would never be satisfied.
+            let before = self.depth();
+            glib::prelude::ObjectExt::emit_by_name::<()>(row, "activated", &[]);
+            settle_until("the sub-page to be pushed", || self.depth() > before);
+        }
+
+        /// Activate the row titled `title` on the page currently on top.
+        fn activate_row(&self, title: &str) {
+            let row: adw::ActionRow = self
+                .find(title)
+                .unwrap_or_else(|| panic!("no row titled {title:?} on {:?}", self.title()));
+            let before = self.depth();
+            glib::prelude::ObjectExt::emit_by_name::<()>(&row, "activated", &[]);
+            settle_until("the sub-page to be pushed", || self.depth() > before);
+        }
+
+        /// Type into the entry row titled `title` on the visible page and
+        /// apply it.
+        fn type_into(&self, title: &str, text: &str) {
+            let row: adw::EntryRow = self
+                .find(title)
+                .unwrap_or_else(|| panic!("no entry titled {title:?} on {:?}", self.title()));
+            row.set_text(text);
+            glib::prelude::ObjectExt::emit_by_name::<()>(&row, "apply", &[]);
+        }
+
+        /// The first widget of type `T` on the visible page whose
+        /// `AdwPreferencesRow` title is `title`.
+        fn find<T: IsA<adw::PreferencesRow> + IsA<gtk::Widget>>(&self, title: &str) -> Option<T> {
+            self.widgets::<T>().into_iter().find(|row| {
+                adw::prelude::PreferencesRowExt::title(row.upcast_ref::<adw::PreferencesRow>())
+                    == title
+            })
+        }
+
+        /// Every widget of type `T` on the visible page, in tree order.
+        fn widgets<T: IsA<gtk::Widget>>(&self) -> Vec<T> {
+            let page = self.nav.visible_page().expect("a visible page");
+            descendants(&page)
+        }
+
+        /// Whether the visible page **shows** a Delete.
+        ///
+        /// Shown rather than present: an entry page builds the button once
+        /// and hides it while the entry has nothing of the operator's to
+        /// remove, because `deletable` can flip under the poll the moment
+        /// they type into a row. `is_visible` is the property that decides
+        /// what an operator can click, and it is orthogonal to mapping
+        /// (#851), so it answers here with nothing on screen.
+        fn shows_delete(&self) -> bool {
+            self.widgets::<gtk::Button>().iter().any(|button| {
+                button.icon_name().as_deref() == Some("user-trash-symbolic") && button.is_visible()
+            })
+        }
+
+        /// The visible page's title.
+        fn title(&self) -> String {
+            self.nav
+                .visible_page()
+                .map(|page| page.title().to_string())
+                .unwrap_or_default()
+        }
+
+        /// How many pages are on the stack, the root included.
+        fn depth(&self) -> u32 {
+            while glib::MainContext::default().iteration(false) {}
+            self.nav.navigation_stack().n_items()
+        }
+    }
+
+    /// Every descendant of `root` of type `T`, in pre-order.
+    fn descendants<T: IsA<gtk::Widget>>(root: &impl IsA<gtk::Widget>) -> Vec<T> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = stack.pop() {
+            if let Ok(matched) = widget.clone().downcast::<T>() {
+                found.push(matched);
+            }
+            let mut children = Vec::new();
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                children.push(current);
+            }
+            stack.extend(children.into_iter().rev());
+        }
+        found
+    }
+
+    /// Item 1 and item 2's first half: the row opens the map, the map lists
+    /// its entries, and an entry opens the **generic form** over the map's
+    /// own fields.
+    ///
+    /// **Red without `Row::key`**: the entry page's rows would read `name`
+    /// rather than `entry.one.name`, so they would render the *root* key of
+    /// that spelling — nothing — and save to the wrong path.
+    #[gtk::test]
+    fn a_map_row_opens_its_entries_and_an_entry_opens_the_form_at_its_prefix() {
+        let scratch = Scratch::new();
+        let page = mounted(
+            &scratch,
+            Some("[entry.one]\nname = \"the first\"\nicon = \"star\"\n"),
+        );
+        page.open("entry");
+        assert_eq!(page.title(), "Entry");
+        let one: adw::ActionRow = page.find("one").expect("the entry is listed");
+        assert!(
+            one.subtitle()
+                .expect("a summary")
+                .starts_with("name, icon —"),
+            "{:?}",
+            one.subtitle()
+        );
+
+        page.activate_row("one");
+        assert_eq!(
+            page.title(),
+            "one",
+            "the entry page is titled for the entry"
+        );
+        let name: adw::EntryRow = page.find("Name").expect("the map's own sub-field");
+        assert_eq!(
+            name.text(),
+            "the first",
+            "the row reads the value at entry.one.name"
+        );
+        let icon: adw::EntryRow = page.find("Icon").expect("the map's other sub-field");
+        assert_eq!(icon.text(), "star");
+    }
+
+    /// Item 2: **Add** takes a name, and the entry exists in the file once
+    /// its first sub-leaf is written — under the map's own prefix, exactly one
+    /// key, with `[entry.alpha]` created on the way.
+    ///
+    /// **Red if the entry page saves through the *checked* writer**: no
+    /// `Field` names `entry.alpha.name`, so every save would answer
+    /// `NotALeaf` and nothing would ever be written.
+    #[gtk::test]
+    fn add_names_an_entry_and_its_first_sub_leaf_creates_it() {
+        let scratch = Scratch::new();
+        let page = mounted(&scratch, None);
+        let overlay = scratch.overlay("form-fixture");
+        page.open("entry");
+
+        page.type_into("Add an entry", "alpha");
+        settle_until("the new entry's page", || page.title() == "alpha");
+        assert_eq!(
+            Scratch::read(&overlay),
+            "",
+            "naming an entry writes nothing on its own"
+        );
+
+        page.type_into("Name", "Alpha");
+        settle_until("the first sub-leaf", || {
+            wrote(&Scratch::read(&overlay), "name = \"Alpha\"")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "[entry.alpha]\nname = \"Alpha\"\n"),
+            "the entry, its one leaf, and nothing else — under #1370's preamble"
+        );
+    }
+
+    /// Item 2 again, and item 6 through the form: delete removes the whole
+    /// entry — the keys the schema does not know included, since they are
+    /// inside the entry — and **only** it.
+    ///
+    /// **Red if the form resets each sub-leaf instead**: `mystery` would be
+    /// left behind holding `[entry.one]` open.
+    #[gtk::test]
+    fn deleting_an_entry_removes_the_table_and_nothing_else() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(
+            &overlay,
+            "flag = false\n\n[entry.one]\nname = \"the first\"\nmystery = 42\n\n\
+             [entry.two]\nname = \"the second\"\n",
+        );
+        let page = mounted(&scratch, None);
+        page.open("entry");
+        page.activate_row("one");
+
+        // The confirm dialog is the operator's; the removal it authorises is
+        // what this asserts, through the same call it makes.
+        collection::remove_entry(&page.form.inner, "entry.one").expect("the entry is the user's");
+        assert_eq!(
+            Scratch::read(&overlay),
+            "flag = false\n\n[entry.two]\nname = \"the second\"\n",
+            "one table, and every byte outside it kept"
+        );
+
+        // Item 7: the page whose subject went away comes down with it.
+        page.form.refresh_from_disk();
+        settle_until("the entry page to be popped", || page.title() == "Entry");
+    }
+
+    /// Item 5: a **locked** entry greys its page and offers no Delete, and the
+    /// row says where the kept value lives.
+    ///
+    /// **Red without `locked_here`'s ancestor walk**: `_locked =
+    /// ["entry.one"]` names the entry, not its leaves, so a membership test
+    /// would leave `entry.one.name` editable under a lock that covers it.
+    #[gtk::test]
+    fn a_locked_entry_greys_its_page_and_hides_delete() {
+        let scratch = Scratch::new();
+        let page = mounted(
+            &scratch,
+            Some("_locked = [\"entry.one\"]\n\n[entry.one]\nname = \"from nix\"\n"),
+        );
+        page.open("entry");
+        // No Add on a page whose map holds a locked entry is not the rule —
+        // the *map* is unlocked, so Add stays; it is the entry that is
+        // pinned.
+        page.activate_row("one");
+
+        let name: adw::EntryRow = page.find("Name").expect("the sub-field renders");
+        assert!(
+            !name.is_sensitive(),
+            "a leaf under a locked entry is still editable"
+        );
+        assert!(!page.shows_delete(), "a locked entry offered a Delete");
+    }
+
+    /// Item 5's other half: an entry every value of which comes from a base
+    /// layer shows *From `<file>`* and has **no Delete** — removing it needs
+    /// an `_unset` marker, and §5 says this form never writes one.
+    ///
+    /// **Red if Delete is offered whenever the entry is unlocked**: the click
+    /// would be refused by nothing and would remove nothing, because there is
+    /// no overlay line to remove.
+    #[gtk::test]
+    fn a_base_layer_entry_says_where_it_is_from_and_offers_no_delete() {
+        let scratch = Scratch::new();
+        let page = mounted(&scratch, Some("[entry.one]\nname = \"from the base\"\n"));
+        page.open("entry");
+        let listed: adw::ActionRow = page.find("one").expect("the entry is listed");
+        let base = scratch.base("form-fixture");
+        assert!(
+            listed
+                .subtitle()
+                .expect("a summary")
+                .contains(&format!("From {}", base.display())),
+            "{:?}",
+            listed.subtitle()
+        );
+
+        page.activate_row("one");
+        assert!(
+            !page.shows_delete(),
+            "a base-layer entry offered a Delete this form cannot honour"
+        );
+
+        // …and the moment one leaf becomes the operator's, it can be.
+        page.type_into("Name", "mine");
+        settle_until("the overlay line", || {
+            Scratch::read(&scratch.overlay("form-fixture")).contains("mine")
+        });
+        settle_until("the Delete button to appear", || page.shows_delete());
+    }
+
+    /// Item 3: a `List` of scalars is edited item by item and **written
+    /// whole** — rule 3 means the overlay states the list or it states
+    /// nothing — and emptying it removes the array rather than writing `[]`.
+    ///
+    /// **Red if a save writes one element**: the assertion below reads the
+    /// whole array back off disk.
+    #[gtk::test]
+    fn a_list_page_appends_removes_and_writes_the_whole_array() {
+        let scratch = Scratch::new();
+        let page = mounted(&scratch, Some("order = [\"one\"]\n"));
+        let overlay = scratch.overlay("form-fixture");
+        page.open("order");
+        assert_eq!(page.title(), "Order");
+
+        page.type_into("Add an order", "two");
+        settle_until("the appended item", || {
+            wrote(&Scratch::read(&overlay), "order = [\"one\", \"two\"]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "order = [\"one\", \"two\"]\n"),
+            "the base layer's item and the new one, stated whole"
+        );
+
+        // A blank edit removes that item, `places_tab::list_group`'s rule.
+        page.type_into("Order 1", "");
+        settle_until("the removal", || {
+            wrote(&Scratch::read(&overlay), "order = [\"two\"]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            first_file(fixture::DEFAULT_TOML, "order = [\"two\"]\n")
+        );
+
+        page.type_into("Order 1", "");
+        settle_until("the empty list", || {
+            !wrote(&Scratch::read(&overlay), "order = [\"two\"]")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            subsystem::commented_seed(fixture::DEFAULT_TOML),
+            "an emptied list is removed, not written as [] — and the documentation stays"
+        );
+    }
+
+    /// Item 3's reset: the parent row's own reset removes the array, so the
+    /// value falls back to the layer below.
+    ///
+    /// **Red on `829add50`**, where a `List` row had no reset at all and
+    /// `save_leaf_to_locked` refused every collection field.
+    #[gtk::test]
+    fn a_list_rows_reset_removes_the_array_and_falls_back() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "order = [\"mine\"]\n");
+        let form = fixture_form(&scratch, Some("order = [\"the base's\"]\n"));
+        assert_eq!(note_of(&form, "order"), "Yours");
+
+        let reset = row_of(&form, "order").reset.as_ref().expect("a reset");
+        assert!(reset.is_sensitive(), "an overlay array can be reset");
+        reset.emit_clicked();
+        settle_until("the reset", || {
+            Scratch::read(&overlay) != "order = [\"mine\"]\n"
+        });
+        assert_eq!(Scratch::read(&overlay), "");
+        assert_eq!(
+            note_of(&form, "order"),
+            format!("From {}", scratch.base("form-fixture").display()),
+            "and the layer below is what the row now shows"
+        );
+    }
+
+    /// Item 4: a `List` of **records** lists its elements, an element opens a
+    /// form of its own, and one field of one record re-emits the whole array.
+    ///
+    /// **Red without `Subject::Element`**: there is no dotted path for
+    /// `items[0].id`, so a leaf write would create a literal key called that.
+    #[gtk::test]
+    fn a_record_page_writes_one_field_by_re_emitting_the_whole_array() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(
+            &overlay,
+            "items = [{ id = \"first\", exec = \"run\" }, { id = \"second\" }]\n",
+        );
+        let page = mounted(&scratch, None);
+        page.open("items");
+        assert_eq!(page.title(), "Items");
+
+        let first: adw::ActionRow = page.find("first").expect("the record's own id titles it");
+        assert_eq!(
+            first.subtitle().map(|s| s.to_string()).as_deref(),
+            Some("id = first, exec = run")
+        );
+
+        page.activate_row("first");
+        assert_eq!(page.title(), "first");
+        let exec: adw::EntryRow = page.find("Exec").expect("the record's second field");
+        assert_eq!(exec.text(), "run");
+
+        page.type_into("Exec", "walk");
+        settle_until("the record edit", || {
+            Scratch::read(&overlay).contains("walk")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\", exec = \"walk\" }, { id = \"second\" }]\n",
+            "one field moved, the array re-emitted whole, the sibling untouched"
+        );
+    }
+
+    /// Item 4 again: **Add** appends an empty record and opens it, and
+    /// removing an element re-emits the array without it.
+    #[gtk::test]
+    fn a_records_page_adds_and_removes_elements() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+
+        page.activate_row("Add an item");
+        settle_until("the new record's page", || page.title() == "Item 2");
+        // #1383 review, MEDIUM 1: Add opens a page and **writes nothing**.
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }]\n",
+            "Add wrote a nameless record"
+        );
+
+        page.type_into("ID", "second");
+        settle_until("the new record's id", || {
+            Scratch::read(&overlay).contains("second")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }, { id = \"second\" }]\n",
+            "exactly one record, and the sibling untouched"
+        );
+    }
+
+    /// #1383 review, MEDIUM 1: **Add then Back writes nothing at all.**
+    ///
+    /// This is the half that was a live bug rather than an untidiness. The
+    /// shell's `parse_apps` returns `Err` for an element with no `id`, and
+    /// `parse_stack` then drops the stack's **whole** apps list — so the `{}`
+    /// that Add used to append blanked a working stack for as long as it was
+    /// there, and going Back without typing left it in the file for good.
+    ///
+    /// **Red before the fix**: the overlay's mtime moves twice — Add writes
+    /// `items = [{ id = "first" }, {}]` and the `on_pop` sweep writes it back
+    /// out again. The **mtime** is what this asserts for exactly that reason:
+    /// comparing content alone cannot tell "nothing was written" from
+    /// "something was written and then undone" (measured — with only the
+    /// content assertion, reverting `add` left this test green while its two
+    /// siblings reddened), and it is the window in between that blanks a
+    /// working stack, since `watch::poll_loop` stamps `(mtime, len)` and the
+    /// shell reads both writes.
+    #[gtk::test]
+    fn adding_a_record_and_going_back_writes_nothing() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        let before = std::fs::metadata(&overlay)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("Add an item");
+        settle_until("the new record's page", || page.title() == "Item 2");
+
+        page.nav.pop();
+        settle_until("the pop", || page.title() == "Items");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }]\n",
+            "a record nobody named reached the file"
+        );
+        assert_eq!(
+            std::fs::metadata(&overlay)
+                .and_then(|meta| meta.modified())
+                .expect("mtime"),
+            before,
+            "the file was rewritten for a record nobody named"
+        );
+    }
+
+    /// …and the other field of a record that does not exist yet is refused on
+    /// its own row rather than committing a nameless one.
+    ///
+    /// **Red without `write_element`'s `naming` gate**: the overlay grows
+    /// `{ exec = "run" }` — the same poison value, by the other door.
+    #[gtk::test]
+    fn a_record_that_is_not_there_yet_takes_its_name_before_anything_else() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("Add an item");
+        settle_until("the new record's page", || page.title() == "Item 2");
+
+        page.type_into("Exec", "run");
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }]\n",
+            "a nameless record was written"
+        );
+
+        // …and the name is what brings it into being, with the field that was
+        // refused still a draft the operator can apply afterwards.
+        page.type_into("ID", "second");
+        settle_until("the name", || Scratch::read(&overlay).contains("second"));
+        page.type_into("Exec", "run");
+        settle_until("the second field", || {
+            Scratch::read(&overlay).contains("run")
+        });
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\" }, { id = \"second\", exec = \"run\" }]\n"
+        );
+    }
+
+    /// …and the name cannot be **reset** out of a record that has one: what
+    /// that leaves is the same value the shell refuses the whole list for.
+    ///
+    /// **Red without `write_element`'s `naming && value.is_none()` arm**: the
+    /// overlay comes back `items = [{ exec = "run" }]`.
+    #[gtk::test]
+    fn a_records_name_cannot_be_reset_out_of_it() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\", exec = \"run\" }]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("first");
+
+        let id: adw::EntryRow = page.find("ID").expect("the naming field");
+        let reset = page
+            .widgets::<gtk::Button>()
+            .into_iter()
+            .find(|button| button.icon_name().as_deref() == Some("edit-undo-symbolic"))
+            .expect("every row has a reset");
+        assert!(id.is_sensitive());
+        reset.emit_clicked();
+        settle_nothing();
+        assert_eq!(
+            Scratch::read(&overlay),
+            "items = [{ id = \"first\", exec = \"run\" }]\n",
+            "the record lost its name"
+        );
+    }
+
+    /// #1383 review, MEDIUM 1's second half: a record carrying **nothing** is
+    /// swept up when its page is left — a hand-written `{}` is exactly what
+    /// `parse_apps` drops the whole list for, and the operator has just been
+    /// looking at it.
+    ///
+    /// **Red without `SubPage::on_pop`**: the `{}` is still there.
+    #[gtk::test]
+    fn an_empty_record_is_swept_up_when_its_page_is_left() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(&overlay, "items = [{ id = \"first\" }, {}]\n");
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("Item 2");
+        assert_eq!(page.title(), "Item 2");
+
+        page.nav.pop();
+        settle_until("the empty record to be swept up", || {
+            Scratch::read(&overlay) == "items = [{ id = \"first\" }]\n"
+        });
+    }
+
+    /// Item 7: a record page whose element the file no longer has comes down
+    /// rather than writing into an index that moved.
+    ///
+    /// **Red without the `element_of(...).is_none()` check** in the record
+    /// page's refresh: the page stays, showing the *previous* element's
+    /// values, and the next save re-emits an array with a record the operator
+    /// never edited.
+    #[gtk::test]
+    fn a_record_page_is_popped_when_its_element_goes_away() {
+        let scratch = Scratch::new();
+        let overlay = scratch.overlay("form-fixture");
+        Scratch::write(
+            &overlay,
+            "items = [{ id = \"first\" }, { id = \"second\" }]\n",
+        );
+        let page = mounted(&scratch, None);
+        page.open("items");
+        page.activate_row("second");
+        assert_eq!(page.title(), "second");
+
+        Scratch::write(&overlay, "items = [{ id = \"first\" }]\n");
+        page.form.refresh_from_disk();
+        settle_until("the record page to be popped", || page.title() == "Items");
+    }
+
+    /// Item 1's degradation: a form mounted with no `AdwNavigationView` above
+    /// it logs and does nothing, rather than panicking on a row it cannot
+    /// open.
+    #[gtk::test]
+    fn a_collection_row_with_nowhere_to_push_does_nothing() {
+        let scratch = Scratch::new();
+        let form = fixture_form(&scratch, Some("[entry.one]\nname = \"x\"\n"));
+        let Control::Collection(row) = &row_of(&form, "entry").control else {
+            panic!("a Map is an action row");
+        };
+        glib::prelude::ObjectExt::emit_by_name::<()>(row, "activated", &[]);
+        settle_nothing();
+        assert_eq!(
+            form.inner.open.borrow().len(),
+            0,
+            "a page was opened onto nothing"
+        );
     }
 
     /// **Nothing the form wires up holds the form.**

@@ -69,10 +69,16 @@
 //! above true for the crate's other consumer: `trollshell-control-center` links
 //! this crate for its Places tab and must not grow a runtime it never drives.
 //!
-//! - **`watch`** — [`subsystem::watch`], the layer poller that turns a saved
+//! - **`watch`** — `subsystem::watch`, the layer poller that turns a saved
 //!   edit into a live reload. Adds `tokio` and `futures-signals`, because the
 //!   loop sleeps and publishes into a `Mutable`. The shell's dependency line
-//!   enables it; the control center's does not.
+//!   enables it; the control center's does not. Spelled as code rather than
+//!   linked (#1367): the module is `#[cfg(feature = "watch")]`, so an
+//!   intra-doc link to it is a `broken_intra_doc_links` warning in any build
+//!   that does not enable the feature — which is every `cargo doc -p
+//!   hytte-config`, and invisible to `checks.rustdoc` only because a
+//!   `--workspace` run unifies the feature in from the shell's dependency
+//!   line.
 //! - **`test-support`** — `test_support`, the process-wide tracing global
 //!   default plus the capture, scratch-overlay and scratch-`$HOME` harnesses.
 //!   A cargo feature rather than `#[cfg(test)]` because `#[cfg(test)]` is

@@ -2384,37 +2384,50 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
 /// Which item is "first" is [`first_rendered_key`]'s answer, not
 /// `doc.iter().next()`'s; see there for the difference and when it bites.
 fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
-    let Some(first_key) = first_rendered_key(doc) else {
-        let header = doc.trailing().as_str().unwrap_or_default().to_owned();
-        doc.set_trailing("");
+    if let Some(header) = take_header_from(doc.as_table_mut()) {
         return header;
-    };
+    }
+    let header = doc.trailing().as_str().unwrap_or_default().to_owned();
+    doc.set_trailing("");
+    header
+}
 
-    if let Some(array) = doc
+/// [`take_header`]'s walk over one table level — `None` when there is nothing
+/// rendered here to take one off.
+///
+/// It descends through an **implicit** sub-table, which is the half #1373
+/// added and which is not an optimisation: an implicit table renders no header
+/// line of its own, so decor hung on it never reaches the file at all. A map
+/// entry — `[display.argus]` under a `[display]` that holds only sub-tables —
+/// is the first shape in the tree that produces one, and without this the
+/// documented preamble #1370 seeds would be silently **dropped** by the first
+/// save that creates one.
+fn take_header_from(table: &mut toml_edit::Table) -> Option<String> {
+    let first_key = first_rendered_key(table)?;
+    if let Some(array) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
-        let Some(table) = array.get_mut(0) else {
-            return String::new();
-        };
-        let header = decor_prefix(table.decor());
-        table.decor_mut().set_prefix("");
-        return header;
+        let first = array.get_mut(0)?;
+        let header = decor_prefix(first.decor());
+        first.decor_mut().set_prefix("");
+        return Some(header);
     }
-    if let Some(table) = doc
+    if let Some(sub) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_table_mut)
     {
-        let header = decor_prefix(table.decor());
-        table.decor_mut().set_prefix("");
-        return header;
+        if !renders_a_header(sub) {
+            return take_header_from(sub);
+        }
+        let header = decor_prefix(sub.decor());
+        sub.decor_mut().set_prefix("");
+        return Some(header);
     }
-    let Some((mut key, _)) = doc.get_key_value_mut(&first_key) else {
-        return String::new();
-    };
+    let (mut key, _) = table.get_key_value_mut(&first_key)?;
     let header = decor_prefix(key.leaf_decor());
     key.leaf_decor_mut().set_prefix("");
-    header
+    Some(header)
 }
 
 /// Put back what [`take_header`] detached, in front of whatever now sits
@@ -2431,34 +2444,78 @@ fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
     if header.is_empty() {
         return;
     }
-    let Some(first_key) = first_rendered_key(doc) else {
-        let rest = doc.trailing().as_str().unwrap_or_default().to_owned();
-        doc.set_trailing(format!("{header}{rest}"));
+    if put_header_in(doc.as_table_mut(), header) {
         return;
-    };
+    }
+    let rest = doc.trailing().as_str().unwrap_or_default().to_owned();
+    doc.set_trailing(format!("{header}{rest}"));
+}
 
-    if let Some(array) = doc
+/// [`put_header`]'s walk over one table level — `false` when there is nothing
+/// rendered here to hang it on, which is what sends the header to the
+/// document's trailing decor instead.
+///
+/// It descends through an **implicit** sub-table for
+/// [`take_header_from`]'s reason, and it is the direction that actually loses
+/// bytes: decor set on a table that renders no header line is simply not in
+/// the output.
+fn put_header_in(table: &mut toml_edit::Table, header: &str) -> bool {
+    let Some(first_key) = first_rendered_key(table) else {
+        return false;
+    };
+    if let Some(array) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_array_of_tables_mut)
     {
-        if let Some(table) = array.get_mut(0) {
-            let rest = decor_prefix(table.decor());
-            table.decor_mut().set_prefix(format!("{header}{rest}"));
-        }
-        return;
+        let Some(first) = array.get_mut(0) else {
+            return false;
+        };
+        let rest = decor_prefix(first.decor());
+        first.decor_mut().set_prefix(under_header(header, &rest));
+        return true;
     }
-    if let Some(table) = doc
+    if let Some(sub) = table
         .get_mut(&first_key)
         .and_then(toml_edit::Item::as_table_mut)
     {
-        let rest = decor_prefix(table.decor());
-        table.decor_mut().set_prefix(format!("{header}{rest}"));
-        return;
+        if !renders_a_header(sub) {
+            return put_header_in(sub, header);
+        }
+        let rest = decor_prefix(sub.decor());
+        sub.decor_mut().set_prefix(under_header(header, &rest));
+        return true;
     }
-    if let Some((mut key, _)) = doc.get_key_value_mut(&first_key) {
-        let rest = decor_prefix(key.leaf_decor());
-        key.leaf_decor_mut().set_prefix(format!("{header}{rest}"));
+    let Some((mut key, _)) = table.get_key_value_mut(&first_key) else {
+        return false;
+    };
+    let rest = decor_prefix(key.leaf_decor());
+    key.leaf_decor_mut().set_prefix(under_header(header, &rest));
+    true
+}
+
+/// `header` joined to the decor it is going in front of, dropping decor that
+/// was only **separating** whatever used to be above.
+///
+/// Only a header that already **ends with a blank line** carries its own
+/// separation — [`commented_seed`]'s does, ending on its "your own settings go
+/// below" block — so joining it to a prefix that is nothing but whitespace
+/// doubles the gap, and keeps doubling it every time the item it was hanging
+/// on is deleted again. Reachable only since #1383: before it, nothing removed
+/// that item, so the decor underneath was always empty.
+///
+/// A header that ends on a single newline (a one-line file comment) is
+/// *followed* by the blank line in `rest`, which is therefore the file's own
+/// layout and is kept — `a_locked_first_key_still_keeps_the_documented_preamble`
+/// is exactly that shape.
+///
+/// A prefix carrying a **comment** is kept whole either way: that is the
+/// operator's note about the item it sits on, and the whole of #1380's "Whose
+/// header is it" is that those do not move.
+fn under_header(header: &str, rest: &str) -> String {
+    if header.ends_with("\n\n") && rest.chars().all(char::is_whitespace) {
+        return header.to_owned();
     }
+    format!("{header}{rest}")
 }
 
 /// The **top-level** key of the item `toml_edit` renders first — which is
@@ -2493,10 +2550,26 @@ fn put_header(doc: &mut toml_edit::DocumentMut, header: &str) {
 /// whose keys are a mix of top-level ones and table ones, so without this the
 /// operator's own line would sit above the documented preamble #1370 put in
 /// front of them.
-fn first_rendered_key(doc: &toml_edit::DocumentMut) -> Option<String> {
-    doc.iter()
+/// Whether `table` emits a `[header]` line of its own, and so has decor a
+/// header block would actually be printed in front of.
+///
+/// An **implicit** table that holds only sub-tables does not: `toml_edit`
+/// renders `[display.argus]` and nothing for the `[display]` above it, which
+/// is what a person writing the file by hand does too. Decor set there is
+/// simply absent from the output — which is why [`take_header_from`] and
+/// [`put_header_in`] descend past one rather than hanging #1370's preamble on
+/// a line that is never written. An implicit table that *does* hold a direct
+/// key still emits its header (`[core]` with `brightness = 7` under it), so
+/// the flag alone is not the question.
+fn renders_a_header(table: &toml_edit::Table) -> bool {
+    !table.is_implicit() || table.iter().any(|(_, item)| item.is_value())
+}
+
+fn first_rendered_key(table: &toml_edit::Table) -> Option<String> {
+    table
+        .iter()
         .find(|(_, item)| item.is_value())
-        .or_else(|| doc.iter().next())
+        .or_else(|| table.iter().next())
         .map(|(key, _)| key.to_owned())
 }
 
@@ -2681,15 +2754,27 @@ pub fn save_overlay_locked<S: Subsystem + serde::Serialize>(
 ///    also be this family's own ([`crate::schema::Schema::family`] equal to
 ///    [`Subsystem::NAME`]), so handing over the wrong family's schema is an
 ///    error rather than a silent write against the wrong rules.
-/// 2. **A collection `Field`** — [`crate::schema::Kind::Map`] or
-///    [`crate::schema::Kind::List`] whose value in the file is a table.
-///    Spec §1 renders those rows *read-only* in v1, but a generic form
-///    iterating `Schema::fields` gives every row a *reset* (§4), and before
-///    #1360 a reset on `agents.display` or `workspaces.workspace` removed
-///    every entry under it — including the un-schema'd keys the sibling
-///    writer goes to documented lengths never to touch. The structural check
-///    below refuses a table or an array-of-tables at the target whatever the
-///    schema says, so the guarantee does not rest on the schema being right.
+/// 2. **A [`crate::schema::Kind::Map`] `Field`** — a table of named entries.
+///    Before #1360 a *reset* on `agents.display` or `workspaces.workspace`
+///    removed every entry under it — including the un-schema'd keys the
+///    sibling writer goes to documented lengths never to touch. The
+///    structural check below refuses a table or an array-of-tables at the
+///    target whatever the schema says, so the guarantee does not rest on the
+///    schema being right. An entry's own leaves go through
+///    [`save_leaf_to_locked_unchecked`] and a whole entry through
+///    [`remove_entry_to_locked`].
+///
+///    A [`crate::schema::Kind::List`] is **not** refused (#1373 item 3, a
+///    change from #1360's blanket collection refusal): rule 3 of the layering
+///    replaces an array whole, so an array *is* one leaf — the overlay states
+///    the list or it states nothing — and `structural_refusal` below already
+///    refuses a table or an array-of-tables at the target, so the only value
+///    that reaches the file here is an inline array whose every element
+///    [`crate::schema::Kind::accepts`] has judged. The alternative the issue
+///    offered — narrowing [`crate::schema::Kind::is_collection`] instead —
+///    would take `verify`'s [`crate::schema::Mismatch::Invented`] exemption
+///    with it, and `workspaces`' `order` would become a mismatch against a
+///    default that documents it in comments by design.
 /// 3. **A value outside the `Field`'s [`crate::schema::Kind`]** —
 ///    [`ConfigError::Rejected`]. This is not politeness: a leaf of the wrong
 ///    *type* is a [`ConfigError::Schema`] on the next load, and
@@ -2747,10 +2832,12 @@ pub fn save_leaf_to_locked<S: Subsystem>(
              use save_leaf_to_locked_unchecked for a key inside a map entry",
         ));
     };
-    if field.kind.is_collection() {
+    // A `Map` only — a `List` is one leaf under rule 3 (see refusal 2 above).
+    if matches!(field.kind, crate::schema::Kind::Map(_)) {
         return Err(not_a_leaf(
-            "it is a list or a table of entries, which v1 renders read-only \
-             — writing it whole would take every entry under it with it",
+            "it is a table of named entries — writing it whole would take every entry under \
+             it with it; an entry's own leaves go through save_leaf_to_locked_unchecked and \
+             a whole entry through remove_entry_to_locked",
         ));
     }
     if let Some(value) = &value
@@ -3075,6 +3162,237 @@ pub fn commented_seed(default_toml: &str) -> String {
     format!("{preamble}{SEED_SEPARATOR}")
 }
 
+// ── The form's write side: one whole entry, removed ─────────────────────────
+
+/// Remove **one whole entry** from the overlay at `path`, format-preserving
+/// and atomic (#888 P2, #1373 item 6).
+///
+/// An entry is a `[display.argus]` table — a named member of a
+/// [`crate::schema::Kind::Map`] — or the inline array a
+/// [`crate::schema::Kind::List`] leaf holds. Both are things the *operator*
+/// put in the file, which is exactly what makes them removable: everything
+/// this writer refuses below is structure somebody else owns.
+///
+/// It exists because until #1373 a removal was only ever a **side effect**:
+/// `remove_leaf` — private to this module, hence the plain span — drops a
+/// table once its last key is reset out of it and
+/// [`Subsystem::DEFAULT_TOML`] does not document it, so deleting
+/// `[display.argus]` meant a form resetting each of its three keys in turn and
+/// trusting the prune rule to notice. That is three writes, three re-reads and
+/// a delete that silently does nothing if the entry happens to carry a key the
+/// schema does not know. This is the one-shot call, and it takes the
+/// un-schema'd keys with it on purpose — they are inside the entry the
+/// operator asked to delete.
+///
+/// # Four refusals, all before a byte is written
+///
+/// 1. **An empty `table_path`, or one with an empty segment** —
+///    [`ConfigError::NotALeaf`], [`save_leaf_to_locked_unchecked`]'s rule.
+/// 2. **A locked `table_path` — itself, an ancestor, or a descendant** —
+///    [`ConfigError::Locked`]. A lock on `display.argus` pins the entry, a
+///    lock on `display` pins the map, and a lock on `display.argus.label`
+///    pins it too, which is the half [`Loaded::is_locked`] alone does not
+///    answer: that predicate walks *up*, because a row is a leaf and a lock
+///    above it covers it. This call takes a whole subtree, so it has to
+///    answer for what is underneath as well (#1383 review, LOW 2). The
+///    refusal names the pinned path, which is the line to go and find.
+/// 3. **A table [`Subsystem::DEFAULT_TOML`] documents** — the same set the
+///    prune rule consults (`table_paths`). `[core]` is part of
+///    `core-leds.toml`'s own shape and is not an entry anybody added, so it is
+///    not one this call may take away.
+/// 4. **A scalar** — a path that exists and holds neither a table nor an
+///    array. That is a leaf, and a leaf is removed by
+///    [`save_leaf_to_locked`] with no value, which is the row's own *reset*.
+///
+/// A `table_path` that exists **nowhere** is not a refusal: the state the
+/// caller asked for is the state on disk, so the answer is `Ok(())` with no
+/// file opened at all. So is a `path` that does not exist yet.
+///
+/// Like the leaf writer, a removal that would produce the bytes already on
+/// disk does not write, and an emptied parent table is pruned only when
+/// `DEFAULT_TOML` does not document it — so removing the last
+/// `[display.<name>]` takes `[display]` with it, while resetting the last key
+/// of `[core]` leaves the documented header standing.
+///
+/// # Errors
+/// [`ConfigError::NotALeaf`] for refusals 1, 3 and 4, [`ConfigError::Locked`]
+/// for 2, [`ConfigError::Unreadable`] if the existing file cannot be read
+/// (refusing rather than overwriting bytes we cannot account for),
+/// [`ConfigError::Encode`] for a file — or a [`Subsystem::DEFAULT_TOML`] —
+/// that is not valid TOML, and [`ConfigError::Write`] for the replace.
+pub fn remove_entry_to_locked<S: Subsystem>(
+    path: &Path,
+    table_path: &str,
+    locked: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    let not_a_leaf = |reason: &str| ConfigError::NotALeaf {
+        subsystem: S::NAME.to_owned(),
+        key: table_path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if table_path.is_empty() || table_path.split('.').any(str::is_empty) {
+        return Err(not_a_leaf(
+            "a table path is one or more non-empty dotted segments",
+        ));
+    }
+    // Itself, an ancestor — and, unlike every other refusal in this module, a
+    // **descendant** (#1383 review, LOW 2). `locked_here` walks up, which is
+    // the right predicate for a *leaf* write: `_locked = ["display.argus"]`
+    // pins `display.argus.label`. It is the wrong one for a write that takes a
+    // whole subtree with it, because a lock one level *down* —
+    // `_locked = ["display.argus.label"]`, which is exactly what
+    // `nix/module-common.nix` renders for an operator who set that one option
+    // — would let this call delete the overlay line the lock exists to hold.
+    // `merge::Locks::refuses` has the same asymmetry for the same reason and
+    // spells it out: rules 1 and 3 replace whole, so a whole-value write must
+    // answer for what is underneath it.
+    if let Some(pinned) = pinned_here_or_below(locked, table_path) {
+        return Err(ConfigError::Locked {
+            subsystem: S::NAME.to_owned(),
+            key: pinned,
+            path: path.to_path_buf(),
+        });
+    }
+
+    let default_doc: toml_edit::DocumentMut =
+        S::DEFAULT_TOML.parse().map_err(|e: toml_edit::TomlError| {
+            ConfigError::Encode(format!("Subsystem::DEFAULT_TOML is not valid TOML: {e}"))
+        })?;
+    let mut documented = BTreeSet::new();
+    table_paths(default_doc.as_table(), "", &mut documented);
+    if documented.contains(table_path) {
+        return Err(not_a_leaf(
+            "the documented default states it as a table of this file's own shape, so it is \
+             not an entry anybody added and not one this call may take away",
+        ));
+    }
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // Nothing to remove from a file that does not exist — which is the
+        // state the caller asked for, so it is `Ok` and not a write.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(ConfigError::Unreadable {
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            });
+        }
+    };
+
+    let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e: toml_edit::TomlError| {
+        ConfigError::Encode(format!("the file being replaced is not valid TOML: {e}"))
+    })?;
+
+    if let Some(reason) = removal_refusal(&doc, table_path) {
+        return Err(not_a_leaf(reason));
+    }
+
+    // The header lift, exactly as [`save_leaf_to_locked_unchecked`] does it
+    // and for a sharper reason (#1383 review, HIGH 1). #1370's commented
+    // preamble is decor, and decor hangs off whatever item renders first —
+    // which, in a file whose only top-level item is a map, is the **first
+    // entry's** `[display.<name>]` header. Removing that entry bare therefore
+    // took the whole documentation with it, and removing the *only* entry left
+    // an empty file, unrecoverably: the seed runs on `NotFound`, and the file
+    // still exists.
+    //
+    // Ownership-gated for #1380's "Whose header is it" reason, unchanged
+    // here: a block this writer seeded belongs to the *file* and must survive
+    // whatever ends up first, while a comment the operator wrote above a key
+    // belongs to that key and goes with it —
+    // `remove_keeping_closing_space` is explicit that a comment describes the
+    // value that is going away.
+    let had_no_top_level_item = doc.iter().next().is_none();
+    let mut header = take_header(&mut doc);
+    if !header.is_empty()
+        && !had_no_top_level_item
+        && !commented_seed(S::DEFAULT_TOML).starts_with(&header)
+    {
+        put_header(&mut doc, &header);
+        header.clear();
+    }
+
+    // The same walk the leaf writer's removal takes, which is what makes the
+    // prune rule one rule rather than two: `remove_leaf`'s terminal step
+    // removes whatever key is at the path — a table as readily as a value —
+    // and its unwind then drops an emptied, undocumented ancestor.
+    remove_leaf(doc.as_table_mut(), table_path, "", &documented);
+    put_header(&mut doc, &header);
+
+    let body = doc.to_string();
+    if body == existing {
+        return Ok(());
+    }
+
+    file::write_atomic(path, &body, Durability::FsyncParent)
+        .map_err(|e| ConfigError::Write(e.to_string()))
+}
+
+/// The pinned path that refuses a whole-subtree removal at `table_path` — the
+/// path itself, an ancestor of it, or a **descendant** — or `None`.
+///
+/// [`locked_here`]'s answer widened downwards, and only for this one caller
+/// (#1383 review, LOW 2). The reader's predicate deliberately walks *up* only,
+/// because a row is a leaf and a lock above it covers it; a call that deletes
+/// everything under a path has to answer for what is under it too, which is
+/// the same asymmetry `merge::Locks::refuses` documents on the merge side.
+///
+/// The **descendant** is what is reported, not the path that was asked for: a
+/// lock named `display.argus.label` is the line the operator has to go and
+/// find, and saying "display.argus is set in nix" when it is not would send
+/// them looking in the wrong place.
+fn pinned_here_or_below(locked: &BTreeSet<String>, table_path: &str) -> Option<String> {
+    if locked_here(locked, table_path) {
+        return Some(table_path.to_owned());
+    }
+    let under = format!("{table_path}.");
+    locked
+        .iter()
+        .find(|pinned| pinned.starts_with(&under))
+        .cloned()
+}
+
+/// Why `table_path` does not name an entry of `doc`, or `None` when it does
+/// (or when nothing is there at all) — the structural half of
+/// [`remove_entry_to_locked`]'s refusals.
+///
+/// [`structural_refusal`]'s mirror image: that one refuses a table at the
+/// target because a *leaf* write would take everything under it; this one
+/// refuses a **scalar** at the target, because a removal that is one leaf is
+/// [`save_leaf_to_locked`]'s `None` and says so on the row rather than
+/// silently deleting a documented key through the delete button of an entry
+/// that is not there.
+///
+/// Asked only of the file being edited, not of [`Subsystem::DEFAULT_TOML`]:
+/// what the documented shape has to say is refusal 3, which is a different
+/// question (*is this structure ours*) asked over [`table_paths`] before the
+/// file is even opened.
+fn removal_refusal(doc: &toml_edit::DocumentMut, table_path: &str) -> Option<&'static str> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    let mut segments = table_path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        // Nothing there: already the state the caller asked for.
+        let item = table.get(segment)?;
+        if segments.peek().is_none() {
+            let is_entry = item.is_table_like()
+                || item.is_array_of_tables()
+                || item.as_value().is_some_and(toml_edit::Value::is_array);
+            return (!is_entry).then_some(
+                "it names a scalar, not an entry; one leaf is removed by save_leaf_to_locked \
+                 with no value, which is what a row's own reset does",
+            );
+        }
+        let Some(sub) = item.as_table_like() else {
+            return Some(
+                "a table on the way to it is a plain value, so there is no entry under it",
+            );
+        };
+        table = sub;
+    }
+    None
+}
+
 /// Why `key_path` does not name a leaf of `doc`, or `None` when it does — the
 /// structural half of [`save_leaf_to_locked`]'s refusals, asked of the file
 /// being edited **and** of [`Subsystem::DEFAULT_TOML`].
@@ -3134,16 +3452,26 @@ fn set_leaf(table: &mut dyn toml_edit::TableLike, key_path: &str, value: toml_ed
     };
 
     if table.get(head).is_none() {
-        // An append takes the same inline-table fix-up `patch` applies. A
-        // `toml_edit::Table` is not implicit, so it renders its own `[head]`
-        // header once it carries the leaf.
+        // An append takes the same inline-table fix-up `patch` applies.
         //
         // Only an *absent* parent is created: a parent that exists and is not
         // a table is refused by `structural_refusal` before this runs, so
         // there is no branch here that replaces somebody's value with a block
         // (#1360 review, LOW 4).
         close_up_for_append(table);
-        table.insert(head, toml_edit::Item::Table(toml_edit::Table::new()));
+        let mut created = toml_edit::Table::new();
+        // **Implicit** (#1373): `toml_edit` then renders `[head]` only when
+        // the table ends up carrying a key of its own, which is exactly the
+        // rule a person writing the file by hand follows. Writing
+        // `bar.poll_seconds` into an empty overlay still produces
+        // `[bar]\npoll_seconds = …`, because `[bar]` holds a value; writing
+        // `display.argus.label` produces `[display.argus]` alone, where a
+        // non-implicit parent would have emitted a bare `[display]` header
+        // above it decorating nothing. A map entry is the first shape in the
+        // tree with a parent that holds only sub-tables (#888 P2), which is
+        // why this never showed before.
+        created.set_implicit(true);
+        table.insert(head, toml_edit::Item::Table(created));
     }
     if let Some(sub) = table
         .get_mut(head)
@@ -6930,6 +7258,70 @@ brightness = 5
         );
     }
 
+    /// A created intermediate is **implicit**: it renders its own header only
+    /// when it carries a key of its own (#1373).
+    ///
+    /// Both directions, because the change is a behaviour change to the leaf
+    /// writer and the wrong one is invisible in the family shapes P1 had:
+    /// `[core]` holds `brightness` directly, so it renders either way, while
+    /// `[display]` — a #888 P2 map, the first shape in the tree whose parent
+    /// holds only sub-tables — would render a bare header decorating nothing.
+    ///
+    /// **Red without `set_implicit(true)`**: the second file comes back as
+    /// `[display]\n\n[display.argus]\nlabel = "Argus"\n`.
+    #[test]
+    fn a_created_intermediate_renders_its_header_only_when_it_holds_a_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let with_a_key = dir.path().join("a.toml");
+        save_leaf_to_locked_unchecked::<Leds>(
+            &with_a_key,
+            "core.brightness",
+            Some(toml_edit::Value::from(7_i64)),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        // The tail after #1370's commented preamble — what this writer
+        // *stated*, which is the half this test is about.
+        let with_a_key = read(&with_a_key);
+        assert!(
+            with_a_key.ends_with("[core]\nbrightness = 7\n"),
+            "a parent holding a key of its own still renders its header:\n{with_a_key}"
+        );
+
+        let only_sub_tables = dir.path().join("b.toml");
+        save_leaf_to_locked_unchecked::<Leds>(
+            &only_sub_tables,
+            "display.argus.label",
+            Some(toml_edit::Value::from("Argus")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        let only_sub_tables = read(&only_sub_tables);
+        assert!(
+            only_sub_tables.ends_with("[display.argus]\nlabel = \"Argus\"\n"),
+            "{only_sub_tables}"
+        );
+        assert!(
+            !only_sub_tables.contains("\n[display]\n"),
+            "a parent holding only sub-tables needs no header of its own:\n{only_sub_tables}"
+        );
+
+        // …and #1370's preamble is still at the **head** of both files.
+        //
+        // The second one is what the implicit parent nearly cost: the header
+        // lift hangs the seed on `first_rendered_key`, and decor set on a
+        // table that emits no header line of its own is simply not in the
+        // output — so before `renders_a_header`, this file came back as the
+        // one written leaf with the whole documentation silently gone.
+        for file in [&with_a_key, &only_sub_tables] {
+            assert!(
+                file.starts_with("# The per-core LED strip.\n"),
+                "the documented preamble was dropped:\n{file}"
+            );
+        }
+    }
+
     /// **A first leaf save states the leaf and nothing else** (#1365 review,
     /// HIGH 1), under the documented preamble (#1370).
     ///
@@ -7530,13 +7922,45 @@ brightness = 5
         assert_eq!(read(&path), HAND_EDITED);
     }
 
-    /// A collection `Field` is refused **by its `Kind`**, before the document
+    /// A collection `Field` is judged **by its `Kind`**, before the document
     /// is even read — so a family whose overlay does not have the table yet is
-    /// refused exactly as one whose overlay does.
+    /// answered exactly as one whose overlay does, and neither leaves a file
+    /// behind.
+    ///
+    /// The two kinds answer differently since #1373 item 3, and that is the
+    /// point of asserting both here: a `Map` is [`ConfigError::NotALeaf`] —
+    /// it is structure, not a value — while a `List` *is* one leaf under rule
+    /// 3 and so gets the ordinary value judgement,
+    /// [`ConfigError::Rejected`], for a scalar where an array was declared.
     #[test]
-    fn a_leaf_save_refuses_a_collection_field_even_on_an_absent_table() {
+    fn a_collection_field_is_judged_by_its_kind_even_on_an_absent_table() {
+        const MAP_SCHEMA: crate::schema::Schema = crate::schema::Schema {
+            family: "core-leds",
+            fields: &[crate::schema::Field {
+                path: "core",
+                kind: crate::schema::Kind::Map(&[]),
+                doc: "pretend the whole table is a map of entries",
+            }],
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("core-leds.toml");
+
+        let err = save_leaf_to_locked::<Leds>(
+            &path,
+            &MAP_SCHEMA,
+            "core",
+            Some(toml_edit::Value::from(1_i64)),
+            &BTreeSet::new(),
+        )
+        .expect_err("a table of named entries is never a leaf");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(
+            reason.contains("table of named entries"),
+            "the #1360 HIGH 1 guarantee, kept while its List sibling was let through: {reason}"
+        );
+        assert!(!path.exists(), "and no file was seeded on the way");
 
         let err = save_leaf(
             &path,
@@ -7544,9 +7968,8 @@ brightness = 5
             Some(toml_edit::Value::from("teal")),
             &BTreeSet::new(),
         )
-        .expect_err("a list row is read-only in v1");
-
-        assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+        .expect_err("a list takes an array, not a word");
+        assert!(matches!(err, ConfigError::Rejected { .. }), "got {err:?}");
         assert!(!path.exists(), "and no file was seeded on the way");
     }
 
@@ -7749,5 +8172,421 @@ brightness = 5
             .expect("mtime");
         assert_eq!(before, after, "the file was replaced for nothing");
         assert_eq!(read(&path), HAND_EDITED);
+    }
+
+    // ── A list is one leaf; a map is not (#1373 item 3) ─────────────────────
+
+    /// `workspaces`' `order` is a [`crate::schema::Kind::List`] of scalars,
+    /// and rule 3 replaces an array whole — so the overlay states the list or
+    /// it states nothing, and the **whole array** is one leaf write.
+    ///
+    /// **Red on `829add50`**, where the checked writer refused every
+    /// `is_collection()` field: `NotALeaf { reason: "it is a list or a table
+    /// of entries, which v1 renders read-only" }`, and a form editing a list
+    /// had to reach for the unchecked spelling and lose `Kind::accepts` over
+    /// the elements.
+    #[test]
+    fn a_list_leaf_is_written_and_reset_whole() {
+        let (_dir, path) = scratch(HAND_EDITED);
+        let mut array = toml_edit::Array::new();
+        array.push("cyan");
+        array.push("magenta");
+
+        save_leaf(
+            &path,
+            "core.palette",
+            Some(toml_edit::Value::Array(array)),
+            &BTreeSet::new(),
+        )
+        .expect("an array is one leaf");
+        let written = read(&path);
+        assert_eq!(
+            changed_lines(HAND_EDITED, &written),
+            vec![(
+                r#"palette = ["amber", "rust"]"#.to_owned(),
+                r#"palette = ["cyan", "magenta"]"#.to_owned()
+            )],
+            "exactly one line moved:\n{written}"
+        );
+
+        // …and the row's reset removes the array rather than emptying it, so
+        // the value falls back to the layer below (spec §5).
+        save_leaf(&path, "core.palette", None, &BTreeSet::new()).expect("a reset removes it");
+        let after = read(&path);
+        assert!(
+            !after.contains("palette"),
+            "the reset left an array behind:\n{after}"
+        );
+        assert!(
+            after.contains("mystery = 42") && after.contains("[unrelated]"),
+            "and took nothing else with it:\n{after}"
+        );
+    }
+
+    /// Every element is still judged by the field's own kind, which is the
+    /// half routing a list through the *unchecked* writer would have lost.
+    #[test]
+    fn a_list_leaf_refuses_an_element_outside_its_kind() {
+        let (_dir, path) = scratch(HAND_EDITED);
+        let mut array = toml_edit::Array::new();
+        array.push("amber");
+        array.push(7_i64); // `core.palette` is a list of non-blank text
+        let err = save_leaf(
+            &path,
+            "core.palette",
+            Some(toml_edit::Value::Array(array)),
+            &BTreeSet::new(),
+        )
+        .expect_err("an integer is not text");
+        assert!(matches!(err, ConfigError::Rejected { .. }), "got {err:?}");
+        assert_eq!(read(&path), HAND_EDITED, "and wrote nothing");
+    }
+
+    // ── One whole entry, removed (#1373 item 6) ─────────────────────────────
+
+    /// A file shaped like an overlay that has grown entries: two undocumented
+    /// `[display.<name>]` tables beside the documented `[core]`.
+    const WITH_ENTRIES: &str = r#"# My LEDs.
+enabled = true
+
+[core]
+brightness = 3
+
+[display.argus]
+# What the row calls it.
+label = "Argus"
+mystery = 42
+
+[display.borealis]
+label = "Borealis"
+"#;
+
+    /// The call's whole point: one table goes, and **only** it — the
+    /// un-schema'd `mystery = 42` inside it included, because it is inside the
+    /// entry the operator asked to delete, while every byte outside is
+    /// untouched.
+    ///
+    /// **Red if `remove_leaf`'s prune rule is what does the work**: resetting
+    /// `display.argus.label` alone leaves `mystery = 42` and the header
+    /// standing, which is the three-write delete this call replaces.
+    #[test]
+    fn remove_entry_takes_one_table_and_nothing_else() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("an undocumented entry is removable");
+        let after = read(&path);
+        assert_eq!(
+            after,
+            r#"# My LEDs.
+enabled = true
+
+[core]
+brightness = 3
+
+[display.borealis]
+label = "Borealis"
+"#,
+            "the byte pin"
+        );
+    }
+
+    /// The last entry takes its **undocumented** parent with it — an empty
+    /// `[display]` is a header that decorates nothing — while the documented
+    /// `[core]` stays behind its own last key (`remove_leaf`'s asymmetry,
+    /// inherited rather than restated).
+    #[test]
+    fn removing_the_last_entry_prunes_its_undocumented_parent() {
+        let (_dir, path) = scratch("[display.argus]\nlabel = \"Argus\"\n");
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new()).expect("removes");
+        assert_eq!(read(&path), "", "the emptied `[display]` went with it");
+    }
+
+    /// Refusal 2: a locked entry, and a locked map above one.
+    ///
+    /// **Red without `locked_here`**: the entry the base layer pinned is
+    /// deleted out of the overlay, and the next load puts nix's value back
+    /// while the operator is looking at a row that says it is gone.
+    #[test]
+    fn remove_entry_refuses_a_locked_entry_or_a_locked_map() {
+        for pin in ["display.argus", "display"] {
+            let (_dir, path) = scratch(WITH_ENTRIES);
+            let locked: BTreeSet<String> = [pin.to_owned()].into_iter().collect();
+            let err = remove_entry_to_locked::<Leds>(&path, "display.argus", &locked)
+                .expect_err("a pinned entry is not the operator's to delete");
+            assert!(
+                matches!(&err, ConfigError::Locked { key, .. } if key == "display.argus"),
+                "{pin}: got {err:?}"
+            );
+            assert_eq!(read(&path), WITH_ENTRIES, "{pin}: it wrote something");
+        }
+    }
+
+    /// …and a lock one level **down** (#1383 review, LOW 2).
+    ///
+    /// `nix/module-common.nix` renders exactly this for an operator who set
+    /// one option of one agent: `_locked = [ "display.argus.label" ]`. The
+    /// reader's [`Loaded::is_locked`] walks *up* only — right for a row,
+    /// which is a leaf — so a delete of the whole entry answered `Ok` and
+    /// took the overlay line that lock exists to hold.
+    ///
+    /// **Red without `pinned_here_or_below`'s downward arm**: the call
+    /// succeeds and `[display.argus]` is gone, `label` and all.
+    #[test]
+    fn remove_entry_refuses_an_entry_with_a_locked_leaf_under_it() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let locked: BTreeSet<String> = ["display.argus.label".to_owned()].into_iter().collect();
+        let err = remove_entry_to_locked::<Leds>(&path, "display.argus", &locked)
+            .expect_err("a lock under the entry is still a lock on it");
+        assert!(
+            matches!(&err, ConfigError::Locked { key, .. } if key == "display.argus.label"),
+            "the refusal names the pinned line, not the path asked for: {err:?}"
+        );
+        assert_eq!(read(&path), WITH_ENTRIES);
+
+        // …and a lock on a *sibling* map entry is not a lock on this one.
+        let unrelated: BTreeSet<String> =
+            ["display.borealis.label".to_owned()].into_iter().collect();
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &unrelated)
+            .expect("a sibling's lock pins nothing here");
+        assert!(!read(&path).contains("argus"));
+    }
+
+    // ── The header lift, around a removal (#1383 review, HIGH 1) ────────────
+
+    /// A file as the writer itself leaves it: #1370's commented preamble,
+    /// then two entries the operator added through the form.
+    ///
+    /// Built by **saving through the public writer** rather than by hand, so
+    /// the preamble is where `put_header` really put it — which is the whole
+    /// point. With the map as the only top-level item, that is the *first
+    /// entry's* `[display.argus]` prefix decor, and a bare removal of that
+    /// entry took the documentation with it.
+    fn seeded_with_two_entries() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+        for (key, value) in [
+            ("display.argus.label", "Argus"),
+            ("display.borealis.label", "Borealis"),
+        ] {
+            save_leaf_to_locked_unchecked::<Leds>(
+                &path,
+                key,
+                Some(toml_edit::Value::from(value)),
+                &BTreeSet::new(),
+            )
+            .expect("saves");
+        }
+        (dir, path)
+    }
+
+    /// Deleting the **first** entry keeps the preamble, byte for byte.
+    ///
+    /// The two byte pins this PR already had miss it by construction: one
+    /// file's preamble hangs off a top-level leaf (`enabled`), the other has
+    /// no preamble at all. Only a seeded file whose *first item is the map*
+    /// puts the documentation on the entry being deleted.
+    ///
+    /// **Red without the lift in `remove_entry_to_locked`**: the file comes
+    /// back as `[display.borealis]\nlabel = "Borealis"\n` and every line of
+    /// the documentation is gone.
+    #[test]
+    fn removing_the_first_entry_of_a_seeded_file_keeps_the_preamble() {
+        let (_dir, path) = seeded_with_two_entries();
+        let seed = commented_seed(Leds::DEFAULT_TOML);
+        assert_eq!(
+            read(&path),
+            format!(
+                "{seed}[display.argus]\nlabel = \"Argus\"\n\n[display.borealis]\nlabel = \"Borealis\"\n"
+            ),
+            "sanity: the preamble is on the first entry's own decor"
+        );
+
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("the operator's own entry");
+        assert_eq!(
+            read(&path),
+            format!("{seed}[display.borealis]\nlabel = \"Borealis\"\n"),
+            "the documentation stays, and only the entry goes"
+        );
+    }
+
+    /// Deleting the **only** entry leaves the documentation rather than an
+    /// empty file — which would be unrecoverable, because the seed runs on
+    /// `NotFound` and the file still exists.
+    ///
+    /// **Red without the lift**: `after: ""`.
+    #[test]
+    fn removing_the_only_entry_of_a_seeded_file_leaves_the_documentation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("core-leds.toml");
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "display.argus.label",
+            Some(toml_edit::Value::from("Argus")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("the operator's own entry");
+        assert_eq!(
+            read(&path),
+            commented_seed(Leds::DEFAULT_TOML),
+            "an emptied overlay is the documentation, not nothing"
+        );
+
+        // …and the next save still lands below it rather than above.
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "display.borealis.label",
+            Some(toml_edit::Value::from("Borealis")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        assert_eq!(
+            read(&path),
+            format!(
+                "{}[display.borealis]\nlabel = \"Borealis\"\n",
+                commented_seed(Leds::DEFAULT_TOML)
+            )
+        );
+    }
+
+    /// #1380's ownership gate, at depth: a comment the **operator** wrote
+    /// above `[core]` is theirs and does not move, on a nested-entry save or
+    /// on a removal.
+    ///
+    /// The nested variants of `the_lift_leaves_a_comment_the_operator_wrote`,
+    /// which #1380 could only write for a top-level key: before #1373 no
+    /// writer created a table two deep, so nothing could reach the arm where
+    /// the lift descends.
+    ///
+    /// **Red without the `commented_seed(…).starts_with(&header)` gate**: the
+    /// note ends up below `[display.argus]`, describing an entry it was never
+    /// about.
+    #[test]
+    fn the_lift_leaves_an_operators_comment_alone_on_a_nested_save_and_a_removal() {
+        const THEIRS: &str = "# I keep the strip dim on purpose.\n[core]\nbrightness = 1\n";
+
+        let (_dir, path) = scratch(THEIRS);
+        save_leaf_to_locked_unchecked::<Leds>(
+            &path,
+            "display.argus.label",
+            Some(toml_edit::Value::from("Argus")),
+            &BTreeSet::new(),
+        )
+        .expect("saves");
+        assert_eq!(
+            read(&path),
+            format!("{THEIRS}\n[display.argus]\nlabel = \"Argus\"\n"),
+            "the operator's note stays on the key it describes"
+        );
+
+        remove_entry_to_locked::<Leds>(&path, "display.argus", &BTreeSet::new())
+            .expect("the operator's own entry");
+        assert_eq!(
+            read(&path),
+            THEIRS,
+            "…and the removal does not lift it either"
+        );
+    }
+
+    /// Refusal 3: `[core]` is part of `core-leds.toml`'s documented shape, so
+    /// it is not an entry anybody added.
+    ///
+    /// **Red without the `documented` check**: the delete button of a map
+    /// whose path collided with a documented table would take the table, its
+    /// comment block and every key under it.
+    #[test]
+    fn remove_entry_refuses_a_table_the_documented_default_states() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let err = remove_entry_to_locked::<Leds>(&path, "core", &BTreeSet::new())
+            .expect_err("the documented shape is not an entry");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(reason.contains("documented default"), "{reason}");
+        assert_eq!(read(&path), WITH_ENTRIES);
+    }
+
+    /// Refusal 4: a scalar is a leaf, and a leaf is `save_leaf_to_locked`'s
+    /// `None`. Refusing here rather than removing it is what keeps a delete
+    /// button from quietly becoming a second, unvalidated reset.
+    #[test]
+    fn remove_entry_refuses_a_scalar() {
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let err = remove_entry_to_locked::<Leds>(&path, "enabled", &BTreeSet::new())
+            .expect_err("a bool is not an entry");
+        let ConfigError::NotALeaf { reason, .. } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(reason.contains("scalar"), "{reason}");
+        assert_eq!(read(&path), WITH_ENTRIES);
+    }
+
+    /// Refusal 1, and the two states that are not refusals at all: an entry
+    /// no layer holds, and a file that does not exist. Both are already what
+    /// the caller asked for, so neither writes.
+    #[test]
+    fn remove_entry_refuses_a_malformed_path_and_shrugs_at_an_absent_one() {
+        for spelling in ["", "display.", ".argus", "display..argus"] {
+            let (_dir, path) = scratch(WITH_ENTRIES);
+            let err = remove_entry_to_locked::<Leds>(&path, spelling, &BTreeSet::new())
+                .expect_err("a table path is non-empty dotted segments");
+            assert!(matches!(err, ConfigError::NotALeaf { .. }), "got {err:?}");
+            assert_eq!(read(&path), WITH_ENTRIES, "{spelling:?} wrote something");
+        }
+
+        let (_dir, path) = scratch(WITH_ENTRIES);
+        let before = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        remove_entry_to_locked::<Leds>(&path, "display.nobody", &BTreeSet::new())
+            .expect("an entry that is not there is already gone");
+        assert_eq!(read(&path), WITH_ENTRIES);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .expect("mtime"),
+            before,
+            "the file was replaced for nothing"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("core-leds.toml");
+        remove_entry_to_locked::<Leds>(&missing, "display.argus", &BTreeSet::new())
+            .expect("nothing to remove from a file that does not exist");
+        assert!(!missing.exists(), "it created a file to delete from");
+    }
+
+    /// An inline array is an entry too — [`crate::schema::Kind::List`]'s half
+    /// of item 6 — and removing it is not the same as emptying it.
+    #[test]
+    fn remove_entry_takes_a_whole_inline_array() {
+        let (_dir, path) = scratch("order = [\"chat\", \"dev\"]\nkept = true\n");
+        remove_entry_to_locked::<Leds>(&path, "order", &BTreeSet::new())
+            .expect("an array is one whole value");
+        assert_eq!(read(&path), "kept = true\n");
+    }
+
+    /// The `(line before, line after)` pairs by which two files differ, by
+    /// position — the same "exactly one leaf" assertion the form's own tests
+    /// make, so a writer that replaced a whole table would move comment and
+    /// blank lines too and the count would not be one.
+    fn changed_lines(before: &str, after: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut a = before.lines();
+        let mut b = after.lines();
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return out,
+                (left, right) => {
+                    let (left, right) = (left.unwrap_or("<missing>"), right.unwrap_or("<missing>"));
+                    if left != right {
+                        out.push((left.to_owned(), right.to_owned()));
+                    }
+                }
+            }
+        }
     }
 }

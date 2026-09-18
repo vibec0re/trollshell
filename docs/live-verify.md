@@ -1858,7 +1858,15 @@ title` in the stderr tail — worth a deliberate look on first run, since
       calendar. Within one poll (60 s) that calendar's rows in the Upcoming
       list should show **that** colour on their leading dot, while a calendar
       with no colour set keeps its old hash-palette dot. Two calendars sharing
-      one colour should look identical. The month-grid dots are deliberately
+      one colour should look identical. That "no colour set" is the **shell's**
+      decision, not something EDS reports: EDS gives every calendar its
+      construct-time default (GNOME blue, `#62a0ea`) when the keyfile carries no
+      `Color=`, and `hytte-ecal` treats exactly that value as unset — so
+      calendars you have never coloured must keep their distinct palette dots
+      rather than all turning the same blue, which is the specific thing to look
+      at on a machine with several untouched calendars. Its one visible cost: a
+      calendar you deliberately colour GNOME blue gets its palette dot instead.
+      The month-grid dots are deliberately
       **not** changed by this — they still hash by name, so a mismatch between
       a grid dot and a row dot for the same calendar is expected here, not a
       bug (see the PR body for why). A value GTK can't read as a colour —

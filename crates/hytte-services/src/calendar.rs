@@ -113,8 +113,12 @@ pub struct CalendarEvent {
     /// The colour the user picked for this calendar, from the EDS source's
     /// `[Calendar] Color=` key ([`hytte_ecal::Source::color`]) — a `#rrggbb`
     /// or `#rrggbbaa` string, already shape-checked there. `None` when the
-    /// source carries no colour (or one in a spelling that isn't hex), in
-    /// which case the UI falls back to its hash-derived palette keyed by
+    /// source carries no colour, when its spelling isn't hex, **or** when EDS
+    /// is reporting its own construct-time default rather than a choice
+    /// ([`hytte_ecal::EDS_DEFAULT_CALENDAR_COLOR`] — there is no "unset" at
+    /// the FFI layer, so without that the fallback below would be dead code
+    /// and every uncoloured calendar would share one blue). In each case the
+    /// UI falls back to its hash-derived palette keyed by
     /// [`calendar_name`](Self::calendar_name). Deliberately **not** on the
     /// plugin wire — `plugins::pump` sends `calendar_name` only (#542).
     pub calendar_color: Option<String>,

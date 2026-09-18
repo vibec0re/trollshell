@@ -125,7 +125,7 @@ pkgs.testers.runNixOSTest {
     # Calendar" carries the `[Calendar]` group with no `Color=` at all —
     # and `Source::color` reads each off its own `ESourceSelectable`
     # extension. This is the only place that FFI read runs against a real
-    # source registry; the hermetic tests cover only the shape check it
+    # source registry; the hermetic tests cover only the decisions it
     # applies to the string.
     #
     # BOTH lines are asserted, because either alone is satisfiable by a
@@ -135,12 +135,34 @@ pkgs.testers.runNixOSTest {
     # regex. Only the `(none)` line makes the pair discriminating — no
     # single constant can answer both.
     #
+    # The `(none)` line carries a SECOND duty, and that one has already
+    # earned its keep. There is no "unset" colour at the FFI layer:
+    # `ESourceSelectable`'s `color` is a *construct* property with
+    # `default-value="#62a0ea"`, so an uncoloured calendar answers GNOME
+    # blue, not NULL. The first version of this assertion found that the
+    # hard way — run 35331529534 printed
+    #     - Uncoloured Calendar (test-calendar-no-color) color=#62a0ea
+    # which is why `hytte_ecal::EDS_DEFAULT_CALENDAR_COLOR` exists and why
+    # `Source::color` reports that exact value as `None`. So this line is
+    # also a deliberate **version tripwire**: an EDS release that changes
+    # the default reddens it here, which is the alarm we want — the
+    # alternative is the shell's whole hash-palette fallback silently
+    # dying and every unconfigured calendar on screen turning one colour.
+    # Read a failure here as "EDS moved, update the constant", never as a
+    # flake to retry.
+    #
     # Keyed off the distinct display names rather than off position, so
     # neither the registry's ordering nor which calendar the recurrence
     # probe below happens to write into can flip them. ("Uncoloured
     # Calendar" does not match the first regex either: after `- Test
     # Calendar ` that line has an `N`, not the literal `(` the pattern
     # requires.)
+    #
+    # EDS's own sources appear in this output too — the auto-provisioned
+    # `Personal` (#62a0ea, i.e. the default) and `Birthdays &
+    # Anniversaries` (#ffbe6f). Deliberately NOT asserted on: their
+    # colours are EDS's business, so pinning them would fail this test for
+    # reasons that say nothing about our read.
     assert re.search(r"- Test Calendar \(.*\) color=#ff8800", output), output
     assert re.search(r"- Uncoloured Calendar \(.*\) color=\(none\)", output), output
 

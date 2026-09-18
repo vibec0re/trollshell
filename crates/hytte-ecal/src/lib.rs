@@ -282,20 +282,33 @@ impl Source {
         r != 0
     }
 
-    /// The colour EDS keeps on this source's `Calendar` extension — the
-    /// `[Calendar] Color=` key of the `.source` keyfile, which Evolution and
-    /// GNOME Calendar write when a user picks a calendar's colour. The
-    /// shell tints its event rows with it instead of the hash-derived palette
-    /// (#1223 item 1).
+    /// The colour **the user picked** for this calendar — the `[Calendar]
+    /// Color=` key of the `.source` keyfile, which Evolution and GNOME Calendar
+    /// write when someone chooses a colour. The shell tints its event rows with
+    /// it instead of the hash-derived palette (#1223 item 1).
     ///
-    /// `None` when the source carries no `Calendar` extension, when the key is
-    /// unset or empty, **or** when the stored value isn't a `#rrggbb` /
-    /// `#rrggbbaa` hex triple. EDS stores whatever GTK's colour parser
-    /// accepted, so a named colour (`red`), a `rgb(…)` form, or a short
-    /// `#rgb` is possible and is deliberately dropped here rather than handed
-    /// to a caller that expects hex — the shell falls back to its own palette
-    /// for those, which is conservative but never wrong. Nothing here panics
-    /// on a malformed value.
+    /// `None` when the source carries no `Calendar` extension, when the stored
+    /// value isn't a `#rrggbb` / `#rrggbbaa` hex triple, **and — the case that
+    /// is not obvious — when EDS is reporting its own default rather than a
+    /// choice.** There is no "unset" to read at this layer:
+    /// `ESourceSelectable`'s `color` property is a *construct* property with
+    /// `default-value="#62a0ea"`, so every calendar source answers that string
+    /// from the moment it exists, keyfile key or not. This method reports that
+    /// exact value as no colour (see [`EDS_DEFAULT_CALENDAR_COLOR`]), so a
+    /// caller's own fallback still applies to a calendar nobody has coloured —
+    /// without it, every unconfigured calendar on screen would collapse to one
+    /// GNOME blue and the caller's palette would be dead code.
+    ///
+    /// The cost of that, stated plainly: a user who deliberately picks
+    /// `#62a0ea` is indistinguishable from one who never picked anything, and
+    /// gets the palette. That is the right trade — the palette colour is a
+    /// perfectly good dot, where the alternative loses every distinction
+    /// between untouched calendars.
+    ///
+    /// EDS stores whatever GTK's colour parser accepted, so a named colour
+    /// (`red`), an `rgb(…)` form, or a short `#rgb` is possible and is
+    /// deliberately dropped rather than handed to a caller that expects hex —
+    /// conservative but never wrong. Nothing here panics on a malformed value.
     #[must_use]
     pub fn color(&self) -> Option<String> {
         // This guard is **load-bearing**, not belt-and-braces.
@@ -345,7 +358,7 @@ impl Source {
         // returns above are both before the allocation exists) and never read
         // after.
         unsafe { sys::g_free(raw.cast::<c_void>()) }
-        is_hex_color(&value).then_some(value)
+        user_picked_color(value)
     }
 
     pub(crate) fn raw(&self) -> *mut sys::ESource {
@@ -353,8 +366,55 @@ impl Source {
     }
 }
 
-/// The shape check behind [`Source::color`]: `true` only for a `#` followed by
-/// exactly 6 (`#rrggbb`) or 8 (`#rrggbbaa`) ASCII hex digits.
+/// EDS's own default for an [`sys::ESourceSelectable`]'s colour — GNOME blue.
+///
+/// **Not a colour anybody picked.** `ESourceSelectable`'s `color` is a
+/// *construct* property with `default-value="#62a0ea"` (EDS 3.60.2's
+/// `EDataServer-1.2.gir`, `<property name="color" … construct="1"
+/// default-value="#62a0ea">`), so every calendar source carries it from
+/// construction whether or not its `.source` keyfile has a `[Calendar] Color=`
+/// key. `e_source_selectable_dup_color` therefore answers this string rather
+/// than `NULL` for an uncoloured calendar: at the FFI layer, "unset" does not
+/// exist.
+///
+/// Confirmed end to end in the `eds-nixos-test` VM (run 35331529534, EDS
+/// 3.60.2): a seeded calendar with a `[Calendar]` group and **no** `Color=`
+/// printed `color=#62a0ea`, as did EDS's auto-provisioned `Personal`.
+/// libedataserver exposes no C constant for it — the literal appears in the
+/// GIR's `default-value` and in `libedataserver-1.2.so`'s strings, and a
+/// `grep -i 62a0ea` over `include/evolution-data-server/` finds nothing — which
+/// is why this crate carries its own copy, and why an EDS release that changes
+/// the default must redden that VM assertion rather than silently pass.
+///
+/// [`Source::color`] reports this value as [`None`]; see that method for the
+/// reasoning and for what it costs.
+pub const EDS_DEFAULT_CALENDAR_COLOR: &str = "#62a0ea";
+
+/// The filter [`Source::color`] applies to whatever string EDS hands back:
+/// `Some` only for a hex triple somebody actually chose.
+///
+/// Two rejections, both `None` so the caller's own fallback applies — a
+/// spelling that isn't `#rrggbb`/`#rrggbbaa` ([`is_hex_color`]), and EDS's
+/// construct-time default ([`EDS_DEFAULT_CALENDAR_COLOR`], compared
+/// case-insensitively because EDS stores the user's spelling verbatim and
+/// `#62A0EA` is the same colour).
+///
+/// Pure and total, and a separate function for exactly that reason: the FFI
+/// read above needs a live EDS, this does not, so this is where both decisions
+/// are tested. Dropping the default compare here is what the VM's
+/// `color=(none)` assertion catches in the other direction.
+fn user_picked_color(value: String) -> Option<String> {
+    if !is_hex_color(&value) {
+        return None;
+    }
+    if value.eq_ignore_ascii_case(EDS_DEFAULT_CALENDAR_COLOR) {
+        return None;
+    }
+    Some(value)
+}
+
+/// The shape check behind [`user_picked_color`]: `true` only for a `#` followed
+/// by exactly 6 (`#rrggbb`) or 8 (`#rrggbbaa`) ASCII hex digits.
 ///
 /// Pure and total — the FFI read above needs a live EDS, this does not, so it
 /// is where the "is this a colour?" decision is tested. Deliberately strict:
@@ -2225,6 +2285,56 @@ mod tests {
         ] {
             assert!(!super::is_hex_color(bad), "should have rejected {bad:?}");
         }
+    }
+
+    /// EDS's construct-time default is reported as **no colour**, so the
+    /// caller's own fallback still applies to a calendar nobody has coloured.
+    ///
+    /// This is the whole reason `Source::color` is not just the hex check:
+    /// `ESourceSelectable`'s `color` is a construct property defaulting to
+    /// `#62a0ea`, so the FFI has no "unset" to answer. Measured in the VM
+    /// (run 35331529534, EDS 3.60.2): a seeded calendar with no `Color=` key
+    /// printed `color=#62a0ea`. Without this compare every unconfigured
+    /// calendar collapses to one blue dot and the caller's palette is dead
+    /// code — a visible regression for anyone who never picked a colour.
+    #[test]
+    fn the_eds_default_colour_is_reported_as_no_colour() {
+        assert_eq!(super::EDS_DEFAULT_CALENDAR_COLOR, "#62a0ea");
+        assert_eq!(
+            super::user_picked_color(super::EDS_DEFAULT_CALENDAR_COLOR.to_owned()),
+            None,
+            "EDS's own default is not a choice; it must fall through to the caller's palette"
+        );
+        // EDS stores the spelling verbatim, so the compare is case-insensitive.
+        assert_eq!(super::user_picked_color("#62A0EA".to_owned()), None);
+        assert_eq!(super::user_picked_color("#62a0EA".to_owned()), None);
+    }
+
+    /// …and a colour somebody actually picked survives, including one that is
+    /// merely *near* the default. Only the exact default is swallowed.
+    #[test]
+    fn a_picked_colour_survives_the_default_filter() {
+        assert_eq!(
+            super::user_picked_color("#ff8800".to_owned()),
+            Some("#ff8800".to_owned())
+        );
+        assert_eq!(
+            super::user_picked_color("#3584e4".to_owned()),
+            Some("#3584e4".to_owned())
+        );
+        // One digit away from the default, and with the default's own alpha
+        // spelling — neither is the default.
+        assert_eq!(
+            super::user_picked_color("#62a0eb".to_owned()),
+            Some("#62a0eb".to_owned())
+        );
+        assert_eq!(
+            super::user_picked_color("#62a0eaff".to_owned()),
+            Some("#62a0eaff".to_owned())
+        );
+        // The shape check still runs first.
+        assert_eq!(super::user_picked_color("red".to_owned()), None);
+        assert_eq!(super::user_picked_color(String::new()), None);
     }
 
     /// `GError.domain` is a `GQuark` (`guint32`); the struct must mirror

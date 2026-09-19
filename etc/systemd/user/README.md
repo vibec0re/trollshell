@@ -68,7 +68,10 @@ host: it renders the plugin's declarative widget tree, brokers its effects,
 and pushes back a subscribed subset of shell state. `hytte-plugin-clock-demo`
 is the **reference plugin** for the "frontend B" plugin architecture (#35): it
 mounts a clock in the sidebar's top slot and opens the power menu when its
-button is clicked.
+button is clicked. Since #1388 it is also the smallest **two-instance** demo —
+the same binary renders a bar chip instead when the launch mounts it in a bar
+region (`mount = "BarCenter"`), which is a second `plugins.<id>` entry pointing
+at the same package, not a second binary.
 
 **The declarative launcher is the path plugins run through (#872).** This
 directory does not ship a unit per plugin. Instead: `programs.trollshell.plugins`

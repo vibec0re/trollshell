@@ -75,10 +75,16 @@ const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 /// which is where the race came from. It cannot *close* the window — zbus
 /// exposes the `started_event` that would prove readiness only through
 /// `connection::Builder`, and only for a connection built with an
-/// already-served interface — so a first call can still be swallowed. Measured
-/// on a 4-CPU set saturated with busy loops (the GitHub runner's shape): 29 of
-/// 100 runs still lose their first `Hello`, and every one of them is answered
-/// on the very next attempt.
+/// already-served interface — so a first call can still be swallowed, and
+/// **this bound, not that fix, is what stops #1011 recurring.** Measured over
+/// `tests/export.rs` on 12 concurrent 4-core shards each contending with 8 busy
+/// loops: the tree without these bounds hung 10 of 300 runs, and the same tree
+/// with them hung 0 of 300 — while the first `Hello` was still lost in 35 of
+/// 900 runs without `begin_dispatching` and 94 of 900 with it (its doc has the
+/// table and why the test constructor is the worse of its two call sites).
+///
+/// Across all 2,400 instrumented runs, **every** lost call was answered on the
+/// very next attempt — the retry count was never above 1.
 ///
 /// So a call that gets no reply is treated as "not ready yet" and **retried**,
 /// not failed. That is what lets [`CALL_BUDGET`] be short: a swallowed call
@@ -100,6 +106,28 @@ pub const CALL_BUDGET: Duration = Duration::from_secs(1);
 #[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
 pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
 
+/// Upper bound on reaping the ephemeral `dbus-daemon` in [`BusGuard`]'s `Drop`.
+///
+/// #1011's diagnosis named **two** things in this crate's tests that can park a
+/// test forever, and the raw `zbus::Proxy::call` that [`CALL_BUDGET`] covers was
+/// only one of them. The other is this drop: `block_in_place` plus a nested
+/// `block_on` on [`tokio::process::Child::wait`], with nothing bounding it.
+///
+/// Nothing reached it in the 2,400 instrumented runs the PR for #1011 measured,
+/// which is why it is a backstop rather than a fix. But an unbounded wait here
+/// would be silent in exactly the way the unbounded call was — the test body has
+/// already finished, libtest has not yet printed a result, and CI shows nothing
+/// at all — so leaving the suite's *other* forever-park unbounded would leave
+/// #1011's signature reachable by a second door. Bounded, a reap that wedges
+/// costs one line on stderr and an abandoned child (already `SIGKILL`ed, and
+/// spawned with `kill_on_drop(true)`) instead of the whole job's timeout.
+///
+/// Sized like [`DBUS_DAEMON_STARTUP_BUDGET`] and for the same reason: it is a
+/// liveness guard, not a latency assertion. Reaping a `SIGKILL`ed local process
+/// takes microseconds; 30 s is headroom for a starved runner, not for a slow
+/// path.
+const DAEMON_REAP_BUDGET: Duration = Duration::from_secs(30);
+
 pub struct BusGuard {
     child: Option<Child>,
     tmp: TempDir,
@@ -116,10 +144,23 @@ impl Drop for BusGuard {
             // TempDir (socket directory) is not removed before the process exits.
             // block_in_place suspends async scheduling on this thread, allowing
             // a nested block_on without the "cannot block inside async" panic.
+            //
+            // Bounded by DAEMON_REAP_BUDGET — see its doc: this is the second of
+            // the two forever-parks #1011's diagnosis named, and an unbounded
+            // wait here is silent in exactly the way the unbounded call was.
             let _ = child.start_kill();
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
-                let _ = handle.block_on(child.wait());
+                if handle
+                    .block_on(tokio::time::timeout(DAEMON_REAP_BUDGET, child.wait()))
+                    .is_err()
+                {
+                    eprintln!(
+                        "common::BusGuard: the ephemeral dbus-daemon did not exit within \
+                         {DAEMON_REAP_BUDGET:?} of SIGKILL; abandoning the reap rather than \
+                         hanging the test (#1011)"
+                    );
+                }
             });
         }
     }

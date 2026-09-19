@@ -664,19 +664,55 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
 ///
 /// ## What it closes, and what it does not
 ///
-/// Calling this the instant a connection is installed shrinks the window from
-/// "until some supervisor task is scheduled and its first mount completes" —
-/// unbounded, and in #1011's captures not even *started* when the call was
-/// issued — to "until one `AddMatch` round-trip to the broker completes",
-/// which is the earliest any zbus consumer can reach. It does not *close* the
-/// window: zbus exposes the `started_event` that would prove readiness only
+/// Registering that rule is **local** — it is not a broker round-trip.
+/// `Connection::add_match` only issues `org.freedesktop.DBus.AddMatch` when
+/// `self.is_bus() && msg_type == Type::Signal`, and the object server's rule is
+/// a `MethodCall` one, so it costs two mutex acquisitions and nothing on the
+/// wire. (An earlier draft of this comment said otherwise; #1011's PR corrected
+/// it against zbus 5.14's source.) What is left is therefore purely a
+/// *scheduling* window — the spawned task has to be polled once — and it does
+/// not *close*: zbus exposes the `started_event` that would prove readiness only
 /// through `connection::Builder`, and only when the connection is built with at
 /// least one already-served interface (`Builder::build_` starts the socket
 /// reader *after* awaiting it). Serving a placeholder interface on both shell
-/// buses to buy that is a bus-surface decision, not a bug fix, so the residual
-/// is instead covered where it can be: every raw-proxy wait in this crate's
-/// tests is bounded, so a recurrence is a named red assertion in seconds
-/// rather than a silent hang.
+/// buses to buy that is a bus-surface decision, not a bug fix.
+///
+/// How wide that window is depends on **which thread calls this**, because
+/// zbus's `tokio` feature makes `Executor::spawn` a plain `tokio::task::spawn`:
+/// called from a runtime worker, the task lands in that worker's LIFO slot and
+/// is polled next; called from outside one — such as the thread a
+/// `#[tokio::test]` body runs `block_on` on — it lands on the global injection
+/// queue, which CPU-starved workers only drain every `global_queue_interval`
+/// ticks. Measured over `tests/export.rs`, 12 concurrent 4-core shards each
+/// contending with 8 busy loops, counting runs whose first `Hello` got no reply
+/// at all:
+///
+/// | where `begin_dispatching` runs | first `Hello` lost |
+/// |---|---|
+/// | nowhere (the tree before this) | 35 / 900 (3.9 %) |
+/// | `supervisor_loop` — a worker; **the production path** | 9 / 600 (1.5 %) |
+/// | `for_test` — `block_on`'s thread; the test path | 94 / 900 (10.4 %) |
+///
+/// So on the path that ships, this is a 2.6x improvement; in the test
+/// constructor it is a regression that the bounded retry absorbs (across 2,400
+/// instrumented runs no run ever needed more than one retry). **Neither number
+/// is what stops #1011 recurring — the bound in the tests is**: with these
+/// bounds and without this function, `tests/export.rs` hung 0 of 300 runs under
+/// that same load, where the unbounded tree hung 10 of 300.
+///
+/// What this function buys that no bound can is the property
+/// `tests/connection_basic.rs`'s
+/// `shared_connection_answers_method_calls_before_anything_is_exported`
+/// asserts — that a `SharedConnection` with nothing exported on it answers a
+/// method call at all — which is deterministically red without it (300 of 300
+/// runs), because there no amount of retrying can help: the object server is
+/// never created, so every call is dropped forever.
+///
+/// # Panics
+///
+/// Must be called from inside a tokio runtime: with zbus's `tokio` feature its
+/// executor is `tokio::task::spawn`, which panics outside a runtime context.
+/// Every call site is a task on the hytte runtime or an `async fn` test body.
 ///
 /// Safe to call on every connection: zbus's `object_server()` is idempotent
 /// (`OnceLock`), and hytte-bus never replies to a method call by hand — every

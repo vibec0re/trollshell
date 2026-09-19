@@ -79,10 +79,14 @@ async fn shared_connection_answers_method_calls_before_anything_is_exported() {
     .await
     .expect("client proxy");
 
-    // Bounded, and retried: the residual window is one `AddMatch` round-trip
-    // that `begin_dispatching` starts but cannot await (zbus exposes the
-    // `started_event` only through `connection::Builder`). A swallowed call
-    // costs one retry; a connection that never dispatches costs the assertion.
+    // Bounded, and retried: `begin_dispatching` starts the object server's
+    // dispatch task but cannot await it (zbus exposes the `started_event` only
+    // through `connection::Builder`), so the residual is one scheduling hop —
+    // the task has to be polled once before its match rule exists. Registering
+    // that rule is local, not a broker round-trip: zbus only sends `AddMatch`
+    // for `Type::Signal` rules. A swallowed call therefore costs one retry; a
+    // connection that never dispatches costs the assertion, which is the whole
+    // point of this test — without `begin_dispatching` it is red on every run.
     let overall = tokio::time::Instant::now() + PROBE_BUDGET;
     let mut answered = false;
     let mut unanswered = 0u32;

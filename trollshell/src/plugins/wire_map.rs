@@ -8,7 +8,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
+use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, FitAxis, Node as UiNode};
+use hytte_plugin_proto::Mount;
 use hytte_plugin_proto::wire::{
     self, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
     MAX_NODES_PER_TREE, MAX_TREE_DEPTH,
@@ -27,6 +28,16 @@ struct Walk<'a> {
     /// [`wire::Node::Shader`] (#893). Carried on the walk rather than looked up
     /// per node: the manifest is per connection and the walk is per frame.
     grants: Grants,
+    /// Which axis **this tree's mount** constrains (#1387), stamped on every
+    /// aspect-locked surface node the walk emits — the `Pixels`, `GlSurface`
+    /// and `Shader` arms.
+    ///
+    /// Carried on the walk for `grants`' reason and one more: it is a property
+    /// of the *mount*, which is per region, and nothing below this function can
+    /// see one. A bar chip constrains the height ([`FitAxis::Height`]), a
+    /// sidebar card and the drawer page constrain the width — see
+    /// [`fit_axis`] and `hytte_ui::fit`.
+    fit: FitAxis,
     /// Nodes still mappable. Decremented on **entry** to every node, so it
     /// bounds nodes *visited*.
     budget: Cell<usize>,
@@ -223,6 +234,50 @@ impl Walk<'_> {
 /// missing style rule, not a different identity). One warning per plugin
 /// tree, on the same latch pattern ([`WARNED_CLASSES_CAP`]).
 pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> UiNode {
+    to_ui_node_fitted(scope, grants, FitAxis::Width, node)
+}
+
+/// Which axis a plugin mounted at `mount` has **constrained for it** (#1387),
+/// and therefore which one its aspect-locked surfaces derive from the other.
+///
+/// A bar region is a horizontal row of a fixed height, so a chip's height is
+/// handed down and its width has to follow ([`FitAxis::Height`],
+/// width-for-height). A sidebar region is a vertical stack, so a card's width
+/// is handed down and its height follows ([`FitAxis::Width`] —
+/// height-for-width, what every surface did unconditionally before #1387, and
+/// what the drawer page wants too).
+///
+/// A **total function over [`Mount`]**, matched variant by variant rather than
+/// through [`Mount::is_bar`], on `effects::page_surface`'s precedent: a tenth
+/// mount is then a compile error here instead of silently inheriting whichever
+/// side the `if` fell on. Its agreement with `is_bar` is asserted in
+/// `tests::the_fit_axis_of_every_mount_follows_its_family`.
+pub(super) const fn fit_axis(mount: Mount) -> FitAxis {
+    match mount {
+        Mount::BarLeft | Mount::BarCenter | Mount::BarRight => FitAxis::Height,
+        Mount::SidebarLead
+        | Mount::SidebarTop
+        | Mount::SidebarBottom
+        | Mount::SidebarRightLead
+        | Mount::SidebarRightTop
+        | Mount::SidebarRightBottom => FitAxis::Width,
+    }
+}
+
+/// [`to_ui_node`] for a tree whose mount constrains `fit` (#1387) — the entry
+/// point a **bar** region takes, since its chips are width-for-height.
+///
+/// Split rather than folded into one four-argument function because
+/// [`FitAxis::Width`] is both the default and the answer for every tree that is
+/// not a bar chip's — a sidebar card, the drawer page, and every caller that
+/// is testing something else entirely. The axis reaches the three surface arms
+/// on the [`Walk`], never as a per-node argument.
+pub(super) fn to_ui_node_fitted(
+    scope: &Scope,
+    grants: Grants,
+    fit: FitAxis,
+    node: &wire::Node,
+) -> UiNode {
     preem_render::begin_pass(scope);
     // The shader arm has its own per-node state cache (#968 review M1) with the
     // same pass lifecycle: opened here, swept below, so a node that left the
@@ -231,6 +286,7 @@ pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> Ui
     let walk = Walk {
         scope,
         grants,
+        fit,
         budget: Cell::new(MAX_NODES_PER_TREE),
         depth: Cell::new(0),
         over_budget: Cell::new(false),
@@ -553,6 +609,10 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 height,
                 data,
                 scale,
+                // The mount's axis (#1387), not the node's: a plugin says how
+                // big its buffer is, the host says which dimension its mount
+                // hands down. Same rule for all three surface arms.
+                fit: walk.fit,
                 classes: walk.classes(classes),
             }
         }
@@ -733,7 +793,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             // own: this walk owns the one rule every node's `classes` obeys,
             // and `map_widget` only ever forwards the slice it is handed.
             let classes = walk.classes(classes);
-            preem_render::map_widget(walk.scope, id.as_deref(), &classes, &widget)
+            preem_render::map_widget(walk.scope, walk.fit, id.as_deref(), &classes, &widget)
         }
         wire::Node::Shader {
             id,
@@ -776,6 +836,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             shader_map::map_shader(
                 walk.scope,
                 walk.grants,
+                walk.fit,
                 &ShaderNode {
                     id: id.as_deref(),
                     width: *width,

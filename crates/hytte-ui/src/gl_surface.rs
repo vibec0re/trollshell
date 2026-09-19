@@ -92,11 +92,13 @@
 //! The surface measures exactly like [`PixelSurface`](crate::PixelSurface): the
 //! node's `width`/`height` are its natural size, the minimum is `0` on both
 //! axes so CSS can scale it, and the height is requested aspect-locked for the
-//! width it is offered. GTK then allocates the framebuffer at logical size ×
-//! the **integer** `scale_factor`, exactly as `gtk_gl_area_allocate_buffers`
-//! does, and the blit pass point-samples the logical grid into whatever it got
-//! — the nearest-neighbour discipline `PixelSurface` uses, moved into a
-//! fragment shader.
+//! width it is offered — or the **width for the height**, when the host has set
+//! [`FitAxis::Height`](crate::FitAxis::Height) because this chip is in a bar
+//! (#1387; see the [`fit`](crate::fit) module docs). GTK then allocates the
+//! framebuffer at logical size × the **integer** `scale_factor`, exactly as
+//! `gtk_gl_area_allocate_buffers` does, and the blit pass point-samples the
+//! logical grid into whatever it got — the nearest-neighbour discipline
+//! `PixelSurface` uses, moved into a fragment shader.
 //!
 //! The latent hazard the design spec documents rather than fixes: on a
 //! fractionally-scaled output the `GLArea` renders at the next integer scale and
@@ -1061,6 +1063,11 @@ mod imp {
         /// Natural (logical) size in pixels, honored by `measure`.
         nat_width: Cell<i32>,
         nat_height: Cell<i32>,
+        /// Which axis the mount constrains (#1387). `Default`-derived
+        /// [`FitAxis::Width`](crate::FitAxis::Width) is height-for-width — what
+        /// this widget measured unconditionally before — so a surface nobody
+        /// sets it on is unchanged.
+        fit: Cell<crate::FitAxis>,
         /// GL objects, built on the first render that has a context.
         resources: RefCell<Option<Resources>>,
         /// The last `step_seq` the accumulator has been advanced to.
@@ -1120,26 +1127,31 @@ mod imp {
     impl ObjectImpl for GlSurface {}
 
     impl WidgetImpl for GlSurface {
-        /// Height-for-width, exactly like `PixelSurface`: the grid carries an
-        /// aspect ratio and layout should request that *shape*, not a fixed box.
+        /// Exactly like `PixelSurface`: the grid carries an aspect ratio and
+        /// layout should request that *shape*, not a fixed box — height-for-width
+        /// by default, and **width-for-height** when the mount constrains the
+        /// height instead ([`FitAxis::Height`](crate::FitAxis::Height), #1387),
+        /// which is a bar chip.
         fn request_mode(&self) -> gtk::SizeRequestMode {
-            gtk::SizeRequestMode::HeightForWidth
+            self.fit.get().request_mode()
         }
 
+        /// The grid's aspect ratio as a size request, with min = 0 on both axes
+        /// so CSS/layout can scale the surface above its grid size, which is
+        /// the whole LCD look.
+        ///
+        /// Which of the two dimensions is handed down and which is derived from
+        /// it — and so what GTK's `for_size` means here — is
+        /// [`FitAxis`](crate::FitAxis)'s answer, shared with the other two
+        /// surfaces rather than spelled out three times.
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            let bw = self.nat_width.get();
-            let bh = self.nat_height.get();
-            let natural = if orientation == gtk::Orientation::Horizontal {
-                bw
-            } else if for_size > 0 && bw > 0 {
-                let h = i64::from(for_size) * i64::from(bh) / i64::from(bw);
-                i32::try_from(h).unwrap_or(i32::MAX)
-            } else {
-                bh
-            };
-            // min = 0 on both axes so CSS/layout can scale the surface above
-            // its grid size, which is the whole LCD look.
-            (0, natural.max(0), -1, -1)
+            let natural = self.fit.get().natural(
+                orientation,
+                for_size,
+                self.nat_width.get(),
+                self.nat_height.get(),
+            );
+            (0, natural, -1, -1)
         }
 
         /// Realize through GTK, then find out whether it actually got a
@@ -1236,6 +1248,15 @@ mod imp {
             self.nat_width.set(w);
             self.nat_height.set(h);
             (true, resized)
+        }
+
+        /// Set which axis the mount constrains (#1387), returning whether it
+        /// changed — so the caller only queues a resize for a real change, the
+        /// same rule `set_state`'s dedup follows for the state itself. The
+        /// reconciler re-applies the axis on every re-map, and a node does not
+        /// change mount while it is mounted.
+        pub(super) fn set_fit_axis(&self, fit: crate::FitAxis) -> bool {
+            self.fit.replace(fit) != fit
         }
 
         /// The whole render: ensure resources, replay the outstanding steps,
@@ -2669,6 +2690,23 @@ impl GlSurface {
         }
     }
 
+    /// Set which axis the surface is fitted on (#1387): the one the mount
+    /// constrains, from which the other is derived.
+    ///
+    /// [`FitAxis::Width`](crate::FitAxis::Width) — the default — is
+    /// height-for-width, what a sidebar card or a drawer page wants.
+    /// [`FitAxis::Height`](crate::FitAxis::Height) is width-for-height, what a
+    /// **bar** chip wants: the bar fixes the height, so a surface still asking
+    /// for its whole grid width reserves a slab it then letterboxes the
+    /// drawing inside. The draw path is untouched — it letterboxes either way
+    /// — and so is the zero minimum. Queues a resize only when the axis
+    /// actually changed.
+    pub fn set_fit_axis(&self, fit: crate::FitAxis) {
+        if self.imp().set_fit_axis(fit) {
+            self.queue_resize();
+        }
+    }
+
     /// Whether this surface's own context failed to be created.
     ///
     /// Per instance, unlike [`gl_abandoned`] — kept because "did *this* area
@@ -3586,6 +3624,104 @@ mod tests {
             data_source.is_none(),
             "the source must be forgotten too, so a later successful upload is not skipped as \
              an unchanged repeat",
+        );
+    }
+}
+
+// ── #1387: the size request (needs a display, not a GL context) ──────────────
+
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{GlProgram, GlSurface, GlUniforms};
+    use crate::FitAxis;
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+    use std::sync::Arc;
+
+    /// A surface at the natural size of the timer plugin's `mm:ss` readout
+    /// (`hytte-preem`'s `seven_seg`: `2·PAD + 4·DIGIT_W + COLON_W + 4·GAP` ×
+    /// `2·PAD + DIGIT_H`), which is the chip #1387's screenshot is of.
+    ///
+    /// Never realized, so no `GdkGLContext` is created and nothing here is
+    /// skippable: `measure`/`request_mode` are the widget's own vfuncs and run
+    /// on any display.
+    fn seven_seg_surface() -> GlSurface {
+        let s = GlSurface::new();
+        let state = Arc::new(GlUniforms {
+            values: Vec::new(),
+            data: None,
+            grid: (188, 70),
+            step_seq: 0,
+        });
+        s.set_state(GlProgram("preem.seven_seg"), 188, 70, &state);
+        s
+    }
+
+    /// The #1387 fix through the widget: fitted on its **height** — a bar chip
+    /// — the surface asks for the width it is going to draw (75 px at the
+    /// bar's 28), not the 188 it would then letterbox that drawing inside.
+    #[gtk::test]
+    fn a_height_fitted_surface_measures_width_for_height() {
+        let s = seven_seg_surface();
+        s.set_fit_axis(FitAxis::Height);
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::WidthForHeight);
+        let (min_w, nat_w, _, _) = s.measure(gtk::Orientation::Horizontal, 28);
+        assert_eq!(nat_w, 75, "a 188×70 readout 28 px tall is 75 px wide");
+        assert_ne!(nat_w, 188, "…and not the whole grid width (#1387)");
+        // The minimum stays 0 on both axes — CSS can still scale it.
+        assert_eq!(min_w, 0);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, -1).0, 0);
+        // The constrained axis answers the grid's own height.
+        assert_eq!(s.measure(gtk::Orientation::Vertical, -1).1, 70);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 188).1, 70);
+    }
+
+    /// The default is unchanged (height-for-width, what a sidebar card and the
+    /// drawer want), and the flip is reversible.
+    #[gtk::test]
+    fn the_default_fit_axis_is_the_pre_1387_behaviour() {
+        let s = seven_seg_surface();
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 188);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 188).1, 70);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 94).1, 35);
+        s.set_fit_axis(FitAxis::Height);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 75);
+        s.set_fit_axis(FitAxis::Width);
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 188);
+    }
+
+    /// An empty surface has no aspect ratio to lock to and asks for nothing,
+    /// on either axis and either fit — the `PixelSurface` backstop, which the
+    /// shared arithmetic gives this widget for free.
+    #[gtk::test]
+    fn an_empty_surface_requests_nothing_on_either_fit() {
+        for fit in [FitAxis::Width, FitAxis::Height] {
+            let s = GlSurface::new();
+            s.set_fit_axis(fit);
+            assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 0);
+            assert_eq!(s.measure(gtk::Orientation::Vertical, 200).1, 0);
+        }
+    }
+
+    /// Setting the same axis twice is free: the second call changes nothing,
+    /// which is what keeps the reconciler's per-frame re-apply (once per
+    /// monitor per frame) from queueing a resize on every tick.
+    #[gtk::test]
+    fn re_applying_the_same_fit_axis_queues_no_resize() {
+        let s = seven_seg_surface();
+        assert!(
+            s.imp().set_fit_axis(FitAxis::Height),
+            "first set changes it"
+        );
+        assert!(
+            !s.imp().set_fit_axis(FitAxis::Height),
+            "the same axis again is a no-op"
+        );
+        assert!(
+            s.imp().set_fit_axis(FitAxis::Width),
+            "and back again is not"
         );
     }
 }

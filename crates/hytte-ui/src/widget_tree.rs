@@ -318,6 +318,14 @@ pub enum Node {
         /// Integer upscale hint (`0` means `1`); natural size becomes
         /// `width*scale` × `height*scale` (mutable prop).
         scale: u32,
+        /// Which axis the **mount** constrains, and so which one the surface
+        /// derives from the other (mutable prop, #1387). Default
+        /// [`FitAxis::Width`](crate::FitAxis::Width) is height-for-width, what
+        /// a sidebar card or a drawer page wants;
+        /// [`FitAxis::Height`](crate::FitAxis::Height) is what a bar chip
+        /// wants. The host names it because it is the only party that knows the
+        /// mount — see the [`fit`](crate::fit) module docs.
+        fit: crate::FitAxis,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
@@ -360,6 +368,10 @@ pub enum Node {
         /// Shared, so mapping one frame onto a second monitor costs a refcount
         /// and settles on an `Arc::ptr_eq`.
         state: Arc<crate::gl_surface::GlUniforms>,
+        /// Which axis the **mount** constrains (mutable prop, #1387) — see
+        /// [`Node::Pixels`]'s field of the same name, which this
+        /// mirrors exactly.
+        fit: crate::FitAxis,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
@@ -403,6 +415,10 @@ pub enum Node {
         /// per frame — not something this type can enforce; before #968's
         /// review it was claimed here and not true anywhere.
         state: Arc<crate::shader_surface::ShaderState>,
+        /// Which axis the **mount** constrains (mutable prop, #1387) — see
+        /// [`Node::Pixels`]'s field of the same name, which this
+        /// mirrors exactly.
+        fit: crate::FitAxis,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
         /// Hover text (mutable prop; `None` clears it) — see
@@ -1078,6 +1094,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             height,
             data,
             scale,
+            fit,
             classes,
             ..
         } => {
@@ -1086,6 +1103,10 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             // mountings (one per monitor) hand their own surfaces (#911).
             surface.set_pixels_shared(*width, *height, data);
             surface.set_scale(*scale);
+            // Which axis the mount constrains (#1387) — the host's answer, set
+            // before the first measure so the widget never requests on the
+            // wrong axis and then corrects itself.
+            surface.set_fit_axis(*fit);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
         }
@@ -1094,6 +1115,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             height,
             program,
             state,
+            fit,
             classes,
             ..
         } => {
@@ -1101,6 +1123,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             // Shared, not copied — the same `Arc` every monitor's mounting of
             // this node hands its own surface, exactly as the `Pixels` arm does.
             surface.set_state(*program, *width, *height, state);
+            surface.set_fit_axis(*fit);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
         }
@@ -1108,6 +1131,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             width,
             height,
             state,
+            fit,
             classes,
             ..
         } => {
@@ -1117,6 +1141,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             // three from ever being handed one another's node.
             let surface = crate::shader_surface::ShaderSurface::new();
             surface.set_state(*width, *height, state);
+            surface.set_fit_axis(*fit);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
         }
@@ -1465,6 +1490,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             height,
             data,
             scale,
+            fit,
             classes,
             ..
         } => {
@@ -1480,6 +1506,11 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // change is uploaded without a copy.
             surface.set_pixels_shared(*width, *height, data);
             surface.set_scale(*scale);
+            // A mutable prop like the two above, and guarded the same way: the
+            // setter queues a resize only when the axis really changed, so the
+            // per-monitor per-frame re-apply of an unmoved chip costs a compare
+            // (#1387).
+            surface.set_fit_axis(*fit);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::GlSurface {
@@ -1487,6 +1518,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             height,
             program,
             state,
+            fit,
             classes,
             ..
         } => {
@@ -1498,12 +1530,14 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // because a sibling animated, or the second monitor's pass over one
             // frame — queues no render at all.
             surface.set_state(*program, *width, *height, state);
+            surface.set_fit_axis(*fit);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::Shader {
             width,
             height,
             state,
+            fit,
             classes,
             ..
         } => {
@@ -1513,6 +1547,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // would throw away the linked program and restart `u_time`. The
             // guard lives inside `set_state`, fast-pathed on `Arc::ptr_eq`.
             surface.set_state(*width, *height, state);
+            surface.set_fit_axis(*fit);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::Button { classes, child, .. } => {
@@ -2451,6 +2486,7 @@ mod diff_tests {
             height: 96,
             program: GlProgram("preem.scope"),
             state: Arc::new(GlUniforms::default()),
+            fit: crate::FitAxis::Width,
             classes: vec!["ts-preem".to_owned()],
         };
         assert_eq!(node_kind(&node), NodeKind::GlSurface);
@@ -2566,6 +2602,7 @@ mod diff_tests {
             width: 288,
             height: 96,
             state: shader_state(),
+            fit: crate::FitAxis::Width,
             classes: vec!["ts-shader".to_owned()],
             tooltip: None,
         };
@@ -3042,6 +3079,7 @@ mod gtk_tests {
             height,
             data,
             scale,
+            fit: crate::FitAxis::Width,
             classes: vec![],
         }
     }
@@ -4172,6 +4210,7 @@ mod gtk_tests {
                     grid: (width, height),
                     ..Default::default()
                 }),
+                fit: crate::FitAxis::Width,
                 classes: vec![],
             }
         }
@@ -4256,6 +4295,7 @@ mod gtk_tests {
                     scale: 1,
                     values: vec![],
                 }),
+                fit: crate::FitAxis::Width,
                 classes: vec![],
                 tooltip: None,
             }
@@ -4308,6 +4348,114 @@ mod gtk_tests {
             48,
             "…and the new height",
         );
+    }
+
+    /// **#1387.** The node's `fit` is a prop like the others, and the widget it
+    /// reaches is the only thing that decides which axis the bar's layout hands
+    /// down — so it must arrive on `build_node` *and* on `update_in_place`, on
+    /// all three surface kinds.
+    ///
+    /// A 188×70 readout (the timer's `mm:ss`, the chip the issue screenshots)
+    /// fitted on its height asks for 75 px at a bar's 28, not 188. The
+    /// *witness* is `request_mode` plus that horizontal measure, both read off
+    /// the mounted widget rather than the node.
+    ///
+    /// **Falsified** on both arms: dropping `surface.set_fit_axis(*fit)` from
+    /// `build_node` leaves the first block red (`HeightForWidth`, 188), and
+    /// dropping it from `update_in_place` leaves the second red — for each of
+    /// the three kinds.
+    #[gtk::test]
+    fn a_surface_node_applies_its_fit_axis_on_build_and_on_update() {
+        fn gl(fit: crate::FitAxis) -> Node {
+            Node::GlSurface {
+                id: Some("seven-seg".to_owned()),
+                width: 188,
+                height: 70,
+                program: crate::gl_surface::GlProgram("preem.seven_seg"),
+                state: Arc::new(crate::gl_surface::GlUniforms {
+                    grid: (188, 70),
+                    ..Default::default()
+                }),
+                fit,
+                classes: vec![],
+            }
+        }
+        fn pixels(fit: crate::FitAxis) -> Node {
+            Node::Pixels {
+                id: Some("px".to_owned()),
+                width: 188,
+                height: 70,
+                data: Arc::from(vec![0xffu8; 188 * 70 * 4]),
+                scale: 1,
+                fit,
+                classes: vec![],
+            }
+        }
+        fn shader(fit: crate::FitAxis) -> Node {
+            Node::Shader {
+                id: Some("sh".to_owned()),
+                width: 188,
+                height: 70,
+                state: Arc::new(crate::shader_surface::ShaderState {
+                    fragment: Arc::from("void main() { fragColor = u_fg; }"),
+                    data: Arc::from(&[0u8, 255][..]),
+                    format: crate::shader_surface::ShaderFormat::R8,
+                    data_size: (2, 1),
+                    scale: 1,
+                    values: vec![],
+                }),
+                fit,
+                classes: vec![],
+                tooltip: None,
+            }
+        }
+
+        for build in [
+            gl as fn(crate::FitAxis) -> Node,
+            pixels as fn(crate::FitAxis) -> Node,
+            shader as fn(crate::FitAxis) -> Node,
+        ] {
+            let root = root();
+            let mut rec = Reconciler::new(&root, |_, _| {});
+
+            // `build_node`: mounted straight into a bar's axis.
+            rec.render(&hbox(vec![build(crate::FitAxis::Height)]));
+            let surface = root
+                .first_child()
+                .expect("the box mounted")
+                .first_child()
+                .expect("the surface mounted");
+            assert_eq!(
+                surface.request_mode(),
+                gtk::SizeRequestMode::WidthForHeight,
+                "build_node moved the node's fit axis into the widget",
+            );
+            assert_eq!(
+                surface.measure(gtk::Orientation::Horizontal, 28).1,
+                75,
+                "…so a 188×70 readout in a 28 px bar reserves the 75 px it draws",
+            );
+
+            // `update_in_place`: a same-id re-render moves a changed axis in,
+            // rather than leaving the widget on the one it was built with.
+            rec.render(&hbox(vec![build(crate::FitAxis::Width)]));
+            let same = root
+                .first_child()
+                .expect("the box survived")
+                .first_child()
+                .expect("the surface survived");
+            assert_eq!(same, surface, "the widget is reused, not rebuilt");
+            assert_eq!(
+                same.request_mode(),
+                gtk::SizeRequestMode::HeightForWidth,
+                "update_in_place moved the new fit axis in",
+            );
+            assert_eq!(
+                same.measure(gtk::Orientation::Horizontal, 28).1,
+                188,
+                "…so the same node fitted on its width is back to the full grid",
+            );
+        }
     }
 
     // ── Tooltips (#957) ─────────────────────────────────────────────────────
@@ -4411,6 +4559,7 @@ mod gtk_tests {
                     scale: 1,
                     values: vec![],
                 }),
+                fit: crate::FitAxis::Width,
                 classes: vec![],
                 tooltip: tooltip.map(ToOwned::to_owned),
             }

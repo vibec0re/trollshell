@@ -369,7 +369,7 @@ pub enum Node {
         /// and settles on an `Arc::ptr_eq`.
         state: Arc<crate::gl_surface::GlUniforms>,
         /// Which axis the **mount** constrains (mutable prop, #1387) — see
-        /// [`Node::Pixels`](Node::Pixels)'s field of the same name, which this
+        /// [`Node::Pixels`]'s field of the same name, which this
         /// mirrors exactly.
         fit: crate::FitAxis,
         /// GTK CSS classes applied verbatim (`add_css_class`).
@@ -416,7 +416,7 @@ pub enum Node {
         /// review it was claimed here and not true anywhere.
         state: Arc<crate::shader_surface::ShaderState>,
         /// Which axis the **mount** constrains (mutable prop, #1387) — see
-        /// [`Node::Pixels`](Node::Pixels)'s field of the same name, which this
+        /// [`Node::Pixels`]'s field of the same name, which this
         /// mirrors exactly.
         fit: crate::FitAxis,
         /// GTK CSS classes applied verbatim (`add_css_class`).

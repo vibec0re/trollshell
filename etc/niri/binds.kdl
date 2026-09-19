@@ -93,7 +93,10 @@ binds {
     //
     // Pressing it again is safe and is the intended way to get back: each
     // window is its own GApplication id, so a second run re-presents the
-    // windows that already exist instead of opening a second set.
+    // windows that already exist instead of opening a second set — and,
+    // since it can see from niri's window list that nothing needs placing,
+    // it takes no second workspace either. A press that DOES have a new
+    // agent to place opens only that one, on a fresh workspace.
     //
     // Needs `programs.trollshell.agentWindow.enable` (on by default once a
     // `plugins.agents` entry exists). Commented out, and for the reason the

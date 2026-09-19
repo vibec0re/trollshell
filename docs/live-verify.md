@@ -5652,16 +5652,27 @@ and at least two agents that can be started.
       columns in the hive's own roster order. Confirm the workspace it picked
       was the trailing empty one and not a gap between two populated ones
       (`niri msg -j workspaces` before the click, and compare `idx`).
-- [ ] **(#1306)** **Click it again → the same windows, no duplicates.** With
-      the two windows still open on that workspace, press it again. Nothing
-      new may appear: each window is its own `GApplication` id, so the second
-      launch finds the running process and presents it — exactly two
-      `AgentWindow` app-ids in `niri msg -j windows`, before and after.
-      Worth knowing what this
-      does **not** promise: a window you dragged to another workspace
-      beforehand is presented _where it is_, so the second press can pull
-      focus off the fan-out workspace. That is the documented behaviour, not
-      a bug.
+- [ ] **(#1306)** **Click it again → the same windows, no duplicates, and no
+      new workspace.** With the two windows still open on that workspace,
+      press it again. Nothing new may appear: each window is its own
+      `GApplication` id, so the second launch finds the running process and
+      presents it — exactly two `AgentWindow` app-ids in `niri msg -j windows`,
+      before and after. Watch the **workspace** too: the press must _not_
+      focus the (now empty) workspace below the one holding the windows —
+      compare `niri msg -j workspaces` before and after and confirm the
+      focused id is unchanged, and that no new workspace was created. Worth
+      knowing what this does **not** promise: a window you dragged to another
+      workspace beforehand is presented _where it is_ (never dragged back),
+      so a press can still end with the focus on that window's workspace.
+      That is the documented behaviour, not a bug.
+- [ ] **(#1306)** **A mixed press places only the new one.** With the two
+      windows up, start a **third** agent and press the button again. It must
+      focus a fresh empty workspace and open **only** the third window there;
+      the two that were already open must stay where they are, untouched
+      (`niri msg -j windows` — the same two `workspace_id`s as before, one new
+      entry). This is the case the second press is most likely to get wrong:
+      presenting one of the open windows mid-run would move the focus and the
+      new window would land on the wrong workspace.
 - [ ] **(#1306)** **The Workspaces page shows it as an ephemeral card.** With
       the windows up, open the Workspaces page (Settings → More → Workspaces,
       or the `open-page workspaces` verb). The fan-out's workspace must appear

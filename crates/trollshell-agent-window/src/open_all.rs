@@ -24,14 +24,17 @@
 //!    ones, which is the membership Annika settled on 2026-09-19 out of the
 //!    issue's own title. Nothing running is **not an error**: one line on
 //!    stderr and exit 0, because "nothing to open" is an answer.
-//! 2. Ask niri for its workspaces and windows, and pick the **empty unnamed
-//!    workspace at the bottom of the focused output** ([`pick_workspace`]).
-//! 3. Focus it, *then* launch. The order is the mechanism: niri opens a new
-//!    window on the focused workspace, so a focus behind the launches would
-//!    race them.
-//! 4. Launch `trollshell-agent-window --agent <name>` per agent, detached, in
-//!    the hive's own roster order — which becomes the column order niri tiles
-//!    them in.
+//! 2. Ask niri for its workspaces and windows **once**. The window list
+//!    answers two questions: which workspaces are empty ([`pick_workspace`]),
+//!    and which of those agents already has a companion window
+//!    ([`without_a_window`], matching `app_id` against [`crate::cli::app_id`]).
+//! 3. If some agent still needs a window, pick the **empty unnamed workspace
+//!    at the bottom of the focused output** and focus it, *then* launch. The
+//!    order is the mechanism: niri opens a new window on the focused
+//!    workspace, so a focus behind the launches would race them.
+//! 4. Launch `trollshell-agent-window --agent <name>` for each agent that
+//!    needs one, detached, in the hive's own roster order — which becomes the
+//!    column order niri tiles them in.
 //!
 //! # The workspace is ephemeral, and that is the whole design
 //!
@@ -44,17 +47,25 @@
 //! schema change — Annika's call on #1071 if it is ever wanted, not something
 //! this mode should grow towards.
 //!
-//! # A second run re-focuses rather than doubling
+//! # A second run presents what is open, and picks no workspace
 //!
 //! Each window is its own `GApplication` id ([`crate::cli::app_id`], one per
-//! agent), so a second launch for an agent that already has a window finds the
+//! agent), so a launch for an agent that already has a window finds the
 //! running process over the session bus, hands it the command line
 //! (`HANDLES_COMMAND_LINE`) and exits — `main`'s `connect_command_line` then
-//! `present()`s the window that exists. This mode therefore needs no bookkeeping
-//! of its own: it launches unconditionally and lets `GApplication` decide
-//! whether that means a new window or a raise. What it does **not** do is
-//! *gather* — a window already open on another workspace is presented where it
-//! is, not moved.
+//! `present()`s the window that exists. That is what "a second press does not
+//! double" rests on, and it is also why this mode keeps no bookkeeping of its
+//! own: the application id *is* the bookkeeping, and [`without_a_window`] reads
+//! it back off niri's window list.
+//!
+//! A second press therefore **picks no workspace and sends no focus**: there
+//! is nothing to place, so every launch is a present, and each window is
+//! presented **where it is** — this mode never *gathers*. (Focusing the spare
+//! on a repeat press would mean a detour through an empty workspace at best,
+//! and being stranded on one at worst; [`open_all_with`] argues both.) A
+//! *mixed* press — some windows open, some not — places only the missing ones
+//! and leaves the open ones alone, because presenting one mid-run would move
+//! the focus out from under the next launch.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -458,36 +469,127 @@ pub struct Report {
     pub workspace: Option<Target>,
 }
 
-/// Focus a workspace, then launch one window per agent.
+/// Which of `agents` has **no** companion window open yet, in the order they
+/// were given.
 ///
-/// The **order is the mechanism** and is what the tests pin: niri opens a new
-/// window on the focused workspace, so every launch has to come after the
-/// focus. A niri that cannot be reached, or an output with no spare workspace,
-/// costs the tidiness and not the windows — the fan-out still launches, on
-/// whatever workspace is current, with one line saying so.
+/// Asked of niri's window list by matching its `app_id` against
+/// [`crate::cli::app_id`] — the very id `main` registers the application
+/// under, which is what makes `GApplication`'s single-instance machinery "one
+/// window per agent" in the first place. So this mode keeps no bookkeeping: it
+/// reads back the fact the id already encodes, from the same window list
+/// [`pick_workspace`] tests emptiness with.
+///
+/// A window list that could not be read is **not** "nothing is open" — the
+/// caller passes an empty slice there and gets every agent back, which is the
+/// answer that keeps the feature working when niri does not answer.
+#[must_use]
+pub fn without_a_window(windows: &[Window], agents: &[AgentName]) -> Vec<AgentName> {
+    agents
+        .iter()
+        .filter(|agent| {
+            let id = crate::cli::app_id(agent);
+            !windows
+                .iter()
+                .any(|w| w.app_id.as_deref() == Some(id.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Focus a workspace, then launch one window per agent that needs one.
+///
+/// # The two shapes one run can take
+///
+/// - **Something to place.** At least one running agent has no window yet, so
+///   a workspace is picked, focused, and *then* the missing windows are
+///   launched onto it. The **order is the mechanism** and is what the tests
+///   pin: niri opens a new window on the focused workspace, so every launch
+///   has to come after the focus.
+/// - **Nothing to place** — the second press, with every running agent's
+///   window already open. No workspace is picked and **no focus is sent**;
+///   every launch is `GApplication` presenting the window that already exists,
+///   wherever the operator left it.
+///
+/// # Why the second press must not pick a workspace (#1390 review, MED 1)
+///
+/// After the first press the fan-out's workspace holds windows, so niri's
+/// trailing spare is the *next* one — and a second press that picked it would
+/// focus an **empty** workspace before presenting anything. Either the
+/// presents bounce the focus back out of it (a visible detour through an empty
+/// workspace on every repeat press) or the compositor declines the activation
+/// — a `systemd-run` child carries no `XDG_ACTIVATION_TOKEN` and this process
+/// holds no focused surface — and the operator is left sitting on an empty
+/// workspace with every agent window somewhere else.
+///
+/// # Why an agent that already has a window is not re-launched here
+///
+/// In the **mixed** case (one window open, one to go) presenting the open one
+/// would move the focus off the workspace this run is filling, and the very
+/// next launch would land wherever that present went — which is exactly the
+/// "a focus that landed between two launches would scatter them" race the
+/// deciding moved into this binary to avoid. So a run that has something to
+/// place places only that, and leaves the rest where they are; that is the
+/// same **no-gather** rule a window the operator dragged away already follows.
+///
+/// A niri that cannot be reached, or an output with no spare workspace, costs
+/// the tidiness and not the windows — the fan-out still launches, on whatever
+/// workspace is current, with one line saying so.
 pub fn open_all_with(
     niri: &mut impl Compositor,
     spawner: &mut impl Spawner,
     agents: &[AgentName],
 ) -> Report {
     let mut report = Report::default();
-    match focus_fresh_workspace(niri) {
-        Ok(target) => {
-            tracing::info!(
-                workspace = target.id,
-                idx = target.idx,
-                output = target.output.as_deref().unwrap_or("<none>"),
-                "focused an empty workspace for the agent windows"
-            );
-            report.workspace = Some(target);
-        }
-        Err(reason) => tracing::warn!(
-            %reason,
-            "opening the agent windows on the current workspace instead"
-        ),
-    }
 
-    for agent in agents {
+    // **One** look at niri, up front: the same two lists answer both questions
+    // this run has — which workspace is the spare, and which of these agents
+    // already has a window.
+    let seen = niri_lists(niri);
+    let open_windows: &[Window] = match &seen {
+        Ok((_, windows)) => windows,
+        Err(_) => &[],
+    };
+    let missing = without_a_window(open_windows, agents);
+
+    let launch: &[AgentName] = if missing.is_empty() {
+        tracing::info!(
+            open = agents.len(),
+            "every running agent already has a window; presenting them where they are"
+        );
+        agents
+    } else {
+        match &seen {
+            Ok((workspaces, windows)) => match pick_workspace(workspaces, windows) {
+                Ok(target) => match focus(niri, &target) {
+                    Ok(()) => {
+                        tracing::info!(
+                            workspace = target.id,
+                            idx = target.idx,
+                            output = target.output.as_deref().unwrap_or("<none>"),
+                            opening = missing.len(),
+                            "focused an empty workspace for the agent windows"
+                        );
+                        report.workspace = Some(target);
+                    }
+                    Err(reason) => tracing::warn!(
+                        %reason,
+                        "opening the agent windows on the current workspace instead"
+                    ),
+                },
+                Err(reason) => tracing::warn!(
+                    %reason,
+                    "opening the agent windows on the current workspace instead"
+                ),
+            },
+            Err(reason) => tracing::warn!(
+                %reason,
+                "opening the agent windows on the current workspace instead"
+            ),
+        }
+        &missing
+    };
+
+    for agent in launch {
         // The plugin's own builder, not a second copy: `--agent <name>` as two
         // argv elements, which is what keeps a legal leading-hyphen name a
         // name rather than a flag.
@@ -506,20 +608,24 @@ pub fn open_all_with(
     report
 }
 
-/// Ask niri where to put the windows, and go there.
-fn focus_fresh_workspace(niri: &mut impl Compositor) -> Result<Target, String> {
-    let workspaces = workspaces(niri)?;
-    let windows = windows(niri)?;
-    let target = pick_workspace(&workspaces, &windows).map_err(|e| e.to_string())?;
-    // **By id, never by index**: `Workspace::idx` is a current position that
-    // changes as workspaces are re-ordered, and it is per-monitor besides.
+/// niri's workspace list and window list, in that order — the two answers one
+/// run needs, fetched once.
+fn niri_lists(niri: &mut impl Compositor) -> Result<(Vec<Workspace>, Vec<Window>), String> {
+    Ok((workspaces(niri)?, windows(niri)?))
+}
+
+/// Go to `target`'s workspace.
+///
+/// **By id, never by index**: `Workspace::idx` is a current position that
+/// changes as workspaces are re-ordered, and it is per-monitor besides.
+fn focus(niri: &mut impl Compositor, target: &Target) -> Result<(), String> {
     ask(
         niri,
         NiriRequest::Action(Action::FocusWorkspace {
             reference: WorkspaceReferenceArg::Id(target.id),
         }),
     )?;
-    Ok(target)
+    Ok(())
 }
 
 fn ask(niri: &mut impl Compositor, request: NiriRequest) -> Result<NiriResponse, String> {
@@ -615,7 +721,7 @@ pub fn run() -> u8 {
 mod tests {
     use super::{
         Compositor, NoWorkspace, Report, Spawner, Target, agent_in, open_all_with, pick_workspace,
-        running_agents, unit_name,
+        running_agents, unit_name, without_a_window,
     };
     use hytte_plugin_agents::hive::wire::AgentStatusRow;
     use hytte_plugin_agents::model::AgentName;
@@ -715,6 +821,17 @@ mod tests {
                 focus_timestamp: None,
             })
             .collect()
+    }
+
+    /// One window carrying the **per-agent application id** the fan-out
+    /// matches on — built with [`crate::cli::app_id`] rather than spelled out,
+    /// so a change to the mangling changes the fixture and the production
+    /// lookup in the same commit. (The spelling itself is pinned as a literal
+    /// in `an_agent_that_already_has_a_window_is_not_launched_again`.)
+    fn agent_window(id: u64, workspace_id: u64, agent: &str) -> niri_ipc::Window {
+        let mut w = windows(&[(id, workspace_id)]).remove(0);
+        w.app_id = Some(crate::cli::app_id(&name(agent)));
+        w
     }
 
     // ── pick_workspace ───────────────────────────────────────────────────────
@@ -1077,6 +1194,125 @@ mod tests {
                 }),
             }
         );
+    }
+
+    // ── who still needs a window (#1390 review, MED 1) ───────────────────────
+
+    /// [`without_a_window`]'s three cases, stated directly: a window list that
+    /// is empty (or could not be read) means *everyone* needs one, a window
+    /// belonging to somebody else does not count, and only the agent's own
+    /// application id does.
+    #[test]
+    fn only_an_agent_windows_own_app_id_counts_as_open() {
+        let agents = [name("argus"), name("bosun")];
+        let names = |v: Vec<AgentName>| {
+            v.iter()
+                .map(|a| a.as_str().to_owned())
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            names(without_a_window(&[], &agents)),
+            vec!["argus", "bosun"]
+        );
+
+        // A terminal on the fan-out's own workspace is not an agent window.
+        let mut stranger = windows(&[(9, 2)]).remove(0);
+        stranger.app_id = Some("org.wezfurlong.wezterm".to_owned());
+        assert_eq!(
+            names(without_a_window(&[stranger], &agents)),
+            vec!["argus", "bosun"]
+        );
+
+        assert_eq!(
+            names(without_a_window(&[agent_window(8, 1, "argus")], &agents)),
+            vec!["bosun"],
+        );
+    }
+
+    /// **A mixed press places only what is missing.** `argus` already has a
+    /// window; `bosun` does not. The run focuses the spare and launches
+    /// `bosun` alone — `argus` is left where it is rather than presented,
+    /// because presenting it mid-run would move the focus out from under the
+    /// launch that follows, which is the scatter the deciding moved into this
+    /// binary to avoid.
+    ///
+    /// Falsification (verified red): launch `agents` instead of `missing` in
+    /// `open_all_with` and the journal grows a `launch … --agent argus`.
+    #[test]
+    fn an_agent_that_already_has_a_window_is_not_launched_again() {
+        // The spelling the match depends on, pinned once as a literal: it is
+        // what *niri* reports, so a silent change to the mangling would make
+        // every agent look closed forever.
+        assert_eq!(
+            crate::cli::app_id(&name("argus")),
+            "mov.vibec0re.trollshell.AgentWindow.argus"
+        );
+
+        let journal = Journal::default();
+        let mut niri = RecordingNiri {
+            niri: FakeNiri {
+                workspaces: workspaces(ONE_OUTPUT),
+                windows: vec![windows(&[(7, 1)]).remove(0), agent_window(8, 1, "argus")],
+                reachable: true,
+            },
+            journal: journal.share(),
+        };
+        let mut spawner = RecordingSpawner {
+            journal: journal.share(),
+            fail: false,
+        };
+
+        let report = open_all_with(&mut niri, &mut spawner, &[name("argus"), name("bosun")]);
+
+        assert_eq!(
+            journal.lines(),
+            vec![
+                "focus Id(2)".to_owned(),
+                "launch trollshell-agent-window --agent bosun".to_owned(),
+            ],
+        );
+        assert_eq!(report.launched, 1);
+        assert_eq!(report.workspace.map(|t| t.id), Some(2));
+    }
+
+    /// **A second press picks no workspace at all.** Every running agent
+    /// already has a window, so there is nothing to place: no `FocusWorkspace`
+    /// is sent, and each launch is `GApplication` presenting the window that
+    /// exists, wherever the operator left it.
+    ///
+    /// Falsification (verified red): focus unconditionally — the shape before
+    /// the #1390 review — and the journal gains a leading `focus Id(2)`, which
+    /// on a real desktop is the **empty** workspace below the one holding the
+    /// windows: a detour at best, and being stranded there at worst.
+    #[test]
+    fn a_second_press_focuses_nothing_and_presents_what_is_open() {
+        let journal = Journal::default();
+        let mut niri = RecordingNiri {
+            niri: FakeNiri {
+                workspaces: workspaces(ONE_OUTPUT),
+                windows: vec![agent_window(8, 1, "argus")],
+                reachable: true,
+            },
+            journal: journal.share(),
+        };
+        let mut spawner = RecordingSpawner {
+            journal: journal.share(),
+            fail: false,
+        };
+
+        let report = open_all_with(&mut niri, &mut spawner, &[name("argus")]);
+
+        assert_eq!(
+            journal.lines(),
+            vec!["launch trollshell-agent-window --agent argus".to_owned()],
+            "the present goes out; nothing is focused"
+        );
+        assert_eq!(
+            report.workspace, None,
+            "no workspace was picked, so none is reported"
+        );
+        assert_eq!(report.launched, 1);
     }
 
     /// A niri nobody can reach costs the workspace, **not** the windows: the

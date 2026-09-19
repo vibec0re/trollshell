@@ -1710,6 +1710,100 @@ mod gtk_tests {
         );
     }
 
+    /// **#1387, end to end through a region.** A chip mounted in a **bar**
+    /// region must reach the screen measuring width-for-height: the region's
+    /// axis → the mapping pass → the node → the widget, every link of it.
+    ///
+    /// The fixture is the chip the issue screenshots — the timer's `mm:ss`
+    /// seven-segment readout, whose kit buffer is 188×70 — and the assertion is
+    /// the number the bug was made of: at the height a bar allows, the mounted
+    /// surface must ask for the width it is going to *draw*, not the 188 px it
+    /// would then letterbox that drawing inside.
+    ///
+    /// The same tree through a **sidebar** region is the control, and it is
+    /// mapped with `FitAxis::Width` — the pre-#1387 behaviour, unchanged.
+    ///
+    /// **Deletion check:** passing `FitAxis::Width` for both regions (i.e.
+    /// `reconcile_region` ignoring its axis) turns the bar half red and leaves
+    /// the sidebar half green.
+    #[gtk::test]
+    fn a_chip_in_a_bar_region_measures_width_for_height() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+
+        /// The first `GlSurface` anywhere under `widget`, depth first — the
+        /// chip's readout, however many boxes the card wraps it in.
+        fn find_surface(widget: &gtk::Widget) -> Option<hytte::ui::GlSurface> {
+            if let Ok(surface) = widget.clone().downcast::<hytte::ui::GlSurface>() {
+                return Some(surface);
+            }
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                if let Some(found) = find_surface(&node) {
+                    return Some(found);
+                }
+                child = node.next_sibling();
+            }
+            None
+        }
+
+        let readout = wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 0,
+            tooltip: None,
+            children: vec![wire::Node::Preem {
+                id: Some("mmss".to_owned()),
+                classes: vec![],
+                widget: Box::new(vocab::PreemWidget::SevenSeg {
+                    config: vocab::SevenSegConfig::default(),
+                    state: vocab::SevenSegState {
+                        text: "25:00".to_owned(),
+                    },
+                }),
+            }],
+        };
+
+        for (fit, card_class, mode, at_28) in [
+            (
+                FitAxis::Height,
+                "ts-plugin-chip",
+                gtk::SizeRequestMode::WidthForHeight,
+                75,
+            ),
+            (
+                FitAxis::Width,
+                "ts-plugin-card",
+                gtk::SizeRequestMode::HeightForWidth,
+                188,
+            ),
+        ] {
+            let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+            reconcile_region(
+                &container,
+                &cards,
+                &[render_with_tree("timer", &tx, readout.clone())],
+                fit,
+                card_class,
+                None,
+            );
+            let surface = find_surface(&container.clone().upcast())
+                .expect("the preem chip mounted a GlSurface");
+            assert_eq!(
+                surface.request_mode(),
+                mode,
+                "a {card_class} region's surface measures on {fit:?}",
+            );
+            assert_eq!(
+                surface.measure(gtk::Orientation::Horizontal, 28).1,
+                at_28,
+                "…so at a 28 px height it asks for {at_28} px of width",
+            );
+            preem_render::forget_scope(&Scope::card("timer"));
+        }
+    }
+
     /// #1042 fix round, HIGH-1: a region whose *every* mounted plugin renders an
     /// empty tree must hide the region container itself, not just the child
     /// cards inside it — otherwise the region stays a *visible*, zero-natural-

@@ -3607,7 +3607,7 @@ fn a_bar_mapping_stamps_the_height_axis_on_every_surface_node() {
         spacing: 0,
         classes: vec![],
         tooltip: None,
-        children: vec![seven_seg, pixels],
+        children: vec![seven_seg, pixels, shader_tree_node()],
     };
 
     for (mount, want) in [
@@ -3615,7 +3615,7 @@ fn a_bar_mapping_stamps_the_height_axis_on_every_surface_node() {
         (Mount::SidebarTop, FitAxis::Width),
     ] {
         let scope = Scope::detached("fit-axis");
-        let mapped = to_ui_node_fitted(&scope, Grants::none(), fit_axis(mount), &tree);
+        let mapped = to_ui_node_fitted(&scope, Grants::all(), fit_axis(mount), &tree);
         let UiNode::Row { children, .. } = mapped else {
             panic!("a Row maps to a Row, got {mapped:?}");
         };
@@ -3633,7 +3633,14 @@ fn a_bar_mapping_stamps_the_height_axis_on_every_surface_node() {
             ),
             other => panic!("a Node::Pixels maps to Pixels, got {other:?}"),
         }
+        match &children[2] {
+            UiNode::Shader { fit, .. } => {
+                assert_eq!(*fit, want, "…and a granted shader node's, through shader_map");
+            }
+            other => panic!("a granted Node::Shader maps to Shader, got {other:?}"),
+        }
         preem_render::forget_scope(&scope);
+        shader_map::forget_scope(&scope);
     }
 }
 

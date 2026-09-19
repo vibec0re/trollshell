@@ -3748,6 +3748,34 @@ session.
      `arm_for` exists for and the one that would be worth the most if it ever
      broke.
 
+## Bar chip geometry (#1387)
+
+- [ ] **(#1387)** A preem surface in a **bar** reserves the width it draws, not
+      the width of its kit buffer. The reported case is the timer chip: its
+      `mm:ss` readout is a 188×70 `SevenSeg` buffer, the bar forces the drawing
+      down to ~24 px tall (≈ 65 px wide), and until this fix the chip still
+      asked for the full 188 px — so the dark VFD field sat centred in a
+      transparent slab with ~60 px of dead pill either side (the screenshot on
+      the issue). Start the timer plugin on a bar mount and look at the chip:
+  1. **No slab.** The pill's edges sit against the readout's own edges, with
+     only `.ts-plugin-chip`'s padding (`0.154em 0.615em`) between them. Sideways
+     neighbours in the same bar group close up accordingly — one 6 px gap, not
+     a gap plus a void.
+  2. **The readout itself is unchanged.** Same height, same digits, same skin;
+     the fix moves the *request*, not the drawing (which letterboxed either way).
+     If the numerals got taller or shorter, something other than the size
+     request moved.
+  3. **The sidebar and the drawer are untouched.** Open the timer's panel (and
+     any sidebar-mounted preem card, e.g. `preem-demo`): those are
+     height-for-width as before — full card width, height following the aspect
+     ratio. A card that suddenly got narrow is this change reaching a mount it
+     should not have.
+  4. Worth a glance at any other bar-mounted plugin drawing a `Pixels` or
+     `Shader` node (`preem-demo` with `Mount::Bar`, `audio-widget`): they take
+     the same axis, so a chip that is now *narrower and correct* is the fix
+     working, and one that got **taller** would mean the bar is honouring a
+     natural height it should still be clamping.
+
 ## Screen recording
 
 - [ ] **(#458)** Rebuild the NixOS/home-manager config with `wf-recorder` +

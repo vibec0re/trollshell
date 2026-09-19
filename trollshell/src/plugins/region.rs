@@ -1728,9 +1728,6 @@ mod gtk_tests {
     /// the sidebar half green.
     #[gtk::test]
     fn a_chip_in_a_bar_region_measures_width_for_height() {
-        adw::init().expect("libadwaita init");
-        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
-
         /// The first `GlSurface` anywhere under `widget`, depth first — the
         /// chip's readout, however many boxes the card wraps it in.
         fn find_surface(widget: &gtk::Widget) -> Option<hytte::ui::GlSurface> {
@@ -1746,6 +1743,9 @@ mod gtk_tests {
             }
             None
         }
+
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
 
         let readout = wire::Node::Row {
             id: Some("root".to_owned()),

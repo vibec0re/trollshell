@@ -2552,10 +2552,14 @@ audio feed, not the raster.
 - [ ] **(#1091)** A marquee with `dot_px = 2` fits the bar without growing it.
       The pitch is a runtime knob now, and `9 * dot_px` is the whole height, so
       a bar-mounted ticker asks for `2` and gets 18 px against the bar's 32 —
-      which CI can check as arithmetic but not as glass. Point a bar-mounted
-      plugin at `Marquee::new(…).dot_px(2)` (the clock demo's bar instance —
-      `hytte-plugin-clock-demo` with `mount = "BarCenter"` — or `preem-demo`
-      with `Mount::Bar`), then:
+      which CI can check as arithmetic but not as glass. This needs a plugin
+      drawing `Marquee::new(…).dot_px(2)` in a bar region, and nothing in the
+      tree ships one: borrow the **shape** of a bar-mounted demo and put a
+      marquee in it. Either the clock demo's bar instance
+      (`hytte-plugin-clock-demo` launched with `mount = "BarCenter"` — its chip
+      is a `SevenSeg`, not a marquee) or `preem-demo`, whose card already draws
+      a marquee but whose manifest is `Mount::SidebarTop`, so it needs the same
+      `mount = "BarCenter"` on its entry to reach a bar at all. Then:
   1. **The bar does not grow.** Its height stays wherever `assets/trollshell/style.css`
      puts it — if the bar gets taller, the chip is asking for more than 32 px
      and the pitch did not reach the kit.
@@ -2720,7 +2724,11 @@ session.
      instance** (`hytte-plugin-clock-demo` under a second
      `programs.trollshell.plugins.<id>` entry with `mount = "BarCenter"`; the
      crate this used to name, `hytte-plugin-bar-clock-demo`, was folded into
-     it by #1388). The card's eight widgets and the bar
+     it by #1388). **If that entry is missing its `mount`, it comes up as a
+     second sidebar card, silently** — the attribute name stays a legal plugin
+     id, so nix has nothing to refuse and the shell nothing to complain about;
+     two clock cards and no bar chip is what a forgotten `mount` looks like.
+     The card's eight widgets and the bar
      chip's seven-segment clock should render through the shell's own kit;
      check the journal for **no** "plugin sent a `Node::Preem`, but this
      shell does not advertise…" warning, which would mean the negotiation

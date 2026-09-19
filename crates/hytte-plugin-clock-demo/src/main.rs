@@ -210,9 +210,20 @@ impl ClockDemo {
     /// 3): the pure half ([`hytte_plugin::effective_mount_from`]) is already
     /// covered by the SDK's own tests, so what a test here has to reach is the
     /// line that *threads* the answer into the model. With the composition
-    /// living here there is no second place for that wiring to hide, and
-    /// hardcoding `is_bar` goes red in the `tests` module's
+    /// living here, hardcoding `is_bar` goes red in the `tests` module's
     /// `the_launch_mount_picks_the_surface`.
+    ///
+    /// **That is not the whole of it**, and saying so was this function's own
+    /// review finding (#1389): [`Plugin::init`]'s one line — the `lookup` it
+    /// passes — is a second place the wiring lives, and no test built on this
+    /// seam can reach it, because every one of them supplies its own `lookup`.
+    /// Neutering `init` to `with_launch(&|_| None)` therefore left all 13
+    /// tests green while shipping a bar instance that renders the sidebar
+    /// card. `init_reads_the_real_process_environment` is what closes it: a
+    /// re-exec'd child of the test binary with a real `HYTTE_PLUGIN_MOUNT` in
+    /// its environment, calling `init` itself. The tree has closed this same
+    /// hole three times (`hytte-plugin`'s `runtime`, `hytte-claude-bridge`'s
+    /// `plugin`, `hytte-plugin-stats`' `plugin`), each as a review finding.
     ///
     /// `&dyn Fn` rather than a generic: `unsafe_code = "forbid"` rules out
     /// `std::env::set_var` (an `unsafe fn` in edition 2024), so a test cannot
@@ -546,6 +557,155 @@ mod tests {
         let seed = with_render_mode(RenderMode::State, || fresh().view());
         assert_eq!(root_id(&seed.tree), Some(ROOT_ID));
         assert!(seed.panel.is_none());
+    }
+
+    /// Set (to any value) only on the re-exec'd child that actually runs
+    /// [`init_reads_the_real_process_environment_inner`] — the same marker
+    /// shape as `hytte-plugin::runtime`'s `MOUNT_ENV_CHILD` and
+    /// `hytte-claude-bridge`'s `INIT_ENV_CHILD`, and for the same reason: an
+    /// ordinary `cargo test` run discovers the inner test like any other and
+    /// must not try to run its scenario with no launch environment set.
+    const INIT_ENV_CHILD: &str = "HYTTE_PLUGIN_CLOCK_DEMO_INIT_TEST_CHILD";
+
+    /// Printed by the child only once its scenario has run to completion and
+    /// passed, so the parent can tell "the scenario passed" from "the
+    /// `--exact` filter matched no test and libtest still reports `0 passed`,
+    /// exit 0" — the failure mode a renamed inner test produces.
+    const INIT_ENV_CHILD_OK: &str = "init-env-child-reached-the-end";
+
+    /// **[`Plugin::init`] itself reads the real process environment** — the
+    /// one production line every other test in this module routes around
+    /// (#1389 review, HIGH 1).
+    ///
+    /// The whole suite reaches the model through [`ClockDemo::with_launch`]
+    /// with a `lookup` of its own, so `init`'s `&|key| std::env::var(key).ok()`
+    /// is never executed by it: neutering that line to `&|_| None` left 13
+    /// tests, clippy and the whole of `nix flake check` green while shipping a
+    /// **bar instance that renders the sidebar card** — a unit that starts
+    /// cleanly, stays running and says nothing. The tree has closed this exact
+    /// seam-wrapper hole three times before, each as a review finding
+    /// (`hytte-plugin`'s `the_mount_env_var_reaches_the_register_frame`,
+    /// `hytte-claude-bridge`'s `init_reaches_the_view_with_a_real_process_environment`,
+    /// `hytte-plugin-stats`' `settings_reads_the_real_process_environment`);
+    /// this is the fourth and it is the one #1388 asked for by name, since the
+    /// ask was "exactly the way `hytte-plugin-stats` does it".
+    ///
+    /// A **child process** rather than a `set_var`: `unsafe_code = "forbid"`
+    /// makes `std::env::set_var` (an `unsafe fn` in edition 2024) unspellable
+    /// here, so the only way to hand this process's own `getenv` a value is to
+    /// be a different process — `Command::env` is the safe builder that does
+    /// it.
+    ///
+    /// **Two children, because they catch different mutations.** The override
+    /// child sets `HYTTE_PLUGIN_MOUNT=BarCenter` and wants the chip:
+    /// `BarCenter` rather than a sidebar name precisely because
+    /// [`DEFAULT_MOUNT`] is a sidebar mount, so a fully neutered `init`
+    /// (falling back to the manifest) and a working one give *different*
+    /// answers — the inner test asserts that premise before anything else.
+    /// The neutral child removes the variable and wants the card, which is
+    /// what catches the opposite mutation (an `init` that hands over a
+    /// constant `Some("BarCenter")`, which the override child would happily
+    /// pass) and is also the one place this crate proves its shipped default
+    /// survives `init` unmolested, in the same real-process harness.
+    #[test]
+    fn init_reads_the_real_process_environment() {
+        let inner = "tests::init_reads_the_real_process_environment_inner";
+        let args = ["--exact", "--nocapture", "--test-threads=1", inner];
+        assert!(
+            args.contains(&"--exact"),
+            "the re-exec must stay filtered to exactly one inner test",
+        );
+        let exe = std::env::current_exe().expect("this test binary's own path");
+
+        let overridden = std::process::Command::new(&exe)
+            .args(args)
+            .env(INIT_ENV_CHILD, "1")
+            .env(MOUNT_ENV, "BarCenter")
+            .output()
+            .expect("re-exec this test binary with the mount override set");
+        assert_init_child_reached_the_end(&overridden, inner, "override");
+
+        // `env_remove`, not merely "unset": a child inherits the parent's
+        // environment, so a developer running `cargo test` from a shell that
+        // happens to export `HYTTE_PLUGIN_MOUNT` would otherwise get a neutral
+        // child that is not neutral.
+        let neutral = std::process::Command::new(&exe)
+            .args(args)
+            .env(INIT_ENV_CHILD, "1")
+            .env_remove(MOUNT_ENV)
+            .output()
+            .expect("re-exec this test binary with no mount override");
+        assert_init_child_reached_the_end(&neutral, inner, "neutral");
+    }
+
+    /// A child scenario both exited 0 **and** reached its own end marker.
+    ///
+    /// The second half is not redundant: `--exact` against a renamed inner
+    /// test matches nothing, libtest reports `0 passed` and exits 0, and the
+    /// whole pin goes inert — the failure mode both precedents call out.
+    fn assert_init_child_reached_the_end(out: &std::process::Output, inner: &str, which: &str) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the {which} child scenario failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status,
+        );
+        assert!(
+            stdout.contains(INIT_ENV_CHILD_OK),
+            "the {which} child exited 0 without reaching the end of {inner} — a stale \
+             filter matches no test and libtest still reports success\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+    }
+
+    /// The scenario body of [`init_reads_the_real_process_environment`]. Does
+    /// nothing at all unless the parent's marker is set, so an ordinary
+    /// `cargo test` run — which discovers it like any other test — does not
+    /// try to run it with no launch environment set up for it.
+    #[test]
+    fn init_reads_the_real_process_environment_inner() {
+        if std::env::var_os(INIT_ENV_CHILD).is_none() {
+            return;
+        }
+        // The premise the parent's choice of override rests on, asserted
+        // rather than assumed (`hytte-plugin-stats`' copy of this, #1327
+        // review LOW 1): if `DEFAULT_MOUNT` ever moved to a bar region — not a
+        // hypothetical on a plugin whose whole point is running on both
+        // families — a neutered `init` and a working one would agree on the
+        // override child and this test would quietly stop catching anything.
+        assert!(
+            !DEFAULT_MOUNT.is_bar(),
+            "test setup: the override's family must differ from DEFAULT_MOUNT's own, \
+             or a neutered init() and a working one give the same answer",
+        );
+
+        let (tx, _rx) = hytte_plugin::cmd_channel();
+        // `init`, not `with_launch`: reaching the seam's wrapper is the entire
+        // point of being a separate process.
+        let model = ClockDemo::init(tx);
+        let view = with_render_mode(RenderMode::State, || model.view());
+
+        match std::env::var(MOUNT_ENV).ok().as_deref() {
+            Some("BarCenter") => {
+                assert_eq!(
+                    root_id(&view.tree),
+                    Some(CHIP_ID),
+                    "init must resolve the surface from the REAL environment",
+                );
+                assert!(view.panel.is_some(), "a bar instance publishes its page");
+            }
+            None => {
+                assert_eq!(
+                    root_id(&view.tree),
+                    Some(ROOT_ID),
+                    "with nothing set, init must land on the manifest's own mount",
+                );
+                assert!(view.panel.is_none(), "a card has no page to publish");
+            }
+            other => panic!("unexpected child environment: {MOUNT_ENV}={other:?}"),
+        }
+        println!("{INIT_ENV_CHILD_OK}");
     }
 
     /// The other half of the split: an instance answers only the click target

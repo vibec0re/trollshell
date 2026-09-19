@@ -98,7 +98,7 @@ anyone else's. Check these on a fresh install:
 
 ## Bundled plugins
 
-Sections below follow `bundledPluginNames`' order in `flake.nix` (14 total).
+Sections below follow `bundledPluginNames`' order in `flake.nix` (13 total).
 
 ### agents (`hytte-plugin-agents`)
 
@@ -270,7 +270,13 @@ programs.trollshell.plugins.bar-clock-demo = {
 
 That second entry is what a `hytte-plugin-bar-clock-demo` deployment becomes:
 #1388 folded that crate in here, since one binary that can be launched twice is
-the whole shape (Annika on #1163).
+the whole shape (Annika on #1163). Keeping the old attribute name is the
+least-churn migration — the unit and the launch id stay
+`trollshell-plugin-bar-clock-demo` — but note the **`mount` line is the whole
+of it, and forgetting it fails open**: the attribute name remains a perfectly
+legal plugin id, so an entry that repoints `package` and drops `mount` comes up
+as a _second sidebar card_ under that id, with no bar chip, no eval error and
+nothing in the journal. Two clock cards is the symptom.
 
 ### departures (`hytte-plugin-departures`)
 

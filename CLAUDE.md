@@ -283,7 +283,7 @@ dev-graph one), and running three of them concurrently on one 4-core runner
 made the wall time their _sum_ — 51, 73 and 86+ min against the 75-minute
 bound #1012 sized and #1230 had to raise. So each heavy check now
 `nix build`s on its own runner: `packages` (every shipped binary is a slice
-of the one `workspace` compile, so one job builds all 19 plus
+of the one `workspace` compile, so one job builds all 18 plus
 `shell-has-no-web-engine` and `workspace-ships-no-probes`), `workspace-tests`,
 `system-tests`, `clippy`, `rustdoc`, and `nixos-tests` (both VMs in one job —
 they share the single `probes` compile, which is the cost; the VMs themselves

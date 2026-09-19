@@ -3711,11 +3711,17 @@ mod gtk_tests {
     #[gtk::test]
     fn re_applying_the_same_fit_axis_queues_no_resize() {
         let s = seven_seg_surface();
-        assert!(s.imp().set_fit_axis(FitAxis::Height), "first set changes it");
+        assert!(
+            s.imp().set_fit_axis(FitAxis::Height),
+            "first set changes it"
+        );
         assert!(
             !s.imp().set_fit_axis(FitAxis::Height),
             "the same axis again is a no-op"
         );
-        assert!(s.imp().set_fit_axis(FitAxis::Width), "and back again is not");
+        assert!(
+            s.imp().set_fit_axis(FitAxis::Width),
+            "and back again is not"
+        );
     }
 }

@@ -229,7 +229,10 @@ mod tests {
         }
         // Degenerate on one axis only: the zero side cannot be a divisor, so
         // the derived answer falls back to this axis's own natural size.
-        assert_eq!(FitAxis::Width.natural(gtk::Orientation::Vertical, 200, 0, 70), 70);
+        assert_eq!(
+            FitAxis::Width.natural(gtk::Orientation::Vertical, 200, 0, 70),
+            70
+        );
         assert_eq!(
             FitAxis::Height.natural(gtk::Orientation::Horizontal, 200, 188, 0),
             188
@@ -250,6 +253,9 @@ mod tests {
         );
         // A negative natural size (not constructible from the setters, but the
         // fields are `i32`) never leaves through the return value.
-        assert_eq!(FitAxis::Width.natural(gtk::Orientation::Horizontal, -1, -5, 70), 0);
+        assert_eq!(
+            FitAxis::Width.natural(gtk::Orientation::Horizontal, -1, -5, 70),
+            0
+        );
     }
 }

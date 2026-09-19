@@ -1905,8 +1905,22 @@ mod gtk_tests {
 
         // Baseline width, per region: the busy sibling alone.
         let busy = || render_with_tree("busy", &tx, row_with_label_tree("root", "l", "hi"));
-        reconcile_region(&a, &cards_a, &[busy()], FitAxis::Height, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &[busy()], FitAxis::Height, "ts-plugin-chip", Some("B"));
+        reconcile_region(
+            &a,
+            &cards_a,
+            &[busy()],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        reconcile_region(
+            &b,
+            &cards_b,
+            &[busy()],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("B"),
+        );
         let width_a_busy_only = a.measure(gtk::Orientation::Horizontal, -1).1;
         let width_b_busy_only = b.measure(gtk::Orientation::Horizontal, -1).1;
 
@@ -1916,8 +1930,22 @@ mod gtk_tests {
             hidden_on_render("layouts", &tx, &["B"]),
             render_with_tree("busy", &tx, row_with_label_tree("root", "l", "hi")),
         ];
-        reconcile_region(&a, &cards_a, &renders, FitAxis::Height, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &renders, FitAxis::Height, "ts-plugin-chip", Some("B"));
+        reconcile_region(
+            &a,
+            &cards_a,
+            &renders,
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        reconcile_region(
+            &b,
+            &cards_b,
+            &renders,
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("B"),
+        );
 
         assert!(
             card_root(&cards_a, "layouts").is_visible(),
@@ -1983,8 +2011,22 @@ mod gtk_tests {
         let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
         let renders = [hidden_on_render("layouts", &tx, &["B"])];
-        reconcile_region(&a, &cards_a, &renders, FitAxis::Height, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &renders, FitAxis::Height, "ts-plugin-chip", Some("B"));
+        reconcile_region(
+            &a,
+            &cards_a,
+            &renders,
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        reconcile_region(
+            &b,
+            &cards_b,
+            &renders,
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("B"),
+        );
 
         assert!(
             a.get_visible(),
@@ -2228,8 +2270,22 @@ mod gtk_tests {
         let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
         let renders = [render_with_tree("layouts", &tx, button_tree("go"))];
-        reconcile_region(&a, &cards_a, &renders, FitAxis::Height, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &renders, FitAxis::Height, "ts-plugin-chip", Some("B"));
+        reconcile_region(
+            &a,
+            &cards_a,
+            &renders,
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        reconcile_region(
+            &b,
+            &cards_b,
+            &renders,
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("B"),
+        );
 
         find_button(&card_root(&cards_b, "layouts")).emit_clicked();
         assert_eq!(
@@ -2990,7 +3046,14 @@ mod gtk_tests {
         );
 
         // The plugin disconnects: its render leaves the region's mailbox.
-        reconcile_region(&container, &cards, &[], FitAxis::Height, "ts-plugin-chip", None);
+        reconcile_region(
+            &container,
+            &cards,
+            &[],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            None,
+        );
         assert!(cards.borrow().is_empty(), "the card itself must be gone");
         assert_eq!(
             preem_render::instance_count(&scope),
@@ -3030,7 +3093,14 @@ mod gtk_tests {
             grants: Grants::all(),
             ..render_of("shader-leaver", &tx)
         };
-        reconcile_region(&container, &cards, &[render], FitAxis::Height, "ts-plugin-chip", None);
+        reconcile_region(
+            &container,
+            &cards,
+            &[render],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            None,
+        );
         if skip_without_gl("card_leaving_its_region_releases_its_shader_states") {
             return;
         }
@@ -3041,7 +3111,14 @@ mod gtk_tests {
         );
 
         // The plugin disconnects: its render leaves the region's mailbox.
-        reconcile_region(&container, &cards, &[], FitAxis::Height, "ts-plugin-chip", None);
+        reconcile_region(
+            &container,
+            &cards,
+            &[],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            None,
+        );
         assert!(cards.borrow().is_empty(), "the card itself must be gone");
         assert_eq!(
             shader_map::cached_states(&scope),

@@ -44,8 +44,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hytte::ui::gl_surface::GlValue;
-use hytte::ui::{FitAxis, Node as UiNode};
 use hytte::ui::shader_surface::{ShaderFormat, ShaderState};
+use hytte::ui::{FitAxis, Node as UiNode};
 use hytte_plugin_proto::wire::{
     MAX_SHADER_DATA_BYTES, MAX_SHADER_DATA_EXTENT, MAX_SHADER_SOURCE_BYTES, ShaderData,
 };

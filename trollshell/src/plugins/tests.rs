@@ -46,7 +46,9 @@ use super::session::{
     push_gate, push_state, state_key_capability,
 };
 use super::shader_map::{self, Grants};
-use super::wire_map::{clamp_pixels_scale, fit_axis, pixels_len_ok, to_ui_node, to_ui_node_fitted, to_wire_event};
+use super::wire_map::{
+    clamp_pixels_scale, fit_axis, pixels_len_ok, to_ui_node, to_ui_node_fitted, to_wire_event,
+};
 use super::{BrokeredEffect, ListenerCtx, SlotRender};
 
 /// Regression for #426: the accept loop's error policy must be **total** —
@@ -3591,7 +3593,9 @@ fn a_bar_mapping_stamps_the_height_axis_on_every_surface_node() {
         Some("mmss"),
         vocab::PreemWidget::SevenSeg {
             config: vocab::SevenSegConfig::default(),
-            state: vocab::SevenSegState { text: "25:00".into() },
+            state: vocab::SevenSegState {
+                text: "25:00".into(),
+            },
         },
     );
     let pixels = wire::Node::Pixels {
@@ -3635,7 +3639,10 @@ fn a_bar_mapping_stamps_the_height_axis_on_every_surface_node() {
         }
         match &children[2] {
             UiNode::Shader { fit, .. } => {
-                assert_eq!(*fit, want, "…and a granted shader node's, through shader_map");
+                assert_eq!(
+                    *fit, want,
+                    "…and a granted shader node's, through shader_map"
+                );
             }
             other => panic!("a granted Node::Shader maps to Shader, got {other:?}"),
         }

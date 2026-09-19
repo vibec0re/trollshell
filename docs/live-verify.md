@@ -3762,7 +3762,7 @@ session.
      neighbours in the same bar group close up accordingly — one 6 px gap, not
      a gap plus a void.
   2. **The readout itself is unchanged.** Same height, same digits, same skin;
-     the fix moves the *request*, not the drawing (which letterboxed either way).
+     the fix moves the _request_, not the drawing (which letterboxed either way).
      If the numerals got taller or shorter, something other than the size
      request moved.
   3. **The sidebar and the drawer are untouched.** Open the timer's panel (and
@@ -3775,7 +3775,7 @@ session.
      `mount = "BarCenter"` on its `programs.trollshell.plugins.<id>` entry
      (the clock demo's bar instance, `preem-demo`, whose manifests are
      otherwise sidebar; see #1388's note above). They take the same axis, so a
-     chip that is now *narrower and correct* is the fix working, and one that
+     chip that is now _narrower and correct_ is the fix working, and one that
      got **taller** would mean the bar is honouring a natural height it should
      still be clamping.
 

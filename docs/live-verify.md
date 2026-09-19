@@ -5655,10 +5655,11 @@ and at least two agents that can be started.
 - [ ] **(#1306)** **Click it again → the same windows, no duplicates.** With
       the two windows still open on that workspace, press it again. Nothing
       new may appear: each window is its own `GApplication` id, so the second
-      launch finds the running process and presents it. `niri msg -j windows |
-      grep AgentWindow` must still show exactly two. Worth knowing what this
+      launch finds the running process and presents it — exactly two
+      `AgentWindow` app-ids in `niri msg -j windows`, before and after.
+      Worth knowing what this
       does **not** promise: a window you dragged to another workspace
-      beforehand is presented *where it is*, so the second press can pull
+      beforehand is presented _where it is_, so the second press can pull
       focus off the fan-out workspace. That is the documented behaviour, not
       a bug.
 - [ ] **(#1306)** **The Workspaces page shows it as an ephemeral card.** With
@@ -5667,7 +5668,7 @@ and at least two agents that can be started.
       as an **ephemeral** card — niri's own workspace number as its title, no
       name, the two `AgentWindow` app-ids as its apps. Close both windows and
       the card must disappear on the next refresh. This is the whole reason
-      the picker insists on an *unnamed* workspace; a named one would render
+      the picker insists on an _unnamed_ workspace; a named one would render
       as nothing here.
 - [ ] **(#1306)** **Only the running ones.** Stop one agent and pause another
       (the card's stop button; `hivectl agent pause <name>`), leaving one
@@ -5690,8 +5691,9 @@ and at least two agents that can be started.
       is not a tiled workspace. Exactly one "not on this plugin's PATH"
       warning in the log, as for the pill route.
 - [ ] **(#1306)** **The launched windows outlive the shell.** With the two
-      windows up, confirm `systemctl --user list-units
-      'trollshell-launch-agent-window-*'` lists one transient unit per window,
+      windows up, confirm that
+      `systemctl --user list-units 'trollshell-launch-agent-window-*'`
+      lists one transient unit per window,
       all of them inside `trollshell-launch.slice`, and then
       `systemctl --user restart trollshell` — both windows must survive it.
       `systemctl --user stop trollshell-launch.slice` must then close them
@@ -5703,7 +5705,7 @@ and at least two agents that can be started.
       plugin involved, so it must also work with `trollshell` stopped
       entirely (the **hive** is what it needs, not the shell).
 - [ ] **(#1306)** **A second output does not steal the windows.** On a
-      two-monitor setup, leave the *unfocused* screen with more workspaces
+      two-monitor setup, leave the _unfocused_ screen with more workspaces
       than the focused one (so its trailing empty workspace has a higher
       `idx`) and press the button. The windows must land on the screen you
       are looking at.

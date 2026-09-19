@@ -98,6 +98,8 @@ async fn an_absent_socket_reports_the_clients_own_reason() {
 async fn a_refusing_hive_carries_its_own_sentence() {
     let hive = FakeHive::script(&[r#"{"version":1,"ok":true,"agent_statuses":[]}"#])
         .refusing("agent_status", "the roster is locked");
-    let err = roster_from(hive.path()).await.expect_err("the hive says no");
+    let err = roster_from(hive.path())
+        .await
+        .expect_err("the hive says no");
     assert!(err.to_string().contains("the roster is locked"), "{err}");
 }

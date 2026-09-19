@@ -612,7 +612,9 @@ mod tests {
         model_family,
     };
     use crate::config::AgentsConfig;
-    use crate::hive::wire::{AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, VersionMismatch};
+    use crate::hive::wire::{
+        AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, VersionMismatch,
+    };
     use std::collections::BTreeSet;
 
     // ── #947 P3: the approval queue's two invariants ─────────────────────────

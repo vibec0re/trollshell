@@ -1665,10 +1665,7 @@ mod tests {
         let ids: Vec<String> = button_ids(&title);
         assert_eq!(
             ids,
-            vec![
-                super::OPEN_ALL_ID.to_owned(),
-                super::OVERVIEW_ID.to_owned()
-            ],
+            vec![super::OPEN_ALL_ID.to_owned(), super::OVERVIEW_ID.to_owned()],
             "the fan-out grows inwards; the overview keeps its corner"
         );
         assert_eq!(

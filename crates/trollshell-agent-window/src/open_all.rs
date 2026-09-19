@@ -217,10 +217,7 @@ impl std::fmt::Display for NoWorkspace {
 ///
 /// # Errors
 /// [`NoWorkspace`] — which the caller reports and then launches anyway.
-pub fn pick_workspace(
-    workspaces: &[Workspace],
-    windows: &[Window],
-) -> Result<Target, NoWorkspace> {
+pub fn pick_workspace(workspaces: &[Workspace], windows: &[Window]) -> Result<Target, NoWorkspace> {
     let focused = workspaces
         .iter()
         .find(|w| w.is_focused)
@@ -584,7 +581,11 @@ pub fn run() -> u8 {
         failed = report.failed,
         "agent windows opened"
     );
-    if report.launched == 0 { EXIT_FAILED } else { EXIT_OK }
+    if report.launched == 0 {
+        EXIT_FAILED
+    } else {
+        EXIT_OK
+    }
 }
 
 #[cfg(test)]
@@ -877,7 +878,9 @@ mod tests {
                 return Err("cannot reach niri over $NIRI_SOCKET: no such file".to_owned());
             }
             Ok(match request {
-                NiriRequest::Workspaces => Ok(NiriResponse::Workspaces(self.niri.workspaces.clone())),
+                NiriRequest::Workspaces => {
+                    Ok(NiriResponse::Workspaces(self.niri.workspaces.clone()))
+                }
                 NiriRequest::Windows => Ok(NiriResponse::Windows(self.niri.windows.clone())),
                 NiriRequest::Action(Action::FocusWorkspace { reference }) => {
                     self.journal.push(format!("focus {reference:?}"));

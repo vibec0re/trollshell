@@ -220,11 +220,11 @@ Three things worth knowing before you bind it:
 - **Press it again and nothing doubles.** Each window is its own
   `GApplication` id (`mov.vibec0re.trollshell.AgentWindow.<agent>`), so a
   second run finds the windows that already exist and presents them. What it
-  does *not* do is gather: a window you had already moved elsewhere is raised
+  does _not_ do is gather: a window you had already moved elsewhere is raised
   where it is, not dragged onto the new workspace.
 - **No hive, no windows.** With `host.sock` unreachable it says so on stderr
   (`journalctl --user -t trollshell-agent-window`, or the terminal you ran it
-  from) and exits non-zero. Nothing running at all is *not* an error — one
+  from) and exits non-zero. Nothing running at all is _not_ an error — one
   line, exit 0.
 - **niri is optional to the launch.** If `$NIRI_SOCKET` cannot be reached, or
   the focused output has no empty workspace to take, the windows still open —

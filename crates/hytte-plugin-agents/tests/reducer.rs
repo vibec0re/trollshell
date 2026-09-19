@@ -1027,7 +1027,9 @@ fn the_open_all_button_is_drawn_exactly_when_the_click_would_launch() {
                 ..AgentStatusRow::default()
             }]));
 
-            let drawn = button_ids(&card_of(&m)).iter().any(|id| id == "agents-open-all");
+            let drawn = button_ids(&card_of(&m))
+                .iter()
+                .any(|id| id == "agents-open-all");
             let launches = !m.update(click("agents-open-all")).is_empty();
             assert_eq!(
                 drawn, launches,

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::ephemeral_bus;
+use common::{CALL_BUDGET, PROBE_BUDGET, ephemeral_bus};
 use hytte_bus::export_object_with;
 use hytte_bus::test_support::SharedConnection;
 use std::time::Duration;
@@ -19,47 +19,16 @@ impl Greeter {
     }
 }
 
-/// Upper bound on a **single** raw `zbus::Proxy::call` in this file.
-///
-/// A zbus method call carries no reply timeout unless the connection was built
-/// with one, and `method_timeout` defaults to `None` — so a call whose reply
-/// never comes does not fail, it parks the calling task **forever**. The
-/// liveness loops below re-check their own deadline only *between* iterations,
-/// so an unbounded call inside one makes that deadline unreachable.
-///
-/// That is exactly what #1011 was. `zbus` drops an inbound method call that
-/// arrives before its object-server dispatch task has registered its match
-/// rule — no reply, not even an error — so the first `Hello` here could be
-/// answered by nobody. The test then hung instead of failing: five
-/// `nix flake check` runs went silent for ~51 minutes apiece and were killed
-/// by the job timeout, with `test export_unmounts_on_handle_drop has been
-/// running for over 60 seconds` as the last thing CI ever printed.
-/// `connection.rs`'s `begin_dispatching` is what removes the race; this bound
-/// is what makes a *recurrence* — of that or of any other lost reply — a named
-/// red assertion in seconds instead of a silent hang.
-///
-/// **This is a liveness guard, not a latency assertion**, in the same sense as
-/// `common`'s `DBUS_DAEMON_STARTUP_BUDGET`: nothing here claims a D-Bus call
-/// *should* complete within five seconds. These tests run inside
-/// `nix flake check` next to two `nixosTest` VMs and a full workspace compile,
-/// so CPU starvation is the normal condition. Five seconds is far past any
-/// honest latency (a green run answers the first call in ~1 ms) and far short
-/// of [`PROBE_BUDGET`], which is what leaves room to retry rather than fail.
-const CALL_BUDGET: Duration = Duration::from_secs(5);
-
-/// Upper bound on a whole mounted/unmounted liveness loop.
-///
-/// Was 2 s while each call inside could park forever, which made it decorative:
-/// the loop could not reach its own deadline. It is deliberately several times
-/// [`CALL_BUDGET`] so that a call which *is* swallowed costs one retry rather
-/// than the test — trading a hang for a flake would be no fix at all. Only the
-/// failing path spends any of this; a healthy run leaves both loops on the
-/// first iteration.
-const PROBE_BUDGET: Duration = Duration::from_secs(20);
-
 /// Dropping the last `ExportHandle` must unregister the interface from the
 /// connection — otherwise a daemon that recorded our unique name keeps reaching
 /// an object whose owner believes it retired (the NM secret-agent leak).
+///
+/// Both liveness loops bound every call with [`CALL_BUDGET`] and treat "no
+/// reply at all" as *retry*, never as an answer. This test is where #1011 was
+/// found: an unbounded raw call here parked forever on a `Hello` that zbus had
+/// dropped, and because a loop re-checks its deadline only between iterations,
+/// the 2 s budget it used to carry was unreachable. See `common`'s
+/// `CALL_BUDGET` for the mechanism and the measurements.
 #[tokio::test(flavor = "multi_thread")]
 async fn export_unmounts_on_handle_drop() {
     let (conn, guard) = ephemeral_bus().await;
@@ -103,9 +72,10 @@ async fn export_unmounts_on_handle_drop() {
             }
             // An error reply — the object is not mounted *yet*. Retry.
             Ok(Err(_)) => {}
-            // No reply at all within the budget. Not a pass and not a fail:
-            // count it, retry, and let the assertion below report it if the
-            // whole budget goes this way.
+            // No reply at all within the budget: the connection was not yet
+            // dispatching when this call landed, so zbus dropped it. Not a pass
+            // and not a fail — count it, retry, and let the assertion below
+            // report it if the whole budget goes this way.
             Err(_elapsed) => unanswered += 1,
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -113,8 +83,8 @@ async fn export_unmounts_on_handle_drop() {
     assert!(
         mounted,
         "exported object was never reachable within {PROBE_BUDGET:?} \
-         ({unanswered} of the Hello calls got no reply at all within \
-         {CALL_BUDGET:?} — see this file's CALL_BUDGET note, #1011)"
+         ({unanswered} Hello calls got no reply at all within {CALL_BUDGET:?} \
+         each — see common::CALL_BUDGET, #1011)"
     );
 
     // Drop the handle — the supervisor must unmount the interface.
@@ -143,7 +113,7 @@ async fn export_unmounts_on_handle_drop() {
     assert!(
         unmounted,
         "exported object stayed reachable after the handle was dropped (leak): \
-         no error reply within {PROBE_BUDGET:?} ({unanswered} of the Hello \
-         calls got no reply at all within {CALL_BUDGET:?})"
+         no error reply within {PROBE_BUDGET:?} ({unanswered} Hello calls got \
+         no reply at all within {CALL_BUDGET:?} each)"
     );
 }

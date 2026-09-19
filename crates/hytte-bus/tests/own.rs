@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::ephemeral_bus;
+use common::{PROBE_BUDGET, ephemeral_bus};
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
@@ -314,9 +314,13 @@ async fn at_path_mounts_iface_callable() {
     // apiece in `tests/export.rs`'s copy of this shape. The wait is bounded so
     // a recurrence is a named red assertion; see `tests/export.rs`'s
     // `CALL_BUDGET` for why the number is generous rather than tight.
-    let result: String = tokio::time::timeout(Duration::from_secs(5), proxy.call("Hello", &()))
+    let result: String = tokio::time::timeout(PROBE_BUDGET, proxy.call("Hello", &()))
         .await
-        .expect("Hello on the mounted object got no reply at all within 5 s (#1011)")
+        .expect(
+            "Hello on the mounted object got no reply at all within common::PROBE_BUDGET \
+             — zbus drops an inbound call its object-server dispatch task has not \
+             subscribed to yet, and a raw call has no reply timeout (#1011)",
+        )
         .expect("Hello call");
     assert_eq!(result, "world");
 }

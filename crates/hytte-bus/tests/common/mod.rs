@@ -44,6 +44,62 @@ use zbus::connection::Builder;
 /// real hang, run the test locally — CI's job is to not lie.
 const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 
+/// Upper bound on a **single** raw `zbus::Proxy::call` issued by a test in this
+/// crate, and on the retry loop such a call sits in. (#1011)
+///
+/// ## Why a raw call must never be awaited unbounded here
+///
+/// A zbus method call carries no reply timeout unless the connection was built
+/// with one, and `Builder`'s `method_timeout` defaults to `None`. So a call
+/// whose reply never arrives does not fail — it parks the awaiting task
+/// **forever**. And a reply can genuinely never arrive: zbus creates its object
+/// server lazily, its dispatch task is the only consumer of inbound
+/// `MethodCall` messages, and until that task has registered its
+/// `msg_type=MethodCall, destination=<unique name>` match rule an arriving call
+/// matches no receiver and is **dropped with no reply at all**. There is no arm
+/// in `zbus::Connection` that synthesises an `UnknownObject`/`UnknownMethod`
+/// error for an unhandled call.
+///
+/// That is what #1011 was, and it cost five `nix flake check` runs ~51 minutes
+/// of silence apiece before the job timeout killed them: `tests/export.rs`
+/// captured a unique name, called `Hello` on it, lost the race, and the
+/// surrounding liveness loop — which re-checks its own deadline only *between*
+/// iterations — could never reach that deadline. The last thing CI printed was
+/// libtest's `test export_unmounts_on_handle_drop has been running for over 60
+/// seconds`.
+///
+/// ## Why these two numbers, and why a timeout is retried rather than fatal
+///
+/// `connection.rs`'s `begin_dispatching` starts the dispatch task as soon as a
+/// `SharedConnection` is built rather than at the first `export`/`own` mount,
+/// which is where the race came from. It cannot *close* the window — zbus
+/// exposes the `started_event` that would prove readiness only through
+/// `connection::Builder`, and only for a connection built with an
+/// already-served interface — so a first call can still be swallowed. Measured
+/// on a 4-CPU set saturated with busy loops (the GitHub runner's shape): 29 of
+/// 100 runs still lose their first `Hello`, and every one of them is answered
+/// on the very next attempt.
+///
+/// So a call that gets no reply is treated as "not ready yet" and **retried**,
+/// not failed. That is what lets [`CALL_BUDGET`] be short: a swallowed call
+/// costs one second, not the test, and a call that is merely slow under load is
+/// re-issued rather than declared broken. It is emphatically **not** a latency
+/// assertion — nothing here claims a D-Bus call *should* answer within a second
+/// (a healthy run answers in ~1 ms). It is the guard that stops an unanswerable
+/// call from wedging the suite, and [`PROBE_BUDGET`] — 20 attempts' worth — is
+/// what decides that something is actually broken. Tightening `PROBE_BUDGET` is
+/// what would buy false reds under CI contention; tightening `CALL_BUDGET`
+/// only costs extra retries. See [`DBUS_DAEMON_STARTUP_BUDGET`] above for the
+/// same distinction stated at length.
+#[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
+pub const CALL_BUDGET: Duration = Duration::from_secs(1);
+
+/// Upper bound on a whole liveness loop built out of [`CALL_BUDGET`] calls —
+/// the deadline that decides a peer is really not answering. See
+/// [`CALL_BUDGET`] for why the two are sized against each other.
+#[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
+pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
+
 pub struct BusGuard {
     child: Option<Child>,
     tmp: TempDir,

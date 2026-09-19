@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::ephemeral_bus;
+use common::{CALL_BUDGET, PROBE_BUDGET, ephemeral_bus};
 use hytte_bus::BusKind;
 use hytte_bus::test_support::SharedConnection;
 use std::time::Duration;
@@ -83,15 +83,11 @@ async fn shared_connection_answers_method_calls_before_anything_is_exported() {
     // that `begin_dispatching` starts but cannot await (zbus exposes the
     // `started_event` only through `connection::Builder`). A swallowed call
     // costs one retry; a connection that never dispatches costs the assertion.
-    let overall = tokio::time::Instant::now() + Duration::from_secs(20);
+    let overall = tokio::time::Instant::now() + PROBE_BUDGET;
     let mut answered = false;
     let mut unanswered = 0u32;
     while tokio::time::Instant::now() < overall {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            proxy.call::<_, _, String>("Introspect", &()),
-        )
-        .await
+        match tokio::time::timeout(CALL_BUDGET, proxy.call::<_, _, String>("Introspect", &())).await
         {
             Ok(Ok(xml)) => {
                 assert!(

@@ -153,11 +153,19 @@ jobs:
       # `max-silent-time` is the daemon-side backstop for #1011: a builder
       # that produces no output for 30 minutes fails with nix's own named
       # error, naming the derivation, instead of waiting out the 105-minute
-      # `timeout` below and being killed as an undiagnosable silence. All
-      # five #1011 occurrences were one derivation going quiet mid-build
-      # (`trollshell-system-tests`, parked in a hytte-bus test on an
-      # unanswerable D-Bus call) while nix, which has no silence limit by
-      # default, waited happily.
+      # `timeout` below and being killed as an undiagnosable silence. The two
+      # occurrences the #1264 `/proc` dump and the 2026-09-13 timeline name
+      # were one derivation going quiet mid-build (`trollshell-system-tests`,
+      # parked in a hytte-bus test on an unanswerable D-Bus call) while nix,
+      # which has no silence limit by default, waited happily.
+      #
+      # Deliberately "the two", not "all five": occurrences 1-3 are recorded
+      # on that thread with a *different* signature — silence after every
+      # check had completed, with the eds VM's `(finished: cleanup)` as the
+      # last line — and were never re-read against their logs; #5's comment
+      # offers a plausible re-reading but does not verify it. And the thread
+      # explicitly excludes run 34750265932, which was not silent at all,
+      # only longer than 75 minutes — a run this bound would not have caught.
       #
       # 1800 s is ~4x the longest silent stretch any single derivation
       # legitimately has: measured across two recent green runs, the worst
@@ -189,6 +197,15 @@ jobs:
       # fsync of one output, a store-wide walk, or a sandbox-mount
       # teardown, and thus what the actual fix is (#1011). The job-level
       # bound above stays the backstop for everything else.
+      #
+      # That dump then read its own paragraph back: occurrence #5's `/proc`
+      # state showed the worker flapping D/R with its fds on the derivation's
+      # lock, log and build dir — what a worker looks like *seconds after*
+      # `timeout` SIGTERMs its client and it starts deleting the build
+      # directory. PSI was 0.00 throughout. So "every builder gone, one `Ds`
+      # worker left" above is post-kill contamination, not the hang: the
+      # builder was alive and parked in one hytte-bus test until we killed
+      # the client. The dump stays because it is what established that.
       - name: nix build
         env:
           NAME: ${{ matrix.name }}

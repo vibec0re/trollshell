@@ -301,12 +301,28 @@ pub mod test_support {
         /// Construct a `SharedConnection` wrapping an existing test
         /// `Connection`. Bypasses the supervisor — for unit tests of
         /// individual primitives that want full control over reconnect.
+        ///
+        /// # Panics
+        ///
+        /// Must be called from inside a tokio runtime context: it starts zbus's
+        /// object-server dispatch task (see `begin_dispatching`, #1011), and
+        /// with zbus's `tokio` feature — the one this workspace pins — that is
+        /// `tokio::task::spawn`, which panics outside a runtime. Every caller is
+        /// an `async fn` test body, so this is a note rather than a hazard;
+        /// neither `clippy::missing_panics_doc` (which cannot see a transitive
+        /// panic, and is `allow` at the workspace root anyway) nor the
+        /// `rustdoc` check would ever have caught its absence.
         #[must_use]
         pub fn for_test_session(conn: Connection) -> Self {
             Self::for_test(BusKind::Session, conn)
         }
 
         /// Like `for_test_session` but for the system bus.
+        ///
+        /// # Panics
+        ///
+        /// Same runtime-context requirement as
+        /// [`for_test_session`](Self::for_test_session).
         #[must_use]
         pub fn for_test_system(conn: Connection) -> Self {
             Self::for_test(BusKind::System, conn)
@@ -334,6 +350,12 @@ pub mod test_support {
         /// on a successful reconnect (bump generation + epoch). Lets a test
         /// deterministically reproduce "a fresh connection was installed while
         /// an old op was still in flight" without racing a real supervisor.
+        ///
+        /// # Panics
+        ///
+        /// Same runtime-context requirement as
+        /// [`for_test_session`](Self::for_test_session) — it reaches the same
+        /// `begin_dispatching`.
         #[doc(hidden)]
         pub async fn install_fresh_connection_for_test(&self, conn: Connection) {
             super::begin_dispatching(&conn);

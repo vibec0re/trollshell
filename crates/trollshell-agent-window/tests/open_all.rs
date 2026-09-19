@@ -30,13 +30,14 @@ const PRECEDENCE: &str = r#"{"version":1,"ok":true,"agent_statuses":[
 /// The whole membership decision, end to end over a real socket: six agents
 /// on the wire, **two** windows.
 ///
-/// Three of the four excluded rows have `running: true` on the wire —
-/// `locked-out` needs a login, `parked` is paused, `wedged` has failed — which
-/// is the point: the rule is the *collapsed* `Status`, not the raw flag, and
-/// only a roster carrying that distinction can tell the two apart.
+/// Two of the four excluded rows have `running: true` on the wire —
+/// `locked-out` needs a login, `parked` is paused — which is the point: the
+/// rule is the *collapsed* `Status`, not the raw flag, and only a roster
+/// carrying that distinction can tell the two apart.
 ///
 /// Falsification (verified red): filter on `row.running` in `running_agents`
-/// and this answers five names instead of two.
+/// and this answers `["locked-out", "parked", "busy", "argus"]` — four
+/// windows for two live terminals.
 #[tokio::test]
 async fn a_real_roster_becomes_the_running_agents_in_the_hives_own_order() {
     // `host.sock` speaks JSON **lines**, one object per line, and the fixture

@@ -932,17 +932,30 @@ fn the_agent_page_click_launches_the_companion_window() {
 /// would hit the host's four-per-burst detached-launch budget (#1165 item 8)
 /// on a hive with five running agents.
 ///
-/// Falsification (each verified red): emit one launch per running agent and
-/// the exact-effect assertion reds on the vector's length; append the agent's
-/// name to the argv and it reds on the argv; drop `detached: true` and it
-/// reds on the effect.
+/// Falsification (verified red): emit one launch per running agent and this
+/// reds with **three** effects naming three agents; append an agent's name to
+/// the argv, or drop `detached: true`, and it reds on the exact effect.
 #[test]
 fn the_open_all_click_is_exactly_one_detached_fan_out_launch() {
     let (mut m, mut rx) = model();
     m.set_window_probe(Probe::fixed(true));
-    // Two running agents (`busy`, and `parked` is Paused so it is not one) —
-    // the roster that would produce two launches under the wrong design.
-    m.update(status(roster("agent_status_precedence.json")));
+    // **Three** running agents, and one paused: the roster that makes the
+    // count assertion below mean something. A single-running-agent roster
+    // would let the per-agent design pass on length alone.
+    let running = |name: &str| AgentStatusRow {
+        name: name.to_owned(),
+        running: true,
+        ..AgentStatusRow::default()
+    };
+    m.update(status(vec![
+        running("argus"),
+        running("bosun"),
+        AgentStatusRow {
+            paused: true,
+            ..running("parked")
+        },
+        running("cinder"),
+    ]));
 
     let fx = m.update(click("agents-open-all"));
     assert_eq!(

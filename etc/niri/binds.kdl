@@ -84,6 +84,25 @@ binds {
     // the sidebar binds above: commented out, pick your own chord.
     // Mod+C hotkey-overlay-title="Open Control Center" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-control-center" "0" "0"; }
 
+    // Every running agent's window, on a fresh workspace (#1306) — the same
+    // thing the agents card's grid button does, from the keyboard. A plain
+    // `spawn` with no D-Bus and no running plugin involved: the companion
+    // window binary reads hyperhive's host.sock and $NIRI_SOCKET itself,
+    // focuses the empty workspace at the bottom of the focused output, opens
+    // one window per RUNNING agent there and exits.
+    //
+    // Pressing it again is safe and is the intended way to get back: each
+    // window is its own GApplication id, so a second run re-presents the
+    // windows that already exist instead of opening a second set.
+    //
+    // Needs `programs.trollshell.agentWindow.enable` (on by default once a
+    // `plugins.agents` entry exists). Commented out, and for the reason the
+    // binds above give: which chord maps to which verb is a deployer
+    // preference, and niri treats a duplicate chord as a hard config error
+    // rather than last-wins. Mod+Alt+A is unused by niri 26.04's stock config
+    // and by everything else in this file.
+    // Mod+Alt+A hotkey-overlay-title="Open every running agent's window" { spawn "trollshell-agent-window" "--open-all"; }
+
     // Column layouts (#1019) — the same binary that paints the bar chip also
     // applies one layout and exits, so these are plain `spawn`s with no shell,
     // no D-Bus and no running plugin involved: it reads $NIRI_SOCKET itself.

@@ -6,8 +6,11 @@
 //! without re-examining it for a `-`. `clap` would read that name as a flag.
 //! The rule is asserted from both ends — `hytte_plugin_agents::window`'s
 //! `a_leading_hyphen_name_is_its_own_argv_element` and
-//! [`tests::the_plugins_own_argv_parses_on_both_tabs`] here, which feeds the
-//! *real* builder's output through the *real* parser.
+//! `the_plugins_own_argv_parses_on_both_tabs` here, which feeds the
+//! *real* builder's output through the *real* parser. Both are named in plain
+//! code rather than linked: they live in `#[cfg(test)]` modules, which rustdoc
+//! never has in scope, so a link would be a `broken_intra_doc_links` error
+//! under `checks.rustdoc`'s `-D warnings` (#1328).
 //!
 //! Two shapes, not one, since
 //! [#1306](https://github.com/vibec0re/trollshell/issues/1306): one window for

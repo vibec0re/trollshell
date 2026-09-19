@@ -49,58 +49,95 @@ use super::shader_map;
 use super::wire_map::{fit_axis, to_ui_node, to_ui_node_fitted, to_wire_event};
 use super::{PluginHandles, SlotRender};
 
-fn lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+/// This mount's **render mailbox**, as a signal — the shared
+/// `Vec<SlotRender>` list every monitor's copy of this region mounts its cards
+/// from (see the module header).
+///
+/// A **total match over [`Mount`]**, on
+/// [`wire_map::fit_axis`](super::wire_map::fit_axis)'s precedent: a tenth mount
+/// is a compile error here rather than a region silently reading whichever
+/// mailbox an `if` fell on.
+///
+/// It exists as one function because of the **#1391 review, HIGH 1**. Before
+/// it, each of the nine regions reached its mailbox through its own one-line
+/// accessor, and the slot wrapper below paired that accessor with a
+/// hand-written axis, orientation and CSS class — four tokens per region,
+/// graded by nothing, where transposing the axis alone re-ships #1387 on the
+/// bar it was reported on and changes nothing else that anyone can see. With
+/// this and [`region_shape`] a region is **one** hand-written token, its
+/// [`Mount`], and every property of it follows from that token.
+fn render_signal(mount: Mount) -> impl Signal<Item = Vec<SlotRender>> {
     registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .sidebar_lead
-            .signal_cloned()
+        let handles = r
+            .get::<PluginHandles>()
+            .expect("plugins::service() not registered");
+        match mount {
+            Mount::SidebarLead => &handles.sidebar_lead,
+            Mount::SidebarTop => &handles.sidebar_top,
+            Mount::SidebarBottom => &handles.sidebar_bottom,
+            Mount::SidebarRightLead => &handles.sidebar_right_lead,
+            Mount::SidebarRightTop => &handles.sidebar_right_top,
+            Mount::SidebarRightBottom => &handles.sidebar_right_bottom,
+            Mount::BarLeft => &handles.bar_left,
+            Mount::BarCenter => &handles.bar_center,
+            Mount::BarRight => &handles.bar_right,
+        }
+        .signal_cloned()
     })
 }
 
-fn top_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .sidebar_top
-            .signal_cloned()
-    })
+/// The three things a region's **family** decides: which axis its surfaces are
+/// fitted on (#1387), which way its cards are laid out, and the CSS class each
+/// card root wears.
+///
+/// One derivation rather than three per-region literals (**#1391 review,
+/// HIGH 1**). The axis is the invisible one — a chip drawn correctly still
+/// reserves 188 px when it is wrong, which is why #1387 needed a screenshot to
+/// find — so it is deliberately not separable from the two that are *loud*: a
+/// region handed the wrong [`Mount`] now lays its cards out the wrong way and
+/// wears the wrong class, and fails on sight instead of silently.
+///
+/// The axis is **not** re-derived here: it is
+/// [`wire_map::fit_axis`](super::wire_map::fit_axis), the same total match the
+/// mapping pass stamps on every surface node, so the region and the tree it
+/// mounts cannot disagree about which way round a chip measures even in
+/// principle. Only the two GTK-side literals are local, and both of them follow
+/// the same family predicate the rest of the host reads ([`Mount::is_bar`],
+/// which `fit_axis` is itself graded against) — asserted over [`Mount::ALL`] in
+/// `tests::every_mounts_region_shape_follows_its_family`.
+fn region_shape(mount: Mount) -> (FitAxis, gtk::Orientation, &'static str) {
+    if mount.is_bar() {
+        // A bar region is a horizontal row of chips whose *height* the bar
+        // hands down (#349 for the row, #1387 for the axis).
+        (
+            fit_axis(mount),
+            gtk::Orientation::Horizontal,
+            "ts-plugin-chip",
+        )
+    } else {
+        // A sidebar region is a vertical stack of cards whose *width* the
+        // sidebar hands down — what every surface did unconditionally before
+        // #1387.
+        (
+            fit_axis(mount),
+            gtk::Orientation::Vertical,
+            "ts-plugin-card",
+        )
+    }
 }
 
-fn bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .sidebar_bottom
-            .signal_cloned()
-    })
-}
-
-fn bar_left_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .bar_left
-            .signal_cloned()
-    })
-}
-
-fn bar_center_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .bar_center
-            .signal_cloned()
-    })
-}
-
-fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .bar_right
-            .signal_cloned()
-    })
+/// One mount's region, built for the monitor `connector` names — the whole body
+/// of all nine public slot wrappers below, so each of them is exactly its
+/// [`Mount`] (**#1391 review, HIGH 1**).
+///
+/// `connector` rather than a [`Monitor`] because that is all [`build_region`]
+/// takes and it is what makes this reachable from `gtk_tests`, which has no way
+/// to build a `Monitor` (`hytte_ui::Monitor::new` is `pub(crate)` to that
+/// crate) — `gtk_tests::every_region_reads_its_own_mailbox_with_its_familys_shape`
+/// drives this function over [`Mount::ALL`] and is what grades both maps above
+/// against the widget they produce.
+fn region_slot(mount: Mount, connector: Option<String>) -> gtk::Widget {
+    build_region(render_signal(mount), mount, connector)
 }
 
 /// The [`Mount::SidebarLead`](hytte_plugin_proto::Mount::SidebarLead) **region** —
@@ -109,22 +146,19 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// above the built-in weather/calendar/tasks cards, so a plugin here leads the
 /// sidebar (#301).
 ///
-/// Every `build_region` call site here passes `monitor.connector()`
-/// straight through (no more `named_connector` fold, #1177):
-/// `hytte_ui::Monitor::connector` itself folds an empty connector name to
-/// `None` since #1180 item 6, so a region can no longer see `Some("")` — the
-/// exact case this module's own doc on `build_region` and
-/// [`HostMsg::Event::output`]'s wire doc in `hytte-plugin-proto` promise
-/// plugins a clean `None` for.
+/// Every slot wrapper here passes `monitor.connector()` straight through (no
+/// more `named_connector` fold, #1177): `hytte_ui::Monitor::connector` itself
+/// folds an empty connector name to `None` since #1180 item 6, so a region can
+/// no longer see `Some("")` — the exact case this module's own doc on
+/// [`build_region`] and [`HostMsg::Event::output`]'s wire doc in
+/// `hytte-plugin-proto` promise plugins a clean `None` for.
+///
+/// The mount is the only thing each of these nine wrappers says; its mailbox,
+/// measure axis, layout orientation and card class all follow from it
+/// ([`region_slot`], **#1391 review, HIGH 1**).
 #[must_use]
 pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        lead_render_signal(),
-        fit_axis(Mount::SidebarLead),
-        gtk::Orientation::Vertical,
-        "ts-plugin-card",
-        monitor.connector(),
-    )
+    region_slot(Mount::SidebarLead, monitor.connector())
 }
 
 /// The [`Mount::SidebarTop`](hytte_plugin_proto::Mount::SidebarTop) **region** — a
@@ -132,26 +166,14 @@ pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
 /// `overlays::sidebar::build_card` and appended above the built-in widgets.
 #[must_use]
 pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        top_render_signal(),
-        fit_axis(Mount::SidebarTop),
-        gtk::Orientation::Vertical,
-        "ts-plugin-card",
-        monitor.connector(),
-    )
+    region_slot(Mount::SidebarTop, monitor.connector())
 }
 
 /// The [`Mount::SidebarBottom`](hytte_plugin_proto::Mount::SidebarBottom)
 /// **region**, appended below the built-in sidebar widgets.
 #[must_use]
 pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        bottom_render_signal(),
-        fit_axis(Mount::SidebarBottom),
-        gtk::Orientation::Vertical,
-        "ts-plugin-card",
-        monitor.connector(),
-    )
+    region_slot(Mount::SidebarBottom, monitor.connector())
 }
 
 /// The [`Mount::BarLeft`](hytte_plugin_proto::Mount::BarLeft) **region** — a
@@ -161,39 +183,21 @@ pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
 /// laid out horizontally so co-mounted chips sit side by side.
 #[must_use]
 pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        bar_left_render_signal(),
-        fit_axis(Mount::BarLeft),
-        gtk::Orientation::Horizontal,
-        "ts-plugin-chip",
-        monitor.connector(),
-    )
+    region_slot(Mount::BarLeft, monitor.connector())
 }
 
 /// The [`Mount::BarCenter`](hytte_plugin_proto::Mount::BarCenter) **region** — a
 /// horizontal row of N plugin chips, appended into the bar's center group (#349).
 #[must_use]
 pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        bar_center_render_signal(),
-        fit_axis(Mount::BarCenter),
-        gtk::Orientation::Horizontal,
-        "ts-plugin-chip",
-        monitor.connector(),
-    )
+    region_slot(Mount::BarCenter, monitor.connector())
 }
 
 /// The [`Mount::BarRight`](hytte_plugin_proto::Mount::BarRight) **region** — a
 /// horizontal row of N plugin chips, appended into the bar's right group (#349).
 #[must_use]
 pub fn bar_right_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        bar_right_render_signal(),
-        fit_axis(Mount::BarRight),
-        gtk::Orientation::Horizontal,
-        "ts-plugin-chip",
-        monitor.connector(),
-    )
+    region_slot(Mount::BarRight, monitor.connector())
 }
 
 /// One plugin's mounted card within a region: its dedicated reconciler root (a
@@ -224,11 +228,14 @@ struct MountedCard {
 /// list). Each connected plugin gets its own reconciler-backed card; the region
 /// reconciles cards in on join / update / reorder / leave, keyed by plugin id.
 ///
-/// `orientation` lays the cards out — `Vertical` for sidebar card stacks,
-/// `Horizontal` for bar chip rows (#349). `card_class` is the CSS class stamped
-/// on each card root: `ts-plugin-card` for a sidebar card, `ts-plugin-chip` for
-/// a bar chip. The region hides itself while empty so an unused bar region never
-/// introduces a phantom inter-widget gap in the bar group it sits in.
+/// `mount` is the **only** thing that decides this region's shape: its layout
+/// orientation (`Vertical` for sidebar card stacks, `Horizontal` for bar chip
+/// rows, #349), the CSS class stamped on each card root (`ts-plugin-card` /
+/// `ts-plugin-chip`), and the axis its aspect-locked surfaces are fitted on
+/// (#1387) all come out of one [`region_shape`] call rather than three literals
+/// a caller transcribes (**#1391 review, HIGH 1**). The region hides itself
+/// while empty so an unused bar region never introduces a phantom inter-widget
+/// gap in the bar group it sits in.
 ///
 /// `connector` is **this** region's monitor, by the name niri and Wayland use
 /// (#1050) — the only per-monitor input a reconciler has, since every monitor's
@@ -239,11 +246,10 @@ struct MountedCard {
 /// hidden by name, and events carry no output.
 fn build_region(
     signal: impl Signal<Item = Vec<SlotRender>> + 'static,
-    fit: FitAxis,
-    orientation: gtk::Orientation,
-    card_class: &'static str,
+    mount: Mount,
     connector: Option<String>,
 ) -> gtk::Widget {
+    let (fit, orientation, card_class) = region_shape(mount);
     // Chips in a horizontal bar row want a small gap between co-mounted plugins;
     // sidebar cards stack tight (each card owns its own bottom margin in CSS).
     let spacing = match orientation {
@@ -1391,9 +1397,9 @@ mod gtk_tests {
     use crate::plugins::shader_map::{self, Grants};
 
     use super::{
-        Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
+        Animator, MountedCard, PluginHandles, Scope, SlotRender, build_panel_child, build_region,
         drive_panel_child, forget_previous_panel_scope, preem_render, reconcile_region,
-        render_active_panel, unknown_connectors,
+        region_slot, render_active_panel, unknown_connectors,
     };
     // The #921 releaser lives in `pump` (beside the animation driver whose
     // "still animating" predicate a leaked scope corrupts), but the mounts it has
@@ -1408,7 +1414,7 @@ mod gtk_tests {
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, glib, prelude::*};
     use hytte::ui::{EventKind as UiEventKind, FitAxis, NodeId, Reconciler};
-    use hytte_plugin_proto::{HostMsg, preem as vocab, wire};
+    use hytte_plugin_proto::{HostMsg, Mount, preem as vocab, wire};
     use std::cell::RefCell;
     use std::rc::Rc;
     use tokio::sync::mpsc;
@@ -1457,12 +1463,15 @@ mod gtk_tests {
     /// with different connectors is the host's real multi-monitor topology in
     /// miniature: one shared render list, one reconciler per screen, each
     /// deciding visibility for itself.
+    ///
+    /// `Mount::BarLeft` because these tests are all about a **bar chip** row
+    /// (horizontal, `ts-plugin-chip`, height-fitted): since the #1391 review a
+    /// region's shape is its mount and nothing else, so naming the mount is how
+    /// a test asks for that shape.
     fn mount_region_on(renders: &Mutable<Vec<SlotRender>>, connector: Option<&str>) -> gtk::Window {
         let region = build_region(
             renders.signal_cloned(),
-            FitAxis::Height,
-            gtk::Orientation::Horizontal,
-            "ts-plugin-chip",
+            Mount::BarLeft,
             connector.map(str::to_owned),
         );
         let window = gtk::Window::new();
@@ -1708,6 +1717,141 @@ mod gtk_tests {
              {width_with_busy_only}px with the busy plugin alone; a card GTK still counts \
              toward layout despite `is_visible() == false` would add one `spacing` gap here",
         );
+    }
+
+    /// **#1391 review, HIGH 1 — the production wrappers, graded.** Each of the
+    /// nine `*_slot()` functions is now exactly one token, its [`Mount`], and
+    /// this drives the body all nine share ([`region_slot`]) over
+    /// [`Mount::ALL`]: every region must read **its own** mailbox and wear its
+    /// family's shape.
+    ///
+    /// The mailbox half is what makes a wrong token *loud* rather than quiet.
+    /// `region_slot`'s two maps (`render_signal` and `region_shape`) are both
+    /// total matches over `Mount`, and both are graded here against a second,
+    /// hand-written opinion: the mailbox through [`mailbox`]'s own match, the
+    /// shape through `Mount::is_bar` directly rather than through
+    /// `region_shape` (which would be circular — `tests::…follows_its_family`
+    /// is the hermetic table for that function itself).
+    ///
+    /// What is left ungraded after this is the single `Mount::` token inside
+    /// each public wrapper, and that token is no longer invisible: the bar's
+    /// centre group handed `Mount::SidebarTop` would show the *sidebar-top*
+    /// plugins, stacked vertically, wearing `.ts-plugin-card`. Closing even
+    /// that would mean driving `bar_center_slot(&monitor)` itself, which needs
+    /// a `hytte_ui::Monitor` — `Monitor::new` is `pub(crate)` to `hytte-ui`,
+    /// and widening it (or growing a `#[doc(hidden)]` constructor) to reach a
+    /// `gdk::Monitor` that only a live display hands out buys a ninth of a
+    /// token for a permanent hole in another crate's API.
+    ///
+    /// **Falsified** by transposing any one arm of either match — e.g.
+    /// `Mount::BarCenter => &handles.bar_left` in `render_signal`, or
+    /// `region_shape`'s `is_bar` test inverted: the affected mounts red,
+    /// the rest stay green.
+    #[gtk::test]
+    fn every_region_reads_its_own_mailbox_with_its_familys_shape() {
+        /// This mount's mailbox, by a **second** hand-written copy of the map
+        /// `render_signal` holds — the two are graded against each other by
+        /// this test and nothing else pairs them.
+        fn mailbox(mount: Mount) -> Mutable<Vec<SlotRender>> {
+            super::registry::with(|r| {
+                let handles = r
+                    .get::<PluginHandles>()
+                    .expect("test handles installed above");
+                match mount {
+                    Mount::SidebarLead => handles.sidebar_lead.clone(),
+                    Mount::SidebarTop => handles.sidebar_top.clone(),
+                    Mount::SidebarBottom => handles.sidebar_bottom.clone(),
+                    Mount::SidebarRightLead => handles.sidebar_right_lead.clone(),
+                    Mount::SidebarRightTop => handles.sidebar_right_top.clone(),
+                    Mount::SidebarRightBottom => handles.sidebar_right_bottom.clone(),
+                    Mount::BarLeft => handles.bar_left.clone(),
+                    Mount::BarCenter => handles.bar_center.clone(),
+                    Mount::BarRight => handles.bar_right.clone(),
+                }
+            })
+        }
+
+        /// The text of the first `gtk::Label` anywhere under `widget`, depth
+        /// first — the card's only content, i.e. which mailbox this region read.
+        fn first_label_text(widget: &gtk::Widget) -> Option<String> {
+            if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+                return Some(label.label().to_string());
+            }
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                if let Some(found) = first_label_text(&node) {
+                    return Some(found);
+                }
+                child = node.next_sibling();
+            }
+            None
+        }
+
+        adw::init().expect("libadwaita init");
+        // `render_signal` reads the nine mailboxes out of the thread-local
+        // registry, so this test needs a host in it. Guarded rather than
+        // unconditional: `Registry::insert` trips a duplicate-registration
+        // `debug_assert!`, and every `#[gtk::test]` in this binary shares one
+        // thread with `overlays::dialog`'s own seeding.
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+
+        // Every mailbox seeded with a card labelled after its own mount, so a
+        // region reading the wrong one names the mount it actually read.
+        for mount in Mount::ALL {
+            mailbox(mount).set(vec![render_with_tree(
+                mount.wire_name(),
+                &tx,
+                row_with_label_tree("root", "label", mount.wire_name()),
+            )]);
+        }
+
+        for mount in Mount::ALL {
+            let widget = region_slot(mount, None);
+            let window = gtk::Window::new();
+            window.set_child(Some(&widget));
+            pump();
+
+            assert_eq!(
+                first_label_text(&widget).as_deref(),
+                Some(mount.wire_name()),
+                "{mount:?}'s region must mount the cards in {mount:?}'s own mailbox",
+            );
+
+            let container: gtk::Box = widget
+                .clone()
+                .downcast()
+                .expect("a region container is a gtk::Box");
+            let (want_orientation, want_class) = if mount.is_bar() {
+                (gtk::Orientation::Horizontal, "ts-plugin-chip")
+            } else {
+                (gtk::Orientation::Vertical, "ts-plugin-card")
+            };
+            assert_eq!(
+                container.orientation(),
+                want_orientation,
+                "{mount:?} is {} region, so it lays its cards out {want_orientation:?}",
+                if mount.is_bar() { "a bar" } else { "a sidebar" },
+            );
+            let card = container
+                .first_child()
+                .expect("the seeded card is mounted in this region");
+            assert!(
+                card.has_css_class(want_class),
+                "{mount:?}'s card root must wear {want_class}",
+            );
+
+            window.destroy();
+        }
+
+        // Leave the registry's mailboxes as they were found: they are shared
+        // with every other `#[gtk::test]` on this thread.
+        for mount in Mount::ALL {
+            mailbox(mount).set(Vec::new());
+        }
+        pump();
     }
 
     /// **#1387, end to end through a region.** A chip mounted in a **bar**
@@ -3555,13 +3699,7 @@ mod gtk_tests {
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
         let renders = Mutable::new(vec![marquee_render_of("anim-hidden", &tx, 0.01)]);
 
-        let region = build_region(
-            renders.signal_cloned(),
-            FitAxis::Height,
-            gtk::Orientation::Horizontal,
-            "ts-plugin-chip",
-            None,
-        );
+        let region = build_region(renders.signal_cloned(), Mount::BarLeft, None);
         // A revealer with no transition, so `set_reveal_child` unmaps the child
         // immediately rather than over an animation — the same `child_visible`
         // flip `overlays/sidebar.rs` does, without the timing.
@@ -3740,13 +3878,7 @@ mod gtk_tests {
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
         let renders = Mutable::new(vec![render_of("region-stranded", &tx)]);
 
-        let region = build_region(
-            renders.signal_cloned(),
-            FitAxis::Height,
-            gtk::Orientation::Horizontal,
-            "ts-plugin-chip",
-            None,
-        );
+        let region = build_region(renders.signal_cloned(), Mount::BarLeft, None);
         let region_weak = region.downgrade();
         let window = gtk::Window::new();
         window.set_child(Some(&region));
@@ -3820,13 +3952,7 @@ mod gtk_tests {
         // clamp and the card — mirrored here rather than skipped, since a
         // viewport that outlived its scroller would strand the whole card,
         // region included.
-        let region = build_region(
-            renders.signal_cloned(),
-            FitAxis::Width,
-            gtk::Orientation::Vertical,
-            "ts-plugin-card",
-            None,
-        );
+        let region = build_region(renders.signal_cloned(), Mount::SidebarLead, None);
         let region_weak = region.downgrade();
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.append(&region);
@@ -4635,71 +4761,26 @@ mod gtk_tests {
 // reconcile them silently and main would go red on `E0425: cannot find function
 // named_connector` (#1159 review, finding 9).
 
-fn right_lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .sidebar_right_lead
-            .signal_cloned()
-    })
-}
-
-fn right_top_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .sidebar_right_top
-            .signal_cloned()
-    })
-}
-
-fn right_bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
-    registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .sidebar_right_bottom
-            .signal_cloned()
-    })
-}
-
 /// The [`Mount::SidebarRightLead`](hytte_plugin_proto::Mount::SidebarRightLead)
 /// **region** — the mirror of [`sidebar_lead_slot`] on the right sidebar: a
 /// vertical container of N plugin cards, mounted at the very top of that surface.
 #[must_use]
 pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        right_lead_render_signal(),
-        fit_axis(Mount::SidebarRightLead),
-        gtk::Orientation::Vertical,
-        "ts-plugin-card",
-        monitor.connector(),
-    )
+    region_slot(Mount::SidebarRightLead, monitor.connector())
 }
 
 /// The [`Mount::SidebarRightTop`](hytte_plugin_proto::Mount::SidebarRightTop)
 /// **region** — the mirror of [`sidebar_top_slot`] on the right sidebar.
 #[must_use]
 pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        right_top_render_signal(),
-        fit_axis(Mount::SidebarRightTop),
-        gtk::Orientation::Vertical,
-        "ts-plugin-card",
-        monitor.connector(),
-    )
+    region_slot(Mount::SidebarRightTop, monitor.connector())
 }
 
 /// The [`Mount::SidebarRightBottom`](hytte_plugin_proto::Mount::SidebarRightBottom)
 /// **region** — the mirror of [`sidebar_bottom_slot`] on the right sidebar.
 #[must_use]
 pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
-    build_region(
-        right_bottom_render_signal(),
-        fit_axis(Mount::SidebarRightBottom),
-        gtk::Orientation::Vertical,
-        "ts-plugin-card",
-        monitor.connector(),
-    )
+    region_slot(Mount::SidebarRightBottom, monitor.connector())
 }
 
 /// Whether **any** card shows on the right sidebar **for this monitor** (#1160):
@@ -4728,9 +4809,9 @@ pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn sidebar_right_non_empty(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
     let connector = monitor.connector();
     map_ref! {
-        let lead = right_lead_render_signal(),
-        let top = right_top_render_signal(),
-        let bottom = right_bottom_render_signal() => {
+        let lead = render_signal(Mount::SidebarRightLead),
+        let top = render_signal(Mount::SidebarRightTop),
+        let bottom = render_signal(Mount::SidebarRightBottom) => {
             let connector = connector.as_deref();
             any_card_shows_here(lead, connector)
                 || any_card_shows_here(top, connector)
@@ -4744,7 +4825,7 @@ pub fn sidebar_right_non_empty(monitor: &Monitor) -> impl Signal<Item = bool> + 
 #[cfg(test)]
 mod tests {
     use super::super::shader_map::Grants;
-    use super::{HostMsg, SlotRender, any_card_shows_here, wire};
+    use super::{FitAxis, HostMsg, Mount, SlotRender, any_card_shows_here, fit_axis, gtk, wire};
     use tokio::sync::mpsc;
 
     /// A render carrying a real, painting tree — the `hidden_on` set is the
@@ -4841,5 +4922,77 @@ mod tests {
     fn a_connectorless_monitor_is_never_hidden_by_name() {
         let (tx, _rx) = mpsc::channel(4);
         assert!(any_card_shows_here(&[render("p", &tx, &["DP-1"])], None));
+    }
+
+    /// **#1391 review, HIGH 1.** Every [`Mount`] gets the region shape its
+    /// *family* implies — measure axis, layout orientation and card class — and
+    /// all three come out of the one [`region_shape`](super::region_shape) call
+    /// that [`build_region`](super::build_region) makes.
+    ///
+    /// The axis is the reason this test exists. Before the review the nine slot
+    /// wrappers each spelled it out beside an orientation and a class, and
+    /// transposing just the axis — `bar_center_slot` handed
+    /// `fit_axis(Mount::SidebarTop)` — re-shipped #1387 on the bar it was
+    /// reported on with the whole suite green, because a chip measured the
+    /// wrong way round still *draws* correctly. It is graded here against the
+    /// same family predicate the rest of the host reads (`Mount::is_bar`), and
+    /// separately against `wire_map::fit_axis` — the axis the **mapping pass**
+    /// stamps on the surface nodes this region mounts, which is the other end
+    /// of the same wire.
+    ///
+    /// Hermetic on purpose (no GTK init, no display): `gtk::Orientation` is a
+    /// plain enum and this is a table over nine values.
+    ///
+    /// **Falsified** by returning the other family's answer for either arm of
+    /// `region_shape` — flipping the axis alone reddens exactly the three
+    /// mounts on that side, and so does flipping the orientation or the class.
+    #[test]
+    fn every_mounts_region_shape_follows_its_family() {
+        for mount in Mount::ALL {
+            let (fit, orientation, class) = super::region_shape(mount);
+            let (want_fit, want_orientation, want_class) = if mount.is_bar() {
+                (
+                    FitAxis::Height,
+                    gtk::Orientation::Horizontal,
+                    "ts-plugin-chip",
+                )
+            } else {
+                (FitAxis::Width, gtk::Orientation::Vertical, "ts-plugin-card")
+            };
+            let family = if mount.is_bar() { "a bar" } else { "a sidebar" };
+            assert_eq!(
+                fit, want_fit,
+                "{mount:?} is {family} region, so its surfaces are fitted on {want_fit:?}",
+            );
+            assert_eq!(
+                fit,
+                fit_axis(mount),
+                "{mount:?}: the region's axis must be the one the mapping pass stamps",
+            );
+            assert_eq!(
+                orientation, want_orientation,
+                "{mount:?} is {family} region, so it lays its cards out {want_orientation:?}",
+            );
+            assert_eq!(
+                class, want_class,
+                "{mount:?} is {family} region, so its card roots wear {want_class}",
+            );
+        }
+
+        // Both answers are actually produced — a rule that returned the sidebar
+        // shape for everything would satisfy the loop above only if `is_bar`
+        // were never true.
+        assert_eq!(
+            super::region_shape(Mount::BarCenter),
+            (
+                FitAxis::Height,
+                gtk::Orientation::Horizontal,
+                "ts-plugin-chip"
+            ),
+        );
+        assert_eq!(
+            super::region_shape(Mount::SidebarTop),
+            (FitAxis::Width, gtk::Orientation::Vertical, "ts-plugin-card"),
+        );
     }
 }

@@ -1571,6 +1571,52 @@ mod gtk_tests {
         }
     }
 
+    /// The first `PixelSurface` anywhere under `widget`, depth first — a
+    /// plugin's readout, however many boxes the card (or the drawer page) wraps
+    /// it in.
+    fn find_surface(widget: &gtk::Widget) -> Option<hytte::ui::PixelSurface> {
+        if let Ok(surface) = widget.clone().downcast::<hytte::ui::PixelSurface>() {
+            return Some(surface);
+        }
+        let mut child = widget.first_child();
+        while let Some(node) = child {
+            if let Some(found) = find_surface(&node) {
+                return Some(found);
+            }
+            child = node.next_sibling();
+        }
+        None
+    }
+
+    /// A `Row` holding the **timer's own readout geometry** — the 188×70 kit
+    /// buffer its `mm:ss` seven-segment display rasterises to, which is the chip
+    /// #1387 was screenshotted from.
+    ///
+    /// A `Node::Pixels` rather than the `Node::Preem` the timer really sends,
+    /// because a preem node only becomes a `GlSurface` while GL is available and
+    /// `hytte-ui`'s `abandon_gl` latch is *per thread* — every `#[gtk::test]` in
+    /// this binary shares one GTK thread, so a sibling test that abandons GL
+    /// would turn this into the broken-widget placeholder and fail an axis test
+    /// for a reason that is not about axes. All three surfaces take the axis
+    /// from the same node field through the same two reconciler arms (pinned per
+    /// kind in `hytte_ui::widget_tree`).
+    fn pixels_readout_tree() -> wire::Node {
+        wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 0,
+            tooltip: None,
+            children: vec![wire::Node::Pixels {
+                id: Some("mmss".to_owned()),
+                classes: vec![],
+                width: 188,
+                height: 70,
+                scale: 1,
+                data: vec![0xff; 188 * 70 * 4],
+            }],
+        }
+    }
+
     /// A render with real content and an explicit `hidden_on` set (#1050) — the
     /// shape #1019's chip emits once it folds per output.
     ///
@@ -1865,16 +1911,10 @@ mod gtk_tests {
     /// 188 px it would then letterbox that drawing inside.
     ///
     /// It is carried by a **`Node::Pixels`** rather than the `Node::Preem` the
-    /// timer really sends, because a preem node only becomes a `GlSurface`
-    /// while GL is available and `hytte-ui`'s `abandon_gl` latch is *per
-    /// thread* — every `#[gtk::test]` in this binary shares one GTK thread, so
-    /// a sibling test that abandons GL would turn this one's chip into the
-    /// broken-widget placeholder and make it fail for a reason that is not
-    /// about axes at all. All three surfaces take the axis from the same field
-    /// through the same two reconciler arms (pinned per kind in
-    /// `hytte_ui::widget_tree`), and that the preem seam *stamps* the mount's
-    /// axis is pinned hermetically in `plugins::tests`; what is left for this
-    /// test is the region's own wiring, which is kind-agnostic.
+    /// timer really sends — see [`pixels_readout_tree`] for why. That the preem
+    /// seam *stamps* the mount's axis is pinned hermetically in
+    /// `plugins::tests`; what is left for this test is the region's own wiring,
+    /// which is kind-agnostic.
     ///
     /// The same tree through a **sidebar** region is the control, and it is
     /// mapped with `FitAxis::Width` — the pre-#1387 behaviour, unchanged.
@@ -1884,39 +1924,10 @@ mod gtk_tests {
     /// the sidebar half green.
     #[gtk::test]
     fn a_chip_in_a_bar_region_measures_width_for_height() {
-        /// The first `PixelSurface` anywhere under `widget`, depth first — the
-        /// chip's readout, however many boxes the card wraps it in.
-        fn find_surface(widget: &gtk::Widget) -> Option<hytte::ui::PixelSurface> {
-            if let Ok(surface) = widget.clone().downcast::<hytte::ui::PixelSurface>() {
-                return Some(surface);
-            }
-            let mut child = widget.first_child();
-            while let Some(node) = child {
-                if let Some(found) = find_surface(&node) {
-                    return Some(found);
-                }
-                child = node.next_sibling();
-            }
-            None
-        }
-
         adw::init().expect("libadwaita init");
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
 
-        let readout = wire::Node::Row {
-            id: Some("root".to_owned()),
-            classes: vec![],
-            spacing: 0,
-            tooltip: None,
-            children: vec![wire::Node::Pixels {
-                id: Some("mmss".to_owned()),
-                classes: vec![],
-                width: 188,
-                height: 70,
-                scale: 1,
-                data: vec![0xff; 188 * 70 * 4],
-            }],
-        };
+        let readout = pixels_readout_tree();
 
         for (fit, card_class, mode, at_28) in [
             (
@@ -1956,6 +1967,60 @@ mod gtk_tests {
             );
             preem_render::forget_scope(&Scope::card("timer"));
         }
+    }
+
+    /// **#1387, the control — #1391 review, MED 1.** A plugin's *page* is a
+    /// column whichever mount the plugin itself has: [`render_active_panel`]
+    /// takes the plain `to_ui_node`, i.e. `FitAxis::Width`, so a bar-mounted
+    /// plugin opening its own page — the drawer, or #1010's centered dialog —
+    /// still measures height-for-width.
+    ///
+    /// That decision was a five-line comment and nothing else. Handing
+    /// `render_active_panel` `FitAxis::Height` left the whole suite green
+    /// (measured: `1195` + `1261` passed), while on glass a full-width preem
+    /// card in a drawer would collapse to a sliver — the reported bug's mirror
+    /// image, on the surface the fix is *not* supposed to reach.
+    /// `the_default_mapping_keeps_the_pre_1387_axis` pins the **helper**
+    /// (`to_ui_node` ⇒ `Width`), which is a different claim from "this call
+    /// site takes the helper".
+    ///
+    /// Same 188×70 fixture as the bar test above, and deliberately the same
+    /// `measure(Horizontal, 28)` question: a page asked for its width at a bar's
+    /// height must still answer with its whole buffer width, because it does not
+    /// derive its width from anything.
+    ///
+    /// **Falsified** by swapping the call to
+    /// `to_ui_node_fitted(&scope, render.grants, FitAxis::Height, …)`.
+    #[gtk::test]
+    fn a_plugin_page_measures_height_for_width() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let panels = Mutable::new(vec![SlotRender {
+            panel: Some(pixels_readout_tree()),
+            ..render_of("paged", &tx)
+        }]);
+        let active = Mutable::new(Some("paged".to_owned()));
+        let window = mount_panel_child(&panels, &active);
+        pump();
+
+        let child = window
+            .child()
+            .expect("the drawer's plugin child is mounted");
+        let surface = find_surface(&child).expect("the page's readout mounted a PixelSurface");
+        assert_eq!(
+            surface.request_mode(),
+            gtk::SizeRequestMode::HeightForWidth,
+            "a drawer page is a column, so its surfaces derive the height from the width",
+        );
+        assert_eq!(
+            surface.measure(gtk::Orientation::Horizontal, 28).1,
+            188,
+            "…so asked for its width at a bar's height it still answers the whole 188 px \
+             buffer, never the 75 px a bar chip would ask for",
+        );
+
+        window.destroy();
+        pump();
     }
 
     /// #1042 fix round, HIGH-1: a region whose *every* mounted plugin renders an

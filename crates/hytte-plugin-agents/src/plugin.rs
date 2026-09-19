@@ -168,6 +168,20 @@ pub struct Agents {
     /// Whether the companion window (#950) can be launched — resolved once,
     /// see [`window::Probe`].
     window: window::Probe,
+    /// [`Agents::window`]'s answer, snapshotted for the **render** (#1306).
+    ///
+    /// [`Plugin::view`] takes `&self` and [`window::Probe::available`] needs
+    /// `&mut` (it resolves on first use and warns once), so a node whose
+    /// existence depends on the probe cannot ask it at render time. Every
+    /// `&mut self` path that precedes a render refreshes this instead:
+    /// [`Agents::set_window_probe`], so a test's pinned probe is in effect
+    /// immediately, and [`Agents::fold_status`], so the live session picks it
+    /// up on its first poll.
+    ///
+    /// It starts `false` — "no button until something has been resolved" — and
+    /// that costs nothing on screen: the only node it gates also needs a
+    /// running agent, which needs a poll to have happened at all.
+    window_available: bool,
 }
 
 impl Agents {
@@ -191,6 +205,7 @@ impl Agents {
             next_effect_id: 0,
             cmd_tx,
             window: window::Probe::path(),
+            window_available: false,
         }
     }
 
@@ -202,8 +217,12 @@ impl Agents {
     /// property of the desktop, so a test that does not say which desktop it
     /// describes would pass or fail depending on whether the reviewer happens
     /// to have the window installed.
+    /// Since #1306 it also refreshes [`Agents::window_available`] on the spot,
+    /// so a test that pins a probe and renders without polling still describes
+    /// the desktop it said it was describing.
     pub fn set_window_probe(&mut self, probe: window::Probe) {
         self.window = probe;
+        self.window_available = self.window.available();
     }
 
     /// Take the next correlation token. See [`Agents::next_effect_id`].
@@ -257,6 +276,10 @@ impl Agents {
 
     /// Fold one poll answer, returning the toasts its **edges** earned.
     fn fold_status(&mut self, result: Result<Vec<AgentStatusRow>, HiveError>) -> Vec<Effect> {
+        // #1306: the render's copy of the probe's answer. Cheap after the
+        // first call (the probe caches), and this is the `&mut self` path that
+        // always precedes a card with a roster on it.
+        self.window_available = self.window.available();
         match result {
             Err(HiveError::Version(mismatch)) => {
                 self.hive = Hive::Incompatible(mismatch);
@@ -744,6 +767,34 @@ impl Agents {
         self.open_agent_page(name)
     }
 
+    /// Every running agent's window at once, on a fresh niri workspace
+    /// ([#1306](https://github.com/vibec0re/trollshell/issues/1306)) — **one**
+    /// detached launch of the companion window's own fan-out mode.
+    ///
+    /// The plugin's whole part in the feature is this line: it cannot pick a
+    /// workspace (it has no compositor connection) and it cannot open N windows
+    /// without racing the focus that puts them together, so
+    /// [`window::open_all_argv`] carries that argument and this emits it.
+    ///
+    /// Both guards re-ask the model rather than trusting the click, which is
+    /// this reducer's standing rule (see [`Agents::click`]): the id came back
+    /// over a socket up to one poll after the render that offered it, so the
+    /// last running agent may have stopped in between, and the answer to "is
+    /// there anything to open" must be the same one the *next* render will
+    /// give. `None` on either is silence, not a fallback — the button that
+    /// produced this click is drawn under exactly these two conditions
+    /// (`view::open_all_button`), so reaching here with one of them false means
+    /// the roster moved, and there is nothing to say about that.
+    fn open_all_windows(&mut self) -> Vec<Effect> {
+        if !self.window.available() || !self.hive.any_wants_terminal() {
+            return Vec::new();
+        }
+        vec![Effect::launch(
+            self.take_effect_id(),
+            window::open_all_argv(),
+        )]
+    }
+
     /// The panel's `dashboard` link — the hive's own root, from the `Urls`
     /// answer rather than from the clicked id, for [`Agents::open_agent_page`]'s
     /// reason.
@@ -818,6 +869,11 @@ impl Agents {
         }
         if node == ids::OPEN_DASHBOARD {
             return self.open_dashboard();
+        }
+        if node == view::OPEN_ALL_ID {
+            // #1306, @kaesaecracker: "all agents in up state" on one workspace,
+            // tiled. One launch — see `open_all_windows`.
+            return self.open_all_windows();
         }
         if node == view::OVERVIEW_ID {
             // The card's title row is the one place that jumps to the drawer,
@@ -1041,7 +1097,13 @@ impl Plugin for Agents {
 /// assert on the tree rather than on a screenshot.
 #[must_use]
 pub fn card_of(model: &Agents) -> Node {
-    view::card(&model.hive, &model.cfg, &model.expanded, &model.pending)
+    view::card(
+        &model.hive,
+        &model.cfg,
+        &model.expanded,
+        &model.pending,
+        model.window_available,
+    )
 }
 
 /// The prompt's secondary line: the manager's own description, or a stand-in

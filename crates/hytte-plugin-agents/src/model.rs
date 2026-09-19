@@ -165,6 +165,36 @@ impl Status {
             Self::Running => "accent",
         }
     }
+
+    /// Does this agent have a live terminal worth opening a window on?
+    /// **The membership rule for
+    /// [#1306](https://github.com/vibec0re/trollshell/issues/1306)'s
+    /// open-every-window fan-out**, and the one place it is written down.
+    ///
+    /// Annika settled it on that thread (2026-09-19) out of the issue's own
+    /// title, "all agents in up state": the **running** ones, not every agent
+    /// the hive lists. A stopped or failed agent has no turn stream to show,
+    /// and a paused one is parked by the harness marker rather than talking —
+    /// [`Status::of`]'s precedence puts it in its own state for exactly that
+    /// reason, so "up" cannot quietly come to mean four states of the five.
+    ///
+    /// It is a method on the collapsed [`Status`] rather than a filter written
+    /// twice because **two crates read it**: this plugin decides whether the
+    /// card's Open-all button is drawn at all, and
+    /// `trollshell-agent-window --open-all` decides which agents it launches a
+    /// window for. Those two have to agree — a button offering to open three
+    /// windows that then opens two is worse than either half alone — and the
+    /// window links this crate as a library precisely so that a shared answer
+    /// is a compile-time fact (the [`crate::hive::wire`] argument, applied to a
+    /// predicate instead of to a struct).
+    ///
+    /// **Where to flip it.** If "up" ever widens to include a paused agent,
+    /// this arm is the whole change: the button's visibility, its tooltip's
+    /// count and the fan-out's membership all follow from here.
+    #[must_use]
+    pub fn wants_terminal(self) -> bool {
+        matches!(self, Self::Running)
+    }
 }
 
 /// One agent, as the rows hold it.
@@ -376,6 +406,24 @@ impl Hive {
         self.agents().iter().find(|a| &a.name == name)
     }
 
+    /// Is there anything for the card's Open-all button to open (#1306)?
+    ///
+    /// `false` for every non-`Up` state by construction — [`Hive::agents`]
+    /// hands back the empty slice there — so "the hive is up" and "at least one
+    /// agent is running" are one question with one answer, asked by the view
+    /// (should the button be drawn) and again by the reducer (is this click
+    /// still worth a launch). Those two ask the *same* function because the
+    /// click arrives over a socket, up to one poll after the render that
+    /// offered it: the roster can have emptied in between, and the reducer's
+    /// standing rule is to re-read the model rather than trust the round trip.
+    ///
+    /// The per-agent half of the rule is [`Status::wants_terminal`] — this only
+    /// quantifies over it.
+    #[must_use]
+    pub fn any_wants_terminal(&self) -> bool {
+        self.agents().iter().any(|a| a.status().wants_terminal())
+    }
+
     /// One agent by name, mutably.
     pub fn agent_mut(&mut self, name: &AgentName) -> Option<&mut Agent> {
         match self {
@@ -564,7 +612,7 @@ mod tests {
         model_family,
     };
     use crate::config::AgentsConfig;
-    use crate::hive::wire::{AgentStatusRow, Approval, ApprovalKind, ApprovalStatus};
+    use crate::hive::wire::{AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, VersionMismatch};
     use std::collections::BTreeSet;
 
     // ── #947 P3: the approval queue's two invariants ─────────────────────────
@@ -711,6 +759,75 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 32, "the sweep must cover every combination");
+    }
+
+    /// #1306's membership: **exactly one** of the five states opens a terminal.
+    ///
+    /// Asserted over [`Status::ALL`] rather than as five literals, so a sixth
+    /// state added to the enum has to be classified here rather than silently
+    /// defaulting to "not up" — and stated as a count as well as a set, which
+    /// is what makes the widening mutation red instead of merely different.
+    ///
+    /// Falsification (both verified red): widen the arm to
+    /// `matches!(self, Self::Running | Self::Paused)` and the count assertion
+    /// goes 1 → 2; narrow it to `false` and the `Running` assertion goes.
+    #[test]
+    fn only_a_running_agent_wants_a_terminal() {
+        let up: Vec<Status> = Status::ALL
+            .into_iter()
+            .filter(|s| s.wants_terminal())
+            .collect();
+        assert_eq!(
+            up,
+            vec![Status::Running],
+            "#1306's membership is the issue title's 'up state' — running, and nothing else"
+        );
+        assert!(
+            !Status::Paused.wants_terminal(),
+            "a paused agent's turn loop is parked by the harness marker; it is not up"
+        );
+        // And the collapse agrees: a row whose container runs *and* carries a
+        // pause marker is `Paused`, so the flags alone never decide this.
+        assert!(Status::of(&flags(false, false, false, true)).wants_terminal());
+        assert!(!Status::of(&flags(false, false, true, true)).wants_terminal());
+    }
+
+    /// The quantified half, over a real [`Hive`]: `Up` with one running agent
+    /// among stopped ones says yes, `Up` with none says no, and every
+    /// non-`Up` state says no without the caller testing for it.
+    ///
+    /// Falsification: change `any` to `all` and the mixed roster reds; drop
+    /// the `Hive::agents()` empty-slice contract (return the roster for
+    /// `Connecting`) and the non-`Up` assertion reds.
+    #[test]
+    fn the_hive_says_whether_anything_wants_a_terminal() {
+        let running = agent("a", flags(false, false, false, true));
+        let stopped = agent("b", flags(false, false, false, false));
+        assert!(
+            Hive::Up {
+                agents: vec![stopped.clone(), running],
+            }
+            .any_wants_terminal()
+        );
+        assert!(
+            !Hive::Up {
+                agents: vec![stopped],
+            }
+            .any_wants_terminal()
+        );
+        assert!(!Hive::Up { agents: Vec::new() }.any_wants_terminal());
+        for down in [
+            Hive::Connecting,
+            Hive::Unreachable {
+                reason: "no socket".to_owned(),
+            },
+            Hive::Error {
+                reason: "nope".to_owned(),
+            },
+            Hive::Incompatible(VersionMismatch { theirs: 9, ours: 1 }),
+        ] {
+            assert!(!down.any_wants_terminal(), "{down:?}");
+        }
     }
 
     /// The five precedence rows, spelled out one by one against the spec's

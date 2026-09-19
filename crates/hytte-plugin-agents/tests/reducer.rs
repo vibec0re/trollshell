@@ -922,6 +922,109 @@ fn the_agent_page_click_launches_the_companion_window() {
     assert_eq!(m.selected, None, "and it neither selects nor opens a page");
 }
 
+/// #1306: the card's Open-all click is **one** detached launch of the
+/// window's own fan-out mode — no agent named, and no second launch however
+/// many agents are running.
+///
+/// The count is the assertion that matters. N launches from here would race
+/// the workspace focus that puts the windows together (which is why the
+/// deciding moved into the binary at all, Annika on #1306 2026-09-14), and
+/// would hit the host's four-per-burst detached-launch budget (#1165 item 8)
+/// on a hive with five running agents.
+///
+/// Falsification (each verified red): emit one launch per running agent and
+/// the exact-effect assertion reds on the vector's length; append the agent's
+/// name to the argv and it reds on the argv; drop `detached: true` and it
+/// reds on the effect.
+#[test]
+fn the_open_all_click_is_exactly_one_detached_fan_out_launch() {
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    // Two running agents (`busy`, and `parked` is Paused so it is not one) —
+    // the roster that would produce two launches under the wrong design.
+    m.update(status(roster("agent_status_precedence.json")));
+
+    let fx = m.update(click("agents-open-all"));
+    assert_eq!(
+        fx,
+        vec![Effect::RunCommand {
+            id: 0,
+            argv: vec![
+                "trollshell-agent-window".to_owned(),
+                "--open-all".to_owned(),
+            ],
+            detached: true,
+        }]
+    );
+    assert!(
+        lines(&mut rx).is_empty(),
+        "the fan-out asks the hive nothing — the launched binary does"
+    );
+    assert_eq!(m.selected, None, "and it neither selects nor opens a page");
+}
+
+/// The two conditions the button is drawn under are re-asked on the click,
+/// because the click arrives up to one poll after the render that offered it.
+///
+/// Falsification: drop either guard from `open_all_windows` and the matching
+/// case emits a launch — a launch into a desktop with no window binary (which
+/// cannot report the failure: `systemd-run` answers `ok: true` regardless), or
+/// one that opens nothing at all.
+#[test]
+fn the_open_all_click_launches_nothing_when_there_is_nothing_to_open() {
+    // No companion window on this desktop.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(false));
+    m.update(status(roster("agent_status_precedence.json")));
+    assert_eq!(m.update(click("agents-open-all")), Vec::new());
+
+    // …and, with the window installed, a roster where nothing is running.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(vec![AgentStatusRow {
+        name: "stray".to_owned(),
+        ..AgentStatusRow::default()
+    }]));
+    assert_eq!(m.update(click("agents-open-all")), Vec::new());
+
+    // …and a hive that never answered at all.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    assert_eq!(m.update(click("agents-open-all")), Vec::new());
+}
+
+/// The rendered button and the reducer's guard agree — the card never offers
+/// a click the reducer will drop, and never hides one it would honour.
+///
+/// Asserted as an **equivalence over the four desktops**, not as two separate
+/// happy paths: the two halves live in different modules (`view::card` and
+/// `Agents::open_all_windows`) and share only `Hive::any_wants_terminal`, so
+/// the way they drift is one of them growing a condition the other lacks.
+///
+/// Falsification: add any extra condition to either side and one row reds.
+#[test]
+fn the_open_all_button_is_drawn_exactly_when_the_click_would_launch() {
+    for installed in [false, true] {
+        for running in [false, true] {
+            let (mut m, _rx) = model();
+            m.set_window_probe(Probe::fixed(installed));
+            m.update(status(vec![AgentStatusRow {
+                name: "stray".to_owned(),
+                running,
+                ..AgentStatusRow::default()
+            }]));
+
+            let drawn = button_ids(&card_of(&m)).iter().any(|id| id == "agents-open-all");
+            let launches = !m.update(click("agents-open-all")).is_empty();
+            assert_eq!(
+                drawn, launches,
+                "installed={installed} running={running}: the button and the guard disagree"
+            );
+            assert_eq!(drawn, installed && running);
+        }
+    }
+}
+
 /// Without the window, the click keeps P1's route: **exactly one** `OpenUri`,
 /// carrying that row's own URL, and asks the hive nothing.
 ///

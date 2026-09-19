@@ -1606,14 +1606,39 @@ mod gtk_tests {
             classes: vec![],
             spacing: 0,
             tooltip: None,
-            children: vec![wire::Node::Pixels {
-                id: Some("mmss".to_owned()),
+            children: vec![readout_node()],
+        }
+    }
+
+    /// [`pixels_readout_tree`] with the readout inside a `Node::Button` — the
+    /// **timer's real shape** (its chip is clickable) and the layer where GTK's
+    /// request-mode vote could plausibly go the other way, since the button is a
+    /// `GtkBinLayout` between the card root and the surface (#1391 review,
+    /// MED 2).
+    fn button_wrapped_readout_tree() -> wire::Node {
+        wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 0,
+            tooltip: None,
+            children: vec![wire::Node::Button {
+                id: "open".to_owned(),
                 classes: vec![],
-                width: 188,
-                height: 70,
-                scale: 1,
-                data: vec![0xff; 188 * 70 * 4],
+                child: Box::new(readout_node()),
             }],
+        }
+    }
+
+    /// The 188×70 readout itself, shared by the two trees above so they differ
+    /// in the wrapper and in nothing else.
+    fn readout_node() -> wire::Node {
+        wire::Node::Pixels {
+            id: Some("mmss".to_owned()),
+            classes: vec![],
+            width: 188,
+            height: 70,
+            scale: 1,
+            data: vec![0xff; 188 * 70 * 4],
         }
     }
 
@@ -1919,53 +1944,116 @@ mod gtk_tests {
     /// The same tree through a **sidebar** region is the control, and it is
     /// mapped with `FitAxis::Width` — the pre-#1387 behaviour, unchanged.
     ///
+    /// # What the bar actually packs (#1391 review, MED 2)
+    ///
+    /// Reaching past the card root to the leaf surface asserts the same thing
+    /// `hytte_ui::pixels::gtk_tests` already pins one layer down. The claim
+    /// #1387 is written in is about the **region container** the bar packs, and
+    /// that depends on `GtkBoxLayout`'s request-mode vote propagating out
+    /// through the card root — and, in the real timer, through a `Node::Button`
+    /// as well. Nothing checked that, so a GTK vote-rule change (or someone
+    /// wrapping the card root in a constant-size widget) would leave every
+    /// assertion here green while the slab came back. Both are asserted on the
+    /// container now, over two fixtures: the bare row, and the button-wrapped
+    /// one that is the timer's real shape.
+    ///
+    /// The bare row's container numbers are exact (75 / 188 — the card root
+    /// adds nothing: `gtk_tests` installs no `CssProvider`, so `.ts-plugin-chip`
+    /// has no padding here). The button-wrapped ones are asserted as the
+    /// *relation* instead — narrower under a bar's height than unconstrained,
+    /// identical to unconstrained on the sidebar axis — because a `GtkButton`'s
+    /// padding comes from the Adwaita stylesheet `adw::init` loads, and pinning
+    /// 84 and 208 would redden on a theme bump that is not a regression.
+    /// (Measured in the devShell at the time of writing: 208 → 84.)
+    ///
     /// **Deletion check:** passing `FitAxis::Width` for both regions (i.e.
     /// `reconcile_region` ignoring its axis) turns the bar half red and leaves
-    /// the sidebar half green.
+    /// the sidebar half green — on the container assertions as well as the
+    /// surface ones, and on both fixtures.
     #[gtk::test]
     fn a_chip_in_a_bar_region_measures_width_for_height() {
         adw::init().expect("libadwaita init");
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
 
-        let readout = pixels_readout_tree();
-
-        for (fit, card_class, mode, at_28) in [
+        for (shape, tree) in [
+            ("a bare row", pixels_readout_tree()),
             (
-                FitAxis::Height,
-                "ts-plugin-chip",
-                gtk::SizeRequestMode::WidthForHeight,
-                75,
-            ),
-            (
-                FitAxis::Width,
-                "ts-plugin-card",
-                gtk::SizeRequestMode::HeightForWidth,
-                188,
+                "a row wrapping the readout in a Button",
+                button_wrapped_readout_tree(),
             ),
         ] {
-            let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
-            reconcile_region(
-                &container,
-                &cards,
-                &[render_with_tree("timer", &tx, readout.clone())],
-                fit,
-                card_class,
-                None,
-            );
-            let surface = find_surface(&container.clone().upcast())
-                .expect("the chip's readout mounted a PixelSurface");
-            assert_eq!(
-                surface.request_mode(),
-                mode,
-                "a {card_class} region's surface measures on {fit:?}",
-            );
-            assert_eq!(
-                surface.measure(gtk::Orientation::Horizontal, 28).1,
-                at_28,
-                "…so at a 28 px height it asks for {at_28} px of width",
-            );
-            preem_render::forget_scope(&Scope::card("timer"));
+            // The button's own padding sits between the card root and the
+            // surface, so only the bare row's container answer is the surface's.
+            let container_is_the_surface = shape == "a bare row";
+
+            for (fit, card_class, mode, at_28) in [
+                (
+                    FitAxis::Height,
+                    "ts-plugin-chip",
+                    gtk::SizeRequestMode::WidthForHeight,
+                    75,
+                ),
+                (
+                    FitAxis::Width,
+                    "ts-plugin-card",
+                    gtk::SizeRequestMode::HeightForWidth,
+                    188,
+                ),
+            ] {
+                let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+                reconcile_region(
+                    &container,
+                    &cards,
+                    &[render_with_tree("timer", &tx, tree.clone())],
+                    fit,
+                    card_class,
+                    None,
+                );
+                let surface = find_surface(&container.clone().upcast())
+                    .expect("the chip's readout mounted a PixelSurface");
+                assert_eq!(
+                    surface.request_mode(),
+                    mode,
+                    "a {card_class} region's surface measures on {fit:?} ({shape})",
+                );
+                assert_eq!(
+                    surface.measure(gtk::Orientation::Horizontal, 28).1,
+                    at_28,
+                    "…so at a 28 px height it asks for {at_28} px of width ({shape})",
+                );
+
+                // …and the widget the bar actually packs takes the same vote,
+                // which is the sentence #1387 is written in.
+                assert_eq!(
+                    container.request_mode(),
+                    mode,
+                    "…and the region container the bar packs takes the same mode ({shape})",
+                );
+                let container_at_28 = container.measure(gtk::Orientation::Horizontal, 28).1;
+                let container_unconstrained = container.measure(gtk::Orientation::Horizontal, -1).1;
+                if container_is_the_surface {
+                    assert_eq!(
+                        container_at_28, at_28,
+                        "…so the *chip*, not just its readout, reserves what it draws ({shape})",
+                    );
+                }
+                if fit == FitAxis::Height {
+                    assert!(
+                        container_at_28 < container_unconstrained,
+                        "a bar chip must reserve less at the bar's height ({container_at_28} px) \
+                         than unconstrained ({container_unconstrained} px) — {shape}",
+                    );
+                } else {
+                    assert_eq!(
+                        container_at_28, container_unconstrained,
+                        "a sidebar card's width does not depend on the height it is offered \
+                         ({shape})",
+                    );
+                }
+
+                preem_render::forget_scope(&Scope::card("timer"));
+            }
         }
     }
 

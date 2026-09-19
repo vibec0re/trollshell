@@ -1118,14 +1118,15 @@ self:
 
             plugins.pet.package = trollshell.packages.''${system}.hytte-plugin-pet;
 
-        The bundled ids are: agents, audio-widget, bar-clock-demo, caw,
-        clock-demo, departures, infobroker, niri-layouts, pet, preem-demo,
+        The bundled ids are: agents, audio-widget, caw, clock-demo,
+        departures, infobroker, niri-layouts, pet, preem-demo, stats,
         terminal, timer, weather (each output named
         `hytte-plugin-<id>`). Their per-plugin runtime knobs go through
         `env` / `secrets` above.
 
-        **Running one bundled binary twice — `stats` (#1250) is the first —
-        needs two attribute sets that differ in this key.** The attribute
+        **Running one bundled binary twice — `stats` (#1250) is the first,
+        `clock-demo` (#1388) the smallest — needs two attribute sets that
+        differ in this key.** The attribute
         name IS the plugin's launch-time id: it names the transient
         `trollshell-plugin-<id>` unit above and, since #1284, renders
         `HYTTE_PLUGIN_ID = "<id>"` into that plugin's `env` whenever it

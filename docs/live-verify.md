@@ -2553,8 +2553,9 @@ audio feed, not the raster.
       The pitch is a runtime knob now, and `9 * dot_px` is the whole height, so
       a bar-mounted ticker asks for `2` and gets 18 px against the bar's 32 —
       which CI can check as arithmetic but not as glass. Point a bar-mounted
-      plugin at `Marquee::new(…).dot_px(2)` (the `hytte-plugin-bar-clock-demo`
-      shape, or `preem-demo` with `Mount::Bar`), then:
+      plugin at `Marquee::new(…).dot_px(2)` (the clock demo's bar instance —
+      `hytte-plugin-clock-demo` with `mount = "BarCenter"` — or `preem-demo`
+      with `Mount::Bar`), then:
   1. **The bar does not grow.** Its height stays wherever `assets/trollshell/style.css`
      puts it — if the bar gets taller, the chip is asking for more than 32 px
      and the pitch did not reach the kit.
@@ -2715,8 +2716,11 @@ session.
      should catch up smoothly rather than snapping. #897/#926 moved this onto
      each mount's frame clock; the arm/park half of it is checked there.
 - [ ] **(#884/#898)** The SDK's display seam, against a shell carrying #896:
-  1. Start (or restart) `hytte-plugin-preem-demo` and
-     `hytte-plugin-bar-clock-demo`. The card's eight widgets and the bar
+  1. Start (or restart) `hytte-plugin-preem-demo` and **the clock demo's bar
+     instance** (`hytte-plugin-clock-demo` under a second
+     `programs.trollshell.plugins.<id>` entry with `mount = "BarCenter"`; the
+     crate this used to name, `hytte-plugin-bar-clock-demo`, was folded into
+     it by #1388). The card's eight widgets and the bar
      chip's seven-segment clock should render through the shell's own kit;
      check the journal for **no** "plugin sent a `Node::Preem`, but this
      shell does not advertise…" warning, which would mean the negotiation

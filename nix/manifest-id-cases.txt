@@ -64,7 +64,6 @@
 # exec	expected-manifest-id
 hytte-plugin-agents	agents
 hytte-plugin-audio-widget	audio-widget
-hytte-plugin-bar-clock-demo	bar-clock-demo
 hytte-plugin-caw	caw
 hytte-plugin-clock-demo	clock-demo
 hytte-plugin-departures	departures

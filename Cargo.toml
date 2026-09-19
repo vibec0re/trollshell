@@ -17,7 +17,6 @@ members = [
   "crates/hytte-preem",
   "crates/hytte-plugin",
   "crates/hytte-plugin-clock-demo",
-  "crates/hytte-plugin-bar-clock-demo",
   "crates/hytte-plugin-pet",
   "crates/hytte-plugin-preem-demo",
   "crates/hytte-plugin-timer",

@@ -158,6 +158,66 @@ async fn a_supervisor_installed_connection_answers_method_calls() {
     );
 }
 
+/// `common::DAEMON_REAP_BUDGET` — the bound on `BusGuard`'s `Drop` and on
+/// `restart_on_same_address`, i.e. the suite's two reaps of the ephemeral
+/// `dbus-daemon` — must actually govern, in both directions.
+///
+/// It had no observable effect before this. libtest captures `eprintln!` per
+/// test and discards it for a *passing* test, and `nix/checks/system-tests.nix`
+/// runs `cargo test` with no `--nocapture`, so the warning the timeout arm
+/// prints reaches nobody in the one place it is meant to be read: measured with
+/// the budget mutated to 1 ns, a run that abandoned **every** reap printed 0
+/// warning lines and passed 92/92, and 1 ns was as green as 30 s.
+///
+/// So the bound gets a seam, `common::reap_within`, and both of its arms get an
+/// assertion:
+///
+/// * budget hit — a live `sleep 60` is **not** reaped within 50 ms, and the
+///   call *returns* rather than parking. Mutating `reap_within` to `true` (the
+///   "bound removed, answer faked" shape) reds this one, as does flipping its
+///   `is_ok()` to `is_err()`. Deleting the `tokio::time::timeout` outright
+///   makes it park forever rather than red, which is the honest shape: an
+///   unbounded reap *is* a hang, and a hang is what #1011 was.
+/// * budget not hit — the same child, after `SIGKILL`, **is** reaped within the
+///   real `DAEMON_REAP_BUDGET`. Mutating `reap_within` to `false` reds this one.
+///
+/// What this deliberately does **not** pin is the constant's magnitude.
+/// Measured, three runs: `DAEMON_REAP_BUDGET = 1 ns` leaves this test green,
+/// because `tokio::time::timeout` polls the inner future before it observes an
+/// already-elapsed deadline and an already-`SIGKILL`ed local child is reaped
+/// inside that first poll. That is not a gap — the number is a liveness guard
+/// sized against a starved runner, exactly like `DBUS_DAEMON_STARTUP_BUDGET`,
+/// and asserting a magnitude would be asserting a latency nobody claims. What
+/// the suite lacked and now has is a test that reds when the *bound* stops
+/// governing.
+///
+/// No `dbus-daemon` is involved: the guard's bound is about reaping a child
+/// process, and `sleep` exercises it honestly without depending on a broker.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reap_that_does_not_finish_within_its_budget_is_abandoned() {
+    let mut slow = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn `sleep` — coreutils is on PATH in the devShell and the check sandbox");
+
+    assert!(
+        !common::reap_within(&mut slow, Duration::from_millis(50)).await,
+        "a live child was reported reaped within 50 ms: `reap_within`'s budget \
+         is not governing, so `BusGuard::drop` would wait for a wedged \
+         dbus-daemon forever — the second of #1011's two forever-parks"
+    );
+
+    let _ = slow.start_kill();
+    assert!(
+        common::reap_within(&mut slow, common::DAEMON_REAP_BUDGET).await,
+        "a SIGKILLed child was not reaped within {:?}: the guard's budget is \
+         too tight to cover the case it exists for, so every teardown would \
+         abandon its daemon",
+        common::DAEMON_REAP_BUDGET
+    );
+}
+
 // Verify the public API surface: BusKind is accessible from outside the crate.
 const _: fn() = || {
     let _ = BusKind::Session;

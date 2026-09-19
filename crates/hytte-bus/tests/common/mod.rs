@@ -200,14 +200,47 @@ pub async fn answers_a_method_call(address: &str, unique: &str) -> (bool, u32) {
 /// already finished, libtest has not yet printed a result, and CI shows nothing
 /// at all — so leaving the suite's *other* forever-park unbounded would leave
 /// #1011's signature reachable by a second door. Bounded, a reap that wedges
-/// costs one line on stderr and an abandoned child (already `SIGKILL`ed, and
-/// spawned with `kill_on_drop(true)`) instead of the whole job's timeout.
+/// costs an abandoned child (already `SIGKILL`ed, and spawned with
+/// `kill_on_drop(true)`) instead of the whole job's timeout.
+///
+/// ## The abandonment is silent in CI, and that is on purpose here
+///
+/// An earlier version of this doc promised the wedged case "costs one line on
+/// stderr". It does not, where it matters: libtest captures `eprintln!`
+/// per test and discards it for a *passing* test, and
+/// `nix/checks/system-tests.nix` runs `cargo test` without `--nocapture`.
+/// Measured with this budget mutated to 1 ns so the timeout arm fires on every
+/// guard: 0 occurrences of the warning in a plain run, 10 under `--nocapture`,
+/// suite green both times. The line is kept because it is what a developer
+/// running the suite by hand with `--nocapture` sees, but it is **not** the
+/// guard's signal in CI — the signal in CI is that the job finishes at all.
+///
+/// What *is* pinned, in both directions, is the bound itself:
+/// `connection_basic.rs`'s
+/// `a_reap_that_does_not_finish_within_its_budget_is_abandoned` drives
+/// [`reap_within`] over a live child (budget hit → `false`, and it returns
+/// rather than parking) and over a `SIGKILL`ed one (budget not hit → `true`).
+/// Faking either answer, or flipping the seam's polarity, reds it by name. The
+/// *magnitude* of this constant is deliberately not asserted — see that test's
+/// doc for the measurement and why.
 ///
 /// Sized like [`DBUS_DAEMON_STARTUP_BUDGET`] and for the same reason: it is a
 /// liveness guard, not a latency assertion. Reaping a `SIGKILL`ed local process
 /// takes microseconds; 30 s is headroom for a starved runner, not for a slow
 /// path.
-const DAEMON_REAP_BUDGET: Duration = Duration::from_secs(30);
+pub const DAEMON_REAP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Wait for `child` to be reaped, giving up after `budget`. Returns whether it
+/// was reaped.
+///
+/// The seam every reap in this module goes through — [`BusGuard`]'s `Drop` and
+/// [`restart_on_same_address`] — so the two cannot drift, and so
+/// [`DAEMON_REAP_BUDGET`] has one place a test can exercise both of its arms.
+/// See that constant for why the bound exists and what is and is not
+/// observable when it fires.
+pub async fn reap_within(child: &mut Child, budget: Duration) -> bool {
+    tokio::time::timeout(budget, child.wait()).await.is_ok()
+}
 
 pub struct BusGuard {
     child: Option<Child>,
@@ -232,10 +265,8 @@ impl Drop for BusGuard {
             let _ = child.start_kill();
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
-                if handle
-                    .block_on(tokio::time::timeout(DAEMON_REAP_BUDGET, child.wait()))
-                    .is_err()
-                {
+                if !handle.block_on(reap_within(&mut child, DAEMON_REAP_BUDGET)) {
+                    // Only visible under `--nocapture`; see DAEMON_REAP_BUDGET.
                     eprintln!(
                         "common::BusGuard: the ephemeral dbus-daemon did not exit within \
                          {DAEMON_REAP_BUDGET:?} of SIGKILL; abandoning the reap rather than \

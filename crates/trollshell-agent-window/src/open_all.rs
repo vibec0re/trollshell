@@ -22,8 +22,8 @@
 //! 1. Ask the hive for the roster and keep the agents whose collapsed
 //!    [`Status`] [`wants_terminal`](Status::wants_terminal) — the *running*
 //!    ones, which is the membership Annika settled on 2026-09-19 out of the
-//!    issue's own title. Nothing running is **not an error**: one line on
-//!    stderr and exit 0, because "nothing to open" is an answer.
+//!    issue's own title. Nothing running is **not an error**: one logged
+//!    line and exit 0, because "nothing to open" is an answer.
 //! 2. Ask niri for its workspaces and windows **once**. The window list
 //!    answers two questions: which workspaces are empty ([`pick_workspace`]),
 //!    and which of those agents already has a companion window
@@ -682,7 +682,15 @@ fn roster(socket: &Path) -> Result<Vec<AgentStatusRow>, HiveError> {
 ///
 /// **Nothing running is exit 0.** A fan-out on a quiet hive has done exactly
 /// what it was asked to, and a non-zero exit would make a keybind look broken;
-/// the sentence on stderr is the whole report.
+/// the one logged line is the whole report. (The log goes to **stdout** —
+/// `main` installs `tracing_subscriber::fmt`, whose default writer is
+/// `io::stdout`; only `main`'s own usage line is an `eprintln!`. Both land in
+/// the journal under `-t trollshell-agent-window` either way, but a caller
+/// redirecting one stream should know which.)
+///
+/// Pinned end to end, as the real binary, by `tests/open_all_binary.rs` — the
+/// exit codes are this function's whole observable contract, and nothing
+/// asserted them before the #1390 review.
 #[must_use]
 pub fn run() -> u8 {
     let cfg = hytte_plugin_agents::config::load();

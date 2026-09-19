@@ -234,10 +234,11 @@ Three things worth knowing before you bind it:
   one of those mid-run would move the focus out from under the launch that
   follows, which is the scatter the whole "focus first, then launch" order
   exists to prevent.
-- **No hive, no windows.** With `host.sock` unreachable it says so on stderr
+- **No hive, no windows.** With `host.sock` unreachable it says so
   (`journalctl --user -t trollshell-agent-window`, or the terminal you ran it
-  from) and exits non-zero. Nothing running at all is _not_ an error — one
-  line, exit 0.
+  from — the log lines go to stdout, only the usage line is on stderr) and
+  exits non-zero. Nothing running at all is _not_ an error — one line,
+  exit 0.
 - **niri is optional to the launch.** If `$NIRI_SOCKET` cannot be reached, or
   the focused output has no empty workspace to take, the windows still open —
   on whatever workspace is current — with one warning saying which of the two

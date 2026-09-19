@@ -3770,11 +3770,14 @@ session.
      height-for-width as before — full card width, height following the aspect
      ratio. A card that suddenly got narrow is this change reaching a mount it
      should not have.
-  4. Worth a glance at any other bar-mounted plugin drawing a `Pixels` or
-     `Shader` node (`preem-demo` with `Mount::Bar`, `audio-widget`): they take
-     the same axis, so a chip that is now *narrower and correct* is the fix
-     working, and one that got **taller** would mean the bar is honouring a
-     natural height it should still be clamping.
+  4. Worth a glance at any other bar-mounted plugin drawing a preem, `Pixels`
+     or `Shader` node — `audio-widget`, or either demo given a
+     `mount = "BarCenter"` on its `programs.trollshell.plugins.<id>` entry
+     (the clock demo's bar instance, `preem-demo`, whose manifests are
+     otherwise sidebar; see #1388's note above). They take the same axis, so a
+     chip that is now *narrower and correct* is the fix working, and one that
+     got **taller** would mean the bar is honouring a natural height it should
+     still be clamping.
 
 ## Screen recording
 

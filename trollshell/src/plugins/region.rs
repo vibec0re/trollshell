@@ -150,12 +150,12 @@ fn region_slot(mount: Mount, connector: Option<String>) -> gtk::Widget {
 /// more `named_connector` fold, #1177): `hytte_ui::Monitor::connector` itself
 /// folds an empty connector name to `None` since #1180 item 6, so a region can
 /// no longer see `Some("")` — the exact case this module's own doc on
-/// [`build_region`] and [`HostMsg::Event::output`]'s wire doc in
+/// `build_region` and [`HostMsg::Event::output`]'s wire doc in
 /// `hytte-plugin-proto` promise plugins a clean `None` for.
 ///
 /// The mount is the only thing each of these nine wrappers says; its mailbox,
 /// measure axis, layout orientation and card class all follow from it
-/// ([`region_slot`], **#1391 review, HIGH 1**).
+/// (`region_slot`, **#1391 review, HIGH 1**).
 #[must_use]
 pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::SidebarLead, monitor.connector())

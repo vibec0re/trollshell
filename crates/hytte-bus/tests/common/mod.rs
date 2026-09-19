@@ -384,8 +384,26 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
 #[allow(dead_code)] // not every test binary that pulls in `common` needs a restart
 pub async fn restart_on_same_address(mut guard: BusGuard) -> (Connection, BusGuard) {
     if let Some(mut child) = guard.child.take() {
+        // Bounded by [`DAEMON_REAP_BUDGET`], through the same [`reap_within`]
+        // seam as [`BusGuard`]'s `Drop`, and for the same reason: this is the
+        // suite's *third* forever-park, the same call on the same kind of
+        // child as the one bounded there, 120 lines up. It is awaited from
+        // three test bodies (`connection_reconnect.rs`, `resubscribe.rs` x2),
+        // so a park here produces precisely #1011's CI signature — `running 1
+        // test`, no `test result:`, silence until the job timeout. Being a
+        // plain `.await` rather than a nested `block_on` makes it harder to
+        // notice, not safer.
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        if !reap_within(&mut child, DAEMON_REAP_BUDGET).await {
+            // Only visible under `--nocapture`; see DAEMON_REAP_BUDGET. The
+            // stale-socket removal below is what lets the fresh daemon bind
+            // the identical path even when the old one is still around.
+            eprintln!(
+                "common::restart_on_same_address: the old dbus-daemon did not exit within \
+                 {DAEMON_REAP_BUDGET:?} of SIGKILL; abandoning the reap rather than hanging \
+                 the test (#1011)"
+            );
+        }
     }
 
     // dbus-daemon doesn't reliably unlink its own socket file on a SIGKILL;

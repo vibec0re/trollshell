@@ -1,8 +1,24 @@
 //! The window's command line, and the application id it picks from it.
 //!
-//! Hand-parsed rather than `clap`: two flags, both required-shaped, and the
-//! workspace has no `clap` in `Cargo.lock` — adding one to read `--agent`
-//! would be a resolved package per flag.
+//! Hand-parsed rather than `clap`, and it has to stay that way: hyperhive's
+//! `Ident` admits a **leading hyphen** (`-leading-hyphen` is a legal agent
+//! name), and this parser takes the token after `--agent` unconditionally,
+//! without re-examining it for a `-`. `clap` would read that name as a flag.
+//! The rule is asserted from both ends — `hytte_plugin_agents::window`'s
+//! `a_leading_hyphen_name_is_its_own_argv_element` and
+//! `the_plugins_own_argv_parses_on_both_tabs` here, which feeds the
+//! *real* builder's output through the *real* parser. Both are named in plain
+//! code rather than linked: they live in `#[cfg(test)]` modules, which rustdoc
+//! never has in scope, so a link would be a `broken_intra_doc_links` error
+//! under `checks.rustdoc`'s `-D warnings` (#1328).
+//!
+//! Two shapes, not one, since
+//! [#1306](https://github.com/vibec0re/trollshell/issues/1306): one window for
+//! one agent ([`Args`]) and the fan-out that opens all of them
+//! ([`Invocation::OpenAll`]). They are an enum rather than an `Option<AgentName>`
+//! because they do not share a `main` — the fan-out registers no
+//! `GApplication`, builds no window and exits, so "which one is this" has to be
+//! answered before an application id can even be derived.
 
 use hytte_plugin_agents::model::AgentName;
 
@@ -51,11 +67,47 @@ pub struct Args {
     pub tab: Tab,
 }
 
+/// What this process was asked to be.
+///
+/// Both arms are reachable from the same binary because the fan-out's whole
+/// job is to launch the other arm N times — one binary, one `PATH` entry, one
+/// nix slice, and no way for the two halves to disagree about the argv that
+/// joins them (`hytte_plugin_agents::window::argv` builds it for both the
+/// plugin and [`crate::open_all`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Invocation {
+    /// One agent's companion window — #950's mode, and the default.
+    Window(Args),
+    /// [#1306](https://github.com/vibec0re/trollshell/issues/1306): open one
+    /// window per **running** agent on a fresh niri workspace, then exit.
+    /// Carries nothing — the roster comes off `host.sock` and the workspace
+    /// off `$NIRI_SOCKET`, both read at run time.
+    OpenAll,
+}
+
+impl Invocation {
+    /// The window arm's arguments, for a caller that has already established
+    /// which arm it is holding.
+    #[must_use]
+    pub fn window(self) -> Option<Args> {
+        match self {
+            Self::Window(args) => Some(args),
+            Self::OpenAll => None,
+        }
+    }
+}
+
 /// Why a command line could not be used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Invalid {
     /// No `--agent` at all.
     MissingAgent,
+    /// `--open-all` was combined with a flag that describes **one** window.
+    ///
+    /// Refused rather than resolved in either direction: silently ignoring
+    /// `--agent` would open every agent when one was asked for, and silently
+    /// ignoring `--open-all` would open one when every was.
+    OpenAllWithWindowFlag(String),
     /// A flag that takes a value did not get one.
     MissingValue(String),
     /// `--agent` was given a name hyperhive would refuse.
@@ -70,6 +122,10 @@ impl std::fmt::Display for Invalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingAgent => f.write_str("no --agent given"),
+            Self::OpenAllWithWindowFlag(flag) => write!(
+                f,
+                "--open-all opens every running agent's window and cannot be combined with {flag}"
+            ),
             Self::MissingValue(flag) => write!(f, "{flag} needs a value"),
             Self::BadAgent(raw) => write!(
                 f,
@@ -82,7 +138,8 @@ impl std::fmt::Display for Invalid {
 }
 
 /// The usage line, printed on a bad command line.
-pub const USAGE: &str = "usage: trollshell-agent-window --agent <name> [--tab agent|settings]";
+pub const USAGE: &str = "usage: trollshell-agent-window --agent <name> [--tab agent|settings]\n   \
+                         or: trollshell-agent-window --open-all";
 
 /// Parse an argv **without** its program name.
 ///
@@ -91,17 +148,24 @@ pub const USAGE: &str = "usage: trollshell-agent-window --agent <name> [--tab ag
 /// of them is a sentence an operator can act on, because this binary is
 /// normally launched by the agents plugin and a human only ever types it when
 /// something already went wrong.
-pub fn parse<I, S>(args: I) -> Result<Args, Invalid>
+pub fn parse<I, S>(args: I) -> Result<Invocation, Invalid>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let mut agent = None;
     let mut tab = Tab::default();
+    let mut open_all = false;
+    let mut window_flag: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_ref() {
+            // #1306. A whole mode rather than a value, so it is parsed here
+            // and the conflict checked once at the end — an `--open-all
+            // --agent x` in either order is the same refusal.
+            hytte_plugin_agents::window::ARG_OPEN_ALL => open_all = true,
             "--agent" => {
+                window_flag.get_or_insert_with(|| "--agent".to_owned());
                 let raw = it
                     .next()
                     .ok_or_else(|| Invalid::MissingValue("--agent".to_owned()))?;
@@ -111,6 +175,7 @@ where
                 );
             }
             "--tab" => {
+                window_flag.get_or_insert_with(|| "--tab".to_owned());
                 let raw = it
                     .next()
                     .ok_or_else(|| Invalid::MissingValue("--tab".to_owned()))?;
@@ -120,10 +185,16 @@ where
             other => return Err(Invalid::Unknown(other.to_owned())),
         }
     }
-    Ok(Args {
+    if open_all {
+        return match window_flag {
+            Some(flag) => Err(Invalid::OpenAllWithWindowFlag(flag)),
+            None => Ok(Invocation::OpenAll),
+        };
+    }
+    Ok(Invocation::Window(Args {
         agent: agent.ok_or(Invalid::MissingAgent)?,
         tab,
-    })
+    }))
 }
 
 /// The `GApplication` id for one agent — **one id per agent**, which is how
@@ -180,11 +251,21 @@ pub fn app_id(agent: &AgentName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{APP_ID_PREFIX, Args, Invalid, Tab, app_id, parse};
+    use super::{APP_ID_PREFIX, Args, Invalid, Invocation, Tab, USAGE, app_id, parse};
     use hytte_plugin_agents::model::AgentName;
 
     fn name(s: &str) -> AgentName {
         AgentName::parse(s).expect("a legal test name")
+    }
+
+    /// Parse, insisting on the one-window arm — the shape every #950-era
+    /// assertion here describes.
+    fn window<I, S>(args: I) -> Result<Args, Invalid>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        parse(args).map(|i| i.window().expect("the one-window arm"))
     }
 
     /// The launch the agents plugin emits for a row click — `--agent` alone —
@@ -192,7 +273,7 @@ mod tests {
     #[test]
     fn the_plain_launch_opens_the_agent_page() {
         assert_eq!(
-            parse(["--agent", "trollshell-choom"]),
+            window(["--agent", "trollshell-choom"]),
             Ok(Args {
                 agent: name("trollshell-choom"),
                 tab: Tab::Agent,
@@ -206,11 +287,11 @@ mod tests {
     #[test]
     fn the_pens_launch_opens_the_settings_page() {
         assert_eq!(
-            parse(["--agent", "stray", "--tab", "settings"]).map(|a| a.tab),
+            window(["--agent", "stray", "--tab", "settings"]).map(|a| a.tab),
             Ok(Tab::Settings)
         );
         assert_eq!(
-            parse(["--agent", "stray", "--tab", "agent"]).map(|a| a.tab),
+            window(["--agent", "stray", "--tab", "agent"]).map(|a| a.tab),
             Ok(Tab::Agent)
         );
     }
@@ -237,37 +318,94 @@ mod tests {
             ] {
                 let argv = window::argv(name, tab);
                 assert_eq!(argv[0], "trollshell-agent-window", "the binary name");
-                let parsed = parse(&argv[1..]).expect("the plugin's own argv parses");
+                let parsed = window(&argv[1..]).expect("the plugin's own argv parses");
                 assert_eq!(parsed.agent.as_str(), name);
                 assert_eq!(parsed.tab, expected);
             }
         }
     }
 
+    /// #1306's fan-out is its own arm, and the **plugin's own builder** is
+    /// what produces the argv this parses — asserted against
+    /// `hytte_plugin_agents::window::open_all_argv` rather than against a copy
+    /// of its output, for `the_plugins_own_argv_parses_on_both_tabs`' reason:
+    /// the two ends are in different crates and a literal here would let one
+    /// move.
+    ///
+    /// Falsification: rename the flag on either side and this reds.
+    #[test]
+    fn the_plugins_fan_out_argv_parses_as_the_open_all_arm() {
+        let argv = hytte_plugin_agents::window::open_all_argv();
+        assert_eq!(argv[0], "trollshell-agent-window", "the binary name");
+        assert_eq!(parse(&argv[1..]), Ok(Invocation::OpenAll));
+        assert_eq!(
+            parse(["--open-all"]).map(Invocation::window),
+            Ok(None),
+            "the fan-out is not a window arm; `main` must not try to build one"
+        );
+    }
+
+    /// `--open-all` and the one-window flags are refused together, in **both
+    /// orders**, rather than one silently winning.
+    ///
+    /// Either resolution would be a surprise in the expensive direction: with
+    /// `--agent` winning, a fan-out opens one window; with `--open-all`
+    /// winning, a request for one agent opens the whole hive.
+    ///
+    /// Falsification: return `Ok(Invocation::OpenAll)` regardless of the
+    /// window flags (or check the conflict only in one order) and this reds.
+    #[test]
+    fn the_fan_out_refuses_to_be_combined_with_a_one_window_flag() {
+        for argv in [
+            vec!["--open-all", "--agent", "stray"],
+            vec!["--agent", "stray", "--open-all"],
+        ] {
+            assert_eq!(
+                parse(&argv),
+                Err(Invalid::OpenAllWithWindowFlag("--agent".to_owned())),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            parse(["--open-all", "--tab", "settings"]),
+            Err(Invalid::OpenAllWithWindowFlag("--tab".to_owned())),
+        );
+        assert!(
+            Invalid::OpenAllWithWindowFlag("--agent".to_owned())
+                .to_string()
+                .contains("--agent"),
+            "the sentence names the flag that clashed"
+        );
+        assert!(
+            USAGE.contains("--open-all"),
+            "…and the usage line offers the mode that was refused"
+        );
+    }
+
     /// Every way a command line can be wrong says which way, because a human
     /// only types this when something already went wrong.
     #[test]
     fn a_bad_command_line_names_what_is_wrong() {
-        assert_eq!(parse::<_, &str>([]), Err(Invalid::MissingAgent));
+        assert_eq!(window::<_, &str>([]), Err(Invalid::MissingAgent));
         assert_eq!(
-            parse(["--agent"]),
+            window(["--agent"]),
             Err(Invalid::MissingValue("--agent".to_owned()))
         );
         assert_eq!(
-            parse(["--agent", "stray", "--tab"]),
+            window(["--agent", "stray", "--tab"]),
             Err(Invalid::MissingValue("--tab".to_owned()))
         );
         assert_eq!(
-            parse(["--agent", "../etc/passwd"]),
+            window(["--agent", "../etc/passwd"]),
             Err(Invalid::BadAgent("../etc/passwd".to_owned())),
             "the §11 whitelist runs before the name reaches a socket or a title"
         );
         assert_eq!(
-            parse(["--agent", "stray", "--tab", "stats"]),
+            window(["--agent", "stray", "--tab", "stats"]),
             Err(Invalid::BadTab("stats".to_owned()))
         );
         assert_eq!(
-            parse(["--verbose"]),
+            window(["--verbose"]),
             Err(Invalid::Unknown("--verbose".to_owned()))
         );
         for e in [

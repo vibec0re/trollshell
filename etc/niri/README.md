@@ -29,6 +29,14 @@ mutations show up in the bar and OSD without further wiring.
   nix store, which is not the same thing. `nix profile install` it, or add it
   to `home.packages`. Passing it `apply <layout>` makes it a one-shot: it
   talks to `$NIRI_SOCKET` directly, so the binds work with trollshell stopped.
+- `trollshell-agent-window` — the per-agent companion window (#950), used by
+  the commented-out `Mod+Alt+A` bind (#1306). It ships as
+  `packages.trollshell-agent-window` and is installed for you by
+  `programs.trollshell.agentWindow.enable`, which defaults on once a
+  `plugins.agents` entry exists. `--open-all` makes it a one-shot, the same
+  way `apply` does for the layouts binary above: it reads hyperhive's
+  `host.sock` and `$NIRI_SOCKET` itself, so the bind works with trollshell
+  stopped — what it needs running is the **hive**, not the shell.
 
 Install on Arch:
 
@@ -189,6 +197,58 @@ own chords and uncomment. Two things are worth knowing before you bind it:
 Both surfaces take their own layer-shell namespace, so a niri `layer-rule` can
 address one without the other: `hytte-sidebar-<connector>` for the left and
 `hytte-sidebar-right-<connector>` for the right.
+
+## Every agent's window at once (#1306)
+
+The agents card's grid button — and the commented-out `Mod+Alt+A` bind in
+`binds.kdl` — both run one command:
+
+```sh
+trollshell-agent-window --open-all
+```
+
+It asks the hive which agents are **running** (only those: a stopped, failed
+or paused agent has no live terminal to show), asks niri for the empty
+unnamed workspace at the bottom of the focused output, focuses it, and opens
+one companion window per agent there. niri's scrolling layout tiles them as
+columns, and trollshell's own Workspaces page shows the result as an
+**ephemeral** card for as long as the windows are up — nothing here names the
+workspace, writes a window rule or saves a stack.
+
+Three things worth knowing before you bind it:
+
+- **Press it again and nothing doubles — and no new workspace is taken.**
+  Each window is its own `GApplication` id
+  (`mov.vibec0re.trollshell.AgentWindow.<agent>`), and the run reads that id
+  back off `niri msg -j windows` to see which agents already have one. With
+  every running agent's window open there is nothing to place, so it picks
+  **no** workspace and sends **no** focus: each launch is simply a present of
+  the window that exists, _where it is_. (Without that rule a second press
+  would focus the trailing spare — the now-empty workspace _below_ the one
+  holding your windows — before presenting anything.) What it does _not_ do
+  is gather: a window you had already moved elsewhere is presented where it
+  is, not dragged onto the new workspace.
+- **A mixed press places only what is missing.** Start one agent after the
+  first press and the next press focuses a fresh workspace and opens the new
+  window there, leaving the windows that were already open alone — presenting
+  one of those mid-run would move the focus out from under the launch that
+  follows, which is the scatter the whole "focus first, then launch" order
+  exists to prevent.
+- **No hive, no windows.** With `host.sock` unreachable it says so
+  (`journalctl --user -t trollshell-agent-window`, or the terminal you ran it
+  from — the log lines go to stdout, only the usage line is on stderr) and
+  exits non-zero. Nothing running at all is _not_ an error — one line,
+  exit 0.
+- **niri is optional to the launch.** If `$NIRI_SOCKET` cannot be reached, or
+  the focused output has no empty workspace to take, the windows still open —
+  on whatever workspace is current — with one warning saying which of the two
+  happened.
+
+The windows it starts are transient `systemd-run --user` units named
+`trollshell-launch-agent-window-<agent>-…` inside `trollshell-launch.slice`,
+the same slice a pill click's window lands in, so
+`systemctl --user stop trollshell-launch.slice` still closes everything
+trollshell has launched on your behalf.
 
 ## Frame struts
 

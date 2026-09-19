@@ -5635,3 +5635,88 @@ location.
   follow-ups. No code changed and no behavior to click through in a Niri
   session; noted here so its absence from the sections above doesn't read as
   an oversight.
+
+## Open every running agent's window (#1306)
+
+The agents card's grid button, the `trollshell-agent-window --open-all`
+command behind it, and the commented-out `Mod+Alt+A` bind in
+`etc/niri/binds.kdl` are all one code path, so verifying the button verifies
+the keybind too. Everything here needs a **live hive**: `host.sock` reachable
+and at least two agents that can be started.
+
+- [ ] **(#1306)** **Two agents up → one fresh workspace, two tiled windows.**
+      With two agents `running` (`hivectl` or the card's own start buttons),
+      click the **grid** button in the agents card's title row — left of the
+      list button. niri must switch to the empty workspace at the bottom of
+      the **focused output** and open both companion windows there, tiled as
+      columns in the hive's own roster order. Confirm the workspace it picked
+      was the trailing empty one and not a gap between two populated ones
+      (`niri msg -j workspaces` before the click, and compare `idx`).
+- [ ] **(#1306)** **Click it again → the same windows, no duplicates, and no
+      new workspace.** With the two windows still open on that workspace,
+      press it again. Nothing new may appear: each window is its own
+      `GApplication` id, so the second launch finds the running process and
+      presents it — exactly two `AgentWindow` app-ids in `niri msg -j windows`,
+      before and after. Watch the **workspace** too: the press must _not_
+      focus the (now empty) workspace below the one holding the windows —
+      compare `niri msg -j workspaces` before and after and confirm the
+      focused id is unchanged, and that no new workspace was created. Worth
+      knowing what this does **not** promise: a window you dragged to another
+      workspace beforehand is presented _where it is_ (never dragged back),
+      so a press can still end with the focus on that window's workspace.
+      That is the documented behaviour, not a bug.
+- [ ] **(#1306)** **A mixed press places only the new one.** With the two
+      windows up, start a **third** agent and press the button again. It must
+      focus a fresh empty workspace and open **only** the third window there;
+      the two that were already open must stay where they are, untouched
+      (`niri msg -j windows` — the same two `workspace_id`s as before, one new
+      entry). This is the case the second press is most likely to get wrong:
+      presenting one of the open windows mid-run would move the focus and the
+      new window would land on the wrong workspace.
+- [ ] **(#1306)** **The Workspaces page shows it as an ephemeral card.** With
+      the windows up, open the Workspaces page (Settings → More → Workspaces,
+      or the `open-page workspaces` verb). The fan-out's workspace must appear
+      as an **ephemeral** card — niri's own workspace number as its title, no
+      name, the two `AgentWindow` app-ids as its apps. Close both windows and
+      the card must disappear on the next refresh. This is the whole reason
+      the picker insists on an _unnamed_ workspace; a named one would render
+      as nothing here.
+- [ ] **(#1306)** **Only the running ones.** Stop one agent and pause another
+      (the card's stop button; `hivectl agent pause <name>`), leaving one
+      running. The button's hover must read "open the running agent's
+      window…" in the singular, and a click must open exactly one window. A
+      **paused** agent is deliberately excluded — if that reads wrong on
+      glass, it is one arm of `Status::wants_terminal` to flip, and a question
+      for #1306's thread rather than a bug.
+- [ ] **(#1306)** **Nothing running → no button.** Stop every agent. The grid
+      button must vanish from the title row entirely (the list button stays
+      where it is). Then run `trollshell-agent-window --open-all` by hand on
+      that same hive: it must print one line naming why there is nothing to
+      open and exit **0** — `echo $?`, since a non-zero exit is what would
+      make the keybind look broken.
+- [ ] **(#1306)** **No window binary → no button.** Restart the agents plugin
+      from a shell with `trollshell-agent-window` off `PATH`
+      (`systemctl --user stop trollshell-plugin-agents`, then run the plugin
+      by hand with a trimmed `PATH`). The grid button must not be drawn at
+      all — there is no browser fallback for this one, because a browser tab
+      is not a tiled workspace. Exactly one "not on this plugin's PATH"
+      warning in the log, as for the pill route.
+- [ ] **(#1306)** **The launched windows outlive the shell.** With the two
+      windows up, confirm that
+      `systemctl --user list-units 'trollshell-launch-agent-window-*'`
+      lists one transient unit per window,
+      all of them inside `trollshell-launch.slice`, and then
+      `systemctl --user restart trollshell` — both windows must survive it.
+      `systemctl --user stop trollshell-launch.slice` must then close them
+      together with anything a pill click opened.
+- [ ] **(#1306)** **The keybind is the same thing.** Uncomment the
+      `Mod+Alt+A` line in your niri config and press it with the drawer and
+      sidebar closed. Same workspace, same windows, same second-press
+      behaviour — it spawns the identical command with no D-Bus and no running
+      plugin involved, so it must also work with `trollshell` stopped
+      entirely (the **hive** is what it needs, not the shell).
+- [ ] **(#1306)** **A second output does not steal the windows.** On a
+      two-monitor setup, leave the _unfocused_ screen with more workspaces
+      than the focused one (so its trailing empty workspace has a higher
+      `idx`) and press the button. The windows must land on the screen you
+      are looking at.

@@ -3134,6 +3134,7 @@ dependencies = [
  "gtk4",
  "hytte-plugin-agents",
  "libadwaita",
+ "niri-ipc",
  "serde_json",
  "tempfile",
  "tokio",

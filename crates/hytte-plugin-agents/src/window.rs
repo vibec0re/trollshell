@@ -40,6 +40,10 @@ pub const ARG_AGENT: &str = "--agent";
 /// Which tab it opens on. Omitted for [`Tab::Agent`] — see [`argv`].
 pub const ARG_TAB: &str = "--tab";
 
+/// The window's **fan-out** mode (#1306): open one window per *running* agent,
+/// on a fresh niri workspace, and exit. See [`open_all_argv`].
+pub const ARG_OPEN_ALL: &str = "--open-all";
+
 /// The window's two tabs, as its `--tab` argument spells them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -79,6 +83,51 @@ pub fn argv(name: &str, tab: Tab) -> Vec<String> {
         out.push(tab.as_str().to_owned());
     }
     out
+}
+
+/// The argv for the fan-out (#1306): **one** launch, no agent named.
+///
+/// # Why the plugin does not simply emit N of [`argv`]
+///
+/// Because it cannot do the part that makes this a feature. "Every running
+/// agent's window, tiled on a fresh workspace" needs niri's **workspace list**
+/// — which empty workspace is at the bottom of the focused output — and a
+/// plugin has no compositor connection: its only lever on the outside world is
+/// a detached [`Effect::RunCommand`](hytte_plugin::proto::Effect::RunCommand).
+/// The companion window is a normal process that can ask niri itself, so the
+/// deciding moved there (Annika on
+/// [#1306](https://github.com/vibec0re/trollshell/issues/1306), 2026-09-14),
+/// and this crate's whole contribution is one launch of it.
+///
+/// Two things fall out of that, and both are the reason it is not merely
+/// tidier:
+///
+/// - **The workspace is picked once, by one process, after the focus lands.**
+///   N launches from here would each open wherever the compositor happened to
+///   be at that instant, which is the race
+///   [#1307](https://github.com/vibec0re/trollshell/pull/1307) reverted a whole
+///   mechanism over.
+/// - **It costs one token of the host's launch budget instead of N.** The host
+///   allows a plugin four detached launches back-to-back and four a minute
+///   after that (`trollshell/src/plugins/effects.rs`'s `LAUNCH_BURST`/
+///   `LAUNCH_PER_MINUTE`, #1165 item 8) — sized, in its own words, for "a user
+///   clicking through a few agents at once". A hive with five running agents
+///   would have the fifth window refused outright.
+///
+///   Not "one launch always fits", which is stronger than the mechanism
+///   (#1390 review, LOW 2): `launch_budget_allows` keys its `TokenBucket` on
+///   the **plugin id**, so this launch shares one four-token burst with every
+///   other detached launch this plugin makes — and since #1282 item 2 a pill
+///   click *is* one. Four pill clicks inside a minute and the fan-out's single
+///   launch is refused too. What one launch buys is that the fan-out spends a
+///   quarter of the budget rather than all of it, and that a refusal is a
+///   refusal of the *whole* action rather than of an arbitrary tail of it.
+///   Nor is a refusal silent: the host's `EffectOutcome` comes back with
+///   `ok: false` and its own sentence, which [`crate::Agents`]'s
+///   `Input::EffectResult` arm turns into an `Effect::Notify`.
+#[must_use]
+pub fn open_all_argv() -> Vec<String> {
+    vec![BINARY.to_owned(), ARG_OPEN_ALL.to_owned()]
 }
 
 /// Is [`BINARY`] on **this process's** `PATH`, as an executable file?
@@ -233,7 +282,7 @@ fn never() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARG_AGENT, ARG_TAB, BINARY, Probe, Tab, argv};
+    use super::{ARG_AGENT, ARG_OPEN_ALL, ARG_TAB, BINARY, Probe, Tab, argv, open_all_argv};
 
     /// The plain launch is `<binary> --agent <name>` and carries **no** tab
     /// argument — #950's own spelling.
@@ -278,6 +327,23 @@ mod tests {
         let av = argv("a-b-c", Tab::Settings);
         assert_eq!(av.iter().filter(|a| *a == "a-b-c").count(), 1);
         assert!(av.iter().all(|a| !a.contains(' ')), "{av:?}");
+    }
+
+    /// The fan-out launch (#1306) is the binary and **one** flag: it names no
+    /// agent, because the window re-reads the roster off `host.sock` itself,
+    /// and it names no tab, because every window it opens is an agent page.
+    ///
+    /// Falsification: append an agent name here and the exact-vector assertion
+    /// reds — which is the shape that matters, since a name spliced into this
+    /// argv would be a second, unvalidated path to `--agent`.
+    #[test]
+    fn the_fan_out_launch_is_the_binary_and_one_flag() {
+        assert_eq!(open_all_argv(), vec![BINARY, ARG_OPEN_ALL]);
+        assert_eq!(ARG_OPEN_ALL, "--open-all");
+        assert!(
+            !open_all_argv().contains(&ARG_AGENT.to_owned()),
+            "the fan-out names no agent — the window reads the roster itself"
+        );
     }
 
     /// A pinned probe answers without touching `PATH`, in both directions.

@@ -112,6 +112,21 @@ pub const BACK_ID: &str = "agents-back";
 /// agent's companion window; this one opens the overview and the full roster.
 pub const OVERVIEW_ID: &str = "agents-overview";
 
+/// The card title row's **fan-out** button
+/// ([#1306](https://github.com/vibec0re/trollshell/issues/1306)): open one
+/// companion window per running agent, tiled on a fresh niri workspace.
+///
+/// A card-level id and not a prefix, because it names no agent — the whole
+/// point is that the launched binary re-reads the roster itself, so a click
+/// carries no roster snapshot over the socket and back (the
+/// [`ids::OPEN`] rule, taken to its limit: nothing to re-validate).
+///
+/// It lives in the **title** row for [`OVERVIEW_ID`]'s reason: this is a
+/// hive-level action, not a row's. It sits to the *left* of the overview
+/// button so that the overview stays pinned in the corner it has occupied
+/// since #963 — the right-hand group grows inwards.
+pub const OPEN_ALL_ID: &str = "agents-open-all";
+
 /// Button id prefixes. Each is `"<prefix><name>"`; the reducer strips the
 /// prefix and re-validates the remainder as an [`AgentName`] rather than
 /// trusting the round trip.
@@ -845,6 +860,51 @@ pub fn hive_summary(hive: &Hive) -> String {
     }
 }
 
+/// The Open-all button's glyph — a grid, because what the click produces is a
+/// workspace of tiled columns rather than one more window.
+const OPEN_ALL_ICON: &str = "view-grid-symbolic";
+
+/// The card's fan-out button (#1306), or `None` when there is nothing for it to
+/// do.
+///
+/// Two conditions, and **both** are "hide", not "show it and explain":
+///
+/// - **At least one running agent** ([`Hive::any_wants_terminal`], which is
+///   `false` for every hive state that is not `Up`). A button that opens zero
+///   windows is a button that looks broken.
+/// - **The companion window is installed** (`window_available`, the
+///   [`crate::window::Probe`]'s answer as of the last poll). There is no
+///   fallback to fall back *to* here: the browser route the pill uses opens one
+///   tab wherever the browser is, which is not "tiled on a fresh workspace" by
+///   any reading, and the workspace half needs the binary regardless. So a
+///   desktop without it simply has no button — the same answer the pen's
+///   removal settled for a control nothing could honour.
+///
+/// The count goes in the hover rather than in a label: the title row is icon
+/// buttons, and "3" beside a grid glyph would read as a badge (which, on this
+/// card, means a pending approval).
+fn open_all_button(hive: &Hive, window_available: bool) -> Option<Node> {
+    if !window_available || !hive.any_wants_terminal() {
+        return None;
+    }
+    let running = hive
+        .agents()
+        .iter()
+        .filter(|a| a.status().wants_terminal())
+        .count();
+    let hover = if running == 1 {
+        "open the running agent's window on a fresh workspace".to_owned()
+    } else {
+        format!("open all {running} running agents' windows on a fresh workspace")
+    };
+    Some(icon_button(
+        OPEN_ALL_ID,
+        OPEN_ALL_ICON,
+        &hover,
+        &["flat", "ts-agent-btn"],
+    ))
+}
+
 /// The sidebar card: a titled surface, then the roster as a dense list.
 ///
 /// The title matches the `Tasks` card above it — the same all-caps caption
@@ -852,28 +912,36 @@ pub fn hive_summary(hive: &Hive) -> String {
 /// as a card and a pile of rows. The host supplies the card surface itself
 /// (`.ts-plugin-card`, #319) and deliberately no padding, so the root carries
 /// `ts-agents-card` for its own inset.
+///
+/// `window_available` is the one input here that is not the model: whether
+/// `trollshell-agent-window` is on this process's `PATH`, snapshotted by
+/// [`Agents`](crate::Agents) wherever it holds `&mut self`, because
+/// [`Plugin::view`](hytte_plugin::Plugin::view) is `&self` and
+/// [`Probe::available`](crate::window::Probe::available) resolves (and warns)
+/// at most once. It gates exactly one node — see `open_all_button`, just
+/// above, for the two conditions and why each of them hides rather than
+/// disables.
 #[must_use]
 pub fn card(
     hive: &Hive,
     cfg: &AgentsConfig,
     expanded: &ExpandedGroups,
     approvals: &PendingApprovals,
+    window_available: bool,
 ) -> Node {
-    let title = hrow(
-        6,
-        &["ts-agents-title"],
-        vec![
-            label("AGENTS", &["ts-agents-heading"]),
-            Node::Spacer,
-            label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
-            icon_button(
-                OVERVIEW_ID,
-                "view-list-symbolic",
-                "hive overview and the full roster",
-                &["flat", "ts-agent-btn"],
-            ),
-        ],
-    );
+    let mut title_row = vec![
+        label("AGENTS", &["ts-agents-heading"]),
+        Node::Spacer,
+        label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
+    ];
+    title_row.extend(open_all_button(hive, window_available));
+    title_row.push(icon_button(
+        OVERVIEW_ID,
+        "view-list-symbolic",
+        "hive overview and the full roster",
+        &["flat", "ts-agent-btn"],
+    ));
+    let title = hrow(6, &["ts-agents-title"], title_row);
 
     let body = match hive {
         Hive::Connecting => vec![notice(
@@ -1425,18 +1493,61 @@ mod tests {
         )
     }
 
+    /// A parked agent: every flag false, which [`Status::of`] collapses to
+    /// `Stopped`. #1306's membership excludes it.
+    fn stopped(name: &str) -> Agent {
+        agent(
+            name,
+            AgentStatusRow {
+                name: name.to_owned(),
+                ..AgentStatusRow::default()
+            },
+        )
+    }
+
+    /// An agent whose unit gave up — `running` on the wire is irrelevant,
+    /// `failed` wins the precedence, so this is the case that proves the
+    /// membership reads the **collapsed** state and not the raw flag.
+    fn failed(name: &str) -> Agent {
+        agent(
+            name,
+            AgentStatusRow {
+                name: name.to_owned(),
+                running: true,
+                failed: true,
+                ..AgentStatusRow::default()
+            },
+        )
+    }
+
     /// An empty approval queue — what every pre-#947-P3 assertion here
     /// describes, named so a badge appearing in one of them is a visible diff.
     fn no_approvals() -> PendingApprovals {
         PendingApprovals::default()
     }
 
+    /// A card on a desktop that **has** the companion window installed — the
+    /// normal deployment (nix installs the two together), and the one where
+    /// every control the card can draw is drawable. `card_without_window`
+    /// below is the other desktop.
     fn card_of(agents: Vec<Agent>) -> Node {
         super::card(
             &Hive::Up { agents },
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
             &no_approvals(),
+            true,
+        )
+    }
+
+    /// The same card on a desktop with no `trollshell-agent-window` on `PATH`.
+    fn card_without_window(agents: Vec<Agent>) -> Node {
+        super::card(
+            &Hive::Up { agents },
+            &AgentsConfig::default(),
+            &ExpandedGroups::new(),
+            &no_approvals(),
+            false,
         )
     }
 
@@ -1536,6 +1647,90 @@ mod tests {
             assert_eq!(*dir, hytte_plugin::proto::Dir::Vertical);
             assert_eq!(children.len(), 2, "two lines, no unfold: {children:?}");
         }
+    }
+
+    /// #1306's button is in the card's **title** row, left of the overview
+    /// button, and it opens on a click rather than decorating a row.
+    ///
+    /// Asserted on the title row's own children rather than on the whole
+    /// tree's ids, because "where" is half the claim: the fan-out is
+    /// hive-level, so it belongs beside the other hive-level control and not
+    /// among the pills.
+    ///
+    /// Falsification: push the button after the overview and the order
+    /// assertion reds; build it inside `agent_row` and the title-row
+    /// assertion does.
+    #[test]
+    fn the_fan_out_button_sits_in_the_title_row_before_the_overview() {
+        let tree = card_of(vec![running("argus", "idle")]);
+        let title = find_class(&tree, "ts-agents-title").expect("the title row renders");
+        let ids: Vec<String> = button_ids(&title);
+        assert_eq!(
+            ids,
+            vec![super::OPEN_ALL_ID.to_owned(), super::OVERVIEW_ID.to_owned()],
+            "the fan-out grows inwards; the overview keeps its corner"
+        );
+        assert_eq!(
+            icon_hover(&title, super::OPEN_ALL_ICON).as_deref(),
+            Some("open the running agent's window on a fresh workspace"),
+            "one running agent reads in the singular"
+        );
+    }
+
+    /// The hover counts the **running** agents, not the roster — which is
+    /// #1306's membership rule showing through to the words the operator
+    /// reads.
+    ///
+    /// Falsification: count `hive.agents()` instead and the count goes 2 → 4.
+    #[test]
+    fn the_fan_out_hover_counts_only_the_running_agents() {
+        let tree = card_of(vec![
+            running("argus", "idle"),
+            stopped("bosun"),
+            running("cinder", "busy"),
+            failed("dross"),
+        ]);
+        assert_eq!(
+            icon_hover(&tree, super::OPEN_ALL_ICON).as_deref(),
+            Some("open all 2 running agents' windows on a fresh workspace"),
+        );
+    }
+
+    /// Three ways for the button to be absent, each of them a hide rather
+    /// than a disabled control: nothing running, no hive, and no companion
+    /// window on `PATH`.
+    ///
+    /// Falsification (each verified red): drop the `window_available` guard
+    /// and the third case renders one; drop the `any_wants_terminal` guard and
+    /// the first two do.
+    #[test]
+    fn the_fan_out_button_is_absent_with_nothing_to_open() {
+        let all_stopped = card_of(vec![stopped("argus"), failed("dross")]);
+        assert!(
+            !button_ids(&all_stopped).contains(&super::OPEN_ALL_ID.to_owned()),
+            "no running agent, no button"
+        );
+
+        let no_hive = super::card(
+            &Hive::Unreachable {
+                reason: "no socket".to_owned(),
+            },
+            &AgentsConfig::default(),
+            &ExpandedGroups::new(),
+            &no_approvals(),
+            true,
+        );
+        assert!(!button_ids(&no_hive).contains(&super::OPEN_ALL_ID.to_owned()));
+
+        let no_window = card_without_window(vec![running("argus", "idle")]);
+        assert!(
+            !button_ids(&no_window).contains(&super::OPEN_ALL_ID.to_owned()),
+            "the window binary is the whole route; there is no fallback to offer"
+        );
+        assert!(
+            button_ids(&no_window).contains(&super::OVERVIEW_ID.to_owned()),
+            "…and nothing else in the title row moved"
+        );
     }
 
     /// The hover stays on the status **`Text`**, never on the enclosing row.
@@ -1838,7 +2033,7 @@ mod tests {
         };
 
         for tree in [
-            super::card(&hive, &cfg, &ExpandedGroups::new(), &no_approvals()),
+            super::card(&hive, &cfg, &ExpandedGroups::new(), &no_approvals(), true),
             super::panel(&hive, &cfg, None, ctx()),
         ] {
             let name = find_text(&tree, "choom").expect("the label renders");
@@ -1857,6 +2052,7 @@ mod tests {
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
             &no_approvals(),
+            true,
         );
         assert_eq!(
             find_text(&plain, "argus")
@@ -2022,7 +2218,7 @@ mod tests {
         let surfaces = [
             (
                 "card",
-                super::card(&hive, &cfg, &ExpandedGroups::new(), &no_approvals()),
+                super::card(&hive, &cfg, &ExpandedGroups::new(), &no_approvals(), true),
             ),
             (
                 "panel/agent",
@@ -2118,6 +2314,7 @@ mod tests {
             &cfg,
             &ExpandedGroups::new(),
             &no_approvals(),
+            true,
         );
 
         let mut expanders = 0usize;
@@ -2332,6 +2529,7 @@ mod tests {
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
             &PendingApprovals::new(queue),
+            true,
         )
     }
 

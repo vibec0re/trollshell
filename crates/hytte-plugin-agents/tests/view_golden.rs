@@ -69,6 +69,18 @@ fn seed(now_unix: i64) -> Agents {
     // documented no-op the SDK tells callers to ignore.
     let (tx, _rx) = cmd_channel();
     let mut m = Agents::with_cmds(tx);
+    // **Pinned, not inherited** (#1306). Since the card's Open-all button is
+    // drawn only where `trollshell-agent-window` is on `PATH`, an unpinned
+    // probe would make every golden here depend on whether the machine running
+    // `cargo test` happens to have the companion window installed — a
+    // committed artifact that differs between a dev's checkout and CI. `true`
+    // is the shipping deployment: nix installs the two together
+    // (`programs.trollshell.agentWindow.enable`, default on once a
+    // `plugins.agents` entry exists), so these goldens describe the desktop
+    // that actually exists. The no-window card is asserted in
+    // `view.rs`'s own tests instead, where it is one node's absence rather
+    // than a second full-tree recording.
+    m.set_window_probe(hytte_plugin_agents::window::Probe::fixed(true));
     m.update(Input::Snapshot(hytte_plugin::proto::StateSnapshot {
         clock: Some(hytte_plugin::proto::ClockState {
             unix: now_unix,

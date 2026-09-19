@@ -37,6 +37,21 @@ View {
                         tooltip: None,
                     },
                     Button {
+                        id: "agents-open-all",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "view-grid-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "open the running agent's window on a fresh workspace",
+                            ),
+                        },
+                    },
+                    Button {
                         id: "agents-overview",
                         classes: [
                             "flat",

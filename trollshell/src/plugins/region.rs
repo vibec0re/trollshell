@@ -1714,11 +1714,23 @@ mod gtk_tests {
     /// region must reach the screen measuring width-for-height: the region's
     /// axis → the mapping pass → the node → the widget, every link of it.
     ///
-    /// The fixture is the chip the issue screenshots — the timer's `mm:ss`
-    /// seven-segment readout, whose kit buffer is 188×70 — and the assertion is
-    /// the number the bug was made of: at the height a bar allows, the mounted
-    /// surface must ask for the width it is going to *draw*, not the 188 px it
-    /// would then letterbox that drawing inside.
+    /// The fixture's geometry is the chip the issue screenshots — the timer's
+    /// `mm:ss` seven-segment readout is a 188×70 kit buffer — and the assertion
+    /// is the number the bug was made of: at the height a bar allows, the
+    /// mounted surface must ask for the width it is going to *draw*, not the
+    /// 188 px it would then letterbox that drawing inside.
+    ///
+    /// It is carried by a **`Node::Pixels`** rather than the `Node::Preem` the
+    /// timer really sends, because a preem node only becomes a `GlSurface`
+    /// while GL is available and `hytte-ui`'s `abandon_gl` latch is *per
+    /// thread* — every `#[gtk::test]` in this binary shares one GTK thread, so
+    /// a sibling test that abandons GL would turn this one's chip into the
+    /// broken-widget placeholder and make it fail for a reason that is not
+    /// about axes at all. All three surfaces take the axis from the same field
+    /// through the same two reconciler arms (pinned per kind in
+    /// `hytte_ui::widget_tree`), and that the preem seam *stamps* the mount's
+    /// axis is pinned hermetically in `plugins::tests`; what is left for this
+    /// test is the region's own wiring, which is kind-agnostic.
     ///
     /// The same tree through a **sidebar** region is the control, and it is
     /// mapped with `FitAxis::Width` — the pre-#1387 behaviour, unchanged.
@@ -1728,10 +1740,10 @@ mod gtk_tests {
     /// the sidebar half green.
     #[gtk::test]
     fn a_chip_in_a_bar_region_measures_width_for_height() {
-        /// The first `GlSurface` anywhere under `widget`, depth first — the
+        /// The first `PixelSurface` anywhere under `widget`, depth first — the
         /// chip's readout, however many boxes the card wraps it in.
-        fn find_surface(widget: &gtk::Widget) -> Option<hytte::ui::GlSurface> {
-            if let Ok(surface) = widget.clone().downcast::<hytte::ui::GlSurface>() {
+        fn find_surface(widget: &gtk::Widget) -> Option<hytte::ui::PixelSurface> {
+            if let Ok(surface) = widget.clone().downcast::<hytte::ui::PixelSurface>() {
                 return Some(surface);
             }
             let mut child = widget.first_child();
@@ -1752,15 +1764,13 @@ mod gtk_tests {
             classes: vec![],
             spacing: 0,
             tooltip: None,
-            children: vec![wire::Node::Preem {
+            children: vec![wire::Node::Pixels {
                 id: Some("mmss".to_owned()),
                 classes: vec![],
-                widget: Box::new(vocab::PreemWidget::SevenSeg {
-                    config: vocab::SevenSegConfig::default(),
-                    state: vocab::SevenSegState {
-                        text: "25:00".to_owned(),
-                    },
-                }),
+                width: 188,
+                height: 70,
+                scale: 1,
+                data: vec![0xff; 188 * 70 * 4],
             }],
         };
 
@@ -1789,7 +1799,7 @@ mod gtk_tests {
                 None,
             );
             let surface = find_surface(&container.clone().upcast())
-                .expect("the preem chip mounted a GlSurface");
+                .expect("the chip's readout mounted a PixelSurface");
             assert_eq!(
                 surface.request_mode(),
                 mode,

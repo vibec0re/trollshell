@@ -44,6 +44,217 @@ use zbus::connection::Builder;
 /// real hang, run the test locally — CI's job is to not lie.
 const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 
+/// Upper bound on a **single** raw `zbus::Proxy::call` issued by a test in this
+/// crate, and on the retry loop such a call sits in. (#1011)
+///
+/// ## Why a raw call must never be awaited unbounded here
+///
+/// A zbus method call carries no reply timeout unless the connection was built
+/// with one, and `Builder`'s `method_timeout` defaults to `None`. So a call
+/// whose reply never arrives does not fail — it parks the awaiting task
+/// **forever**. And a reply can genuinely never arrive: zbus creates its object
+/// server lazily, its dispatch task is the only consumer of inbound
+/// `MethodCall` messages, and until that task has registered its
+/// `msg_type=MethodCall, destination=<unique name>` match rule an arriving call
+/// matches no receiver and is **dropped with no reply at all**. There is no arm
+/// in `zbus::Connection` that synthesises an `UnknownObject`/`UnknownMethod`
+/// error for an unhandled call.
+///
+/// That is what #1011 was, and it cost five `nix flake check` runs ~51 minutes
+/// of silence apiece before the job timeout killed them: `tests/export.rs`
+/// captured a unique name, called `Hello` on it, lost the race, and the
+/// surrounding liveness loop — which re-checks its own deadline only *between*
+/// iterations — could never reach that deadline. The last thing CI printed was
+/// libtest's `test export_unmounts_on_handle_drop has been running for over 60
+/// seconds`.
+///
+/// ## Why these two numbers, and why a timeout is retried rather than fatal
+///
+/// `connection.rs`'s `begin_dispatching` starts the dispatch task as soon as a
+/// `SharedConnection` is built rather than at the first `export`/`own` mount,
+/// which is where the race came from. It cannot *close* the window — zbus
+/// exposes the `started_event` that would prove readiness only through
+/// `connection::Builder`, and only for a connection built with an
+/// already-served interface — so a first call can still be swallowed, and
+/// **this bound, not that fix, is what stops #1011 recurring.** Measured over
+/// `tests/export.rs` on 12 concurrent 4-core shards each contending with 8 busy
+/// loops: the tree without these bounds hung 10 of 300 runs, and the same tree
+/// with them hung 0 of 300 — while the first `Hello` was still lost in 35 of
+/// 900 runs without `begin_dispatching` and 94 of 900 with it (its doc has the
+/// table and why the test constructor is the worse of its two call sites).
+///
+/// Across all 2,400 instrumented runs, **every** lost call was answered on the
+/// very next attempt — the retry count was never above 1.
+///
+/// So a call that gets no reply is treated as "not ready yet" and **retried**,
+/// not failed. That is what lets [`CALL_BUDGET`] be short: a swallowed call
+/// costs one second, not the test, and a call that is merely slow under load is
+/// re-issued rather than declared broken. It is emphatically **not** a latency
+/// assertion — nothing here claims a D-Bus call *should* answer within a second
+/// (a healthy run answers in ~1 ms). It is the guard that stops an unanswerable
+/// call from wedging the suite, and [`PROBE_BUDGET`] — 20 attempts' worth — is
+/// what decides that something is actually broken. Tightening `PROBE_BUDGET` is
+/// what would buy false reds under CI contention; tightening `CALL_BUDGET`
+/// only costs extra retries. See [`DBUS_DAEMON_STARTUP_BUDGET`] above for the
+/// same distinction stated at length.
+///
+/// ## See also
+///
+/// This is the third place in the tree that writes this zbus mechanism down.
+/// `hytte-bus`'s own `connection.rs`, at `begin_dispatching`, has the
+/// measurements and the argument for starting the dispatch task early;
+/// `hytte-services`' `wifi/nm_agent.rs` (`mount_and_proxy`, #714/#743/#756)
+/// derived it first, against the same zbus 5.14.0 line numbers, and has the
+/// one fix that closes the window rather than narrowing it —
+/// `Builder::serve_at` before `build()`, which a pooled `SharedConnection`
+/// cannot use because it is not built per interface. All three point at each
+/// other, because three uncoordinated transcriptions of one upstream behaviour
+/// is how drift starts.
+#[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
+pub const CALL_BUDGET: Duration = Duration::from_secs(1);
+
+/// Upper bound on a whole liveness loop built out of [`CALL_BUDGET`] calls —
+/// the deadline that decides a peer is really not answering. See
+/// [`CALL_BUDGET`] for why the two are sized against each other.
+#[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
+pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Error names the **broker** generates on its own, without the call ever
+/// reaching the connection we are probing.
+///
+/// [`answers_a_method_call`] exists to tell "our dispatch task replied" apart
+/// from "nobody replied". An error reply from the peer proves the first; these
+/// two do not, because `dbus-daemon` answers them itself when the destination
+/// name has no owner. Accepting them would let the probe pass on a connection
+/// that is not dispatching at all.
+const BROKER_GENERATED_ERRORS: [&str; 2] = [
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+    "org.freedesktop.DBus.Error.NameHasNoOwner",
+];
+
+/// Does the connection whose unique name is `unique`, on the bus at `address`,
+/// answer an inbound method call **at all**?
+///
+/// `Introspectable.Introspect` on `/` is the probe because zbus's object server
+/// serves it from the root node with no interface mounted, so a reply proves
+/// the dispatch task is live and proves nothing else.
+///
+/// Bounded and retried, exactly as [`CALL_BUDGET`] prescribes:
+/// `connection.rs`'s `begin_dispatching` starts the object server's dispatch
+/// task but cannot await it (zbus exposes the `started_event` only through
+/// `connection::Builder`), so the residual is one scheduling hop — the task has
+/// to be polled once before its match rule exists. Registering that rule is
+/// local, not a broker round-trip: zbus only sends `AddMatch` for
+/// `Type::Signal` rules. So a swallowed call costs one retry; a connection that
+/// never dispatches costs the whole [`PROBE_BUDGET`] and returns `false`.
+///
+/// Returns `(answered, unanswered)` — the second is how many calls got no reply
+/// at all, for the caller's failure message.
+///
+/// This lives in `common` rather than in the test file because
+/// `connection_basic.rs` has **two** `begin_dispatching` pins — one per call
+/// site that ships or is test-support — and they must not drift on what
+/// "answers" means.
+#[allow(dead_code)] // not every test binary that pulls in `common` probes a peer
+pub async fn answers_a_method_call(address: &str, unique: &str) -> (bool, u32) {
+    let client = Builder::address(address)
+        .expect("parse ephemeral bus address")
+        .build()
+        .await
+        .expect("client connection");
+    let proxy = zbus::Proxy::new(&client, unique, "/", "org.freedesktop.DBus.Introspectable")
+        .await
+        .expect("client proxy");
+
+    let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
+    let mut unanswered = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CALL_BUDGET, proxy.call::<_, _, String>("Introspect", &())).await
+        {
+            Ok(Ok(xml)) => {
+                assert!(
+                    xml.contains("org.freedesktop.DBus.Introspectable"),
+                    "unexpected introspection reply: {xml}"
+                );
+                return (true, unanswered);
+            }
+            // An error reply *from the peer* is still proof its dispatch task
+            // is live — it ran, and refused. Deliberately not `Ok(Err(_))`:
+            // that would also accept a broker-generated `ServiceUnknown` (the
+            // daemon answering for a destination that does not exist) and a
+            // client-side transport error on the *probing* connection, neither
+            // of which says anything about the peer. This is the one test whose
+            // whole job is to tell those two apart.
+            Ok(Err(zbus::Error::MethodError(name, _, _)))
+                if !BROKER_GENERATED_ERRORS.contains(&name.as_str()) =>
+            {
+                return (true, unanswered);
+            }
+            // A broker-generated error, or a transport error on our own side:
+            // not proof either way. Retry.
+            Ok(Err(_)) => {}
+            Err(_elapsed) => unanswered += 1,
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    (false, unanswered)
+}
+
+/// Upper bound on reaping the ephemeral `dbus-daemon` in [`BusGuard`]'s `Drop`.
+///
+/// #1011's diagnosis named **two** things in this crate's tests that can park a
+/// test forever, and the raw `zbus::Proxy::call` that [`CALL_BUDGET`] covers was
+/// only one of them. The other is this drop: `block_in_place` plus a nested
+/// `block_on` on [`tokio::process::Child::wait`], with nothing bounding it.
+///
+/// Nothing reached it in the 2,400 instrumented runs the PR for #1011 measured,
+/// which is why it is a backstop rather than a fix. But an unbounded wait here
+/// would be silent in exactly the way the unbounded call was — the test body has
+/// already finished, libtest has not yet printed a result, and CI shows nothing
+/// at all — so leaving the suite's *other* forever-park unbounded would leave
+/// #1011's signature reachable by a second door. Bounded, a reap that wedges
+/// costs an abandoned child (already `SIGKILL`ed, and spawned with
+/// `kill_on_drop(true)`) instead of the whole job's timeout.
+///
+/// ## The abandonment is silent in CI, and that is on purpose here
+///
+/// An earlier version of this doc promised the wedged case "costs one line on
+/// stderr". It does not, where it matters: libtest captures `eprintln!`
+/// per test and discards it for a *passing* test, and
+/// `nix/checks/system-tests.nix` runs `cargo test` without `--nocapture`.
+/// Measured with this budget mutated to 1 ns so the timeout arm fires on every
+/// guard: 0 occurrences of the warning in a plain run, 10 under `--nocapture`,
+/// suite green both times. The line is kept because it is what a developer
+/// running the suite by hand with `--nocapture` sees, but it is **not** the
+/// guard's signal in CI — the signal in CI is that the job finishes at all.
+///
+/// What *is* pinned, in both directions, is the bound itself:
+/// `connection_basic.rs`'s
+/// `a_reap_that_does_not_finish_within_its_budget_is_abandoned` drives
+/// [`reap_within`] over a live child (budget hit → `false`, and it returns
+/// rather than parking) and over a `SIGKILL`ed one (budget not hit → `true`).
+/// Faking either answer, or flipping the seam's polarity, reds it by name. The
+/// *magnitude* of this constant is deliberately not asserted — see that test's
+/// doc for the measurement and why.
+///
+/// Sized like [`DBUS_DAEMON_STARTUP_BUDGET`] and for the same reason: it is a
+/// liveness guard, not a latency assertion. Reaping a `SIGKILL`ed local process
+/// takes microseconds; 30 s is headroom for a starved runner, not for a slow
+/// path.
+pub const DAEMON_REAP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Wait for `child` to be reaped, giving up after `budget`. Returns whether it
+/// was reaped.
+///
+/// The seam every reap in this module goes through — [`BusGuard`]'s `Drop` and
+/// [`restart_on_same_address`] — so the two cannot drift, and so
+/// [`DAEMON_REAP_BUDGET`] has one place a test can exercise both of its arms.
+/// See that constant for why the bound exists and what is and is not
+/// observable when it fires.
+pub async fn reap_within(child: &mut Child, budget: Duration) -> bool {
+    tokio::time::timeout(budget, child.wait()).await.is_ok()
+}
+
 pub struct BusGuard {
     child: Option<Child>,
     tmp: TempDir,
@@ -60,10 +271,21 @@ impl Drop for BusGuard {
             // TempDir (socket directory) is not removed before the process exits.
             // block_in_place suspends async scheduling on this thread, allowing
             // a nested block_on without the "cannot block inside async" panic.
+            //
+            // Bounded by DAEMON_REAP_BUDGET — see its doc: this is the second of
+            // the two forever-parks #1011's diagnosis named, and an unbounded
+            // wait here is silent in exactly the way the unbounded call was.
             let _ = child.start_kill();
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
-                let _ = handle.block_on(child.wait());
+                if !handle.block_on(reap_within(&mut child, DAEMON_REAP_BUDGET)) {
+                    // Only visible under `--nocapture`; see DAEMON_REAP_BUDGET.
+                    eprintln!(
+                        "common::BusGuard: the ephemeral dbus-daemon did not exit within \
+                         {DAEMON_REAP_BUDGET:?} of SIGKILL; abandoning the reap rather than \
+                         hanging the test (#1011)"
+                    );
+                }
             });
         }
     }
@@ -175,8 +397,26 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
 #[allow(dead_code)] // not every test binary that pulls in `common` needs a restart
 pub async fn restart_on_same_address(mut guard: BusGuard) -> (Connection, BusGuard) {
     if let Some(mut child) = guard.child.take() {
+        // Bounded by [`DAEMON_REAP_BUDGET`], through the same [`reap_within`]
+        // seam as [`BusGuard`]'s `Drop`, and for the same reason: this is the
+        // suite's *third* forever-park, the same call on the same kind of
+        // child as the one bounded there, 120 lines up. It is awaited from
+        // three test bodies (`connection_reconnect.rs`, `resubscribe.rs` x2),
+        // so a park here produces precisely #1011's CI signature — `running 1
+        // test`, no `test result:`, silence until the job timeout. Being a
+        // plain `.await` rather than a nested `block_on` makes it harder to
+        // notice, not safer.
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        if !reap_within(&mut child, DAEMON_REAP_BUDGET).await {
+            // Only visible under `--nocapture`; see DAEMON_REAP_BUDGET. The
+            // stale-socket removal below is what lets the fresh daemon bind
+            // the identical path even when the old one is still around.
+            eprintln!(
+                "common::restart_on_same_address: the old dbus-daemon did not exit within \
+                 {DAEMON_REAP_BUDGET:?} of SIGKILL; abandoning the reap rather than hanging \
+                 the test (#1011)"
+            );
+        }
     }
 
     // dbus-daemon doesn't reliably unlink its own socket file on a SIGKILL;

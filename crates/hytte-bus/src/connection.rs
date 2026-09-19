@@ -301,18 +301,40 @@ pub mod test_support {
         /// Construct a `SharedConnection` wrapping an existing test
         /// `Connection`. Bypasses the supervisor — for unit tests of
         /// individual primitives that want full control over reconnect.
+        ///
+        /// # Panics
+        ///
+        /// Must be called from inside a tokio runtime context: it starts zbus's
+        /// object-server dispatch task (see `begin_dispatching`, #1011), and
+        /// with zbus's `tokio` feature — the one this workspace pins — that is
+        /// `tokio::task::spawn`, which panics outside a runtime. Every caller is
+        /// an `async fn` test body, so this is a note rather than a hazard;
+        /// neither `clippy::missing_panics_doc` (which cannot see a transitive
+        /// panic, and is `allow` at the workspace root anyway) nor the
+        /// `rustdoc` check would ever have caught its absence.
         #[must_use]
         pub fn for_test_session(conn: Connection) -> Self {
             Self::for_test(BusKind::Session, conn)
         }
 
         /// Like `for_test_session` but for the system bus.
+        ///
+        /// # Panics
+        ///
+        /// Same runtime-context requirement as
+        /// [`for_test_session`](Self::for_test_session).
         #[must_use]
         pub fn for_test_system(conn: Connection) -> Self {
             Self::for_test(BusKind::System, conn)
         }
 
         fn for_test(kind: BusKind, conn: Connection) -> Self {
+            // Same contract as the supervisor's install path: a
+            // `SharedConnection` answers method calls from the moment it
+            // exists, not from the first `export`/`own` mount (#1011). Must be
+            // called from inside a tokio runtime — every caller is an
+            // `async fn` test body, as the supervisor's call site is.
+            super::begin_dispatching(&conn);
             Self {
                 kind,
                 inner: Arc::new(Mutex::new(Inner {
@@ -328,8 +350,15 @@ pub mod test_support {
         /// on a successful reconnect (bump generation + epoch). Lets a test
         /// deterministically reproduce "a fresh connection was installed while
         /// an old op was still in flight" without racing a real supervisor.
+        ///
+        /// # Panics
+        ///
+        /// Same runtime-context requirement as
+        /// [`for_test_session`](Self::for_test_session) — it reaches the same
+        /// `begin_dispatching`.
         #[doc(hidden)]
         pub async fn install_fresh_connection_for_test(&self, conn: Connection) {
+            super::begin_dispatching(&conn);
             let mut g = self.inner.lock().await;
             g.conn = Some(conn);
             g.generation += 1;
@@ -583,6 +612,11 @@ async fn supervisor_loop(
 
             match result {
                 Ok(conn) => {
+                    // Before the connection is visible to anything: make it able
+                    // to answer an inbound method call. See `begin_dispatching`
+                    // — until zbus's dispatch task is up, a call addressed to us
+                    // is dropped with no reply at all (#1011).
+                    begin_dispatching(&conn);
                     let mut g = inner.lock().await;
                     g.conn = Some(conn);
                     g.generation += 1;
@@ -614,6 +648,119 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
         BusKind::Session => Connection::session().await,
         BusKind::System => Connection::system().await,
     }
+}
+
+/// Start zbus's object-server dispatch task on `conn` **before the connection is
+/// published**, so a `SharedConnection` is able to answer an incoming method
+/// call from the moment anything can reach it.
+///
+/// ## Why this is not merely tidy (#1011)
+///
+/// zbus creates the object server *lazily*: `Connection::object_server()` is
+/// what spawns the dispatch task, and that task is the only consumer of inbound
+/// `MethodCall` messages — it subscribes by adding a
+/// `msg_type=MethodCall, destination=<our unique name>` match rule to the
+/// connection's internal routing table. Until that rule is registered, an
+/// arriving method call matches **no** receiver, and zbus's socket reader drops
+/// it: there is no fallback arm anywhere in `zbus::Connection` that synthesises
+/// an `UnknownMethod`/`UnknownObject` error for an unhandled call. The caller is
+/// simply never answered — and since a zbus method call carries no reply timeout
+/// unless the connection was built with one (`method_timeout` defaults to
+/// `None`), "never answered" means the peer's `Proxy::call` awaits **forever**.
+/// zbus says as much itself, warning at `request_name` time that "method calls
+/// arriving before interfaces are registered may be lost".
+///
+/// Before this call existed, the first thing to touch `object_server()` on a
+/// hytte connection was whichever [`export`](crate::export) or
+/// [`own`](crate::own) supervisor happened to mount first — a task on the hytte
+/// runtime, scheduled whenever the runtime got round to it. Everything
+/// addressed to our unique name before that moment was dropped with no reply.
+/// That is what #1011 was: `tests/export.rs` captured the unique name, called
+/// `Hello` on it, and lost the race against the export supervisor's first
+/// mount ~5 % of the time under CI load; the call never returned, the test
+/// never finished, and `nix flake check` went silent for 51 minutes. The same
+/// trap is reachable in production — `control.rs`'s `Control` endpoint and
+/// `wifi/nm_agent.rs`'s secret agent are both objects a peer calls on a name it
+/// learned from us, and a peer with no reply timeout would hang rather than
+/// error.
+///
+/// ## What it closes, and what it does not
+///
+/// Registering that rule is **local** — it is not a broker round-trip.
+/// `Connection::add_match` only issues `org.freedesktop.DBus.AddMatch` when
+/// `self.is_bus() && msg_type == Type::Signal`, and the object server's rule is
+/// a `MethodCall` one, so it costs two mutex acquisitions and nothing on the
+/// wire. (An earlier draft of this comment said otherwise; #1011's PR corrected
+/// it against zbus 5.14's source.) What is left is therefore purely a
+/// *scheduling* window — the spawned task has to be polled once — and it does
+/// not *close*: zbus exposes the `started_event` that would prove readiness only
+/// through `connection::Builder`, and only when the connection is built with at
+/// least one already-served interface (`Builder::build_` starts the socket
+/// reader *after* awaiting it). Serving a placeholder interface on both shell
+/// buses to buy that is a bus-surface decision, not a bug fix.
+///
+/// How wide that window is depends on **which thread calls this**, because
+/// zbus's `tokio` feature makes `Executor::spawn` a plain `tokio::task::spawn`:
+/// called from a runtime worker, the task lands in that worker's LIFO slot and
+/// is polled next; called from outside one — such as the thread a
+/// `#[tokio::test]` body runs `block_on` on — it lands on the global injection
+/// queue, which CPU-starved workers only drain every `global_queue_interval`
+/// ticks. Measured over `tests/export.rs`, 12 concurrent 4-core shards each
+/// contending with 8 busy loops, counting runs whose first `Hello` got no reply
+/// at all:
+///
+/// | where `begin_dispatching` runs | first `Hello` lost |
+/// |---|---|
+/// | nowhere (the tree before this) | 35 / 900 (3.9 %) |
+/// | `supervisor_loop` — a worker; **the production path** | 9 / 600 (1.5 %) |
+/// | `for_test` — `block_on`'s thread; the test path | 94 / 900 (10.4 %) |
+///
+/// So on the path that ships, this is a 2.6x improvement; in the test
+/// constructor it is a regression that the bounded retry absorbs (across 2,400
+/// instrumented runs no run ever needed more than one retry). **Neither number
+/// is what stops #1011 recurring — the bound in the tests is**: with these
+/// bounds and without this function, `tests/export.rs` hung 0 of 300 runs under
+/// that same load, where the unbounded tree hung 10 of 300.
+///
+/// What this function buys that no bound can is the property
+/// `tests/connection_basic.rs`'s
+/// `shared_connection_answers_method_calls_before_anything_is_exported`
+/// asserts — that a `SharedConnection` with nothing exported on it answers a
+/// method call at all — which is deterministically red without it (300 of 300
+/// runs), because there no amount of retrying can help: the object server is
+/// never created, so every call is dropped forever.
+///
+/// ## See also
+///
+/// `hytte-services`' `wifi/nm_agent.rs` documents this same zbus mechanism
+/// against the same 5.14.0 line numbers, from #714/#743/#756, where it showed
+/// up as a 30-second hang on a `get_secrets` path containing no `await` at
+/// all. That module's `mount_and_proxy` has the fix this function cannot take:
+/// `Builder::serve_at` before `build()`, where `build_` creates a
+/// `started_event`, awaits it, and only *then* starts the socket reader — so
+/// there is no window for a message to arrive into, rather than a narrowed
+/// one. It is unavailable here for one reason: a pooled `SharedConnection` is
+/// not built per interface, and giving both shell buses a placeholder
+/// interface to buy the barrier is a bus-surface decision (see the section
+/// above). `tests/common/mod.rs`'s `CALL_BUDGET` is the third copy of this
+/// mechanism in the tree; all three now point at each other, because three
+/// uncoordinated transcriptions of one upstream behaviour is how drift starts.
+///
+/// # Panics
+///
+/// Must be called from inside a tokio runtime: with zbus's `tokio` feature its
+/// executor is `tokio::task::spawn`, which panics outside a runtime context.
+/// Every call site is a task on the hytte runtime or an `async fn` test body.
+///
+/// Safe to call on every connection: zbus's `object_server()` is idempotent
+/// (`OnceLock`), and hytte-bus never replies to a method call by hand — every
+/// exported interface in the workspace goes through `#[zbus::interface]` plus
+/// [`export_object`](crate::export_object)/[`own_name`](crate::own_name), which
+/// is the object server's own path.
+fn begin_dispatching(conn: &Connection) {
+    // The returned `&ObjectServer` is deliberately unused: constructing it is
+    // the whole point, because that is what spawns the dispatch task.
+    let _ = conn.object_server();
 }
 
 #[cfg(test)]

@@ -38,15 +38,15 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::reactive::registry;
 use hytte::ui::{
-    Dir as UiDir, EventKind as UiEventKind, Monitor, Node as UiNode, NodeId, Reconciler,
+    Dir as UiDir, EventKind as UiEventKind, FitAxis, Monitor, Node as UiNode, NodeId, Reconciler,
 };
-use hytte_plugin_proto::{HostMsg, wire};
+use hytte_plugin_proto::{HostMsg, Mount, wire};
 use tokio::sync::mpsc;
 
 use super::preem_render::{self, Scope};
 use super::pump::Animator;
 use super::shader_map;
-use super::wire_map::{to_ui_node, to_wire_event};
+use super::wire_map::{fit_axis, to_ui_node, to_ui_node_fitted, to_wire_event};
 use super::{PluginHandles, SlotRender};
 
 fn lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
@@ -120,6 +120,7 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         lead_render_signal(),
+        fit_axis(Mount::SidebarLead),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
         monitor.connector(),
@@ -133,6 +134,7 @@ pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         top_render_signal(),
+        fit_axis(Mount::SidebarTop),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
         monitor.connector(),
@@ -145,6 +147,7 @@ pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bottom_render_signal(),
+        fit_axis(Mount::SidebarBottom),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
         monitor.connector(),
@@ -160,6 +163,7 @@ pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bar_left_render_signal(),
+        fit_axis(Mount::BarLeft),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
         monitor.connector(),
@@ -172,6 +176,7 @@ pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bar_center_render_signal(),
+        fit_axis(Mount::BarCenter),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
         monitor.connector(),
@@ -184,6 +189,7 @@ pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn bar_right_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bar_right_render_signal(),
+        fit_axis(Mount::BarRight),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
         monitor.connector(),
@@ -233,6 +239,7 @@ struct MountedCard {
 /// hidden by name, and events carry no output.
 fn build_region(
     signal: impl Signal<Item = Vec<SlotRender>> + 'static,
+    fit: FitAxis,
     orientation: gtk::Orientation,
     card_class: &'static str,
     connector: Option<String>,
@@ -355,6 +362,7 @@ fn build_region(
             container,
             &cards_for_signal,
             &renders,
+            fit,
             card_class,
             connector.as_deref(),
         );
@@ -559,10 +567,17 @@ fn attached_connectors() -> Option<HashSet<String>> {
 /// `connector` is this region's monitor (#1050): the same render list reconciles
 /// into every monitor's region, and this is the only argument that differs
 /// between them.
+///
+/// `fit` is this region's **axis** (#1387): the one its mount constrains, which
+/// every aspect-locked surface in every card here is mapped with. It is a
+/// per-region constant — a bar row hands its chips a height, a sidebar column
+/// hands its cards a width — so it rides the mapping rather than the render
+/// list, which is shared across mounts.
 fn reconcile_region(
     container: &gtk::Box,
     cards: &Rc<RefCell<Vec<MountedCard>>>,
     renders: &[SlotRender],
+    fit: FitAxis,
     card_class: &str,
     connector: Option<&str>,
 ) {
@@ -624,7 +639,11 @@ fn reconcile_region(
     let mut prev: Option<gtk::Widget> = None;
     for render in renders {
         let preem_scope = Scope::card(&render.plugin_id);
-        let ui_tree = to_ui_node(&preem_scope, render.grants, &render.tree);
+        // `fit` is this region's own axis (#1387): the same tree mapped into a
+        // bar row and into a sidebar column measures on opposite axes, which is
+        // why it is the region — not the plugin, and not the node — that names
+        // it.
+        let ui_tree = to_ui_node_fitted(&preem_scope, render.grants, fit, &render.tree);
         // #1039: render nothing → occupy nothing. Set on the card's own root —
         // the region `container` above is driven by the same predicate over
         // *every* render (`any`), so a region whose only plugin renders an
@@ -1125,6 +1144,11 @@ fn render_active_panel(
         *outbound.borrow_mut() = Some(render.outbound.clone());
         let scope = Scope::panel(&render.plugin_id);
         forget_previous_panel_scope(shown_scope, Some(&scope));
+        // The plain entry point, i.e. `FitAxis::Width` (#1387): a drawer page —
+        // and the centered dialog #1010 routes a sidebar plugin's page into —
+        // is a column that hands its content a width, exactly like a sidebar
+        // card. Only a bar row constrains the other axis, and a panel is never
+        // one.
         reconciler.render(&to_ui_node(
             &scope,
             render.grants,
@@ -1383,7 +1407,7 @@ mod gtk_tests {
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, glib, prelude::*};
-    use hytte::ui::{EventKind as UiEventKind, NodeId, Reconciler};
+    use hytte::ui::{EventKind as UiEventKind, FitAxis, NodeId, Reconciler};
     use hytte_plugin_proto::{HostMsg, preem as vocab, wire};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1436,6 +1460,7 @@ mod gtk_tests {
     fn mount_region_on(renders: &Mutable<Vec<SlotRender>>, connector: Option<&str>) -> gtk::Window {
         let region = build_region(
             renders.signal_cloned(),
+            FitAxis::Height,
             gtk::Orientation::Horizontal,
             "ts-plugin-chip",
             connector.map(str::to_owned),
@@ -1645,6 +1670,7 @@ mod gtk_tests {
                 &tx,
                 row_with_label_tree("root", "label", "hi"),
             )],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -1658,6 +1684,7 @@ mod gtk_tests {
                 render_with_tree("empty", &tx, empty_row_tree("root")),
                 render_with_tree("busy", &tx, row_with_label_tree("root", "label", "hi")),
             ],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -1716,6 +1743,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("empty", &tx, empty_row_tree("root"))],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -1773,8 +1801,8 @@ mod gtk_tests {
 
         // Baseline width, per region: the busy sibling alone.
         let busy = || render_with_tree("busy", &tx, row_with_label_tree("root", "l", "hi"));
-        reconcile_region(&a, &cards_a, &[busy()], "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &[busy()], "ts-plugin-chip", Some("B"));
+        reconcile_region(&a, &cards_a, &[busy()], FitAxis::Height, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &[busy()], FitAxis::Height, "ts-plugin-chip", Some("B"));
         let width_a_busy_only = a.measure(gtk::Orientation::Horizontal, -1).1;
         let width_b_busy_only = b.measure(gtk::Orientation::Horizontal, -1).1;
 
@@ -1784,8 +1812,8 @@ mod gtk_tests {
             hidden_on_render("layouts", &tx, &["B"]),
             render_with_tree("busy", &tx, row_with_label_tree("root", "l", "hi")),
         ];
-        reconcile_region(&a, &cards_a, &renders, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
+        reconcile_region(&a, &cards_a, &renders, FitAxis::Height, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &renders, FitAxis::Height, "ts-plugin-chip", Some("B"));
 
         assert!(
             card_root(&cards_a, "layouts").is_visible(),
@@ -1851,8 +1879,8 @@ mod gtk_tests {
         let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
         let renders = [hidden_on_render("layouts", &tx, &["B"])];
-        reconcile_region(&a, &cards_a, &renders, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
+        reconcile_region(&a, &cards_a, &renders, FitAxis::Height, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &renders, FitAxis::Height, "ts-plugin-chip", Some("B"));
 
         assert!(
             a.get_visible(),
@@ -1899,6 +1927,7 @@ mod gtk_tests {
             &b,
             &cards,
             &[hidden_on_render("layouts", &tx, &["B"])],
+            FitAxis::Height,
             "ts-plugin-chip",
             Some("B"),
         );
@@ -1911,6 +1940,7 @@ mod gtk_tests {
             &b,
             &cards,
             &[hidden_on_render("layouts", &tx, &[])],
+            FitAxis::Height,
             "ts-plugin-chip",
             Some("B"),
         );
@@ -1950,6 +1980,7 @@ mod gtk_tests {
                 &tx,
                 &["DP", "dp-1", "HDMI-A-9"],
             )],
+            FitAxis::Height,
             "ts-plugin-chip",
             Some("DP-1"),
         );
@@ -1983,6 +2014,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[hidden_on_render("layouts", &tx, &["A", "B", "DP-1"])],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2014,6 +2046,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("empty", &tx, empty_row_tree("root"))],
+            FitAxis::Height,
             "ts-plugin-chip",
             Some("A"),
         );
@@ -2091,8 +2124,8 @@ mod gtk_tests {
         let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
         let renders = [render_with_tree("layouts", &tx, button_tree("go"))];
-        reconcile_region(&a, &cards_a, &renders, "ts-plugin-chip", Some("A"));
-        reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
+        reconcile_region(&a, &cards_a, &renders, FitAxis::Height, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &renders, FitAxis::Height, "ts-plugin-chip", Some("B"));
 
         find_button(&card_root(&cards_b, "layouts")).emit_clicked();
         assert_eq!(
@@ -2215,6 +2248,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[hidden_on_render("unnamed-target", &tx, &[""])],
+            FitAxis::Height,
             "ts-plugin-chip",
             connector.as_deref(),
         );
@@ -2316,6 +2350,7 @@ mod gtk_tests {
             &gtk::Box::new(gtk::Orientation::Horizontal, 0),
             &Rc::new(RefCell::new(Vec::new())),
             &[render_named()],
+            FitAxis::Height,
             "ts-plugin-chip",
             Some("log-target-output"),
         );
@@ -2328,6 +2363,7 @@ mod gtk_tests {
                 &container,
                 &cards,
                 &[render_named()],
+                FitAxis::Height,
                 "ts-plugin-chip",
                 Some("log-target-output"),
             );
@@ -2344,6 +2380,7 @@ mod gtk_tests {
                 &container,
                 &cards,
                 &[render_named()],
+                FitAxis::Height,
                 "ts-plugin-chip",
                 Some("log-target-output"),
             );
@@ -2365,6 +2402,7 @@ mod gtk_tests {
                     &tx,
                     row_with_label_tree("root", "l", "hi"),
                 )],
+                FitAxis::Height,
                 "ts-plugin-chip",
                 Some("log-target-output"),
             );
@@ -2380,6 +2418,7 @@ mod gtk_tests {
                 &container,
                 &cards,
                 &[render_named()],
+                FitAxis::Height,
                 "ts-plugin-chip",
                 Some("log-target-output"),
             );
@@ -2426,6 +2465,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("toggle", &tx, empty_row_tree("root"))],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2456,6 +2496,7 @@ mod gtk_tests {
                 &tx,
                 row_with_label_tree("root", "label", "hi"),
             )],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2489,6 +2530,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("leaf", &tx, leaf_label_tree("root", ""))],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2521,6 +2563,7 @@ mod gtk_tests {
                 render_with_tree("empty", &tx, empty_row_tree("root")),
                 render_with_tree("busy", &tx, row_with_label_tree("root", "label", "hi")),
             ],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2572,6 +2615,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("scrolled", &tx, tree)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2610,6 +2654,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("nested-empty", &tx, tree)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2648,6 +2693,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("nested-busy", &tx, tree)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2675,6 +2721,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("spacer", &tx, wire::Node::Spacer)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2712,6 +2759,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("revealer", &tx, tree)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2759,6 +2807,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("expander", &tx, tree)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2797,6 +2846,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_with_tree("revealer", &tx, tree)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2825,6 +2875,7 @@ mod gtk_tests {
             &container,
             &cards,
             &[render_of("leaver", &tx)],
+            FitAxis::Height,
             "ts-plugin-chip",
             None,
         );
@@ -2835,7 +2886,7 @@ mod gtk_tests {
         );
 
         // The plugin disconnects: its render leaves the region's mailbox.
-        reconcile_region(&container, &cards, &[], "ts-plugin-chip", None);
+        reconcile_region(&container, &cards, &[], FitAxis::Height, "ts-plugin-chip", None);
         assert!(cards.borrow().is_empty(), "the card itself must be gone");
         assert_eq!(
             preem_render::instance_count(&scope),
@@ -2875,7 +2926,7 @@ mod gtk_tests {
             grants: Grants::all(),
             ..render_of("shader-leaver", &tx)
         };
-        reconcile_region(&container, &cards, &[render], "ts-plugin-chip", None);
+        reconcile_region(&container, &cards, &[render], FitAxis::Height, "ts-plugin-chip", None);
         if skip_without_gl("card_leaving_its_region_releases_its_shader_states") {
             return;
         }
@@ -2886,7 +2937,7 @@ mod gtk_tests {
         );
 
         // The plugin disconnects: its render leaves the region's mailbox.
-        reconcile_region(&container, &cards, &[], "ts-plugin-chip", None);
+        reconcile_region(&container, &cards, &[], FitAxis::Height, "ts-plugin-chip", None);
         assert!(cards.borrow().is_empty(), "the card itself must be gone");
         assert_eq!(
             shader_map::cached_states(&scope),
@@ -3325,6 +3376,7 @@ mod gtk_tests {
 
         let region = build_region(
             renders.signal_cloned(),
+            FitAxis::Height,
             gtk::Orientation::Horizontal,
             "ts-plugin-chip",
             None,
@@ -3509,6 +3561,7 @@ mod gtk_tests {
 
         let region = build_region(
             renders.signal_cloned(),
+            FitAxis::Height,
             gtk::Orientation::Horizontal,
             "ts-plugin-chip",
             None,
@@ -3588,6 +3641,7 @@ mod gtk_tests {
         // region included.
         let region = build_region(
             renders.signal_cloned(),
+            FitAxis::Width,
             gtk::Orientation::Vertical,
             "ts-plugin-card",
             None,
@@ -4434,6 +4488,7 @@ fn right_bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         right_lead_render_signal(),
+        fit_axis(Mount::SidebarRightLead),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
         monitor.connector(),
@@ -4446,6 +4501,7 @@ pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         right_top_render_signal(),
+        fit_axis(Mount::SidebarRightTop),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
         monitor.connector(),
@@ -4458,6 +4514,7 @@ pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
 pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         right_bottom_render_signal(),
+        fit_axis(Mount::SidebarRightBottom),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
         monitor.connector(),

@@ -99,13 +99,19 @@
 //! it on **both** ends so a `128×128` LCD never renders stretched in a wide card
 //! (issue #302):
 //!
-//! - **Geometry.** The widget is [`HeightForWidth`](gtk::SizeRequestMode): its
-//!   natural width is the buffer width times the [`set_scale`](PixelSurface::set_scale)
-//!   factor (#358 — a crisp integer blow-up without a shell CSS px rule), and
-//!   `measure` for the height returns `for_width * buf_h / buf_w` — so layout
-//!   itself requests the right *shape*. The minimum stays 0 on both axes, so
-//!   CSS/layout can still scale the widget up freely (small buffer, big widget —
-//!   the LCD look).
+//! - **Geometry.** The widget is [`HeightForWidth`](gtk::SizeRequestMode) by
+//!   default: its natural width is the buffer width times the
+//!   [`set_scale`](PixelSurface::set_scale) factor (#358 — a crisp integer
+//!   blow-up without a shell CSS px rule), and `measure` for the height returns
+//!   `for_width * buf_h / buf_w` — so layout itself requests the right *shape*.
+//!   The minimum stays 0 on both axes, so CSS/layout can still scale the widget
+//!   up freely (small buffer, big widget — the LCD look).
+//!
+//!   [`set_fit_axis`](PixelSurface::set_fit_axis) flips that to
+//!   **width-for-height** for a mount that constrains the other axis — a bar
+//!   chip, whose height the bar fixes (#1387). Same aspect lock, same minimum,
+//!   same draw; only which dimension is handed down and which is derived
+//!   changes. See the [`fit`](crate::fit) module docs.
 //! - **Draw.** As a backstop against a CSS-forced wrong-shape allocation, the
 //!   texture is drawn into the largest buffer-aspect rect that fits the
 //!   allocation, centered ([`fit_rect`]) — letterboxing (padding) rather than
@@ -118,6 +124,8 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use std::sync::Arc;
 
+use crate::fit::FitAxis;
+
 /// Whether `data_len` is exactly `width * height * 4` (RGBA8), computed in
 /// `u64` so no intermediate product can overflow.
 fn rgba_len_ok(width: u32, height: u32, data_len: usize) -> bool {
@@ -125,19 +133,6 @@ fn rgba_len_ok(width: u32, height: u32, data_len: usize) -> bool {
         .checked_mul(u64::from(height))
         .and_then(|n| n.checked_mul(4));
     expected == u64::try_from(data_len).ok()
-}
-
-/// The aspect-locked height a `buf_w`×`buf_h` buffer wants at a proposed width
-/// of `for_width` pixels: `for_width * buf_h / buf_w`, the height-for-width
-/// request. Computed in `i64` so the intermediate product can't overflow, and
-/// guarded so any non-positive input (an unconstrained `for_width == -1`, or an
-/// empty buffer) yields `0` — the caller then falls back to the natural height.
-fn scaled_height(for_width: i32, buf_w: i32, buf_h: i32) -> i32 {
-    if for_width <= 0 || buf_w <= 0 || buf_h <= 0 {
-        return 0;
-    }
-    let h = i64::from(for_width) * i64::from(buf_h) / i64::from(buf_w);
-    i32::try_from(h).unwrap_or(i32::MAX)
 }
 
 /// A buffer dimension times the widget's integer upscale factor, saturated to
@@ -168,7 +163,7 @@ fn fit_rect(alloc_w: f32, alloc_h: f32, buf_w: f32, buf_h: f32) -> (f32, f32, f3
 }
 
 mod imp {
-    use super::{fit_rect, glib, graphene, gsk, rgba_len_ok, scaled_height, scaled_nat};
+    use super::{fit_rect, glib, graphene, gsk, rgba_len_ok, scaled_nat};
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use std::cell::{Cell, RefCell};
@@ -239,6 +234,10 @@ mod imp {
         /// `Default`-derived `0` is treated as `1` everywhere (see
         /// [`scaled_nat`]), so a freshly-built surface measures at 1×.
         scale: Cell<u32>,
+        /// Which axis the mount constrains (#1387). `Default`-derived
+        /// [`FitAxis::Width`] is height-for-width — what this widget measured
+        /// unconditionally before, so a surface nobody sets it on is unchanged.
+        fit: Cell<super::FitAxis>,
         /// Test seam (#902): how many `MemoryTexture`s this surface has built,
         /// and how many invalidations it has asked GTK for. Compiled out
         /// entirely outside `cargo test`.
@@ -262,34 +261,36 @@ mod imp {
     impl ObjectImpl for PixelSurface {}
 
     impl WidgetImpl for PixelSurface {
-        /// Height-for-width: the widget's height is a function of the width it is
-        /// given, so layout requests the buffer's aspect ratio rather than a
-        /// fixed box.
+        /// Height-for-width by default: the widget's height is a function of
+        /// the width it is given, so layout requests the buffer's aspect ratio
+        /// rather than a fixed box — and **width-for-height** when the mount
+        /// constrains the other axis instead
+        /// ([`FitAxis::Height`](super::FitAxis::Height), #1387), which is a bar
+        /// chip. See the [`fit`](crate::fit) module docs.
         fn request_mode(&self) -> gtk::SizeRequestMode {
-            gtk::SizeRequestMode::HeightForWidth
+            self.fit.get().request_mode()
         }
 
+        /// The buffer's aspect ratio as a size request, with a minimum of `0`
+        /// on both axes so CSS / layout can scale the widget above its buffer
+        /// size (the LCD look).
+        ///
+        /// The *natural* size is the buffer × the integer upscale (#358) on
+        /// both axes; which of the two is then derived from the other — and so
+        /// what GTK's `for_size` means here — is [`FitAxis`](super::FitAxis)'s
+        /// answer, not this widget's. The aspect lock is scale-invariant (both
+        /// axes multiply by the same factor, so the ratio is unchanged), which
+        /// is why the scaled naturals can be handed over rather than the raw
+        /// buffer.
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            let bw = self.nat_width.get();
-            let bh = self.nat_height.get();
             let scale = self.scale.get();
-            let natural = if orientation == gtk::Orientation::Horizontal {
-                // Width: the buffer's natural width × the integer upscale.
-                scaled_nat(bw, scale)
-            } else {
-                // Height-for-width: at a known proposed width (`for_size > 0`),
-                // request the aspect-locked height (scale-invariant — both axes
-                // multiply by the same factor, so the ratio is unchanged); with
-                // the width still unconstrained (`for_size == -1`), fall back to
-                // the natural buffer height × the upscale.
-                if for_size > 0 {
-                    scaled_height(for_size, bw, bh)
-                } else {
-                    scaled_nat(bh, scale)
-                }
-            };
-            // (min, natural, min_baseline, natural_baseline). min = 0 lets CSS /
-            // layout scale the widget above its buffer size (the LCD look).
+            let natural = self.fit.get().natural(
+                orientation,
+                for_size,
+                scaled_nat(self.nat_width.get(), scale),
+                scaled_nat(self.nat_height.get(), scale),
+            );
+            // (min, natural, min_baseline, natural_baseline).
             (0, natural, -1, -1)
         }
 
@@ -486,6 +487,14 @@ mod imp {
             old.max(1) != scale.max(1)
         }
 
+        /// Set which axis the mount constrains (#1387). Returns whether it
+        /// changed, so the caller only queues a resize for a real change — the
+        /// common case is the reconciler re-applying the same axis on every
+        /// re-map of a node that never moves mount.
+        pub(super) fn set_fit_axis(&self, fit: super::FitAxis) -> bool {
+            self.fit.replace(fit) != fit
+        }
+
         /// Test seam (#902): the running `(builds, draws, resizes)` tally.
         #[cfg(all(test, feature = "system-tests"))]
         pub(super) fn counts(&self) -> super::Counts {
@@ -613,6 +622,22 @@ impl PixelSurface {
         }
     }
 
+    /// Set which axis the surface is fitted on (#1387): the one the mount
+    /// constrains, from which the other is derived.
+    ///
+    /// [`FitAxis::Width`] — the default — is height-for-width, what a sidebar
+    /// card or a drawer page wants. [`FitAxis::Height`] is width-for-height,
+    /// what a **bar** chip wants: the bar fixes the height, so a surface still
+    /// asking for its whole buffer width reserves a slab it then letterboxes
+    /// the drawing inside. Neither changes the draw, the aspect lock or the
+    /// zero minimum — only which dimension layout hands down. Queues a resize
+    /// only when the axis actually changed.
+    pub fn set_fit_axis(&self, fit: FitAxis) {
+        if self.imp().set_fit_axis(fit) {
+            self.queue_resize();
+        }
+    }
+
     /// Test seam (#902): this surface's `(builds, draws, resizes)` tally.
     /// Crate-visible so the reconciler's own GTK tests can assert what a
     /// `Node::Pixels` re-render cost, not just what a direct setter call did.
@@ -638,7 +663,7 @@ impl Default for PixelSurface {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_rect, rgba_len_ok, scaled_height, scaled_nat};
+    use super::{fit_rect, rgba_len_ok, scaled_nat};
 
     #[test]
     fn rgba_len_ok_matches_exact_product() {
@@ -659,27 +684,6 @@ mod tests {
         // width*height*4 overflows u32 but not u64; must not panic, must reject
         // a realistically-sized buffer against absurd dimensions.
         assert!(!rgba_len_ok(u32::MAX, u32::MAX, 16));
-    }
-
-    #[test]
-    fn scaled_height_is_the_aspect_locked_height() {
-        // Square buffer → square request.
-        assert_eq!(scaled_height(200, 128, 128), 200);
-        // 2:1 buffer at width 100 → height 50.
-        assert_eq!(scaled_height(100, 4, 2), 50);
-        // 1:2 buffer at width 100 → height 200.
-        assert_eq!(scaled_height(100, 2, 4), 200);
-    }
-
-    #[test]
-    fn scaled_height_guards_degenerate_inputs() {
-        // Unconstrained width (GTK passes -1), and empty buffers, yield 0 so the
-        // caller falls back to the natural height.
-        assert_eq!(scaled_height(-1, 128, 128), 0);
-        assert_eq!(scaled_height(0, 128, 128), 0);
-        assert_eq!(scaled_height(200, 0, 0), 0);
-        // A huge width can't overflow (i64 math), and never panics.
-        assert!(scaled_height(i32::MAX, 1, 1) > 0);
     }
 
     #[test]
@@ -760,6 +764,14 @@ mod gtk_tests {
         s
     }
 
+    /// A 188×70 buffer: the timer plugin's `mm:ss` seven-segment readout
+    /// (`hytte-preem`'s `seven_seg`), i.e. the exact chip #1387 is about.
+    fn seven_seg_surface() -> PixelSurface {
+        let s = PixelSurface::new();
+        s.set_pixels(188, 70, &vec![0xff; 188 * 70 * 4]);
+        s
+    }
+
     /// The surface's `(builds, draws, resizes)` tally — the #902 test seam.
     fn counts(s: &PixelSurface) -> Counts {
         s.imp().counts()
@@ -794,6 +806,62 @@ mod gtk_tests {
     fn request_mode_is_height_for_width() {
         let s = wide_surface();
         assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+    }
+
+    /// The #1387 shape, through the widget rather than the arithmetic: a
+    /// surface fitted on its **height** — a bar chip — measures the other way
+    /// round, and the number that matters is the one it asks for horizontally.
+    ///
+    /// The buffer is the timer's `mm:ss` readout (188×70, `hytte-preem`'s
+    /// `seven_seg`) because that is the chip the issue's screenshot is of: in a
+    /// 28 px bar it must ask for **75 px** of width, not the 188 it then
+    /// letterboxes a 75 px drawing inside.
+    #[gtk::test]
+    fn a_height_fitted_surface_measures_width_for_height() {
+        let s = seven_seg_surface();
+        s.set_fit_axis(crate::FitAxis::Height);
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::WidthForHeight);
+        let (min_w, nat_w, _, _) = s.measure(gtk::Orientation::Horizontal, 28);
+        assert_eq!(nat_w, 75, "a 188×70 readout 28 px tall is 75 px wide");
+        assert_ne!(nat_w, 188, "…and not the whole buffer width (#1387)");
+        // The minimum stays 0 on both axes — CSS can still scale it.
+        assert_eq!(min_w, 0);
+        // The constrained axis answers the buffer's own height, and is not
+        // derived from anything.
+        assert_eq!(s.measure(gtk::Orientation::Vertical, -1).1, 70);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 188).1, 70);
+    }
+
+    /// The default is unchanged, and the flip is reversible: the same surface
+    /// left alone (or set back) measures exactly as it did before #1387.
+    #[gtk::test]
+    fn the_default_fit_axis_is_the_pre_1387_behaviour() {
+        let s = seven_seg_surface();
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+        // Height-for-width: the whole buffer width, and a height derived from
+        // the width offered.
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 188);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 188).1, 70);
+        s.set_fit_axis(crate::FitAxis::Height);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 75);
+        s.set_fit_axis(crate::FitAxis::Width);
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 188);
+    }
+
+    /// The axis composes with the #358 upscale: both natural sizes scale, so
+    /// the aspect-locked answer is scale-invariant on *either* axis.
+    #[gtk::test]
+    fn a_height_fitted_surface_scales_like_a_width_fitted_one() {
+        let s = wide_surface(); // 2×1
+        s.set_fit_axis(crate::FitAxis::Height);
+        s.set_scale(3); // 6×3
+        assert_eq!(s.measure(gtk::Orientation::Vertical, -1).1, 3);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 6);
+        // 2:1 at height 100 is 200 wide, scaled or not.
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 100).1, 200);
+        s.set_scale(1);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 100).1, 200);
     }
 
     #[gtk::test]

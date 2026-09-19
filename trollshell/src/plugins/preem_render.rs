@@ -261,8 +261,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hytte::gtk::{self, prelude::*};
-use hytte::ui::Node as UiNode;
 use hytte::ui::gl_surface::{GlProgram, GlUniforms};
+use hytte::ui::{FitAxis, Node as UiNode};
 use hytte_plugin_proto::preem as vocab;
 use hytte_plugin_proto::wire::MAX_PREEM_NODES_PER_TREE;
 use hytte_preem as kit;
@@ -1293,8 +1293,20 @@ struct Mapped {
 /// Within a pass a scope can transiently hold up to twice that — the incumbents
 /// the plugin has stopped rendering, not yet swept, plus the newcomers this pass
 /// admitted — and [`end_pass`] closes it back down to the touched set.
+///
+/// # `fit` — the mount's axis, not the widget's (#1387)
+///
+/// The kit's buffer gives a preem widget its *shape*; which of that shape's two
+/// dimensions the layout hands down is a property of the **mount**, and the
+/// walk carries it here from `wire_map::fit_axis` (a bar chip:
+/// [`FitAxis::Height`], width-for-height; a sidebar card or a drawer page:
+/// [`FitAxis::Width`]). It is stamped on the emitted node — on the placeholder
+/// too, so a node that flips between the two keeps one answer — and nothing in
+/// this module reads it: the renderer instances, the caching and the animation
+/// are all untouched by it.
 pub(super) fn map_widget(
     scope: &Scope,
+    fit: FitAxis,
     id: Option<&str>,
     classes: &[String],
     widget: &vocab::PreemWidget,
@@ -1408,6 +1420,12 @@ pub(super) fn map_widget(
             width: 0,
             height: 0,
             data: nothing(),
+            // Nothing to fit either — a 0×0 surface has no aspect ratio, so
+            // both axes measure 0 whichever this is — but it is carried rather
+            // than hard-coded so the placeholder and the widget it stands in
+            // for always agree, including for a later frame that replaces one
+            // with the other in place.
+            fit,
             // Nothing to scale, and `1` is what every `Pixels` node the preem
             // seam emits says: the kit bakes its own upscale into a buffer
             // (`Frame::upscale`, and every widget's `scale` knob), so the host
@@ -1427,6 +1445,13 @@ pub(super) fn map_widget(
             height,
             program,
             state,
+            // #1387: which axis this widget's **mount** constrains. The kit's
+            // buffer decides the chip's shape; the mount decides which of its
+            // two dimensions the layout hands down. A bar chip that keeps
+            // asking for its whole buffer width reserves a slab it then
+            // letterboxes the drawing inside — the timer's `mm:ss` readout
+            // reserving 188 px to draw 75 of them, which is the issue.
+            fit,
             classes: classes.to_vec(),
         },
     }
@@ -3366,7 +3391,7 @@ pub(super) fn gl_kind_for(widget: &vocab::PreemWidget) -> Option<preem_gl::Kind>
 #[cfg(test)]
 mod tests {
     use super::{
-        Arm, Scope, UiNode, any_animating_in, begin_pass, build, display_style, end_pass,
+        Arm, FitAxis, Scope, UiNode, any_animating_in, begin_pass, build, display_style, end_pass,
         map_widget, preem_gl, probe, program_for, vocab,
     };
 
@@ -3559,8 +3584,8 @@ mod tests {
 
         let key = Scope::detached("refused-fallback");
         begin_pass(&key);
-        let scope_before = map_widget(&key, Some("sc"), &[], &scope);
-        let gauge_before = map_widget(&key, Some("ga"), &[], &gauge);
+        let scope_before = map_widget(&key, FitAxis::Width, Some("sc"), &[], &scope);
+        let gauge_before = map_widget(&key, FitAxis::Width, Some("ga"), &[], &gauge);
         end_pass(&key);
         assert!(
             matches!(scope_before, UiNode::GlSurface { .. }),
@@ -3622,8 +3647,8 @@ mod tests {
         );
 
         begin_pass(&key);
-        let scope_after = map_widget(&key, Some("sc"), &[], &scope);
-        let gauge_after = map_widget(&key, Some("ga"), &[], &gauge);
+        let scope_after = map_widget(&key, FitAxis::Width, Some("sc"), &[], &scope);
+        let gauge_after = map_widget(&key, FitAxis::Width, Some("ga"), &[], &gauge);
         end_pass(&key);
 
         assert_placeholder(&scope_after);

@@ -5,6 +5,7 @@ mod app;
 mod bar;
 pub(crate) mod cast;
 mod error;
+pub mod fit;
 pub mod gl_surface;
 mod layer_window;
 mod monitor;
@@ -18,6 +19,11 @@ pub mod widget_tree;
 pub use app::{App, AppBuilder};
 pub use bar::{Bar, BarHandle, Edge};
 pub use error::{Error, Result};
+// Which axis an aspect-locked surface is fitted on (#1387) — shared by all
+// three surface widgets and named by the host on every node that mounts one,
+// because the answer is a property of the mount (a bar constrains the height, a
+// sidebar card the width) and nothing the widget can ask.
+pub use fit::FitAxis;
 // The GPU counterpart to `PixelSurface` (#893 stage B): a `GtkGLArea` running a
 // host-registered shader pipeline for `Node::GlSurface`. The pipeline
 // vocabulary and the registry live in the module; only the widget and the

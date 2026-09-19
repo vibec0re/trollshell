@@ -744,6 +744,11 @@ mod imp {
         /// Natural (logical) size in pixels, honored by `measure`.
         nat_width: Cell<i32>,
         nat_height: Cell<i32>,
+        /// Which axis the mount constrains (#1387). `Default`-derived
+        /// [`FitAxis::Width`](crate::FitAxis::Width) is height-for-width — what
+        /// this widget measured unconditionally before — so a surface nobody
+        /// sets it on is unchanged.
+        fit: Cell<crate::FitAxis>,
         /// GL objects, built on the first render that has a context — and the
         /// **latch** for a context that refused to allocate them, which is
         /// why this is a [`ResourceSlot`] rather than an `Option` (PR #1199
@@ -791,23 +796,26 @@ mod imp {
     impl ObjectImpl for ShaderSurface {}
 
     impl WidgetImpl for ShaderSurface {
-        /// Height-for-width, exactly like `PixelSurface` and `GlSurface`.
+        /// Exactly like `PixelSurface` and `GlSurface`: height-for-width by
+        /// default, width-for-height when the host has said this surface's
+        /// mount constrains the height instead
+        /// ([`FitAxis::Height`](crate::FitAxis::Height), #1387).
         fn request_mode(&self) -> gtk::SizeRequestMode {
-            gtk::SizeRequestMode::HeightForWidth
+            self.fit.get().request_mode()
         }
 
+        /// The aspect ratio as a size request, minimum `0` on both axes —
+        /// which dimension is handed down and which is derived is
+        /// [`FitAxis`](crate::FitAxis)'s answer, shared with the other two
+        /// surfaces.
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            let bw = self.nat_width.get();
-            let bh = self.nat_height.get();
-            let natural = if orientation == gtk::Orientation::Horizontal {
-                bw
-            } else if for_size > 0 && bw > 0 {
-                let h = i64::from(for_size) * i64::from(bh) / i64::from(bw);
-                i32::try_from(h).unwrap_or(i32::MAX)
-            } else {
-                bh
-            };
-            (0, natural.max(0), -1, -1)
+            let natural = self.fit.get().natural(
+                orientation,
+                for_size,
+                self.nat_width.get(),
+                self.nat_height.get(),
+            );
+            (0, natural, -1, -1)
         }
 
         /// Realize through GTK, then find out whether it actually got a context
@@ -889,6 +897,13 @@ mod imp {
             self.nat_width.set(w);
             self.nat_height.set(h);
             (true, resized)
+        }
+
+        /// Set which axis the mount constrains (#1387), returning whether it
+        /// changed — so the caller only queues a resize for a real change, the
+        /// dedup rule `set_state` above follows for the state itself.
+        pub(super) fn set_fit_axis(&self, fit: crate::FitAxis) -> bool {
+            self.fit.replace(fit) != fit
         }
 
         /// The whole render: ensure the program, upload the data, draw one
@@ -1718,6 +1733,20 @@ impl ShaderSurface {
         }
         if render {
             self.queue_render();
+        }
+    }
+
+    /// Set which axis the surface is fitted on (#1387): the one the mount
+    /// constrains, from which the other is derived.
+    ///
+    /// [`FitAxis::Width`](crate::FitAxis::Width) — the default — is
+    /// height-for-width, what a sidebar card or a drawer page wants;
+    /// [`FitAxis::Height`](crate::FitAxis::Height) is width-for-height, what a
+    /// **bar** chip wants. The draw (which letterboxes either way) and the
+    /// zero minimum are untouched. Queues a resize only on a real change.
+    pub fn set_fit_axis(&self, fit: crate::FitAxis) {
+        if self.imp().set_fit_axis(fit) {
+            self.queue_resize();
         }
     }
 
@@ -2587,5 +2616,63 @@ mod tests {
             "the source must still be forgotten so a later successful upload is not skipped as \
              an unchanged repeat",
         );
+    }
+}
+
+// ── #1387: the size request (needs a display, not a GL context) ──────────────
+
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{ShaderFormat, ShaderState, ShaderSurface};
+    use crate::FitAxis;
+    use gtk::prelude::*;
+    use std::sync::Arc;
+
+    /// A surface at 188×70 — the same readout geometry #1387 is about, here as
+    /// a plugin-supplied shader node rather than a preem one. Never realized,
+    /// so no `GdkGLContext` is created: `measure`/`request_mode` are the
+    /// widget's own vfuncs and run on any display.
+    fn wide_surface() -> ShaderSurface {
+        let s = ShaderSurface::new();
+        let state = Arc::new(ShaderState {
+            fragment: Arc::from("void main() { fragColor = vec4(1.0); }"),
+            data: Arc::from(&[0u8; 4][..]),
+            format: ShaderFormat::Rgba8,
+            data_size: (1, 1),
+            scale: 1,
+            values: Vec::new(),
+        });
+        s.set_state(188, 70, &state);
+        s
+    }
+
+    /// The #1387 fix through the widget: fitted on its **height** — a bar chip
+    /// — it asks for the width it is going to draw, not the one it would
+    /// letterbox that drawing inside.
+    #[gtk::test]
+    fn a_height_fitted_surface_measures_width_for_height() {
+        let s = wide_surface();
+        s.set_fit_axis(FitAxis::Height);
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::WidthForHeight);
+        let (min_w, nat_w, _, _) = s.measure(gtk::Orientation::Horizontal, 28);
+        assert_eq!(nat_w, 75, "a 188×70 surface 28 px tall is 75 px wide");
+        assert_ne!(nat_w, 188, "…and not the whole natural width (#1387)");
+        assert_eq!(min_w, 0);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, -1).1, 70);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 188).1, 70);
+    }
+
+    /// The default is unchanged, and the flip is reversible.
+    #[gtk::test]
+    fn the_default_fit_axis_is_the_pre_1387_behaviour() {
+        let s = wide_surface();
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 188);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 188).1, 70);
+        s.set_fit_axis(FitAxis::Height);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 75);
+        s.set_fit_axis(FitAxis::Width);
+        assert_eq!(s.request_mode(), gtk::SizeRequestMode::HeightForWidth);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, 28).1, 188);
     }
 }

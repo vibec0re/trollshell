@@ -43,8 +43,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use hytte::ui::Node as UiNode;
 use hytte::ui::gl_surface::GlValue;
+use hytte::ui::{FitAxis, Node as UiNode};
 use hytte::ui::shader_surface::{ShaderFormat, ShaderState};
 use hytte_plugin_proto::wire::{
     MAX_SHADER_DATA_BYTES, MAX_SHADER_DATA_EXTENT, MAX_SHADER_SOURCE_BYTES, ShaderData,
@@ -358,10 +358,20 @@ pub(super) fn refusal(
 
 /// Map one shader node, applying [`refusal`] and — where it says yes — building
 /// the [`ShaderState`] the widget draws from.
-pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -> UiNode {
+///
+/// `fit` is the **mount's** axis (#1387), carried down the walk and stamped on
+/// whichever node this produces — the shader surface or the placeholder — for
+/// the reason `wire_map::fit_axis` states: a shader chip is aspect-locked like
+/// every other surface, and a bar constrains its height.
+pub(super) fn map_shader(
+    scope: &Scope,
+    grants: Grants,
+    fit: FitAxis,
+    node: &ShaderNode<'_>,
+) -> UiNode {
     if let Some(refused) = refusal(grants, GlAvailability::current(), node) {
         warn(scope, node, refused);
-        return placeholder(node);
+        return placeholder(fit, node);
     }
     // The `scale` hint takes the *same* clamp a `Pixels` node's does, so a
     // hostile or buggy plugin cannot request a monster allocation through the
@@ -373,6 +383,7 @@ pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -
         width: node.width.saturating_mul(scale),
         height: node.height.saturating_mul(scale),
         state: shared_state(scope, node, scale),
+        fit,
         classes: node.classes.to_vec(),
         tooltip: node.tooltip.map(ToOwned::to_owned),
     }
@@ -563,13 +574,17 @@ pub(super) fn cached_states(scope: &Scope) -> usize {
 /// along with its picture. Stated rather than silently true — the journal line
 /// is where a refused node explains itself, and that is the surface that
 /// matters here.
-fn placeholder(node: &ShaderNode<'_>) -> UiNode {
+fn placeholder(fit: FitAxis, node: &ShaderNode<'_>) -> UiNode {
     UiNode::Pixels {
         id: node.id.map(ToOwned::to_owned),
         width: 0,
         height: 0,
         data: preem_render::nothing(),
         scale: 1,
+        // A 0×0 surface has no aspect ratio and measures 0 on both axes
+        // whichever this is; carried anyway so the placeholder and the widget
+        // it stands in for never disagree about their mount (#1387).
+        fit,
         classes: node.classes.to_vec(),
     }
 }
@@ -786,7 +801,7 @@ fn rgba(color: kit::Rgba) -> GlValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, GlAvailability, Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_DATA_EXTENT,
+        Arc, FitAxis, GlAvailability, Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_DATA_EXTENT,
         MAX_SHADER_SOURCE_BYTES, Refusal, ShaderData, ShaderNode, ShaderState,
         WARNED_GRID_TOO_LARGE, Warned, begin_pass, cached_states, end_pass, forget_scope,
         map_shader, refusal, theme_values, warn_once_grid_too_large,
@@ -819,7 +834,7 @@ mod tests {
     /// sweep included.
     fn mapped_state(scope: &Scope, node: &ShaderNode<'_>) -> Arc<ShaderState> {
         begin_pass(scope);
-        let mapped = map_shader(scope, granted(), node);
+        let mapped = map_shader(scope, granted(), FitAxis::Width, node);
         end_pass(scope);
         match mapped {
             UiNode::Shader { state, .. } => state,
@@ -1312,7 +1327,7 @@ mod tests {
         let scope = Scope::detached("shader-refusal-placeholder");
         let before = preem_render::warnings_for(&scope, Warned::ShaderDenied);
         for _ in 0..5 {
-            let mapped = map_shader(&scope, Grants::none(), &node);
+            let mapped = map_shader(&scope, Grants::none(), FitAxis::Width, &node);
             assert_eq!(
                 mapped,
                 UiNode::Pixels {
@@ -1321,6 +1336,9 @@ mod tests {
                     height: 0,
                     data: preem_render::nothing(),
                     scale: 1,
+                    // The mount's axis rides onto the placeholder too (#1387),
+                    // so the refused node and the one it stands in for agree.
+                    fit: FitAxis::Width,
                     classes: classes.to_vec(),
                 },
                 "the placeholder keeps the id and the classes",
@@ -1453,17 +1471,19 @@ mod tests {
         node.scale = 3;
 
         let scope = Scope::detached("shader-happy-path");
-        match map_shader(&scope, granted(), &node) {
+        match map_shader(&scope, granted(), FitAxis::Width, &node) {
             UiNode::Shader {
                 id,
                 width,
                 height,
                 state,
+                fit,
                 classes,
                 tooltip,
             } => {
                 assert_eq!(id.as_deref(), Some("spectrum"));
                 assert_eq!(tooltip, None, "this fixture sets none");
+                assert_eq!(fit, FitAxis::Width, "the axis the mapping was given");
                 assert_eq!((width, height), (144 * 3, 48 * 3), "size × scale");
                 assert_eq!(&*state.fragment, "void main() { fragColor = u_accent; }");
                 assert_eq!(&*state.data, &data[..]);
@@ -1488,7 +1508,7 @@ mod tests {
         node.scale = 100_000;
 
         let scope = Scope::detached("shader-scale-clamp");
-        match map_shader(&scope, granted(), &node) {
+        match map_shader(&scope, granted(), FitAxis::Width, &node) {
             UiNode::Shader { width, height, .. } => {
                 assert!(
                     width <= 16_384 && height <= 16_384,
@@ -1739,7 +1759,7 @@ mod tests {
         forget_scope(&scope);
 
         begin_pass(&scope);
-        let _ = map_shader(&scope, granted(), &node);
+        let _ = map_shader(&scope, granted(), FitAxis::Width, &node);
         end_pass(&scope);
         assert_eq!(cached_states(&scope), 1, "the mapped node is cached");
 
@@ -1751,7 +1771,7 @@ mod tests {
         // `forget_scope` is the other release path (a plugin leaving its
         // region, a drawer panel closing).
         begin_pass(&scope);
-        let _ = map_shader(&scope, granted(), &node);
+        let _ = map_shader(&scope, granted(), FitAxis::Width, &node);
         end_pass(&scope);
         assert_eq!(cached_states(&scope), 1);
         forget_scope(&scope);
@@ -1794,7 +1814,7 @@ mod tests {
         let scope = Scope::detached("shader-tooltip");
         forget_scope(&scope);
 
-        match map_shader(&scope, granted(), &node) {
+        match map_shader(&scope, granted(), FitAxis::Width, &node) {
             UiNode::Shader { tooltip, .. } => {
                 assert_eq!(tooltip.as_deref(), Some("audio spectrum"));
             }
@@ -1852,7 +1872,7 @@ mod tests {
         let node = ok_node("void main() {}", &data);
         let emitted = counting_events("shader-warn-once-events", |scope| {
             for _ in 0..5 {
-                let _ = map_shader(scope, Grants::none(), &node);
+                let _ = map_shader(scope, Grants::none(), FitAxis::Width, &node);
             }
         });
         assert_eq!(
@@ -1911,7 +1931,7 @@ mod tests {
 
         let emitted = counting_events("shader-two-refusal-kinds", |scope| {
             // A plugin ships one over-cap source at startup…
-            let _ = map_shader(scope, granted(), &big);
+            let _ = map_shader(scope, granted(), FitAxis::Width, &big);
             // …and, later in the same run, the session loses its GL.
             super::warn(scope, &fine, Refusal::NoGl);
         });
@@ -1951,10 +1971,10 @@ mod tests {
         let emitted = counting_events("shader-grid-too-large-not-swallowed", |scope| {
             // A plugin ships one over-cap source at startup, claiming
             // `Warned::ShaderCap` for the tree…
-            let _ = map_shader(scope, granted(), &source_too_large);
+            let _ = map_shader(scope, granted(), FitAxis::Width, &source_too_large);
             // …and, later in the same run, sends a grid too wide for the
             // per-axis cap. Before #1023 this second refusal wrote nothing.
-            let _ = map_shader(scope, granted(), &grid_too_large);
+            let _ = map_shader(scope, granted(), FitAxis::Width, &grid_too_large);
         });
         assert_eq!(
             emitted, 2,

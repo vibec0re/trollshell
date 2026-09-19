@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hytte::futures_signals::signal::{Mutable, Signal};
-use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
+use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, FitAxis, Node as UiNode};
 use hytte_plugin_proto::{
     Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, EffectOutcome, HostMsg,
     Manifest, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource, StateKey, VOCAB,
@@ -46,7 +46,7 @@ use super::session::{
     push_gate, push_state, state_key_capability,
 };
 use super::shader_map::{self, Grants};
-use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
+use super::wire_map::{clamp_pixels_scale, fit_axis, pixels_len_ok, to_ui_node, to_ui_node_fitted, to_wire_event};
 use super::{BrokeredEffect, ListenerCtx, SlotRender};
 
 /// Regression for #426: the accept loop's error policy must be **total** —
@@ -197,6 +197,7 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 height: 1,
                 data: Arc::from([10, 20, 30, 255].as_slice()),
                 scale: 2,
+                fit: FitAxis::Width,
                 classes: vec!["ts-lcd".into()],
             },
             UiNode::Button {
@@ -722,6 +723,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
             // The degraded (empty) surface renders nothing; scale is inert
             // there, so it normalizes to 1.
             scale: 1,
+            fit: FitAxis::Width,
             classes: vec!["ts-lcd".into()],
         },
         "malformed Pixels degrades to a nothing-rendered surface",
@@ -743,6 +745,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
             height: 2,
             data: Arc::from([1, 2, 3, 4, 5, 6, 7, 8].as_slice()),
             scale: 1,
+            fit: FitAxis::Width,
             classes: vec![],
         },
         "well-formed Pixels passes through 1:1",
@@ -3534,6 +3537,129 @@ fn preem_node(id: Option<&str>, widget: vocab::PreemWidget) -> wire::Node {
     }
 }
 
+/// **#1387, the host's half of it.** Every `Mount` gets the axis its *family*
+/// implies: a bar row constrains the height of the chips in it, a sidebar
+/// column the width of its cards.
+///
+/// `fit_axis` is written as a total match over `Mount` (so a tenth mount is a
+/// compile error rather than a silent default) and this is what keeps that
+/// match honest against the family predicate the rest of the host uses —
+/// `Mount::is_bar`, the same one `hytte-plugin-stats` picks its config table
+/// with. A table over `Mount::ALL`, on `page_surface`'s precedent, rather than
+/// nine hand-written asserts.
+///
+/// **Falsified** by flipping either arm of `fit_axis`: each flip reddens
+/// exactly the three mounts on that side.
+#[test]
+fn the_fit_axis_of_every_mount_follows_its_family() {
+    for mount in Mount::ALL {
+        let want = if mount.is_bar() {
+            FitAxis::Height
+        } else {
+            FitAxis::Width
+        };
+        assert_eq!(
+            fit_axis(mount),
+            want,
+            "{mount:?} is {} so it constrains the {}",
+            if mount.is_bar() { "a bar" } else { "a sidebar" },
+            if mount.is_bar() { "height" } else { "width" },
+        );
+    }
+    // Both answers are actually produced — a rule that said `Width` for
+    // everything would satisfy the loop above only if `is_bar` were never true.
+    assert_eq!(fit_axis(Mount::BarCenter), FitAxis::Height);
+    assert_eq!(fit_axis(Mount::SidebarTop), FitAxis::Width);
+}
+
+/// **#1387.** The mount's axis reaches **every** surface node a mapping pass
+/// emits — the preem seam's `GlSurface`, a plugin's own `Pixels`, and a
+/// shader — because all three are aspect-locked and all three letterbox the
+/// wrong way round in a bar.
+///
+/// The same tree is mapped twice, once with each axis, and nothing else about
+/// it changes: a chip mounted in a bar and the identical card mounted in a
+/// sidebar differ in this field and this field only.
+///
+/// **Falsified** by hard-coding `fit: FitAxis::Width` in any one of the three
+/// arms (`preem_render::map_widget`, `wire_map`'s `Pixels` arm,
+/// `shader_map::map_shader`): the matching assertion below goes red while the
+/// other two stay green.
+#[test]
+fn a_bar_mapping_stamps_the_height_axis_on_every_surface_node() {
+    let seven_seg = preem_node(
+        Some("mmss"),
+        vocab::PreemWidget::SevenSeg {
+            config: vocab::SevenSegConfig::default(),
+            state: vocab::SevenSegState { text: "25:00".into() },
+        },
+    );
+    let pixels = wire::Node::Pixels {
+        id: Some("px".into()),
+        width: 1,
+        height: 1,
+        data: vec![1, 2, 3, 4],
+        scale: 1,
+        classes: vec![],
+    };
+    let tree = wire::Node::Row {
+        id: None,
+        spacing: 0,
+        classes: vec![],
+        tooltip: None,
+        children: vec![seven_seg, pixels],
+    };
+
+    for (mount, want) in [
+        (Mount::BarCenter, FitAxis::Height),
+        (Mount::SidebarTop, FitAxis::Width),
+    ] {
+        let scope = Scope::detached("fit-axis");
+        let mapped = to_ui_node_fitted(&scope, Grants::none(), fit_axis(mount), &tree);
+        let UiNode::Row { children, .. } = mapped else {
+            panic!("a Row maps to a Row, got {mapped:?}");
+        };
+        match &children[0] {
+            UiNode::GlSurface { fit, .. } => assert_eq!(
+                *fit, want,
+                "the preem seam stamps {mount:?}'s axis on its GlSurface",
+            ),
+            other => panic!("a drawable Node::Preem maps to a GlSurface, got {other:?}"),
+        }
+        match &children[1] {
+            UiNode::Pixels { fit, .. } => assert_eq!(
+                *fit, want,
+                "…and the same axis reaches a plugin's own Pixels node",
+            ),
+            other => panic!("a Node::Pixels maps to Pixels, got {other:?}"),
+        }
+        preem_render::forget_scope(&scope);
+    }
+}
+
+/// **#1387.** The plain `to_ui_node` — what the drawer page and every test
+/// that is about something else takes — means [`FitAxis::Width`], the
+/// behaviour every surface had before the fix.
+///
+/// **Falsified** by changing the axis `to_ui_node` delegates with: this goes
+/// red while the two tests above, which name their axis, stay green.
+#[test]
+fn the_default_mapping_keeps_the_pre_1387_axis() {
+    let scope = Scope::detached("fit-axis-default");
+    let node = wire::Node::Pixels {
+        id: Some("px".into()),
+        width: 1,
+        height: 1,
+        data: vec![1, 2, 3, 4],
+        scale: 1,
+        classes: vec![],
+    };
+    match to_ui_node(&scope, Grants::none(), &node) {
+        UiNode::Pixels { fit, .. } => assert_eq!(fit, FitAxis::Width),
+        other => panic!("a Node::Pixels maps to Pixels, got {other:?}"),
+    }
+}
+
 /// Map `node` through the real host path and take the GL payload out of it,
 /// asserting the invariants every preem node must satisfy on the way.
 ///
@@ -3613,12 +3739,18 @@ fn assert_placeholder(scope: &Scope, node: &wire::Node, id: &str) {
             height,
             data,
             scale,
+            fit,
             classes,
         } => {
             assert_eq!(got_id.as_deref(), Some(id), "the placeholder keeps the id");
             assert_eq!((width, height), (0, 0), "…and has no size at all");
             assert!(data.is_empty(), "…and no bytes");
             assert_eq!(scale, 1, "…and the preem seam's one scale value");
+            assert_eq!(
+                fit,
+                FitAxis::Width,
+                "…and the axis this mapping was given (#1387)",
+            );
             assert_eq!(
                 classes,
                 vec!["ts-preem".to_owned()],
@@ -6109,6 +6241,7 @@ fn an_unrenderable_preem_widget_degrades_to_an_empty_surface() {
             height: 0,
             data: Arc::from(&[][..]),
             scale: 1,
+            fit: FitAxis::Width,
             classes: vec!["ts-preem".into()],
         },
         "an unrenderable widget keeps its id and classes so a later frame updates in place",
@@ -9082,10 +9215,12 @@ fn a_wire_shader_node_maps_its_fields_across_intact() {
             width,
             height,
             state,
+            fit,
             classes,
             tooltip,
         } => {
             assert_eq!(id.as_deref(), Some("spectrum"));
+            assert_eq!(fit, FitAxis::Width, "the axis this mapping was given");
             assert_eq!(
                 tooltip.as_deref(),
                 Some("dropped on purpose — the reconciler node carries none"),

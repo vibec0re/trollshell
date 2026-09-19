@@ -106,6 +106,87 @@ pub const CALL_BUDGET: Duration = Duration::from_secs(1);
 #[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
 pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
 
+/// Error names the **broker** generates on its own, without the call ever
+/// reaching the connection we are probing.
+///
+/// [`answers_a_method_call`] exists to tell "our dispatch task replied" apart
+/// from "nobody replied". An error reply from the peer proves the first; these
+/// two do not, because `dbus-daemon` answers them itself when the destination
+/// name has no owner. Accepting them would let the probe pass on a connection
+/// that is not dispatching at all.
+const BROKER_GENERATED_ERRORS: [&str; 2] = [
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+    "org.freedesktop.DBus.Error.NameHasNoOwner",
+];
+
+/// Does the connection whose unique name is `unique`, on the bus at `address`,
+/// answer an inbound method call **at all**?
+///
+/// `Introspectable.Introspect` on `/` is the probe because zbus's object server
+/// serves it from the root node with no interface mounted, so a reply proves
+/// the dispatch task is live and proves nothing else.
+///
+/// Bounded and retried, exactly as [`CALL_BUDGET`] prescribes:
+/// `connection.rs`'s `begin_dispatching` starts the object server's dispatch
+/// task but cannot await it (zbus exposes the `started_event` only through
+/// `connection::Builder`), so the residual is one scheduling hop — the task has
+/// to be polled once before its match rule exists. Registering that rule is
+/// local, not a broker round-trip: zbus only sends `AddMatch` for
+/// `Type::Signal` rules. So a swallowed call costs one retry; a connection that
+/// never dispatches costs the whole [`PROBE_BUDGET`] and returns `false`.
+///
+/// Returns `(answered, unanswered)` — the second is how many calls got no reply
+/// at all, for the caller's failure message.
+///
+/// This lives in `common` rather than in the test file because
+/// `connection_basic.rs` has **two** `begin_dispatching` pins — one per call
+/// site that ships or is test-support — and they must not drift on what
+/// "answers" means.
+#[allow(dead_code)] // not every test binary that pulls in `common` probes a peer
+pub async fn answers_a_method_call(address: &str, unique: &str) -> (bool, u32) {
+    let client = Builder::address(address)
+        .expect("parse ephemeral bus address")
+        .build()
+        .await
+        .expect("client connection");
+    let proxy = zbus::Proxy::new(&client, unique, "/", "org.freedesktop.DBus.Introspectable")
+        .await
+        .expect("client proxy");
+
+    let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
+    let mut unanswered = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CALL_BUDGET, proxy.call::<_, _, String>("Introspect", &())).await
+        {
+            Ok(Ok(xml)) => {
+                assert!(
+                    xml.contains("org.freedesktop.DBus.Introspectable"),
+                    "unexpected introspection reply: {xml}"
+                );
+                return (true, unanswered);
+            }
+            // An error reply *from the peer* is still proof its dispatch task
+            // is live — it ran, and refused. Deliberately not `Ok(Err(_))`:
+            // that would also accept a broker-generated `ServiceUnknown` (the
+            // daemon answering for a destination that does not exist) and a
+            // client-side transport error on the *probing* connection, neither
+            // of which says anything about the peer. This is the one test whose
+            // whole job is to tell those two apart.
+            Ok(Err(zbus::Error::MethodError(name, _, _)))
+                if !BROKER_GENERATED_ERRORS.contains(&name.as_str()) =>
+            {
+                return (true, unanswered);
+            }
+            // A broker-generated error, or a transport error on our own side:
+            // not proof either way. Retry.
+            Ok(Err(_)) => {}
+            Err(_elapsed) => unanswered += 1,
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    (false, unanswered)
+}
+
 /// Upper bound on reaping the ephemeral `dbus-daemon` in [`BusGuard`]'s `Drop`.
 ///
 /// #1011's diagnosis named **two** things in this crate's tests that can park a

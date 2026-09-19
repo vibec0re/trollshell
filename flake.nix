@@ -42,8 +42,11 @@
       bundledPluginNames = [
         "hytte-plugin-agents"
         "hytte-plugin-audio-widget"
-        "hytte-plugin-bar-clock-demo"
         "hytte-plugin-caw"
+        # One binary meant to be listed twice in `programs.trollshell.plugins`
+        # (#1388, on `hytte-plugin-stats`' shape below): the sidebar card its
+        # manifest mounts, and — with `mount = "BarCenter"` — the bar chip that
+        # used to be a second crate, `hytte-plugin-bar-clock-demo`.
         "hytte-plugin-clock-demo"
         "hytte-plugin-departures"
         "hytte-plugin-infobroker"

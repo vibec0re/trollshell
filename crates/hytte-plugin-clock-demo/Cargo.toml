@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Reference out-of-process clock widget plugin for trollshell (frontend B, issue #35)"
+description = "Reference out-of-process clock widget plugin for trollshell, and the two-instance demo: one binary rendering a sidebar card or a bar chip by mount family (frontend B, issues #35/#349/#1388)"
 
 [lints]
 workspace = true

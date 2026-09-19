@@ -80,7 +80,7 @@ jobs:
         include:
           # Every shipped binary is a *slice* of the one `workspace` crane
           # compile (#587/#572 — see CLAUDE.md "Packaging"), so building all
-          # 19 of them plus the two closure/derivation assertions that read
+          # 18 of them plus the two closure/derivation assertions that read
           # that same output costs exactly one compile. Splitting them
           # further would buy nothing and pay for the compile twice.
           - name: packages
@@ -94,7 +94,6 @@ jobs:
               .#checks.x86_64-linux.hytte-infobroker
               .#checks.x86_64-linux.hytte-plugin-agents
               .#checks.x86_64-linux.hytte-plugin-audio-widget
-              .#checks.x86_64-linux.hytte-plugin-bar-clock-demo
               .#checks.x86_64-linux.hytte-plugin-caw
               .#checks.x86_64-linux.hytte-plugin-clock-demo
               .#checks.x86_64-linux.hytte-plugin-departures

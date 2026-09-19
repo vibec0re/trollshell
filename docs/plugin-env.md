@@ -98,7 +98,7 @@ anyone else's. Check these on a fresh install:
 
 ## Bundled plugins
 
-Sections below follow `bundledPluginNames`' order in `flake.nix` (14 total).
+Sections below follow `bundledPluginNames`' order in `flake.nix` (13 total).
 
 ### agents (`hytte-plugin-agents`)
 
@@ -189,10 +189,6 @@ cadence; the row's badge is what carries it in the meantime.
 No runtime knobs — configuration is entirely via the shell/wire protocol
 (it renders purely off the host's `StateKey::AudioSpectrum` push).
 
-### bar-clock-demo (`hytte-plugin-bar-clock-demo`)
-
-No runtime knobs — configuration is entirely via the shell/wire protocol.
-
 ### caw (`hytte-plugin-caw`)
 
 | Variable                  | Default                                                                        | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -250,7 +246,37 @@ is declared.
 
 ### clock-demo (`hytte-plugin-clock-demo`)
 
-No runtime knobs — configuration is entirely via the shell/wire protocol.
+No runtime knobs of its own — configuration is entirely via the shell/wire
+protocol.
+
+What belongs here is the mount: like `stats` and `claude-bridge`, it renders by
+mount **family** (`Mount::is_bar`) rather than by a flag of its own. Its
+manifest default (`Mount::SidebarTop`) draws the reference **sidebar card** — a
+label plus a button that opens the power menu — and a bar mount
+(`plugins.<id>.mount = "BarCenter"`) draws the compact `HH:MM` seven-segment
+**bar chip** whose click opens the plugin's own drawer page. Running both at
+once is two `programs.trollshell.plugins` entries pointing at the same package,
+the second under its own attribute name (which supplies `HYTTE_PLUGIN_ID`
+automatically, #1284):
+
+```nix
+programs.trollshell.plugins.clock-demo.package =
+  trollshell.packages.${system}.hytte-plugin-clock-demo;
+programs.trollshell.plugins.bar-clock-demo = {
+  package = trollshell.packages.${system}.hytte-plugin-clock-demo;
+  mount = "BarCenter";
+};
+```
+
+That second entry is what a `hytte-plugin-bar-clock-demo` deployment becomes:
+#1388 folded that crate in here, since one binary that can be launched twice is
+the whole shape (Annika on #1163). Keeping the old attribute name is the
+least-churn migration — the unit and the launch id stay
+`trollshell-plugin-bar-clock-demo` — but note the **`mount` line is the whole
+of it, and forgetting it fails open**: the attribute name remains a perfectly
+legal plugin id, so an entry that repoints `package` and drops `mount` comes up
+as a _second sidebar card_ under that id, with no bar chip, no eval error and
+nothing in the journal. Two clock cards is the symptom.
 
 ### departures (`hytte-plugin-departures`)
 

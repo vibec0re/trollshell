@@ -58,6 +58,14 @@ webkit = { workspace = true }
 # closure; the alternative, a third crate holding the client, would move ~700
 # lines to buy nothing this window needs.
 hytte-plugin-agents = { path = "../hytte-plugin-agents" }
+# #1306's `--open-all` asks the compositor which workspace is the empty one at
+# the bottom of the focused output, and then focuses it. Typed rather than
+# shelling out to `niri msg -j` and parsing its JSON by hand: the same crate,
+# at the same `=`-pinned version, that `hytte-services` and
+# `hytte-plugin-niri-layouts` already talk to niri through, so all three agree
+# about the wire. It adds **no** resolved package (`niri-ipc` is already in
+# `Cargo.lock`, and pulls only serde + serde_json) and no GUI closure.
+niri-ipc.workspace = true
 # The poll loop's socket I/O and its `select!`. The window drives its own
 # multi-thread runtime (it links no `hytte-reactive`, so there is no shared
 # one), and hands results to the GTK thread over a `tokio::sync::mpsc` whose

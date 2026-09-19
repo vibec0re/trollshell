@@ -13,6 +13,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use trollshell_agent_window::cli;
+use trollshell_agent_window::open_all;
 use trollshell_agent_window::window::Window;
 
 /// Default `tracing` level when `RUST_LOG` is unset — `INFO`, matching the
@@ -48,7 +49,13 @@ fn main() -> glib::ExitCode {
     // reachable through a hand-rolled `execv`, and panicking on it would be
     // the same failure as above with a different cause.
     let args = match cli::parse(command_line.get(1..).unwrap_or_default()) {
-        Ok(args) => args,
+        // #1306's fan-out: no application, no window, no GTK main loop — it
+        // launches one `--agent` process per running agent and exits, so it
+        // returns from here rather than falling through to the registration
+        // below. Nothing it does touches GTK, which is also what lets its
+        // whole module be unit-tested without a display.
+        Ok(cli::Invocation::OpenAll) => return glib::ExitCode::from(open_all::run()),
+        Ok(cli::Invocation::Window(args)) => args,
         Err(e) => {
             eprintln!("trollshell-agent-window: {e}\n{}", cli::USAGE);
             return glib::ExitCode::from(EXIT_USAGE);
@@ -84,7 +91,16 @@ fn main() -> glib::ExitCode {
             .skip(1)
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let args = match cli::parse(&args) {
+        let args = match cli::parse(&args).and_then(|i| {
+            // A remote `--open-all` cannot get here in practice — the arm
+            // above returns before any application is registered, so no such
+            // process ever reaches `run_with_args` to hand a command line
+            // over. It is refused rather than unwrapped because "this arm is
+            // unreachable" is an argument about another function, and the
+            // window this instance owns is for one agent either way.
+            i.window()
+                .ok_or_else(|| cli::Invalid::Unknown(cli::USAGE.to_owned()))
+        }) {
             Ok(args) => args,
             Err(e) => {
                 // The *remote* process learns this through the exit code this

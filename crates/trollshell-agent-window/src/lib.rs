@@ -43,9 +43,19 @@
 //! than dropped) and exits, while a different agent is simply a different
 //! application. See [`cli::app_id`] for the trade against one shared id.
 
+//! # Opening every running agent's window at once
+//!
+//! Since [#1306](https://github.com/vibec0re/trollshell/issues/1306) the same
+//! binary carries a second mode, `--open-all`: it reads the roster itself,
+//! asks niri for the empty workspace at the bottom of the focused output, and
+//! launches one `--agent` window per **running** agent there. It lives here
+//! rather than in the plugin because picking that workspace needs niri's
+//! workspace list, which a plugin cannot reach. See [`open_all`].
+
 pub mod chrome;
 pub mod cli;
 pub mod feed;
+pub mod open_all;
 pub mod page;
 pub mod tls;
 pub mod ui;

@@ -918,7 +918,9 @@ fn open_all_button(hive: &Hive, window_available: bool) -> Option<Node> {
 /// [`Agents`](crate::Agents) wherever it holds `&mut self`, because
 /// [`Plugin::view`](hytte_plugin::Plugin::view) is `&self` and
 /// [`Probe::available`](crate::window::Probe::available) resolves (and warns)
-/// at most once. It gates exactly one node — see [`open_all_button`].
+/// at most once. It gates exactly one node — see `open_all_button`, just
+/// above, for the two conditions and why each of them hides rather than
+/// disables.
 #[must_use]
 pub fn card(
     hive: &Hive,

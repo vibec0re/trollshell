@@ -217,7 +217,8 @@ impl Agents {
     /// property of the desktop, so a test that does not say which desktop it
     /// describes would pass or fail depending on whether the reviewer happens
     /// to have the window installed.
-    /// Since #1306 it also refreshes [`Agents::window_available`] on the spot,
+    /// Since #1306 it also refreshes the render's `window_available` snapshot
+    /// (see that field) on the spot,
     /// so a test that pins a probe and renders without polling still describes
     /// the desktop it said it was describing.
     pub fn set_window_probe(&mut self, probe: window::Probe) {

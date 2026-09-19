@@ -150,10 +150,28 @@ jobs:
               .#checks.x86_64-linux.wifi-nm-nixos-test
     steps:
       - uses: actions/checkout@v6
+      # `max-silent-time` is the daemon-side backstop for #1011: a builder
+      # that produces no output for 30 minutes fails with nix's own named
+      # error, naming the derivation, instead of waiting out the 105-minute
+      # `timeout` below and being killed as an undiagnosable silence. All
+      # five #1011 occurrences were one derivation going quiet mid-build
+      # (`trollshell-system-tests`, parked in a hytte-bus test on an
+      # unanswerable D-Bus call) while nix, which has no silence limit by
+      # default, waited happily.
+      #
+      # 1800 s is ~4x the longest silent stretch any single derivation
+      # legitimately has: measured across two recent green runs, the worst
+      # gap between consecutive relayed lines of one derivation was 423 s
+      # (run 35369168200, `trollshell-test` linking the workspace's test
+      # binaries) and 246 s (run 35354517045, same derivation). Nothing here
+      # is silent by design — every heavy check is a cargo invocation that
+      # prints a line per crate, and both nixosTest VMs narrate — so the
+      # headroom is for a slow runner, not for a quiet phase.
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+            max-silent-time = 1800
       # No binary cache is wired up (#1231 item 2 — it needs a token), so
       # every job pays its own cold build of the GTK/crane closure.
       #
@@ -275,10 +293,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+      # Same #1011 backstop as the `heavy` job above — see the comment there
+      # for how 1800 s was sized. This job runs `--no-build`, so nothing it
+      # does should come near it; it is set here so the two nix
+      # installations do not drift, and so a check that *does* build
+      # something in future inherits the bound.
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+            max-silent-time = 1800
       # `nix flake check` itself is still here — it is the *builds* that
       # moved out to the jobs above, not the evaluation. `--no-build` keeps
       # everything that never needed a runner-hour: every output leaf on

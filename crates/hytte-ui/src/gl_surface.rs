@@ -94,11 +94,11 @@
 //! axes so CSS can scale it, and the height is requested aspect-locked for the
 //! width it is offered — or the **width for the height**, when the host has set
 //! [`FitAxis::Height`](crate::FitAxis::Height) because this chip is in a bar
-//! (#1387; see the [`fit`](crate::fit) module docs). GTK then allocates the framebuffer at logical size ×
-//! the **integer** `scale_factor`, exactly as `gtk_gl_area_allocate_buffers`
-//! does, and the blit pass point-samples the logical grid into whatever it got
-//! — the nearest-neighbour discipline `PixelSurface` uses, moved into a
-//! fragment shader.
+//! (#1387; see the [`fit`](crate::fit) module docs). GTK then allocates the
+//! framebuffer at logical size × the **integer** `scale_factor`, exactly as
+//! `gtk_gl_area_allocate_buffers` does, and the blit pass point-samples the
+//! logical grid into whatever it got — the nearest-neighbour discipline
+//! `PixelSurface` uses, moved into a fragment shader.
 //!
 //! The latent hazard the design spec documents rather than fixes: on a
 //! fractionally-scaled output the `GLArea` renders at the next integer scale and

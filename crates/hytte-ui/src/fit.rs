@@ -81,10 +81,11 @@ impl FitAxis {
     /// the dimension the layout hands down. Along the **derived** axis the
     /// answer is the aspect-locked one, `for_size * this / that`, whenever GTK
     /// passed a real size (`for_size > 0`) and the buffer has an aspect ratio
-    /// to lock to; with the other axis still unconstrained (`for_size == -1`,
-    /// which is what GTK passes while it is collecting a widget's
-    /// mode-independent request) it falls back to the buffer's natural size on
-    /// this axis.
+    /// to lock to; when `for_size` is **not a positive size** it falls back to
+    /// the buffer's natural size on this axis. That is `-1` — what GTK passes
+    /// while it is collecting a widget's mode-independent request — and, in
+    /// practice, `0` and anything negative, all of which
+    /// `an_unconstrained_derived_axis_falls_back_to_the_buffer` covers.
     ///
     /// Computed in `i64` so the intermediate product cannot overflow, saturated
     /// back into `i32`, and never negative — the caller pairs it with a

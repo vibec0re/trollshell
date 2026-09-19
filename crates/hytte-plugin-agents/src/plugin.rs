@@ -172,11 +172,13 @@ pub struct Agents {
     ///
     /// [`Plugin::view`] takes `&self` and [`window::Probe::available`] needs
     /// `&mut` (it resolves on first use and warns once), so a node whose
-    /// existence depends on the probe cannot ask it at render time. Every
-    /// `&mut self` path that precedes a render refreshes this instead:
-    /// [`Agents::set_window_probe`], so a test's pinned probe is in effect
-    /// immediately, and [`Agents::fold_status`], so the live session picks it
-    /// up on its first poll.
+    /// existence depends on the probe cannot ask it at render time.
+    /// [`Agents::fold_status`] refreshes it instead, and is the **one** place
+    /// that writes it — a card with a roster on it has always been folded
+    /// first, so there is no render this misses, and one writer is what keeps
+    /// the production path falsifiable (the #1390 review found a second, test-
+    /// only writer in [`Agents::set_window_probe`] hiding the deletion of this
+    /// one).
     ///
     /// It starts `false` — "no button until something has been resolved" — and
     /// that costs nothing on screen: the only node it gates also needs a
@@ -217,13 +219,18 @@ impl Agents {
     /// property of the desktop, so a test that does not say which desktop it
     /// describes would pass or fail depending on whether the reviewer happens
     /// to have the window installed.
-    /// Since #1306 it also refreshes the render's `window_available` snapshot
-    /// (see that field) on the spot,
-    /// so a test that pins a probe and renders without polling still describes
-    /// the desktop it said it was describing.
+    ///
+    /// It deliberately does **not** refresh the render's `window_available`
+    /// snapshot (see that field). It did until the #1390 review, and that
+    /// second write was what made the *production* one unfalsifiable: this
+    /// function has no caller outside `tests/`, so every test reached the
+    /// button through the injected path and deleting
+    /// [`Agents::fold_status`]'s refresh — the only write a live session ever
+    /// performs — left the whole suite green while the button could never
+    /// appear on a real desktop. With this line gone a test pins the probe and
+    /// then *polls*, which is the sequence a session actually runs.
     pub fn set_window_probe(&mut self, probe: window::Probe) {
         self.window = probe;
-        self.window_available = self.window.available();
     }
 
     /// Take the next correlation token. See [`Agents::next_effect_id`].

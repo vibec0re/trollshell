@@ -293,20 +293,43 @@ impl Compositor for SocketCompositor {
 /// cgroup to escape either.
 pub struct DetachedSpawner;
 
+/// The agent an agent-window argv names: the element **after**
+/// [`plugin_window::ARG_AGENT`], not `argv[2]`.
+///
+/// Positional indexing happened to be right — `plugin_window::argv` puts the
+/// name third — but that is a fact about another crate's function rather than
+/// about this argv, and nothing asserted it (#1390 review, LOW 3). Taking the
+/// *first* `--agent` is also what keeps an agent legitimately named `--agent`
+/// (hyperhive's `Ident` admits it) reading as a value.
+#[must_use]
+pub fn agent_in(argv: &[String]) -> Option<&str> {
+    let flag = argv.iter().position(|a| a == plugin_window::ARG_AGENT)?;
+    argv.get(flag + 1).map(String::as_str)
+}
+
+/// The transient unit one launched window runs as.
+///
+/// A pure function for the reason the shell's counterpart
+/// (`trollshell/src/plugins/effects.rs`'s `launch_unit_name`) is one: the
+/// format is a contract with `systemctl --user list-units 'trollshell-launch-*'`
+/// and with a *second* run of this mode, so it is worth asserting rather than
+/// spelling inline in an impl no test can reach.
+///
+/// The `pid` as well as the `seq`, for that counterpart's own reason: these
+/// units outlive the process that asked for them, so a second run's `seq`
+/// starts at 0 again while the first run's `…-0.service` may still be alive.
+#[must_use]
+pub fn unit_name(agent: &str, pid: u32, seq: u64) -> String {
+    format!("{UNIT_PREFIX}-{agent}-{pid}-{seq}.service")
+}
+
 impl Spawner for DetachedSpawner {
     fn launch(&mut self, argv: &[String]) -> Result<String, String> {
-        let Some(agent) = argv.get(2) else {
+        let Some(agent) = agent_in(argv) else {
             return Err(format!("not a window launch: {argv:?}"));
         };
         let seq = LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed);
-        // The pid as well as the sequence, for the shell's own reason
-        // (`effects.rs`'s `launch_unit_name`): these units outlive the process
-        // that asked for them, so a second run's `seq` starts at 0 again while
-        // the first run's `…-0.service` may still be alive.
-        let unit = format!(
-            "{UNIT_PREFIX}-{agent}-{pid}-{seq}.service",
-            pid = std::process::id()
-        );
+        let unit = unit_name(agent, std::process::id(), seq);
         match systemd_run(&unit, argv) {
             Ok(()) => Ok(format!("unit {unit}")),
             Err(reason) => {
@@ -330,7 +353,7 @@ fn systemd_run(unit: &str, argv: &[String]) -> Result<(), String> {
         .arg(format!("--unit={unit}"))
         .arg(format!(
             "--description=trollshell agent window: {}",
-            argv.get(2).map_or("?", String::as_str)
+            agent_in(argv).unwrap_or("?")
         ));
     for name in FORWARDED_ENV {
         // Skipped when unset or empty, so a launch never asserts an empty
@@ -591,8 +614,8 @@ pub fn run() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Compositor, NoWorkspace, Report, Spawner, Target, open_all_with, pick_workspace,
-        running_agents,
+        Compositor, NoWorkspace, Report, Spawner, Target, agent_in, open_all_with, pick_workspace,
+        running_agents, unit_name,
     };
     use hytte_plugin_agents::hive::wire::AgentStatusRow;
     use hytte_plugin_agents::model::AgentName;
@@ -837,6 +860,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["argus"],
         );
+    }
+
+    // ── the launched unit (#1390 review, LOW 3) ──────────────────────────────
+
+    /// The agent is read out of the argv **by its flag**, against the builder
+    /// that writes it — both tabs, and the leading-hyphen name the whole
+    /// two-element shape exists for.
+    ///
+    /// Falsification: go back to `argv.get(2)` and the `--tab settings` row
+    /// still passes while an argv that ever grew a flag in front of `--agent`
+    /// would silently name the wrong thing; go back to it *and* swap the
+    /// builder's two flags and the `-leading-hyphen` row answers `"--agent"`.
+    #[test]
+    fn the_agent_is_read_out_of_the_argv_by_its_flag() {
+        use hytte_plugin_agents::window::{Tab as PluginTab, argv as plugin_argv, open_all_argv};
+
+        assert_eq!(
+            agent_in(&plugin_argv("argus", PluginTab::Agent)),
+            Some("argus")
+        );
+        assert_eq!(
+            agent_in(&plugin_argv("argus", PluginTab::Settings)),
+            Some("argus")
+        );
+        assert_eq!(
+            agent_in(&plugin_argv("-leading-hyphen", PluginTab::Agent)),
+            Some("-leading-hyphen"),
+        );
+        // The fan-out's own argv names no agent — which is what makes
+        // `DetachedSpawner::launch`'s refusal reachable rather than decorative.
+        assert_eq!(agent_in(&open_all_argv()), None);
+        assert_eq!(agent_in(&[]), None);
+        assert_eq!(
+            agent_in(&["trollshell-agent-window".to_owned(), "--agent".to_owned()]),
+            None,
+            "a flag with no value is not a name"
+        );
+    }
+
+    /// The unit name a launched window runs as — the format
+    /// `systemctl --user list-units 'trollshell-launch-*'` globs, and the one
+    /// a *second* run must not collide with.
+    ///
+    /// Falsification: drop the `pid` (or the `seq`) and the two rows below
+    /// stop differing, which on a real desktop is `systemd-run` refusing the
+    /// second window with "unit … already exists".
+    #[test]
+    fn the_unit_name_carries_the_agent_the_pid_and_the_sequence() {
+        assert_eq!(
+            unit_name("argus", 4242, 0),
+            "trollshell-launch-agent-window-argus-4242-0.service"
+        );
+        assert!(
+            unit_name("argus", 4242, 0).starts_with("trollshell-launch-"),
+            "the shell's own list-units glob has to find it"
+        );
+        assert_ne!(unit_name("argus", 4242, 0), unit_name("argus", 4242, 1));
+        assert_ne!(unit_name("argus", 4242, 0), unit_name("argus", 99, 0));
     }
 
     // ── the fan-out ──────────────────────────────────────────────────────────

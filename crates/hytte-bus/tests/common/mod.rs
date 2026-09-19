@@ -278,6 +278,12 @@ impl Drop for BusGuard {
             let _ = child.start_kill();
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
+                // This call site's bound is guaranteed only by the tree-wide
+                // invariant that `reap_within` is the sole caller of the raw
+                // `Child::wait` future — enforced by grep, not by
+                // connection_basic.rs's seam test, which pins `reap_within`
+                // in isolation and cannot see this call site (#1392 re-review
+                // LOW 1).
                 if !handle.block_on(reap_within(&mut child, DAEMON_REAP_BUDGET)) {
                     // Only visible under `--nocapture`; see DAEMON_REAP_BUDGET.
                     eprintln!(
@@ -407,6 +413,11 @@ pub async fn restart_on_same_address(mut guard: BusGuard) -> (Connection, BusGua
         // plain `.await` rather than a nested `block_on` makes it harder to
         // notice, not safer.
         let _ = child.start_kill();
+        // This call site's bound is guaranteed only by the tree-wide
+        // invariant that `reap_within` is the sole caller of the raw
+        // `Child::wait` future — enforced by grep, not by
+        // connection_basic.rs's seam test, which pins `reap_within` in
+        // isolation and cannot see this call site (#1392 re-review LOW 1).
         if !reap_within(&mut child, DAEMON_REAP_BUDGET).await {
             // Only visible under `--nocapture`; see DAEMON_REAP_BUDGET. The
             // stale-socket removal below is what lets the fresh daemon bind

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{PROBE_BUDGET, ephemeral_bus};
+use common::{CALL_BUDGET, PROBE_BUDGET, ephemeral_bus};
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
@@ -306,23 +306,45 @@ async fn at_path_mounts_iface_callable() {
     .expect("create proxy");
     // zbus maps snake_case fn names to PascalCase D-Bus member names.
     //
-    // Bounded: a raw `zbus::Proxy::call` has no reply timeout (`method_timeout`
-    // defaults to `None`), and an inbound call that zbus's object-server
-    // dispatch task never sees is dropped with no reply at all — so an
-    // unbounded call here does not fail, it parks the test forever. That is
-    // #1011, which cost five `nix flake check` runs ~51 minutes of silence
-    // apiece in `tests/export.rs`'s copy of this shape. The wait is bounded so
-    // a recurrence is a named red assertion; see `tests/export.rs`'s
-    // `CALL_BUDGET` for why the number is generous rather than tight.
-    let result: String = tokio::time::timeout(PROBE_BUDGET, proxy.call("Hello", &()))
-        .await
-        .expect(
-            "Hello on the mounted object got no reply at all within common::PROBE_BUDGET \
-             — zbus drops an inbound call its object-server dispatch task has not \
-             subscribed to yet, and a raw call has no reply timeout (#1011)",
-        )
-        .expect("Hello call");
-    assert_eq!(result, "world");
+    // Bounded **and retried**, which is the shape `common::CALL_BUDGET`'s doc
+    // prescribes and the only shape that keeps that doc true: a raw
+    // `zbus::Proxy::call` has no reply timeout (`method_timeout` defaults to
+    // `None`), and an inbound call that zbus's object-server dispatch task has
+    // not subscribed to yet is dropped with no reply at all — so an unbounded
+    // call here does not fail, it parks the test forever (#1011, which cost
+    // five `nix flake check` runs ~51 minutes of silence apiece in
+    // `tests/export.rs`'s copy of this shape).
+    //
+    // Spending the whole `PROBE_BUDGET` on ONE call would instead convert that
+    // hang into a *false red*: `CALL_BUDGET` bounds a single call and
+    // `PROBE_BUDGET` bounds the loop built out of them, and a swallowed call is
+    // "not ready yet", to be retried, never an answer. Across the 2,400
+    // instrumented runs the #1011 campaign measured, every lost call was
+    // answered on the very next attempt.
+    let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
+    let mut reply: Option<String> = None;
+    let mut unanswered = 0u32;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CALL_BUDGET, proxy.call::<_, _, String>("Hello", &())).await {
+            Ok(Ok(got)) => {
+                reply = Some(got);
+                break;
+            }
+            // An error reply — the supervisor has not mounted the object yet.
+            Ok(Err(_)) => {}
+            Err(_elapsed) => unanswered += 1,
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        reply.as_deref(),
+        Some("world"),
+        "Hello on the mounted object was never answered within {PROBE_BUDGET:?} \
+         ({unanswered} calls got no reply at all within {CALL_BUDGET:?} each) — \
+         zbus drops an inbound call its object-server dispatch task has not \
+         subscribed to yet, and a raw call has no reply timeout (see \
+         common::CALL_BUDGET, #1011)"
+    );
 }
 
 async fn wait_for_state<S>(

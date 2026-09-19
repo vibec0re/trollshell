@@ -663,6 +663,18 @@ mod tests {
       {"id":2,"idx":2,"name":null,"output":"DP-2","is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":9}
     ]"#;
 
+    /// **Two** empty unnamed workspaces on the focused output, with a
+    /// populated one between them: `[1 populated, 2 empty, 3 populated,
+    /// 4 empty]`. The shape a workspace you have just emptied and not yet left
+    /// produces, and the only fixture here that can tell "the highest `idx`"
+    /// from "the first one" (#1390 review, MED 3).
+    const GAP_AND_SPARE: &str = r#"[
+      {"id":1,"idx":1,"name":null,"output":"DP-2","is_urgent":false,"is_active":true,"is_focused":true,"active_window_id":7},
+      {"id":2,"idx":2,"name":null,"output":"DP-2","is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":null},
+      {"id":3,"idx":3,"name":null,"output":"DP-2","is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":9},
+      {"id":4,"idx":4,"name":null,"output":"DP-2","is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":null}
+    ]"#;
+
     /// A workspace holding a window that is **not** its active one — the
     /// shape that separates "the window list says empty" from
     /// "`active_window_id` is null".
@@ -737,6 +749,27 @@ mod tests {
             Ok(Target {
                 id: 21,
                 idx: 2,
+                output: Some("DP-2".to_owned()),
+            })
+        );
+    }
+
+    /// Among **two** empty unnamed workspaces on the focused output, the one
+    /// at the bottom is the target: niri keeps its spare there, and the other
+    /// is a gap between two populated workspaces.
+    ///
+    /// Falsification (verified red): `max_by_key(|w| w.idx)` →
+    /// `min_by_key(|w| w.idx)` in `pick_workspace` answers `id: 2` here, which
+    /// drops the fan-out into the gap. Every other fixture in this file has
+    /// exactly one candidate, so that mutation was green before this test
+    /// existed (#1390 review, MED 3).
+    #[test]
+    fn the_bottom_spare_wins_over_an_empty_workspace_in_a_gap() {
+        assert_eq!(
+            pick_workspace(&workspaces(GAP_AND_SPARE), &windows(&[(7, 1), (9, 3)])),
+            Ok(Target {
+                id: 4,
+                idx: 4,
                 output: Some("DP-2".to_owned()),
             })
         );

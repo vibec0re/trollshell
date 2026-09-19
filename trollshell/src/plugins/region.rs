@@ -2044,6 +2044,17 @@ mod gtk_tests {
                         "a bar chip must reserve less at the bar's height ({container_at_28} px) \
                          than unconstrained ({container_unconstrained} px) — {shape}",
                     );
+                    // Theme-independent floor (#1391 re-review, LOW 1): the
+                    // relation above alone is still satisfied if the card
+                    // root grows a hard-coded `root.set_size_request(188, -1)`,
+                    // since container_unconstrained would grow right along
+                    // with it. Pin the container strictly under the 188 px
+                    // kit buffer width too, so that mutation reds here.
+                    assert!(
+                        container_at_28 < 188,
+                        "a bar chip must reserve less at the bar's height ({container_at_28} px) \
+                         than the kit's 188 px buffer width — {shape}",
+                    );
                 } else {
                     assert_eq!(
                         container_at_28, container_unconstrained,

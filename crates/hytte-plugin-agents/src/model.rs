@@ -765,10 +765,20 @@ mod tests {
 
     /// #1306's membership: **exactly one** of the five states opens a terminal.
     ///
-    /// Asserted over [`Status::ALL`] rather than as five literals, so a sixth
-    /// state added to the enum has to be classified here rather than silently
-    /// defaulting to "not up" — and stated as a count as well as a set, which
-    /// is what makes the widening mutation red instead of merely different.
+    /// Asserted over [`Status::ALL`] rather than as five literals, and stated
+    /// as a count as well as a set, which is what makes the widening mutation
+    /// red instead of merely different.
+    ///
+    /// What that does **not** buy is exhaustiveness (#1390 review, LOW 1):
+    /// `ALL` is a hand-written `[Status; 5]` literal and
+    /// [`Status::wants_terminal`]'s `matches!` has a catch-all `false`, so a
+    /// sixth variant would not red here on its own. What forces an author's
+    /// hand is the exhaustive `match self` in [`Status::icon`]/[`Status::text`]
+    /// /[`Status::class`] — the compiler refuses those — and then
+    /// `every_status_row_matches_the_spec_table`'s
+    /// `Status::ALL.len() == table.len()`, which refuses an `ALL` that was not
+    /// extended with the table. This test's own guarantee is narrower and
+    /// exact: whatever is in `ALL`, one member of it wants a terminal.
     ///
     /// Falsification (both verified red): widen the arm to
     /// `matches!(self, Self::Running | Self::Paused)` and the count assertion

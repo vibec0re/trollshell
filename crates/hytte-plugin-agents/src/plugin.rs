@@ -225,7 +225,7 @@ impl Agents {
     /// second write was what made the *production* one unfalsifiable: this
     /// function has no caller outside `tests/`, so every test reached the
     /// button through the injected path and deleting
-    /// [`Agents::fold_status`]'s refresh — the only write a live session ever
+    /// `fold_status`'s refresh — the only write a live session ever
     /// performs — left the whole suite green while the button could never
     /// appear on a real desktop. With this line gone a test pins the probe and
     /// then *polls*, which is the sequence a session actually runs.

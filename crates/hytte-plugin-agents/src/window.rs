@@ -107,12 +107,24 @@ pub fn argv(name: &str, tab: Tab) -> Vec<String> {
 ///   be at that instant, which is the race
 ///   [#1307](https://github.com/vibec0re/trollshell/pull/1307) reverted a whole
 ///   mechanism over.
-/// - **It fits the host's launch budget.** The host allows a plugin four
-///   detached launches back-to-back and four a minute after that
-///   (`trollshell/src/plugins/effects.rs`'s `LAUNCH_BURST`/
+/// - **It costs one token of the host's launch budget instead of N.** The host
+///   allows a plugin four detached launches back-to-back and four a minute
+///   after that (`trollshell/src/plugins/effects.rs`'s `LAUNCH_BURST`/
 ///   `LAUNCH_PER_MINUTE`, #1165 item 8) — sized, in its own words, for "a user
 ///   clicking through a few agents at once". A hive with five running agents
-///   would have the fifth window silently refused. One launch always fits.
+///   would have the fifth window refused outright.
+///
+///   Not "one launch always fits", which is stronger than the mechanism
+///   (#1390 review, LOW 2): `launch_budget_allows` keys its `TokenBucket` on
+///   the **plugin id**, so this launch shares one four-token burst with every
+///   other detached launch this plugin makes — and since #1282 item 2 a pill
+///   click *is* one. Four pill clicks inside a minute and the fan-out's single
+///   launch is refused too. What one launch buys is that the fan-out spends a
+///   quarter of the budget rather than all of it, and that a refusal is a
+///   refusal of the *whole* action rather than of an arbitrary tail of it.
+///   Nor is a refusal silent: the host's `EffectOutcome` comes back with
+///   `ok: false` and its own sentence, which [`crate::Agents`]'s
+///   `Input::EffectResult` arm turns into an `Effect::Notify`.
 #[must_use]
 pub fn open_all_argv() -> Vec<String> {
     vec![BINARY.to_owned(), ARG_OPEN_ALL.to_owned()]

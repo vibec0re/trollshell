@@ -730,6 +730,22 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
 /// runs), because there no amount of retrying can help: the object server is
 /// never created, so every call is dropped forever.
 ///
+/// ## See also
+///
+/// `hytte-services`' `wifi/nm_agent.rs` documents this same zbus mechanism
+/// against the same 5.14.0 line numbers, from #714/#743/#756, where it showed
+/// up as a 30-second hang on a `get_secrets` path containing no `await` at
+/// all. That module's `mount_and_proxy` has the fix this function cannot take:
+/// `Builder::serve_at` before `build()`, where `build_` creates a
+/// `started_event`, awaits it, and only *then* starts the socket reader — so
+/// there is no window for a message to arrive into, rather than a narrowed
+/// one. It is unavailable here for one reason: a pooled `SharedConnection` is
+/// not built per interface, and giving both shell buses a placeholder
+/// interface to buy the barrier is a bus-surface decision (see the section
+/// above). `tests/common/mod.rs`'s `CALL_BUDGET` is the third copy of this
+/// mechanism in the tree; all three now point at each other, because three
+/// uncoordinated transcriptions of one upstream behaviour is how drift starts.
+///
 /// # Panics
 ///
 /// Must be called from inside a tokio runtime: with zbus's `tokio` feature its

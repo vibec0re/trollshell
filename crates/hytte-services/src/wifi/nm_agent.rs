@@ -1143,6 +1143,18 @@ mod system_tests {
     /// does not exist until the `MethodCall` subscription does, and there is no
     /// window for a message to arrive into. No probe, no retry, no extra
     /// budget, no assumption about round-trip latency.
+    ///
+    /// **See also**, because this is not the only transcription of that
+    /// mechanism in the tree: `hytte-bus`'s `connection.rs` documents it at
+    /// `begin_dispatching` and its `tests/common/mod.rs` at `CALL_BUDGET`,
+    /// both from #1011 — the same race, reached through the pooled
+    /// `SharedConnection`, where it cost five `nix flake check` runs ~51
+    /// minutes of silence apiece instead of a 30-second hang. Those two cannot
+    /// take the barrier this function has: a pooled connection is not built
+    /// per interface, so `Builder::serve_at` has nothing to stage, and what
+    /// #1011 shipped instead is an early `object_server()` that narrows the
+    /// window plus bounded, retried calls that survive it. Keep the three
+    /// accounts in step if zbus's internals move.
     async fn mount_and_proxy(
         guard: &BusGuard,
         agent: NmAgent,

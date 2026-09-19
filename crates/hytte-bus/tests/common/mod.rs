@@ -97,6 +97,19 @@ const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 /// what would buy false reds under CI contention; tightening `CALL_BUDGET`
 /// only costs extra retries. See [`DBUS_DAEMON_STARTUP_BUDGET`] above for the
 /// same distinction stated at length.
+///
+/// ## See also
+///
+/// This is the third place in the tree that writes this zbus mechanism down.
+/// `hytte-bus`'s own `connection.rs`, at `begin_dispatching`, has the
+/// measurements and the argument for starting the dispatch task early;
+/// `hytte-services`' `wifi/nm_agent.rs` (`mount_and_proxy`, #714/#743/#756)
+/// derived it first, against the same zbus 5.14.0 line numbers, and has the
+/// one fix that closes the window rather than narrowing it —
+/// `Builder::serve_at` before `build()`, which a pooled `SharedConnection`
+/// cannot use because it is not built per interface. All three point at each
+/// other, because three uncoordinated transcriptions of one upstream behaviour
+/// is how drift starts.
 #[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
 pub const CALL_BUDGET: Duration = Duration::from_secs(1);
 

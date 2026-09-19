@@ -305,7 +305,19 @@ async fn at_path_mounts_iface_callable() {
     .await
     .expect("create proxy");
     // zbus maps snake_case fn names to PascalCase D-Bus member names.
-    let result: String = proxy.call("Hello", &()).await.expect("Hello call");
+    //
+    // Bounded: a raw `zbus::Proxy::call` has no reply timeout (`method_timeout`
+    // defaults to `None`), and an inbound call that zbus's object-server
+    // dispatch task never sees is dropped with no reply at all — so an
+    // unbounded call here does not fail, it parks the test forever. That is
+    // #1011, which cost five `nix flake check` runs ~51 minutes of silence
+    // apiece in `tests/export.rs`'s copy of this shape. The wait is bounded so
+    // a recurrence is a named red assertion; see `tests/export.rs`'s
+    // `CALL_BUDGET` for why the number is generous rather than tight.
+    let result: String = tokio::time::timeout(Duration::from_secs(5), proxy.call("Hello", &()))
+        .await
+        .expect("Hello on the mounted object got no reply at all within 5 s (#1011)")
+        .expect("Hello call");
     assert_eq!(result, "world");
 }
 

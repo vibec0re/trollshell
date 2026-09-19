@@ -313,6 +313,12 @@ pub mod test_support {
         }
 
         fn for_test(kind: BusKind, conn: Connection) -> Self {
+            // Same contract as the supervisor's install path: a
+            // `SharedConnection` answers method calls from the moment it
+            // exists, not from the first `export`/`own` mount (#1011). Must be
+            // called from inside a tokio runtime — every caller is an
+            // `async fn` test body, as the supervisor's call site is.
+            super::begin_dispatching(&conn);
             Self {
                 kind,
                 inner: Arc::new(Mutex::new(Inner {
@@ -330,6 +336,7 @@ pub mod test_support {
         /// an old op was still in flight" without racing a real supervisor.
         #[doc(hidden)]
         pub async fn install_fresh_connection_for_test(&self, conn: Connection) {
+            super::begin_dispatching(&conn);
             let mut g = self.inner.lock().await;
             g.conn = Some(conn);
             g.generation += 1;
@@ -583,6 +590,11 @@ async fn supervisor_loop(
 
             match result {
                 Ok(conn) => {
+                    // Before the connection is visible to anything: make it able
+                    // to answer an inbound method call. See `begin_dispatching`
+                    // — until zbus's dispatch task is up, a call addressed to us
+                    // is dropped with no reply at all (#1011).
+                    begin_dispatching(&conn);
                     let mut g = inner.lock().await;
                     g.conn = Some(conn);
                     g.generation += 1;
@@ -614,6 +626,67 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
         BusKind::Session => Connection::session().await,
         BusKind::System => Connection::system().await,
     }
+}
+
+/// Start zbus's object-server dispatch task on `conn` **before the connection is
+/// published**, so a `SharedConnection` is able to answer an incoming method
+/// call from the moment anything can reach it.
+///
+/// ## Why this is not merely tidy (#1011)
+///
+/// zbus creates the object server *lazily*: `Connection::object_server()` is
+/// what spawns the dispatch task, and that task is the only consumer of inbound
+/// `MethodCall` messages — it subscribes by adding a
+/// `msg_type=MethodCall, destination=<our unique name>` match rule to the
+/// connection's internal routing table. Until that rule is registered, an
+/// arriving method call matches **no** receiver, and zbus's socket reader drops
+/// it: there is no fallback arm anywhere in `zbus::Connection` that synthesises
+/// an `UnknownMethod`/`UnknownObject` error for an unhandled call. The caller is
+/// simply never answered — and since a zbus method call carries no reply timeout
+/// unless the connection was built with one (`method_timeout` defaults to
+/// `None`), "never answered" means the peer's `Proxy::call` awaits **forever**.
+/// zbus says as much itself, warning at `request_name` time that "method calls
+/// arriving before interfaces are registered may be lost".
+///
+/// Before this call existed, the first thing to touch `object_server()` on a
+/// hytte connection was whichever [`export`](crate::export) or
+/// [`own`](crate::own) supervisor happened to mount first — a task on the hytte
+/// runtime, scheduled whenever the runtime got round to it. Everything
+/// addressed to our unique name before that moment was dropped with no reply.
+/// That is what #1011 was: `tests/export.rs` captured the unique name, called
+/// `Hello` on it, and lost the race against the export supervisor's first
+/// mount ~5 % of the time under CI load; the call never returned, the test
+/// never finished, and `nix flake check` went silent for 51 minutes. The same
+/// trap is reachable in production — `control.rs`'s `Control` endpoint and
+/// `wifi/nm_agent.rs`'s secret agent are both objects a peer calls on a name it
+/// learned from us, and a peer with no reply timeout would hang rather than
+/// error.
+///
+/// ## What it closes, and what it does not
+///
+/// Calling this the instant a connection is installed shrinks the window from
+/// "until some supervisor task is scheduled and its first mount completes" —
+/// unbounded, and in #1011's captures not even *started* when the call was
+/// issued — to "until one `AddMatch` round-trip to the broker completes",
+/// which is the earliest any zbus consumer can reach. It does not *close* the
+/// window: zbus exposes the `started_event` that would prove readiness only
+/// through `connection::Builder`, and only when the connection is built with at
+/// least one already-served interface (`Builder::build_` starts the socket
+/// reader *after* awaiting it). Serving a placeholder interface on both shell
+/// buses to buy that is a bus-surface decision, not a bug fix, so the residual
+/// is instead covered where it can be: every raw-proxy wait in this crate's
+/// tests is bounded, so a recurrence is a named red assertion in seconds
+/// rather than a silent hang.
+///
+/// Safe to call on every connection: zbus's `object_server()` is idempotent
+/// (`OnceLock`), and hytte-bus never replies to a method call by hand — every
+/// exported interface in the workspace goes through `#[zbus::interface]` plus
+/// [`export_object`](crate::export_object)/[`own_name`](crate::own_name), which
+/// is the object server's own path.
+fn begin_dispatching(conn: &Connection) {
+    // The returned `&ObjectServer` is deliberately unused: constructing it is
+    // the whole point, because that is what spawns the dispatch task.
+    let _ = conn.object_server();
 }
 
 #[cfg(test)]

@@ -503,16 +503,13 @@ visibility and needs no such care.
 `hytte-ai-providers` (the shared OpenAI-compatible chat client `pet` and
 `caw`'s brains both use) reads no timeout of its own — the per-request budget
 is `ChatOpts::timeout`, which each plugin resolves (`PET_LLM_TIMEOUT_SECS`;
-`caw` has no knob yet and takes the 10s `DEFAULT_TIMEOUT`). It reads three
-variables — two via `load_key`, one via `owner` — though only the first of
-them is a key **source** since #1330 retired the on-disk `<name>.key`
-fallback (Annika's "no fallbacks", #866):
+`caw` has no knob yet and takes the 10s `DEFAULT_TIMEOUT`). It reads two
+variables — one via `load_key`, one via `owner`:
 
-| Variable                                     | Default                   | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<NAME>_API_KEY` (e.g. `OPENROUTER_API_KEY`) | unset                     | **The** key for provider `<name>` (upper-cased) — since #1330, the only source there is. This is exactly the variable `plugins.<id>.secrets = [ "<name>" ]` injects at spawn from the login keyring. Trimmed; blank counts as unset, and unset means the plugin runs keyless (its own fallback applies) rather than falling back to a file.                                                                                                                                                                                 |
-| `XDG_CONFIG_HOME`                            | unset (→ `$HOME/.config`) | Base directory the **retired** `<name>.key` path resolves against (`$XDG_CONFIG_HOME/trollshell/<name>.key`, e.g. `openrouter.key`). Nothing reads that file since #1330: if one is still sitting there, `load_key` prints one line per startup naming it and the `secrets` line to write instead, and resolves no key from it. This variable stops mattering to the crate entirely when that notice is removed (#1349). Standard XDG var, not plugin-specific.                                                             |
-| `TROLLSHELL_OWNER`                           | unset (→ `"your human"`)  | How a plugin persona refers to whoever is running the shell. Resolved by `hytte_ai_providers::owner` (trimmed, blank counts as unset, neutral `DEFAULT_OWNER` fallback, **never** guessed from `$USER`/GECOS) and read by both `caw` and `pet` — set it once for the session, not per plugin (#696/#706). Usually set session-wide via `programs.trollshell.ownerName` rather than per-plugin here — that Nix option is what actually sets this var for both plugins' launch (null, the default, leaves it unset entirely). |
+| Variable                                     | Default                  | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<NAME>_API_KEY` (e.g. `OPENROUTER_API_KEY`) | unset                    | **The** key for provider `<name>` (upper-cased) — since #1330, the only source there is. This is exactly the variable `plugins.<id>.secrets = [ "<name>" ]` injects at spawn from the login keyring. Trimmed; blank counts as unset, and unset means the plugin runs keyless (its own fallback applies) rather than falling back to a file.                                                                                                                                                                                 |
+| `TROLLSHELL_OWNER`                           | unset (→ `"your human"`) | How a plugin persona refers to whoever is running the shell. Resolved by `hytte_ai_providers::owner` (trimmed, blank counts as unset, neutral `DEFAULT_OWNER` fallback, **never** guessed from `$USER`/GECOS) and read by both `caw` and `pet` — set it once for the session, not per plugin (#696/#706). Usually set session-wide via `programs.trollshell.ownerName` rather than per-plugin here — that Nix option is what actually sets this var for both plugins' launch (null, the default, leaves it unset entirely). |
 
 For pet/caw specifically, the OpenRouter key precedence is therefore:
 `OPENROUTER_API_KEY` env → the plugin's own `PET_LLM_API_KEY`/`CAW_LLM_API_KEY`
@@ -520,14 +517,13 @@ env fallback (last resort, not recommended — see each plugin's table above).
 There is **no third step**: the `~/.config/trollshell/openrouter.key` file that
 used to sit between them was retired by #1330.
 
-**The retired file, and what to do if you have one.** `plugins.<id>.secrets =
-[ "<name>" ]`'s keyring injection (#392) has been the recommended path since it
-landed and is unchanged; #1330 removed the thing behind it, so there is one way
-to supply a key rather than two. A file left at the old path is never read —
-for one release `load_key` prints a single line per startup naming the file and
-the option to declare instead (`journalctl --user -u trollshell-plugin-pet`),
-after which it goes quiet and the file is simply inert. To migrate: put the key
-in the login keyring (the control-center's **AI Keys** tab), add
+**The retired file.** `plugins.<id>.secrets = [ "<name>" ]`'s keyring
+injection (#392) has been the recommended path since it landed and is
+unchanged; #1330 removed the on-disk fallback behind it, so there is one way
+to supply a key rather than two. A file left at the old path is never read
+and, since #1349, produces no startup notice either — it is simply inert. To
+migrate (if you still have one): put the key in the login keyring (the
+control-center's **AI Keys** tab), add
 `programs.trollshell.plugins.pet.secrets = [ "openrouter" ];`, and delete the
 file.
 

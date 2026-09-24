@@ -490,6 +490,41 @@ fn drop_ungranted_effects(
     (kept, messages)
 }
 
+/// Whether `mount` is one of the three **right**-sidebar regions (#1158) — the
+/// one mount family with no bar chip and therefore no mouse path onto its
+/// surface at all; the only way to open it is the `toggle-sidebar-right`
+/// action (`trollshell/src/commands.rs`). [`registered_line`] uses this to
+/// decide whether the one-line startup confirmation needs the extra hint.
+#[must_use]
+fn is_sidebar_right(mount: Mount) -> bool {
+    matches!(
+        mount,
+        Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom
+    )
+}
+
+/// The one line [`session`] prints, once per session, the moment `Register`
+/// is proven **accepted** (#1394 — see [`recv_and_acknowledge`]'s doc for what
+/// "proven" means and why). A plugin mounted on the right sidebar gets an
+/// extra hint on the same line: that family has no bar chip, so there is no
+/// mouse path to it short of the `toggle-sidebar-right` action (#1252's
+/// reported case — a working plugin that looked like it did nothing).
+///
+/// Pure and separate from the `eprintln!` call site so the exact wording —
+/// the id, the mount's wire name, and the hint's phrasing — is unit tested
+/// without a fake host.
+fn registered_line(plugin_id: &str, mount: Mount) -> String {
+    let hint = if is_sidebar_right(mount) {
+        " (right sidebar: no chip — open it with the toggle-sidebar-right action)"
+    } else {
+        ""
+    };
+    format!(
+        "[{plugin_id}] registered; card on {}{hint}",
+        mount.wire_name()
+    )
+}
+
 /// Minimum interval between full `view()` recomputation + dedup + `write_frame`
 /// passes in the session loop (~33 ms ≈ 30 Hz), the SDK-wide view-rate cap
 /// (#560). `update()` still runs on **every** event so a plugin's model/
@@ -580,6 +615,45 @@ enum Step<M> {
     Flush,
 }
 
+/// Await the next inbound host frame and, the first time this session sees
+/// one, mark `acknowledged` and print the one-line proof `Register` was
+/// accepted (#1394).
+///
+/// **Why "the first inbound frame" is the honest signal.** The wire protocol
+/// has no explicit `Register` acknowledgement (grep `hytte-plugin-proto`'s
+/// `HostMsg` — there is no such variant): the host is a stateless render
+/// target that only ever *pushes* state, it never replies to a frame. Writing
+/// `Register` onto our own socket buffer (`write_frame` returning `Ok`) proves
+/// nothing about the host's side — it proves the local write succeeded, which
+/// it still would moments before a duplicate-id rejection closes the
+/// connection (`IdGuard::claim` failing in `trollshell/src/plugins/session.rs`
+/// drops the peer having sent nothing back at all). A real inbound frame,
+/// by contrast, cannot exist unless the host finished validating and
+/// registering this connection first — every host push this SDK can decode
+/// (state snapshots, `Hello`, slot visibility, the accent seed this session
+/// auto-subscribes to at `Register` time, a liveness `Ping`, …) is sent only
+/// to a connection that made it past `serve_conn`'s handshake. So waiting for
+/// *any* one of them, rather than a particular variant, is what makes this
+/// line true and also what makes an accept vs. a rejected-duplicate EOF
+/// distinguishable at all — see `reconnect_loop`'s `acknowledged.get()` check.
+///
+/// Factored out of the `select!` loop below only so that arm stays the single
+/// `match frame { … }` expression it already was — the decision (whether to
+/// print, and the exact text) lives in the pure [`registered_line`], not here.
+async fn recv_and_acknowledge(
+    rx: &mut mpsc::UnboundedReceiver<Result<HostMsg, ProtoError>>,
+    plugin_id: &str,
+    mount: Mount,
+    acknowledged: &std::cell::Cell<bool>,
+) -> Option<Result<HostMsg, ProtoError>> {
+    let frame = rx.recv().await;
+    if matches!(frame, Some(Ok(_))) && !acknowledged.get() {
+        acknowledged.set(true);
+        eprintln!("{}", registered_line(plugin_id, mount));
+    }
+    frame
+}
+
 /// Drive one connected session: handshake, seed render, then the
 /// read→update→render loop. `Ok(())` means the host sent `Shutdown` **or**
 /// `shutdown` fired (#1079) — either way the caller checks `*shutdown.borrow()`
@@ -614,6 +688,16 @@ enum Step<M> {
 /// in `run` would put the second instance back on the first one's id the moment
 /// the shell restarted, and the host would then reject whichever of the two
 /// redialled second.
+///
+/// `acknowledged` is [`reconnect_loop`]'s window into whether this session ever
+/// received proof `Register` was accepted (#1394): [`recv_and_acknowledge`]
+/// flips it the moment the *first* inbound host frame arrives, of any kind.
+/// Owned by the caller (a fresh `Cell::new(false)` per connection attempt, not
+/// per process) so a session that never gets that far — the shape of a
+/// rejected duplicate id, `IdGuard` in `trollshell/src/plugins/session.rs`,
+/// #436 — leaves it `false` and `reconnect_loop` can say so instead of
+/// printing the same "session ended" line a duplicate rejection and an
+/// ordinary transport failure would otherwise share.
 // One cohesive session lifecycle (handshake → seed render → the select loop over
 // every host frame → dedup); the length is the host-frame vocabulary, not
 // branching complexity — splitting it would scatter the loop for no gain.
@@ -624,6 +708,7 @@ async fn session<P, R, W>(
     mut shutdown: watch::Receiver<bool>,
     mount_override: Option<Mount>,
     id_override: Option<String>,
+    acknowledged: &std::cell::Cell<bool>,
 ) -> Result<(), ProtoError>
 where
     P: Plugin,
@@ -802,7 +887,7 @@ where
             // recovered by this mechanism.
             biased;
             Some(()) = shutdown_fired(&mut shutdown) => break 'session Ok(()),
-            frame = rx.recv() => match frame {
+            frame = recv_and_acknowledge(&mut rx, &plugin_id, negotiation.mount, acknowledged) => match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
                 // `output` (#1050, the monitor whose copy of the mirrored card
                 // produced this) is carried through verbatim — including its
@@ -1097,6 +1182,14 @@ async fn reconnect_loop<P, R, W, C, Fut>(
         match connected {
             Ok((rd, wr)) => {
                 let started = Instant::now();
+                // #1394: a fresh flag per connection attempt — `session` flips
+                // it the moment the first inbound host frame proves `Register`
+                // was accepted (see `recv_and_acknowledge`'s doc). Read below,
+                // after the session ends, to tell a rejected duplicate id
+                // (never flipped — the host drops the connection having sent
+                // nothing) apart from an ordinary transport failure mid-session
+                // (flipped, since the host was clearly talking to us).
+                let acknowledged = std::cell::Cell::new(false);
                 // `id_override` is cloned per session rather than moved: the
                 // manifest is rebuilt on every reconnect, so every session needs
                 // its own copy of the identity this launch registers under.
@@ -1106,6 +1199,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                     shutdown.clone(),
                     mount_override,
                     id_override.clone(),
+                    &acknowledged,
                 )
                 .await;
                 let lived = started.elapsed();
@@ -1127,6 +1221,20 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 }
                 match outcome {
                     Ok(()) => eprintln!("[{plugin_id}] host shut down; will reconnect"),
+                    // #1394: the one case where an ordinary "session ended"
+                    // line would hide a real, diagnosable cause. The host
+                    // never sent a byte back, which is exactly the shape of
+                    // `IdGuard` (`trollshell/src/plugins/session.rs`, #436)
+                    // dropping a duplicate-id `Register` — but it is *also*
+                    // the shape of any other pre-first-frame transport
+                    // failure, and this SDK has no way to tell those apart
+                    // (the protocol carries no rejection reason). Naming the
+                    // ambiguity is the honest answer; claiming either cause
+                    // outright would sometimes be a lie.
+                    Err(e) if !acknowledged.get() => eprintln!(
+                        "[{plugin_id}] session ended before the host acknowledged: {e} — \
+                         is another instance already connected as {plugin_id}?",
+                    ),
                     Err(e) if skew => eprintln!(
                         "[{plugin_id}] WARNING: session keeps failing immediately ({e}); \
                          the host may be older than this plugin's wire vocabulary \
@@ -1324,7 +1432,7 @@ mod tests {
         BACKOFF_BASE, BACKOFF_CAP, Backoff, ID_ENV, IMMEDIATE_FAILURE, MOUNT_ENV,
         MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, effective_mount,
         effective_mount_from, id_override, id_override_from, id_override_from_env, mount_override,
-        mount_override_from, mount_override_from_env, reconnect_loop,
+        mount_override_from, mount_override_from_env, reconnect_loop, registered_line,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -1351,15 +1459,18 @@ mod tests {
         watch::channel(false).1
     }
 
-    /// [`super::session`] with **no** launch-time overrides — what every test
-    /// here wants except the #1159 placement ones and the #1250 identity ones,
-    /// which call `super::session` directly with a `Some`.
+    /// [`super::session`] with **no** launch-time overrides and a throwaway
+    /// [`recv_and_acknowledge`] flag — what every test here wants except the
+    /// #1159 placement ones, the #1250 identity ones, and the #1394 ones,
+    /// which call `super::session` directly to pass a `Some` override or read
+    /// back the shared `Cell`.
     ///
     /// A shim in the test module rather than a second entry point in the shipped
     /// lib: neither override is optional in production (both are threaded from
     /// [`run`] on every path), so a `None`-defaulting wrapper there would be dead
     /// code, while here it keeps thirty-odd call sites that have nothing to do
-    /// with placement or identity reading exactly as they did.
+    /// with placement, identity, or the acknowledgement flag reading exactly as
+    /// they did.
     async fn session<P, R, W>(
         rd: R,
         wr: W,
@@ -1370,7 +1481,7 @@ mod tests {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Unpin,
     {
-        super::session::<P, R, W>(rd, wr, shutdown, None, None).await
+        super::session::<P, R, W>(rd, wr, shutdown, None, None, &std::cell::Cell::new(false)).await
     }
 
     // ── Test plugins ─────────────────────────────────────────────────────────
@@ -4008,8 +4119,16 @@ mod tests {
             manifest
         };
 
+        let acknowledged = std::cell::Cell::new(false);
         let (_ended, manifest) = tokio::join!(
-            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), override_mount, override_id),
+            super::session::<Echo, _, _>(
+                prd,
+                pwr,
+                never_shuts_down(),
+                override_mount,
+                override_id,
+                &acknowledged,
+            ),
             host
         );
         manifest
@@ -4841,5 +4960,196 @@ mod tests {
             "the environment's id must be the id in the Register frame",
         );
         println!("{ID_ENV_CHILD_OK}");
+    }
+
+    // ── Startup acknowledgement line (#1394) ─────────────────────────────────
+
+    /// The exact text — id, mount, no hint — for a mount outside the right
+    /// sidebar family. Pinned so a wording change is a deliberate edit here,
+    /// not a surprise read off stderr.
+    #[test]
+    fn registered_line_names_the_id_and_mount() {
+        assert_eq!(
+            registered_line("stats", Mount::BarRight),
+            "[stats] registered; card on BarRight",
+        );
+        assert_eq!(
+            registered_line("clock-demo", Mount::SidebarTop),
+            "[clock-demo] registered; card on SidebarTop",
+        );
+    }
+
+    /// Every **right**-sidebar mount (#1158) gets the extra hint, verbatim —
+    /// that family is the one #1252 reported a plugin vanishing into (no bar
+    /// chip, no mouse path but the `toggle-sidebar-right` action).
+    ///
+    /// **Falsified** by deleting the hint branch in `registered_line` (or
+    /// `is_sidebar_right`'s match arms): this test reds immediately, with no
+    /// fake host or session involved.
+    #[test]
+    fn registered_line_hints_at_every_right_sidebar_mount() {
+        for mount in [
+            Mount::SidebarRightLead,
+            Mount::SidebarRightTop,
+            Mount::SidebarRightBottom,
+        ] {
+            assert_eq!(
+                registered_line("stats", mount),
+                format!(
+                    "[stats] registered; card on {} (right sidebar: no chip — \
+                     open it with the toggle-sidebar-right action)",
+                    mount.wire_name(),
+                ),
+                "{mount:?}",
+            );
+        }
+    }
+
+    /// The inverse of the hint test above, over every **other** mount
+    /// (`Mount::ALL` minus the three right-sidebar ones) — a regression that
+    /// widened the hint's match arms would show up here, not only as a
+    /// missing hint on the right sidebar.
+    #[test]
+    fn registered_line_has_no_hint_outside_the_right_sidebar() {
+        for mount in Mount::ALL {
+            if matches!(
+                mount,
+                Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom
+            ) {
+                continue;
+            }
+            let line = registered_line("stats", mount);
+            assert!(
+                !line.contains("right sidebar"),
+                "{mount:?} must not carry the right-sidebar hint: {line:?}",
+            );
+        }
+    }
+
+    /// The honest-acceptance signal (#1394): the first inbound host frame —
+    /// here, `Shutdown` itself — marks the session acknowledged. Exercises the
+    /// exact `session`/fake-host seam every other session test uses, with the
+    /// `Cell` `reconnect_loop` reads laid bare instead of buried in the loop.
+    ///
+    /// **Falsified** by deleting the `if matches!(frame, Some(Ok(_))) …` block
+    /// in `recv_and_acknowledge`: `acknowledged` stays `false` and this test
+    /// reds on its final assertion.
+    #[tokio::test]
+    async fn the_first_inbound_host_frame_marks_the_session_acknowledged() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+        let acknowledged = std::cell::Cell::new(false);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(
+            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), None, None, &acknowledged,),
+            host,
+        );
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
+        assert!(
+            acknowledged.get(),
+            "the first inbound host frame must mark the session acknowledged",
+        );
+    }
+
+    /// The other half of #1394's ask: a session that ends in error **without**
+    /// ever receiving a host frame — the shape of a rejected duplicate id
+    /// (`IdGuard` in `trollshell/src/plugins/session.rs`, #436) — must leave
+    /// `acknowledged` `false`. This is what lets `reconnect_loop` tell that
+    /// case apart from an ordinary mid-session transport failure instead of
+    /// printing the same "session ended" line for both.
+    ///
+    /// The host here reads exactly `Register` and then drops both halves —
+    /// the same shape `registered_manifest` already uses, reused here because
+    /// it *is* the scenario: a peer that dials, sends `Register`, and gets
+    /// nothing back at all.
+    #[tokio::test]
+    async fn an_eof_before_any_host_frame_leaves_the_session_unacknowledged() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, hwr) = tokio::io::split(host_end);
+        let acknowledged = std::cell::Cell::new(false);
+
+        let host = async move {
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(manifest.id, "echo-test");
+            // No frame back at all — drop both halves immediately, exactly
+            // what a duplicate-id rejection looks like from the plugin's side.
+            drop(hwr);
+            drop(hrd);
+        };
+
+        let (result, ()) = tokio::join!(
+            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), None, None, &acknowledged,),
+            host,
+        );
+        assert!(
+            result.is_err(),
+            "no host frame ever arrived, so the transport fails",
+        );
+        assert!(
+            !acknowledged.get(),
+            "a session that never received a host frame must not be marked \
+             acknowledged",
+        );
+    }
+
+    /// End-to-end through `reconnect_loop` (not just `session`): an
+    /// accept-then-nothing-back connection — the duplicate-id shape again —
+    /// must still be treated as an ordinary failed attempt that backs off and
+    /// redials, not a hang or a panic. Doesn't (and can't, from outside)
+    /// observe the printed line itself; it pins that the surrounding loop
+    /// keeps working across exactly the case that line exists to explain.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_loop_redials_after_an_unacknowledged_session() {
+        let (p1, h1) = duplex(64 * 1024);
+        let (p2, h2) = duplex(64 * 1024);
+        let mut pending = vec![p2, p1];
+
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
+            "echo-test",
+            never_shuts_down(),
+            move || {
+                let next = pending.pop();
+                async move {
+                    match next {
+                        Some(end) => Ok(tokio::io::split(end)),
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            None,
+            None,
+        );
+
+        let host = async move {
+            let (mut hrd1, hwr1) = tokio::io::split(h1);
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd1).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(manifest.id, "echo-test");
+            drop(hwr1);
+            drop(hrd1);
+
+            // The loop must treat that as an ordinary failed attempt and
+            // redial: the second prepared connection completes a fresh
+            // handshake.
+            let (mut hrd2, _hwr2) = tokio::io::split(h2);
+            eat_handshake(&mut hrd2, "echo-test").await;
+        };
+
+        tokio::select! {
+            () = host => {}
+            () = dial_loop => unreachable!(
+                "reconnect_loop never returns with a live shutdown notice that never fires"
+            ),
+        }
     }
 }

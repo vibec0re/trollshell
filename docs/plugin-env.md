@@ -275,8 +275,15 @@ least-churn migration — the unit and the launch id stay
 `trollshell-plugin-bar-clock-demo` — but note the **`mount` line is the whole
 of it, and forgetting it fails open**: the attribute name remains a perfectly
 legal plugin id, so an entry that repoints `package` and drops `mount` comes up
-as a _second sidebar card_ under that id, with no bar chip, no eval error and
-nothing in the journal. Two clock cards is the symptom.
+as a _second sidebar card_ under that id, with no bar chip and no eval error.
+Since #1394 the journal does get one line out of it — `hytte_plugin::run`
+prints `[<id>] registered; card on <mount>` once a session's `Register` is
+accepted — so the second unit's own line will read
+`[bar-clock-demo] registered; card on SidebarTop` instead of the `BarCenter`
+its name implies; nothing calls that out as a _duplicate_, though, so two
+`registered; card on SidebarTop` lines under two different ids is still the
+tell to look for, and two clock cards on the sidebar is still the symptom on
+glass.
 
 ### departures (`hytte-plugin-departures`)
 

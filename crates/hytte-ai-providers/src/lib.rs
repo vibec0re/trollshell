@@ -21,8 +21,8 @@
 //! `programs.trollshell.plugins.<id>.secrets = [ "{name}" ]` injects from the
 //! login keyring at spawn (#392). The on-disk
 //! `$XDG_CONFIG_HOME/trollshell/{name}.key` fallback was **retired in #1330**
-//! (Annika's "no fallbacks", #866): a leftover file is never read, only
-//! reported once per startup for one release. See [`load_key`].
+//! (Annika's "no fallbacks", #866) and its startup deprecation notice was
+//! **removed in #1349**. See [`load_key`].
 //!
 //! One prompt-shaped thing does live here rather than in a plugin: [`owner`],
 //! the session-wide `$TROLLSHELL_OWNER` resolver every persona uses to refer to
@@ -55,7 +55,7 @@ pub mod http;
 /// Resolving a plugin's chat [`Provider`] from its env inputs (#1168).
 pub mod provider;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// The one route this crate speaks, appended to every provider's base URL.
@@ -335,36 +335,15 @@ pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Resul
 ///
 /// That variable is what `programs.trollshell.plugins.<id>.secrets =
 /// [ "{name}" ]` injects from the login keyring at spawn (#392) — the
-/// recommended path since it landed, and **since #1330 the only one**.
-///
-/// # The retired file fallback (#1330)
-///
-/// This used to read `$XDG_CONFIG_HOME/trollshell/{name}.key` (falling back to
-/// `$HOME/.config/trollshell/{name}.key`) when the variable was unset. Annika's
-/// call on #866 — "no fallbacks <3" — retired it: a provider key comes from the
-/// keyring injection or from nothing at all.
-///
-/// A file left at the old path is **never read**. For one release it is still
-/// *noticed*: `stale_key_file_notice` renders one line naming the file and the
-/// option to declare instead, which this prints to stderr. After that window
-/// the notice, `config_dir` and `load_key_from`'s `config_dir` parameter all
-/// go with it — see #1349.
+/// recommended path since it landed, and **since #1330 the only one**. An
+/// on-disk `$XDG_CONFIG_HOME/trollshell/{name}.key` fallback used to sit
+/// behind it; Annika's call on #866 — "no fallbacks <3" — retired it in
+/// #1330, and its startup deprecation notice (for a leftover file at that
+/// path) was removed in #1349.
 #[must_use]
 pub fn load_key(name: &str) -> Option<String> {
     let env_override = std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok();
-    load_key_from(name, env_override, config_dir().as_deref())
-}
-
-/// `$XDG_CONFIG_HOME` (if set and non-empty) else `$HOME/.config`.
-///
-/// Since #1330 this resolves nothing this crate *reads* — it exists only to
-/// locate a retired `{name}.key` file for [`stale_key_file_notice`], and goes
-/// when that notice does.
-fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|x| !x.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    load_key_from(env_override)
 }
 
 /// Refuse a key file that grants any access to group or other — the way
@@ -395,70 +374,17 @@ pub fn check_key_file_permissions(path: &Path, mode: u32) -> Result<(), String> 
     Ok(())
 }
 
-/// Core of [`load_key`] with the env override and config dir injected, so it's
-/// unit-testable without mutating the process environment (which is `unsafe`
-/// under edition 2024, and this crate forbids `unsafe`).
+/// Core of [`load_key`] with the env override injected, so it's unit-testable
+/// without mutating the process environment (which is `unsafe` under edition
+/// 2024, and this crate forbids `unsafe`).
 ///
 /// Since #1330 the resolution is one step: the trimmed override, or `None`.
-/// `config_dir` is no longer where a key comes from — it is only where a
-/// **retired** one might still be sitting, so that [`stale_key_file_notice`]
-/// can name it. The notice is emitted before the override is even examined,
-/// deliberately: the file is equally dead whether or not a key was injected,
-/// and the operator on the recommended path is the one best placed to delete
-/// it.
-///
-/// The notice goes to stderr rather than through `tracing`. This crate carries
-/// no logging dependency (#1169 added none, and #1330 adds none), and — the
-/// reason that stayed the right call — neither `hytte-plugin-pet` nor
-/// `hytte-plugin-caw`, the two binaries that actually call [`load_key`],
-/// installs a `tracing` subscriber, so a `warn!` here would be dropped on the
-/// floor for exactly the audience the notice is for. Their stderr is captured
-/// by the transient `trollshell-plugin-<id>` unit the launcher creates, so
-/// `eprintln!` lands in the journal where a human can find it. Same mechanism
-/// #1169's permission refusal already used.
-fn load_key_from(
-    name: &str,
-    env_override: Option<String>,
-    config_dir: Option<&Path>,
-) -> Option<String> {
-    if let Some(notice) = stale_key_file_notice(name, config_dir) {
-        eprintln!("hytte-ai-providers: {notice}");
-    }
+/// There is no on-disk fallback, and, since #1349, no deprecation notice for
+/// one either — a leftover `{name}.key` file is simply never consulted.
+fn load_key_from(env_override: Option<String>) -> Option<String> {
     let value = env_override?;
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-/// One line for an operator who still has a `{name}.key` file at the retired
-/// path, or `None` — which is every ordinary case, including "no config dir at
-/// all".
-///
-/// #1330's whole deprecation window is this function. It names the file (so
-/// nobody has to guess *which* one), says plainly that it is not read, and
-/// gives the replacement as the exact option line to write, because "declare
-/// the secret instead" is not actionable on its own. Returned as data rather
-/// than printed here so a test can assert its content — and that it is **one**
-/// line: this is a startup notice, not a paragraph, and a multi-line one would
-/// read as an error in the journal.
-///
-/// Presence is `symlink_metadata`, not `exists()`: the documented failure that
-/// sent people down this path in the first place is a home-manager `home.file`
-/// symlink into the Nix store (`docs/plugin-env.md`), and a *dangling* one —
-/// left behind by a store GC — is still a file the operator meant as a key and
-/// still wants to hear about.
-fn stale_key_file_notice(name: &str, config_dir: Option<&Path>) -> Option<String> {
-    let path = config_dir?.join("trollshell").join(format!("{name}.key"));
-    if path.symlink_metadata().is_err() {
-        return None;
-    }
-    Some(format!(
-        "{} is no longer read (#1330) — a provider key now comes only from \
-         ${}_API_KEY. Declare it with `programs.trollshell.plugins.<id>.secrets = \
-         [ \"{name}\" ]`, which injects the key from your login keyring at spawn, \
-         then delete the file.",
-        path.display(),
-        name.to_uppercase(),
-    ))
 }
 
 // ── The desktop owner ────────────────────────────────────────────────────────
@@ -503,7 +429,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, PoisonError};
 
     /// Every test that binds an ephemeral port (`fake_server`,
@@ -944,119 +870,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The env var is the whole resolution now (#1330): trimmed, non-empty ⇒
-    /// `Some`; unset, empty, or whitespace-only ⇒ `None`. The config dir is
-    /// passed on every call and is never a source — see
-    /// [`a_leftover_key_file_yields_no_key_and_exactly_one_notice`] for the
-    /// case where one is actually sitting there.
+    /// The env var is the whole resolution (#1330): trimmed, non-empty ⇒
+    /// `Some`; unset, empty, or whitespace-only ⇒ `None`. There is no on-disk
+    /// fallback and, since #1349, no deprecation notice standing in for one.
     #[test]
     fn load_key_reads_the_env_override_and_nothing_else() {
-        // A private temp config dir; no process-env mutation (that's unsafe
-        // under edition 2024 and forbidden here) — inject the dir directly.
-        let dir = std::env::temp_dir().join(format!("hytte-ai-providers-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("trollshell")).expect("mkdir");
-
         // The override, trimmed.
         assert_eq!(
-            load_key_from("openrouter", Some("  sk-env-9 ".to_owned()), Some(&dir)).as_deref(),
+            load_key_from(Some("  sk-env-9 ".to_owned())).as_deref(),
             Some("sk-env-9"),
         );
         // No override → None. There is nowhere else to look.
-        assert!(load_key_from("openrouter", None, Some(&dir)).is_none());
+        assert!(load_key_from(None).is_none());
         // A blank override is "unset", not an empty key on the wire.
-        assert!(load_key_from("openrouter", Some("   ".to_owned()), Some(&dir)).is_none());
-        // No config dir at all is not a panic — and, with the file arm gone,
-        // not even a different answer.
-        assert_eq!(
-            load_key_from("openrouter", Some("sk-x".to_owned()), None).as_deref(),
-            Some("sk-x"),
-        );
-        assert!(load_key_from("openrouter", None, None).is_none());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// **#1330's removal, end to end**: a key file at the retired path — the
-    /// well-permissioned `0600` one that loaded clean before this change — is
-    /// not read, whatever it contains, and the operator gets exactly one line
-    /// about it naming the file and the option to write instead.
-    ///
-    /// Falsification: restore the file read in `load_key_from` (the
-    /// `read_to_string` arm this PR deleted) and the first assertion goes red
-    /// — `sk-file-abc` comes back.
-    ///
-    /// The notice's *emission* is an `eprintln!` (see `load_key_from` for why
-    /// it is not a `tracing::warn!`), which a unit test in a crate with no
-    /// capture harness cannot intercept; so the "exactly one" claim is asserted
-    /// where it is decided — [`stale_key_file_notice`] returns one `String`,
-    /// with no interior newline, or nothing at all. The one thing left to the
-    /// eye is that the line appears in the journal, which the PR carries as a
-    /// live-verify item.
-    #[test]
-    fn a_leftover_key_file_yields_no_key_and_exactly_one_notice() {
-        let dir =
-            std::env::temp_dir().join(format!("hytte-ai-providers-stale-{}", std::process::id()));
-        let ts = dir.join("trollshell");
-        std::fs::create_dir_all(&ts).expect("mkdir");
-        let path = ts.join("openrouter.key");
-        std::fs::write(&path, "  sk-file-abc\n").expect("write key");
-        chmod(&path, 0o600);
-
-        assert!(
-            load_key_from("openrouter", None, Some(&dir)).is_none(),
-            "the retired key file must not be a key source, however well permissioned",
-        );
-        // …and it does not come back as a fallback behind a blank override
-        // either — the old code fell through to the file there.
-        assert!(
-            load_key_from("openrouter", Some("  ".to_owned()), Some(&dir)).is_none(),
-            "a blank override must resolve to no key, not fall through to the file",
-        );
-
-        let notice = stale_key_file_notice("openrouter", Some(&dir)).expect("the file is there");
-        assert_eq!(
-            notice.lines().count(),
-            1,
-            "a startup notice is one line, not a paragraph: {notice}",
-        );
-        assert!(
-            notice.contains(&path.display().to_string()),
-            "the notice must name the file so nobody has to guess which: {notice}",
-        );
-        assert!(
-            notice.contains("no longer read"),
-            "the notice must say the file has no effect: {notice}",
-        );
-        assert!(
-            notice.contains(r#"secrets = [ "openrouter" ]"#),
-            "the notice must give the replacement as the exact option line: {notice}",
-        );
-        assert!(
-            notice.contains("OPENROUTER_API_KEY"),
-            "the notice must name the variable that IS read: {notice}",
-        );
-
-        // No file, no notice — the ordinary case must stay silent.
-        assert!(
-            stale_key_file_notice("absent", Some(&dir)).is_none(),
-            "a provider with no leftover file must produce no line at all",
-        );
-        assert!(
-            stale_key_file_notice("openrouter", None).is_none(),
-            "no config dir, nothing to notice",
-        );
-
-        // A dangling symlink is still a file the operator meant as a key: the
-        // `home.file`-into-the-store case after a store GC. `exists()` would
-        // miss it; `symlink_metadata` is why this passes.
-        let dangling = ts.join("ghost.key");
-        std::os::unix::fs::symlink(ts.join("nothing-here"), &dangling).expect("symlink");
-        assert!(
-            stale_key_file_notice("ghost", Some(&dir)).is_some(),
-            "a dangling key symlink must still be reported",
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(load_key_from(Some("   ".to_owned())).is_none());
     }
 
     /// A tiny `chmod` wrapper so the tests read as intent, not

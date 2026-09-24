@@ -977,9 +977,9 @@ self:
                 This is the only way to supply a provider key. The on-disk
                 `~/.config/trollshell/<slot>.key` fallback that used to sit
                 behind this option was retired in #1330 ("no fallbacks", #866);
-                a file left at that path is never read, and for one release the
-                plugin logs one line per startup naming it and pointing back
-                here. See <https://vibec0re.mov/trollshell/plugin-env.html>
+                a file left at that path is never read, and, since #1349, the
+                plugin logs no startup notice about it either — it is simply
+                inert. See <https://vibec0re.mov/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`) for the migration.
               '';
             };

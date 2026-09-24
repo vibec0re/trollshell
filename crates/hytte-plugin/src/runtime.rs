@@ -490,6 +490,49 @@ fn drop_ungranted_effects(
     (kept, messages)
 }
 
+/// Whether `mount` is one of the three **right**-sidebar regions (#1158) — the
+/// one mount family with no bar chip and therefore no mouse path onto its
+/// surface at all; the only way to open it is the `toggle-sidebar-right`
+/// action (`trollshell/src/commands.rs`). [`registered_line`] uses this to
+/// decide whether the one-line startup confirmation needs the extra hint.
+#[must_use]
+fn is_sidebar_right(mount: Mount) -> bool {
+    matches!(
+        mount,
+        Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom
+    )
+}
+
+/// The one line [`session`] prints, once per session, the moment `Register`
+/// is proven **accepted** (#1394 — see [`recv_and_acknowledge`]'s doc for what
+/// "proven" means and why). A plugin mounted on the right sidebar gets an
+/// extra hint on the same line: that family has no bar chip, so there is no
+/// mouse path to it short of the `toggle-sidebar-right` action (#1252's
+/// reported case — a working plugin that looked like it did nothing).
+///
+/// Pure and separate from the `eprintln!` call site so the exact wording —
+/// the id, the mount's wire name, and the hint's phrasing — is unit tested
+/// without a fake host.
+///
+/// **A read-the-tail caveat (#1394 review LOW).** In a **post**-handshake
+/// skew crash-loop (the host accepted `Register`, then a later render frame
+/// carries a variant it can't decode — see [`session_end_line`]'s
+/// `acknowledged, skew` arm), every ~5 s redial prints this line again before
+/// [`session_end_line`]'s warning. The line is true each time, but an
+/// operator who only reads the last line of a scrolling journal sees
+/// "registered" as the most recent news, not the warning two lines above it.
+fn registered_line(plugin_id: &str, mount: Mount) -> String {
+    let hint = if is_sidebar_right(mount) {
+        " (right sidebar: no chip — open it with the toggle-sidebar-right action)"
+    } else {
+        ""
+    };
+    format!(
+        "[{plugin_id}] registered; card on {}{hint}",
+        mount.wire_name()
+    )
+}
+
 /// Minimum interval between full `view()` recomputation + dedup + `write_frame`
 /// passes in the session loop (~33 ms ≈ 30 Hz), the SDK-wide view-rate cap
 /// (#560). `update()` still runs on **every** event so a plugin's model/
@@ -580,6 +623,58 @@ enum Step<M> {
     Flush,
 }
 
+/// Await the next inbound host frame and, the first time this session sees
+/// one, mark `*acknowledged` and return the one-line proof `Register` was
+/// accepted (#1394; review point 4) as the second element — the caller
+/// `eprintln!`s it, so the decision of *whether* a line was produced is a
+/// plain return value a test can inspect, not something only visible on
+/// stderr.
+///
+/// **Why "the first inbound frame" is the honest signal.** The wire protocol
+/// has no explicit `Register` acknowledgement (grep `hytte-plugin-proto`'s
+/// `HostMsg` — there is no such variant): the host is a stateless render
+/// target that only ever *pushes* state, it never replies to a frame. Writing
+/// `Register` onto our own socket buffer (`write_frame` returning `Ok`) proves
+/// nothing about the host's side — it proves the local write succeeded, which
+/// it still would moments before a duplicate-id rejection closes the
+/// connection (`IdGuard::claim` failing in `trollshell/src/plugins/session.rs`
+/// drops the peer having sent nothing back at all). A real inbound frame,
+/// by contrast, cannot exist unless the host finished validating and
+/// registering this connection first — every host push this SDK can decode
+/// (state snapshots, `Hello`, slot visibility, the accent seed this session
+/// auto-subscribes to at `Register` time, a liveness `Ping`, …) is sent only
+/// to a connection that made it past `serve_conn`'s handshake. So waiting for
+/// *any* one of them, rather than a particular variant, is what makes this
+/// line true and also what makes an accept vs. a rejected-duplicate EOF
+/// distinguishable at all — see [`SessionEnd`] and [`session_end_line`].
+///
+/// A frame that fails to **decode** (`Some(Err(ProtoError::Decode(_)))`) also
+/// acknowledges: `rmp-serde` only has bytes to fail on because the host wrote
+/// some, which is `serve_conn` handing frames to an already-registered
+/// connection — a **newer** host pushing a variant this build's `rmp-serde`
+/// can't read looks like this. Every *other* `Err` (a raw I/O failure — EOF,
+/// a broken pipe, a reset) means no bytes arrived at all, so it does not.
+///
+/// Factored out of the `select!` loop below so that arm's `match frame { … }`
+/// stays the single expression it already was — the decision of what line to
+/// print (and the wording) lives in the pure [`registered_line`], not here.
+async fn recv_and_acknowledge(
+    rx: &mut mpsc::UnboundedReceiver<Result<HostMsg, ProtoError>>,
+    plugin_id: &str,
+    mount: Mount,
+    acknowledged: &mut bool,
+) -> (Option<Result<HostMsg, ProtoError>>, Option<String>) {
+    let frame = rx.recv().await;
+    let proves_acceptance = matches!(frame, Some(Ok(_) | Err(ProtoError::Decode(_))));
+    let line = if proves_acceptance && !*acknowledged {
+        *acknowledged = true;
+        Some(registered_line(plugin_id, mount))
+    } else {
+        None
+    };
+    (frame, line)
+}
+
 /// Drive one connected session: handshake, seed render, then the
 /// read→update→render loop. `Ok(())` means the host sent `Shutdown` **or**
 /// `shutdown` fired (#1079) — either way the caller checks `*shutdown.borrow()`
@@ -614,6 +709,14 @@ enum Step<M> {
 /// in `run` would put the second instance back on the first one's id the moment
 /// the shell restarted, and the host would then reject whichever of the two
 /// redialled second.
+///
+/// The returned [`SessionEnd`] carries whether this session ever received
+/// proof `Register` was accepted (#1394 review point 3): a local `acknowledged`
+/// flag starts `false`, [`recv_and_acknowledge`] flips it the moment the
+/// *first* inbound host frame arrives, and it rides out in the result rather
+/// than through a parameter a caller could keep past this call's own scope —
+/// see [`SessionEnd`]'s doc for why that shape was a real bug in the #1394
+/// PR's first cut, not just a hypothetical one.
 // One cohesive session lifecycle (handshake → seed render → the select loop over
 // every host frame → dedup); the length is the host-frame vocabulary, not
 // branching complexity — splitting it would scatter the loop for no gain.
@@ -624,7 +727,7 @@ async fn session<P, R, W>(
     mut shutdown: watch::Receiver<bool>,
     mount_override: Option<Mount>,
     id_override: Option<String>,
-) -> Result<(), ProtoError>
+) -> SessionEnd
 where
     P: Plugin,
     R: AsyncRead + Send + Unpin + 'static,
@@ -677,6 +780,15 @@ where
         manifest.subscribes.push(StateKey::Accent);
     }
     let plugin_id = manifest.id.clone();
+    // #1394: whether `Register` has been proven accepted this session — see
+    // `recv_and_acknowledge`'s doc. Declared here (before the handshake
+    // writes below) rather than only before the loop, so every early-return
+    // path — including a handshake write failing outright, before any host
+    // frame could possibly have arrived — has it in scope and it is always
+    // `false` there, honestly. Local, not a caller-owned cell (review point
+    // 3): the only way to read it is the `SessionEnd` this function returns,
+    // so it cannot outlive the connection attempt it describes.
+    let mut acknowledged = false;
     // Kept for the vocabulary negotiation (#884): `Manifest::negotiated_vocab`
     // is the proto's own arithmetic over `vocab_max` and the host's offer, and
     // both ends must compute the same number from the same two inputs — so the
@@ -698,15 +810,32 @@ where
     // prevent. An older host's `check_vocab` refuses such a plugin anyway, so
     // this only closes the window against a current one.
     crate::display::set_negotiated(negotiation.vocab.min(VOCAB_UNCONDITIONAL));
-    write_frame(&mut wr, &PluginMsg::Register { manifest }).await?;
-    write_frame(
+    // The three handshake/seed writes below can't use `?` any more: this
+    // function no longer returns a bare `Result`, so an early failure has to
+    // build the `SessionEnd` by hand — `acknowledged` is still `false` at
+    // every one of these sites (no host frame can exist before the socket
+    // even has `Register` on it), which is exactly what makes returning it
+    // honest rather than a placeholder.
+    if let Err(e) = write_frame(&mut wr, &PluginMsg::Register { manifest }).await {
+        return SessionEnd {
+            outcome: Err(e),
+            acknowledged,
+        };
+    }
+    if let Err(e) = write_frame(
         &mut wr,
         &PluginMsg::Log {
             level: LogLevel::Info,
             msg: format!("{plugin_id} connected"),
         },
     )
-    .await?;
+    .await
+    {
+        return SessionEnd {
+            outcome: Err(e),
+            acknowledged,
+        };
+    }
 
     // The per-session command lane (#280): the runtime owns the channel, so
     // its lifecycle is exactly this session. `init` gets the sender (the model
@@ -724,7 +853,7 @@ where
     // first frame on the wire and the baseline every later dedup compares
     // against, so a `NaN` here would poison both at once.
     sanitise_view(&mut last_view);
-    write_frame(
+    if let Err(e) = write_frame(
         &mut wr,
         &PluginMsg::Render {
             tree: last_view.tree.clone(),
@@ -738,7 +867,13 @@ where
             effects: Vec::new(),
         },
     )
-    .await?;
+    .await
+    {
+        return SessionEnd {
+            outcome: Err(e),
+            acknowledged,
+        };
+    }
 
     // View-rate cap state (#560). `next_send_allowed` is the earliest instant a
     // coalesced view send may go out; seeded to *now* (not now + interval) so the
@@ -802,7 +937,12 @@ where
             // recovered by this mechanism.
             biased;
             Some(()) = shutdown_fired(&mut shutdown) => break 'session Ok(()),
-            frame = rx.recv() => match frame {
+            frame_and_line = recv_and_acknowledge(&mut rx, &plugin_id, negotiation.mount, &mut acknowledged) => {
+                let (frame, line) = frame_and_line;
+                if let Some(line) = line {
+                    eprintln!("{line}");
+                }
+                match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
                 // `output` (#1050, the monitor whose copy of the mirrored card
                 // produced this) is carried through verbatim — including its
@@ -902,6 +1042,7 @@ where
                 Some(Err(e)) => break Err(e),
                 // Reader gone without a final error: treat as EOF.
                 None => break Err(ProtoError::Io(std::io::ErrorKind::UnexpectedEof.into())),
+                }
             },
             msg = src.next(), if !src_done => {
                 if let Some(m) = msg {
@@ -1037,7 +1178,111 @@ where
     }
     // Keeps the `!Send` marker live across every await above — see its comment.
     drop(thread_bound);
-    result
+    SessionEnd {
+        outcome: result,
+        acknowledged,
+    }
+}
+
+/// What a [`session`] attempt ended with (#1394 review point 3): the
+/// connection [`outcome`](SessionEnd::outcome) plus whether `Register` was
+/// ever proven accepted this attempt.
+///
+/// Returned from `session` itself rather than written into a caller-owned
+/// `Cell<bool>` — the shape the #1394 PR originally shipped, and a real bug in
+/// it, not a hypothetical one: the review's mutation A hoisted the `Cell`
+/// construction out of `reconnect_loop`'s per-attempt `loop { … }` body so one
+/// flag was reused across every reconnect, and `cargo test -p hytte-plugin
+/// --lib` stayed 127/127 green, because nothing pinned the cell's *scope*,
+/// only what `session` did to whatever cell it was handed. With the flag
+/// folded into this return value there is no cell left to hoist — a stale
+/// flag from a previous attempt literally cannot exist, which is a stronger
+/// guarantee than a test that happens to catch today's mistake.
+struct SessionEnd {
+    /// `Ok(())` = the host sent `Shutdown` **or** the process-level shutdown
+    /// notice fired — `session`'s own doc is the tie-breaker
+    /// (`*shutdown.borrow()`, read by the caller). `Err` = a transport
+    /// failure.
+    outcome: Result<(), ProtoError>,
+    /// Whether the first inbound host frame (or a decode failure — see
+    /// [`recv_and_acknowledge`]'s doc) arrived this session. `false` only
+    /// when the host refused the connection outright and never wrote back:
+    /// a duplicate id (`IdGuard`, #436) or a handshake-time #437 rejection
+    /// (`check_proto`/`check_vocab` in `trollshell/src/plugins/session.rs`).
+    acknowledged: bool,
+}
+
+/// The one line [`reconnect_loop`] prints after each connection attempt ends
+/// (#1394 review HIGH + point 2): a pure function of the attempt's
+/// [`SessionEnd`] plus the streak flag [`Redial::note`] returns, so the
+/// choice among the five framings below is unit tested without a fake host
+/// or captured stderr.
+///
+/// **Takes `&SessionEnd`, not a bare `acknowledged: bool` beside `skew: bool`**
+/// (#1394 re-review M6/point 1): two same-typed positional bools is exactly
+/// the shape that invites a swapped call site, and a swap here is not
+/// cosmetic — with the two arguments exchanged, every *ordinary* mid-session
+/// end (`acknowledged = true, skew = false`, read as `skew = true,
+/// acknowledged = false` by the swapped call) would print the phantom-
+/// duplicate question this function exists to stop printing wrongly. Wrapping
+/// `outcome` and `acknowledged` in the struct `session` already returns
+/// removes the swap as a *representable* call: `session_end_line(plugin_id,
+/// skew, &end)` no longer type-checks, because `&SessionEnd` and `bool` are
+/// different types — see this function's own tests for the mutation that
+/// used to compile.
+///
+/// The two remaining inputs — [`SessionEnd::acknowledged`] and `skew` — are
+/// independent, and all four combinations on the `Err` side are real:
+///
+/// - `!acknowledged, skew` — the HIGH this function exists to fix. Before it,
+///   `reconnect_loop` checked `!acknowledged` **before** `skew`, so a
+///   handshake-time refusal (`check_proto`/`check_vocab` in
+///   `trollshell/src/plugins/session.rs`, which — like a duplicate id —
+///   sends nothing back and so *always* leaves `acknowledged == false`)
+///   could never reach the skew warning at all, however long the crash-loop
+///   ran: every redial printed "another instance?" instead of naming a wire
+///   mismatch, indefinitely. This arm now names both honest causes — but
+///   scopes the remedy to the one it actually fixes (re-review wording nit):
+///   "update the shell" only helps the skew half, so it sits in its own
+///   parenthetical rather than reading as a universal fix for "another
+///   instance" too. It also doesn't claim a *direction*: `check_proto` is an
+///   **exact** version match, so a plugin **older** than the shell reaches
+///   this arm exactly as a newer one does, and "the plugin and the shell
+///   disagree on the wire version" is true either way — "newer than the
+///   shell's" would not be.
+/// - `!acknowledged, !skew` — a single pre-first-frame failure: too early to
+///   tell a duplicate-id rejection from a one-off transport error, so the
+///   line asks rather than claims a cause. No raw `{e}` (an `UnexpectedEof`/
+///   `BrokenPipe` errno) before that question — review LOW, it reads worse
+///   than it informs.
+/// - `acknowledged, skew` — a **post**-handshake mismatch: the host accepted
+///   `Register` (so a `Hello`, a snapshot, … already flipped the flag) and
+///   later choked decoding a render frame this plugin's newer wire
+///   vocabulary emitted. The original #437 wording, unchanged.
+/// - `acknowledged, !skew` — an ordinary session end with no diagnosable
+///   cause beyond the transport error itself.
+///
+/// `Ok(())` ignores both: a clean host `Shutdown` needs neither.
+fn session_end_line(plugin_id: &str, end: &SessionEnd, skew: bool) -> String {
+    match &end.outcome {
+        Ok(()) => format!("[{plugin_id}] host shut down; will reconnect"),
+        Err(_) if !end.acknowledged && skew => format!(
+            "[{plugin_id}] WARNING: the host keeps closing the connection before any \
+             reply; another instance may already be connected as {plugin_id}, or the \
+             plugin and the shell disagree on the wire version (schema skew, #437) — \
+             the shell's journal names which (a skew means: update the shell)",
+        ),
+        Err(_) if !end.acknowledged => format!(
+            "[{plugin_id}] the host closed the connection without a reply — is another \
+             instance already connected as {plugin_id}?",
+        ),
+        Err(e) if skew => format!(
+            "[{plugin_id}] WARNING: session keeps failing immediately ({e}); the host may \
+             be older than this plugin's wire vocabulary (schema skew, #437) — update the \
+             shell",
+        ),
+        Err(e) => format!("[{plugin_id}] session ended: {e}"),
+    }
 }
 
 /// Run `model.shutdown()` under [`SHUTDOWN_GRACE`], eprintln-ing rather than
@@ -1100,7 +1345,12 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 // `id_override` is cloned per session rather than moved: the
                 // manifest is rebuilt on every reconnect, so every session needs
                 // its own copy of the identity this launch registers under.
-                let outcome = session::<P, _, _>(
+                //
+                // Kept whole rather than destructured (#1394 re-review point
+                // 1): `session_end_line` takes `&SessionEnd`, not its two
+                // fields as separate positional arguments, specifically so
+                // there is nothing left to pass in the wrong order.
+                let ended = session::<P, _, _>(
                     rd,
                     wr,
                     shutdown.clone(),
@@ -1111,7 +1361,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 let lived = started.elapsed();
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
-                let skew = redial.note(lived, outcome.is_ok());
+                let skew = redial.note(lived, ended.outcome.is_ok());
                 backoff.note_session(lived);
                 // `session` already ran the shutdown hook if this is why it
                 // ended (see its doc). Checked *before* logging `outcome`
@@ -1125,15 +1375,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                     eprintln!("[{plugin_id}] shutting down; not reconnecting");
                     return;
                 }
-                match outcome {
-                    Ok(()) => eprintln!("[{plugin_id}] host shut down; will reconnect"),
-                    Err(e) if skew => eprintln!(
-                        "[{plugin_id}] WARNING: session keeps failing immediately ({e}); \
-                         the host may be older than this plugin's wire vocabulary \
-                         (schema skew, #437) — update the shell",
-                    ),
-                    Err(e) => eprintln!("[{plugin_id}] session ended: {e}"),
-                }
+                eprintln!("{}", session_end_line(plugin_id, &ended, skew));
             }
             Err(e) => {
                 eprintln!("[{plugin_id}] connect failed: {e}");
@@ -1322,9 +1564,10 @@ pub fn run<P: Plugin>() -> ! {
 mod tests {
     use super::{
         BACKOFF_BASE, BACKOFF_CAP, Backoff, ID_ENV, IMMEDIATE_FAILURE, MOUNT_ENV,
-        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, effective_mount,
+        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, SessionEnd, effective_mount,
         effective_mount_from, id_override, id_override_from, id_override_from_env, mount_override,
-        mount_override_from, mount_override_from_env, reconnect_loop,
+        mount_override_from, mount_override_from_env, reconnect_loop, recv_and_acknowledge,
+        registered_line, session_end_line,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -1342,7 +1585,7 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, duplex};
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     /// A shutdown notice that never fires — the test stand-in for a plugin
     /// process's whole life with no `SIGTERM`/`SIGINT`, for every test that
@@ -1351,9 +1594,11 @@ mod tests {
         watch::channel(false).1
     }
 
-    /// [`super::session`] with **no** launch-time overrides — what every test
-    /// here wants except the #1159 placement ones and the #1250 identity ones,
-    /// which call `super::session` directly with a `Some`.
+    /// [`super::session`] with **no** launch-time overrides, returning just
+    /// its [`SessionEnd::outcome`] — what every test here wants except the
+    /// #1159 placement ones, the #1250 identity ones, and the #1394 ones,
+    /// which call `super::session` directly to pass a `Some` override or read
+    /// back [`SessionEnd::acknowledged`].
     ///
     /// A shim in the test module rather than a second entry point in the shipped
     /// lib: neither override is optional in production (both are threaded from
@@ -1370,7 +1615,9 @@ mod tests {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Unpin,
     {
-        super::session::<P, R, W>(rd, wr, shutdown, None, None).await
+        super::session::<P, R, W>(rd, wr, shutdown, None, None)
+            .await
+            .outcome
     }
 
     // ── Test plugins ─────────────────────────────────────────────────────────
@@ -4841,5 +5088,408 @@ mod tests {
             "the environment's id must be the id in the Register frame",
         );
         println!("{ID_ENV_CHILD_OK}");
+    }
+
+    // ── Startup acknowledgement line (#1394) ─────────────────────────────────
+
+    /// The exact text — id, mount, no hint — for a mount outside the right
+    /// sidebar family. Pinned so a wording change is a deliberate edit here,
+    /// not a surprise read off stderr.
+    #[test]
+    fn registered_line_names_the_id_and_mount() {
+        assert_eq!(
+            registered_line("stats", Mount::BarRight),
+            "[stats] registered; card on BarRight",
+        );
+        assert_eq!(
+            registered_line("clock-demo", Mount::SidebarTop),
+            "[clock-demo] registered; card on SidebarTop",
+        );
+    }
+
+    /// Every **right**-sidebar mount (#1158) gets the extra hint, verbatim —
+    /// that family is the one #1252 reported a plugin vanishing into (no bar
+    /// chip, no mouse path but the `toggle-sidebar-right` action).
+    ///
+    /// **Falsified** by deleting the hint branch in `registered_line` (or
+    /// `is_sidebar_right`'s match arms): this test reds immediately, with no
+    /// fake host or session involved.
+    #[test]
+    fn registered_line_hints_at_every_right_sidebar_mount() {
+        for mount in [
+            Mount::SidebarRightLead,
+            Mount::SidebarRightTop,
+            Mount::SidebarRightBottom,
+        ] {
+            assert_eq!(
+                registered_line("stats", mount),
+                format!(
+                    "[stats] registered; card on {} (right sidebar: no chip — \
+                     open it with the toggle-sidebar-right action)",
+                    mount.wire_name(),
+                ),
+                "{mount:?}",
+            );
+        }
+    }
+
+    /// The inverse of the hint test above, over every **other** mount
+    /// (`Mount::ALL` minus the three right-sidebar ones) — a regression that
+    /// widened the hint's match arms would show up here, not only as a
+    /// missing hint on the right sidebar.
+    #[test]
+    fn registered_line_has_no_hint_outside_the_right_sidebar() {
+        for mount in Mount::ALL {
+            if matches!(
+                mount,
+                Mount::SidebarRightLead | Mount::SidebarRightTop | Mount::SidebarRightBottom
+            ) {
+                continue;
+            }
+            let line = registered_line("stats", mount);
+            assert!(
+                !line.contains("right sidebar"),
+                "{mount:?} must not carry the right-sidebar hint: {line:?}",
+            );
+        }
+    }
+
+    /// The honest-acceptance signal (#1394): the first inbound host frame —
+    /// here, `Shutdown` itself — marks the session acknowledged. Exercises the
+    /// exact `session`/fake-host seam every other session test uses, reading
+    /// [`SessionEnd::acknowledged`] straight off the return value rather than
+    /// a side-channel `Cell`.
+    ///
+    /// **Falsified** by deleting the `let proves_acceptance = …` line (or its
+    /// use) in `recv_and_acknowledge`: `acknowledged` stays `false` and this
+    /// test reds on its final assertion.
+    #[tokio::test]
+    async fn the_first_inbound_host_frame_marks_the_session_acknowledged() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (ended, ()) = tokio::join!(
+            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), None, None),
+            host,
+        );
+        assert!(ended.outcome.is_ok(), "Shutdown ends the session cleanly");
+        assert!(
+            ended.acknowledged,
+            "the first inbound host frame must mark the session acknowledged",
+        );
+    }
+
+    /// The other half of #1394's ask: a session that ends in error **without**
+    /// ever receiving a host frame — the shape of a rejected duplicate id
+    /// (`IdGuard` in `trollshell/src/plugins/session.rs`, #436) — must leave
+    /// `SessionEnd::acknowledged` `false`. This is what lets `reconnect_loop`
+    /// tell that case apart from an ordinary mid-session transport failure
+    /// instead of printing the same "session ended" line for both.
+    ///
+    /// The host here reads exactly `Register` and then drops both halves —
+    /// the same shape `registered_manifest` already uses, reused here because
+    /// it *is* the scenario: a peer that dials, sends `Register`, and gets
+    /// nothing back at all.
+    #[tokio::test]
+    async fn an_eof_before_any_host_frame_leaves_the_session_unacknowledged() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(manifest.id, "echo-test");
+            // No frame back at all — drop both halves immediately, exactly
+            // what a duplicate-id rejection looks like from the plugin's side.
+            drop(hwr);
+            drop(hrd);
+        };
+
+        let (ended, ()) = tokio::join!(
+            super::session::<Echo, _, _>(prd, pwr, never_shuts_down(), None, None),
+            host,
+        );
+        assert!(
+            ended.outcome.is_err(),
+            "no host frame ever arrived, so the transport fails",
+        );
+        assert!(
+            !ended.acknowledged,
+            "a session that never received a host frame must not be marked \
+             acknowledged",
+        );
+    }
+
+    /// Direct unit test on [`recv_and_acknowledge`] itself (#1394 review point
+    /// 4): the returned line is `Some` exactly once — on the first accepted
+    /// frame — and `None` on every frame after, over a hand-fed channel
+    /// rather than a full session.
+    ///
+    /// **Falsified** by dropping the `&& !*acknowledged` guard: the second
+    /// assertion (`line2` must be `None`) reds because the line is produced
+    /// again.
+    #[tokio::test]
+    async fn recv_and_acknowledge_prints_the_line_exactly_once_on_the_first_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<HostMsg, ProtoError>>();
+        let mut acknowledged = false;
+
+        tx.send(Ok(HostMsg::Shutdown))
+            .expect("receiver still alive");
+        let (frame, line) =
+            recv_and_acknowledge(&mut rx, "stats", Mount::BarRight, &mut acknowledged).await;
+        assert!(matches!(frame, Some(Ok(HostMsg::Shutdown))));
+        assert_eq!(
+            line.as_deref(),
+            Some("[stats] registered; card on BarRight"),
+            "the first accepted frame must produce the line",
+        );
+        assert!(acknowledged);
+
+        tx.send(Ok(HostMsg::Ping { seq: 1 }))
+            .expect("receiver still alive");
+        let (frame2, line2) =
+            recv_and_acknowledge(&mut rx, "stats", Mount::BarRight, &mut acknowledged).await;
+        assert!(matches!(frame2, Some(Ok(HostMsg::Ping { seq: 1 }))));
+        assert_eq!(line2, None, "a second accepted frame must not reprint");
+    }
+
+    /// The negative half of the same seam: a raw I/O error (no bytes ever
+    /// arrived) and a closed channel (`None`, the reader task gone) neither
+    /// acknowledge nor produce a line — `recv_and_acknowledge` never invents
+    /// proof of acceptance out of the *absence* of a frame.
+    #[tokio::test]
+    async fn recv_and_acknowledge_is_silent_on_a_raw_transport_error_and_on_channel_close() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<HostMsg, ProtoError>>();
+        let mut acknowledged = false;
+
+        tx.send(Err(ProtoError::Io(
+            std::io::ErrorKind::UnexpectedEof.into(),
+        )))
+        .expect("receiver still alive");
+        let (frame, line) =
+            recv_and_acknowledge(&mut rx, "stats", Mount::BarRight, &mut acknowledged).await;
+        assert!(matches!(frame, Some(Err(ProtoError::Io(_)))));
+        assert_eq!(line, None);
+        assert!(!acknowledged);
+
+        drop(tx);
+        let (frame2, line2) =
+            recv_and_acknowledge(&mut rx, "stats", Mount::BarRight, &mut acknowledged).await;
+        assert!(frame2.is_none(), "a closed channel surfaces as None");
+        assert_eq!(line2, None);
+        assert!(!acknowledged);
+    }
+
+    /// #1394 re-review's requested addition (its M5): a frame that fails to
+    /// **decode** still proves acceptance. `0xc1` is `MessagePack`'s one
+    /// never-assigned type byte, so `decode_body` is guaranteed to fail on it
+    /// regardless of what `HostMsg` looks like — the same real
+    /// `rmp_serde::decode::Error` `read_frame` would hand back over the wire,
+    /// not a hand-built stand-in.
+    ///
+    /// **Falsified** by narrowing `recv_and_acknowledge`'s `matches!` back to
+    /// `Some(Ok(_))` only (undoing the #1394 fix-round LOW): this test reds
+    /// because `line`/`acknowledged` both come back empty/`false`.
+    #[tokio::test]
+    async fn recv_and_acknowledge_treats_a_decode_failure_as_acknowledgement() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<HostMsg, ProtoError>>();
+        let mut acknowledged = false;
+
+        let decode_err = hytte_plugin_proto::codec::decode_body::<HostMsg>(&[0xc1])
+            .expect_err("0xc1 is never a valid MessagePack type byte");
+        tx.send(Err(decode_err)).expect("receiver still alive");
+
+        let (frame, line) =
+            recv_and_acknowledge(&mut rx, "stats", Mount::BarRight, &mut acknowledged).await;
+        assert!(matches!(frame, Some(Err(ProtoError::Decode(_)))));
+        assert_eq!(
+            line.as_deref(),
+            Some("[stats] registered; card on BarRight"),
+            "a decode failure must still prove Register was accepted",
+        );
+        assert!(acknowledged);
+    }
+
+    // ── `session_end_line` (#1394 review HIGH + point 2; re-review point 1) ──
+    //
+    // One test per `(outcome, acknowledged, skew)` arm `session_end_line`
+    // matches on, plus the review's own three (adapted to build a
+    // `SessionEnd` rather than pass two positional bools — see M6/point 1).
+
+    fn eof() -> ProtoError {
+        ProtoError::Io(std::io::ErrorKind::UnexpectedEof.into())
+    }
+
+    /// A `SessionEnd` literal for the tests below — the two-bool swap
+    /// `session_end_line` no longer accepts is impossible to reintroduce
+    /// here either, since `outcome`/`acknowledged` are named fields, not
+    /// positional arguments.
+    fn ended(outcome: Result<(), ProtoError>, acknowledged: bool) -> SessionEnd {
+        SessionEnd {
+            outcome,
+            acknowledged,
+        }
+    }
+
+    /// `Ok(())` ignores both `acknowledged` and `skew`: a clean host
+    /// `Shutdown` is always the same line.
+    #[test]
+    fn session_end_line_names_a_clean_shutdown() {
+        assert_eq!(
+            session_end_line("stats", &ended(Ok(()), false), false),
+            "[stats] host shut down; will reconnect",
+        );
+        assert_eq!(
+            session_end_line("stats", &ended(Ok(()), true), true),
+            "[stats] host shut down; will reconnect",
+            "acknowledged/skew must not change the Ok(()) line",
+        );
+    }
+
+    /// The review's own first test: a skew streak that never once received a
+    /// host frame (a handshake-time refusal, repeated) must still name #437
+    /// and tell the operator to update the shell — the HIGH finding this
+    /// whole function exists to fix.
+    ///
+    /// **Falsified** by reverting to the pre-fix ordering (`!acknowledged`
+    /// checked, and returning its line, before `skew` is ever consulted):
+    /// this assertion reds because the line stops containing `"#437"` and
+    /// `"update the shell"`.
+    #[test]
+    fn a_skew_streak_before_any_host_frame_still_warns_about_skew() {
+        let line = session_end_line("stats", &ended(Err(eof()), false), true);
+        assert!(
+            line.contains("#437") && line.contains("update the shell"),
+            "{line}"
+        );
+    }
+
+    /// The review's second test: an acknowledged session that later fails
+    /// with no skew streak is an ordinary end, not a duplicate-id question.
+    #[test]
+    fn an_acknowledged_session_that_later_fails_is_an_ordinary_end() {
+        let line = session_end_line("stats", &ended(Err(eof()), true), false);
+        assert!(line.starts_with("[stats] session ended: "), "{line}");
+        assert!(!line.contains("another instance"), "{line}");
+    }
+
+    /// The review's third test: a single unacknowledged failure (not yet a
+    /// streak) names the duplicate-id ambiguity as a question.
+    #[test]
+    fn a_first_unacknowledged_failure_names_the_duplicate_id_ambiguity() {
+        let line = session_end_line("stats", &ended(Err(eof()), false), false);
+        assert!(
+            line.contains("another instance already connected as stats"),
+            "{line}",
+        );
+    }
+
+    /// #1394 re-review wording nit: the merged unacknowledged+skew line must
+    /// scope "update the shell" to the skew cause only — "another instance"
+    /// has no remedy this SDK can name, and a plugin **older** than the
+    /// shell (`check_proto` is an exact-version match, so this arm catches
+    /// both directions, not just newer) would be told the wrong thing by an
+    /// unscoped "update the shell". The remedy must sit next to "#437", not
+    /// dangle off the end reading like it fixes everything above it.
+    #[test]
+    fn the_merged_line_scopes_its_remedy_to_the_skew_cause() {
+        let line = session_end_line("stats", &ended(Err(eof()), false), true);
+        assert!(
+            line.contains("a skew means: update the shell"),
+            "the remedy must read as conditional on the skew cause, via its \
+             own parenthetical — not a dangling \"or just update the shell\" \
+             that reads as a universal fix including \"another instance\": \
+             {line}",
+        );
+        assert!(
+            !line.contains("or just update the shell"),
+            "the pre-nit dangling phrasing must be gone: {line}",
+        );
+        assert!(
+            !line.contains("newer than"),
+            "must not claim a direction `check_proto`'s exact match can't \
+             tell (an older plugin hits this arm too): {line}",
+        );
+    }
+
+    /// The fourth `Err` arm the review's three tests didn't cover: an
+    /// acknowledged session mid-skew-streak (a **post**-handshake mismatch —
+    /// the host accepted `Register`, then choked on a render frame) keeps the
+    /// original #437 wording and must NOT read like the duplicate-id case.
+    ///
+    /// **Falsified** by inverting the classification (swapping which branch
+    /// checks `acknowledged` vs. `!acknowledged`, the review's mutation C):
+    /// this reds because the line stops containing `"#437"`, or because
+    /// [`an_acknowledged_session_that_later_fails_is_an_ordinary_end`] /
+    /// [`a_first_unacknowledged_failure_names_the_duplicate_id_ambiguity`]
+    /// above red instead.
+    #[test]
+    fn a_post_handshake_skew_streak_keeps_its_original_warning() {
+        let line = session_end_line("stats", &ended(Err(eof()), true), true);
+        assert!(
+            line.contains("#437") && line.contains("update the shell"),
+            "{line}"
+        );
+        assert!(!line.contains("another instance"), "{line}");
+    }
+
+    /// End-to-end through `reconnect_loop` (not just `session`): an
+    /// accept-then-nothing-back connection — the duplicate-id shape again —
+    /// must still be treated as an ordinary failed attempt that backs off and
+    /// redials, not a hang or a panic. Doesn't (and can't, from outside)
+    /// observe the printed line itself; it pins that the surrounding loop
+    /// keeps working across exactly the case that line exists to explain.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_loop_redials_after_an_unacknowledged_session() {
+        let (p1, h1) = duplex(64 * 1024);
+        let (p2, h2) = duplex(64 * 1024);
+        let mut pending = vec![p2, p1];
+
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
+            "echo-test",
+            never_shuts_down(),
+            move || {
+                let next = pending.pop();
+                async move {
+                    match next {
+                        Some(end) => Ok(tokio::io::split(end)),
+                        None => std::future::pending().await,
+                    }
+                }
+            },
+            None,
+            None,
+        );
+
+        let host = async move {
+            let (mut hrd1, hwr1) = tokio::io::split(h1);
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd1).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(manifest.id, "echo-test");
+            drop(hwr1);
+            drop(hrd1);
+
+            // The loop must treat that as an ordinary failed attempt and
+            // redial: the second prepared connection completes a fresh
+            // handshake.
+            let (mut hrd2, _hwr2) = tokio::io::split(h2);
+            eat_handshake(&mut hrd2, "echo-test").await;
+        };
+
+        tokio::select! {
+            () = host => {}
+            () = dial_loop => unreachable!(
+                "reconnect_loop never returns with a live shutdown notice that never fires"
+            ),
+        }
     }
 }

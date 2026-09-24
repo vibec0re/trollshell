@@ -297,7 +297,7 @@ impl Plugin for Stats {
     /// auto-grants every manifest capability and the only safe assertion is the
     /// whole list.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT);
+        let mut m = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT).with_version(env!("CARGO_PKG_VERSION"));
         m.subscribes = vec![StateKey::SlotVisible];
         m.capabilities = vec![Capability::OpenPage];
         m

@@ -419,7 +419,8 @@ impl Plugin for BridgeChip {
     /// the same reason `OpenPage` is: a manifest is per binary, and a sidebar
     /// instance answers queries just as well as a bar one.
     fn manifest() -> Manifest {
-        let mut manifest = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT);
+        let mut manifest =
+            Manifest::new(PLUGIN_ID, DEFAULT_MOUNT).with_version(env!("CARGO_PKG_VERSION"));
         manifest.capabilities = vec![Capability::OpenPage, Capability::DatasourceProvider];
         manifest.provides = vec![ProvidedDatasource::new(
             datasource::DATASOURCE_ID,

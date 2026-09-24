@@ -543,7 +543,9 @@ impl Plugin for PreemDemo {
     /// The #884 vocabulary negotiation needs no declaration here:
     /// `Manifest::new` stamps the `vocab`/`vocab_max` pair for every plugin.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(1);
+        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop)
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_order(1);
         m.subscribes = vec![
             StateKey::Clock,
             StateKey::AudioSpectrum,

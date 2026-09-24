@@ -200,6 +200,10 @@ fn full_manifest() -> Manifest {
             ProvidedDatasource::new("departures", vec!["next".into()]),
             ProvidedDatasource::new("weather", vec!["current".into()]),
         ],
+        // Left unset on purpose (#887): `version` is `skip_serializing_if`, so
+        // `None` keeps this golden frame byte-identical to its pre-#887 recording.
+        // The field itself is pinned by `tests/proto.rs`' version round-trips.
+        version: None,
     }
 }
 

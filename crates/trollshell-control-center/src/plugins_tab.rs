@@ -1,7 +1,8 @@
 //! The **Plugins** tab (#348, live runtime overlay #423, adaptive drill-down
 //! #887) — one entry per `trollshell-plugin-<id>` systemd **user** unit,
 //! round-tripped over the shell's `Control` endpoint (`ListPlugins` /
-//! `ListPluginStates` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled`).
+//! `ListPluginStates` / `ListPluginVersions` / `StartPlugin` / `StopPlugin` /
+//! `SetPluginEnabled`).
 //!
 //! Lives in its own module for the reason [`crate::places_tab`] does: a tab
 //! with its own state struct, its own poll timer and its own D-Bus surface is a
@@ -61,7 +62,7 @@
 //! # Polls are ordered, not serialised (#983)
 //!
 //! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
-//! and each is two sequential `Control` calls with a 3 s timeout apiece — so
+//! and each is three sequential `Control` calls with a 3 s timeout apiece — so
 //! completions can and do arrive out of order. Every poll therefore carries a
 //! [`PollGenerations`] stamp and [`on_poll_result_with_declared`] drops any
 //! result older than the newest already applied. That is a *different* door
@@ -106,6 +107,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use adw::prelude::*;
@@ -214,6 +216,11 @@ struct PluginRuntime {
     /// Effects the host's containment guards dropped (#435 rate cap / #436
     /// capability enforcement) over the connection's life.
     violations: u32,
+    /// The release version the plugin declared in its manifest (#887), as
+    /// `ListPluginVersions` reports it — already sanitised and capped by the
+    /// host. `None` for a plugin that declares none, and for every plugin when
+    /// the shell predates the method ([`versions_or_empty`]).
+    version: Option<String>,
 }
 
 /// Everything the UI knows about one plugin at the last poll, cached by id.
@@ -242,6 +249,8 @@ struct PluginRow {
     badge: gtk::Image,
     /// The status column (#887): the compact word [`status_cell`] picks.
     status: gtk::Label,
+    /// The version column (#887): [`version_label`]'s text, `—` when absent.
+    version: gtk::Label,
 }
 
 /// One plugin's config form, mounted in the detail pane (#888 P1).
@@ -283,6 +292,9 @@ struct PluginDetail {
     conn_row: adw::ActionRow,
     /// [`conn_row`](Self::conn_row)'s prefix badge.
     conn_badge: gtk::Image,
+    /// The plugin's declared release version (#887) — [`version_label`]'s
+    /// text, `—` when absent or not connected.
+    version_row: adw::ActionRow,
 }
 
 /// A selection set aside while the shell is unreachable, so a transient failure
@@ -349,8 +361,8 @@ enum PluginsView {
 ///
 /// Nothing serialises the polls. [`build_page`]'s timer fires every
 /// [`PLUGIN_POLL_INTERVAL`], [`refresh_plugins_soon`] adds two more after a
-/// toggle, and each one is a [`list_plugins_and_states`] round trip — two
-/// sequential calls with a 3 s timeout each, so 0–6 s wide — spawned onto the
+/// toggle, and each one is a [`list_plugins_and_states`] round trip — three
+/// sequential calls with a 3 s timeout each, so 0–9 s wide — spawned onto the
 /// shared runtime and fired-and-forgotten by [`spawn_on_runtime`]. One slow
 /// reply is therefore enough to make completions arrive out of order, and
 /// [`apply_plugins`] rewrites [`PluginsState::snapshot`] wholesale: a stale
@@ -582,6 +594,7 @@ struct WeakPluginDetail {
     unit_row: glib::WeakRef<adw::ActionRow>,
     conn_row: glib::WeakRef<adw::ActionRow>,
     conn_badge: glib::WeakRef<gtk::Image>,
+    version_row: glib::WeakRef<adw::ActionRow>,
 }
 
 impl PluginsState {
@@ -602,6 +615,7 @@ impl PluginsState {
                 unit_row: self.detail.unit_row.downgrade(),
                 conn_row: self.detail.conn_row.downgrade(),
                 conn_badge: self.detail.conn_badge.downgrade(),
+                version_row: self.detail.version_row.downgrade(),
             },
             rows: self.rows.clone(),
             by_id: self.by_id.clone(),
@@ -644,6 +658,7 @@ impl WeakPluginsState {
                 unit_row: self.detail.unit_row.upgrade()?,
                 conn_row: self.detail.conn_row.upgrade()?,
                 conn_badge: self.detail.conn_badge.upgrade()?,
+                version_row: self.detail.version_row.upgrade()?,
             },
             rows: self.rows.clone(),
             by_id: self.by_id.clone(),
@@ -888,12 +903,21 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
     let conn_badge = gtk::Image::new();
     conn_badge.set_valign(gtk::Align::Center);
     conn_row.add_prefix(&conn_badge);
+    // Plain text, not Pango markup: the value is plugin-declared (the host
+    // strips control characters, not `<`/`&`), and `AdwActionRow` parses its
+    // subtitle as markup by default.
+    let version_row = adw::ActionRow::builder()
+        .title("Version")
+        .use_markup(false)
+        .subtitle(NO_VERSION)
+        .build();
     let status_group = adw::PreferencesGroup::builder()
         .title("Status")
         .description("The unit's own state, and the host's live view of the plugin's connection.")
         .build();
     status_group.add(&unit_row);
     status_group.add(&conn_row);
+    status_group.add(&version_row);
 
     let plugin_page = adw::PreferencesPage::new();
     plugin_page.add(&controls);
@@ -977,6 +1001,7 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
             unit_row,
             conn_row,
             conn_badge,
+            version_row,
         },
         shell_forms,
     )
@@ -1386,8 +1411,8 @@ fn on_poll_result_with_declared(
         LogTransition::None => {}
     }
     match res {
-        Ok((units, states)) if !units.is_empty() => {
-            apply_plugins(state, &units, &runtime_states(states, declared));
+        Ok((units, states, versions)) if !units.is_empty() => {
+            apply_plugins(state, &units, &runtime_states(states, declared, &versions));
         }
         Ok(_) => set_placeholder(
             state,
@@ -1417,11 +1442,16 @@ fn on_poll_result_with_declared(
 fn runtime_states(
     states: PollStates,
     declared: &HashMap<String, String>,
+    versions: &PollVersions,
 ) -> HashMap<String, PluginRuntime> {
     states
         .into_iter()
         .map(|(id, rendering, mount, last_seen_secs, violations)| {
             let declared_mount = declared.get(&id).cloned();
+            // Only a plugin in `states` (i.e. connected) gets a version: a
+            // `ListPluginVersions` entry for an id the states reply does not
+            // list is dropped with the rest of the stale overlay.
+            let version = versions.get(&id).cloned();
             (
                 id,
                 PluginRuntime {
@@ -1430,6 +1460,7 @@ fn runtime_states(
                     declared_mount,
                     last_seen_secs,
                     violations,
+                    version,
                 },
             )
         })
@@ -2026,6 +2057,10 @@ fn refresh_detail(state: &PluginsState) {
     };
     state.detail.conn_row.set_subtitle(&connection);
     apply_badge(&state.detail.conn_badge, icon, css, &connection);
+    state
+        .detail
+        .version_row
+        .set_subtitle(&version_label(snap.rt.as_ref()));
 
     // #944: while a user toggle is pending for *this* plugin and the poll
     // hasn't caught up (or timed out), show what the user asked for instead
@@ -2293,9 +2328,30 @@ fn build_plugin_row(
         .build();
     status.add_css_class("dim-label");
     status.add_css_class("caption");
+    // The version column (#887), left of the status word. Ellipsized with a
+    // small width budget so a long (up to 64-char) version can never widen
+    // the sidebar past the #856 breakpoint floor; the full text is its
+    // tooltip and the detail page's Version row. A plain `GtkLabel`, so the
+    // plugin-declared text is never parsed as markup.
+    let version = gtk::Label::builder()
+        .valign(gtk::Align::Center)
+        .xalign(1.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(10)
+        .build();
+    version.add_css_class("dim-label");
+    version.add_css_class("caption");
+    version.add_css_class("numeric");
+    row.add_suffix(&version);
+
     row.add_suffix(&status);
 
-    let prow = PluginRow { row, badge, status };
+    let prow = PluginRow {
+        row,
+        badge,
+        status,
+        version,
+    };
     update_plugin_row(&prow, active_state, enabled, rt);
     prow
 }
@@ -2315,6 +2371,9 @@ fn update_plugin_row(
     // spells out; the detail page shows it in full.
     apply_badge(&prow.badge, icon, css, &status);
     prow.status.set_text(status_cell(active_state, rt));
+    let version = version_label(rt);
+    prow.version.set_tooltip_text(Some(&version));
+    prow.version.set_text(&version);
 }
 
 /// Set (or hide) a prefix runtime badge: a recolored symbolic icon whose
@@ -2546,9 +2605,13 @@ type PollUnits = Vec<(String, String, bool)>;
 /// violations)` per plugin with a live host connection.
 type PollStates = Vec<(String, bool, String, u64, u32)>;
 
+/// `ListPluginVersions`' reply (#887): `id → version` for each connected
+/// plugin that declared one.
+type PollVersions = HashMap<String, String>;
+
 /// What one [`list_plugins_and_states`] round trip hands
 /// [`on_poll_result_with_declared`].
-type PollResult = Result<(PollUnits, PollStates), hytte_bus::BusError>;
+type PollResult = Result<(PollUnits, PollStates, PollVersions), hytte_bus::BusError>;
 
 /// `ListPlugins` → `[(id, active_state, enabled)]` for each plugin user unit.
 async fn list_plugins() -> Result<PollUnits, hytte_bus::BusError> {
@@ -2576,14 +2639,139 @@ async fn list_plugin_states() -> Result<PollStates, hytte_bus::BusError> {
         .await
 }
 
+/// `ListPluginVersions` → `{id: version}` for each connected plugin that
+/// declared a release version in its manifest (#887).
+async fn list_plugin_versions() -> Result<PollVersions, hytte_bus::BusError> {
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("ListPluginVersions")
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<HashMap<String, String>>()
+        .await
+}
+
+/// The version column's degradation rule (#887), split out of
+/// [`list_plugins_and_states`] so it is testable without a bus. **Any** error
+/// is "no versions", never a failed poll: the column is decoration on top of
+/// the unit list, and the error a newer control-center gets from an older
+/// shell — `org.freedesktop.DBus.Error.UnknownMethod`, the shell having no
+/// `ListPluginVersions` — must leave every row reading "—" rather than
+/// blanking the tab into "Unavailable". Same best-effort rule
+/// `ListPluginStates` already follows (#423).
+///
+/// Swallowed, not silent (#1397 review L1): an error is logged on a
+/// **change** of [`VersionsOutcome`] only, so a 2 s poll against an older
+/// shell writes one line, not one per tick. `UnknownMethod` is expected (an
+/// older shell) and logs at `debug`; anything else — e.g. a reply signature
+/// that drifted from `a{ss}`, which would otherwise look exactly like "no
+/// plugin declares a version" forever — logs at `warn`.
+fn versions_or_empty(res: Result<PollVersions, hytte_bus::BusError>) -> PollVersions {
+    let now = classify_versions(&res);
+    let prev = VersionsOutcome::from_u8(LAST_VERSIONS_OUTCOME.swap(now as u8, Ordering::Relaxed));
+    match (versions_log(prev, now), &res) {
+        (Some(VersionsOutcome::UnknownMethod), _) => tracing::debug!(
+            "the shell has no ListPluginVersions (it predates #887); versions read \"—\""
+        ),
+        (Some(VersionsOutcome::Failed), Err(err)) => tracing::warn!(
+            %err,
+            "ListPluginVersions failed; versions read \"—\" until it recovers"
+        ),
+        (Some(VersionsOutcome::Ok), _) => tracing::debug!("ListPluginVersions answering again"),
+        _ => {}
+    }
+    res.unwrap_or_default()
+}
+
+/// How the last `ListPluginVersions` call went — the state
+/// [`versions_or_empty`] logs transitions of (#1397 review L1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VersionsOutcome {
+    /// A reply.
+    Ok = 1,
+    /// `org.freedesktop.DBus.Error.UnknownMethod`: a shell older than #887.
+    UnknownMethod = 2,
+    /// Any other error.
+    Failed = 3,
+}
+
+impl VersionsOutcome {
+    /// Back from [`LAST_VERSIONS_OUTCOME`]'s byte; `0` (nothing yet) is `None`.
+    fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Ok),
+            2 => Some(Self::UnknownMethod),
+            3 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// The previous [`VersionsOutcome`], as its discriminant (`0` = no call yet).
+/// A process-wide atomic because the call runs on the shared tokio runtime,
+/// not the GTK thread the tab's own `Cell`s live on; there is one Plugins tab.
+static LAST_VERSIONS_OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+/// The D-Bus error an older shell answers an unknown method with.
+const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
+
+/// Which [`VersionsOutcome`] `res` is. Pure → unit-tested. `hytte_bus` keeps
+/// the error name in `dbus_name` for a method error, but an FDO-typed error
+/// carries it only in its text, so both are checked.
+fn classify_versions(res: &Result<PollVersions, hytte_bus::BusError>) -> VersionsOutcome {
+    match res {
+        Ok(_) => VersionsOutcome::Ok,
+        Err(hytte_bus::BusError::Permanent { dbus_name, reason })
+            if dbus_name.as_deref() == Some(UNKNOWN_METHOD) || reason.contains("UnknownMethod") =>
+        {
+            VersionsOutcome::UnknownMethod
+        }
+        Err(_) => VersionsOutcome::Failed,
+    }
+}
+
+/// Whether to log `now` given the previous outcome: only on a change, and
+/// never for a first call that simply worked (the `log_transition` rule the
+/// tab's own poll follows, #1017). Pure → unit-tested.
+fn versions_log(prev: Option<VersionsOutcome>, now: VersionsOutcome) -> Option<VersionsOutcome> {
+    if prev == Some(now) || (prev.is_none() && now == VersionsOutcome::Ok) {
+        None
+    } else {
+        Some(now)
+    }
+}
+
+/// The version cell's placeholder (#887): no connected plugin, or one that
+/// declared no version.
+const NO_VERSION: &str = "—";
+
+/// What a version cell shows (#887): the connected plugin's declared version,
+/// or [`NO_VERSION`] when it is not connected (`None`) or declared none.
+/// Pure → unit-tested.
+fn version_label(rt: Option<&PluginRuntime>) -> String {
+    rt.and_then(|rt| rt.version.clone())
+        .unwrap_or_else(|| NO_VERSION.to_owned())
+}
+
 /// Fetch the unit list and the runtime overlay for the Plugins tab in one shot
 /// (#423). The overlay is **best-effort**: a `ListPluginStates` error (e.g. an
 /// older shell that predates it) degrades to no overlay rather than blanking the
 /// unit list, so the tab still works against a shell without the method.
+/// The version map (#887) degrades the same way, through
+/// [`versions_or_empty`].
 async fn list_plugins_and_states() -> PollResult {
     let units = list_plugins().await?;
     let states = list_plugin_states().await.unwrap_or_default();
-    Ok((units, states))
+    // Two snapshots, not one (#1397 review L3): the states and versions
+    // replies are separate reads of the host's mirror. A plugin that
+    // disconnects between them reads "Connected / —" for one tick, and one
+    // that reconnects as a different build shows the old build's version for
+    // one tick. Both are cosmetic and heal on the next 2 s poll; making the
+    // pair atomic would mean a combined reply, i.e. changing
+    // `ListPluginStates`' signature, which this method exists to avoid.
+    let versions = versions_or_empty(list_plugin_versions().await);
+    Ok((units, states, versions))
 }
 
 /// Apply an on/off toggle for plugin `id`: `on` → start + enable, `off` → stop +
@@ -2630,11 +2818,12 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates,
-        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
-        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
+        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates, VersionsOutcome,
+        classify_versions, declared_mounts_from_json, is_running, manifest_id_of_exec,
+        mount_display, mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
         read_declared_mounts_at, resolved_search_path, runtime_overlay, runtime_states,
-        same_plugin_set, seen_suffix, status_cell, violations_suffix,
+        same_plugin_set, seen_suffix, status_cell, version_label, versions_log, versions_or_empty,
+        violations_suffix,
     };
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -2699,6 +2888,7 @@ mod tests {
             declared_mount: None,
             last_seen_secs,
             violations,
+            version: None,
         }
     }
 
@@ -2974,7 +3164,7 @@ mod tests {
         let mut declared = HashMap::new();
         declared.insert("agents".to_owned(), "SidebarRightTop".to_owned());
         let states: PollStates = vec![("agents".to_owned(), true, "SidebarTop".to_owned(), 1, 0)];
-        let rt = runtime_states(states, &declared);
+        let rt = runtime_states(states, &declared, &HashMap::new());
         let agents = rt.get("agents").expect("an entry for agents");
         assert_eq!(agents.mount, "SidebarTop");
         assert_eq!(agents.declared_mount.as_deref(), Some("SidebarRightTop"));
@@ -2983,11 +3173,106 @@ mod tests {
     #[test]
     fn runtime_states_leaves_declared_mount_none_when_undeclared() {
         let states: PollStates = vec![("clock".to_owned(), true, "BarCenter".to_owned(), 1, 0)];
-        let rt = runtime_states(states, &HashMap::new());
+        let rt = runtime_states(states, &HashMap::new(), &HashMap::new());
         assert_eq!(
             rt.get("clock").expect("an entry for clock").declared_mount,
             None
         );
+    }
+
+    // ── The version column (#887) ────────────────────────────────────────────
+
+    #[test]
+    fn runtime_states_attaches_versions_to_connected_plugins_only() {
+        let states: PollStates = vec![
+            ("stats".to_owned(), true, "BarRight".to_owned(), 1, 0),
+            ("pet".to_owned(), true, "SidebarBottom".to_owned(), 1, 0),
+        ];
+        let mut versions = HashMap::new();
+        versions.insert("stats".to_owned(), "0.4.1".to_owned());
+        // A version for an id the states reply does not list (it disconnected
+        // between the two calls) must not conjure a runtime entry.
+        versions.insert("gone".to_owned(), "9.9.9".to_owned());
+        let rt = runtime_states(states, &HashMap::new(), &versions);
+        assert_eq!(rt["stats"].version.as_deref(), Some("0.4.1"));
+        assert_eq!(rt["pet"].version, None, "declared none");
+        assert!(!rt.contains_key("gone"), "not connected ⇒ no row state");
+    }
+
+    #[test]
+    fn version_label_is_the_version_or_a_dash() {
+        assert_eq!(version_label(None), "—", "not connected");
+        assert_eq!(
+            version_label(Some(&rt(true, "BarRight", 1, 0))),
+            "—",
+            "connected, declared no version (a pre-#887 plugin)",
+        );
+        let versioned = PluginRuntime {
+            version: Some("0.4.1".to_owned()),
+            ..rt(true, "BarRight", 1, 0)
+        };
+        assert_eq!(version_label(Some(&versioned)), "0.4.1");
+    }
+
+    #[test]
+    fn an_older_shell_without_list_plugin_versions_degrades_to_no_versions() {
+        // What a newer control-center gets from a shell that predates #887.
+        let unknown_method = Err(hytte_bus::BusError::Permanent {
+            reason: "Unknown method ListPluginVersions".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.UnknownMethod".to_owned()),
+        });
+        let versions = versions_or_empty(unknown_method);
+        assert!(versions.is_empty());
+        // …and every row then reads "—" rather than the tab failing.
+        let rt = runtime_states(
+            vec![("stats".to_owned(), true, "BarRight".to_owned(), 1, 0)],
+            &HashMap::new(),
+            &versions,
+        );
+        assert_eq!(version_label(rt.get("stats")), "—");
+
+        // A good reply passes through untouched.
+        let mut ok = HashMap::new();
+        ok.insert("stats".to_owned(), "0.4.1".to_owned());
+        assert_eq!(versions_or_empty(Ok(ok.clone())), ok);
+    }
+
+    #[test]
+    fn version_errors_classify_unknown_method_apart_from_real_failures() {
+        let unknown = Err(hytte_bus::BusError::Permanent {
+            reason: "no such method".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.UnknownMethod".to_owned()),
+        });
+        assert_eq!(classify_versions(&unknown), VersionsOutcome::UnknownMethod);
+        // An FDO-typed error carries the name only in its text.
+        let fdo = Err(hytte_bus::BusError::Permanent {
+            reason: "org.freedesktop.DBus.Error.UnknownMethod: no such method".to_owned(),
+            dbus_name: None,
+        });
+        assert_eq!(classify_versions(&fdo), VersionsOutcome::UnknownMethod);
+        // A drifted reply signature is a real failure, logged at warn.
+        let drift = Err(hytte_bus::BusError::Permanent {
+            reason: "type mismatch: expected a{ss}, got a{sv}".to_owned(),
+            dbus_name: None,
+        });
+        assert_eq!(classify_versions(&drift), VersionsOutcome::Failed);
+        assert_eq!(classify_versions(&Ok(HashMap::new())), VersionsOutcome::Ok);
+    }
+
+    #[test]
+    fn version_errors_log_on_a_change_only() {
+        use VersionsOutcome::{Failed, Ok, UnknownMethod};
+        // First call: silent if it worked, logged if it did not.
+        assert_eq!(versions_log(None, Ok), None);
+        assert_eq!(versions_log(None, UnknownMethod), Some(UnknownMethod));
+        assert_eq!(versions_log(None, Failed), Some(Failed));
+        // A run of the same outcome is one line, not one per 2 s tick.
+        assert_eq!(versions_log(Some(UnknownMethod), UnknownMethod), None);
+        assert_eq!(versions_log(Some(Failed), Failed), None);
+        // Changes are logged, recovery included.
+        assert_eq!(versions_log(Some(Ok), Failed), Some(Failed));
+        assert_eq!(versions_log(Some(Failed), Ok), Some(Ok));
+        assert_eq!(versions_log(Some(UnknownMethod), Failed), Some(Failed));
     }
 
     // ── The declared-mount cache (#1260 review F7) ───────────────────────────
@@ -3586,6 +3871,7 @@ mod gtk_tests {
                     declared_mount: None,
                     last_seen_secs: 1,
                     violations: 0,
+                    version: None,
                 },
             );
         }
@@ -3654,7 +3940,7 @@ mod gtk_tests {
             .iter()
             .map(|id| ((*id).to_owned(), active_state.to_owned(), true))
             .collect();
-        Ok((units, Vec::new()))
+        Ok((units, Vec::new(), HashMap::new()))
     }
 
     /// A failed poll's completion — what a `ListPlugins` timeout hands

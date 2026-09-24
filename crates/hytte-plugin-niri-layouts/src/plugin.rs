@@ -309,7 +309,8 @@ impl Plugin for NiriLayouts {
     /// [`StateKey`](hytte_plugin::proto::StateKey) to subscribe to, which is
     /// why [`crate::watch`] exists.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::BarRight);
+        let mut m =
+            Manifest::new(PLUGIN_ID, Mount::BarRight).with_version(env!("CARGO_PKG_VERSION"));
         m.capabilities = vec![Capability::Notify];
         m
     }

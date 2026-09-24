@@ -1138,6 +1138,145 @@ async fn wait_for_region(region: &Mutable<Vec<SlotRender>>) -> Vec<SlotRender> {
     panic!("region never populated within timeout");
 }
 
+/// Poll the runtime mirror until `pred` holds for `id`'s entry (`None` when the
+/// id is absent), failing rather than hanging if it never does.
+async fn wait_for_runtime(
+    store: &super::PluginRuntimeStore,
+    id: &str,
+    pred: impl Fn(Option<&super::PluginRuntime>) -> bool,
+) {
+    for _ in 0..400 {
+        if pred(store.lock().expect("runtime store").get(id)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("runtime mirror for {id:?} never reached the expected state");
+}
+
+/// #887: the version a plugin declares in its `Register` reaches the runtime
+/// mirror (`ListPluginVersions`' source) **sanitised**, and is gone the moment
+/// the connection drops — a stopped plugin must read "—", not its last version.
+#[tokio::test]
+async fn declared_version_is_sanitised_into_the_mirror_and_cleared_on_disconnect() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let runtime = ctx.runtime.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            // A newline and an ESC: both must be stripped host-side.
+            manifest: Manifest::new("versioned", Mount::SidebarTop)
+                .with_version("0.4.1\n\u{1b}[2J"),
+        },
+    )
+    .await
+    .expect("send Register");
+
+    wait_for_runtime(&runtime, "versioned", |rt| rt.is_some()).await;
+    assert_eq!(
+        runtime.lock().expect("runtime store")["versioned"]
+            .version
+            .as_deref(),
+        Some("0.4.1[2J"),
+        "the mirror holds the sanitised version, never the raw text",
+    );
+
+    // Disconnect: both halves drop, the session tears down.
+    drop(pwr);
+    drop(prd);
+    wait_for_runtime(&runtime, "versioned", |rt| rt.is_none()).await;
+}
+
+/// #887: a plugin built before the field existed (or one that declares none)
+/// registers with `version: None` and the mirror says so — the "—" case.
+#[tokio::test]
+async fn a_versionless_manifest_registers_with_no_version() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let runtime = ctx.runtime.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (_prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("plain", Mount::SidebarTop),
+        },
+    )
+    .await
+    .expect("send Register");
+
+    wait_for_runtime(&runtime, "plain", |rt| rt.is_some()).await;
+    assert_eq!(
+        runtime.lock().expect("runtime store")["plain"].version,
+        None
+    );
+}
+
+/// #887 (#1397 review M2): a rejected duplicate neither overwrites nor clears
+/// the incumbent's version — the tab must name the binary that is actually
+/// connected. Reddens if the duplicate-reject arm in `session.rs` either
+/// re-registers (the newcomer's version wins) or removes the entry (the tab
+/// reads "—" while the incumbent is still connected).
+#[tokio::test]
+async fn duplicate_id_keeps_the_incumbents_version() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let ctx_b = ctx.clone();
+    let runtime = ctx.runtime.clone();
+
+    let (a_host, a_plugin) = UnixStream::pair().expect("socketpair A");
+    tokio::spawn(async move { handle_conn(a_host, &ctx).await });
+    let (_ard, mut awr) = a_plugin.into_split();
+    write_frame(
+        &mut awr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("twin", Mount::BarCenter).with_version("1.0.0"),
+        },
+    )
+    .await
+    .expect("A Register");
+    wait_for_runtime(&runtime, "twin", |rt| rt.is_some()).await;
+
+    let (b_host, b_plugin) = UnixStream::pair().expect("socketpair B");
+    tokio::spawn(async move { handle_conn(b_host, &ctx_b).await });
+    let (mut brd, mut bwr) = b_plugin.into_split();
+    write_frame(
+        &mut bwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("twin", Mount::BarCenter).with_version("6.6.6"),
+        },
+    )
+    .await
+    .expect("B Register");
+    let dropped = tokio::time::timeout(Duration::from_secs(5), read_frame::<HostMsg, _>(&mut brd))
+        .await
+        .expect("B is dropped within 5s");
+    assert!(dropped.is_err(), "B rejected");
+
+    let v = runtime
+        .lock()
+        .expect("runtime store")
+        .get("twin")
+        .map(|rt| rt.version.clone());
+    assert_eq!(
+        v,
+        Some(Some("1.0.0".to_owned())),
+        "incumbent's entry and version survive"
+    );
+}
+
 /// #349: a `Bar*`-mounted plugin's render must now reach the matching bar
 /// region mailbox instead of being dropped (the v1 behavior this PR replaces).
 /// Registers a `BarCenter` plugin, sends one `Render`, and asserts the card

@@ -174,6 +174,7 @@ mod pump;
 mod region;
 mod session;
 mod shader_map;
+mod version;
 mod wire_map;
 
 use datasource::DatasourceRouter;
@@ -263,6 +264,10 @@ struct PluginRuntime {
     /// rate cap + #436 capability enforcement). A nonzero count flags a
     /// misbehaving plugin.
     violations: u32,
+    /// The release version the plugin declared in its manifest (#887), already
+    /// through [`version::sanitize`] — `None` when it declared none. Lives and
+    /// dies with the entry, so a disconnect clears it with everything else.
+    version: Option<String>,
 }
 
 /// Cross-thread mirror of every connected plugin's [`PluginRuntime`], keyed by
@@ -300,6 +305,9 @@ pub struct PluginState {
     pub last_seen_secs: u64,
     /// Effects dropped by containment (#435/#436) over the connection's life.
     pub violations: u32,
+    /// The plugin's self-declared release version (#887), sanitised and capped
+    /// by the host; `None` when its manifest declared none.
+    pub version: Option<String>,
 }
 
 /// Snapshot the connected plugins' host-side runtime state for the `Control`
@@ -323,6 +331,7 @@ pub fn plugin_states() -> Vec<PluginState> {
             rendering: rt.rendering,
             last_seen_secs: now.saturating_duration_since(rt.last_seen).as_secs(),
             violations: rt.violations,
+            version: rt.version.clone(),
         })
         .collect()
 }
@@ -342,7 +351,11 @@ fn mount_name(mount: Mount) -> &'static str {
 
 /// Record a newly-registered connection in the runtime mirror (#423): connected,
 /// not yet rendering. Called from the session handshake once the id is claimed.
-fn runtime_register(store: &PluginRuntimeStore, id: &str, mount: Mount) {
+/// Also keeps the release version its manifest declared (#887) passed through
+/// [`version::sanitize`] — the one place untrusted version text enters host
+/// state. The entry, version included, is dropped by [`runtime_remove`] at
+/// disconnect.
+fn runtime_register(store: &PluginRuntimeStore, id: &str, mount: Mount, version: Option<&str>) {
     store.lock().expect("plugin runtime store poisoned").insert(
         id.to_owned(),
         PluginRuntime {
@@ -350,6 +363,7 @@ fn runtime_register(store: &PluginRuntimeStore, id: &str, mount: Mount) {
             rendering: false,
             last_seen: Instant::now(),
             violations: 0,
+            version: version::sanitize(version),
         },
     );
 }

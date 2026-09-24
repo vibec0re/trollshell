@@ -97,7 +97,8 @@ impl Plugin for Infobroker {
     /// Subscribes [`StateKey::Clock`] for the panel's "expires in" / "N ago"
     /// labels; the SDK adds the accent subscription on its behalf.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::BarRight);
+        let mut m =
+            Manifest::new(PLUGIN_ID, Mount::BarRight).with_version(env!("CARGO_PKG_VERSION"));
         // `Clock` relabels the panel; `CalendarUpcoming` feeds the live copy that
         // `get calendar` serves (#484); `SessionLocked` drives the privacy blank.
         m.subscribes = vec![

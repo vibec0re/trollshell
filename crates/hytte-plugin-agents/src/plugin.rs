@@ -976,7 +976,8 @@ impl Plugin for Agents {
     /// arbitrary argv as the user and the highest-trust capability in the
     /// vocabulary (#1045's own argument).
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop);
+        let mut m =
+            Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_version(env!("CARGO_PKG_VERSION"));
         m.subscribes = vec![StateKey::Clock, StateKey::SlotVisible];
         m.capabilities = vec![
             Capability::OpenPage,

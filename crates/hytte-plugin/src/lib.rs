@@ -1033,6 +1033,21 @@ pub trait Plugin: Sized {
 
     /// The plugin's self-description: id, subscriptions, capabilities, mount.
     /// Sent as the `Register` handshake frame on every (re)connect.
+    ///
+    /// Declare the plugin's release version here too, so the control-center's
+    /// Plugins tab can show which build is running (#887) — every bundled
+    /// plugin does it the same way:
+    ///
+    /// ```
+    /// # use hytte_plugin::proto::{Manifest, Mount};
+    /// let manifest = Manifest::new("my-plugin", Mount::SidebarTop)
+    ///     .with_version(env!("CARGO_PKG_VERSION"));
+    /// assert!(manifest.version.is_some());
+    /// ```
+    ///
+    /// Optional: a plugin that declares none (or predates the field) shows `—`.
+    /// The host treats the value as display text only, capping it at 64
+    /// characters and stripping control characters.
     fn manifest() -> Manifest;
 
     /// The initial model, built fresh on every session (see the crate docs on

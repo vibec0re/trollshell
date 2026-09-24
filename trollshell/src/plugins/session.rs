@@ -1281,7 +1281,7 @@ pub(super) async fn serve_conn(
     // rendering). The matching `runtime_remove` runs in teardown while this
     // connection still owns the id (its `IdGuard` above hasn't released), so a
     // fast-reconnect successor never clobbers the wrong entry.
-    super::runtime_register(&ctx.runtime, &plugin_id, mount);
+    super::runtime_register(&ctx.runtime, &plugin_id, mount, manifest.version.as_deref());
 
     // Outbound writer: the single point that serializes host→plugin frames. The
     // queue is **bounded** (#435): a plugin that stops reading its socket can no

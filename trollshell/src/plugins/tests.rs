@@ -1144,6 +1144,91 @@ async fn wait_for_region(region: &Mutable<Vec<SlotRender>>) -> Vec<SlotRender> {
 /// lands in `bar_center` — and *only* there (no leak into the sibling bar
 /// regions or a sidebar). Proves the un-defer end to end through `handle_conn`,
 /// the same socketpair harness the visibility-gating tests use.
+/// Poll the runtime mirror until `pred` holds for `id`'s entry (`None` when the
+/// id is absent), failing rather than hanging if it never does.
+async fn wait_for_runtime(
+    store: &super::PluginRuntimeStore,
+    id: &str,
+    pred: impl Fn(Option<&super::PluginRuntime>) -> bool,
+) {
+    for _ in 0..400 {
+        if pred(store.lock().expect("runtime store").get(id)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("runtime mirror for {id:?} never reached the expected state");
+}
+
+/// #887: the version a plugin declares in its `Register` reaches the runtime
+/// mirror (`ListPluginVersions`' source) **sanitised**, and is gone the moment
+/// the connection drops — a stopped plugin must read "—", not its last version.
+#[tokio::test]
+async fn declared_version_is_sanitised_into_the_mirror_and_cleared_on_disconnect() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let runtime = ctx.runtime.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            // A newline and an ESC: both must be stripped host-side.
+            manifest: Manifest::new("versioned", Mount::SidebarTop)
+                .with_version("0.4.1\n\u{1b}[2J"),
+        },
+    )
+    .await
+    .expect("send Register");
+
+    wait_for_runtime(&runtime, "versioned", |rt| rt.is_some()).await;
+    assert_eq!(
+        runtime.lock().expect("runtime store")["versioned"]
+            .version
+            .as_deref(),
+        Some("0.4.1[2J"),
+        "the mirror holds the sanitised version, never the raw text",
+    );
+
+    // Disconnect: both halves drop, the session tears down.
+    drop(pwr);
+    drop(prd);
+    wait_for_runtime(&runtime, "versioned", |rt| rt.is_none()).await;
+}
+
+/// #887: a plugin built before the field existed (or one that declares none)
+/// registers with `version: None` and the mirror says so — the "—" case.
+#[tokio::test]
+async fn a_versionless_manifest_registers_with_no_version() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let runtime = ctx.runtime.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (_prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("plain", Mount::SidebarTop),
+        },
+    )
+    .await
+    .expect("send Register");
+
+    wait_for_runtime(&runtime, "plain", |rt| rt.is_some()).await;
+    assert_eq!(
+        runtime.lock().expect("runtime store")["plain"].version,
+        None
+    );
+}
+
 #[tokio::test]
 async fn bar_mount_render_reaches_bar_region() {
     let (_clock_tx, clock_rx) = watch::channel(None);

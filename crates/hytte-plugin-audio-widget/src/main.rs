@@ -453,7 +453,9 @@ impl Plugin for AudioWidget {
     /// didn't declare it. The SDK adds the accent subscription (#376) on its
     /// behalf.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarBottom).with_order(1);
+        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarBottom)
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_order(1);
         m.subscribes = vec![
             StateKey::AudioSpectrum,
             StateKey::SlotVisible,

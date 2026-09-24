@@ -569,6 +569,25 @@ pub struct Manifest {
     /// non-provider's manifest stays byte-identical on the wire to a pre-#509 one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provides: Vec<ProvidedDatasource>,
+    /// The plugin's own **release version** (#887) — display text for the
+    /// control-center's Plugins tab, nothing more. A bundled plugin declares
+    /// its crate version with
+    /// [`with_version`](Manifest::with_version)`(env!("CARGO_PKG_VERSION"))`.
+    ///
+    /// The host treats it as **untrusted display text**: it never parses it,
+    /// compares it or gates anything on it, and it caps and strips it before
+    /// showing it (see the shell's `plugins::version`). It is what the
+    /// *running* process declared, so it is honest about the binary actually
+    /// connected rather than about the one a config names.
+    ///
+    /// `None` — the default, and what every pre-#887 manifest decodes to —
+    /// renders as "—". Additive under the crate's compat rules — same
+    /// [`PROTO_VERSION`], `#[serde(default)]` for backward decode, and
+    /// `skip_serializing_if` so a version-less manifest stays byte-identical on
+    /// the wire to a pre-#887 one. A field, not a variant, so it does not move
+    /// [`VOCAB`]: an older host skips the unknown key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 impl Manifest {
@@ -593,6 +612,7 @@ impl Manifest {
             mount,
             order: None,
             provides: Vec::new(),
+            version: None,
         }
     }
 
@@ -602,6 +622,15 @@ impl Manifest {
     #[must_use]
     pub fn with_order(mut self, order: i32) -> Self {
         self.order = Some(order);
+        self
+    }
+
+    /// Declare the plugin's release [`version`](Manifest::version) (#887) —
+    /// typically `env!("CARGO_PKG_VERSION")`. Display text only; the host caps
+    /// and sanitises it. Chainable off [`Manifest::new`].
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
         self
     }
 

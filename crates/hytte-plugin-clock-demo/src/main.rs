@@ -375,7 +375,7 @@ impl Plugin for ClockDemo {
     /// list is exactly `[OpenPage]` rather than that it lacks something,
     /// because the host auto-grants every manifest capability.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT);
+        let mut m = Manifest::new(PLUGIN_ID, DEFAULT_MOUNT).with_version(env!("CARGO_PKG_VERSION"));
         m.subscribes = vec![StateKey::Clock];
         m.capabilities = vec![Capability::OpenPage];
         m

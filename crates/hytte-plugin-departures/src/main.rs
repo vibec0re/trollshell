@@ -376,7 +376,8 @@ impl Plugin for Board {
         // manifest now, so a poller MUST subscribe to keep being gated. Requests
         // the `RaiseOsd` cap for arm-a-train's leave-by nudge (#236); no `order`
         // (sole card in the region today).
-        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarBottom);
+        let mut m =
+            Manifest::new(PLUGIN_ID, Mount::SidebarBottom).with_version(env!("CARGO_PKG_VERSION"));
         m.subscribes = vec![StateKey::Clock, StateKey::SlotVisible];
         // `DatasourceProvider` + `provides` (#509): this board also serves its next
         // departures as the `departures` datasource, so the infobroker can source

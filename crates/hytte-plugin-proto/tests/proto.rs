@@ -26,6 +26,7 @@ fn sample_manifest() -> Manifest {
         mount: Mount::SidebarTop,
         order: None,
         provides: Vec::new(),
+        version: None,
     }
 }
 
@@ -2052,6 +2053,86 @@ fn manifest_with_order_round_trips() {
     assert!(contains(&body, b"order"), "a set order rides the wire");
     let back: Manifest = decode_body(&body).expect("decode manifest with order");
     assert_eq!(back, m);
+}
+
+#[test]
+fn manifest_with_version_round_trips() {
+    // #887: the builder sets the display version and it rides the wire intact.
+    let m = Manifest::new("stats", Mount::BarRight).with_version("0.4.1");
+    assert_eq!(m.version.as_deref(), Some("0.4.1"));
+    let body = encode_body(&m);
+    assert!(contains(&body, b"version"), "a set version rides the wire");
+    let back: Manifest = decode_body(&body).expect("decode manifest with version");
+    assert_eq!(back, m);
+}
+
+#[test]
+fn manifest_without_version_decodes_old_plugin_compat() {
+    // #887: a plugin built before `version` existed sends a manifest map with NO
+    // `version` key. The current host must still decode it — `#[serde(default)]`
+    // turns the absent key into `None`, which the control-center shows as "—".
+    #[derive(serde::Serialize)]
+    struct ManifestNoVersion {
+        id: String,
+        proto: u16,
+        vocab: u16,
+        vocab_max: Option<u16>,
+        subscribes: Vec<StateKey>,
+        capabilities: Vec<Capability>,
+        mount: Mount,
+    }
+
+    let old = ManifestNoVersion {
+        id: "vibectl".into(),
+        proto: PROTO_VERSION,
+        vocab: VOCAB_UNCONDITIONAL,
+        vocab_max: Some(VOCAB),
+        subscribes: vec![StateKey::Clock],
+        capabilities: vec![Capability::OpenPage, Capability::RunCommand],
+        mount: Mount::SidebarTop,
+    };
+    let decoded: Manifest =
+        decode_body(&encode_body(&old)).expect("decode a pre-#887 version-less manifest");
+    assert_eq!(
+        decoded,
+        sample_manifest(),
+        "absent version defaults to None"
+    );
+    assert_eq!(decoded.version, None);
+
+    // And the other direction: a modern `version: None` manifest keeps the key
+    // off the wire, so it is byte-identical to that pre-#887 frame.
+    assert!(
+        !contains(&encode_body(&sample_manifest()), b"version"),
+        "an unset version stays off the wire",
+    );
+    assert_eq!(encode_body(&sample_manifest()), encode_body(&old));
+}
+
+#[test]
+fn an_older_decoder_ignores_the_version_key() {
+    // #887: an older host's `Manifest` has no `version` field. A newer plugin's
+    // manifest that declares one must still decode there — the unknown key is
+    // skipped (named-map encoding, no `deny_unknown_fields`), which is why this
+    // is a field and not a VOCAB bump.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct PreVersionManifest {
+        id: String,
+        proto: u16,
+        #[serde(default)]
+        vocab: u16,
+        #[serde(default)]
+        vocab_max: Option<u16>,
+        subscribes: Vec<StateKey>,
+        capabilities: Vec<Capability>,
+        mount: Mount,
+    }
+
+    let newer = sample_manifest().with_version("9.9.9");
+    let old: PreVersionManifest =
+        decode_body(&encode_body(&newer)).expect("an older decoder skips `version`");
+    assert_eq!(old.id, "vibectl");
+    assert_eq!(old.mount, Mount::SidebarTop);
 }
 
 #[test]

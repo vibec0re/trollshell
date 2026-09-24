@@ -13,7 +13,8 @@
 //! (see [`hytte::services::geoclue::PlaceOverride`]). The **Plugins** tab (#348)
 //! adds `ListPlugins` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled` (plus
 //! `ListPluginStates`, #423 — the live connected/rendering overlay read from the
-//! host's in-process plugin registry), which
+//! host's in-process plugin registry, and `ListPluginVersions`, #887 — each
+//! connected plugin's self-declared release version), which
 //! manage the `trollshell-plugin-<id>` **user** units through the declarative
 //! launcher ([`crate::plugin_launcher`], #419): declared plugins run as
 //! *transient* units the host launches via `systemd-run --user`, with a
@@ -298,6 +299,23 @@ impl ControlIface {
         crate::plugins::plugin_states()
             .into_iter()
             .map(|s| (s.id, s.rendering, s.mount, s.last_seen_secs, s.violations))
+            .collect()
+    }
+
+    /// The release version each **connected** plugin declared in its manifest
+    /// (#887), as `id → version` (`a{ss}`).
+    ///
+    /// Additive beside [`list_plugin_states`](Self::list_plugin_states) rather
+    /// than a sixth tuple element there, so neither that method's nor
+    /// [`list_plugins`](Self::list_plugins)' signature changes under an older
+    /// control-center. A plugin that is not connected, or connected but declared
+    /// no version (built before #887), is simply absent — the Plugins tab shows
+    /// "—" for both. Values are display text the host has already sanitised and
+    /// capped (`plugins::version`); nothing here parses them.
+    async fn list_plugin_versions(&self) -> std::collections::HashMap<String, String> {
+        crate::plugins::plugin_states()
+            .into_iter()
+            .filter_map(|s| Some((s.id, s.version?)))
             .collect()
     }
 

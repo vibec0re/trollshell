@@ -5278,9 +5278,27 @@ trollshell`. Expect the cards to come back Active and **no notification at
       Also worth an eye on every one of these steps: the tab must show
       **exactly one** set of window buttons — the app's own, top right.
       Switching between Plugins, Places and AI Keys must not make a second
-      close/minimise/maximise cluster appear or disappear. **No version
-      column** — that half of #887 is held pending the source decision on the
-      issue.
+      close/minimise/maximise cluster appear or disappear. (The version
+      column is the next item.)
+- [ ] **(#887, version column)** Every bundled plugin now declares its crate
+      version in its manifest, and the Plugins tab shows it. Open the tab with
+      the shell and a few plugins running: each **connected** plugin's row
+      carries its version (e.g. `0.1.0`, dim, left of the status word) and its
+      detail page has a `Version` row saying the same; a **stopped** plugin
+      reads `—` in both places. Stop a running plugin from its detail page —
+      within ~2 s its version must turn into `—` (the host clears it on
+      disconnect, it does not linger from the last session); start it again and
+      the version comes back. The raw transport, with no UI:
+      `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control ListPluginVersions`
+      returns an `a{ss}` of the connected plugins only. **Compat, both ways**:
+      (a) an **old shell** (pre-#887) with this control-center — every row and
+      the detail `Version` row read `—` and the tab otherwise works (no
+      "Unavailable", no journal spam), since the `UnknownMethod` reply degrades
+      to "no versions"; (b) an **out-of-tree plugin built before #887** (e.g.
+      `v1bectl_widget` on an older pin) still connects to this shell and reads
+      `—`. Resize the window across ~520 px with a plugin selected: the version
+      column must not keep the list from collapsing (it ellipsizes; the
+      `exceeds` journal check above still applies).
 - [ ] **(#601/#836)** The control-center's **footer** reports the running
       _shell's_ revision, not its own. The companion app is a separate binary
       with its **own** `TROLLSHELL_REV` baked in by `nix/control-center.nix`,

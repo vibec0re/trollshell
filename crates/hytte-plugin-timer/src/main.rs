@@ -284,7 +284,8 @@ impl Plugin for Timer {
     /// zero, #406). It subscribes no host state — its countdown is self-driven;
     /// the SDK adds the accent subscription (#376) on its behalf.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::BarRight);
+        let mut m =
+            Manifest::new(PLUGIN_ID, Mount::BarRight).with_version(env!("CARGO_PKG_VERSION"));
         m.capabilities = vec![Capability::OpenPage, Capability::Notify];
         m
     }

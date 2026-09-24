@@ -258,7 +258,9 @@ impl Plugin for Weather {
         // reading as the `weather` datasource (#509) — `DatasourceProvider` +
         // `provides` — so the infobroker can source weather through this running
         // plugin. Scope `current` = the latest reading the card holds.
-        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarLead).with_order(ORDER);
+        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarLead)
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_order(ORDER);
         m.capabilities = vec![Capability::DatasourceProvider];
         m.provides = vec![ProvidedDatasource::new(
             PLUGIN_ID,

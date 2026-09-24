@@ -158,7 +158,9 @@ impl Plugin for Terminal {
     /// only ever reacts to submit events on its own entry, and asks the shell
     /// for nothing.
     fn manifest() -> Manifest {
-        Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(2)
+        Manifest::new(PLUGIN_ID, Mount::SidebarTop)
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_order(2)
     }
 
     /// The banner screen + empty entry, rendered immediately so the card mounts

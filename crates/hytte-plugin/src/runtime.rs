@@ -1218,18 +1218,38 @@ struct SessionEnd {
 /// choice among the five framings below is unit tested without a fake host
 /// or captured stderr.
 ///
-/// The two booleans are independent, and all four `(acknowledged, skew)`
-/// combinations on the `Err` side are real:
+/// **Takes `&SessionEnd`, not a bare `acknowledged: bool` beside `skew: bool`**
+/// (#1394 re-review M6/point 1): two same-typed positional bools is exactly
+/// the shape that invites a swapped call site, and a swap here is not
+/// cosmetic — with the two arguments exchanged, every *ordinary* mid-session
+/// end (`acknowledged = true, skew = false`, read as `skew = true,
+/// acknowledged = false` by the swapped call) would print the phantom-
+/// duplicate question this function exists to stop printing wrongly. Wrapping
+/// `outcome` and `acknowledged` in the struct `session` already returns
+/// removes the swap as a *representable* call: `session_end_line(plugin_id,
+/// skew, &end)` no longer type-checks, because `&SessionEnd` and `bool` are
+/// different types — see this function's own tests for the mutation that
+/// used to compile.
 ///
-/// - `!acknowledged, skew` — the bug this function exists to fix. Before it,
+/// The two remaining inputs — [`SessionEnd::acknowledged`] and `skew` — are
+/// independent, and all four combinations on the `Err` side are real:
+///
+/// - `!acknowledged, skew` — the HIGH this function exists to fix. Before it,
 ///   `reconnect_loop` checked `!acknowledged` **before** `skew`, so a
-///   handshake-time #437 rejection (`check_proto`/`check_vocab` in
+///   handshake-time refusal (`check_proto`/`check_vocab` in
 ///   `trollshell/src/plugins/session.rs`, which — like a duplicate id —
 ///   sends nothing back and so *always* leaves `acknowledged == false`)
 ///   could never reach the skew warning at all, however long the crash-loop
-///   ran: every redial printed "another instance?" instead of "update the
-///   shell", indefinitely. This arm now names **both** honest causes, so a
-///   real skew streak is never silently mislabelled as a phantom duplicate.
+///   ran: every redial printed "another instance?" instead of naming a wire
+///   mismatch, indefinitely. This arm now names both honest causes — but
+///   scopes the remedy to the one it actually fixes (re-review wording nit):
+///   "update the shell" only helps the skew half, so it sits in its own
+///   parenthetical rather than reading as a universal fix for "another
+///   instance" too. It also doesn't claim a *direction*: `check_proto` is an
+///   **exact** version match, so a plugin **older** than the shell reaches
+///   this arm exactly as a newer one does, and "the plugin and the shell
+///   disagree on the wire version" is true either way — "newer than the
+///   shell's" would not be.
 /// - `!acknowledged, !skew` — a single pre-first-frame failure: too early to
 ///   tell a duplicate-id rejection from a one-off transport error, so the
 ///   line asks rather than claims a cause. No raw `{e}` (an `UnexpectedEof`/
@@ -1242,22 +1262,17 @@ struct SessionEnd {
 /// - `acknowledged, !skew` — an ordinary session end with no diagnosable
 ///   cause beyond the transport error itself.
 ///
-/// `Ok(())` ignores both flags: a clean host `Shutdown` needs neither.
-fn session_end_line(
-    plugin_id: &str,
-    outcome: &Result<(), ProtoError>,
-    acknowledged: bool,
-    skew: bool,
-) -> String {
-    match outcome {
+/// `Ok(())` ignores both: a clean host `Shutdown` needs neither.
+fn session_end_line(plugin_id: &str, end: &SessionEnd, skew: bool) -> String {
+    match &end.outcome {
         Ok(()) => format!("[{plugin_id}] host shut down; will reconnect"),
-        Err(_) if !acknowledged && skew => format!(
+        Err(_) if !end.acknowledged && skew => format!(
             "[{plugin_id}] WARNING: the host keeps closing the connection before any \
-             reply; another instance may already be connected as {plugin_id}, or this \
-             plugin's wire vocabulary is newer than the shell's (schema skew, #437) — \
-             the shell's journal names which, or just update the shell",
+             reply; another instance may already be connected as {plugin_id}, or the \
+             plugin and the shell disagree on the wire version (schema skew, #437) — \
+             the shell's journal names which (a skew means: update the shell)",
         ),
-        Err(_) if !acknowledged => format!(
+        Err(_) if !end.acknowledged => format!(
             "[{plugin_id}] the host closed the connection without a reply — is another \
              instance already connected as {plugin_id}?",
         ),
@@ -1330,10 +1345,12 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 // `id_override` is cloned per session rather than moved: the
                 // manifest is rebuilt on every reconnect, so every session needs
                 // its own copy of the identity this launch registers under.
-                let SessionEnd {
-                    outcome,
-                    acknowledged,
-                } = session::<P, _, _>(
+                //
+                // Kept whole rather than destructured (#1394 re-review point
+                // 1): `session_end_line` takes `&SessionEnd`, not its two
+                // fields as separate positional arguments, specifically so
+                // there is nothing left to pass in the wrong order.
+                let ended = session::<P, _, _>(
                     rd,
                     wr,
                     shutdown.clone(),
@@ -1344,7 +1361,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 let lived = started.elapsed();
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
-                let skew = redial.note(lived, outcome.is_ok());
+                let skew = redial.note(lived, ended.outcome.is_ok());
                 backoff.note_session(lived);
                 // `session` already ran the shutdown hook if this is why it
                 // ended (see its doc). Checked *before* logging `outcome`
@@ -1358,10 +1375,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                     eprintln!("[{plugin_id}] shutting down; not reconnecting");
                     return;
                 }
-                eprintln!(
-                    "{}",
-                    session_end_line(plugin_id, &outcome, acknowledged, skew)
-                );
+                eprintln!("{}", session_end_line(plugin_id, &ended, skew));
             }
             Err(e) => {
                 eprintln!("[{plugin_id}] connect failed: {e}");
@@ -1550,7 +1564,7 @@ pub fn run<P: Plugin>() -> ! {
 mod tests {
     use super::{
         BACKOFF_BASE, BACKOFF_CAP, Backoff, ID_ENV, IMMEDIATE_FAILURE, MOUNT_ENV,
-        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, effective_mount,
+        MountOverrideError, Redial, SHUTDOWN_GRACE, SKEW_WARN_AFTER, SessionEnd, effective_mount,
         effective_mount_from, id_override, id_override_from, id_override_from_env, mount_override,
         mount_override_from, mount_override_from_env, reconnect_loop, recv_and_acknowledge,
         registered_line, session_end_line,
@@ -5274,35 +5288,76 @@ mod tests {
         assert!(!acknowledged);
     }
 
-    // ── `session_end_line` (#1394 review HIGH + point 2) ─────────────────────
+    /// #1394 re-review's requested addition (its M5): a frame that fails to
+    /// **decode** still proves acceptance. `0xc1` is `MessagePack`'s one
+    /// never-assigned type byte, so `decode_body` is guaranteed to fail on it
+    /// regardless of what `HostMsg` looks like — the same real
+    /// `rmp_serde::decode::Error` `read_frame` would hand back over the wire,
+    /// not a hand-built stand-in.
+    ///
+    /// **Falsified** by narrowing `recv_and_acknowledge`'s `matches!` back to
+    /// `Some(Ok(_))` only (undoing the #1394 fix-round LOW): this test reds
+    /// because `line`/`acknowledged` both come back empty/`false`.
+    #[tokio::test]
+    async fn recv_and_acknowledge_treats_a_decode_failure_as_acknowledgement() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<HostMsg, ProtoError>>();
+        let mut acknowledged = false;
+
+        let decode_err = hytte_plugin_proto::codec::decode_body::<HostMsg>(&[0xc1])
+            .expect_err("0xc1 is never a valid MessagePack type byte");
+        tx.send(Err(decode_err)).expect("receiver still alive");
+
+        let (frame, line) =
+            recv_and_acknowledge(&mut rx, "stats", Mount::BarRight, &mut acknowledged).await;
+        assert!(matches!(frame, Some(Err(ProtoError::Decode(_)))));
+        assert_eq!(
+            line.as_deref(),
+            Some("[stats] registered; card on BarRight"),
+            "a decode failure must still prove Register was accepted",
+        );
+        assert!(acknowledged);
+    }
+
+    // ── `session_end_line` (#1394 review HIGH + point 2; re-review point 1) ──
     //
     // One test per `(outcome, acknowledged, skew)` arm `session_end_line`
-    // matches on, plus the review's own three verbatim (adapted to call the
-    // shipped function rather than the sketch in its comment).
+    // matches on, plus the review's own three (adapted to build a
+    // `SessionEnd` rather than pass two positional bools — see M6/point 1).
 
     fn eof() -> ProtoError {
         ProtoError::Io(std::io::ErrorKind::UnexpectedEof.into())
     }
 
-    /// `Ok(())` ignores both flags: a clean host `Shutdown` is always the
-    /// same line.
+    /// A `SessionEnd` literal for the tests below — the two-bool swap
+    /// `session_end_line` no longer accepts is impossible to reintroduce
+    /// here either, since `outcome`/`acknowledged` are named fields, not
+    /// positional arguments.
+    fn ended(outcome: Result<(), ProtoError>, acknowledged: bool) -> SessionEnd {
+        SessionEnd {
+            outcome,
+            acknowledged,
+        }
+    }
+
+    /// `Ok(())` ignores both `acknowledged` and `skew`: a clean host
+    /// `Shutdown` is always the same line.
     #[test]
     fn session_end_line_names_a_clean_shutdown() {
         assert_eq!(
-            session_end_line("stats", &Ok(()), false, false),
+            session_end_line("stats", &ended(Ok(()), false), false),
             "[stats] host shut down; will reconnect",
         );
         assert_eq!(
-            session_end_line("stats", &Ok(()), true, true),
+            session_end_line("stats", &ended(Ok(()), true), true),
             "[stats] host shut down; will reconnect",
             "acknowledged/skew must not change the Ok(()) line",
         );
     }
 
-    /// The review's own first test, verbatim: a skew streak that never once
-    /// received a host frame (a handshake-time #437 refusal, repeated) must
-    /// still name #437 and tell the operator to update the shell — the HIGH
-    /// finding this whole function exists to fix.
+    /// The review's own first test: a skew streak that never once received a
+    /// host frame (a handshake-time refusal, repeated) must still name #437
+    /// and tell the operator to update the shell — the HIGH finding this
+    /// whole function exists to fix.
     ///
     /// **Falsified** by reverting to the pre-fix ordering (`!acknowledged`
     /// checked, and returning its line, before `skew` is ever consulted):
@@ -5310,31 +5365,58 @@ mod tests {
     /// `"update the shell"`.
     #[test]
     fn a_skew_streak_before_any_host_frame_still_warns_about_skew() {
-        let line = session_end_line("stats", &Err(eof()), false, true);
+        let line = session_end_line("stats", &ended(Err(eof()), false), true);
         assert!(
             line.contains("#437") && line.contains("update the shell"),
             "{line}"
         );
     }
 
-    /// The review's second test, verbatim: an acknowledged session that later
-    /// fails with no skew streak is an ordinary end, not a duplicate-id
-    /// question.
+    /// The review's second test: an acknowledged session that later fails
+    /// with no skew streak is an ordinary end, not a duplicate-id question.
     #[test]
     fn an_acknowledged_session_that_later_fails_is_an_ordinary_end() {
-        let line = session_end_line("stats", &Err(eof()), true, false);
+        let line = session_end_line("stats", &ended(Err(eof()), true), false);
         assert!(line.starts_with("[stats] session ended: "), "{line}");
         assert!(!line.contains("another instance"), "{line}");
     }
 
-    /// The review's third test, verbatim: a single unacknowledged failure
-    /// (not yet a streak) names the duplicate-id ambiguity as a question.
+    /// The review's third test: a single unacknowledged failure (not yet a
+    /// streak) names the duplicate-id ambiguity as a question.
     #[test]
     fn a_first_unacknowledged_failure_names_the_duplicate_id_ambiguity() {
-        let line = session_end_line("stats", &Err(eof()), false, false);
+        let line = session_end_line("stats", &ended(Err(eof()), false), false);
         assert!(
             line.contains("another instance already connected as stats"),
             "{line}",
+        );
+    }
+
+    /// #1394 re-review wording nit: the merged unacknowledged+skew line must
+    /// scope "update the shell" to the skew cause only — "another instance"
+    /// has no remedy this SDK can name, and a plugin **older** than the
+    /// shell (`check_proto` is an exact-version match, so this arm catches
+    /// both directions, not just newer) would be told the wrong thing by an
+    /// unscoped "update the shell". The remedy must sit next to "#437", not
+    /// dangle off the end reading like it fixes everything above it.
+    #[test]
+    fn the_merged_line_scopes_its_remedy_to_the_skew_cause() {
+        let line = session_end_line("stats", &ended(Err(eof()), false), true);
+        assert!(
+            line.contains("a skew means: update the shell"),
+            "the remedy must read as conditional on the skew cause, via its \
+             own parenthetical — not a dangling \"or just update the shell\" \
+             that reads as a universal fix including \"another instance\": \
+             {line}",
+        );
+        assert!(
+            !line.contains("or just update the shell"),
+            "the pre-nit dangling phrasing must be gone: {line}",
+        );
+        assert!(
+            !line.contains("newer than"),
+            "must not claim a direction `check_proto`'s exact match can't \
+             tell (an older plugin hits this arm too): {line}",
         );
     }
 
@@ -5351,7 +5433,7 @@ mod tests {
     /// above red instead.
     #[test]
     fn a_post_handshake_skew_streak_keeps_its_original_warning() {
-        let line = session_end_line("stats", &Err(eof()), true, true);
+        let line = session_end_line("stats", &ended(Err(eof()), true), true);
         assert!(
             line.contains("#437") && line.contains("update the shell"),
             "{line}"

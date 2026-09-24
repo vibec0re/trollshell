@@ -62,7 +62,7 @@
 //! # Polls are ordered, not serialised (#983)
 //!
 //! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
-//! and each is two sequential `Control` calls with a 3 s timeout apiece — so
+//! and each is three sequential `Control` calls with a 3 s timeout apiece — so
 //! completions can and do arrive out of order. Every poll therefore carries a
 //! [`PollGenerations`] stamp and [`on_poll_result_with_declared`] drops any
 //! result older than the newest already applied. That is a *different* door
@@ -107,6 +107,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use adw::prelude::*;
@@ -360,8 +361,8 @@ enum PluginsView {
 ///
 /// Nothing serialises the polls. [`build_page`]'s timer fires every
 /// [`PLUGIN_POLL_INTERVAL`], [`refresh_plugins_soon`] adds two more after a
-/// toggle, and each one is a [`list_plugins_and_states`] round trip — two
-/// sequential calls with a 3 s timeout each, so 0–6 s wide — spawned onto the
+/// toggle, and each one is a [`list_plugins_and_states`] round trip — three
+/// sequential calls with a 3 s timeout each, so 0–9 s wide — spawned onto the
 /// shared runtime and fired-and-forgotten by [`spawn_on_runtime`]. One slow
 /// reply is therefore enough to make completions arrive out of order, and
 /// [`apply_plugins`] rewrites [`PluginsState::snapshot`] wholesale: a stale
@@ -2659,8 +2660,86 @@ async fn list_plugin_versions() -> Result<PollVersions, hytte_bus::BusError> {
 /// `ListPluginVersions` — must leave every row reading "—" rather than
 /// blanking the tab into "Unavailable". Same best-effort rule
 /// `ListPluginStates` already follows (#423).
+///
+/// Swallowed, not silent (#1397 review L1): an error is logged on a
+/// **change** of [`VersionsOutcome`] only, so a 2 s poll against an older
+/// shell writes one line, not one per tick. `UnknownMethod` is expected (an
+/// older shell) and logs at `debug`; anything else — e.g. a reply signature
+/// that drifted from `a{ss}`, which would otherwise look exactly like "no
+/// plugin declares a version" forever — logs at `warn`.
 fn versions_or_empty(res: Result<PollVersions, hytte_bus::BusError>) -> PollVersions {
+    let now = classify_versions(&res);
+    let prev = VersionsOutcome::from_u8(LAST_VERSIONS_OUTCOME.swap(now as u8, Ordering::Relaxed));
+    match (versions_log(prev, now), &res) {
+        (Some(VersionsOutcome::UnknownMethod), _) => tracing::debug!(
+            "the shell has no ListPluginVersions (it predates #887); versions read \"—\""
+        ),
+        (Some(VersionsOutcome::Failed), Err(err)) => tracing::warn!(
+            %err,
+            "ListPluginVersions failed; versions read \"—\" until it recovers"
+        ),
+        (Some(VersionsOutcome::Ok), _) => tracing::debug!("ListPluginVersions answering again"),
+        _ => {}
+    }
     res.unwrap_or_default()
+}
+
+/// How the last `ListPluginVersions` call went — the state
+/// [`versions_or_empty`] logs transitions of (#1397 review L1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VersionsOutcome {
+    /// A reply.
+    Ok = 1,
+    /// `org.freedesktop.DBus.Error.UnknownMethod`: a shell older than #887.
+    UnknownMethod = 2,
+    /// Any other error.
+    Failed = 3,
+}
+
+impl VersionsOutcome {
+    /// Back from [`LAST_VERSIONS_OUTCOME`]'s byte; `0` (nothing yet) is `None`.
+    fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Ok),
+            2 => Some(Self::UnknownMethod),
+            3 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// The previous [`VersionsOutcome`], as its discriminant (`0` = no call yet).
+/// A process-wide atomic because the call runs on the shared tokio runtime,
+/// not the GTK thread the tab's own `Cell`s live on; there is one Plugins tab.
+static LAST_VERSIONS_OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+/// The D-Bus error an older shell answers an unknown method with.
+const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
+
+/// Which [`VersionsOutcome`] `res` is. Pure → unit-tested. `hytte_bus` keeps
+/// the error name in `dbus_name` for a method error, but an FDO-typed error
+/// carries it only in its text, so both are checked.
+fn classify_versions(res: &Result<PollVersions, hytte_bus::BusError>) -> VersionsOutcome {
+    match res {
+        Ok(_) => VersionsOutcome::Ok,
+        Err(hytte_bus::BusError::Permanent { dbus_name, reason })
+            if dbus_name.as_deref() == Some(UNKNOWN_METHOD) || reason.contains("UnknownMethod") =>
+        {
+            VersionsOutcome::UnknownMethod
+        }
+        Err(_) => VersionsOutcome::Failed,
+    }
+}
+
+/// Whether to log `now` given the previous outcome: only on a change, and
+/// never for a first call that simply worked (the `log_transition` rule the
+/// tab's own poll follows, #1017). Pure → unit-tested.
+fn versions_log(prev: Option<VersionsOutcome>, now: VersionsOutcome) -> Option<VersionsOutcome> {
+    if prev == Some(now) || (prev.is_none() && now == VersionsOutcome::Ok) {
+        None
+    } else {
+        Some(now)
+    }
 }
 
 /// The version cell's placeholder (#887): no connected plugin, or one that
@@ -2684,6 +2763,13 @@ fn version_label(rt: Option<&PluginRuntime>) -> String {
 async fn list_plugins_and_states() -> PollResult {
     let units = list_plugins().await?;
     let states = list_plugin_states().await.unwrap_or_default();
+    // Two snapshots, not one (#1397 review L3): the states and versions
+    // replies are separate reads of the host's mirror. A plugin that
+    // disconnects between them reads "Connected / —" for one tick, and one
+    // that reconnects as a different build shows the old build's version for
+    // one tick. Both are cosmetic and heal on the next 2 s poll; making the
+    // pair atomic would mean a combined reply, i.e. changing
+    // `ListPluginStates`' signature, which this method exists to avoid.
     let versions = versions_or_empty(list_plugin_versions().await);
     Ok((units, states, versions))
 }
@@ -2732,11 +2818,11 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates,
-        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
-        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
+        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates, VersionsOutcome,
+        classify_versions, declared_mounts_from_json, is_running, manifest_id_of_exec,
+        mount_display, mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
         read_declared_mounts_at, resolved_search_path, runtime_overlay, runtime_states,
-        same_plugin_set, seen_suffix, status_cell, version_label, versions_or_empty,
+        same_plugin_set, seen_suffix, status_cell, version_label, versions_log, versions_or_empty,
         violations_suffix,
     };
 
@@ -3149,6 +3235,44 @@ mod tests {
         let mut ok = HashMap::new();
         ok.insert("stats".to_owned(), "0.4.1".to_owned());
         assert_eq!(versions_or_empty(Ok(ok.clone())), ok);
+    }
+
+    #[test]
+    fn version_errors_classify_unknown_method_apart_from_real_failures() {
+        let unknown = Err(hytte_bus::BusError::Permanent {
+            reason: "no such method".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.UnknownMethod".to_owned()),
+        });
+        assert_eq!(classify_versions(&unknown), VersionsOutcome::UnknownMethod);
+        // An FDO-typed error carries the name only in its text.
+        let fdo = Err(hytte_bus::BusError::Permanent {
+            reason: "org.freedesktop.DBus.Error.UnknownMethod: no such method".to_owned(),
+            dbus_name: None,
+        });
+        assert_eq!(classify_versions(&fdo), VersionsOutcome::UnknownMethod);
+        // A drifted reply signature is a real failure, logged at warn.
+        let drift = Err(hytte_bus::BusError::Permanent {
+            reason: "type mismatch: expected a{ss}, got a{sv}".to_owned(),
+            dbus_name: None,
+        });
+        assert_eq!(classify_versions(&drift), VersionsOutcome::Failed);
+        assert_eq!(classify_versions(&Ok(HashMap::new())), VersionsOutcome::Ok);
+    }
+
+    #[test]
+    fn version_errors_log_on_a_change_only() {
+        use VersionsOutcome::{Failed, Ok, UnknownMethod};
+        // First call: silent if it worked, logged if it did not.
+        assert_eq!(versions_log(None, Ok), None);
+        assert_eq!(versions_log(None, UnknownMethod), Some(UnknownMethod));
+        assert_eq!(versions_log(None, Failed), Some(Failed));
+        // A run of the same outcome is one line, not one per 2 s tick.
+        assert_eq!(versions_log(Some(UnknownMethod), UnknownMethod), None);
+        assert_eq!(versions_log(Some(Failed), Failed), None);
+        // Changes are logged, recovery included.
+        assert_eq!(versions_log(Some(Ok), Failed), Some(Failed));
+        assert_eq!(versions_log(Some(Failed), Ok), Some(Ok));
+        assert_eq!(versions_log(Some(UnknownMethod), Failed), Some(Failed));
     }
 
     // ── The declared-mount cache (#1260 review F7) ───────────────────────────

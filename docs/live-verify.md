@@ -5283,9 +5283,12 @@ trollshell`. Expect the cards to come back Active and **no notification at
 - [ ] **(#887, version column)** Every bundled plugin now declares its crate
       version in its manifest, and the Plugins tab shows it. Open the tab with
       the shell and a few plugins running: each **connected** plugin's row
-      carries its version (e.g. `0.1.0`, dim, left of the status word) and its
-      detail page has a `Version` row saying the same; a **stopped** plugin
-      reads `—` in both places. Stop a running plugin from its detail page —
+      carries its version (dim, left of the status word) and its detail page
+      has a `Version` row saying the same; a **stopped** plugin reads `—` in
+      both places. **Expect `0.1.0` on every row today**: every bundled
+      plugin crate is still `version = "0.1.0"`, so two builds of one plugin
+      read the same until crate versions are bumped. That is the crate
+      versions' state, not a bug in the column (#1397 review L5). Stop a running plugin from its detail page —
       within ~2 s its version must turn into `—` (the host clears it on
       disconnect, it does not linger from the last session); start it again and
       the version comes back. The raw transport, with no UI:

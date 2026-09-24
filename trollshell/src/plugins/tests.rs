@@ -1138,12 +1138,6 @@ async fn wait_for_region(region: &Mutable<Vec<SlotRender>>) -> Vec<SlotRender> {
     panic!("region never populated within timeout");
 }
 
-/// #349: a `Bar*`-mounted plugin's render must now reach the matching bar
-/// region mailbox instead of being dropped (the v1 behavior this PR replaces).
-/// Registers a `BarCenter` plugin, sends one `Render`, and asserts the card
-/// lands in `bar_center` — and *only* there (no leak into the sibling bar
-/// regions or a sidebar). Proves the un-defer end to end through `handle_conn`,
-/// the same socketpair harness the visibility-gating tests use.
 /// Poll the runtime mirror until `pred` holds for `id`'s entry (`None` when the
 /// id is absent), failing rather than hanging if it never does.
 async fn wait_for_runtime(
@@ -1229,6 +1223,66 @@ async fn a_versionless_manifest_registers_with_no_version() {
     );
 }
 
+/// #887 (#1397 review M2): a rejected duplicate neither overwrites nor clears
+/// the incumbent's version — the tab must name the binary that is actually
+/// connected. Reddens if the duplicate-reject arm in `session.rs` either
+/// re-registers (the newcomer's version wins) or removes the entry (the tab
+/// reads "—" while the incumbent is still connected).
+#[tokio::test]
+async fn duplicate_id_keeps_the_incumbents_version() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let ctx_b = ctx.clone();
+    let runtime = ctx.runtime.clone();
+
+    let (a_host, a_plugin) = UnixStream::pair().expect("socketpair A");
+    tokio::spawn(async move { handle_conn(a_host, &ctx).await });
+    let (_ard, mut awr) = a_plugin.into_split();
+    write_frame(
+        &mut awr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("twin", Mount::BarCenter).with_version("1.0.0"),
+        },
+    )
+    .await
+    .expect("A Register");
+    wait_for_runtime(&runtime, "twin", |rt| rt.is_some()).await;
+
+    let (b_host, b_plugin) = UnixStream::pair().expect("socketpair B");
+    tokio::spawn(async move { handle_conn(b_host, &ctx_b).await });
+    let (mut brd, mut bwr) = b_plugin.into_split();
+    write_frame(
+        &mut bwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("twin", Mount::BarCenter).with_version("6.6.6"),
+        },
+    )
+    .await
+    .expect("B Register");
+    let dropped = tokio::time::timeout(Duration::from_secs(5), read_frame::<HostMsg, _>(&mut brd))
+        .await
+        .expect("B is dropped within 5s");
+    assert!(dropped.is_err(), "B rejected");
+
+    let v = runtime
+        .lock()
+        .expect("runtime store")
+        .get("twin")
+        .map(|rt| rt.version.clone());
+    assert_eq!(
+        v,
+        Some(Some("1.0.0".to_owned())),
+        "incumbent's entry and version survive"
+    );
+}
+
+/// #349: a `Bar*`-mounted plugin's render must now reach the matching bar
+/// region mailbox instead of being dropped (the v1 behavior this PR replaces).
+/// Registers a `BarCenter` plugin, sends one `Render`, and asserts the card
+/// lands in `bar_center` — and *only* there (no leak into the sibling bar
+/// regions or a sidebar). Proves the un-defer end to end through `handle_conn`,
+/// the same socketpair harness the visibility-gating tests use.
 #[tokio::test]
 async fn bar_mount_render_reaches_bar_region() {
     let (_clock_tx, clock_rx) = watch::channel(None);

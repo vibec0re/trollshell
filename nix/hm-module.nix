@@ -4,6 +4,12 @@ self:
   options,
   lib,
   pkgs,
+  # The NixOS configuration this home-manager configuration is part of, when
+  # home-manager runs as a NixOS module (its own `specialArgs`); home-manager
+  # itself defaults it to null standalone. Read only through `or`, so a
+  # standalone config and one whose NixOS side has no trollshell evaluate
+  # alike — see the `availablePlugins` default below (#1400).
+  osConfig ? null,
   # `plugins.json`'s per-plugin entries, threaded in from
   # `nix/module-common.nix`'s `_module.args` (imported below) rather than
   # hand-copied here — the NixOS module renders the same map through the
@@ -457,6 +463,20 @@ in
 
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
+      # #1400 review, finding 1: with the NixOS module on as well, declare no
+      # bundled plugins here by default. `/etc/xdg/trollshell/plugins.json`
+      # already declares every one of them, and this module's file shadows
+      # that one whole (first existing file wins). If `availablePlugins` kept
+      # its full default here, this module would always render a file (every
+      # bundled plugin, none of the NixOS-level `plugins`), and the shell
+      # would stop each NixOS-declared plugin as an orphan on its next
+      # reconcile, including one pinned on. With `[ ]`, this module renders a
+      # file only when `plugins` is declared under home-manager itself, as it
+      # did before #1400. `mkDefault`, so an explicit list here still wins.
+      (lib.mkIf (osConfig.programs.trollshell.enable or false) {
+        programs.trollshell.availablePlugins = lib.mkDefault [ ];
+      })
+
       {
         # cfg.package plus the fonts the stylesheets name (Inter + Cantarell for
         # the bar UI, JetBrains Mono / Fira Code for the clock + workspace chips)
@@ -573,7 +593,10 @@ in
       # declared, so a plugin-less config grows no config file — and since
       # #1400 "plugin-less" takes `availablePlugins = [ ]` too, because by
       # default every bundled plugin is declared (off), so an enabled module
-      # writes this file, and installs the poke below, on every switch.
+      # writes this file, and installs the poke below, on every switch. The
+      # exception is a home-manager config inside a NixOS one that enables
+      # trollshell too: there `availablePlugins` defaults to `[ ]` (the first
+      # `mkMerge` element above), so only plugins declared here render a file.
       #
       # Writing the file is only half of "declarative", though (#695): the units
       # are *transient*, created by the shell at runtime, so there is no unit

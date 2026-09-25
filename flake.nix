@@ -2163,6 +2163,94 @@
               touch $out
             '';
 
+          # #1400 review, finding 1: the NixOS module and home-manager's, both
+          # on. The NixOS module registers the home-manager one for every user
+          # (`home-manager.sharedModules`), so a user who enables trollshell in
+          # home-manager with no `plugins` of their own must not get a
+          # `~/.config/trollshell/plugins.json`: that file shadows the
+          # `/etc/xdg` one whole, and a default-`availablePlugins` one would
+          # list the thirteen bundled plugins and none of the NixOS-level ones,
+          # so the shell would stop `demo` below (pinned on, launcher-stamped)
+          # as an orphan. Two arms:
+          #
+          #   bare     home-manager enables the shell and declares nothing:
+          #            no home-manager file, its `availablePlugins` is `[ ]`,
+          #            and the system file still declares `demo` enabled.
+          #   declared home-manager declares a plugin of its own: it still
+          #            gets a file, holding that plugin and no bundled one.
+          #            That file shadows the system one, which is the
+          #            documented "declare in one module" rule, unchanged.
+          nixos-module-with-hm-keeps-etc-plugins =
+            let
+              nixosWithHm =
+                hmExtra:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    home-manager.nixosModules.home-manager
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                        plugins.demo = {
+                          package = stubPlugin;
+                          enable = true;
+                        };
+                      };
+                      users.users.alice.isNormalUser = true;
+                      home-manager.users.alice = {
+                        imports = [ hmExtra ];
+                        home.stateVersion = "24.11";
+                        programs.trollshell = {
+                          enable = true;
+                          package = stubPackage;
+                        };
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                  ];
+                }).config;
+              bare = nixosWithHm { };
+              declared = nixosWithHm {
+                programs.trollshell.plugins.hmonly = {
+                  package = stubPlugin;
+                  enable = true;
+                };
+              };
+              etc = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext bare.environment.etc."xdg/trollshell/plugins.json".text
+              );
+              hmFile =
+                cfg:
+                builtins.fromJSON (
+                  builtins.unsafeDiscardStringContext
+                    cfg.home-manager.users.alice.xdg.configFile."trollshell/plugins.json".text
+                );
+              probe =
+                assert !(bare.home-manager.users.alice.xdg.configFile ? "trollshell/plugins.json");
+                assert bare.home-manager.users.alice.programs.trollshell.availablePlugins == [ ];
+                assert etc.plugins.demo.enabled;
+                assert etc.plugins.demo._locked == [ "enabled" ];
+                assert etc.plugins ? timer;
+                assert builtins.attrNames (hmFile declared).plugins == [ "hmonly" ];
+                assert (hmFile declared).plugins.hmonly.enabled;
+                builtins.deepSeq {
+                  inherit etc;
+                  declared = hmFile declared;
+                } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-with-hm-keeps-etc-plugins-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
           # #1041: `programs.trollshell.config.core-leds` renders a base-layer
           # `core-leds.toml` spliced onto the trollshell unit's own
           # `XDG_CONFIG_DIRS` (`nix/hm-module.nix`'s `configBase` +

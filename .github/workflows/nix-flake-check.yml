@@ -400,7 +400,8 @@ jobs:
             .#checks.x86_64-linux.nixos-module-plugin-mount \
             .#checks.x86_64-linux.nixos-module-plugin-mount-conflict \
             .#checks.x86_64-linux.nixos-module-plugin-removed-1200 \
-            .#checks.x86_64-linux.nixos-module-plugins-available
+            .#checks.x86_64-linux.nixos-module-plugins-available \
+            .#checks.x86_64-linux.nixos-module-with-hm-keeps-etc-plugins
 
   # The required check. Branch protection and the merge poller read a check
   # run named exactly `flake-check` and require `completed/success`, so this

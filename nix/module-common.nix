@@ -987,6 +987,14 @@ in
         Everything per plugin — `enable`, `env`, `secrets`, `mount` — still
         goes under `plugins.<id>`, and a second instance of a bundled binary
         is its own `plugins.<other-id>` entry, with its own `package`.
+
+        **Under home-manager inside a NixOS configuration that enables
+        trollshell too**, this defaults to `[ ]` instead. The NixOS module's
+        `/etc/xdg/trollshell/plugins.json` already declares every bundled
+        plugin, and a home-manager file listing them again would shadow it
+        whole, silently dropping every plugin declared at the NixOS level.
+        So the home-manager side renders a file only for plugins declared
+        under its own `plugins`.
       '';
     };
 
@@ -1304,10 +1312,12 @@ in
         **Both modules at once.** The home-manager file
         (`~/.config/trollshell/plugins.json`) fully shadows the NixOS one
         (`/etc/xdg/trollshell/plugins.json`) — first existing file wins,
-        whole. Since `availablePlugins` makes either module render its file
-        whenever it is enabled, a machine that enables both should declare
-        its plugins in one of them and set `availablePlugins = [ ];` (and
-        declare no `plugins`) in the other.
+        whole. So home-manager's `availablePlugins` defaults to `[ ]` when
+        the NixOS module is enabled too: the system file keeps declaring
+        every bundled plugin, and home-manager renders a file only when its
+        own `plugins` declares something. Declare your plugins in one of the
+        two modules; a home-manager file, once it exists, replaces the
+        system one outright.
 
         **Running one bundled binary twice — `stats` (#1250) is the first,
         `clock-demo` (#1388) the smallest — needs two attribute sets that

@@ -269,9 +269,11 @@ in
       # `programs.trollshell.plugins` — set it wherever you actually run the
       # shell. Since #1400 `availablePlugins` declares every bundled plugin
       # by default, so an enabled module always has a plugin declared and
-      # always writes this file; a machine that also enables the
-      # home-manager module gets that one's file shadowing this one, whole
-      # (the `plugins` option description says how to pick).
+      # always writes this file. The home-manager module, run inside this
+      # one, defaults its own `availablePlugins` to `[ ]` for that reason, so
+      # it renders a file (which then shadows this one, whole) only for
+      # plugins a user declares there (the `plugins` option description says
+      # how to pick).
       #
       # There is no activation poke here, unlike home-manager's
       # ReloadPlugins call: system activation runs as root with no user bus

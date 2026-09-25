@@ -3224,14 +3224,15 @@ mod tests {
     }
 
     /// **What [`reconcile`] does with its outcome.** It is the
-    /// `ReloadPlugins` entry point, reads the real environment and the real
-    /// user manager, and nothing drives it, so its body is held by source on
+    /// `ReloadPlugins` entry point and reads the real environment. Its
+    /// `Unlisted` arm needs a failing listing, i.e. the real user manager, so
+    /// that half is held by source, on
     /// `launch_at_startup_spawns_the_supervised_watch`'s precedent: it runs
     /// the one-shot pass and raises [`RELOAD_UNLISTED`] when that pass could
-    /// not list. `a_reload_that_could_not_list_is_retried_next_tick` pins
-    /// what the watch does with the flag, and
-    /// `the_production_task_hands_reconcile_to_the_loop` that the production
-    /// task watches this flag.
+    /// not list. `a_reload_that_settled_raises_nothing` drives the other half,
+    /// `a_reload_that_could_not_list_is_retried_next_tick` pins what the watch
+    /// does with the flag, and `the_production_task_hands_reconcile_to_the_loop`
+    /// that the production task watches this flag.
     ///
     /// Red if the poke goes back to discarding its outcome, or raises some
     /// other flag.
@@ -3251,6 +3252,42 @@ mod tests {
         ] {
             assert!(body.contains(needle), "{needle} missing from:\n{body}");
         }
+    }
+
+    /// **A poke that settled raises nothing** (#1407 review, finding 2). The
+    /// driven half of `reconcile_hands_a_failed_listing_to_the_watch`:
+    /// [`reconcile`] itself, against an unparsable `plugins.json` under
+    /// [`scratch_home`], which is the one input it answers (`Settled`)
+    /// without reaching a user manager. `scratch_home`'s `temp_env` lock
+    /// serialises this against `the_production_task_hands_reconcile_to_the_loop`,
+    /// the one other test that touches [`RELOAD_UNLISTED`].
+    ///
+    /// Red if `reconcile()` raises the flag whatever its pass returned, or on
+    /// the wrong outcome (`!matches!(…, Outcome::Unlisted { .. })`). The
+    /// source scan's four needles are still all there in both.
+    #[test]
+    fn a_reload_that_settled_raises_nothing() {
+        scratch_home(|home| {
+            let path = home.join(".config").join(STATE_FILE_REL);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "{ this is not json").expect("write");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                assert!(
+                    load_declared().await.is_none(),
+                    "rail: the environment must resolve to the unparsable scratch file"
+                );
+                RELOAD_UNLISTED.store(false, Ordering::SeqCst);
+                reconcile().await;
+                assert!(
+                    !RELOAD_UNLISTED.load(Ordering::SeqCst),
+                    "a poke that settled owes the watch nothing"
+                );
+            });
+        });
     }
 
     /// Which callers launch blind when the listing fails: the one-shot ones,

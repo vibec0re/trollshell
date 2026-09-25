@@ -1917,16 +1917,18 @@ mod tests {
         );
     }
 
-    /// **The loop**: startup converges once, a quiet tick does nothing, a
-    /// store-shaped rewrite converges exactly once on the next tick, and the
-    /// tick after that does nothing again.
+    /// **The loop**: startup converges once, a store-shaped rewrite converges
+    /// exactly once one interval later, and the quiet ticks after that
+    /// converge nothing.
     ///
     /// Red if the loop's `converge().await` after a move is deleted (the
     /// second count never arrives), if the stamps stop updating on a move
-    /// (every later tick fires again), or if the stamp stops seeing a
-    /// same-length same-mtime rewrite.
+    /// (every later tick fires again), if the stamp stops seeing a
+    /// same-length same-mtime rewrite, or if the loop waits longer than one
+    /// `cadence` (the rewrite comes straight after startup, so a doubled
+    /// sleep has not woken by the first tick).
     #[tokio::test(start_paused = true)]
-    async fn a_rewrite_converges_exactly_once_and_a_quiet_tick_not_at_all() {
+    async fn a_rewrite_converges_exactly_once_one_interval_later() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("plugins.json");
         write_store_file(&path, SPEC_A);
@@ -1944,19 +1946,12 @@ mod tests {
             "startup's own converge, once"
         );
 
-        tick(TICK).await;
-        assert_eq!(
-            runs.load(Ordering::SeqCst),
-            1,
-            "nothing moved: the first observation is not a change"
-        );
-
         write_store_file(&path, SPEC_B);
         tick(TICK).await;
         assert_eq!(
             runs.load(Ordering::SeqCst),
             2,
-            "the rewrite converges on the next tick"
+            "the rewrite converges one interval later"
         );
 
         tick(TICK).await;
@@ -1965,6 +1960,36 @@ mod tests {
             runs.load(Ordering::SeqCst),
             2,
             "and only once: later quiet ticks converge nothing"
+        );
+        task.abort();
+    }
+
+    /// **No reconcile on the first observation**: with nothing changed,
+    /// startup's converge is the only one, however many ticks go by.
+    ///
+    /// Red if the baseline is not a real stamp of the files — e.g. every
+    /// path starting as "absent", which makes the first tick see each
+    /// existing file "appear" and reconcile a second time for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_observation_is_not_a_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            counting(runs.clone()),
+        ));
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "startup's converge covers the first observation"
         );
         task.abort();
     }

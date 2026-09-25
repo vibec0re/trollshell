@@ -500,7 +500,7 @@ pub(super) enum Role {
 /// The two halves are kept as **fields** rather than concatenated into one
 /// string so the repaint fan-out can ask a moved scope which plugin and which
 /// tree it belongs to, and nudge only the mailboxes that actually hold it — see
-/// [`advance_all`] and `pump::request_preem_repaint`. (The previous spelling
+/// `advance_all` and `pump::request_preem_repaint`. (The previous spelling
 /// joined them with `\u{1}` and justified it by claiming a plugin id cannot
 /// contain that byte; `session.rs` validates only that the id is non-empty, so
 /// the stated reason was wrong even though the scheme was injective. Fields
@@ -925,7 +925,7 @@ struct ScopeState {
     /// from `g_get_monotonic_time`, so clocks belonging to different monitors
     /// are directly comparable.
     ///
-    /// Deliberately **not** touched by [`advance_all`], which takes an explicit
+    /// Deliberately **not** touched by `advance_all`, which takes an explicit
     /// `dt` and exists for the tests.
     last_advance_us: Option<i64>,
 }
@@ -1022,13 +1022,13 @@ pub(super) enum Warned {
 
 impl Warned {
     /// This diagnostic's slot — its bit in [`WARNED`]'s per-scope mask, and its
-    /// index in [`WARN_COUNTS`].
+    /// index in `WARN_COUNTS`.
     ///
     /// One exhaustive match so a new variant is a compile error here rather than
     /// an aliased bit *and* an aliased counter. The mask is a `u8`, so it holds
     /// eight — and since #981 **all eight are spoken for**. A ninth diagnostic
     /// needs a wider integer here, in [`WARNED`]'s value type and in
-    /// [`WARN_COUNTS`]'s length; there is no free bit left to borrow.
+    /// `WARN_COUNTS`'s length; there is no free bit left to borrow.
     const fn slot(self) -> u32 {
         match self {
             Self::NoId => 0,
@@ -1130,11 +1130,11 @@ thread_local! {
 /// `shader_map::warn_once_grid_too_large` follows this exact contract shape
 /// (`if warn_once_grid_too_large(scope) { tracing::warn!(…) }`) for
 /// `shader_map::Refusal::GridTooLarge` specifically, entirely outside this
-/// function and outside [`WARN_COUNTS`]/[`WARN_COUNTS_BY_SCOPE`] — `Warned`
+/// function and outside `WARN_COUNTS`/`WARN_COUNTS_BY_SCOPE` — `Warned`
 /// was out of bits for a ninth diagnostic (#981; #1023 item 2). The test
 /// counters below therefore do not see that one refusal's line even though
 /// `Refusal::slot()` classifies it under [`Warned::ShaderCap`]; see
-/// [`warnings_for`]'s own doc (PR #1031 review L1).
+/// `warnings_for`'s own doc (PR #1031 review L1).
 pub(super) fn warn_once(scope: &Scope, what: Warned) -> bool {
     let bit = what.bit();
     let claimed = WARNED.with_borrow_mut(|warned| {
@@ -1654,7 +1654,7 @@ pub(super) fn nothing() -> Arc<[u8]> {
 /// This is the production advance path since #897, called from
 /// `pump::install_animation`'s tick callback with the mount's own
 /// `GdkFrameClock::frame_time` and the scopes that mount is currently showing.
-/// [`advance_all`] is its test-only sibling.
+/// `advance_all` is its test-only sibling.
 ///
 /// ## Where the `dt` comes from, and why it is not the caller's
 ///
@@ -1740,7 +1740,7 @@ pub(super) fn advance_all(dt: f32) -> Vec<Scope> {
 /// Advance one scope's instances by `dt`, dropping the cached frame of each one
 /// that moved; answers whether the scope as a whole needs a repaint.
 ///
-/// The shared body of [`advance_scopes`] and [`advance_all`], split out so the
+/// The shared body of [`advance_scopes`] and `advance_all`, split out so the
 /// production path and the test path cannot drift on what "moved" means — which
 /// is the property every parity assertion in `plugins::tests` reads through
 /// `advance_all` and every frame on glass reads through `advance_scopes`.

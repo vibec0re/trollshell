@@ -22,7 +22,7 @@ use hytte::gtk::gdk;
 const MANIFEST_FALLBACK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/trollshell");
 
 /// Pick the effective base directory across the three tiers. Split out as a
-/// pure function for the same reason [`crate::revision::resolve`] is: the
+/// pure function for the same reason `crate::revision::resolve` is: the
 /// runtime tier can't be driven from a test (the workspace forbids `unsafe`,
 /// so `std::env::set_var` is unavailable) and the compile-time tier is baked
 /// in before any test runs.

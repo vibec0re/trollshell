@@ -9,7 +9,8 @@
 //!
 //! # There is no marquee shader
 //!
-//! [`MARQUEE_PIPELINE`] *is* [`dot_matrix::DOT_MATRIX_PIPELINE`], by
+//! [`MARQUEE_PIPELINE`] *is*
+//! [`dot_matrix::DOT_MATRIX_PIPELINE`](super::dot_matrix::DOT_MATRIX_PIPELINE), by
 //! definition rather than by copy. A marquee is the **same dot hardware** — the
 //! kit says so in as many words (`hytte-preem/src/marquee.rs`: "The dot
 //! *hardware* is `dot_matrix`'s — same pitch, same bezel, same falloff

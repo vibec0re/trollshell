@@ -80,7 +80,7 @@ const TEXTBOX_FRAG: &str = include_str!("textbox.frag");
 /// Bit 7 of a strip texel: this cell is an uncovered char, so its set pixels
 /// take the `.notdef` color. Bits 0..=6 are the glyph's own rows, so 7 is the
 /// first one free. Mirrored in `textbox.frag` as `NOTDEF_BIT`, and
-/// [`tests::the_shader_and_the_mapping_agree_about_the_font_metrics`] reads it
+/// `tests::the_shader_and_the_mapping_agree_about_the_font_metrics` reads it
 /// back out of the GLSL.
 const NOTDEF_BIT: u32 = 7;
 

@@ -1,5 +1,6 @@
 //! The host half of #893's shader widget: the trust checks a
-//! [`wire::Node::Shader`] passes before it becomes a
+//! [`wire::Node::Shader`](hytte_plugin_proto::wire::Node::Shader) passes before
+//! it becomes a
 //! [`UiNode::Shader`](hytte::ui::Node::Shader), and the theme bag that reaches
 //! the shader as uniforms.
 //!
@@ -66,7 +67,8 @@ use super::preem_render::{self, Scope, Warned};
 /// `Copy`, so passing it down the recursion costs nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Grants {
-    /// [`Capability::Shader`] was declared, so [`wire::Node::Shader`] renders.
+    /// [`Capability::Shader`] was declared, so
+    /// [`wire::Node::Shader`](hytte_plugin_proto::wire::Node::Shader) renders.
     pub(super) shader: bool,
 }
 
@@ -98,7 +100,9 @@ impl Grants {
     }
 }
 
-/// A borrowed view of a [`wire::Node::Shader`]'s fields, so the checks below
+/// A borrowed view of a
+/// [`wire::Node::Shader`](hytte_plugin_proto::wire::Node::Shader)'s fields, so
+/// the checks below
 /// take one argument instead of ten.
 pub(super) struct ShaderNode<'a> {
     /// The node's reconciliation key, kept on the placeholder too.
@@ -243,7 +247,7 @@ impl Refusal {
     ///   #1023 item 2 only **four** of them (`SourceTooLarge`, `DataTooLarge`,
     ///   `MalformedData`, `EmptyGrid`) actually *claim* it in [`warn`]; see
     ///   the section below for the fifth. Splitting the four further would
-    ///   spend more of [`Warned`](super::preem_render::Warned)'s eight bits on
+    ///   spend more of [`Warned`]'s eight bits on
     ///   one node kind.
     /// - [`Warned::ShaderNoGpu`] — the session, i.e. a shell restart. Two
     ///   refusals, which cannot both fire in one run.
@@ -753,7 +757,7 @@ fn to_ui_format(format: ShaderData) -> ShaderFormat {
 ///   a widget that opted out of the accent draws with.
 /// - `u_accent` is the same ink **as the desktop accent tints it** (the default
 ///   path), which is what every un-pinned preem widget on screen is using. With
-///   no accent installed, or on a skin whose [`AccentPolicy`] declines to follow
+///   no accent installed, or on a skin whose `AccentPolicy` declines to follow
 ///   one, the two are equal — and that is the honest answer, not a bug.
 ///
 /// The three status roles are resolved off the live theme and then run through

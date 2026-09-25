@@ -51,7 +51,7 @@
 //! spare-slot clamp resolved by the kit rather than restated in GLSL. The only
 //! numbers this shader restates are the CRT pass's four fixed-point constants,
 //! which every shader on this seam restates and which
-//! [`program::assert_crt_constants`](super::program::assert_crt_constants)
+//! `program::assert_crt_constants`
 //! holds to the kit's own items.
 
 use std::sync::Arc;

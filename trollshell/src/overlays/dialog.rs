@@ -745,7 +745,7 @@ fn watch_focused_output(connector: &str) -> glib::JoinHandle<()> {
 ///
 /// A named predicate rather than a comparison inline in the handler so the rule
 /// is pinnable on its own — the handler below is reachable from a test (see
-/// [`gtk_tests`]), but only by emitting the signal, and a predicate that reads
+/// `gtk_tests`), but only by emitting the signal, and a predicate that reads
 /// as "`Esc` closes, every other key reaches the plugin's page" is worth being
 /// able to state.
 fn dismisses(key: gdk::Key) -> bool {

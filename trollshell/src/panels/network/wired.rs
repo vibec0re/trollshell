@@ -3,7 +3,7 @@
 //!
 //! Backed by [`wifi::wired_profiles`] (populated by the NM backend on the same
 //! refresh tick as the Wi-Fi state). The whole card hides when there are no
-//! saved ethernet profiles — see the visibility bind in [`super::mod`].
+//! saved ethernet profiles — see the visibility bind in [`super::panel_network`].
 
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self};

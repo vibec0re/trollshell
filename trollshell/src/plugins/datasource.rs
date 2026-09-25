@@ -5,7 +5,8 @@
 //! [`Effect::DatasourceQuery`](hytte_plugin_proto::Effect::DatasourceQuery); the
 //! host validates it, forwards it to the providing connection as
 //! [`HostMsg::DatasourceQuery`], receives the provider's
-//! [`Effect::DatasourceResult`], and routes the answer back to the requester as
+//! [`Effect::DatasourceResult`](hytte_plugin_proto::Effect::DatasourceResult),
+//! and routes the answer back to the requester as
 //! [`HostMsg::DatasourceResult`]. The host stays the single policy chokepoint —
 //! consistent with the capability enforcement (#436) and the audit log (#510)
 //! every effect already flows through.
@@ -23,7 +24,8 @@
 //! the provider must not see (or be able to collide on) another plugin's id-space,
 //! so the host mints an **opaque host correlation** for each in-flight query and
 //! forwards *that* to the provider. The provider echoes it in its
-//! [`Effect::DatasourceResult`]; the host maps it back to the parked requester +
+//! [`Effect::DatasourceResult`](hytte_plugin_proto::Effect::DatasourceResult);
+//! the host maps it back to the parked requester +
 //! original `request_id`. Provider and requester id-spaces never touch.
 
 use std::collections::{BTreeMap, HashMap};

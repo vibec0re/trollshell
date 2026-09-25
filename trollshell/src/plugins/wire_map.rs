@@ -1,6 +1,6 @@
 //! Wire ⇄ host mappings (mechanical, but exhaustive).
 //!
-//! Projects the GTK-free [`wire`](hytte_plugin_proto::wire) vocabulary onto the
+//! Projects the GTK-free [`wire`] vocabulary onto the
 //! reconciler's `hytte_ui` types (and back for events). Each mapping is written
 //! exhaustively so adding a variant to either side is a compile error here.
 

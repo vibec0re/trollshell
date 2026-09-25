@@ -6,7 +6,8 @@
 //! one-click **Allow**), the datasource status, the live sessions, and a
 //! recent-requests audit trail. The heavy lifting — the socket server, the grant
 //! store, the token TTL machine, the consent decisions — lives in the SDK-free
-//! [`hytte_plugin_infobroker`] library ([`broker::serve`]); this file is just the
+//! [`hytte_plugin_infobroker`] library
+//! ([`broker::serve`](hytte_plugin_infobroker::broker::serve)); this file is just the
 //! TEA shell that spawns it and paints its state.
 //!
 //! # Why a bar chip, not a sidebar card
@@ -18,7 +19,7 @@
 //!
 //! # The two host effects
 //!
-//! - [`Effect::OpenPage(Page::PluginSelf)`] — clicking the chip opens this
+//! - `Effect::OpenPage(Page::PluginSelf)` — clicking the chip opens this
 //!   plugin's own panel (cap [`Capability::OpenPage`]).
 //! - [`Effect::Notify`] — a denied auth/data knock raises one informational
 //!   toast so the human sees it (cap [`Capability::Notify`], #414). Interactive

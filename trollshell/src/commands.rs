@@ -68,7 +68,7 @@ pub fn install(app: &App) {
 }
 
 /// The `GActionEntry`s [`install`] registers, pulled into their own function
-/// so [`tests::every_verb_registers_as_a_named_action`] can build them
+/// so `tests::every_verb_registers_as_a_named_action` can build them
 /// against a plain `adw::Application` instead of the full `hytte_ui::App`
 /// lifecycle — `App` exposes no lightweight test constructor (it wraps a
 /// running `GApplication` plus the monitor-hotplug `Mutable`), and nothing

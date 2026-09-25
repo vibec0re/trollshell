@@ -30,7 +30,7 @@
 //! At 1:1 the shader snaps to the pixel centre and takes the *point* test,
 //! where each of the three residuals is a non-zero half-integer and the answer
 //! is exactly `stamp_bar`'s integer range test — see `seven_seg.frag`'s header,
-//! and [`tests::the_taper_law_is_the_kits_own_staircase`] for the one law this
+//! and `tests::the_taper_law_is_the_kits_own_staircase` for the one law this
 //! side copies rather than reads.
 //!
 //! # Why this pipeline has a blur pass where `led_strip`'s does not
@@ -56,9 +56,9 @@
 //! [`kit::seven_seg_layout`]'s own answer, encoded into the strip. The only
 //! numbers the shader restates are the CRT pass's four fixed-point constants —
 //! which every shader on this seam restates, and which
-//! [`program::assert_crt_constants`](super::program::assert_crt_constants)
+//! `program::assert_crt_constants`
 //! holds to the kit's own items — plus `TAPER_EDGE`, the continuous reading of
-//! the taper staircase, which [`tests::the_taper_law_is_the_kits_own_staircase`]
+//! the taper staircase, which `tests::the_taper_law_is_the_kits_own_staircase`
 //! holds to [`kit::seven_seg_taper`].
 //!
 //! # What the issue assumed and the kit does not have
@@ -152,7 +152,7 @@ pub(crate) const SEVEN_SEG_PIPELINE: GlPipeline = GlPipeline {
 /// `0..SEVEN_SEG_BARS.len()`, so the next one up is free, the way
 /// `textbox.rs`'s `NOTDEF_BIT` sits above the glyph rows. `seven_seg.frag`
 /// declares the same number as `COLON_BIT`, and
-/// [`tests::the_shader_and_the_mapping_agree_about_the_strip_encoding`] reads
+/// `tests::the_shader_and_the_mapping_agree_about_the_strip_encoding` reads
 /// it back out of the GLSL.
 const COLON_BIT: u8 = 7;
 

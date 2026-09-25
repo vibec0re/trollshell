@@ -92,9 +92,9 @@
 //! (#1148/#1154). The card metrics, the fixture tones and the emission's
 //! ceiling are the kit's constants, read by name. The only numbers restated
 //! anywhere on this side are `font`'s 5×7 glyph box (held to the kit by
-//! [`tests::the_shader_restates_only_the_fonts_glyph_box`]) and the CRT pass's
+//! `tests::the_shader_restates_only_the_fonts_glyph_box`) and the CRT pass's
 //! four fixed-point constants, which every shader on this seam restates and
-//! [`program::assert_crt_constants`](super::program::assert_crt_constants)
+//! `program::assert_crt_constants`
 //! holds to the kit's items.
 //!
 //! # The strip is rebuilt every mapping pass, and that is not #911's case
@@ -227,7 +227,7 @@ pub(crate) const FLIP_BOARD_PIPELINE: GlPipeline = GlPipeline {
 
 /// Texels per cell in the strip — `flip_board.frag` declares the same number as
 /// `CELL_TEXELS`, and
-/// [`tests::the_shader_and_the_mapping_agree_about_the_strip_encoding`] reads
+/// `tests::the_shader_and_the_mapping_agree_about_the_strip_encoding` reads
 /// it back out of the GLSL.
 const CELL_TEXELS: usize = 14;
 

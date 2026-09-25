@@ -2320,7 +2320,7 @@ fn manifest_id_at(path: &Path, id: &str) -> Option<String> {
 
 /// [`manifest_id_at`]'s pure half: `{"plugins": {"<id>": {"exec": "…"}}}` →
 /// the manifest id of that binary. Split out so a test can drive it without
-/// touching the filesystem, exactly as [`declared_mounts_from_json`] is.
+/// touching the filesystem, exactly as [`declared_from_json`] is.
 fn manifest_id_from_json(text: &str, id: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let exec = value.get("plugins")?.get(id)?.get("exec")?.as_str()?;

@@ -927,13 +927,19 @@ in
           secrets = lib.optionals (cb.mode == "api") [ "anthropic" ];
         };
 
-        # See petTimeoutSecs in the `let` above. Only asserted when a `pet` is
-        # declared in the same config — with no pet there is no client budget for
-        # nix to compare against, and asserting against the compiled 10s default
-        # would be a false positive for a bridge consumed by something else.
+        # See petTimeoutSecs in the `let` above. Only asserted when the pet in
+        # this config actually talks to this bridge (its PET_LLM_URL is
+        # `claudeBridge.baseUrl`). A pet pointed elsewhere (or at nothing) has
+        # no client budget in this relationship, and comparing against the
+        # compiled 10s default would be a false positive for a bridge consumed
+        # by something else. "Is a `pet` declared" stopped meaning that in
+        # #1400: `availablePlugins` declares `pet` on every config, so that
+        # guard fired on a bridge with a raised timeout and no pet at all
+        # (#1400 review, finding 2).
         assertions = [
           {
-            assertion = !(cfg.plugins ? pet) || cb.timeoutSeconds < petTimeoutSecs;
+            assertion =
+              (cfg.plugins.pet.env.PET_LLM_URL or null) != cb.baseUrl || cb.timeoutSeconds < petTimeoutSecs;
             message = ''
               programs.trollshell.claudeBridge.timeoutSeconds is
               ${toString cb.timeoutSeconds}, which is not strictly less than the

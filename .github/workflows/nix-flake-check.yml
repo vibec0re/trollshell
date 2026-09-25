@@ -376,6 +376,7 @@ jobs:
             .#checks.x86_64-linux.hm-module \
             .#checks.x86_64-linux.hm-module-agents-fixture \
             .#checks.x86_64-linux.hm-module-claude-bridge-api \
+            .#checks.x86_64-linux.hm-module-claude-bridge-without-pet \
             .#checks.x86_64-linux.hm-module-core-leds \
             .#checks.x86_64-linux.hm-module-core-leds-composes-with-xdg-systemdirs \
             .#checks.x86_64-linux.hm-module-places-fixture \

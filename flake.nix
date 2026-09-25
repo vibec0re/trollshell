@@ -853,10 +853,12 @@
                           enable = false;
                         };
                         # The client half of the bridge's timeout invariant
-                        # (#694): a declared `pet` is what switches that
-                        # assertion from vacuously true to a real comparison,
-                        # and PET_LLM_TIMEOUT_SECS is the string the module has
-                        # to parse the way the plugin does (#699/#711).
+                        # (#694): a `pet` whose PET_LLM_URL is the bridge's
+                        # `baseUrl` is what switches that assertion from
+                        # vacuously true to a real comparison (#1400 review,
+                        # finding 2), and PET_LLM_TIMEOUT_SECS is the string
+                        # the module has to parse the way the plugin does
+                        # (#699/#711).
                         pet = {
                           package = stubPlugin;
                           env = {
@@ -1120,6 +1122,50 @@
                 builtins.deepSeq { inherit pluginsState; } "ok";
             in
             pkgs.runCommand "trollshell-hm-module-claude-bridge-api-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #1400 review, finding 2: the bridge's timeout-ordering assertion
+          # (`nix/hm-module.nix`, #694) compares against the pet's budget only
+          # when that pet talks to this bridge. Its old guard was "a `pet` is
+          # declared", and `availablePlugins` declares `pet` on every config
+          # since #1400, so a bridge with `timeoutSeconds` raised past the
+          # compiled 10 s default and no pet anywhere failed
+          # `home-manager switch` with a message about a pet the user never
+          # configured. This fixture is that config. home-manager throws on a
+          # failed assertion when a config value is forced, so forcing the
+          # rendered `plugins.json` is the whole probe. The `hm-module`
+          # fixture above is the positive arm: its pet points at the bridge,
+          # so the comparison still runs there.
+          hm-module-claude-bridge-without-pet =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      claudeBridge = {
+                        enable = true;
+                        package = stubClaudeBridge;
+                        timeoutSeconds = 12;
+                      };
+                    };
+                  }
+                ];
+              };
+              probe = builtins.deepSeq hm.config.xdg.configFile."trollshell/plugins.json".text "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-claude-bridge-without-pet-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

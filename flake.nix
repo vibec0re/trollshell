@@ -758,55 +758,153 @@
           # already carries `--workspace --locked` (#572), so its own call
           # would run exactly `cargo doc --workspace --locked --no-deps`,
           # matching the `cargo doc --workspace --no-deps` in the issue and
-          # CLAUDE.md — but that alone never reaches the shell **binary**'s
-          # own modules: `trollshell/` carries both a `lib.rs` and a
-          # same-named `main.rs`, and `cargo doc` silently documents only the
-          # library when a package has both, so everything that lives only in
-          # `main.rs`'s tree (`plugin_launcher.rs` among it) went unchecked
-          # (#1403). The fix is a second invocation beside the first —
-          # `cargo rustdoc -p trollshell --bin trollshell -- --document-
-          # private-items`, the one the issue named and #1403 ran by hand to
-          # find and fix every warning it reported first (private items are
-          # the point there, since nothing in the binary is `pub` to anyone)
-          # — which `craneLib.cargoDoc` cannot host: `lib/cargoDoc.nix`
-          # hardcodes `buildPhaseCargoCommand` to its one `cargo doc` call and
-          # silently drops any override, the same reason `system-tests` above
-          # reaches for `mkCargoDerivation` directly instead of `cargoTest`.
-          # `cargo rustdoc` also refuses `--workspace` outright (it only ever
-          # checks one target), so unlike the first line the second names
-          # `-p trollshell --bin trollshell` directly rather than reading
-          # `cargoExtraArgs`. `RUSTDOCFLAGS="-D warnings"` is what turns a
-          # warning into a build failure for **either** command — `cargo doc`/
+          # CLAUDE.md — but `cargo doc` documents only a package's **lib**
+          # target, and only its `pub` items, so no private item anywhere in
+          # this workspace was ever rustdoc'd, and no module that lives only
+          # in a same-named **bin** target's own tree (`trollshell/src/
+          # main.rs`'s, `plugin_launcher.rs` among it) was reachable at all
+          # (#1403). Measuring `cargo rustdoc -p trollshell --bin trollshell
+          # -- --document-private-items` against `origin/main` gives 73
+          # warnings — 70 of them in modules `lib.rs` also compiles (missed
+          # only because the lib pass never turns on private items), and just
+          # 3 truly bin-only (`commands.rs:71`, `plugin_launcher.rs:150`,
+          # `:1477`) — #1403's own framing ("everything that lives only in
+          # `main.rs`'s tree went unchecked") named the smaller half; #1406's
+          # review measured the real one.
+          #
+          # `craneLib.cargoDoc` cannot host that second command: `lib/
+          # cargoDoc.nix` hardcodes `buildPhaseCargoCommand` to its one
+          # `cargo doc` call and silently drops any override, the same reason
+          # `system-tests` above reaches for `mkCargoDerivation` directly
+          # instead of `cargoTest`. `cargo rustdoc` also refuses `--workspace`
+          # outright (it only ever checks one target), so every per-package
+          # invocation below names `-p <pkg> --bin <pkg>` directly rather than
+          # reading `cargoExtraArgs`. `--document-private-items` is already
+          # what cargo passes a bin's own rustdoc invocation by default
+          # (`cargo rustdoc -v -p trollshell --bin trollshell` shows it on
+          # the `--crate-type bin` line with no flag at all) — spelled out
+          # anyway because it is the one thing this whole second command is
+          # *for*, and a reader should not have to know cargo's default to
+          # see that. `RUSTDOCFLAGS="-D warnings"` is what turns a warning
+          # into a build failure for **every** command here — `cargo doc`/
           # `cargo rustdoc` alone exit 0 on one — since it is one env var the
           # whole derivation shares, not a per-command flag.
+          #
+          # #1403 shipped checking only `trollshell` itself; #1406's review
+          # found the same gap open on four more packages — every package
+          # whose **bin** target shares its **lib** target's crate name is
+          # the exact condition `cargo doc` silently skips (rust-lang/
+          # cargo#6313's "output filename collision"), and that is not just
+          # `trollshell`. `same_name_bins` below asks `cargo metadata` for
+          # that condition directly rather than hand-listing the packages it
+          # is currently true for (`hytte-plugin-agents`, `hytte-plugin-
+          # stats`, `trollshell-agent-window` and `hytte-plugin-infobroker`,
+          # at the time of writing — `ls crates/hytte-plugin-*` rots, a nix
+          # attribute list would too), so a new package of this shape is
+          # covered the day it lands rather than the day someone remembers to
+          # add a line. Target names are normalized (hyphens to underscores)
+          # before comparing: a lib target's name is always its package name
+          # with hyphens replaced (crate identifiers cannot contain them), a
+          # bin target's keeps the package's own spelling, and `trollshell`'s
+          # own crate name happens to have no hyphens at all, which is why
+          # the original single-package line here never needed this step.
+          # The `grep -qx trollshell` guard is the "a static list needs a
+          # completeness check" rule turned around: rather than asserting a
+          # hand-kept list is complete, it asserts the *derivation* is —
+          # `trollshell` is the one package #1403 already proved belongs in
+          # this set, so its absence means the metadata/jq query broke, not
+          # that the workspace shrank.
+          #
+          # Every one of the four added packages writes into the exact same
+          # per-crate `target/doc/<crate>/` directory its own lib pass (in
+          # the workspace `cargo doc` above) already populated — the same
+          # collision `trollshell` has always had, just once per package
+          # instead of once. Left alone, each per-package `cargo rustdoc`
+          # call below would silently replace that package's lib pages with
+          # its bin pages, and the install phase would ship whichever ran
+          # last. Nothing in the tree **consumes** `$out/share/doc` (this
+          # check only builds it), so nothing was actually broken by that —
+          # but an earlier revision of this comment claimed "one move
+          # captures both invocations' output", which was not quite true (a
+          # #1406 review finding: the bin's pages really do replace the lib's
+          # for the one package that collides). The install phase below keeps
+          # both instead of asserting it doesn't need to: the workspace
+          # pass's output is copied aside into `workspace-doc/` before any
+          # bin pass can touch `target/doc`, and each bin pass's own
+          # `target/doc/<crate>/` subtree is copied into `bin-doc/<pkg>/`
+          # right after it runs, before the next package's pass reuses
+          # `target/doc` again. `installPhaseCommand` moves those two saved
+          # copies to `$out/share/doc` (every lib crate, `--no-deps` —
+          # unaffected by any of this) and `$out/share/doc-bins/<pkg>/
+          # <crate>/` (that one package's bin pages, private items included)
+          # rather than `lib/cargoDoc.nix`'s own single `mv`.
+          #
+          # This is not free: `-p <pkg>` resolves a narrower feature union
+          # than `--workspace` did (the #587 trap: `tokio` without `signal`,
+          # `glib` without `v2_68`/`v2_70`, `ureq` without `json`, for
+          # `-p trollshell` alone), so cargo re-checks a chunk of the
+          # dependency graph under every package's own feature set instead of
+          # reusing `cargoArtifacts` untouched — the PR that added the four
+          # extra packages measured and reported per-package numbers rather
+          # than fixing this here; `resolver.feature-unification =
+          # "workspace"` would, but this toolchain's cargo still answers
+          # `warning: ignoring resolver.feature-unification without
+          # -Zfeature-unification`. Affordable on this check's own runner, so
+          # left as a known, growing cost rather than a reason to check only
+          # one package.
           rustdoc = craneLib.mkCargoDerivation (
             trollshell.passthru.commonArgs
             // {
               pnameSuffix = "-doc";
               cargoArtifacts = trollshell.passthru.cargoArtifacts;
+              nativeBuildInputs = trollshell.passthru.commonArgs.nativeBuildInputs ++ [ pkgs.jq ];
               RUSTDOCFLAGS = "-D warnings";
               buildPhaseCargoCommand = ''
                 cargoWithProfile doc --workspace --locked --no-deps
-                cargoWithProfile rustdoc -p trollshell --locked --bin trollshell -- --document-private-items
+
+                docRoot="''${CARGO_TARGET_DIR:-target}/''${CARGO_BUILD_TARGET:-}/doc"
+                if ! [ -d "$docRoot" ]; then
+                  docRoot="''${CARGO_TARGET_DIR:-target}/doc"
+                fi
+                mkdir -p workspace-doc
+                cp -r "$docRoot"/. workspace-doc/
+
+                same_name_bins=$(cargo metadata --offline --no-deps --format-version 1 | jq -r '
+                  .packages[] as $p
+                  | ($p.targets | map(select(.kind | index("lib")) | .name | gsub("-"; "_"))) as $libs
+                  | ($p.targets | map(select(.kind | index("bin")) | .name | gsub("-"; "_"))) as $bins
+                  | select(any($libs[]; . as $l | $bins | index($l) != null))
+                  | $p.name
+                ')
+                if ! grep -qx trollshell <<< "$same_name_bins"; then
+                  echo "checks.rustdoc: same-name-bin derivation did not include trollshell (cargo metadata/jq query broken)" >&2
+                  exit 1
+                fi
+
+                mkdir -p bin-doc
+                for pkg in $same_name_bins; do
+                  cargoWithProfile rustdoc -p "$pkg" --locked --bin "$pkg" -- --document-private-items
+                  crate="$(printf '%s' "$pkg" | tr '-' '_')"
+                  mkdir -p "bin-doc/$pkg"
+                  cp -r "$docRoot/$crate" "bin-doc/$pkg/$crate"
+                done
               '';
               # Leaf/terminal check: nothing consumes its target dir (this
               # already matches `cargoDoc`'s own default, spelled out here
               # for the same reason `workspace-tests` above does).
               doInstallCargoArtifacts = false;
-              # `lib/cargoDoc.nix`'s own install phase, inlined verbatim
-              # (`mkCargoDerivation`'s bare default is `mkdir -p $out`, which
-              # installs nothing): cargo always places docs at the target
-              # dir's root regardless of profile except when cross-compiling,
-              # and both `cargo doc` and `cargo rustdoc` above write into that
-              # same `target/doc`, so one move captures both invocations'
-              # output.
+              # See the long comment above `rustdoc` for why this installs
+              # two trees rather than `lib/cargoDoc.nix`'s single `mv`:
+              # `$out/share/doc` is the workspace pass's own output (every
+              # lib crate, `--no-deps`), saved aside before any bin pass
+              # could overwrite it; `$out/share/doc-bins/<pkg>/<crate>/` is
+              # that one package's bin-only pages, saved right after its own
+              # `cargo rustdoc` call and before the next package's call
+              # reuses `target/doc`.
               installPhaseCommand = ''
-                docInstallRoot="''${CARGO_TARGET_DIR:-target}/''${CARGO_BUILD_TARGET:-}/doc"
-                if ! [ -d "''${docInstallRoot}" ]; then
-                  docInstallRoot="''${CARGO_TARGET_DIR:-target}/doc"
-                fi
                 mkdir -p $out/share
-                mv "''${docInstallRoot}" $out/share
+                mv workspace-doc $out/share/doc
+                mv bin-doc $out/share/doc-bins
               '';
             }
           );

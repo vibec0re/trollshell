@@ -1594,7 +1594,7 @@ fn build_disk_mount_row(m: &sensors::DiskMount) -> gtk::ListBoxRow {
 
 /// Disk I/O throughput history row, mirroring the network traffic row
 /// (`crate::panels::network::traffic`): a full-width auto-scaling
-/// `Sparkline` of the aggregate `read + write` rate, a `↓ read ↑ write`
+/// [`Sparkline`](hytte::ui::Sparkline) of the aggregate `read + write` rate, a `↓ read ↑ write`
 /// current-rate line, a `min … · max …` line over the graph window, and a
 /// `total ↓ … ↑ …` cumulative-since-boot line.
 ///

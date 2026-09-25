@@ -248,14 +248,26 @@ inline in `flake.nix` as one-liners.
   instead, an explicit `[`name`](Self::name)`-style path, a `mod@`/disambiguated
   path, or dropping the markdown link syntax to plain code when nothing public
   is a legitimate target — never with `#[allow]` or `#[doc(hidden)]`. Since
-  #1403 it also runs
-  `cargo rustdoc -p trollshell --bin trollshell -- --document-private-items`
-  beside the workspace call, sharing the same `cargoArtifacts`, because a
-  package's binary is silently skipped by `cargo doc` when the package also
-  has a same-named library, and every module that lives only in
-  `trollshell/src/main.rs`'s tree (`plugin_launcher.rs` among them) went
-  unchecked until then. Run it by hand from the devShell with
-  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+  #1403 it also runs `cargo rustdoc -p <pkg> --bin <pkg> -- --document-private-items`
+  beside the workspace call, sharing the same `cargoArtifacts`, for every
+  package whose bin target shares its lib target's crate name — the exact
+  condition under which `cargo doc` silently skips a binary, and not just
+  `trollshell`'s (`hytte-plugin-agents`, `hytte-plugin-stats`,
+  `trollshell-agent-window` and `hytte-plugin-infobroker` too, as of #1406 —
+  derived from `cargo metadata` at build time rather than hand-listed, see
+  `flake.nix`). `cargo doc` documents only a package's lib target, and only
+  its `pub` items, so no
+  private item anywhere in the workspace and no module that lives only in
+  one of those packages' bin-only tree (`plugin_launcher.rs` among them) was
+  ever rustdoc'd until then — measured at 73 warnings on `origin/main`'s
+  `trollshell` alone, only 3 of them truly bin-only (`commands.rs:71`,
+  `plugin_launcher.rs:150`, `:1477`); the other 70 were private items in
+  modules `lib.rs` also compiles, which #1403's own framing ("everything
+  that lives only in `main.rs`'s tree went unchecked") did not name. Run it
+  by hand from the devShell with
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps && for pkg in trollshell hytte-plugin-agents hytte-plugin-stats trollshell-agent-window hytte-plugin-infobroker; do RUSTDOCFLAGS="-D warnings" cargo rustdoc -p "$pkg" --bin "$pkg" -- --document-private-items; done`
+  — that package list is `checks.rustdoc`'s own derived set as of #1406, not
+  a second hand-kept copy of it.
 - Since #1036, the `system-tests` check's closure carries `mesa` (llvmpipe) and
   its `preCheck` exports the software-GL env plus `TROLLSHELL_REQUIRE_GL=1`,
   so the three GL-context tests in `hytte-ui` (`gl_surface.rs`) actually run

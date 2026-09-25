@@ -255,10 +255,12 @@ protocol.
 
 What belongs here is the mount: like `stats` and `claude-bridge`, it renders by
 mount **family** (`Mount::is_bar`) rather than by a flag of its own. Its
-manifest default (`Mount::SidebarTop`) draws the reference **sidebar card** — a
-label plus a button that opens the power menu — and a bar mount
-(`plugins.<id>.mount = "BarCenter"`) draws the compact `HH:MM` seven-segment
-**bar chip** whose click opens the plugin's own drawer page. Running both at
+manifest default (`Mount::SidebarTop`) draws the reference **sidebar card** —
+since #1408 a preem clock: a split-flap `HH:MM`, a dot-matrix date line and a
+seconds sweep, the whole card one button that opens the plugin's own page in
+the centered dialog — and a bar mount (`plugins.<id>.mount = "BarCenter"`)
+draws the compact `HH:MM` seven-segment **bar chip** whose click opens the same
+page in the drawer. Running both at
 once is two `programs.trollshell.plugins` entries pointing at the same package,
 the second under its own attribute name (which supplies `HYTTE_PLUGIN_ID`
 automatically, #1284):

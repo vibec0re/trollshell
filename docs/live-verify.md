@@ -3817,6 +3817,48 @@ session.
      `arm_for` exists for and the one that would be worth the most if it ever
      broke.
 
+### The clock demo's sidebar card (#1408)
+
+The reference plugin's card became a preem clock: a split-flap `HH:MM`
+(`FlipBoard`), a dot-matrix date line (`DotMatrix`) and a seconds sweep
+(`LedStrip`), inside one flat button. The tests pin the tree, the readings, the
+ids and both wire shapes; the four items below are the ones only glass answers.
+Enable it first — it is declared but off by default since #1400
+(`programs.trollshell.plugins.clock-demo.enable = true;`, or its switch in the
+control-center's Plugins tab).
+
+- [ ] **(#1408)** **The card renders.** The left sidebar's top slot shows three
+      rows in the VFD skin, every one spanning the card's width (sidebar preem
+      widgets are height-for-width, #1387): the five-card board reading the
+      current `HH:MM`, a date line like `FRI 25 SEP`, and a 20-segment LED strip.
+      No "Power menu" button, nothing blank, no broken-widget placeholder, and
+      `journalctl --user -u trollshell | grep -i 'does not advertise'` finds
+      nothing for `clock-demo` (the rows went out as `Node::Preem`).
+- [ ] **(#1408)** **The minute flip animates.** Watch the board across a minute
+      boundary: the digit that changes **folds** — its upper card falls over
+      the lower one — rather than swapping, and on a multi-digit change
+      (`09:59` → `10:00`) the cards ripple left to right. It lands within about
+      half a second. In between, the board must stay perfectly still: the
+      plugin re-states the same face every second and that must not re-flip a
+      card.
+- [ ] **(#1408)** **The date and the seconds are right.** The date line matches
+      `date +'%a %d %b' | tr a-z A-Z`. The sweep lights one more segment every
+      three seconds against `date +%S` (one segment at `:00`–`:02`, all twenty
+      at `:57`–`:59`) and drops back to one **as the board flips the minute**.
+      A second read twice or skipped now and then is expected (the host's 1 s
+      timer is not aligned to the wall-clock second); a sweep that lags the
+      board by a whole segment is not. If a session is up across local
+      midnight: the date line changes at `00:00` together with the board — not
+      at UTC midnight, which is what a date read off `unix` would do.
+- [ ] **(#1408)** **A click opens the dialog.** Click anywhere on the card —
+      the board, the date, the sweep, or the padding between them (hover lights
+      the whole card as one flat button). A centered dialog opens on the
+      focused output (#1010), its header reading `clock-demo`, showing the
+      RFC3339 timestamp and `unix: …`. The power menu must **not** open. With a
+      bar instance also running (`mount = "BarCenter"`, see
+      `docs/plugin-env.md`), its chip is unchanged and its click opens the
+      **same** page, in the drawer.
+
 ## Bar chip geometry (#1387)
 
 - [ ] **(#1387)** A preem surface in a **bar** reserves the width it draws, not

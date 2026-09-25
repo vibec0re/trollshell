@@ -67,8 +67,9 @@ same-user socket `$XDG_RUNTIME_DIR/trollshell/plugin.sock`. trollshell is the
 host: it renders the plugin's declarative widget tree, brokers its effects,
 and pushes back a subscribed subset of shell state. `hytte-plugin-clock-demo`
 is the **reference plugin** for the "frontend B" plugin architecture (#35): it
-mounts a clock in the sidebar's top slot and opens the power menu when its
-button is clicked. Since #1388 it is also the smallest **two-instance** demo —
+mounts a clock in the sidebar's top slot (since #1408 a preem clock: split-flap
+`HH:MM`, dot-matrix date, seconds sweep) and opens its own page when the card
+is clicked. Since #1388 it is also the smallest **two-instance** demo —
 the same binary renders a bar chip instead when the launch mounts it in a bar
 region (`mount = "BarCenter"`), which is a second `plugins.<id>` entry pointing
 at the same package, not a second binary.

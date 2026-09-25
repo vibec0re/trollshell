@@ -160,25 +160,26 @@
 //! and a raw unix count are text, not a retro readout, and the contrast is the
 //! point — the seam is opt-in per widget, not a mode the plugin enters.
 //!
-//! ## What the raster arm costs, stated (#898 review R5)
+//! ## What a snapshot costs, stated (#898 review R5, corrected by #1409's)
 //!
-//! Against a shell that does not speak preem, a **bar** instance's `view()`
-//! rasterises a 188×70 frame — 52,640 bytes — on **every** `Clock` snapshot,
-//! i.e. about once a second, while the `HH:MM` it draws changes once a minute.
-//! The runtime's render dedup then throws 59 of every 60 away, after the
-//! allocation, the rasterise and a 52 KB compare. That is not new (`timer` has
-//! always cost exactly this for its bar readout) and it is not a bug, but it is
-//! the honest price of a pixel chip on a 1 Hz cadence. It is left as it stands
-//! deliberately: a cache keyed on [`clock_face`] would need interior mutability
-//! in `view(&self)` and would make the reference plugin less readable than the
-//! thing it references. In state mode the same chip is a ~40-byte node.
+//! **Every snapshot puts a frame on the wire, on both surfaces.** The runtime
+//! dedups on the whole `View`, tree and page together, and both surfaces
+//! publish the page, whose first label is the host's timestamp — seconds and
+//! nanoseconds included — so the view differs every second even while the
+//! `HH:MM` holds. Measured over 120 one-second ticks (#1409 review), 120 of 120
+//! frames went out on each surface in each mode:
 //!
-//! Since #1408 a **sidebar** instance pays the same kind of price: its card
-//! rasterises three buffers (the sizes above, 121,680 bytes together) per
-//! snapshot, where it used to be labels. In state mode it is three small nodes,
-//! and nothing on the card changes more often than the sweep's three seconds —
-//! the frame a snapshot still produces every second is the page's timestamp
-//! label, as it always was for the card's own label.
+//! | | preem host (state) | old host (raster) |
+//! |---|---|---|
+//! | chip | 509 B | 53 KB (the 188×70 readout) |
+//! | card | 785 B | ~122 KB (the three buffers above) |
+//!
+//! So against a shell that does not speak preem, each surface re-sends its
+//! rasterised pixels about once a second. That is the honest price of a pixel
+//! surface beside a per-second page, and it is left as it stands on purpose:
+//! the shipped shell speaks preem, and a cache keyed on the reading would need
+//! interior mutability in `view(&self)`, making the reference plugin less
+//! readable than the thing it references.
 
 use hytte_plugin::display::{DotMatrix, FlipBoard, LedStrip, Mechanism, SevenSeg, StyleName};
 use hytte_plugin::proto::{

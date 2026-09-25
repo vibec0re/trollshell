@@ -487,9 +487,6 @@ pub struct AgentStatusRow {
     /// The turn loop is parked (the harness pause marker is present).
     #[serde(default)]
     pub paused: bool,
-    /// Parent in the topology tree. `None` marks a root-level agent.
-    #[serde(default)]
-    pub parent: Option<String>,
     /// First 12 chars of the sha the meta flake has locked for this agent.
     #[serde(default)]
     pub deployed_sha: Option<String>,

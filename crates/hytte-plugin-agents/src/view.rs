@@ -1861,7 +1861,6 @@ mod tests {
                 name: "argus".to_owned(),
                 running: true,
                 needs_login: true,
-                parent: Some("bosun".to_owned()),
                 deployed_sha: Some("1bfaf24abcde".to_owned()),
                 url: Some("https://hive.local/agent/argus/".to_owned()),
                 ..AgentStatusRow::default()

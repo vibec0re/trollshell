@@ -193,10 +193,6 @@ impl Facts {
                 value: opt(row.and_then(|r| r.deployed_sha.as_ref())),
             },
             Fact {
-                label: "Parent",
-                value: opt(row.and_then(|r| r.parent.as_ref())),
-            },
-            Fact {
                 label: "Agent page",
                 value: state
                     .agent()

@@ -1159,10 +1159,10 @@ opens what it claims.
       one default Annika may veto — if the flat list wants the card's project
       headers after all, that is a finding, not a bug.
 - [ ] **(#947 P4)** **Every reported fact is the hive's.** Pick an agent and
-      diff the six rows (Status / Status set / Model / Parent / Deployed /
-      Project) against `hivectl`'s own answer for it. `Status set` must lead
-      with the **raw** RFC 3339 timestamp and trail a relative age; `Model`
-      must be the full id, not the card's shortened family word.
+      diff the five rows (Status / Status set / Model / Deployed / Project)
+      against `hivectl`'s own answer for it. `Status set` must lead with the
+      **raw** RFC 3339 timestamp and trail a relative age; `Model` must be the
+      full id, not the card's shortened family word.
 - [ ] **(#947 P4)** **The five flags are the raw flags.** Find (or make) an
       agent that is both `running` and `failed` and confirm the tab shows
       **both** as `yes` — the sidebar card collapses that to one word by

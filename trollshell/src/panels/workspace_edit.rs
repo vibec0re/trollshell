@@ -140,7 +140,7 @@ const FIELD_COLUMN_WIDTH: i32 = 240;
 /// `modal::apply_workspace_edit_width_cap`). This cap is still right, and still
 /// load-bearing once the floor exists: without it the note balloons the fields
 /// column the moment you edit a running stack. Both cases are asserted in
-/// [`tests::the_app_list_keeps_most_of_the_width_stopped_or_running`].
+/// `tests::the_app_list_keeps_most_of_the_width_stopped_or_running`.
 ///
 /// 28 characters is about [`FIELD_COLUMN_WIDTH`] at the form's font, so the
 /// column's natural width comes out at its own 240-px request rather than above
@@ -1198,7 +1198,7 @@ enum RowVisual {
     /// click does nothing.
     Lit,
     /// No window (yet), and the stack has a workspace to start it into.
-    /// [`crate::panels::workspaces::APP_IDLE_CLASS`], tooltip "Start <app>" —
+    /// [`crate::panels::workspaces::APP_IDLE_CLASS`], tooltip "Start `<app>`" —
     /// a click starts it.
     Dim,
     /// Either this row's own click started it and
@@ -1356,7 +1356,7 @@ fn live_workspace_id(workspaces: &[Workspace], name: &str) -> Option<u64> {
 /// scoped to one row.
 ///
 /// Returns the `Cell` the click handler reads to decide whether a click does
-/// anything ([`row_click_starts`]) — [`bind`]'s apply-loop is the only place
+/// anything ([`row_click_starts`]) — [`bind()`]'s apply-loop is the only place
 /// the latest value is known synchronously, so this is where it is stashed.
 fn bind_row_icon<S>(
     button: &gtk::Button,

@@ -493,7 +493,8 @@ impl Animator {
     /// bookkeeping: a tick that finds nothing left to animate clears
     /// [`armed`](Self::armed) on its way to telling the caller to `Break`.
     ///
-    /// Separate from the closure in [`ensure_armed`] so `gtk_tests` can drive
+    /// Separate from the closure in [`ensure_armed`](Self::ensure_armed) so
+    /// `gtk_tests` can drive
     /// the real driver — its scopes, its arm flag, its break edge — at chosen
     /// frame times, instead of waiting on a real frame clock to fire inside a
     /// `#[gtk::test]`.

@@ -348,7 +348,7 @@ pub(crate) fn arm_for(program: GlProgram) -> Arm {
 ///
 /// **What the suite pins of that is the record being a set**, not the early
 /// return (PR #1243 review, LOW 2, measured both ways):
-/// [`tests::a_refused_pipeline_takes_only_its_own_kinds_arm`] reds if the
+/// `tests::a_refused_pipeline_takes_only_its_own_kinds_arm` reds if the
 /// `contains` check below is dropped so [`REFUSED`] grows an entry per
 /// surface, and stays **green** if `if !first { return; }` is deleted
 /// outright. That is honest rather than a gap to close: with the program
@@ -359,7 +359,7 @@ pub(crate) fn arm_for(program: GlProgram) -> Arm {
 /// NEW LOW B — pinned instead at the shared callee,
 /// `pump::request_preem_repaint_all_when_live`). The journal line **is**
 /// observable, and is pinned right here:
-/// [`tests::one_journal_line_per_program`] reds (`left: 2, right: 1`) if the
+/// `tests::one_journal_line_per_program` reds (`left: 2, right: 1`) if the
 /// same `contains` check is dropped. It is kept because a bar with four chips
 /// of one kind would otherwise write four identical lines about one driver
 /// refusal.

@@ -189,7 +189,7 @@
 //!
 //! ## Secret injection (#392)
 //!
-//! [`launch`] takes `extra_env`. That is the hook #392 (AI API-key management)
+//! [`launch()`] takes `extra_env`. That is the hook #392 (AI API-key management)
 //! rides on: [`resolve_secret_env`] reads each slot in [`PluginSpec::secrets`]
 //! from the login keyring (via [`crate::secrets`]) and maps it to its injected
 //! `(<SLOT>_API_KEY, value)` pair; every `launch` call site builds `extra_env`
@@ -1749,7 +1749,7 @@ fn merge_declared(
 }
 
 /// Start plugin `id` now: a declared plugin is (re)launched as a transient
-/// unit ([`launch`] — `--collect` already released any failed previous run);
+/// unit ([`launch()`] — `--collect` already released any failed previous run);
 /// an undeclared id falls back to `StartUnit` for a legacy static unit.
 ///
 /// Takes [`CONVERGE_LOCK`] so a human clicking Start cannot land inside a
@@ -3395,7 +3395,7 @@ mod tests {
         )
     }
 
-    /// The argv of the invocation [`launch`] would actually run, read back off
+    /// The argv of the invocation [`launch()`] would actually run, read back off
     /// the built `Command`. Replaces the old habit of pinning the pure argv
     /// builder: same assertions, but on the command that really runs rather than
     /// on a function a second launch path could sidestep.

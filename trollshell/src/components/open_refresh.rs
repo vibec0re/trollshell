@@ -29,7 +29,7 @@ use crate::overlays::sidebar;
 /// Call `refresh` on each rising edge of `monitor`'s sidebar-open state
 /// (closed → open), for as long as `anchor` is alive.
 ///
-/// The subscription's lifetime is tied to `anchor` via [`bind`], so a widget
+/// The subscription's lifetime is tied to `anchor` via [`bind()`], so a widget
 /// rebuilt on monitor hot-plug drops its old subscription instead of leaking it
 /// (#439). Edge-triggered via a `Cell` so the initial `false` replay from
 /// `signal()` doesn't fire a `refresh` against a still-closed sidebar.

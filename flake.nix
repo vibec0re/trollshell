@@ -755,20 +755,59 @@
           # `craneLib.cargoDoc` defaults `cargoDocExtraArgs` to `--no-deps`
           # (only this workspace's own docs, not every dependency's) and
           # `cargoExtraArgs` to `--locked`; `commonArgs.cargoExtraArgs`
-          # already carries `--workspace --locked` (#572), so this call runs
-          # exactly `cargo doc --workspace --locked --no-deps`, matching the
-          # `cargo doc --workspace --no-deps` in the issue and CLAUDE.md.
-          # `RUSTDOCFLAGS="-D warnings"` is what turns a warning into a build
-          # failure — `cargo doc` alone exits 0 on one.
-          rustdoc = craneLib.cargoDoc (
+          # already carries `--workspace --locked` (#572), so its own call
+          # would run exactly `cargo doc --workspace --locked --no-deps`,
+          # matching the `cargo doc --workspace --no-deps` in the issue and
+          # CLAUDE.md — but that alone never reaches the shell **binary**'s
+          # own modules: `trollshell/` carries both a `lib.rs` and a
+          # same-named `main.rs`, and `cargo doc` silently documents only the
+          # library when a package has both, so everything that lives only in
+          # `main.rs`'s tree (`plugin_launcher.rs` among it) went unchecked
+          # (#1403). The fix is a second invocation beside the first —
+          # `cargo rustdoc -p trollshell --bin trollshell -- --document-
+          # private-items`, the one the issue named and #1403 ran by hand to
+          # find and fix every warning it reported first (private items are
+          # the point there, since nothing in the binary is `pub` to anyone)
+          # — which `craneLib.cargoDoc` cannot host: `lib/cargoDoc.nix`
+          # hardcodes `buildPhaseCargoCommand` to its one `cargo doc` call and
+          # silently drops any override, the same reason `system-tests` above
+          # reaches for `mkCargoDerivation` directly instead of `cargoTest`.
+          # `cargo rustdoc` also refuses `--workspace` outright (it only ever
+          # checks one target), so unlike the first line the second names
+          # `-p trollshell --bin trollshell` directly rather than reading
+          # `cargoExtraArgs`. `RUSTDOCFLAGS="-D warnings"` is what turns a
+          # warning into a build failure for **either** command — `cargo doc`/
+          # `cargo rustdoc` alone exit 0 on one — since it is one env var the
+          # whole derivation shares, not a per-command flag.
+          rustdoc = craneLib.mkCargoDerivation (
             trollshell.passthru.commonArgs
             // {
+              pnameSuffix = "-doc";
               cargoArtifacts = trollshell.passthru.cargoArtifacts;
               RUSTDOCFLAGS = "-D warnings";
+              buildPhaseCargoCommand = ''
+                cargoWithProfile doc --workspace --locked --no-deps
+                cargoWithProfile rustdoc -p trollshell --locked --bin trollshell -- --document-private-items
+              '';
               # Leaf/terminal check: nothing consumes its target dir (this
               # already matches `cargoDoc`'s own default, spelled out here
               # for the same reason `workspace-tests` above does).
               doInstallCargoArtifacts = false;
+              # `lib/cargoDoc.nix`'s own install phase, inlined verbatim
+              # (`mkCargoDerivation`'s bare default is `mkdir -p $out`, which
+              # installs nothing): cargo always places docs at the target
+              # dir's root regardless of profile except when cross-compiling,
+              # and both `cargo doc` and `cargo rustdoc` above write into that
+              # same `target/doc`, so one move captures both invocations'
+              # output.
+              installPhaseCommand = ''
+                docInstallRoot="''${CARGO_TARGET_DIR:-target}/''${CARGO_BUILD_TARGET:-}/doc"
+                if ! [ -d "''${docInstallRoot}" ]; then
+                  docInstallRoot="''${CARGO_TARGET_DIR:-target}/doc"
+                fi
+                mkdir -p $out/share
+                mv "''${docInstallRoot}" $out/share
+              '';
             }
           );
 

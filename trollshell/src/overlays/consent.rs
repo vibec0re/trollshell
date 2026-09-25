@@ -164,7 +164,7 @@ pub(crate) const fn card(choices: ConsentChoices) -> &'static [Choice] {
 /// Now `on_silence` is computed **once** from [`ConsentChoices::unanswered`] and
 /// the three sites read this field. `request`'s body consequently names no
 /// [`ConsentDecision`] variant at all, which
-/// [`request_never_names_a_decision_of_its_own`] asserts over this file's own
+/// `request_never_names_a_decision_of_its_own` asserts over this file's own
 /// source — crude, on the `nix/lint-bind-pins.py` precedent, and the only thing
 /// that reaches the two sites living inside the widget half.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

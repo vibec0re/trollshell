@@ -296,7 +296,7 @@ fn control_center_row() -> adw::ActionRow {
 
 /// [`control_center_row`]'s testable half: everything after the route is
 /// already known, over an injected [`Route`] — the seam
-/// [`tests::the_control_center_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing`]
+/// `tests::the_control_center_row_is_insensitive_with_a_subtitle_only_when_the_route_is_missing`
 /// uses. Delegates to [`build_control_center_row_with`] with the real
 /// [`crate::modal::dismiss_all`] as the "close the drawer" side effect;
 /// production never calls the `_with` form directly.
@@ -305,7 +305,7 @@ fn build_control_center_row(route: Route) -> adw::ActionRow {
 }
 
 /// [`build_control_center_row`] with the drawer-dismiss side effect also
-/// injected, so [`tests::activating_the_row_dismisses_the_drawer`] can observe
+/// injected, so `tests::activating_the_row_dismisses_the_drawer` can observe
 /// it fired without a live `modal` panel (`modal`'s panel set is a private
 /// thread-local `gtk::Window` registry that a bare test thread never
 /// populates — see `tests/modal_deeplink.rs`'s module doc for the same

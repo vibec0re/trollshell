@@ -921,7 +921,7 @@ const CORE_PANEL_MAX_H: usize = 104;
 /// Whole factors only, because `PixelSurface` paints nearest-neighbour: a
 /// fractional blow-up would duplicate some lamp rows and not others, and the
 /// panel would shimmer as the core count changed. Across the shapes
-/// [`core_led_matrix`] produces it keeps every machine's panel a comparable
+/// [`core_led_matrix_for`] produces it keeps every machine's panel a comparable
 /// on-glass size rather than letting a 4-core box render a postage stamp next
 /// to a 64-core box's full panel — with the #857 rectangle default the widths
 /// land in a 96–279 px band (1 core → 96, 4 → 245, 8 → 147, 16 → 279, 32 →
@@ -1211,7 +1211,7 @@ where
 /// `WeakRef` contract (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven
 /// with a synthetic signal in tests, the same extraction #772 made for its
 /// four sites. The builder reads `sensors::cpu()` and
-/// [`core_leds::signal`](crate::config::core_leds::signal) inline, both of
+/// [`core_leds::signal`] inline, both of
 /// which `.expect()` without a registered `Registry` (#831). This is the
 /// successor of #831's `cores_row` site in this file: #857 replaced the
 /// `gtk::FlowBox` of per-core `ProgressBar`s with the LED panel, carrying the
@@ -1593,8 +1593,8 @@ fn build_disk_mount_row(m: &sensors::DiskMount) -> gtk::ListBoxRow {
 }
 
 /// Disk I/O throughput history row, mirroring the network traffic row
-/// ([`crate::panels::network::traffic`]): a full-width auto-scaling
-/// [`Sparkline`] of the aggregate `read + write` rate, a `↓ read ↑ write`
+/// (`crate::panels::network::traffic`): a full-width auto-scaling
+/// `Sparkline` of the aggregate `read + write` rate, a `↓ read ↑ write`
 /// current-rate line, a `min … · max …` line over the graph window, and a
 /// `total ↓ … ↑ …` cumulative-since-boot line.
 ///

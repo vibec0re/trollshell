@@ -1724,7 +1724,7 @@ pub(super) fn launch_argv(
 }
 
 /// The environment variables a detached launch forwards from the shell's own
-/// process when it has them (#953 L5) — see [`launch_argv`] for why the user
+/// process when it has them (#953 L5) — see `launch_argv` for why the user
 /// manager's import is not enough on its own.
 pub(super) const FORWARDED_ENV: [&str; 4] = [
     "WAYLAND_DISPLAY",

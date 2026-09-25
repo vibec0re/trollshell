@@ -364,9 +364,9 @@ pub(super) type EffectWarnLatch = HashSet<std::mem::Discriminant<Effect>>;
 ///
 /// Single-line fields (a title, a summary, an icon name, the consent card's
 /// agent/datasource/scope) take
-/// [`MAX_DISPLAY_TEXT_BYTES`](hytte_plugin_proto::MAX_DISPLAY_TEXT_BYTES);
+/// [`MAX_DISPLAY_TEXT_BYTES`];
 /// bodies and the consent detail take
-/// [`MAX_BODY_TEXT_BYTES`](hytte_plugin_proto::MAX_BODY_TEXT_BYTES). **Truncate,
+/// [`MAX_BODY_TEXT_BYTES`]. **Truncate,
 /// never refuse**: an OSD nudge whose title is cut still tells the user
 /// something, and dropping the effect would make a plugin bug look like a dead
 /// click.
@@ -810,7 +810,7 @@ impl LogGate {
 /// **Bounded by construction, in both dimensions, since #1165 review round
 /// 2:** at most [`MAX_TRACKED_EFFECT_BUCKETS`] entries
 /// ([`spend_effect_tokens`]'s refusal past that count), each keyed by a
-/// `String` no longer than [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES)
+/// `String` no longer than [`MAX_PLUGIN_ID_BYTES`]
 /// bytes — `serve_conn` refuses a `Register` over that cap before a
 /// connection's id can ever reach this map. Before the id cap, the entry count
 /// was bounded but an entry's own key was not, so the worst case was
@@ -832,7 +832,7 @@ pub(super) type EffectBuckets = Arc<Mutex<std::collections::HashMap<String, Effe
 /// this at all takes a thousand plugin ids actively spending effects, which is
 /// the abuse, not a deployment.
 ///
-/// With [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES)
+/// With [`MAX_PLUGIN_ID_BYTES`]
 /// bounding every key, this table's worst-case retained memory is
 /// `MAX_TRACKED_EFFECT_BUCKETS × MAX_PLUGIN_ID_BYTES` bytes of keys — 64 KiB —
 /// plus one fixed-size [`EffectRateLimiter`] per entry, not the unbounded

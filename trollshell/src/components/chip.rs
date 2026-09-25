@@ -139,7 +139,7 @@ pub(crate) fn wire_scroll<W: IsA<gtk::Widget>>(widget: &W, on_step: impl Fn(f64)
 /// - `inverted = true` (fills from the bottom)
 /// - `valign = Align::Center`
 ///
-/// The caller binds the fraction via [`bind`] after this call, or (for disk)
+/// The caller binds the fraction via [`bind()`] after this call, or (for disk)
 /// calls this inside the bind closure once per mount point.
 pub(crate) fn vertical_bar() -> gtk::ProgressBar {
     let bar = gtk::ProgressBar::new();

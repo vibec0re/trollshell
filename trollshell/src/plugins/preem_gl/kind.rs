@@ -255,7 +255,7 @@ impl Kind {
     /// a kind `gl_kind_for` merely forgot.
     ///
     /// An exhaustive `match` rather than a `matches!`, for
-    /// [`pinned_exact`](Self::pinned_exact)'s reason: a tenth kind must not
+    /// `pinned_exact`'s reason: a tenth kind must not
     /// inherit an answer by falling off the end of a pattern.
     ///
     /// Its readers are all `#[cfg(test)]` — `plugins::tests`'

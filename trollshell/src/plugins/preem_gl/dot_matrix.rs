@@ -31,7 +31,7 @@
 //! takes a bilinear tap out of it (`halo_at`) on the same branch the lattice
 //! takes its continuous position on. Before that the stretched frame had round
 //! dots with a blocky bloom around them — see
-//! [`tests::the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap`]
+//! `tests::the_blit_reads_the_halo_at_the_fragments_resolution_off_the_snap`
 //! for why nothing but a source read can hold that in place.
 //!
 //! At the natural size — what the reconciler requests and what the parity
@@ -64,14 +64,14 @@
 //! 1. [`kit::dot_cell`] — an **additive** `pub` accessor #1144 added to
 //!    `hytte-preem` (plain data, nothing in the kit reads it, no render path
 //!    changed) publishing the very table `ghost_dot`/`lit_dot` stamp;
-//! 2. [`tests::the_falloff_law_is_the_kits_own_published_cell`] holds a Rust
+//! 2. `tests::the_falloff_law_is_the_kits_own_published_cell` holds a Rust
 //!    mirror of the law to that table, at every pitch and every pixel — which
 //!    is exactly where the shader samples it at 1:1;
-//! 3. [`tests::the_shader_and_the_mapping_agree_about_the_falloff_knots`] reads
+//! 3. `tests::the_shader_and_the_mapping_agree_about_the_falloff_knots` reads
 //!    the constants back out of the GLSL, so the mirror and the shader cannot
 //!    drift.
 //!
-//! [`tests::the_falloff_law_is_the_kits_own_ghost_dot`] then measures the
+//! `tests::the_falloff_law_is_the_kits_own_ghost_dot` then measures the
 //! *geometry* — where those dots land — against the kit's rendered bytes.
 //!
 //! # The pipeline

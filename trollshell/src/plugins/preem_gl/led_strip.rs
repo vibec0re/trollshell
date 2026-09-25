@@ -61,7 +61,7 @@
 //! buffer and the dot's cap as [`kit::led_cap_ink`]'s quad. The only numbers
 //! this shader restates are the CRT pass's four fixed-point constants, which
 //! every shader on this seam restates and which
-//! [`program::assert_crt_constants`](super::program::assert_crt_constants)
+//! `program::assert_crt_constants`
 //! holds to the kit's own items.
 
 use hytte::ui::gl_surface::{

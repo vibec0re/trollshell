@@ -154,7 +154,7 @@ impl BarGeometry {
     /// `Edge::Top`. It is fixed anyway because the arithmetic's own tests would
     /// otherwise stand as a passing assertion of the wrong number for whoever
     /// first ships a left/right bar — see
-    /// [`tests::clamp_card_height_reserves_a_vertical_bars_main_margin_not_its_thickness`].
+    /// `tests::clamp_card_height_reserves_a_vertical_bars_main_margin_not_its_thickness`.
     ///
     /// `main_margin` comes from [`live_main_margin`], the same expression
     /// [`reposition_card`] solves, so the budget and the placement cannot
@@ -1094,7 +1094,7 @@ fn on_active_show(panel: &ModalPanel, active: &Active) {
 /// call, so the first-open page is built then.
 ///
 /// [`EAGER_PAGES`] is the single source for which pages skip the lazy path;
-/// [`tests::eager_pages_is_empty`] tripwires it so a future edit can't silently
+/// `tests::eager_pages_is_empty` tripwires it so a future edit can't silently
 /// grow this set without revisiting the reasoning above.
 const EAGER_PAGES: [Page; 0] = [];
 

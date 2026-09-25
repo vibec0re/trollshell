@@ -140,7 +140,7 @@ fn region_slot(mount: Mount, connector: Option<String>) -> gtk::Widget {
     build_region(render_signal(mount), mount, connector)
 }
 
-/// The [`Mount::SidebarLead`](hytte_plugin_proto::Mount::SidebarLead) **region** —
+/// The [`Mount::SidebarLead`] **region** —
 /// a vertical container of N plugin cards. Built per monitor from
 /// `overlays::sidebar::build_card` and mounted at the very **top** of the sidebar,
 /// above the built-in weather/calendar/tasks cards, so a plugin here leads the
@@ -161,7 +161,7 @@ pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::SidebarLead, monitor.connector())
 }
 
-/// The [`Mount::SidebarTop`](hytte_plugin_proto::Mount::SidebarTop) **region** — a
+/// The [`Mount::SidebarTop`] **region** — a
 /// vertical container of N plugin cards. Built per monitor from
 /// `overlays::sidebar::build_card` and appended above the built-in widgets.
 #[must_use]
@@ -169,14 +169,14 @@ pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::SidebarTop, monitor.connector())
 }
 
-/// The [`Mount::SidebarBottom`](hytte_plugin_proto::Mount::SidebarBottom)
+/// The [`Mount::SidebarBottom`]
 /// **region**, appended below the built-in sidebar widgets.
 #[must_use]
 pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::SidebarBottom, monitor.connector())
 }
 
-/// The [`Mount::BarLeft`](hytte_plugin_proto::Mount::BarLeft) **region** — a
+/// The [`Mount::BarLeft`] **region** — a
 /// horizontal row of N plugin **chips** (#349). Built per monitor from `main.rs`'s
 /// `build_bar` and appended into the bar's left group. Each plugin's `view()` tree
 /// renders inside a `.ts-plugin-chip` pill, mirroring the sidebar card path but
@@ -186,14 +186,14 @@ pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::BarLeft, monitor.connector())
 }
 
-/// The [`Mount::BarCenter`](hytte_plugin_proto::Mount::BarCenter) **region** — a
+/// The [`Mount::BarCenter`] **region** — a
 /// horizontal row of N plugin chips, appended into the bar's center group (#349).
 #[must_use]
 pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::BarCenter, monitor.connector())
 }
 
-/// The [`Mount::BarRight`](hytte_plugin_proto::Mount::BarRight) **region** — a
+/// The [`Mount::BarRight`] **region** — a
 /// horizontal row of N plugin chips, appended into the bar's right group (#349).
 #[must_use]
 pub fn bar_right_slot(monitor: &Monitor) -> gtk::Widget {
@@ -430,7 +430,7 @@ fn build_region(
 /// here, so `Revealer { open: true, child: Row { children: vec![] } }` and
 /// `Expander { header: Row { children: vec![] }, children: vec![], .. }`
 /// both fall through to `_ => false` no matter what their header/child(ren)
-/// contain — see [`gtk_tests`]'s `an_open_revealer_over_an_empty_child_is_not_hidden`,
+/// contain — see `gtk_tests`'s `an_open_revealer_over_an_empty_child_is_not_hidden`,
 /// `a_closed_revealer_over_an_empty_child_is_not_hidden`, and
 /// `an_expander_with_no_children_is_not_hidden`, which pin exactly this. A
 /// *closed* `Revealer` needs the non-recursion: GTK is mid-collapse-animation,
@@ -1090,7 +1090,7 @@ fn build_panel_child(
     root.upcast()
 }
 
-/// The drawer plugin child's render apply-loop: [`hytte::reactive::bind`]'s two
+/// The drawer plugin child's render apply-loop: [`hytte::reactive::bind()`]'s two
 /// legs plus the panel-scope release `bind` has no hook for (see
 /// [`build_panel_child`]).
 ///
@@ -4925,7 +4925,7 @@ mod gtk_tests {
 // reconcile them silently and main would go red on `E0425: cannot find function
 // named_connector` (#1159 review, finding 9).
 
-/// The [`Mount::SidebarRightLead`](hytte_plugin_proto::Mount::SidebarRightLead)
+/// The [`Mount::SidebarRightLead`]
 /// **region** — the mirror of [`sidebar_lead_slot`] on the right sidebar: a
 /// vertical container of N plugin cards, mounted at the very top of that surface.
 #[must_use]
@@ -4933,14 +4933,14 @@ pub fn sidebar_right_lead_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::SidebarRightLead, monitor.connector())
 }
 
-/// The [`Mount::SidebarRightTop`](hytte_plugin_proto::Mount::SidebarRightTop)
+/// The [`Mount::SidebarRightTop`]
 /// **region** — the mirror of [`sidebar_top_slot`] on the right sidebar.
 #[must_use]
 pub fn sidebar_right_top_slot(monitor: &Monitor) -> gtk::Widget {
     region_slot(Mount::SidebarRightTop, monitor.connector())
 }
 
-/// The [`Mount::SidebarRightBottom`](hytte_plugin_proto::Mount::SidebarRightBottom)
+/// The [`Mount::SidebarRightBottom`]
 /// **region** — the mirror of [`sidebar_bottom_slot`] on the right sidebar.
 #[must_use]
 pub fn sidebar_right_bottom_slot(monitor: &Monitor) -> gtk::Widget {

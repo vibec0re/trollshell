@@ -62,7 +62,7 @@ impl RowContainer for adw::ExpanderRow {
 /// then: if the `Vec` is empty and `empty_placeholder` is `Some`, the
 /// placeholder row is built and added; otherwise one row per item is built via
 /// `build_row` and added. The container is held only weakly, exactly like
-/// [`hytte::prelude::bind`] (#224): the apply closure takes its container
+/// [`hytte::prelude::bind()`] (#224): the apply closure takes its container
 /// argument from `bind` itself rather than capturing a strong clone, so
 /// dropping the container's last strong ref frees it instead of pinning it
 /// alive for the life of the binding (#761).

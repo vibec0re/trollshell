@@ -8,7 +8,8 @@
 //!   home-manager / NixOS modules render it to a small JSON state file
 //!   ([`STATE_FILE_REL`] under `$XDG_CONFIG_HOME`, then each entry of
 //!   `$XDG_CONFIG_DIRS`) saying which plugins exist, how to exec them, and
-//!   whether they're enabled.
+//!   whether they're enabled — which, unless nix pins it, the Plugins tab's
+//!   switch may override (see "The Plugins tab's switch persists" below).
 //! - **the host launches.** At startup ([`launch_at_startup`]) every enabled,
 //!   not-already-running plugin is spawned as a *transient* user unit
 //!   (`systemd-run --user --unit=trollshell-plugin-<id>.service … <exec>`); the
@@ -79,9 +80,11 @@
 //!   home-manager file appearing over the `/etc/xdg` one changes the spec
 //!   without either file's bytes changing (`hytte-config`'s #1040 R9, same
 //!   shape). Stamping a shadowed file costs a spurious reconcile at worst,
-//!   which also relaunches any declared-enabled plugin that is not running
-//!   (stopped from the Plugins tab, or crashed) — declared state wins, as it
-//!   does on a home-manager poke.
+//!   which also relaunches any effectively-enabled plugin that is not running
+//!   (crashed, or stopped behind the launcher's back with `systemctl --user
+//!   stop`) — the effective state wins, as it does on a home-manager poke.
+//!   Since #1400 a plugin stopped from the Plugins tab is not one of them:
+//!   the switch persisted the stop, so it is effectively off.
 //! - **Stamp, then load** (#1040 V2): the baseline is taken before startup's
 //!   reconcile reads the file, and every later tick re-stamps before it
 //!   reconciles, so an edit landing in between is one tick late, never folded
@@ -121,6 +124,36 @@
 //! relaunches them from the new file. It is a one-off bounce, and nothing
 //! here debounces it. The reverse move (home-manager → NixOS) has no gap,
 //! because the `/etc` file appears before home-manager removes its own.
+//!
+//! ## The Plugins tab's switch persists (#1400)
+//!
+//! nix declares, but for most plugins it only declares a **default**. The
+//! control-center's switch sends `StartPlugin`/`StopPlugin` and then
+//! `SetPluginEnabled`, and [`set_enabled`] keeps that choice for a declared
+//! plugin in `$XDG_STATE_HOME/trollshell/plugins.toml` ([`Overrides`],
+//! through `hytte_config::state`, #866 decision 3: state is what the shell
+//! writes when you flip a toggle). It stores only **differences** from the
+//! declared value, in either direction, so switching a plugin back to what
+//! nix says deletes its entry. [`load_declared_from`] folds the file into
+//! every plugin's `enabled` ([`effective_enabled`]), which is how
+//! [`reconcile`], [`list`], [`start`] and the #1399 watch all see one
+//! effective value and a switched-on plugin survives a shell restart.
+//!
+//! Who wins is decided by **nix priority**, the rule #1227 set for config
+//! keys (option C on the #1400 thread): an `enable` assigned plainly or with
+//! `lib.mkForce` is **pinned**, and the modules render `"_locked":
+//! ["enabled"]` on its entry ([`PluginSpec::enable_locked`]). For a pinned
+//! plugin an override on disk is ignored and [`set_enabled`] refuses to
+//! write one, with an error naming `programs.trollshell.plugins.<id>.enable`;
+//! the control-center greys that switch, so only a stale tab or a hand-made
+//! `busctl` call ever sees the error. An `enable` left unset or set with
+//! `lib.mkDefault` pins nothing, and the switch decides.
+//!
+//! The state file is **not** watched: its only writer is [`set_enabled`],
+//! behind a switch that has already started or stopped the plugin. An
+//! override for an id no longer declared, or for a pinned one, is ignored
+//! rather than deleted, so a pin relaxed back to `lib.mkDefault` finds the
+//! switch's last choice again.
 //!
 //! ## The session target (#707)
 //!
@@ -1647,8 +1680,9 @@ fn moved_since<'a>(paths: &'a [PathBuf], seen: &mut Vec<Stamp>) -> Vec<&'a Path>
 
 /// The plugins the control-center lists: the *declared* set (state file) ∪ the
 /// `trollshell-plugin-*` units systemd knows (transient runs + legacy static
-/// units). For a declared plugin the declarative `enabled` flag wins — a
-/// transient unit has no unit file, so systemd would report it `disabled` —
+/// units). For a declared plugin the effective `enabled` flag wins — nix's,
+/// or the switch's persisted override (#1400); a transient unit has no unit
+/// file, so systemd would report it `disabled` —
 /// and a declared-but-stopped plugin still lists as `inactive` (a stopped
 /// `--collect` transient unit vanishes from systemd entirely). Pure merge in
 /// [`merge_declared`].
@@ -1774,8 +1808,7 @@ async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::R
     })?;
     let mut overrides = read_overrides(Some(path));
     if record_override(&mut overrides, id, declared, enabled) {
-        write_overrides(path, &overrides)
-            .with_context(|| format!("writing {}", path.display()))?;
+        write_overrides(path, &overrides).with_context(|| format!("writing {}", path.display()))?;
         tracing::info!(
             plugin = %id,
             enabled,
@@ -2808,7 +2841,10 @@ mod tests {
                 overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
             };
             assert!(
-                sources.overrides.as_deref().is_some_and(|p| p.starts_with(home)),
+                sources
+                    .overrides
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(home)),
                 "rail: the override file must resolve under the scratch home, got {:?}",
                 sources.overrides
             );
@@ -2959,9 +2995,15 @@ mod tests {
         assert_eq!(o.enabled.get("timer"), Some(&true));
         assert_eq!(o.enabled.get("pet"), Some(&false));
 
-        assert!(record_override(&mut o, "timer", false, false), "back to nix");
+        assert!(
+            record_override(&mut o, "timer", false, false),
+            "back to nix"
+        );
         assert!(!o.enabled.contains_key("timer"), "the entry is deleted");
-        assert!(!record_override(&mut o, "timer", false, false), "nothing left");
+        assert!(
+            !record_override(&mut o, "timer", false, false),
+            "nothing left"
+        );
         assert!(
             !record_override(&mut o, "clock", true, true),
             "agreeing with nix never writes an entry"
@@ -3074,7 +3116,9 @@ mod tests {
         set_enabled_in(&sources, "pet", false).await.expect("off");
         assert_eq!(effective(&sources).await, both(true, false));
 
-        set_enabled_in(&sources, "timer", false).await.expect("back");
+        set_enabled_in(&sources, "timer", false)
+            .await
+            .expect("back");
         assert_eq!(
             read_overrides(Some(&toml)),
             Overrides {

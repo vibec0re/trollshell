@@ -6173,7 +6173,10 @@ mod gtk_tests {
         );
 
         let (live, subtitle) = shown("timer");
-        assert!(live, "a free plugin's switch is live — and live again after a pinned one");
+        assert!(
+            live,
+            "a free plugin's switch is live — and live again after a pinned one"
+        );
         assert!(subtitle.contains("kept across restarts"), "{subtitle}");
 
         let (live, subtitle) = shown("hand-made");

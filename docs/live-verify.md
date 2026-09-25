@@ -1650,6 +1650,10 @@ four window properties below are pinned nowhere but here.
       `programs.trollshell.plugins.clock-demo.package = trollshell.packages.${pkgs.system}.hytte-plugin-clock-demo;`
       (the entry needs its `package`: there is no default, so a bare
       `plugins.clock-demo = { };` fails to evaluate), and `nixos-rebuild switch`.
+      _Since #1400 every bundled plugin is declared by default (off), so the
+      "not declared yet" arm is a second instance instead —
+      `plugins.clock-bar = { package = …hytte-plugin-clock-demo; mount = "BarCenter"; enable = true; };`
+      — or `plugins.clock-demo.enable = true;` to watch a declared one start._
       Within about 3 s of activation finishing, the journal must show
       "plugins.json changed; reconciling the declared plugins" naming
       `/etc/xdg/trollshell/plugins.json`, then "launched plugin as transient
@@ -1664,6 +1668,34 @@ four window properties below are pinned nowhere but here.
       "declared spec changed; restarting". Finally, delete the entry and
       switch: the unit must stop within ~3 s. A switch that changes nothing in
       `plugins.json` must log none of this.
+- [ ] **(#1400)** The Plugins tab's switch persists, and nix pins win. Start
+      from a module whose only plugin configuration is
+      `programs.trollshell.enable = true;` (no `plugins`, no
+      `availablePlugins`) and rebuild. 1. `/etc/xdg/trollshell/plugins.json` (NixOS) or
+      `~/.config/trollshell/plugins.json` (home-manager) lists all thirteen
+      bundled plugins, every entry `"enabled": false` and none carrying
+      `_locked`; the control-center's Plugins tab lists every one of them,
+      all **off**, each switch live with the subtitle "…the choice is kept
+      across restarts". 2. Switch one on (say `timer`): it starts
+      (`systemctl --user status trollshell-plugin-timer` is `active`), and
+      `$XDG_STATE_HOME/trollshell/plugins.toml` (default
+      `~/.local/state/trollshell/plugins.toml`) now reads
+      `[enabled]` / `timer = true`, and nothing else. 3. `systemctl --user restart trollshell`: `timer` is still running
+      afterwards (the startup reconcile relaunches it from the folded
+      value) and its switch is still on. Switch it off again: it stops,
+      and `plugins.toml` is **gone** (the one override matched nix again). 4. Pin one: add `programs.trollshell.plugins.niri-layouts.enable = true;`
+      and rebuild. With the shell running, within about 3 s (the #1399
+      watch) the journal shows "plugins.json changed" and
+      `trollshell-plugin-niri-layouts` starts, with no shell restart; its
+      `plugins.json` entry carries `"_locked": ["enabled"]`, and its
+      switch in the tab is **greyed** with the subtitle
+      "Set in nix — programs.trollshell.plugins.niri-layouts.enable".
+      `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control SetPluginEnabled sb niri-layouts false`
+      fails with an error naming that option and leaves `plugins.toml`
+      untouched. 5. Change it to `lib.mkDefault true` and rebuild: the entry loses
+      `_locked`, the switch is live again, and switching it off now
+      persists (`niri-layouts = false` in `plugins.toml`) across a
+      `systemctl --user restart trollshell`.
 
 ## Infobroker
 

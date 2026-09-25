@@ -2064,8 +2064,8 @@
                   };
                 assert pinsState.plugins.timer == expectedDefault.timer;
                 assert builtins.length missingFalse == 1;
-                assert
-                  pkgs.lib.hasInfix "programs.trollshell.plugins.vibectl.package" (builtins.head missingFalse).message;
+                assert pkgs.lib.hasInfix "programs.trollshell.plugins.vibectl.package"
+                  (builtins.head missingFalse).message;
                 assert !((rendered missing).plugins ? vibectl);
                 builtins.deepSeq {
                   inherit defaultState pinsState;
@@ -2139,7 +2139,9 @@
               missingPlugins =
                 plugin:
                 builtins.tryEval (
-                  builtins.deepSeq (rendered (hmConfig { programs.trollshell.plugins.vibectl = plugin; })) "ok"
+                  builtins.deepSeq (rendered (hmConfig {
+                    programs.trollshell.plugins.vibectl = plugin;
+                  })) "ok"
                 );
               missing = missingPlugins { env.X = "1"; };
               control = missingPlugins { package = stubPlugin; };

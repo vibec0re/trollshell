@@ -88,9 +88,13 @@ the shell (re)launch it."
 Without nix, the same state file is hand-editable: add a `plugins.json` entry
 (`exec`, `env`, `enabled`, …) and the running shell converges on it within
 about 3 s (it polls the file, #1399; poke `Control.ReloadPlugins`, below, to
-skip the wait), or drive a plugin at runtime from the control-center's Plugins
-tab (start/stop — a runtime action, not a
-declaration). A hand-written static unit still works too, as long as its id
+skip the wait), or drive a plugin from the control-center's Plugins tab. Since
+#1400 that tab's switch **persists** for a declared plugin: the shell keeps the
+choice in its own `$XDG_STATE_HOME/trollshell/plugins.toml` (only where it
+differs from the declared `enabled`) and a restart keeps it — unless the entry
+carries `"_locked": ["enabled"]`, which is what the nix modules render for an
+`enable` assigned plainly or with `lib.mkForce`; then the switch is greyed and
+the file wins. A hand-written static unit still works too, as long as its id
 isn't _also_ declared in `plugins.json`: the launcher's reconcile fingerprints
 only the units it spawns, and deliberately leaves alone any running unit that
 carries no fingerprint and isn't declared
@@ -120,7 +124,8 @@ templates for one; the 11 that used to live in this directory were retired in
 > 1. **nix rewrites the state file.** A switch renders
 >    `~/.config/trollshell/plugins.json` afresh from the option — every plugin's
 >    `exec` (a store path, so a rebuilt `package` is a new value), `env`,
->    `secrets`, `enabled`, plus the session `target`.
+>    `secrets`, `enabled` (and `_locked` where nix pins it, #1400), plus the
+>    session `target`.
 > 2. **the shell notices.** It polls every candidate `plugins.json` path every
 >    ~3 s (#1399) — a content hash, not `(mtime, len)`, because every nix-store
 >    file shares one mtime and a package bump is a same-length edit — and
@@ -154,19 +159,22 @@ templates for one; the 11 that used to live in this directory were retired in
 > Two things deliberately do **not** ride this path: a **secret** rotated in the
 > control-center's AI Keys tab (that has its own precise relaunch, #392 — the
 > values never enter `plugins.json`), and the control-center Plugins tab's
-> start/stop, which is a runtime action rather than a declaration. Since #707
+> switch, which starts or stops the plugin itself and records the choice in the
+> shell's own state file rather than in `plugins.json` (#1400; a reconcile then
+> reads the two together, so it never undoes the switch). Since #707
 > that tab's `StartPlugin`/`StopPlugin`/`SetPluginEnabled` **report failure**
 > back over D-Bus instead of only logging it, so a start whose unit never came
 > up surfaces as an error rather than as apparent success — check the journal
 > for the cause either way.
 >
 > Since #558 each bundled plugin also ships as its own flake package
-> (`hytte-plugin-<id>`), so the declarative path needs no out-of-tree
-> derivation — point `package` straight at it:
-> `programs.trollshell.plugins.pet.package =
-trollshell.packages.${system}.hytte-plugin-pet;`. Outside nix, point `exec`
-> in a hand-edited `plugins.json` at wherever you installed the binary; there
-> is no static-unit fallback to fall back to (#872).
+> (`hytte-plugin-<id>`), and since #1400 the modules declare every one of them
+> by default (`programs.trollshell.availablePlugins`), off, with `package`
+> already pointing at that output — so a bundled plugin needs no nix at all to
+> list in the Plugins tab, and `programs.trollshell.plugins.<id>.enable = true;`
+> pins one on at login. Outside nix, point `exec` in a hand-edited
+> `plugins.json` at wherever you installed the binary; there is no static-unit
+> fallback to fall back to (#872).
 
 The **pet** plugin (`hytte-plugin-pet`, #276) is the second in-tree plugin: a
 kaomoji cat in the sidebar's top slot — poke it by clicking. It shares the

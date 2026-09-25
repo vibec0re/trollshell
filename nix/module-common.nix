@@ -1081,153 +1081,153 @@ in
                 '';
               };
 
-            env = lib.mkOption {
-              type = lib.types.attrsOf lib.types.str;
-              default = { };
-              example = {
-                PET_NAME = "nisse";
-                PET_LLM_MODEL = "google/gemini-3.5-flash";
+              env = lib.mkOption {
+                type = lib.types.attrsOf lib.types.str;
+                default = { };
+                example = {
+                  PET_NAME = "nisse";
+                  PET_LLM_MODEL = "google/gemini-3.5-flash";
+                };
+                description = ''
+                  Environment variables passed to the plugin binary at launch
+                  (rendered into the launch-state file's per-plugin `env` map and
+                  applied as `--setenv=K=V` by the launcher,
+                  trollshell/src/plugin_launcher.rs). This is the non-secret
+                  sibling of `secrets` below and the idiom each bundled plugin
+                  reads its config through — so it is *how the non-secret runtime
+                  knobs are exposed as nix options* (#533): set the plugin's env
+                  var here rather than in a shell profile. Values must be strings.
+
+                  Do NOT put API keys here — the launch-state file is
+                  world-readable; use `secrets` (below) instead, which injects the
+                  key from the login keyring at spawn.
+
+                  A few representative examples (each also readable from the
+                  environment directly; the nix option is just the declarative
+                  way to set it):
+
+                  - `pet` (hytte-plugin-pet): `PET_NAME` (display name),
+                    `PET_LLM_URL` (opt into a local llama-server brain — the API
+                    *key* is a `secrets` slot, not env).
+                  - `weather` (hytte-plugin-weather): `TROLLSHELL_WEATHER_CITY`
+                    (geocoded fallback when GeoClue is unavailable — usually set
+                    session-wide via `programs.trollshell.weather.fallbackCity`
+                    instead of per-plugin here).
+
+                  The full inventory — swept from source, all 14 bundled
+                  plugins including the ones with zero knobs — is published at
+                  <https://vibec0re.mov/trollshell/plugin-env.html>
+                  (source: `docs/plugin-env.md`). An absolute URL rather than a
+                  relative one because this description is also rendered by
+                  `nixos-option` and `man home-configuration.nix`, where a
+                  relative `plugin-env.html` link would resolve to nothing.
+
+                  Precedence for a plugin that also reads a config file for the
+                  same setting: environment (this option) wins over the file,
+                  which wins over the built-in default.
+                '';
               };
-              description = ''
-                Environment variables passed to the plugin binary at launch
-                (rendered into the launch-state file's per-plugin `env` map and
-                applied as `--setenv=K=V` by the launcher,
-                trollshell/src/plugin_launcher.rs). This is the non-secret
-                sibling of `secrets` below and the idiom each bundled plugin
-                reads its config through — so it is *how the non-secret runtime
-                knobs are exposed as nix options* (#533): set the plugin's env
-                var here rather than in a shell profile. Values must be strings.
 
-                Do NOT put API keys here — the launch-state file is
-                world-readable; use `secrets` (below) instead, which injects the
-                key from the login keyring at spawn.
+              secrets = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = [ "openrouter" ];
+                description = ''
+                  AI-provider key *slots* to inject into this plugin at launch
+                  (#392). For each slot the shell reads the key stored in your
+                  login keyring — managed by the control-center's AI Keys tab,
+                  never written to disk or this config — and passes it to the
+                  plugin as the `<SLOT>_API_KEY` environment variable (e.g.
+                  "openrouter" → OPENROUTER_API_KEY), which is exactly — and,
+                  since #1330, *only* — what hytte-ai-providers' `load_key`
+                  reads. So an LLM-backed plugin picks the key up with no
+                  per-plugin config: `plugins.pet.secrets = [ "openrouter" ];`.
+                  A slot with no stored key is simply skipped (the plugin runs
+                  keyless and uses its own fallback); a plugin that doesn't list
+                  a slot never gets that key in its environment. Rotating a key
+                  in the control-center relaunches the running plugins that
+                  declare it.
 
-                A few representative examples (each also readable from the
-                environment directly; the nix option is just the declarative
-                way to set it):
+                  This is the only way to supply a provider key. The on-disk
+                  `~/.config/trollshell/<slot>.key` fallback that used to sit
+                  behind this option was retired in #1330 ("no fallbacks", #866);
+                  a file left at that path is never read, and, since #1349, the
+                  plugin logs no startup notice about it either — it is simply
+                  inert. See <https://vibec0re.mov/trollshell/plugin-env.html>
+                  (source: `docs/plugin-env.md`) for the migration.
+                '';
+              };
 
-                - `pet` (hytte-plugin-pet): `PET_NAME` (display name),
-                  `PET_LLM_URL` (opt into a local llama-server brain — the API
-                  *key* is a `secrets` slot, not env).
-                - `weather` (hytte-plugin-weather): `TROLLSHELL_WEATHER_CITY`
-                  (geocoded fallback when GeoClue is unavailable — usually set
-                  session-wide via `programs.trollshell.weather.fallbackCity`
-                  instead of per-plugin here).
+              mount = lib.mkOption {
+                type = lib.types.nullOr (
+                  lib.types.enum [
+                    "SidebarLead"
+                    "SidebarTop"
+                    "SidebarBottom"
+                    "SidebarRightLead"
+                    "SidebarRightTop"
+                    "SidebarRightBottom"
+                    "BarLeft"
+                    "BarCenter"
+                    "BarRight"
+                  ]
+                );
+                default = null;
+                example = "SidebarRightTop";
+                description = ''
+                  Override where this plugin's card mounts (#1158/#1159/#1161),
+                  as a launch-time deployment decision rather than something the
+                  plugin author bakes into its manifest. `null` (the default)
+                  leaves the plugin's own `Mount` in force — nothing is rendered
+                  and the manifest's choice wins, exactly as before this option
+                  existed.
 
-                The full inventory — swept from source, all 14 bundled
-                plugins including the ones with zero knobs — is published at
-                <https://vibec0re.mov/trollshell/plugin-env.html>
-                (source: `docs/plugin-env.md`). An absolute URL rather than a
-                relative one because this description is also rendered by
-                `nixos-option` and `man home-configuration.nix`, where a
-                relative `plugin-env.html` link would resolve to nothing.
+                  The nine values are the wire names
+                  `hytte_plugin_proto::manifest::Mount` carries, in two
+                  families: the **left** sidebar (`SidebarLead` — the very top,
+                  above the built-in weather/calendar/tasks cards;
+                  `SidebarTop` — after those cards, above the flex gap;
+                  `SidebarBottom` — below everything, by the departures board),
+                  its mirror the **right** sidebar (`SidebarRightLead` /
+                  `SidebarRightTop` / `SidebarRightBottom`, #1158 — hidden
+                  entirely while no plugin occupies one of its three regions),
+                  and the **bar** (`BarLeft` / `BarCenter` / `BarRight`, a slim
+                  inline chip rather than a sidebar card). A non-null value
+                  renders as `HYTTE_PLUGIN_MOUNT = "<name>";` in this plugin's
+                  `env` (above) in `plugins.json`; the SDK's `hytte_plugin::run`
+                  reads it before `Register` and refuses to start on a name
+                  outside these nine, so a rename here and on the wire cannot
+                  silently drift apart — a stale spelling is a launch failure,
+                  not a misplaced card.
 
-                Precedence for a plugin that also reads a config file for the
-                same setting: environment (this option) wins over the file,
-                which wins over the built-in default.
-              '';
+                  Setting this does not change the plugin's own manifest, only
+                  where *this deployment* puts it — reinstalling the same
+                  plugin elsewhere with `mount` unset goes right back to the
+                  author's own choice.
+
+                  **This option and `env.HYTTE_PLUGIN_MOUNT` are the same
+                  knob, and this one wins.** Setting the variable by hand still
+                  works (it is how the override was reached before this option
+                  existed, and `docs/plugin-env.md` documents the variable
+                  itself), but a non-null `mount` is merged over `env` when
+                  `plugins.json` is rendered, so the two disagreeing would
+                  silently discard the hand-written value. Rather than let that
+                  happen quietly, setting **both** to different values is an
+                  eval error naming the plugin; setting both to the same value
+                  is merely redundant. Prefer this option: it is checked against
+                  the nine wire names at eval time, while a hand-set variable is
+                  only checked when the plugin tries to start.
+
+                  **Mounting into the right sidebar needs the right sidebar.**
+                  The three `SidebarRight*` values are accepted and rendered
+                  today, and the host already routes a render to their
+                  mailboxes — but no window mounts those mailboxes until
+                  #1160/#1244 ships, so until then a card sent there simply does
+                  not appear. The left-sidebar and bar values work now.
+                '';
+              };
             };
-
-            secrets = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ ];
-              example = [ "openrouter" ];
-              description = ''
-                AI-provider key *slots* to inject into this plugin at launch
-                (#392). For each slot the shell reads the key stored in your
-                login keyring — managed by the control-center's AI Keys tab,
-                never written to disk or this config — and passes it to the
-                plugin as the `<SLOT>_API_KEY` environment variable (e.g.
-                "openrouter" → OPENROUTER_API_KEY), which is exactly — and,
-                since #1330, *only* — what hytte-ai-providers' `load_key`
-                reads. So an LLM-backed plugin picks the key up with no
-                per-plugin config: `plugins.pet.secrets = [ "openrouter" ];`.
-                A slot with no stored key is simply skipped (the plugin runs
-                keyless and uses its own fallback); a plugin that doesn't list
-                a slot never gets that key in its environment. Rotating a key
-                in the control-center relaunches the running plugins that
-                declare it.
-
-                This is the only way to supply a provider key. The on-disk
-                `~/.config/trollshell/<slot>.key` fallback that used to sit
-                behind this option was retired in #1330 ("no fallbacks", #866);
-                a file left at that path is never read, and, since #1349, the
-                plugin logs no startup notice about it either — it is simply
-                inert. See <https://vibec0re.mov/trollshell/plugin-env.html>
-                (source: `docs/plugin-env.md`) for the migration.
-              '';
-            };
-
-            mount = lib.mkOption {
-              type = lib.types.nullOr (
-                lib.types.enum [
-                  "SidebarLead"
-                  "SidebarTop"
-                  "SidebarBottom"
-                  "SidebarRightLead"
-                  "SidebarRightTop"
-                  "SidebarRightBottom"
-                  "BarLeft"
-                  "BarCenter"
-                  "BarRight"
-                ]
-              );
-              default = null;
-              example = "SidebarRightTop";
-              description = ''
-                Override where this plugin's card mounts (#1158/#1159/#1161),
-                as a launch-time deployment decision rather than something the
-                plugin author bakes into its manifest. `null` (the default)
-                leaves the plugin's own `Mount` in force — nothing is rendered
-                and the manifest's choice wins, exactly as before this option
-                existed.
-
-                The nine values are the wire names
-                `hytte_plugin_proto::manifest::Mount` carries, in two
-                families: the **left** sidebar (`SidebarLead` — the very top,
-                above the built-in weather/calendar/tasks cards;
-                `SidebarTop` — after those cards, above the flex gap;
-                `SidebarBottom` — below everything, by the departures board),
-                its mirror the **right** sidebar (`SidebarRightLead` /
-                `SidebarRightTop` / `SidebarRightBottom`, #1158 — hidden
-                entirely while no plugin occupies one of its three regions),
-                and the **bar** (`BarLeft` / `BarCenter` / `BarRight`, a slim
-                inline chip rather than a sidebar card). A non-null value
-                renders as `HYTTE_PLUGIN_MOUNT = "<name>";` in this plugin's
-                `env` (above) in `plugins.json`; the SDK's `hytte_plugin::run`
-                reads it before `Register` and refuses to start on a name
-                outside these nine, so a rename here and on the wire cannot
-                silently drift apart — a stale spelling is a launch failure,
-                not a misplaced card.
-
-                Setting this does not change the plugin's own manifest, only
-                where *this deployment* puts it — reinstalling the same
-                plugin elsewhere with `mount` unset goes right back to the
-                author's own choice.
-
-                **This option and `env.HYTTE_PLUGIN_MOUNT` are the same
-                knob, and this one wins.** Setting the variable by hand still
-                works (it is how the override was reached before this option
-                existed, and `docs/plugin-env.md` documents the variable
-                itself), but a non-null `mount` is merged over `env` when
-                `plugins.json` is rendered, so the two disagreeing would
-                silently discard the hand-written value. Rather than let that
-                happen quietly, setting **both** to different values is an
-                eval error naming the plugin; setting both to the same value
-                is merely redundant. Prefer this option: it is checked against
-                the nine wire names at eval time, while a hand-set variable is
-                only checked when the plugin tries to start.
-
-                **Mounting into the right sidebar needs the right sidebar.**
-                The three `SidebarRight*` values are accepted and rendered
-                today, and the host already routes a render to their
-                mailboxes — but no window mounts those mailboxes until
-                #1160/#1244 ships, so until then a card sent there simply does
-                not appear. The left-sidebar and bar values work now.
-              '';
-            };
-          };
-        }
+          }
         )
       );
       default = { };

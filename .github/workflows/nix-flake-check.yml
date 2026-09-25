@@ -385,6 +385,7 @@ jobs:
             .#checks.x86_64-linux.hm-module-plugin-mount \
             .#checks.x86_64-linux.hm-module-plugin-target-default \
             .#checks.x86_64-linux.hm-module-plugins-available \
+            .#checks.x86_64-linux.modules-agent-window-follows-hyperhive \
             .#checks.x86_64-linux.modules-agents-absent-when-unset \
             .#checks.x86_64-linux.modules-places-absent-when-unset \
             .#checks.x86_64-linux.nixos-module \

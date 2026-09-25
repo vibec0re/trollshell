@@ -1994,8 +1994,12 @@
           #             manifest id). Red if `enable` defaults on again, if
           #             `availablePlugins` stops declaring them, or if the
           #             bundled `package` default goes missing.
-          #   opt-out   `availablePlugins = [ ]`: no plugins.json at all, and
-          #             no agent window either (it follows `plugins.agents`).
+          #   opt-out   `availablePlugins = [ ]`: no plugins.json at all.
+          #
+          # The agent window stays off in every arm here, `defaults` included
+          # although it declares `agents`: since #1400's review (finding 3)
+          # it follows whether this machine runs hyperhive, which
+          # `modules-agent-window-follows-hyperhive` covers.
           #   pins      `enable = true` / `lib.mkForce false` render
           #             `_locked = [ "enabled" ]`; `lib.mkDefault true`
           #             renders enabled and NOT locked. Red if the priority
@@ -2072,7 +2076,7 @@
                 assert defaultState.plugins == expectedDefault;
                 assert defaults.programs.trollshell.availablePlugins == bundledIds;
                 assert builtins.length bundledIds == 13;
-                assert defaults.programs.trollshell.agentWindow.enable;
+                assert !defaults.programs.trollshell.agentWindow.enable;
                 assert !(optOut.environment.etc ? "xdg/trollshell/plugins.json");
                 assert !optOut.programs.trollshell.agentWindow.enable;
                 assert
@@ -2193,6 +2197,7 @@
               control = missingPlugins { package = stubPlugin; };
               probe =
                 assert (rendered defaults).plugins == expectedDefault;
+                assert !defaults.programs.trollshell.agentWindow.enable;
                 assert defaults.home.activation ? trollshellReloadPlugins;
                 assert !(optOut.xdg.configFile ? "trollshell/plugins.json");
                 assert !(optOut.home.activation ? trollshellReloadPlugins);
@@ -2293,6 +2298,119 @@
                 } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-with-hm-keeps-etc-plugins-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #1400 review, finding 3 (option C): `agentWindow.enable` defaults
+          # to "this machine runs hyperhive". It used to follow whether
+          # `plugins.agents` was declared, and `availablePlugins` declares
+          # `agents` on every config since #1400, which would have installed
+          # WebKitGTK (~167 MiB) everywhere. The window, and the TLS directory
+          # its trust path reads, now follow `services.hyperhive`: read from
+          # the NixOS config directly, and through `osConfig` under
+          # home-manager run as a NixOS module. There is no hyperhive module
+          # in this flake's inputs, so `stubHive` declares the two options
+          # the modules read.
+          #
+          #   nixos    no hive: off, no TLS dir; a hive: on, TLS dir is the
+          #            hive's `tls.stateDir`.
+          #   hm       standalone: off (no NixOS tree, `osConfig` is null);
+          #            inside NixOS with no hive: off; inside NixOS with a
+          #            hive: on, and the same TLS dir.
+          #   explicit `enable = true` still installs it with no hive (the
+          #            remote-hive case), and `false` keeps it off a hive host.
+          modules-agent-window-follows-hyperhive =
+            let
+              stubHive =
+                { lib, ... }:
+                {
+                  options.services.hyperhive = {
+                    enable = lib.mkEnableOption "a stand-in for hyperhive's module";
+                    deploy.hive-controller.tls.stateDir = lib.mkOption {
+                      type = lib.types.str;
+                      default = "/var/lib/hive-tls-stub";
+                    };
+                  };
+                };
+              nixos =
+                extra:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    home-manager.nixosModules.home-manager
+                    self.nixosModules.default
+                    stubHive
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                      };
+                      users.users.alice.isNormalUser = true;
+                      home-manager.users.alice = {
+                        home.stateVersion = "24.11";
+                        programs.trollshell = {
+                          enable = true;
+                          package = stubPackage;
+                        };
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                    extra
+                  ];
+                }).config;
+              standalone =
+                (home-manager.lib.homeManagerConfiguration {
+                  inherit pkgs;
+                  modules = [
+                    self.homeModules.default
+                    {
+                      home = {
+                        username = "alice";
+                        homeDirectory = "/home/alice";
+                        stateVersion = "24.11";
+                        enableNixpkgsReleaseCheck = false;
+                      };
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                      };
+                    }
+                  ];
+                }).config;
+              window = cfg: cfg.programs.trollshell.agentWindow;
+              hmWindow = cfg: window cfg.home-manager.users.alice;
+              noHive = nixos { };
+              hive = nixos { services.hyperhive.enable = true; };
+              remote = nixos { programs.trollshell.agentWindow.enable = true; };
+              hiveOff = nixos {
+                services.hyperhive.enable = true;
+                programs.trollshell.agentWindow.enable = false;
+              };
+              probe =
+                # `agents` is declared in every arm (availablePlugins' default):
+                # the window must not follow it any more.
+                assert noHive.programs.trollshell.plugins ? agents;
+                assert !(window noHive).enable;
+                assert (window noHive).hiveTlsStateDir == null;
+                assert (window hive).enable;
+                assert (window hive).hiveTlsStateDir == "/var/lib/hive-tls-stub";
+                assert !(window standalone).enable;
+                assert (window standalone).hiveTlsStateDir == null;
+                assert !(hmWindow noHive).enable;
+                assert (hmWindow hive).enable;
+                assert (hmWindow hive).hiveTlsStateDir == "/var/lib/hive-tls-stub";
+                assert (window remote).enable;
+                assert !(window hiveOff).enable;
+                "ok";
+            in
+            pkgs.runCommand "trollshell-modules-agent-window-follows-hyperhive-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

@@ -4,13 +4,28 @@
 # its own platform-specific options (geoclue system-side, systemd user service
 # home-side) plus the matching config.
 self:
-{
+args@{
   config,
   lib,
   pkgs,
   ...
 }:
 let
+  # The NixOS configuration of the machine this module runs on, for the
+  # options that follow `services.hyperhive` (#950, #1234, #1400): this
+  # module's own `config` under the NixOS module, and home-manager's
+  # `osConfig` under home-manager — the NixOS configuration a home-manager
+  # config runs inside, which home-manager passes as a module argument (its
+  # NixOS module's `specialArgs`) and leaves out standalone. Read out of
+  # `args` rather than named in the pattern above, because the NixOS module
+  # system has no `osConfig` to supply. null (standalone home-manager) reads
+  # as "no hyperhive here" through every `or` below.
+  hostConfig = if config ? services.hyperhive then config else args.osConfig or null;
+  # Whether this machine runs a hive — the default of `agentWindow.enable`
+  # and the gate on `agentWindow.hiveTlsStateDir`'s. Guarded with `or`, so
+  # a machine with no hyperhive module evaluates as `false`.
+  hostRunsHyperhive = hostConfig.services.hyperhive.enable or false;
+
   # The bundled plugin ids (#1400): nix/bundled-plugins.nix's
   # `hytte-plugin-<id>` names — the same list flake.nix builds a
   # `packages.hytte-plugin-<id>` output from — stripped to `<id>`. Every one
@@ -259,13 +274,20 @@ in
     # launches it from a menu: the `agents` plugin's card does, by resolving
     # `trollshell-agent-window` on the session's PATH and asking the host for a
     # detached launch (#953). So installing it is what turns the card's two
-    # destinations from "the browser and a drawer page" into "the window", and
-    # the default follows the plugin rather than being an independent switch.
+    # destinations from "the browser and a drawer page" into "the window".
+    # It defaults on where a hive runs rather than where `agents` is
+    # declared: since #1400 `availablePlugins` declares `agents` on every
+    # config, and following that would put the web engine on every machine
+    # (#1400 review, finding 3; option C).
     agentWindow = {
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = config.programs.trollshell.plugins ? agents;
-        defaultText = lib.literalExpression "config.programs.trollshell.plugins ? agents";
+        default = hostRunsHyperhive;
+        defaultText = lib.literalExpression ''
+          config.services.hyperhive.enable (NixOS), or
+          osConfig.services.hyperhive.enable (home-manager inside NixOS);
+          false when neither exists
+        '';
         example = true;
         description = ''
           Install the trollshell-agent-window companion alongside the shell —
@@ -273,17 +295,22 @@ in
           hyperhive's agent page embedded in a WebKitGTK view and start / stop /
           pause / settings as its own chrome.
 
-          Defaults to on exactly when a `plugins.agents` entry is declared,
-          because that plugin is the only thing that launches it: without the
-          window on PATH its card falls back to opening the agent's page in the
-          browser and its own drawer page for the pen (one warning in the
-          journal, then silence). Since #1400 `availablePlugins` declares
-          `agents` by default — declared, not started, so its Plugins-tab
-          switch works the moment it is flipped — which turns this on too;
-          leave `agents` out of `availablePlugins`, or set this false, to
-          keep the window (and its web engine) off the machine. Set it true
-          by hand if you want the binary without the plugin — it is
-          launchable as `trollshell-agent-window --agent <name>`.
+          **Defaults to on exactly when this machine runs hyperhive**
+          (`services.hyperhive.enable`; under home-manager, read through
+          `osConfig` when home-manager runs as a NixOS module, and off
+          standalone). The window is the one package in this flake that
+          links WebKitGTK, about 167 MiB of closure (#1400 review), and it
+          has nothing to show without a hive, so a machine without one does
+          not pay for it. It no longer follows whether `plugins.agents` is
+          declared: since #1400 `availablePlugins` declares `agents` on
+          every config.
+
+          **A hive on another machine:** set this `true`. Without the window
+          on PATH the `agents` card still works, and falls back to opening
+          the agent's page in the browser (one warning in the journal, then
+          silence). Set it `false` to keep the window off a hive host. It is
+          also launchable by hand, as
+          `trollshell-agent-window --agent <name>`.
 
           A hyperhive gateway is self-signed by default. Since #1234 the
           window handles that itself when the hive is on this machine, and
@@ -322,13 +349,14 @@ in
       hiveTlsStateDir = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default =
-          if (config ? services.hyperhive) && (config.services.hyperhive.enable or false) then
-            (config.services.hyperhive.deploy.hive-controller.tls.stateDir or null)
+          if hostRunsHyperhive then
+            (hostConfig.services.hyperhive.deploy.hive-controller.tls.stateDir or null)
           else
             null;
         defaultText = lib.literalExpression ''
           config.services.hyperhive.deploy.hive-controller.tls.stateDir
-          when services.hyperhive is enabled on this host, else null
+          (osConfig.… under home-manager inside NixOS) when
+          services.hyperhive is enabled on this host, else null
         '';
         example = "/var/lib/hive-tls";
         description = ''
@@ -365,8 +393,10 @@ in
           The default reads hyperhive's own `tls.stateDir` option when that
           module is on this host, so the two sides cannot drift when it moves —
           guarded so this module still evaluates on a machine with no hyperhive.
-          Set it by hand under home-manager, where the NixOS option tree is not
-          in scope; null exports nothing and leaves the window on
+          Under home-manager it reads the same option through `osConfig` when
+          home-manager runs as a NixOS module (as `enable` above does); set it
+          by hand under a standalone home-manager, where no NixOS option tree
+          is in scope. null exports nothing and leaves the window on
           `/var/lib/hive-tls`, hyperhive's own default.
         '';
       };

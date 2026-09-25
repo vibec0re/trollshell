@@ -288,7 +288,7 @@ of the one `workspace` compile, so one job builds all 18 plus
 `system-tests`, `clippy`, `rustdoc`, and `nixos-tests` (both VMs in one job —
 they share the single `probes` compile, which is the cost; the VMs themselves
 are ~2 min each). Everything else — treefmt, the five source scans,
-`options-doc`, the 30 module evals — is one `cheap` job. **The required check
+`options-doc`, the 31 module evals — is one `cheap` job. **The required check
 is the aggregate job named `flake-check`**, which `needs:` every job above and
 is red if any failed, was cancelled or was skipped; that name is what branch
 protection and the merge poller read, so it does not move. It is only the

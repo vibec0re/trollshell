@@ -661,8 +661,8 @@ the reducer but cannot prove the hive agrees.
 ### The companion window (#947 P2, #950)
 
 Needs the same hive, plus `programs.trollshell.agentWindow.enable` (on by
-default once a `plugins.agents` entry exists) so `trollshell-agent-window` is
-on the session's `PATH`. CI proves the argv both ends speak, the `?hide=`
+default on a machine that runs hyperhive since #1400; set it `true` for a
+remote hive) so `trollshell-agent-window` is on the session's `PATH`. CI proves the argv both ends speak, the `?hide=`
 assembly, the verbs' bytes against a scripted socket and the TLS policy's
 scope; it cannot prove that hyperhive's page renders in WebKitGTK, which is the
 whole point of the window.
@@ -834,8 +834,9 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
      **Nothing to do**: `programs.trollshell.agentWindow.hiveTlsStateDir`
      already defaults to hyperhive's own `tls.stateDir` when that module is on
      this host, and the window reads `trust-bundle.pem` and `gateway.pem` out
-     of it itself. Set the option by hand only under home-manager, where the
-     NixOS option tree is not in scope to default from.
+     of it itself. Set the option by hand only under a standalone
+     home-manager, where no NixOS option tree is in scope to default from
+     (home-manager run as a NixOS module reads it through `osConfig`).
   2. **A remote hive, or a host you do not configure.** Copy that hive's
      `trust-bundle.pem` over and name it:
      `TROLLSHELL_AGENT_WINDOW_CA=/etc/ssl/hive/trust-bundle.pem`. The window

@@ -654,18 +654,20 @@ in
         # manager imports for every unit it starts); `home.sessionVariables` is
         # for a launch from a terminal.
         #
-        # Under home-manager the NixOS option tree is out of scope, so this
-        # option has no automatic default here — an operator on a same-host
-        # deploy sets it, or leaves it null and the window falls back to
-        # hyperhive's own `/var/lib/hive-tls`.
+        # Under a standalone home-manager the NixOS option tree is out of
+        # scope, so this option has no automatic default there — an operator
+        # on a same-host deploy sets it, or leaves it null and the window
+        # falls back to hyperhive's own `/var/lib/hive-tls`. Run as a NixOS
+        # module, home-manager reads it through `osConfig` (#1400).
         home.sessionVariables.TROLLSHELL_AGENT_WINDOW_TLS_DIR = cfg.agentWindow.hiveTlsStateDir;
         systemd.user.sessionVariables.TROLLSHELL_AGENT_WINDOW_TLS_DIR = cfg.agentWindow.hiveTlsStateDir;
       })
 
       # The per-agent companion window (#950): the hyperhive agents card's two
-      # destinations. On by default exactly when `plugins.agents` is declared —
-      # the plugin resolves this binary on the *user manager's* PATH, which is
-      # what the user profile feeds, and degrades to the browser without it.
+      # destinations. On by default exactly when this machine runs hyperhive,
+      # read through `osConfig` (#1400; see the option) — the plugin resolves
+      # this binary on the *user manager's* PATH, which is what the user
+      # profile feeds, and degrades to the browser without it.
       (lib.mkIf cfg.agentWindow.enable {
         home.packages = [ cfg.agentWindow.package ];
       })

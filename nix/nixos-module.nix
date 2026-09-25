@@ -385,10 +385,10 @@ in
       })
 
       # The per-agent companion window (#950): the hyperhive agents card's two
-      # destinations. On by default exactly when `plugins.agents` is declared —
-      # the plugin resolves this binary on PATH and degrades to the browser
-      # without it (see the option). Its own mkMerge branch for the same reason
-      # the control center has one.
+      # destinations. On by default exactly when `services.hyperhive` is
+      # enabled on this machine (#1400) — the plugin resolves this binary on
+      # PATH and degrades to the browser without it (see the option). Its own
+      # mkMerge branch for the same reason the control center has one.
       (lib.mkIf cfg.agentWindow.enable {
         environment.systemPackages = [ cfg.agentWindow.package ];
 

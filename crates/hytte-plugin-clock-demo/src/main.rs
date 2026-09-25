@@ -1322,6 +1322,37 @@ mod tests {
         assert_eq!(date_line("2026-07-11T15:49:00Z").len(), NO_DATE.len());
     }
 
+    /// One date in every month, plus the 400-year leap rule and `weekday`'s
+    /// year-0000 guard — each checked against `date -u -d … +'%a %d %b'`.
+    ///
+    /// The #1409 review's test: the one above reaches only six months, so a
+    /// typo in `MONTHS` or in `weekday`'s offset table for any of the other
+    /// six, a dropped `% 400` clause or a dropped `+ 400` shift all shipped
+    /// green before it.
+    #[test]
+    fn the_date_line_names_every_month_and_the_400_year_rule() {
+        for (iso, want) in [
+            ("2026-01-15T12:00:00+01:00", "THU 15 JAN"),
+            ("2026-02-15T12:00:00+01:00", "SUN 15 FEB"),
+            ("2026-03-15T12:00:00+01:00", "SUN 15 MAR"),
+            ("2026-04-15T12:00:00+02:00", "WED 15 APR"),
+            ("2026-05-15T12:00:00+02:00", "FRI 15 MAY"),
+            ("2026-06-15T12:00:00+02:00", "MON 15 JUN"),
+            ("2026-07-15T12:00:00+02:00", "WED 15 JUL"),
+            ("2026-08-15T12:00:00+02:00", "SAT 15 AUG"),
+            ("2026-09-15T12:00:00+02:00", "TUE 15 SEP"),
+            ("2026-10-15T12:00:00+02:00", "THU 15 OCT"),
+            ("2026-11-15T12:00:00+01:00", "SUN 15 NOV"),
+            ("2026-12-15T12:00:00+01:00", "TUE 15 DEC"),
+            // divisible by 100 *and* 400: a leap year (2100 is the other half)
+            ("2000-02-29T12:00:00+01:00", "TUE 29 FEB"),
+            // `weekday`'s +400 shift: year 0000's January must not underflow
+            ("0000-01-01T00:00:00Z", "SAT 01 JAN"),
+        ] {
+            assert_eq!(date_line(iso), want, "{iso}");
+        }
+    }
+
     /// The sweep's projection on its own: 1-based three-second segments, dark
     /// without readable seconds, and a leap second pinned to the last segment.
     #[test]

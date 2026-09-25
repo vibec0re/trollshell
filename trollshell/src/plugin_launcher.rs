@@ -3223,6 +3223,40 @@ mod tests {
         }
     }
 
+    /// **What production hands the seam** (#1407 review, finding 3).
+    /// `reconcile_from` is the one place the real unit listing and the
+    /// caller's trigger reach [`reconcile_listing`]. Every test that gets as
+    /// far as the listing fakes it, and the production-task test stops at an
+    /// unparsable file before any listing, so this is held by source, on
+    /// `launch_at_startup_spawns_the_supervised_watch`'s precedent.
+    ///
+    /// Red if `reconcile_from` hands the seam a stub listing (every pass
+    /// planning against nothing: launches only, never a stop or restart) or
+    /// a fixed trigger, or if [`reconcile_then_watch`] stops forwarding the
+    /// loop's trigger (every watch retry launching blind, or startup never
+    /// doing so).
+    #[test]
+    fn production_hands_the_seam_the_real_listing_and_the_callers_trigger() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        let from = body("async fn reconcile_from(");
+        assert!(
+            from.contains("reconcile_listing(sources, trigger, systemd::list_plugin_units)"),
+            "reconcile_from must hand the seam the real listing and its own trigger:\n{from}"
+        );
+        let task = body("fn reconcile_then_watch(");
+        assert!(
+            task.contains("move |trigger|")
+                && task.contains("reconcile_from(sources.clone(), trigger)"),
+            "reconcile_then_watch must forward the loop's trigger:\n{task}"
+        );
+    }
+
     /// **What [`reconcile`] does with its outcome.** It is the
     /// `ReloadPlugins` entry point and reads the real environment. Its
     /// `Unlisted` arm needs a failing listing, i.e. the real user manager, so

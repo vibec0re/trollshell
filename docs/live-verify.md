@@ -1672,31 +1672,45 @@ four window properties below are pinned nowhere but here.
 - [ ] **(#1400)** The Plugins tab's switch persists, and nix pins win. Start
       from a module whose only plugin configuration is
       `programs.trollshell.enable = true;` (no `plugins`, no
-      `availablePlugins`) and rebuild. 1. `/etc/xdg/trollshell/plugins.json` (NixOS) or
-      `~/.config/trollshell/plugins.json` (home-manager) lists all thirteen
-      bundled plugins, every entry `"enabled": false` and none carrying
-      `_locked`; the control-center's Plugins tab lists every one of them,
-      all **off**, each switch live with the subtitle "…the choice is kept
-      across restarts". 2. Switch one on (say `timer`): it starts
-      (`systemctl --user status trollshell-plugin-timer` is `active`), and
-      `$XDG_STATE_HOME/trollshell/plugins.toml` (default
-      `~/.local/state/trollshell/plugins.toml`) now reads
-      `[enabled]` / `timer = true`, and nothing else. 3. `systemctl --user restart trollshell`: `timer` is still running
-      afterwards (the startup reconcile relaunches it from the folded
-      value) and its switch is still on. Switch it off again: it stops,
-      and `plugins.toml` is **gone** (the one override matched nix again). 4. Pin one: add `programs.trollshell.plugins.niri-layouts.enable = true;`
-      and rebuild. With the shell running, within about 3 s (the #1399
-      watch) the journal shows "plugins.json changed" and
-      `trollshell-plugin-niri-layouts` starts, with no shell restart; its
-      `plugins.json` entry carries `"_locked": ["enabled"]`, and its
-      switch in the tab is **greyed** with the subtitle
-      "Set in nix — programs.trollshell.plugins.niri-layouts.enable".
-      `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control SetPluginEnabled sb niri-layouts false`
-      fails with an error naming that option and leaves `plugins.toml`
-      untouched. 5. Change it to `lib.mkDefault true` and rebuild: the entry loses
-      `_locked`, the switch is live again, and switching it off now
-      persists (`niri-layouts = false` in `plugins.toml`) across a
-      `systemctl --user restart trollshell`.
+      `availablePlugins`) and rebuild.
+  1. `/etc/xdg/trollshell/plugins.json` (NixOS) or
+     `~/.config/trollshell/plugins.json` (home-manager) lists all thirteen
+     bundled plugins, every entry `"enabled": false` and none carrying
+     `_locked`; the control-center's Plugins tab lists every one of them, all
+     **off**, each switch live with the subtitle "…the choice is kept across
+     restarts". With **both** modules enabled and no `plugins` under
+     home-manager, only the `/etc/xdg` file exists (home-manager's
+     `availablePlugins` defaults to `[ ]` there).
+  2. Switch one on (say `timer`): it starts
+     (`systemctl --user status trollshell-plugin-timer` is `active`), and
+     `$XDG_STATE_HOME/trollshell/plugins.toml` (default
+     `~/.local/state/trollshell/plugins.toml`) now reads `[enabled]` /
+     `timer = true`, and nothing else.
+  3. `systemctl --user restart trollshell`: `timer` is still running
+     afterwards (the startup reconcile relaunches it from the folded value)
+     and its switch is still on. Switch it off again: it stops, and
+     `plugins.toml` is **gone** (the one override matched nix again).
+  4. Pin one: add `programs.trollshell.plugins.niri-layouts.enable = true;`
+     and rebuild. With the shell running, within about 3 s (the #1399 watch)
+     the journal shows "plugins.json changed" and
+     `trollshell-plugin-niri-layouts` starts, with no shell restart; its
+     `plugins.json` entry carries `"_locked": ["enabled"]`, and its switch in
+     the tab is **greyed** with the subtitle
+     "Set in nix — programs.trollshell.plugins.niri-layouts.enable".
+     `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control SetPluginEnabled sb niri-layouts false`
+     fails with an error naming that option and leaves `plugins.toml`
+     untouched.
+  5. Change it to `lib.mkDefault true` and rebuild: the entry loses
+     `_locked`, the switch is live again, and switching it off now persists
+     (`niri-layouts = false` in `plugins.toml`) across a
+     `systemctl --user restart trollshell`.
+  6. A refused persist changes nothing (#1400 review, finding 5): with a
+     plugin free, make the state directory unwritable
+     (`chmod a-w ~/.local/state/trollshell`, creating it first if needed) and
+     flip its switch. The plugin must **not** start or stop, the switch
+     snaps back within a poll, and its subtitle reads "Not changed: the
+     choice could not be kept (…)" naming the write error. Restore the mode
+     afterwards.
 
 ## Infobroker
 

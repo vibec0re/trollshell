@@ -37,32 +37,10 @@
       # between the `packages` output (per-plugin flake outputs, so
       # `programs.trollshell.plugins.<id>.package` has something in THIS flake to
       # point at) and the `checks` output (build coverage, #449), so the list
-      # lives once. `hytte-plugin-proto` (the wire-protocol lib) and
-      # `hytte-plugin` (the SDK) are not plugins and are deliberately absent.
-      bundledPluginNames = [
-        "hytte-plugin-agents"
-        "hytte-plugin-audio-widget"
-        "hytte-plugin-caw"
-        # One binary meant to be listed twice in `programs.trollshell.plugins`
-        # (#1388, on `hytte-plugin-stats`' shape below): the sidebar card its
-        # manifest mounts, and — with `mount = "BarCenter"` — the bar chip that
-        # used to be a second crate, `hytte-plugin-bar-clock-demo`.
-        "hytte-plugin-clock-demo"
-        "hytte-plugin-departures"
-        "hytte-plugin-infobroker"
-        "hytte-plugin-niri-layouts"
-        "hytte-plugin-pet"
-        "hytte-plugin-preem-demo"
-        # One binary meant to be listed twice in `programs.trollshell.plugins`
-        # (#1250): a bar instance and a right-sidebar one, distinguished by
-        # `HYTTE_PLUGIN_ID` + `HYTTE_PLUGIN_MOUNT` on the launch. That is a
-        # deployment shape, not a packaging one — there is still exactly one
-        # slice here, and `plugins.<id>.package` points both entries at it.
-        "hytte-plugin-stats"
-        "hytte-plugin-terminal"
-        "hytte-plugin-timer"
-        "hytte-plugin-weather"
-      ];
+      # lives once — and since #1400 in its own file, because the modules read
+      # it too (`programs.trollshell.availablePlugins` defaults to every id in
+      # it); see nix/bundled-plugins.nix for what is in it and why.
+      bundledPluginNames = import ./nix/bundled-plugins.nix;
       # The source revision this build came from (#601), threaded into the
       # *wrapped* binaries' runtime environment as `TROLLSHELL_REV` so a running
       # shell can answer "which commit am I?" — the question that has now cost
@@ -860,11 +838,14 @@
                         package = stubLlamaCpp;
                         model = "/var/empty/brain.gguf";
                       };
-                      # plugins (#350/#355, attrsOf keyed by id): `demo` gets a
-                      # unit; `off` must be filtered out by enable = false.
+                      # plugins (#350/#355, attrsOf keyed by id): `demo` is
+                      # declared enabled; `off` must render declared-but-off.
+                      # `demo` spells `enable = true` since #1400 flipped the
+                      # default to off (that makes it a pin, too).
                       plugins = {
                         demo = {
                           package = stubPlugin;
+                          enable = true;
                           env.DEMO_TOKEN = "hunter2";
                         };
                         off = {
@@ -1214,7 +1195,9 @@
                 exec = pkgs.lib.getExe stubPlugin;
                 env = { };
                 secrets = [ ];
-                enabled = true;
+                # #1400: off by default, and an unset `enable` pins nothing, so
+                # full equality also proves no `_locked` key is rendered.
+                enabled = false;
               };
               assertionPredicates = map (a: a.assertion) cfg.assertions;
               probe =
@@ -1306,13 +1289,14 @@
                 exec = pkgs.lib.getExe stubPlugin;
                 env = { };
                 secrets = [ ];
-                enabled = true;
+                # #1400: off by default, unpinned (no `_locked`).
+                enabled = false;
               };
               expectedClaudeBridge = {
                 exec = pkgs.lib.getExe stubClaudeBridge;
                 env = { };
                 secrets = [ ];
-                enabled = true;
+                enabled = false;
               };
               assertionPredicates = map (a: a.assertion) cfg.assertions;
               probe =
@@ -1432,11 +1416,14 @@
                       enable = true;
                       package = stubPackage;
                       weather.fallbackCity = "Berlin";
-                      # plugins (#350/#355, attrsOf keyed by id): `demo` gets a
-                      # unit; `off` must be filtered out by enable = false.
+                      # plugins (#350/#355, attrsOf keyed by id): `demo` is
+                      # declared enabled; `off` must render declared-but-off.
+                      # `demo` spells `enable = true` since #1400 flipped the
+                      # default to off (that makes it a pin, too).
                       plugins = {
                         demo = {
                           package = stubPlugin;
+                          enable = true;
                           env.DEMO_TOKEN = "hunter2";
                         };
                         off = {
@@ -1675,7 +1662,9 @@
                 exec = pkgs.lib.getExe stubPlugin;
                 env = { };
                 secrets = [ ];
-                enabled = true;
+                # #1400: off by default, and an unset `enable` pins nothing, so
+                # full equality also proves no `_locked` key is rendered.
+                enabled = false;
               };
               # The `plugins.<id>.mount` precedence assertion lives in the
               # shared `nix/module-common.nix`, so it has to hold on this
@@ -1806,13 +1795,14 @@
                 exec = pkgs.lib.getExe stubPlugin;
                 env = { };
                 secrets = [ ];
-                enabled = true;
+                # #1400: off by default, unpinned (no `_locked`).
+                enabled = false;
               };
               expectedClaudeBridge = {
                 exec = pkgs.lib.getExe stubClaudeBridge;
                 env = { };
                 secrets = [ ];
-                enabled = true;
+                enabled = false;
               };
               # The `plugins.<id>` id precedence assertion lives in the shared
               # `nix/module-common.nix`, so it has to hold on this platform
@@ -1942,6 +1932,234 @@
                 echo "$probe" >/dev/null
                 touch $out
               '';
+
+          # #1400, NixOS side: what a module with (almost) no plugin
+          # configuration renders into /etc/xdg/trollshell/plugins.json, and
+          # how `enable`'s nix PRIORITY decides whether the Plugins tab's
+          # switch may override it. One evaluation per arm, each against the
+          # real bundled packages (`self.packages`), since those are the
+          # defaults under test:
+          #
+          #   default   `programs.trollshell.enable = true;` alone: exactly
+          #             the thirteen bundled ids, each entry EQUAL to
+          #             `{ exec = <bundled>; env = { }; secrets = [ ];
+          #             enabled = false; }` — off, unpinned (no `_locked`),
+          #             and no HYTTE_PLUGIN_ID (every bundled id is its own
+          #             manifest id). Red if `enable` defaults on again, if
+          #             `availablePlugins` stops declaring them, or if the
+          #             bundled `package` default goes missing.
+          #   opt-out   `availablePlugins = [ ]`: no plugins.json at all, and
+          #             no agent window either (it follows `plugins.agents`).
+          #   pins      `enable = true` / `lib.mkForce false` render
+          #             `_locked = [ "enabled" ]`; `lib.mkDefault true`
+          #             renders enabled and NOT locked. Red if the priority
+          #             threshold moves (`< 1000` → `<= 1000` locks the
+          #             mkDefault arm).
+          #   instance  a second `stats` instance with its own `package` and
+          #             `mount`: rendered off, with its mount and its id.
+          #   missing   a non-bundled id with no `package`: the one false
+          #             assertion names `programs.trollshell.plugins.<id>.package`,
+          #             and the entry is left out of plugins.json rather than
+          #             rendered broken.
+          #
+          # `hm-module-plugins-available` below is the home-manager twin; the
+          # two render through the same `renderPluginEntries`.
+          nixos-module-plugins-available =
+            let
+              bundledIds = map (pkgs.lib.removePrefix "hytte-plugin-") bundledPluginNames;
+              bundledExe = id: pkgs.lib.getExe self.packages.${system}."hytte-plugin-${id}";
+              nixosConfig =
+                extra:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        weather.fallbackCity = "Berlin";
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                    extra
+                  ];
+                }).config;
+              rendered =
+                cfg:
+                builtins.fromJSON (
+                  builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
+                );
+              defaults = nixosConfig { };
+              defaultState = rendered defaults;
+              expectedDefault = pkgs.lib.genAttrs bundledIds (id: {
+                exec = bundledExe id;
+                env = { };
+                secrets = [ ];
+                enabled = false;
+              });
+              optOut = nixosConfig { programs.trollshell.availablePlugins = [ ]; };
+              pinsState = rendered (
+                nixosConfig (
+                  { lib, ... }:
+                  {
+                    programs.trollshell.plugins = {
+                      niri-layouts.enable = true;
+                      pet.enable = lib.mkForce false;
+                      stats.enable = lib.mkDefault true;
+                      stats-bar = {
+                        package = self.packages.${system}.hytte-plugin-stats;
+                        mount = "BarRight";
+                      };
+                    };
+                  }
+                )
+              );
+              missing = nixosConfig { programs.trollshell.plugins.vibectl.env.X = "1"; };
+              missingFalse = builtins.filter (a: !a.assertion) missing.assertions;
+              probe =
+                assert defaultState.plugins == expectedDefault;
+                assert defaults.programs.trollshell.availablePlugins == bundledIds;
+                assert builtins.length bundledIds == 13;
+                assert defaults.programs.trollshell.agentWindow.enable;
+                assert !(optOut.environment.etc ? "xdg/trollshell/plugins.json");
+                assert !optOut.programs.trollshell.agentWindow.enable;
+                assert
+                  pinsState.plugins.niri-layouts == {
+                    exec = bundledExe "niri-layouts";
+                    env = { };
+                    secrets = [ ];
+                    enabled = true;
+                    _locked = [ "enabled" ];
+                  };
+                assert
+                  pinsState.plugins.pet == {
+                    exec = bundledExe "pet";
+                    env = { };
+                    secrets = [ ];
+                    enabled = false;
+                    _locked = [ "enabled" ];
+                  };
+                assert
+                  pinsState.plugins.stats == {
+                    exec = bundledExe "stats";
+                    env = { };
+                    secrets = [ ];
+                    enabled = true;
+                  };
+                assert
+                  pinsState.plugins.stats-bar == {
+                    exec = bundledExe "stats";
+                    env = {
+                      HYTTE_PLUGIN_MOUNT = "BarRight";
+                      HYTTE_PLUGIN_ID = "stats-bar";
+                    };
+                    secrets = [ ];
+                    enabled = false;
+                  };
+                assert pinsState.plugins.timer == expectedDefault.timer;
+                assert builtins.length missingFalse == 1;
+                assert
+                  pkgs.lib.hasInfix "programs.trollshell.plugins.vibectl.package" (builtins.head missingFalse).message;
+                assert !((rendered missing).plugins ? vibectl);
+                builtins.deepSeq {
+                  inherit defaultState pinsState;
+                  missingMessage = (builtins.head missingFalse).message;
+                } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugins-available-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #1400, home-manager side: `nixos-module-plugins-available`'s
+          # arms against `$XDG_CONFIG_HOME/trollshell/plugins.json`, plus the
+          # one thing only this module has — the activation-time
+          # `ReloadPlugins` poke, installed exactly when the file is (so an
+          # opted-out config grows neither). home-manager throws on a failed
+          # assertion instead of handing back a predicate, so the `missing`
+          # arm is a `tryEval` with a control beside it (the same fixture
+          # WITH a `package` must evaluate), on
+          # `hm-module-plugin-id-conflict-unconditional`'s shape; the NixOS
+          # twin is where the message itself is checked.
+          hm-module-plugins-available =
+            let
+              bundledIds = map (pkgs.lib.removePrefix "hytte-plugin-") bundledPluginNames;
+              bundledExe = id: pkgs.lib.getExe self.packages.${system}."hytte-plugin-${id}";
+              hmConfig =
+                extra:
+                (home-manager.lib.homeManagerConfiguration {
+                  inherit pkgs;
+                  modules = [
+                    self.homeModules.default
+                    {
+                      home = {
+                        username = "alice";
+                        homeDirectory = "/home/alice";
+                        stateVersion = "24.11";
+                        enableNixpkgsReleaseCheck = false;
+                      };
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                      };
+                    }
+                    extra
+                  ];
+                }).config;
+              rendered =
+                cfg:
+                builtins.fromJSON (
+                  builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+                );
+              defaults = hmConfig { };
+              expectedDefault = pkgs.lib.genAttrs bundledIds (id: {
+                exec = bundledExe id;
+                env = { };
+                secrets = [ ];
+                enabled = false;
+              });
+              optOut = hmConfig { programs.trollshell.availablePlugins = [ ]; };
+              pinsState = rendered (
+                hmConfig (
+                  { lib, ... }:
+                  {
+                    programs.trollshell.plugins = {
+                      niri-layouts.enable = true;
+                      stats.enable = lib.mkDefault true;
+                    };
+                  }
+                )
+              );
+              missingPlugins =
+                plugin:
+                builtins.tryEval (
+                  builtins.deepSeq (rendered (hmConfig { programs.trollshell.plugins.vibectl = plugin; })) "ok"
+                );
+              missing = missingPlugins { env.X = "1"; };
+              control = missingPlugins { package = stubPlugin; };
+              probe =
+                assert (rendered defaults).plugins == expectedDefault;
+                assert defaults.home.activation ? trollshellReloadPlugins;
+                assert !(optOut.xdg.configFile ? "trollshell/plugins.json");
+                assert !(optOut.home.activation ? trollshellReloadPlugins);
+                assert pinsState.plugins.niri-layouts.enabled;
+                assert pinsState.plugins.niri-layouts._locked == [ "enabled" ];
+                assert pinsState.plugins.stats.enabled;
+                assert !(pinsState.plugins.stats ? _locked);
+                assert !missing.success;
+                assert control.success;
+                builtins.deepSeq { inherit pinsState missing control; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-plugins-available-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
 
           # #1041: `programs.trollshell.config.core-leds` renders a base-layer
           # `core-leds.toml` spliced onto the trollshell unit's own

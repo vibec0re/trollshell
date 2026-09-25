@@ -4,12 +4,12 @@ self:
   options,
   lib,
   pkgs,
-  # The programs.trollshell.plugins.<id> manifest-id inference (#1284),
-  # threaded in from `nix/module-common.nix`'s `_module.args` (imported
-  # below) rather than hand-copied here — see that file's own comment for
-  # the two-prefix heuristic and why a shared definition replaced three
-  # drifting copies (#1284 fix round, review LOW 3).
-  inferManifestId,
+  # `plugins.json`'s per-plugin entries, threaded in from
+  # `nix/module-common.nix`'s `_module.args` (imported below) rather than
+  # hand-copied here — the NixOS module renders the same map through the
+  # same function (#1400). What each entry carries, and why three of its
+  # fields are conditional, is documented there.
+  renderPluginEntries,
   # The `_locked` leaf-path list a rendered base-layer config file carries
   # beside its values (#1227), threaded in from the same `_module.args` for
   # the same reason — see `nix/module-common.nix` for what it renders and why
@@ -31,10 +31,10 @@ let
   # renders to a JSON state file the *shell* reads at startup — the host
   # launches each enabled plugin itself as a transient user unit via
   # `systemd-run --user` (trollshell/src/plugin_launcher.rs), which is also
-  # where #392's secret injection hooks in at spawn. Every entry is written,
-  # including enable = false ones ("enabled": false — declared but not
-  # auto-launched), so a disabled plugin still lists in the control-center's
-  # Plugins tab and can be started manually.
+  # where #392's secret injection hooks in at spawn. The `plugins` map is
+  # `renderPluginEntries`' (nix/module-common.nix, shared with the NixOS
+  # module since #1400): every entry, disabled ones included, plus the
+  # conditional `mount`/`HYTTE_PLUGIN_ID`/`_locked` fields documented there.
   #
   # `target` (#707) is the systemd user target each launched plugin unit binds
   # to (`PartOf=`) — the SAME value the shell's own unit below binds to. The
@@ -49,61 +49,14 @@ let
   # trollshellSessionEnv below) — a default-configured session's plugins.json
   # therefore stays byte-identical to the pre-#707 one, so upgrading recycles
   # no already-running plugin (#813 item 2 fixed this key being emitted
-  # unconditionally, which silently defeated that invariant).
-  #
-  # `mount` (#1161) is the same shape again: `null` (the default) adds
-  # nothing to `env`, so a config that never sets it renders byte-identical
-  # `plugins.json` to before this option existed; a non-null value merges in
-  # `HYTTE_PLUGIN_MOUNT`, which the launcher already turns into
-  # `--setenv=HYTTE_PLUGIN_MOUNT=<name>` with no launcher change at all — the
-  # override rides the same `env` path #392's key injection already uses.
-  #
-  # Note the merge order: `mount` is on the RIGHT of `//`, so it beats a
-  # hand-set `env.HYTTE_PLUGIN_MOUNT`. That is the right precedence (the
-  # typed option is the checked one) but would be a silent discard, so
-  # `nix/module-common.nix` asserts the two never disagree (#1260 review
-  # F5); agreeing values are merely redundant.
-  #
-  # `HYTTE_PLUGIN_ID` (#1284) gets the same treatment, on the same #1260
-  # precedent, but has no typed option of its own — the attribute NAME
-  # (`id` below) is the value, since #1250 already needs it to agree with
-  # the systemd unit name (`trollshell-plugin-<id>`) this launcher gives the
-  # plugin. `manifestId` is the plugin's own id absent an override, computed
-  # by `inferManifestId` (a module argument off `nix/module-common.nix` —
-  # see there for the two-prefix heuristic and why hytte-claude-bridge is
-  # the fallback prefix's one real consumer; `hytte-infobroker`'s CLI is
-  # deliberately NOT wired through `programs.trollshell.plugins` at all, see
-  # flake.nix's `bundledPluginNames` comment) rather than hand-declared, so
-  # nothing here can drift from the Rust constant the plugin actually
-  # registers with.
-  #
-  # `HYTTE_PLUGIN_ID` is therefore rendered only when the attribute key
-  # disagrees with that inferred id — a plugin declared under its own name
-  # (`plugins.stats`, `plugins.claude-bridge`) renders nothing, exactly as
-  # before this existed. `nix/module-common.nix`'s conflict assertion is a
-  # separate, UNCONDITIONAL guard on an explicit `env.HYTTE_PLUGIN_ID`
-  # against the attribute name — it does not consult `manifestId` at all
-  # (#1284 fix round, review MED 1), so it still fires even when nothing
-  # below would have rendered an override.
+  # unconditionally, which silently defeated that invariant). The per-plugin
+  # `mount` (#1161), `HYTTE_PLUGIN_ID` (#1284) and `_locked` (#1400) fields
+  # follow the same rule — rendered only when they say something — and are
+  # `renderPluginEntries`' job, in nix/module-common.nix.
   pluginsState = builtins.toJSON (
     {
       version = 1;
-      plugins = lib.mapAttrs (
-        id: plugin:
-        let
-          exec = lib.getExe plugin.package;
-          manifestId = inferManifestId plugin.package;
-        in
-        {
-          inherit exec;
-          env =
-            plugin.env
-            // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })
-            // (lib.optionalAttrs (id != manifestId) { HYTTE_PLUGIN_ID = id; });
-          inherit (plugin) secrets;
-          enabled = plugin.enable;
-        }
-      ) cfg.plugins;
+      plugins = renderPluginEntries cfg.plugins;
     }
     // (lib.optionalAttrs (cfg.systemd.target != "graphical-session.target") {
       target = cfg.systemd.target;
@@ -617,7 +570,10 @@ in
       # plugins dial plugin.sock and register themselves as before; supervision
       # (Restart=on-failure) and session lifetime (PartOf=graphical-session
       # .target) ride on the transient unit. Only written when any plugin is
-      # declared, so a plugin-less config grows no config file.
+      # declared, so a plugin-less config grows no config file — and since
+      # #1400 "plugin-less" takes `availablePlugins = [ ]` too, because by
+      # default every bundled plugin is declared (off), so an enabled module
+      # writes this file, and installs the poke below, on every switch.
       #
       # Writing the file is only half of "declarative", though (#695): the units
       # are *transient*, created by the shell at runtime, so there is no unit
@@ -630,7 +586,11 @@ in
       # reconciles on a change, so the poke is no longer what makes a switch
       # apply at all: it makes it apply *now* instead of on the next tick, and
       # it is kept because it is idempotent (a poke and a tick that see the
-      # same change serialise, and the second finds nothing to do). Notes:
+      # same change serialise, and the second finds nothing to do). It
+      # reconciles onto the *effective* state, the Plugins tab's persisted
+      # switch folded in (#1400), so a switch that leaves a plugin's
+      # declaration alone does not undo what the tab turned on or off.
+      # Notes:
       #   * run as a NixOS module, activation happens in home-manager-<user>
       #     .service, which has no DBUS_SESSION_BUS_ADDRESS — hence the same
       #     XDG_RUNTIME_DIR prelude home-manager's own startServices uses.

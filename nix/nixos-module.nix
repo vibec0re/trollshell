@@ -4,12 +4,12 @@ self:
   options,
   lib,
   pkgs,
-  # The programs.trollshell.plugins.<id> manifest-id inference (#1284),
-  # threaded in from `nix/module-common.nix`'s `_module.args` (imported
-  # below) rather than hand-copied here — see that file's own comment for
-  # the two-prefix heuristic and why a shared definition replaced three
-  # drifting copies (#1284 fix round, review LOW 3).
-  inferManifestId,
+  # `plugins.json`'s per-plugin entries, threaded in from
+  # `nix/module-common.nix`'s `_module.args` (imported below) rather than
+  # hand-copied here — the home-manager module renders the same map through
+  # the same function (#1400). What each entry carries, and why three of its
+  # fields are conditional, is documented there.
+  renderPluginEntries,
   # The `_locked` leaf-path list a rendered base-layer config file carries
   # beside its values (#1227), threaded in from the same `_module.args` for
   # the same reason — see `nix/module-common.nix` for what it renders and why
@@ -43,53 +43,20 @@ let
   # renders to a JSON state file the *shell* reads at startup — the host
   # launches each enabled plugin itself as a transient user unit via
   # `systemd-run --user` (trollshell/src/plugin_launcher.rs), which is also
-  # where #392's secret injection hooks in at spawn. Every entry is written,
-  # including enable = false ones ("enabled": false — declared but not
-  # auto-launched), so a disabled plugin still lists in the control-center's
-  # Plugins tab and can be started manually. Same JSON as the home-manager
-  # module builds, minus its top-level "target" key (#707): that renders
+  # where #392's secret injection hooks in at spawn. The `plugins` map is
+  # `renderPluginEntries`' (nix/module-common.nix), the same function the
+  # home-manager module renders through since #1400, so the two cannot drift:
+  # every entry, disabled ones included, plus the conditional `mount`
+  # (#1161), `HYTTE_PLUGIN_ID` (#1284) and `_locked` (#1400) fields documented
+  # there. The one difference is the top-level "target" key (#707), which
+  # only the home-manager module writes: it renders
   # `programs.trollshell.systemd.target`, a home-manager-only option — this
   # module ships no shell user unit of its own, so it has no session target to
   # bind plugins to. The key is optional on the shell side and its absence means
-  # graphical-session.target, which is exactly what this module wants. Keep the
-  # rest of the two in sync.
-  #
-  # `mount` (#1161): see `nix/hm-module.nix`'s matching comment — `null` (the
-  # default) adds nothing to `env`, so the strictly-additive/byte-identical
-  # claim holds here too, and the same `//` merge order makes `mount` beat a
-  # hand-set `env.HYTTE_PLUGIN_MOUNT` (asserted against in
-  # `nix/module-common.nix` rather than resolved silently, #1260 review F5).
-  #
-  # `HYTTE_PLUGIN_ID` (#1284): see `nix/hm-module.nix`'s matching comment —
-  # the attribute key (`id` below) IS the override, rendered only when it
-  # disagrees with `manifestId`, computed by `inferManifestId` (a module
-  # argument off `nix/module-common.nix` — the two-prefix heuristic and why
-  # `hytte-claude-bridge` is the fallback prefix's one real consumer live
-  # there now, not here; `hytte-infobroker`'s CLI is deliberately NOT wired
-  # through `programs.trollshell.plugins`, see flake.nix's
-  # `bundledPluginNames` comment). `nix/module-common.nix`'s conflict
-  # assertion is a separate, UNCONDITIONAL guard on an explicit
-  # `env.HYTTE_PLUGIN_ID` against the attribute name — it does not consult
-  # `manifestId` at all (#1284 fix round, review MED 1). Keep the rest of
-  # the two platform modules in sync.
+  # graphical-session.target, which is exactly what this module wants.
   pluginsState = builtins.toJSON {
     version = 1;
-    plugins = lib.mapAttrs (
-      id: plugin:
-      let
-        exec = lib.getExe plugin.package;
-        manifestId = inferManifestId plugin.package;
-      in
-      {
-        inherit exec;
-        env =
-          plugin.env
-          // (lib.optionalAttrs (plugin.mount != null) { HYTTE_PLUGIN_MOUNT = plugin.mount; })
-          // (lib.optionalAttrs (id != manifestId) { HYTTE_PLUGIN_ID = id; });
-        inherit (plugin) secrets;
-        enabled = plugin.enable;
-      }
-    ) cfg.plugins;
+    plugins = renderPluginEntries cfg.plugins;
   };
 
   # Bottom-up prune of one subsystem's option value (#1237 review MEDIUM-1) —
@@ -299,9 +266,12 @@ in
       # shadows this system one (first existing file wins whole, no merge).
       # Note `programs.trollshell.plugins` set at NixOS system level is a
       # *separate* declaration from any home-manager per-user
-      # `programs.trollshell.plugins` (home-manager.sharedModules below only
-      # shares the module definition, not config values) — set it wherever
-      # you actually run the shell.
+      # `programs.trollshell.plugins` — set it wherever you actually run the
+      # shell. Since #1400 `availablePlugins` declares every bundled plugin
+      # by default, so an enabled module always has a plugin declared and
+      # always writes this file; a machine that also enables the
+      # home-manager module gets that one's file shadowing this one, whole
+      # (the `plugins` option description says how to pick).
       #
       # There is no activation poke here, unlike home-manager's
       # ReloadPlugins call: system activation runs as root with no user bus

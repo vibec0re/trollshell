@@ -59,6 +59,21 @@
 //! a Start/Stop call) is what stops `refresh_detail`'s own `set_active` from
 //! recording a bogus intent of its own.
 //!
+//! # What the switch means depends on who declared the plugin (#1400)
+//!
+//! Flipping the switch sends `StartPlugin`/`StopPlugin`, then
+//! `SetPluginEnabled`, and since #1400 that second call **persists** for a
+//! plugin `plugins.json` declares: the shell keeps the choice in its own
+//! `$XDG_STATE_HOME/trollshell/plugins.toml`, so it survives a restart. The
+//! exception is a plugin whose `enable` nix pins — assigned plainly or with
+//! `lib.mkForce`, which the modules render as `"_locked": ["enabled"]` on its
+//! entry. The shell refuses to persist over a pin, so this tab greys that
+//! switch and names the option to change instead. It reads the pins out of
+//! `plugins.json` directly ([`read_declared_at`]), through the same
+//! parse-once cache as the #1161 mounts ([`DeclaredPlugins`]) and with no
+//! `Control` change. An undeclared plugin (a hand-installed static unit)
+//! keeps its unit file's enable/disable. [`switch_policy`] is the rule.
+//!
 //! # Polls are ordered, not serialised (#983)
 //!
 //! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
@@ -104,7 +119,7 @@
 //! floor is set on both axes.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -487,10 +502,11 @@ struct PluginsState {
     /// of identical outcomes logs once, not once per poll — see
     /// [`on_poll_result_with_declared`].
     last_failing: Rc<Cell<Option<bool>>>,
-    /// `plugins.json`'s declared `HYTTE_PLUGIN_MOUNT` overrides (#1161),
-    /// parsed at most once per change to the file — see [`DeclaredMounts`]
-    /// for why the 2 s poll must not re-read it (#1260 review F7).
-    declared: Rc<RefCell<DeclaredMounts>>,
+    /// What `plugins.json` declares — the `HYTTE_PLUGIN_MOUNT` overrides
+    /// (#1161) and which plugins nix pins (#1400) — parsed at most once per
+    /// change to the file; see [`DeclaredPlugins`] for why the 2 s poll must
+    /// not re-read it (#1260 review F7).
+    declared: Rc<RefCell<DeclaredPlugins>>,
     /// The selected plugin's manifest id out of the same `plugins.json`,
     /// remembered under the same stamp — see [`DeclaredManifestId`] for why
     /// this is a second cache and not a column of the one above (#1365
@@ -572,7 +588,7 @@ struct WeakPluginsState {
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
-    declared: Rc<RefCell<DeclaredMounts>>,
+    declared: Rc<RefCell<DeclaredPlugins>>,
     manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
@@ -825,7 +841,7 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
-        declared: Rc::new(RefCell::new(DeclaredMounts::default())),
+        declared: Rc::new(RefCell::new(DeclaredPlugins::default())),
         manifest_ids: Rc::new(RefCell::new(DeclaredManifestId::default())),
         env,
         search_path: Rc::new(OnceCell::new()),
@@ -891,9 +907,12 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
         )
         .build();
 
+    // The subtitle is `switch_subtitle`'s, set per plugin by `refresh_detail`
+    // (#1400). Plain text, not markup: it can carry a plugin id.
     let switch = adw::SwitchRow::builder()
         .title("Running")
-        .subtitle("Start and enable the unit, or stop and disable it")
+        .use_markup(false)
+        .subtitle(switch_subtitle(SwitchPolicy::UnitFile, ""))
         .build();
     let controls = adw::PreferencesGroup::new();
     controls.add(&switch);
@@ -1318,7 +1337,7 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 ///
 /// What this tick costs is one [`probe_candidates`] stat, not a read and a
 /// `serde_json` parse: the parse happens on the first tick and then only when
-/// the file's stamp changes (#1260 review F7 — see [`DeclaredMounts`] for why
+/// the file's stamp changes (#1260 review F7 — see [`DeclaredPlugins`] for why
 /// a stat-shaped stamp is enough for a nix-rendered store symlink). The search
 /// path itself — which candidate paths to stat — is resolved from
 /// [`PluginsState::env`] through [`PluginsState::search_path`] once, not per
@@ -1327,18 +1346,24 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// default).
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
-    let candidates = resolved_search_path(&state.search_path, &state.env);
-    let declared = {
-        let probe = probe_candidates(candidates);
-        state
-            .declared
-            .borrow_mut()
-            .get(probe, read_declared_mounts_at)
-    };
+    let declared = refresh_declared(state);
     let state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
-        on_poll_result_with_declared(&state, generation, res, &declared);
+        on_poll_result_with_declared(&state, generation, res, &declared.mounts);
     });
+}
+
+/// The filesystem half of [`refresh_plugins`]'s tick: probe the search path
+/// and hand back [`PluginsState::declared`]'s parse of `plugins.json`,
+/// re-reading it only when its stamp moved.
+///
+/// Its own function so a test can refresh what the switch renders from
+/// (#1400) through the production path without the `Control` round trip the
+/// rest of the tick spawns.
+fn refresh_declared(state: &PluginsState) -> Rc<DeclaredFile> {
+    let candidates = resolved_search_path(&state.search_path, &state.env);
+    let probe = probe_candidates(candidates);
+    state.declared.borrow_mut().get(probe, read_declared_at)
 }
 
 /// One [`list_plugins_and_states`] completion, applied to the tab — or
@@ -1380,7 +1405,7 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
 
 /// `on_poll_result`'s real logic, parameterised by the plugin-id →
 /// declared-mount map
-/// [`read_declared_mounts_at`] reads out of `plugins.json` (#1161). Split out so
+/// [`read_declared_at`] reads out of `plugins.json` (#1161). Split out so
 /// that real filesystem read is injectable rather than baked into the
 /// function every existing poll-ordering test already drives — see
 /// `tests-must-not-touch-real-xdg` in the project's own house rules for why
@@ -1432,7 +1457,7 @@ fn on_poll_result_with_declared(
 }
 
 /// Zip a `ListPluginStates` reply with the declared-mount map
-/// [`read_declared_mounts_at`] read into `PluginRuntime`s, keyed by id (#1161).
+/// [`read_declared_at`] read into `PluginRuntime`s, keyed by id (#1161).
 ///
 /// Split out of [`on_poll_result_with_declared`] purely so the
 /// declared-mount attachment is unit-testable on its own: it takes no
@@ -1523,7 +1548,7 @@ fn resolved_search_path<'a>(
 }
 
 /// The `plugins.json` the search path settled on, plus the cheap identity
-/// [`DeclaredMounts`] keys its cached parse on (#1260 review F7).
+/// [`DeclaredPlugins`] keys its cached parse on (#1260 review F7).
 ///
 /// Everything here comes from one `stat` plus a `realpath`-style walk (a
 /// handful of `readlink`s — one per path component per symlink hop crossed)
@@ -1605,8 +1630,24 @@ fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
     })
 }
 
-/// The declared `HYTTE_PLUGIN_MOUNT` overrides in `plugins.json`, parsed **at
-/// most once per change to the file** (#1260 review F7).
+/// What `plugins.json` declares, as far as this tab reads it: the
+/// `HYTTE_PLUGIN_MOUNT` overrides (#1161), and which ids are declared at all
+/// and which of those nix pins (#1400). One parse, cached by
+/// [`DeclaredPlugins`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DeclaredFile {
+    /// Plugin id → its declared `HYTTE_PLUGIN_MOUNT` wire name (#1161).
+    mounts: HashMap<String, String>,
+    /// Every plugin id the file declares (#1400) — a declared plugin's
+    /// switch persists, an undeclared one's is a legacy unit file's.
+    ids: HashSet<String>,
+    /// The declared ids whose `enabled` nix pins, i.e. whose entry carries
+    /// `"_locked": ["enabled"]` (#1400): their switch is greyed.
+    pinned: HashSet<String>,
+}
+
+/// What `plugins.json` declares ([`DeclaredFile`]), parsed **at most once per
+/// change to the file** (#1260 review F7).
 ///
 /// Before this, [`refresh_plugins`] did a full read + `serde_json` parse on
 /// the GTK main thread on every 2 s tick, for the window's whole life and
@@ -1619,15 +1660,15 @@ fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
 /// box whose plugins were installed by hand, and it should not re-walk the
 /// search path's every candidate any more often than a hit does.
 #[derive(Default)]
-struct DeclaredMounts {
+struct DeclaredPlugins {
     /// What the last `probe_plugins_json` found — see [`Seen`].
     seen: Seen,
     /// The last parse. Handed out by `Rc` so a poll's completion closure can
-    /// hold it without re-cloning the map.
-    map: Rc<HashMap<String, String>>,
+    /// hold it without re-cloning the maps.
+    map: Rc<DeclaredFile>,
 }
 
-/// The state [`DeclaredMounts`] compares tick to tick.
+/// The state [`DeclaredPlugins`] compares tick to tick.
 ///
 /// Three states, not `Option<Option<…>>`: [`Unprobed`](Self::Unprobed) — the
 /// cache has never run, so the first tick must read — is a genuinely
@@ -1641,26 +1682,33 @@ enum Seen {
     Found(PluginsJson),
 }
 
-impl DeclaredMounts {
-    /// The cached map, re-reading through `read` **only** when `probe`
+impl DeclaredPlugins {
+    /// The cached parse, re-reading through `read` **only** when `probe`
     /// differs from the one the cache last parsed.
     ///
     /// `read` is a parameter rather than a hard-wired call so a test can
     /// count how often the blocking half actually runs — which is the
     /// property this type exists for, and the one a stamp comparison that
     /// stopped working would break silently.
-    fn get<F>(&mut self, probe: Option<PluginsJson>, read: F) -> Rc<HashMap<String, String>>
+    fn get<F>(&mut self, probe: Option<PluginsJson>, read: F) -> Rc<DeclaredFile>
     where
-        F: FnOnce(&Path) -> HashMap<String, String>,
+        F: FnOnce(&Path) -> DeclaredFile,
     {
         let seen = probe.map_or(Seen::Missing, Seen::Found);
         if self.seen != seen {
             self.map = Rc::new(match &seen {
                 Seen::Found(found) => read(&found.path),
-                Seen::Unprobed | Seen::Missing => HashMap::new(),
+                Seen::Unprobed | Seen::Missing => DeclaredFile::default(),
             });
             self.seen = seen;
         }
+        Rc::clone(&self.map)
+    }
+
+    /// The last parse, without probing — what a selection change between two
+    /// polls renders the switch from (#1400). Empty until the first
+    /// [`refresh_declared`].
+    fn last(&self) -> Rc<DeclaredFile> {
         Rc::clone(&self.map)
     }
 }
@@ -1668,7 +1716,7 @@ impl DeclaredMounts {
 /// The manifest id `plugins.json` implies for **the selected plugin**,
 /// remembered per id and per file stamp (#1365 review, MED 5).
 ///
-/// [`DeclaredMounts`] above, narrowed to one id. It is a second cache rather
+/// [`DeclaredPlugins`] above, narrowed to one id. It is a second cache rather
 /// than a second column of that map because the two are asked different
 /// questions at different times: that one is asked for *every* row on every
 /// poll and so is worth parsing whole, this one is asked about the one
@@ -1694,7 +1742,7 @@ impl DeclaredManifestId {
     /// The cached manifest id for `id`, re-reading through `read` **only**
     /// when the id or the file's stamp differs from the last lookup.
     ///
-    /// `read` is a parameter for [`DeclaredMounts::get`]'s reason: a test can
+    /// `read` is a parameter for [`DeclaredPlugins::get`]'s reason: a test can
     /// then count how often the blocking half runs, which is the property
     /// this type exists for and the one a stamp comparison that stopped
     /// working would break silently.
@@ -1718,50 +1766,111 @@ impl DeclaredManifestId {
     }
 }
 
-/// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` out of the
-/// `plugins.json` at `path` (#1161) — the same file `nix/hm-module.nix` /
-/// `nix/nixos-module.nix` render.
+/// Read what the `plugins.json` at `path` declares ([`DeclaredFile`]) —
+/// the same file `nix/hm-module.nix` / `nix/nixos-module.nix` render and
+/// `trollshell::plugin_launcher` reads.
 ///
 /// Best-effort, the same failure mode [`hytte_config::places::load_places`]
 /// gives this tab's Places sibling: an unreadable or unparsable file yields
-/// an empty map rather than an error — the row simply shows no override note,
-/// same as an unreachable shell showing no runtime overlay.
+/// an empty parse rather than an error — the row simply shows no override
+/// note and its switch reads as a legacy unit's, same as an unreachable shell
+/// showing no runtime overlay.
 ///
-/// **Two id namespaces meet in the map this returns** (#1260 review F9, and
-/// inherited from #423 rather than new here): its keys are `plugins.json`
-/// attribute names — i.e. `programs.trollshell.plugins.<id>`, a nix option
-/// name — while the ids they are looked up by in [`runtime_states`] come from
-/// `ListPluginStates`, i.e. the **manifest** id the plugin registered with.
-/// Nothing enforces that the two agree; they coincide by convention, and
-/// `apply_plugins`' own `rt.get(id)` has zipped the same two namespaces since
-/// #423. A plugin whose manifest id differs from its nix attribute name
-/// simply shows no override note.
-fn read_declared_mounts_at(path: &Path) -> HashMap<String, String> {
+/// **Two id namespaces meet in the mount map this returns** (#1260 review
+/// F9, and inherited from #423 rather than new here): its keys are
+/// `plugins.json` attribute names — i.e. `programs.trollshell.plugins.<id>`,
+/// a nix option name — while the ids they are looked up by in
+/// [`runtime_states`] come from `ListPluginStates`, i.e. the **manifest** id
+/// the plugin registered with. Nothing enforces that the two agree; they
+/// coincide by convention, and `apply_plugins`' own `rt.get(id)` has zipped
+/// the same two namespaces since #423. A plugin whose manifest id differs
+/// from its nix attribute name simply shows no override note. The
+/// [`ids`](DeclaredFile::ids) and [`pinned`](DeclaredFile::pinned) sets have
+/// no such seam: the switch looks them up by the `ListPlugins` id, which is
+/// the unit's, i.e. the attribute name itself.
+fn read_declared_at(path: &Path) -> DeclaredFile {
     std::fs::read_to_string(path)
         .ok()
-        .map(|text| declared_mounts_from_json(&text))
+        .map(|text| declared_from_json(&text))
         .unwrap_or_default()
 }
 
-/// The pure half of [`read_declared_mounts_at`]: `{"plugins": {"<id>": {"env":
-/// {"HYTTE_PLUGIN_MOUNT": "<name>"}}}}` → `{id: name}`, dropping any entry
-/// that is missing the key or shaped unexpectedly rather than erroring — the
-/// same tolerance the rest of this best-effort read has. Split out so a test
-/// can drive it without touching the filesystem.
-fn declared_mounts_from_json(text: &str) -> HashMap<String, String> {
+/// The pure half of [`read_declared_at`]: one `serde_json` parse of
+/// `{"plugins": {"<id>": {"env": {"HYTTE_PLUGIN_MOUNT": "<name>"},
+/// "_locked": ["enabled"], …}}}`, dropping any entry shaped unexpectedly
+/// rather than erroring — the same tolerance the rest of this best-effort
+/// read has. Split out so a test can drive it without touching the
+/// filesystem.
+fn declared_from_json(text: &str) -> DeclaredFile {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return HashMap::new();
+        return DeclaredFile::default();
     };
     let Some(plugins) = value.get("plugins").and_then(serde_json::Value::as_object) else {
-        return HashMap::new();
+        return DeclaredFile::default();
     };
-    plugins
+    let mounts = plugins
         .iter()
         .filter_map(|(id, spec)| {
             let mount = spec.get("env")?.get("HYTTE_PLUGIN_MOUNT")?.as_str()?;
             Some((id.clone(), mount.to_owned()))
         })
-        .collect()
+        .collect();
+    let pinned = plugins
+        .iter()
+        .filter(|(_, spec)| {
+            spec.get("_locked")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("enabled")))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    DeclaredFile {
+        mounts,
+        ids: plugins.keys().cloned().collect(),
+        pinned,
+    }
+}
+
+/// [`declared_from_json`]'s mount map alone (#1161) — what the mount tests
+/// below were written against.
+#[cfg(test)]
+fn declared_mounts_from_json(text: &str) -> HashMap<String, String> {
+    declared_from_json(text).mounts
+}
+
+/// What the detail pane's switch does for one plugin (#1400).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchPolicy {
+    /// Declared in `plugins.json` and pinned in nix: the switch is greyed,
+    /// since `SetPluginEnabled` would refuse it.
+    Pinned,
+    /// Declared and free: start/stop now, and the shell keeps the choice
+    /// across restarts (its `plugins.toml` state file).
+    Kept,
+    /// Not declared: a hand-installed static unit — start/stop plus the unit
+    /// file's own enable/disable.
+    UnitFile,
+}
+
+/// The [`SwitchPolicy`] for `id` under what `plugins.json` declares. Pure.
+fn switch_policy(file: &DeclaredFile, id: &str) -> SwitchPolicy {
+    if file.pinned.contains(id) {
+        SwitchPolicy::Pinned
+    } else if file.ids.contains(id) {
+        SwitchPolicy::Kept
+    } else {
+        SwitchPolicy::UnitFile
+    }
+}
+
+/// The switch row's subtitle for `policy` — for a pinned plugin, the option
+/// to change instead (#1400). Plain text: the row is built with markup off.
+fn switch_subtitle(policy: SwitchPolicy, id: &str) -> String {
+    match policy {
+        SwitchPolicy::Pinned => format!("Set in nix — programs.trollshell.plugins.{id}.enable"),
+        SwitchPolicy::Kept => "Start or stop it; the choice is kept across restarts".to_owned(),
+        SwitchPolicy::UnitFile => "Start and enable the unit, or stop and disable it".to_owned(),
+    }
 }
 
 /// Apply a non-empty unit list + runtime overlay: update the existing rows in
@@ -2074,6 +2183,19 @@ fn refresh_detail(state: &PluginsState) {
     state.syncing.set(true);
     state.detail.switch.set_active(show_running);
     state.syncing.set(false);
+
+    // #1400: what flipping it means. A plugin nix pins gets a greyed switch
+    // naming the option to change instead — the shell would refuse to
+    // persist it — while a free one says its choice is kept.
+    let policy = switch_policy(&state.declared.borrow().last(), &id);
+    state
+        .detail
+        .switch
+        .set_sensitive(policy != SwitchPolicy::Pinned);
+    state
+        .detail
+        .switch
+        .set_subtitle(&switch_subtitle(policy, &id));
 }
 
 /// Mount (or leave alone, or tear down) the selected plugin's *Configuration*
@@ -2154,7 +2276,7 @@ fn refresh_config(state: &PluginsState, id: &str) {
 /// runs from [`refresh_detail`] on every tick and early-returns only when a
 /// form **is** mounted — so for a selected plugin that owns no family, which
 /// is most of them, this is reached every time. The read and the
-/// `serde_json` parse behind it are exactly the cost [`DeclaredMounts`]
+/// `serde_json` parse behind it are exactly the cost [`DeclaredPlugins`]
 /// exists to keep off that tick (#1260 review F7), so the answer is
 /// remembered by [`DeclaredManifestId`] under the same
 /// [`probe_candidates`] stamp: the tick pays one `stat` plus one `realpath`,
@@ -2165,7 +2287,7 @@ fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_for
 }
 
 /// [`family_for_plugin`] with the read half as a parameter, so a test can
-/// count how often it actually runs — [`DeclaredMounts::get`]'s shape, and
+/// count how often it actually runs — [`DeclaredPlugins::get`]'s shape, and
 /// the property the memo exists for.
 fn family_for_plugin_reading<F>(
     state: &PluginsState,
@@ -2818,12 +2940,13 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates, VersionsOutcome,
-        classify_versions, declared_mounts_from_json, is_running, manifest_id_of_exec,
-        mount_display, mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
-        read_declared_mounts_at, resolved_search_path, runtime_overlay, runtime_states,
-        same_plugin_set, seen_suffix, status_cell, version_label, versions_log, versions_or_empty,
-        violations_suffix,
+        DeclaredFile, DeclaredPlugins, PluginRuntime, PluginsJson, PollGenerations, PollStates,
+        SwitchPolicy, VersionsOutcome, classify_versions, declared_from_json,
+        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
+        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json, read_declared_at,
+        resolved_search_path, runtime_overlay, runtime_states, same_plugin_set, seen_suffix,
+        status_cell, switch_policy, switch_subtitle, version_label, versions_log,
+        versions_or_empty, violations_suffix,
     };
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -3150,6 +3273,61 @@ mod tests {
         assert!(declared_mounts_from_json(r#"{"plugins": "not an object"}"#).is_empty());
     }
 
+    // ── What the switch means (#1400) ───────────────────────────────────────
+
+    /// The declared ids and the pinned ones, read off the same parse as the
+    /// mounts: `_locked` naming `enabled` pins, anything else does not, and
+    /// an entry without it — every unpinned one, and every pre-#1400 file —
+    /// is declared and free.
+    #[test]
+    fn declared_from_json_reads_the_pins_and_the_declared_ids() {
+        let text = r#"{
+            "version": 1,
+            "plugins": {
+                "niri-layouts": { "exec": "x", "enabled": true, "_locked": ["enabled"] },
+                "timer": { "exec": "x", "enabled": false },
+                "later": { "exec": "x", "enabled": false, "_locked": ["some-future-key"] },
+                "odd": { "exec": "x", "enabled": false, "_locked": "enabled" }
+            }
+        }"#;
+        let file = declared_from_json(text);
+        let set = |ids: &[&str]| ids.iter().map(|&id| id.to_owned()).collect();
+        assert_eq!(file.ids, set(&["later", "niri-layouts", "odd", "timer"]));
+        assert_eq!(
+            file.pinned,
+            set(&["niri-layouts"]),
+            "only a list naming `enabled` pins the switch"
+        );
+        assert_eq!(declared_from_json("not json"), DeclaredFile::default());
+    }
+
+    /// Pinned beats declared, declared beats a unit file, and each says what
+    /// it means — the pinned one by naming the option to change.
+    ///
+    /// Red if the pin check is dropped (a pinned plugin reads as `Kept`) or
+    /// the subtitle stops naming the option.
+    #[test]
+    fn switch_policy_greys_only_a_pinned_plugin() {
+        let file = declared_from_json(
+            r#"{"plugins":{
+                "niri-layouts":{"exec":"x","enabled":true,"_locked":["enabled"]},
+                "timer":{"exec":"x","enabled":false}
+            }}"#,
+        );
+        assert_eq!(switch_policy(&file, "niri-layouts"), SwitchPolicy::Pinned);
+        assert_eq!(switch_policy(&file, "timer"), SwitchPolicy::Kept);
+        assert_eq!(switch_policy(&file, "hand-made"), SwitchPolicy::UnitFile);
+        assert_eq!(
+            switch_subtitle(SwitchPolicy::Pinned, "niri-layouts"),
+            "Set in nix — programs.trollshell.plugins.niri-layouts.enable"
+        );
+        assert!(switch_subtitle(SwitchPolicy::Kept, "timer").contains("kept across restarts"));
+        assert!(
+            switch_subtitle(SwitchPolicy::UnitFile, "hand-made").contains("enable the unit"),
+            "a legacy unit's switch keeps its unit-file wording"
+        );
+    }
+
     // ── The declared-mount map reaches `PluginRuntime` (#1161) ───────────────
     //
     // `runtime_states` is the wiring `on_poll_result_with_declared` runs on
@@ -3294,15 +3472,18 @@ mod tests {
         }
     }
 
-    fn one_override() -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        map.insert("agents".to_owned(), "SidebarRightTop".to_owned());
-        map
+    fn one_override() -> DeclaredFile {
+        let mut mounts = HashMap::new();
+        mounts.insert("agents".to_owned(), "SidebarRightTop".to_owned());
+        DeclaredFile {
+            mounts,
+            ..DeclaredFile::default()
+        }
     }
 
     #[test]
     fn the_declared_mount_file_is_parsed_once_while_its_stamp_holds() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         let mut reads = 0;
         for _ in 0..5 {
             let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| {
@@ -3310,7 +3491,7 @@ mod tests {
                 one_override()
             });
             assert_eq!(
-                map.get("agents").map(String::as_str),
+                map.mounts.get("agents").map(String::as_str),
                 Some("SidebarRightTop"),
                 "every tick must still see the overrides"
             );
@@ -3323,11 +3504,11 @@ mod tests {
 
     #[test]
     fn a_changed_stamp_reparses() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         let mut reads = 0;
         cache.get(Some(stamp("/x/plugins.json", 42)), |_| {
             reads += 1;
-            HashMap::new()
+            DeclaredFile::default()
         });
         // Same path, different content: a rebuild.
         let map = cache.get(Some(stamp("/x/plugins.json", 43)), |_| {
@@ -3336,17 +3517,17 @@ mod tests {
         });
         assert_eq!(reads, 2, "a changed stamp must re-read");
         assert_eq!(
-            map.get("agents").map(String::as_str),
+            map.mounts.get("agents").map(String::as_str),
             Some("SidebarRightTop")
         );
     }
 
     #[test]
     fn no_plugins_json_is_cached_too_and_never_read() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         for _ in 0..3 {
             let map = cache.get(None, |_| panic!("there is no file to read"));
-            assert!(map.is_empty());
+            assert!(map.mounts.is_empty());
         }
     }
 
@@ -3354,15 +3535,16 @@ mod tests {
     /// none must be picked up, not swallowed by the cached "no file".
     #[test]
     fn a_file_appearing_later_is_picked_up() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         assert!(
             cache
                 .get(None, |_| panic!("there is no file yet"))
+                .mounts
                 .is_empty()
         );
         let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| one_override());
         assert_eq!(
-            map.get("agents").map(String::as_str),
+            map.mounts.get("agents").map(String::as_str),
             Some("SidebarRightTop")
         );
     }
@@ -3413,7 +3595,8 @@ mod tests {
         let found = probe_plugins_json(&env).expect("the dirs entry must be found");
         assert_eq!(found.path, written);
         assert_eq!(
-            read_declared_mounts_at(&found.path)
+            read_declared_at(&found.path)
+                .mounts
                 .get("agents")
                 .map(String::as_str),
             Some("SidebarRightBottom"),
@@ -3432,7 +3615,8 @@ mod tests {
         let found = probe_plugins_json(&env).expect("the overlay must be found");
         assert_eq!(found.path, overlay, "first existing wins, overlay first");
         assert_eq!(
-            read_declared_mounts_at(&found.path)
+            read_declared_at(&found.path)
+                .mounts
                 .get("agents")
                 .map(String::as_str),
             Some("BarRight")
@@ -3601,7 +3785,10 @@ mod tests {
     /// unparsable one — no override note, never a panic.
     #[test]
     fn reading_a_missing_file_yields_an_empty_map() {
-        assert!(read_declared_mounts_at(Path::new("/nonexistent/plugins.json")).is_empty());
+        assert_eq!(
+            read_declared_at(Path::new("/nonexistent/plugins.json")),
+            DeclaredFile::default()
+        );
     }
 
     #[test]
@@ -5865,7 +6052,7 @@ mod gtk_tests {
     /// *is* mounted, so "there is nothing to mount" was re-derived — a
     /// `read_to_string` plus a `serde_json::from_str` on the GTK main thread —
     /// every two seconds, for the window's whole life. That is exactly the
-    /// cost [`super::DeclaredMounts`] exists to keep off this tick (#1260
+    /// cost [`super::DeclaredPlugins`] exists to keep off this tick (#1260
     /// review F7), added back on the same file.
     ///
     /// The reader is injected for that type's reason: the property is *how
@@ -5933,6 +6120,67 @@ mod gtk_tests {
             3,
             "a rebuild under the same selection must be re-read, not remembered"
         );
+    }
+
+    /// #1400: the switch of a plugin nix pins is greyed and names the option
+    /// to change instead; a declared, free one's is live and says its choice
+    /// is kept; an undeclared unit's keeps the unit-file wording. Rendered
+    /// from the tab's own parse of `plugins.json`, refreshed through the
+    /// production [`super::refresh_declared`] — no `Control` round trip.
+    ///
+    /// **Falsify** by dropping the `set_sensitive` call from
+    /// `refresh_detail`: the pinned switch stays live. Dropping the
+    /// `_locked` read from `declared_from_json` fails the subtitle too.
+    #[gtk::test]
+    fn a_pinned_plugins_switch_is_greyed_and_names_the_option() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"version":1,"plugins":{
+                "niri-layouts":{"exec":"/x/bin/hytte-plugin-niri-layouts","enabled":true,"_locked":["enabled"]},
+                "timer":{"exec":"/x/bin/hytte-plugin-timer","enabled":false}
+            }}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (bin, state) = build_tab_in(env);
+        super::refresh_declared(&state);
+        apply_state(&state, &["hand-made", "niri-layouts", "timer"], "active");
+        let window = present(&bin, 640);
+
+        let shown = |id: &str| {
+            click(&state, id);
+            let switch = &state.detail.switch;
+            (
+                switch.is_sensitive(),
+                switch.subtitle().map(|s| s.to_string()).unwrap_or_default(),
+            )
+        };
+
+        let (live, subtitle) = shown("niri-layouts");
+        assert!(!live, "a pinned plugin's switch must be greyed");
+        assert_eq!(
+            subtitle,
+            "Set in nix — programs.trollshell.plugins.niri-layouts.enable"
+        );
+
+        let (live, subtitle) = shown("timer");
+        assert!(live, "a free plugin's switch is live — and live again after a pinned one");
+        assert!(subtitle.contains("kept across restarts"), "{subtitle}");
+
+        let (live, subtitle) = shown("hand-made");
+        assert!(live);
+        assert!(subtitle.contains("enable the unit"), "{subtitle}");
+
+        dismiss(&window);
     }
 
     /// Picking a plugin is the mirror image: the Shell entry lets go.

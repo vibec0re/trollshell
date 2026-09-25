@@ -420,10 +420,11 @@ fn main() -> hytte::ui::Result<()> {
 
             // Launch the *declared* plugins (#419): read the nix-written
             // `plugins.json` state and spawn each enabled plugin as a transient
-            // user unit via `systemd-run --user`. Runs on the tokio side and is
-            // idempotent across shell restarts (systemd owns the units, so a
-            // still-running plugin is skipped); guarded internally against a
-            // re-fired activate.
+            // user unit via `systemd-run --user`, then keep watching the file
+            // and reconcile when it changes (#1399). Runs on the tokio side and
+            // is idempotent across shell restarts (systemd owns the units, so a
+            // plugin already running its declared spec is left alone); guarded
+            // internally against a re-fired activate.
             plugin_launcher::launch_at_startup();
 
             // The second half of a workspace stack's Active/Inactive

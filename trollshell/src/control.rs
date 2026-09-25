@@ -260,7 +260,10 @@ impl ControlIface {
     /// the *running* session — the transient `trollshell-plugin-<id>` units are
     /// created by the shell at runtime, so activation has no unit file of its own
     /// to diff or restart. Idempotent, argument-free, and safe to call when
-    /// nothing changed (it then does nothing at all).
+    /// nothing changed (it then does nothing at all). Since #1399 the shell
+    /// also notices a changed `plugins.json` by itself within a few seconds,
+    /// so this call is what makes a switch apply immediately, not what makes
+    /// it apply at all.
     ///
     /// Fire-and-forget: the reconcile is spawned onto the shell's runtime and
     /// this returns immediately, so a caller (`busctl` from an activation script)

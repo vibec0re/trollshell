@@ -161,8 +161,8 @@ async fn wait_cadence(cadence: &(dyn Fn() -> Duration + Send + Sync)) {
 /// cryptographic hash: its output is explicitly unspecified across Rust
 /// releases, which is fine here because the only thing a stamp is ever
 /// compared against is another stamp read by this **same process**
-/// (`Watcher::poll`'s `now == self.stamps`), never persisted or compared
-/// cross-process.
+/// (`Watcher::poll`'s `now == self.stamps`, and the shell's `plugins.json`
+/// watch through [`stamps_of`]), never persisted or compared cross-process.
 fn stamp(path: &Path) -> Stamp {
     let meta = std::fs::metadata(path).ok()?;
     let bytes = std::fs::read(path).ok()?;
@@ -171,12 +171,22 @@ fn stamp(path: &Path) -> Stamp {
     Some((meta.modified().ok()?, std::hash::Hasher::finish(&hasher)))
 }
 
-/// Every layer's [`stamp`], in path order — one read per layer.
+/// Every layer's [`Stamp`], in path order — one read per layer. Two stamp
+/// lists compare equal exactly when no path's file appeared, disappeared or
+/// changed a byte (or an mtime) in between; see the module doc for why that
+/// is a content hash and not `(mtime, len)`.
 ///
 /// **Every** layer, not just the overlay: a nix rebuild moves the base file,
 /// and a shell that only watched the top layer would show a stale base until
 /// the user happened to touch their own file (#1040 R9).
-fn stamps_of(paths: &[PathBuf]) -> Vec<Stamp> {
+///
+/// `pub` for one caller outside this module (#1399): the shell's plugin
+/// launcher watches `plugins.json`'s candidate paths with it. That file is
+/// JSON and not a [`Subsystem`], so it cannot ride [`Watcher`], but it is a
+/// nix-store file with the same frozen mtime, and a second copy of this
+/// function would be a second place the fix above has to land.
+#[must_use]
+pub fn stamps_of(paths: &[PathBuf]) -> Vec<Stamp> {
     paths.iter().map(|p| stamp(p)).collect()
 }
 

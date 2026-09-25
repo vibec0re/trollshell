@@ -49,11 +49,78 @@
 //! That last pair is the legacy-static-unit guard: a unit this launcher never
 //! spawned carries no fingerprint, so reconcile never touches it.
 //!
-//! [`reconcile`] runs at shell startup (so a `systemctl --user restart
-//! trollshell` applies current config — the only path that helps NixOS-module
-//! users, whose activation can't reach the user bus) and on demand via the
-//! `Control.ReloadPlugins` D-Bus method, which the home-manager module calls
-//! from its activation script so a switch fully applies live.
+//! [`reconcile`] runs at shell startup, again whenever `plugins.json` changes
+//! on disk (#1399, see the next section), and on demand via
+//! the `Control.ReloadPlugins` D-Bus method, which the home-manager module
+//! still calls from its activation script so a switch applies at once instead
+//! of on the next poll.
+//!
+//! ## Watching the state file (#1399)
+//!
+//! Until #1399 a shell restart was the only thing that helped NixOS-module
+//! users: that module writes `/etc/xdg/trollshell/plugins.json` from *system*
+//! activation, which runs as root with no user bus and so can never call
+//! `ReloadPlugins`. A `nixos-rebuild switch` that added a plugin, bumped its
+//! package or flipped `enable` succeeded, and nothing happened. So the shell
+//! now polls the file itself ([`converge_then_watch`]), in the same task that
+//! runs the startup reconcile, and reconciles when it moves. Five choices in
+//! it are not obvious:
+//!
+//! - **The stamp is `hytte-config`'s content hash**
+//!   ([`stamps_of`](hytte_config::subsystem::watch::stamps_of)), not `(mtime,
+//!   len)`. Both modules deploy the file as a nix-store path (`/etc/xdg/…` →
+//!   `/etc/static/…` → `/nix/store/…`, and home-manager's `xdg.configFile`
+//!   symlink), every store file has the constant mtime `1970-01-01 00:00:01`,
+//!   and the most common change, a package bump, swaps one store hash inside
+//!   `exec` for another of the same length. An `(mtime, len)` stamp sees
+//!   neither.
+//! - **Every candidate path is stamped**, not only the file that won.
+//!   Resolution is first-existing-file-wins ([`candidate_paths`]), so a
+//!   home-manager file appearing over the `/etc/xdg` one changes the spec
+//!   without either file's bytes changing (`hytte-config`'s #1040 R9, same
+//!   shape). Stamping a shadowed file costs a spurious reconcile at worst,
+//!   which also relaunches any declared-enabled plugin that is not running
+//!   (stopped from the Plugins tab, or crashed) — declared state wins, as it
+//!   does on a home-manager poke.
+//! - **Stamp, then load** (#1040 V2): the baseline is taken before startup's
+//!   reconcile reads the file, and every later tick re-stamps before it
+//!   reconciles, so an edit landing in between is one tick late, never folded
+//!   into the stamps and lost. The first observation therefore runs no
+//!   reconcile of its own; startup's covers it. The stamps update
+//!   **unconditionally** on a move, so a file that stops parsing is
+//!   reconciled against once per save (which leaves the plugins alone, see
+//!   [`load_declared_from`]) rather than once per tick.
+//! - **A reconcile that could not list the units is retried** (#1402 review,
+//!   finding 4). The stamps took the change before that reconcile ran, so a
+//!   watch pass that cannot list the live units acts on nothing
+//!   ([`Trigger::Watch`]) and leaves the change pending, and the next tick
+//!   reconciles again until one pass settles. It warns once per outage.
+//!   Startup and `ReloadPlugins` keep launching blind, since nothing retries
+//!   them. A *single plugin's* launch, stop or restart that fails is **not**
+//!   retried by anyone: an unbounded relaunch retry is #880's bug.
+//! - **Serialisation is [`CONVERGE_LOCK`]'s**, which [`reconcile`] already
+//!   takes: a tick racing a home-manager poke or a Plugins-tab start queues
+//!   behind it, and the second pass re-reads the file and finds nothing left
+//!   to do.
+//!
+//! The cadence is `hytte-config`'s
+//! [`POLL_INTERVAL`](hytte_config::subsystem::watch::POLL_INTERVAL) (3 s).
+//! The task is supervised (`hytte::reactive::spawn_supervised`), so a panic
+//! in it restarts it with a fresh baseline and a fresh reconcile rather than
+//! leaving the watch dead for the session.
+//!
+//! **One transient the watch does see: moving plugins from the NixOS module
+//! to home-manager in one `nixos-rebuild switch`** (#1402 review, finding 5).
+//! Within either module a switch replaces its `plugins.json` symlink
+//! atomically, so no tick ever finds the file missing. Across that one
+//! migration, though, the `/etc/xdg` file is gone at the `/etc/static` swap,
+//! inside system activation, and `~/.config/trollshell/plugins.json` only
+//! appears seconds later when `home-manager-<user>.service` runs. A tick in
+//! that gap sees every candidate absent, reads it as "nothing declared" and
+//! stops every launched plugin. The next tick, or home-manager's own poke,
+//! relaunches them from the new file. It is a one-off bounce, and nothing
+//! here debounces it. The reverse move (home-manager → NixOS) has no gap,
+//! because the `/etc` file appears before home-manager removes its own.
 //!
 //! ## The session target (#707)
 //!
@@ -206,12 +273,13 @@
 //! runtime.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use hytte::services::systemd;
+use hytte_config::subsystem::watch::{self, Stamp};
 use serde::Deserialize;
 
 use crate::launch::{self, Launch};
@@ -399,10 +467,25 @@ fn candidate_paths(
     out
 }
 
-/// Load + parse + sanitize the declarative plugin state. Missing file = **no
-/// declared plugins** (inert, not an error) — `Some(Declared::default())`, which
-/// is a real answer: it says every declarative plugin was removed from the
-/// config.
+/// [`candidate_paths`] for this process's own environment — the one place the
+/// launcher reads `XDG_CONFIG_HOME`/`HOME`/`XDG_CONFIG_DIRS`.
+fn state_file_paths() -> Vec<PathBuf> {
+    candidate_paths(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("XDG_CONFIG_DIRS").ok().as_deref(),
+    )
+}
+
+/// [`load_declared_from`] over this process's own [`state_file_paths`].
+async fn load_declared() -> Option<Declared> {
+    load_declared_from(&state_file_paths()).await
+}
+
+/// Load + parse + sanitize the declarative plugin state from the first of
+/// `paths` that exists. Missing file = **no declared plugins** (inert, not an
+/// error) — `Some(Declared::default())`, which is a real answer: it says every
+/// declarative plugin was removed from the config.
 ///
 /// `None` means "a state file exists but we couldn't read or parse it" —
 /// deliberately *not* the same as "nothing is declared", because [`reconcile`]
@@ -410,14 +493,14 @@ fn candidate_paths(
 /// read as "stop everything". A broken file also stops the search rather than
 /// falling through to a lower-precedence one: masking a broken user file with a
 /// system one would be quiet drift.
-async fn load_declared() -> Option<Declared> {
-    let paths = candidate_paths(
-        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-        std::env::var("XDG_CONFIG_DIRS").ok().as_deref(),
-    );
+///
+/// This is the one place the effective spec is assembled; every reader goes
+/// through it, [`load_declared`] included. It takes the paths rather than
+/// reading the environment so the #1399 watch's production task is drivable
+/// in a test against a scratch file (see [`reconcile_then_watch`]).
+async fn load_declared_from(paths: &[PathBuf]) -> Option<Declared> {
     for path in paths {
-        match tokio::fs::read_to_string(&path).await {
+        match tokio::fs::read_to_string(path).await {
             Ok(json) => match parse_state(&json) {
                 Ok(state) => return Some(sanitize(state)),
                 Err(err) => {
@@ -1087,33 +1170,97 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
 /// Converge the running plugins onto the declared state (#695): launch what
 /// should be running and isn't, stop what shouldn't be, and restart anything
 /// running from a superseded spec (changed `env` / `package` / `secrets`).
-/// Called at shell startup ([`launch_at_startup`]) and on demand from the
+/// Three callers: shell startup and the `plugins.json` watch after it (both
+/// [`launch_at_startup`]'s one task, [`reconcile_then_watch`], #1399), and the
 /// `Control.ReloadPlugins` handler, which the home-manager activation script
-/// pokes after rewriting `plugins.json`.
+/// pokes after rewriting `plugins.json` so a switch does not wait for the
+/// watch's next tick.
 ///
 /// Best-effort throughout: every per-plugin failure is logged, never propagated
 /// — one broken plugin must not stop the rest from converging. Serialized on
-/// [`CONVERGE_LOCK`], so a reconcile racing another (activation firing twice, or
-/// landing while startup is still running) queues instead of interleaving a stop
-/// with the other's launch; the second then re-reads the state file and
-/// converges on whatever is current.
+/// [`CONVERGE_LOCK`], so a reconcile racing another (activation firing twice, a
+/// poke landing on the same change a watch tick saw, or either landing while
+/// startup is still running) queues instead of interleaving a stop with the
+/// other's launch; the second then re-reads the state file and converges on
+/// whatever is current.
 pub async fn reconcile() {
+    // One-shot: nothing retries a poke, so the outcome has no reader.
+    let _ = reconcile_from(state_file_paths(), Trigger::OneShot).await;
+}
+
+/// Who asked for a reconcile, which decides what a failed unit listing means
+/// (#1399 review, finding 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trigger {
+    /// Shell startup, or a `Control.ReloadPlugins` poke. Nothing retries
+    /// either, so a failed listing launches blind, as it always has: the
+    /// empty live set can only plan launches, never a stop of something
+    /// unseen, and each launch surfaces its own error.
+    OneShot,
+    /// A `plugins.json` watch tick. The watch retries on its next tick, so a
+    /// failed listing acts on **nothing** and reports [`Outcome::Unlisted`].
+    /// A blind pass here would drop the change's stops and restarts with the
+    /// change already marked seen, so they would never be applied.
+    Watch,
+}
+
+impl Trigger {
+    /// Whether a failed listing still goes ahead with an empty live set. Pure.
+    fn launches_blind(self) -> bool {
+        matches!(self, Self::OneShot)
+    }
+}
+
+/// What one [`reconcile_from`] made of its attempt — only the watch reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+enum Outcome {
+    /// Nothing for a retry to do. It planned against the live units, or the
+    /// file was unreadable or unparsable, which leaves the plugins alone and
+    /// which a later save (a moved stamp), not a retry, is what fixes.
+    Settled,
+    /// A [`Trigger::Watch`] reconcile could not list the live units and so
+    /// acted on nothing. The watch keeps the change pending and reconciles
+    /// again on its next tick.
+    Unlisted {
+        /// The listing error, for the watch's log line.
+        error: String,
+    },
+}
+
+/// [`reconcile`] over an explicit candidate-path list rather than the process
+/// environment. Owned rather than borrowed so the watch can hand out one
+/// `'static` future per change (see [`reconcile_then_watch`]).
+///
+/// Only a failed **listing** is ever reported back for a retry (see
+/// [`Trigger`]). A single plugin's launch, stop or restart that fails is
+/// logged and left alone, whoever triggered the pass. Retrying those
+/// unboundedly is #880's bug: a plugin that can only ever fail (an id both
+/// declared and hand-installed as a static unit) bouncing every tick for the
+/// rest of the session. The next change, poke or shell start tries it again.
+async fn reconcile_from(paths: Vec<PathBuf>, trigger: Trigger) -> Outcome {
     let _guard = CONVERGE_LOCK.lock().await;
 
-    let Some(declared) = load_declared().await else {
+    let Some(declared) = load_declared_from(&paths).await else {
         // Unreadable/unparsable state file — leave the running set alone.
-        return;
+        return Outcome::Settled;
     };
     // One list call up front beats racing systemd-run's "unit already exists"
     // error per plugin — and it carries the fingerprints the diff runs on.
     let units = match systemd::list_plugin_units().await {
         Ok(units) => units,
-        Err(err) => {
+        Err(err) if trigger.launches_blind() => {
             // No reachable user manager: fall through with an empty live set,
             // which can only ever plan launches (each of which surfaces its own
             // error) — never a stop of something we failed to see.
             tracing::warn!(%err, "listing plugin units failed; launching blind");
             Vec::new()
+        }
+        // The watch logs this itself, once per outage rather than per tick.
+        Err(err) => {
+            return Outcome::Unlisted {
+                error: err.to_string(),
+            };
         }
     };
     let actions = plan(&declared, &units);
@@ -1123,8 +1270,10 @@ pub async fn reconcile() {
             target = %declared.target,
             "plugins already match the declared state"
         );
-        return;
+        return Outcome::Settled;
     }
+    // Per-plugin failures below are logged, not reported back: see this
+    // fn's doc for why a retry here would be #880's bounce loop.
     for (id, action) in actions {
         match action {
             Action::Stop => {
@@ -1153,17 +1302,130 @@ pub async fn reconcile() {
             }
         }
     }
+    Outcome::Settled
 }
 
-/// Kick off the startup reconcile on the shared tokio runtime. Called once from
-/// `main.rs`'s run body; guarded so a re-fired `activate` (a second `trollshell`
-/// invocation remote-activating the primary instance) can't double-launch.
+/// Kick off the startup reconcile, and the `plugins.json` watch behind it
+/// (#1399), as one supervised task on the shared tokio runtime. Called once
+/// from `main.rs`'s run body; guarded so a re-fired `activate` (a second
+/// `trollshell` invocation remote-activating the primary instance) can't
+/// double-launch, and — because the watch is the same task — can't start a
+/// second watch either.
 pub fn launch_at_startup() {
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    hytte::reactive::runtime::handle().spawn(reconcile());
+    let paths = state_file_paths();
+    hytte::reactive::spawn_supervised("plugins-json", move || {
+        reconcile_then_watch(paths.clone(), watch::POLL_INTERVAL)
+    });
+}
+
+// ── Watching the state file (#1399) ──────────────────────────────────────────
+
+/// The production task: [`converge_then_watch`] over `paths`, with
+/// [`reconcile_from`] as the thing it runs.
+///
+/// Its whole job is that one hand-over, and it is a function of its own so a
+/// test can drive exactly what [`launch_at_startup`] spawns: a generic loop
+/// tested with a counting stand-in still ships inert if the real call site
+/// hands it something else. The test,
+/// `the_production_task_hands_reconcile_to_the_loop`, runs this against an
+/// unparsable scratch file, which is the one input `reconcile_from` answers
+/// without reaching a user manager, and counts the warnings it leaves.
+fn reconcile_then_watch(
+    paths: Vec<PathBuf>,
+    cadence: Duration,
+) -> impl Future<Output = ()> + Send + 'static {
+    let reconcile_paths = paths.clone();
+    converge_then_watch(paths, cadence, move |trigger| {
+        reconcile_from(reconcile_paths.clone(), trigger)
+    })
+}
+
+/// Stamp every candidate path, run `converge` once — startup's reconcile —
+/// then re-stamp every `cadence` and run `converge` again whenever a stamp
+/// moved. Never returns. See the module doc's "Watching the state file".
+///
+/// The baseline is taken **here, before** the first `converge`, and not by the
+/// caller: as two statements at a call site the order is a rule nothing
+/// enforces (`hytte-config`'s #1040 V2, which is where a swap of exactly this
+/// pair was measured losing an edit forever). Every later tick re-stamps
+/// **before** it converges too, for the same reason. Generic over `converge`
+/// so the loop's timing is testable on a paused clock with no systemd
+/// anywhere; [`reconcile_then_watch`] is what pins the production argument.
+///
+/// A watch reconcile that could not list the live units
+/// ([`Outcome::Unlisted`]) leaves the change **pending**, and the next tick
+/// reconciles again whether or not a stamp moved, until one attempt settles.
+/// That is a flag here, not a re-stamp delayed until after the converge,
+/// which would fold an edit landing during the converge into the stamps and
+/// lose it. The first failure of an outage warns and the repeats are
+/// `debug`, so a dead user manager costs one journal line, not one every
+/// tick. Startup's own pass is [`Trigger::OneShot`]: it launches blind as it
+/// always has, and its outcome leaves nothing pending.
+async fn converge_then_watch<C, F>(paths: Vec<PathBuf>, cadence: Duration, mut converge: C)
+where
+    C: FnMut(Trigger) -> F,
+    F: Future<Output = Outcome>,
+{
+    let mut seen = watch::stamps_of(&paths);
+    let _ = converge(Trigger::OneShot).await;
+    let mut pending = false;
+    loop {
+        tokio::time::sleep(cadence).await;
+        let moved = moved_since(&paths, &mut seen);
+        if moved.is_empty() {
+            if !pending {
+                continue;
+            }
+            tracing::debug!("retrying the reconcile a failed unit listing left pending");
+        } else {
+            tracing::info!(paths = ?moved, "plugins.json changed; reconciling the declared plugins");
+        }
+        match converge(Trigger::Watch).await {
+            Outcome::Settled => {
+                if pending {
+                    tracing::info!(
+                        "listing plugin units works again; the pending change is applied"
+                    );
+                }
+                pending = false;
+            }
+            Outcome::Unlisted { error } => {
+                if pending {
+                    tracing::debug!(%error, "listing plugin units still fails; retrying next tick");
+                } else {
+                    tracing::warn!(
+                        %error,
+                        "listing plugin units failed; acted on nothing and will retry every tick until it works",
+                    );
+                }
+                pending = true;
+            }
+        }
+    }
+}
+
+/// Re-stamp `paths` and return the ones whose stamp differs from `seen`,
+/// replacing `seen` with the fresh stamps **unconditionally** — so a change is
+/// reported once, on the tick that first sees it, whatever the reconcile after
+/// it makes of the file.
+///
+/// A path that appeared or vanished counts as moved (its stamp goes from or to
+/// `None`); that is how a higher-precedence file showing up over a lower one
+/// fires the watch although no existing file's bytes changed.
+fn moved_since<'a>(paths: &'a [PathBuf], seen: &mut Vec<Stamp>) -> Vec<&'a Path> {
+    let now = watch::stamps_of(paths);
+    let moved = paths
+        .iter()
+        .zip(now.iter().zip(seen.iter()))
+        .filter(|(_, (now, then))| now != then)
+        .map(|(path, _)| path.as_path())
+        .collect();
+    *seen = now;
+    moved
 }
 
 // ── Control surface (the #348 Plugins tab, via control.rs) ───────────────────
@@ -1680,6 +1942,642 @@ mod tests {
                 PathBuf::from("/b/trollshell/plugins.json"),
             ]
         );
+    }
+
+    // ── Watching the state file (#1399) ──────────────────────────────────────
+
+    use hytte_config::test_support::{capture, scratch_home};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The one mtime every nix-store file carries, `1970-01-01 00:00:01` —
+    /// what both nix modules' `plugins.json` resolves to through its symlinks.
+    const STORE_MTIME: Duration = Duration::from_secs(1);
+
+    /// Cadence for the paused-clock loop tests. Any value works, since the
+    /// clock only moves when a test says so; a round one keeps the arithmetic
+    /// readable.
+    const TICK: Duration = Duration::from_secs(3);
+
+    /// Two `plugins.json` bodies differing only in the store hash inside
+    /// `exec`, which is what a package bump changes: same length, different
+    /// bytes.
+    const SPEC_A: &str = r#"{"plugins":{"pet":{"exec":"/nix/store/aaaaaaaa-pet/bin/pet"}}}"#;
+    const SPEC_B: &str = r#"{"plugins":{"pet":{"exec":"/nix/store/bbbbbbbb-pet/bin/pet"}}}"#;
+
+    /// Write `body` to `path` the way a nix-store file looks: mtime pinned to
+    /// [`STORE_MTIME`], whatever the wall clock says. Creates parent dirs.
+    fn write_store_file(path: &Path, body: &str) {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("mkdir");
+        }
+        std::fs::write(path, body).expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + STORE_MTIME)
+            .expect("set mtime");
+    }
+
+    /// A `converge` stand-in that only counts its calls, each of which settles.
+    fn counting(
+        runs: Arc<AtomicUsize>,
+    ) -> impl FnMut(Trigger) -> std::future::Ready<Outcome> + Send {
+        move |_| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Outcome::Settled)
+        }
+    }
+
+    /// Move the paused clock by `by`, then let the woken loop run: `advance`
+    /// only marks a sleep ready, and nothing polls it until the next `.await`.
+    async fn tick(by: Duration) {
+        tokio::time::advance(by).await;
+        tokio::task::yield_now().await;
+    }
+
+    /// **A store-shaped rewrite moves the stamp**: same mtime, same length,
+    /// different bytes — a package bump under either nix module.
+    ///
+    /// Red if the stamp the launcher uses goes back to `(mtime, len)`
+    /// (`hytte-config`'s `watch::stamp`), or if the launcher grows its own
+    /// stamp of that shape: both halves of it are identical here, by
+    /// construction and by the precondition asserts.
+    #[test]
+    fn a_store_shaped_rewrite_moves_the_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        let paths = vec![path.clone()];
+        write_store_file(&path, SPEC_A);
+        let mut seen = watch::stamps_of(&paths);
+
+        write_store_file(&path, SPEC_B);
+
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert_eq!(
+            meta.modified().expect("mtime"),
+            std::time::SystemTime::UNIX_EPOCH + STORE_MTIME,
+            "precondition: the rewrite kept the store mtime"
+        );
+        assert_eq!(
+            usize::try_from(meta.len()).expect("small"),
+            SPEC_A.len(),
+            "precondition: the rewrite kept the length"
+        );
+        assert_eq!(
+            moved_since(&paths, &mut seen),
+            vec![path.as_path()],
+            "a store-hash bump inside `exec` must move the stamp"
+        );
+        assert!(
+            moved_since(&paths, &mut seen).is_empty(),
+            "and it is reported once: `seen` took the new stamp"
+        );
+    }
+
+    /// **The loop**: startup converges once, a store-shaped rewrite converges
+    /// exactly once one interval later, and the quiet ticks after that
+    /// converge nothing.
+    ///
+    /// Red if the loop's `converge().await` after a move is deleted (the
+    /// second count never arrives), if the stamps stop updating on a move
+    /// (every later tick fires again), if the stamp stops seeing a
+    /// same-length same-mtime rewrite, or if the loop waits longer than one
+    /// `cadence` (the rewrite comes straight after startup, so a doubled
+    /// sleep has not woken by the first tick).
+    #[tokio::test(start_paused = true)]
+    async fn a_rewrite_converges_exactly_once_one_interval_later() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            counting(runs.clone()),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "startup's own converge, once"
+        );
+
+        write_store_file(&path, SPEC_B);
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the rewrite converges one interval later"
+        );
+
+        tick(TICK).await;
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "and only once: later quiet ticks converge nothing"
+        );
+        task.abort();
+    }
+
+    /// **No reconcile on the first observation**: with nothing changed,
+    /// startup's converge is the only one, however many ticks go by.
+    ///
+    /// Red if the baseline is not a real stamp of the files — e.g. every
+    /// path starting as "absent", which makes the first tick see each
+    /// existing file "appear" and reconcile a second time for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_observation_is_not_a_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            counting(runs.clone()),
+        ));
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "startup's converge covers the first observation"
+        );
+        task.abort();
+    }
+
+    /// **Stamp, then load** (#1040 V2): an edit that lands after the baseline
+    /// was taken but while startup's converge is still running is picked up by
+    /// the next tick, not folded into the baseline and lost.
+    ///
+    /// The edit is made *by* the first converge, which is the only way to put
+    /// it strictly between the two. Red if [`converge_then_watch`] takes its
+    /// baseline after the first `converge().await` instead of before: the
+    /// baseline then already holds the edit and no tick ever fires.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_landing_during_startups_reconcile_is_picked_up_next_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let converge = {
+            let runs = runs.clone();
+            let path = path.clone();
+            move |_| {
+                if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // A `nixos-rebuild switch` finishing mid-startup.
+                    write_store_file(&path, SPEC_B);
+                }
+                std::future::ready(Outcome::Settled)
+            }
+        };
+        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "startup's own converge");
+
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the edit made during startup's converge must reach the next tick"
+        );
+        task.abort();
+    }
+
+    /// **Every candidate path is watched**: a higher-precedence file appearing
+    /// over a lower one fires the watch, though the lower one never changed.
+    ///
+    /// The new file carries the *same bytes* as the one it shadows, so the
+    /// only thing that moved is which path exists. Red if the watch stamps
+    /// only the path that won at startup (the lower one here), and red if it
+    /// stamps the winner's *content* instead of every path, since the
+    /// content, the length and the mtime of the winner are all unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn a_higher_precedence_file_appearing_fires_the_watch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let high = dir.path().join("home/trollshell/plugins.json");
+        let low = dir.path().join("etc/xdg/trollshell/plugins.json");
+        write_store_file(&low, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let task = tokio::spawn(converge_then_watch(
+            vec![high.clone(), low.clone()],
+            TICK,
+            counting(runs.clone()),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "startup's own converge");
+
+        write_store_file(&high, SPEC_A);
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "a home-manager file appearing over the /etc/xdg one must converge"
+        );
+
+        tick(TICK).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "once");
+        task.abort();
+    }
+
+    // The next four tests are the #1402 adversarial review's (findings 2, 1,
+    // 3 and 6), ported with the seam's `Trigger`/`Outcome` added.
+
+    /// **A file vanishing fires the watch too**: removing the last plugin
+    /// makes both modules delete `plugins.json`, and a home-manager file
+    /// going away reveals the `/etc/xdg` one below it. Either way the only
+    /// thing that moved is a path going from present to absent.
+    ///
+    /// Red if a disappearance stops counting as a move (a stamp filter that
+    /// only looks at files that exist now), which no test above can see:
+    /// every one of them only ever makes a file appear or change.
+    #[tokio::test(start_paused = true)]
+    async fn a_vanishing_file_fires_the_watch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let high = dir.path().join("home/trollshell/plugins.json");
+        let low = dir.path().join("etc/xdg/trollshell/plugins.json");
+        write_store_file(&high, SPEC_B);
+        write_store_file(&low, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let task = tokio::spawn(converge_then_watch(
+            vec![high.clone(), low.clone()],
+            TICK,
+            counting(runs.clone()),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "startup's own converge");
+
+        std::fs::remove_file(&high).expect("rm");
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the shadowing file going away must converge onto the one below"
+        );
+
+        std::fs::remove_file(&low).expect("rm");
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            3,
+            "and the last file going away must converge onto nothing declared"
+        );
+
+        tick(TICK).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "once each");
+        task.abort();
+    }
+
+    /// **Stamp, then load, on every change — not only at startup**: an edit
+    /// that lands while a *watch-triggered* reconcile is running is picked up
+    /// by the tick after it, not folded into the stamps and lost.
+    ///
+    /// Red if the loop re-stamps after its `converge(..).await` instead of
+    /// before it (compare without updating `seen`, converge, then
+    /// `seen = stamps_of(..)`): the post-converge stamp already holds the
+    /// edit, so no later tick ever sees it move. The startup test above
+    /// cannot see that swap, because it only pins where the *baseline* is
+    /// taken. It is also the tempting way to retry a failed reconcile, which
+    /// is why the retry is a pending flag instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_landing_during_a_watch_reconcile_is_picked_up_next_tick() {
+        const SPEC_C: &str = r#"{"plugins":{"pet":{"exec":"/nix/store/cccccccc-pet/bin/pet"}}}"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let converge = {
+            let runs = runs.clone();
+            let path = path.clone();
+            move |_| {
+                if runs.fetch_add(1, Ordering::SeqCst) == 1 {
+                    // A second switch finishing while the first one's
+                    // reconcile is still running.
+                    write_store_file(&path, SPEC_C);
+                }
+                std::future::ready(Outcome::Settled)
+            }
+        };
+        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        tokio::task::yield_now().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "startup's own converge");
+
+        write_store_file(&path, SPEC_B);
+        tick(TICK).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "the first change");
+
+        tick(TICK).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            3,
+            "the edit made during the watch's own reconcile must reach the next tick"
+        );
+        task.abort();
+    }
+
+    /// **What a save in progress reads as.** Since #1399 a tick can land in
+    /// the middle of a truncate-then-write save (`>`, `cp`, an editor that
+    /// writes in place), so the empty and the half-written file must both read
+    /// as "unparsable, leave the plugins alone" (`None`) — never as "nothing
+    /// declared", which would stop every launched plugin and relaunch them
+    /// all on the next tick. Only a file *absent* from every candidate path
+    /// means nothing is declared; an absent (or dangling) higher-precedence
+    /// file falls through to the one below.
+    ///
+    /// Red if an empty or whitespace-only file is ever treated as "no
+    /// plugins" (a tolerant `json.trim().is_empty()` arm), if a dangling
+    /// symlink stops the search instead of falling through, or if the
+    /// all-absent answer stops being `Some(empty)`.
+    #[tokio::test]
+    async fn a_save_in_progress_never_reads_as_nothing_declared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let high = dir.path().join("home/trollshell/plugins.json");
+        let low = dir.path().join("etc/xdg/trollshell/plugins.json");
+        let paths = vec![high.clone(), low.clone()];
+        write_store_file(&low, SPEC_A);
+
+        for partial in [
+            "",
+            "\n",
+            &SPEC_B[..SPEC_B.len() / 2],
+            &SPEC_B[..SPEC_B.len() - 1],
+        ] {
+            write_store_file(&high, partial);
+            assert!(
+                load_declared_from(&paths).await.is_none(),
+                "{partial:?} must read as unparsable, not as nothing declared"
+            );
+        }
+
+        std::fs::remove_file(&high).expect("rm");
+        std::os::unix::fs::symlink(dir.path().join("gc-collected"), &high).expect("symlink");
+        let fell_through = load_declared_from(&paths)
+            .await
+            .expect("a dangling link falls through to the file below");
+        assert_eq!(
+            fell_through.plugins["pet"].exec,
+            "/nix/store/aaaaaaaa-pet/bin/pet"
+        );
+
+        std::fs::remove_file(&high).expect("rm");
+        std::fs::remove_file(&low).expect("rm");
+        let nothing = load_declared_from(&paths)
+            .await
+            .expect("absent everywhere is an answer");
+        assert!(
+            nothing.plugins.is_empty(),
+            "absent everywhere = nothing declared"
+        );
+    }
+
+    /// **What `launch_at_startup` spawns.** Its two statements are the one
+    /// place the watch is wired into the running shell, and nothing drives
+    /// them (the global runtime, the real `XDG_*`, a real user manager), so
+    /// this holds the body to its shape by source instead.
+    ///
+    /// Red if it goes back to spawning a bare startup `reconcile()` (every
+    /// other test in this module stays green: they drive
+    /// `reconcile_then_watch` directly), drops supervision, or polls at
+    /// anything but `hytte-config`'s interval.
+    #[test]
+    fn launch_at_startup_spawns_the_supervised_watch() {
+        let src = include_str!("plugin_launcher.rs");
+        let start = src
+            .find("pub fn launch_at_startup()")
+            .expect("launch_at_startup is defined");
+        let len = src[start..].find("\n}\n").expect("its body ends");
+        let body = &src[start..start + len];
+        for needle in [
+            "spawn_supervised(",
+            "reconcile_then_watch(",
+            "watch::POLL_INTERVAL",
+        ] {
+            assert!(body.contains(needle), "{needle} missing from:\n{body}");
+        }
+    }
+
+    // ── A reconcile that could not list the units (review finding 4) ─────────
+
+    /// A `converge` stand-in that records the [`Trigger`] of every call and
+    /// answers each from `outcomes` in turn, settling once they run out.
+    fn scripted(
+        calls: Arc<std::sync::Mutex<Vec<Trigger>>>,
+        outcomes: Vec<Outcome>,
+    ) -> impl FnMut(Trigger) -> std::future::Ready<Outcome> + Send {
+        let mut outcomes = outcomes.into_iter();
+        move |trigger| {
+            calls.lock().expect("calls").push(trigger);
+            std::future::ready(outcomes.next().unwrap_or(Outcome::Settled))
+        }
+    }
+
+    fn unlisted() -> Outcome {
+        Outcome::Unlisted {
+            error: "no user manager".to_owned(),
+        }
+    }
+
+    /// **A watch reconcile that could not list the units is retried on the
+    /// next tick, and once it settles, never again.** The stamps already took
+    /// the change before that reconcile ran, so without the pending flag no
+    /// later tick would ever apply it: its stops and restarts would be gone
+    /// until the file changed again.
+    ///
+    /// Also pins the triggers: startup is [`Trigger::OneShot`] (it keeps
+    /// launching blind), and every watch pass is [`Trigger::Watch`].
+    ///
+    /// Red if the pending flag is dropped (no retry: two calls, not three),
+    /// if a settled retry leaves it set (a retry every tick forever), or if
+    /// the loop hands the wrong trigger to either pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_reconcile_that_could_not_list_is_retried_once_next_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Startup settles, the change's reconcile cannot list, the retry
+        // settles.
+        let converge = scripted(
+            calls.clone(),
+            vec![Outcome::Settled, unlisted(), Outcome::Settled],
+        );
+        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        tokio::task::yield_now().await;
+
+        write_store_file(&path, SPEC_B);
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch],
+            "startup, then the change"
+        );
+
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch, Trigger::Watch],
+            "nothing moved, but the change is still pending: retried"
+        );
+
+        tick(TICK).await;
+        tick(TICK).await;
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            3,
+            "the retry settled: nothing pending, nothing more"
+        );
+        task.abort();
+    }
+
+    /// **An outage costs one warning, however long it lasts**, while the
+    /// retries go on every tick underneath it.
+    ///
+    /// Red if every failed retry warns (a dead user manager would put a line
+    /// in the journal every 3 s), or if the retries stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_that_keeps_failing_warns_once_and_retries_every_tick() {
+        let (captured, _guard) = capture();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let converge = scripted(
+            calls.clone(),
+            vec![
+                Outcome::Settled,
+                unlisted(),
+                unlisted(),
+                unlisted(),
+                unlisted(),
+            ],
+        );
+        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        tokio::task::yield_now().await;
+
+        write_store_file(&path, SPEC_B);
+        for _ in 0..4 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            5,
+            "startup, the change, and a retry on each of the three ticks after"
+        );
+        let warned = captured
+            .warnings()
+            .iter()
+            .filter(|m| m.contains("listing plugin units failed"))
+            .count();
+        assert_eq!(warned, 1, "one warning for the whole outage");
+        task.abort();
+    }
+
+    /// Which callers launch blind when the listing fails: the one-shot ones,
+    /// which nothing retries, and never a watch tick, which retries instead.
+    ///
+    /// Red if the two answers are swapped or merged — a watch tick launching
+    /// blind would drop the change's stops and restarts for good.
+    #[test]
+    fn only_a_one_shot_reconcile_launches_blind() {
+        assert!(Trigger::OneShot.launches_blind());
+        assert!(!Trigger::Watch.launches_blind());
+    }
+
+    /// **The wiring**: what [`launch_at_startup`] spawns really runs
+    /// [`reconcile_from`] — at startup, and again when the file moves.
+    ///
+    /// The loop tests above drive [`converge_then_watch`] with a counting
+    /// stand-in, which says nothing about what production hands it. This
+    /// drives [`reconcile_then_watch`] itself, against a scratch file that
+    /// never parses: the one input `reconcile_from` answers by logging
+    /// "unparsable" and returning *before* it lists or touches a single unit.
+    /// Every body this test writes must stay unparsable, and the rail below
+    /// checks that before anything runs — a parsable file here would send the
+    /// reconcile on to the developer's real user manager.
+    ///
+    /// Belt and braces, the whole test runs under [`scratch_home`] with the
+    /// file at the scratch `$HOME`'s own `plugins.json`, so even a refactor
+    /// that swapped `reconcile_from(paths)` for the environment-reading
+    /// `reconcile()` would read this file and stop in the same place.
+    ///
+    /// Red if [`reconcile_then_watch`] hands the loop anything but
+    /// `reconcile_from` (a no-op: not one warning ever arrives).
+    #[test]
+    fn the_production_task_hands_reconcile_to_the_loop() {
+        scratch_home(|home| {
+            let path = home.join(".config").join(STATE_FILE_REL);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "{ this is not json").expect("write");
+            let paths = vec![path.clone()];
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let (captured, _guard) = capture();
+                // The rail: both routes to the file must refuse it.
+                assert!(
+                    load_declared_from(&paths).await.is_none(),
+                    "rail: the scratch file must not parse"
+                );
+                assert!(
+                    load_declared().await.is_none(),
+                    "rail: the environment must resolve to the scratch file too"
+                );
+                let shown = path.display().to_string();
+                let unparsable = || {
+                    captured
+                        .events()
+                        .iter()
+                        .filter(|e| {
+                            e.level == tracing::Level::WARN
+                                && e.message.contains("unparsable")
+                                && e.fields.get("path") == Some(&shown)
+                        })
+                        .count()
+                };
+                let before = unparsable();
+                assert_eq!(before, 2, "the rail's own two reads, live control");
+
+                let settles = |want: usize| async move {
+                    for _ in 0..1000 {
+                        if unparsable() >= want {
+                            return true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    false
+                };
+                let reached = tokio::select! {
+                    () = reconcile_then_watch(paths.clone(), Duration::from_millis(10)) => false,
+                    reached = async {
+                        if !settles(before + 1).await {
+                            return false;
+                        }
+                        // Different bytes, still not JSON.
+                        std::fs::write(&path, "{ still not json, either").expect("rewrite");
+                        settles(before + 2).await
+                    } => reached,
+                };
+                assert!(
+                    reached,
+                    "startup and one change must each run the real reconcile; saw {} of 2",
+                    unparsable() - before
+                );
+            });
+        });
     }
 
     // ── systemd-run argv ─────────────────────────────────────────────────────

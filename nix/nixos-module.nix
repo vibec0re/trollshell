@@ -302,6 +302,13 @@ in
       # `programs.trollshell.plugins` (home-manager.sharedModules below only
       # shares the module definition, not config values) — set it wherever
       # you actually run the shell.
+      #
+      # There is no activation poke here, unlike home-manager's
+      # ReloadPlugins call: system activation runs as root with no user bus
+      # to reach the shell on. The running shell polls every candidate
+      # plugins.json path instead (#1399, content-hashed, since every store
+      # file shares one mtime) and reconciles within ~3 s of a
+      # `nixos-rebuild switch` — no shell restart needed.
       (lib.mkIf (cfg.plugins != { }) {
         environment.etc."xdg/trollshell/plugins.json".text = pluginsState;
       })

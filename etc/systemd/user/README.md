@@ -86,9 +86,10 @@ scanning a directory, so "enable a plugin" is just "declare it enabled and let
 the shell (re)launch it."
 
 Without nix, the same state file is hand-editable: add a `plugins.json` entry
-(`exec`, `env`, `enabled`, …) and either restart trollshell or poke
-`Control.ReloadPlugins` (below) to converge, or drive a plugin at runtime from
-the control-center's Plugins tab (start/stop — a runtime action, not a
+(`exec`, `env`, `enabled`, …) and the running shell converges on it within
+about 3 s (it polls the file, #1399; poke `Control.ReloadPlugins`, below, to
+skip the wait), or drive a plugin at runtime from the control-center's Plugins
+tab (start/stop — a runtime action, not a
 declaration). A hand-written static unit still works too, as long as its id
 isn't _also_ declared in `plugins.json`: the launcher's reconcile fingerprints
 only the units it spawns, and deliberately leaves alone any running unit that
@@ -120,11 +121,15 @@ templates for one; the 11 that used to live in this directory were retired in
 >    `~/.config/trollshell/plugins.json` afresh from the option — every plugin's
 >    `exec` (a store path, so a rebuilt `package` is a new value), `env`,
 >    `secrets`, `enabled`, plus the session `target`.
-> 2. **something pokes `Control.ReloadPlugins`.** The home-manager module does
->    it from its activation script (`busctl --user call … ReloadPlugins`, with a
->    `|| true` so a switch outside a graphical session is a no-op). The shell
->    also reconciles on its own at startup, which is the only path a
->    NixOS-module deployment gets — root activation has no user session bus.
+> 2. **the shell notices.** It polls every candidate `plugins.json` path every
+>    ~3 s (#1399) — a content hash, not `(mtime, len)`, because every nix-store
+>    file shares one mtime and a package bump is a same-length edit — and
+>    reconciles when one moves. That is the path a NixOS-module deployment
+>    gets, since root activation has no user session bus. The home-manager
+>    module additionally pokes `Control.ReloadPlugins` from its activation
+>    script (`busctl --user call … ReloadPlugins`, with a `|| true` so a switch
+>    outside a graphical session is a no-op), which only skips the wait. The
+>    shell also reconciles on its own at startup.
 > 3. **the shell reconciles** (#695): it lists the live `trollshell-plugin-*`
 >    units, diffs them against the freshly read file, and starts what was added
 >    or enabled, stops what was disabled or removed, and **restarts** anything
@@ -135,10 +140,10 @@ templates for one; the 11 that used to live in this directory were retired in
 >    back; a unit the shell never stamped (a hand-written static unit whose id
 >    isn't declared in `plugins.json`) is never touched.
 >
-> So: **under home-manager a `switch` applies live.** Under the NixOS module,
-> or if the shell wasn't running when you switched, a changed `env`/`package`
-> lands on the next `systemctl --user restart trollshell` or login. To force it
-> by hand at any time:
+> So: **a `switch` applies live under either module** — at once under
+> home-manager, within about 3 s under the NixOS module. If the shell wasn't
+> running when you switched, it lands when the shell next starts. To force it by
+> hand at any time:
 >
 > ```sh
 > busctl --user call mov.vibec0re.trollshell.Control \
@@ -312,8 +317,8 @@ every other bundled plugin — as a transient `trollshell-plugin-claude-bridge.s
 via `systemd-run --user`. There is no unit to hand-install here any more; a
 hand-installed (non-home-manager) deployment adds a `plugins.claude-bridge`
 entry to `~/.config/trollshell/plugins.json` instead (`exec`, `env`, `enabled`
-— see "Out-of-process widget plugins" above), and either restarts trollshell or
-pokes `Control.ReloadPlugins` to converge. **The shell is what starts it now** —
+— see "Out-of-process widget plugins" above), which the running shell picks up
+within about 3 s (#1399), or at once with a `Control.ReloadPlugins` poke. **The shell is what starts it now** —
 the retired unit carried `WantedBy=`; a plugin entry only comes up once
 `trollshell.service` launches it, so with the shell down or crash-looping
 nothing brings the bridge up. It does outlive a shell restart on its own

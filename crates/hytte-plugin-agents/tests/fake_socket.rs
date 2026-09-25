@@ -62,7 +62,16 @@ async fn a_recorded_agent_status_round_trips_through_the_real_client() {
     );
     assert!(rows[1].paused);
     assert!(rows[1].needs_update);
-    assert_eq!(rows[1].parent.as_deref(), Some("trollshell-choom"));
+    // `rows[1]`'s fixture row still carries a `"parent":"trollshell-choom"`
+    // key that `AgentStatusRow` no longer declares a field for (#1398) —
+    // deliberately kept rather than trimmed, and explained here because a JSON
+    // fixture cannot carry a comment of its own. It is what an older hive
+    // still sends, so this round trip doubles as proof of the mirror's
+    // unknown-key tolerance (`wire.rs`'s module doc, rule 1). What it decoded
+    // correctly is these fields, in the same row:
+    assert_eq!(rows[1].name, "nixos-choom");
+    assert_eq!(rows[1].deployed_sha.as_deref(), Some("cafebabe0001"));
+    assert_eq!(rows[1].active_model.as_deref(), Some("claude-sonnet-4-6"));
     assert!(!rows[2].running);
 
     // And the wire the client actually put on the socket.

@@ -7,8 +7,8 @@
 //! One row per agent of the one hive `agents.toml` configures, with the detail
 //! pane carrying **what the wire reports and nothing else**: the five flags
 //! (running, paused, failed, needs update, needs login), the harness's status
-//! text and when it was set, the active model, the parent, the deployed sha,
-//! and two links — the agent's own page and the hive's config repo.
+//! text and when it was set, the active model, the deployed sha, and two
+//! links — the agent's own page and the hive's config repo.
 //!
 //! **v1 is read-only, and read-only is not a placeholder** (spec §10): edits
 //! hive-side are a forge PR plus an operator approval
@@ -62,7 +62,7 @@
 //!
 //! **The rule for this whole file: a string that came from the hive reaches a
 //! label as text, never as Pango markup.** `status_text` is written by the
-//! *agent itself*, `active_model` / `parent` / `deployed_sha` by the hive, and
+//! *agent itself*, `active_model` / `deployed_sha` by the hive, and
 //! the client's `reason` strings quote whatever the daemon said — a bare `&`
 //! ("R&D", a URL with a query string) makes Pango fail the whole label and
 //! render it **blank**, and a well-formed `<span …>` would be an injection
@@ -384,7 +384,6 @@ pub(crate) fn detail_of(
             status_set(row.status_set_at.as_deref(), now_unix),
         ),
         ("Model", opt(row.active_model.as_deref())),
-        ("Parent", opt(row.parent.as_deref())),
         ("Deployed", opt(row.deployed_sha.as_deref())),
         (
             "Project",
@@ -1245,14 +1244,7 @@ fn flags_of_labels() -> [&'static str; 5] {
 
 /// The fact rows' labels, in [`detail_of`]'s order — same contract as
 /// [`flags_of_labels`].
-const FACT_LABELS: [&str; 6] = [
-    "Status",
-    "Status set",
-    "Model",
-    "Parent",
-    "Deployed",
-    "Project",
-];
+const FACT_LABELS: [&str; 5] = ["Status", "Status set", "Model", "Deployed", "Project"];
 
 /// A flag row's `yes`/`no` suffix, styled once here rather than at each of the
 /// five call sites.
@@ -2641,12 +2633,12 @@ mod tests {
     /// Every reported fact lands on its own labelled row, verbatim — nothing
     /// is derived, reordered or merged.
     ///
-    /// Mutation (run, verified red): swap `parent` and `deployed_sha` in
-    /// `detail_of` and the two assertions below red on each other's value.
+    /// Mutation (run, verified red): swap `active_model` and `deployed_sha`
+    /// in `detail_of` and the two assertions below red on each other's
+    /// value.
     #[test]
     fn each_reported_fact_reaches_its_own_row() {
         let a = agent(AgentStatusRow {
-            parent: Some("queen".to_owned()),
             deployed_sha: Some("0123456789ab".to_owned()),
             active_model: Some("claude-opus-4-6".to_owned()),
             status_text: Some("reviewing PR #947".to_owned()),
@@ -2662,7 +2654,6 @@ mod tests {
         };
         assert_eq!(fact("Status"), "reviewing PR #947");
         assert_eq!(fact("Model"), "claude-opus-4-6");
-        assert_eq!(fact("Parent"), "queen");
         assert_eq!(fact("Deployed"), "0123456789ab");
         assert_eq!(fact("Project"), "trollshell");
         assert!(fact("Status set").starts_with("2026-09-07T12:34:56Z"));
@@ -2675,7 +2666,7 @@ mod tests {
     fn an_unreported_fact_is_a_dash_and_not_a_missing_row() {
         let d = detail_of(&agent(row("argus")), &AgentsConfig::default(), None, now());
         assert_eq!(d.facts.len(), FACT_LABELS.len());
-        for label in ["Model", "Parent", "Deployed", "Status set", "Project"] {
+        for label in ["Model", "Deployed", "Status set", "Project"] {
             let (_, value) = d
                 .facts
                 .iter()
@@ -3747,7 +3738,6 @@ mod gtk_tests {
                 version: HOST_SOCK_VERSION,
                 ok: true,
                 agent_statuses: Some(vec![AgentStatusRow {
-                    parent: Some("queen".to_owned()),
                     deployed_sha: Some("0123456789ab".to_owned()),
                     active_model: Some("claude-opus-4-6".to_owned()),
                     status_text: Some("reviewing PR #947".to_owned()),
@@ -3770,8 +3760,7 @@ mod gtk_tests {
         let values = fact_values(&state);
         assert_eq!(values[0], "reviewing PR #947");
         assert_eq!(values[2], "claude-opus-4-6");
-        assert_eq!(values[3], "queen");
-        assert_eq!(values[4], "0123456789ab");
+        assert_eq!(values[3], "0123456789ab");
 
         assert!(
             !state.detail.agent_page.is_sensitive(),

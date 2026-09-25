@@ -3153,6 +3153,67 @@ mod tests {
         task.abort();
     }
 
+    /// **A flag raised while a watch pass runs belongs to the tick after**
+    /// (#1407 review, finding 4). A `ReloadPlugins` pass that could not list
+    /// raises the flag only once it has dropped [`CONVERGE_LOCK`], i.e. while
+    /// the watch pass queued behind it may already be running. That tick took
+    /// the flag *before* its pass, so whatever lands during the pass is the
+    /// next tick's to take. The stand-in raises it from inside the pass,
+    /// which is that interleaving.
+    ///
+    /// Red if the loop clears the flag once a pass settles, or reads it
+    /// before the pass and clears it after (`load` at the top,
+    /// `store(false)` at the bottom). [`RELOAD_UNLISTED`]'s doc rules both
+    /// out ("taken before the pass, never cleared after one"), and no other
+    /// test raises the flag while a pass is running.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_failing_during_a_watch_pass_is_retried_the_tick_after() {
+        static POKED: AtomicBool = AtomicBool::new(false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let converge = {
+            let calls = calls.clone();
+            move |trigger: Trigger| {
+                let mut seen = calls.lock().expect("calls");
+                seen.push(trigger);
+                if seen.len() == 2 {
+                    // The change's pass: a poke's failure lands while it runs.
+                    POKED.store(true, Ordering::SeqCst);
+                }
+                std::future::ready(Outcome::Settled)
+            }
+        };
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &POKED,
+            converge,
+        ));
+        tokio::task::yield_now().await;
+
+        write_store_file(&path, SPEC_B);
+        tick(TICK).await;
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            2,
+            "startup, then the change"
+        );
+
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch, Trigger::Watch],
+            "the failure raised during that pass is retried on the next tick"
+        );
+        tick(TICK).await;
+        tick(TICK).await;
+        assert_eq!(calls.lock().expect("calls").len(), 3, "once");
+        assert!(!POKED.load(Ordering::SeqCst), "and the flag was taken");
+        task.abort();
+    }
+
     /// **What a failed listing returns, per trigger**, through the real
     /// reconcile with only the listing faked. Both triggers report
     /// [`Outcome::Unlisted`], since both leave the stops and restarts owed,

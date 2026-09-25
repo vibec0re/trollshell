@@ -1607,15 +1607,16 @@ where
         }
     };
     let actions = plan(&declared, &units);
-    if actions.is_empty() {
-        if outcome == Outcome::Settled {
-            tracing::debug!(
-                declared = declared.plugins.len(),
-                target = %declared.target,
-                "plugins already match the declared state"
-            );
-        }
-        return outcome;
+    // No early return: once the listing is answered this fn has one exit, so
+    // the test that drives a failed listing (an empty plan) pins the same
+    // `outcome` a blind pass with launches to make returns (#1407 review,
+    // finding 1).
+    if actions.is_empty() && outcome == Outcome::Settled {
+        tracing::debug!(
+            declared = declared.plugins.len(),
+            target = %declared.target,
+            "plugins already match the declared state"
+        );
     }
     // Per-plugin failures below are logged, not reported back: see this
     // fn's doc for why a retry here would be #880's bounce loop.
@@ -3164,11 +3165,15 @@ mod tests {
     /// Hermetic by construction: the scratch `plugins.json` declares one
     /// plugin, off, and there is no override file, so the plan against any
     /// live set here is empty and no pass reaches `systemd-run` or the
-    /// keyring. The rail below checks that before anything runs.
+    /// keyring. The rail below checks that before anything runs. An empty
+    /// plan is still the path a real outage takes, because
+    /// `reconcile_listing` has one exit after the listing whatever the plan
+    /// holds; a blind pass that launches something returns the same
+    /// `outcome` this one does (#1407 review, finding 1).
     ///
-    /// Red if a one-shot pass that launched blind reports `Settled` again,
-    /// if a watch pass launches blind, or if a watch pass that could not
-    /// list reports `Settled`.
+    /// Red if a one-shot pass that launched blind reports `Settled` again
+    /// (from its blind arm or from that one exit), if a watch pass launches
+    /// blind, or if a watch pass that could not list reports `Settled`.
     #[tokio::test]
     async fn a_failed_listing_is_owed_for_every_trigger_and_only_a_one_shot_launches_blind() {
         const OFF: &str =

@@ -106,9 +106,15 @@
 //!   watch pass that cannot list the live units acts on nothing
 //!   ([`Trigger::Watch`]) and leaves the change pending, and the next tick
 //!   reconciles again until one pass settles. It warns once per outage.
-//!   Startup and `ReloadPlugins` keep launching blind, since nothing retries
-//!   them. A *single plugin's* launch, stop or restart that fails is **not**
-//!   retried by anyone: an unbounded relaunch retry is #880's bug.
+//!   Startup and `ReloadPlugins` still launch blind ([`Trigger::OneShot`]),
+//!   so the plugins come up while the user manager is briefly unreachable,
+//!   but since #1404 the stops and restarts such a pass could not see are
+//!   retried too: one blind pass, then a real one on the next tick. Startup's
+//!   pass starts the watch with the retry already pending, and a
+//!   `ReloadPlugins` pass hands its failure to the watch through
+//!   [`RELOAD_UNLISTED`]. A *single plugin's* launch, stop or restart that
+//!   fails is **not** retried by anyone: an unbounded relaunch retry is
+//!   #880's bug.
 //! - **Serialisation is [`CONVERGE_LOCK`]'s**, which [`reconcile`] already
 //!   takes: a tick racing a home-manager poke or a Plugins-tab start queues
 //!   behind it, and the second pass re-reads the file and finds nothing left
@@ -1451,24 +1457,80 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
 /// startup is still running) queues instead of interleaving a stop with the
 /// other's launch; the second then re-reads the state file and converges on
 /// whatever is current.
+///
+/// Nothing awaits a poke's result (the handler spawns this and returns), so
+/// a pass that could not list the live units ([`Outcome::Unlisted`]: it
+/// launched blind) raises [`RELOAD_UNLISTED`], and the watch's next tick
+/// makes the real pass (#1404).
 pub async fn reconcile() {
-    // One-shot: nothing retries a poke, so the outcome has no reader.
-    let _ = reconcile_from(Sources::from_env(), Trigger::OneShot).await;
+    if let Outcome::Unlisted { .. } = reconcile_from(Sources::from_env(), Trigger::OneShot).await {
+        RELOAD_UNLISTED.store(true, Ordering::SeqCst);
+    }
 }
 
+/// Raised by a `Control.ReloadPlugins` pass ([`reconcile`]) that could not
+/// list the live units and so launched blind (#1404). The stops and restarts
+/// it could not see are still owed, so the watch takes the flag on its next
+/// tick and reconciles as though its own pass had failed
+/// ([`converge_then_watch`]).
+///
+/// A flag the running watch reads, rather than a retry the poke runs itself:
+/// - **One owner of retries.** The watch already retries its own failed
+///   passes every tick and warns once per outage. A poke retrying on its own
+///   would be a second loop beside it, retrying the same outage on its own
+///   cadence with its own log lines.
+/// - **Every retry is an ordinary watch pass**, under [`CONVERGE_LOCK`] like
+///   any other. The flag only decides whether the next tick runs one, and it
+///   folds into the watch's own pending state, so a tick that owes both a
+///   failed watch pass and a failed poke still runs one reconcile, not two.
+/// - **Taken before the pass, never cleared after one.** The watch swaps it
+///   to `false` at the top of a tick and then reconciles, so a poke that
+///   fails after the swap raises it again for the tick after: a failure is
+///   never credited to a pass that started before it. Clearing it once a
+///   pass settled would race a poke failing in between and lose that
+///   failure, and a poke that settles leaves it alone for the same reason.
+///
+/// What that costs is at most one redundant pass per raise, since the flag
+/// is a bool. Any pass that lists after the failed poke has already applied
+/// everything: a watch pass queued behind it on the lock, a second poke
+/// queued behind the first (two quick switches), or startup's own pass
+/// queued behind a poke that arrived before [`launch_at_startup`] ran (the
+/// `Control` service is registered before the launcher starts). The next
+/// tick still takes the flag and reconciles once more. That pass finds
+/// nothing owed; like any spurious reconcile, all it can do is relaunch an
+/// effectively-enabled plugin that is not running. Avoiding it would take
+/// the flag raised and cleared under the lock, inside [`reconcile_listing`],
+/// by whichever pass lists: more machinery than one serialised extra pass is
+/// worth.
+///
+/// The outage's warning is not always shared either (#1407 review, finding
+/// 5). A watch pass queued behind the failed poke took the flag *before* the
+/// poke raised it, so it starts with nothing pending. If its own listing
+/// fails too, it warns as a new failure, and the outage logs two lines: the
+/// poke's "launching blind" and the watch's "acted on nothing". A retry the
+/// flag itself sets off is a repeat, and logs at `debug`.
+static RELOAD_UNLISTED: AtomicBool = AtomicBool::new(false);
+
 /// Who asked for a reconcile, which decides what a failed unit listing means
-/// (#1399 review, finding 4).
+/// (#1399 review, finding 4; #1404).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Trigger {
-    /// Shell startup, or a `Control.ReloadPlugins` poke. Nothing retries
-    /// either, so a failed listing launches blind, as it always has: the
-    /// empty live set can only plan launches, never a stop of something
-    /// unseen, and each launch surfaces its own error.
+    /// Shell startup, or a `Control.ReloadPlugins` poke. A failed listing
+    /// launches blind, as it always has: the empty live set can only plan
+    /// launches, never a stop of something unseen, each launch surfaces its
+    /// own error, and the plugins come up while the user manager is briefly
+    /// unreachable. The pass still reports [`Outcome::Unlisted`], because the
+    /// stops and restarts it could not see are owed, and the watch makes the
+    /// real pass on its next tick (#1404): startup's outcome starts the watch
+    /// with the retry pending, and a poke's raises [`RELOAD_UNLISTED`].
     OneShot,
-    /// A `plugins.json` watch tick. The watch retries on its next tick, so a
-    /// failed listing acts on **nothing** and reports [`Outcome::Unlisted`].
-    /// A blind pass here would drop the change's stops and restarts with the
-    /// change already marked seen, so they would never be applied.
+    /// A `plugins.json` watch tick, or its retry. A failed listing acts on
+    /// **nothing** and reports [`Outcome::Unlisted`], and the watch retries
+    /// on its next tick. It does not launch blind: that retry comes every
+    /// tick for as long as the outage lasts, and a blind pass on each would
+    /// re-run `systemd-run` for every enabled plugin every few seconds (the
+    /// running ones answering "unit already exists" each time). A one-shot
+    /// pass launches blind once and leaves the rest to this retry.
     Watch,
 }
 
@@ -1479,7 +1541,9 @@ impl Trigger {
     }
 }
 
-/// What one [`reconcile_from`] made of its attempt — only the watch reads it.
+/// What one [`reconcile_from`] made of its attempt. The watch reads it for
+/// startup's pass and its own, and [`reconcile`] reads it to hand a poke's
+/// failed listing to the watch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
 enum Outcome {
@@ -1487,9 +1551,10 @@ enum Outcome {
     /// file was unreadable or unparsable, which leaves the plugins alone and
     /// which a later save (a moved stamp), not a retry, is what fixes.
     Settled,
-    /// A [`Trigger::Watch`] reconcile could not list the live units and so
-    /// acted on nothing. The watch keeps the change pending and reconciles
-    /// again on its next tick.
+    /// The pass could not list the live units, so the stops and restarts it
+    /// should have made are missing: a [`Trigger::Watch`] pass acted on
+    /// nothing, and a [`Trigger::OneShot`] pass launched blind. Either way
+    /// the watch reconciles again on its next tick.
     Unlisted {
         /// The listing error, for the watch's log line.
         error: String,
@@ -1507,6 +1572,18 @@ enum Outcome {
 /// declared and hand-installed as a static unit) bouncing every tick for the
 /// rest of the session. The next change, poke or shell start tries it again.
 async fn reconcile_from(sources: Sources, trigger: Trigger) -> Outcome {
+    reconcile_listing(sources, trigger, systemd::list_plugin_units).await
+}
+
+/// [`reconcile_from`] with the unit listing passed in. Production always
+/// passes [`systemd::list_plugin_units`]; the seam exists because that call
+/// fails only without a reachable user manager, and what a failed listing
+/// returns for each [`Trigger`] is what the #1404 retry runs on.
+async fn reconcile_listing<L, Fut>(sources: Sources, trigger: Trigger, list_units: L) -> Outcome
+where
+    L: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+{
     let _guard = CONVERGE_LOCK.lock().await;
 
     let Some(declared) = load_declared_from(&sources).await else {
@@ -1515,14 +1592,23 @@ async fn reconcile_from(sources: Sources, trigger: Trigger) -> Outcome {
     };
     // One list call up front beats racing systemd-run's "unit already exists"
     // error per plugin — and it carries the fingerprints the diff runs on.
-    let units = match systemd::list_plugin_units().await {
-        Ok(units) => units,
+    let (units, outcome) = match list_units().await {
+        Ok(units) => (units, Outcome::Settled),
         Err(err) if trigger.launches_blind() => {
             // No reachable user manager: fall through with an empty live set,
             // which can only ever plan launches (each of which surfaces its own
-            // error) — never a stop of something we failed to see.
-            tracing::warn!(%err, "listing plugin units failed; launching blind");
-            Vec::new()
+            // error) — never a stop of something we failed to see. What it
+            // cannot see is still owed, so the pass reports it (#1404).
+            tracing::warn!(
+                %err,
+                "listing plugin units failed; launching blind, and reconciling again on the watch's next tick",
+            );
+            (
+                Vec::new(),
+                Outcome::Unlisted {
+                    error: err.to_string(),
+                },
+            )
         }
         // The watch logs this itself, once per outage rather than per tick.
         Err(err) => {
@@ -1532,13 +1618,16 @@ async fn reconcile_from(sources: Sources, trigger: Trigger) -> Outcome {
         }
     };
     let actions = plan(&declared, &units);
-    if actions.is_empty() {
+    // No early return: once the listing is answered this fn has one exit, so
+    // the test that drives a failed listing (an empty plan) pins the same
+    // `outcome` a blind pass with launches to make returns (#1407 review,
+    // finding 1).
+    if actions.is_empty() && outcome == Outcome::Settled {
         tracing::debug!(
             declared = declared.plugins.len(),
             target = %declared.target,
             "plugins already match the declared state"
         );
-        return Outcome::Settled;
     }
     // Per-plugin failures below are logged, not reported back: see this
     // fn's doc for why a retry here would be #880's bounce loop.
@@ -1570,7 +1659,7 @@ async fn reconcile_from(sources: Sources, trigger: Trigger) -> Outcome {
             }
         }
     }
-    Outcome::Settled
+    outcome
 }
 
 /// Kick off the startup reconcile, and the `plugins.json` watch behind it
@@ -1594,15 +1683,17 @@ pub fn launch_at_startup() {
 
 /// The production task: [`converge_then_watch`] over the `plugins.json`
 /// candidates in `sources`, with [`reconcile_from`] over all of `sources` as
-/// the thing it runs.
+/// the thing it runs and [`RELOAD_UNLISTED`] as the flag a failed
+/// `ReloadPlugins` pass raises for it (#1404).
 ///
-/// Its whole job is that one hand-over, and it is a function of its own so a
+/// Its whole job is that hand-over, and it is a function of its own so a
 /// test can drive exactly what [`launch_at_startup`] spawns: a generic loop
 /// tested with a counting stand-in still ships inert if the real call site
 /// hands it something else. The test,
 /// `the_production_task_hands_reconcile_to_the_loop`, runs this against an
 /// unparsable scratch file, which is the one input `reconcile_from` answers
-/// without reaching a user manager, and counts the warnings it leaves.
+/// without reaching a user manager, and counts the warnings it leaves: one
+/// at startup, one after the file changes, and one after it raises the flag.
 ///
 /// Only the config half is watched. The switch's `plugins.toml` is read on
 /// every reconcile but never stamped: its only writer is [`set_enabled_in`],
@@ -1613,7 +1704,7 @@ fn reconcile_then_watch(
     cadence: Duration,
 ) -> impl Future<Output = ()> + Send + 'static {
     let watched = sources.config.clone();
-    converge_then_watch(watched, cadence, move |trigger| {
+    converge_then_watch(watched, cadence, &RELOAD_UNLISTED, move |trigger| {
         reconcile_from(sources.clone(), trigger)
     })
 }
@@ -1637,19 +1728,36 @@ fn reconcile_then_watch(
 /// which would fold an edit landing during the converge into the stamps and
 /// lose it. The first failure of an outage warns and the repeats are
 /// `debug`, so a dead user manager costs one journal line, not one every
-/// tick. Startup's own pass is [`Trigger::OneShot`]: it launches blind as it
-/// always has, and its outcome leaves nothing pending.
-async fn converge_then_watch<C, F>(paths: Vec<PathBuf>, cadence: Duration, mut converge: C)
-where
+/// tick.
+///
+/// The one-shot passes feed the same pending state (#1404). Startup's own
+/// pass is [`Trigger::OneShot`]: it launches blind as it always has, and an
+/// [`Outcome::Unlisted`] from it starts the loop with the retry already
+/// pending, so the first tick makes the real pass. `reload_unlisted` is the
+/// same hand-over for a `Control.ReloadPlugins` pass, whose outcome nobody
+/// awaits ([`RELOAD_UNLISTED`] in production, which says why it is a flag).
+/// Every tick takes it before its pass and folds it into `pending`, so a
+/// poke's failure costs one pass on the next tick and never adds a second
+/// pass to a tick that owes one anyway. A retry that the flag sets off logs
+/// no warning of its own if it fails too, because the blind pass already
+/// logged the outage. A watch pass that was already under way when the poke
+/// raised the flag can still warn once more (see [`RELOAD_UNLISTED`]).
+async fn converge_then_watch<C, F>(
+    paths: Vec<PathBuf>,
+    cadence: Duration,
+    reload_unlisted: &'static AtomicBool,
+    mut converge: C,
+) where
     C: FnMut(Trigger) -> F,
     F: Future<Output = Outcome>,
 {
     let mut seen = watch::stamps_of(&paths);
-    let _ = converge(Trigger::OneShot).await;
-    let mut pending = false;
+    let mut pending = matches!(converge(Trigger::OneShot).await, Outcome::Unlisted { .. });
     loop {
         tokio::time::sleep(cadence).await;
         let moved = moved_since(&paths, &mut seen);
+        // Taken before the pass, never cleared after it: see RELOAD_UNLISTED.
+        pending |= reload_unlisted.swap(false, Ordering::SeqCst);
         if moved.is_empty() {
             if !pending {
                 continue;
@@ -2299,6 +2407,11 @@ mod tests {
     /// readable.
     const TICK: Duration = Duration::from_secs(3);
 
+    /// The `reload_unlisted` flag for every loop test that is not about a
+    /// `ReloadPlugins` pass (#1404): nothing ever raises it. A test that
+    /// raises one declares its own, so parallel tests never share one.
+    static NO_RELOAD: AtomicBool = AtomicBool::new(false);
+
     /// Two `plugins.json` bodies differing only in the store hash inside
     /// `exec`, which is what a package bump changes: same length, different
     /// bytes.
@@ -2396,6 +2509,7 @@ mod tests {
         let task = tokio::spawn(converge_then_watch(
             vec![path.clone()],
             TICK,
+            &NO_RELOAD,
             counting(runs.clone()),
         ));
         tokio::task::yield_now().await;
@@ -2439,6 +2553,7 @@ mod tests {
         let task = tokio::spawn(converge_then_watch(
             vec![path.clone()],
             TICK,
+            &NO_RELOAD,
             counting(runs.clone()),
         ));
         tokio::task::yield_now().await;
@@ -2479,7 +2594,12 @@ mod tests {
                 std::future::ready(Outcome::Settled)
             }
         };
-        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
         tokio::task::yield_now().await;
         assert_eq!(runs.load(Ordering::SeqCst), 1, "startup's own converge");
 
@@ -2511,6 +2631,7 @@ mod tests {
         let task = tokio::spawn(converge_then_watch(
             vec![high.clone(), low.clone()],
             TICK,
+            &NO_RELOAD,
             counting(runs.clone()),
         ));
         tokio::task::yield_now().await;
@@ -2552,6 +2673,7 @@ mod tests {
         let task = tokio::spawn(converge_then_watch(
             vec![high.clone(), low.clone()],
             TICK,
+            &NO_RELOAD,
             counting(runs.clone()),
         ));
         tokio::task::yield_now().await;
@@ -2609,7 +2731,12 @@ mod tests {
                 std::future::ready(Outcome::Settled)
             }
         };
-        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
         tokio::task::yield_now().await;
         assert_eq!(runs.load(Ordering::SeqCst), 1, "startup's own converge");
 
@@ -2752,7 +2879,12 @@ mod tests {
             calls.clone(),
             vec![Outcome::Settled, unlisted(), Outcome::Settled],
         );
-        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
         tokio::task::yield_now().await;
 
         write_store_file(&path, SPEC_B);
@@ -2802,7 +2934,12 @@ mod tests {
                 unlisted(),
             ],
         );
-        let task = tokio::spawn(converge_then_watch(vec![path.clone()], TICK, converge));
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
         tokio::task::yield_now().await;
 
         write_store_file(&path, SPEC_B);
@@ -2823,11 +2960,451 @@ mod tests {
         task.abort();
     }
 
+    // ── A one-shot pass that could not list the units (#1404) ────────────────
+
+    /// The warnings a loop test's `converge` stand-ins could never have
+    /// logged themselves: whatever the loop says about a failed listing.
+    fn listing_warnings(captured: &hytte_config::test_support::Captured) -> usize {
+        captured
+            .warnings()
+            .iter()
+            .filter(|m| m.contains("listing plugin units"))
+            .count()
+    }
+
+    /// **A startup reconcile that could not list the units gets its real
+    /// pass on the first tick, and exactly one.** Startup launched blind,
+    /// which can only plan launches, so a stop or restart it should have
+    /// made is owed although no stamp will ever move for it.
+    ///
+    /// Red if the loop starts with nothing pending whatever startup returned
+    /// (the retry never comes: one call, not two), or if a settled retry
+    /// leaves it pending (a retry every tick).
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_reconcile_that_could_not_list_is_retried_once_next_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Startup launches blind, the retry settles.
+        let converge = scripted(calls.clone(), vec![unlisted(), Outcome::Settled]);
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(*calls.lock().expect("calls"), [Trigger::OneShot], "startup");
+
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch],
+            "nothing moved, but startup's stops and restarts are owed: retried on the first tick"
+        );
+
+        for _ in 0..3 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            2,
+            "the retry settled: nothing pending, nothing more"
+        );
+        task.abort();
+    }
+
+    /// **A startup reconcile that settled owes nothing**: no retry, however
+    /// many ticks go by.
+    ///
+    /// Red if the loop starts with the retry pending whatever startup
+    /// returned.
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_reconcile_that_settled_is_not_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let converge = scripted(calls.clone(), vec![Outcome::Settled]);
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot],
+            "startup settled: nothing owed"
+        );
+        task.abort();
+    }
+
+    /// **A startup outage costs the loop no warning of its own**, while the
+    /// retries go on every tick until one settles. The blind pass already
+    /// logged the outage (`reconcile_listing`'s one-shot arm), so the loop's
+    /// failed retries are repeats of it.
+    ///
+    /// Red if the retries stop before one settles, or if the loop treats the
+    /// first failed retry of a startup outage as a new outage and warns.
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_outage_is_retried_every_tick_without_a_second_warning() {
+        let (captured, _guard) = capture();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let converge = scripted(
+            calls.clone(),
+            vec![unlisted(), unlisted(), unlisted(), Outcome::Settled],
+        );
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &NO_RELOAD,
+            converge,
+        ));
+        tokio::task::yield_now().await;
+        for _ in 0..5 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [
+                Trigger::OneShot,
+                Trigger::Watch,
+                Trigger::Watch,
+                Trigger::Watch
+            ],
+            "startup, then a retry every tick until one settles, then nothing"
+        );
+        assert_eq!(
+            listing_warnings(&captured),
+            0,
+            "the blind pass logged this outage; the loop adds nothing"
+        );
+        task.abort();
+    }
+
+    /// **A `ReloadPlugins` pass that could not list the units is retried by
+    /// the watch on its next tick.** The poke's own pass launched blind and
+    /// nothing awaits its outcome, so [`reconcile`] raises the flag the
+    /// loop was handed (`RELOAD_UNLISTED` in production, which
+    /// `the_production_task_hands_reconcile_to_the_loop` pins). This raises
+    /// it by hand, exactly as `reconcile` does with an `Unlisted`.
+    ///
+    /// The retry fails once before it settles, which pins that the flag
+    /// joins the loop's pending state: the retry's own failure is the poke's
+    /// outage again, so it warns nothing and is retried in turn.
+    ///
+    /// Red if the loop never reads the flag (no retry: one call, not three),
+    /// if it reads the flag without taking it (a retry every tick forever),
+    /// or if the flag runs a pass without marking it pending (the failed
+    /// retry warns).
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_that_could_not_list_is_retried_next_tick() {
+        static POKED: AtomicBool = AtomicBool::new(false);
+        let (captured, _guard) = capture();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Startup settles, the poke's retry cannot list, the next settles.
+        let converge = scripted(
+            calls.clone(),
+            vec![Outcome::Settled, unlisted(), Outcome::Settled],
+        );
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &POKED,
+            converge,
+        ));
+        tokio::task::yield_now().await;
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot],
+            "control: nothing moved and nothing was poked"
+        );
+
+        // What `reconcile` does when its one-shot pass comes back Unlisted.
+        POKED.store(true, Ordering::SeqCst);
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch],
+            "the poke's stops and restarts are owed: retried on the next tick"
+        );
+        assert!(!POKED.load(Ordering::SeqCst), "and the tick took the flag");
+
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch, Trigger::Watch],
+            "that retry could not list either: retried again"
+        );
+
+        for _ in 0..3 {
+            tick(TICK).await;
+        }
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            3,
+            "the retry settled: nothing pending, nothing more"
+        );
+        assert_eq!(
+            listing_warnings(&captured),
+            0,
+            "the poke's blind pass logged this outage; the loop adds nothing"
+        );
+        task.abort();
+    }
+
+    /// **A flag raised while a watch pass runs belongs to the tick after**
+    /// (#1407 review, finding 4). A `ReloadPlugins` pass that could not list
+    /// raises the flag only once it has dropped [`CONVERGE_LOCK`], i.e. while
+    /// the watch pass queued behind it may already be running. That tick took
+    /// the flag *before* its pass, so whatever lands during the pass is the
+    /// next tick's to take. The stand-in raises it from inside the pass,
+    /// which is that interleaving.
+    ///
+    /// Red if the loop clears the flag once a pass settles, or reads it
+    /// before the pass and clears it after (`load` at the top,
+    /// `store(false)` at the bottom). [`RELOAD_UNLISTED`]'s doc rules both
+    /// out ("taken before the pass, never cleared after one"), and no other
+    /// test raises the flag while a pass is running.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_failing_during_a_watch_pass_is_retried_the_tick_after() {
+        static POKED: AtomicBool = AtomicBool::new(false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, SPEC_A);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let converge = {
+            let calls = calls.clone();
+            move |trigger: Trigger| {
+                let mut seen = calls.lock().expect("calls");
+                seen.push(trigger);
+                if seen.len() == 2 {
+                    // The change's pass: a poke's failure lands while it runs.
+                    POKED.store(true, Ordering::SeqCst);
+                }
+                std::future::ready(Outcome::Settled)
+            }
+        };
+        let task = tokio::spawn(converge_then_watch(
+            vec![path.clone()],
+            TICK,
+            &POKED,
+            converge,
+        ));
+        tokio::task::yield_now().await;
+
+        write_store_file(&path, SPEC_B);
+        tick(TICK).await;
+        assert_eq!(
+            calls.lock().expect("calls").len(),
+            2,
+            "startup, then the change"
+        );
+
+        tick(TICK).await;
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            [Trigger::OneShot, Trigger::Watch, Trigger::Watch],
+            "the failure raised during that pass is retried on the next tick"
+        );
+        tick(TICK).await;
+        tick(TICK).await;
+        assert_eq!(calls.lock().expect("calls").len(), 3, "once");
+        assert!(!POKED.load(Ordering::SeqCst), "and the flag was taken");
+        task.abort();
+    }
+
+    /// **What a failed listing returns, per trigger**, through the real
+    /// reconcile with only the listing faked. Both triggers report
+    /// [`Outcome::Unlisted`], since both leave the stops and restarts owed,
+    /// and that answer is all the startup and `ReloadPlugins` retries run on
+    /// (#1404): before it, a one-shot pass that launched blind reported
+    /// `Settled`, and no test above could tell, because they all script the
+    /// outcome. Only the one-shot pass launches blind first, and says so. A
+    /// listing that works settles.
+    ///
+    /// Hermetic by construction: the scratch `plugins.json` declares one
+    /// plugin, off, and there is no override file, so the plan against any
+    /// live set here is empty and no pass reaches `systemd-run` or the
+    /// keyring. The rail below checks that before anything runs. An empty
+    /// plan is still the path a real outage takes, because
+    /// `reconcile_listing` has one exit after the listing whatever the plan
+    /// holds; a blind pass that launches something returns the same
+    /// `outcome` this one does (#1407 review, finding 1).
+    ///
+    /// Red if a one-shot pass that launched blind reports `Settled` again
+    /// (from its blind arm or from that one exit), if a watch pass launches
+    /// blind, or if a watch pass that could not list reports `Settled`.
+    #[tokio::test]
+    async fn a_failed_listing_is_owed_for_every_trigger_and_only_a_one_shot_launches_blind() {
+        const OFF: &str =
+            r#"{"plugins":{"pet":{"exec":"/nix/store/aaaaaaaa-pet/bin/pet","enabled":false}}}"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins.json");
+        write_store_file(&path, OFF);
+        let sources = config_only(&[path]);
+        let declared = load_declared_from(&sources).await.expect("parses");
+        assert!(
+            declared.plugins.contains_key("pet") && plan(&declared, &[]).is_empty(),
+            "rail: one plugin declared, and nothing here may launch it"
+        );
+
+        let (captured, _guard) = capture();
+        let blind = || {
+            captured
+                .warnings()
+                .iter()
+                .filter(|m| m.contains("launching blind"))
+                .count()
+        };
+        let failing = || async { Err(anyhow::anyhow!("no user manager")) };
+        for (trigger, launches_blind) in [(Trigger::OneShot, 1), (Trigger::Watch, 0)] {
+            let before = blind();
+            assert_eq!(
+                reconcile_listing(sources.clone(), trigger, failing).await,
+                Outcome::Unlisted {
+                    error: "no user manager".to_owned()
+                },
+                "{trigger:?}: what it could not see is owed"
+            );
+            assert_eq!(
+                blind() - before,
+                launches_blind,
+                "{trigger:?}: blind passes"
+            );
+        }
+
+        let listed = || async { Ok(Vec::new()) };
+        for trigger in [Trigger::OneShot, Trigger::Watch] {
+            assert_eq!(
+                reconcile_listing(sources.clone(), trigger, listed).await,
+                Outcome::Settled,
+                "{trigger:?}: a pass that listed owes nothing"
+            );
+        }
+    }
+
+    /// **What production hands the seam** (#1407 review, finding 3).
+    /// `reconcile_from` is the one place the real unit listing and the
+    /// caller's trigger reach [`reconcile_listing`]. Every test that gets as
+    /// far as the listing fakes it, and the production-task test stops at an
+    /// unparsable file before any listing, so this is held by source, on
+    /// `launch_at_startup_spawns_the_supervised_watch`'s precedent.
+    ///
+    /// Red if `reconcile_from` hands the seam a stub listing (every pass
+    /// planning against nothing: launches only, never a stop or restart) or
+    /// a fixed trigger, or if [`reconcile_then_watch`] stops forwarding the
+    /// loop's trigger (every watch retry launching blind, or startup never
+    /// doing so).
+    #[test]
+    fn production_hands_the_seam_the_real_listing_and_the_callers_trigger() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        let from = body("async fn reconcile_from(");
+        assert!(
+            from.contains("reconcile_listing(sources, trigger, systemd::list_plugin_units)"),
+            "reconcile_from must hand the seam the real listing and its own trigger:\n{from}"
+        );
+        let task = body("fn reconcile_then_watch(");
+        assert!(
+            task.contains("move |trigger|")
+                && task.contains("reconcile_from(sources.clone(), trigger)"),
+            "reconcile_then_watch must forward the loop's trigger:\n{task}"
+        );
+    }
+
+    /// **What [`reconcile`] does with its outcome.** It is the
+    /// `ReloadPlugins` entry point and reads the real environment. Its
+    /// `Unlisted` arm needs a failing listing, i.e. the real user manager, so
+    /// that half is held by source, on
+    /// `launch_at_startup_spawns_the_supervised_watch`'s precedent: it runs
+    /// the one-shot pass and raises [`RELOAD_UNLISTED`] when that pass could
+    /// not list. `a_reload_that_settled_raises_nothing` drives the other half,
+    /// `a_reload_that_could_not_list_is_retried_next_tick` pins what the watch
+    /// does with the flag, and `the_production_task_hands_reconcile_to_the_loop`
+    /// that the production task watches this flag.
+    ///
+    /// Red if the poke goes back to discarding its outcome, or raises some
+    /// other flag.
+    #[test]
+    fn reconcile_hands_a_failed_listing_to_the_watch() {
+        let src = include_str!("plugin_launcher.rs");
+        let start = src
+            .find("pub async fn reconcile()")
+            .expect("reconcile is defined");
+        let len = src[start..].find("\n}\n").expect("its body ends");
+        let body = &src[start..start + len];
+        for needle in [
+            "reconcile_from(",
+            "Trigger::OneShot",
+            "Outcome::Unlisted",
+            "RELOAD_UNLISTED.store(true",
+        ] {
+            assert!(body.contains(needle), "{needle} missing from:\n{body}");
+        }
+    }
+
+    /// **A poke that settled raises nothing** (#1407 review, finding 2). The
+    /// driven half of `reconcile_hands_a_failed_listing_to_the_watch`:
+    /// [`reconcile`] itself, against an unparsable `plugins.json` under
+    /// [`scratch_home`], which is the one input it answers (`Settled`)
+    /// without reaching a user manager. `scratch_home`'s `temp_env` lock
+    /// serialises this against `the_production_task_hands_reconcile_to_the_loop`,
+    /// the one other test that touches [`RELOAD_UNLISTED`].
+    ///
+    /// Red if `reconcile()` raises the flag whatever its pass returned, or on
+    /// the wrong outcome (`!matches!(…, Outcome::Unlisted { .. })`). The
+    /// source scan's four needles are still all there in both.
+    #[test]
+    fn a_reload_that_settled_raises_nothing() {
+        scratch_home(|home| {
+            let path = home.join(".config").join(STATE_FILE_REL);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "{ this is not json").expect("write");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                assert!(
+                    load_declared().await.is_none(),
+                    "rail: the environment must resolve to the unparsable scratch file"
+                );
+                RELOAD_UNLISTED.store(false, Ordering::SeqCst);
+                reconcile().await;
+                assert!(
+                    !RELOAD_UNLISTED.load(Ordering::SeqCst),
+                    "a poke that settled owes the watch nothing"
+                );
+            });
+        });
+    }
+
     /// Which callers launch blind when the listing fails: the one-shot ones,
-    /// which nothing retries, and never a watch tick, which retries instead.
+    /// which run once and leave the rest to the watch's retry (#1404), and
+    /// never a watch tick, whose retry comes every tick.
     ///
     /// Red if the two answers are swapped or merged — a watch tick launching
-    /// blind would drop the change's stops and restarts for good.
+    /// blind would re-run `systemd-run` for every enabled plugin on every
+    /// tick of an outage.
     #[test]
     fn only_a_one_shot_reconcile_launches_blind() {
         assert!(Trigger::OneShot.launches_blind());
@@ -2835,7 +3412,8 @@ mod tests {
     }
 
     /// **The wiring**: what [`launch_at_startup`] spawns really runs
-    /// [`reconcile_from`] — at startup, and again when the file moves.
+    /// [`reconcile_from`] — at startup, again when the file moves, and again
+    /// when a failed `ReloadPlugins` pass raises [`RELOAD_UNLISTED`] (#1404).
     ///
     /// The loop tests above drive [`converge_then_watch`] with a counting
     /// stand-in, which says nothing about what production hands it. This
@@ -2852,7 +3430,8 @@ mod tests {
     /// `reconcile()` would read this file and stop in the same place.
     ///
     /// Red if [`reconcile_then_watch`] hands the loop anything but
-    /// `reconcile_from` (a no-op: not one warning ever arrives).
+    /// `reconcile_from` (a no-op: not one warning ever arrives), or any flag
+    /// but `RELOAD_UNLISTED` (the third never arrives).
     #[test]
     fn the_production_task_hands_reconcile_to_the_loop() {
         scratch_home(|home| {
@@ -2923,13 +3502,29 @@ mod tests {
                         }
                         // Different bytes, still not JSON.
                         std::fs::write(&path, "{ still not json, either").expect("rewrite");
-                        settles(before + 2).await
+                        if !settles(before + 2).await {
+                            return false;
+                        }
+                        // What `reconcile` does when a poke's pass could not
+                        // list (#1404). No other test touches this flag.
+                        RELOAD_UNLISTED.store(true, Ordering::SeqCst);
+                        if !settles(before + 3).await {
+                            return false;
+                        }
+                        // Ten quiet ticks: the flag was taken, not left up.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        unparsable() == before + 3
                     } => reached,
                 };
                 assert!(
                     reached,
-                    "startup and one change must each run the real reconcile; saw {} of 2",
+                    "startup, one change and one raised flag must each run the real reconcile \
+                     once; saw {} (want 3)",
                     unparsable() - before
+                );
+                assert!(
+                    !RELOAD_UNLISTED.load(Ordering::SeqCst),
+                    "the production task took the flag"
                 );
             });
         });
@@ -3269,16 +3864,16 @@ mod tests {
 
     /// #1400 review, finding 6 (R1): every reader of the declared state but
     /// `set_enabled_in` reads the *effective* state, through the fold. The
-    /// whole feature rests on it: a `reconcile_from` that read nix's
+    /// whole feature rests on it: a `reconcile_listing` that read nix's
     /// declaration alone would forget the switch on every restart and stop a
     /// switched-on plugin on every rebuild tick, and all the behavioural
     /// tests above would stay green, since `load_declared_from` is tested but
     /// its callers are not. A source scan, on
     /// `launch_at_startup_spawns_the_supervised_watch`'s precedent, because
-    /// `reconcile_from` cannot get past `list_plugin_units` without the real
-    /// user manager.
+    /// a pass that gets past the listing with a plugin switched on launches
+    /// it for real (#1404's seam fakes the listing, not the launch).
     ///
-    /// Falsified by `reconcile_from` reading `load_nix_declared(&sources.config)`.
+    /// Falsified by `reconcile_listing` reading `load_nix_declared(&sources.config)`.
     #[test]
     fn every_reader_but_set_enabled_goes_through_the_fold() {
         let src = include_str!("plugin_launcher.rs");
@@ -3289,7 +3884,7 @@ mod tests {
             &prod[start..start + len]
         };
         for sig in [
-            "async fn reconcile_from(",
+            "async fn reconcile_listing<",
             "pub async fn list()",
             "pub async fn start(",
         ] {

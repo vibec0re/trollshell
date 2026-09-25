@@ -274,7 +274,9 @@ impl ControlIface {
     /// this returns immediately, so a caller (`busctl` from an activation script)
     /// never blocks on a plugin's stop→relaunch wait. Failures are logged
     /// shell-side; re-query [`list_plugins`](Self::list_plugins) to observe the
-    /// result.
+    /// result. A pass that could not list the plugin units launches blind and
+    /// leaves the rest to the `plugins.json` watch, which reconciles again on
+    /// its next tick (#1404).
     async fn reload_plugins(&self) {
         tracing::info!("ReloadPlugins: reconciling plugins against plugins.json");
         hytte::reactive::runtime::handle().spawn(plugin_launcher::reconcile());

@@ -1387,7 +1387,9 @@ where
         match converge(Trigger::Watch).await {
             Outcome::Settled => {
                 if pending {
-                    tracing::info!("listing plugin units works again; the pending change is applied");
+                    tracing::info!(
+                        "listing plugin units works again; the pending change is applied"
+                    );
                 }
                 pending = false;
             }
@@ -1979,7 +1981,9 @@ mod tests {
     }
 
     /// A `converge` stand-in that only counts its calls, each of which settles.
-    fn counting(runs: Arc<AtomicUsize>) -> impl FnMut(Trigger) -> std::future::Ready<Outcome> + Send {
+    fn counting(
+        runs: Arc<AtomicUsize>,
+    ) -> impl FnMut(Trigger) -> std::future::Ready<Outcome> + Send {
         move |_| {
             runs.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Outcome::Settled)

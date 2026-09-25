@@ -1490,14 +1490,25 @@ pub async fn reconcile() {
 ///   pass settled would race a poke failing in between and lose that
 ///   failure, and a poke that settles leaves it alone for the same reason.
 ///
-/// What that costs is at most one redundant pass, in one corner: a watch pass
-/// already queued on the lock behind the failed poke lists the units and
-/// applies everything, and the next tick still takes the flag and reconciles
-/// once more. That pass finds nothing owed; like any spurious reconcile, all
-/// it can do is relaunch an effectively-enabled plugin that is not running.
-/// Closing the corner would take the flag raised and cleared under the lock,
-/// inside [`reconcile_listing`], by whichever pass lists: more machinery than
-/// one serialised extra pass is worth.
+/// What that costs is at most one redundant pass per raise, since the flag
+/// is a bool. Any pass that lists after the failed poke has already applied
+/// everything: a watch pass queued behind it on the lock, a second poke
+/// queued behind the first (two quick switches), or startup's own pass
+/// queued behind a poke that arrived before [`launch_at_startup`] ran (the
+/// `Control` service is registered before the launcher starts). The next
+/// tick still takes the flag and reconciles once more. That pass finds
+/// nothing owed; like any spurious reconcile, all it can do is relaunch an
+/// effectively-enabled plugin that is not running. Avoiding it would take
+/// the flag raised and cleared under the lock, inside [`reconcile_listing`],
+/// by whichever pass lists: more machinery than one serialised extra pass is
+/// worth.
+///
+/// The outage's warning is not always shared either (#1407 review, finding
+/// 5). A watch pass queued behind the failed poke took the flag *before* the
+/// poke raised it, so it starts with nothing pending. If its own listing
+/// fails too, it warns as a new failure, and the outage logs two lines: the
+/// poke's "launching blind" and the watch's "acted on nothing". A retry the
+/// flag itself sets off is a repeat, and logs at `debug`.
 static RELOAD_UNLISTED: AtomicBool = AtomicBool::new(false);
 
 /// Who asked for a reconcile, which decides what a failed unit listing means
@@ -1726,9 +1737,11 @@ fn reconcile_then_watch(
 /// same hand-over for a `Control.ReloadPlugins` pass, whose outcome nobody
 /// awaits ([`RELOAD_UNLISTED`] in production, which says why it is a flag).
 /// Every tick takes it before its pass and folds it into `pending`, so a
-/// poke's failure costs one pass on the next tick, shares the outage's one
-/// warning (the blind pass already logged it), and never adds a second pass
-/// to a tick that owes one anyway.
+/// poke's failure costs one pass on the next tick and never adds a second
+/// pass to a tick that owes one anyway. A retry that the flag sets off logs
+/// no warning of its own if it fails too, because the blind pass already
+/// logged the outage. A watch pass that was already under way when the poke
+/// raised the flag can still warn once more (see [`RELOAD_UNLISTED`]).
 async fn converge_then_watch<C, F>(
     paths: Vec<PathBuf>,
     cadence: Duration,

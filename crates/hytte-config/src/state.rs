@@ -62,12 +62,21 @@ pub fn read(subsystem: &str) -> Option<String> {
 /// to handle: the next write repairs it.
 #[must_use]
 pub fn load<T: serde::de::DeserializeOwned>(subsystem: &str) -> Option<T> {
-    let text = read(subsystem)?;
+    load_at(&path(subsystem)?)
+}
+
+/// [`load`] against an already-resolved path — the read half of
+/// [`store_at`], split out for the same reason: so a caller that carries its
+/// path as a seam (the plugin launcher's `plugins.toml`, #1400) and its tests
+/// read through the one parse-and-warn rule rather than a second copy of it.
+#[must_use]
+pub fn load_at<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let text = std::fs::read_to_string(path).ok()?;
     match toml::from_str(&text) {
         Ok(value) => Some(value),
         Err(e) => {
             tracing::warn!(
-                subsystem,
+                path = %path.display(),
                 error = %e,
                 "state file does not parse; the documented default is now in force, and the next write overwrites this file"
             );
@@ -201,12 +210,20 @@ pub fn remove(subsystem: &str) {
     let Some(path) = path(subsystem) else {
         return;
     };
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            tracing::warn!(subsystem, error = %e, path = %path.display(), "state remove failed");
-        }
+    if let Err(e) = remove_at(&path) {
+        tracing::warn!(subsystem, error = %e, path = %path.display(), "state remove failed");
+    }
+}
+
+/// [`remove`] against an already-resolved path, for [`store_at`]'s reason. A
+/// file that is already gone is success.
+///
+/// # Errors
+/// Any I/O error from the unlink other than "not found".
+pub fn remove_at(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -241,6 +258,30 @@ mod tests {
             1,
             "the atomic writer must not leave a temp file behind"
         );
+    }
+
+    /// The path seams (#1400): what `store_at` writes, `load_at` reads back;
+    /// a file that does not parse is `None` (the caller's zero state), never
+    /// an error; and `remove_at` treats an already-missing file as done.
+    #[test]
+    fn the_path_seams_round_trip_and_tolerate_a_missing_or_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trollshell/plugins.toml");
+        let want = Toggle {
+            enabled: true,
+            apps: vec!["timer".into()],
+        };
+        assert_eq!(load_at::<Toggle>(&path), None, "no file yet");
+
+        store_at(&path, &want).expect("writes");
+        assert_eq!(load_at::<Toggle>(&path), Some(want));
+
+        std::fs::write(&path, "not valid toml {{{").expect("corrupt it");
+        assert_eq!(load_at::<Toggle>(&path), None, "corrupt is the zero state");
+
+        remove_at(&path).expect("removes");
+        assert!(!path.exists());
+        remove_at(&path).expect("an already-missing file is success");
     }
 
     /// State is re-rendered, not patched: unlike the config overlay there is

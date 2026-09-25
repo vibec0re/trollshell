@@ -199,9 +199,10 @@ impl ControlIface {
     /// `trollshell-plugin-<id>` **user** units systemd knows (transient runs +
     /// legacy static units). `active_state` is systemd's (`active` /
     /// `inactive` / `failed` / …; a declared-but-stopped plugin reports
-    /// `inactive`); `enabled` is the declarative flag for declared plugins,
-    /// unit-file enablement for legacy ones. The companion app's Plugins tab
-    /// renders one switch row per entry.
+    /// `inactive`); `enabled` is the effective flag for declared plugins —
+    /// nix's, or the Plugins tab's persisted switch where nix leaves it free
+    /// (#1400) — and unit-file enablement for legacy ones. The companion
+    /// app's Plugins tab renders one switch row per entry.
     async fn list_plugins(&self) -> Vec<(String, String, bool)> {
         plugin_launcher::list()
             .await
@@ -237,14 +238,18 @@ impl ControlIface {
     }
 
     /// Enable or disable plugin `id` for persistence across logins. For a
-    /// *declared* plugin enablement is declarative — nix owns it (#419), so
-    /// this is a logged no-op (persist by flipping
-    /// `programs.trollshell.plugins.<id>.enable`); runtime start/stop still
-    /// applies live. Legacy static units keep unit-file enable/disable.
+    /// *declared* plugin nix leaves free, the choice is kept in the shell's
+    /// own `$XDG_STATE_HOME/trollshell/plugins.toml` and applies from the
+    /// next reconcile on (#1400); for one whose
+    /// `programs.trollshell.plugins.<id>.enable` nix pins, this refuses and
+    /// says so. The start/stop itself is the caller's `StartPlugin` /
+    /// `StopPlugin`, which the control-center's switch sends only after this
+    /// succeeded. Legacy static units keep unit-file enable/disable.
     ///
     /// # Errors
-    /// Invalid id, or an unreachable user manager (legacy static-unit path
-    /// only — the declarative path can't fail).
+    /// A pinned plugin, an unreadable `plugins.json`, or a failed state
+    /// write; on the legacy static-unit path, an invalid id or an
+    /// unreachable user manager — see [`plugin_launcher::set_enabled`].
     async fn set_plugin_enabled(&self, id: String, enabled: bool) -> zbus::fdo::Result<()> {
         plugin_launcher::set_enabled(&id, enabled)
             .await

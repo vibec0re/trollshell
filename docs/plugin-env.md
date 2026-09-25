@@ -98,19 +98,23 @@ anyone else's. Check these on a fresh install:
 
 ## Bundled plugins
 
-Sections below follow `bundledPluginNames`' order in `flake.nix` (13 total).
+Sections below follow `nix/bundled-plugins.nix`'s order — the list `flake.nix`
+reads as `bundledPluginNames` (13 total). Since #1400 every one of them is
+declared by default (`programs.trollshell.availablePlugins`), **off**, with its
+`package` already pointing at this flake's `hytte-plugin-<id>` output: the
+control-center's Plugins tab lists each one, and its switch starts it and keeps
+that choice across restarts. The `env` knobs below still go under
+`programs.trollshell.plugins.<id>.env`, with no `package` line needed.
 
 ### agents (`hytte-plugin-agents`)
 
-**Turning it on.** There is no `programs.trollshell.plugins.agents.enable`
-option to find — `plugins` is an `attrsOf` submodule, so nothing named
-`agents` exists in the rendered option docs until you write the attr, and
-`package` is **required** with no default. Writing the entry is what enables
-it:
+**Turning it on.** It is already declared, off (#1400): flip its switch in the
+control-center's Plugins tab, and the choice is kept across restarts. To start
+it at login from nix instead — pinned, so the switch greys out:
 
 ```nix
 programs.trollshell.plugins.agents = {
-  package = trollshell.packages.${system}.hytte-plugin-agents;
+  enable = true; # or `lib.mkDefault true` to leave the switch free
   # optional; the plugin has no other env knobs
   env.RUST_LOG = "hytte_plugin_agents=debug";
 };
@@ -260,8 +264,8 @@ the second under its own attribute name (which supplies `HYTTE_PLUGIN_ID`
 automatically, #1284):
 
 ```nix
-programs.trollshell.plugins.clock-demo.package =
-  trollshell.packages.${system}.hytte-plugin-clock-demo;
+# `clock-demo` itself is already declared (#1400). The bar instance is the one
+# entry to write, with its own `package`: `bar-clock-demo` is not a bundled id.
 programs.trollshell.plugins.bar-clock-demo = {
   package = trollshell.packages.${system}.hytte-plugin-clock-demo;
   mount = "BarCenter";
@@ -359,8 +363,9 @@ load-bearing for the second entry:
 
 ```nix
 programs.trollshell.plugins = {
-  # the right-sidebar card (#1250) — the manifest's own id and mount
-  stats.package = trollshell.packages.${system}.hytte-plugin-stats;
+  # the right-sidebar card (#1250) — the manifest's own id and mount. Already
+  # declared, off (#1400); this line only pins it on at login.
+  stats.enable = true;
   # …and the same binary in the bar (#1251): four chips plus the plugin's own
   # drawer page, driven by the [bar] table of the same stats.toml
   stats-bar = {

@@ -661,8 +661,8 @@ the reducer but cannot prove the hive agrees.
 ### The companion window (#947 P2, #950)
 
 Needs the same hive, plus `programs.trollshell.agentWindow.enable` (on by
-default once a `plugins.agents` entry exists) so `trollshell-agent-window` is
-on the session's `PATH`. CI proves the argv both ends speak, the `?hide=`
+default on a machine that runs hyperhive since #1400; set it `true` for a
+remote hive) so `trollshell-agent-window` is on the session's `PATH`. CI proves the argv both ends speak, the `?hide=`
 assembly, the verbs' bytes against a scripted socket and the TLS policy's
 scope; it cannot prove that hyperhive's page renders in WebKitGTK, which is the
 whole point of the window.
@@ -834,8 +834,9 @@ nothing in that file signs the chain it presented (UNKNOWN_CA)`. That
      **Nothing to do**: `programs.trollshell.agentWindow.hiveTlsStateDir`
      already defaults to hyperhive's own `tls.stateDir` when that module is on
      this host, and the window reads `trust-bundle.pem` and `gateway.pem` out
-     of it itself. Set the option by hand only under home-manager, where the
-     NixOS option tree is not in scope to default from.
+     of it itself. Set the option by hand only under a standalone
+     home-manager, where no NixOS option tree is in scope to default from
+     (home-manager run as a NixOS module reads it through `osConfig`).
   2. **A remote hive, or a host you do not configure.** Copy that hive's
      `trust-bundle.pem` over and name it:
      `TROLLSHELL_AGENT_WINDOW_CA=/etc/ssl/hive/trust-bundle.pem`. The window
@@ -1650,6 +1651,10 @@ four window properties below are pinned nowhere but here.
       `programs.trollshell.plugins.clock-demo.package = trollshell.packages.${pkgs.system}.hytte-plugin-clock-demo;`
       (the entry needs its `package`: there is no default, so a bare
       `plugins.clock-demo = { };` fails to evaluate), and `nixos-rebuild switch`.
+      _Since #1400 every bundled plugin is declared by default (off), so the
+      "not declared yet" arm is a second instance instead —
+      `plugins.clock-bar = { package = …hytte-plugin-clock-demo; mount = "BarCenter"; enable = true; };`
+      — or `plugins.clock-demo.enable = true;` to watch a declared one start._
       Within about 3 s of activation finishing, the journal must show
       "plugins.json changed; reconciling the declared plugins" naming
       `/etc/xdg/trollshell/plugins.json`, then "launched plugin as transient
@@ -1664,6 +1669,48 @@ four window properties below are pinned nowhere but here.
       "declared spec changed; restarting". Finally, delete the entry and
       switch: the unit must stop within ~3 s. A switch that changes nothing in
       `plugins.json` must log none of this.
+- [ ] **(#1400)** The Plugins tab's switch persists, and nix pins win. Start
+      from a module whose only plugin configuration is
+      `programs.trollshell.enable = true;` (no `plugins`, no
+      `availablePlugins`) and rebuild.
+  1. `/etc/xdg/trollshell/plugins.json` (NixOS) or
+     `~/.config/trollshell/plugins.json` (home-manager) lists all thirteen
+     bundled plugins, every entry `"enabled": false` and none carrying
+     `_locked`; the control-center's Plugins tab lists every one of them, all
+     **off**, each switch live with the subtitle "…the choice is kept across
+     restarts". With **both** modules enabled and no `plugins` under
+     home-manager, only the `/etc/xdg` file exists (home-manager's
+     `availablePlugins` defaults to `[ ]` there).
+  2. Switch one on (say `timer`): it starts
+     (`systemctl --user status trollshell-plugin-timer` is `active`), and
+     `$XDG_STATE_HOME/trollshell/plugins.toml` (default
+     `~/.local/state/trollshell/plugins.toml`) now reads `[enabled]` /
+     `timer = true`, and nothing else.
+  3. `systemctl --user restart trollshell`: `timer` is still running
+     afterwards (the startup reconcile relaunches it from the folded value)
+     and its switch is still on. Switch it off again: it stops, and
+     `plugins.toml` is **gone** (the one override matched nix again).
+  4. Pin one: add `programs.trollshell.plugins.niri-layouts.enable = true;`
+     and rebuild. With the shell running, within about 3 s (the #1399 watch)
+     the journal shows "plugins.json changed" and
+     `trollshell-plugin-niri-layouts` starts, with no shell restart; its
+     `plugins.json` entry carries `"_locked": ["enabled"]`, and its switch in
+     the tab is **greyed** with the subtitle
+     "Set in nix — programs.trollshell.plugins.niri-layouts.enable".
+     `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control SetPluginEnabled sb niri-layouts false`
+     fails with an error naming that option and leaves `plugins.toml`
+     untouched.
+  5. Change it to `lib.mkDefault true` and rebuild: the entry loses
+     `_locked`, the switch is live again, and switching it off now persists
+     (`niri-layouts = false` in `plugins.toml`) across a
+     `systemctl --user restart trollshell`.
+  6. A refused persist changes nothing (#1400 review, finding 5): with a
+     plugin free, make the state directory unwritable
+     (`chmod a-w ~/.local/state/trollshell`, creating it first if needed) and
+     flip its switch. The plugin must **not** start or stop, the switch
+     snaps back within a poll, and its subtitle reads "Not changed: the
+     choice could not be kept (…)" naming the write error. Restore the mode
+     afterwards.
 
 ## Infobroker
 

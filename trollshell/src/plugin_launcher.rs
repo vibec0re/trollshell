@@ -8,7 +8,8 @@
 //!   home-manager / NixOS modules render it to a small JSON state file
 //!   ([`STATE_FILE_REL`] under `$XDG_CONFIG_HOME`, then each entry of
 //!   `$XDG_CONFIG_DIRS`) saying which plugins exist, how to exec them, and
-//!   whether they're enabled.
+//!   whether they're enabled — which, unless nix pins it, the Plugins tab's
+//!   switch may override (see "The Plugins tab's switch persists" below).
 //! - **the host launches.** At startup ([`launch_at_startup`]) every enabled,
 //!   not-already-running plugin is spawned as a *transient* user unit
 //!   (`systemd-run --user --unit=trollshell-plugin-<id>.service … <exec>`); the
@@ -42,12 +43,20 @@
 //! | enabled  | not running                  | launch    |
 //! | enabled  | running, fingerprint matches  | leave     |
 //! | enabled  | running, fingerprint differs  | restart   |
-//! | disabled | running                      | stop      |
+//! | enabled  | running, no fingerprint      | restart   |
+//! | disabled | running, launcher-stamped    | stop      |
+//! | disabled | running, no fingerprint      | leave     |
 //! | absent   | running, launcher-stamped    | stop      |
 //! | absent   | running, no fingerprint      | leave     |
 //!
-//! That last pair is the legacy-static-unit guard: a unit this launcher never
-//! spawned carries no fingerprint, so reconcile never touches it.
+//! The two "no fingerprint → leave" rows are the legacy-static-unit guard: a
+//! unit this launcher never spawned carries no fingerprint, so reconcile never
+//! **stops** it. That covers a declared-but-off id too (#1400 review, finding
+//! 4): `availablePlugins` declares every bundled id, off, so without that row
+//! a hand-installed static unit for one of them would be stopped on every
+//! reconcile. A declared-**on** id with an unstamped running unit is still
+//! restarted, since converging onto the declared spec is the point; for a
+//! static unit that bounces it through [`restart`]'s unit-file fallback.
 //!
 //! [`reconcile`] runs at shell startup, again whenever `plugins.json` changes
 //! on disk (#1399, see the next section), and on demand via
@@ -79,9 +88,11 @@
 //!   home-manager file appearing over the `/etc/xdg` one changes the spec
 //!   without either file's bytes changing (`hytte-config`'s #1040 R9, same
 //!   shape). Stamping a shadowed file costs a spurious reconcile at worst,
-//!   which also relaunches any declared-enabled plugin that is not running
-//!   (stopped from the Plugins tab, or crashed) — declared state wins, as it
-//!   does on a home-manager poke.
+//!   which also relaunches any effectively-enabled plugin that is not running
+//!   (crashed, or stopped behind the launcher's back with `systemctl --user
+//!   stop`) — the effective state wins, as it does on a home-manager poke.
+//!   Since #1400 a plugin stopped from the Plugins tab is not one of them:
+//!   the switch persisted the stop, so it is effectively off.
 //! - **Stamp, then load** (#1040 V2): the baseline is taken before startup's
 //!   reconcile reads the file, and every later tick re-stamps before it
 //!   reconciles, so an edit landing in between is one tick late, never folded
@@ -121,6 +132,37 @@
 //! relaunches them from the new file. It is a one-off bounce, and nothing
 //! here debounces it. The reverse move (home-manager → NixOS) has no gap,
 //! because the `/etc` file appears before home-manager removes its own.
+//!
+//! ## The Plugins tab's switch persists (#1400)
+//!
+//! nix declares, but for most plugins it only declares a **default**. The
+//! control-center's switch sends `SetPluginEnabled` and then
+//! `StartPlugin`/`StopPlugin` (persist first, so a refused persist changes
+//! nothing; #1400 review, finding 5), and [`set_enabled`] keeps that choice
+//! for a declared plugin in `$XDG_STATE_HOME/trollshell/plugins.toml`
+//! ([`Overrides`], through `hytte_config::state`, #866 decision 3: state is
+//! what the shell writes when you flip a toggle). It stores only
+//! **differences** from the declared value, in either direction, so switching
+//! a plugin back to what nix says deletes its entry. [`load_declared_from`]
+//! folds the file into every plugin's `enabled` ([`effective_enabled`]), which
+//! is how [`reconcile`], [`list`], [`start`] and the #1399 watch all see one
+//! effective value and a switched-on plugin survives a shell restart.
+//!
+//! Who wins is decided by **nix priority**, the rule #1227 set for config
+//! keys (option C on the #1400 thread): an `enable` assigned plainly or with
+//! `lib.mkForce` is **pinned**, and the modules render `"_locked":
+//! ["enabled"]` on its entry ([`PluginSpec::enable_locked`]). For a pinned
+//! plugin an override on disk is ignored and [`set_enabled`] refuses to
+//! write one, with an error naming `programs.trollshell.plugins.<id>.enable`;
+//! the control-center greys that switch, so only a stale tab or a hand-made
+//! `busctl` call ever sees the error. An `enable` left unset or set with
+//! `lib.mkDefault` pins nothing, and the switch decides.
+//!
+//! The state file is **not** watched: its only writer is [`set_enabled`],
+//! behind a switch that starts or stops the plugin itself right after. An
+//! override for an id no longer declared, or for a pinned one, is ignored
+//! rather than deleted, so a pin relaxed back to `lib.mkDefault` finds the
+//! switch's last choice again.
 //!
 //! ## The session target (#707)
 //!
@@ -253,10 +295,19 @@
 //! ## Legacy static units
 //!
 //! Hand-installed static units (`etc/systemd/user/trollshell-plugin-*.service`,
-//! the pre-#419 path) keep working unchanged: the transport (`plugins.rs`)
-//! doesn't care who spawned a plugin, and the control-surface fns here fall
-//! back to plain `StartUnit` / unit-file enablement for any id that isn't in
-//! the declarative state file.
+//! the pre-#419 path) keep working: the transport (`plugins.rs`) doesn't care
+//! who spawned a plugin, and the control-surface fns here fall back to plain
+//! `StartUnit` / unit-file enablement for any id that isn't in the declarative
+//! state file.
+//!
+//! An id that **is** declared is the launcher's, and since #1400 the nix
+//! modules declare every bundled id by default (`availablePlugins`, off). A
+//! static unit for such an id is left alone while the plugin is off: reconcile
+//! stops only a unit it stamped ([`plan`]). What the launcher cannot do is
+//! start it: switching the plugin on (the Plugins tab, or `enable = true`)
+//! makes it launch its own transient unit, which systemd refuses while the
+//! static unit's file exists. To hand an id to a static unit entirely, drop it
+//! from `availablePlugins` (and `plugins`), so it is undeclared again.
 //!
 //! ## Why the `systemd-run` CLI, not D-Bus `StartTransientUnit`
 //!
@@ -280,7 +331,7 @@ use std::time::Duration;
 use anyhow::Context;
 use hytte::services::systemd;
 use hytte_config::subsystem::watch::{self, Stamp};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::launch::{self, Launch};
 use crate::secrets::SecretProbe;
@@ -322,10 +373,40 @@ struct PluginSpec {
     /// Whether the host launches this plugin at startup. A disabled plugin is
     /// still *declared* — it lists in the control-center and can be started
     /// manually — it just doesn't auto-launch.
+    ///
+    /// As read from the file this is the **declared** value; [`load_declared_from`]
+    /// replaces it with the effective one, the Plugins tab's persisted switch
+    /// folded in (#1400, [`effective_enabled`]).
     #[serde(default = "default_enabled")]
     enabled: bool,
+    /// The keys of this entry nix **pins** (#1400), in #1227's `_locked`
+    /// spelling. Today only ever `["enabled"]`, rendered when
+    /// `programs.trollshell.plugins.<id>.enable` was assigned at a priority
+    /// stronger than `lib.mkDefault` — a plain `enable = true;` or a
+    /// `lib.mkForce`. Absent (every unpinned entry, and every file written
+    /// before #1400) pins nothing; a name this shell does not know is
+    /// ignored, so a later module pinning another key cannot break it.
+    #[serde(default, rename = "_locked")]
+    locked: Vec<String>,
 }
 
+/// The `_locked` entry that pins [`PluginSpec::enabled`] (#1400) — the JSON
+/// key it pins, exactly as #1227's markers name theirs.
+const LOCKED_ENABLED: &str = "enabled";
+
+impl PluginSpec {
+    /// Whether nix pins this plugin's `enabled` (#1400): the Plugins tab's
+    /// switch cannot persist over it, and any override already on disk for it
+    /// is ignored. Pure.
+    fn enable_locked(&self) -> bool {
+        self.locked.iter().any(|key| key == LOCKED_ENABLED)
+    }
+}
+
+/// `enabled`'s value when a hand-written `plugins.json` omits it. Still
+/// `true`, unlike the nix option's `false` default since #1400: both modules
+/// always write the field, so this only ever answers for a file a person
+/// wrote, and such a file written before #1400 meant "launch it".
 fn default_enabled() -> bool {
     true
 }
@@ -477,14 +558,71 @@ fn state_file_paths() -> Vec<PathBuf> {
     )
 }
 
-/// [`load_declared_from`] over this process's own [`state_file_paths`].
+/// Everything the launcher reads to decide what is declared, as paths: the
+/// `plugins.json` candidates nix renders (config), and the one
+/// `plugins.toml` the Plugins tab's switch persists into (state, #1400).
+///
+/// A value rather than two environment reads at each use so the whole chain
+/// — the #1399 watch, [`reconcile_from`], [`set_enabled_in`] — is drivable in
+/// a test against scratch files, with neither the developer's real
+/// `~/.config/trollshell` nor their real `$XDG_STATE_HOME/trollshell` in
+/// reach.
+#[derive(Clone, Debug)]
+struct Sources {
+    /// The `plugins.json` candidates, in XDG precedence order
+    /// ([`candidate_paths`]).
+    config: Vec<PathBuf>,
+    /// `$XDG_STATE_HOME/trollshell/plugins.toml` ([`OVERRIDES_SUBSYSTEM`]),
+    /// or `None` when neither `$XDG_STATE_HOME` nor `$HOME` is set — then
+    /// nothing is overridden and the switch cannot persist.
+    overrides: Option<PathBuf>,
+}
+
+impl Sources {
+    /// This process's own sources — the one place the launcher resolves both
+    /// halves from the environment.
+    fn from_env() -> Self {
+        Self {
+            config: state_file_paths(),
+            overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
+        }
+    }
+}
+
+/// [`load_declared_from`] over this process's own [`Sources`].
 async fn load_declared() -> Option<Declared> {
-    load_declared_from(&state_file_paths()).await
+    load_declared_from(&Sources::from_env()).await
+}
+
+/// The **effective** declaration: what nix declares ([`load_nix_declared`]),
+/// with the Plugins tab's persisted switch folded into each plugin's
+/// `enabled` ([`fold_overrides`], #1400).
+///
+/// `None` exactly when [`load_nix_declared`] says so — a `plugins.json` that
+/// exists but cannot be read or parsed. The override file never makes this
+/// `None`: it is the shell's own, and one that does not parse is read as "no
+/// overrides" (`hytte_config::state`'s contract; the next switch rewrites
+/// it).
+///
+/// This is the one place the effective spec is assembled; every reader goes
+/// through it — [`reconcile`], [`list`], [`start`], the #1399 watch — so they
+/// cannot disagree about whether a plugin is on. It takes its [`Sources`]
+/// rather than reading the environment so the watch's production task is
+/// drivable in a test against scratch files (see [`reconcile_then_watch`]).
+async fn load_declared_from(sources: &Sources) -> Option<Declared> {
+    let mut declared = load_nix_declared(&sources.config).await?;
+    fold_overrides(&mut declared, &read_overrides(sources.overrides.as_deref()));
+    Some(declared)
 }
 
 /// Load + parse + sanitize the declarative plugin state from the first of
-/// `paths` that exists. Missing file = **no declared plugins** (inert, not an
-/// error) — `Some(Declared::default())`, which is a real answer: it says every
+/// `paths` that exists — nix's half of [`load_declared_from`], before the
+/// switch's overrides are folded in. [`set_enabled_in`] reads this one
+/// directly, because an override is stored as a difference from the
+/// **declared** value, never from an effective one.
+///
+/// Missing file = **no declared plugins** (inert, not an error) —
+/// `Some(Declared::default())`, which is a real answer: it says every
 /// declarative plugin was removed from the config.
 ///
 /// `None` means "a state file exists but we couldn't read or parse it" —
@@ -493,12 +631,7 @@ async fn load_declared() -> Option<Declared> {
 /// read as "stop everything". A broken file also stops the search rather than
 /// falling through to a lower-precedence one: masking a broken user file with a
 /// system one would be quiet drift.
-///
-/// This is the one place the effective spec is assembled; every reader goes
-/// through it, [`load_declared`] included. It takes the paths rather than
-/// reading the environment so the #1399 watch's production task is drivable
-/// in a test against a scratch file (see [`reconcile_then_watch`]).
-async fn load_declared_from(paths: &[PathBuf]) -> Option<Declared> {
+async fn load_nix_declared(paths: &[PathBuf]) -> Option<Declared> {
     for path in paths {
         match tokio::fs::read_to_string(path).await {
             Ok(json) => match parse_state(&json) {
@@ -516,6 +649,133 @@ async fn load_declared_from(paths: &[PathBuf]) -> Option<Declared> {
         }
     }
     Some(Declared::default())
+}
+
+// ── The Plugins tab's persisted switch (#1400) ───────────────────────────────
+
+/// The `hytte_config::state` subsystem the switch persists into:
+/// `$XDG_STATE_HOME/trollshell/plugins.toml`. State, not config — #866
+/// decision 3: the shell writes it when you flip a toggle, you never edit it,
+/// and nix never renders it.
+const OVERRIDES_SUBSYSTEM: &str = "plugins";
+
+/// `plugins.toml`: where the Plugins tab's switch disagrees with what nix
+/// declares, per plugin id.
+///
+/// ```toml
+/// [enabled]
+/// timer = true    # declared off (the default); switched on
+/// pet = false     # declared `lib.mkDefault true`; switched off
+/// ```
+///
+/// Only **differences** are stored ([`record_override`]), in either
+/// direction, so switching a plugin back to what nix says deletes its entry
+/// and a file with no entries is deleted outright. The shell is its only
+/// writer ([`set_enabled_in`]), and it is deliberately **not** watched: the
+/// switch that writes it applies the change live with its own
+/// `StartPlugin`/`StopPlugin` right after, so a watch would only ever
+/// re-apply what the switch is already doing.
+///
+/// An entry is **ignored**, not deleted, when its plugin is pinned in nix or
+/// no longer declared at all ([`fold_overrides`]): a pin that is later
+/// relaxed back to `lib.mkDefault`, or a plugin that comes back, finds the
+/// last choice the switch made.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+struct Overrides {
+    /// Plugin id → the `enabled` the switch chose.
+    #[serde(default)]
+    enabled: BTreeMap<String, bool>,
+}
+
+/// A plugin's effective `enabled` (#1400): nix's value when nix pins it,
+/// otherwise the switch's override if there is one, otherwise nix's value.
+/// The whole of option C's rule, and pure so the truth table is a test.
+fn effective_enabled(declared: bool, locked: bool, overridden: Option<bool>) -> bool {
+    if locked {
+        declared
+    } else {
+        overridden.unwrap_or(declared)
+    }
+}
+
+/// Fold `overrides` into every declared plugin's `enabled`
+/// ([`effective_enabled`]). Iterates the **declared** set, so an override for
+/// an id `plugins.json` no longer declares is ignored by construction. Pure.
+fn fold_overrides(declared: &mut Declared, overrides: &Overrides) {
+    for (id, spec) in &mut declared.plugins {
+        spec.enabled = effective_enabled(
+            spec.enabled,
+            spec.enable_locked(),
+            overrides.enabled.get(id).copied(),
+        );
+    }
+}
+
+/// Record the switch's choice for `id` as a difference from its `declared`
+/// value: store it when the two differ, drop the entry when they agree.
+/// Returns whether the map changed, i.e. whether the file needs a write.
+/// Pure.
+fn record_override(overrides: &mut Overrides, id: &str, declared: bool, wanted: bool) -> bool {
+    if wanted == declared {
+        overrides.enabled.remove(id).is_some()
+    } else {
+        overrides.enabled.insert(id.to_owned(), wanted) != Some(wanted)
+    }
+}
+
+/// The override file at `path`, or no overrides at all: no path, no file, or
+/// a file that does not parse (logged by `hytte_config::state`).
+fn read_overrides(path: Option<&Path>) -> Overrides {
+    path.and_then(hytte_config::state::load_at)
+        .unwrap_or_default()
+}
+
+/// Write `overrides` to `path`, or delete the file once nothing is
+/// overridden — a switch put back to what nix says leaves no trace.
+fn write_overrides(path: &Path, overrides: &Overrides) -> std::io::Result<()> {
+    if overrides.enabled.is_empty() {
+        hytte_config::state::remove_at(path)
+    } else {
+        hytte_config::state::store_at(path, overrides)
+    }
+}
+
+/// What [`set_enabled_in`] does for one id, decided from nix's declaration
+/// alone. Pure, so the three arms are testable without a user manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Persist {
+    /// Not declared in `plugins.json`: a legacy static unit, whose
+    /// enablement is its unit file's (`Enable/DisableUnitFiles`).
+    UnitFile,
+    /// Declared, and nix pins `enable`: refuse, and write nothing.
+    Pinned,
+    /// Declared and free: record the choice against this declared value.
+    Override {
+        /// What nix declares, which the override is stored relative to.
+        declared: bool,
+    },
+}
+
+/// Decide [`Persist`] for `id` against nix's own declaration (never an
+/// effective one — see [`load_nix_declared`]). Pure.
+fn persist_decision(nix: &Declared, id: &str) -> Persist {
+    match nix.plugins.get(id) {
+        None => Persist::UnitFile,
+        Some(spec) if spec.enable_locked() => Persist::Pinned,
+        Some(spec) => Persist::Override {
+            declared: spec.enabled,
+        },
+    }
+}
+
+/// The error a pinned plugin's switch gets (#1400), naming the option that
+/// pins it. The control-center greys a pinned switch, so this only reaches a
+/// stale tab or a hand-made `busctl` call.
+fn pinned_error(id: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "plugin {id} is pinned in nix (programs.trollshell.plugins.{id}.enable); \
+         change it there, or declare it with lib.mkDefault so the Plugins tab can switch it"
+    )
 }
 
 // ── Spec fingerprint (#695) ──────────────────────────────────────────────────
@@ -1129,14 +1389,18 @@ enum Action {
 /// restarts before launches, then by id) so execution order is deterministic.
 ///
 /// Two deliberate asymmetries:
-/// - A **running unit with no fingerprint** whose id *is* declared is restarted
-///   (we can't prove it matches, and converging is the point) — this is the
-///   one-time recycle when a pre-#695 shell's units meet a #695 shell. An id
-///   that is both declared *and* hand-installed as a static unit lands here on
-///   every reconcile; [`restart`] documents what that does.
-/// - A **running unit with no fingerprint** whose id is *not* declared is left
-///   strictly alone: that is a legacy static unit (or someone else's), and the
-///   launcher has never owned it.
+/// - A **running unit with no fingerprint** whose id is declared **enabled**
+///   is restarted (we can't prove it matches, and converging is the point) —
+///   this is the one-time recycle when a pre-#695 shell's units meet a #695
+///   shell. An id that is both declared enabled *and* hand-installed as a
+///   static unit lands here on every reconcile; [`restart`] documents what
+///   that does.
+/// - A **running unit with no fingerprint** is otherwise left strictly alone,
+///   whether its id is undeclared or declared **disabled**: that is a legacy
+///   static unit (or someone else's), and the launcher has never owned it.
+///   Only a launcher-stamped unit is ever stopped. The declared-disabled half
+///   matters since #1400, whose `availablePlugins` declares every bundled id
+///   off by default (#1400 review, finding 4).
 fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Action)> {
     let running: BTreeMap<&str, Option<&str>> = units
         .iter()
@@ -1152,8 +1416,12 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
                     out.push((id.clone(), Action::Restart));
                 }
             }
-            (false, Some(_)) => out.push((id.clone(), Action::Stop)),
-            (false, None) => {}
+            // Stamped: the launcher's own unit, so a disabled plugin stops.
+            (false, Some(Some(_))) => out.push((id.clone(), Action::Stop)),
+            // Unstamped: a unit this launcher never spawned (a hand-installed
+            // static unit for a declared-off id) — left alone, like an
+            // undeclared one (#1400 review, finding 4).
+            (false, Some(None) | None) => {}
         }
     }
     // Orphans: units this launcher stamped (so it owns them) whose plugin is no
@@ -1185,7 +1453,7 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
 /// whatever is current.
 pub async fn reconcile() {
     // One-shot: nothing retries a poke, so the outcome has no reader.
-    let _ = reconcile_from(state_file_paths(), Trigger::OneShot).await;
+    let _ = reconcile_from(Sources::from_env(), Trigger::OneShot).await;
 }
 
 /// Who asked for a reconcile, which decides what a failed unit listing means
@@ -1228,7 +1496,7 @@ enum Outcome {
     },
 }
 
-/// [`reconcile`] over an explicit candidate-path list rather than the process
+/// [`reconcile`] over explicit [`Sources`] rather than the process
 /// environment. Owned rather than borrowed so the watch can hand out one
 /// `'static` future per change (see [`reconcile_then_watch`]).
 ///
@@ -1238,10 +1506,10 @@ enum Outcome {
 /// unboundedly is #880's bug: a plugin that can only ever fail (an id both
 /// declared and hand-installed as a static unit) bouncing every tick for the
 /// rest of the session. The next change, poke or shell start tries it again.
-async fn reconcile_from(paths: Vec<PathBuf>, trigger: Trigger) -> Outcome {
+async fn reconcile_from(sources: Sources, trigger: Trigger) -> Outcome {
     let _guard = CONVERGE_LOCK.lock().await;
 
-    let Some(declared) = load_declared_from(&paths).await else {
+    let Some(declared) = load_declared_from(&sources).await else {
         // Unreadable/unparsable state file — leave the running set alone.
         return Outcome::Settled;
     };
@@ -1316,16 +1584,17 @@ pub fn launch_at_startup() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let paths = state_file_paths();
+    let sources = Sources::from_env();
     hytte::reactive::spawn_supervised("plugins-json", move || {
-        reconcile_then_watch(paths.clone(), watch::POLL_INTERVAL)
+        reconcile_then_watch(sources.clone(), watch::POLL_INTERVAL)
     });
 }
 
 // ── Watching the state file (#1399) ──────────────────────────────────────────
 
-/// The production task: [`converge_then_watch`] over `paths`, with
-/// [`reconcile_from`] as the thing it runs.
+/// The production task: [`converge_then_watch`] over the `plugins.json`
+/// candidates in `sources`, with [`reconcile_from`] over all of `sources` as
+/// the thing it runs.
 ///
 /// Its whole job is that one hand-over, and it is a function of its own so a
 /// test can drive exactly what [`launch_at_startup`] spawns: a generic loop
@@ -1334,13 +1603,18 @@ pub fn launch_at_startup() {
 /// `the_production_task_hands_reconcile_to_the_loop`, runs this against an
 /// unparsable scratch file, which is the one input `reconcile_from` answers
 /// without reaching a user manager, and counts the warnings it leaves.
+///
+/// Only the config half is watched. The switch's `plugins.toml` is read on
+/// every reconcile but never stamped: its only writer is [`set_enabled_in`],
+/// behind a switch that starts or stops the plugin itself right after (see
+/// [`Overrides`]).
 fn reconcile_then_watch(
-    paths: Vec<PathBuf>,
+    sources: Sources,
     cadence: Duration,
 ) -> impl Future<Output = ()> + Send + 'static {
-    let reconcile_paths = paths.clone();
-    converge_then_watch(paths, cadence, move |trigger| {
-        reconcile_from(reconcile_paths.clone(), trigger)
+    let watched = sources.config.clone();
+    converge_then_watch(watched, cadence, move |trigger| {
+        reconcile_from(sources.clone(), trigger)
     })
 }
 
@@ -1432,8 +1706,9 @@ fn moved_since<'a>(paths: &'a [PathBuf], seen: &mut Vec<Stamp>) -> Vec<&'a Path>
 
 /// The plugins the control-center lists: the *declared* set (state file) ∪ the
 /// `trollshell-plugin-*` units systemd knows (transient runs + legacy static
-/// units). For a declared plugin the declarative `enabled` flag wins — a
-/// transient unit has no unit file, so systemd would report it `disabled` —
+/// units). For a declared plugin the effective `enabled` flag wins — nix's,
+/// or the switch's persisted override (#1400); a transient unit has no unit
+/// file, so systemd would report it `disabled` —
 /// and a declared-but-stopped plugin still lists as `inactive` (a stopped
 /// `--collect` transient unit vanishes from systemd entirely). Pure merge in
 /// [`merge_declared`].
@@ -1505,25 +1780,71 @@ pub async fn stop(id: &str) -> anyhow::Result<()> {
     systemd::stop_plugin(id).await
 }
 
-/// Persist plugin `id`'s auto-start state. For a **declared** plugin
-/// enablement is *declarative* — nix owns it (#419), so a runtime toggle is a
-/// logged no-op (flip `programs.trollshell.plugins.<id>.enable` to persist;
-/// the tab's live start/stop still applies the runtime half). An undeclared id
-/// falls back to unit-file `Enable/DisableUnitFiles` for legacy static units.
+/// Persist plugin `id`'s auto-start state — the first half of the Plugins
+/// tab's switch, before its `StartPlugin`/`StopPlugin` (#1400), so a refusal
+/// here starts or stops nothing.
+///
+/// - A **declared** plugin nix leaves free (`enable` unset, or
+///   `lib.mkDefault`): the choice is kept in `$XDG_STATE_HOME/trollshell/
+///   plugins.toml` as a difference from the declared value ([`Overrides`]),
+///   and every reconcile, listing and watch tick after it reads the folded
+///   value ([`load_declared_from`]), so it survives a shell restart and a
+///   rebuild that leaves the declaration alone.
+/// - A **declared** plugin nix pins (`enable` assigned plainly, or with
+///   `lib.mkForce`): an error naming `programs.trollshell.plugins.<id>.enable`,
+///   and nothing is written.
+/// - An **undeclared** id: unit-file `Enable/DisableUnitFiles`, for legacy
+///   static units.
 ///
 /// # Errors
-/// Invalid id or an unreachable user manager (legacy path only).
+/// A pinned plugin; an unreadable `plugins.json`; no state directory to
+/// persist into (neither `$XDG_STATE_HOME` nor `$HOME` set) or a failed write;
+/// on the legacy path, an invalid id or an unreachable user manager.
 pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
-    let declared = load_declared().await.unwrap_or_default();
-    if declared.plugins.contains_key(id) {
+    set_enabled_in(&Sources::from_env(), id, enabled).await
+}
+
+/// [`set_enabled`] over explicit [`Sources`], so a test can drive it against
+/// scratch files.
+///
+/// The declared-plugin arms run under [`CONVERGE_LOCK`]: the override file is
+/// a read-modify-write, so two switches flipped in quick succession must not
+/// lose one of the two, and a reconcile must not read the file between the
+/// two halves of either. The legacy arm drops the lock before its D-Bus call;
+/// it touches nothing a reconcile reads.
+async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::Result<()> {
+    let guard = CONVERGE_LOCK.lock().await;
+    // Nix's own declaration, not the effective one: an override is stored
+    // relative to what nix declares.
+    let Some(nix) = load_nix_declared(&sources.config).await else {
+        anyhow::bail!(
+            "plugins.json exists but cannot be read; not persisting plugin {id}'s switch \
+             (the journal names the file)"
+        );
+    };
+    let declared = match persist_decision(&nix, id) {
+        Persist::UnitFile => {
+            drop(guard);
+            return systemd::set_plugin_enabled(id, enabled).await;
+        }
+        Persist::Pinned => return Err(pinned_error(id)),
+        Persist::Override { declared } => declared,
+    };
+    let path = sources.overrides.as_deref().with_context(|| {
+        format!("cannot persist plugin {id}'s switch: neither $XDG_STATE_HOME nor $HOME is set")
+    })?;
+    let mut overrides = read_overrides(Some(path));
+    if record_override(&mut overrides, id, declared, enabled) {
+        write_overrides(path, &overrides).with_context(|| format!("writing {}", path.display()))?;
         tracing::info!(
             plugin = %id,
             enabled,
-            "enablement is declarative (nix-managed, #419); runtime toggle not persisted"
+            declared,
+            path = %path.display(),
+            "Plugins tab switch persisted (#1400)"
         );
-        return Ok(());
     }
-    systemd::set_plugin_enabled(id, enabled).await
+    Ok(())
 }
 
 // ── Secret rotation (#392): relaunch to re-inject a changed key ───────────────
@@ -1670,6 +1991,25 @@ mod tests {
             env: BTreeMap::new(),
             secrets: Vec::new(),
             enabled,
+            locked: Vec::new(),
+        }
+    }
+
+    /// [`spec`], pinned by nix (`_locked = ["enabled"]`, #1400).
+    fn pinned(exec: &str, enabled: bool) -> PluginSpec {
+        PluginSpec {
+            locked: vec![LOCKED_ENABLED.to_owned()],
+            ..spec(exec, enabled)
+        }
+    }
+
+    /// [`Sources`] naming only `plugins.json` candidates — no override file,
+    /// so nothing is folded in: what every test that is about nix's half
+    /// alone wants.
+    fn config_only(paths: &[PathBuf]) -> Sources {
+        Sources {
+            config: paths.to_vec(),
+            overrides: None,
         }
     }
 
@@ -2315,14 +2655,14 @@ mod tests {
         ] {
             write_store_file(&high, partial);
             assert!(
-                load_declared_from(&paths).await.is_none(),
+                load_declared_from(&config_only(&paths)).await.is_none(),
                 "{partial:?} must read as unparsable, not as nothing declared"
             );
         }
 
         std::fs::remove_file(&high).expect("rm");
         std::os::unix::fs::symlink(dir.path().join("gc-collected"), &high).expect("symlink");
-        let fell_through = load_declared_from(&paths)
+        let fell_through = load_declared_from(&config_only(&paths))
             .await
             .expect("a dangling link falls through to the file below");
         assert_eq!(
@@ -2332,7 +2672,7 @@ mod tests {
 
         std::fs::remove_file(&high).expect("rm");
         std::fs::remove_file(&low).expect("rm");
-        let nothing = load_declared_from(&paths)
+        let nothing = load_declared_from(&config_only(&paths))
             .await
             .expect("absent everywhere is an answer");
         assert!(
@@ -2508,7 +2848,7 @@ mod tests {
     ///
     /// Belt and braces, the whole test runs under [`scratch_home`] with the
     /// file at the scratch `$HOME`'s own `plugins.json`, so even a refactor
-    /// that swapped `reconcile_from(paths)` for the environment-reading
+    /// that swapped `reconcile_from(sources)` for the environment-reading
     /// `reconcile()` would read this file and stop in the same place.
     ///
     /// Red if [`reconcile_then_watch`] hands the loop anything but
@@ -2520,6 +2860,21 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
             std::fs::write(&path, "{ this is not json").expect("write");
             let paths = vec![path.clone()];
+            // The override half resolves under the scratch home too (#1400):
+            // `scratch_home` clears `$XDG_STATE_HOME`, so this is
+            // `<scratch>/.local/state/trollshell/plugins.toml`.
+            let sources = Sources {
+                config: paths.clone(),
+                overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
+            };
+            assert!(
+                sources
+                    .overrides
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(home)),
+                "rail: the override file must resolve under the scratch home, got {:?}",
+                sources.overrides
+            );
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2529,7 +2884,7 @@ mod tests {
                 let (captured, _guard) = capture();
                 // The rail: both routes to the file must refuse it.
                 assert!(
-                    load_declared_from(&paths).await.is_none(),
+                    load_declared_from(&sources).await.is_none(),
                     "rail: the scratch file must not parse"
                 );
                 assert!(
@@ -2561,7 +2916,7 @@ mod tests {
                     false
                 };
                 let reached = tokio::select! {
-                    () = reconcile_then_watch(paths.clone(), Duration::from_millis(10)) => false,
+                    () = reconcile_then_watch(sources.clone(), Duration::from_millis(10)) => false,
                     reached = async {
                         if !settles(before + 1).await {
                             return false;
@@ -2578,6 +2933,402 @@ mod tests {
                 );
             });
         });
+    }
+
+    // ── The Plugins tab's persisted switch (#1400) ───────────────────────────
+
+    /// Option C's rule, every row of it: nix's value when nix pins it, else
+    /// the switch's override, else nix's value.
+    ///
+    /// Red if a pin stops winning (the two starred rows), if an override
+    /// stops applying to a free plugin, or if "no override" stops meaning
+    /// the declared value.
+    #[test]
+    fn effective_enabled_is_option_cs_truth_table() {
+        // (declared, pinned, override, effective)
+        let rows = [
+            (false, false, None, false),
+            (false, false, Some(false), false),
+            (false, false, Some(true), true),
+            (true, false, None, true),
+            (true, false, Some(false), false),
+            (true, false, Some(true), true),
+            (false, true, None, false),
+            (false, true, Some(false), false),
+            (false, true, Some(true), false), // * a pin ignores the switch
+            (true, true, None, true),
+            (true, true, Some(false), true), // * a pin ignores the switch
+            (true, true, Some(true), true),
+        ];
+        for (declared, pinned, overridden, want) in rows {
+            assert_eq!(
+                effective_enabled(declared, pinned, overridden),
+                want,
+                "declared {declared}, pinned {pinned}, override {overridden:?}"
+            );
+        }
+    }
+
+    /// The fold over a whole declaration: a free plugin takes its override in
+    /// either direction, a pinned one keeps nix's value, a free one with no
+    /// override keeps nix's value, and an override naming an id nix no longer
+    /// declares brings nothing back.
+    #[test]
+    fn fold_overrides_skips_pinned_and_undeclared_ids() {
+        let mut d = declared(&[
+            ("timer", spec("/bin/timer", false)),
+            ("pet", spec("/bin/pet", true)),
+            ("niri-layouts", pinned("/bin/niri", true)),
+            ("weather", spec("/bin/weather", false)),
+        ]);
+        let overrides = Overrides {
+            enabled: [
+                ("timer".to_owned(), true),
+                ("pet".to_owned(), false),
+                ("niri-layouts".to_owned(), false),
+                ("ghost".to_owned(), true),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        fold_overrides(&mut d, &overrides);
+        let enabled: BTreeMap<&str, bool> = d
+            .plugins
+            .iter()
+            .map(|(id, s)| (id.as_str(), s.enabled))
+            .collect();
+        assert_eq!(
+            enabled,
+            [
+                ("niri-layouts", true),
+                ("pet", false),
+                ("timer", true),
+                ("weather", false),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "an undeclared id must not be declared by its override"
+        );
+    }
+
+    /// Only differences are stored, in both directions, and agreeing with nix
+    /// deletes the entry. The return value is whether a write is needed.
+    #[test]
+    fn record_override_stores_only_differences() {
+        let mut o = Overrides::default();
+        assert!(record_override(&mut o, "timer", false, true), "on over off");
+        assert!(!record_override(&mut o, "timer", false, true), "same again");
+        assert!(record_override(&mut o, "pet", true, false), "off over on");
+        assert_eq!(o.enabled.get("timer"), Some(&true));
+        assert_eq!(o.enabled.get("pet"), Some(&false));
+
+        assert!(
+            record_override(&mut o, "timer", false, false),
+            "back to nix"
+        );
+        assert!(!o.enabled.contains_key("timer"), "the entry is deleted");
+        assert!(
+            !record_override(&mut o, "timer", false, false),
+            "nothing left"
+        );
+        assert!(
+            !record_override(&mut o, "clock", true, true),
+            "agreeing with nix never writes an entry"
+        );
+        assert_eq!(o.enabled.len(), 1);
+    }
+
+    /// `_locked` is read off each entry, only `"enabled"` pins the switch, and
+    /// an entry without it — every unpinned one, and every pre-#1400 file —
+    /// pins nothing.
+    #[test]
+    fn parse_reads_the_locked_marker_and_defaults_it_absent() {
+        let json = r#"{
+            "version": 1,
+            "plugins": {
+                "niri-layouts": { "exec": "/bin/niri", "enabled": true, "_locked": ["enabled"] },
+                "timer": { "exec": "/bin/timer", "enabled": false },
+                "later": { "exec": "/bin/later", "enabled": false, "_locked": ["some-future-key"] }
+            }
+        }"#;
+        let plugins = sanitize(parse_state(json).expect("parses")).plugins;
+        assert!(plugins["niri-layouts"].enable_locked());
+        assert!(!plugins["timer"].enable_locked());
+        assert!(
+            !plugins["later"].enable_locked(),
+            "a marker naming another key does not pin enabled"
+        );
+    }
+
+    /// Which way `set_enabled` goes, decided from nix's declaration alone.
+    #[test]
+    fn persist_decision_routes_each_kind_of_id() {
+        let nix = declared(&[
+            ("timer", spec("/bin/timer", false)),
+            ("pet", spec("/bin/pet", true)),
+            ("niri-layouts", pinned("/bin/niri", true)),
+        ]);
+        assert_eq!(persist_decision(&nix, "legacy"), Persist::UnitFile);
+        assert_eq!(persist_decision(&nix, "niri-layouts"), Persist::Pinned);
+        assert_eq!(
+            persist_decision(&nix, "timer"),
+            Persist::Override { declared: false }
+        );
+        assert_eq!(
+            persist_decision(&nix, "pet"),
+            Persist::Override { declared: true }
+        );
+    }
+
+    /// A scratch `plugins.json` + `plugins.toml` pair: `(dir, sources, the
+    /// override file's path)`. The state file lives under the tempdir, never
+    /// under the real `$XDG_STATE_HOME`.
+    fn scratch_sources(plugins_json: &str) -> (tempfile::TempDir, Sources, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = dir.path().join("config/trollshell/plugins.json");
+        std::fs::create_dir_all(json.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&json, plugins_json).expect("write plugins.json");
+        let toml = dir.path().join("state/trollshell/plugins.toml");
+        let sources = Sources {
+            config: vec![json],
+            overrides: Some(toml.clone()),
+        };
+        (dir, sources, toml)
+    }
+
+    /// Two free plugins: `timer` declared off (the default), `pet` declared
+    /// on (`lib.mkDefault true`).
+    const TWO_FREE: &str = r#"{"version":1,"plugins":{
+        "timer":{"exec":"/bin/timer","enabled":false},
+        "pet":{"exec":"/bin/pet","enabled":true}
+    }}"#;
+
+    /// Every effective `enabled` the launcher would act on, by id.
+    async fn effective(sources: &Sources) -> BTreeMap<String, bool> {
+        load_declared_from(sources)
+            .await
+            .expect("plugins.json parses")
+            .plugins
+            .into_iter()
+            .map(|(id, s)| (id, s.enabled))
+            .collect()
+    }
+
+    /// **The switch persists** (#1400): what `set_enabled` writes is what the
+    /// next `load_declared_from` — every reconcile, listing and watch tick,
+    /// and the one after a shell restart — reads back, in both directions;
+    /// and switching a plugin back to what nix declares deletes its entry,
+    /// and the last one the file.
+    ///
+    /// Red if the fold is dropped from `load_declared_from` (the effective
+    /// values stay nix's), if an agreeing switch is written rather than
+    /// deleted, or if an emptied map leaves a file behind.
+    #[tokio::test]
+    async fn the_switch_persists_and_switching_back_deletes_the_entry() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let both = |timer: bool, pet: bool| -> BTreeMap<String, bool> {
+            [("pet".to_owned(), pet), ("timer".to_owned(), timer)]
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(effective(&sources).await, both(false, true), "as declared");
+
+        set_enabled_in(&sources, "timer", true).await.expect("on");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("the switch wrote state"),
+            "[enabled]\ntimer = true\n"
+        );
+        assert_eq!(effective(&sources).await, both(true, true));
+
+        set_enabled_in(&sources, "pet", false).await.expect("off");
+        assert_eq!(effective(&sources).await, both(true, false));
+
+        set_enabled_in(&sources, "timer", false)
+            .await
+            .expect("back");
+        assert_eq!(
+            read_overrides(Some(&toml)),
+            Overrides {
+                enabled: [("pet".to_owned(), false)].into_iter().collect()
+            },
+            "switching back to the declared value deletes the entry"
+        );
+        assert_eq!(effective(&sources).await, both(false, false));
+
+        set_enabled_in(&sources, "pet", true).await.expect("back");
+        assert!(!toml.exists(), "no override left, no file left");
+        assert_eq!(effective(&sources).await, both(false, true));
+    }
+
+    /// A plugin nix pins refuses the switch with the option's name and writes
+    /// nothing; a stale override already on disk for it stays on disk,
+    /// untouched and ignored.
+    ///
+    /// Red if the pin check is dropped from `set_enabled_in` (the override is
+    /// written) or the error stops naming the option.
+    #[tokio::test]
+    async fn a_pinned_plugins_switch_errors_and_writes_nothing() {
+        let (_dir, sources, toml) = scratch_sources(
+            r#"{"plugins":{"niri-layouts":{"exec":"/bin/niri","enabled":true,"_locked":["enabled"]}}}"#,
+        );
+        let err = set_enabled_in(&sources, "niri-layouts", false)
+            .await
+            .expect_err("a pinned plugin's switch must not persist");
+        assert!(
+            err.to_string()
+                .contains("programs.trollshell.plugins.niri-layouts.enable"),
+            "the error must name the option that pins it: {err}"
+        );
+        assert!(!toml.exists(), "nothing written");
+
+        // An override left from before the pin: ignored, and left alone.
+        std::fs::create_dir_all(toml.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&toml, "[enabled]\nniri-layouts = false\n").expect("seed");
+        assert_eq!(
+            effective(&sources).await.get("niri-layouts"),
+            Some(&true),
+            "a pin wins over an override on disk"
+        );
+        set_enabled_in(&sources, "niri-layouts", false)
+            .await
+            .expect_err("still pinned");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("still there"),
+            "[enabled]\nniri-layouts = false\n",
+            "a refused switch leaves the file's bytes alone"
+        );
+    }
+
+    /// A `plugins.json` that exists but does not parse cannot say whether an
+    /// id is declared or pinned, so the switch refuses rather than guessing —
+    /// and never falls through to the legacy unit-file path, which would
+    /// reach the user manager.
+    #[tokio::test]
+    async fn an_unparsable_plugins_json_refuses_to_persist() {
+        let (_dir, sources, toml) = scratch_sources("{ not json");
+        set_enabled_in(&sources, "timer", true)
+            .await
+            .expect_err("nothing to decide against");
+        assert!(!toml.exists());
+    }
+
+    /// The override file is the shell's own; one that no longer parses reads
+    /// as "no overrides" — nix's values — rather than failing the load.
+    #[tokio::test]
+    async fn a_corrupt_override_file_reads_as_no_overrides() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        std::fs::create_dir_all(toml.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&toml, "not toml {{{").expect("corrupt");
+        assert_eq!(
+            effective(&sources).await,
+            [("pet".to_owned(), true), ("timer".to_owned(), false)]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        );
+    }
+
+    /// **The wiring**: `set_enabled` and `load_declared`, the two
+    /// environment-reading wrappers the `Control` handlers and `list`/`start`
+    /// call, really do resolve the override file under `$XDG_STATE_HOME` and
+    /// agree with each other about it.
+    ///
+    /// Under [`scratch_home`], so both the `plugins.json` it declares and the
+    /// `plugins.toml` it writes are a tempdir's. Red if either wrapper stops
+    /// going through [`Sources::from_env`] (an override path of `None` makes
+    /// `set_enabled` fail; a wrapper reading only the config half makes the
+    /// switch vanish from `load_declared`).
+    #[test]
+    fn the_environment_wrappers_persist_under_the_state_home() {
+        scratch_home(|home| {
+            let json = home.join(".config").join(STATE_FILE_REL);
+            std::fs::create_dir_all(json.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&json, TWO_FREE).expect("write");
+            let toml = home.join(".local/state/trollshell/plugins.toml");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                set_enabled("timer", true).await.expect("persists");
+                assert_eq!(
+                    read_overrides(Some(&toml)).enabled.get("timer"),
+                    Some(&true),
+                    "set_enabled must write $XDG_STATE_HOME/trollshell/plugins.toml"
+                );
+                let timer = load_declared()
+                    .await
+                    .expect("parses")
+                    .plugins
+                    .remove("timer")
+                    .expect("declared");
+                assert!(timer.enabled, "load_declared must fold the override in");
+            });
+        });
+    }
+
+    /// #1400 review, finding 6 (R1): every reader of the declared state but
+    /// `set_enabled_in` reads the *effective* state, through the fold. The
+    /// whole feature rests on it: a `reconcile_from` that read nix's
+    /// declaration alone would forget the switch on every restart and stop a
+    /// switched-on plugin on every rebuild tick, and all the behavioural
+    /// tests above would stay green, since `load_declared_from` is tested but
+    /// its callers are not. A source scan, on
+    /// `launch_at_startup_spawns_the_supervised_watch`'s precedent, because
+    /// `reconcile_from` cannot get past `list_plugin_units` without the real
+    /// user manager.
+    ///
+    /// Falsified by `reconcile_from` reading `load_nix_declared(&sources.config)`.
+    #[test]
+    fn every_reader_but_set_enabled_goes_through_the_fold() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        for sig in [
+            "async fn reconcile_from(",
+            "pub async fn list()",
+            "pub async fn start(",
+        ] {
+            let b = body(sig);
+            assert!(
+                !b.contains("load_nix_declared("),
+                "{sig} must read the effective state:\n{b}"
+            );
+            assert!(
+                b.contains("load_declared"),
+                "{sig} must go through load_declared(_from):\n{b}"
+            );
+        }
+        // Definition + `load_declared_from` + `set_enabled_in`, nothing else.
+        assert_eq!(prod.matches("load_nix_declared(").count(), 3);
+    }
+
+    /// #1400 review, finding 6 (R3): the switch's read-modify-write of the
+    /// override file runs under [`CONVERGE_LOCK`], so a reconcile cannot read
+    /// the file between its two halves, and two quick switches cannot lose
+    /// one. Nothing else pins that the lock is taken at all.
+    ///
+    /// Falsified by `let guard = ();` in `set_enabled_in`.
+    #[tokio::test]
+    async fn the_switch_waits_for_the_converge_lock() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let held = CONVERGE_LOCK.lock().await;
+        let write = set_enabled_in(&sources, "timer", true);
+        tokio::pin!(write);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut write)
+                .await
+                .is_err(),
+            "set_enabled_in must not write while a reconcile holds the lock"
+        );
+        assert!(!toml.exists(), "nothing written under someone else's lock");
+        drop(held);
+        write.await.expect("persists once the lock is free");
+        assert!(toml.exists());
     }
 
     // ── systemd-run argv ─────────────────────────────────────────────────────
@@ -3061,6 +3812,47 @@ mod tests {
             },
         ];
         assert!(plan(&Declared::default(), &units).is_empty());
+    }
+
+    /// #1400 review, finding 4: `availablePlugins` declares every bundled id,
+    /// off, so the two hand-written units above are now *declared* disabled.
+    /// A unit without the launcher's stamp is still not the launcher's to
+    /// stop, and the same unit carrying the stamp still is.
+    ///
+    /// Falsified by folding the stamp back out of the disabled arm (`(false,
+    /// Some(_)) => Stop`): the unstamped half returns both units as stops.
+    #[test]
+    fn plan_leaves_an_unstamped_unit_for_a_declared_off_id_alone() {
+        let mut timer = spec("/bin/timer", true);
+        timer.enabled = false;
+        let mut terminal = spec("/bin/terminal", true);
+        terminal.enabled = false;
+        let d = declared(&[("timer", timer.clone()), ("terminal", terminal.clone())]);
+
+        let unstamped = vec![
+            unit("timer", "active", true),
+            systemd::PluginUnit {
+                description: "Hand-written plugin unit".to_owned(),
+                ..unit("terminal", "active", true)
+            },
+        ];
+        assert!(
+            plan(&d, &unstamped).is_empty(),
+            "a declared-off id's unstamped unit is left alone"
+        );
+
+        let stamped = vec![
+            unit_for("timer", "active", &timer),
+            unit_for("terminal", "active", &terminal),
+        ];
+        assert_eq!(
+            plan(&d, &stamped),
+            vec![
+                ("terminal".to_owned(), Action::Stop),
+                ("timer".to_owned(), Action::Stop),
+            ],
+            "a declared-off id's stamped unit is the launcher's, and stops"
+        );
     }
 
     #[test]

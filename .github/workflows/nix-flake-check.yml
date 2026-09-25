@@ -376,6 +376,7 @@ jobs:
             .#checks.x86_64-linux.hm-module \
             .#checks.x86_64-linux.hm-module-agents-fixture \
             .#checks.x86_64-linux.hm-module-claude-bridge-api \
+            .#checks.x86_64-linux.hm-module-claude-bridge-without-pet \
             .#checks.x86_64-linux.hm-module-core-leds \
             .#checks.x86_64-linux.hm-module-core-leds-composes-with-xdg-systemdirs \
             .#checks.x86_64-linux.hm-module-places-fixture \
@@ -383,6 +384,8 @@ jobs:
             .#checks.x86_64-linux.hm-module-plugin-id-conflict-unconditional \
             .#checks.x86_64-linux.hm-module-plugin-mount \
             .#checks.x86_64-linux.hm-module-plugin-target-default \
+            .#checks.x86_64-linux.hm-module-plugins-available \
+            .#checks.x86_64-linux.modules-agent-window-follows-hyperhive \
             .#checks.x86_64-linux.modules-agents-absent-when-unset \
             .#checks.x86_64-linux.modules-places-absent-when-unset \
             .#checks.x86_64-linux.nixos-module \
@@ -398,7 +401,9 @@ jobs:
             .#checks.x86_64-linux.nixos-module-plugin-id-conflict-unconditional \
             .#checks.x86_64-linux.nixos-module-plugin-mount \
             .#checks.x86_64-linux.nixos-module-plugin-mount-conflict \
-            .#checks.x86_64-linux.nixos-module-plugin-removed-1200
+            .#checks.x86_64-linux.nixos-module-plugin-removed-1200 \
+            .#checks.x86_64-linux.nixos-module-plugins-available \
+            .#checks.x86_64-linux.nixos-module-with-hm-keeps-etc-plugins
 
   # The required check. Branch protection and the merge poller read a check
   # run named exactly `flake-check` and require `completed/success`, so this

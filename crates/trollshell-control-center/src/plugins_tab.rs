@@ -59,6 +59,23 @@
 //! a Start/Stop call) is what stops `refresh_detail`'s own `set_active` from
 //! recording a bogus intent of its own.
 //!
+//! # What the switch means depends on who declared the plugin (#1400)
+//!
+//! Flipping the switch sends `SetPluginEnabled`, then `StartPlugin`/
+//! `StopPlugin` ([`set_plugin_state`]), and since #1400 that first call
+//! **persists** for a plugin `plugins.json` declares: the shell keeps the
+//! choice in its own `$XDG_STATE_HOME/trollshell/plugins.toml`, so it
+//! survives a restart. It goes first so that a refused persist starts or stops
+//! nothing, and says so in the switch row ([`LastToggle`]). The
+//! exception is a plugin whose `enable` nix pins — assigned plainly or with
+//! `lib.mkForce`, which the modules render as `"_locked": ["enabled"]` on its
+//! entry. The shell refuses to persist over a pin, so this tab greys that
+//! switch and names the option to change instead. It reads the pins out of
+//! `plugins.json` directly ([`read_declared_at`]), through the same
+//! parse-once cache as the #1161 mounts ([`DeclaredPlugins`]) and with no
+//! `Control` change. An undeclared plugin (a hand-installed static unit)
+//! keeps its unit file's enable/disable. [`switch_policy`] is the rule.
+//!
 //! # Polls are ordered, not serialised (#983)
 //!
 //! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
@@ -104,7 +121,7 @@
 //! floor is set on both axes.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -347,6 +364,30 @@ struct PendingToggle {
     since: Instant,
 }
 
+/// The switch's most recent toggle, and whether its `SetPluginEnabled` failed
+/// (#1400 review, finding 5).
+///
+/// Since the switch persists before it starts or stops anything
+/// ([`set_plugin_state`]), a refused persist changes nothing, and the switch
+/// snaps back on the next poll. This is what lets the row also say *why*,
+/// instead of "the choice is kept across restarts" ([`switch_row_subtitle`]).
+///
+/// Its own cell rather than a field of [`PendingToggle`]: an intent is cleared
+/// the moment its call fails (that is what makes the switch snap back), while
+/// the reason has to outlive it until the user toggles again or looks at
+/// another plugin ([`persist_error_for`]). Recorded by [`connect_switch`] with
+/// the same `since` as the intent, which is the identity [`on_toggle_result`]
+/// checks, so a late failure cannot annotate a newer toggle.
+struct LastToggle {
+    /// The plugin the toggle was for.
+    plugin_id: String,
+    /// When it happened: the same instant as its [`PendingToggle::since`].
+    since: Instant,
+    /// `SetPluginEnabled`'s error, once it failed. `None` while the call is in
+    /// flight, and after it succeeded.
+    persist_error: Option<String>,
+}
+
 /// What the sidebar list is currently showing, so a poll only rebuilds on a
 /// real transition (list ⇄ empty ⇄ unavailable) and otherwise updates in place.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -474,6 +515,9 @@ struct PluginsState {
     /// [`PendingToggle`]. `None` whenever the shown plugin's switch is free to
     /// follow the snapshot.
     pending: Rc<RefCell<Option<PendingToggle>>>,
+    /// The switch's most recent toggle and whether its persist failed (#1400
+    /// review, finding 5) — see [`LastToggle`].
+    last_toggle: Rc<RefCell<Option<LastToggle>>>,
     /// Guard so programmatically setting the detail switch from a fetched state
     /// doesn't loop back into a Start/Stop call (mirrors the Places tab's).
     syncing: Rc<Cell<bool>>,
@@ -487,10 +531,11 @@ struct PluginsState {
     /// of identical outcomes logs once, not once per poll — see
     /// [`on_poll_result_with_declared`].
     last_failing: Rc<Cell<Option<bool>>>,
-    /// `plugins.json`'s declared `HYTTE_PLUGIN_MOUNT` overrides (#1161),
-    /// parsed at most once per change to the file — see [`DeclaredMounts`]
-    /// for why the 2 s poll must not re-read it (#1260 review F7).
-    declared: Rc<RefCell<DeclaredMounts>>,
+    /// What `plugins.json` declares — the `HYTTE_PLUGIN_MOUNT` overrides
+    /// (#1161) and which plugins nix pins (#1400) — parsed at most once per
+    /// change to the file; see [`DeclaredPlugins`] for why the 2 s poll must
+    /// not re-read it (#1260 review F7).
+    declared: Rc<RefCell<DeclaredPlugins>>,
     /// The selected plugin's manifest id out of the same `plugins.json`,
     /// remembered under the same stamp — see [`DeclaredManifestId`] for why
     /// this is a second cache and not a column of the one above (#1365
@@ -569,10 +614,11 @@ struct WeakPluginsState {
     view: Rc<Cell<PluginsView>>,
     polls: Rc<PollGenerations>,
     pending: Rc<RefCell<Option<PendingToggle>>>,
+    last_toggle: Rc<RefCell<Option<LastToggle>>>,
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
-    declared: Rc<RefCell<DeclaredMounts>>,
+    declared: Rc<RefCell<DeclaredPlugins>>,
     manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
@@ -625,6 +671,7 @@ impl PluginsState {
             view: self.view.clone(),
             polls: self.polls.clone(),
             pending: self.pending.clone(),
+            last_toggle: self.last_toggle.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
@@ -668,6 +715,7 @@ impl WeakPluginsState {
             view: self.view.clone(),
             polls: self.polls.clone(),
             pending: self.pending.clone(),
+            last_toggle: self.last_toggle.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
@@ -822,10 +870,11 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         view: Rc::new(Cell::new(PluginsView::Uninit)),
         polls: Rc::new(PollGenerations::default()),
         pending: Rc::new(RefCell::new(None)),
+        last_toggle: Rc::new(RefCell::new(None)),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
-        declared: Rc::new(RefCell::new(DeclaredMounts::default())),
+        declared: Rc::new(RefCell::new(DeclaredPlugins::default())),
         manifest_ids: Rc::new(RefCell::new(DeclaredManifestId::default())),
         env,
         search_path: Rc::new(OnceCell::new()),
@@ -891,9 +940,12 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
         )
         .build();
 
+    // The subtitle is `switch_subtitle`'s, set per plugin by `refresh_detail`
+    // (#1400). Plain text, not markup: it can carry a plugin id.
     let switch = adw::SwitchRow::builder()
         .title("Running")
-        .subtitle("Start and enable the unit, or stop and disable it")
+        .use_markup(false)
+        .subtitle(switch_subtitle(SwitchPolicy::UnitFile, ""))
         .build();
     let controls = adw::PreferencesGroup::new();
     controls.add(&switch);
@@ -1215,6 +1267,13 @@ fn connect_switch(state: &PluginsState) {
             wanted: want_on,
             since,
         });
+        // A new toggle retires the last one's persist error, whichever plugin
+        // it was for (#1400 review, finding 5).
+        *state.last_toggle.borrow_mut() = Some(LastToggle {
+            plugin_id: id.clone(),
+            since,
+            persist_error: None,
+        });
         spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
             on_toggle_result(&state, since, res);
         });
@@ -1222,12 +1281,16 @@ fn connect_switch(state: &PluginsState) {
 }
 
 /// The completion half of the round trip [`connect_switch`] starts (#945
-/// review, finding 1): a failed `StartPlugin`/`StopPlugin` already knows —
-/// at the call's own `RetryPolicy::Never` timeout, well inside
-/// [`PENDING_TOGGLE_TIMEOUT`] — that the transition it recorded an intent for
-/// never happened, so it must clear that intent rather than let
-/// [`resolve_pending`] keep answering `wanted` for the full 10s window on a
-/// switch that is never coming back on its own.
+/// review, finding 1): a failed `SetPluginEnabled` or `StartPlugin`/
+/// `StopPlugin` already knows — at the call's own `RetryPolicy::Never`
+/// timeout, well inside [`PENDING_TOGGLE_TIMEOUT`] — that the transition it
+/// recorded an intent for never happened, so it must clear that intent rather
+/// than let [`resolve_pending`] keep answering `wanted` for the full 10s
+/// window on a switch that is never coming back on its own.
+///
+/// A failed **persist** is also recorded on [`LastToggle`] (#1400 review,
+/// finding 5), guarded on the same `since`, so the switch row can name the
+/// error: nothing was started or stopped, and nothing was kept.
 ///
 /// Guarded on identity: `since` is the timestamp *this* call's intent was
 /// recorded with, captured by `connect_switch` before the round trip started.
@@ -1254,9 +1317,27 @@ fn connect_switch(state: &PluginsState) {
 /// the parked selection itself alone, same as `set_placeholder`'s own
 /// `take()`. The two homes are mutually exclusive (an intent lives in exactly
 /// one), so at most one of the two clears ever fires.
-fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), hytte_bus::BusError>) {
+fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), ToggleError>) {
     if let Err(err) = res {
-        tracing::info!(%err, "plugin start/stop failed");
+        match err {
+            ToggleError::Persist(err) => {
+                tracing::info!(
+                    %err,
+                    "the Plugins tab switch was not kept, so nothing was started or stopped"
+                );
+                if let Some(last) = state.last_toggle.borrow_mut().as_mut()
+                    && last.since == since
+                {
+                    last.persist_error = Some(err.to_string());
+                }
+            }
+            ToggleError::Apply(err) => {
+                tracing::info!(
+                    %err,
+                    "the Plugins tab switch was kept, but starting or stopping the plugin failed"
+                );
+            }
+        }
         let still_this_intent = state
             .pending
             .borrow()
@@ -1318,7 +1399,7 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 ///
 /// What this tick costs is one [`probe_candidates`] stat, not a read and a
 /// `serde_json` parse: the parse happens on the first tick and then only when
-/// the file's stamp changes (#1260 review F7 — see [`DeclaredMounts`] for why
+/// the file's stamp changes (#1260 review F7 — see [`DeclaredPlugins`] for why
 /// a stat-shaped stamp is enough for a nix-rendered store symlink). The search
 /// path itself — which candidate paths to stat — is resolved from
 /// [`PluginsState::env`] through [`PluginsState::search_path`] once, not per
@@ -1327,18 +1408,24 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// default).
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
-    let candidates = resolved_search_path(&state.search_path, &state.env);
-    let declared = {
-        let probe = probe_candidates(candidates);
-        state
-            .declared
-            .borrow_mut()
-            .get(probe, read_declared_mounts_at)
-    };
+    let declared = refresh_declared(state);
     let state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
-        on_poll_result_with_declared(&state, generation, res, &declared);
+        on_poll_result_with_declared(&state, generation, res, &declared.mounts);
     });
+}
+
+/// The filesystem half of [`refresh_plugins`]'s tick: probe the search path
+/// and hand back [`PluginsState::declared`]'s parse of `plugins.json`,
+/// re-reading it only when its stamp moved.
+///
+/// Its own function so a test can refresh what the switch renders from
+/// (#1400) through the production path without the `Control` round trip the
+/// rest of the tick spawns.
+fn refresh_declared(state: &PluginsState) -> Rc<DeclaredFile> {
+    let candidates = resolved_search_path(&state.search_path, &state.env);
+    let probe = probe_candidates(candidates);
+    state.declared.borrow_mut().get(probe, read_declared_at)
 }
 
 /// One [`list_plugins_and_states`] completion, applied to the tab — or
@@ -1380,7 +1467,7 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
 
 /// `on_poll_result`'s real logic, parameterised by the plugin-id →
 /// declared-mount map
-/// [`read_declared_mounts_at`] reads out of `plugins.json` (#1161). Split out so
+/// [`read_declared_at`] reads out of `plugins.json` (#1161). Split out so
 /// that real filesystem read is injectable rather than baked into the
 /// function every existing poll-ordering test already drives — see
 /// `tests-must-not-touch-real-xdg` in the project's own house rules for why
@@ -1432,7 +1519,7 @@ fn on_poll_result_with_declared(
 }
 
 /// Zip a `ListPluginStates` reply with the declared-mount map
-/// [`read_declared_mounts_at`] read into `PluginRuntime`s, keyed by id (#1161).
+/// [`read_declared_at`] read into `PluginRuntime`s, keyed by id (#1161).
 ///
 /// Split out of [`on_poll_result_with_declared`] purely so the
 /// declared-mount attachment is unit-testable on its own: it takes no
@@ -1523,7 +1610,7 @@ fn resolved_search_path<'a>(
 }
 
 /// The `plugins.json` the search path settled on, plus the cheap identity
-/// [`DeclaredMounts`] keys its cached parse on (#1260 review F7).
+/// [`DeclaredPlugins`] keys its cached parse on (#1260 review F7).
 ///
 /// Everything here comes from one `stat` plus a `realpath`-style walk (a
 /// handful of `readlink`s — one per path component per symlink hop crossed)
@@ -1605,8 +1692,24 @@ fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
     })
 }
 
-/// The declared `HYTTE_PLUGIN_MOUNT` overrides in `plugins.json`, parsed **at
-/// most once per change to the file** (#1260 review F7).
+/// What `plugins.json` declares, as far as this tab reads it: the
+/// `HYTTE_PLUGIN_MOUNT` overrides (#1161), and which ids are declared at all
+/// and which of those nix pins (#1400). One parse, cached by
+/// [`DeclaredPlugins`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DeclaredFile {
+    /// Plugin id → its declared `HYTTE_PLUGIN_MOUNT` wire name (#1161).
+    mounts: HashMap<String, String>,
+    /// Every plugin id the file declares (#1400) — a declared plugin's
+    /// switch persists, an undeclared one's is a legacy unit file's.
+    ids: HashSet<String>,
+    /// The declared ids whose `enabled` nix pins, i.e. whose entry carries
+    /// `"_locked": ["enabled"]` (#1400): their switch is greyed.
+    pinned: HashSet<String>,
+}
+
+/// What `plugins.json` declares ([`DeclaredFile`]), parsed **at most once per
+/// change to the file** (#1260 review F7).
 ///
 /// Before this, [`refresh_plugins`] did a full read + `serde_json` parse on
 /// the GTK main thread on every 2 s tick, for the window's whole life and
@@ -1619,15 +1722,15 @@ fn probe_candidates(candidates: &[PathBuf]) -> Option<PluginsJson> {
 /// box whose plugins were installed by hand, and it should not re-walk the
 /// search path's every candidate any more often than a hit does.
 #[derive(Default)]
-struct DeclaredMounts {
+struct DeclaredPlugins {
     /// What the last `probe_plugins_json` found — see [`Seen`].
     seen: Seen,
     /// The last parse. Handed out by `Rc` so a poll's completion closure can
-    /// hold it without re-cloning the map.
-    map: Rc<HashMap<String, String>>,
+    /// hold it without re-cloning the maps.
+    map: Rc<DeclaredFile>,
 }
 
-/// The state [`DeclaredMounts`] compares tick to tick.
+/// The state [`DeclaredPlugins`] compares tick to tick.
 ///
 /// Three states, not `Option<Option<…>>`: [`Unprobed`](Self::Unprobed) — the
 /// cache has never run, so the first tick must read — is a genuinely
@@ -1641,26 +1744,33 @@ enum Seen {
     Found(PluginsJson),
 }
 
-impl DeclaredMounts {
-    /// The cached map, re-reading through `read` **only** when `probe`
+impl DeclaredPlugins {
+    /// The cached parse, re-reading through `read` **only** when `probe`
     /// differs from the one the cache last parsed.
     ///
     /// `read` is a parameter rather than a hard-wired call so a test can
     /// count how often the blocking half actually runs — which is the
     /// property this type exists for, and the one a stamp comparison that
     /// stopped working would break silently.
-    fn get<F>(&mut self, probe: Option<PluginsJson>, read: F) -> Rc<HashMap<String, String>>
+    fn get<F>(&mut self, probe: Option<PluginsJson>, read: F) -> Rc<DeclaredFile>
     where
-        F: FnOnce(&Path) -> HashMap<String, String>,
+        F: FnOnce(&Path) -> DeclaredFile,
     {
         let seen = probe.map_or(Seen::Missing, Seen::Found);
         if self.seen != seen {
             self.map = Rc::new(match &seen {
                 Seen::Found(found) => read(&found.path),
-                Seen::Unprobed | Seen::Missing => HashMap::new(),
+                Seen::Unprobed | Seen::Missing => DeclaredFile::default(),
             });
             self.seen = seen;
         }
+        Rc::clone(&self.map)
+    }
+
+    /// The last parse, without probing — what a selection change between two
+    /// polls renders the switch from (#1400). Empty until the first
+    /// [`refresh_declared`].
+    fn last(&self) -> Rc<DeclaredFile> {
         Rc::clone(&self.map)
     }
 }
@@ -1668,7 +1778,7 @@ impl DeclaredMounts {
 /// The manifest id `plugins.json` implies for **the selected plugin**,
 /// remembered per id and per file stamp (#1365 review, MED 5).
 ///
-/// [`DeclaredMounts`] above, narrowed to one id. It is a second cache rather
+/// [`DeclaredPlugins`] above, narrowed to one id. It is a second cache rather
 /// than a second column of that map because the two are asked different
 /// questions at different times: that one is asked for *every* row on every
 /// poll and so is worth parsing whole, this one is asked about the one
@@ -1694,7 +1804,7 @@ impl DeclaredManifestId {
     /// The cached manifest id for `id`, re-reading through `read` **only**
     /// when the id or the file's stamp differs from the last lookup.
     ///
-    /// `read` is a parameter for [`DeclaredMounts::get`]'s reason: a test can
+    /// `read` is a parameter for [`DeclaredPlugins::get`]'s reason: a test can
     /// then count how often the blocking half runs, which is the property
     /// this type exists for and the one a stamp comparison that stopped
     /// working would break silently.
@@ -1718,50 +1828,125 @@ impl DeclaredManifestId {
     }
 }
 
-/// Read every plugin's declared `HYTTE_PLUGIN_MOUNT` out of the
-/// `plugins.json` at `path` (#1161) — the same file `nix/hm-module.nix` /
-/// `nix/nixos-module.nix` render.
+/// Read what the `plugins.json` at `path` declares ([`DeclaredFile`]) —
+/// the same file `nix/hm-module.nix` / `nix/nixos-module.nix` render and
+/// `trollshell::plugin_launcher` reads.
 ///
 /// Best-effort, the same failure mode [`hytte_config::places::load_places`]
 /// gives this tab's Places sibling: an unreadable or unparsable file yields
-/// an empty map rather than an error — the row simply shows no override note,
-/// same as an unreachable shell showing no runtime overlay.
+/// an empty parse rather than an error — the row simply shows no override
+/// note and its switch reads as a legacy unit's, same as an unreachable shell
+/// showing no runtime overlay.
 ///
-/// **Two id namespaces meet in the map this returns** (#1260 review F9, and
-/// inherited from #423 rather than new here): its keys are `plugins.json`
-/// attribute names — i.e. `programs.trollshell.plugins.<id>`, a nix option
-/// name — while the ids they are looked up by in [`runtime_states`] come from
-/// `ListPluginStates`, i.e. the **manifest** id the plugin registered with.
-/// Nothing enforces that the two agree; they coincide by convention, and
-/// `apply_plugins`' own `rt.get(id)` has zipped the same two namespaces since
-/// #423. A plugin whose manifest id differs from its nix attribute name
-/// simply shows no override note.
-fn read_declared_mounts_at(path: &Path) -> HashMap<String, String> {
+/// **Two id namespaces meet in the mount map this returns** (#1260 review
+/// F9, and inherited from #423 rather than new here): its keys are
+/// `plugins.json` attribute names — i.e. `programs.trollshell.plugins.<id>`,
+/// a nix option name — while the ids they are looked up by in
+/// [`runtime_states`] come from `ListPluginStates`, i.e. the **manifest** id
+/// the plugin registered with. Nothing enforces that the two agree; they
+/// coincide by convention, and `apply_plugins`' own `rt.get(id)` has zipped
+/// the same two namespaces since #423. A plugin whose manifest id differs
+/// from its nix attribute name simply shows no override note. The
+/// [`ids`](DeclaredFile::ids) and [`pinned`](DeclaredFile::pinned) sets have
+/// no such seam: the switch looks them up by the `ListPlugins` id, which is
+/// the unit's, i.e. the attribute name itself.
+fn read_declared_at(path: &Path) -> DeclaredFile {
     std::fs::read_to_string(path)
         .ok()
-        .map(|text| declared_mounts_from_json(&text))
+        .map(|text| declared_from_json(&text))
         .unwrap_or_default()
 }
 
-/// The pure half of [`read_declared_mounts_at`]: `{"plugins": {"<id>": {"env":
-/// {"HYTTE_PLUGIN_MOUNT": "<name>"}}}}` → `{id: name}`, dropping any entry
-/// that is missing the key or shaped unexpectedly rather than erroring — the
-/// same tolerance the rest of this best-effort read has. Split out so a test
-/// can drive it without touching the filesystem.
-fn declared_mounts_from_json(text: &str) -> HashMap<String, String> {
+/// The pure half of [`read_declared_at`]: one `serde_json` parse of
+/// `{"plugins": {"<id>": {"env": {"HYTTE_PLUGIN_MOUNT": "<name>"},
+/// "_locked": ["enabled"], …}}}`, dropping any entry shaped unexpectedly
+/// rather than erroring — the same tolerance the rest of this best-effort
+/// read has. Split out so a test can drive it without touching the
+/// filesystem.
+fn declared_from_json(text: &str) -> DeclaredFile {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return HashMap::new();
+        return DeclaredFile::default();
     };
     let Some(plugins) = value.get("plugins").and_then(serde_json::Value::as_object) else {
-        return HashMap::new();
+        return DeclaredFile::default();
     };
-    plugins
+    let mounts = plugins
         .iter()
         .filter_map(|(id, spec)| {
             let mount = spec.get("env")?.get("HYTTE_PLUGIN_MOUNT")?.as_str()?;
             Some((id.clone(), mount.to_owned()))
         })
-        .collect()
+        .collect();
+    let pinned = plugins
+        .iter()
+        .filter(|(_, spec)| {
+            spec.get("_locked")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("enabled")))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    DeclaredFile {
+        mounts,
+        ids: plugins.keys().cloned().collect(),
+        pinned,
+    }
+}
+
+/// [`declared_from_json`]'s mount map alone (#1161) — what the mount tests
+/// below were written against.
+#[cfg(test)]
+fn declared_mounts_from_json(text: &str) -> HashMap<String, String> {
+    declared_from_json(text).mounts
+}
+
+/// What the detail pane's switch does for one plugin (#1400).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchPolicy {
+    /// Declared in `plugins.json` and pinned in nix: the switch is greyed,
+    /// since `SetPluginEnabled` would refuse it.
+    Pinned,
+    /// Declared and free: start/stop now, and the shell keeps the choice
+    /// across restarts (its `plugins.toml` state file).
+    Kept,
+    /// Not declared: a hand-installed static unit — start/stop plus the unit
+    /// file's own enable/disable.
+    UnitFile,
+}
+
+/// The [`SwitchPolicy`] for `id` under what `plugins.json` declares. Pure.
+fn switch_policy(file: &DeclaredFile, id: &str) -> SwitchPolicy {
+    if file.pinned.contains(id) {
+        SwitchPolicy::Pinned
+    } else if file.ids.contains(id) {
+        SwitchPolicy::Kept
+    } else {
+        SwitchPolicy::UnitFile
+    }
+}
+
+/// The switch row's subtitle for `policy` — for a pinned plugin, the option
+/// to change instead (#1400). Plain text: the row is built with markup off.
+fn switch_subtitle(policy: SwitchPolicy, id: &str) -> String {
+    match policy {
+        SwitchPolicy::Pinned => format!("Set in nix — programs.trollshell.plugins.{id}.enable"),
+        SwitchPolicy::Kept => "Start or stop it; the choice is kept across restarts".to_owned(),
+        SwitchPolicy::UnitFile => "Start and enable the unit, or stop and disable it".to_owned(),
+    }
+}
+
+/// What the switch row's subtitle actually shows: [`switch_subtitle`], or,
+/// after a toggle whose `SetPluginEnabled` failed, that nothing changed and
+/// why (#1400 review, finding 5). A pinned plugin keeps its "Set in nix" line
+/// either way: that already names what to change, and a refused persist on a
+/// pin the tab had not re-read yet is exactly what it explains. Pure.
+fn switch_row_subtitle(policy: SwitchPolicy, id: &str, persist_error: Option<&str>) -> String {
+    match persist_error {
+        Some(err) if policy != SwitchPolicy::Pinned => {
+            format!("Not changed: the choice could not be kept ({err})")
+        }
+        _ => switch_subtitle(policy, id),
+    }
 }
 
 /// Apply a non-empty unit list + runtime overlay: update the existing rows in
@@ -2074,6 +2259,40 @@ fn refresh_detail(state: &PluginsState) {
     state.syncing.set(true);
     state.detail.switch.set_active(show_running);
     state.syncing.set(false);
+
+    // #1400: what flipping it means. A plugin nix pins gets a greyed switch
+    // naming the option to change instead — the shell would refuse to
+    // persist it — while a free one says its choice is kept.
+    let policy = switch_policy(&state.declared.borrow().last(), &id);
+    state
+        .detail
+        .switch
+        .set_sensitive(policy != SwitchPolicy::Pinned);
+    // …unless the last toggle for this plugin could not be kept (#1400
+    // review, finding 5): then the row says why instead.
+    let persist_error = persist_error_for(&state.last_toggle, &id);
+    state
+        .detail
+        .switch
+        .set_subtitle(&switch_row_subtitle(policy, &id, persist_error.as_deref()));
+}
+
+/// The persist error to show for plugin `id`'s switch, if its last toggle's
+/// `SetPluginEnabled` failed — see [`LastToggle`].
+///
+/// A [`LastToggle`] for a plugin that is not the one shown is dropped
+/// outright, [`resolve_pending`]'s rule: the error belonged to a switch the
+/// user has since looked away from, and must not reappear on a later visit.
+fn persist_error_for(last: &RefCell<Option<LastToggle>>, id: &str) -> Option<String> {
+    let mut last = last.borrow_mut();
+    match last.as_ref() {
+        Some(toggle) if toggle.plugin_id == id => toggle.persist_error.clone(),
+        Some(_) => {
+            *last = None;
+            None
+        }
+        None => None,
+    }
 }
 
 /// Mount (or leave alone, or tear down) the selected plugin's *Configuration*
@@ -2154,7 +2373,7 @@ fn refresh_config(state: &PluginsState, id: &str) {
 /// runs from [`refresh_detail`] on every tick and early-returns only when a
 /// form **is** mounted — so for a selected plugin that owns no family, which
 /// is most of them, this is reached every time. The read and the
-/// `serde_json` parse behind it are exactly the cost [`DeclaredMounts`]
+/// `serde_json` parse behind it are exactly the cost [`DeclaredPlugins`]
 /// exists to keep off that tick (#1260 review F7), so the answer is
 /// remembered by [`DeclaredManifestId`] under the same
 /// [`probe_candidates`] stamp: the tick pays one `stat` plus one `realpath`,
@@ -2165,7 +2384,7 @@ fn family_for_plugin(state: &PluginsState, id: &str) -> Option<crate::config_for
 }
 
 /// [`family_for_plugin`] with the read half as a parameter, so a test can
-/// count how often it actually runs — [`DeclaredMounts::get`]'s shape, and
+/// count how often it actually runs — [`DeclaredPlugins::get`]'s shape, and
 /// the property the memo exists for.
 fn family_for_plugin_reading<F>(
     state: &PluginsState,
@@ -2198,7 +2417,7 @@ fn manifest_id_at(path: &Path, id: &str) -> Option<String> {
 
 /// [`manifest_id_at`]'s pure half: `{"plugins": {"<id>": {"exec": "…"}}}` →
 /// the manifest id of that binary. Split out so a test can drive it without
-/// touching the filesystem, exactly as [`declared_mounts_from_json`] is.
+/// touching the filesystem, exactly as [`declared_from_json`] is.
 fn manifest_id_from_json(text: &str, id: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let exec = value.get("plugins")?.get(id)?.get("exec")?.as_str()?;
@@ -2774,13 +2993,59 @@ async fn list_plugins_and_states() -> PollResult {
     Ok((units, states, versions))
 }
 
-/// Apply an on/off toggle for plugin `id`: `on` → start + enable, `off` → stop +
-/// disable, so the change both takes effect now and persists across logins. Two
-/// `Control` calls; the first error short-circuits.
-async fn set_plugin_state(id: String, on: bool) -> Result<(), hytte_bus::BusError> {
+/// Which half of the switch's round trip failed — see [`set_plugin_state`].
+#[derive(Debug)]
+enum ToggleError {
+    /// `SetPluginEnabled` failed or refused. Nothing was kept, so nothing was
+    /// started or stopped either.
+    Persist(hytte_bus::BusError),
+    /// The choice was kept, but `StartPlugin`/`StopPlugin` failed.
+    Apply(hytte_bus::BusError),
+}
+
+/// Apply an on/off toggle for plugin `id`: persist it first
+/// (`SetPluginEnabled`), then `StartPlugin` (`on`) or `StopPlugin` (`off`), so
+/// the change both persists and takes effect now. Two `Control` calls; a
+/// failed persist short-circuits.
+///
+/// Persist first (#1400 review, finding 5):
+///
+/// - A refused persist (a pin the tab has not re-read yet, an unreadable
+///   `plugins.json`, a failed write) starts or stops **nothing**. The other
+///   way round, a pinned-off plugin kept running for the session behind a
+///   switch whose subtitle said the choice was kept.
+/// - A reconcile landing between the two calls (a `plugins.json` change)
+///   already reads the new choice and converges onto it, so there is no
+///   window in which it undoes the switch, and no `Control` change needed.
+/// - For a legacy static unit, `EnableUnitFiles` before `StartUnit` is as
+///   good as the reverse.
+///
+/// That reconcile can leave the second call nothing to do. A stop answered
+/// "not loaded" ([`already_stopped`]) therefore counts as done. A start
+/// answered "was already loaded" does **not**: systemd gives that one answer
+/// both for a unit that is running and for a static unit's file blocking the
+/// launcher's transient one (#1400 review, finding 4), and only the first is
+/// success. It stays a [`ToggleError::Apply`], whose completion re-polls at
+/// once, so a plugin that is in fact running shows as on regardless.
+async fn set_plugin_state(id: String, on: bool) -> Result<(), ToggleError> {
+    set_plugin_enabled(&id, on)
+        .await
+        .map_err(ToggleError::Persist)?;
     let start_stop = if on { "StartPlugin" } else { "StopPlugin" };
-    plugin_id_call(start_stop, &id).await?;
-    set_plugin_enabled(&id, on).await
+    match plugin_id_call(start_stop, &id).await {
+        Err(err) if !on && already_stopped(&err) => {
+            tracing::debug!(%err, plugin = %id, "switched off a plugin that was already stopped");
+            Ok(())
+        }
+        res => res.map_err(ToggleError::Apply),
+    }
+}
+
+/// Whether a `StopPlugin` error means the unit was already gone: systemd's
+/// `NoSuchUnit` answer to `StopUnit`, "Unit … not loaded.", which the shell
+/// passes through in its `Failed` message. Pure.
+fn already_stopped(err: &hytte_bus::BusError) -> bool {
+    err.to_string().contains(" not loaded.")
 }
 
 /// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`. A
@@ -2818,11 +3083,13 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        DeclaredMounts, PluginRuntime, PluginsJson, PollGenerations, PollStates, VersionsOutcome,
-        classify_versions, declared_mounts_from_json, is_running, manifest_id_of_exec,
-        mount_display, mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json,
-        read_declared_mounts_at, resolved_search_path, runtime_overlay, runtime_states,
-        same_plugin_set, seen_suffix, status_cell, version_label, versions_log, versions_or_empty,
+        DeclaredFile, DeclaredPlugins, LastToggle, PluginRuntime, PluginsJson, PollGenerations,
+        PollStates, SwitchPolicy, VersionsOutcome, already_stopped, classify_versions,
+        declared_from_json, declared_mounts_from_json, is_running, manifest_id_of_exec,
+        mount_display, mount_or_unknown, persist_error_for, plugin_subtitle, probe_candidates,
+        probe_plugins_json, read_declared_at, resolved_search_path, runtime_overlay,
+        runtime_states, same_plugin_set, seen_suffix, status_cell, switch_policy,
+        switch_row_subtitle, switch_subtitle, version_label, versions_log, versions_or_empty,
         violations_suffix,
     };
 
@@ -3150,6 +3417,154 @@ mod tests {
         assert!(declared_mounts_from_json(r#"{"plugins": "not an object"}"#).is_empty());
     }
 
+    // ── What the switch means (#1400) ───────────────────────────────────────
+
+    /// The declared ids and the pinned ones, read off the same parse as the
+    /// mounts: `_locked` naming `enabled` pins, anything else does not, and
+    /// an entry without it — every unpinned one, and every pre-#1400 file —
+    /// is declared and free.
+    #[test]
+    fn declared_from_json_reads_the_pins_and_the_declared_ids() {
+        let text = r#"{
+            "version": 1,
+            "plugins": {
+                "niri-layouts": { "exec": "x", "enabled": true, "_locked": ["enabled"] },
+                "timer": { "exec": "x", "enabled": false },
+                "later": { "exec": "x", "enabled": false, "_locked": ["some-future-key"] },
+                "odd": { "exec": "x", "enabled": false, "_locked": "enabled" }
+            }
+        }"#;
+        let file = declared_from_json(text);
+        let set = |ids: &[&str]| ids.iter().map(|&id| id.to_owned()).collect();
+        assert_eq!(file.ids, set(&["later", "niri-layouts", "odd", "timer"]));
+        assert_eq!(
+            file.pinned,
+            set(&["niri-layouts"]),
+            "only a list naming `enabled` pins the switch"
+        );
+        assert_eq!(declared_from_json("not json"), DeclaredFile::default());
+    }
+
+    /// Pinned beats declared, declared beats a unit file, and each says what
+    /// it means — the pinned one by naming the option to change.
+    ///
+    /// Red if the pin check is dropped (a pinned plugin reads as `Kept`) or
+    /// the subtitle stops naming the option.
+    #[test]
+    fn switch_policy_greys_only_a_pinned_plugin() {
+        let file = declared_from_json(
+            r#"{"plugins":{
+                "niri-layouts":{"exec":"x","enabled":true,"_locked":["enabled"]},
+                "timer":{"exec":"x","enabled":false}
+            }}"#,
+        );
+        assert_eq!(switch_policy(&file, "niri-layouts"), SwitchPolicy::Pinned);
+        assert_eq!(switch_policy(&file, "timer"), SwitchPolicy::Kept);
+        assert_eq!(switch_policy(&file, "hand-made"), SwitchPolicy::UnitFile);
+        assert_eq!(
+            switch_subtitle(SwitchPolicy::Pinned, "niri-layouts"),
+            "Set in nix — programs.trollshell.plugins.niri-layouts.enable"
+        );
+        assert!(switch_subtitle(SwitchPolicy::Kept, "timer").contains("kept across restarts"));
+        assert!(
+            switch_subtitle(SwitchPolicy::UnitFile, "hand-made").contains("enable the unit"),
+            "a legacy unit's switch keeps its unit-file wording"
+        );
+    }
+
+    // ── The switch persists first (#1400 review, finding 5) ─────────────────
+
+    /// The order itself: `SetPluginEnabled` before `StartPlugin`/`StopPlugin`,
+    /// so a refused persist starts or stops nothing. A source scan, on the
+    /// launcher's `launch_at_startup_spawns_the_supervised_watch` precedent:
+    /// both calls go to the shell's `Control` endpoint, which no hermetic
+    /// test has.
+    ///
+    /// Red if the two calls swap back.
+    #[test]
+    fn the_switch_persists_before_it_starts_or_stops() {
+        let src = include_str!("plugins_tab.rs");
+        let start = src
+            .find("async fn set_plugin_state(")
+            .expect("set_plugin_state is defined");
+        let len = src[start..].find("\n}\n").expect("its body ends");
+        let body = &src[start..start + len];
+        let persist = body
+            .find("set_plugin_enabled(&id, on)")
+            .expect("set_plugin_state persists");
+        let apply = body
+            .find("plugin_id_call(start_stop, &id)")
+            .expect("set_plugin_state starts or stops");
+        assert!(persist < apply, "persist first:\n{body}");
+    }
+
+    /// Only a stop that finds the unit already gone counts as done; the
+    /// literal is systemd 260's answer to `StopUnit` on a unit it does not
+    /// have, as the shell's `Failed` message carries it. A start's "was
+    /// already loaded" is not done: systemd says the same for a static unit's
+    /// file blocking the launch.
+    #[test]
+    fn a_stop_of_a_unit_that_is_gone_counts_as_done() {
+        let failed = |reason: &str| hytte_bus::BusError::Permanent {
+            reason: reason.to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.Failed".to_owned()),
+        };
+        assert!(already_stopped(&failed(
+            "StopPlugin for plugin timer failed: StopUnit for plugin timer: bus operation \
+             permanently failed: Unit trollshell-plugin-timer.service not loaded."
+        )));
+        assert!(!already_stopped(&failed(
+            "StartPlugin for plugin timer failed: systemd-run --user failed for plugin timer \
+             (exit status: 1): Failed to start transient service unit: Unit \
+             trollshell-plugin-timer.service was already loaded or has a fragment file."
+        )));
+        assert!(!already_stopped(&failed("Connection timed out")));
+    }
+
+    /// The row names a failed persist instead of "kept across restarts" —
+    /// except under a pin, whose "Set in nix" line already says what to do.
+    #[test]
+    fn a_failed_persist_replaces_the_kept_subtitle_except_under_a_pin() {
+        assert_eq!(
+            switch_row_subtitle(SwitchPolicy::Kept, "timer", None),
+            switch_subtitle(SwitchPolicy::Kept, "timer")
+        );
+        let kept = switch_row_subtitle(SwitchPolicy::Kept, "timer", Some("disk full"));
+        assert!(kept.starts_with("Not changed"), "{kept}");
+        assert!(kept.contains("disk full"), "{kept}");
+        assert!(!kept.contains("kept across restarts"), "{kept}");
+        assert!(
+            switch_row_subtitle(SwitchPolicy::UnitFile, "hand-made", Some("no manager"))
+                .contains("no manager")
+        );
+        assert_eq!(
+            switch_row_subtitle(SwitchPolicy::Pinned, "niri-layouts", Some("pinned")),
+            switch_subtitle(SwitchPolicy::Pinned, "niri-layouts")
+        );
+    }
+
+    /// A persist error shows for its own plugin only, and is dropped the first
+    /// time another plugin is shown, so it cannot reappear on a later visit.
+    #[test]
+    fn a_persist_error_is_dropped_once_another_plugin_is_shown() {
+        let last = std::cell::RefCell::new(Some(LastToggle {
+            plugin_id: "timer".to_owned(),
+            since: std::time::Instant::now(),
+            persist_error: Some("disk full".to_owned()),
+        }));
+        assert_eq!(
+            persist_error_for(&last, "timer").as_deref(),
+            Some("disk full")
+        );
+        assert_eq!(
+            persist_error_for(&last, "timer").as_deref(),
+            Some("disk full")
+        );
+        assert_eq!(persist_error_for(&last, "pet"), None);
+        assert!(last.borrow().is_none(), "another plugin shown: dropped");
+        assert_eq!(persist_error_for(&last, "timer"), None);
+    }
+
     // ── The declared-mount map reaches `PluginRuntime` (#1161) ───────────────
     //
     // `runtime_states` is the wiring `on_poll_result_with_declared` runs on
@@ -3294,15 +3709,18 @@ mod tests {
         }
     }
 
-    fn one_override() -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        map.insert("agents".to_owned(), "SidebarRightTop".to_owned());
-        map
+    fn one_override() -> DeclaredFile {
+        let mut mounts = HashMap::new();
+        mounts.insert("agents".to_owned(), "SidebarRightTop".to_owned());
+        DeclaredFile {
+            mounts,
+            ..DeclaredFile::default()
+        }
     }
 
     #[test]
     fn the_declared_mount_file_is_parsed_once_while_its_stamp_holds() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         let mut reads = 0;
         for _ in 0..5 {
             let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| {
@@ -3310,7 +3728,7 @@ mod tests {
                 one_override()
             });
             assert_eq!(
-                map.get("agents").map(String::as_str),
+                map.mounts.get("agents").map(String::as_str),
                 Some("SidebarRightTop"),
                 "every tick must still see the overrides"
             );
@@ -3323,11 +3741,11 @@ mod tests {
 
     #[test]
     fn a_changed_stamp_reparses() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         let mut reads = 0;
         cache.get(Some(stamp("/x/plugins.json", 42)), |_| {
             reads += 1;
-            HashMap::new()
+            DeclaredFile::default()
         });
         // Same path, different content: a rebuild.
         let map = cache.get(Some(stamp("/x/plugins.json", 43)), |_| {
@@ -3336,17 +3754,17 @@ mod tests {
         });
         assert_eq!(reads, 2, "a changed stamp must re-read");
         assert_eq!(
-            map.get("agents").map(String::as_str),
+            map.mounts.get("agents").map(String::as_str),
             Some("SidebarRightTop")
         );
     }
 
     #[test]
     fn no_plugins_json_is_cached_too_and_never_read() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         for _ in 0..3 {
             let map = cache.get(None, |_| panic!("there is no file to read"));
-            assert!(map.is_empty());
+            assert!(map.mounts.is_empty());
         }
     }
 
@@ -3354,15 +3772,16 @@ mod tests {
     /// none must be picked up, not swallowed by the cached "no file".
     #[test]
     fn a_file_appearing_later_is_picked_up() {
-        let mut cache = DeclaredMounts::default();
+        let mut cache = DeclaredPlugins::default();
         assert!(
             cache
                 .get(None, |_| panic!("there is no file yet"))
+                .mounts
                 .is_empty()
         );
         let map = cache.get(Some(stamp("/x/plugins.json", 42)), |_| one_override());
         assert_eq!(
-            map.get("agents").map(String::as_str),
+            map.mounts.get("agents").map(String::as_str),
             Some("SidebarRightTop")
         );
     }
@@ -3413,7 +3832,8 @@ mod tests {
         let found = probe_plugins_json(&env).expect("the dirs entry must be found");
         assert_eq!(found.path, written);
         assert_eq!(
-            read_declared_mounts_at(&found.path)
+            read_declared_at(&found.path)
+                .mounts
                 .get("agents")
                 .map(String::as_str),
             Some("SidebarRightBottom"),
@@ -3432,7 +3852,8 @@ mod tests {
         let found = probe_plugins_json(&env).expect("the overlay must be found");
         assert_eq!(found.path, overlay, "first existing wins, overlay first");
         assert_eq!(
-            read_declared_mounts_at(&found.path)
+            read_declared_at(&found.path)
+                .mounts
                 .get("agents")
                 .map(String::as_str),
             Some("BarRight")
@@ -3601,7 +4022,10 @@ mod tests {
     /// unparsable one — no override note, never a panic.
     #[test]
     fn reading_a_missing_file_yields_an_empty_map() {
-        assert!(read_declared_mounts_at(Path::new("/nonexistent/plugins.json")).is_empty());
+        assert_eq!(
+            read_declared_at(Path::new("/nonexistent/plugins.json")),
+            DeclaredFile::default()
+        );
     }
 
     #[test]
@@ -3806,9 +4230,9 @@ mod gtk_tests {
     use gtk::glib;
 
     use super::{
-        BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, PENDING_TOGGLE_TIMEOUT, PendingToggle, PluginRuntime,
-        PluginsState, PollResult, apply_plugins, build_tab_in, on_poll_result, on_toggle_result,
-        refresh_detail,
+        BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, LastToggle, PENDING_TOGGLE_TIMEOUT, PendingToggle,
+        PluginRuntime, PluginsState, PollResult, ToggleError, apply_plugins, build_tab_in,
+        on_poll_result, on_toggle_result, refresh_detail,
     };
     use crate::test_support::captured_logs;
 
@@ -4813,10 +5237,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "no such unit".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         assert!(
@@ -4873,10 +5297,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since_a,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "timed out".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         let pending = state.pending.borrow();
@@ -4892,6 +5316,117 @@ mod gtk_tests {
             "the surviving intent must still be B's wish"
         );
         drop(pending);
+
+        dismiss(&window);
+    }
+
+    /// Records a toggle the way [`super::connect_switch`] does: the intent and
+    /// the [`LastToggle`], under one `since`.
+    fn record_toggle(state: &PluginsState, id: &str, wanted: bool) -> Instant {
+        let since = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: id.to_owned(),
+            wanted,
+            since,
+        });
+        *state.last_toggle.borrow_mut() = Some(LastToggle {
+            plugin_id: id.to_owned(),
+            since,
+            persist_error: None,
+        });
+        since
+    }
+
+    fn persist_failed(reason: &str) -> Result<(), ToggleError> {
+        Err(ToggleError::Persist(hytte_bus::BusError::Permanent {
+            reason: reason.to_owned(),
+            dbus_name: None,
+        }))
+    }
+
+    /// #1400 review, finding 5: a refused `SetPluginEnabled` starts or stops
+    /// nothing (the switch persists first), so the switch has to snap back
+    /// **and** the row has to stop claiming the choice is kept. It names the
+    /// error instead, until the next toggle.
+    ///
+    /// Falsified by dropping the `persist_error` write in
+    /// `on_toggle_result`'s `Persist` arm, or by `refresh_detail` setting
+    /// `switch_subtitle` directly: either way the row keeps "kept across
+    /// restarts".
+    #[gtk::test]
+    fn a_failed_persist_says_so_in_the_switch_row() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        let since = record_toggle(&state, "clock", true);
+        on_toggle_result(
+            &state,
+            since,
+            persist_failed("writing plugins.toml: disk full"),
+        );
+        assert!(
+            state.pending.borrow().is_none(),
+            "a failed persist clears its intent like any failed toggle"
+        );
+
+        apply_state(&state, &["clock"], "inactive");
+        assert!(
+            !state.detail.switch.is_active(),
+            "nothing was started, so the switch shows the unchanged state"
+        );
+        let subtitle = state.detail.switch.subtitle().map(|s| s.to_string());
+        let subtitle = subtitle.as_deref().unwrap_or_default();
+        assert!(subtitle.starts_with("Not changed"), "{subtitle}");
+        assert!(subtitle.contains("disk full"), "{subtitle}");
+
+        // The next toggle retires it, and one that fails to *start* (the
+        // choice was kept) leaves the ordinary wording.
+        let since = record_toggle(&state, "clock", true);
+        on_toggle_result(
+            &state,
+            since,
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
+                reason: "no user manager".to_owned(),
+                dbus_name: None,
+            })),
+        );
+        apply_state(&state, &["clock"], "inactive");
+        let subtitle = state.detail.switch.subtitle().map(|s| s.to_string());
+        assert!(
+            !subtitle
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Not changed"),
+            "{subtitle:?}"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The identity guard on [`LastToggle`]: a persist failure arriving for an
+    /// older toggle must not annotate a newer one still in flight.
+    ///
+    /// Falsified by dropping the `last.since == since` check in
+    /// `on_toggle_result`.
+    #[gtk::test]
+    fn a_late_persist_failure_does_not_annotate_a_newer_toggle() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        let since_a = record_toggle(&state, "clock", true);
+        let since_b = record_toggle(&state, "clock", false);
+        assert_ne!(since_a, since_b);
+        on_toggle_result(&state, since_a, persist_failed("stale"));
+
+        let recorded = state.last_toggle.borrow();
+        let last = recorded.as_ref().expect("B's toggle is still recorded");
+        assert_eq!(last.since, since_b);
+        assert!(last.persist_error.is_none(), "A's failure is not B's");
+        drop(recorded);
 
         dismiss(&window);
     }
@@ -5029,10 +5564,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "no such unit".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         // The next good poll restores the selection. Applied directly
@@ -5105,10 +5640,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since_a,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "timed out".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         let parked = state.parked.borrow();
@@ -5865,7 +6400,7 @@ mod gtk_tests {
     /// *is* mounted, so "there is nothing to mount" was re-derived — a
     /// `read_to_string` plus a `serde_json::from_str` on the GTK main thread —
     /// every two seconds, for the window's whole life. That is exactly the
-    /// cost [`super::DeclaredMounts`] exists to keep off this tick (#1260
+    /// cost [`super::DeclaredPlugins`] exists to keep off this tick (#1260
     /// review F7), added back on the same file.
     ///
     /// The reader is injected for that type's reason: the property is *how
@@ -5932,6 +6467,114 @@ mod gtk_tests {
             reads.get(),
             3,
             "a rebuild under the same selection must be re-read, not remembered"
+        );
+    }
+
+    /// #1400: the switch of a plugin nix pins is greyed and names the option
+    /// to change instead; a declared, free one's is live and says its choice
+    /// is kept; an undeclared unit's keeps the unit-file wording. Rendered
+    /// from the tab's own parse of `plugins.json`, refreshed through the
+    /// production [`super::refresh_declared`] — no `Control` round trip.
+    ///
+    /// **Falsify** by dropping the `set_sensitive` call from
+    /// `refresh_detail`: the pinned switch stays live. Dropping the
+    /// `_locked` read from `declared_from_json` fails the subtitle too.
+    #[gtk::test]
+    fn a_pinned_plugins_switch_is_greyed_and_names_the_option() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"version":1,"plugins":{
+                "niri-layouts":{"exec":"/x/bin/hytte-plugin-niri-layouts","enabled":true,"_locked":["enabled"]},
+                "timer":{"exec":"/x/bin/hytte-plugin-timer","enabled":false}
+            }}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (bin, state) = build_tab_in(env);
+        super::refresh_declared(&state);
+        apply_state(&state, &["hand-made", "niri-layouts", "timer"], "active");
+        let window = present(&bin, 640);
+
+        let shown = |id: &str| {
+            click(&state, id);
+            let switch = &state.detail.switch;
+            (
+                switch.is_sensitive(),
+                switch.subtitle().map(|s| s.to_string()).unwrap_or_default(),
+            )
+        };
+
+        let (live, subtitle) = shown("niri-layouts");
+        assert!(!live, "a pinned plugin's switch must be greyed");
+        assert_eq!(
+            subtitle,
+            "Set in nix — programs.trollshell.plugins.niri-layouts.enable"
+        );
+
+        let (live, subtitle) = shown("timer");
+        assert!(
+            live,
+            "a free plugin's switch is live — and live again after a pinned one"
+        );
+        assert!(subtitle.contains("kept across restarts"), "{subtitle}");
+
+        let (live, subtitle) = shown("hand-made");
+        assert!(live);
+        assert!(subtitle.contains("enable the unit"), "{subtitle}");
+
+        dismiss(&window);
+    }
+
+    /// #1400's wiring: the 2 s tick itself is what refreshes the parse the
+    /// switch renders from — [`super::refresh_plugins`] goes through
+    /// [`super::refresh_declared`] and so through
+    /// [`PluginsState::declared`](super::PluginsState::declared), not around
+    /// it.
+    ///
+    /// **Falsify** by having `refresh_plugins` parse `plugins.json` into a
+    /// local of its own (the mounts still reach the poll, so every mount
+    /// test stays green): the tab's own parse stays empty and a pinned
+    /// plugin's switch would never grey in production.
+    #[gtk::test]
+    fn the_tick_refreshes_the_pins_the_switch_reads() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"niri-layouts":{"exec":"/x","enabled":true,"_locked":["enabled"]}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (_bin, state) = build_tab_in(env);
+        assert!(
+            state.declared.borrow().last().pinned.is_empty(),
+            "nothing is parsed before the first tick"
+        );
+        super::refresh_plugins(&state);
+        assert!(
+            state
+                .declared
+                .borrow()
+                .last()
+                .pinned
+                .contains("niri-layouts"),
+            "the tick must leave its parse where the switch reads it"
         );
     }
 

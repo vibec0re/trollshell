@@ -61,10 +61,12 @@
 //!
 //! # What the switch means depends on who declared the plugin (#1400)
 //!
-//! Flipping the switch sends `StartPlugin`/`StopPlugin`, then
-//! `SetPluginEnabled`, and since #1400 that second call **persists** for a
-//! plugin `plugins.json` declares: the shell keeps the choice in its own
-//! `$XDG_STATE_HOME/trollshell/plugins.toml`, so it survives a restart. The
+//! Flipping the switch sends `SetPluginEnabled`, then `StartPlugin`/
+//! `StopPlugin` ([`set_plugin_state`]), and since #1400 that first call
+//! **persists** for a plugin `plugins.json` declares: the shell keeps the
+//! choice in its own `$XDG_STATE_HOME/trollshell/plugins.toml`, so it
+//! survives a restart. It goes first so that a refused persist starts or stops
+//! nothing, and says so in the switch row ([`LastToggle`]). The
 //! exception is a plugin whose `enable` nix pins — assigned plainly or with
 //! `lib.mkForce`, which the modules render as `"_locked": ["enabled"]` on its
 //! entry. The shell refuses to persist over a pin, so this tab greys that
@@ -362,6 +364,30 @@ struct PendingToggle {
     since: Instant,
 }
 
+/// The switch's most recent toggle, and whether its `SetPluginEnabled` failed
+/// (#1400 review, finding 5).
+///
+/// Since the switch persists before it starts or stops anything
+/// ([`set_plugin_state`]), a refused persist changes nothing, and the switch
+/// snaps back on the next poll. This is what lets the row also say *why*,
+/// instead of "the choice is kept across restarts" ([`switch_row_subtitle`]).
+///
+/// Its own cell rather than a field of [`PendingToggle`]: an intent is cleared
+/// the moment its call fails (that is what makes the switch snap back), while
+/// the reason has to outlive it until the user toggles again or looks at
+/// another plugin ([`persist_error_for`]). Recorded by [`connect_switch`] with
+/// the same `since` as the intent, which is the identity [`on_toggle_result`]
+/// checks, so a late failure cannot annotate a newer toggle.
+struct LastToggle {
+    /// The plugin the toggle was for.
+    plugin_id: String,
+    /// When it happened: the same instant as its [`PendingToggle::since`].
+    since: Instant,
+    /// `SetPluginEnabled`'s error, once it failed. `None` while the call is in
+    /// flight, and after it succeeded.
+    persist_error: Option<String>,
+}
+
 /// What the sidebar list is currently showing, so a poll only rebuilds on a
 /// real transition (list ⇄ empty ⇄ unavailable) and otherwise updates in place.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,6 +515,9 @@ struct PluginsState {
     /// [`PendingToggle`]. `None` whenever the shown plugin's switch is free to
     /// follow the snapshot.
     pending: Rc<RefCell<Option<PendingToggle>>>,
+    /// The switch's most recent toggle and whether its persist failed (#1400
+    /// review, finding 5) — see [`LastToggle`].
+    last_toggle: Rc<RefCell<Option<LastToggle>>>,
     /// Guard so programmatically setting the detail switch from a fetched state
     /// doesn't loop back into a Start/Stop call (mirrors the Places tab's).
     syncing: Rc<Cell<bool>>,
@@ -585,6 +614,7 @@ struct WeakPluginsState {
     view: Rc<Cell<PluginsView>>,
     polls: Rc<PollGenerations>,
     pending: Rc<RefCell<Option<PendingToggle>>>,
+    last_toggle: Rc<RefCell<Option<LastToggle>>>,
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
@@ -641,6 +671,7 @@ impl PluginsState {
             view: self.view.clone(),
             polls: self.polls.clone(),
             pending: self.pending.clone(),
+            last_toggle: self.last_toggle.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
@@ -684,6 +715,7 @@ impl WeakPluginsState {
             view: self.view.clone(),
             polls: self.polls.clone(),
             pending: self.pending.clone(),
+            last_toggle: self.last_toggle.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
@@ -838,6 +870,7 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         view: Rc::new(Cell::new(PluginsView::Uninit)),
         polls: Rc::new(PollGenerations::default()),
         pending: Rc::new(RefCell::new(None)),
+        last_toggle: Rc::new(RefCell::new(None)),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
@@ -1234,6 +1267,13 @@ fn connect_switch(state: &PluginsState) {
             wanted: want_on,
             since,
         });
+        // A new toggle retires the last one's persist error, whichever plugin
+        // it was for (#1400 review, finding 5).
+        *state.last_toggle.borrow_mut() = Some(LastToggle {
+            plugin_id: id.clone(),
+            since,
+            persist_error: None,
+        });
         spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
             on_toggle_result(&state, since, res);
         });
@@ -1241,12 +1281,16 @@ fn connect_switch(state: &PluginsState) {
 }
 
 /// The completion half of the round trip [`connect_switch`] starts (#945
-/// review, finding 1): a failed `StartPlugin`/`StopPlugin` already knows —
-/// at the call's own `RetryPolicy::Never` timeout, well inside
-/// [`PENDING_TOGGLE_TIMEOUT`] — that the transition it recorded an intent for
-/// never happened, so it must clear that intent rather than let
-/// [`resolve_pending`] keep answering `wanted` for the full 10s window on a
-/// switch that is never coming back on its own.
+/// review, finding 1): a failed `SetPluginEnabled` or `StartPlugin`/
+/// `StopPlugin` already knows — at the call's own `RetryPolicy::Never`
+/// timeout, well inside [`PENDING_TOGGLE_TIMEOUT`] — that the transition it
+/// recorded an intent for never happened, so it must clear that intent rather
+/// than let [`resolve_pending`] keep answering `wanted` for the full 10s
+/// window on a switch that is never coming back on its own.
+///
+/// A failed **persist** is also recorded on [`LastToggle`] (#1400 review,
+/// finding 5), guarded on the same `since`, so the switch row can name the
+/// error: nothing was started or stopped, and nothing was kept.
 ///
 /// Guarded on identity: `since` is the timestamp *this* call's intent was
 /// recorded with, captured by `connect_switch` before the round trip started.
@@ -1273,9 +1317,27 @@ fn connect_switch(state: &PluginsState) {
 /// the parked selection itself alone, same as `set_placeholder`'s own
 /// `take()`. The two homes are mutually exclusive (an intent lives in exactly
 /// one), so at most one of the two clears ever fires.
-fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), hytte_bus::BusError>) {
+fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), ToggleError>) {
     if let Err(err) = res {
-        tracing::info!(%err, "plugin start/stop failed");
+        match err {
+            ToggleError::Persist(err) => {
+                tracing::info!(
+                    %err,
+                    "the Plugins tab switch was not kept, so nothing was started or stopped"
+                );
+                if let Some(last) = state.last_toggle.borrow_mut().as_mut()
+                    && last.since == since
+                {
+                    last.persist_error = Some(err.to_string());
+                }
+            }
+            ToggleError::Apply(err) => {
+                tracing::info!(
+                    %err,
+                    "the Plugins tab switch was kept, but starting or stopping the plugin failed"
+                );
+            }
+        }
         let still_this_intent = state
             .pending
             .borrow()
@@ -1873,6 +1935,20 @@ fn switch_subtitle(policy: SwitchPolicy, id: &str) -> String {
     }
 }
 
+/// What the switch row's subtitle actually shows: [`switch_subtitle`], or,
+/// after a toggle whose `SetPluginEnabled` failed, that nothing changed and
+/// why (#1400 review, finding 5). A pinned plugin keeps its "Set in nix" line
+/// either way: that already names what to change, and a refused persist on a
+/// pin the tab had not re-read yet is exactly what it explains. Pure.
+fn switch_row_subtitle(policy: SwitchPolicy, id: &str, persist_error: Option<&str>) -> String {
+    match persist_error {
+        Some(err) if policy != SwitchPolicy::Pinned => {
+            format!("Not changed: the choice could not be kept ({err})")
+        }
+        _ => switch_subtitle(policy, id),
+    }
+}
+
 /// Apply a non-empty unit list + runtime overlay: update the existing rows in
 /// place when the plugin set already matches (no flicker, no lost selection),
 /// else rebuild them and restore the selection by id.
@@ -2192,10 +2268,31 @@ fn refresh_detail(state: &PluginsState) {
         .detail
         .switch
         .set_sensitive(policy != SwitchPolicy::Pinned);
+    // …unless the last toggle for this plugin could not be kept (#1400
+    // review, finding 5): then the row says why instead.
+    let persist_error = persist_error_for(&state.last_toggle, &id);
     state
         .detail
         .switch
-        .set_subtitle(&switch_subtitle(policy, &id));
+        .set_subtitle(&switch_row_subtitle(policy, &id, persist_error.as_deref()));
+}
+
+/// The persist error to show for plugin `id`'s switch, if its last toggle's
+/// `SetPluginEnabled` failed — see [`LastToggle`].
+///
+/// A [`LastToggle`] for a plugin that is not the one shown is dropped
+/// outright, [`resolve_pending`]'s rule: the error belonged to a switch the
+/// user has since looked away from, and must not reappear on a later visit.
+fn persist_error_for(last: &RefCell<Option<LastToggle>>, id: &str) -> Option<String> {
+    let mut last = last.borrow_mut();
+    match last.as_ref() {
+        Some(toggle) if toggle.plugin_id == id => toggle.persist_error.clone(),
+        Some(_) => {
+            *last = None;
+            None
+        }
+        None => None,
+    }
 }
 
 /// Mount (or leave alone, or tear down) the selected plugin's *Configuration*
@@ -2896,13 +2993,59 @@ async fn list_plugins_and_states() -> PollResult {
     Ok((units, states, versions))
 }
 
-/// Apply an on/off toggle for plugin `id`: `on` → start + enable, `off` → stop +
-/// disable, so the change both takes effect now and persists across logins. Two
-/// `Control` calls; the first error short-circuits.
-async fn set_plugin_state(id: String, on: bool) -> Result<(), hytte_bus::BusError> {
+/// Which half of the switch's round trip failed — see [`set_plugin_state`].
+#[derive(Debug)]
+enum ToggleError {
+    /// `SetPluginEnabled` failed or refused. Nothing was kept, so nothing was
+    /// started or stopped either.
+    Persist(hytte_bus::BusError),
+    /// The choice was kept, but `StartPlugin`/`StopPlugin` failed.
+    Apply(hytte_bus::BusError),
+}
+
+/// Apply an on/off toggle for plugin `id`: persist it first
+/// (`SetPluginEnabled`), then `StartPlugin` (`on`) or `StopPlugin` (`off`), so
+/// the change both persists and takes effect now. Two `Control` calls; a
+/// failed persist short-circuits.
+///
+/// Persist first (#1400 review, finding 5):
+///
+/// - A refused persist (a pin the tab has not re-read yet, an unreadable
+///   `plugins.json`, a failed write) starts or stops **nothing**. The other
+///   way round, a pinned-off plugin kept running for the session behind a
+///   switch whose subtitle said the choice was kept.
+/// - A reconcile landing between the two calls (a `plugins.json` change)
+///   already reads the new choice and converges onto it, so there is no
+///   window in which it undoes the switch, and no `Control` change needed.
+/// - For a legacy static unit, `EnableUnitFiles` before `StartUnit` is as
+///   good as the reverse.
+///
+/// That reconcile can leave the second call nothing to do. A stop answered
+/// "not loaded" ([`already_stopped`]) therefore counts as done. A start
+/// answered "was already loaded" does **not**: systemd gives that one answer
+/// both for a unit that is running and for a static unit's file blocking the
+/// launcher's transient one (#1400 review, finding 4), and only the first is
+/// success. It stays a [`ToggleError::Apply`], whose completion re-polls at
+/// once, so a plugin that is in fact running shows as on regardless.
+async fn set_plugin_state(id: String, on: bool) -> Result<(), ToggleError> {
+    set_plugin_enabled(&id, on)
+        .await
+        .map_err(ToggleError::Persist)?;
     let start_stop = if on { "StartPlugin" } else { "StopPlugin" };
-    plugin_id_call(start_stop, &id).await?;
-    set_plugin_enabled(&id, on).await
+    match plugin_id_call(start_stop, &id).await {
+        Err(err) if !on && already_stopped(&err) => {
+            tracing::debug!(%err, plugin = %id, "switched off a plugin that was already stopped");
+            Ok(())
+        }
+        res => res.map_err(ToggleError::Apply),
+    }
+}
+
+/// Whether a `StopPlugin` error means the unit was already gone: systemd's
+/// `NoSuchUnit` answer to `StopUnit`, "Unit … not loaded.", which the shell
+/// passes through in its `Failed` message. Pure.
+fn already_stopped(err: &hytte_bus::BusError) -> bool {
+    err.to_string().contains(" not loaded.")
 }
 
 /// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`. A
@@ -2940,13 +3083,14 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        DeclaredFile, DeclaredPlugins, PluginRuntime, PluginsJson, PollGenerations, PollStates,
-        SwitchPolicy, VersionsOutcome, classify_versions, declared_from_json,
-        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
-        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json, read_declared_at,
-        resolved_search_path, runtime_overlay, runtime_states, same_plugin_set, seen_suffix,
-        status_cell, switch_policy, switch_subtitle, version_label, versions_log,
-        versions_or_empty, violations_suffix,
+        DeclaredFile, DeclaredPlugins, LastToggle, PluginRuntime, PluginsJson, PollGenerations,
+        PollStates, SwitchPolicy, VersionsOutcome, already_stopped, classify_versions,
+        declared_from_json, declared_mounts_from_json, is_running, manifest_id_of_exec,
+        mount_display, mount_or_unknown, persist_error_for, plugin_subtitle, probe_candidates,
+        probe_plugins_json, read_declared_at, resolved_search_path, runtime_overlay,
+        runtime_states, same_plugin_set, seen_suffix, status_cell, switch_policy,
+        switch_row_subtitle, switch_subtitle, version_label, versions_log, versions_or_empty,
+        violations_suffix,
     };
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -3326,6 +3470,99 @@ mod tests {
             switch_subtitle(SwitchPolicy::UnitFile, "hand-made").contains("enable the unit"),
             "a legacy unit's switch keeps its unit-file wording"
         );
+    }
+
+    // ── The switch persists first (#1400 review, finding 5) ─────────────────
+
+    /// The order itself: `SetPluginEnabled` before `StartPlugin`/`StopPlugin`,
+    /// so a refused persist starts or stops nothing. A source scan, on the
+    /// launcher's `launch_at_startup_spawns_the_supervised_watch` precedent:
+    /// both calls go to the shell's `Control` endpoint, which no hermetic
+    /// test has.
+    ///
+    /// Red if the two calls swap back.
+    #[test]
+    fn the_switch_persists_before_it_starts_or_stops() {
+        let src = include_str!("plugins_tab.rs");
+        let start = src
+            .find("async fn set_plugin_state(")
+            .expect("set_plugin_state is defined");
+        let len = src[start..].find("\n}\n").expect("its body ends");
+        let body = &src[start..start + len];
+        let persist = body
+            .find("set_plugin_enabled(&id, on)")
+            .expect("set_plugin_state persists");
+        let apply = body
+            .find("plugin_id_call(start_stop, &id)")
+            .expect("set_plugin_state starts or stops");
+        assert!(persist < apply, "persist first:\n{body}");
+    }
+
+    /// Only a stop that finds the unit already gone counts as done; the
+    /// literal is systemd 260's answer to `StopUnit` on a unit it does not
+    /// have, as the shell's `Failed` message carries it. A start's "was
+    /// already loaded" is not done: systemd says the same for a static unit's
+    /// file blocking the launch.
+    #[test]
+    fn a_stop_of_a_unit_that_is_gone_counts_as_done() {
+        let failed = |reason: &str| hytte_bus::BusError::Permanent {
+            reason: reason.to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.Failed".to_owned()),
+        };
+        assert!(already_stopped(&failed(
+            "StopPlugin for plugin timer failed: StopUnit for plugin timer: bus operation \
+             permanently failed: Unit trollshell-plugin-timer.service not loaded."
+        )));
+        assert!(!already_stopped(&failed(
+            "StartPlugin for plugin timer failed: systemd-run --user failed for plugin timer \
+             (exit status: 1): Failed to start transient service unit: Unit \
+             trollshell-plugin-timer.service was already loaded or has a fragment file."
+        )));
+        assert!(!already_stopped(&failed("Connection timed out")));
+    }
+
+    /// The row names a failed persist instead of "kept across restarts" —
+    /// except under a pin, whose "Set in nix" line already says what to do.
+    #[test]
+    fn a_failed_persist_replaces_the_kept_subtitle_except_under_a_pin() {
+        assert_eq!(
+            switch_row_subtitle(SwitchPolicy::Kept, "timer", None),
+            switch_subtitle(SwitchPolicy::Kept, "timer")
+        );
+        let kept = switch_row_subtitle(SwitchPolicy::Kept, "timer", Some("disk full"));
+        assert!(kept.starts_with("Not changed"), "{kept}");
+        assert!(kept.contains("disk full"), "{kept}");
+        assert!(!kept.contains("kept across restarts"), "{kept}");
+        assert!(
+            switch_row_subtitle(SwitchPolicy::UnitFile, "hand-made", Some("no manager"))
+                .contains("no manager")
+        );
+        assert_eq!(
+            switch_row_subtitle(SwitchPolicy::Pinned, "niri-layouts", Some("pinned")),
+            switch_subtitle(SwitchPolicy::Pinned, "niri-layouts")
+        );
+    }
+
+    /// A persist error shows for its own plugin only, and is dropped the first
+    /// time another plugin is shown, so it cannot reappear on a later visit.
+    #[test]
+    fn a_persist_error_is_dropped_once_another_plugin_is_shown() {
+        let last = std::cell::RefCell::new(Some(LastToggle {
+            plugin_id: "timer".to_owned(),
+            since: std::time::Instant::now(),
+            persist_error: Some("disk full".to_owned()),
+        }));
+        assert_eq!(
+            persist_error_for(&last, "timer").as_deref(),
+            Some("disk full")
+        );
+        assert_eq!(
+            persist_error_for(&last, "timer").as_deref(),
+            Some("disk full")
+        );
+        assert_eq!(persist_error_for(&last, "pet"), None);
+        assert!(last.borrow().is_none(), "another plugin shown: dropped");
+        assert_eq!(persist_error_for(&last, "timer"), None);
     }
 
     // ── The declared-mount map reaches `PluginRuntime` (#1161) ───────────────
@@ -3993,9 +4230,9 @@ mod gtk_tests {
     use gtk::glib;
 
     use super::{
-        BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, PENDING_TOGGLE_TIMEOUT, PendingToggle, PluginRuntime,
-        PluginsState, PollResult, apply_plugins, build_tab_in, on_poll_result, on_toggle_result,
-        refresh_detail,
+        BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, LastToggle, PENDING_TOGGLE_TIMEOUT, PendingToggle,
+        PluginRuntime, PluginsState, PollResult, ToggleError, apply_plugins, build_tab_in,
+        on_poll_result, on_toggle_result, refresh_detail,
     };
     use crate::test_support::captured_logs;
 
@@ -5000,10 +5237,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "no such unit".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         assert!(
@@ -5060,10 +5297,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since_a,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "timed out".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         let pending = state.pending.borrow();
@@ -5079,6 +5316,117 @@ mod gtk_tests {
             "the surviving intent must still be B's wish"
         );
         drop(pending);
+
+        dismiss(&window);
+    }
+
+    /// Records a toggle the way [`super::connect_switch`] does: the intent and
+    /// the [`LastToggle`], under one `since`.
+    fn record_toggle(state: &PluginsState, id: &str, wanted: bool) -> Instant {
+        let since = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: id.to_owned(),
+            wanted,
+            since,
+        });
+        *state.last_toggle.borrow_mut() = Some(LastToggle {
+            plugin_id: id.to_owned(),
+            since,
+            persist_error: None,
+        });
+        since
+    }
+
+    fn persist_failed(reason: &str) -> Result<(), ToggleError> {
+        Err(ToggleError::Persist(hytte_bus::BusError::Permanent {
+            reason: reason.to_owned(),
+            dbus_name: None,
+        }))
+    }
+
+    /// #1400 review, finding 5: a refused `SetPluginEnabled` starts or stops
+    /// nothing (the switch persists first), so the switch has to snap back
+    /// **and** the row has to stop claiming the choice is kept. It names the
+    /// error instead, until the next toggle.
+    ///
+    /// Falsified by dropping the `persist_error` write in
+    /// `on_toggle_result`'s `Persist` arm, or by `refresh_detail` setting
+    /// `switch_subtitle` directly: either way the row keeps "kept across
+    /// restarts".
+    #[gtk::test]
+    fn a_failed_persist_says_so_in_the_switch_row() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        let since = record_toggle(&state, "clock", true);
+        on_toggle_result(
+            &state,
+            since,
+            persist_failed("writing plugins.toml: disk full"),
+        );
+        assert!(
+            state.pending.borrow().is_none(),
+            "a failed persist clears its intent like any failed toggle"
+        );
+
+        apply_state(&state, &["clock"], "inactive");
+        assert!(
+            !state.detail.switch.is_active(),
+            "nothing was started, so the switch shows the unchanged state"
+        );
+        let subtitle = state.detail.switch.subtitle().map(|s| s.to_string());
+        let subtitle = subtitle.as_deref().unwrap_or_default();
+        assert!(subtitle.starts_with("Not changed"), "{subtitle}");
+        assert!(subtitle.contains("disk full"), "{subtitle}");
+
+        // The next toggle retires it, and one that fails to *start* (the
+        // choice was kept) leaves the ordinary wording.
+        let since = record_toggle(&state, "clock", true);
+        on_toggle_result(
+            &state,
+            since,
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
+                reason: "no user manager".to_owned(),
+                dbus_name: None,
+            })),
+        );
+        apply_state(&state, &["clock"], "inactive");
+        let subtitle = state.detail.switch.subtitle().map(|s| s.to_string());
+        assert!(
+            !subtitle
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Not changed"),
+            "{subtitle:?}"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The identity guard on [`LastToggle`]: a persist failure arriving for an
+    /// older toggle must not annotate a newer one still in flight.
+    ///
+    /// Falsified by dropping the `last.since == since` check in
+    /// `on_toggle_result`.
+    #[gtk::test]
+    fn a_late_persist_failure_does_not_annotate_a_newer_toggle() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        let since_a = record_toggle(&state, "clock", true);
+        let since_b = record_toggle(&state, "clock", false);
+        assert_ne!(since_a, since_b);
+        on_toggle_result(&state, since_a, persist_failed("stale"));
+
+        let recorded = state.last_toggle.borrow();
+        let last = recorded.as_ref().expect("B's toggle is still recorded");
+        assert_eq!(last.since, since_b);
+        assert!(last.persist_error.is_none(), "A's failure is not B's");
+        drop(recorded);
 
         dismiss(&window);
     }
@@ -5216,10 +5564,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "no such unit".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         // The next good poll restores the selection. Applied directly
@@ -5292,10 +5640,10 @@ mod gtk_tests {
         on_toggle_result(
             &state,
             since_a,
-            Err(hytte_bus::BusError::Permanent {
+            Err(ToggleError::Apply(hytte_bus::BusError::Permanent {
                 reason: "timed out".to_owned(),
                 dbus_name: None,
-            }),
+            })),
         );
 
         let parked = state.parked.borrow();

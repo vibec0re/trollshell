@@ -136,15 +136,16 @@
 //! ## The Plugins tab's switch persists (#1400)
 //!
 //! nix declares, but for most plugins it only declares a **default**. The
-//! control-center's switch sends `StartPlugin`/`StopPlugin` and then
-//! `SetPluginEnabled`, and [`set_enabled`] keeps that choice for a declared
-//! plugin in `$XDG_STATE_HOME/trollshell/plugins.toml` ([`Overrides`],
-//! through `hytte_config::state`, #866 decision 3: state is what the shell
-//! writes when you flip a toggle). It stores only **differences** from the
-//! declared value, in either direction, so switching a plugin back to what
-//! nix says deletes its entry. [`load_declared_from`] folds the file into
-//! every plugin's `enabled` ([`effective_enabled`]), which is how
-//! [`reconcile`], [`list`], [`start`] and the #1399 watch all see one
+//! control-center's switch sends `SetPluginEnabled` and then
+//! `StartPlugin`/`StopPlugin` (persist first, so a refused persist changes
+//! nothing; #1400 review, finding 5), and [`set_enabled`] keeps that choice
+//! for a declared plugin in `$XDG_STATE_HOME/trollshell/plugins.toml`
+//! ([`Overrides`], through `hytte_config::state`, #866 decision 3: state is
+//! what the shell writes when you flip a toggle). It stores only
+//! **differences** from the declared value, in either direction, so switching
+//! a plugin back to what nix says deletes its entry. [`load_declared_from`]
+//! folds the file into every plugin's `enabled` ([`effective_enabled`]), which
+//! is how [`reconcile`], [`list`], [`start`] and the #1399 watch all see one
 //! effective value and a switched-on plugin survives a shell restart.
 //!
 //! Who wins is decided by **nix priority**, the rule #1227 set for config
@@ -158,7 +159,7 @@
 //! `lib.mkDefault` pins nothing, and the switch decides.
 //!
 //! The state file is **not** watched: its only writer is [`set_enabled`],
-//! behind a switch that has already started or stopped the plugin. An
+//! behind a switch that starts or stops the plugin itself right after. An
 //! override for an id no longer declared, or for a pinned one, is ignored
 //! rather than deleted, so a pin relaxed back to `lib.mkDefault` finds the
 //! switch's last choice again.
@@ -671,9 +672,9 @@ const OVERRIDES_SUBSYSTEM: &str = "plugins";
 /// direction, so switching a plugin back to what nix says deletes its entry
 /// and a file with no entries is deleted outright. The shell is its only
 /// writer ([`set_enabled_in`]), and it is deliberately **not** watched: the
-/// switch that writes it has already applied the change live with its own
-/// `StartPlugin`/`StopPlugin`, so a watch would only ever re-apply what is
-/// already running.
+/// switch that writes it applies the change live with its own
+/// `StartPlugin`/`StopPlugin` right after, so a watch would only ever
+/// re-apply what the switch is already doing.
 ///
 /// An entry is **ignored**, not deleted, when its plugin is pinned in nix or
 /// no longer declared at all ([`fold_overrides`]): a pin that is later
@@ -1605,8 +1606,8 @@ pub fn launch_at_startup() {
 ///
 /// Only the config half is watched. The switch's `plugins.toml` is read on
 /// every reconcile but never stamped: its only writer is [`set_enabled_in`],
-/// behind a switch that has already started or stopped the plugin itself
-/// (see [`Overrides`]).
+/// behind a switch that starts or stops the plugin itself right after (see
+/// [`Overrides`]).
 fn reconcile_then_watch(
     sources: Sources,
     cadence: Duration,
@@ -1779,8 +1780,9 @@ pub async fn stop(id: &str) -> anyhow::Result<()> {
     systemd::stop_plugin(id).await
 }
 
-/// Persist plugin `id`'s auto-start state — the second half of the Plugins
-/// tab's switch, after its `StartPlugin`/`StopPlugin` (#1400).
+/// Persist plugin `id`'s auto-start state — the first half of the Plugins
+/// tab's switch, before its `StartPlugin`/`StopPlugin` (#1400), so a refusal
+/// here starts or stops nothing.
 ///
 /// - A **declared** plugin nix leaves free (`enable` unset, or
 ///   `lib.mkDefault`): the choice is kept in `$XDG_STATE_HOME/trollshell/

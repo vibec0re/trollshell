@@ -243,7 +243,8 @@ impl ControlIface {
     /// next reconcile on (#1400); for one whose
     /// `programs.trollshell.plugins.<id>.enable` nix pins, this refuses and
     /// says so. The start/stop itself is the caller's `StartPlugin` /
-    /// `StopPlugin`. Legacy static units keep unit-file enable/disable.
+    /// `StopPlugin`, which the control-center's switch sends only after this
+    /// succeeded. Legacy static units keep unit-file enable/disable.
     ///
     /// # Errors
     /// A pinned plugin, an unreadable `plugins.json`, or a failed state

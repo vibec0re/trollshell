@@ -3265,6 +3265,70 @@ mod tests {
         });
     }
 
+    /// #1400 review, finding 6 (R1): every reader of the declared state but
+    /// `set_enabled_in` reads the *effective* state, through the fold. The
+    /// whole feature rests on it: a `reconcile_from` that read nix's
+    /// declaration alone would forget the switch on every restart and stop a
+    /// switched-on plugin on every rebuild tick, and all the behavioural
+    /// tests above would stay green, since `load_declared_from` is tested but
+    /// its callers are not. A source scan, on
+    /// `launch_at_startup_spawns_the_supervised_watch`'s precedent, because
+    /// `reconcile_from` cannot get past `list_plugin_units` without the real
+    /// user manager.
+    ///
+    /// Falsified by `reconcile_from` reading `load_nix_declared(&sources.config)`.
+    #[test]
+    fn every_reader_but_set_enabled_goes_through_the_fold() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        for sig in [
+            "async fn reconcile_from(",
+            "pub async fn list()",
+            "pub async fn start(",
+        ] {
+            let b = body(sig);
+            assert!(
+                !b.contains("load_nix_declared("),
+                "{sig} must read the effective state:\n{b}"
+            );
+            assert!(
+                b.contains("load_declared"),
+                "{sig} must go through load_declared(_from):\n{b}"
+            );
+        }
+        // Definition + `load_declared_from` + `set_enabled_in`, nothing else.
+        assert_eq!(prod.matches("load_nix_declared(").count(), 3);
+    }
+
+    /// #1400 review, finding 6 (R3): the switch's read-modify-write of the
+    /// override file runs under [`CONVERGE_LOCK`], so a reconcile cannot read
+    /// the file between its two halves, and two quick switches cannot lose
+    /// one. Nothing else pins that the lock is taken at all.
+    ///
+    /// Falsified by `let guard = ();` in `set_enabled_in`.
+    #[tokio::test]
+    async fn the_switch_waits_for_the_converge_lock() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let held = CONVERGE_LOCK.lock().await;
+        let write = set_enabled_in(&sources, "timer", true);
+        tokio::pin!(write);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut write)
+                .await
+                .is_err(),
+            "set_enabled_in must not write while a reconcile holds the lock"
+        );
+        assert!(!toml.exists(), "nothing written under someone else's lock");
+        drop(held);
+        write.await.expect("persists once the lock is free");
+        assert!(toml.exists());
+    }
+
     // ── systemd-run argv ─────────────────────────────────────────────────────
 
     #[test]

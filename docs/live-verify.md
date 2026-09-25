@@ -1642,6 +1642,28 @@ four window properties below are pinned nowhere but here.
       new value within a poll or two — the stamp (the symlink's target, else
       `(mtime, len)`) is what makes a rebuild visible without re-reading
       every tick.
+- [ ] **(#1399)** A `nixos-rebuild switch` reaches the running shell with no
+      restart. Under the **NixOS** module (the case this fixes: root
+      activation has no user bus, so nothing pokes `ReloadPlugins`), with the
+      shell running and `journalctl --user -u trollshell -f` open, declare a
+      bundled plugin that is not declared yet, e.g.
+      `programs.trollshell.plugins.clock-demo.package = trollshell.packages.${pkgs.system}.hytte-plugin-clock-demo;`
+      (the entry needs its `package`: there is no default, so a bare
+      `plugins.clock-demo = { };` fails to evaluate), and `nixos-rebuild switch`.
+      Within about 3 s of activation finishing, the journal must show
+      "plugins.json changed; reconciling the declared plugins" naming
+      `/etc/xdg/trollshell/plugins.json`, then "launched plugin as transient
+      user unit" for `clock-demo`, and
+      `systemctl --user status trollshell-plugin-clock-demo` must be
+      `active (running)` — with `systemctl --user show -p ActiveEnterTimestamp trollshell`
+      unchanged from before the switch. Then the case the stamp exists for:
+      rebuild with a **changed** package for an already-running plugin (bump
+      the flake input, or point `package` at a different build) — the new
+      `plugins.json` has the same mtime (`1970-01-01 00:00:01`, `stat -L`) and
+      usually the same length, and the journal must still show the change and
+      "declared spec changed; restarting". Finally, delete the entry and
+      switch: the unit must stop within ~3 s. A switch that changes nothing in
+      `plugins.json` must log none of this.
 
 ## Infobroker
 

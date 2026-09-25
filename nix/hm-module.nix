@@ -625,13 +625,19 @@ in
       # and a changed env/package/enable stayed frozen in the running plugin
       # until the next login, silently. So after the write, poke the running
       # shell's Control endpoint to reconcile (ReloadPlugins re-reads
-      # plugins.json and starts/stops/restarts to match). Notes:
+      # plugins.json and starts/stops/restarts to match). Since #1399 the
+      # shell also polls plugins.json itself (every ~3 s, content-hashed) and
+      # reconciles on a change, so the poke is no longer what makes a switch
+      # apply at all: it makes it apply *now* instead of on the next tick, and
+      # it is kept because it is idempotent (a poke and a tick that see the
+      # same change serialise, and the second finds nothing to do). Notes:
       #   * run as a NixOS module, activation happens in home-manager-<user>
       #     .service, which has no DBUS_SESSION_BUS_ADDRESS — hence the same
       #     XDG_RUNTIME_DIR prelude home-manager's own startServices uses.
       #   * it must be a hard no-op at boot / on a non-graphical switch, hence
       #     `|| true`: no shell running is the normal case, not an error (the
-      #     shell reconciles on its own next start).
+      #     shell reconciles on its own next start). A poke that fails for any
+      #     other reason is silent too, which the #1399 poll now covers.
       (lib.mkIf (cfg.plugins != { }) {
         xdg.configFile."trollshell/plugins.json".text = pluginsState;
 

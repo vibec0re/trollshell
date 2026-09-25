@@ -6183,6 +6183,50 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// #1400's wiring: the 2 s tick itself is what refreshes the parse the
+    /// switch renders from — [`super::refresh_plugins`] goes through
+    /// [`super::refresh_declared`] and so through
+    /// [`PluginsState::declared`](super::PluginsState::declared), not around
+    /// it.
+    ///
+    /// **Falsify** by having `refresh_plugins` parse `plugins.json` into a
+    /// local of its own (the mounts still reach the poll, so every mount
+    /// test stays green): the tab's own parse stays empty and a pinned
+    /// plugin's switch would never grey in production.
+    #[gtk::test]
+    fn the_tick_refreshes_the_pins_the_switch_reads() {
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"plugins":{"niri-layouts":{"exec":"/x","enabled":true,"_locked":["enabled"]}}}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (_bin, state) = build_tab_in(env);
+        assert!(
+            state.declared.borrow().last().pinned.is_empty(),
+            "nothing is parsed before the first tick"
+        );
+        super::refresh_plugins(&state);
+        assert!(
+            state
+                .declared
+                .borrow()
+                .last()
+                .pinned
+                .contains("niri-layouts"),
+            "the tick must leave its parse where the switch reads it"
+        );
+    }
+
     /// Picking a plugin is the mirror image: the Shell entry lets go.
     #[gtk::test]
     fn picking_a_plugin_releases_the_shell_entry() {

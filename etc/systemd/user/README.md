@@ -94,13 +94,20 @@ choice in its own `$XDG_STATE_HOME/trollshell/plugins.toml` (only where it
 differs from the declared `enabled`) and a restart keeps it — unless the entry
 carries `"_locked": ["enabled"]`, which is what the nix modules render for an
 `enable` assigned plainly or with `lib.mkForce`; then the switch is greyed and
-the file wins. A hand-written static unit still works too, as long as its id
-isn't _also_ declared in `plugins.json`: the launcher's reconcile fingerprints
-only the units it spawns, and deliberately leaves alone any running unit that
-carries no fingerprint and isn't declared
-(`trollshell/src/plugin_launcher.rs:565-597`,
-`plan_never_touches_units_it_did_not_launch`) — but the repo no longer ships
-templates for one; the 11 that used to live in this directory were retired in
+the file wins. A hand-written static unit still works too. The launcher's
+reconcile fingerprints only the units it spawns, and never stops a running unit
+that carries no fingerprint, whether its id is undeclared or declared off
+(`plan` in `trollshell/src/plugin_launcher.rs`,
+`plan_never_touches_units_it_did_not_launch`,
+`plan_leaves_an_unstamped_unit_for_a_declared_off_id_alone`). Under nix, note
+that since #1400 `programs.trollshell.availablePlugins` declares **every
+bundled id** (off) by default, so a static unit for one of them has a declared
+id: it is left alone while the plugin is off, but the launcher cannot start it,
+because switching the plugin on (the tab, or `enable = true`) makes the shell
+launch its own transient unit, which systemd refuses while the static unit's
+file exists. To hand a bundled id to a static unit entirely, drop it from
+`availablePlugins` (and from `plugins`). The repo no longer ships templates for
+a static unit; the 11 that used to live in this directory were retired in
 #872.
 
 > Since #707 that `PartOf=` is the state file's top-level `"target"`, which

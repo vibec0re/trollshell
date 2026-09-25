@@ -43,12 +43,20 @@
 //! | enabled  | not running                  | launch    |
 //! | enabled  | running, fingerprint matches  | leave     |
 //! | enabled  | running, fingerprint differs  | restart   |
-//! | disabled | running                      | stop      |
+//! | enabled  | running, no fingerprint      | restart   |
+//! | disabled | running, launcher-stamped    | stop      |
+//! | disabled | running, no fingerprint      | leave     |
 //! | absent   | running, launcher-stamped    | stop      |
 //! | absent   | running, no fingerprint      | leave     |
 //!
-//! That last pair is the legacy-static-unit guard: a unit this launcher never
-//! spawned carries no fingerprint, so reconcile never touches it.
+//! The two "no fingerprint → leave" rows are the legacy-static-unit guard: a
+//! unit this launcher never spawned carries no fingerprint, so reconcile never
+//! **stops** it. That covers a declared-but-off id too (#1400 review, finding
+//! 4): `availablePlugins` declares every bundled id, off, so without that row
+//! a hand-installed static unit for one of them would be stopped on every
+//! reconcile. A declared-**on** id with an unstamped running unit is still
+//! restarted, since converging onto the declared spec is the point; for a
+//! static unit that bounces it through [`restart`]'s unit-file fallback.
 //!
 //! [`reconcile`] runs at shell startup, again whenever `plugins.json` changes
 //! on disk (#1399, see the next section), and on demand via
@@ -286,10 +294,19 @@
 //! ## Legacy static units
 //!
 //! Hand-installed static units (`etc/systemd/user/trollshell-plugin-*.service`,
-//! the pre-#419 path) keep working unchanged: the transport (`plugins.rs`)
-//! doesn't care who spawned a plugin, and the control-surface fns here fall
-//! back to plain `StartUnit` / unit-file enablement for any id that isn't in
-//! the declarative state file.
+//! the pre-#419 path) keep working: the transport (`plugins.rs`) doesn't care
+//! who spawned a plugin, and the control-surface fns here fall back to plain
+//! `StartUnit` / unit-file enablement for any id that isn't in the declarative
+//! state file.
+//!
+//! An id that **is** declared is the launcher's, and since #1400 the nix
+//! modules declare every bundled id by default (`availablePlugins`, off). A
+//! static unit for such an id is left alone while the plugin is off: reconcile
+//! stops only a unit it stamped ([`plan`]). What the launcher cannot do is
+//! start it: switching the plugin on (the Plugins tab, or `enable = true`)
+//! makes it launch its own transient unit, which systemd refuses while the
+//! static unit's file exists. To hand an id to a static unit entirely, drop it
+//! from `availablePlugins` (and `plugins`), so it is undeclared again.
 //!
 //! ## Why the `systemd-run` CLI, not D-Bus `StartTransientUnit`
 //!
@@ -1371,14 +1388,18 @@ enum Action {
 /// restarts before launches, then by id) so execution order is deterministic.
 ///
 /// Two deliberate asymmetries:
-/// - A **running unit with no fingerprint** whose id *is* declared is restarted
-///   (we can't prove it matches, and converging is the point) — this is the
-///   one-time recycle when a pre-#695 shell's units meet a #695 shell. An id
-///   that is both declared *and* hand-installed as a static unit lands here on
-///   every reconcile; [`restart`] documents what that does.
-/// - A **running unit with no fingerprint** whose id is *not* declared is left
-///   strictly alone: that is a legacy static unit (or someone else's), and the
-///   launcher has never owned it.
+/// - A **running unit with no fingerprint** whose id is declared **enabled**
+///   is restarted (we can't prove it matches, and converging is the point) —
+///   this is the one-time recycle when a pre-#695 shell's units meet a #695
+///   shell. An id that is both declared enabled *and* hand-installed as a
+///   static unit lands here on every reconcile; [`restart`] documents what
+///   that does.
+/// - A **running unit with no fingerprint** is otherwise left strictly alone,
+///   whether its id is undeclared or declared **disabled**: that is a legacy
+///   static unit (or someone else's), and the launcher has never owned it.
+///   Only a launcher-stamped unit is ever stopped. The declared-disabled half
+///   matters since #1400, whose `availablePlugins` declares every bundled id
+///   off by default (#1400 review, finding 4).
 fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Action)> {
     let running: BTreeMap<&str, Option<&str>> = units
         .iter()
@@ -1394,8 +1415,12 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
                     out.push((id.clone(), Action::Restart));
                 }
             }
-            (false, Some(_)) => out.push((id.clone(), Action::Stop)),
-            (false, None) => {}
+            // Stamped: the launcher's own unit, so a disabled plugin stops.
+            (false, Some(Some(_))) => out.push((id.clone(), Action::Stop)),
+            // Unstamped: a unit this launcher never spawned (a hand-installed
+            // static unit for a declared-off id) — left alone, like an
+            // undeclared one (#1400 review, finding 4).
+            (false, Some(None) | None) => {}
         }
     }
     // Orphans: units this launcher stamped (so it owns them) whose plugin is no
@@ -3721,6 +3746,47 @@ mod tests {
             },
         ];
         assert!(plan(&Declared::default(), &units).is_empty());
+    }
+
+    /// #1400 review, finding 4: `availablePlugins` declares every bundled id,
+    /// off, so the two hand-written units above are now *declared* disabled.
+    /// A unit without the launcher's stamp is still not the launcher's to
+    /// stop, and the same unit carrying the stamp still is.
+    ///
+    /// Falsified by folding the stamp back out of the disabled arm (`(false,
+    /// Some(_)) => Stop`): the unstamped half returns both units as stops.
+    #[test]
+    fn plan_leaves_an_unstamped_unit_for_a_declared_off_id_alone() {
+        let mut timer = spec("/bin/timer", true);
+        timer.enabled = false;
+        let mut terminal = spec("/bin/terminal", true);
+        terminal.enabled = false;
+        let d = declared(&[("timer", timer.clone()), ("terminal", terminal.clone())]);
+
+        let unstamped = vec![
+            unit("timer", "active", true),
+            systemd::PluginUnit {
+                description: "Hand-written plugin unit".to_owned(),
+                ..unit("terminal", "active", true)
+            },
+        ];
+        assert!(
+            plan(&d, &unstamped).is_empty(),
+            "a declared-off id's unstamped unit is left alone"
+        );
+
+        let stamped = vec![
+            unit_for("timer", "active", &timer),
+            unit_for("terminal", "active", &terminal),
+        ];
+        assert_eq!(
+            plan(&d, &stamped),
+            vec![
+                ("terminal".to_owned(), Action::Stop),
+                ("timer".to_owned(), Action::Stop),
+            ],
+            "a declared-off id's stamped unit is the launcher's, and stops"
+        );
     }
 
     #[test]

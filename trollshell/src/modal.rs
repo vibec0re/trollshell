@@ -3821,7 +3821,8 @@ mod gtk_tests {
     ///
     /// **Falsification:** pass `focused` in place of `page_output(…)` in
     /// `open_builtin_page`'s fallback → one of the two rounds opens on the
-    /// wrong drawer.
+    /// wrong drawer; ignore `toggle_builtin_under`'s `false`
+    /// (`|| true`) → nothing opens at all.
     #[gtk::test]
     fn a_sidebar_cards_click_opens_a_builtin_page_on_its_own_monitor() {
         use crate::plugins::effects::broker_page_for_test;

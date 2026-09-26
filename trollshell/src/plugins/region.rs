@@ -5735,12 +5735,16 @@ mod gtk_tests {
 
     /// A real **double** click on `mem` is two clicks to the button and both
     /// are recorded under `mem` — the second press of a double click reaches
-    /// the tracker as its own press (`n_press` 2), and the first click's
-    /// deferred clear does not wipe it (#1413 item 3).
+    /// the tracker as its own press (`n_press` 2), and the first click spent
+    /// the first press, so nothing else could anchor the second (#1413 item 3).
     ///
-    /// **Falsification:** drop the press-count comparison from the tracker's
-    /// deferred clear → the second press can be wiped before its click, which
-    /// falls back to the card.
+    /// **Falsification:** have the tracker record only the first press of a
+    /// sequence (`if n_press > 1 { return; }`) → the second click falls back
+    /// to the card and this reds. Not the press-count check in the deferred
+    /// clear: XTest queues the whole double click before GTK dispatches any of
+    /// it, and GTK drains queued input before an idle runs, so that race does
+    /// not arise here — `a_click_still_finds_its_press_after_the_sequence_ends`
+    /// is what pins it.
     #[gtk::test]
     fn a_real_double_click_is_recorded_under_its_chip() {
         adw::init().expect("libadwaita init");
@@ -5772,8 +5776,12 @@ mod gtk_tests {
     /// is what makes the `None` about the button rather than the aim (#1413
     /// item 3).
     ///
-    /// **Falsification:** set the tracker's button to 0 (any) and record the
-    /// origin on any event → the first assertion reds.
+    /// **Falsification:** set the tracker's button to 3 → the control reds (the
+    /// primary click falls back to the card). The `None` half is the contract
+    /// itself — no path turns a secondary click into a click origin — and has
+    /// no one-line mutation in this file today, because nothing here sees a
+    /// secondary click as a `Click` at all; it is what would catch one that
+    /// started to (a context-menu binding in `hytte-ui`, say).
     #[gtk::test]
     fn a_real_right_click_records_nothing() {
         adw::init().expect("libadwaita init");

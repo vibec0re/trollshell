@@ -121,6 +121,22 @@ impl Sparkline {
     }
 }
 
+/// Read-back for this crate's own tests: the ring and the domain exactly as the
+/// draw function will read them. `widget_tree`'s reconciler tests (#1252) assert
+/// through these that a re-render reached the **widget** and not just the
+/// reconciler's bookkeeping of it. Test-only (and only in the display-server
+/// bucket those tests live in), so no public API grows.
+#[cfg(all(test, feature = "system-tests"))]
+impl Sparkline {
+    pub(crate) fn samples_for_test(&self) -> Vec<f64> {
+        self.samples.borrow().iter().copied().collect()
+    }
+
+    pub(crate) fn domain_max_for_test(&self) -> Option<f64> {
+        self.domain_max.get()
+    }
+}
+
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
 #[allow(clippy::many_single_char_names)]

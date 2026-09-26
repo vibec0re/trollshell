@@ -53,7 +53,9 @@
 //! after the `vocab_max` / `vocab` key, with the frame length and every other
 //! byte's position unchanged. That is what tells this diff apart from a real
 //! encoder change — the census is a `u16` whose *value* moved, not a field whose
-//! shape did.
+//! shape did. #1252's bump (`06` → `07`, the `Sparkline` node) moved exactly the
+//! same four files by exactly one hex digit each, and pinned its new variant in
+//! a new file (`plugin_render_sparkline_v1`) rather than in any of them.
 //!
 //! What did **not** move in those files is the `mount` tag, and that is the
 //! point: #1158 pinned its new mount in a **new** fixture
@@ -1073,7 +1075,48 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 manifest: Manifest::new("right-hand", Mount::SidebarRightTop),
             }),
         ),
+        // #1252's trend line, in its own file for #1050's reason: an appended
+        // variant pinned here cannot move a pre-existing fixture, so every
+        // render fixture above staying byte-identical is itself evidence that
+        // nothing else changed shape.
+        (
+            "plugin_render_sparkline_v1",
+            Box::new(PluginMsg::Render {
+                tree: sparkline_tree(),
+                panel: None,
+                effects: vec![],
+                hidden_on: Vec::new(),
+            }),
+        ),
     ]
+}
+
+/// A native-look history row (#1252): `[name | Sparkline | value]`, with one
+/// auto-scaled line (no `max` key on the wire at all) and one on a fixed
+/// `0..=1` top, so the fixture pins both the variant tag and the
+/// `skip_serializing_if` on `max` — and the `f32` encoding of `values`, which
+/// is the first `f32` list this vocabulary puts outside a preem widget.
+fn sparkline_tree() -> Node {
+    Node::Row {
+        id: Some("cpu-history-row".into()),
+        classes: vec!["ts-history-row".into()],
+        spacing: 8,
+        children: vec![
+            Node::Sparkline {
+                id: Some("cpu-history".into()),
+                values: vec![0.0, 0.25, 0.5, 1.0],
+                max: Some(1.0),
+                classes: vec!["ts-cpu".into()],
+            },
+            Node::Sparkline {
+                id: Some("disk-io".into()),
+                values: vec![1024.0, 4096.0],
+                max: None,
+                classes: vec![],
+            },
+        ],
+        tooltip: None,
+    }
 }
 
 // ── the pinning test ─────────────────────────────────────────────────────────

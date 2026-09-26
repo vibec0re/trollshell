@@ -15,6 +15,10 @@
 //!   never advertised [`SCROLLED_VOCAB`] would kill the session's decode. The
 //!   builder does that check, exactly as [`shader`](crate::shader) does for
 //!   [`Node::Shader`], so the safe path is the short one.
+//! - [`sparkline`] (#1252) is the same shape of builder for [`Node::Sparkline`],
+//!   the shell's own flat history line, negotiated on [`SPARKLINE_VOCAB`]: it
+//!   degrades to a [`Node::Progress`] at the newest sample's level against a
+//!   shell that cannot draw one.
 //!
 //! ```ignore
 //! use hytte_plugin::nodes;
@@ -36,8 +40,25 @@
 //! // against one that hasn't.
 //! nodes::scrolled(240, card).id("hive-body").build()
 //! ```
+//!
+//! A native-look history row — the shell's Stats page's
+//! `[name | line | value]` — is a [`row`] around a [`sparkline`]:
+//!
+//! ```ignore
+//! nodes::row(vec![
+//!     name_label,
+//!     // The last minute of load, oldest first, on a fixed 0..=1 axis.
+//!     nodes::sparkline(ring.iter().copied().collect::<Vec<f32>>())
+//!         .id("cpu-history")
+//!         .max(1.0)
+//!         .build(),
+//!     value_label,
+//! ])
+//! .spacing(8)
+//! .build()
+//! ```
 
-use hytte_plugin_proto::{Cls, Node, NodeId, SCROLLED_VOCAB};
+use hytte_plugin_proto::{Cls, Node, NodeId, SCROLLED_VOCAB, SPARKLINE_VOCAB};
 
 /// Start a [`Node::Row`] — a horizontal list row — with `children`.
 ///
@@ -80,6 +101,26 @@ pub fn scrolled(max_height: u16, child: Node) -> Scrolled {
         max_height,
         classes: Vec::new(),
         child: Box::new(child),
+    }
+}
+
+/// Start a [`Node::Sparkline`] — the shell's flat history line — over
+/// `values`, **oldest first**.
+///
+/// Defaults: no id, no classes, `max: None` (auto-scale to the largest sample,
+/// which is what the native page does for a byte rate or a temperature). Set
+/// [`Sparkline::max`] for a quantity with a natural ceiling — `1.0` for a load
+/// fraction, `100.0` for a percentage.
+///
+/// Read [`Sparkline::build`] before using it: the node is **negotiated**, and
+/// `build` is where that is handled.
+#[must_use]
+pub fn sparkline(values: impl Into<Vec<f32>>) -> Sparkline {
+    Sparkline {
+        id: None,
+        values: values.into(),
+        max: None,
+        classes: Vec::new(),
     }
 }
 
@@ -273,10 +314,139 @@ pub fn host_speaks_scrolled() -> bool {
     crate::display::negotiated_vocab() >= SCROLLED_VOCAB
 }
 
+/// Builder for [`Node::Sparkline`]; see [`sparkline`].
+#[derive(Clone, Debug)]
+pub struct Sparkline {
+    id: Option<NodeId>,
+    values: Vec<f32>,
+    max: Option<f32>,
+    classes: Vec<Cls>,
+}
+
+impl Sparkline {
+    /// Set the diff/reorder key.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<NodeId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Fix the top of the y axis at `max` (the line draws `0..=max`), instead
+    /// of auto-scaling to the largest sample. A `max` that is not a positive
+    /// finite number auto-scales anyway — see
+    /// [`sane_sparkline_max`](hytte_plugin_proto::sane_sparkline_max).
+    #[must_use]
+    pub fn max(mut self, max: f32) -> Self {
+        self.max = Some(max);
+        self
+    }
+
+    /// Append one CSS class. A class whose rule sets `color` recolours the
+    /// line (the widget strokes in its own theme colour).
+    #[must_use]
+    pub fn class(mut self, class: impl Into<Cls>) -> Self {
+        self.classes.push(class.into());
+        self
+    }
+
+    /// Finish the node — **or fall back to a [`Node::Progress`]** at the newest
+    /// sample's level if this session's host never advertised
+    /// [`SPARKLINE_VOCAB`].
+    ///
+    /// [`Node::Sparkline`] is a negotiated variant (#1252): a host that
+    /// predates it cannot decode the frame at all, so emitting one
+    /// unconditionally would turn a nicer picture into #437's silent 5 s
+    /// reconnect loop. A plugin can therefore call this unconditionally and let
+    /// the shell decide.
+    ///
+    /// **Why a progress bar.** The fallback has to be something every shell
+    /// already draws. A preem `Scope` is the other trend line on the wire, but
+    /// the node exists precisely so a page can read like the shell's own rather
+    /// than a retro display, and handing an older shell a phosphor sweep would
+    /// undo that. A `Label` of the newest value would repeat the reading a
+    /// history row already prints beside its line. A `Progress` is a flat,
+    /// native widget that still answers the question the line's right-hand end
+    /// answers — *how much, now* — on the same axis: the newest sample over
+    /// `max`, or over the largest sample when auto-scaling, exactly the
+    /// `draw_sparkline` normalisation, so the bar is as full as the line's last
+    /// point is high. What it loses is the history itself, and nothing on an
+    /// older shell can draw that except the scope this is avoiding.
+    ///
+    /// The fallback keeps this node's `id` and `class`es — negotiation is
+    /// fixed for the life of a session, so the degraded tree is consistently
+    /// shaped and diffs against itself by the same key.
+    ///
+    /// Use [`build_unnegotiated`](Self::build_unnegotiated) only where the wire
+    /// shape itself is under test.
+    #[must_use]
+    pub fn build(self) -> Node {
+        if host_speaks_sparkline() {
+            self.build_unnegotiated()
+        } else {
+            self.build_fallback()
+        }
+    }
+
+    /// The [`Node::Sparkline`] itself, with no host check.
+    ///
+    /// For tests that pin the wire shape. In a live plugin this is only correct
+    /// behind your own [`host_speaks_sparkline`] branch — see
+    /// [`build`](Self::build).
+    #[must_use]
+    pub fn build_unnegotiated(self) -> Node {
+        Node::Sparkline {
+            id: self.id,
+            values: self.values,
+            max: self.max,
+            classes: self.classes,
+        }
+    }
+
+    /// The older-shell arm of [`build`](Self::build): a [`Node::Progress`] at
+    /// the newest sample's level on the line's own axis.
+    fn build_fallback(self) -> Node {
+        use hytte_plugin_proto::{sane_fraction, sane_sparkline_max, sane_sparkline_sample};
+
+        let newest = self
+            .values
+            .last()
+            .copied()
+            .map_or(0.0, sane_sparkline_sample);
+        // `draw_sparkline`'s own denominator: the fixed top when there is a
+        // usable one, else the largest sample (never below `EPSILON`, so an
+        // all-zero line is an empty bar rather than a division by zero).
+        let top = sane_sparkline_max(self.max).unwrap_or_else(|| {
+            self.values
+                .iter()
+                .copied()
+                .map(sane_sparkline_sample)
+                .fold(0.0_f32, f32::max)
+                .max(f32::EPSILON)
+        });
+        Node::Progress {
+            id: self.id,
+            fraction: sane_fraction(f64::from(newest / top)),
+            classes: self.classes,
+        }
+    }
+}
+
+/// Whether this session's host advertised the flat trend line (#1252) — i.e.
+/// whether [`negotiated_vocab`](crate::display::negotiated_vocab) has reached
+/// [`SPARKLINE_VOCAB`].
+///
+/// [`Sparkline::build`] consults this for you; call it directly only to skip
+/// work of your own (keeping a history ring an older shell would never see
+/// drawn, say).
+#[must_use]
+pub fn host_speaks_sparkline() -> bool {
+    crate::display::negotiated_vocab() >= SPARKLINE_VOCAB
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{host_speaks_scrolled, list, row, scrolled};
-    use hytte_plugin_proto::{Node, SCROLLED_VOCAB};
+    use super::{host_speaks_scrolled, host_speaks_sparkline, list, row, scrolled, sparkline};
+    use hytte_plugin_proto::{Node, SCROLLED_VOCAB, SPARKLINE_VOCAB};
 
     fn label(text: &str) -> Node {
         Node::Label {
@@ -396,5 +566,101 @@ mod tests {
         assert!(!host_speaks_scrolled());
         assert_eq!(scrolled(240, label("body")).build(), label("body"));
         crate::display::set_negotiated(0);
+    }
+
+    #[test]
+    fn sparkline_defaults_auto_scale_with_no_id_or_classes() {
+        assert_eq!(
+            sparkline(vec![0.5, 1.5]).build_unnegotiated(),
+            Node::Sparkline {
+                id: None,
+                values: vec![0.5, 1.5],
+                max: None,
+                classes: vec![],
+            },
+        );
+    }
+
+    /// #1252's negotiation, both arms, on one thread (the `NEGOTIATED`
+    /// thread-local, same reason as the viewport test above): the variant on a
+    /// host that advertised it, a `Progress` at the newest sample's level on
+    /// one that did not.
+    ///
+    /// **Falsified** by making `build` return `build_unnegotiated()`
+    /// unconditionally (the old-host arm emits a `Sparkline` an older shell
+    /// cannot decode), or by comparing against `SCROLLED_VOCAB` (a generation-6
+    /// shell would be sent one — the next test).
+    #[test]
+    fn sparkline_emits_the_variant_only_once_the_host_advertised_it() {
+        let line = || {
+            sparkline(vec![0.2, 0.9, 0.25])
+                .id("cpu-history")
+                .max(1.0)
+                .class("ts-cpu")
+        };
+
+        crate::display::set_negotiated(0);
+        assert!(!host_speaks_sparkline());
+        assert_eq!(
+            line().build(),
+            Node::Progress {
+                id: Some("cpu-history".into()),
+                fraction: 0.25,
+                classes: vec!["ts-cpu".into()],
+            },
+            "an unadvertised host gets a bar at the NEWEST sample's level, id and \
+             classes kept",
+        );
+
+        crate::display::set_negotiated(SPARKLINE_VOCAB);
+        assert!(host_speaks_sparkline());
+        assert_eq!(
+            line().build(),
+            Node::Sparkline {
+                id: Some("cpu-history".into()),
+                values: vec![0.2, 0.9, 0.25],
+                max: Some(1.0),
+                classes: vec!["ts-cpu".into()],
+            },
+        );
+        crate::display::set_negotiated(0);
+    }
+
+    /// A generation-6 shell (#1158's mounts — the generation right before this
+    /// one, and not itself `Hello`-negotiated) is still an older shell: `>=`
+    /// against `SPARKLINE_VOCAB`, not against whichever marker came last.
+    #[test]
+    fn an_older_negotiated_generation_does_not_unlock_the_sparkline() {
+        crate::display::set_negotiated(SPARKLINE_VOCAB - 1);
+        assert!(!host_speaks_sparkline());
+        assert!(matches!(
+            sparkline(vec![1.0]).build(),
+            Node::Progress { .. }
+        ));
+        crate::display::set_negotiated(0);
+    }
+
+    /// The fallback's axis is the line's own: over `max` when there is one,
+    /// over the largest sample when auto-scaling, and total over the inputs the
+    /// sanitisers exist for.
+    #[test]
+    fn the_fallback_bar_reads_the_newest_sample_on_the_lines_own_axis() {
+        crate::display::set_negotiated(0);
+        let fraction = |node: Node| match node {
+            Node::Progress { fraction, .. } => fraction,
+            other => panic!("expected the fallback bar, got {other:?}"),
+        };
+        // Auto-scaled: 2 of a peak of 8 is a quarter.
+        assert!((fraction(sparkline(vec![8.0, 4.0, 2.0]).build()) - 0.25).abs() < 1e-9);
+        // Fixed top: 50 of 100.
+        assert!((fraction(sparkline(vec![10.0, 50.0]).max(100.0).build()) - 0.5).abs() < 1e-9);
+        // Over the top pins full, a negative pins empty — the line's own pin.
+        assert!((fraction(sparkline(vec![3.0]).max(1.0).build()) - 1.0).abs() < 1e-9);
+        assert!(fraction(sparkline(vec![-3.0]).max(1.0).build()).abs() < 1e-9);
+        // Empty, all-zero and poisoned lines are an empty bar, never a NaN.
+        assert!(fraction(sparkline(Vec::<f32>::new()).build()).abs() < 1e-9);
+        assert!(fraction(sparkline(vec![0.0, 0.0]).build()).abs() < 1e-9);
+        assert!(fraction(sparkline(vec![f32::NAN]).build()).abs() < 1e-9);
+        assert!(fraction(sparkline(vec![1.0, f32::NAN]).max(f32::NAN).build()).abs() < 1e-9);
     }
 }

@@ -8,12 +8,23 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use hytte::ui::widget_tree::SPARKLINE_CAPACITY;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, FitAxis, Node as UiNode};
 use hytte_plugin_proto::Mount;
 use hytte_plugin_proto::wire::{
     self, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
-    MAX_NODES_PER_TREE, MAX_TREE_DEPTH,
+    MAX_NODES_PER_TREE, MAX_SPARKLINE_SAMPLES, MAX_TREE_DEPTH,
 };
+
+// The reconciler builds a `Node::Sparkline`'s ring once, at
+// `SPARKLINE_CAPACITY`, and never rebuilds it on a value change (#1252) — so
+// every line this seam can hand it must fit. `hytte-ui` does not link the
+// proto, which is why the two numbers are two constants and this is where they
+// are held equal-or-ordered.
+const _: () = assert!(
+    MAX_SPARKLINE_SAMPLES <= SPARKLINE_CAPACITY,
+    "the wire's sparkline cap must fit the reconciler's ring",
+);
 
 use super::effects::truncate_on_char_boundary;
 use super::preem_render::{self, Scope, Warned};
@@ -410,6 +421,26 @@ fn warn_once_classes_cap(scope: &Scope) -> bool {
     })
 }
 
+thread_local! {
+    /// Per-scope latch for a sanitised [`wire::Node::Sparkline`] (#1252) — the
+    /// [`WARNED_TEXT_CAP`] shape again, and kept separate from it for the same
+    /// reason the `classes` latch is: a different mistake, a different fix
+    /// (send finite samples, or fewer).
+    static WARNED_SPARKLINE: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the sparkline latch for `scope`: `true` the first time it is asked
+/// for, `false` for the rest of the shell's run. See [`WARNED_SPARKLINE`].
+fn warn_once_sparkline(scope: &Scope) -> bool {
+    WARNED_SPARKLINE.with_borrow_mut(|warned| {
+        if warned.contains(scope) {
+            return false;
+        }
+        warned.insert(scope.clone());
+        true
+    })
+}
+
 /// Map a wire [`wire::Node`] onto the reconciler's `hytte_ui::Node`. The two
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
 /// is written exhaustively so adding a node variant to either side is a compile
@@ -659,6 +690,55 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 classes: walk.classes(classes),
             }
         }
+        wire::Node::Sparkline {
+            id,
+            values,
+            max,
+            classes,
+        } => {
+            // #1252's trend line. The float seam is the proto's own two
+            // sanitisers — the same ones `wire::Node::clamp_in_place` runs,
+            // so the SDK's pass and this one cannot disagree — applied while
+            // widening to the reconciler's `f64`, which is a copy this arm
+            // pays anyway. The count seam keeps the **newest**
+            // `MAX_SPARKLINE_SAMPLES`, as the clamp does.
+            //
+            // Warned once per plugin tree rather than per pass, unlike the
+            // `Progress` arm above: a sparkline is a *window*, so one `NaN` a
+            // plugin pushed into its ring rides every frame for the next
+            // minute, and a per-pass line would be sixty of them.
+            let skip = values.len().saturating_sub(MAX_SPARKLINE_SAMPLES);
+            let mut rewritten = skip > 0;
+            let values: Vec<f64> = values[skip..]
+                .iter()
+                .map(|v| {
+                    let sane = wire::sane_sparkline_sample(*v);
+                    rewritten |= sane.to_bits() != v.to_bits();
+                    f64::from(sane)
+                })
+                .collect();
+            let sane_max = wire::sane_sparkline_max(*max);
+            rewritten |= sane_max.map(f32::to_bits) != max.map(f32::to_bits);
+            if rewritten && warn_once_sparkline(walk.scope) {
+                tracing::warn!(
+                    plugin = walk.scope.plugin_id(),
+                    tree = ?walk.scope.role(),
+                    node = ?id,
+                    samples = skip + values.len(),
+                    cap = MAX_SPARKLINE_SAMPLES,
+                    "plugin Sparkline carries a non-finite sample or top, or more samples than \
+                     the host draws; sanitised (a NaN draws at the bottom, an infinity at the \
+                     edge, and the oldest samples past the cap are dropped). Further occurrences \
+                     in this tree are silenced for the rest of this shell run",
+                );
+            }
+            UiNode::Sparkline {
+                id: id.clone(),
+                values,
+                max: sane_max.map(f64::from),
+                classes: walk.classes(classes),
+            }
+        }
         wire::Node::Slider {
             id,
             min,
@@ -901,5 +981,103 @@ pub(super) fn to_wire_event(kind: UiEventKind) -> wire::EventKind {
         UiEventKind::Scroll { dx, dy } => wire::EventKind::Scroll { dx, dy },
         UiEventKind::ValueChanged { value } => wire::EventKind::ValueChanged { value },
         UiEventKind::Submitted { text } => wire::EventKind::Submitted { text },
+    }
+}
+
+// Hermetic: `to_ui_node` builds a `hytte_ui::Node`, never a widget, so none of
+// these needs a display. The GTK half of #1252 — that the mapped node becomes
+// the library's `Sparkline` and updates in place — is `hytte-ui`'s own
+// `widget_tree` gtk tests.
+#[cfg(test)]
+mod tests {
+    use super::{Grants, Scope, to_ui_node};
+    use hytte::ui::Node as UiNode;
+    use hytte_plugin_proto::wire::{self, MAX_SPARKLINE_SAMPLES};
+
+    fn line(values: Vec<f32>, max: Option<f32>) -> wire::Node {
+        wire::Node::Sparkline {
+            id: Some("cpu-history".into()),
+            values,
+            max,
+            classes: vec!["ts-cpu".into()],
+        }
+    }
+
+    /// The wire's `Sparkline` is the reconciler's `Sparkline`, field for field:
+    /// the id is the reconciler key, the samples widen `f32` → `f64` without
+    /// moving, the top rides through and the classes are the node's.
+    ///
+    /// **Falsified** by mapping it to a `UiNode::Progress` (or anything else),
+    /// or by dropping `max` to `None` in the arm.
+    #[test]
+    fn a_sparkline_maps_to_the_reconcilers_sparkline() {
+        let scope = Scope::detached("t1252-map");
+        let mapped = to_ui_node(
+            &scope,
+            Grants::none(),
+            &line(vec![0.0, 0.25, 0.5], Some(1.0)),
+        );
+        assert_eq!(
+            mapped,
+            UiNode::Sparkline {
+                id: Some("cpu-history".into()),
+                values: vec![0.0, 0.25, 0.5],
+                max: Some(1.0),
+                classes: vec!["ts-cpu".into()],
+            },
+        );
+
+        // Auto-scaled stays auto-scaled.
+        let auto = to_ui_node(&scope, Grants::none(), &line(vec![4096.0], None));
+        assert!(
+            matches!(auto, UiNode::Sparkline { max: None, .. }),
+            "{auto:?}"
+        );
+    }
+
+    /// The host re-runs the proto's sanitisers at its own seam — an SDK-built
+    /// plugin is not the only thing that can dial the socket — and trims to the
+    /// **newest** `MAX_SPARKLINE_SAMPLES`, so the reconciler never meets a
+    /// `NaN`, an infinity, an unusable top or more samples than its ring holds.
+    ///
+    /// **Falsified** by `values.iter()` in place of `values[skip..].iter()`
+    /// (the length assertion reds), or by widening without
+    /// `sane_sparkline_sample` (the `NaN` survives into the host node).
+    #[test]
+    fn a_sparkline_is_sanitised_at_the_seam() {
+        let scope = Scope::detached("t1252-sane");
+        let total = MAX_SPARKLINE_SAMPLES + 3;
+        #[allow(clippy::cast_precision_loss)]
+        let mut values: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        values[total - 1] = f32::NAN;
+        values[total - 2] = f32::NEG_INFINITY;
+
+        let UiNode::Sparkline { values, max, .. } =
+            to_ui_node(&scope, Grants::none(), &line(values, Some(f32::NAN)))
+        else {
+            panic!("still a sparkline");
+        };
+        assert_eq!(values.len(), MAX_SPARKLINE_SAMPLES, "trimmed to the cap");
+        assert_eq!(
+            values.first().copied(),
+            Some(3.0),
+            "the three OLDEST went — the newest are what the row reads out",
+        );
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "{:?}",
+            &values[values.len() - 3..]
+        );
+        assert_eq!(
+            values.last().copied(),
+            Some(0.0),
+            "a NaN draws at the bottom"
+        );
+        assert_eq!(
+            values.get(values.len() - 2).copied(),
+            Some(f64::from(-f32::MAX)),
+            "an infinity pins to the edge",
+        );
+        assert_eq!(max, None, "a NaN top auto-scales, as the drawing code would");
     }
 }

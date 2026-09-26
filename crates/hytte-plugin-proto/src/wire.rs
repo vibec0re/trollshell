@@ -155,7 +155,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 ///   input; `set_tooltip_markup` would hand it a parser.)
 /// - It is **not** part of a node's identity: only `kind` and `id` decide reuse,
 ///   so changing a tooltip never rebuilds a widget.
-/// - **Seven** of the eighteen variants, not all of them — the ones a chip or a
+/// - **Seven** of the nineteen variants, not all of them — the ones a chip or a
 ///   list card is made of: [`Box`](Node::Box), [`Label`](Node::Label),
 ///   [`Icon`](Node::Icon) and [`Shader`](Node::Shader) (#893, a picture with
 ///   nowhere else to say what it is), then — since #961 — [`Row`](Node::Row),
@@ -286,6 +286,16 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello), so an old host can never
 /// receive a variant it cannot decode and
 /// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) stays at 1.
+///
+/// # A native-looking page (#1252)
+///
+/// [`Sparkline`](Node::Sparkline) is the fourth negotiated variant, on
+/// [`SPARKLINE_VOCAB`]: the flat history line the shell's own Stats page draws,
+/// so a plugin page can read like a native one instead of reaching for a preem
+/// `Scope`. Together with a `boxed-list` [`ListBox`](Node::ListBox) per card and
+/// two vertical [`Box`](Node::Box)es in a horizontal one for the columns, it is
+/// everything `hytte-plugin-stats`' drawer page needed to mirror the native
+/// multicolumn Stats page card for card.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
@@ -1062,6 +1072,84 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tooltip: Option<String>,
     },
+    /// A **flat trend line**: the native Stats page's history sparkline, drawn
+    /// by the shell from a plain list of samples (#1252).
+    ///
+    /// The host materializes it as `hytte_ui::Sparkline` — the *same* widget the
+    /// shell's own Stats page draws its CPU / memory / GPU / disk-I/O history
+    /// rows with — so a plugin row and a native row are one widget, not two
+    /// that look alike. That widget is a single anti-aliased stroke through the
+    /// samples plus a 15 %-alpha fill under it, in the theme's accent colour
+    /// (the `hytte-sparkline` class, which the library stylesheet colours and
+    /// gives its minimum height). It **fills its row's width** (`hexpand`), as
+    /// the native history row's does, and has no natural size of its own —
+    /// which is why there is no `width`/`height` here: the native widget takes
+    /// none either. It is a row widget, not a chip.
+    ///
+    /// Before this variant the only trend line on the wire was
+    /// [`Preem`](Node::Preem)'s `Scope` — a phosphor oscilloscope, which is the
+    /// right answer on a retro card and the wrong one on a page that is meant
+    /// to read like the shell's own (Annika on #1252: "maybe not use preem
+    /// widgets here?").
+    ///
+    /// - **`values`** are the samples, **oldest first**, newest last — the
+    ///   whole window every time, not a delta: the host holds no history of its
+    ///   own, so a plugin that wants a moving line keeps a ring and sends it.
+    ///   The x axis is the sample index, spread evenly across the width. At most
+    ///   [`MAX_SPARKLINE_SAMPLES`] are drawn; past that the host keeps the
+    ///   **newest** ones.
+    /// - **`max`** is the top of the y axis: `Some(m)` draws `0..=m` (a load
+    ///   fraction wants `Some(1.0)`, a percentage `Some(100.0)` — what the
+    ///   native rows pass), `None` **auto-scales** to the largest sample in
+    ///   `values` (a byte rate or a temperature, which have no natural ceiling).
+    ///   A sample outside `0..=max` is pinned to the nearest edge.
+    ///
+    /// Both are **mutable props**: a same-id re-render re-points the existing
+    /// widget at the new samples and queues one redraw, so a line that moves
+    /// every second never rebuilds its widget. An `id` is recommended for the
+    /// usual reason — without one a sparkline that changes position among its
+    /// siblings is matched positionally — but the widget carries no state the
+    /// wire does not restate, so a rebuild costs a redraw and nothing else.
+    ///
+    /// # Floats (#904)
+    ///
+    /// [`clamp_in_place`](Node::clamp_in_place) sanitises both fields, and the
+    /// host re-runs the same two functions at its mapping seam:
+    /// [`sane_sparkline_sample`] (`NaN` → `0.0`, `±inf` → `±f32::MAX`) and
+    /// [`sane_sparkline_max`] (anything the drawing code would auto-scale on
+    /// anyway — `NaN`, `-inf`, zero, a negative — becomes `None`; `+inf`
+    /// becomes `f32::MAX`). Each mapping is the drawing code's own answer made
+    /// canonical, so a sanitised tree draws exactly what the raw one would
+    /// have, and compares equal to an identical copy of itself.
+    ///
+    /// # Negotiated (#1252)
+    ///
+    /// Appending this variant bumps [`VOCAB`](crate::VOCAB) to
+    /// [`SPARKLINE_VOCAB`], and — like [`Preem`](Node::Preem),
+    /// [`Shader`](Node::Shader) and [`Scrolled`](Node::Scrolled) — a plugin
+    /// must only emit it once the host has advertised that generation in
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello). An older shell cannot
+    /// decode the variant at all: one on the wire fails the whole frame with
+    /// ``unknown variant `Sparkline` `` and puts the plugin in #437's 5 s
+    /// reconnect loop. The SDK's `hytte_plugin::nodes::sparkline` does the
+    /// check and degrades to a [`Progress`](Node::Progress) bar at the newest
+    /// sample's level — a flat, native widget that still says "how much, now",
+    /// rather than a preem scope on a page that asked for no preem.
+    Sparkline {
+        /// Optional reconciliation key (see [`NodeId`]).
+        id: Option<NodeId>,
+        /// The samples, oldest first. At most [`MAX_SPARKLINE_SAMPLES`] are
+        /// drawn (the newest).
+        values: Vec<f32>,
+        /// The y axis' top: `Some(m)` draws `0..=m`, `None` auto-scales to the
+        /// largest sample. Defaulted and kept off the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f32>,
+        /// GTK CSS classes applied verbatim (`add_css_class`), on top of the
+        /// widget's own `hytte-sparkline` — a class that sets `color` recolours
+        /// the line.
+        classes: Vec<Cls>,
+    },
 }
 
 /// How the host reads a [`Node::Shader`]'s data buffer into the `u_data`
@@ -1168,6 +1256,87 @@ pub const SHADER_VOCAB: u16 = 3;
 /// viewport simply renders the child unwrapped — an unbounded card, i.e. exactly
 /// what it rendered before #966.
 pub const SCROLLED_VOCAB: u16 = 4;
+
+/// The [`VOCAB`](crate::VOCAB) generation that carries the flat trend line
+/// ([`Node::Sparkline`]) — #1252.
+///
+/// **Negotiated**, exactly like [`SCROLLED_VOCAB`], [`SHADER_VOCAB`] and
+/// [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB): a plugin emits
+/// [`Node::Sparkline`] only once
+/// [`Manifest::negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab)
+/// has reached this number, so an old host — which advertises something lower
+/// in [`HostMsg::Hello`](crate::msg::HostMsg::Hello), or nothing at all — can
+/// never receive a variant it cannot decode. Generation 7 therefore bumps
+/// [`VOCAB`](crate::VOCAB) (the census) and leaves
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) alone; see that const
+/// for the rule.
+///
+/// Generations 5 and 6 (#1045's `OpenUri`, #1158's right-sidebar mounts) were
+/// census-only on other arguments and are **not** `Hello`-negotiated, so this
+/// is the first negotiated generation whose predecessor is not one: a shell on
+/// generation 6 advertises 6, which is below this, and the arithmetic says so
+/// with no special case.
+pub const SPARKLINE_VOCAB: u16 = 7;
+
+/// The most samples one [`Node::Sparkline`] draws; past it the host keeps the
+/// **newest** ones (and [`Node::clamp_in_place`] trims to the same number, so
+/// the SDK never sends more).
+///
+/// **1024.** The native Stats page's history rows keep 60 samples (one a
+/// second for a minute), and a sparkline is at most as wide as a drawer page —
+/// ~1080 px on the widest one — so a sample per horizontal pixel is the useful
+/// ceiling and anything past it is drawn into the same column. 1024 is that
+/// ceiling rounded to a power of two, a quarter of
+/// [`MAX_SCOPE_SAMPLES`](crate::preem::MAX_SCOPE_SAMPLES) (a scope's samples
+/// are a *batch* drawn over phosphor; these are the whole picture), and it
+/// bounds the host's per-widget buffer at 8 KiB.
+pub const MAX_SPARKLINE_SAMPLES: usize = 1024;
+
+/// Sanitise one [`Node::Sparkline`] sample: `NaN` → `0.0`, `+inf` →
+/// `f32::MAX`, `-inf` → `-f32::MAX`; every finite value passes through
+/// unchanged, so the function is a fixpoint.
+///
+/// Derived from the drawing code (`hytte_ui::sparkline`'s `draw_sparkline`),
+/// on #899's rule — saturate where it saturates:
+///
+/// - it pins `sample / top` into `0..=1`, so a huge finite sample and `+inf`
+///   both draw at the top edge — but `+inf` **also** poisons the auto-scaled
+///   top (`inf / inf` is `NaN`, and a `NaN` point breaks the stroke), where
+///   `f32::MAX` is simply the largest sample;
+/// - a negative sample draws at the bottom edge however negative it is, so
+///   `-inf` → `-f32::MAX` is parity;
+/// - `NaN` is the one input the pin does not decide (`NaN.clamp` is `NaN`, a
+///   `NaN` y breaks the path), and `0.0` — the bottom rail — is the same
+///   "no reading" neutral [`sane_fraction`] gives a
+///   [`Progress`](Node::Progress).
+#[must_use]
+pub fn sane_sparkline_sample(sample: f32) -> f32 {
+    if sample.is_nan() {
+        0.0
+    } else if sample.is_infinite() {
+        f32::MAX.copysign(sample)
+    } else {
+        sample
+    }
+}
+
+/// Sanitise a [`Node::Sparkline`]'s `max`, to the canonical spelling of what
+/// the drawing code does with it.
+///
+/// `draw_sparkline` uses a fixed top only for `Some(m) if m > 0.0`; every
+/// other value — `None`, zero, a negative, `NaN` (which is not `> 0`), `-inf` —
+/// auto-scales, so all of them become `None` here and draw exactly as they
+/// did. `+inf` *is* `> 0` and would pin every finite sample to the bottom
+/// edge; `f32::MAX` does the same with a finite number. A positive finite `max`
+/// passes through unchanged, so this is a fixpoint.
+#[must_use]
+pub fn sane_sparkline_max(max: Option<f32>) -> Option<f32> {
+    match max {
+        Some(m) if m.is_finite() && m > 0.0 => Some(m),
+        Some(m) if m.is_infinite() && m > 0.0 => Some(f32::MAX),
+        _ => None,
+    }
+}
 
 /// The largest [`Node::Shader::fragment`] the host will hand a driver, in bytes.
 ///
@@ -1647,7 +1816,9 @@ impl Node {
     /// # The float invariant
     ///
     /// Afterwards, **every** `f64` this tree carries is finite and within its
-    /// documented bounds, and every [`Preem`](Node::Preem) child satisfies
+    /// documented bounds, so is every [`Sparkline`](Node::Sparkline) `f32`
+    /// (#1252, whose count is trimmed to [`MAX_SPARKLINE_SAMPLES`] in the same
+    /// pass), and every [`Preem`](Node::Preem) child satisfies
     /// [`PreemWidget::clamp_in_place`](crate::preem::PreemWidget::clamp_in_place)'s
     /// own invariant. That makes the derived `PartialEq` on [`Node`] a usable
     /// *did anything change?* test: `NaN != NaN`, so before this a single
@@ -1788,6 +1959,19 @@ impl Node {
             // that rasterises it; delegating is what makes the invariant above
             // hold for a whole tree rather than for this file's two variants.
             Self::Preem { widget, .. } => widget.clamp_in_place(),
+            // #1252's trend line: the float half is the two `sane_sparkline_*`
+            // functions (see their docs for the derivation); the count half is
+            // the `Scope` precedent in `PreemWidget::clamp_in_place`, except
+            // that it keeps the **newest** samples — a sparkline's last value
+            // is the one the row's label is reading out beside it.
+            Self::Sparkline { values, max, .. } => {
+                let excess = values.len().saturating_sub(MAX_SPARKLINE_SAMPLES);
+                values.drain(..excess);
+                for sample in values.iter_mut() {
+                    *sample = sane_sparkline_sample(*sample);
+                }
+                *max = sane_sparkline_max(*max);
+            }
             Self::Box { children, .. }
             | Self::Row { children, .. }
             | Self::ListBox { children, .. } => {
@@ -1814,6 +1998,8 @@ impl Node {
             // are the host's (`trollshell/src/plugins/shader_map.rs`), on the
             // same reasoning `Pixels`'s `len == w*h*4` check is host-side — the
             // host is the trust boundary and the layer with `tracing`.
+            // (`Sparkline` is *not* here: it carries `f32`s, and is sanitised
+            // in its own arm above.)
             Self::Label { .. }
             | Self::Text { .. }
             | Self::Icon { .. }

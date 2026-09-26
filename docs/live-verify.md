@@ -6062,3 +6062,63 @@ Revert the edit afterwards.
       focused output.** Anything that opens a sidebar plugin's page without a
       click (a plugin timer, or the late-click trick above against the sidebar
       instance) opens the dialog on niri's focused output, as before.
+
+## Plugin settings in the control center (#1410)
+
+Verified with the **pet**, which is the first plugin to declare settings
+(`PET_NAME`, `PET_PERSONA`, `TROLLSHELL_PET_KAOMOJI`). Switch it on in the
+Plugins tab first if it is off.
+
+- [ ] **The group appears.** Control center → Plugins → `pet`. Below Status
+      there is a **Settings** group with three rows: _Name_ and _Persona_ as
+      entries whose placeholders read `nisse` and `playful, a little sassy`,
+      and _Kaomoji face_ as a switch whose subtitle says the plugin's default
+      (`false`) applies. Select `timer`: no Settings group at all.
+- [ ] **Save restarts a running plugin.** Save and Revert are disabled until
+      you change something. Type a name into _Name_; they light up. Press
+      Save. The status line under the rows reads
+      "Saved. Restarting the plugin…", then "Saved, and the plugin restarted."
+      `cat ~/.config/trollshell/plugin-settings.toml` shows `[pet]` with
+      `PET_NAME = "…"`, and
+      `systemctl --user show -p Environment trollshell-plugin-pet` lists it.
+      `ps -o args= -C systemd-run` during a save (or the journal's
+      `systemd-run` line) must **not** show the value — only
+      `--setenv=PET_NAME`.
+- [ ] **The switch row unsets.** Flip _Kaomoji face_ on and Save: the pet
+      shows the text face after its restart. Press the row's undo button and
+      Save: the key is gone from the file and the pixel cat is back.
+- [ ] **Nix wins, and says so.** Set
+      `programs.trollshell.plugins.pet.env.PET_NAME = "nixcat";` and switch.
+      The _Name_ row is greyed, shows `nixcat`, and reads "Set in nix —
+      programs.trollshell.plugins.pet.env.PET_NAME". A `PET_NAME` still in
+      `plugin-settings.toml` is ignored (the pet answers to `nixcat`).
+- [ ] **The form outlives the plugin.** Switch `pet` off and restart the
+      shell (`systemctl --user restart trollshell`). The Settings group is
+      still there for `pet` (read from
+      `~/.local/state/trollshell/plugin-settings-schema.toml`); Save now says
+      "Saved. The plugin reads it the next time it starts." and starts
+      nothing.
+- [ ] **Hand edits are kept.** Add a comment line and a key of your own under
+      `[pet]` in `plugin-settings.toml`, then save a change from the tab. The
+      comment and your key are still there, byte for byte.
+- [ ] **(#1415 H1) A value the tab cannot show is left alone.** Write
+      `TROLLSHELL_PET_KAOMOJI = "yes"` under `[pet]` by hand and reopen the
+      pet. The form opens with Save and Revert **disabled**, and the
+      _Kaomoji face_ row's subtitle says the file holds “yes”. Change _Name_
+      and Save: `TROLLSHELL_PET_KAOMOJI = "yes"` is still in the file,
+      unchanged.
+- [ ] **(#1415 H2) Save's restart does not race the stop.** With the pet
+      running, change _Name_ and Save, three times in a row, quickly. Each
+      ends with "Saved, and the plugin restarted.", and
+      `systemctl --user is-active trollshell-plugin-pet` says `active` after
+      the last one — never a stopped pet and a "restarting the plugin
+      failed" line.
+- [ ] **(#1415 M1) The shell going away keeps the form.** Type into _Name_
+      without saving, then `systemctl --user stop trollshell`. Within a few
+      seconds the group says the shell is not answering, and your text is
+      still in the row. Start the shell again: the note goes, the text stays.
+- [ ] **The file cannot set the refused names.** Add
+      `LD_PRELOAD = "/nonexistent.so"` under `[pet]` by hand and restart the
+      pet from the tab. It starts normally, the environment
+      (`systemctl --user show -p Environment …`) has no `LD_PRELOAD`, and the
+      shell's journal has one line saying the variable is not passed.

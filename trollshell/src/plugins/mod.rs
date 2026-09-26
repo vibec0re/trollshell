@@ -173,6 +173,7 @@ mod preem_render;
 mod pump;
 mod region;
 mod session;
+pub mod settings;
 mod shader_map;
 mod version;
 mod wire_map;

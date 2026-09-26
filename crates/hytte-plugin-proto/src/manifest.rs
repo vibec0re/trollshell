@@ -480,6 +480,414 @@ impl ProvidedDatasource {
     }
 }
 
+/// One setting a plugin reads from its **environment**, declared in
+/// [`Manifest::settings`] so the control-center can render a form row for it
+/// (#1410).
+///
+/// Environment variables on purpose: that is how every plugin already takes its
+/// configuration — the bundled ones through `programs.trollshell.plugins.<id>.env`,
+/// an out-of-tree one like vibectl's widget through `V1BECTL_SCREENS` — so a
+/// plugin declares its settings and changes no other code. The value a person
+/// saves lands in `$XDG_CONFIG_HOME/trollshell/plugin-settings.toml`, one table
+/// per plugin id, and the shell's launcher passes it to the next launch as that
+/// variable. A value nix sets in the plugin's `env` wins over the file, and the
+/// Plugins tab shows it read-only as "set in nix".
+///
+/// ```
+/// use hytte_plugin_proto::manifest::{Manifest, Mount, Setting};
+///
+/// let manifest = Manifest::new("vibectl", Mount::SidebarTop)
+///     .with_setting(
+///         Setting::path("V1BECTL_SCREENS", "Screens layout file")
+///             .doc("A screens.kdl; one group per room when unset.")
+///             .default_value("~/.config/v1bectl/screens.kdl"),
+///     )
+///     .with_setting(Setting::text("V1BECTL_SERVER", "Server address"));
+/// assert_eq!(manifest.settings.len(), 2);
+/// ```
+///
+/// # What the host does with it
+///
+/// The whole declaration is **untrusted input**. The host checks it once, at
+/// registration, and drops (with one warning each) any entry it will not act
+/// on:
+///
+/// - [`env`](Setting::env) must pass [`Setting::env_refusal`] — an environment
+///   variable name, and not one the session, the loader or the plugin runtime
+///   owns.
+/// - At most 32 settings are kept, and a repeated `env` keeps its first entry.
+/// - [`label`](Setting::label), [`doc`](Setting::doc) and
+///   [`default`](Setting::default) are display text: control, bidi and
+///   zero-width characters are stripped and each is capped in length, the same
+///   treatment the host gives [`Manifest::version`].
+/// - A [`Choice`](SettingKind::Choice)'s options are **values** the plugin
+///   receives, so they are never rewritten: an option that the same treatment
+///   would change is dropped instead, and a `Choice` left with none is dropped
+///   whole.
+/// - An entry this shell cannot read ([`SettingKind::Unknown`]: a newer kind,
+///   a malformed known kind, or no readable `env`) is dropped with a warning
+///   saying which, and the rest of the manifest registers as usual.
+///
+/// The host keeps the last list each plugin id declared, so the form is there
+/// for a plugin that is switched off or fails to start without its setting.
+///
+/// Secrets do not belong here: a saved value is plain text in a config file.
+/// API keys go through the keyring (`programs.trollshell.plugins.<id>.secrets`,
+/// #392), and a setting named `*_API_KEY` is refused for that reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setting {
+    /// The environment variable the plugin reads, e.g. `"V1BECTL_SCREENS"`.
+    /// Also the setting's key in its plugin's table in `plugin-settings.toml`.
+    pub env: String,
+    /// The row's title, e.g. `"Screens layout file"`.
+    pub label: String,
+    /// One sentence shown under the row. Empty for none.
+    #[serde(default)]
+    pub doc: String,
+    /// What kind of value it takes, which decides the row the form draws.
+    pub kind: SettingKind,
+    /// What the plugin does when the variable is unset, shown as the row's
+    /// placeholder. Display text only: it is never written to the file and
+    /// never passed to the plugin — the plugin applies its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// The kind of value a [`Setting`] takes (#1410), which picks the row the
+/// control-center draws for it. Every value still reaches the plugin as an
+/// environment **string**; the kind is how it is edited and how the saved value
+/// is spelled.
+///
+/// Externally tagged, like every enum on this wire (see the crate root).
+///
+/// # Append only, and a new kind costs only its own row
+///
+/// [`Manifest::settings`] is decoded **per entry**: an entry this build cannot
+/// read — a kind it does not know, a malformed known kind, or no readable
+/// `env` at all — becomes [`SettingKind::Unknown`] saying which
+/// ([`UnknownKind::describe`]), and the rest of the manifest decodes as usual.
+/// So a plugin that declares a kind added after a shell was built still
+/// registers with that shell, and only that one setting's row is missing —
+/// unlike a [`Mount`], which is load-bearing and so decoded strictly. The
+/// leniency is on the decode side only; the bytes a known kind encodes to do
+/// not depend on it (`tests/settings_golden.rs` pins both).
+///
+/// Append a new kind before `Unknown`, and bump [`VOCAB`] like any other
+/// variant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettingKind {
+    /// Free text: an entry row.
+    Text,
+    /// A filesystem path: an entry row with a *Choose…* button that opens a
+    /// file chooser, or a folder chooser when `directory` is set. The chosen
+    /// path is passed as-is; the plugin decides what a missing file means.
+    Path {
+        /// Choose a folder rather than a file.
+        #[serde(default)]
+        directory: bool,
+    },
+    /// On/off: a switch row. Saved as a TOML boolean and passed as `true` or
+    /// `false`.
+    Bool,
+    /// A whole number within `min..=max`: a spin row. Saved as a TOML integer
+    /// and passed in decimal.
+    Int {
+        /// The smallest value the row allows.
+        min: i64,
+        /// The largest value the row allows.
+        max: i64,
+    },
+    /// One of a fixed list of strings: a drop-down. The option text is both
+    /// what the row shows and the value passed.
+    Choice {
+        /// The values to pick from, in display order.
+        options: Vec<String>,
+    },
+    /// A kind this build does not know, read out of a newer plugin's manifest
+    /// (see the enum's own doc). Never on the wire: it cannot be constructed
+    /// outside this crate ([`UnknownKind`]), and encoding one is an error. The
+    /// host drops such a setting with a warning.
+    #[serde(skip)]
+    Unknown(UnknownKind),
+}
+
+/// The payload of [`SettingKind::Unknown`]: why this build could not read the
+/// setting. Its field is private, so only this crate's decoder can make one —
+/// a plugin cannot declare an unknown kind by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownKind(Unreadable);
+
+/// Why a [`SettingKind::Unknown`] entry could not be read (#1415 second review
+/// L6): a newer plugin's kind and a malformed known one call for different
+/// fixes, so the host's warning must not confuse them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unreadable {
+    /// A kind name this build does not know — a plugin built against a newer
+    /// proto.
+    Newer(String),
+    /// A kind name this build knows, in an entry that does not decode as it
+    /// (a missing `max`, a non-string `default`, …) — a plugin whose encoder
+    /// is wrong. An empty name: the kind is missing or unreadable.
+    Malformed(String),
+    /// Not a setting at all: no readable `env`.
+    Entry,
+}
+
+/// The kind names this build decodes — [`SettingKind`]'s variants as serde
+/// spells them. `tests/settings_golden.rs` pins it against real encodings.
+pub const KNOWN_SETTING_KINDS: [&str; 5] = ["Text", "Path", "Bool", "Int", "Choice"];
+
+impl UnknownKind {
+    /// Whether the entry names a kind **newer** than this build, as opposed to
+    /// a malformed known kind or an unreadable entry.
+    #[must_use]
+    pub fn is_newer(&self) -> bool {
+        matches!(self.0, Unreadable::Newer(_))
+    }
+
+    /// One phrase for the host's warning, saying which of the three it is.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match &self.0 {
+            Unreadable::Newer(name) => {
+                format!("its kind `{name}` is newer than this shell")
+            }
+            Unreadable::Malformed(name) if name.is_empty() => "it has no readable kind".to_owned(),
+            Unreadable::Malformed(name) => {
+                format!(
+                    "it is a malformed `{name}` setting (a field is missing or of the wrong type)"
+                )
+            }
+            Unreadable::Entry => "it is not a readable setting (no `env`)".to_owned(),
+        }
+    }
+}
+
+/// [`Manifest::settings`]' decoder: one entry at a time, so an entry this
+/// build cannot read costs that entry and not the whole `Register` frame (see
+/// [`SettingKind`]'s doc). **Nothing is dropped silently**: every entry this
+/// build cannot read is kept as a [`SettingKind::Unknown`] saying why — a
+/// newer kind, a malformed known one, or not a setting at all — so the host
+/// can name it when it drops it (#1415 second review L6).
+fn lenient_settings<'de, D>(deserializer: D) -> Result<Vec<Setting>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// One entry, as far as this build can read it.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Known(Setting),
+        Named(NamedEntry),
+        Unreadable(serde::de::IgnoredAny),
+    }
+
+    /// An entry that is not a [`Setting`] this build can decode, read only as
+    /// far as its `env` and its kind's **name**. Every other field is skipped,
+    /// so a malformed one (a `default` that is not a string) cannot hide the
+    /// entry.
+    #[derive(Deserialize)]
+    struct NamedEntry {
+        env: String,
+        #[serde(default)]
+        kind: Option<KindName>,
+    }
+
+    /// An externally tagged kind's name: a bare string for a unit kind, the
+    /// single key of a map for a kind with fields. The map's values are
+    /// skipped on purpose — only the key names the kind — which is what the
+    /// zero-sized value type is for.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    #[allow(clippy::zero_sized_map_values)]
+    enum KindName {
+        Unit(String),
+        Tagged(std::collections::BTreeMap<String, serde::de::IgnoredAny>),
+    }
+
+    let unknown = |why| SettingKind::Unknown(UnknownKind(why));
+    Ok(Vec::<Entry>::deserialize(deserializer)?
+        .into_iter()
+        .map(|entry| match entry {
+            Entry::Known(setting) => setting,
+            Entry::Named(named) => {
+                let name = match named.kind {
+                    Some(KindName::Unit(name)) => name,
+                    Some(KindName::Tagged(map)) if map.len() == 1 => {
+                        map.into_keys().next().unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                let why = if name.is_empty() || KNOWN_SETTING_KINDS.contains(&name.as_str()) {
+                    Unreadable::Malformed(name)
+                } else {
+                    Unreadable::Newer(name)
+                };
+                Setting {
+                    env: named.env,
+                    label: String::new(),
+                    doc: String::new(),
+                    kind: unknown(why),
+                    default: None,
+                }
+            }
+            Entry::Unreadable(_) => Setting {
+                env: String::new(),
+                label: String::new(),
+                doc: String::new(),
+                kind: unknown(Unreadable::Entry),
+                default: None,
+            },
+        })
+        .collect())
+}
+
+/// The longest environment variable name [`Setting::env_refusal`] accepts, in
+/// bytes. Generous for any real name; keeps a hostile manifest from making the
+/// form and the settings file carry a megabyte key.
+pub const MAX_SETTING_ENV_BYTES: usize = 128;
+
+impl Setting {
+    fn new(env: impl Into<String>, label: impl Into<String>, kind: SettingKind) -> Self {
+        Self {
+            env: env.into(),
+            label: label.into(),
+            doc: String::new(),
+            kind,
+            default: None,
+        }
+    }
+
+    /// A free-text setting ([`SettingKind::Text`]).
+    #[must_use]
+    pub fn text(env: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::new(env, label, SettingKind::Text)
+    }
+
+    /// A file path ([`SettingKind::Path`] with `directory: false`).
+    #[must_use]
+    pub fn path(env: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::new(env, label, SettingKind::Path { directory: false })
+    }
+
+    /// A folder path ([`SettingKind::Path`] with `directory: true`).
+    #[must_use]
+    pub fn directory(env: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::new(env, label, SettingKind::Path { directory: true })
+    }
+
+    /// An on/off setting ([`SettingKind::Bool`]).
+    #[must_use]
+    pub fn bool(env: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::new(env, label, SettingKind::Bool)
+    }
+
+    /// A whole number in `min..=max` ([`SettingKind::Int`]).
+    #[must_use]
+    pub fn int(env: impl Into<String>, label: impl Into<String>, min: i64, max: i64) -> Self {
+        Self::new(env, label, SettingKind::Int { min, max })
+    }
+
+    /// One of `options` ([`SettingKind::Choice`]).
+    #[must_use]
+    pub fn choice<I, S>(env: impl Into<String>, label: impl Into<String>, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(
+            env,
+            label,
+            SettingKind::Choice {
+                options: options.into_iter().map(Into::into).collect(),
+            },
+        )
+    }
+
+    /// Set the one-sentence [`doc`](Setting::doc) shown under the row.
+    #[must_use]
+    pub fn doc(mut self, doc: impl Into<String>) -> Self {
+        self.doc = doc.into();
+        self
+    }
+
+    /// Set the [`default`](Setting::default) the row shows as its placeholder.
+    #[must_use]
+    pub fn default_value(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+
+    /// Why the host refuses `name` as a setting's [`env`](Setting::env), or
+    /// `None` when it accepts it.
+    ///
+    /// One rule for every reader: the host applies it to a manifest's
+    /// declaration at registration, and the launcher applies it again to every
+    /// key it reads out of `plugin-settings.toml`, because that file is
+    /// hand-editable and must not become a way to set arbitrary environment.
+    ///
+    /// Refused:
+    ///
+    /// - anything that is not `[A-Z_][A-Z0-9_]*` (uppercase ASCII, digits and
+    ///   `_`, not starting with a digit), or is longer than
+    ///   [`MAX_SETTING_ENV_BYTES`];
+    /// - `HYTTE_*` — the plugin runtime's own variables (`HYTTE_PLUGIN_ID`,
+    ///   `HYTTE_PLUGIN_MOUNT`), which nix renders;
+    /// - `LD_*` — the dynamic loader's (`LD_PRELOAD`, `LD_LIBRARY_PATH`);
+    /// - `XDG_*`, `PATH` and `HOME` — the session's, which decide where the
+    ///   plugin finds the host socket, its own files and its programs;
+    /// - `*_API_KEY` — the names the launcher injects keyring secrets under
+    ///   (#392). A key must never sit in a plain-text settings file.
+    /// - `SYSTEMD_*` and `NOTIFY_SOCKET` — systemd's. The launcher hands a
+    ///   saved value to `systemd-run` through that tool's **own** environment
+    ///   (the #984 channel), so these would configure the launcher's tool
+    ///   rather than the plugin: `SYSTEMD_LOG_TARGET=null` would silence the
+    ///   very error a failed launch reports.
+    ///
+    /// # A footgun guard, not a sandbox
+    ///
+    /// A plugin is already arbitrary code running as the user, its unit has no
+    /// sandboxing, and whoever edits `plugin-settings.toml` *is* the user. So
+    /// this list does not try to refuse every variable that loads code into a
+    /// process (`GIO_EXTRA_MODULES`, `GTK_MODULES`, `PYTHONPATH`,
+    /// `GCONV_PATH`, …): a plugin that declared one would gain nothing it did
+    /// not already have, and refusing them would be theatre. What it refuses
+    /// is what would quietly break the session or the launch, or put a key in
+    /// a plain-text file.
+    #[must_use]
+    pub fn env_refusal(name: &str) -> Option<&'static str> {
+        if name.len() > MAX_SETTING_ENV_BYTES {
+            return Some("longer than 128 bytes");
+        }
+        let mut bytes = name.bytes();
+        let well_formed = bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+            && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+        if !well_formed {
+            return Some("not an environment variable name ([A-Z_][A-Z0-9_]*)");
+        }
+        if name.starts_with("HYTTE_") {
+            return Some("HYTTE_* belongs to the plugin runtime");
+        }
+        if name.starts_with("LD_") {
+            return Some("LD_* belongs to the dynamic loader");
+        }
+        if name.starts_with("XDG_") || name == "PATH" || name == "HOME" {
+            return Some("a session variable (XDG_*, PATH, HOME)");
+        }
+        if name.starts_with("SYSTEMD_") || name == "NOTIFY_SOCKET" {
+            return Some("SYSTEMD_* and NOTIFY_SOCKET configure systemd-run, not the plugin");
+        }
+        if name.ends_with("_API_KEY") {
+            return Some(
+                "*_API_KEY is a keyring secret's name (#392); keys never go in a settings file",
+            );
+        }
+        None
+    }
+}
+
 /// A plugin's self-description, sent once in
 /// [`PluginMsg::Register`](crate::msg::PluginMsg::Register) right after it dials
 /// into the host socket. The host validates [`proto`](Manifest::proto) by exact
@@ -588,6 +996,26 @@ pub struct Manifest {
     /// [`VOCAB`]: an older host skips the unknown key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The settings the plugin reads from its environment (#1410), which the
+    /// control-center's Plugins tab turns into a form. See [`Setting`] for
+    /// what the host checks and where a saved value goes.
+    ///
+    /// Empty — the default, and what every pre-#1410 manifest decodes to —
+    /// means the tab shows no Settings group. Additive under the crate's compat
+    /// rules — same [`PROTO_VERSION`], `#[serde(default)]` for backward decode,
+    /// and `skip_serializing_if` so a settings-less manifest stays
+    /// byte-identical on the wire to a pre-#1410 one. A field, not a variant,
+    /// so it does not move [`VOCAB`]: an older host skips the unknown key along
+    /// with everything inside it.
+    ///
+    /// Decoded per entry (see [`SettingKind`]'s doc): an entry of a kind this
+    /// build does not know costs that entry, never the registration.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_settings"
+    )]
+    pub settings: Vec<Setting>,
 }
 
 impl Manifest {
@@ -613,6 +1041,7 @@ impl Manifest {
             order: None,
             provides: Vec::new(),
             version: None,
+            settings: Vec::new(),
         }
     }
 
@@ -631,6 +1060,15 @@ impl Manifest {
     #[must_use]
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
+        self
+    }
+
+    /// Declare one [`Setting`] the plugin reads from its environment (#1410),
+    /// appended to [`settings`](Manifest::settings) in call order — the order
+    /// the Plugins tab draws the rows in. Chainable off [`Manifest::new`].
+    #[must_use]
+    pub fn with_setting(mut self, setting: Setting) -> Self {
+        self.settings.push(setting);
         self
     }
 

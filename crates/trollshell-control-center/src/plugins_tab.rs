@@ -121,7 +121,7 @@
 //! floor is set on both axes.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -130,6 +130,7 @@ use std::time::{Duration, Instant, SystemTime};
 use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
+use hytte_plugin_proto::manifest::Setting;
 
 use crate::{
     CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, LogTransition, log_transition, spawn_on_runtime,
@@ -284,6 +285,23 @@ struct MountedForm {
     form: crate::config_form::Form,
 }
 
+/// One plugin's Settings group, mounted in the detail pane (#1410).
+///
+/// Keyed by everything it was built from — the plugin, what it declared, and
+/// what nix sets — so the 2 s poll leaves it (and any unsaved edit in it)
+/// alone until one of those actually changes.
+struct MountedSettings {
+    /// The plugin id this group was built for.
+    plugin: String,
+    /// The declaration it was built from.
+    schema: Vec<Setting>,
+    /// The plugin's nix `env` it was built against.
+    nix: BTreeMap<String, String>,
+    /// The form. Its group is in [`PluginDetail::plugin_page`] until this is
+    /// dropped.
+    form: crate::plugin_settings::SettingsForm,
+}
+
 /// The detail pane's live widgets. Built once and retargeted at the selected
 /// plugin — see the module docs on why there is exactly one of these.
 #[derive(Clone)]
@@ -301,6 +319,9 @@ struct PluginDetail {
     /// `None` for a plugin with no config file of its own — which is most of
     /// them.
     config: Rc<RefCell<Option<MountedForm>>>,
+    /// The selected plugin's **Settings** group (#1410), when it declared any
+    /// in its manifest — see [`refresh_settings`].
+    settings: Rc<RefCell<Option<MountedSettings>>>,
     /// The relocated on/off control: start+enable, or stop+disable.
     switch: adw::SwitchRow,
     /// The unit's own state — [`plugin_subtitle`]'s wording, unchanged.
@@ -577,6 +598,18 @@ struct PluginsState {
     /// a future edit could quietly break by moving the resolution back inside
     /// the tick.
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
+    /// The settings each plugin declared (#1410), from the last applied
+    /// `ListPluginSettings` — what [`refresh_settings`] builds the selected
+    /// plugin's Settings group from. Empty until the first answer, and for
+    /// good against a shell that predates the method.
+    schemas: Rc<RefCell<HashMap<String, Vec<Setting>>>>,
+    /// Ordering over the overlapping `ListPluginSettings` polls, on the #983
+    /// rule: an older answer never replaces a newer one.
+    schema_polls: Rc<PollGenerations>,
+    /// Whether the last applied `ListPluginSettings` failed (anything but an
+    /// older shell's `UnknownMethod`), so [`schemas`](Self::schemas) are the
+    /// last good ones and the mounted group says so (#1415 review M1).
+    schemas_stale: Rc<Cell<bool>>,
 }
 
 /// [`PluginsState`] with its widget handles held **weakly** — what the
@@ -622,6 +655,9 @@ struct WeakPluginsState {
     manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
+    schemas: Rc<RefCell<HashMap<String, Vec<Setting>>>>,
+    schema_polls: Rc<PollGenerations>,
+    schemas_stale: Rc<Cell<bool>>,
 }
 
 /// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
@@ -636,6 +672,8 @@ struct WeakPluginDetail {
     /// it strongly is what lets a handler firing during teardown still see
     /// coherent bookkeeping.
     config: Rc<RefCell<Option<MountedForm>>>,
+    /// Strongly, for [`config`](Self::config)'s reason.
+    settings: Rc<RefCell<Option<MountedSettings>>>,
     switch: glib::WeakRef<adw::SwitchRow>,
     unit_row: glib::WeakRef<adw::ActionRow>,
     conn_row: glib::WeakRef<adw::ActionRow>,
@@ -657,6 +695,7 @@ impl PluginsState {
                 stack: self.detail.stack.downgrade(),
                 plugin_page: self.detail.plugin_page.downgrade(),
                 config: self.detail.config.clone(),
+                settings: self.detail.settings.clone(),
                 switch: self.detail.switch.downgrade(),
                 unit_row: self.detail.unit_row.downgrade(),
                 conn_row: self.detail.conn_row.downgrade(),
@@ -679,6 +718,9 @@ impl PluginsState {
             manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
+            schemas: self.schemas.clone(),
+            schema_polls: self.schema_polls.clone(),
+            schemas_stale: self.schemas_stale.clone(),
         }
     }
 }
@@ -701,6 +743,7 @@ impl WeakPluginsState {
                 stack: self.detail.stack.upgrade()?,
                 plugin_page: self.detail.plugin_page.upgrade()?,
                 config: self.detail.config.clone(),
+                settings: self.detail.settings.clone(),
                 switch: self.detail.switch.upgrade()?,
                 unit_row: self.detail.unit_row.upgrade()?,
                 conn_row: self.detail.conn_row.upgrade()?,
@@ -723,6 +766,9 @@ impl WeakPluginsState {
             manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
+            schemas: self.schemas.clone(),
+            schema_polls: self.schema_polls.clone(),
+            schemas_stale: self.schemas_stale.clone(),
         })
     }
 }
@@ -878,6 +924,9 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         manifest_ids: Rc::new(RefCell::new(DeclaredManifestId::default())),
         env,
         search_path: Rc::new(OnceCell::new()),
+        schemas: Rc::new(RefCell::new(HashMap::new())),
+        schema_polls: Rc::new(PollGenerations::default()),
+        schemas_stale: Rc::new(Cell::new(false)),
     };
 
     connect_selection(&state);
@@ -1049,6 +1098,7 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
             stack,
             plugin_page,
             config: Rc::new(RefCell::new(None)),
+            settings: Rc::new(RefCell::new(None)),
             switch,
             unit_row,
             conn_row,
@@ -1114,6 +1164,7 @@ fn connect_shell_entry(state: &PluginsState) {
         // The plugin page is not what is on screen any more, so its config
         // form goes with the selection rather than polling behind this one.
         unmount_config(&state);
+        unmount_settings(&state);
         refresh_shell_forms(&state);
         show_shell_detail(&state);
         // Collapsed, this *is* the push; uncollapsed the split view already
@@ -1409,10 +1460,66 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
     let declared = refresh_declared(state);
-    let state = state.clone();
+    let poll_state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
-        on_poll_result_with_declared(&state, generation, res, &declared.mounts);
+        on_poll_result_with_declared(&poll_state, generation, res, &declared.mounts);
     });
+    // The declared settings (#1410) ride their own call beside the poll
+    // rather than a fourth element of it: a shell that predates the method
+    // must cost only the Settings group, never the unit list.
+    let schema_generation = state.schema_polls.issue();
+    let state = state.clone();
+    spawn_on_runtime(list_plugin_settings(), move |res| {
+        on_settings_result(&state, schema_generation, res);
+    });
+}
+
+/// One `ListPluginSettings` completion (#1410): keep it unless a newer one
+/// already landed, then retarget the Settings group at the selected plugin.
+///
+/// What an error means depends on which one (#1415 review M1):
+///
+/// - `UnknownMethod` is an **older shell** that has no such call: no plugin
+///   there declares settings, so the schemas are cleared and no group shows.
+/// - Anything else — a 3 s timeout, the shell restarting under a rebuild — is
+///   a shell that is **not answering right now**. The last schemas are kept,
+///   so a mounted group and the edit in it stay where they are, and the group
+///   says the shell is not answering until a poll gets through again.
+///
+/// Logged at `debug`: the call repeats on every poll.
+fn on_settings_result(
+    state: &PluginsState,
+    generation: u64,
+    res: Result<HashMap<String, String>, hytte_bus::BusError>,
+) {
+    if !state.schema_polls.accept(generation) {
+        return;
+    }
+    match res {
+        Ok(reply) => {
+            *state.schemas.borrow_mut() = crate::plugin_settings::decode_schemas(reply);
+            state.schemas_stale.set(false);
+        }
+        Err(err) if is_unknown_method(&err) => {
+            tracing::debug!(%err, "the shell has no ListPluginSettings; no Settings groups");
+            state.schemas.borrow_mut().clear();
+            state.schemas_stale.set(false);
+        }
+        Err(err) => {
+            tracing::debug!(%err, "ListPluginSettings failed; keeping the last Settings groups");
+            state.schemas_stale.set(true);
+        }
+    }
+    // Only a plugin the detail pane is actually showing; `refresh_detail`
+    // mounts the rest on selection.
+    let shown = state
+        .selected
+        .borrow()
+        .clone()
+        .filter(|id| state.snapshot.borrow().contains_key(id));
+    if let Some(id) = shown {
+        refresh_settings(state, &id);
+    }
 }
 
 /// The filesystem half of [`refresh_plugins`]'s tick: probe the search path
@@ -1706,6 +1813,11 @@ struct DeclaredFile {
     /// The declared ids whose `enabled` nix pins, i.e. whose entry carries
     /// `"_locked": ["enabled"]` (#1400): their switch is greyed.
     pinned: HashSet<String>,
+    /// Plugin id → its whole declared `env` (#1410): a declared setting nix
+    /// sets here is shown read-only in the Settings group, because the
+    /// launcher lets nix win over `plugin-settings.toml`. Only string values
+    /// — the only kind nix renders there.
+    env: HashMap<String, BTreeMap<String, String>>,
 }
 
 /// What `plugins.json` declares ([`DeclaredFile`]), parsed **at most once per
@@ -1886,10 +1998,22 @@ fn declared_from_json(text: &str) -> DeclaredFile {
         })
         .map(|(id, _)| id.clone())
         .collect();
+    let env = plugins
+        .iter()
+        .filter_map(|(id, spec)| {
+            let vars = spec.get("env")?.as_object()?;
+            let vars: BTreeMap<String, String> = vars
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect();
+            (!vars.is_empty()).then(|| (id.clone(), vars))
+        })
+        .collect();
     DeclaredFile {
         mounts,
         ids: plugins.keys().cloned().collect(),
         pinned,
+        env,
     }
 }
 
@@ -2216,6 +2340,7 @@ fn refresh_detail(state: &PluginsState) {
         state.pending.borrow_mut().take();
         // …and no plugin's *config form* is for it either (#888 P1).
         unmount_config(state);
+        unmount_settings(state);
         show_empty_detail(state);
         return;
     };
@@ -2228,6 +2353,7 @@ fn refresh_detail(state: &PluginsState) {
     state.detail.page.set_title(&id);
     state.detail.stack.set_visible_child_name("plugin");
     refresh_config(state, &id);
+    refresh_settings(state, &id);
 
     state
         .detail
@@ -2324,6 +2450,191 @@ fn unmount_config(state: &PluginsState) {
     // Explicit, and load-bearing: dropping the handle is what stops the form's
     // re-read poll.
     drop(previous);
+}
+
+/// Take the mounted Settings group (#1410) back out of the plugin page — the
+/// [`unmount_config`] shape, called from the same places, and for the same
+/// #643 reason the cell is emptied before GTK is touched.
+fn unmount_settings(state: &PluginsState) {
+    let Some(previous) = state.detail.settings.take() else {
+        return;
+    };
+    state.detail.plugin_page.remove(previous.form.group());
+}
+
+/// Mount plugin `id`'s **Settings** group (#1410), built from what it declared
+/// in its manifest ([`PluginsState::schemas`]) against what nix sets in its
+/// `env` ([`DeclaredFile::env`]) — or none, when it declared nothing.
+///
+/// Left alone while the plugin, its declaration and its nix `env` are all
+/// what the mounted group was built from, so the 2 s poll never throws away
+/// an edit the user has not saved. The group goes last on the page: after the
+/// Status group and after a [`refresh_config`] Configuration group, since
+/// that one is mounted first on every selection.
+fn refresh_settings(state: &PluginsState, id: &str) {
+    let schema = state.schemas.borrow().get(id).cloned().unwrap_or_default();
+    let nix = state
+        .declared
+        .borrow()
+        .last()
+        .env
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    let reachable = !state.schemas_stale.get();
+    let unchanged = {
+        let mounted = state.detail.settings.borrow();
+        let unchanged = mounted
+            .as_ref()
+            .is_some_and(|m| m.plugin == id && m.schema == schema && m.nix == nix);
+        if unchanged && let Some(m) = mounted.as_ref() {
+            m.form.set_shell_reachable(reachable);
+        }
+        unchanged
+    };
+    if unchanged {
+        return;
+    }
+    unmount_settings(state);
+    if schema.is_empty() {
+        return;
+    }
+    let form = crate::plugin_settings::SettingsForm::build(
+        id,
+        &schema,
+        &nix,
+        state
+            .env
+            .overlay_path(hytte_config::plugin_settings::SUBSYSTEM),
+        settings_saved(state),
+    );
+    form.set_shell_reachable(reachable);
+    state.detail.plugin_page.add(form.group());
+    *state.detail.settings.borrow_mut() = Some(MountedSettings {
+        plugin: id.to_owned(),
+        schema,
+        nix,
+        form,
+    });
+}
+
+/// The line under a Settings group while its Save's `RestartPlugin` is out.
+const APPLYING: &str = "Saved. Asking the shell to apply it…";
+
+/// What the shell answered `RestartPlugin` with, as the line under a saved
+/// Settings group (#1415 review L6). Pure, so every wording is a test.
+///
+/// - `not-declared` is a hand-installed static unit: the launcher does not
+///   launch it, so it never reads the file, and saying "restarted" there
+///   would be a lie twice over.
+/// - `not-running` depends on whether the plugin is switched on (`enabled`,
+///   from the tab's last poll): a plugin that is off picks the values up when
+///   it is switched on; one that is **on but not running** — it failed, or
+///   exited, very likely for want of this very setting — would otherwise wait
+///   for the next login, so the line says how to start it now (#1415 second
+///   review L7).
+fn restart_status(answer: &str, enabled: bool) -> &'static str {
+    match answer {
+        "relaunched" => "Saved, and the plugin restarted.",
+        "not-running" if enabled => {
+            "Saved. The plugin is switched on but not running (it may have failed to start); \
+             switch it off and on to start it with the new values."
+        }
+        "not-running" => "Saved. The plugin reads it the next time it starts.",
+        "not-declared" => {
+            "Saved, but this plugin runs from a unit file of its own, which does not read \
+             plugin-settings.toml. Nothing was restarted."
+        }
+        _ => "Saved.",
+    }
+}
+
+/// The `RestartPlugin` a Save sends. A seam, so no test ever sends one to a
+/// real session bus: under `cfg(test)` it records the id and answers that no
+/// shell is there.
+#[cfg(not(test))]
+fn send_restart(
+    id: String,
+) -> impl Future<Output = Result<String, hytte_bus::BusError>> + Send + 'static {
+    restart_plugin(id)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every id a Save asked the shell to restart, in order.
+    static SENT_RESTARTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn send_restart(
+    id: String,
+) -> impl Future<Output = Result<String, hytte_bus::BusError>> + Send + 'static {
+    SENT_RESTARTS.with(|sent| sent.borrow_mut().push(id));
+    std::future::ready(Err(hytte_bus::BusError::Permanent {
+        reason: "no shell under test".to_owned(),
+        dbus_name: None,
+    }))
+}
+
+/// The ids every Save on this thread asked the shell to restart, draining the
+/// record.
+#[cfg(all(test, feature = "system-tests"))]
+fn take_sent_restarts() -> Vec<String> {
+    SENT_RESTARTS.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
+}
+
+/// What a Settings group does after it saved (#1410): ask the shell to apply
+/// the values, and put its answer under the rows.
+///
+/// **Always** one `RestartPlugin`, off the GTK thread, whatever this tab's
+/// last poll said (#1415 second review M1). The poll can be two seconds
+/// stale: a Save made while an earlier one is still restarting the plugin
+/// sees `deactivating` or `inactive` there, and skipping the call on that
+/// would write the file and never apply it. The shell answers after any
+/// restart already under way, from the unit's current state — relaunching a
+/// running plugin with the file as it is now, starting nothing that is not
+/// running — so its answer, not this tab's guess, picks the line.
+fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
+    let weak = state.downgrade();
+    Rc::new(
+        move |id: &str, form: &crate::plugin_settings::SettingsForm| {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            form.set_status(APPLYING, false);
+            let form = form.clone();
+            let weak = weak.clone();
+            let plugin = id.to_owned();
+            spawn_on_runtime(send_restart(plugin.clone()), move |res| {
+                let state = weak.upgrade();
+                let enabled = state.as_ref().is_some_and(|state| {
+                    state
+                        .snapshot
+                        .borrow()
+                        .get(&plugin)
+                        .is_some_and(|snap| snap.enabled)
+                });
+                match res {
+                    Ok(answer) => {
+                        form.set_status(restart_status(&answer, enabled), false);
+                        // Only an answer can have moved the unit; re-poll so
+                        // the row and the switch catch up with it.
+                        if let Some(state) = &state {
+                            refresh_plugins_soon(state);
+                        }
+                    }
+                    Err(err) if is_unknown_method(&err) => form.set_status(
+                        "Saved, but this shell cannot restart plugins for their settings \
+                         (it predates RestartPlugin). Switch the plugin off and on to apply it.",
+                        true,
+                    ),
+                    Err(err) => {
+                        form.set_status(&format!("Saved, but applying it failed: {err}"), true);
+                    }
+                }
+            });
+        },
+    )
 }
 
 fn refresh_config(state: &PluginsState, id: &str) {
@@ -2941,13 +3252,20 @@ const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 fn classify_versions(res: &Result<PollVersions, hytte_bus::BusError>) -> VersionsOutcome {
     match res {
         Ok(_) => VersionsOutcome::Ok,
-        Err(hytte_bus::BusError::Permanent { dbus_name, reason })
-            if dbus_name.as_deref() == Some(UNKNOWN_METHOD) || reason.contains("UnknownMethod") =>
-        {
-            VersionsOutcome::UnknownMethod
-        }
+        Err(err) if is_unknown_method(err) => VersionsOutcome::UnknownMethod,
         Err(_) => VersionsOutcome::Failed,
     }
+}
+
+/// Whether `err` is the shell saying it has no such method — an older shell
+/// than this control-center, rather than one that failed to answer. Shared
+/// by every additive `Control` call this tab degrades on.
+fn is_unknown_method(err: &hytte_bus::BusError) -> bool {
+    matches!(
+        err,
+        hytte_bus::BusError::Permanent { dbus_name, reason }
+            if dbus_name.as_deref() == Some(UNKNOWN_METHOD) || reason.contains("UnknownMethod")
+    )
 }
 
 /// Whether to log `now` given the previous outcome: only on a change, and
@@ -3048,28 +3366,86 @@ fn already_stopped(err: &hytte_bus::BusError) -> bool {
     err.to_string().contains(" not loaded.")
 }
 
-/// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`. A
-/// slightly longer timeout — the shell drives a systemd job to apply it.
+/// How long the tab waits for a call that takes the shell's plugin
+/// convergence lock — `StartPlugin`, `SetPluginEnabled` — before it gives up
+/// (#1415 second review L1).
+///
+/// It must outlast the longest the lock can be held by a restart already
+/// under way — the stop, the wait of up to 12 s for the unit to go down, the
+/// keyring read, `systemd-run` — because a call the tab gives up on is **not**
+/// cancelled in the shell: it still runs when the lock frees. A shorter wait
+/// would report "not changed" for a change the shell then makes anyway (a
+/// switch flipped off during a stuck restart, persisted seconds after the tab
+/// said it was not).
+const LOCKED_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`,
+/// with [`LOCKED_CALL_TIMEOUT`]: the shell drives a systemd job to apply it,
+/// and a start queues behind any restart holding the convergence lock.
 async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method(method)
         .args((id.to_owned(),))
-        .timeout(Duration::from_secs(5))
+        .timeout(LOCKED_CALL_TIMEOUT)
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
 }
 
-/// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
+/// `ListPluginSettings` → `{id: JSON}` (#1410): the settings each plugin
+/// declared, decoded by [`crate::plugin_settings::decode_schemas`].
+async fn list_plugin_settings() -> Result<HashMap<String, String>, hytte_bus::BusError> {
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("ListPluginSettings")
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<HashMap<String, String>>()
+        .await
+}
+
+/// How long a `RestartPlugin` may take before the tab stops waiting for its
+/// answer: its own hold of the convergence lock (the shell waits up to 12 s
+/// for the old unit to go down, past its 10 s `TimeoutStopSec=`, then
+/// launches the new one) **plus** a whole restart queued ahead of it — a
+/// second Save's call waits for the first's.
+#[cfg_attr(test, allow(dead_code))]
+const RESTART_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// `RestartPlugin(id)` → what the shell did (#1410, #1415 review H2): one
+/// call, which runs the stop, the wait through `deactivating` and the
+/// relaunch under the launcher's convergence lock. The answer is a word —
+/// `relaunched`, `not-running`, `not-declared` — that [`restart_status`]
+/// turns into the line under the group.
+///
+/// Not called under `cfg(test)`, where [`send_restart`] records the call
+/// instead of reaching a session bus.
+#[cfg_attr(test, allow(dead_code))]
+async fn restart_plugin(id: String) -> Result<String, hytte_bus::BusError> {
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("RestartPlugin")
+        .args((id,))
+        .timeout(RESTART_TIMEOUT)
+        .retry(RetryPolicy::Never)
+        .send::<String>()
+        .await
+}
+
+/// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state,
+/// with [`LOCKED_CALL_TIMEOUT`] — the shell persists it under the convergence
+/// lock.
 async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetPluginEnabled")
         .args((id.to_owned(), enabled))
-        .timeout(Duration::from_secs(5))
+        .timeout(LOCKED_CALL_TIMEOUT)
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
@@ -4207,6 +4583,75 @@ mod tests {
             checked >= 12,
             "expected at least 12 table rows (#1372's ask), found {checked} — did the table \
              lose its data rows to a bad edit?"
+        );
+    }
+
+    /// #1415 review L6: what the Save line says for each `RestartPlugin`
+    /// answer — never "restarted" for a static unit, which never reads the
+    /// file, nor for a plugin that was not running.
+    #[test]
+    fn the_save_line_says_what_the_shell_did() {
+        for enabled in [false, true] {
+            assert_eq!(
+                super::restart_status("relaunched", enabled),
+                "Saved, and the plugin restarted."
+            );
+            let static_unit = super::restart_status("not-declared", enabled);
+            assert!(
+                static_unit.contains("does not read") && !static_unit.contains("plugin restarted"),
+                "{static_unit}"
+            );
+            assert_eq!(super::restart_status("something-newer", enabled), "Saved.");
+        }
+        assert_eq!(
+            super::restart_status("not-running", false),
+            "Saved. The plugin reads it the next time it starts."
+        );
+        // #1415 second review L7: switched on but not running — the plugin
+        // that "cannot start without its setting" — is told how to start it,
+        // not to wait for a next start nothing will trigger.
+        let failed = super::restart_status("not-running", true);
+        assert!(
+            failed.contains("switch it off and on") && !failed.contains("next time"),
+            "{failed}"
+        );
+    }
+
+    /// Only `UnknownMethod` is "an older shell"; a timeout is not.
+    #[test]
+    fn only_unknown_method_means_an_older_shell() {
+        assert!(super::is_unknown_method(&hytte_bus::BusError::Permanent {
+            reason: "No such method".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.UnknownMethod".to_owned()),
+        }));
+        assert!(!super::is_unknown_method(&hytte_bus::BusError::Permanent {
+            reason: "Did not receive a reply".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.NoReply".to_owned()),
+        }));
+    }
+
+    /// #1410: the Settings group reads the plugin's whole nix `env` to grey
+    /// what nix sets — every string value, per plugin, and nothing for a
+    /// plugin with no `env`.
+    #[test]
+    fn the_declared_env_is_read_whole_for_the_settings_group() {
+        let file = declared_from_json(
+            r#"{"plugins":{
+                "vibectl":{"exec":"/x","env":{"V1BECTL_SERVER":"h:1","HYTTE_PLUGIN_MOUNT":"BarLeft","N":3}},
+                "timer":{"exec":"/t"}
+            }}"#,
+        );
+        assert_eq!(
+            file.env["vibectl"],
+            std::collections::BTreeMap::from([
+                ("HYTTE_PLUGIN_MOUNT".to_owned(), "BarLeft".to_owned()),
+                ("V1BECTL_SERVER".to_owned(), "h:1".to_owned()),
+            ])
+        );
+        assert!(!file.env.contains_key("timer"));
+        assert_eq!(
+            file.mounts["vibectl"], "BarLeft",
+            "the #1161 read is unchanged"
         );
     }
 }
@@ -6609,6 +7054,347 @@ mod gtk_tests {
             Some("plugin".to_owned())
         );
 
+        dismiss(&window);
+    }
+
+    /// #1410: a plugin that declared settings gets a **Settings** group built
+    /// from `ListPluginSettings`, with the variable its nix `env` sets shown
+    /// read-only; a plugin that declared none gets no group. A poll that
+    /// changes nothing keeps the mounted group — and the edit in it — and a
+    /// save for a plugin that is not running writes the file and says the
+    /// plugin reads it at its next start rather than restarting anything.
+    #[gtk::test]
+    fn a_plugin_that_declares_settings_gets_a_settings_group() {
+        use crate::plugin_settings::{Chooser, RowView};
+        use hytte_plugin_proto::manifest::Setting;
+
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"version":1,"plugins":{
+                "vibectl":{"exec":"/x/bin/v1bectl_widget","enabled":true,
+                           "env":{"V1BECTL_SERVER":"host:31337"}},
+                "timer":{"exec":"/x/bin/hytte-plugin-timer","enabled":false}
+            }}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (bin, state) = build_tab_in(env);
+        super::refresh_declared(&state);
+        apply_state(&state, &["timer", "vibectl"], "inactive");
+        let window = present(&bin, 640);
+
+        let declared = serde_json::to_string(&[
+            Setting::path("V1BECTL_SCREENS", "Screens layout file"),
+            Setting::text("V1BECTL_SERVER", "Server address"),
+        ])
+        .expect("encodes");
+        let reply = || HashMap::from([("vibectl".to_owned(), declared.clone())]);
+        super::on_settings_result(&state, state.schema_polls.issue(), Ok(reply()));
+
+        click(&state, "vibectl");
+        let group = {
+            let mounted = state.detail.settings.borrow();
+            let form = &mounted.as_ref().expect("vibectl declared settings").form;
+            assert_eq!(
+                form.rows(),
+                vec![
+                    (
+                        "V1BECTL_SCREENS".to_owned(),
+                        RowView::Entry {
+                            placeholder: None,
+                            chooser: Some(Chooser::File),
+                        }
+                    ),
+                    (
+                        "V1BECTL_SERVER".to_owned(),
+                        RowView::Nix {
+                            subtitle:
+                                "Set in nix — programs.trollshell.plugins.vibectl.env.V1BECTL_SERVER"
+                                    .to_owned(),
+                            sensitive: false,
+                        }
+                    ),
+                ]
+            );
+            assert!(
+                form.group()
+                    .ancestor(adw::PreferencesPage::static_type())
+                    .is_some_and(
+                        |page| page == state.detail.plugin_page.clone().upcast::<gtk::Widget>()
+                    ),
+                "the group is on the plugin page"
+            );
+            form.type_into("V1BECTL_SCREENS", "/home/u/screens.kdl");
+            form.group().clone()
+        };
+
+        // The next poll brings the same declaration: nothing is rebuilt, so
+        // the unsaved edit is still there.
+        super::on_settings_result(&state, state.schema_polls.issue(), Ok(reply()));
+        refresh_detail(&state);
+        {
+            let mounted = state.detail.settings.borrow();
+            let form = &mounted.as_ref().expect("still mounted").form;
+            assert!(form.group() == &group, "the same group, not a rebuild");
+            assert!(form.is_dirty(), "the edit survived the poll");
+            let _ = super::take_sent_restarts();
+            form.press_save();
+            assert_eq!(form.status(), super::APPLYING);
+            assert_eq!(
+                super::take_sent_restarts(),
+                ["vibectl"],
+                "the shell, not the tab, decides whether a stopped plugin restarts"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(config_home.join("trollshell").join("plugin-settings.toml"))
+                .expect("saved under the tab's own config home"),
+            "[vibectl]\nV1BECTL_SCREENS = \"/home/u/screens.kdl\"\n",
+            "the nix-set variable is never written"
+        );
+
+        click(&state, "timer");
+        assert!(
+            state.detail.settings.borrow().is_none(),
+            "a plugin that declared nothing has no Settings group"
+        );
+        assert!(group.parent().is_none(), "and vibectl's left the page");
+
+        click(&state, "vibectl");
+        assert!(state.detail.settings.borrow().is_some(), "back again");
+
+        dismiss(&window);
+    }
+
+    /// A tab over a scratch `plugins.json` declaring `vibectl` with `env`,
+    /// the plugin shown and a declaration of two text settings applied —
+    /// what the three tests below start from.
+    fn settings_fixture(
+        env_json: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        adw::BreakpointBin,
+        PluginsState,
+        gtk::Window,
+        String,
+    ) {
+        use hytte_plugin_proto::manifest::Setting;
+
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        let plugins_json = config_home.join("trollshell").join("plugins.json");
+        std::fs::write(
+            &plugins_json,
+            format!(
+                r#"{{"version":1,"plugins":{{
+                    "vibectl":{{"exec":"/x/bin/v1bectl_widget","enabled":true,"env":{env_json}}}
+                }}}}"#
+            ),
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (bin, state) = build_tab_in(env);
+        super::refresh_declared(&state);
+        apply_state(&state, &["vibectl"], "active");
+        let window = present(&bin, 640);
+        let declared = serde_json::to_string(&[
+            Setting::text("V1BECTL_SERVER", "Server"),
+            Setting::text("V1BECTL_SCREENS", "Screens"),
+        ])
+        .expect("encodes");
+        super::on_settings_result(
+            &state,
+            state.schema_polls.issue(),
+            Ok(HashMap::from([("vibectl".to_owned(), declared.clone())])),
+        );
+        click(&state, "vibectl");
+        (tree, plugins_json, bin, state, window, declared)
+    }
+
+    /// #1415 review M1 (the reviewer's killing test, adapted): one failed
+    /// `ListPluginSettings` — a timeout, the shell restarting — leaves the
+    /// mounted form and the edit in it alone, and the group says the shell is
+    /// not answering until a poll gets through again. Only an older shell's
+    /// `UnknownMethod` takes the group away.
+    ///
+    /// Red before the fix: the error cleared the schemas, which unmounted the
+    /// group and threw the edit away.
+    #[gtk::test]
+    fn a_failed_settings_poll_keeps_the_form_and_the_unsaved_edit() {
+        adw::init().expect("libadwaita init");
+        let (_tree, _json, _bin, state, window, declared) = settings_fixture("{}");
+        let form = |state: &PluginsState| {
+            state
+                .detail
+                .settings
+                .borrow()
+                .as_ref()
+                .map(|m| m.form.clone())
+        };
+        form(&state)
+            .expect("mounted")
+            .type_into("V1BECTL_SERVER", "typed, not saved yet");
+
+        super::on_settings_result(
+            &state,
+            state.schema_polls.issue(),
+            Err(hytte_bus::BusError::Permanent {
+                reason: "Did not receive a reply".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.NoReply".to_owned()),
+            }),
+        );
+        let kept = form(&state).expect("one failed poll unmounted the form");
+        assert!(kept.is_dirty(), "the edit survived");
+        assert!(
+            kept.says_offline(),
+            "and the group says the shell is not answering"
+        );
+
+        super::on_settings_result(
+            &state,
+            state.schema_polls.issue(),
+            Ok(HashMap::from([("vibectl".to_owned(), declared)])),
+        );
+        let back = form(&state).expect("still mounted");
+        assert!(
+            back.is_dirty() && !back.says_offline(),
+            "the note goes, the edit stays"
+        );
+
+        super::on_settings_result(
+            &state,
+            state.schema_polls.issue(),
+            Err(hytte_bus::BusError::Permanent {
+                reason: "No such method".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.UnknownMethod".to_owned()),
+            }),
+        );
+        assert!(
+            form(&state).is_none(),
+            "an older shell has no Settings group"
+        );
+        dismiss(&window);
+    }
+
+    /// #1415 review CC3: `ListPluginSettings` answers are ordered like the
+    /// unit poll's (#983) — an older answer that lands after a newer one is
+    /// dropped, rather than putting back a form the newer one took away.
+    #[gtk::test]
+    fn an_older_settings_answer_never_replaces_a_newer_one() {
+        adw::init().expect("libadwaita init");
+        let (_tree, _json, _bin, state, window, declared) = settings_fixture("{}");
+        let older = state.schema_polls.issue();
+        let newer = state.schema_polls.issue();
+        super::on_settings_result(&state, newer, Ok(HashMap::new()));
+        assert!(
+            state.detail.settings.borrow().is_none(),
+            "the newer answer declares nothing"
+        );
+        super::on_settings_result(
+            &state,
+            older,
+            Ok(HashMap::from([("vibectl".to_owned(), declared)])),
+        );
+        assert!(
+            state.detail.settings.borrow().is_none(),
+            "a stale answer put the form back"
+        );
+        dismiss(&window);
+    }
+
+    /// #1415 review CC2: a nix `env` that starts setting a declared variable
+    /// while the group is mounted turns that row read-only on the next poll,
+    /// without a reselect — otherwise Save would write a key the launcher then
+    /// ignores.
+    #[gtk::test]
+    fn a_nix_env_change_rebuilds_the_group() {
+        use crate::plugin_settings::RowView;
+
+        adw::init().expect("libadwaita init");
+        let (_tree, plugins_json, _bin, state, window, _declared) = settings_fixture("{}");
+        let server_row = |state: &PluginsState| {
+            state
+                .detail
+                .settings
+                .borrow()
+                .as_ref()
+                .expect("mounted")
+                .form
+                .rows()
+                .into_iter()
+                .find(|(env, _)| env == "V1BECTL_SERVER")
+                .map(|(_, view)| view)
+                .expect("a row for it")
+        };
+        assert!(matches!(server_row(&state), RowView::Entry { .. }));
+
+        std::fs::write(
+            &plugins_json,
+            r#"{"version":1,"plugins":{
+                "vibectl":{"exec":"/x/bin/v1bectl_widget","enabled":true,
+                           "env":{"V1BECTL_SERVER":"from-nix:1","PADDING":"so the length moves"}}
+            }}"#,
+        )
+        .expect("rewrite");
+        super::refresh_declared(&state);
+        refresh_detail(&state);
+        assert!(
+            matches!(
+                server_row(&state),
+                RowView::Nix {
+                    sensitive: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            server_row(&state)
+        );
+        dismiss(&window);
+    }
+
+    /// #1415 second review M1 (the reviewer's probe, inverted): a Save made
+    /// while the tab's last poll shows the plugin mid-restart
+    /// (`deactivating`, or already `inactive`) still asks the shell, which
+    /// answers after the restart under way and applies this Save's values too.
+    ///
+    /// Red before the fix: the tab skipped `RestartPlugin` on its stale
+    /// poll and said "Saved. The plugin reads it the next time it starts." —
+    /// for a plugin that had just started with the previous Save's values.
+    #[gtk::test]
+    fn a_save_during_a_restart_in_flight_still_asks_the_shell() {
+        adw::init().expect("libadwaita init");
+        let (_tree, _json, _bin, state, window, _declared) = settings_fixture("{}");
+        for active_state in ["deactivating", "inactive", "failed"] {
+            apply_state(&state, &["vibectl"], active_state);
+            let form = state
+                .detail
+                .settings
+                .borrow()
+                .as_ref()
+                .map(|m| m.form.clone())
+                .expect("still mounted");
+            form.type_into("V1BECTL_SERVER", active_state);
+            let _ = super::take_sent_restarts();
+            form.press_save();
+            assert_eq!(form.status(), super::APPLYING, "{active_state}");
+            assert_eq!(super::take_sent_restarts(), ["vibectl"], "{active_state}");
+        }
         dismiss(&window);
     }
 }

@@ -31,15 +31,27 @@ pub(super) const MAX_VERSION_CHARS: usize = 64;
 ///   plugin that declared nothing — never a blank cell.
 #[must_use]
 pub(super) fn sanitize(raw: Option<&str>) -> Option<String> {
-    let cleaned: String = raw?.chars().filter(|&c| !is_dropped(c)).collect();
+    sanitize_capped(raw?, MAX_VERSION_CHARS)
+}
+
+/// [`sanitize`] at a cap of the caller's choosing — the same stripping,
+/// trimming and visible `…` truncation, for the other plugin-declared display
+/// text the host shows (#1410's setting labels, docs and defaults, in
+/// `plugins::settings`). One copy of the rule rather than two, so the two
+/// kinds of untrusted text cannot drift apart on what counts as invisible.
+///
+/// `max_chars` must be at least 1; the ellipsis takes the last slot.
+#[must_use]
+pub(super) fn sanitize_capped(raw: &str, max_chars: usize) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|&c| !is_dropped(c)).collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.chars().count() <= MAX_VERSION_CHARS {
+    if trimmed.chars().count() <= max_chars {
         return Some(trimmed.to_owned());
     }
-    let mut capped: String = trimmed.chars().take(MAX_VERSION_CHARS - 1).collect();
+    let mut capped: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
     capped.push('…');
     Some(capped)
 }

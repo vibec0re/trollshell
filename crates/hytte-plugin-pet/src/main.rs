@@ -52,6 +52,7 @@ mod font;
 use std::time::Duration;
 
 use brain::{ThinkKind, ThinkReq};
+use hytte_plugin::proto::manifest::Setting;
 use hytte_plugin::proto::{Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::tokio::sync::mpsc;
 use hytte_plugin::tokio_stream::StreamExt as _;
@@ -239,7 +240,26 @@ impl Plugin for Pet {
         // region sorts `(order, id)` ascending, lower renders higher (#303).
         let mut m = Manifest::new(brain::PLUGIN_ID, Mount::SidebarBottom)
             .with_version(env!("CARGO_PKG_VERSION"))
-            .with_order(-1);
+            .with_order(-1)
+            // The knobs a person tunes by hand (#1410), as a form in the
+            // control-center's Plugins tab. The LLM wiring (`PET_LLM_*`) stays
+            // off it: those are deployment details, and a key never goes in
+            // a plain-text settings file anyway.
+            .with_setting(
+                Setting::text("PET_NAME", "Name")
+                    .doc("What the pet calls itself when its brain is on.")
+                    .default_value("nisse"),
+            )
+            .with_setting(
+                Setting::text("PET_PERSONA", "Persona")
+                    .doc("A style clause for the pet's replies.")
+                    .default_value("playful, a little sassy"),
+            )
+            .with_setting(
+                Setting::bool("TROLLSHELL_PET_KAOMOJI", "Kaomoji face")
+                    .doc("Draw the text face instead of the pixel cat.")
+                    .default_value("false"),
+            );
         m.subscribes = vec![StateKey::Clock];
         m
     }

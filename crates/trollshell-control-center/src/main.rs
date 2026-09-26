@@ -50,6 +50,7 @@ mod agents_tab;
 mod ai_keys_tab;
 mod config_form;
 mod places_tab;
+mod plugin_settings;
 mod plugins_tab;
 #[cfg(all(test, feature = "system-tests"))]
 mod test_support;

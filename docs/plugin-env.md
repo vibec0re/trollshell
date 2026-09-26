@@ -62,6 +62,120 @@ systemd, not something you set per-plugin — they're omitted from the tables
 below and noted inline only where a plugin's behavior depends on them in a
 non-obvious way.
 
+## Settings in the Plugins tab (#1410)
+
+A plugin can **declare** the variables it reads, and the control-center's
+Plugins tab then shows a **Settings** group for it: an entry per text or path
+setting (with a _Choose…_ button for a path), a switch, a number, or a
+drop-down. Nothing else about the plugin changes; it still reads its
+environment.
+
+### Where the values go
+
+Saved values land in `~/.config/trollshell/plugin-settings.toml`
+(`$XDG_CONFIG_HOME`), one table per plugin **id** — the
+`programs.trollshell.plugins.<id>` name, so two instances of one binary
+(`stats` on the bar and on the sidebar) keep separate values. It is config, not
+state: edit it by hand if you like, and the tab keeps your comments and
+formatting when it saves.
+
+```toml
+[vibectl]
+V1BECTL_SCREENS = "/home/me/.config/v1bectl/screens.kdl"
+```
+
+The shell's launcher passes each value as that variable the next time it
+starts the plugin, and **Save** asks the shell to restart a running plugin
+(`Control.RestartPlugin`) so the change takes effect at once. A hand edit is
+not watched: it applies the next time the plugin starts, like any change to
+the environment of a process that is already running. Precedence for one
+variable:
+
+1. `programs.trollshell.plugins.<id>.env` in nix. The tab shows that row
+   read-only, "Set in nix".
+2. `plugin-settings.toml`.
+3. The plugin's own default, when neither sets it. Clearing a field (or
+   choosing _Default_, or the reset button on a switch or number) is how you
+   get back here.
+
+Save writes only the rows you changed. A value the tab cannot show — a choice
+that is not one of the plugin's options, a number outside its range, a switch
+written as `yes` — is shown for what it is and kept exactly as the file has
+it until you change that row.
+
+The launcher reads the file for every plugin it launches, before that plugin
+has ever said what it declares, so it accepts any key in the plugin's table —
+but never one of the names below, so the file cannot become a way to set
+`LD_PRELOAD` or `PATH`. A value no environment can carry (one with a NUL in
+it, or longer than 32 KiB) is skipped with a warning rather than failing the
+plugin's whole launch. The values reach `systemd-run` through its own
+environment, like a secret (#984), not through its world-readable argv, and
+they are not part of the unit's fingerprint either (that also rides the
+argv). A legacy static unit is not launched by the launcher and does not see
+the file; the tab's Save says so.
+
+**Secrets still don't belong here**: the file is plain text. API keys go
+through `secrets` and the keyring, as above.
+
+### Declaring settings (plugin authors)
+
+Add them to the manifest with `Manifest::with_setting`. The types live in the
+wire crate, which the SDK re-exports as `hytte_plugin::proto`:
+
+```rust
+use hytte_plugin::proto::manifest::{Manifest, Mount, Setting};
+
+fn manifest() -> Manifest {
+    Manifest::new("vibectl", Mount::SidebarTop)
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .with_setting(
+            Setting::path("V1BECTL_SCREENS", "Screens layout file")
+                .doc("A screens.kdl. Without one, each room is its own group.")
+                .default_value("~/.config/v1bectl/screens.kdl"),
+        )
+        .with_setting(Setting::text("V1BECTL_SERVER", "Server address"))
+}
+```
+
+The kinds are `Setting::text`, `path`, `directory` (a folder chooser),
+`bool` (passed as `true`/`false`), `int(env, label, min, max)` (passed in
+decimal) and `choice(env, label, options)` (passed as the option's text).
+`default_value` is only what the row shows as a placeholder; the plugin still
+applies its own default when the variable is unset.
+
+The shell checks the declaration when the plugin registers and drops, with a
+warning in its journal, any setting whose variable:
+
+- is not `[A-Z_][A-Z0-9_]*`, or is longer than 128 bytes;
+- is `HYTTE_*` (the plugin runtime's own), `LD_*`, `XDG_*`, `PATH` or `HOME`;
+- is `SYSTEMD_*` or `NOTIFY_SOCKET` (these would configure `systemd-run`
+  itself, which carries the values);
+- ends in `_API_KEY` (the keyring's names, #392);
+- repeats an earlier one.
+
+That list is a guard against footguns, **not a sandbox**. A plugin is already
+code running as you, so it deliberately does not refuse the variables that
+load code into a process (`GIO_EXTRA_MODULES`, `GTK_MODULES`, `PYTHONPATH`, …):
+a plugin declaring one would gain nothing it did not already have.
+
+It keeps at most 32, strips control and bidi characters from labels and docs,
+drops a `Choice` option that isn't plain text (rather than change a value the
+plugin would receive), and drops an `Int` whose `min` exceeds its `max`.
+`Setting::env_refusal` is the name rule, if you want to check yours in a test.
+
+The shell remembers the last list each plugin id declared
+(`$XDG_STATE_HOME/trollshell/plugin-settings-schema.toml`), so the form is
+there for a plugin that is switched off, or one that cannot start without its
+setting. A plugin has to have registered once for its form to appear, and an
+id is forgotten once `plugins.json` stops declaring it (unless it registered
+this session).
+
+Declaring settings needs no protocol bump: an older shell ignores the list,
+and a plugin that declares none sends exactly the bytes it sent before. A
+shell that does not know one of your setting **kinds** drops that one setting
+and registers the plugin as usual, so adding a kind later never locks a
+plugin out of an older shell.
+
 ## New-install checklist
 
 Most of what's below is already owner-neutral out of the box — unset, or a

@@ -28,6 +28,7 @@ fn sample_manifest() -> Manifest {
         order: None,
         provides: Vec::new(),
         version: None,
+        settings: Vec::new(),
     }
 }
 

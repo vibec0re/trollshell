@@ -329,6 +329,81 @@ impl ControlIface {
             .collect()
     }
 
+    /// The settings each plugin declared in its manifest (#1410), as
+    /// `id → JSON` (`a{ss}`): the value is a JSON array of
+    /// `hytte_plugin_proto::manifest::Setting`, exactly as serde spells that
+    /// type (`{"env":…,"label":…,"doc":…,"kind":{"Path":{"directory":false}},
+    /// "default":…}`, a unit kind as the bare string `"Text"`).
+    ///
+    /// JSON rather than a D-Bus struct because a setting's `kind` is a tagged
+    /// union with per-variant fields, which a D-Bus signature can only carry
+    /// as a variant the control-center would then unpick by hand; serde's own
+    /// spelling lets it decode straight into the proto's types, so the two ends
+    /// share one definition. Additive beside
+    /// [`list_plugin_versions`](Self::list_plugin_versions), so no existing
+    /// signature changes.
+    ///
+    /// Not only the connected plugins are here: each id's last declaration is
+    /// remembered under `$XDG_STATE_HOME`, so a plugin that is switched off,
+    /// or cannot start without its setting, still has a form. An id is
+    /// forgotten once `plugins.json` stops declaring it and it has not
+    /// registered this session (#1415 review L3). A plugin that declares none
+    /// is absent. Every list is already sanitised (`plugins::settings`).
+    async fn list_plugin_settings(&self) -> std::collections::HashMap<String, String> {
+        let declared = plugin_launcher::declared_ids().await;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            crate::plugins::settings::snapshot(declared.as_ref())
+        });
+        let schemas = match snapshot.await {
+            Ok(schemas) => schemas,
+            Err(err) => {
+                tracing::warn!(%err, "ListPluginSettings: reading the settings store failed");
+                return std::collections::HashMap::new();
+            }
+        };
+        schemas
+            .into_iter()
+            .filter_map(|(id, list)| match serde_json::to_string(&list) {
+                Ok(json) => Some((id, json)),
+                Err(err) => {
+                    tracing::warn!(plugin = %id, %err, "ListPluginSettings: could not encode a plugin's settings");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Restart plugin `id` so it reads `plugin-settings.toml` again (#1410) —
+    /// what the Plugins tab's Settings group calls once after a Save.
+    ///
+    /// One call, where the tab used to send `StopPlugin` then `StartPlugin`
+    /// itself (#1415 review H2): the launcher runs the stop, the wait for the
+    /// unit to be really down (through `deactivating`) and the relaunch under
+    /// its own convergence lock, so no reconcile or second Save lands in
+    /// between. Answers what it did, as a word
+    /// ([`plugin_launcher::SettingsRestart::wire_name`]):
+    ///
+    /// - `"relaunched"` — it was running, and now runs with the saved values;
+    /// - `"not-running"` — declared but stopped: nothing was started, and the
+    ///   values apply at its next start;
+    /// - `"not-declared"` — a hand-installed static unit, which the launcher
+    ///   does not launch and which never reads the file: left alone.
+    ///
+    /// The tab sends this after **every** Save, whatever its own last poll
+    /// said: the answer is decided here, after any restart already under way,
+    /// so a Save made while an earlier one is still restarting the plugin is
+    /// applied too (#1415 second review).
+    ///
+    /// # Errors
+    /// A `plugins.json` that exists but cannot be read (never answered as
+    /// `not-declared`), or a failed unit listing, stop or relaunch.
+    async fn restart_plugin(&self, id: String) -> zbus::fdo::Result<String> {
+        plugin_launcher::restart_for_settings(&id)
+            .await
+            .map(|outcome| outcome.wire_name().to_owned())
+            .map_err(|err| fail(&id, &err, "RestartPlugin"))
+    }
+
     // ── AI keys (#392) ──────────────────────────────────────────────────────
     //
     // Store the LLM-backed plugins' API keys in the login keyring

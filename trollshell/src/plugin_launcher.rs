@@ -315,6 +315,53 @@
 //! static unit's file exists. To hand an id to a static unit entirely, drop it
 //! from `availablePlugins` (and `plugins`), so it is undeclared again.
 //!
+//! ## Plugin settings (#1410)
+//!
+//! A plugin may declare the environment variables it reads in its manifest,
+//! and the control-center's Plugins tab turns those into a form whose values
+//! land in `$XDG_CONFIG_HOME/trollshell/plugin-settings.toml`
+//! ([`hytte_config::plugin_settings`]), one table per plugin id. This module
+//! is the file's reader: [`load_declared_from`] folds each id's table into its
+//! spec ([`fold_settings`]), so every launch path sees the same values. The
+//! rules, all in [`settings_env`]:
+//!
+//! - **nix wins.** A variable the plugin's `plugins.json` `env` sets is not
+//!   taken from the file; the tab shows that row read-only as "set in nix".
+//! - **The name rule is applied here too.** The launcher launches a plugin
+//!   before that plugin has ever told anyone its schema, so it cannot check a
+//!   key against what the plugin declared; it accepts any key in the plugin's
+//!   table instead, and applies the proto's `Setting::env_refusal` to each —
+//!   the same rule the host applies to a manifest — because the file is
+//!   hand-editable and must not become a way to set `LD_PRELOAD` or `PATH`.
+//!   That rule also refuses every `*_API_KEY`, which is every name a keyring
+//!   secret is injected under, so a file value can never shadow a secret.
+//! - **The value rule too** (`hytte_config::plugin_settings::value_refusal`):
+//!   a NUL or a value over 32 KiB would fail the spawn outright and take the
+//!   plugin's other values with it, so it costs its own key instead.
+//! - **Empty means unset.** A key whose value is empty is not passed, so the
+//!   plugin falls back to its own default.
+//!
+//! A refused key is warned about once per session, and at most
+//! `MAX_SETTING_WARNINGS` times in all ([`warn_refused_setting`]).
+//!
+//! The values ride [`Launch::secret_env`], the owner-only channel #984 built
+//! for secrets, rather than the world-readable argv. They are not secrets, but
+//! unlike the nix `env` they are not already public either — they come from the
+//! user's own config directory — and the stricter channel costs nothing.
+//!
+//! They are deliberately **not** part of the spec fingerprint
+//! ([`spec_fingerprint`]): that digest rides the unit's `--description=` on
+//! `systemd-run`'s world-readable argv, and an unkeyed hash of a switch or a
+//! short choice can be brute-forced from it (#1415 review L2). So a reconcile
+//! never relaunches a plugin for a change to this file. The change reaches a
+//! running plugin through [`restart_for_settings`] — the Plugins tab's Save,
+//! over `Control.RestartPlugin` — and a hand edit reaches it at the plugin's
+//! next start, like any environment change to a process that is already
+//! running.
+//!
+//! A legacy static unit is not launched here, so the file does not reach it;
+//! [`restart_for_settings`] says so rather than restarting it for nothing.
+//!
 //! ## Why the `systemd-run` CLI, not D-Bus `StartTransientUnit`
 //!
 //! Per the #419/#392 thread's letter. The CLI does the transient-unit property
@@ -394,6 +441,12 @@ struct PluginSpec {
     /// ignored, so a later module pinning another key cannot break it.
     #[serde(default, rename = "_locked")]
     locked: Vec<String>,
+    /// The values `plugin-settings.toml` sets for this plugin (#1410), as they
+    /// will be passed: already through [`settings_env`], so nothing here is
+    /// refused, empty, or shadowed by [`env`](Self::env). Never read from
+    /// `plugins.json` — [`fold_settings`] fills it in [`load_declared_from`].
+    #[serde(skip)]
+    settings: BTreeMap<String, String>,
 }
 
 /// The `_locked` entry that pins [`PluginSpec::enabled`] (#1400) — the JSON
@@ -582,15 +635,20 @@ struct Sources {
     /// or `None` when neither `$XDG_STATE_HOME` nor `$HOME` is set — then
     /// nothing is overridden and the switch cannot persist.
     overrides: Option<PathBuf>,
+    /// `$XDG_CONFIG_HOME/trollshell/plugin-settings.toml` (#1410), or `None`
+    /// when neither `$XDG_CONFIG_HOME` nor `$HOME` is set — then no plugin
+    /// gets a value from it.
+    settings: Option<PathBuf>,
 }
 
 impl Sources {
-    /// This process's own sources — the one place the launcher resolves both
-    /// halves from the environment.
+    /// This process's own sources — the one place the launcher resolves all
+    /// three from the environment.
     fn from_env() -> Self {
         Self {
             config: state_file_paths(),
             overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
+            settings: hytte_config::plugin_settings::path(),
         }
     }
 }
@@ -602,7 +660,8 @@ async fn load_declared() -> Option<Declared> {
 
 /// The **effective** declaration: what nix declares ([`load_nix_declared`]),
 /// with the Plugins tab's persisted switch folded into each plugin's
-/// `enabled` ([`fold_overrides`], #1400).
+/// `enabled` ([`fold_overrides`], #1400) and `plugin-settings.toml`'s values
+/// into its `settings` ([`fold_settings`], #1410).
 ///
 /// `None` exactly when [`load_nix_declared`] says so — a `plugins.json` that
 /// exists but cannot be read or parsed. The override file never makes this
@@ -618,6 +677,9 @@ async fn load_declared() -> Option<Declared> {
 async fn load_declared_from(sources: &Sources) -> Option<Declared> {
     let mut declared = load_nix_declared(&sources.config).await?;
     fold_overrides(&mut declared, &read_overrides(sources.overrides.as_deref()));
+    if let Some(path) = &sources.settings {
+        fold_settings(&mut declared, &hytte_config::plugin_settings::load_at(path));
+    }
     Some(declared)
 }
 
@@ -784,6 +846,118 @@ fn pinned_error(id: &str) -> anyhow::Error {
     )
 }
 
+// ── Plugin settings (#1410) ──────────────────────────────────────────────────
+
+/// Fold `plugin-settings.toml` into every declared plugin's
+/// [`settings`](PluginSpec::settings) ([`settings_env`]). Iterates the
+/// **declared** set, so a table for an id `plugins.json` does not declare is
+/// ignored by construction — the [`fold_overrides`] shape. Pure but for the
+/// once-per-session warnings.
+fn fold_settings(declared: &mut Declared, file: &hytte_config::plugin_settings::AllValues) {
+    for (id, spec) in &mut declared.plugins {
+        spec.settings = file
+            .get(id)
+            .map(|values| settings_env(id, spec, values))
+            .unwrap_or_default();
+    }
+}
+
+/// The subset of plugin `id`'s `plugin-settings.toml` table it is launched
+/// with — the module doc's rules: a key must pass
+/// [`Setting::env_refusal`](hytte_plugin_proto::manifest::Setting::env_refusal),
+/// its value must pass `hytte_config::plugin_settings::value_refusal` and be
+/// non-empty, and nix's `spec.env` must not already set it (nix wins).
+///
+/// There is no separate "a keyring secret wins" filter: every name a secret
+/// is injected under ends in `_API_KEY`, which the name rule already refuses,
+/// so such a filter could never drop anything (#1415 review TS1;
+/// `every_secret_name_is_refused_as_a_setting` pins the premise).
+///
+/// A refused key is warned about once per session per `(id, key)`, not on
+/// every call — [`list`] runs this on the Plugins tab's 2 s poll — and the
+/// number of those warnings is capped ([`warn_refused_setting`]).
+fn settings_env(
+    id: &str,
+    spec: &PluginSpec,
+    values: &hytte_config::plugin_settings::Values,
+) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .filter(|(key, value)| {
+            let refusal = hytte_plugin_proto::manifest::Setting::env_refusal(key)
+                .or_else(|| hytte_config::plugin_settings::value_refusal(value));
+            if let Some(reason) = refusal {
+                warn_refused_setting(id, key, reason);
+                return false;
+            }
+            !value.is_empty() && !spec.env.contains_key(*key)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// How many distinct refused keys [`warn_refused_setting`] names in one
+/// session before it goes quiet (#1415 review L4): a hand-edited file with
+/// thousands of bad keys must not put thousands of lines in the journal.
+const MAX_SETTING_WARNINGS: usize = 16;
+
+/// The `(plugin id, key)` pairs [`settings_env`] has already warned about
+/// this session.
+static WARNED_SETTINGS: std::sync::Mutex<BTreeSet<(String, String)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// What [`first_report`] says to do about one refused key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Report {
+    /// Its first sighting, under the cap: name it.
+    Warn,
+    /// The sighting that reaches the cap: name it, and say the rest go
+    /// unreported.
+    WarnLast,
+    /// Already named, or past the cap.
+    Quiet,
+}
+
+/// Whether `(id, key)` should be reported, given what `seen` already has.
+/// Pure, so the dedup and the cap are testable without a log capture.
+fn first_report(seen: &mut BTreeSet<(String, String)>, id: &str, key: &str) -> Report {
+    if seen.len() >= MAX_SETTING_WARNINGS || !seen.insert((id.to_owned(), key.to_owned())) {
+        return Report::Quiet;
+    }
+    if seen.len() == MAX_SETTING_WARNINGS {
+        Report::WarnLast
+    } else {
+        Report::Warn
+    }
+}
+
+/// One `warn!` per session for a key `plugin-settings.toml` sets that the
+/// launcher refuses to pass, and none past [`MAX_SETTING_WARNINGS`] keys.
+fn warn_refused_setting(id: &str, key: &str, reason: &str) {
+    let report = first_report(
+        &mut WARNED_SETTINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        id,
+        key,
+    );
+    if report == Report::Quiet {
+        return;
+    }
+    tracing::warn!(
+        plugin = %id,
+        key = ?key,
+        reason,
+        "plugin-settings.toml: this variable is not passed to the plugin"
+    );
+    if report == Report::WarnLast {
+        tracing::warn!(
+            limit = MAX_SETTING_WARNINGS,
+            "plugin-settings.toml: further refused variables are not reported this session"
+        );
+    }
+}
+
 // ── Spec fingerprint (#695) ──────────────────────────────────────────────────
 
 /// Opening delimiter of the spec fingerprint inside a launched unit's
@@ -830,6 +1004,13 @@ fn fnv1a(bytes: &[u8], hash: u64) -> u64 {
 ///   plugins it isn't going to touch. (A key changed *outside* the control-center
 ///   while the shell is down therefore doesn't trigger a restart; use the
 ///   control-center, or stop/start the plugin.)
+/// - the `plugin-settings.toml` values ([`PluginSpec::settings`], #1410).
+///   Every other input here is already public in the `0444` `plugins.json`,
+///   but these come from the user's own config, and this digest rides the
+///   world-readable `systemd-run` argv: an unkeyed hash of a switch or a
+///   short choice gives the value away to any local user (#1415 review L2). A
+///   change to them reaches a running plugin through [`restart_for_settings`]
+///   instead — see the module doc's "Plugin settings".
 ///
 /// Pure, so the fingerprint contract is unit-testable.
 fn spec_fingerprint(spec: &PluginSpec, target: &str) -> String {
@@ -901,10 +1082,15 @@ fn parse_fingerprint(description: &str) -> Option<&str> {
 ///   nix-rendered into the world-readable state file, so the argv discloses
 ///   nothing new, and an explicit value can't be shadowed by whatever the shell
 ///   inherited under the same name.
-/// - `extra_env` (the #392 secret hook) goes in [`Launch::secret_env`], which is
-///   rendered as the **bare** `--setenv=<NAME>` form with the value carried on
-///   `systemd-run`'s own environment (#984), after the declared env so an
-///   injected secret still overrides a stale declared value.
+/// - the spec's [`settings`](PluginSpec::settings) (`plugin-settings.toml`,
+///   #1410) and then `extra_env` (the #392 secret hook) go in
+///   [`Launch::secret_env`], which is rendered as the **bare** `--setenv=<NAME>`
+///   form with the value carried on `systemd-run`'s own environment (#984),
+///   after the declared env so an injected secret still overrides a stale
+///   declared value. The settings are already free of any name the declared
+///   env or a secret sets ([`settings_env`]), so their place in that order
+///   decides nothing; they ride this channel because they come from the
+///   user's own config rather than the world-readable `plugins.json`.
 /// - `--description=` carries the spec fingerprint (#695) so a later
 ///   [`reconcile`] can tell this unit's spec from the currently declared one.
 ///
@@ -932,7 +1118,12 @@ fn plugin_launch(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        secret_env: extra_env.to_vec(),
+        secret_env: spec
+            .settings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .chain(extra_env.iter().cloned())
+            .collect(),
         argv: vec![spec.exec.clone()],
     }
 }
@@ -1835,6 +2026,22 @@ pub async fn list() -> Vec<systemd::PluginUnit> {
     merge_declared(units, &declared.plugins)
 }
 
+/// Every plugin id `plugins.json` declares, or `None` when a `plugins.json`
+/// exists but cannot be read or parsed — so a caller that prunes by this set
+/// (the host's settings cache, #1415 review L3) can tell "declares nothing"
+/// from "could not tell" and leave things alone on the second.
+pub async fn declared_ids() -> Option<BTreeSet<String>> {
+    declared_ids_from(&Sources::from_env()).await
+}
+
+/// [`declared_ids`] over explicit [`Sources`], so the `None` contract is
+/// testable against scratch files (#1415 second review B4).
+async fn declared_ids_from(sources: &Sources) -> Option<BTreeSet<String>> {
+    load_declared_from(sources)
+        .await
+        .map(|declared| declared.plugins.into_keys().collect())
+}
+
 /// Overlay the declared set onto systemd's unit list — see [`list`]. Pure.
 fn merge_declared(
     mut units: Vec<systemd::PluginUnit>,
@@ -2050,6 +2257,17 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
 /// ever run from the static unit. Pick one or the other — with both, every
 /// reconcile that decides to restart will bounce the plugin through this
 /// fallback and log it.
+///
+/// Known cost (#1415 second review L3, a follow-up rather than a fix here):
+/// the wait really waits now, under [`CONVERGE_LOCK`], so a unit that never
+/// leaves `deactivating` (a process stuck past its SIGKILL) holds every
+/// queued lock-taker for the full [`STOP_WAIT`], and a reconcile that
+/// restarts several plugins pays their stops one after another. When such a
+/// relaunch then fails, the unit-file fallback below may `StartUnit` the old
+/// transient unit while it is still loaded, which brings the plugin back
+/// with its **old** environment. Stopping every restart first and waiting
+/// for them together would bound the first cost; the second needs the
+/// fallback to skip a unit this launcher stamped.
 async fn restart(id: &str, spec: &PluginSpec, target: &str) -> anyhow::Result<()> {
     stop(id).await?;
     wait_until_stopped(id).await;
@@ -2067,26 +2285,179 @@ async fn restart(id: &str, spec: &PluginSpec, target: &str) -> anyhow::Result<()
     Err(err)
 }
 
-/// Poll the plugin's unit until it is no longer running (inactive/failed, or
-/// gone — a collected transient unit vanishes), bounded to ~5s so a stuck stop
-/// can't wedge the relaunch. On a list error we return early and let the launch
-/// attempt surface any "still exists" error itself.
+/// Whether a unit in `active_state` still holds its name, so a relaunch under
+/// that name would be refused: running (see [`is_running`]) **or still
+/// stopping**.
+///
+/// `deactivating` is the state a restart exists to wait through (#1415
+/// review H2). `StopUnit` returns once the job is queued; the unit then sits
+/// in `deactivating` until its process exits — up to the SDK's shutdown grace,
+/// or `TimeoutStopSec=` for a stuck hook — and while that stop job is pending
+/// systemd answers `StartTransientUnit` with "was already loaded or has a
+/// fragment file". [`is_running`] deliberately counts it as *not* running
+/// (a reconcile must not skip launching a plugin that is on its way down), so
+/// the wait needs this wider predicate rather than that one.
+fn blocks_relaunch(active_state: &str) -> bool {
+    is_running(active_state) || active_state == "deactivating"
+}
+
+/// How often [`wait_until_stopped`] re-lists the units.
+const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// How long [`wait_until_stopped`] waits in all: past the launched unit's own
+/// `TimeoutStopSec=` ([`launch::PLUGIN_TIMEOUT_STOP`], 10 s), after which
+/// systemd kills the process, plus two seconds for that kill to land. A wait
+/// shorter than that timeout would give up on exactly the slow stop it is
+/// for.
+const STOP_WAIT: Duration = Duration::from_secs(12);
+
+/// Poll the plugin's unit until it no longer holds its name
+/// ([`blocks_relaunch`]: inactive, failed, or gone — a collected transient
+/// unit vanishes), bounded by [`STOP_WAIT`] so a stuck stop cannot wedge the
+/// relaunch. On a list error it returns early and lets the launch surface any
+/// "still exists" error itself.
 async fn wait_until_stopped(id: &str) {
-    for _ in 0..25 {
-        match systemd::list_plugin_units().await {
-            Ok(units) => {
+    wait_until_stopped_listing(id, systemd::list_plugin_units).await;
+}
+
+/// [`wait_until_stopped`] with the unit listing passed in — the
+/// [`reconcile_listing`] seam's shape, so a test can hand it a unit that stays
+/// `deactivating` for a while. Returns how many listings it took.
+async fn wait_until_stopped_listing<L, Fut>(id: &str, mut list_units: L) -> usize
+where
+    L: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+{
+    // A wall-clock deadline, not a count of polls (#1415 second review L2):
+    // each listing is two D-Bus round trips with their own 25 s timeout, so a
+    // slow but answering user manager would stretch a counted loop — and the
+    // `CONVERGE_LOCK` hold it runs under — far past `STOP_WAIT`.
+    let deadline = tokio::time::Instant::now() + STOP_WAIT;
+    let mut listings = 0;
+    while tokio::time::Instant::now() < deadline {
+        listings += 1;
+        match tokio::time::timeout_at(deadline, list_units()).await {
+            Ok(Ok(units))
                 if !units
                     .iter()
-                    .any(|u| u.id == id && is_running(&u.active_state))
-                {
-                    return;
-                }
+                    .any(|u| u.id == id && blocks_relaunch(&u.active_state)) =>
+            {
+                return listings;
             }
-            Err(_) => return,
+            Ok(Err(_)) => return listings,
+            Ok(Ok(_)) | Err(_) => {}
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + STOP_POLL)).await;
     }
-    tracing::warn!(plugin = %id, "unit still running after stop; relaunch may fail");
+    tracing::warn!(plugin = %id, "unit still stopping after the wait; relaunch may fail");
+    listings
+}
+
+/// What [`restart_for_settings`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsRestart {
+    /// The plugin was running; it was stopped and relaunched, and so reads
+    /// `plugin-settings.toml` again.
+    Relaunched,
+    /// The plugin is declared but not running: nothing was done, and it
+    /// reads the file when it next starts.
+    NotRunning,
+    /// Not in `plugins.json`: a hand-installed static unit, which this
+    /// launcher does not launch and which therefore never reads the file.
+    /// Left alone.
+    NotDeclared,
+}
+
+impl SettingsRestart {
+    /// The word `Control.RestartPlugin` answers with.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            SettingsRestart::Relaunched => "relaunched",
+            SettingsRestart::NotRunning => "not-running",
+            SettingsRestart::NotDeclared => "not-declared",
+        }
+    }
+}
+
+/// Restart plugin `id` so a running one reads `plugin-settings.toml` again —
+/// the Plugins tab's Save, over `Control.RestartPlugin` (#1410).
+///
+/// One call, under [`CONVERGE_LOCK`], through [`restart`] — the path a
+/// reconcile and a key rotation already take — so the stop, the wait through
+/// `deactivating` ([`wait_until_stopped`]) and the relaunch cannot interleave
+/// with a reconcile or a second Save (#1415 review H2; the #866 F6 shape).
+/// The control-center used to send `StopPlugin` and `StartPlugin` itself,
+/// three bus calls outside the lock, with a wait that took `deactivating` for
+/// stopped.
+///
+/// Reads the effective declaration (so the relaunch carries the file's
+/// current values) and the live unit list, and starts nothing that was not
+/// already running.
+///
+/// **Every** Save calls this, whatever the tab last saw (#1415 second review
+/// M1): the tab's own poll can be two seconds stale, and a Save that lands
+/// while an earlier restart is still stopping the unit would otherwise be
+/// written and never applied. Here the question has a current answer — the
+/// call queues behind any restart already under way, and only then reads the
+/// declaration (with the file's newest values) and the unit list. So two
+/// Saves in quick succession end with the plugin running the second one's
+/// values, at the cost of one more bounce.
+///
+/// # Errors
+/// A `plugins.json` that exists but cannot be read or parsed (never read as
+/// "nothing declared", which would answer `not-declared` for a plugin that
+/// is declared — #1415 second review L5); a failed unit listing, stop or
+/// relaunch.
+pub async fn restart_for_settings(id: &str) -> anyhow::Result<SettingsRestart> {
+    restart_for_settings_via(
+        id,
+        load_declared,
+        systemd::list_plugin_units,
+        |spec, target| async move { restart(id, &spec, &target).await },
+    )
+    .await
+}
+
+/// [`restart_for_settings`] with its three effects passed in — the
+/// declaration, the unit listing and the relaunch — so a test can drive the
+/// decision and the lock without a user manager (the [`reconcile_listing`]
+/// seam's shape).
+async fn restart_for_settings_via<D, DF, L, LF, R, RF>(
+    id: &str,
+    load: D,
+    list_units: L,
+    relaunch: R,
+) -> anyhow::Result<SettingsRestart>
+where
+    D: FnOnce() -> DF,
+    DF: Future<Output = Option<Declared>>,
+    L: FnOnce() -> LF,
+    LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+    R: FnOnce(PluginSpec, String) -> RF,
+    RF: Future<Output = anyhow::Result<()>>,
+{
+    let _guard = CONVERGE_LOCK.lock().await;
+    let Some(declared) = load().await else {
+        anyhow::bail!(
+            "plugins.json exists but cannot be read or parsed, so the shell cannot tell how \
+             to launch this plugin; nothing was restarted. Fix the file (or rebuild), then \
+             switch the plugin off and on"
+        );
+    };
+    let Some(spec) = declared.plugins.get(id).cloned() else {
+        return Ok(SettingsRestart::NotDeclared);
+    };
+    let units = list_units().await.context("listing plugin units")?;
+    if !units
+        .iter()
+        .any(|u| u.id == id && is_running(&u.active_state))
+    {
+        return Ok(SettingsRestart::NotRunning);
+    }
+    relaunch(spec, declared.target).await?;
+    tracing::info!(plugin = %id, "relaunched to apply its saved settings");
+    Ok(SettingsRestart::Relaunched)
 }
 
 #[cfg(test)]
@@ -2100,6 +2471,7 @@ mod tests {
             secrets: Vec::new(),
             enabled,
             locked: Vec::new(),
+            settings: BTreeMap::new(),
         }
     }
 
@@ -2118,6 +2490,7 @@ mod tests {
         Sources {
             config: paths.to_vec(),
             overrides: None,
+            settings: None,
         }
     }
 
@@ -3445,6 +3818,7 @@ mod tests {
             let sources = Sources {
                 config: paths.clone(),
                 overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
+                settings: None,
             };
             assert!(
                 sources
@@ -3687,6 +4061,7 @@ mod tests {
         let sources = Sources {
             config: vec![json],
             overrides: Some(toml.clone()),
+            settings: Some(dir.path().join("config/trollshell/plugin-settings.toml")),
         };
         (dir, sources, toml)
     }
@@ -3887,6 +4262,8 @@ mod tests {
             "async fn reconcile_listing<",
             "pub async fn list()",
             "pub async fn start(",
+            "pub async fn restart_for_settings(",
+            "async fn declared_ids_from(",
         ] {
             let b = body(sig);
             assert!(
@@ -4762,5 +5139,566 @@ mod tests {
             ..unit("gone", "inactive", false)
         }];
         assert!(plan(&Declared::default(), &units).is_empty());
+    }
+
+    // ── plugin settings (#1410) ──────────────────────────────────────────────
+
+    fn values(pairs: &[(&str, &str)]) -> hytte_config::plugin_settings::Values {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// The four rules, as a truth table. Red if nix stops winning, if the
+    /// name rule is not applied to the hand-editable file, if an empty value
+    /// is passed rather than left unset, or if a file value can shadow an
+    /// injected secret.
+    #[test]
+    fn settings_env_keeps_only_what_the_file_may_set() {
+        let mut s = spec_env("/bin/vibectl", &[("V1BECTL_SERVER", "from-nix")]);
+        s.secrets = vec!["openrouter".to_owned()];
+        let file = values(&[
+            ("V1BECTL_SERVER", "from-file"),
+            ("V1BECTL_SCREENS", "/home/u/screens.kdl"),
+            ("V1BECTL_EMPTY", ""),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("PATH", "/tmp"),
+            ("XDG_RUNTIME_DIR", "/tmp"),
+            ("HYTTE_PLUGIN_ID", "other"),
+            ("lower_case", "x"),
+            ("OPENROUTER_API_KEY", "sk-plain-text"),
+            ("SYSTEMD_LOG_TARGET", "null"),
+        ]);
+        assert_eq!(
+            settings_env("vibectl", &s, &file),
+            values(&[("V1BECTL_SCREENS", "/home/u/screens.kdl")]),
+        );
+    }
+
+    /// The fold reads the file for the declared ids only, and a plugin with no
+    /// table gets nothing.
+    #[test]
+    fn fold_settings_applies_each_plugins_own_table() {
+        let mut declared = Declared::default();
+        declared
+            .plugins
+            .insert("vibectl".to_owned(), spec("/bin/vibectl", true));
+        declared
+            .plugins
+            .insert("pet".to_owned(), spec("/bin/pet", true));
+        let file = hytte_config::plugin_settings::AllValues::from([
+            (
+                "vibectl".to_owned(),
+                values(&[("V1BECTL_SCREENS", "/s.kdl")]),
+            ),
+            ("ghost".to_owned(), values(&[("GHOST", "boo")])),
+        ]);
+        fold_settings(&mut declared, &file);
+        assert_eq!(
+            declared.plugins["vibectl"].settings,
+            values(&[("V1BECTL_SCREENS", "/s.kdl")])
+        );
+        assert!(declared.plugins["pet"].settings.is_empty());
+        assert!(!declared.plugins.contains_key("ghost"));
+    }
+
+    /// End to end through the effective loader every launch path uses: a value
+    /// saved in the scratch `plugin-settings.toml` is on the spec that
+    /// [`launch`] would run, and nix's `env` still wins on its own key.
+    #[tokio::test]
+    async fn load_declared_from_folds_the_settings_file() {
+        let (dir, sources, _toml) = scratch_sources(
+            r#"{"version":1,"plugins":{
+                "vibectl":{"exec":"/bin/vibectl","enabled":true,
+                           "env":{"V1BECTL_SERVER":"from-nix"}}
+            }}"#,
+        );
+        let settings = sources.settings.clone().expect("scratch settings path");
+        assert!(
+            settings.starts_with(dir.path()),
+            "rail: never the real config"
+        );
+        hytte_config::plugin_settings::save_at(
+            &settings,
+            "vibectl",
+            &[
+                (
+                    "V1BECTL_SCREENS".to_owned(),
+                    Some(hytte_config::toml_edit::Value::from("/s.kdl")),
+                ),
+                (
+                    "V1BECTL_SERVER".to_owned(),
+                    Some(hytte_config::toml_edit::Value::from("from-file")),
+                ),
+            ],
+        )
+        .expect("save");
+
+        let declared = load_declared_from(&sources).await.expect("parses");
+        let spec = &declared.plugins["vibectl"];
+        assert_eq!(spec.settings, values(&[("V1BECTL_SCREENS", "/s.kdl")]));
+        assert_eq!(spec.env["V1BECTL_SERVER"], "from-nix");
+    }
+
+    /// A saved value reaches the launched unit's environment, by name only on
+    /// the argv — the #984 channel — and the nix `env` stays inline as before.
+    #[test]
+    fn a_settings_value_reaches_the_launch_off_the_argv() {
+        let mut s = spec_env("/bin/vibectl", &[("V1BECTL_SERVER", "host:1")]);
+        s.settings = values(&[("V1BECTL_SCREENS", "/home/u/screens.kdl")]);
+        let args = run_argv("vibectl", &s, &[], DEFAULT_TARGET);
+        assert!(args.contains(&"--setenv=V1BECTL_SERVER=host:1".to_owned()));
+        assert!(
+            args.contains(&"--setenv=V1BECTL_SCREENS".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("screens.kdl")),
+            "a settings value never rides the argv: {args:?}"
+        );
+        let cmd = run_command("vibectl", &s, &[], DEFAULT_TARGET);
+        assert_eq!(
+            command_envs(&cmd),
+            vec![(
+                "V1BECTL_SCREENS".to_owned(),
+                Some("/home/u/screens.kdl".to_owned())
+            )],
+        );
+    }
+
+    /// #1415 review L2: the settings never reach the fingerprint, which rides
+    /// `systemd-run`'s world-readable argv — an unkeyed hash of a switch or a
+    /// short choice would give the value away. So a plugin digests the same
+    /// whatever the file holds, which is also what keeps a settings-less
+    /// plugin at the literal `963338d3f7f67d63` the pins above hold to.
+    ///
+    /// Red if any value (or any settings key) is folded back in.
+    #[test]
+    fn settings_never_reach_the_fingerprint() {
+        let plain = spec_env("/bin/vibectl", &[]);
+        for file in [
+            values(&[("A", "1")]),
+            values(&[("A", "2")]),
+            values(&[("V1BECTL_DEBUG", "true"), ("V1BECTL_THEME", "dark")]),
+        ] {
+            let mut with = plain.clone();
+            with.settings = file;
+            assert_eq!(fp(&with), fp(&plain), "{:?}", with.settings);
+        }
+    }
+
+    /// #1415 review M3 (the reviewer's probe, adapted): a NUL in one
+    /// hand-written value is valid TOML, but no environment string can carry
+    /// it, and `Command` then refuses to spawn at all — so it must cost that
+    /// key and nothing else. Driven through the real reader, the real fold and
+    /// the real `systemd-run` command builder, spawning `true` in its place.
+    ///
+    /// Red before the fix: the spawn failed with "nul byte found in provided
+    /// data" and the plugin's other value was lost with it.
+    #[tokio::test]
+    async fn a_nul_in_one_file_value_costs_only_that_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        std::fs::write(
+            &path,
+            "[vibectl]\nV1BECTL_SERVER = \"a\\u0000b\"\nV1BECTL_OTHER = \"fine\"\n",
+        )
+        .expect("seed");
+        let file = hytte_config::plugin_settings::load_at(&path);
+        let mut declared = Declared::default();
+        declared
+            .plugins
+            .insert("vibectl".to_owned(), spec("/bin/true", true));
+        fold_settings(&mut declared, &file);
+        let spec = &declared.plugins["vibectl"];
+        assert_eq!(spec.settings, values(&[("V1BECTL_OTHER", "fine")]));
+        let launch = plugin_launch("vibectl", spec, &[], DEFAULT_TARGET);
+        let out = launch::command("true", &launch).output().await;
+        assert!(
+            out.is_ok(),
+            "one bad value made the launch unspawnable: {out:?}"
+        );
+    }
+
+    /// The launcher applies the value rule itself too, not only the reader:
+    /// a NUL or an over-long value handed straight to [`settings_env`] is not
+    /// passed.
+    #[test]
+    fn settings_env_refuses_values_no_environment_can_carry() {
+        let long = "x".repeat(hytte_config::plugin_settings::MAX_VALUE_BYTES + 1);
+        let file = values(&[("NUL", "a\0b"), ("LONG", long.as_str()), ("OK", "fine")]);
+        assert_eq!(
+            settings_env("nul-probe", &spec("/bin/x", true), &file),
+            values(&[("OK", "fine")])
+        );
+    }
+
+    /// Why [`settings_env`] needs no "a keyring secret wins" filter (#1415
+    /// review TS1): every name a secret is injected under is refused as a
+    /// setting name to begin with. Red if the name rule or the injection
+    /// naming ever drift apart.
+    #[test]
+    fn every_secret_name_is_refused_as_a_setting() {
+        for slot in ["openrouter", "anthropic", "gemini", "my-provider", "a_b"] {
+            let name = crate::secrets::env_var_for(slot);
+            assert!(
+                hytte_plugin_proto::manifest::Setting::env_refusal(&name).is_some(),
+                "{name} would reach a plugin from plugin-settings.toml"
+            );
+        }
+    }
+
+    /// #1415 review L4 / TS2: a refused key is named once per session, and
+    /// after [`MAX_SETTING_WARNINGS`] of them the rest go unreported, with one
+    /// line saying so. Red if the dedup or the cap is dropped.
+    #[test]
+    fn refused_keys_are_reported_once_each_and_capped() {
+        let mut seen = BTreeSet::new();
+        assert_eq!(first_report(&mut seen, "p", "LD_PRELOAD"), Report::Warn);
+        assert_eq!(
+            first_report(&mut seen, "p", "LD_PRELOAD"),
+            Report::Quiet,
+            "the 2 s poll must not repeat it"
+        );
+        assert_eq!(
+            first_report(&mut seen, "q", "LD_PRELOAD"),
+            Report::Warn,
+            "per plugin"
+        );
+        for i in seen.len()..MAX_SETTING_WARNINGS - 1 {
+            assert_eq!(first_report(&mut seen, "p", &format!("K{i}")), Report::Warn);
+        }
+        assert_eq!(first_report(&mut seen, "p", "LAST"), Report::WarnLast);
+        assert_eq!(first_report(&mut seen, "p", "PAST"), Report::Quiet);
+        assert_eq!(
+            seen.len(),
+            MAX_SETTING_WARNINGS,
+            "the set stops growing too"
+        );
+    }
+
+    // ── the restart's wait (#1415 review H2) ────────────────────────────────
+
+    /// `deactivating` still holds the unit's name: the stop job is pending,
+    /// and systemd refuses a transient unit of the same name until it is
+    /// gone. Red if the wait's predicate is `is_running` again.
+    #[test]
+    fn a_unit_still_stopping_blocks_a_relaunch() {
+        for state in ["active", "activating", "reloading", "deactivating"] {
+            assert!(blocks_relaunch(state), "{state}");
+        }
+        for state in ["inactive", "failed", "maintenance"] {
+            assert!(!blocks_relaunch(state), "{state}");
+        }
+        assert!(
+            !is_running("deactivating"),
+            "is_running keeps its reconcile meaning; only the wait widens it"
+        );
+    }
+
+    /// The wait lasts through `deactivating` and returns on the first listing
+    /// that shows the unit down. Red if it treats `deactivating` as stopped
+    /// (it would return after the first listing).
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_lasts_through_deactivating() {
+        let calls = std::cell::Cell::new(0_usize);
+        let listings = wait_until_stopped_listing("vibectl", || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                let state = if n <= 3 { "deactivating" } else { "inactive" };
+                Ok(vec![
+                    unit("vibectl", state, false),
+                    unit("pet", "active", true),
+                ])
+            }
+        })
+        .await;
+        assert_eq!(listings, 4, "three listings still stopping, then down");
+    }
+
+    /// A unit that never finishes stopping costs the whole bound, not forever
+    /// and not less: [`STOP_WAIT`] outlasts the unit's own `TimeoutStopSec=`,
+    /// after which systemd kills it.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_is_bounded_past_the_units_own_stop_timeout() {
+        let timeout_secs: u64 = launch::PLUGIN_TIMEOUT_STOP
+            .trim_end_matches('s')
+            .parse()
+            .expect("PLUGIN_TIMEOUT_STOP is whole seconds");
+        assert!(STOP_WAIT > Duration::from_secs(timeout_secs));
+        let start = tokio::time::Instant::now();
+        let listings = wait_until_stopped_listing("vibectl", || async {
+            Ok(vec![unit("vibectl", "deactivating", false)])
+        })
+        .await;
+        assert_eq!(
+            listings as u128,
+            STOP_WAIT.as_millis() / STOP_POLL.as_millis()
+        );
+        assert!(start.elapsed() >= STOP_WAIT, "{:?}", start.elapsed());
+    }
+
+    /// The restart path waits between its stop and its relaunch, through the
+    /// real listing; and `Control.RestartPlugin`'s entry point runs under
+    /// [`CONVERGE_LOCK`], reads the effective declaration and goes through that
+    /// same [`restart`]. A source scan, on the
+    /// `production_hands_the_seam_the_real_listing_and_the_callers_trigger`
+    /// precedent: the real stop and launch need a user manager.
+    ///
+    /// Red if the wait is deleted from [`restart`] (#1415 review CC1, which
+    /// survived the whole suite before), if it stops handing the seam the real
+    /// listing, or if `restart_for_settings` drops the lock or re-implements
+    /// the restart.
+    #[test]
+    fn the_restart_waits_for_the_stop_under_the_lock() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        let restart = body("async fn restart(id: &str");
+        let stop = restart
+            .find("stop(id).await?")
+            .expect("restart stops first");
+        let wait = restart
+            .find("wait_until_stopped(id).await")
+            .expect("restart waits for the stop");
+        let launch = restart.find("launch(id, spec").expect("restart relaunches");
+        assert!(stop < wait && wait < launch, "{restart}");
+        assert!(
+            body("async fn wait_until_stopped(id: &str)")
+                .contains("wait_until_stopped_listing(id, systemd::list_plugin_units)"),
+            "the wait must list the real units"
+        );
+        // Compared with all whitespace squeezed out, so rustfmt re-wrapping a
+        // call over several lines cannot turn this red on its own.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let entry = squash(body("pub async fn restart_for_settings("));
+        assert!(
+            entry.contains(&squash(
+                "restart_for_settings_via(id, load_declared, systemd::list_plugin_units,"
+            )),
+            "production must hand the seam the real declaration and listing:\n{entry}"
+        );
+        assert!(
+            entry.contains(&squash("restart(id, &spec, &target)")),
+            "{entry}"
+        );
+        // The guard must be *held*: `let _ = …lock().await` drops it at once
+        // and no lint catches that for a tokio guard (#1415 second review
+        // B1). `two_restarts_for_settings_run_one_after_the_other` is the
+        // behavioural half.
+        assert!(
+            squash(body("async fn restart_for_settings_via<"))
+                .contains(&squash("let _guard = CONVERGE_LOCK.lock().await;")),
+            "the settings restart must hold the convergence lock"
+        );
+    }
+
+    // ── restart_for_settings' decisions (#1415 second review B1/B2/L5) ──────
+
+    /// A spec whose `settings` say which Save it carries — the one thing the
+    /// ordering test needs to tell two relaunches apart.
+    fn saved(value: &str) -> Declared {
+        let mut spec = spec("/bin/vibectl", true);
+        spec.settings = values(&[("V1BECTL_SERVER", value)]);
+        Declared {
+            plugins: BTreeMap::from([("vibectl".to_owned(), spec)]),
+            ..Declared::default()
+        }
+    }
+
+    /// B2: a declared plugin that is not running is left alone — no relaunch
+    /// is even attempted — and the answer says so. (`deactivating` counts as
+    /// not running here: the unit is on its way down, and starting it is a
+    /// switch's job, not a Save's.)
+    #[tokio::test]
+    async fn a_plugin_that_is_not_running_is_not_restarted() {
+        for state in ["inactive", "failed", "deactivating"] {
+            let relaunched = std::cell::Cell::new(false);
+            let answer = restart_for_settings_via(
+                "vibectl",
+                || async { Some(saved("x")) },
+                || async move { Ok(vec![unit("vibectl", state, true)]) },
+                |_, _| {
+                    relaunched.set(true);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .expect("answers");
+            assert_eq!(answer, SettingsRestart::NotRunning, "{state}");
+            assert!(!relaunched.get(), "{state}: a stopped plugin was started");
+        }
+    }
+
+    /// An undeclared id is a static unit's: answered `not-declared`, and
+    /// neither listed nor relaunched. A running declared one is relaunched
+    /// with its spec and target.
+    #[tokio::test]
+    async fn the_answer_follows_the_declaration_and_the_unit() {
+        let answer = restart_for_settings_via(
+            "hand-made",
+            || async { Some(saved("x")) },
+            || async { panic!("an undeclared id needs no listing") },
+            |_, _| async { panic!("an undeclared id is never relaunched") },
+        )
+        .await
+        .expect("answers");
+        assert_eq!(answer, SettingsRestart::NotDeclared);
+
+        let got = std::cell::RefCell::new(None);
+        let answer = restart_for_settings_via(
+            "vibectl",
+            || async { Some(saved("v")) },
+            || async { Ok(vec![unit("vibectl", "active", true)]) },
+            |spec, target| {
+                *got.borrow_mut() = Some((spec.settings, target));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .expect("answers");
+        assert_eq!(answer, SettingsRestart::Relaunched);
+        assert_eq!(
+            got.into_inner(),
+            Some((
+                values(&[("V1BECTL_SERVER", "v")]),
+                DEFAULT_TARGET.to_owned()
+            ))
+        );
+    }
+
+    /// L5: a `plugins.json` that cannot be read is an error, never "nothing
+    /// declared" — which would answer `not-declared` and have the tab call a
+    /// declared plugin a static unit.
+    #[tokio::test]
+    async fn an_unreadable_declaration_is_an_error_not_an_answer() {
+        let err = restart_for_settings_via(
+            "vibectl",
+            || async { None },
+            || async { panic!("nothing is listed") },
+            |_, _| async { panic!("nothing is relaunched") },
+        )
+        .await
+        .expect_err("an unreadable plugins.json is not an answer");
+        assert!(err.to_string().contains("plugins.json"), "{err}");
+    }
+
+    /// B1 and the MEDIUM's ordering, together: two Saves in quick succession
+    /// send two `RestartPlugin`s. The second queues behind the first on the
+    /// convergence lock and only then reads the declaration — so it sees the
+    /// file as the second Save left it, and the plugin ends up running the
+    /// **second** Save's values.
+    ///
+    /// The file changes while the first relaunch is in flight, which is the
+    /// case the review found: a second call that did not wait (`let _ =` on
+    /// the guard, B1) reads the declaration too early and relaunches with the
+    /// first Save's values again.
+    #[tokio::test(start_paused = true)]
+    async fn two_restarts_for_settings_run_one_after_the_other() {
+        let file = std::cell::RefCell::new("first".to_owned());
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let call = |n: u8| {
+            let (file, log) = (&file, &log);
+            restart_for_settings_via(
+                "vibectl",
+                move || {
+                    log.borrow_mut().push(format!("{n}: read"));
+                    let declared = saved(&file.borrow());
+                    async move { Some(declared) }
+                },
+                || async { Ok(vec![unit("vibectl", "active", true)]) },
+                move |spec, _| async move {
+                    log.borrow_mut().push(format!(
+                        "{n}: relaunch with {}",
+                        spec.settings["V1BECTL_SERVER"]
+                    ));
+                    if n == 1 {
+                        // The second Save lands while this relaunch runs.
+                        *file.borrow_mut() = "second".to_owned();
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    log.borrow_mut().push(format!("{n}: up"));
+                    Ok(())
+                },
+            )
+        };
+        let (a, b) = tokio::join!(call(1), async {
+            // Sent a moment later, while the first restart holds the lock.
+            tokio::task::yield_now().await;
+            call(2).await
+        });
+        assert_eq!(a.expect("first"), SettingsRestart::Relaunched);
+        assert_eq!(b.expect("second"), SettingsRestart::Relaunched);
+        assert_eq!(
+            log.into_inner(),
+            [
+                "1: read",
+                "1: relaunch with first",
+                "1: up",
+                "2: read",
+                "2: relaunch with second",
+                "2: up",
+            ],
+            "the second restart must wait for the first and relaunch with the newest file"
+        );
+    }
+
+    /// B4: `declared_ids` tells "declares nothing" from "could not tell", so
+    /// the host's settings cache never forgets every id because
+    /// `plugins.json` was briefly unreadable.
+    #[tokio::test]
+    async fn declared_ids_are_none_when_plugins_json_cannot_be_read() {
+        let (_dir, sources, _toml) = scratch_sources("{ this is not json");
+        assert_eq!(declared_ids_from(&sources).await, None);
+
+        let (dir, sources, _toml) = scratch_sources(TWO_FREE);
+        assert_eq!(
+            declared_ids_from(&sources).await,
+            Some(BTreeSet::from(["pet".to_owned(), "timer".to_owned()]))
+        );
+
+        let missing = Sources {
+            config: vec![dir.path().join("absent/plugins.json")],
+            overrides: None,
+            settings: None,
+        };
+        assert_eq!(
+            declared_ids_from(&missing).await,
+            Some(BTreeSet::new()),
+            "a missing file does declare nothing"
+        );
+    }
+
+    /// L2: the wait is bounded by the clock, not by a count of polls — a user
+    /// manager that answers slowly cannot stretch it (and the lock held
+    /// around it) past `STOP_WAIT`.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_is_bounded_by_the_clock_even_when_listings_are_slow() {
+        let start = tokio::time::Instant::now();
+        wait_until_stopped_listing("vibectl", || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(vec![unit("vibectl", "deactivating", false)])
+        })
+        .await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= STOP_WAIT && waited <= STOP_WAIT + STOP_POLL,
+            "waited {waited:?} for a {STOP_WAIT:?} bound"
+        );
+    }
+
+    /// The words `Control.RestartPlugin` answers with; the control-center
+    /// matches on them.
+    #[test]
+    fn settings_restart_wire_names_are_pinned() {
+        assert_eq!(SettingsRestart::Relaunched.wire_name(), "relaunched");
+        assert_eq!(SettingsRestart::NotRunning.wire_name(), "not-running");
+        assert_eq!(SettingsRestart::NotDeclared.wire_name(), "not-declared");
     }
 }

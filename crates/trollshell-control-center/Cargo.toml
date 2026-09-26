@@ -67,6 +67,14 @@ hytte-config-families = { path = "../hytte-config-families" }
 # would pull libpipewire and evolution-data-server into a settings app) and no
 # web engine. `checks.shell-has-no-web-engine` still holds.
 hytte-plugin-agents = { path = "../hytte-plugin-agents" }
+# The Plugins tab's Settings group (#1410) decodes `ListPluginSettings`
+# straight into the proto's own `Setting`, so the shell and this app share one
+# definition of a setting rather than a hand mirror. Since #1260 it was a
+# dev-dependency for the mount-label test (`every_wire_mount_has_a_human_label`
+# iterates `Mount::ALL`); now the app itself names the types. Either way the
+# proto rlib was already compiled into this binary through
+# `hytte-plugin-agents`, so this adds no `Cargo.lock` package and no closure.
+hytte-plugin-proto = { path = "../hytte-plugin-proto" }
 # `stats.toml`'s `Schema` + `DEFAULT_TOML` + its `impl Subsystem`, for the
 # Plugins tab's Configuration group (#888 P1). Linked as a **library** on
 # exactly the `hytte-plugin-agents` precedent above — #1360 gave this crate a
@@ -92,8 +100,11 @@ serde.workspace = true
 # `Cargo.lock` entry.
 serde_json.workspace = true
 # A oneshot to carry the Ping/Version reply from the tokio runtime back to the
-# GTK main thread. `sync` only — no runtime features (hytte-reactive owns it).
-tokio = { workspace = true, features = ["sync"] }
+# GTK main thread. No runtime features (hytte-reactive owns the runtime);
+# `time` since #1410, for the Settings group's restart, which waits for a
+# stopped plugin's unit to go down before starting it again. `hytte-reactive`
+# already builds tokio with it, so this names an edge the build had anyway.
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 # Workspace `tracing-subscriber` sets `default-features = false` (what
 # hytte-services' dev-dependency needs); widen back to the full default set
@@ -104,17 +115,6 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 ] }
 
 [dev-dependencies]
-# The Plugins tab's nine human mount labels are a hand-mirror of
-# `Mount::wire_name`'s table, and nine string literals in a test cannot see
-# the wire they mirror (#1260 review F4) — `every_wire_mount_has_a_human_label`
-# iterates `Mount::ALL` instead, so a rename or a tenth variant reds here
-# rather than leaking a raw wire string onto the screen.
-#
-# A **dev**-dependency, not a dependency: the proto rlib is already compiled
-# into this binary through `hytte-plugin-agents` (see its entry above), so
-# this adds no `Cargo.lock` package and no closure — but only the test names
-# `Mount`, so only the test target needs the edge.
-hytte-plugin-proto = { path = "../hytte-plugin-proto" }
 # The Agents tab's scripted `host.sock` (#947 P4): a real `UnixListener` in a
 # `TempDir` answering one recorded JSON line, the shape
 # `hytte-plugin-agents/tests/fake_socket.rs` uses. Dev-only — the app itself

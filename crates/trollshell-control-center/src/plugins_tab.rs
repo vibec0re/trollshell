@@ -121,7 +121,7 @@
 //! floor is set on both axes.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -130,6 +130,7 @@ use std::time::{Duration, Instant, SystemTime};
 use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
+use hytte_plugin_proto::manifest::Setting;
 
 use crate::{
     CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, LogTransition, log_transition, spawn_on_runtime,
@@ -284,6 +285,23 @@ struct MountedForm {
     form: crate::config_form::Form,
 }
 
+/// One plugin's Settings group, mounted in the detail pane (#1410).
+///
+/// Keyed by everything it was built from — the plugin, what it declared, and
+/// what nix sets — so the 2 s poll leaves it (and any unsaved edit in it)
+/// alone until one of those actually changes.
+struct MountedSettings {
+    /// The plugin id this group was built for.
+    plugin: String,
+    /// The declaration it was built from.
+    schema: Vec<Setting>,
+    /// The plugin's nix `env` it was built against.
+    nix: BTreeMap<String, String>,
+    /// The form. Its group is in [`PluginDetail::plugin_page`] until this is
+    /// dropped.
+    form: crate::plugin_settings::SettingsForm,
+}
+
 /// The detail pane's live widgets. Built once and retargeted at the selected
 /// plugin — see the module docs on why there is exactly one of these.
 #[derive(Clone)]
@@ -301,6 +319,9 @@ struct PluginDetail {
     /// `None` for a plugin with no config file of its own — which is most of
     /// them.
     config: Rc<RefCell<Option<MountedForm>>>,
+    /// The selected plugin's **Settings** group (#1410), when it declared any
+    /// in its manifest — see [`refresh_settings`].
+    settings: Rc<RefCell<Option<MountedSettings>>>,
     /// The relocated on/off control: start+enable, or stop+disable.
     switch: adw::SwitchRow,
     /// The unit's own state — [`plugin_subtitle`]'s wording, unchanged.
@@ -577,6 +598,14 @@ struct PluginsState {
     /// a future edit could quietly break by moving the resolution back inside
     /// the tick.
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
+    /// The settings each plugin declared (#1410), from the last applied
+    /// `ListPluginSettings` — what [`refresh_settings`] builds the selected
+    /// plugin's Settings group from. Empty until the first answer, and for
+    /// good against a shell that predates the method.
+    schemas: Rc<RefCell<HashMap<String, Vec<Setting>>>>,
+    /// Ordering over the overlapping `ListPluginSettings` polls, on the #983
+    /// rule: an older answer never replaces a newer one.
+    schema_polls: Rc<PollGenerations>,
 }
 
 /// [`PluginsState`] with its widget handles held **weakly** — what the
@@ -622,6 +651,8 @@ struct WeakPluginsState {
     manifest_ids: Rc<RefCell<DeclaredManifestId>>,
     env: Rc<hytte_config::xdg::Env>,
     search_path: Rc<OnceCell<Vec<PathBuf>>>,
+    schemas: Rc<RefCell<HashMap<String, Vec<Setting>>>>,
+    schema_polls: Rc<PollGenerations>,
 }
 
 /// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
@@ -636,6 +667,8 @@ struct WeakPluginDetail {
     /// it strongly is what lets a handler firing during teardown still see
     /// coherent bookkeeping.
     config: Rc<RefCell<Option<MountedForm>>>,
+    /// Strongly, for [`config`](Self::config)'s reason.
+    settings: Rc<RefCell<Option<MountedSettings>>>,
     switch: glib::WeakRef<adw::SwitchRow>,
     unit_row: glib::WeakRef<adw::ActionRow>,
     conn_row: glib::WeakRef<adw::ActionRow>,
@@ -657,6 +690,7 @@ impl PluginsState {
                 stack: self.detail.stack.downgrade(),
                 plugin_page: self.detail.plugin_page.downgrade(),
                 config: self.detail.config.clone(),
+                settings: self.detail.settings.clone(),
                 switch: self.detail.switch.downgrade(),
                 unit_row: self.detail.unit_row.downgrade(),
                 conn_row: self.detail.conn_row.downgrade(),
@@ -679,6 +713,8 @@ impl PluginsState {
             manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
+            schemas: self.schemas.clone(),
+            schema_polls: self.schema_polls.clone(),
         }
     }
 }
@@ -701,6 +737,7 @@ impl WeakPluginsState {
                 stack: self.detail.stack.upgrade()?,
                 plugin_page: self.detail.plugin_page.upgrade()?,
                 config: self.detail.config.clone(),
+                settings: self.detail.settings.clone(),
                 switch: self.detail.switch.upgrade()?,
                 unit_row: self.detail.unit_row.upgrade()?,
                 conn_row: self.detail.conn_row.upgrade()?,
@@ -723,6 +760,8 @@ impl WeakPluginsState {
             manifest_ids: self.manifest_ids.clone(),
             env: self.env.clone(),
             search_path: self.search_path.clone(),
+            schemas: self.schemas.clone(),
+            schema_polls: self.schema_polls.clone(),
         })
     }
 }
@@ -878,6 +917,8 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         manifest_ids: Rc::new(RefCell::new(DeclaredManifestId::default())),
         env,
         search_path: Rc::new(OnceCell::new()),
+        schemas: Rc::new(RefCell::new(HashMap::new())),
+        schema_polls: Rc::new(PollGenerations::default()),
     };
 
     connect_selection(&state);
@@ -1049,6 +1090,7 @@ fn build_detail(env: &Rc<hytte_config::xdg::Env>) -> (PluginDetail, Vec<crate::c
             stack,
             plugin_page,
             config: Rc::new(RefCell::new(None)),
+            settings: Rc::new(RefCell::new(None)),
             switch,
             unit_row,
             conn_row,
@@ -1114,6 +1156,7 @@ fn connect_shell_entry(state: &PluginsState) {
         // The plugin page is not what is on screen any more, so its config
         // form goes with the selection rather than polling behind this one.
         unmount_config(&state);
+        unmount_settings(&state);
         refresh_shell_forms(&state);
         show_shell_detail(&state);
         // Collapsed, this *is* the push; uncollapsed the split view already
@@ -1409,10 +1452,49 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 fn refresh_plugins(state: &PluginsState) {
     let generation = state.polls.issue();
     let declared = refresh_declared(state);
-    let state = state.clone();
+    let poll_state = state.clone();
     spawn_on_runtime(list_plugins_and_states(), move |res| {
-        on_poll_result_with_declared(&state, generation, res, &declared.mounts);
+        on_poll_result_with_declared(&poll_state, generation, res, &declared.mounts);
     });
+    // The declared settings (#1410) ride their own call beside the poll
+    // rather than a fourth element of it: a shell that predates the method
+    // must cost only the Settings group, never the unit list.
+    let schema_generation = state.schema_polls.issue();
+    let state = state.clone();
+    spawn_on_runtime(list_plugin_settings(), move |res| {
+        on_settings_result(&state, schema_generation, res);
+    });
+}
+
+/// One `ListPluginSettings` completion (#1410): keep it unless a newer one
+/// already landed, then retarget the Settings group at the selected plugin.
+///
+/// **Any** error is "no plugin declares settings" — an older shell answers
+/// `UnknownMethod` — so the group disappears rather than the tab failing.
+/// Logged at `debug`: the call repeats on every poll.
+fn on_settings_result(
+    state: &PluginsState,
+    generation: u64,
+    res: Result<HashMap<String, String>, hytte_bus::BusError>,
+) {
+    if !state.schema_polls.accept(generation) {
+        return;
+    }
+    let reply = res.unwrap_or_else(|err| {
+        tracing::debug!(%err, "ListPluginSettings failed; no Settings groups");
+        HashMap::new()
+    });
+    *state.schemas.borrow_mut() = crate::plugin_settings::decode_schemas(reply);
+    // Only a plugin the detail pane is actually showing; `refresh_detail`
+    // mounts the rest on selection.
+    let shown = state
+        .selected
+        .borrow()
+        .clone()
+        .filter(|id| state.snapshot.borrow().contains_key(id));
+    if let Some(id) = shown {
+        refresh_settings(state, &id);
+    }
 }
 
 /// The filesystem half of [`refresh_plugins`]'s tick: probe the search path
@@ -1706,6 +1788,11 @@ struct DeclaredFile {
     /// The declared ids whose `enabled` nix pins, i.e. whose entry carries
     /// `"_locked": ["enabled"]` (#1400): their switch is greyed.
     pinned: HashSet<String>,
+    /// Plugin id → its whole declared `env` (#1410): a declared setting nix
+    /// sets here is shown read-only in the Settings group, because the
+    /// launcher lets nix win over `plugin-settings.toml`. Only string values
+    /// — the only kind nix renders there.
+    env: HashMap<String, BTreeMap<String, String>>,
 }
 
 /// What `plugins.json` declares ([`DeclaredFile`]), parsed **at most once per
@@ -1886,10 +1973,22 @@ fn declared_from_json(text: &str) -> DeclaredFile {
         })
         .map(|(id, _)| id.clone())
         .collect();
+    let env = plugins
+        .iter()
+        .filter_map(|(id, spec)| {
+            let vars = spec.get("env")?.as_object()?;
+            let vars: BTreeMap<String, String> = vars
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect();
+            (!vars.is_empty()).then(|| (id.clone(), vars))
+        })
+        .collect();
     DeclaredFile {
         mounts,
         ids: plugins.keys().cloned().collect(),
         pinned,
+        env,
     }
 }
 
@@ -2216,6 +2315,7 @@ fn refresh_detail(state: &PluginsState) {
         state.pending.borrow_mut().take();
         // …and no plugin's *config form* is for it either (#888 P1).
         unmount_config(state);
+        unmount_settings(state);
         show_empty_detail(state);
         return;
     };
@@ -2228,6 +2328,7 @@ fn refresh_detail(state: &PluginsState) {
     state.detail.page.set_title(&id);
     state.detail.stack.set_visible_child_name("plugin");
     refresh_config(state, &id);
+    refresh_settings(state, &id);
 
     state
         .detail
@@ -2324,6 +2425,104 @@ fn unmount_config(state: &PluginsState) {
     // Explicit, and load-bearing: dropping the handle is what stops the form's
     // re-read poll.
     drop(previous);
+}
+
+/// Take the mounted Settings group (#1410) back out of the plugin page — the
+/// [`unmount_config`] shape, called from the same places, and for the same
+/// #643 reason the cell is emptied before GTK is touched.
+fn unmount_settings(state: &PluginsState) {
+    let Some(previous) = state.detail.settings.take() else {
+        return;
+    };
+    state.detail.plugin_page.remove(previous.form.group());
+}
+
+/// Mount plugin `id`'s **Settings** group (#1410), built from what it declared
+/// in its manifest ([`PluginsState::schemas`]) against what nix sets in its
+/// `env` ([`DeclaredFile::env`]) — or none, when it declared nothing.
+///
+/// Left alone while the plugin, its declaration and its nix `env` are all
+/// what the mounted group was built from, so the 2 s poll never throws away
+/// an edit the user has not saved. The group goes last on the page: after the
+/// Status group and after a [`refresh_config`] Configuration group, since
+/// that one is mounted first on every selection.
+fn refresh_settings(state: &PluginsState, id: &str) {
+    let schema = state.schemas.borrow().get(id).cloned().unwrap_or_default();
+    let nix = state
+        .declared
+        .borrow()
+        .last()
+        .env
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    let unchanged = state
+        .detail
+        .settings
+        .borrow()
+        .as_ref()
+        .is_some_and(|m| m.plugin == id && m.schema == schema && m.nix == nix);
+    if unchanged {
+        return;
+    }
+    unmount_settings(state);
+    if schema.is_empty() {
+        return;
+    }
+    let form = crate::plugin_settings::SettingsForm::build(
+        id,
+        &schema,
+        &nix,
+        state
+            .env
+            .overlay_path(hytte_config::plugin_settings::SUBSYSTEM),
+        settings_saved(state),
+    );
+    state.detail.plugin_page.add(form.group());
+    *state.detail.settings.borrow_mut() = Some(MountedSettings {
+        plugin: id.to_owned(),
+        schema,
+        nix,
+        form,
+    });
+}
+
+/// What a Settings group does after it saved (#1410): restart the plugin if
+/// it is running, so it reads the new values — `StopPlugin` then
+/// `StartPlugin`, the switch's own two calls — and report the outcome under
+/// the rows. A plugin that is not running picks the values up at its next
+/// start, and says so.
+fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
+    let weak = state.downgrade();
+    Rc::new(move |id: &str, form: &crate::plugin_settings::SettingsForm| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let running = state
+            .snapshot
+            .borrow()
+            .get(id)
+            .is_some_and(|snap| is_running(&snap.active_state));
+        if !running {
+            form.set_status("Saved. The plugin reads it the next time it starts.", false);
+            return;
+        }
+        form.set_status("Saved. Restarting the plugin…", false);
+        let form = form.clone();
+        let weak = state.downgrade();
+        spawn_on_runtime(restart_plugin(id.to_owned()), move |res| {
+            match res {
+                Ok(()) => form.set_status("Saved, and the plugin restarted.", false),
+                Err(err) => form.set_status(
+                    &format!("Saved, but restarting the plugin failed: {err}"),
+                    true,
+                ),
+            }
+            if let Some(state) = weak.upgrade() {
+                refresh_plugins_soon(&state);
+            }
+        });
+    })
 }
 
 fn refresh_config(state: &PluginsState, id: &str) {
@@ -3060,6 +3259,32 @@ async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusErro
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
+}
+
+/// `ListPluginSettings` → `{id: JSON}` (#1410): the settings each plugin
+/// declared, decoded by [`crate::plugin_settings::decode_schemas`].
+async fn list_plugin_settings() -> Result<HashMap<String, String>, hytte_bus::BusError> {
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("ListPluginSettings")
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<HashMap<String, String>>()
+        .await
+}
+
+/// Restart plugin `id` so it reads its settings again (#1410): the switch's
+/// own `StopPlugin` then `StartPlugin`, which for a declared plugin relaunches
+/// it through the launcher with `plugin-settings.toml` read afresh. A stop
+/// that finds the unit already gone is not a failure, as for the switch.
+async fn restart_plugin(id: String) -> Result<(), hytte_bus::BusError> {
+    if let Err(err) = plugin_id_call("StopPlugin", &id).await
+        && !already_stopped(&err)
+    {
+        return Err(err);
+    }
+    plugin_id_call("StartPlugin", &id).await
 }
 
 /// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
@@ -4208,6 +4433,28 @@ mod tests {
             "expected at least 12 table rows (#1372's ask), found {checked} — did the table \
              lose its data rows to a bad edit?"
         );
+    }
+
+    /// #1410: the Settings group reads the plugin's whole nix `env` to grey
+    /// what nix sets — every string value, per plugin, and nothing for a
+    /// plugin with no `env`.
+    #[test]
+    fn the_declared_env_is_read_whole_for_the_settings_group() {
+        let file = declared_from_json(
+            r#"{"plugins":{
+                "vibectl":{"exec":"/x","env":{"V1BECTL_SERVER":"h:1","HYTTE_PLUGIN_MOUNT":"BarLeft","N":3}},
+                "timer":{"exec":"/t"}
+            }}"#,
+        );
+        assert_eq!(
+            file.env["vibectl"],
+            std::collections::BTreeMap::from([
+                ("HYTTE_PLUGIN_MOUNT".to_owned(), "BarLeft".to_owned()),
+                ("V1BECTL_SERVER".to_owned(), "h:1".to_owned()),
+            ])
+        );
+        assert!(!file.env.contains_key("timer"));
+        assert_eq!(file.mounts["vibectl"], "BarLeft", "the #1161 read is unchanged");
     }
 }
 
@@ -6608,6 +6855,119 @@ mod gtk_tests {
                 .map(|n| n.to_string()),
             Some("plugin".to_owned())
         );
+
+        dismiss(&window);
+    }
+
+    /// #1410: a plugin that declared settings gets a **Settings** group built
+    /// from `ListPluginSettings`, with the variable its nix `env` sets shown
+    /// read-only; a plugin that declared none gets no group. A poll that
+    /// changes nothing keeps the mounted group — and the edit in it — and a
+    /// save for a plugin that is not running writes the file and says the
+    /// plugin reads it at its next start rather than restarting anything.
+    #[gtk::test]
+    fn a_plugin_that_declares_settings_gets_a_settings_group() {
+        use crate::plugin_settings::{Chooser, RowView};
+        use hytte_plugin_proto::manifest::Setting;
+
+        adw::init().expect("libadwaita init");
+        let tree = tempfile::tempdir().expect("a config tree of this test's own");
+        let config_home = tree.path().join("home");
+        std::fs::create_dir_all(config_home.join("trollshell")).expect("it is writable");
+        std::fs::write(
+            config_home.join("trollshell").join("plugins.json"),
+            r#"{"version":1,"plugins":{
+                "vibectl":{"exec":"/x/bin/v1bectl_widget","enabled":true,
+                           "env":{"V1BECTL_SERVER":"host:31337"}},
+                "timer":{"exec":"/x/bin/hytte-plugin-timer","enabled":false}
+            }}"#,
+        )
+        .expect("the plugins.json is writable");
+        let env = Rc::new(hytte_config::xdg::Env {
+            home: None,
+            config_home: Some(config_home.to_string_lossy().into_owned()),
+            config_dirs: Some(tree.path().join("etc").to_string_lossy().into_owned()),
+            state_home: None,
+        });
+        let (bin, state) = build_tab_in(env);
+        super::refresh_declared(&state);
+        apply_state(&state, &["timer", "vibectl"], "inactive");
+        let window = present(&bin, 640);
+
+        let declared = serde_json::to_string(&[
+            Setting::path("V1BECTL_SCREENS", "Screens layout file"),
+            Setting::text("V1BECTL_SERVER", "Server address"),
+        ])
+        .expect("encodes");
+        let reply = || HashMap::from([("vibectl".to_owned(), declared.clone())]);
+        super::on_settings_result(&state, state.schema_polls.issue(), Ok(reply()));
+
+        click(&state, "vibectl");
+        let group = {
+            let mounted = state.detail.settings.borrow();
+            let form = &mounted.as_ref().expect("vibectl declared settings").form;
+            assert_eq!(
+                form.rows(),
+                vec![
+                    (
+                        "V1BECTL_SCREENS".to_owned(),
+                        RowView::Entry {
+                            placeholder: None,
+                            chooser: Some(Chooser::File),
+                        }
+                    ),
+                    (
+                        "V1BECTL_SERVER".to_owned(),
+                        RowView::Nix {
+                            subtitle:
+                                "Set in nix — programs.trollshell.plugins.vibectl.env.V1BECTL_SERVER"
+                                    .to_owned(),
+                            sensitive: false,
+                        }
+                    ),
+                ]
+            );
+            assert!(
+                form.group()
+                    .ancestor(adw::PreferencesPage::static_type())
+                    .is_some_and(|page| page == state.detail.plugin_page.clone().upcast::<gtk::Widget>()),
+                "the group is on the plugin page"
+            );
+            form.type_into("V1BECTL_SCREENS", "/home/u/screens.kdl");
+            form.group().clone()
+        };
+
+        // The next poll brings the same declaration: nothing is rebuilt, so
+        // the unsaved edit is still there.
+        super::on_settings_result(&state, state.schema_polls.issue(), Ok(reply()));
+        refresh_detail(&state);
+        {
+            let mounted = state.detail.settings.borrow();
+            let form = &mounted.as_ref().expect("still mounted").form;
+            assert!(form.group() == &group, "the same group, not a rebuild");
+            assert!(form.is_dirty(), "the edit survived the poll");
+            form.press_save();
+            assert_eq!(
+                form.status(),
+                "Saved. The plugin reads it the next time it starts."
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(config_home.join("trollshell").join("plugin-settings.toml"))
+                .expect("saved under the tab's own config home"),
+            "[vibectl]\nV1BECTL_SCREENS = \"/home/u/screens.kdl\"\n",
+            "the nix-set variable is never written"
+        );
+
+        click(&state, "timer");
+        assert!(
+            state.detail.settings.borrow().is_none(),
+            "a plugin that declared nothing has no Settings group"
+        );
+        assert!(group.parent().is_none(), "and vibectl's left the page");
+
+        click(&state, "vibectl");
+        assert!(state.detail.settings.borrow().is_some(), "back again");
 
         dismiss(&window);
     }

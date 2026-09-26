@@ -30,12 +30,16 @@
 # what the block closed over in flake.nix: `craneLib`, `pkgs`, and the two
 # `trollshell.passthru.*` values (`commonArgs`/`cargoArtifacts`) it read off
 # the package derivation there — passed in directly rather than the whole
-# `trollshell` value, since those two fields are all this ever used.
+# `trollshell` value, since those two fields are all this ever used. Since
+# #1413 it also takes `assets` (`trollshell.passthru.assets`, the cheap
+# `trollshell-assets` derivation in `nix/package.nix`) for the
+# `TROLLSHELL_DATA_DIR` export in `preCheck` below.
 {
   craneLib,
   pkgs,
   commonArgs,
   cargoArtifacts,
+  assets,
 }:
 let
   # The one place the parity-harness case count lives on the nix side
@@ -261,6 +265,27 @@ craneLib.mkCargoDerivation (
       # GTK that did not come up on the `xvfb-run` X11 display fails them,
       # naming which.
       export TROLLSHELL_REQUIRE_XDOTOOL=1
+      # #1413, for #1414's pixel render test
+      # (`plugins::wire_map::render_tests::a_page_card_paints_a_card_under_the_plugin_page_flattening`),
+      # which paints a plugin page card under the **shell's own** stylesheet,
+      # read through `crate::assets::path("style.css")`. The crane source
+      # filter strips `assets/trollshell/` (`nix/package.nix`, #133 — so an
+      # asset edit never rehashes the Rust compile), so here the dev fallback
+      # (`CARGO_MANIFEST_DIR/../assets/trollshell`) names a directory that is
+      # not there. The runtime tier of `assets.rs` is pointed at the shipped
+      # `trollshell-assets` derivation instead — the very directory the
+      # packaged wrapper's `--set TROLLSHELL_DATA_DIR` names, so the test
+      # paints with the bytes that ship. It is also what the native chips'
+      # `gtk::Image::from_file(assets::path("icons/…"))` read, which now find
+      # real files where they found none; no test asserts on either outcome
+      # (measured: the whole `trollshell` system-tests run is identical with
+      # and without it).
+      export TROLLSHELL_DATA_DIR="${assets}/share/trollshell"
+      # …and, on the `TROLLSHELL_REQUIRE_GL` precedent above, the render test
+      # skips when the stylesheet is missing (a local `cargo test` with no
+      # assets dir) unless this is set — a skip reads as a pass, and this is
+      # the build that means it to run, so a missing sheet fails it here.
+      export TROLLSHELL_REQUIRE_SHELL_CSS=1
       # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
       # CPU/GL parity harness) runs through the same llvmpipe context
       # as the three `hytte-ui` GL tests. Under llvmpipe every *scope*

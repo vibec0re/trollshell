@@ -920,11 +920,14 @@
           # the parity gate). This call passes exactly what the block used
           # to close over here: `craneLib` and the two
           # `trollshell.passthru.*` values it read off the package
-          # derivation (`pkgs` is auto-supplied by `callPackage`).
+          # derivation (`pkgs` is auto-supplied by `callPackage`) — plus,
+          # since #1413, the package's `assets` derivation, whose
+          # `share/trollshell` the check exports as `TROLLSHELL_DATA_DIR`.
           system-tests = pkgs.callPackage ./nix/checks/system-tests.nix {
             inherit craneLib;
             commonArgs = trollshell.passthru.commonArgs;
             cargoArtifacts = trollshell.passthru.cargoArtifacts;
+            assets = trollshell.passthru.assets;
           };
 
           # Evaluate homeModules.default against a real home-manager module set so

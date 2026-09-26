@@ -703,7 +703,7 @@ fn reconcile_region(
                 // safe: the effect it may provoke is brokered on this same GTK
                 // thread, i.e. not before this callback has returned.
                 if matches!(kind, UiEventKind::Click) {
-                    note_card_click(&ev_plugin, &ev_card, &pressed);
+                    note_card_click(&ev_plugin, &ev_card, &pressed, ev_output.as_deref());
                 }
                 if let Some(tx) = ev_outbound.borrow().as_ref() {
                     // Non-blocking: a stuck plugin's full outbound queue drops the
@@ -869,18 +869,25 @@ fn clicked_widget(pressed: Option<gtk::Widget>, card: &gtk::Widget) -> gtk::Widg
 }
 
 /// Record a click on `plugin_id`'s card as that plugin's **click origin**
-/// (#1252) — what `effects::open_own_page_in_drawer` anchors the plugin's page
-/// under if the click makes the plugin open it.
+/// (#1252) — what the effect broker places the page under if the click makes
+/// the plugin open one: a drawer page (its own or a built-in) anchors under the
+/// clicked widget, and a sidebar card's dialog opens on `output`, this region's
+/// own connector (#1413) — the same value the click's `HostMsg::Event` carries.
 ///
 /// Consumes the recorded press, so a later click with no press behind it (a
 /// keyboard activation) cannot inherit an old press's button.
-fn note_card_click(plugin_id: &str, card: &glib::WeakRef<gtk::Box>, pressed: &PressedButton) {
+fn note_card_click(
+    plugin_id: &str,
+    card: &glib::WeakRef<gtk::Box>,
+    pressed: &PressedButton,
+    output: Option<&str>,
+) {
     let pressed = pressed.take();
     let Some(card) = card.upgrade() else {
         return;
     };
     let widget = clicked_widget(pressed, card.upcast_ref());
-    super::effects::note_click_origin(plugin_id, &widget, Instant::now());
+    super::effects::note_click_origin(plugin_id, &widget, output, Instant::now());
 }
 
 /// Log this card's #1050 per-screen verdict, but only when the frame's
@@ -5186,6 +5193,12 @@ mod gtk_tests {
         gesture
     }
 
+    /// `plugin_id`'s click origin, taken as a page opened now would take it —
+    /// just the widget, which is all the press-tracker tests are about.
+    fn taken(plugin_id: &str) -> Option<gtk::Widget> {
+        super::super::effects::take_click_origin(plugin_id, Instant::now()).map(|click| click.widget)
+    }
+
     /// End the tracker's current press sequence the way GTK does on a release,
     /// a denial or a cancel: `GtkGesture::end` (#1252 review, LOW 4).
     fn end_press(card: &gtk::Box) {
@@ -5219,12 +5232,15 @@ mod gtk_tests {
     /// A click on one chip of a several-chip card is recorded under **that
     /// chip**, not under the card — the case the brief calls out, and the one
     /// `hytte-plugin-stats` needs: its four chips are one card, and a drawer
-    /// centred under the card sits under the middle of the four (#1252).
+    /// centred under the card sits under the middle of the four (#1252). It is
+    /// recorded on **this region's output**, too — what a sidebar card's dialog
+    /// opens on (#1413).
     ///
     /// **Falsification:** make `clicked_widget` return the card
     /// unconditionally → the chip assertion reds; delete the
     /// `note_card_click` call from the card's event callback → the `expect`
-    /// reds (nothing recorded at all).
+    /// reds (nothing recorded at all); pass `None` for the output in the
+    /// callback → the output assertion reds.
     #[gtk::test]
     fn a_click_is_recorded_under_the_chip_its_press_landed_on() {
         adw::init().expect("libadwaita init");
@@ -5234,19 +5250,25 @@ mod gtk_tests {
 
         press_on(&card, &mem);
         mem.emit_clicked();
-        let origin = super::super::effects::take_click_origin("click-origin-chip", Instant::now())
-            .expect("a click on a mounted, rooted chip is recorded as its plugin's origin");
+        let origin =
+            super::super::effects::take_click_origin("click-origin-chip", Instant::now())
+                .expect("a click on a mounted, rooted chip is recorded as its plugin's origin");
         assert_eq!(
-            origin,
+            origin.widget,
             mem.clone().upcast::<gtk::Widget>(),
             "the page must hang off the chip that was pressed, not the card around it",
+        );
+        assert_eq!(
+            origin.output.as_deref(),
+            Some("A"),
+            "…on the output of the region it was clicked in (#1413)",
         );
 
         // …and the other chip, pressed next, is recorded under itself.
         press_on(&card, &cpu);
         cpu.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-chip", Instant::now()),
+            taken("click-origin-chip"),
             Some(cpu.upcast::<gtk::Widget>()),
         );
         window.destroy();
@@ -5269,17 +5291,17 @@ mod gtk_tests {
 
         cpu.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-card", Instant::now()),
+            taken("click-origin-card"),
             Some(card.clone().upcast::<gtk::Widget>()),
             "with no press to go by, the card is the best anchor there is",
         );
 
         press_on(&card, &mem);
         mem.emit_clicked();
-        let _ = super::super::effects::take_click_origin("click-origin-card", Instant::now());
+        let _ = taken("click-origin-card");
         cpu.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-card", Instant::now()),
+            taken("click-origin-card"),
             Some(card.upcast::<gtk::Widget>()),
             "a press is spent by its click; the next click without one falls back to the card",
         );
@@ -5308,7 +5330,7 @@ mod gtk_tests {
         // A press-less activation of `mem`.
         mem.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-drag-off", Instant::now()),
+            taken("click-origin-drag-off"),
             Some(card.clone().upcast::<gtk::Widget>()),
             "an abandoned press on `cpu` must not anchor a later click on `mem`",
         );
@@ -5337,7 +5359,7 @@ mod gtk_tests {
         end_press(&card);
         mem.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            taken("click-origin-end-order"),
             Some(mem.clone().upcast::<gtk::Widget>()),
             "the click in the same dispatch as its release spends its press",
         );
@@ -5350,7 +5372,7 @@ mod gtk_tests {
         pump();
         mem.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            taken("click-origin-end-order"),
             Some(mem.upcast::<gtk::Widget>()),
             "an older press's deferred clear must not wipe the newer press",
         );
@@ -5422,7 +5444,7 @@ mod gtk_tests {
             "premise: the submit reached the plugin",
         );
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-entry", Instant::now()),
+            taken("click-origin-entry"),
             None,
             "a submit is not a click and anchors nothing",
         );
@@ -5440,7 +5462,9 @@ mod gtk_tests {
     /// the `root()` check → the unrooted assertion reds.
     #[gtk::test]
     fn a_click_origin_anchors_one_page_and_only_while_recent_and_rooted() {
-        use super::super::effects::{CLICK_ORIGIN_WINDOW, note_click_origin, take_click_origin};
+        use super::super::effects::{
+            CLICK_ORIGIN_WINDOW, Click, note_click_origin, take_click_origin,
+        };
 
         adw::init().expect("libadwaita init");
         let window = gtk::Window::new();
@@ -5453,30 +5477,39 @@ mod gtk_tests {
         note_click_origin(
             "click-origin-age",
             &chip,
+            None,
             ago(CLICK_ORIGIN_WINDOW + Duration::from_millis(1)),
         );
         assert_eq!(
-            take_click_origin("click-origin-age", now),
+            take_click_origin("click-origin-age", now).map(|click| click.widget),
             None,
             "a click older than the window caused nothing opening now",
         );
 
-        note_click_origin("click-origin-age", &chip, ago(CLICK_ORIGIN_WINDOW));
-        assert_eq!(
-            take_click_origin("click-origin-age", now),
-            Some(chip.clone()),
-            "the window is inclusive",
+        note_click_origin(
+            "click-origin-age",
+            &chip,
+            Some("B"),
+            ago(CLICK_ORIGIN_WINDOW),
         );
         assert_eq!(
             take_click_origin("click-origin-age", now),
+            Some(Click {
+                widget: chip.clone(),
+                output: Some("B".to_owned()),
+            }),
+            "the window is inclusive, and the click keeps the output it was on (#1413)",
+        );
+        assert_eq!(
+            take_click_origin("click-origin-age", now).map(|click| click.widget),
             None,
             "one click anchors one page",
         );
 
         let unrooted: gtk::Widget = gtk::Button::new().upcast();
-        note_click_origin("click-origin-age", &unrooted, now);
+        note_click_origin("click-origin-age", &unrooted, Some("B"), now);
         assert_eq!(
-            take_click_origin("click-origin-age", now),
+            take_click_origin("click-origin-age", now).map(|click| click.widget),
             None,
             "a chip on no surface has nothing to measure",
         );

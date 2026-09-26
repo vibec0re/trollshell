@@ -1,5 +1,6 @@
 //! Layer-shell **plugin dialog** overlay (#1010): a centered surface on the
-//! focused output holding one plugin's own page.
+//! clicked card's output (else the focused one, #1413) holding one plugin's own
+//! page.
 //!
 //! Raised by the effect broker ([`crate::plugins`]) when a **sidebar-mounted**
 //! plugin emits `Effect::OpenPage(Page::PluginSelf)`. A bar chip's page keeps
@@ -94,13 +95,24 @@
 //! treatment (a popover-toned surface, a different radius and shadow, and a
 //! ruled header whose plugin id is monospaced), which no shell prompt uses.
 //!
-//! # One window, on the focused output
+//! # One window, on the clicked card's output
 //!
 //! Not one per monitor: [`install`] keeps a connector → [`Monitor`] map and
-//! [`open_on_focused`] builds the single window on niri's focused output, the
-//! `consent.rs` shape (#499/#517). Opening a second plugin's page while one is
-//! up swaps the selection in place; opening on a *different* output rebuilds the
-//! one window there. Never two windows.
+//! [`open_on_focused`] builds the single window on the output it is handed, the
+//! `consent.rs` shape (#499/#517). Since #1413 the broker hands it the output
+//! the sidebar card was **clicked** on when a recent click is behind the page
+//! (`plugins::effects::page_output`), and niri's focused output only when none
+//! is — a card clicked on monitor B opens its page on B even while niri's focus,
+//! as the shell last heard of it, is still on A. The card is centred either
+//! way; the output is all a click changes. Opening a second plugin's page while
+//! one is up swaps the selection in place; opening on a *different* output
+//! rebuilds the one window there. Never two windows.
+//!
+//! Keyboard: niri hands keyboard focus only to layer surfaces on its **active**
+//! output, so the `Exclusive` grab — and with it `Esc` — lands once niri's focus
+//! is on the dialog's output. A click on a layer surface moves niri's focus to
+//! that output, so this is normally immediate; the close button and an outside
+//! click dismiss regardless.
 //!
 //! CSS hooks (`ts-`-prefixed, matching the prompt/consent overlays' shape):
 //! - window root: `.ts-dialog` (transparent, like `.ts-prompt`)
@@ -442,9 +454,11 @@ pub fn close_all() {
     MONITORS.with(|m| m.borrow_mut().clear());
 }
 
-/// Open `plugin_id`'s own page in the dialog on niri's focused output (`preferred`),
-/// falling back to any mounted one. Called from the plugin effect broker when a
-/// **sidebar-mounted** plugin emits `Effect::OpenPage(Page::PluginSelf)`.
+/// Open `plugin_id`'s own page in the dialog on the `preferred` output, falling
+/// back to any mounted one. Called from the plugin effect broker when a
+/// **sidebar-mounted** plugin emits `Effect::OpenPage(Page::PluginSelf)`, with
+/// `preferred` the output the card was clicked on when a recent click is behind
+/// the page, else niri's focused output (#1413; the name predates that).
 /// GTK-main-thread only (the broker runs there).
 ///
 /// `mount` is the producing plugin's mount, carried through for the
@@ -723,14 +737,30 @@ fn show(monitor: &Monitor, connector: &str, plugin_id: &str) {
 /// Subscribed per window and aborted with it, so there is at most one of these
 /// alive. The connector is re-checked inside, so an abort that loses a race can
 /// still not act on a *later* window.
+///
+/// What closes it is a **move** — [`focus_moved_off`] — not merely a focused
+/// output that differs (#1413). Since the dialog opens on the output the card
+/// was *clicked* on, it can be built while niri's focused output is still
+/// another one: niri moves its focus to a clicked output, but the shell hears of
+/// that over IPC, and the plugin round trip that produced the page can beat it.
+/// The subscription's first value is the focus as it stands when the window is
+/// built, and under the old "any other named output" rule that stale first value
+/// took the page down the instant it went up.
 fn watch_focused_output(connector: &str) -> glib::JoinHandle<()> {
     let built_on = connector.to_owned();
+    // Whether the next value is the subscription's first, and the last one seen.
+    let mut first = true;
+    let mut last: Option<String> = None;
     glib::MainContext::default().spawn_local(niri::focused_output().for_each(move |focused| {
-        // `None` (niri startup, no focused workspace) is not "somewhere else" —
-        // only a *named* other output is.
-        if focused.is_some_and(|out| out != built_on)
-            && live_connector().as_deref() == Some(&*built_on)
-        {
+        let seen = if first {
+            SeenFocus::First
+        } else {
+            SeenFocus::Was(last.as_deref())
+        };
+        let moved_off = focus_moved_off(&built_on, seen, focused.as_deref());
+        first = false;
+        last = focused;
+        if moved_off && live_connector().as_deref() == Some(&*built_on) {
             tracing::debug!(
                 output = %built_on,
                 "plugin dialog closed: the focused output moved off the screen it was built on",
@@ -739,6 +769,44 @@ fn watch_focused_output(connector: &str) -> glib::JoinHandle<()> {
         }
         std::future::ready(())
     }))
+}
+
+/// What the dialog's focused-output subscription saw before its current value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeenFocus<'a> {
+    /// Nothing yet: the current value is the subscription's first, i.e. the
+    /// focus the dialog was built under.
+    First,
+    /// The previous value — `None` when niri reported no focused workspace.
+    Was(Option<&'a str>),
+}
+
+/// Whether niri's focused output, now `focused`, has just **moved off** the
+/// output the dialog was built on (`built_on`), given what the subscription saw
+/// before it (`seen`).
+///
+/// Two conditions, both needed:
+///
+/// * **A named output other than `built_on`.** `None` (niri startup, no focused
+///   workspace) is not "somewhere else", and focus arriving *on* the dialog's
+///   own screen is the opposite of leaving it.
+/// * **A change from the previous value.** The subscription's first value is
+///   the focus the dialog was *built* under, not a move — and since #1413 that
+///   can be another output, when the card was clicked on a screen niri's focus
+///   had not yet reached as far as the shell knows (or never will, on a
+///   compositor that does not move focus on a click). `niri::focused_output`
+///   also re-emits the same output on every workspace change, and a repeat of
+///   the output the focus was already on is not a move either.
+///
+/// So a dialog built under focus on `A` for a click on `B` stays up while the
+/// focus stays on `A` or follows the click to `B`, and goes down the moment it
+/// moves from wherever it was to any screen other than `B` — which, for a
+/// dialog built on the focused output, is exactly the pre-#1413 rule.
+fn focus_moved_off(built_on: &str, seen: SeenFocus<'_>, focused: Option<&str>) -> bool {
+    let SeenFocus::Was(last) = seen else {
+        return false;
+    };
+    focused.is_some_and(|out| out != built_on && Some(out) != last)
 }
 
 /// Which key presses dismiss the dialog: `Escape`, and nothing else.
@@ -896,6 +964,41 @@ fn set_title(plugin_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::SeenFocus::{First, Was};
+    use super::focus_moved_off;
+
+    /// [`focus_moved_off`]'s truth table (#1361 MEDIUM-3, re-scoped by #1413):
+    /// the dialog goes down when niri's focus **moves** to another screen, and
+    /// not merely because the focus sat on another screen when it went up — the
+    /// case a click on a card on `B` with the focus still on `A` produces.
+    ///
+    /// **Falsification:** restore the pre-#1413 rule
+    /// (`focused.is_some_and(|out| out != built_on)`, ignoring `last`) → the two
+    /// "built under focus on A" rows red, which is the dialog closing the
+    /// instant it opens on the clicked monitor; drop the `out != built_on` term
+    /// → "focus follows the click to B" reds.
+    #[test]
+    fn the_dialog_closes_when_the_focus_moves_off_its_screen_not_when_it_starts_elsewhere() {
+        let rows = [
+            // First value: the focus the dialog was built under.
+            (First, Some("B"), false, "built on the focused output"),
+            (First, Some("A"), false, "built on B for a click there, focus still on A"),
+            (First, None, false, "built while niri reports no focus"),
+            // Later values: a move, or not.
+            (Was(Some("B")), Some("A"), true, "focus moved from B to A"),
+            (Was(Some("B")), Some("B"), false, "a repeat of B"),
+            (Was(Some("B")), None, false, "no focus is not somewhere else"),
+            (Was(Some("A")), Some("A"), false, "a repeat of A: the focus never moved"),
+            (Was(Some("A")), Some("B"), false, "focus follows the click to B"),
+            (Was(Some("A")), Some("C"), true, "focus moved from A to a third screen"),
+            (Was(None), Some("A"), true, "focus appeared on another screen"),
+            (Was(None), Some("B"), false, "focus appeared on the dialog's screen"),
+        ];
+        for (seen, focused, closes, case) in rows {
+            assert_eq!(focus_moved_off("B", seen, focused), closes, "{case}");
+        }
+    }
+
     /// HIGH-1's second half is only a rule if the two shell surfaces actually
     /// call it. A source scan, on `consent.rs`'s own
     /// `request_never_names_a_decision_of_its_own` precedent: the *behaviour* of

@@ -5665,7 +5665,14 @@ mod gtk_tests {
             wait_for(
                 "the card's layout",
                 || window.is_mapped() && cpu.width() > 0 && mem.width() > 0,
-                || format!("mapped {}, cpu {}, mem {}", window.is_mapped(), cpu.width(), mem.width()),
+                || {
+                    format!(
+                        "mapped {}, cpu {}, mem {}",
+                        window.is_mapped(),
+                        cpu.width(),
+                        mem.width()
+                    )
+                },
             );
 
             let pattern = format!("^{title}$");

@@ -1007,12 +1007,7 @@ mod tests {
                 false,
                 "built on B for a click there, focus still on A: a repeat of A",
             ),
-            (
-                Some("A"),
-                Some("B"),
-                false,
-                "focus follows the click to B",
-            ),
+            (Some("A"), Some("B"), false, "focus follows the click to B"),
             (
                 Some("A"),
                 Some("C"),
@@ -1094,7 +1089,9 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(
-            body.contains("FocusWatch::new(connector,crate::components::focused_output::current())"),
+            body.contains(
+                "FocusWatch::new(connector,crate::components::focused_output::current())"
+            ),
             "watch_focused_output must seed its FocusWatch with the focused output the shell \
              knew when the window was built (#1416 review, L3)",
         );

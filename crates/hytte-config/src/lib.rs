@@ -90,6 +90,7 @@
 pub mod file;
 pub mod merge;
 pub mod places;
+pub mod plugin_settings;
 pub mod schema;
 pub mod state;
 pub mod subsystem;

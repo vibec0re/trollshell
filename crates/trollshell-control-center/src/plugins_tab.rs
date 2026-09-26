@@ -2518,15 +2518,28 @@ fn refresh_settings(state: &PluginsState, id: &str) {
     });
 }
 
+/// The line under a Settings group while its Save's `RestartPlugin` is out.
+const APPLYING: &str = "Saved. Asking the shell to apply it…";
+
 /// What the shell answered `RestartPlugin` with, as the line under a saved
 /// Settings group (#1415 review L6). Pure, so every wording is a test.
 ///
-/// `not-declared` is a hand-installed static unit: the launcher does not
-/// launch it, so it never reads the file, and saying "restarted" there would
-/// be a lie twice over.
-fn restart_status(answer: &str) -> &'static str {
+/// - `not-declared` is a hand-installed static unit: the launcher does not
+///   launch it, so it never reads the file, and saying "restarted" there
+///   would be a lie twice over.
+/// - `not-running` depends on whether the plugin is switched on (`enabled`,
+///   from the tab's last poll): a plugin that is off picks the values up when
+///   it is switched on; one that is **on but not running** — it failed, or
+///   exited, very likely for want of this very setting — would otherwise wait
+///   for the next login, so the line says how to start it now (#1415 second
+///   review L7).
+fn restart_status(answer: &str, enabled: bool) -> &'static str {
     match answer {
         "relaunched" => "Saved, and the plugin restarted.",
+        "not-running" if enabled => {
+            "Saved. The plugin is switched on but not running (it may have failed to start); \
+             switch it off and on to start it with the new values."
+        }
         "not-running" => "Saved. The plugin reads it the next time it starts.",
         "not-declared" => {
             "Saved, but this plugin runs from a unit file of its own, which does not read \
@@ -2536,49 +2549,88 @@ fn restart_status(answer: &str) -> &'static str {
     }
 }
 
-/// What a Settings group does after it saved (#1410): ask the shell to
-/// restart the plugin if it is running, so it reads the new values, and
-/// report the outcome under the rows. A plugin that is not running picks the
-/// values up at its next start, and says so.
+/// The `RestartPlugin` a Save sends. A seam, so no test ever sends one to a
+/// real session bus: under `cfg(test)` it records the id and answers that no
+/// shell is there.
+#[cfg(not(test))]
+fn send_restart(
+    id: String,
+) -> impl Future<Output = Result<String, hytte_bus::BusError>> + Send + 'static {
+    restart_plugin(id)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every id a Save asked the shell to restart, in order.
+    static SENT_RESTARTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn send_restart(
+    id: String,
+) -> impl Future<Output = Result<String, hytte_bus::BusError>> + Send + 'static {
+    SENT_RESTARTS.with(|sent| sent.borrow_mut().push(id));
+    std::future::ready(Err(hytte_bus::BusError::Permanent {
+        reason: "no shell under test".to_owned(),
+        dbus_name: None,
+    }))
+}
+
+/// The ids every Save on this thread asked the shell to restart, draining the
+/// record.
+#[cfg(all(test, feature = "system-tests"))]
+fn take_sent_restarts() -> Vec<String> {
+    SENT_RESTARTS.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
+}
+
+/// What a Settings group does after it saved (#1410): ask the shell to apply
+/// the values, and put its answer under the rows.
 ///
-/// One `RestartPlugin` call, off the GTK thread (#1415 review H2): the shell
-/// runs the stop, the wait for the unit to be really down and the relaunch
-/// under its launcher's lock, where this tab used to send `StopPlugin` and
-/// `StartPlugin` itself with a wait that took `deactivating` for stopped.
+/// **Always** one `RestartPlugin`, off the GTK thread, whatever this tab's
+/// last poll said (#1415 second review M1). The poll can be two seconds
+/// stale: a Save made while an earlier one is still restarting the plugin
+/// sees `deactivating` or `inactive` there, and skipping the call on that
+/// would write the file and never apply it. The shell answers after any
+/// restart already under way, from the unit's current state — relaunching a
+/// running plugin with the file as it is now, starting nothing that is not
+/// running — so its answer, not this tab's guess, picks the line.
 fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
     let weak = state.downgrade();
     Rc::new(
         move |id: &str, form: &crate::plugin_settings::SettingsForm| {
-            let Some(state) = weak.upgrade() else {
-                return;
-            };
-            let running = state
-                .snapshot
-                .borrow()
-                .get(id)
-                .is_some_and(|snap| is_running(&snap.active_state));
-            if !running {
-                form.set_status("Saved. The plugin reads it the next time it starts.", false);
+            if weak.upgrade().is_none() {
                 return;
             }
-            form.set_status("Saved. Restarting the plugin…", false);
+            form.set_status(APPLYING, false);
             let form = form.clone();
-            let weak = state.downgrade();
-            spawn_on_runtime(restart_plugin(id.to_owned()), move |res| {
+            let weak = weak.clone();
+            let plugin = id.to_owned();
+            spawn_on_runtime(send_restart(plugin.clone()), move |res| {
+                let state = weak.upgrade();
+                let enabled = state.as_ref().is_some_and(|state| {
+                    state
+                        .snapshot
+                        .borrow()
+                        .get(&plugin)
+                        .is_some_and(|snap| snap.enabled)
+                });
                 match res {
-                    Ok(answer) => form.set_status(restart_status(&answer), false),
+                    Ok(answer) => {
+                        form.set_status(restart_status(&answer, enabled), false);
+                        // Only an answer can have moved the unit; re-poll so
+                        // the row and the switch catch up with it.
+                        if let Some(state) = &state {
+                            refresh_plugins_soon(state);
+                        }
+                    }
                     Err(err) if is_unknown_method(&err) => form.set_status(
                         "Saved, but this shell cannot restart plugins for their settings \
                          (it predates RestartPlugin). Switch the plugin off and on to apply it.",
                         true,
                     ),
-                    Err(err) => form.set_status(
-                        &format!("Saved, but restarting the plugin failed: {err}"),
-                        true,
-                    ),
-                }
-                if let Some(state) = weak.upgrade() {
-                    refresh_plugins_soon(&state);
+                    Err(err) => {
+                        form.set_status(&format!("Saved, but applying it failed: {err}"), true)
+                    }
                 }
             });
         },
@@ -3314,15 +3366,29 @@ fn already_stopped(err: &hytte_bus::BusError) -> bool {
     err.to_string().contains(" not loaded.")
 }
 
-/// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`. A
-/// slightly longer timeout — the shell drives a systemd job to apply it.
+/// How long the tab waits for a call that takes the shell's plugin
+/// convergence lock — `StartPlugin`, `SetPluginEnabled` — before it gives up
+/// (#1415 second review L1).
+///
+/// It must outlast the longest the lock can be held by a restart already
+/// under way — the stop, the wait of up to 12 s for the unit to go down, the
+/// keyring read, `systemd-run` — because a call the tab gives up on is **not**
+/// cancelled in the shell: it still runs when the lock frees. A shorter wait
+/// would report "not changed" for a change the shell then makes anyway (a
+/// switch flipped off during a stuck restart, persisted seconds after the tab
+/// said it was not).
+const LOCKED_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`,
+/// with [`LOCKED_CALL_TIMEOUT`]: the shell drives a systemd job to apply it,
+/// and a start queues behind any restart holding the convergence lock.
 async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method(method)
         .args((id.to_owned(),))
-        .timeout(Duration::from_secs(5))
+        .timeout(LOCKED_CALL_TIMEOUT)
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
@@ -3342,15 +3408,22 @@ async fn list_plugin_settings() -> Result<HashMap<String, String>, hytte_bus::Bu
 }
 
 /// How long a `RestartPlugin` may take before the tab stops waiting for its
-/// answer: the shell waits up to 12 s for the old unit to go down (past its
-/// 10 s `TimeoutStopSec=`), then launches the new one.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(30);
+/// answer: its own hold of the convergence lock (the shell waits up to 12 s
+/// for the old unit to go down, past its 10 s `TimeoutStopSec=`, then
+/// launches the new one) **plus** a whole restart queued ahead of it — a
+/// second Save's call waits for the first's.
+#[cfg_attr(test, allow(dead_code))]
+const RESTART_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// `RestartPlugin(id)` → what the shell did (#1410, #1415 review H2): one
 /// call, which runs the stop, the wait through `deactivating` and the
 /// relaunch under the launcher's convergence lock. The answer is a word —
 /// `relaunched`, `not-running`, `not-declared` — that [`restart_status`]
 /// turns into the line under the group.
+///
+/// Not called under `cfg(test)`, where [`send_restart`] records the call
+/// instead of reaching a session bus.
+#[cfg_attr(test, allow(dead_code))]
 async fn restart_plugin(id: String) -> Result<String, hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
@@ -3363,14 +3436,16 @@ async fn restart_plugin(id: String) -> Result<String, hytte_bus::BusError> {
         .await
 }
 
-/// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
+/// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state,
+/// with [`LOCKED_CALL_TIMEOUT`] — the shell persists it under the convergence
+/// lock.
 async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetPluginEnabled")
         .args((id.to_owned(), enabled))
-        .timeout(Duration::from_secs(5))
+        .timeout(LOCKED_CALL_TIMEOUT)
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
@@ -4516,20 +4591,30 @@ mod tests {
     /// file, nor for a plugin that was not running.
     #[test]
     fn the_save_line_says_what_the_shell_did() {
+        for enabled in [false, true] {
+            assert_eq!(
+                super::restart_status("relaunched", enabled),
+                "Saved, and the plugin restarted."
+            );
+            let static_unit = super::restart_status("not-declared", enabled);
+            assert!(
+                static_unit.contains("does not read") && !static_unit.contains("plugin restarted"),
+                "{static_unit}"
+            );
+            assert_eq!(super::restart_status("something-newer", enabled), "Saved.");
+        }
         assert_eq!(
-            super::restart_status("relaunched"),
-            "Saved, and the plugin restarted."
-        );
-        assert_eq!(
-            super::restart_status("not-running"),
+            super::restart_status("not-running", false),
             "Saved. The plugin reads it the next time it starts."
         );
-        let static_unit = super::restart_status("not-declared");
+        // #1415 second review L7: switched on but not running — the plugin
+        // that "cannot start without its setting" — is told how to start it,
+        // not to wait for a next start nothing will trigger.
+        let failed = super::restart_status("not-running", true);
         assert!(
-            static_unit.contains("does not read") && !static_unit.contains("plugin restarted"),
-            "{static_unit}"
+            failed.contains("switch it off and on") && !failed.contains("next time"),
+            "{failed}"
         );
-        assert_eq!(super::restart_status("something-newer"), "Saved.");
     }
 
     /// Only `UnknownMethod` is "an older shell"; a timeout is not.
@@ -7061,10 +7146,13 @@ mod gtk_tests {
             let form = &mounted.as_ref().expect("still mounted").form;
             assert!(form.group() == &group, "the same group, not a rebuild");
             assert!(form.is_dirty(), "the edit survived the poll");
+            let _ = super::take_sent_restarts();
             form.press_save();
+            assert_eq!(form.status(), super::APPLYING);
             assert_eq!(
-                form.status(),
-                "Saved. The plugin reads it the next time it starts."
+                super::take_sent_restarts(),
+                ["vibectl"],
+                "the shell, not the tab, decides whether a stopped plugin restarts"
             );
         }
         assert_eq!(
@@ -7277,6 +7365,36 @@ mod gtk_tests {
             "{:?}",
             server_row(&state)
         );
+        dismiss(&window);
+    }
+
+    /// #1415 second review M1 (the reviewer's probe, inverted): a Save made
+    /// while the tab's last poll shows the plugin mid-restart
+    /// (`deactivating`, or already `inactive`) still asks the shell, which
+    /// answers after the restart under way and applies this Save's values too.
+    ///
+    /// Red before the fix: the tab skipped `RestartPlugin` on its stale
+    /// poll and said "Saved. The plugin reads it the next time it starts." —
+    /// for a plugin that had just started with the previous Save's values.
+    #[gtk::test]
+    fn a_save_during_a_restart_in_flight_still_asks_the_shell() {
+        adw::init().expect("libadwaita init");
+        let (_tree, _json, _bin, state, window, _declared) = settings_fixture("{}");
+        for active_state in ["deactivating", "inactive", "failed"] {
+            apply_state(&state, &["vibectl"], active_state);
+            let form = state
+                .detail
+                .settings
+                .borrow()
+                .as_ref()
+                .map(|m| m.form.clone())
+                .expect("still mounted");
+            form.type_into("V1BECTL_SERVER", active_state);
+            let _ = super::take_sent_restarts();
+            form.press_save();
+            assert_eq!(form.status(), super::APPLYING, "{active_state}");
+            assert_eq!(super::take_sent_restarts(), ["vibectl"], "{active_state}");
+        }
         dismiss(&window);
     }
 }

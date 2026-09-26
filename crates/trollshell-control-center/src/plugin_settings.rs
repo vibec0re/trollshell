@@ -57,7 +57,8 @@
 //! one, never a key the plugin does not declare, never an untouched row —
 //! refuses a value no environment can carry
 //! (`hytte_config::plugin_settings::value_refusal`), then hands the id to the
-//! tab, which asks the shell to restart the plugin if it is running.
+//! tab, which asks the shell to apply it: the shell restarts the plugin if it
+//! is running, after any restart already under way.
 //! **Revert** re-reads the file. The file is not polled: a hand edit shows on
 //! the next Revert or selection.
 
@@ -649,11 +650,25 @@ impl SettingsForm {
         row.set_selected(index);
     }
 
-    /// Press the reset button of the switch or spin row for `env`.
+    /// Press the reset button of the switch or spin row for `env`, as a click
+    /// would — which a person can only do on a button that is **sensitive**,
+    /// so this refuses one that is not rather than firing it anyway
+    /// (`emit_clicked` would; #1415 second review A2).
     #[cfg(all(test, feature = "system-tests"))]
     pub(crate) fn reset(&self, env: &str) {
+        let reset = self.reset_button(env);
+        assert!(
+            reset.is_sensitive(),
+            "{env}: the reset button is greyed out, so nobody could click it"
+        );
+        reset.emit_clicked();
+    }
+
+    /// The reset button of the switch or spin row for `env`.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn reset_button(&self, env: &str) -> &gtk::Button {
         match &self.row(env).editor {
-            Editor::Switch { reset, .. } | Editor::Spin { reset, .. } => reset.emit_clicked(),
+            Editor::Switch { reset, .. } | Editor::Spin { reset, .. } => reset,
             _ => panic!("{env} has no reset button"),
         }
     }
@@ -1436,5 +1451,78 @@ V1BECTL_THEME = \"light\"
         assert!(form.is_dirty(), "the edit is untouched");
         form.set_shell_reachable(true);
         assert!(!form.says_offline());
+    }
+
+    /// #1415 second review A2 (the reviewer's probe): the reset button is
+    /// offered for a value the row cannot show — exactly the value it exists
+    /// to clear — not only for one it can.
+    #[gtk::test]
+    fn reset_is_offered_for_a_foreign_value() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        std::fs::write(
+            &path,
+            "[vibectl]\nV1BECTL_DEBUG = \"yes\"\nV1BECTL_COLUMNS = 12\n",
+        )
+        .expect("seed");
+        let form = form_at(Some(path), &[], no_op());
+        for env in ["V1BECTL_DEBUG", "V1BECTL_COLUMNS"] {
+            assert!(
+                form.reset_button(env).is_sensitive(),
+                "{env}: the reset button cannot be clicked"
+            );
+        }
+        // …and not offered for a row that holds nothing to clear.
+        let empty = form_at(None, &[], no_op());
+        assert!(!empty.reset_button("V1BECTL_DEBUG").is_sensitive());
+    }
+
+    /// #1415 second review A5 (the reviewer's probe): flipping a switch and
+    /// then resetting it is no change at all — the reset's own redraw of the
+    /// row is not read as an edit.
+    #[gtk::test]
+    fn reset_after_an_edit_removes_the_key() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        std::fs::write(&path, "[vibectl]\nOTHER = \"x\"\n").expect("seed");
+        let form = form_at(Some(path.clone()), &[], no_op());
+        form.toggle("V1BECTL_DEBUG");
+        form.reset("V1BECTL_DEBUG");
+        assert_eq!(
+            form.buttons(),
+            (false, false),
+            "reset back to unset is no change"
+        );
+        form.press_save();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "[vibectl]\nOTHER = \"x\"\n"
+        );
+    }
+
+    /// #1415 second review A1 (the reviewer's probe): Revert forgets what was
+    /// touched, so a later, unrelated Save cannot write the reverted row — the
+    /// H1 bug again, through Revert.
+    #[gtk::test]
+    fn revert_forgets_the_touch() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        let before = "[vibectl]\nV1BECTL_DEBUG = \"yes\"\n";
+        std::fs::write(&path, before).expect("seed");
+        let form = form_at(Some(path.clone()), &[], no_op());
+        form.toggle("V1BECTL_DEBUG");
+        assert!(form.is_dirty());
+        form.load();
+        assert_eq!(form.buttons(), (false, false), "dirty right after Revert");
+        form.type_into("V1BECTL_SERVER", "h:1");
+        form.press_save();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            format!("{before}V1BECTL_SERVER = \"h:1\"\n"),
+            "an unrelated save after Revert rewrote the value the row cannot show"
+        );
     }
 }

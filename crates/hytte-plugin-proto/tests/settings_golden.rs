@@ -230,10 +230,17 @@ fn a_newer_setting_kind_costs_only_its_own_setting() {
     assert_eq!(decoded.settings[1].env, "V1BECTL_TOKEN");
     let newer = unknown(&decoded.settings[1]);
     assert!(newer.is_newer());
-    assert_eq!(newer.describe(), "its kind `Secret` is newer than this shell");
+    assert_eq!(
+        newer.describe(),
+        "its kind `Secret` is newer than this shell"
+    );
     let no_env = unknown(&decoded.settings[2]);
     assert!(!no_env.is_newer());
-    assert!(no_env.describe().contains("no `env`"), "{}", no_env.describe());
+    assert!(
+        no_env.describe().contains("no `env`"),
+        "{}",
+        no_env.describe()
+    );
 }
 
 /// #1415 second review L6: a malformed **known** kind is not reported as a
@@ -310,7 +317,10 @@ fn the_known_kind_names_are_the_wire_names() {
         .collect();
     assert_eq!(
         names,
-        KNOWN_SETTING_KINDS.iter().map(|k| (*k).to_owned()).collect(),
+        KNOWN_SETTING_KINDS
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect(),
         "every constructor's kind, as the wire spells it"
     );
 }

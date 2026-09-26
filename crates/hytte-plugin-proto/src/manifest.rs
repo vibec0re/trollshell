@@ -611,7 +611,6 @@ pub enum SettingKind {
     Unknown(UnknownKind),
 }
 
-
 /// The payload of [`SettingKind::Unknown`]: why this build could not read the
 /// setting. Its field is private, so only this crate's decoder can make one —
 /// a plugin cannot declare an unknown kind by accident.
@@ -653,11 +652,11 @@ impl UnknownKind {
             Unreadable::Newer(name) => {
                 format!("its kind `{name}` is newer than this shell")
             }
-            Unreadable::Malformed(name) if name.is_empty() => {
-                "it has no readable kind".to_owned()
-            }
+            Unreadable::Malformed(name) if name.is_empty() => "it has no readable kind".to_owned(),
             Unreadable::Malformed(name) => {
-                format!("it is a malformed `{name}` setting (a field is missing or of the wrong type)")
+                format!(
+                    "it is a malformed `{name}` setting (a field is missing or of the wrong type)"
+                )
             }
             Unreadable::Entry => "it is not a readable setting (no `env`)".to_owned(),
         }
@@ -742,7 +741,6 @@ where
         })
         .collect())
 }
-
 
 /// The longest environment variable name [`Setting::env_refusal`] accepts, in
 /// bytes. Generous for any real name; keeps a hostile manifest from making the

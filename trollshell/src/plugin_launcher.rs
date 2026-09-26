@@ -2410,9 +2410,12 @@ impl SettingsRestart {
 /// is declared — #1415 second review L5); a failed unit listing, stop or
 /// relaunch.
 pub async fn restart_for_settings(id: &str) -> anyhow::Result<SettingsRestart> {
-    restart_for_settings_via(id, load_declared, systemd::list_plugin_units, |spec, target| {
-        async move { restart(id, &spec, &target).await }
-    })
+    restart_for_settings_via(
+        id,
+        load_declared,
+        systemd::list_plugin_units,
+        |spec, target| async move { restart(id, &spec, &target).await },
+    )
     .await
 }
 
@@ -5473,7 +5476,8 @@ mod tests {
         );
         let entry = body("pub async fn restart_for_settings(");
         assert!(
-            entry.contains("restart_for_settings_via(id, load_declared, systemd::list_plugin_units"),
+            entry
+                .contains("restart_for_settings_via(id, load_declared, systemd::list_plugin_units"),
             "production must hand the seam the real declaration and listing:\n{entry}"
         );
         assert!(entry.contains("restart(id, &spec, &target)"), "{entry}");
@@ -5555,7 +5559,10 @@ mod tests {
         assert_eq!(answer, SettingsRestart::Relaunched);
         assert_eq!(
             got.into_inner(),
-            Some((values(&[("V1BECTL_SERVER", "v")]), DEFAULT_TARGET.to_owned()))
+            Some((
+                values(&[("V1BECTL_SERVER", "v")]),
+                DEFAULT_TARGET.to_owned()
+            ))
         );
     }
 

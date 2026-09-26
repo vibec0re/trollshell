@@ -1,5 +1,7 @@
 //! The plugin's **own drawer page** (#1251) — the native Stats page's cards
-//! re-expressed in the wire vocabulary.
+//! re-expressed in the wire vocabulary, and since #1252 in the native page's
+//! own **layout and widgets**: two columns of `boxed-list` cards, one-line
+//! "label … value" rows, `Progress` bars and flat history lines. **No preem.**
 //!
 //! A click on any bar chip emits
 //! [`Effect::OpenPage(Page::PluginSelf)`](hytte_plugin::proto::Page::PluginSelf)
@@ -7,346 +9,686 @@
 //! It rides the same render frame as the chips (`View::panel`), so the page and
 //! the chip a click came from are always one observation of the machine.
 //!
-//! # What it mirrors, and what it cannot
+//! # Why it stopped being a preem page (#1252)
 //!
-//! The native page (`trollshell/src/panels/stats.rs`, 3 165 lines over five
-//! cards in three layouts) is the source of truth for the card set, every
-//! format string and every hide rule. Four of its five cards are here — CPU,
-//! Memory, GPU, Disks — and the fifth, **Services**, is not, for the reason
-//! `crate::card::chips` gives about the services chip: failed systemd units are
-//! a system-bus client and flapping shell tasks are the shell's own task
-//! supervisor, and a plugin process can reach neither. Epic #1248's P3 already
-//! has that card staying native.
+//! #1251 drew this page with the retro kit — a seven-segment temperature, a
+//! gauge needle for GPU load, LED strips for memory and swap, phosphor scopes
+//! for every history — in one narrow column. Next to the native page it read
+//! as a different program, and Annika said so ("typ ultra dogshit compared
+//! to [the native page] … maybe not use preem widgets here?"). The sidebar
+//! card is the preem surface and stays one (`crate::card::card`, which she
+//! does like); **this** page mirrors `trollshell/src/panels/stats.rs`'s
+//! multicolumn layout card for card, with the widgets that page uses:
 //!
-//! **Two rows genuinely cannot follow, and everything else does.** The
-//! `#1295` review's MED 1 found five native rows missing and named nowhere:
-//! four had no dependency or wire reason to be absent (a gap in this page, not
-//! in what a GTK-free process can reach) and are here now — **Processes**
-//! (`stats.rs:576` → `:1182`), **CPU clock** (`:578` → `:1557`), **disk I/O
-//! history** (`:610` → `:1293`) and **GPU VRAM history** (`:632`), all sourced
-//! from `hytte-sensors` the same way every other row on this page is. The
-//! fifth, **Top apps · CPU / RAM** (`:579`, `:596`), is the one genuine gap:
-//! `app_usage` (`crates/hytte-services/src/app_usage.rs`) walks `/proc`
-//! grouped by systemd app-scope/service cgroup and resolves each app's icon
-//! through `gio::AppInfo` — a `hytte-services` module, which a GTK-free plugin
-//! process never links, the same shape of gap as the Services card. Not built
-//! here, and not planned — see `docs/live-verify.md`'s side-by-side item and
-//! #1251.
-//!
-//! The translation, row by row:
-//!
-//! | native | here |
+//! | native (`panels/stats.rs`) | here |
 //! | --- | --- |
-//! | `MultiSparkline` per-core history | **not drawn** — the wire's `Scope` is one trace, and N traces is N nodes; the overall sweep is the one that fits |
-//! | `Sparkline` overall CPU history | a [`Scope`](hytte_plugin::display::Scope) |
-//! | the `LedMatrix` per-core panel | the P1 lamp row, fitted to the page's own width (`card::PAGE_PX`) rather than the sidebar card's |
-//! | "Processes" row | a plain reading, `hytte_sensors::read_process_count` |
-//! | "Clock" row (`fmt_hz`) | a plain reading, `hytte_sensors::read_cpu_freq`; hidden with no `cpufreq` governor, same as native |
-//! | memory / swap `GtkProgressBar` | a [`LedStrip`](hytte_plugin::display::LedStrip) apiece, with the exact `used / total (pct%)` text beside it |
-//! | GPU load (a text suffix natively) | a [`Gauge`](hytte_plugin::display::Gauge) — the one place this page is *more* than the native one, and P1's own choice |
-//! | "GPU VRAM" history row | a `Scope`; hidden unless both used+total VRAM are reported, same as native |
-//! | per-mount `GtkProgressBar` | [`Node::Progress`] with the shell's own `ts-stat-progress` class |
-//! | "Disk I/O" history row | a `Scope`, auto-scaled against the peak rate this session has seen rather than the native row's windowed max (a named simplification, `card::Widgets::disk_io`'s doc) |
-//! | Top apps · CPU / RAM | **not drawn** — shell-only, see above |
+//! | `page_grid`, `CPU \| Memory` / `GPU \| Disks` | a **homogeneous** horizontal [`Node::Box`] (the grid is column-homogeneous too) of two vertical column boxes — CPU over GPU, Memory over Disk; the wire has no grid, and two columns of independent height is what the grid draws once the Services row is gone |
+//! | `adw::PreferencesGroup` per card | a `boxed-list` [`Node::ListBox`] (not `dense`: the native rows keep libadwaita's row height), also classed `ts-page-card` so the shell's plugin-page flattening of `boxed-list` leaves this page's cards their card surface |
+//! | `AdwActionRow` / `slim_row` (title, subtitle, suffix) | a [`Node::Row`] classed `header`, so libadwaita's own `row > box.header` rule (12 px margins, 50 px rows) applies to it exactly as to `slim_row`'s box; title, then the subtitle as a `subtitle` label **on the same line** (a two-line title column cannot be vertically centred from the wire), a [`Node::Spacer`], then the suffix |
+//! | `build_history_row`'s `[name 80px \| Sparkline \| value 80px]` | a `ts-history-row` [`Node::Row`] of a `ts-stat-name` label, a [`Node::Sparkline`] — the **same** `hytte_ui::Sparkline` — and a `ts-stat-value` label; the 80 px columns are the `ts-stat-col` rule, since a node cannot call `set_size_request` |
+//! | memory / swap / per-mount `GtkProgressBar` (`ts-stat-progress`) | [`Node::Progress`] with the same class |
+//! | the Disk `AdwExpanderRow`, collapsed | a [`Node::Expander`], collapsed until clicked (the plugin holds the flag — see [`DISKS_EXPANDER_ID`]) |
+//! | Disk I/O's `↓ … ↑ …` / `min … · max …` / `total ↓ … ↑ …` lines, indented 88 px | three `ts-stat-value` labels under the line, indented by the `ts-stat-detail` rule |
 //!
-//! **Why the mounts are `Node::Progress` and not a strip each.** #1251 asks for
-//! "progress bars become `Gauge`/`LedStrip`", and the memory and swap bars are
-//! exactly that. The mount list is the one place that would be wrong: the
-//! preem wrappers hold animation state, a node's id is its reconciler key
-//! (#900), and the mount list is **variable-length** — so N strips means N
-//! wrappers in the model, rebuilt whenever a filesystem is mounted, which is
-//! the shape #900's documentation names as the thing that goes wrong. A
-//! `Node::Progress` is stateless, carries the native page's own
-//! `.ts-stat-progress` rule verbatim, and is what the native page draws there.
+//! The history lines keep [`HISTORY_LEN`] samples, the native rows' 60, on the
+//! native rows' axes: load, memory, GPU usage and VRAM on a fixed `0..=1`, the
+//! clock normalised to the highest `cpuinfo_max_freq` (the native row's fixed
+//! "0→max-clock" domain), GPU temperature and the disk I/O rate auto-scaled —
+//! which for disk I/O is now exactly the native row's windowed max rather than
+//! #1251's session-peak simplification, because the line auto-scales over the
+//! same sixty samples the native `Sparkline` holds.
 //!
-//! # Three layouts, one page
+//! Against a shell too old to draw a [`Node::Sparkline`] (it is negotiated,
+//! generation 7), every line degrades to a `Progress` bar at its newest
+//! sample's level — `hytte_plugin::nodes::sparkline`'s fallback — so even the
+//! old-shell page carries no preem.
 //!
-//! The native page has `combined` / `multicolumn` / `split`
-//! (`TROLLSHELL_STATS_LAYOUT`), because it is the whole Stats surface and has a
-//! grid to lay out. This is one column: the wire has no grid, the drawer is
-//! 680 px wide, and `split` exists so a chip can open *its own* page — which
-//! here is the same page for all four chips, since a plugin has exactly one
-//! `PluginSelf`. Nothing about that is configurable and nothing pretends to be.
+//! # What it cannot mirror
+//!
+//! - **Services** (the fifth card): failed systemd units are a system-bus
+//!   client and flapping shell tasks are the shell's own task supervisor; a
+//!   plugin process can reach neither. Epic #1248 has that card staying
+//!   native.
+//! - **Top apps · CPU / RAM**: `app_usage` (`crates/hytte-services`) walks
+//!   `/proc` by systemd cgroup and resolves icons through `gio::AppInfo` — a
+//!   `hytte-services` module a GTK-free plugin never links.
+//! - **The per-core LED panel.** Native draws it with `hytte_preem::LedMatrix`,
+//!   which is not on the wire (#1156); the only lamp the wire has is a preem
+//!   `DotMatrix`, which is exactly what this page is no longer allowed to
+//!   carry, and the flat alternative — one `Progress` per core — is the 64-bar
+//!   strip #702 removed for its minimum width. So the page omits it (and the
+//!   "Per-core · N cores" header row that only introduced it). The sidebar card
+//!   still draws the lamp row.
+//! - **The per-core history** (native's expandable CPU and Clock rows switch
+//!   to a `MultiSparkline`): one line per node, and N lines is N nodes; the
+//!   overall line is the one that fits.
+//!
+//! # The page width
+//!
+//! It is **this tree's content**, not the host's frame. The drawer sizes a
+//! plugin page to the page's own natural width, and a host clamp (#1412's
+//! `finish_page_clamped(…, DRAWER_MAX_WIDTH_WIDE)`) only *caps* it: libadwaita's
+//! clamp reports its child's natural width whenever that is under the cap, so
+//! a 1080 px cap never binds here (#1414 review, LOW 7: 736 px as mounted on
+//! main and 758 px inside #1412's frame with unequal columns; 882 px and
+//! 904 px once they are equal). What makes two columns read as two columns is
+//! therefore theirs to decide: the root box is homogeneous, so both columns
+//! take the wider one's width — which is also what sets the page's minimum.
+
+use std::collections::VecDeque;
 
 use hytte_plugin::nodes;
-use hytte_plugin::proto::Node;
+use hytte_plugin::proto::{Dir, Node};
 
-use crate::card::{self, Widgets, cls, header, label, percent_text};
+use crate::card::{label, percent_text};
 use crate::format;
 use crate::sample::{Disk, Snapshot};
 
 /// The page's root node id.
 pub const ROOT_ID: &str = "stats-panel";
 
-/// Project a snapshot into the drawer page.
+/// The id of the Disk card's expander — the one click target on the page.
 ///
-/// Pure, like [`card::card`] and [`card::chips`]: every branch is decided by
-/// `cfg` and by what the snapshot holds, so the whole page is testable from a
-/// `Snapshot` literal.
-#[must_use]
-pub fn panel(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -> Node {
-    let mut cards = Vec::new();
+/// The wire's [`Node::Expander`] is **plugin-driven**: the host fires a click
+/// at this id and the plugin flips its own `expanded` flag and re-renders
+/// (`Stats::update`), so the model is the only place the state lives.
+pub const DISKS_EXPANDER_ID: &str = "stats-panel-disks-mounts";
 
-    if cfg.cpu {
-        cards.push(boxed("stats-panel-cpu", cpu_rows(cfg, snapshot, widgets)));
+/// How many samples each history line keeps: the native page's 60 (one a
+/// second for a minute at the default cadence — `build_history_row`'s
+/// `Sparkline::new(60)`).
+pub const HISTORY_LEN: usize = 60;
+
+/// libadwaita's own row-header class: `row > box.header` gives a box 12 px
+/// side margins, 6 px spacing and a 50 px minimum height, and a [`Node::Row`]
+/// inside a `boxed-list` is exactly `row > box` (the host wraps each list child
+/// in a `GtkListBoxRow`). This is what `slim_row` builds by hand natively.
+const HEADER: &str = "header";
+
+/// The fixed 80 px name/value columns of a history row (`ts-stat-col` in the
+/// shell's stylesheet — the `set_size_request(scale(80))` a node cannot make).
+const STAT_COL: &str = "ts-stat-col";
+
+/// The 88 px indent of the Disk I/O detail lines (`ts-stat-detail`).
+const STAT_DETAIL: &str = "ts-stat-detail";
+
+/// The class that opts a card back into libadwaita's card surface on a plugin
+/// page (`.ts-plugin-panel list.boxed-list.ts-page-card` in the shell's
+/// stylesheet), out-ranking the shell's page-wide `boxed-list` flattening.
+const PAGE_CARD: &str = "ts-page-card";
+
+/// The Disk card's expander hook (`ts-page-expander`): the shell stylesheet
+/// gives its header button a libadwaita row's 50 px height and 12 px inset.
+const PAGE_EXPANDER: &str = "ts-page-expander";
+
+/// The page's history lines, as plain samples — oldest first, each capped at
+/// [`HISTORY_LEN`].
+///
+/// Held in the model and fed by [`History::push`] once per sample, because the
+/// host keeps no history for a [`Node::Sparkline`]: every render restates the
+/// whole window. A reading the snapshot withholds (a cold `/proc/stat` tick, a
+/// vendor with no VRAM counter) is **not** a sample and does not move its line,
+/// the same rule the sidebar card's scope ring follows.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct History {
+    /// Overall CPU load, `0.0..=1.0`.
+    cpu: VecDeque<f32>,
+    /// Aggregate clock over the `cpuinfo_max_freq` ceiling, `0.0..=1.0`.
+    clock: VecDeque<f32>,
+    /// Memory used over total, `0.0..=1.0`.
+    memory: VecDeque<f32>,
+    /// GPU load, `0.0..=1.0`.
+    gpu_load: VecDeque<f32>,
+    /// VRAM used over total, `0.0..=1.0`.
+    gpu_vram: VecDeque<f32>,
+    /// GPU temperature, °C (auto-scaled).
+    gpu_temp: VecDeque<f32>,
+    /// Combined disk read + write rate, bytes/s (auto-scaled).
+    disk_io: VecDeque<f32>,
+}
+
+/// Append one sample to a ring, dropping the oldest past [`HISTORY_LEN`].
+fn push_capped(ring: &mut VecDeque<f32>, sample: f32) {
+    while ring.len() >= HISTORY_LEN {
+        ring.pop_front();
     }
-    if cfg.memory {
-        cards.push(boxed(
-            "stats-panel-memory",
-            card::memory_rows(snapshot, widgets, "stats-panel"),
-        ));
-    }
-    // The GPU card hides itself entirely when there is nothing to read — the
-    // native page's `bind(sensors::gpu().map(|g| g.is_some()), &group, …)`,
-    // which hides the whole `PreferencesGroup` rather than parking a gauge at
-    // zero.
-    if cfg.gpu && snapshot.gpu.is_some() {
-        cards.push(boxed("stats-panel-gpu", gpu_rows(cfg, snapshot, widgets)));
-    }
-    if cfg.disk {
-        cards.push(boxed("stats-panel-disks", disk_rows(snapshot, widgets)));
+    ring.push_back(sample);
+}
+
+impl History {
+    /// Fold one snapshot's readings into the lines — one point per line that
+    /// has a reading this tick, none for a line that does not.
+    pub fn push(&mut self, snapshot: &Snapshot) {
+        if let Some(cpu) = snapshot.cpu {
+            push_capped(&mut self.cpu, cpu.clamp(0.0, 1.0));
+        }
+        if let (Some(hz), Some(ceiling)) = (snapshot.cpu_clock_hz, snapshot.cpu_clock_ceiling_hz)
+            && ceiling > 0.0
+        {
+            // A ratio in `0.0..=1.0`, so the narrowing cast loses nothing a
+            // line can draw.
+            #[allow(clippy::cast_possible_truncation)]
+            push_capped(&mut self.clock, (hz / ceiling).clamp(0.0, 1.0) as f32);
+        }
+        if let Some(m) = snapshot.memory.filter(|m| m.total > 0) {
+            push_capped(&mut self.memory, format::fraction(m.used, m.total));
+        }
+        if let Some(gpu) = snapshot.gpu.as_ref() {
+            if let Some(load) = gpu.load {
+                push_capped(&mut self.gpu_load, load.clamp(0.0, 1.0));
+            }
+            if let Some((used, total)) = gpu
+                .memory_used_bytes
+                .zip(gpu.memory_total_bytes)
+                .filter(|(_, total)| *total > 0)
+            {
+                push_capped(&mut self.gpu_vram, format::fraction(used, total));
+            }
+            if let Some(c) = gpu.temperature_c.filter(|c| c.is_finite()) {
+                push_capped(&mut self.gpu_temp, c);
+            }
+        }
+        if let Some(io) = snapshot.disk_io.as_ref() {
+            // Bytes per second in an `f32`: exact to 2^24 B/s and within a
+            // part in ten million above it, far finer than the line's pixels.
+            #[allow(clippy::cast_possible_truncation)]
+            push_capped(&mut self.disk_io, (io.read_bps + io.write_bps) as f32);
+        }
     }
 
-    Node::Box {
-        id: Some(ROOT_ID.to_owned()),
-        dir: hytte_plugin::proto::Dir::Vertical,
-        spacing: 12,
-        scroll: false,
-        // No `.card` and no `.ts-plugin-card`: the drawer supplies the page
-        // chrome (`.ts-plugin-panel` > `.ts-plugin-canvas`), and a panel root
-        // that adds its own reads as a card in a card — the SDK's *Styling*
-        // docs, same rule the sidebar card follows.
-        classes: Vec::new(),
-        children: cards,
-        tooltip: None,
+    /// The `(min, max)` combined disk rate over the window, in bytes/s — the
+    /// native Disk I/O row's `min … · max …` line, which is taken over the
+    /// same sixty samples the line draws. `(0, 0)` before the first sample.
+    fn disk_io_range(&self) -> (f64, f64) {
+        let mut samples = self.disk_io.iter().copied().map(f64::from);
+        let Some(first) = samples.next() else {
+            return (0.0, 0.0);
+        };
+        samples.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)))
     }
 }
 
-/// One card: a `boxed-list` around its rows, which is the vocabulary's nearest
-/// thing to the `adw::PreferencesGroup` every native card is.
+/// Project a snapshot into the drawer page.
 ///
-/// `dense` because these rows are one line of text each and libadwaita's own
-/// row min-height is most of the height a dense list would otherwise take
-/// (#966) — the page is a monitor, not a settings list.
+/// Pure, like [`card::card`](crate::card::card) and
+/// [`card::chips`](crate::card::chips): every branch is decided by `cfg`, by
+/// what the snapshot and the history hold, and by whether the Disk card is
+/// open, so the whole page is testable from literals.
+///
+/// Of `cfg`'s keys, the page reads `cpu` / `memory` / `gpu` / `disk` (a card
+/// each) and `temperature` (every `°C` reading). `per_core` and `history` are
+/// the **chips'** switches — the per-core lamp row and the chip's scope sweep —
+/// and the page, which draws neither, ignores them: its history lines are the
+/// native page's, and the native page does not make them optional.
+#[must_use]
+pub fn panel(
+    cfg: crate::config::Card,
+    snapshot: &Snapshot,
+    history: &History,
+    disks_expanded: bool,
+) -> Node {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+
+    if cfg.cpu {
+        left.push(boxed("stats-panel-cpu", cpu_rows(cfg, snapshot, history)));
+    }
+    // The GPU card hides itself entirely when there is nothing to read — the
+    // native page's `bind(sensors::gpu().map(|g| g.is_some()), &group, …)`,
+    // which hides the whole `PreferencesGroup` rather than drawing an empty
+    // card.
+    if cfg.gpu && snapshot.gpu.is_some() {
+        left.push(boxed("stats-panel-gpu", gpu_rows(cfg, snapshot, history)));
+    }
+    if cfg.memory {
+        right.push(boxed("stats-panel-memory", memory_rows(snapshot, history)));
+    }
+    if cfg.disk {
+        right.push(boxed(
+            "stats-panel-disks",
+            disk_rows(snapshot, history, disks_expanded),
+        ));
+    }
+
+    // A column with nothing in it is left out rather than drawn empty: an
+    // empty vertical box still takes a gap's worth of the row, and the page
+    // would sit off-centre. The two ids are stable either way, so the
+    // reconciler keeps the surviving column's widgets across the change.
+    let columns = [("stats-panel-col-0", left), ("stats-panel-col-1", right)]
+        .into_iter()
+        .filter(|(_, cards)| !cards.is_empty())
+        .map(|(id, cards)| {
+            nodes::container(Dir::Vertical, cards)
+                .id(id)
+                .spacing(12)
+                .build()
+        })
+        .collect();
+
+    // No `.card` and no `.ts-plugin-card` on the root: the drawer supplies the
+    // page chrome, and a panel root that adds its own reads as a card in a
+    // card — the SDK's *Styling* docs, same rule the sidebar card follows.
+    //
+    // **Homogeneous**, as the native page's grid is: without it each column
+    // takes its own natural width and the spare is split equally on top, so
+    // the left column (short CPU/GPU rows) came out 289 px beside a 435 px
+    // right one and its history lines were 85 px thumbnails (#1414 review,
+    // MEDIUM 2). An older shell ignores the class and draws the unequal
+    // columns it always did.
+    nodes::container(Dir::Horizontal, columns)
+        .id(ROOT_ID)
+        .spacing(12)
+        .homogeneous(true)
+        .build()
+}
+
+/// One card: a `boxed-list` around its rows, the vocabulary's
+/// `adw::PreferencesGroup`. Not `dense` — the native cards keep libadwaita's
+/// row height, and so does this one.
+///
+/// [`PAGE_CARD`] as well as `boxed-list`: the shell flattens every
+/// `boxed-list` on a plugin page onto the drawer surface
+/// (`.ts-plugin-panel list.boxed-list`), which on this page erased the cards
+/// themselves (#1414 review, HIGH 1); the extra class is the page's opt back in
+/// to libadwaita's card look.
 fn boxed(id: &str, rows: Vec<Node>) -> Node {
     nodes::list(rows)
         .id(id)
         .class("boxed-list")
-        .dense(true)
+        .class(PAGE_CARD)
         .build()
 }
 
-/// The CPU card: load, the process count, the core count, the lamp row at the
-/// page's own pitch, the package temperature, the history sweep and the
-/// clock.
-fn cpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -> Vec<Node> {
-    let mut rows = vec![header("CPU", percent_text(snapshot.cpu), "ts-cpu", None)];
+/// An `AdwActionRow`, on one line: the title, the subtitle beside it (smaller
+/// and dimmed by libadwaita's own `row label.subtitle` rule), then whatever the
+/// native row puts in its suffix box, pinned right.
+fn title_row(id: &str, title: &str, subtitle: Option<Node>, suffix: Vec<Node>) -> Node {
+    let mut children = vec![label(title, &[])];
+    children.extend(subtitle);
+    children.push(Node::Spacer);
+    children.extend(suffix);
+    nodes::row(children).id(id).class(HEADER).spacing(6).build()
+}
 
-    // Processes — native `stats.rs:576` → `:1182`, shown unconditionally like
-    // the headline: it carries no cpufreq/hwmon gate of its own, and the `—`
-    // fallback is the seed-render state before the first tick (#1295 review
-    // MED 1).
-    rows.push(header(
-        "Processes",
-        snapshot
-            .processes
-            .map_or_else(|| "—".to_owned(), |n| n.to_string()),
-        "ts-cpu",
-        None,
-    ));
+/// A row's subtitle — the reading an `AdwActionRow` prints under its title.
+fn subtitle(text: impl Into<String>, class: &str) -> Node {
+    label(text, &["subtitle", "numeric", class])
+}
 
-    if cfg.per_core {
-        // `{} cores` verbatim from the native per-core header row, including
-        // its ungrammatical `1 cores` — the native page's own tests pin that
-        // spelling, and reading differently from the thing beside it would be
-        // worse than reading badly.
-        rows.push(header(
-            "Per-core",
-            format!("{} cores", snapshot.per_core.len()),
-            "ts-cpu",
+/// `build_history_row`: `[name | line | value]`, the value column dropped for
+/// the one native row that hides it (Disk I/O).
+fn history_row(id: &str, name: &str, line: Node, value: Option<Node>) -> Node {
+    let mut children = vec![label(name, &["ts-stat-name", STAT_COL]), line];
+    children.extend(value);
+    nodes::row(children)
+        .id(id)
+        .class("ts-history-row")
+        .spacing(8)
+        .build()
+}
+
+/// A history row's right-hand reading.
+fn stat_value(text: impl Into<String>, class: &str) -> Node {
+    label(text, &["ts-stat-value", STAT_COL, class])
+}
+
+/// One history line — a [`Node::Sparkline`] against a shell that draws one, a
+/// `Progress` at the newest sample's level against one that does not.
+fn line(id: &str, ring: &VecDeque<f32>, max: Option<f32>, class: &str) -> Node {
+    let builder = nodes::sparkline(ring.iter().copied().collect::<Vec<f32>>())
+        .id(id)
+        .class(class);
+    match max {
+        Some(m) => builder.max(m),
+        None => builder,
+    }
+    .build()
+}
+
+/// `{t:.0} °C` — the native CPU and GPU rows' temperature suffix, which unlike
+/// the bar chip's `{c:.0}°` carries the unit letter and a space.
+fn celsius(c: f32) -> String {
+    format!("{c:.0} \u{00b0}C")
+}
+
+/// The CPU card: the headline row (load as the subtitle, the package
+/// temperature as the suffix), Processes, the CPU history line and — with a
+/// `cpufreq` governor — the Clock line.
+fn cpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, history: &History) -> Vec<Node> {
+    let temperature = snapshot
+        .cpu_temp_c
+        .filter(|c| cfg.temperature && c.is_finite());
+    let mut rows = vec![
+        title_row(
+            "stats-panel-cpu-row",
+            "CPU",
+            Some(subtitle(percent_text(snapshot.cpu), "ts-cpu")),
+            temperature
+                .map(|c| label(celsius(c), &["numeric", "ts-cpu-temp"]))
+                .into_iter()
+                .collect(),
+        ),
+        // Processes — native `build_live_processes_row`. No hide rule of its
+        // own; the `—` is the seed render before the first tick.
+        title_row(
+            "stats-panel-processes-row",
+            "Processes",
             None,
+            vec![label(
+                snapshot
+                    .processes
+                    .map_or_else(|| "—".to_owned(), |n| n.to_string()),
+                &["numeric", "ts-cpu"],
+            )],
+        ),
+        history_row(
+            "stats-panel-cpu-history-row",
+            "CPU",
+            line("stats-panel-cpu-history", &history.cpu, Some(1.0), "ts-cpu"),
+            Some(stat_value(percent_text(snapshot.cpu), "ts-cpu")),
+        ),
+    ];
+
+    // Clock — native `build_expandable_cpu_clock_row`'s collapsed line: the
+    // aggregate clock over the highest `cpuinfo_max_freq`, hidden with no
+    // `cpufreq` governor (`snapshot.cpu_clock_hz` is `None` then — see
+    // `Sampler::tick`).
+    if let Some(hz) = snapshot.cpu_clock_hz {
+        rows.push(history_row(
+            "stats-panel-clock-history-row",
+            "Clock",
+            line(
+                "stats-panel-clock-history",
+                &history.clock,
+                Some(1.0),
+                "ts-cpu",
+            ),
+            Some(stat_value(format::hz(hz), "ts-cpu")),
         ));
-        rows.extend(widgets.page_core_nodes(&snapshot.per_core));
     }
-
-    if cfg.temperature {
-        rows.push(Node::Row {
-            id: Some("stats-panel-cpu-temp-row".to_owned()),
-            classes: Vec::new(),
-            spacing: 4,
-            children: vec![
-                widgets.temp_node(
-                    "stats-panel-cpu-temp",
-                    cls("ts-cpu-temp"),
-                    snapshot.cpu_temp_c,
-                ),
-                label("°C", &["dim-label", "ts-cpu-temp"]),
-                Node::Spacer,
-            ],
-            tooltip: None,
-        });
-    }
-
-    if cfg.history {
-        rows.push(widgets.history_node("stats-panel-cpu-history", cls("ts-cpu")));
-    }
-
-    // Clock — native `stats.rs:578` → `:1557`'s collapsed reading
-    // (`fmt_hz(f.max_hz)`), hidden with no `cpufreq` governor exactly like the
-    // native row (#1295 review MED 1). `snapshot.cpu_clock_hz` is already
-    // `None` in that case — see `Sampler::tick`.
-    if let Some(clock_hz) = snapshot.cpu_clock_hz {
-        rows.push(header("Clock", format::hz(clock_hz), "ts-cpu", None));
-    }
-
     rows
 }
 
-/// The GPU card: the adapter's own name, its load, its temperature and the
-/// needle.
+/// The Memory card: memory and — on a machine that has any — swap, each as
+/// the native row's `used / total (pct%)` subtitle over a `ts-stat-progress`
+/// bar, then the memory history line.
+fn memory_rows(snapshot: &Snapshot, history: &History) -> Vec<Node> {
+    let mem = snapshot.memory.as_ref();
+    let meter = |used: u64, total: u64| Node::Progress {
+        id: None,
+        fraction: f64::from(format::fraction(used, total)),
+        classes: vec!["ts-stat-progress".to_owned()],
+    };
+    let mut rows = vec![title_row(
+        "stats-panel-memory-row",
+        "Memory",
+        Some(subtitle(
+            mem.map_or_else(
+                || "—".to_owned(),
+                |m| format::used_of_total(m.used, m.total),
+            ),
+            "ts-memory",
+        )),
+        vec![mem.map_or_else(|| meter(0, 0), |m| meter(m.used, m.total))],
+    )];
+    // Swap hides itself when the machine has none — the native page's own rule
+    // (`m.swap_total > 0`), not a new one.
+    if let Some(m) = mem.filter(|m| m.swap_total > 0) {
+        rows.push(title_row(
+            "stats-panel-swap-row",
+            "Swap",
+            Some(subtitle(
+                format::used_of_total(m.swap_used, m.swap_total),
+                "ts-memory",
+            )),
+            vec![meter(m.swap_used, m.swap_total)],
+        ));
+    }
+    rows.push(history_row(
+        "stats-panel-memory-history-row",
+        "Memory",
+        line(
+            "stats-panel-memory-history",
+            &history.memory,
+            Some(1.0),
+            "ts-memory",
+        ),
+        Some(stat_value(
+            mem.filter(|m| m.total > 0).map_or_else(
+                || "—".to_owned(),
+                |m| format!("{:.0}%", format::fraction(m.used, m.total) * 100.0),
+            ),
+            "ts-memory",
+        )),
+    ));
+    rows
+}
+
+/// The GPU card: the adapter row (its name as the subtitle, the temperature —
+/// or the load where there is no thermal probe — as the suffix), then the
+/// usage, VRAM and temperature lines, each hidden when its reading is not
+/// reported, exactly as the native rows hide.
 ///
-/// Only reached with `snapshot.gpu.is_some()`, so the `else` arms below are the
-/// *within*-adapter absences (a vendor with no busy counter, no thermal probe),
-/// which the native page renders as a hidden row rather than a dash.
-fn gpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -> Vec<Node> {
+/// Only reached with `snapshot.gpu.is_some()`.
+fn gpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, history: &History) -> Vec<Node> {
     let Some(gpu) = snapshot.gpu.as_ref() else {
         return Vec::new();
     };
-    let mut rows = vec![
-        header("GPU", gpu.name.clone(), "ts-gpu", None),
-        header("Load", percent_text(gpu.load), "ts-gpu", None),
-    ];
-    // `{t:.0} °C` — the native GPU row's suffix, which unlike the bar chip's
-    // `{c:.0}°` carries the unit letter and a space.
-    if cfg.temperature
-        && let Some(c) = gpu.temperature_c.filter(|c| c.is_finite())
-    {
-        rows.push(header(
-            "Temperature",
-            format!("{c:.0} °C"),
-            "ts-gpu-temp",
-            None,
+    let temperature = gpu
+        .temperature_c
+        .filter(|c| cfg.temperature && c.is_finite());
+
+    // The native suffix: `{t:.0} °C`, else the load, else nothing.
+    let suffix = match (temperature, gpu.load) {
+        (Some(c), _) => Some(label(celsius(c), &["numeric", "ts-gpu-temp"])),
+        (None, Some(load)) => Some(label(percent_text(Some(load)), &["numeric", "ts-gpu"])),
+        (None, None) => None,
+    };
+    // The device name is driver-reported and can be long; the native row caps
+    // its subtitle at 20 characters (`GPU_SUBTITLE_CHARS`) and ellipsizes, and
+    // an ellipsizing `Text` tooltips its own full string.
+    let name = (!gpu.name.trim().is_empty()).then(|| Node::Text {
+        id: None,
+        text: gpu.name.clone(),
+        max_width_chars: Some(20),
+        ellipsize: true,
+        classes: vec!["subtitle".to_owned(), "ts-gpu".to_owned()],
+        tooltip: None,
+    });
+    let mut rows = vec![title_row(
+        "stats-panel-gpu-row",
+        "GPU",
+        name,
+        suffix.into_iter().collect(),
+    )];
+
+    if let Some(load) = gpu.load {
+        rows.push(history_row(
+            "stats-panel-gpu-usage-history-row",
+            "GPU usage",
+            line(
+                "stats-panel-gpu-usage-history",
+                &history.gpu_load,
+                Some(1.0),
+                "ts-gpu",
+            ),
+            Some(stat_value(percent_text(Some(load)), "ts-gpu")),
         ));
     }
-    rows.push(widgets.gpu_node("stats-panel-gpu-load", cls("ts-gpu")));
-
-    // GPU VRAM history — native `stats.rs:632`, hidden unless both used and
-    // total VRAM are reported (some vendors expose load/temperature but not
-    // memory), the native row's own hide rule (#1295 review MED 1).
+    // Hidden unless both used and total VRAM are reported — some vendors expose
+    // load and temperature but not memory.
     if let Some((used, total)) = gpu
         .memory_used_bytes
         .zip(gpu.memory_total_bytes)
         .filter(|(_, total)| *total > 0)
     {
-        let pct = format::fraction(used, total) * 100.0;
-        rows.push(header("VRAM", format!("{pct:.0}%"), "ts-gpu", None));
-        rows.push(widgets.gpu_vram_node("stats-panel-gpu-vram", cls("ts-gpu")));
-    }
-
-    rows
-}
-
-/// The Disks card: the `N mount(s)` summary and lamp row (at the page's own
-/// pitch, #1295 review LOW 4), one row per mount carrying the exact numbers,
-/// then the disk I/O history sweep.
-fn disk_rows(snapshot: &Snapshot, widgets: &Widgets) -> Vec<Node> {
-    let mut rows = card::page_disk_rows(snapshot, widgets, "stats-panel");
-    if snapshot.disks.is_empty() {
-        // The native expander renders nothing at all for an empty list, which
-        // on a page that is otherwise all rows reads as a broken card; one row
-        // saying so is the honest version.
-        rows.push(header("No mounts", String::new(), "ts-disk", None));
-    } else {
-        for (i, disk) in snapshot.disks.iter().enumerate() {
-            rows.push(mount_row(i, disk));
-        }
-    }
-
-    // Disk I/O history — native `stats.rs:610` → `:1293`'s combined rate row.
-    // Unconditional like the native one (no vendor/governor hide rule; an
-    // idle machine just draws a flat trace at the bottom rail) — #1295 review
-    // MED 1.
-    if let Some(io) = snapshot.disk_io.as_ref() {
-        rows.push(header(
-            "Disk I/O",
-            format!(
-                "\u{2193} {} \u{2191} {}",
-                format::rate(io.read_bps),
-                format::rate(io.write_bps),
+        rows.push(history_row(
+            "stats-panel-gpu-vram-history-row",
+            "GPU VRAM",
+            line(
+                "stats-panel-gpu-vram-history",
+                &history.gpu_vram,
+                Some(1.0),
+                "ts-gpu",
             ),
-            "ts-disk",
-            Some(format!(
-                "total \u{2193} {} \u{2191} {}",
-                format::bytes(io.total_read_bytes),
-                format::bytes(io.total_write_bytes),
+            Some(stat_value(
+                format!("{:.0}%", format::fraction(used, total) * 100.0),
+                "ts-gpu",
             )),
         ));
-        rows.push(widgets.disk_io_node("stats-panel-disk-io", cls("ts-disk")));
     }
-
+    if let Some(c) = temperature {
+        rows.push(history_row(
+            "stats-panel-gpu-temp-history-row",
+            "GPU temp",
+            // A temperature has no natural ceiling: auto-scaled, as native.
+            line(
+                "stats-panel-gpu-temp-history",
+                &history.gpu_temp,
+                None,
+                "ts-gpu-temp",
+            ),
+            Some(stat_value(celsius(c), "ts-gpu-temp")),
+        ));
+    }
     rows
 }
 
-/// One mounted filesystem: its path, the native `used / total (pct%)` text, and
-/// a progress bar wearing the shell's own `ts-stat-progress` class.
+/// The Disk card: the native `AdwExpanderRow` — "Disk", `N mount(s)`, one row
+/// per mount inside, collapsed until clicked — then the Disk I/O line and its
+/// three detail lines.
+fn disk_rows(snapshot: &Snapshot, history: &History, expanded: bool) -> Vec<Node> {
+    let mounts: Vec<Node> = if snapshot.disks.is_empty() {
+        // The native expander opens onto nothing at all, which reads as a
+        // broken card; one line saying so is the honest version.
+        vec![label("No mounts", &["dim-label", "ts-history-row"])]
+    } else {
+        snapshot
+            .disks
+            .iter()
+            .enumerate()
+            .map(|(i, disk)| mount_row(i, disk))
+            .collect()
+    };
+    let mut rows = vec![Node::Expander {
+        id: DISKS_EXPANDER_ID.to_owned(),
+        header: Box::new(
+            nodes::row(vec![
+                label("Disk", &[]),
+                subtitle(format!("{} mount(s)", snapshot.disks.len()), "ts-disk"),
+                Node::Spacer,
+            ])
+            .spacing(6)
+            .build(),
+        ),
+        children: mounts,
+        expanded,
+        // The header is the host's flat button, not a list row, so
+        // libadwaita's `row > box.header` rule (the 50 px, 12 px-inset row every
+        // other title row on the page gets) cannot reach it; `ts-page-expander`
+        // is the shell stylesheet's hook that gives it the same height and
+        // inset (#1414 review, nit — it measured 24 px).
+        classes: vec![PAGE_EXPANDER.to_owned()],
+        tooltip: None,
+    }];
+
+    // Disk I/O — native `build_history_disk_io_row`: the auto-scaled line of
+    // the combined rate (its right-hand value hidden, "units live in the
+    // detail rows below"), then the current `↓ read ↑ write`, the window's
+    // `min · max` and the since-boot totals.
+    if let Some(io) = snapshot.disk_io.as_ref() {
+        let (min, max) = history.disk_io_range();
+        let detail = |text: String| label(text, &["ts-stat-value", STAT_DETAIL, "ts-disk"]);
+        rows.push(Node::Box {
+            id: Some("stats-panel-disk-io".to_owned()),
+            dir: Dir::Vertical,
+            spacing: 2,
+            scroll: false,
+            classes: Vec::new(),
+            children: vec![
+                history_row(
+                    "stats-panel-disk-io-history-row",
+                    "Disk I/O",
+                    line(
+                        "stats-panel-disk-io-history",
+                        &history.disk_io,
+                        None,
+                        "ts-disk",
+                    ),
+                    None,
+                ),
+                detail(format!(
+                    "\u{2193} {} \u{2191} {}",
+                    format::rate(io.read_bps),
+                    format::rate(io.write_bps),
+                )),
+                detail(format!(
+                    "min {} \u{00b7} max {}",
+                    format::rate(min),
+                    format::rate(max),
+                )),
+                detail(format!(
+                    "total \u{2193} {} \u{2191} {}",
+                    format::bytes(io.total_read_bytes),
+                    format::bytes(io.total_write_bytes),
+                )),
+            ],
+            tooltip: None,
+        });
+    }
+    rows
+}
+
+/// One mounted filesystem — native `build_disk_mount_row`: its path, the
+/// `used / total (pct%)` text and a `ts-stat-progress` bar, with the path as
+/// the row's hover.
+///
+/// Padded with `ts-history-row` rather than classed `header`: the row sits in
+/// the expander's body box, not directly in a list row, so libadwaita's
+/// `row > box.header` rule cannot reach it, and the history row's padding is
+/// the nearest native spacing that can.
 fn mount_row(index: usize, disk: &Disk) -> Node {
     nodes::row(vec![
-        label(disk.path.clone(), &["ts-disk"]),
+        // A bind-mount path can be long; the native row caps its title at 8
+        // characters of natural width and ellipsizes (`DISK_MOUNT_TITLE_CHARS`).
+        Node::Text {
+            id: None,
+            text: disk.path.clone(),
+            max_width_chars: Some(8),
+            ellipsize: true,
+            classes: vec!["ts-disk".to_owned()],
+            tooltip: None,
+        },
         Node::Spacer,
         label(
             format::used_of_total(disk.used_bytes, disk.total_bytes),
-            &["numeric", "ts-disk"],
+            &["numeric", "dim-label", "ts-disk"],
         ),
         Node::Progress {
             id: None,
             // The native row recomputes the fraction from the byte counts
             // rather than taking `DiskMount.usage`; both are the same quantity
-            // and this takes the sampler's sanitised one, which is the value
-            // the lamp above it is drawn from — so the bar and the lamp for one
-            // mount can never disagree.
+            // and this takes the sampler's sanitised one.
             fraction: f64::from(disk.usage.clamp(0.0, 1.0)),
-            classes: cls("ts-stat-progress"),
+            classes: vec!["ts-stat-progress".to_owned()],
         },
     ])
     .id(format!("stats-panel-mount-{index}"))
+    .class("ts-history-row")
     .spacing(6)
-    .tooltip(format!(
-        "{}: {:.0}%",
-        disk.path,
-        disk.usage.clamp(0.0, 1.0) * 100.0
-    ))
+    .tooltip(disk.path.clone())
     .build()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::panel;
-    use crate::card::Widgets;
+    use super::{DISKS_EXPANDER_ID, HISTORY_LEN, History, ROOT_ID, panel};
     use crate::config::Card;
-    use crate::sample::{Disk, Gpu, Memory, Snapshot};
-    use hytte_plugin::display::RenderMode;
-    use hytte_plugin::display::testing::with_render_mode;
-    use hytte_plugin::proto::Node;
+    use crate::sample::{Disk, DiskIo, Gpu, Memory, Snapshot};
+    use hytte_plugin::display::testing::with_negotiated_vocab;
+    use hytte_plugin::proto::{Dir, HOMOGENEOUS_CLASS, Node, SPARKLINE_VOCAB};
 
-    /// The page's skeleton, taken with the host advertising the preem
-    /// vocabulary.
-    ///
-    /// `RenderMode` is process-global and defaults to `Raster` with no live
-    /// session, so without this the wrappers lower to `Node::Pixels` and the
-    /// golden below would record the *fallback* shape — which is a real shape,
-    /// but not the one a preem-speaking shell draws and not the one #865 is
-    /// about. `card.rs`'s `preem_ids` does the same for the sidebar card.
-    fn skeleton_of(cfg: Card, snapshot: &Snapshot) -> Vec<String> {
-        with_render_mode(RenderMode::State, || {
-            let mut out = Vec::new();
-            skeleton(&panel(cfg, snapshot, &Widgets::default()), &mut out);
-            out
-        })
-    }
-
-    /// A machine with something to say about every card — including, since
-    /// the #1295 review's MED 1, the four rows that were missing from it:
-    /// a process count, a CPU clock, a disk I/O rate and a GPU VRAM level.
+    /// A machine with something to say about every card.
     fn busy() -> Snapshot {
         Snapshot {
             cpu: Some(0.42),
@@ -356,8 +698,7 @@ mod tests {
                 name: "Test Adapter".to_owned(),
                 load: Some(0.37),
                 temperature_c: Some(52.0),
-                // 4 GiB / 16 GiB — a clean 25%, chosen so the golden's string
-                // assertion needs no float-rounding judgment call.
+                // 4 GiB / 16 GiB — a clean 25%.
                 memory_used_bytes: Some(4_294_967_296),
                 memory_total_bytes: Some(17_179_869_184),
             }),
@@ -383,7 +724,8 @@ mod tests {
             ],
             processes: Some(287),
             cpu_clock_hz: Some(3_800_000_000.0),
-            disk_io: Some(crate::sample::DiskIo {
+            cpu_clock_ceiling_hz: Some(5_000_000_000.0),
+            disk_io: Some(DiskIo {
                 read_bps: 2_097_152.0,
                 write_bps: 1_048_576.0,
                 total_read_bytes: 107_374_182_400,
@@ -392,217 +734,285 @@ mod tests {
         }
     }
 
-    /// The whole table this page draws for a bar instance: every card's
-    /// `boxed-list` and every id inside it.
-    ///
-    /// Every `Node` kind and every id, in tree order, so the shape of the page
-    /// is a literal rather than a description of one.
-    fn skeleton(node: &Node, out: &mut Vec<String>) {
-        let (kind, id, children): (&str, Option<&str>, Vec<&Node>) = match node {
-            Node::Box { id, children, .. } => ("Box", id.as_deref(), children.iter().collect()),
-            Node::Row { id, children, .. } => ("Row", id.as_deref(), children.iter().collect()),
-            Node::ListBox { id, children, .. } => {
-                ("ListBox", id.as_deref(), children.iter().collect())
-            }
-            Node::Label { id, .. } => ("Label", id.as_deref(), Vec::new()),
-            Node::Preem { id, .. } => ("Preem", id.as_deref(), Vec::new()),
-            Node::Pixels { id, .. } => ("Pixels", id.as_deref(), Vec::new()),
-            Node::Progress { id, .. } => ("Progress", id.as_deref(), Vec::new()),
-            Node::Spacer => ("Spacer", None, Vec::new()),
-            other => panic!("the page must not use {other:?}"),
-        };
-        out.push(match id {
-            Some(id) => format!("{kind}#{id}"),
-            None => kind.to_owned(),
-        });
-        for child in children {
-            skeleton(child, out);
+    /// A history with a few ticks of [`busy`] in it.
+    fn warm() -> History {
+        let mut history = History::default();
+        for _ in 0..3 {
+            history.push(&busy());
         }
+        history
     }
 
-    /// Every `ts-*`/`.ts-stat-progress` class the page carries, in tree order
-    /// — the page half of `card::tests::the_bar_renders_four_chips_each_keeping_its_class`
-    /// (#1295 review MED 3). `skeleton` deliberately records kind+id only (it
-    /// calls itself "the exact node tree", and a class is neither); this is
-    /// its sibling for the one thing `skeleton` cannot see.
-    fn classes_of(node: &Node, out: &mut Vec<String>) {
-        let children: Vec<&Node> = match node {
-            Node::Box {
-                classes, children, ..
+    /// The page against a shell that draws sparklines (today's), or against
+    /// the newest one that does not.
+    fn page_at(vocab: u16, cfg: Card, snapshot: &Snapshot, expanded: bool) -> Node {
+        with_negotiated_vocab(vocab, || panel(cfg, snapshot, &warm(), expanded))
+    }
+
+    fn page(cfg: Card, snapshot: &Snapshot) -> Node {
+        page_at(SPARKLINE_VOCAB, cfg, snapshot, true)
+    }
+
+    /// Every node in tree order, the expander's header and body included.
+    fn walk<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
+        out.push(node);
+        match node {
+            Node::Box { children, .. }
+            | Node::Row { children, .. }
+            | Node::ListBox { children, .. } => {
+                for child in children {
+                    walk(child, out);
+                }
             }
-            | Node::Row {
-                classes, children, ..
-            }
-            | Node::ListBox {
-                classes, children, ..
+            Node::Expander {
+                header, children, ..
             } => {
-                out.extend(classes.iter().cloned());
-                children.iter().collect()
+                walk(header, out);
+                for child in children {
+                    walk(child, out);
+                }
             }
-            Node::Label { classes, .. }
-            | Node::Preem { classes, .. }
-            | Node::Pixels { classes, .. }
-            | Node::Progress { classes, .. } => {
-                out.extend(classes.iter().cloned());
-                Vec::new()
-            }
-            Node::Spacer => Vec::new(),
-            other => panic!("the page must not use {other:?}"),
-        };
-        for child in children {
-            classes_of(child, out);
+            Node::Button { child, .. }
+            | Node::Revealer { child, .. }
+            | Node::Scrolled { child, .. } => walk(child, out),
+            _ => {}
         }
     }
 
-    /// **The golden**: the exact node tree a `[bar]`-configured instance draws
-    /// for [`busy`].
+    fn nodes_of(node: &Node) -> Vec<&Node> {
+        let mut out = Vec::new();
+        walk(node, &mut out);
+        out
+    }
+
+    fn id_of(node: &Node) -> Option<&str> {
+        match node {
+            Node::Box { id, .. }
+            | Node::Row { id, .. }
+            | Node::ListBox { id, .. }
+            | Node::Label { id, .. }
+            | Node::Text { id, .. }
+            | Node::Progress { id, .. }
+            | Node::Sparkline { id, .. }
+            | Node::Preem { id, .. }
+            | Node::Pixels { id, .. } => id.as_deref(),
+            Node::Expander { id, .. } | Node::Button { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn texts(node: &Node) -> Vec<String> {
+        nodes_of(node)
+            .into_iter()
+            .filter_map(|n| match n {
+                Node::Label { text, .. } | Node::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn classes(node: &Node) -> Vec<String> {
+        nodes_of(node)
+            .into_iter()
+            .flat_map(|n| match n {
+                Node::Box { classes, .. }
+                | Node::Row { classes, .. }
+                | Node::ListBox { classes, .. }
+                | Node::Label { classes, .. }
+                | Node::Text { classes, .. }
+                | Node::Progress { classes, .. }
+                | Node::Sparkline { classes, .. }
+                | Node::Expander { classes, .. } => classes.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The column ids and, under each, the card ids — the page's layout as a
+    /// literal.
+    fn layout(node: &Node) -> Vec<(String, Vec<String>)> {
+        let Node::Box {
+            dir: Dir::Horizontal,
+            children,
+            ..
+        } = node
+        else {
+            panic!("the root is a horizontal box: {node:?}");
+        };
+        children
+            .iter()
+            .map(|column| match column {
+                Node::Box {
+                    id,
+                    dir: Dir::Vertical,
+                    children,
+                    ..
+                } => (
+                    id.clone().unwrap_or_default(),
+                    children
+                        .iter()
+                        .map(|card| id_of(card).unwrap_or_default().to_owned())
+                        .collect(),
+                ),
+                other => panic!("a column is a vertical box: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// **The #1252 layout**: two columns, as the native multicolumn page —
+    /// CPU over GPU on the left, Memory over Disk on the right — each card a
+    /// `boxed-list`, the root a horizontal box of two vertical ones.
     ///
-    /// Written out rather than computed, so a card that silently stops being
-    /// emitted — or an id that drifts away from the reconciler key some other
-    /// surface already uses — reds here instead of on glass.
-    ///
-    /// **Falsified** by deleting any `if cfg.…` arm in [`panel`], by dropping
-    /// the swap pair, or by renaming one id.
+    /// **Falsified** by laying the cards out in one vertical column again (the
+    /// root-is-horizontal `let … else` panics), by putting GPU beside CPU, by
+    /// dropping `.homogeneous(true)` from the root (the columns take their own
+    /// widths again — #1414 review, MEDIUM 2), or by dropping `PAGE_CARD` from
+    /// `boxed` (the shell flattens the cards away — #1414 review, HIGH 1; the
+    /// shell side of that is `wire_map`'s render test).
     #[test]
-    fn the_pages_node_tree_is_the_recorded_one() {
+    fn the_page_is_two_columns_of_boxed_list_cards() {
+        let node = page(Card::bar_default(), &busy());
+        let Node::Box { id, classes, .. } = &node else {
+            panic!("root is a box");
+        };
+        assert_eq!(id.as_deref(), Some(ROOT_ID));
+        assert!(
+            classes.iter().any(|c| c == HOMOGENEOUS_CLASS),
+            "the two columns are one width, like the native grid: {classes:?}",
+        );
+        assert_eq!(
+            layout(&node),
+            vec![
+                (
+                    "stats-panel-col-0".to_owned(),
+                    vec!["stats-panel-cpu".to_owned(), "stats-panel-gpu".to_owned()],
+                ),
+                (
+                    "stats-panel-col-1".to_owned(),
+                    vec![
+                        "stats-panel-memory".to_owned(),
+                        "stats-panel-disks".to_owned(),
+                    ],
+                ),
+            ],
+        );
+        for n in nodes_of(&node) {
+            if let Node::ListBox { classes, dense, .. } = n {
+                assert!(classes.iter().any(|c| c == "boxed-list"), "{classes:?}");
+                assert!(
+                    classes.iter().any(|c| c == "ts-page-card"),
+                    "each card opts back into its card surface: {classes:?}",
+                );
+                assert!(!dense, "native rows keep libadwaita's row height");
+            }
+        }
+    }
+
+    /// **No preem on the page** — the whole of Annika's ask on #1252 — against
+    /// both a shell that draws sparklines and the newest one that does not
+    /// (whose fallback is a flat `Progress`, not a scope), while the sidebar
+    /// card, which she does like, still is preem.
+    ///
+    /// **Falsified** by putting any preem widget back on the page (e.g. the
+    /// sidebar card's `SevenSeg` temperature in the CPU row), or by making the
+    /// SDK's sparkline fallback a preem `Scope`.
+    #[test]
+    fn the_page_carries_no_preem_and_the_sidebar_card_still_does() {
         let mut cfg = Card::bar_default();
-        // The page draws the lamp row and the sweep regardless of whether the
-        // CHIP does — but they ride the same two keys, so the golden is taken
-        // with them on, which is also the configuration a reader who turned
-        // them on would see.
         cfg.per_core = true;
         cfg.history = true;
+        for vocab in [SPARKLINE_VOCAB, SPARKLINE_VOCAB - 1, 0] {
+            let node = page_at(vocab, cfg, &busy(), true);
+            let preem: Vec<_> = nodes_of(&node)
+                .into_iter()
+                .filter(|n| matches!(n, Node::Preem { .. } | Node::Pixels { .. }))
+                .collect();
+            assert!(preem.is_empty(), "vocab {vocab}: {preem:?}");
+        }
 
-        let got = skeleton_of(cfg, &busy());
-
-        assert_eq!(
-            got,
-            vec![
-                "Box#stats-panel",
-                // CPU
-                "ListBox#stats-panel-cpu",
-                "Row", // CPU
-                "Label",
-                "Spacer",
-                "Label",
-                "Row", // Processes (#1295 review MED 1)
-                "Label",
-                "Spacer",
-                "Label",
-                "Row", // Per-core
-                "Label",
-                "Spacer",
-                "Label",
-                "Preem#stats-panel-cores-0",
-                "Row#stats-panel-cpu-temp-row",
-                "Preem#stats-panel-cpu-temp",
-                "Label",
-                "Spacer",
-                "Preem#stats-panel-cpu-history",
-                "Row", // Clock (#1295 review MED 1)
-                "Label",
-                "Spacer",
-                "Label",
-                // Memory
-                "ListBox#stats-panel-memory",
-                "Row",
-                "Label",
-                "Spacer",
-                "Label",
-                "Preem#stats-panel-memory-level",
-                "Row",
-                "Label",
-                "Spacer",
-                "Label",
-                "Preem#stats-panel-swap-level",
-                // GPU
-                "ListBox#stats-panel-gpu",
-                "Row", // GPU (name)
-                "Label",
-                "Spacer",
-                "Label",
-                "Row", // Load
-                "Label",
-                "Spacer",
-                "Label",
-                "Row", // Temperature
-                "Label",
-                "Spacer",
-                "Label",
-                "Preem#stats-panel-gpu-load",
-                "Row", // VRAM (#1295 review MED 1)
-                "Label",
-                "Spacer",
-                "Label",
-                "Preem#stats-panel-gpu-vram",
-                // Disks
-                "ListBox#stats-panel-disks",
-                "Row", // Disks (N mount(s))
-                "Label",
-                "Spacer",
-                "Label",
-                "Row",
-                "Preem#stats-panel-disk-lamps",
-                "Spacer",
-                "Row#stats-panel-mount-0",
-                "Label",
-                "Spacer",
-                "Label",
-                "Progress",
-                "Row#stats-panel-mount-1",
-                "Label",
-                "Spacer",
-                "Label",
-                "Progress",
-                "Row", // Disk I/O (#1295 review MED 1)
-                "Label",
-                "Spacer",
-                "Label",
-                "Preem#stats-panel-disk-io",
-            ],
+        let card = with_negotiated_vocab(SPARKLINE_VOCAB, || {
+            crate::card::card(
+                Card::sidebar_default(),
+                &busy(),
+                &crate::card::Widgets::default(),
+            )
+        });
+        assert!(
+            nodes_of(&card)
+                .iter()
+                .any(|n| matches!(n, Node::Preem { .. })),
+            "the sidebar card is still the preem surface",
         );
     }
 
-    /// Every id in the page is unique — a preem node's id is its reconciler key
-    /// (#900), and two nodes sharing one is a widget that flickers between two
-    /// states rather than a visible error.
+    /// Every history line is a `Sparkline` on today's shell — the same widget
+    /// the native rows draw — on the native rows' axes, and a `Progress` bar
+    /// on an older one.
+    ///
+    /// **Falsified** by building the lines with `build_unnegotiated` (the
+    /// old-shell arm then carries `Sparkline`s it cannot decode), or by
+    /// dropping a line's fixed top.
+    #[test]
+    fn the_history_lines_are_sparklines_on_the_native_axes() {
+        let lines = |vocab| {
+            nodes_of(&page_at(vocab, Card::bar_default(), &busy(), true))
+                .into_iter()
+                .filter_map(|n| match n {
+                    Node::Sparkline { id, max, .. } => Some((id.clone().unwrap(), *max)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lines(SPARKLINE_VOCAB),
+            vec![
+                ("stats-panel-cpu-history".to_owned(), Some(1.0)),
+                ("stats-panel-clock-history".to_owned(), Some(1.0)),
+                ("stats-panel-gpu-usage-history".to_owned(), Some(1.0)),
+                ("stats-panel-gpu-vram-history".to_owned(), Some(1.0)),
+                ("stats-panel-gpu-temp-history".to_owned(), None),
+                ("stats-panel-memory-history".to_owned(), Some(1.0)),
+                ("stats-panel-disk-io-history".to_owned(), None),
+            ],
+        );
+        assert!(
+            lines(SPARKLINE_VOCAB - 1).is_empty(),
+            "an older shell is never sent a variant it cannot decode",
+        );
+        let old = page_at(SPARKLINE_VOCAB - 1, Card::bar_default(), &busy(), true);
+        assert!(
+            nodes_of(&old)
+                .iter()
+                .any(|n| id_of(n) == Some("stats-panel-cpu-history")
+                    && matches!(n, Node::Progress { .. })),
+            "…it gets the fallback bar under the same id",
+        );
+    }
+
+    /// Every id on the page is unique — a node's id is its reconciler key, and
+    /// two sharing one is a widget flickering between two states.
     #[test]
     fn every_id_on_the_page_is_unique() {
-        let mut cfg = Card::bar_default();
-        cfg.per_core = true;
-        cfg.history = true;
-        let got = skeleton_of(cfg, &busy());
-        let ids: Vec<&String> = got.iter().filter(|s| s.contains('#')).collect();
-        let mut sorted: Vec<&&String> = ids.iter().collect();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), ids.len(), "duplicate ids in {ids:?}");
+        let node = page(Card::bar_default(), &busy());
+        let mut ids: Vec<&str> = nodes_of(&node).into_iter().filter_map(id_of).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "duplicate ids on the page");
     }
 
     /// Every card can be switched off on its own, and switching one off removes
-    /// exactly its own `boxed-list`.
-    ///
-    /// **Falsified** by making any card unconditional.
+    /// exactly its own `boxed-list`; a column left with no card is dropped.
     #[test]
     fn each_switch_removes_exactly_its_own_card() {
-        let lists = |cfg: Card| {
-            skeleton_of(cfg, &busy())
+        let cards = |cfg: Card| {
+            layout(&page(cfg, &busy()))
                 .into_iter()
-                .filter(|s| s.starts_with("ListBox#"))
+                .flat_map(|(_, cards)| cards)
                 .collect::<Vec<_>>()
         };
-
-        let all = lists(Card::bar_default());
-        assert_eq!(
-            all,
-            vec![
-                "ListBox#stats-panel-cpu",
-                "ListBox#stats-panel-memory",
-                "ListBox#stats-panel-gpu",
-                "ListBox#stats-panel-disks",
-            ],
-        );
-
+        let all = cards(Card::bar_default());
+        assert_eq!(all.len(), 4);
         for (name, off) in [
             (
                 "stats-panel-cpu",
@@ -633,104 +1043,140 @@ mod tests {
                 },
             ),
         ] {
-            let got = lists(off);
-            assert!(
-                !got.iter().any(|s| s == &format!("ListBox#{name}")),
-                "{name}"
-            );
+            let got = cards(off);
+            assert!(!got.iter().any(|c| c == name), "{name}");
             assert_eq!(got.len(), all.len() - 1, "{name} removed more than itself");
         }
+
+        // CPU and GPU both off: the left column goes, the right keeps its id.
+        let right_only = layout(&page(
+            Card {
+                cpu: false,
+                gpu: false,
+                ..Card::bar_default()
+            },
+            &busy(),
+        ));
+        assert_eq!(right_only.len(), 1);
+        assert_eq!(right_only[0].0, "stats-panel-col-1");
     }
 
-    /// A machine with no GPU draws no GPU card at all — not a card with a
-    /// needle parked at zero, which is the native page's rule and the one hide
-    /// that matters most (it is what makes `gpu = true` free on a GPU-less
-    /// box).
+    /// A machine with no GPU draws no GPU card at all, the native rule.
     #[test]
     fn a_machine_with_no_gpu_draws_no_gpu_card() {
         let snapshot = Snapshot {
             gpu: None,
             ..busy()
         };
-        let got = skeleton_of(Card::bar_default(), &snapshot);
+        let node = page(Card::bar_default(), &snapshot);
         assert!(
-            !got.iter().any(|s| s.contains("stats-panel-gpu")),
-            "{got:?}",
+            !nodes_of(&node)
+                .into_iter()
+                .filter_map(id_of)
+                .any(|id| id.contains("gpu")),
         );
     }
 
-    /// A machine with no swap draws no swap row — the native page's
-    /// `m.swap_total > 0` rule, and the only place on this page where a row
-    /// inside a card disappears on its own.
+    /// Swap, the Clock line and the GPU's usage / VRAM / temperature lines each
+    /// hide exactly the way the native row they mirror hides.
     #[test]
-    fn a_machine_with_no_swap_draws_no_swap_row() {
-        let snapshot = Snapshot {
+    fn the_optional_rows_hide_like_their_native_ones() {
+        let original = busy();
+        let bare = Snapshot {
             memory: Some(Memory {
-                used: 1,
-                total: 2,
                 swap_used: 0,
                 swap_total: 0,
+                ..original.memory.unwrap()
             }),
-            ..busy()
+            cpu_clock_hz: None,
+            cpu_clock_ceiling_hz: None,
+            gpu: original.gpu.clone().map(|g| Gpu {
+                load: None,
+                temperature_c: None,
+                memory_used_bytes: None,
+                memory_total_bytes: None,
+                ..g
+            }),
+            ..original
         };
-        let got = skeleton_of(Card::bar_default(), &snapshot);
-        assert!(
-            got.iter().any(|s| s == "Preem#stats-panel-memory-level"),
-            "the memory meter is still there: {got:?}",
-        );
-        assert!(
-            !got.iter().any(|s| s == "Preem#stats-panel-swap-level"),
-            "{got:?}",
-        );
+        let ids: Vec<String> = nodes_of(&page(Card::bar_default(), &bare))
+            .into_iter()
+            .filter_map(id_of)
+            .map(ToOwned::to_owned)
+            .collect();
+        for gone in [
+            "stats-panel-swap-row",
+            "stats-panel-clock-history-row",
+            "stats-panel-gpu-usage-history-row",
+            "stats-panel-gpu-vram-history-row",
+            "stats-panel-gpu-temp-history-row",
+        ] {
+            assert!(!ids.iter().any(|id| id == gone), "{gone} in {ids:?}");
+        }
+        // …while the rows with no hide rule stay.
+        for kept in [
+            "stats-panel-gpu-row",
+            "stats-panel-memory-row",
+            "stats-panel-processes-row",
+        ] {
+            assert!(ids.iter().any(|id| id == kept), "{kept} in {ids:?}");
+        }
     }
 
-    /// An empty mount list says so rather than rendering an empty card.
+    /// `temperature = false` takes every `°C` reading off the page — the CPU
+    /// row's suffix, the GPU row's (which falls back to the load, as native
+    /// does with no probe) and the GPU temperature line.
     #[test]
-    fn no_mounts_is_a_row_that_says_so() {
-        let snapshot = Snapshot {
-            disks: Vec::new(),
-            ..busy()
-        };
-        let node = panel(Card::bar_default(), &snapshot, &Widgets::default());
-        let mut texts = Vec::new();
-        collect_text(&node, &mut texts);
-        assert!(texts.iter().any(|t| t == "No mounts"), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "0 mount(s)"), "{texts:?}");
+    fn the_temperature_switch_governs_every_reading() {
+        let node = page(
+            Card {
+                temperature: false,
+                ..Card::bar_default()
+            },
+            &busy(),
+        );
+        let texts = texts(&node);
+        assert!(!texts.iter().any(|t| t.contains('\u{00b0}')), "{texts:?}");
+        assert!(
+            texts.iter().filter(|t| *t == "37%").count() >= 2,
+            "the GPU row's suffix falls back to the load: {texts:?}",
+        );
+        assert!(
+            !nodes_of(&node)
+                .into_iter()
+                .filter_map(id_of)
+                .any(|id| id == "stats-panel-gpu-temp-history"),
+        );
     }
 
-    /// The exact numbers the page prints for [`busy`] — the mirror of the
+    /// The exact strings the page prints for [`busy`] — the mirror of the
     /// native page's own format strings, asserted as literals so a change to
     /// either side of the mirror is visible here (#1026).
     #[test]
     fn the_page_prints_the_native_pages_strings() {
-        let mut cfg = Card::bar_default();
-        cfg.per_core = true;
-        let node = panel(cfg, &busy(), &Widgets::default());
-        let mut texts = Vec::new();
-        collect_text(&node, &mut texts);
-
+        let texts = texts(&page(Card::bar_default(), &busy()));
         for want in [
             "CPU",
             "42%",
+            "61 °C",
             "Processes",
             "287",
-            "Per-core",
-            "4 cores",
             "Clock",
             "3.8 GHz",
             "Memory",
             "11.2 GiB / 31.2 GiB (36%)",
+            "36%",
             "Swap",
             "1.0 GiB / 8.0 GiB (12%)",
             "GPU",
             "Test Adapter",
-            "Load",
-            "37%",
-            "Temperature",
             "52 °C",
-            "VRAM",
+            "GPU usage",
+            "37%",
+            "GPU VRAM",
             "25%",
-            "Disks",
+            "GPU temp",
+            "Disk",
             "2 mount(s)",
             "/",
             "37.3 GiB / 93.1 GiB (40%)",
@@ -738,86 +1184,78 @@ mod tests {
             "679.9 GiB / 931.3 GiB (73%)",
             "Disk I/O",
             "\u{2193} 2.0 MiB/s \u{2191} 1.0 MiB/s",
+            "min 3.0 MiB/s \u{00b7} max 3.0 MiB/s",
+            "total \u{2193} 100.0 GiB \u{2191} 50.0 GiB",
         ] {
             assert!(texts.iter().any(|t| t == want), "{want:?} in {texts:?}");
         }
+        // The per-core header row went with the lamp panel it introduced.
+        assert!(!texts.iter().any(|t| t == "Per-core"), "{texts:?}");
     }
 
-    /// The four rows the #1295 review's MED 1 found missing, each hidden
-    /// exactly the way the native row it mirrors hides — a machine that
-    /// answers `None`/`0` for every one of them draws none of the four.
-    ///
-    /// **Falsified** by dropping any of the four `if let`/unconditional
-    /// pushes MED 1 added to `cpu_rows` / `gpu_rows` / `disk_rows`.
+    /// The seed render — nothing sampled yet — dashes rather than inventing
+    /// numbers, and still draws every card's skeleton.
     #[test]
-    fn the_four_med_1_rows_hide_exactly_like_their_native_ones() {
-        let original = busy();
-        let nothing_extra = Snapshot {
-            processes: None,
-            cpu_clock_hz: None,
-            disk_io: None,
-            gpu: original.gpu.clone().map(|g| Gpu {
-                memory_used_bytes: None,
-                memory_total_bytes: None,
-                ..g
-            }),
-            ..original
-        };
-        let mut texts = Vec::new();
-        collect_text(
-            &panel(Card::bar_default(), &nothing_extra, &Widgets::default()),
-            &mut texts,
-        );
-
-        assert!(
-            !texts.iter().any(|t| t == "Clock"),
-            "no cpufreq governor, no Clock row: {texts:?}",
-        );
-        assert!(!texts.iter().any(|t| t == "VRAM"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "Disk I/O"), "{texts:?}");
-        // Processes is the one MED 1 row with no hide rule — it dashes
-        // instead, the same "unmeasured, not absent" convention every other
-        // seed-render reading on this page follows.
-        assert!(texts.iter().any(|t| t == "Processes"), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "—"), "{texts:?}");
+    fn the_seed_render_is_dashes_not_invented_numbers() {
+        let node = with_negotiated_vocab(SPARKLINE_VOCAB, || {
+            panel(
+                Card::bar_default(),
+                &Snapshot::default(),
+                &History::default(),
+                false,
+            )
+        });
+        let texts = texts(&node);
+        assert!(texts.iter().filter(|t| *t == "—").count() >= 3, "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "0%"), "{texts:?}");
     }
 
-    fn collect_text(node: &Node, out: &mut Vec<String>) {
-        match node {
-            Node::Box { children, .. }
-            | Node::Row { children, .. }
-            | Node::ListBox { children, .. } => {
-                for child in children {
-                    collect_text(child, out);
-                }
-            }
-            Node::Label { text, .. } | Node::Text { text, .. } => out.push(text.clone()),
-            _ => {}
+    /// The Disk card is a collapsed expander until the plugin says otherwise:
+    /// the flag the model holds is the one the node carries, under the id the
+    /// plugin's `update` toggles on.
+    #[test]
+    fn the_mounts_live_in_the_disk_expander() {
+        for expanded in [false, true] {
+            let node = page_at(SPARKLINE_VOCAB, Card::bar_default(), &busy(), expanded);
+            let expander = nodes_of(&node)
+                .into_iter()
+                .find_map(|n| match n {
+                    Node::Expander {
+                        id,
+                        expanded,
+                        children,
+                        ..
+                    } => Some((id.clone(), *expanded, children.len())),
+                    _ => None,
+                })
+                .expect("the Disk card has an expander");
+            assert_eq!(expander, (DISKS_EXPANDER_ID.to_owned(), expanded, 2));
         }
+
+        // An empty mount list says so inside the expander rather than opening
+        // onto nothing.
+        let empty = page(
+            Card::bar_default(),
+            &Snapshot {
+                disks: Vec::new(),
+                ..busy()
+            },
+        );
+        let texts = texts(&empty);
+        assert!(texts.iter().any(|t| t == "No mounts"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "0 mount(s)"), "{texts:?}");
     }
 
-    /// Every `ts-*` class the page carries, in tree order — the page half of
-    /// `card::tests::the_bar_renders_four_chips_each_keeping_its_class`, and
-    /// the only thing that pins `docs/live-verify.md`'s "the plugin's page
-    /// rows must tint". `ts-stat-progress` in particular is not decoration:
-    /// it is what makes a mount bar the shell's own pill rather than a
-    /// default `GtkProgressBar` (`assets/trollshell/style.css:1899-1913`,
-    /// applied by the host at `trollshell/src/plugins/wire_map.rs:596-600`).
+    /// The shell's own classes ride the page — the `ts-*` tint contract Annika
+    /// asked for on #1235 ("the skins carry over"), the native history row's
+    /// `ts-history-row` / `ts-stat-name` / `ts-stat-value`, libadwaita's row
+    /// `header`, the progress bars' `ts-stat-progress` — plus the two additive
+    /// rules this page brought (`ts-stat-col`, `ts-stat-detail`).
     ///
-    /// Lifted from the #1295 review's MED 3, adapted to this crate's own
-    /// `busy`/`cls` names.
-    ///
-    /// **Falsified** by dropping any `cls(...)` argument in this module — in
-    /// particular `mount_row`'s `cls("ts-stat-progress")` on the
-    /// `Node::Progress`.
+    /// **Falsified** by dropping any of them from its helper.
     #[test]
     fn the_page_keeps_the_shells_own_classes() {
-        let mut got = Vec::new();
-        classes_of(
-            &panel(Card::bar_default(), &busy(), &Widgets::default()),
-            &mut got,
-        );
-        assert!(got.iter().any(|c| c == "ts-stat-progress"), "{got:?}");
+        let got = classes(&page(Card::bar_default(), &busy()));
         for want in [
             "ts-cpu",
             "ts-cpu-temp",
@@ -825,8 +1263,101 @@ mod tests {
             "ts-gpu-temp",
             "ts-memory",
             "ts-disk",
+            "ts-stat-progress",
+            "ts-history-row",
+            "ts-stat-name",
+            "ts-stat-value",
+            "ts-stat-col",
+            "ts-stat-detail",
+            "header",
+            "subtitle",
+            "boxed-list",
+            "ts-page-card",
+            "ts-page-expander",
+            HOMOGENEOUS_CLASS,
         ] {
             assert!(got.iter().any(|c| c == want), "{want} missing: {got:?}");
         }
+    }
+
+    /// **Each line carries its own reading** — not merely a reading of the
+    /// right length (#1414 review, MEDIUM 5). The bounded-and-withheld test
+    /// below counts samples; this one reads them, which is what kills a memory
+    /// line plotting swap, an inverted CPU line, a NaN temperature pushed as a
+    /// 0 °C dip, and a disk "min" that is really the running max.
+    ///
+    /// **Falsified** by each of: `fraction(m.swap_used, m.swap_total)` in the
+    /// memory arm, `1.0 - cpu` in the CPU arm, dropping the `is_finite` filter
+    /// on the GPU temperature, and `lo.max(v)` in `disk_io_range`.
+    #[test]
+    fn each_line_carries_its_own_reading() {
+        let mut h = History::default();
+        h.push(&busy());
+        assert_eq!(h.cpu.back().copied(), Some(0.42));
+        let memory = h.memory.back().copied().expect("a memory point");
+        assert!(
+            (memory - 11_999_999_000.0_f32 / 33_500_000_000.0).abs() < 1e-6,
+            "memory used over total, not swap: {memory}",
+        );
+        assert_eq!(h.gpu_load.back().copied(), Some(0.37));
+        assert_eq!(h.gpu_vram.back().copied(), Some(0.25));
+        assert_eq!(h.gpu_temp.back().copied(), Some(52.0));
+
+        let mut nan = busy();
+        nan.gpu.as_mut().expect("busy has a GPU").temperature_c = Some(f32::NAN);
+        h.push(&nan);
+        assert_eq!(h.gpu_temp.len(), 1, "a NaN temperature is not a sample");
+
+        let mut quiet = busy();
+        quiet
+            .disk_io
+            .as_mut()
+            .expect("busy reads disk I/O")
+            .read_bps = 0.0;
+        h.push(&quiet);
+        assert_eq!(h.disk_io_range(), (1_048_576.0, 3_145_728.0));
+    }
+
+    /// The history rings keep the native rows' sixty samples, and a withheld
+    /// reading is not a sample — the rule the sidebar card's scope ring
+    /// follows for a cold `/proc/stat` tick.
+    ///
+    /// **Falsified** by dropping `push_capped`'s `pop_front` (the rings grow
+    /// past sixty), or by pushing a point for a `None` reading.
+    #[test]
+    fn the_history_is_bounded_and_skips_withheld_readings() {
+        let mut history = History::default();
+        for _ in 0..(HISTORY_LEN * 3) {
+            history.push(&busy());
+        }
+        for (name, ring) in [
+            ("cpu", &history.cpu),
+            ("clock", &history.clock),
+            ("memory", &history.memory),
+            ("gpu_load", &history.gpu_load),
+            ("gpu_vram", &history.gpu_vram),
+            ("gpu_temp", &history.gpu_temp),
+            ("disk_io", &history.disk_io),
+        ] {
+            assert_eq!(ring.len(), HISTORY_LEN, "{name}");
+        }
+
+        let mut cold = History::default();
+        cold.push(&Snapshot::default());
+        assert_eq!(cold, History::default(), "nothing measured, nothing drawn");
+
+        // The clock is on the native row's fixed axis: max over the ceiling.
+        let mut one = History::default();
+        one.push(&busy());
+        let clock = one.clock.back().copied().expect("one clock point");
+        assert!(
+            (clock - 0.76).abs() < 1e-6,
+            "3.8 GHz of a 5 GHz ceiling: {clock}"
+        );
+        assert_eq!(
+            one.disk_io.back().map(|v| v.to_bits()),
+            Some(3_145_728.0_f32.to_bits()),
+            "read + write, in bytes/s",
+        );
     }
 }

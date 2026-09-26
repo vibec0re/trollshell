@@ -308,6 +308,26 @@ pub mod testing {
         });
         f()
     }
+
+    /// Call `f` as if this session had negotiated exactly `vocab`, then restore
+    /// the real generation — the seam for pinning a negotiated **node**'s two
+    /// arms from outside this crate, where [`with_render_mode`] only reaches
+    /// the preem one.
+    ///
+    /// `with_negotiated_vocab(SPARKLINE_VOCAB, …)` is a shell that draws
+    /// `Node::Sparkline` and every generation before it (preem included, since
+    /// generations are cumulative); `with_negotiated_vocab(SPARKLINE_VOCAB - 1,
+    /// …)` is the newest shell that does not. `hytte-plugin-stats`' drawer page
+    /// (#1252) is the reference consumer.
+    ///
+    /// **Tests only**, for [`with_render_mode`]'s reason: forcing a generation
+    /// the host never advertised is how a live plugin sends a frame the host
+    /// cannot decode.
+    pub fn with_negotiated_vocab<T>(vocab: u16, f: impl FnOnce() -> T) -> T {
+        let _restore = Restore(super::negotiated_vocab());
+        NEGOTIATED.with(|v| v.set(vocab));
+        f()
+    }
 }
 
 // ── style conversion ────────────────────────────────────────────────────────
@@ -2124,6 +2144,28 @@ mod tests {
     use hytte_plugin_proto::{decode, encode};
     use hytte_preem as kit;
     use hytte_preem::DisplayStyle;
+
+    /// `testing::with_negotiated_vocab` sets exactly the generation it was
+    /// handed for the closure and puts the session's real one back afterwards —
+    /// including when the closure panics, which is how a failing assertion in a
+    /// consumer's test leaves it.
+    #[test]
+    fn with_negotiated_vocab_is_scoped_and_restores() {
+        use super::testing::with_negotiated_vocab;
+        use hytte_plugin_proto::SPARKLINE_VOCAB;
+
+        set_negotiated(3);
+        let seen = with_negotiated_vocab(SPARKLINE_VOCAB, negotiated_vocab);
+        assert_eq!(seen, SPARKLINE_VOCAB);
+        assert_eq!(negotiated_vocab(), 3, "restored after a normal return");
+
+        let unwound = std::panic::catch_unwind(|| {
+            with_negotiated_vocab(SPARKLINE_VOCAB, || panic!("a failing assertion"));
+        });
+        assert!(unwound.is_err());
+        assert_eq!(negotiated_vocab(), 3, "restored after a panic too");
+        set_negotiated(0);
+    }
 
     /// The widget a `Node::Preem` carries, or a panic naming what came instead —
     /// the assertion every state-mode test funnels through.

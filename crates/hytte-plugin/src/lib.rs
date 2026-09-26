@@ -276,6 +276,20 @@
 //!   **degrades to the bare child** against a shell too old to decode the
 //!   variant (it is negotiated, like the preem and shader vocabularies).
 //!
+//! ## A native history line: [`Node::Sparkline`] (#1252)
+//!
+//! The shell's own Stats page draws its history rows as
+//! `[name | line | value]`, the line being `hytte_ui::Sparkline` — a flat
+//! accent-coloured stroke with a faint fill, as wide as its row.
+//! [`Node::Sparkline`] is that widget on the wire: send the samples oldest
+//! first (the whole window, every render — the host keeps no history) and the
+//! shell draws the same line it draws for itself. It is the answer when a
+//! page should read like the shell's own rather than like a preem display; a
+//! preem `Scope` stays the answer on a retro card.
+//! `nodes::sparkline(ring).id("cpu-history").max(1.0).build()` builds one, and
+//! degrades to a [`Node::Progress`] at the newest sample's level against a
+//! shell too old to decode it (negotiated, like [`Node::Scrolled`]).
+//!
 //! For a **collapsible** section, reach for [`Node::Expander`] instead of
 //! hand-rolling a button + chevron + revealer. It renders a flat, full-width
 //! header (your `header` node, with a trailing disclosure chevron) over a

@@ -93,6 +93,13 @@ pub struct Snapshot {
     /// governor (`max_ceiling_hz == 0.0`: VMs and some ARM boards), which is
     /// the native row's own hide rule.
     pub cpu_clock_hz: Option<f64>,
+    /// The highest `cpuinfo_max_freq` across cores in Hz — the fixed top the
+    /// native Clock row's sparkline is normalised against
+    /// (`CpuFreq::max_ceiling_hz`, "a fixed 0→max-clock domain that shows
+    /// headroom rather than auto-scaling"), so the drawer page's line can
+    /// draw on the same axis (#1252). `Some` exactly when
+    /// [`cpu_clock_hz`](Self::cpu_clock_hz) is.
+    pub cpu_clock_ceiling_hz: Option<f64>,
     /// Aggregate disk-throughput history — the native Disks card's I/O row
     /// (`stats.rs:610` → `:1293`) — or `None` when this instance does not draw
     /// disks (see [`Needs`]). Unlike [`cpu`](Self::cpu) this is never withheld
@@ -362,14 +369,10 @@ impl Sampler {
         } else {
             None
         };
-        let cpu_clock_hz = if self.needs.cpu {
-            let freq = hytte_sensors::read_cpu_freq();
-            // The native row's own hide rule: no `cpufreq` governor at all
-            // (VMs, some ARM boards) is `max_ceiling_hz == 0.0`, and the row
-            // disappears rather than showing a flat, meaningless `0 Hz`.
-            (freq.max_ceiling_hz > 0.0).then(|| finite_or_zero(freq.max_hz))
+        let (cpu_clock_hz, cpu_clock_ceiling_hz) = if self.needs.cpu {
+            clock_of(&hytte_sensors::read_cpu_freq())
         } else {
-            None
+            (None, None)
         };
 
         let memory = if self.needs.memory {
@@ -432,6 +435,7 @@ impl Sampler {
             disks,
             processes,
             cpu_clock_hz,
+            cpu_clock_ceiling_hz,
             disk_io,
         }
     }
@@ -514,6 +518,29 @@ fn as_unit(load: f64) -> f32 {
 #[allow(clippy::cast_possible_truncation)]
 fn celsius(c: f64) -> f32 {
     c as f32
+}
+
+/// The CPU clock half of a tick: `(aggregate clock, its normalisation
+/// ceiling)`, both in Hz — or `(None, None)` on a machine with no `cpufreq`
+/// governor (`max_ceiling_hz == 0.0`: VMs and some ARM boards), the native
+/// Clock row's own hide rule, so the row disappears rather than showing a flat,
+/// meaningless `0 Hz`.
+///
+/// The aggregate is `max_hz` (the fastest core right now) and the ceiling is
+/// `max_ceiling_hz` (the highest `cpuinfo_max_freq`) — the native row's fixed
+/// "0→max-clock" axis. Split out of [`Sampler::tick`] so the mapping is pinned
+/// without reading sysfs: swapping the ceiling for the current clock would pin
+/// the page's Clock line to its top edge forever, and nothing else would see it
+/// (#1414 review, MEDIUM 5).
+fn clock_of(freq: &hytte_sensors::CpuFreq) -> (Option<f64>, Option<f64>) {
+    if freq.max_ceiling_hz > 0.0 {
+        (
+            Some(finite_or_zero(freq.max_hz)),
+            Some(finite_or_zero(freq.max_ceiling_hz)),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 /// An `f64` reading with no bounded range (a byte rate, a clock frequency) as
@@ -690,11 +717,40 @@ async fn sampler_task_with<S: Sample>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, cpu_half, sampler_task,
+        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, sampler_task,
         sampler_task_with,
     };
     use crate::config::Card;
     use hytte_plugin::cmd_channel;
+
+    /// The Clock row's two numbers are the **fastest core now** over the
+    /// **highest `cpuinfo_max_freq`** — the native row's fixed 0→max-clock
+    /// axis — and a machine with no `cpufreq` governor has neither.
+    ///
+    /// **Falsified** by taking the ceiling from `max_hz` (the page's Clock line
+    /// then sits on its top edge forever), or by dropping the zero-ceiling hide.
+    #[test]
+    fn the_clock_is_the_fastest_core_over_the_highest_ceiling() {
+        let freq = hytte_sensors::CpuFreq {
+            max_hz: 3_800_000_000.0,
+            per_core: vec![1_200_000_000.0, 3_800_000_000.0],
+            max_ceiling_hz: 5_000_000_000.0,
+        };
+        assert_eq!(
+            clock_of(&freq),
+            (Some(3_800_000_000.0), Some(5_000_000_000.0))
+        );
+        assert_eq!(
+            clock_of(&hytte_sensors::CpuFreq::default()),
+            (None, None),
+            "no governor, no Clock row",
+        );
+        let poisoned = hytte_sensors::CpuFreq {
+            max_hz: f64::NAN,
+            ..freq
+        };
+        assert_eq!(clock_of(&poisoned), (Some(0.0), Some(5_000_000_000.0)));
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -873,6 +929,7 @@ mod tests {
         assert!(s.gpu.is_none());
         assert!(s.processes.is_none());
         assert!(s.cpu_clock_hz.is_none());
+        assert!(s.cpu_clock_ceiling_hz.is_none());
         assert!(s.disk_io.is_none());
     }
 
@@ -1034,6 +1091,7 @@ mod tests {
         assert!(snap.disks.is_empty(), "the mount walk + statvfs are gated");
         assert_eq!(snap.processes, None, "the /proc read_dir walk is gated");
         assert_eq!(snap.cpu_clock_hz, None, "the cpufreq sysfs walk is gated");
+        assert_eq!(snap.cpu_clock_ceiling_hz, None, "…and so is its ceiling");
         assert_eq!(snap.disk_io, None, "the /proc/diskstats read is gated");
     }
 

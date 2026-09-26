@@ -5,12 +5,13 @@
 use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentChoices, ConsentDecision, DEFAULT_SLIDER_MAX,
     DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
-    Effect, EffectOutcome, EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel,
-    MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount,
-    NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget,
-    ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB, ShaderData,
-    SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode,
-    encode_body, sane_fraction, sane_slider_floats,
+    Effect, EffectOutcome, EventKind, HOMOGENEOUS_CLASS, HostMsg, LedStripConfig, LedStripState,
+    LogLevel, MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES,
+    Manifest, MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page,
+    PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB,
+    SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB,
+    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, sane_fraction,
+    sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -872,6 +873,236 @@ fn the_clamp_recurses_through_a_viewport() {
     assert_node_floats_are_sane(&node);
 }
 
+// ── Sparkline node (#1252) ───────────────────────────────────────────────────
+
+fn sparkline(values: Vec<f32>, max: Option<f32>) -> Node {
+    Node::Sparkline {
+        id: Some("cpu-history".into()),
+        values,
+        max,
+        classes: vec!["ts-cpu".into()],
+    }
+}
+
+#[test]
+fn sparkline_round_trips_with_and_without_a_fixed_top() {
+    for max in [None, Some(1.0_f32), Some(100.0)] {
+        let node = sparkline(vec![0.0, 0.25, 0.5, 1.0], max);
+        let back: Node = decode(&encode(&node)).expect("decode Sparkline");
+        assert_eq!(node, back, "max={max:?} round-trips");
+    }
+    // An empty line is a legal node — a ring before its first sample.
+    let empty = sparkline(Vec::new(), None);
+    assert_eq!(empty, decode::<Node>(&encode(&empty)).expect("decode"));
+}
+
+/// `max: None` stays off the wire (`skip_serializing_if`), and a frame without
+/// the key decodes to `None` — so an auto-scaled line costs no bytes for the
+/// field and a hand-rolled client may omit it.
+#[test]
+fn a_sparkline_without_a_fixed_top_carries_no_max_key() {
+    // A hand-rolled client's node that simply never names `max`.
+    #[derive(serde::Serialize)]
+    enum Hand {
+        Sparkline {
+            id: Option<String>,
+            values: Vec<f32>,
+            classes: Vec<String>,
+        },
+    }
+
+    let auto = encode_body(&sparkline(vec![1.0], None));
+    assert!(contains(&auto, b"Sparkline"), "tagged by variant name");
+    assert!(contains(&auto, b"values"));
+    assert!(!contains(&auto, b"max"), "None is kept off the wire");
+    let fixed = encode_body(&sparkline(vec![1.0], Some(1.0)));
+    assert!(contains(&fixed, b"max"), "Some rides as a named key");
+
+    // …and the absent key decodes to `None`, not a decode error.
+    let hand = encode_body(&Hand::Sparkline {
+        id: None,
+        values: vec![0.5],
+        classes: vec![],
+    });
+    assert_eq!(
+        decode_body::<Node>(&hand).expect("a frame without `max` decodes"),
+        Node::Sparkline {
+            id: None,
+            values: vec![0.5],
+            max: None,
+            classes: vec![],
+        },
+    );
+}
+
+/// Why the variant is **negotiated** rather than emitted on sight: a pre-#1252
+/// host's decoder has no `Sparkline` arm and fails the whole frame on it —
+/// #437's reconnect loop, which the `Hello` gate is what prevents.
+#[test]
+fn an_older_host_cannot_decode_a_sparkline() {
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    enum NodeOld {
+        Label {
+            id: Option<String>,
+            text: String,
+            classes: Vec<String>,
+        },
+    }
+    let err = decode_body::<NodeOld>(&encode_body(&sparkline(vec![0.1], Some(1.0))))
+        .expect_err("a pre-#1252 host cannot decode the appended variant");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "the frame fails to decode: {err:?}",
+    );
+}
+
+/// The two sanitisers, row by row against their docs — each value the drawing
+/// code cannot draw is mapped to the one it would have drawn anyway, and every
+/// value it can draw is left alone.
+#[test]
+fn the_sparkline_sanitisers_follow_the_drawing_code() {
+    assert_eq!(sane_sparkline_sample(f32::NAN).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(
+        sane_sparkline_sample(f32::INFINITY).to_bits(),
+        f32::MAX.to_bits()
+    );
+    assert_eq!(
+        sane_sparkline_sample(f32::NEG_INFINITY).to_bits(),
+        (-f32::MAX).to_bits()
+    );
+    for finite in [0.0_f32, -0.0, 0.42, -3.0, 1e30, f32::MIN_POSITIVE] {
+        assert_eq!(
+            sane_sparkline_sample(finite).to_bits(),
+            finite.to_bits(),
+            "a finite sample passes through: {finite}",
+        );
+    }
+
+    // Everything `draw_sparkline` would auto-scale on anyway is `None`.
+    for auto in [
+        None,
+        Some(0.0_f32),
+        Some(-1.0),
+        Some(f32::NAN),
+        Some(f32::NEG_INFINITY),
+    ] {
+        assert_eq!(sane_sparkline_max(auto), None, "{auto:?} auto-scales");
+    }
+    assert_eq!(sane_sparkline_max(Some(f32::INFINITY)), Some(f32::MAX));
+    assert_eq!(sane_sparkline_max(Some(1.0)), Some(1.0));
+    assert_eq!(sane_sparkline_max(Some(100.0)), Some(100.0));
+}
+
+/// The clamp keeps the **newest** `MAX_SPARKLINE_SAMPLES` (the ones at the
+/// end), sanitises every survivor, and is a fixpoint — a clamped line compares
+/// equal to itself, which is the dedup property the SDK's `view != last_view`
+/// gate needs.
+///
+/// **Falsified** by `values.truncate(MAX_SPARKLINE_SAMPLES)` in place of the
+/// `drain(..excess)` (the head assertion reds — the oldest samples survive), or
+/// by dropping the `Sparkline` arm from `clamp_in_place` (the `NaN` survives).
+#[test]
+fn the_clamp_keeps_the_newest_samples_and_sanitises_them() {
+    let total = MAX_SPARKLINE_SAMPLES + 10;
+    #[allow(clippy::cast_precision_loss)]
+    let mut values: Vec<f32> = (0..total).map(|i| i as f32).collect();
+    values[total - 1] = f32::NAN;
+    values[total - 2] = f32::INFINITY;
+    let clamped = sparkline(values, Some(f32::NAN)).clamped();
+
+    let Node::Sparkline { values, max, .. } = &clamped else {
+        panic!("still a sparkline: {clamped:?}");
+    };
+    assert_eq!(values.len(), MAX_SPARKLINE_SAMPLES);
+    assert_eq!(
+        values[0].to_bits(),
+        10.0_f32.to_bits(),
+        "the ten OLDEST samples were dropped"
+    );
+    assert_eq!(
+        values[MAX_SPARKLINE_SAMPLES - 2].to_bits(),
+        f32::MAX.to_bits()
+    );
+    assert_eq!(
+        values[MAX_SPARKLINE_SAMPLES - 1].to_bits(),
+        0.0_f32.to_bits()
+    );
+    assert_eq!(*max, None, "a NaN top auto-scales");
+    assert_node_floats_are_sane(&clamped);
+    assert_eq!(clamped.clone().clamped(), clamped, "fixpoint");
+}
+
+/// A sparkline nested in a list card is reached by the same recursion as every
+/// other leaf — the container arms need nothing new.
+#[test]
+fn the_clamp_reaches_a_sparkline_inside_a_card() {
+    let card = Node::ListBox {
+        id: None,
+        classes: vec!["boxed-list".into()],
+        dense: false,
+        children: vec![Node::Row {
+            id: None,
+            classes: vec![],
+            spacing: 8,
+            children: vec![sparkline(vec![f32::NAN, 0.5], None)],
+            tooltip: None,
+        }],
+    }
+    .clamped();
+    assert_node_floats_are_sane(&card);
+    assert_eq!(card.clone().clamped(), card);
+}
+
+// ── Homogeneous boxes (#1252) ────────────────────────────────────────────────
+
+/// The homogeneous switch is a **class**, so it rides the wire as nothing but
+/// one more string in `classes`: a box carrying it round-trips, and a decoder
+/// that knows only the pre-#1252 `Box` fields — and refuses any other key —
+/// still decodes it. That is the "additive, no `VOCAB` bump, fixtures
+/// byte-identical" claim, stated against a decoder rather than asserted.
+///
+/// The literal is pinned too: host and plugin must spell it identically, and a
+/// test derived from the constant cannot see the constant change (#1026).
+///
+/// **Falsified** by carrying the switch as a `homogeneous` field instead (the
+/// strict old decoder refuses the unknown key).
+#[test]
+fn the_homogeneous_switch_is_a_class_and_adds_no_key() {
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum NodeOld {
+        Box {
+            id: Option<String>,
+            dir: Dir,
+            spacing: i32,
+            scroll: bool,
+            classes: Vec<String>,
+            children: Vec<serde::de::IgnoredAny>,
+        },
+    }
+
+    assert_eq!(HOMOGENEOUS_CLASS, "hytte-homogeneous");
+    let columns = Node::Box {
+        id: Some("stats-panel".into()),
+        dir: Dir::Horizontal,
+        spacing: 12,
+        scroll: false,
+        classes: vec![HOMOGENEOUS_CLASS.into()],
+        children: vec![],
+        tooltip: None,
+    };
+    let body = encode_body(&columns);
+    assert_eq!(decode_body::<Node>(&body).expect("round-trips"), columns);
+    assert!(contains(&body, HOMOGENEOUS_CLASS.as_bytes()));
+    let old = decode_body::<NodeOld>(&body).expect("a pre-#1252 decoder sees no new key");
+    assert!(
+        matches!(&old, NodeOld::Box { classes, .. } if classes == &[HOMOGENEOUS_CLASS.to_owned()]),
+        "{old:?}",
+    );
+}
+
 // ── Slider node + ValueChanged event (#315) ──────────────────────────────────
 
 #[test]
@@ -1720,14 +1951,15 @@ fn the_per_screen_fields_bump_no_vocabulary_generation() {
     // #1050 adds two defaulted **fields**, not variants. The crate root's rule
     // ("appending a wire variant ⇒ bump `VOCAB`") therefore does not fire, and
     // the counter must not have moved for them. Pinned as an equality against
-    // the newest *variant* generation (`SIDEBAR_RIGHT_VOCAB`, #1158) rather than
+    // the newest *variant* generation (`SPARKLINE_VOCAB`, #1252) rather than
     // a bare literal: a later PR that legitimately appends a variant bumps both
     // together and this stays green, while a reflexive `VOCAB += 1` for a field
     // addition — the mistake this test exists to catch — turns it red. The pin
     // moved here from `OPEN_URI_VOCAB` when #1158 appended the next variant, as
-    // that const's own doc said it would.
+    // that const's own doc said it would, and on from `SIDEBAR_RIGHT_VOCAB`
+    // when #1252 appended the one after.
     assert_eq!(
-        VOCAB, SIDEBAR_RIGHT_VOCAB,
+        VOCAB, SPARKLINE_VOCAB,
         "#1050's fields must not have advanced VOCAB past the newest appended variant",
     );
     assert_eq!(
@@ -2751,6 +2983,19 @@ fn assert_node_floats_are_sane(node: &Node) {
                 max - min
             );
         }
+        Node::Sparkline { values, max, .. } => {
+            assert!(
+                values.len() <= MAX_SPARKLINE_SAMPLES,
+                "{} samples survived the clamp",
+                values.len()
+            );
+            for v in values {
+                assert!(v.is_finite(), "a non-finite sample survived: {v}");
+            }
+            if let Some(m) = max {
+                assert!(m.is_finite() && *m > 0.0, "an unusable top survived: {m}");
+            }
+        }
         Node::Box { children, .. }
         | Node::Row { children, .. }
         | Node::ListBox { children, .. } => {
@@ -2800,6 +3045,13 @@ fn node_float_bits(node: &Node) -> Vec<u64> {
             value.to_bits(),
             step.to_bits(),
         ],
+        // `f32`s, widened bit-for-bit (`From<u32> for u64`) so a `NaN`'s
+        // payload survives into the identity comparison.
+        Node::Sparkline { values, max, .. } => values
+            .iter()
+            .chain(max)
+            .map(|v| u64::from(v.to_bits()))
+            .collect(),
         Node::Box { children, .. }
         | Node::Row { children, .. }
         | Node::ListBox { children, .. } => children.iter().flat_map(node_float_bits).collect(),
@@ -3726,10 +3978,14 @@ fn the_open_uri_generation_bumps_the_census_only() {
 #[test]
 fn the_sidebar_right_generation_bumps_the_census_only() {
     assert_eq!(SIDEBAR_RIGHT_VOCAB, 6, "#1158 is generation 6");
-    assert_eq!(
-        VOCAB, SIDEBAR_RIGHT_VOCAB,
-        "the census reaches the newest appended variant",
-    );
+    // `<=`, not `==` since #1252: the "census reaches the newest variant" pin
+    // moved on to `the_sparkline_generation_bumps_the_census_only`.
+    const {
+        assert!(
+            SIDEBAR_RIGHT_VOCAB <= VOCAB,
+            "the census counts it, and never un-counts a shipped generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "an appended variant does not move the unconditional ceiling",
@@ -3746,6 +4002,58 @@ fn the_sidebar_right_generation_bumps_the_census_only() {
         m.vocab < SIDEBAR_RIGHT_VOCAB,
         "so the handshake counter is NOT what keeps this mount away from an \
          older host — the `Register` decode is (see the const's doc)",
+    );
+}
+
+/// #1252's trend line is generation **7**, it bumps the census, and it leaves
+/// `VOCAB_UNCONDITIONAL` alone — the `Hello`-negotiated rule #882/#893/#966
+/// set, applied a fourth time.
+///
+/// Its predecessor is the first one that is *not* `Hello`-negotiated (#1158's
+/// mounts), so this is also where "a shell on the previous generation
+/// negotiates below this one" is checked against a census-only generation:
+/// a generation-6 shell advertises 6 in its `Hello`, and the arithmetic keeps
+/// the variant away from it with no special case.
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 7 (the third assertion
+/// reds, and with it every older shell's acceptance of a rebuilt plugin), or by
+/// leaving `VOCAB` at 6 (the second), or by `SPARKLINE_VOCAB = 6` (the
+/// generation-6 assertion).
+#[test]
+fn the_sparkline_generation_bumps_the_census_only() {
+    assert_eq!(SPARKLINE_VOCAB, 7, "#1252 is generation 7");
+    assert_eq!(
+        VOCAB, SPARKLINE_VOCAB,
+        "the census reaches the newest appended variant",
+    );
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "a negotiated variant does not move the unconditional ceiling",
+    );
+
+    let m = Manifest::new("stats", Mount::BarRight);
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "the stamped generation an old host exact-checks did not move",
+    );
+    m.check_vocab()
+        .expect("a plugin rebuilt on this SDK still clears a same-vocab host");
+    assert_eq!(
+        m.negotiated_vocab(VOCAB),
+        SPARKLINE_VOCAB,
+        "a host advertising today's census negotiates the trend line",
+    );
+    assert!(
+        m.negotiated_vocab(SIDEBAR_RIGHT_VOCAB) < SPARKLINE_VOCAB,
+        "a generation-6 shell negotiates below it, so the plugin falls back",
+    );
+    assert!(
+        m.negotiated_vocab(SCROLLED_VOCAB) < SPARKLINE_VOCAB,
+        "…as does a #966-era one",
+    );
+    assert!(
+        m.negotiated_vocab(VOCAB_UNCONDITIONAL) < SPARKLINE_VOCAB,
+        "and a host that advertises nothing",
     );
 }
 

@@ -2331,7 +2331,9 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       contract Annika asked for on #1235 ("the skins carry over"): the plugin's
       nodes carry `ts-cpu`/`ts-memory`/`ts-disk`/`ts-gpu` and `ts-cpu-temp`/
       `ts-gpu-temp` verbatim.
-- [ ] **(#1251)** **A click opens the plugin's own page.** Click any of the
+- [ ] **(#1251 — the page's _contents_ are superseded by #1252 below: it is
+      no longer preem and no longer one column)** **A click opens the
+      plugin's own page.** Click any of the
       four chips: the drawer opens on a page with a CPU card (load, process
       count, core count, the lamp row at **full width** — chunkier dots than
       the sidebar card's — the package temperature, the history sweep and the
@@ -2342,7 +2344,8 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       width**, one row per mount with `used / total (pct%)` and a bar, then a
       Disk I/O history sweep). All four chips open the **same** page — a
       plugin has exactly one `PluginSelf`.
-- [ ] **(#1251)** **Compare it against the native page, side by side.** The
+- [ ] **(#1251 — superseded by #1252's side-by-side below)** **Compare it
+      against the native page, side by side.** The
       native Stats page is still in the tree (P3, #1252, retires it) — open it
       from the native chips and put the two next to each other. Expected
       differences, all deliberate: the per-core `MultiSparkline` is **gone**
@@ -2448,6 +2451,81 @@ above (`HYTTE_PLUGIN_ID=stats-bar HYTTE_PLUGIN_MOUNT=BarRight`).
       **sidebar**-mounted plugin card that opens its page (the clock demo's
       sidebar card, #1408): it still opens in the centred dialog, with the same
       padding as before — the drawer's page frame must not appear there.
+
+### Stats as a plugin — the page in the native layout (#1252)
+
+Annika on #1252, comparing the #1251 page with the native one: "typ ultra
+dogshit … maybe not use preem widgets here?". The page is rebuilt on the
+native multicolumn Stats page's own widgets, and the wire grew one node for it
+(`Node::Sparkline`, drawn with the same `hytte_ui::Sparkline` the native
+history rows use). Needs a shell **and** a plugin built from this change — the
+node is negotiated, so an older shell gets `Progress` bars instead of lines
+(last item). Launch the bar instance exactly as in #1251 above.
+
+- [ ] **(#1252)** **Two columns of cards, like the native page.** Click any
+      of the four chips: the page shows **two columns** — CPU over GPU on the
+      left, Memory over Disk on the right — each card a rounded `boxed-list`
+      with hairline separators, rows the height of the native ones (~50 px
+      for the "label … value" rows) and a card surface of its own — rounded,
+      lifted off the drawer, not hairlines on the drawer's background (the
+      #1414 review found the shell's plugin-page `boxed-list` flattening had
+      erased them; `ts-page-card` opts this page back in). The two columns
+      are the **same width** (the root box is homogeneous; the review measured
+      289 px against 435 px before), so the CPU and GPU lines are as wide as
+      the Memory line beside them. Open the native Stats page from the native
+      chips and put the two side by side: same card order, same row heights,
+      same fonts. The page's width is its own content (~880 px); the host's
+      frame only caps it, so a wider drawer does not make it wider.
+- [ ] **(#1252)** **The rows read like the native rows.** CPU card: `CPU` with
+      the load beside it (smaller, dimmed) and the package temperature on the
+      right (`61 °C`); `Processes … 287`; a `CPU [line] 42%` history row; a
+      `Clock [line] 3.8 GHz` row (hidden with no `cpufreq`). Memory card:
+      `Memory 11.2 GiB / 31.2 GiB (36%)` with a slim accent **progress bar**
+      on the right, **vertically centred** in the row like the native one
+      (not riding its top edge), the same for `Swap` (only with swap), then
+      `Memory [line] 36%`. GPU card: `GPU <adapter name>` (ellipsized past 20
+      characters, full name on hover) with the temperature on the right, then
+      `GPU usage`, `GPU VRAM` (only when the vendor reports it) and
+      `GPU temp` lines. Disk card: a collapsed `Disk  N mount(s)` row with a
+      chevron, then `Disk I/O [line]` with the `↓ … ↑ …`, `min … · max …` and
+      `total ↓ … ↑ …` lines indented under it.
+- [ ] **(#1252)** **The lines are the native lines, and they move.** Each
+      history row's line is a flat accent-coloured stroke with a faint fill —
+      no glow, no phosphor, no graticule — and every one of them advances once
+      a second. The name column is the same width in every row (the lines'
+      left edges line up), as on the native page. Load something
+      (`stress -c 4` or a build): the CPU line climbs on a fixed 0–100 %
+      axis; copy a large file: the Disk I/O line auto-scales to the last
+      minute's peak, and `min · max` describes that same window.
+- [ ] **(#1252)** **The Disk card expands and collapses on click.** Click the
+      `Disk` row — as tall as the other title rows, its text inset like
+      theirs — the per-mount rows (`/ … 37.3 GiB / 93.1 GiB (40%)` + a
+      bar) slide out; click again and they fold away. Close and reopen the
+      drawer: the card remembers which way it was (the plugin holds the flag).
+- [ ] **(#1252)** **No preem anywhere on the page — and the sidebar card is
+      unchanged.** Nothing on the page is a dot-matrix, seven-segment, gauge,
+      LED strip or scope (GTK Inspector: no `PixelSurface`/`GlSurface` under
+      the page). The right-sidebar instance (`stats-side` above) must look
+      exactly as it did: lamps, seven-segment temperature, scope, needle.
+- [ ] **(#1252)** **Expected differences from the native page, all
+      deliberate:** no Services card and no **Top apps** rows (a plugin
+      process cannot reach systemd's failed units, the shell's task
+      supervisor or `app_usage` — #1251); no per-core LED panel (its native
+      widget is not on the wire, #1156, and the only wire lamp is a preem
+      one); no per-core expansion of the CPU and Clock lines (one line per
+      node); the value column's text starts at the column's left edge rather
+      than ending at its right (a wire label cannot be right-aligned); the
+      Disk expander's header is a flat button rather than an `AdwExpanderRow`
+      row (same height and inset, but it highlights on hover like a button);
+      and against a shell built before this change the two columns come out
+      at their natural, unequal widths (the equal-width switch is a class an
+      older shell ignores).
+- [ ] **(#1252)** **An older shell still gets a working page.** Against a
+      shell built before this change (generation 6), the page must still
+      open with the same two columns, and each history line must be a slim
+      progress bar at the newest reading instead — no reconnect loop in the
+      plugin's journal (`journalctl --user -u trollshell-plugin-stats-bar`
+      shows one `dialing`/`registered` pair, not one every 5 s).
 
 ## Audio & media
 

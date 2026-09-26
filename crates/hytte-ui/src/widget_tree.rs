@@ -443,6 +443,31 @@ pub enum Node {
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
+    /// A flat trend line: a [`Sparkline`](crate::Sparkline) — the widget the
+    /// shell's own Stats page draws its history rows with — over `values`
+    /// (#1252).
+    ///
+    /// The widget fills its row's width (`hexpand`, as the native history
+    /// row's does) and takes its height from the `hytte-sparkline` stylesheet
+    /// rule. `values` and `max` are **mutable props**: a same-id re-render
+    /// hands the existing widget the new samples and queues one redraw, and a
+    /// re-render carrying the samples it already holds — a sibling changed, or
+    /// the second monitor's pass over one frame — touches nothing. It never
+    /// rebuilds on a value change, which is what lets a line that moves every
+    /// second keep one widget for its whole life.
+    Sparkline {
+        /// Optional diff/reorder key (see [`NodeId`]).
+        id: Option<NodeId>,
+        /// The samples, oldest first (mutable prop). At most
+        /// [`SPARKLINE_CAPACITY`] are drawn — the newest.
+        values: Vec<f64>,
+        /// The y axis' top: `Some(m)` draws `0..=m`, `None` auto-scales to the
+        /// largest sample (mutable prop) — `Sparkline::set_domain_max`.
+        max: Option<f64>,
+        /// GTK CSS classes applied verbatim (`add_css_class`), on top of the
+        /// widget's own `hytte-sparkline`.
+        classes: Vec<String>,
+    },
     /// An interactive horizontal `gtk::Scale` — the writable counterpart to
     /// [`Node::Progress`]. `id` is **required** (like [`Node::Button`]): it is
     /// the [`EventKind::ValueChanged`] target. `min`/`max`/`step`/`value` set the
@@ -654,6 +679,73 @@ struct RetainedNode {
     /// single-threaded, so no locking is needed. Always `None` for every other
     /// node kind.
     entry_submitted: Option<Rc<Cell<bool>>>,
+    /// A [`Node::Sparkline`]'s widget handle and the props it last applied.
+    ///
+    /// Retained because the handle is not recoverable from
+    /// [`RetainedNode::widget`]: a [`Sparkline`](crate::Sparkline) is a plain
+    /// struct around a `gtk::DrawingArea` and the ring its draw function reads,
+    /// not a widget subclass, so there is nothing to `downcast` back to. The
+    /// last-applied `values`/`max` are what let [`update_in_place`] skip the
+    /// ring copy and the redraw when a re-render restates them. Always `None`
+    /// for every other node kind.
+    sparkline: Option<Box<SparklineState>>,
+}
+
+/// The largest number of samples a reconciled [`Node::Sparkline`] draws — the
+/// capacity its [`Sparkline`](crate::Sparkline) ring is built with (#1252).
+///
+/// `Sparkline::new` fixes the capacity for the widget's life, and the
+/// reconciler **never rebuilds on a value change**, so the capacity has to
+/// cover every line the node can carry rather than the first one it was
+/// built from. 1024 is the wire's own cap (`MAX_SPARKLINE_SAMPLES` in
+/// `hytte-plugin-proto`, which this crate does not link — the shell's mapping
+/// seam asserts the two agree at compile time). It is a **bound, not an
+/// allocation**: the ring grows to the samples it is actually handed (60 on the
+/// stats page), so a tree of empty lines costs no ring memory at all (#1414
+/// review, LOW 8). A longer `values` keeps its newest samples, the ring's own
+/// rule.
+pub const SPARKLINE_CAPACITY: usize = 1024;
+
+/// A [`Node::Sparkline`]'s retained pieces (see [`RetainedNode::sparkline`]).
+struct SparklineState {
+    /// The widget handle — cheap to clone, shares the ring with the draw
+    /// function.
+    spark: crate::Sparkline,
+    /// The `values` prop as last applied.
+    values: Vec<f64>,
+    /// The `max` prop as last applied.
+    max: Option<f64>,
+}
+
+impl SparklineState {
+    /// Build the widget and apply the node's props once.
+    fn build(values: &[f64], max: Option<f64>) -> Self {
+        let spark = crate::Sparkline::new(SPARKLINE_CAPACITY);
+        // The native history row's layout (`build_history_row` in the shell):
+        // the line takes whatever width its row has left over.
+        spark.widget().set_hexpand(true);
+        spark.set_domain_max(max);
+        spark.set_samples(&values.iter().copied().collect());
+        Self {
+            spark,
+            values: values.to_vec(),
+            max,
+        }
+    }
+
+    /// Re-point the existing widget at the node's props, touching only what
+    /// changed: each setter queues a redraw, and a frame that restates the
+    /// same line should cost none.
+    fn update(&mut self, values: &[f64], max: Option<f64>) {
+        if self.max != max {
+            self.spark.set_domain_max(max);
+            self.max = max;
+        }
+        if self.values != values {
+            self.spark.set_samples(&values.iter().copied().collect());
+            values.clone_into(&mut self.values);
+        }
+    }
 }
 
 /// A [`Node::Expander`]'s retained pieces (see [`RetainedNode::expander`]).
@@ -738,6 +830,7 @@ enum NodeKind {
     Shader,
     Button,
     Progress,
+    Sparkline,
     Slider,
     Revealer,
     Separator,
@@ -955,6 +1048,31 @@ fn list_row_of(child: &gtk::Widget) -> Option<gtk::ListBoxRow> {
 /// `install_default_css` loads the library sheet at.
 pub const DENSE_ROW_CLASS: &str = "hytte-dense-row";
 
+/// The class that makes a [`Node::Box`] or [`Node::Row`] **homogeneous** —
+/// `gtk_box_set_homogeneous(true)`, every child the same size along the box's
+/// axis (#1252).
+///
+/// The reconciler reads it off the node's own `classes` at build and at every
+/// in-place update, so adding or removing it re-lays the existing box out
+/// rather than rebuilding it. It is also applied as an ordinary CSS class, which
+/// no stylesheet styles.
+///
+/// A class rather than a node field for the reason the wire vocabulary's
+/// `HOMOGENEOUS_CLASS` gives (the same string, held equal by a test at the
+/// shell's mapping seam, since this crate does not link the proto): a field on
+/// `Box`/`Row` would be additive on the wire but a breaking change for every
+/// struct literal that builds one, in this tree and outside it. The motivating
+/// consumer is `hytte-plugin-stats`' two-column drawer page, whose columns
+/// otherwise take their own natural widths — measured 289 px against 435 px —
+/// where the native Stats page's grid is column-homogeneous.
+pub const HOMOGENEOUS_CLASS: &str = "hytte-homogeneous";
+
+/// Whether a box's `classes` ask for [`HOMOGENEOUS_CLASS`] — the one reading
+/// both the build and the update arms share, so they cannot disagree.
+fn wants_homogeneous(classes: &[String]) -> bool {
+    classes.iter().any(|c| c == HOMOGENEOUS_CLASS)
+}
+
 /// Mark (or unmark) every auto-created `GtkListBoxRow` wrapper in `list` for the
 /// dense rule (#966).
 ///
@@ -990,6 +1108,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut expander = None;
     let mut entry_text = None;
     let mut entry_submitted = None;
+    let mut sparkline = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
@@ -1004,6 +1123,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let boxw = gtk::Box::new(orientation(*dir), *spacing);
             apply_classes(&boxw, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             // Scroll behaviour is driven purely by `scroll`; `id` (if any)
             // is only along for the ride as the fired event's target.
             if *scroll {
@@ -1020,6 +1140,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let boxw = gtk::Box::new(gtk::Orientation::Horizontal, *spacing);
             apply_classes(&boxw, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             let kids = build_children(&Container::Box(boxw.clone()), children, on_event);
             (boxw.upcast(), kids)
         }
@@ -1161,8 +1282,28 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let bar = gtk::ProgressBar::new();
             bar.set_fraction(*fraction);
+            // Centred on the cross axis, as every native `ts-stat-progress` is
+            // (`panels/stats.rs`' `bar.set_valign(gtk::Align::Center)`). Under
+            // the default FILL a bar in a row taller than itself — a 50 px
+            // libadwaita row header — is allocated the whole height and draws
+            // its trough along the top edge (#1414 review, MEDIUM 3). In a
+            // vertical box, which hands a child exactly its natural height,
+            // this changes nothing.
+            bar.set_valign(gtk::Align::Center);
             apply_classes(&bar, classes);
             (bar.upcast(), Vec::new())
+        }
+        Node::Sparkline {
+            values,
+            max,
+            classes,
+            ..
+        } => {
+            let state = SparklineState::build(values, *max);
+            let area = state.spark.widget().clone();
+            apply_classes(&area, classes);
+            sparkline = Some(Box::new(state));
+            (area.upcast(), Vec::new())
         }
         Node::Slider {
             id,
@@ -1328,6 +1469,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         expander,
         entry_text,
         entry_submitted,
+        sparkline,
     }
 }
 
@@ -1387,6 +1529,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             boxw.set_orientation(orientation(*dir));
             boxw.set_spacing(*spacing);
             reconcile_classes(boxw, &retained.desc.classes, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             // `scroll` is a plain mutable property (like `classes`), not
             // part of this node's identity, so a flip attaches/detaches the
             // controller in place rather than forcing a subtree rebuild.
@@ -1417,6 +1560,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             let boxw = downcast::<gtk::Box>(&retained.widget);
             boxw.set_spacing(*spacing);
             reconcile_classes(boxw, &retained.desc.classes, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             diff_children(
                 &Container::Box(boxw.clone()),
                 &mut retained.children,
@@ -1564,6 +1708,21 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             let bar = downcast::<gtk::ProgressBar>(&retained.widget);
             bar.set_fraction(*fraction);
             reconcile_classes(bar, &retained.desc.classes, classes);
+        }
+        Node::Sparkline {
+            values,
+            max,
+            classes,
+            ..
+        } => {
+            // In place, never a rebuild: the retained handle is the widget's
+            // own ring, and `update` only touches the props that moved.
+            retained
+                .sparkline
+                .as_mut()
+                .expect("kind invariant: a Sparkline node retains its SparklineState")
+                .update(values, *max);
+            reconcile_classes(&retained.widget, &retained.desc.classes, classes);
         }
         Node::Slider {
             min,
@@ -2114,6 +2273,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Shader { .. } => NodeKind::Shader,
         Node::Button { .. } => NodeKind::Button,
         Node::Progress { .. } => NodeKind::Progress,
+        Node::Sparkline { .. } => NodeKind::Sparkline,
         Node::Slider { .. } => NodeKind::Slider,
         Node::Revealer { .. } => NodeKind::Revealer,
         Node::Separator { .. } => NodeKind::Separator,
@@ -2135,6 +2295,7 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::GlSurface { id, .. }
         | Node::Shader { id, .. }
         | Node::Progress { id, .. }
+        | Node::Sparkline { id, .. }
         | Node::Revealer { id, .. }
         | Node::Scrolled { id, .. } => id.as_deref(),
         // `Button`, `Slider`, `Expander`, and `Entry` all require an id — it is
@@ -2161,6 +2322,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Shader { classes, .. }
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
+        | Node::Sparkline { classes, .. }
         | Node::Slider { classes, .. }
         | Node::Expander { classes, .. }
         | Node::Entry { classes, .. }
@@ -2656,6 +2818,47 @@ mod diff_tests {
         }
     }
 
+    /// #1252's trend line keys as its **own** kind, by its id, with its classes
+    /// — the three accessors a new variant has to be added to, each of which
+    /// has a wrong-but-compiling arm to land in (`Separator | Spacer => None`
+    /// for the id, `Revealer | Spacer => &[]` for the classes).
+    #[test]
+    fn a_sparkline_node_carries_its_kind_id_and_classes() {
+        let node = Node::Sparkline {
+            id: Some("cpu-history".to_owned()),
+            values: vec![0.1, 0.4],
+            max: Some(1.0),
+            classes: vec!["ts-cpu".to_owned()],
+        };
+        assert_eq!(node_kind(&node), NodeKind::Sparkline);
+        assert_eq!(node_id(&node), Some("cpu-history"));
+        assert_eq!(node_classes(&node), ["ts-cpu".to_owned()]);
+        assert_eq!(
+            child_key(&node),
+            key(Some("cpu-history"), NodeKind::Sparkline)
+        );
+    }
+
+    /// A same-id sparkline re-render **reuses** its widget, and a same-id
+    /// sparkline never reuses the `Progress` bar the SDK falls back to (or the
+    /// other way round) — the flip a plugin makes if its session renegotiates
+    /// across a shell upgrade. The retained `SparklineState` exists only on a
+    /// sparkline, so the reuse would reach its kind-invariant `expect`.
+    #[test]
+    fn a_sparkline_reuses_itself_and_never_a_progress_bar() {
+        let line = vec![key(Some("cpu-history"), NodeKind::Sparkline)];
+        let plan = plan_diff(&line, &line.clone());
+        assert_eq!(plan.ops, vec![SlotOp::Reuse(0)], "same id, same kind");
+        assert!(plan.removals.is_empty());
+
+        let bar = vec![key(Some("cpu-history"), NodeKind::Progress)];
+        for (from, to, what) in [(&bar, &line, "Progress → Sparkline"), (&line, &bar, "back")] {
+            let plan = plan_diff(from, to);
+            assert_eq!(plan.ops, vec![SlotOp::Create], "{what}");
+            assert_eq!(plan.removals, vec![0], "{what}");
+        }
+    }
+
     /// A same-id `Shader` re-render reuses its widget in place — which is what
     /// makes "compiled once" true across frames, since a rebuilt surface drops
     /// its program cache and restarts `u_time`.
@@ -3038,6 +3241,315 @@ mod gtk_tests {
             child: Box::new(lbl(None, "body")),
         });
         assert!(!revealer.reveals_child(), "reused revealer toggled closed");
+    }
+
+    // ── Sparkline (#1252) ──────────────────────────────────────────────────
+
+    fn spark(id: Option<&str>, values: Vec<f64>, max: Option<f64>, class: &str) -> Node {
+        Node::Sparkline {
+            id: id.map(ToOwned::to_owned),
+            values,
+            max,
+            classes: vec![class.to_owned()],
+        }
+    }
+
+    /// The retained widget handle of the tree's root sparkline.
+    fn root_spark(rec: &Reconciler) -> crate::Sparkline {
+        rec.tree
+            .as_ref()
+            .and_then(|t| t.sparkline.as_ref())
+            .expect("the root is a sparkline")
+            .spark
+            .clone()
+    }
+
+    /// A `Node::Sparkline` is the library's own `Sparkline`: its drawing area,
+    /// wearing `hytte-sparkline` *and* the node's classes, filling its row
+    /// (`hexpand`, as the native history row's does), with the node's samples
+    /// and top in the ring the draw function reads.
+    #[gtk::test]
+    fn a_sparkline_builds_the_native_widget() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(None, vec![0.1, 0.5, 0.9], Some(1.0), "ts-cpu"));
+
+        let area = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::DrawingArea>().ok())
+            .expect("a GtkDrawingArea");
+        assert!(area.has_css_class("hytte-sparkline"), "the library's class");
+        assert!(area.has_css_class("ts-cpu"), "and the node's");
+        assert!(area.hexpands(), "fills its row like the native one");
+
+        let handle = root_spark(&rec);
+        assert_eq!(
+            handle.widget().upcast_ref::<gtk::Widget>(),
+            area.upcast_ref::<gtk::Widget>(),
+            "the retained handle is the mounted widget",
+        );
+        assert_eq!(handle.samples_for_test(), vec![0.1, 0.5, 0.9]);
+        assert_eq!(handle.domain_max_for_test(), Some(1.0));
+    }
+
+    /// **The #1252 contract**: new samples, a new top and a new class list on
+    /// a re-render reach the **same** widget — a line that moves every second
+    /// keeps one widget for its life. Pinned twice, because the two ways a
+    /// node gets reused are two different code paths: as a tree's root
+    /// (`Reconciler::render`'s `reusable`) and as a keyed child
+    /// (`diff_children`'s `plan_diff`).
+    ///
+    /// **Falsified** by making `update_in_place`'s `Sparkline` arm skip
+    /// `SparklineState::update` (the samples assertion reds — the bookkeeping
+    /// alone moving is not enough), and by making `reusable` refuse a
+    /// sparkline (the identity assertion reds).
+    #[gtk::test]
+    fn a_sparkline_updates_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(Some("cpu"), vec![0.1, 0.2], Some(1.0), "ts-cpu"));
+        let before = root.first_child().expect("mounted");
+
+        rec.render(&spark(Some("cpu"), vec![0.2, 0.3, 0.4], None, "ts-gpu"));
+        let after = root.first_child().expect("still mounted");
+        assert_eq!(before, after, "the same widget, not a rebuild");
+        let handle = root_spark(&rec);
+        assert_eq!(handle.samples_for_test(), vec![0.2, 0.3, 0.4]);
+        assert_eq!(handle.domain_max_for_test(), None, "the top moved too");
+        assert!(after.has_css_class("ts-gpu") && !after.has_css_class("ts-cpu"));
+        assert!(
+            after.has_css_class("hytte-sparkline"),
+            "a class reconcile never strips the library's own class",
+        );
+
+        // …and as a keyed child of a row, beside a sibling that changes.
+        let row = |values: Vec<f64>, label: &str| Node::Row {
+            id: None,
+            classes: vec![],
+            spacing: 8,
+            children: vec![
+                lbl(Some("name"), label),
+                spark(Some("cpu"), values, Some(1.0), "ts-cpu"),
+            ],
+            tooltip: None,
+        };
+        let root = self::root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&row(vec![0.5], "CPU"));
+        let row_box = root.first_child().expect("the row");
+        let line = row_box.last_child().expect("the line");
+        rec.render(&row(vec![0.5, 0.6], "CPU 60%"));
+        assert_eq!(
+            row_box.last_child().as_ref(),
+            Some(&line),
+            "a keyed child keeps its widget too",
+        );
+        let child = &rec.tree.as_ref().expect("rendered").children[1];
+        let handle = &child.sparkline.as_ref().expect("a sparkline").spark;
+        assert_eq!(handle.samples_for_test(), vec![0.5, 0.6]);
+    }
+
+    /// The widget's ring is built at [`super::SPARKLINE_CAPACITY`] — the wire's
+    /// cap — so a line longer than the one it was built from still fits after
+    /// an in-place update, and one past the cap keeps its **newest** samples.
+    ///
+    /// **Falsified** by building the ring at `values.len()` (the second render
+    /// is cut to the first's two samples).
+    #[gtk::test]
+    fn a_sparkline_grows_in_place_up_to_the_cap() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(Some("io"), vec![1.0, 2.0], None, "ts-disk"));
+        let sixty: Vec<f64> = (0..60).map(f64::from).collect();
+        rec.render(&spark(Some("io"), sixty.clone(), None, "ts-disk"));
+        assert_eq!(root_spark(&rec).samples_for_test(), sixty, "grew in place");
+
+        let over: Vec<f64> = (0..u32::try_from(super::SPARKLINE_CAPACITY + 5).unwrap())
+            .map(f64::from)
+            .collect();
+        rec.render(&spark(Some("io"), over.clone(), None, "ts-disk"));
+        let kept = root_spark(&rec).samples_for_test();
+        assert_eq!(kept.len(), super::SPARKLINE_CAPACITY);
+        assert_eq!(kept.first().copied(), Some(5.0), "the oldest five went");
+        assert_eq!(kept.last(), over.last(), "the newest stayed");
+    }
+
+    /// **A warm line moves at a constant length** — the only shape a page ever
+    /// sends once its ring is full: sixty samples, then sixty again one tick
+    /// later, every one shifted by one. Every other test here changes the
+    /// length between renders, so an update gated on the *count* alone passed
+    /// them all and froze every line a minute after the page opened (#1414
+    /// review, MEDIUM 4).
+    ///
+    /// **Falsified** by `if self.values.len() != values.len()` in
+    /// `SparklineState::update`.
+    #[gtk::test]
+    fn a_full_window_that_moved_reaches_the_ring() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(
+            Some("cpu"),
+            vec![0.1, 0.2, 0.3],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        rec.render(&spark(
+            Some("cpu"),
+            vec![0.2, 0.3, 0.4],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        assert_eq!(root_spark(&rec).samples_for_test(), vec![0.2, 0.3, 0.4]);
+    }
+
+    // ── Homogeneous boxes and centred bars (#1252) ─────────────────────────
+
+    fn classed_box(dir: Dir, classes: &[&str], children: Vec<Node>) -> Node {
+        Node::Box {
+            id: Some("cols".to_owned()),
+            dir,
+            spacing: 12,
+            scroll: false,
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            children,
+            tooltip: None,
+        }
+    }
+
+    fn classed_row(classes: &[&str], children: Vec<Node>) -> Node {
+        Node::Row {
+            id: Some("row".to_owned()),
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            spacing: 6,
+            children,
+            tooltip: None,
+        }
+    }
+
+    /// [`HOMOGENEOUS_CLASS`](super::HOMOGENEOUS_CLASS) makes a `Box` and a
+    /// `Row` homogeneous at build, and flipping it on a same-id re-render
+    /// re-lays the **same** box out in both directions.
+    ///
+    /// **Falsified** by dropping `set_homogeneous` from either the build arm
+    /// or the update arm of `Box` (or of `Row`).
+    #[gtk::test]
+    fn the_homogeneous_class_applies_at_build_and_in_place() {
+        let h = super::HOMOGENEOUS_CLASS;
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        rec.render(&classed_box(Dir::Horizontal, &[h], vec![lbl(None, "a")]));
+        let boxw = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::Box>().ok())
+            .expect("a box");
+        assert!(boxw.is_homogeneous(), "built homogeneous");
+
+        rec.render(&classed_box(Dir::Horizontal, &[], vec![lbl(None, "a")]));
+        assert_eq!(root.first_child().as_ref(), Some(boxw.upcast_ref()));
+        assert!(!boxw.is_homogeneous(), "cleared in place");
+
+        rec.render(&classed_box(
+            Dir::Horizontal,
+            &["x", h],
+            vec![lbl(None, "a")],
+        ));
+        assert_eq!(root.first_child().as_ref(), Some(boxw.upcast_ref()));
+        assert!(boxw.is_homogeneous(), "set in place");
+
+        let root = self::root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&classed_row(&[h], vec![lbl(None, "a")]));
+        let row = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::Box>().ok())
+            .expect("a row's box");
+        assert!(row.is_homogeneous(), "a Row honours it at build");
+        rec.render(&classed_row(&[], vec![lbl(None, "a")]));
+        assert!(!row.is_homogeneous(), "and in place");
+        rec.render(&classed_row(&[h], vec![lbl(None, "a")]));
+        assert!(row.is_homogeneous());
+    }
+
+    /// The point of the class, measured: two columns of very different natural
+    /// widths come out the **same** width once the box is homogeneous, and do
+    /// not without it — the stats page's 289 px against 435 px (#1414 review,
+    /// MEDIUM 2).
+    #[gtk::test]
+    fn a_homogeneous_box_gives_its_columns_equal_widths() {
+        let columns = |classes: &[&str]| {
+            classed_box(
+                Dir::Horizontal,
+                classes,
+                vec![
+                    lbl(Some("narrow"), "a"),
+                    lbl(Some("wide"), "a much, much wider column of text"),
+                ],
+            )
+        };
+        let widths = |classes: &[&str]| {
+            let root = root();
+            let mut rec = Reconciler::new(&root, |_, _| {});
+            rec.render(&columns(classes));
+            let window = gtk::Window::new();
+            window.set_child(Some(&root));
+            window.present();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let boxw = root.first_child().expect("the box");
+            while boxw.last_child().is_some_and(|w| w.width() == 0) && Instant::now() < deadline {
+                glib::MainContext::default().iteration(true);
+            }
+            let kids = children(&boxw);
+            let w = (kids[0].width(), kids[1].width());
+            window.destroy();
+            w
+        };
+        let (a, b) = widths(&[]);
+        assert!(a < b, "precondition: natural widths differ ({a} vs {b})");
+        let (a, b) = widths(&[super::HOMOGENEOUS_CLASS]);
+        assert_eq!(a, b, "a homogeneous box splits its width equally");
+    }
+
+    /// A `Progress` is centred on the cross axis, like the native page's bars:
+    /// in a row taller than the bar it gets its own height, centred, rather
+    /// than the whole row with its trough drawn along the top (#1414 review,
+    /// MEDIUM 3).
+    ///
+    /// **Falsified** by dropping `bar.set_valign(gtk::Align::Center)` from the
+    /// `Progress` build arm.
+    #[gtk::test]
+    fn a_progress_bar_is_centred_in_a_taller_row() {
+        let tall = gtk::Label::new(Some("tall"));
+        tall.set_size_request(-1, 50);
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&Node::Progress {
+            id: None,
+            fraction: 0.5,
+            classes: vec![],
+        });
+        root.append(&tall);
+        let bar = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::ProgressBar>().ok())
+            .expect("a progress bar");
+        assert_eq!(bar.valign(), gtk::Align::Center);
+
+        let window = gtk::Window::new();
+        window.set_child(Some(&root));
+        window.present();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bar.height() == 0 && Instant::now() < deadline {
+            glib::MainContext::default().iteration(true);
+        }
+        let row_height = root.height();
+        assert!(row_height >= 50, "the row is as tall as its tallest child");
+        assert!(
+            bar.height() < row_height,
+            "the bar keeps its own height ({}) inside a {row_height} px row",
+            bar.height(),
+        );
+        window.destroy();
     }
 
     #[gtk::test]

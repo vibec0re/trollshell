@@ -242,7 +242,13 @@ pub const PROTO_VERSION: u16 = 1;
 /// bumped anyway — it is a census — and
 /// [`SIDEBAR_RIGHT_VOCAB`] carries the full
 /// argument for why the *unconditional* ceiling still must not move.
-pub const VOCAB: u16 = 6;
+///
+/// Generation `7` is #1252's flat trend line ([`Node::Sparkline`]), negotiated
+/// against [`SPARKLINE_VOCAB`] exactly as #882/#893/#966 were — the first
+/// `Hello`-negotiated generation since #966, so a generation-6 shell (which
+/// advertises 6) negotiates below it and a rebuilt plugin falls back rather
+/// than being refused.
+pub const VOCAB: u16 = 7;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -254,11 +260,12 @@ pub const VOCAB: u16 = 6;
 /// exact-checks at the handshake.
 ///
 /// The two diverge because #882 added a *negotiated* generation; #893's shader
-/// widget ([`SHADER_VOCAB`]) is the second and #966's bounded
-/// viewport ([`SCROLLED_VOCAB`]) the third. (#1045's
-/// [`OPEN_URI_VOCAB`] is the fourth to leave this const
-/// alone, on a capability argument rather than a `Hello` one, and #1158's
-/// [`SIDEBAR_RIGHT_VOCAB`] the fifth, on a third
+/// widget ([`SHADER_VOCAB`]) is the second, #966's bounded
+/// viewport ([`SCROLLED_VOCAB`]) the third and #1252's trend line
+/// ([`SPARKLINE_VOCAB`]) the fourth negotiated one. Two more generations leave
+/// this const alone without being negotiated at all: #1045's
+/// [`OPEN_URI_VOCAB`], on a capability argument rather than a `Hello` one, and
+/// #1158's [`SIDEBAR_RIGHT_VOCAB`], on a third
 /// argument again: a [`Mount`] rides inside the `Register` frame
 /// that carries the counter, so a handshake refusal is not reachable and bumping
 /// this would only refuse every plugin that never leaves the left sidebar. Read the rule
@@ -266,7 +273,7 @@ pub const VOCAB: u16 = 6;
 /// `OpenUri` with no advertisement — what stops an old host seeing one is the
 /// plugin having declared the gating capability, which nothing enforces. #1045
 /// weighed the residual against refusing every rebuilt plugin and chose to name
-/// it; its docs carry the reasoning and the test that pins it.) A plugin emits
+/// it; its docs carry the reasoning and the test that pins it. A plugin emits
 /// [`Node::Preem`] only after the host advertised
 /// [`PREEM_VOCAB`] in [`HostMsg::Hello`],
 /// so an old host — which never advertises — can never receive one, and the
@@ -315,9 +322,10 @@ pub use state::{
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{
     Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
-    MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
-    MAX_PLUGIN_ID_BYTES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, NodeId,
-    SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats, sane_fraction, sane_slider_floats,
+    HOMOGENEOUS_CLASS, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES,
+    MAX_NODE_CLASSES, MAX_PLUGIN_ID_BYTES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES,
+    MAX_SPARKLINE_SAMPLES, Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB, SPARKLINE_VOCAB, ShaderData,
+    SliderFloats, sane_fraction, sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
 };
 
 #[cfg(feature = "tokio")]

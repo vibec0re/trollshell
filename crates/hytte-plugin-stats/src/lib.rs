@@ -20,18 +20,24 @@
 //!   shell's own samplers) and the visibility-gated task that drives them.
 //! - `card` — the geometry, the per-core lamp ramp, the sidebar card and the
 //!   bar chips.
-//! - `panel` — the drawer page a chip click opens (#1251).
+//! - `panel` — the drawer page a chip click opens (#1251), in the native Stats
+//!   page's own two-column layout and widgets since #1252.
 //! - `format` — the byte and `used / total` strings the native Stats page
 //!   prints, mirrored.
 //! - [`plugin`] — the TEA core: manifest, `update`, `view`.
 //!
-//! Every meter either surface draws is a `Node::Preem` widget: the per-core
-//! lamp row as a `DotMatrix`, the package temperature as a `SevenSeg`, the GPU
-//! load as a `Gauge`, the load history as a `Scope`, memory and swap as
-//! `LedStrip`s. The SDK's `display` wrappers decide per render whether those go
-//! out as typed state (a preem-speaking shell draws them on the GPU) or as
-//! CPU-rasterised pixels (an older one), so this plugin has one code path for
-//! both.
+//! Every meter the **sidebar card** and the **bar chips** draw is a
+//! `Node::Preem` widget: the per-core lamp row as a `DotMatrix`, the package
+//! temperature as a `SevenSeg`, the GPU load as a `Gauge`, the load history as
+//! a `Scope`, memory and swap as `LedStrip`s. The SDK's `display` wrappers
+//! decide per render whether those go out as typed state (a preem-speaking
+//! shell draws them on the GPU) or as CPU-rasterised pixels (an older one), so
+//! this plugin has one code path for both.
+//!
+//! The **drawer page** is the exception, deliberately (#1252): it mirrors the
+//! native Stats page — `boxed-list` cards in two columns, `Progress` bars and
+//! the shell's own flat `Node::Sparkline` history lines — and carries no preem
+//! at all.
 //!
 //! # Four chips, not five
 //!

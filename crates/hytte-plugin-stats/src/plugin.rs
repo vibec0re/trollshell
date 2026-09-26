@@ -108,27 +108,23 @@ pub struct Stats {
     /// the seed render draws as dashes — every reading of it, headline
     /// included (#1277 LOW 5).
     snapshot: Snapshot,
-    /// The overall-load history the scope sweeps, newest last, capped at the
-    /// scope's own column count.
+    /// The overall-load history the sidebar card's (and the CPU chip's) scope
+    /// sweeps, newest last, capped at the scope's own column count.
     ring: VecDeque<f32>,
-    /// The disk-I/O-history ring (#1295 review MED 1) — the drawer page's Disk
-    /// I/O sweep, normalised each tick against [`disk_io_peak`](Self) rather
-    /// than against a fixed ceiling: a byte rate has no natural `0.0..=1.0`
-    /// the way a load or a percentage does.
-    disk_io_ring: VecDeque<f32>,
-    /// The peak combined disk read+write rate this session has seen, in
-    /// bytes/sec — the auto-scale denominator for [`disk_io_ring`](Self).
+    /// The drawer page's history lines (#1252) — plain samples in each
+    /// line's own unit, sixty apiece, for the page's `Node::Sparkline`s.
     ///
-    /// A simplification against the native row's **windowed** max
-    /// (`trollshell/src/panels/stats.rs`'s `build_history_disk_io_row`): this
-    /// one never decays, so a single burst early in a long session compresses
-    /// every quieter period after it. Named here and in `card::Widgets`'
-    /// `disk_io` doc rather than silently carried, because #1251's whole point
-    /// is an honest list of where this page and the native one diverge.
-    disk_io_peak: f32,
-    /// The GPU-VRAM-history ring (#1295 review MED 1) — already a percentage,
-    /// so no peak-tracking denominator is needed the way disk I/O's is.
-    gpu_vram_ring: VecDeque<f32>,
+    /// Kept apart from [`ring`](Self) on purpose: that one is the sidebar
+    /// card's, in the scope's `-1.0..=1.0` range over 144 columns, and the
+    /// card is not changing. Replaces #1295's disk-I/O and VRAM scope rings
+    /// and the session-peak denominator the disk ring needed — an auto-scaled
+    /// sparkline over the window *is* the native row's windowed max.
+    page: panel::History,
+    /// Whether the drawer page's Disk card is expanded — the one piece of UI
+    /// state this plugin holds, because the wire's `Node::Expander` is
+    /// plugin-driven: a click on [`panel::DISKS_EXPANDER_ID`] flips it and the
+    /// next render carries it. Collapsed by default, like the native row.
+    disks_expanded: bool,
     /// The preem widgets, held across renders so the shell keeps one renderer
     /// instance per node (and so the raster fallback keeps its animation).
     widgets: Widgets,
@@ -151,11 +147,10 @@ impl Stats {
         self.widgets
             .set_gpu(snapshot.gpu.as_ref().and_then(|g| g.load), self.dt());
         self.widgets.set_memory(snapshot.memory.as_ref());
-        // The disk lamp row's own pitch (#1295 review LOW 4) — the same
-        // "fitted to the widest row" argument as `fit_cores`, over the mount
-        // usages rather than the core loads.
-        let disk_usages: Vec<f32> = snapshot.disks.iter().map(|d| d.usage).collect();
-        self.widgets.fit_disk_lamps(&disk_usages);
+
+        // The drawer page's lines (#1252): one point per reading this tick
+        // actually has, none for one it withholds — see `panel::History`.
+        self.page.push(&snapshot);
 
         // A withheld reading is not a sample: a cold tick (or one whose
         // `/proc/stat` read failed) must not push a fake rest value onto the
@@ -170,46 +165,6 @@ impl Stats {
             // cheap way to hand it one without copying on every render.
             let ring: Vec<f32> = self.ring.iter().copied().collect();
             self.widgets.push_history(&ring);
-        }
-
-        // Disk I/O (#1295 review MED 1): unlike CPU load, never withheld for a
-        // cold start (`compute_disk_io` answers an empty `prev` map with a
-        // valid zero rate) — so every tick that reads disk contributes a
-        // point, auto-scaled against the peak combined rate seen so far (see
-        // `disk_io_peak`'s doc for the honest limit of that).
-        if let Some(io) = snapshot.disk_io.as_ref() {
-            #[allow(clippy::cast_possible_truncation)]
-            let combined = (io.read_bps + io.write_bps) as f32;
-            self.disk_io_peak = self.disk_io_peak.max(combined);
-            let norm = if self.disk_io_peak > 0.0 {
-                (combined / self.disk_io_peak).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            self.disk_io_ring.push_back(card::trace_sample(norm));
-            while self.disk_io_ring.len() > card::HISTORY_COLS as usize {
-                self.disk_io_ring.pop_front();
-            }
-            let ring: Vec<f32> = self.disk_io_ring.iter().copied().collect();
-            self.widgets.push_disk_io_history(&ring);
-        }
-
-        // GPU VRAM (#1295 review MED 1): already a `0.0..=1.0` fraction, so no
-        // peak-tracking denominator is needed — withheld exactly like the
-        // native row, when the vendor answers neither used nor total.
-        if let Some((used, total)) = snapshot
-            .gpu
-            .as_ref()
-            .and_then(|g| g.memory_used_bytes.zip(g.memory_total_bytes))
-            .filter(|(_, total)| *total > 0)
-        {
-            let level = crate::format::fraction(used, total);
-            self.gpu_vram_ring.push_back(card::trace_sample(level));
-            while self.gpu_vram_ring.len() > card::HISTORY_COLS as usize {
-                self.gpu_vram_ring.pop_front();
-            }
-            let ring: Vec<f32> = self.gpu_vram_ring.iter().copied().collect();
-            self.widgets.push_gpu_vram_history(&ring);
         }
 
         self.snapshot = snapshot;
@@ -260,9 +215,8 @@ impl Stats {
             cfg,
             snapshot: Snapshot::default(),
             ring: VecDeque::new(),
-            disk_io_ring: VecDeque::new(),
-            disk_io_peak: 0.0,
-            gpu_vram_ring: VecDeque::new(),
+            page: panel::History::default(),
+            disks_expanded: false,
             widgets: Widgets::default(),
             cmds,
         }
@@ -353,6 +307,14 @@ impl Plugin for Stats {
                 kind: EventKind::Click,
                 ..
             } if card::is_chip_button(&node) => return vec![Effect::OpenPage(Page::PluginSelf)],
+            // The drawer page's Disk card (#1252): the wire's expander is
+            // plugin-driven, so its header click lands here and the next
+            // render carries the flipped flag. No effect — it is page-local.
+            Input::Event {
+                node,
+                kind: EventKind::Click,
+                ..
+            } if node == panel::DISKS_EXPANDER_ID => self.disks_expanded = !self.disks_expanded,
             // Everything else is a push this plugin never subscribed to, or an
             // answer to an effect it never emits. Listed rather than wildcarded
             // so a new host→plugin frame is a compile error here — the place to
@@ -383,8 +345,9 @@ impl Plugin for Stats {
     /// change the card #1250 put on glass.
     fn view(&self) -> View {
         match self.family {
-            Family::Bar => View::new(card::chips(self.cfg, &self.snapshot, &self.widgets))
-                .panel(panel::panel(self.cfg, &self.snapshot, &self.widgets)),
+            Family::Bar => View::new(card::chips(self.cfg, &self.snapshot, &self.widgets)).panel(
+                panel::panel(self.cfg, &self.snapshot, &self.page, self.disks_expanded),
+            ),
             Family::Sidebar => card::card(self.cfg, &self.snapshot, &self.widgets).into(),
         }
     }
@@ -397,7 +360,8 @@ mod tests {
     use crate::config::{self, Card, Family};
     use crate::sample::{Cmd, Gpu, Msg, Snapshot};
     use hytte_plugin::proto::{
-        Capability, Effect, EventKind, Mount, Page, PluginMsg, StateKey, decode, encode,
+        Capability, Effect, EventKind, Mount, Node, Page, PluginMsg, SPARKLINE_VOCAB, StateKey,
+        decode, encode,
     };
     use hytte_plugin::{CmdReceiver, Input, Plugin};
 
@@ -705,44 +669,92 @@ mod tests {
         assert_eq!(model.ring.len(), HISTORY_COLS as usize);
     }
 
-    /// **The two #1295-review-MED-1 histories are bounded the same way**:
-    /// disk I/O and GPU VRAM each grow their own ring, capped at the scope's
-    /// width, and neither one grows when its reading is withheld — the same
-    /// "a withheld reading is not a sample" rule
-    /// `a_withheld_reading_leaves_the_trace_alone` pins for CPU.
+    /// **The drawer page's lines move with the samples** (#1252): each sample
+    /// is folded into `panel::History` by `apply`, so the page's
+    /// `Sparkline`s carry one more point per tick, and a cold tick carries
+    /// none.
     ///
-    /// **Falsified** by dropping either ring's `pop_front`, or by pushing a
-    /// point when `disk_io`/the GPU's VRAM pair is `None`.
+    /// **Falsified** by dropping `self.page.push(&snapshot)` from `apply`: the
+    /// page's CPU line stays empty however many samples land.
     #[test]
-    fn the_new_page_histories_are_bounded_and_withheld_like_the_cpu_one() {
-        let mut model = fresh(Card::sidebar_default());
-        for i in 0..(HISTORY_COLS * 3) {
-            let bps = f64::from(i % 100) * 1024.0;
-            let snap = Snapshot {
-                disk_io: Some(crate::sample::DiskIo {
-                    read_bps: bps,
-                    write_bps: 0.0,
-                    total_read_bytes: 0,
-                    total_write_bytes: 0,
-                }),
-                gpu: Some(Gpu {
-                    name: "test".to_owned(),
-                    memory_used_bytes: Some(u64::from(i % 100)),
-                    memory_total_bytes: Some(100),
-                    ..Gpu::default()
-                }),
-                ..Snapshot::default()
-            };
-            let _ = model.update(Input::App(Msg::Sampled(Box::new(snap))));
-        }
-        assert_eq!(model.disk_io_ring.len(), HISTORY_COLS as usize);
-        assert_eq!(model.gpu_vram_ring.len(), HISTORY_COLS as usize);
+    fn a_sample_moves_the_pages_history_lines() {
+        let line_len = |model: &Stats| {
+            hytte_plugin::display::testing::with_negotiated_vocab(SPARKLINE_VOCAB, || {
+                let panel = model.view().panel.expect("a bar instance publishes a page");
+                find_sparkline(&panel, "stats-panel-cpu-history")
+            })
+        };
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        assert_eq!(
+            line_len(&model),
+            Some(0),
+            "the seed page draws an empty line"
+        );
 
-        // Withheld: neither `None` case grows its ring.
-        let mut fresh_model = fresh(Card::sidebar_default());
-        let _ = fresh_model.update(Input::App(Msg::Sampled(Box::default())));
-        assert!(fresh_model.disk_io_ring.is_empty());
-        assert!(fresh_model.gpu_vram_ring.is_empty());
+        let _ = model.update(Input::App(Msg::Sampled(Box::default())));
+        assert_eq!(line_len(&model), Some(0), "a cold tick is not a sample");
+
+        for i in 1..=3 {
+            let _ = model.update(sample(0.5));
+            assert_eq!(line_len(&model), Some(i));
+        }
+    }
+
+    /// How many samples the page's sparkline `id` carries, if it is there.
+    fn find_sparkline(node: &Node, id: &str) -> Option<usize> {
+        match node {
+            Node::Sparkline {
+                id: Some(found),
+                values,
+                ..
+            } if found == id => Some(values.len()),
+            Node::Box { children, .. }
+            | Node::Row { children, .. }
+            | Node::ListBox { children, .. } => children.iter().find_map(|c| find_sparkline(c, id)),
+            Node::Expander {
+                header, children, ..
+            } => find_sparkline(header, id)
+                .or_else(|| children.iter().find_map(|c| find_sparkline(c, id))),
+            _ => None,
+        }
+    }
+
+    /// Whether the page's Disk expander is open.
+    fn disks_open(model: &Stats) -> bool {
+        fn walk(node: &Node) -> Option<bool> {
+            match node {
+                Node::Expander { id, expanded, .. } if id == crate::panel::DISKS_EXPANDER_ID => {
+                    Some(*expanded)
+                }
+                Node::Box { children, .. }
+                | Node::Row { children, .. }
+                | Node::ListBox { children, .. } => children.iter().find_map(walk),
+                _ => None,
+            }
+        }
+        walk(&model.view().panel.expect("a bar instance publishes a page"))
+            .expect("the page has a Disk expander")
+    }
+
+    /// **The Disk card's expander is plugin-driven** (#1252): it starts
+    /// collapsed like the native row, a click on its id opens it and a second
+    /// click closes it again — with no effect emitted, since opening a section
+    /// of a page the user is already on asks the shell for nothing.
+    ///
+    /// **Falsified** by dropping the `DISKS_EXPANDER_ID` arm from `update` (the
+    /// click falls through to the no-op arm and the card never opens).
+    #[test]
+    fn a_click_on_the_disk_card_toggles_it() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        assert!(!disks_open(&model), "collapsed by default, as native");
+        let click = || Input::event(crate::panel::DISKS_EXPANDER_ID, EventKind::Click);
+        assert!(
+            model.update(click()).is_empty(),
+            "no effect for a page-local toggle"
+        );
+        assert!(disks_open(&model));
+        assert!(model.update(click()).is_empty());
+        assert!(!disks_open(&model));
     }
 
     /// **A withheld reading is not a sample**: the cold tick, whose `cpu` is

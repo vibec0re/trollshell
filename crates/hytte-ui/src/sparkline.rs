@@ -53,8 +53,14 @@ impl Sparkline {
         // reaching into a namespace it does not own.
         inner.add_css_class("hytte-sparkline");
 
-        let samples: Rc<RefCell<VecDeque<f64>>> =
-            Rc::new(RefCell::new(VecDeque::with_capacity(capacity)));
+        // Empty, not `with_capacity(capacity)`: the ring grows to what it is
+        // actually handed, and `push`/`set_samples` already bound it at
+        // `capacity`. An eager allocation cost every widget its whole capacity
+        // up front — for the plugin reconciler's sparklines, built at a 1024
+        // sample capacity, 8 KiB apiece whatever they carried, so a 4096-node
+        // tree of empty lines was 32 MiB per monitor from a ~160 KB frame
+        // (#1414 review, LOW 8).
+        let samples: Rc<RefCell<VecDeque<f64>>> = Rc::new(RefCell::new(VecDeque::new()));
         let domain_max: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
 
         let samples_for_draw = samples.clone();
@@ -118,6 +124,22 @@ impl Sparkline {
     pub fn clear(&self) {
         self.samples.borrow_mut().clear();
         self.inner.queue_draw();
+    }
+}
+
+/// Read-back for this crate's own tests: the ring and the domain exactly as the
+/// draw function will read them. `widget_tree`'s reconciler tests (#1252) assert
+/// through these that a re-render reached the **widget** and not just the
+/// reconciler's bookkeeping of it. Test-only (and only in the display-server
+/// bucket those tests live in), so no public API grows.
+#[cfg(all(test, feature = "system-tests"))]
+impl Sparkline {
+    pub(crate) fn samples_for_test(&self) -> Vec<f64> {
+        self.samples.borrow().iter().copied().collect()
+    }
+
+    pub(crate) fn domain_max_for_test(&self) -> Option<f64> {
+        self.domain_max.get()
     }
 }
 
@@ -219,6 +241,21 @@ mod tests {
             !s.widget().has_css_class("ts-sparkline"),
             "and not through a shell's: `ts-*` is trollshell's stylesheet, which a second \
              shell built on hytte does not load",
+        );
+    }
+
+    /// A fresh sparkline holds no ring memory until it is handed samples, and
+    /// then only what it holds — the capacity is a bound, not an allocation.
+    ///
+    /// **Falsified** by `VecDeque::with_capacity(capacity)` in `new`.
+    #[gtk::test]
+    fn the_ring_is_allocated_lazily() {
+        let s = Sparkline::new(1024);
+        assert_eq!(s.samples.borrow().capacity(), 0, "nothing up front");
+        s.set_samples(&[1.0, 2.0, 3.0].into_iter().collect());
+        assert!(
+            s.samples.borrow().capacity() < 1024,
+            "a 3-sample line does not reserve the whole capacity",
         );
     }
 

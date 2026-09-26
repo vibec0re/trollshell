@@ -8,12 +8,23 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use hytte::ui::widget_tree::SPARKLINE_CAPACITY;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, FitAxis, Node as UiNode};
 use hytte_plugin_proto::Mount;
 use hytte_plugin_proto::wire::{
     self, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
-    MAX_NODES_PER_TREE, MAX_TREE_DEPTH,
+    MAX_NODES_PER_TREE, MAX_SPARKLINE_SAMPLES, MAX_TREE_DEPTH,
 };
+
+// The reconciler builds a `Node::Sparkline`'s ring once, at
+// `SPARKLINE_CAPACITY`, and never rebuilds it on a value change (#1252) — so
+// every line this seam can hand it must fit. `hytte-ui` does not link the
+// proto, which is why the two numbers are two constants and this is where they
+// are held equal-or-ordered.
+const _: () = assert!(
+    MAX_SPARKLINE_SAMPLES <= SPARKLINE_CAPACITY,
+    "the wire's sparkline cap must fit the reconciler's ring",
+);
 
 use super::effects::truncate_on_char_boundary;
 use super::preem_render::{self, Scope, Warned};
@@ -410,6 +421,26 @@ fn warn_once_classes_cap(scope: &Scope) -> bool {
     })
 }
 
+thread_local! {
+    /// Per-scope latch for a sanitised [`wire::Node::Sparkline`] (#1252) — the
+    /// [`WARNED_TEXT_CAP`] shape again, and kept separate from it for the same
+    /// reason the `classes` latch is: a different mistake, a different fix
+    /// (send finite samples, or fewer).
+    static WARNED_SPARKLINE: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the sparkline latch for `scope`: `true` the first time it is asked
+/// for, `false` for the rest of the shell's run. See [`WARNED_SPARKLINE`].
+fn warn_once_sparkline(scope: &Scope) -> bool {
+    WARNED_SPARKLINE.with_borrow_mut(|warned| {
+        if warned.contains(scope) {
+            return false;
+        }
+        warned.insert(scope.clone());
+        true
+    })
+}
+
 /// Map a wire [`wire::Node`] onto the reconciler's `hytte_ui::Node`. The two
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
 /// is written exhaustively so adding a node variant to either side is a compile
@@ -659,6 +690,55 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 classes: walk.classes(classes),
             }
         }
+        wire::Node::Sparkline {
+            id,
+            values,
+            max,
+            classes,
+        } => {
+            // #1252's trend line. The float seam is the proto's own two
+            // sanitisers — the same ones `wire::Node::clamp_in_place` runs,
+            // so the SDK's pass and this one cannot disagree — applied while
+            // widening to the reconciler's `f64`, which is a copy this arm
+            // pays anyway. The count seam keeps the **newest**
+            // `MAX_SPARKLINE_SAMPLES`, as the clamp does.
+            //
+            // Warned once per plugin tree rather than per pass, unlike the
+            // `Progress` arm above: a sparkline is a *window*, so one `NaN` a
+            // plugin pushed into its ring rides every frame for the next
+            // minute, and a per-pass line would be sixty of them.
+            let skip = values.len().saturating_sub(MAX_SPARKLINE_SAMPLES);
+            let mut rewritten = skip > 0;
+            let values: Vec<f64> = values[skip..]
+                .iter()
+                .map(|v| {
+                    let sane = wire::sane_sparkline_sample(*v);
+                    rewritten |= sane.to_bits() != v.to_bits();
+                    f64::from(sane)
+                })
+                .collect();
+            let sane_max = wire::sane_sparkline_max(*max);
+            rewritten |= sane_max.map(f32::to_bits) != max.map(f32::to_bits);
+            if rewritten && warn_once_sparkline(walk.scope) {
+                tracing::warn!(
+                    plugin = walk.scope.plugin_id(),
+                    tree = ?walk.scope.role(),
+                    node = ?id,
+                    samples = skip + values.len(),
+                    cap = MAX_SPARKLINE_SAMPLES,
+                    "plugin Sparkline carries a non-finite sample or top, or more samples than \
+                     the host draws; sanitised (a NaN draws at the bottom, an infinity at the \
+                     edge, and the oldest samples past the cap are dropped). Further occurrences \
+                     in this tree are silenced for the rest of this shell run",
+                );
+            }
+            UiNode::Sparkline {
+                id: id.clone(),
+                values,
+                max: sane_max.map(f64::from),
+                classes: walk.classes(classes),
+            }
+        }
         wire::Node::Slider {
             id,
             min,
@@ -901,5 +981,410 @@ pub(super) fn to_wire_event(kind: UiEventKind) -> wire::EventKind {
         UiEventKind::Scroll { dx, dy } => wire::EventKind::Scroll { dx, dy },
         UiEventKind::ValueChanged { value } => wire::EventKind::ValueChanged { value },
         UiEventKind::Submitted { text } => wire::EventKind::Submitted { text },
+    }
+}
+
+// Hermetic: `to_ui_node` builds a `hytte_ui::Node`, never a widget, so none of
+// these needs a display. The GTK half of #1252 — that the mapped node becomes
+// the library's `Sparkline` and updates in place — is `hytte-ui`'s own
+// `widget_tree` gtk tests.
+#[cfg(test)]
+mod tests {
+    use super::{Grants, Scope, to_ui_node};
+    use hytte::ui::Node as UiNode;
+    use hytte_plugin_proto::wire::{self, MAX_SPARKLINE_SAMPLES};
+
+    fn line(values: Vec<f32>, max: Option<f32>) -> wire::Node {
+        wire::Node::Sparkline {
+            id: Some("cpu-history".into()),
+            values,
+            max,
+            classes: vec!["ts-cpu".into()],
+        }
+    }
+
+    /// The wire's `Sparkline` is the reconciler's `Sparkline`, field for field:
+    /// the id is the reconciler key, the samples widen `f32` → `f64` without
+    /// moving, the top rides through and the classes are the node's.
+    ///
+    /// **Falsified** by mapping it to a `UiNode::Progress` (or anything else),
+    /// or by dropping `max` to `None` in the arm.
+    #[test]
+    fn a_sparkline_maps_to_the_reconcilers_sparkline() {
+        let scope = Scope::detached("t1252-map");
+        let mapped = to_ui_node(
+            &scope,
+            Grants::none(),
+            &line(vec![0.0, 0.25, 0.5], Some(1.0)),
+        );
+        assert_eq!(
+            mapped,
+            UiNode::Sparkline {
+                id: Some("cpu-history".into()),
+                values: vec![0.0, 0.25, 0.5],
+                max: Some(1.0),
+                classes: vec!["ts-cpu".into()],
+            },
+        );
+
+        // Auto-scaled stays auto-scaled.
+        let auto = to_ui_node(&scope, Grants::none(), &line(vec![4096.0], None));
+        assert!(
+            matches!(auto, UiNode::Sparkline { max: None, .. }),
+            "{auto:?}"
+        );
+    }
+
+    /// The host re-runs the proto's sanitisers at its own seam — an SDK-built
+    /// plugin is not the only thing that can dial the socket — and trims to the
+    /// **newest** `MAX_SPARKLINE_SAMPLES`, so the reconciler never meets a
+    /// `NaN`, an infinity, an unusable top or more samples than its ring holds.
+    ///
+    /// **Falsified** by `values.iter()` in place of `values[skip..].iter()`
+    /// (the length assertion reds), or by widening without
+    /// `sane_sparkline_sample` (the `NaN` survives into the host node).
+    #[test]
+    fn a_sparkline_is_sanitised_at_the_seam() {
+        let scope = Scope::detached("t1252-sane");
+        let total = MAX_SPARKLINE_SAMPLES + 3;
+        #[allow(clippy::cast_precision_loss)]
+        let mut values: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        values[total - 1] = f32::NAN;
+        values[total - 2] = f32::NEG_INFINITY;
+
+        let UiNode::Sparkline { values, max, .. } =
+            to_ui_node(&scope, Grants::none(), &line(values, Some(f32::NAN)))
+        else {
+            panic!("still a sparkline");
+        };
+        assert_eq!(values.len(), MAX_SPARKLINE_SAMPLES, "trimmed to the cap");
+        assert_eq!(
+            values.first().copied(),
+            Some(3.0),
+            "the three OLDEST went — the newest are what the row reads out",
+        );
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "{:?}",
+            &values[values.len() - 3..]
+        );
+        assert_eq!(
+            values.last().copied(),
+            Some(0.0),
+            "a NaN draws at the bottom"
+        );
+        assert_eq!(
+            values.get(values.len() - 2).copied(),
+            Some(f64::from(-f32::MAX)),
+            "an infinity pins to the edge",
+        );
+        assert_eq!(
+            max, None,
+            "a NaN top auto-scales, as the drawing code would"
+        );
+    }
+
+    /// The wire's homogeneous class and the reconciler's are one string — the
+    /// plugin writes the first, the host reads the second, and neither crate
+    /// links the other's constant (#1252).
+    ///
+    /// **Falsified** by changing either literal.
+    #[test]
+    fn the_homogeneous_class_is_one_string_on_both_sides() {
+        assert_eq!(
+            wire::HOMOGENEOUS_CLASS,
+            hytte::ui::widget_tree::HOMOGENEOUS_CLASS
+        );
+        // …and the mapping hands it through like any other class.
+        let mapped = to_ui_node(
+            &Scope::detached("t1252-homogeneous"),
+            Grants::none(),
+            &wire::Node::Box {
+                id: None,
+                dir: wire::Dir::Horizontal,
+                spacing: 12,
+                scroll: false,
+                classes: vec![wire::HOMOGENEOUS_CLASS.into()],
+                children: vec![],
+                tooltip: None,
+            },
+        );
+        assert!(
+            matches!(&mapped, UiNode::Box { classes, .. }
+                if classes == &[hytte::ui::widget_tree::HOMOGENEOUS_CLASS.to_owned()]),
+            "{mapped:?}",
+        );
+    }
+}
+
+/// The #1414 review's HIGH 1, as a test: what a plugin page's cards look like
+/// **on glass**, under the shell's real stylesheets.
+///
+/// Every other test of the stats page checks class literals, and the class
+/// literal was right all along — `boxed-list` was on every card — while the
+/// shell's `.ts-plugin-panel list.boxed-list` rule flattened every one of them
+/// onto the drawer. Nothing in CI looked at a rendered colour, so this renders
+/// one: a page-card list and a plain `boxed-list` stacked under
+/// `.ts-plugin-panel`, painted to a texture, and a pixel inside each compared
+/// with the page behind them.
+#[cfg(all(test, feature = "system-tests"))]
+mod render_tests {
+    use super::{Grants, Scope, to_ui_node};
+    use hytte::adw;
+    use hytte::gtk::{self, gdk, glib, prelude::*};
+    use hytte::ui::Reconciler;
+    use hytte_plugin_proto::wire;
+    use std::time::{Duration, Instant};
+
+    /// The shipped stylesheets (library below, shell above, as the shell loads
+    /// them) plus a fixed backdrop colour for the test's own page, installed
+    /// for the life of the guard and removed again however the test ends —
+    /// every `#[gtk::test]` shares one display, so a provider left behind would
+    /// restyle the tests after this one.
+    struct Styled(Vec<gtk::CssProvider>);
+
+    impl Styled {
+        /// Install the library sheet, `shell_css` (the shell's own, already
+        /// read — see [`shell_sheet`]) at the priority the shell gives it, and
+        /// the test backdrop.
+        fn install(shell_css: &str) -> Self {
+            let display = gdk::Display::default().expect("a display");
+            let add = |provider: &gtk::CssProvider, priority: u32| {
+                gtk::style_context_add_provider_for_display(&display, provider, priority);
+            };
+            // The library sheet is in crane's source filter (`nix/package.nix`
+            // keeps `assets/hytte-ui/style.css` for `hytte-ui`'s compile-time
+            // fallback), so its source path is there in every sandbox.
+            let library = gtk::CssProvider::new();
+            library.load_from_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/hytte-ui/style.css"
+            ));
+            add(&library, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+            let shell = gtk::CssProvider::new();
+            shell.load_from_string(shell_css);
+            add(&shell, gtk::STYLE_PROVIDER_PRIORITY_USER);
+            let backdrop = gtk::CssProvider::new();
+            backdrop.load_from_string(".t1252-backdrop { background: #101010; }");
+            add(&backdrop, gtk::STYLE_PROVIDER_PRIORITY_USER + 10);
+            Self(vec![library, shell, backdrop])
+        }
+    }
+
+    /// The shell's own stylesheet, read where the shell itself reads it —
+    /// [`crate::assets::path`]: `TROLLSHELL_DATA_DIR`, else the source tree —
+    /// or `None` when it is not there.
+    ///
+    /// It is **not** there in a `nix flake check` sandbox unless that check
+    /// points `TROLLSHELL_DATA_DIR` at the assets output: crane's source filter
+    /// deliberately keeps no `assets/trollshell/` (#133 keeps the stylesheet out
+    /// of the Rust compile), so the source-tree path this test first read from
+    /// did not exist in CI, `load_from_path` only logged a warning, and the
+    /// test measured libadwaita's cards instead of the shell's (PR #1414's CI
+    /// failure). Reading the text first is what turns "the sheet is missing"
+    /// into a decision this test makes, rather than a silently empty provider.
+    fn shell_sheet() -> Option<String> {
+        std::fs::read_to_string(crate::assets::path("style.css")).ok()
+    }
+
+    impl Drop for Styled {
+        fn drop(&mut self) {
+            if let Some(display) = gdk::Display::default() {
+                for provider in &self.0 {
+                    gtk::style_context_remove_provider_for_display(&display, provider);
+                }
+            }
+            adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+        }
+    }
+
+    fn card(id: &str, classes: &[&str]) -> wire::Node {
+        wire::Node::ListBox {
+            id: Some(id.to_owned()),
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            dense: false,
+            children: vec![wire::Node::Label {
+                id: None,
+                text: "CPU".to_owned(),
+                classes: vec![],
+                tooltip: None,
+            }],
+        }
+    }
+
+    /// The four bytes at `(x, y)` of a downloaded texture.
+    fn pixel(bytes: &[u8], stride: usize, x: i32, y: i32) -> [u8; 4] {
+        let at = usize::try_from(y).expect("y") * stride + usize::try_from(x).expect("x") * 4;
+        [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    }
+
+    fn differs(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).any(|(x, y)| x.abs_diff(y) > 3)
+    }
+
+    /// Every `GtkListBox` under `root`, top to bottom.
+    fn lists_under(root: &gtk::Widget, relative_to: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(w) = stack.pop() {
+            if w.is::<gtk::ListBox>() {
+                found.push(w.clone());
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        found.sort_by(|a, b| {
+            let y = |w: &gtk::Widget| w.compute_bounds(relative_to).map_or(0.0, |r| r.y());
+            y(a).total_cmp(&y(b))
+        });
+        found
+    }
+
+    /// **A page card paints a card; a plain `boxed-list` on the same page is
+    /// still flattened.** The first half is the fix (`ts-page-card` out-ranks
+    /// the flattening rule); the second is the promise that the fix did not
+    /// change that rule for every other plugin page.
+    ///
+    /// The plain list doubles as the **sentinel** that the shell's stylesheet
+    /// is in effect at all, and is asserted first: only that sheet flattens a
+    /// plugin page's `boxed-list`, so without it both lists wear libadwaita's
+    /// own card and the page-card assertion would pass vacuously.
+    ///
+    /// Where the sheet cannot be read the test **skips** with a line saying so,
+    /// unless `TROLLSHELL_REQUIRE_SHELL_CSS=1` — the `TROLLSHELL_REQUIRE_*`
+    /// convention — turns that into a failure; see [`shell_sheet`] for why a
+    /// `nix flake check` sandbox has no sheet unless the check provides one.
+    ///
+    /// **Falsified** by deleting the
+    /// `.ts-plugin-panel list.boxed-list.ts-page-card` rule from
+    /// `assets/trollshell/style.css` (the card pixel equals the page), by
+    /// widening it to every `boxed-list` (the sentinel reds: the plain list is
+    /// painted), and by leaving the shell sheet out of [`Styled::install`] (the
+    /// sentinel reds with the exact pixels PR #1414's first CI run showed).
+    #[gtk::test]
+    fn a_page_card_paints_a_card_under_the_plugin_page_flattening() {
+        let required =
+            std::env::var_os("TROLLSHELL_REQUIRE_SHELL_CSS").is_some_and(|want| want == "1");
+        let Some(shell_css) = shell_sheet() else {
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_SHELL_CSS=1, but the shell stylesheet is not at {} \
+                 — point TROLLSHELL_DATA_DIR at the `trollshell-assets` output's \
+                 `share/trollshell`; the build that set the variable meant to check \
+                 the rendered cards for real, so skipping here is itself the bug",
+                crate::assets::path("style.css").display(),
+            );
+            eprintln!(
+                "SKIPPED: no shell stylesheet at {} (crane's source filter keeps no \
+                 `assets/trollshell/`; set TROLLSHELL_DATA_DIR) — run this in the \
+                 source tree to check the rendered cards for real",
+                crate::assets::path("style.css").display(),
+            );
+            return;
+        };
+        adw::init().expect("libadwaita init");
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        let _styled = Styled::install(&shell_css);
+
+        let tree = wire::Node::Box {
+            id: None,
+            dir: wire::Dir::Vertical,
+            spacing: 24,
+            scroll: false,
+            classes: vec![],
+            children: vec![
+                card("page-card", &["boxed-list", "ts-page-card"]),
+                card("plain", &["boxed-list"]),
+            ],
+            tooltip: None,
+        };
+        let ui = to_ui_node(&Scope::detached("t1252-render"), Grants::none(), &tree);
+
+        let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        backdrop.add_css_class("t1252-backdrop");
+        let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panel.add_css_class("ts-plugin-panel");
+        panel.set_size_request(240, -1);
+        backdrop.append(&panel);
+        let mut rec = Reconciler::new(&panel, |_, _| {});
+        rec.render(&ui);
+
+        let window = gtk::Window::new();
+        window.set_decorated(false);
+        window.set_child(Some(&backdrop));
+        window.present();
+        // A fixed settle rather than "until allocated": the first allocation
+        // can land before the style pass that sizes the rows, and the order
+        // below is read off the settled layout.
+        let settled = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < settled {
+            glib::MainContext::default().iteration(false);
+        }
+        let lists = lists_under(panel.upcast_ref(), backdrop.upcast_ref());
+        assert_eq!(lists.len(), 2, "both cards mounted");
+        assert!(lists.iter().all(|l| l.height() > 0), "both laid out");
+
+        let paintable = gtk::WidgetPaintable::new(Some(&backdrop));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(
+            &snapshot,
+            f64::from(backdrop.width()),
+            f64::from(backdrop.height()),
+        );
+        let node = snapshot.to_node().expect("the page painted something");
+        let texture = window
+            .renderer()
+            .expect("a realized window has a renderer")
+            .render_texture(&node, None);
+        let stride = usize::try_from(texture.width()).expect("width") * 4;
+        let mut bytes = vec![0_u8; stride * usize::try_from(texture.height()).expect("height")];
+        texture.download(&mut bytes, stride);
+
+        // Inside each list: its vertical middle, a little in from the right
+        // edge — clear of the label (left-aligned) and of the rounded corners.
+        let inside = |list: &gtk::Widget| {
+            let b = list.compute_bounds(&backdrop).expect("laid out");
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, y) = (
+                (b.x() + b.width() - 16.0).round() as i32,
+                (b.y() + b.height() / 2.0).round() as i32,
+            );
+            pixel(&bytes, stride, x, y)
+        };
+        // The page itself: the middle of the 24 px gap between the two lists,
+        // which neither list's surface can reach.
+        let page = {
+            let top = lists[0].compute_bounds(&backdrop).expect("laid out");
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, y) = (
+                (top.x() + top.width() / 2.0).round() as i32,
+                (top.y() + top.height() + 12.0).round() as i32,
+            );
+            pixel(&bytes, stride, x, y)
+        };
+        let (card_px, plain_px) = (inside(&lists[0]), inside(&lists[1]));
+        window.destroy();
+
+        // The sentinel, and it has to come first. The flattening rule exists
+        // ONLY in the shell's stylesheet, so a plain list painted flat is proof
+        // that sheet is in effect. Without it libadwaita's own `boxed-list`
+        // card paints BOTH lists, and the card assertion below would pass for
+        // the wrong reason — which is exactly how this test first failed in CI
+        // (`nix flake check`'s sandbox had no `assets/trollshell/style.css`).
+        assert!(
+            !differs(plain_px, page),
+            "the shell stylesheet is not in effect — a plain `boxed-list` on a \
+             plugin page must be flattened onto it by `.ts-plugin-panel \
+             list.boxed-list`, and it was painted as a card instead: list \
+             {plain_px:?} vs page {page:?}. Every pixel below would then be \
+             libadwaita's, not the shell's",
+        );
+        assert!(
+            differs(card_px, page),
+            "a `ts-page-card` paints a card surface: card {card_px:?} vs page {page:?}",
+        );
     }
 }

@@ -677,16 +677,27 @@ pub(super) fn anchors_to_click(age: Duration, rooted: bool) -> bool {
 /// `OpenPage(PluginSelf)`: anchored under the chip that was just clicked when
 /// there is one, else the pre-#1252 unanchored open on the focused output.
 ///
-/// The anchored arm is [`crate::modal::toggle_plugin_under`] — the native
-/// chip's own toggle, on the drawer of the bar the chip lives in — and it falls
-/// through to [`crate::modal::open_plugin_on_focused`] when that chip is on no
-/// drawer's bar any more. The fallback keeps exactly the pre-#1252 behaviour:
-/// the focused output, flush with the bar's trailing edge.
+/// Three routes, in order:
+///
+/// 1. **Anchored** — [`crate::modal::toggle_plugin_under`], the native chip's
+///    own toggle, on the drawer of the bar the clicked chip lives in.
+/// 2. **Already open** — [`crate::modal::reshow_plugin_if_open`]: the page is
+///    up on some drawer and asked for again with no chip click behind it (a
+///    button *inside* the page navigating it), so it stays where it is, under
+///    the chip it was opened from. Without this the third route re-placed the
+///    card flush in the corner (#1252 review, MEDIUM).
+/// 3. **Unanchored** — [`crate::modal::open_plugin_on_focused`], exactly the
+///    pre-#1252 behaviour: the focused output, flush with the bar's trailing
+///    edge. Also where a click lands whose chip is on no drawer's bar any more.
 fn open_own_page_in_drawer(focused: Option<&str>, plugin_id: &str) {
     if let Some(chip) = take_click_origin(plugin_id, Instant::now())
         && crate::modal::toggle_plugin_under(&chip, plugin_id)
     {
         tracing::debug!(plugin = %plugin_id, "plugin page anchored under the clicked chip (#1252)");
+        return;
+    }
+    if crate::modal::reshow_plugin_if_open(plugin_id) {
+        tracing::debug!(plugin = %plugin_id, "plugin page already open; re-shown in place (#1252)");
         return;
     }
     crate::modal::open_plugin_on_focused(focused, plugin_id);

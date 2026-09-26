@@ -1478,9 +1478,10 @@ pub fn open_on_focused(preferred: Option<&str>, page: Page) {
 ///
 /// Since #1252 this is the **fallback** for a plugin's page, not its usual
 /// route: a page a plugin chip's own click produced goes through
-/// [`toggle_plugin_under`] instead and lands under that chip. What still comes
-/// here is a page with no recent click behind it — a plugin opening its page
-/// on its own schedule, or a click whose chip is gone.
+/// [`toggle_plugin_under`] instead and lands under that chip, and a page that is
+/// already open is re-shown where it is by [`reshow_plugin_if_open`]. What still
+/// comes here is a *closed* page with no recent click behind it — a plugin
+/// opening its page on its own schedule, or a click whose chip is gone.
 fn open_plugin_by_key(key: &str, plugin_id: &str) {
     // Owned handle, no live `PANELS` borrow (#643) — as in [`open_by_key`],
     // plus `set_active_panel`, which publishes into the plugin host.
@@ -1535,12 +1536,49 @@ pub fn open_plugin_on_focused(preferred: Option<&str>, plugin_id: &str) {
 /// Returns `false`, having touched nothing, when `trigger` is on no mounted
 /// drawer's bar — unrooted, or torn down by a hot-plug since the click — so the
 /// caller can take the unanchored [`open_plugin_on_focused`] route instead.
+///
+/// **A plugin has one page, so every one of its chips toggles it.** With the
+/// page open, a click that reaches a *different* chip of the same plugin closes
+/// it, where the native Stats chips keep the drawer open and jump within the
+/// page (`toggle_keep_open`, #516). A plugin page has nothing to jump to, and in
+/// practice the open drawer's full-screen catcher sits above the bar and takes
+/// that click first — it closes the drawer too — so the difference only shows on
+/// a compositor that stacks the bar above the drawer.
 pub fn toggle_plugin_under(trigger: &gtk::Widget, plugin_id: &str) -> bool {
     let Some(panel) = panel_under(trigger) else {
         return false;
     };
     toggle_panel(&panel, Active::Plugin(plugin_id.to_owned()), trigger, true);
     recompute_gates();
+    true
+}
+
+/// Re-show `plugin_id`'s page **in place** if a drawer is already showing it,
+/// leaving that drawer, its anchor and its monitor exactly as they are; `false`
+/// when no drawer is (#1252 review, MEDIUM).
+///
+/// The case is a page that opens *itself* while open — a button inside the
+/// page emitting `OpenPage(PluginSelf)` again, as `hytte-plugin-agents`' roster
+/// rows do to switch its detail view. The drawer page's own events record no
+/// click origin (only a bar card's do), so without this such an effect took the
+/// unanchored [`open_plugin_on_focused`] route: `open_plugin_by_key` clears the
+/// anchor and re-places the card, so it jumped from under its chip to the bar's
+/// trailing corner — the #1252 symptom, re-introduced by the page's own
+/// navigation — and with niri's focus on another output a *second* drawer opened
+/// there.
+///
+/// "Showing" means revealed: a drawer mid-retract (`reveals_child` already
+/// `false`, `current` not yet cleared by `wire_retract_finish`) is closing, and
+/// a page asked for then is opened afresh rather than resurrected.
+pub fn reshow_plugin_if_open(plugin_id: &str) -> bool {
+    let target = Active::Plugin(plugin_id.to_owned());
+    // Snapshot, then act with no `PANELS` borrow live (#643).
+    let Some(panel) = live_panels().into_iter().find(|panel| {
+        panel.revealer.reveals_child() && panel.current.borrow().as_ref() == Some(&target)
+    }) else {
+        return false;
+    };
+    on_active_show(&panel, &target);
     true
 }
 
@@ -3439,5 +3477,145 @@ mod gtk_tests {
         );
 
         drop_plugin_drawers(&["test-1252-broker-a", "test-1252-broker-b"], &[&a, &b]);
+    }
+
+    /// A page already open under its chip that asks for itself again — a
+    /// button **inside** the page emitting `OpenPage(PluginSelf)`, as
+    /// `hytte-plugin-agents`' roster rows do — stays where it is: open, on the
+    /// same drawer, under the same chip (#1252 review, MEDIUM). The drawer page's
+    /// own events record no click origin, so before the fix this took the
+    /// unanchored route and the card jumped to the bar's trailing corner.
+    ///
+    /// A second drawer is mounted, with its bar elsewhere, so "stays on the same
+    /// drawer" is not satisfied by there being only one: the unanchored route
+    /// picks niri's focused output, else any drawer.
+    ///
+    /// **Falsification:** delete the `reshow_plugin_if_open` early return from
+    /// `open_own_page_in_drawer` → the anchor assertion reds (the reviewer's
+    /// `left: None, right: Some(GtkButton)` on the first cut of this PR).
+    #[gtk::test]
+    fn an_in_page_reopen_keeps_the_open_card_under_its_chip() {
+        use crate::plugins::broker_own_page_for_test;
+        use hytte_plugin_proto::Mount;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _chip_a) = plugin_drawer(&monitor, "test-1252-keep-a");
+        let (b, chip_b) = plugin_drawer(&monitor, "test-1252-keep-b");
+        assert!(toggle_plugin_under(chip_b.upcast_ref(), "keep"));
+
+        // The open page re-emits `OpenPage(PluginSelf)`; no chip click behind it.
+        broker_own_page_for_test("keep", Mount::BarRight);
+        let (b_open, b_anchor) = (b.revealer.reveals_child(), anchored_on(&b));
+        let a_current = a.current.borrow().clone();
+        drop_plugin_drawers(&["test-1252-keep-a", "test-1252-keep-b"], &[&a, &b]);
+
+        assert!(b_open, "the page stays open");
+        assert_eq!(
+            b_anchor,
+            Some(chip_b.upcast::<gtk::Widget>()),
+            "…under its chip, not jumped to the bar's trailing corner",
+        );
+        assert_eq!(a_current, None, "…and no second drawer opens elsewhere");
+    }
+
+    /// …but only a page that is **showing** is re-shown in place. A drawer
+    /// mid-retract still has its page in `current` until `wire_retract_finish`
+    /// runs; a page asked for then must open again, not be "re-shown" into a
+    /// drawer that is sliding shut (#1252 review fix round).
+    ///
+    /// **Falsification:** drop the `reveals_child()` term from
+    /// `reshow_plugin_if_open` → the request is swallowed by the closing drawer
+    /// and this reds.
+    #[gtk::test]
+    fn a_page_asked_for_while_its_drawer_retracts_opens_again() {
+        use crate::plugins::broker_own_page_for_test;
+        use hytte_plugin_proto::Mount;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (b, chip_b) = plugin_drawer(&test_monitor(), "test-1252-retracting");
+        assert!(toggle_plugin_under(chip_b.upcast_ref(), "retracting"));
+        // Second click: the retract starts. The harness wires no
+        // `wire_retract_finish`, so `current` still names the page — exactly
+        // the mid-animation state.
+        assert!(toggle_plugin_under(chip_b.upcast_ref(), "retracting"));
+        assert!(
+            !b.revealer.reveals_child(),
+            "premise: the drawer is closing"
+        );
+
+        broker_own_page_for_test("retracting", Mount::BarRight);
+        let revealed = b.revealer.reveals_child();
+        drop_plugin_drawers(&["test-1252-retracting"], &[&b]);
+        assert!(
+            revealed,
+            "a page asked for while its drawer closes opens again"
+        );
+    }
+
+    /// The click origin is **per plugin id**: plugin A's chip click does not
+    /// anchor plugin B's page, even when B opens it within the window (#1252
+    /// review, LOW 3a). B's page opens, unanchored.
+    ///
+    /// **Falsification:** key the origin store by one global slot (`""`) → this
+    /// reds (B's page lands under A's chip).
+    #[gtk::test]
+    fn another_plugins_click_does_not_anchor_this_plugins_page() {
+        use crate::plugins::{broker_own_page_for_test, note_click_origin};
+        use hytte_plugin_proto::Mount;
+        use std::time::Instant;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (b, chip_b) = plugin_drawer(&test_monitor(), "test-1252-other");
+        note_click_origin("plugin-a", chip_b.upcast_ref(), Instant::now());
+        broker_own_page_for_test("plugin-b", Mount::BarRight);
+        let (opened, anchor) = (b.current.borrow().clone(), anchored_on(&b));
+        drop_plugin_drawers(&["test-1252-other"], &[&b]);
+
+        assert_eq!(opened, Some(Active::Plugin("plugin-b".to_owned())));
+        assert_eq!(
+            anchor, None,
+            "plugin a's click must not anchor plugin b's page"
+        );
+    }
+
+    /// A recent click whose chip is on **no** drawer's bar — rooted, but in some
+    /// other window — still opens the page, by the unanchored route, rather
+    /// than nothing (#1252 review, LOW 3b): `toggle_plugin_under`'s `false` is
+    /// the broker's cue to fall back, not a no-op.
+    ///
+    /// **Falsification:** ignore the `false` (`&& (toggle_plugin_under(..) ||
+    /// true)`) → nothing opens and this reds.
+    #[gtk::test]
+    fn a_recent_click_off_every_bar_still_opens_the_page() {
+        use crate::plugins::{broker_own_page_for_test, note_click_origin};
+        use hytte_plugin_proto::Mount;
+        use std::time::Instant;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let (b, _chip_b) = plugin_drawer(&test_monitor(), "test-1252-fallback");
+        let stray_window = gtk::Window::new();
+        let stray = gtk::Button::new();
+        stray_window.set_child(Some(&stray));
+        note_click_origin("fallback", stray.upcast_ref(), Instant::now());
+        broker_own_page_for_test("fallback", Mount::BarRight);
+        let (opened, anchor) = (b.current.borrow().clone(), anchored_on(&b));
+        drop_plugin_drawers(&["test-1252-fallback"], &[&b]);
+        stray_window.destroy();
+
+        assert_eq!(
+            opened,
+            Some(Active::Plugin("fallback".to_owned())),
+            "a chip on no drawer's bar falls back to the unanchored open",
+        );
+        assert_eq!(anchor, None, "…unanchored, as before #1252");
     }
 }

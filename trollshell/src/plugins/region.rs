@@ -29,7 +29,7 @@
 //!   clicked. The drawer panel is the one mount with no monitor in scope and
 //!   sends `None` (see [`build_panel_child`]).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
@@ -742,9 +742,31 @@ fn reconcile_region(
     }
 }
 
-/// The button a card's last press landed on (#1252), weakly — see
+/// What a card's press tracker remembers (#1252): the button the latest press
+/// landed on, weakly, and a count of presses so a deferred clear can tell
+/// whether the press it was scheduled for is still the latest — see
 /// [`track_pressed_button`].
-type PressedButton = Rc<RefCell<Option<glib::WeakRef<gtk::Widget>>>>;
+#[derive(Default)]
+struct PressTracker {
+    /// The button the latest press landed on, until a click spends it or the
+    /// press ends without one.
+    button: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
+    /// How many presses this card has seen.
+    presses: Cell<u64>,
+}
+
+impl PressTracker {
+    /// Spend the recorded press: the button it landed on, if it is still alive.
+    fn take(&self) -> Option<gtk::Widget> {
+        self.button
+            .borrow_mut()
+            .take()
+            .and_then(|button| button.upgrade())
+    }
+}
+
+/// A card's [`PressTracker`], shared by its gesture and its event callback.
+type PressedButton = Rc<PressTracker>;
 
 /// Watch `card`'s presses and remember which of its buttons each one lands on
 /// (#1252), so a click can anchor the page it opens under **that** button
@@ -762,16 +784,33 @@ type PressedButton = Rc<RefCell<Option<glib::WeakRef<gtk::Widget>>>>;
 /// unclaimed gesture's `handle_event` returns `FALSE` (`gtkgesture.c`, "Only
 /// claimed events should be consumed"), so propagation continues to the button's
 /// own gesture exactly as before; when that one claims the sequence, this one is
-/// merely cancelled. `pressed` has already run by then.
+/// denied (capture runs before bubble, so GTK denies rather than cancels it).
+/// `pressed` has already run by then. It listens for the primary button only —
+/// `GestureSingle`'s default, and the only one `GtkButton` emits `clicked` for.
+///
+/// **A press is spent by its click, or forgotten once its sequence ends
+/// without one** (#1252 review, LOW 4). A press dragged off its chip and
+/// released elsewhere clicks nothing; left recorded, it would anchor the *next*
+/// press-less click — a keyboard or accessibility activation of a different
+/// chip — under the chip that was pressed and abandoned. The sequence's end
+/// (`GtkGesture::end`: released, denied or cancelled) cannot clear it on the
+/// spot, because for an ordinary click it fires *before* `GtkButton::clicked`:
+/// the release reaches this capture-phase gesture first. So the clear is
+/// deferred to an idle, which runs only after the whole event — the `clicked`
+/// emission included — has been dispatched: a click spends its press first, and
+/// a press that clicked nothing is gone before any later click can use it. The
+/// press count keeps a stale idle from wiping a *newer* press GTK dispatched
+/// ahead of it (input events outrank idles, so a fast second press can land
+/// between a release and its idle).
 ///
 /// A click with no press behind it — a keyboard activation, or a synthetic
 /// `clicked` — finds nothing recorded and falls back to the card root in
 /// [`clicked_widget`].
 fn track_pressed_button(card: &gtk::Box) -> PressedButton {
-    let pressed: PressedButton = Rc::new(RefCell::new(None));
+    let tracker: PressedButton = Rc::default();
     let gesture = gtk::GestureClick::new();
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let cell = pressed.clone();
+    let on_press = tracker.clone();
     // The card is the gesture's own widget, read back per press rather than
     // captured: the gesture is owned by the card, so a captured clone would be
     // the card pinning itself.
@@ -779,13 +818,24 @@ fn track_pressed_button(card: &gtk::Box) -> PressedButton {
         let Some(card) = gesture.widget() else {
             return;
         };
-        *cell.borrow_mut() = card
+        on_press.presses.set(on_press.presses.get().wrapping_add(1));
+        *on_press.button.borrow_mut() = card
             .pick(x, y, gtk::PickFlags::DEFAULT)
             .and_then(|hit| enclosing_button(&hit, &card))
             .map(|button| button.downgrade());
     });
+    let on_end = tracker.clone();
+    gesture.connect_end(move |_, _| {
+        let press = on_end.presses.get();
+        let tracker = on_end.clone();
+        glib::idle_add_local_once(move || {
+            if tracker.presses.get() == press {
+                tracker.button.borrow_mut().take();
+            }
+        });
+    });
     card.add_controller(gesture);
-    pressed
+    tracker
 }
 
 /// The innermost `gtk::Button` at or above `hit`, looking no further up than
@@ -825,10 +875,7 @@ fn clicked_widget(pressed: Option<gtk::Widget>, card: &gtk::Widget) -> gtk::Widg
 /// Consumes the recorded press, so a later click with no press behind it (a
 /// keyboard activation) cannot inherit an old press's button.
 fn note_card_click(plugin_id: &str, card: &glib::WeakRef<gtk::Box>, pressed: &PressedButton) {
-    let pressed = pressed
-        .borrow_mut()
-        .take()
-        .and_then(|button| button.upgrade());
+    let pressed = pressed.take();
     let Some(card) = card.upgrade() else {
         return;
     };
@@ -5111,6 +5158,40 @@ mod gtk_tests {
         (window, card)
     }
 
+    /// The card root's #1252 press tracker, with its **wiring** pinned: every
+    /// test that presses a chip goes through here, so each of them also checks
+    /// the tracker is the one GTK's real dispatch would feed a click's press to.
+    ///
+    /// The two assertions are what a direct `pressed` emission cannot see
+    /// (#1252 review, LOW 2): the signal runs whatever the gesture's phase or
+    /// button filter is, so `PropagationPhase::None` (the tracker never fires)
+    /// or a `set_button(3)` (it fires for right-clicks only) would leave every
+    /// press-driven test green while every real click fell back to the card.
+    fn tracker_of(card: &gtk::Box) -> gtk::GestureClick {
+        let controllers = card.observe_controllers();
+        let gesture = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .find_map(|c| c.downcast::<gtk::GestureClick>().ok())
+            .expect("the card root carries the #1252 press tracker");
+        assert_eq!(
+            gesture.propagation_phase(),
+            gtk::PropagationPhase::Capture,
+            "the tracker must see the press on its way down, before the button's own gesture",
+        );
+        assert_eq!(
+            gesture.button(),
+            gtk::gdk::BUTTON_PRIMARY,
+            "the tracker must listen for the button `GtkButton` clicks on",
+        );
+        gesture
+    }
+
+    /// End the tracker's current press sequence the way GTK does on a release,
+    /// a denial or a cancel: `GtkGesture::end` (#1252 review, LOW 4).
+    fn end_press(card: &gtk::Box) {
+        tracker_of(card).emit_by_name::<()>("end", &[&None::<gtk::gdk::EventSequence>]);
+    }
+
     /// Press `target` the way a pointer does, as far as the card's own press
     /// tracker can tell: its capture-phase `GestureClick` emits `pressed` at
     /// `target`'s centre, in the card's coordinates (#1252).
@@ -5118,13 +5199,10 @@ mod gtk_tests {
     /// Emitted on the gesture rather than synthesised as an input event —
     /// GTK 4 has no public event injection — which exercises everything the
     /// tracker does with a press (the pick, the walk to the enclosing button,
-    /// the record) and nothing of GTK's event dispatch, which is GTK's.
+    /// the record); [`tracker_of`] pins the wiring that decides whether GTK's
+    /// own dispatch would reach it.
     fn press_on(card: &gtk::Box, target: &gtk::Button) {
-        let controllers = card.observe_controllers();
-        let gesture = (0..controllers.n_items())
-            .filter_map(|i| controllers.item(i))
-            .find_map(|c| c.downcast::<gtk::GestureClick>().ok())
-            .expect("the card root carries the #1252 press tracker");
+        let gesture = tracker_of(card);
         let (w, h) = (target.width(), target.height());
         assert!(
             w > 0 && h > 0,
@@ -5204,6 +5282,149 @@ mod gtk_tests {
             super::super::effects::take_click_origin("click-origin-card", Instant::now()),
             Some(card.upcast::<gtk::Widget>()),
             "a press is spent by its click; the next click without one falls back to the card",
+        );
+        window.destroy();
+    }
+
+    /// A press that never became a click — dragged off its chip and released
+    /// elsewhere — is forgotten, so a later press-less activation of a
+    /// **different** chip (keyboard, accessibility) anchors under the card, not
+    /// under the chip that was pressed and abandoned (#1252 review, LOW 4: the
+    /// reviewer measured exactly that with real X11 test input on the first cut).
+    ///
+    /// **Falsification:** delete the tracker's `connect_end` handler → the
+    /// origin is recorded under `cpu` and this reds.
+    #[gtk::test]
+    fn a_press_that_clicked_nothing_does_not_anchor_a_later_click() {
+        adw::init().expect("libadwaita init");
+        let (window, card) = mount_laid_out_card("click-origin-drag-off", two_button_tree());
+        let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+            .expect("the card holds exactly the two chips");
+
+        // Press `cpu`, then the sequence ends with no click (a drag-off).
+        press_on(&card, &cpu);
+        end_press(&card);
+        pump();
+        // A press-less activation of `mem`.
+        mem.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-drag-off", Instant::now()),
+            Some(card.clone().upcast::<gtk::Widget>()),
+            "an abandoned press on `cpu` must not anchor a later click on `mem`",
+        );
+        window.destroy();
+    }
+
+    /// …but the clear is **deferred**: GTK ends the tracker's sequence on the
+    /// release *before* `GtkButton::clicked` runs (the capture phase sees the
+    /// release first), so the click that release produces must still find its
+    /// press. And a newer press that lands before an older press's deferred
+    /// clear runs is not wiped by it (#1252 review, LOW 4).
+    ///
+    /// **Falsification:** clear the press synchronously in the `end` handler →
+    /// the first assertion reds (the click falls back to the card); drop the
+    /// press-count comparison from the idle → the second reds.
+    #[gtk::test]
+    fn a_click_still_finds_its_press_after_the_sequence_ends() {
+        adw::init().expect("libadwaita init");
+        let (window, card) = mount_laid_out_card("click-origin-end-order", two_button_tree());
+        let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+            .expect("the card holds exactly the two chips");
+
+        // An ordinary click, in GTK's order: press, sequence end, `clicked` —
+        // all inside one event dispatch, so no main-loop turn between them.
+        press_on(&card, &mem);
+        end_press(&card);
+        mem.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            Some(mem.clone().upcast::<gtk::Widget>()),
+            "the click in the same dispatch as its release spends its press",
+        );
+        pump();
+
+        // A fast second press dispatched ahead of the first press's idle.
+        press_on(&card, &cpu);
+        end_press(&card);
+        press_on(&card, &mem);
+        pump();
+        mem.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            Some(mem.upcast::<gtk::Widget>()),
+            "an older press's deferred clear must not wipe the newer press",
+        );
+        window.destroy();
+    }
+
+    /// Only a **click** records a click origin: an entry submitted (or a slider
+    /// dragged, or a box scrolled) on a chip causes no page, so it must not
+    /// leave an origin for a page the plugin opens a moment later on its own
+    /// (#1252 review, LOW 3c).
+    ///
+    /// **Falsification:** record on every event kind (drop the `Click` match
+    /// in the card's event callback) → this reds.
+    #[gtk::test]
+    fn only_a_click_records_a_click_origin() {
+        adw::init().expect("libadwaita init");
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(8);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let tree = wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 6,
+            children: vec![wire::Node::Entry {
+                id: "q".to_owned(),
+                text: "search".to_owned(),
+                placeholder: String::new(),
+                classes: vec![],
+            }],
+            tooltip: None,
+        };
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("click-origin-entry", &tx, tree)],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        let window = gtk::Window::new();
+        window.set_child(Some(&container));
+        let card = card_root(&cards, "click-origin-entry");
+        let entry = {
+            fn find(w: &gtk::Widget) -> Option<gtk::Entry> {
+                if let Ok(e) = w.clone().downcast::<gtk::Entry>() {
+                    return Some(e);
+                }
+                let mut child = w.first_child();
+                while let Some(c) = child {
+                    if let Some(found) = find(&c) {
+                        return Some(found);
+                    }
+                    child = c.next_sibling();
+                }
+                None
+            }
+            find(card.upcast_ref()).expect("the card holds the entry")
+        };
+
+        entry.emit_by_name::<()>("activate", &[]);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(HostMsg::Event {
+                    kind: wire::EventKind::Submitted { .. },
+                    ..
+                })
+            ),
+            "premise: the submit reached the plugin",
+        );
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-entry", Instant::now()),
+            None,
+            "a submit is not a click and anchors nothing",
         );
         window.destroy();
     }

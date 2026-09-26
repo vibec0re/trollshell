@@ -1998,6 +1998,25 @@ label.ts-gpu-temp {
     font-variant-numeric: tabular-nums;
 }
 
+/* The stats plugin's drawer page (#1252) draws `build_history_row`'s
+   `[name 80px | sparkline | value 80px]` row from the wire, where a node cannot
+   call `set_size_request`. These rules are that call, in CSS: the fixed 80 px
+   name/value columns (80 / 13 = 6.154em at the injected 13 px base, which is
+   exactly what `scale(80)` resolves to), and the Disk I/O detail lines'
+   `set_margin_start(scale(88))` indent (6.769em) with the last line's 4 px
+   bottom margin. Additive: no native widget carries either class. */
+.ts-stat-col {
+    min-width: 6.154em;
+}
+
+.ts-stat-detail {
+    margin-left: 6.769em;
+}
+
+.ts-stat-detail:last-child {
+    margin-bottom: 0.308em;
+}
+
 /* The shell's override of the library's `.hytte-sparkline` default (#1180
    item 7). The widget carries a `hytte-` class now, because `hytte-ui` is
    where it is built and its stylesheet is what has to be able to style it;

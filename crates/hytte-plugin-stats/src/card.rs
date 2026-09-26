@@ -96,17 +96,6 @@ pub const CORES_PER_ROW: usize = 16;
 /// count of 24 renders 269 px wide — inside the ~296 px sidebar card").
 pub const CARD_PX: u32 = 296;
 
-/// The width budget the **drawer page**'s per-core row is fitted to, in buffer
-/// pixels.
-///
-/// The drawer clamps at `DRAWER_MAX_WIDTH = 680` (the shell's
-/// `components/layout.rs`) and the host's own panel chrome takes some of that,
-/// so 640 is the honest budget. This is the whole reason the page holds a
-/// *second* `DotMatrix`: "the P1 row at full width" (#1251) means the row is
-/// fitted to the page it is on, and a 16-wide row admits a 6 px pitch here
-/// against the sidebar card's 3 px.
-pub const PAGE_PX: u32 = 640;
-
 /// The dot pitch every **bar** lamp is drawn at.
 ///
 /// Fixed rather than fitted: a bar chip's budget is its *height*, not its
@@ -197,11 +186,13 @@ pub fn dot_px_for(cells: usize) -> u32 {
     dot_px_for_in(CARD_PX, cells)
 }
 
-/// [`dot_px_for`] against an arbitrary width budget — the sidebar card's
-/// [`CARD_PX`] or the drawer page's [`PAGE_PX`].
+/// [`dot_px_for`] against an arbitrary width budget.
 ///
-/// One function with the budget as a parameter rather than two transcriptions
-/// of `dot_px * (6n + 1)`: a second copy of a width formula is exactly the
+/// Only the sidebar card's [`CARD_PX`] is a caller since #1252 took the drawer
+/// page's lamp rows (and the page-wide budget they were fitted to) off the
+/// page, but the budget stays a parameter: one function rather than two
+/// transcriptions of `dot_px * (6n + 1)` the day a second budget returns. A
+/// second copy of a width formula is exactly the
 /// mirror the kit's own sizing notes warn about, and #1277's MEDIUM 1 was a
 /// *caller* feeding this the wrong `cells` — a second body would have been a
 /// second place for that to happen.
@@ -353,16 +344,17 @@ pub(crate) fn header(
 /// the wire, which makes the shell drop its renderer instance and start that
 /// animation over. The one exception is [`Widgets::cores`], which is rebuilt
 /// deliberately when the core count changes — see [`Widgets::fit_cores`].
+///
+/// These are the **sidebar card's and the bar chips'** widgets only. The
+/// drawer page stopped drawing preem in #1252 (Annika: "maybe not use preem
+/// widgets here?") and keeps its history in `crate::panel::History` instead,
+/// as plain samples for [`Node::Sparkline`](hytte_plugin::proto::Node::Sparkline)s.
 #[derive(Debug)]
 pub struct Widgets {
     cores: DotMatrix,
     /// The cell count `cores` was last fitted to, so the rebuild happens once
     /// rather than on every render.
     fitted_cells: usize,
-    /// The drawer page's per-core row — the same lamps fitted to [`PAGE_PX`]
-    /// instead of [`CARD_PX`], which is what "the P1 row at full width" means.
-    page_cores: DotMatrix,
-    page_fitted_cells: usize,
     /// Every **bar** lamp, and every disk lamp on the **sidebar card**: one
     /// pitch, many nodes. A `DotMatrix` wrapper carries no per-node state —
     /// the id, the classes and the text are all arguments to `node_classed` —
@@ -370,13 +362,6 @@ pub struct Widgets {
     /// chip's and the sidebar card's disk row without them sharing anything
     /// but their pitch.
     lamps: DotMatrix,
-    /// The drawer page's disk-lamp row, fitted to [`PAGE_PX`] like
-    /// `page_cores` — #1295 review LOW 4: at the bar's fixed [`CHIP_DOT_PX`]
-    /// floor a two-mount row is `2*(6*2+1) = 26 px` wide sitting under a
-    /// per-core row six times that pitch, the same "fit the row to the
-    /// surface it is on" argument [`PAGE_PX`]'s own doc makes.
-    page_disk_lamps: DotMatrix,
-    page_disk_fitted_cells: usize,
     temp: SevenSeg,
     history: Scope,
     /// The CPU chip's sweep when `[bar] history = true`: the same trace as
@@ -385,17 +370,6 @@ pub struct Widgets {
     gpu: Gauge,
     memory: LedStrip,
     swap: LedStrip,
-    /// The drawer page's disk-I/O-history sweep (#1295 review MED 1) — the
-    /// native Disks card's combined read+write rate row
-    /// (`trollshell/src/panels/stats.rs:610` → `:1293`), auto-scaled against
-    /// the peak rate this session has seen (`Stats::apply`) rather than the
-    /// native row's windowed max: a simplification, named here because #1251's
-    /// whole point is an honest list of where this page and the native one
-    /// diverge.
-    disk_io: Scope,
-    /// The drawer page's GPU-VRAM-history sweep (#1295 review MED 1) — the
-    /// native GPU card's "GPU VRAM" row (`stats.rs:632`).
-    gpu_vram: Scope,
 }
 
 /// Logical width of the history sweep, in samples — one per poll tick, so at
@@ -407,11 +381,7 @@ impl Default for Widgets {
         Self {
             cores: DotMatrix::new(SKIN).dot_px(dot_px_for(DASH_CELLS)),
             fitted_cells: DASH_CELLS,
-            page_cores: DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, DASH_CELLS)),
-            page_fitted_cells: DASH_CELLS,
             lamps: DotMatrix::new(SKIN).dot_px(CHIP_DOT_PX),
-            page_disk_lamps: DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, DASH_CELLS)),
-            page_disk_fitted_cells: DASH_CELLS,
             temp: SevenSeg::new(SKIN),
             // 144x32 at 2x is 288x64 — the card's width, and short enough that
             // the sweep reads as a strip beside the lamp row rather than
@@ -423,14 +393,10 @@ impl Default for Widgets {
             // A 0..100 needle, sized to the card at 2x (224x112).
             gpu: Gauge::with_size(SKIN, 112, 56).scale(2).range(0.0, 100.0),
             // Twelve segments render 2*4 + 12*8 + 11*3 = 137 px — half the
-            // sidebar card, and a comfortable meter in the drawer page beside
-            // the `used / total` text that carries the exact numbers.
+            // sidebar card, beside the `used / total` text that carries the
+            // exact numbers.
             memory: LedStrip::new(SKIN).leds(12),
             swap: LedStrip::new(SKIN).leds(12),
-            // Both new page-only sweeps are the same footprint as `history` —
-            // neither has a bar-sized twin, since neither row exists on a chip.
-            disk_io: Scope::with_size(SKIN, HISTORY_COLS, 32).scale(2),
-            gpu_vram: Scope::with_size(SKIN, HISTORY_COLS, 32).scale(2),
         }
     }
 }
@@ -457,24 +423,6 @@ impl Widgets {
         if cells != self.fitted_cells {
             self.cores = DotMatrix::new(SKIN).dot_px(dot_px_for(cells));
             self.fitted_cells = cells;
-        }
-        if cells != self.page_fitted_cells {
-            self.page_cores = DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, cells));
-            self.page_fitted_cells = cells;
-        }
-    }
-
-    /// Re-fit the drawer page's disk-lamp row to a fresh set of mount usages —
-    /// [`fit_cores`](Self::fit_cores)'s twin for the Disks card (#1295 review
-    /// LOW 4). The sidebar card's and the bar chip's disk lamps stay at the
-    /// fixed [`CHIP_DOT_PX`] pitch (`self.lamps`); only the page's row is
-    /// fitted to a width budget, for the same reason the per-core row's page
-    /// copy is.
-    pub fn fit_disk_lamps(&mut self, usages: &[f32]) {
-        let cells = row_cells(usages);
-        if cells != self.page_disk_fitted_cells {
-            self.page_disk_lamps = DotMatrix::new(SKIN).dot_px(dot_px_for_in(PAGE_PX, cells));
-            self.page_disk_fitted_cells = cells;
         }
     }
 
@@ -515,47 +463,9 @@ impl Widgets {
         self.chip_history.push(ring);
     }
 
-    /// Stamp a fresh batch onto the drawer page's disk-I/O sweep (#1295 review
-    /// MED 1) — see [`push_history`](Self::push_history) for why it is the
-    /// whole ring rather than the newest sample.
-    pub fn push_disk_io_history(&mut self, ring: &[f32]) {
-        self.disk_io.push(ring);
-    }
-
-    /// Stamp a fresh batch onto the drawer page's GPU-VRAM sweep (#1295 review
-    /// MED 1).
-    pub fn push_gpu_vram_history(&mut self, ring: &[f32]) {
-        self.gpu_vram.push(ring);
-    }
-
-    /// The card's history sweep, as a node.
-    pub(crate) fn history_node(&self, id: &str, classes: Vec<Cls>) -> Node {
-        self.history.node_classed(id, classes)
-    }
-
-    /// The drawer page's disk-I/O sweep.
-    pub(crate) fn disk_io_node(&self, id: &str, classes: Vec<Cls>) -> Node {
-        self.disk_io.node_classed(id, classes)
-    }
-
-    /// The drawer page's GPU-VRAM sweep.
-    pub(crate) fn gpu_vram_node(&self, id: &str, classes: Vec<Cls>) -> Node {
-        self.gpu_vram.node_classed(id, classes)
-    }
-
     /// The bar chip's history sweep.
     pub(crate) fn chip_history_node(&self, id: &str, classes: Vec<Cls>) -> Node {
         self.chip_history.node_classed(id, classes)
-    }
-
-    /// The GPU needle.
-    pub(crate) fn gpu_node(&self, id: &str, classes: Vec<Cls>) -> Node {
-        self.gpu.node_classed(id, classes)
-    }
-
-    /// The seven-segment temperature readout for `celsius`.
-    pub(crate) fn temp_node(&self, id: &str, classes: Vec<Cls>, celsius: Option<f32>) -> Node {
-        self.temp.node_classed(id, classes, &temp_text(celsius))
     }
 
     /// The memory meter.
@@ -572,25 +482,6 @@ impl Widgets {
     /// [`lamp_rows`] row.
     pub(crate) fn lamp_node(&self, id: &str, classes: Vec<Cls>, text: &str) -> Node {
         self.lamps.node_classed(id, classes, text)
-    }
-
-    /// The drawer page's disk-lamp row, at the page's own pitch (#1295 review
-    /// LOW 4) — [`lamp_node`](Self::lamp_node)'s twin for
-    /// [`fit_disk_lamps`](Self::fit_disk_lamps).
-    pub(crate) fn page_disk_lamp_node(&self, id: &str, classes: Vec<Cls>, text: &str) -> Node {
-        self.page_disk_lamps.node_classed(id, classes, text)
-    }
-
-    /// The drawer page's per-core rows, at the page's own pitch.
-    pub(crate) fn page_core_nodes(&self, loads: &[f32]) -> Vec<Node> {
-        lamp_rows(loads)
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                self.page_cores
-                    .node_classed(&format!("stats-panel-cores-{i}"), cls("ts-cpu"), row)
-            })
-            .collect()
     }
 
     /// The lamp rows, as nodes.
@@ -691,13 +582,13 @@ pub fn card(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) ->
     }
 }
 
-/// The memory rows shared by the sidebar card and the drawer page: a header
-/// carrying the exact `used / total (pct%)` the native row prints, the LED
-/// meter, and — only on a machine that has swap — the same pair for swap.
+/// The sidebar card's memory rows: a header carrying the exact
+/// `used / total (pct%)` the native row prints, the LED meter, and — only on a
+/// machine that has swap — the same pair for swap. (The drawer page drew these
+/// too until #1252 gave it the native row's own `Progress` bars.)
 ///
-/// `prefix` namespaces the node ids, because the chip tree and the panel tree
-/// are two trees in one frame and a preem node's id is its reconciler key
-/// (#900).
+/// `prefix` namespaces the node ids, because a preem node's id is its
+/// reconciler key (#900) and a tree must not carry one twice.
 pub(crate) fn memory_rows(snapshot: &Snapshot, widgets: &Widgets, prefix: &str) -> Vec<Node> {
     let mem = snapshot.memory.as_ref();
     let mut out = vec![
@@ -744,40 +635,6 @@ pub(crate) fn disk_rows(snapshot: &Snapshot, widgets: &Widgets, prefix: &str) ->
             spacing: 4,
             children: vec![
                 widgets.lamp_node(
-                    &format!("{prefix}-disk-lamps"),
-                    cls("ts-disk"),
-                    &lamp_rows(&usages).join(" "),
-                ),
-                Node::Spacer,
-            ],
-            tooltip: Some(disk_tooltip(&snapshot.disks)),
-        },
-    ]
-}
-
-/// [`disk_rows`]'s twin for the **drawer page** (#1295 review LOW 4): the same
-/// header and lamp row, but through [`Widgets::page_disk_lamp_node`] so the
-/// row draws at the page's own pitch rather than the bar/sidebar's fixed
-/// [`CHIP_DOT_PX`] floor. Not folded into `disk_rows` with a pitch parameter:
-/// the two are ten lines of otherwise-identical layout, and the module already
-/// keeps `history_node`/`chip_history_node` and `lamp_node`/
-/// `page_disk_lamp_node` as separate named wrappers rather than parametrised
-/// ones (see the module doc's precedent).
-pub(crate) fn page_disk_rows(snapshot: &Snapshot, widgets: &Widgets, prefix: &str) -> Vec<Node> {
-    let usages: Vec<f32> = snapshot.disks.iter().map(|d| d.usage).collect();
-    vec![
-        header(
-            "Disks",
-            format!("{} mount(s)", snapshot.disks.len()),
-            "ts-disk",
-            Some(disk_tooltip(&snapshot.disks)),
-        ),
-        Node::Row {
-            id: None,
-            classes: Vec::new(),
-            spacing: 4,
-            children: vec![
-                widgets.page_disk_lamp_node(
                     &format!("{prefix}-disk-lamps"),
                     cls("ts-disk"),
                     &lamp_rows(&usages).join(" "),
@@ -963,8 +820,8 @@ pub fn chips(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_PX, CHIP_CLASSES, CHIP_DOT_PX, CORES_PER_ROW, DASH_CELLS, LAMPS, PAGE_PX, Widgets,
-        card, chip_button_id, chips, cls, cpu_tooltip, disk_tooltip, dot_px_for, dot_px_for_in,
+        CARD_PX, CHIP_CLASSES, CORES_PER_ROW, DASH_CELLS, LAMPS, Widgets, card, chip_button_id,
+        chips, cpu_tooltip, disk_tooltip, dot_px_for,
         gpu_tooltip, is_chip_button, lamp, lamp_rows, memory_tooltip, percent_text, row_cells,
         temp_text, trace_sample,
     };
@@ -1250,6 +1107,7 @@ mod tests {
             // (`crate::panel`), whose own `busy()` fixture carries real values.
             processes: None,
             cpu_clock_hz: None,
+            cpu_clock_ceiling_hz: None,
             disk_io: None,
             disks: vec![
                 Disk {
@@ -1723,36 +1581,6 @@ mod tests {
         assert!(!got.iter().any(|t| t.ends_with('°')), "{got:?}");
     }
 
-    /// The drawer page's lamp row is fitted to the page's own width, not the
-    /// sidebar card's — "the P1 row at full width" (#1251), which is a
-    /// measurable claim and not a layout wish.
-    ///
-    /// **Falsified** by having `Widgets::fit_cores` point `page_cores` at
-    /// `dot_px_for` (the card's budget): the two pitches then agree and the
-    /// second assertion reds.
-    #[test]
-    fn the_pages_lamp_row_is_fitted_to_the_page() {
-        // A `const` assertion rather than a runtime one: both sides are
-        // compile-time constants, so this is a claim about the source and
-        // belongs where the compiler checks it.
-        const _: () = assert!(PAGE_PX > CARD_PX, "the page is wider than the card");
-        for cells in [1_usize, 4, 8, 16, 17, 32, 64] {
-            let row = cells.min(CORES_PER_ROW);
-            let page = dot_px_for_in(PAGE_PX, row);
-            let card_pitch = dot_px_for(row);
-            assert!(page >= card_pitch, "cells={cells}");
-            assert!(
-                page * (6 * u32::try_from(row).expect("small") + 1) <= PAGE_PX
-                    || page == MIN_DOT_PX,
-                "cells={cells}: the row must fit the page",
-            );
-        }
-        assert!(
-            dot_px_for_in(PAGE_PX, CORES_PER_ROW) > dot_px_for(CORES_PER_ROW),
-            "a 16-wide row is chunkier on the page than on the card",
-        );
-    }
-
     /// The dot pitch of the `DotMatrix` node with id `want`, read off the wire
     /// state the wrapper lowered to.
     fn node_dot_px(node: &Node, want: &str) -> Option<u32> {
@@ -1772,20 +1600,16 @@ mod tests {
         }
     }
 
-    /// **`fit_cores` fits two rows, not one**: the sidebar card's lamps to the
-    /// card's width and the drawer page's to the page's, in the same call —
-    /// asserted off the pitch each **widget** actually emits, not off the two
-    /// formulas.
+    /// **`fit_cores` fits the sidebar card's lamp row to the card** — asserted
+    /// off the pitch the **widget** actually emits, not off the formula.
     ///
-    /// The formula-level test above cannot see this: it compares
-    /// `dot_px_for_in(PAGE_PX, …)` with `dot_px_for(…)` and would stay green
-    /// with `fit_cores` handing the page row the card's budget (measured — that
-    /// mutation left it passing). This is the test that reds.
+    /// (Until #1252 it fitted a second, page-wide row too; the drawer page no
+    /// longer draws lamps, so there is one row to fit.)
     ///
-    /// **Falsified** by pointing `page_cores` at `dot_px_for(cells)`:
-    /// `left: 3 / right: 6`.
+    /// **Falsified** by pointing `cores` at a fixed pitch instead of
+    /// `dot_px_for(cells)`.
     #[test]
-    fn fit_cores_fits_the_card_row_and_the_page_row_separately() {
+    fn fit_cores_fits_the_card_row_and_the_bar_keeps_its_floor() {
         let mut widgets = Widgets::default();
         let loads = vec![0.5_f32; CORES_PER_ROW];
         widgets.fit_cores(&loads);
@@ -1799,15 +1623,7 @@ mod tests {
                 &card(Card::sidebar_default(), &snapshot, &widgets),
                 "stats-cores-0",
             );
-            let page_pitch =
-                node_dot_px(&widgets.page_core_nodes(&loads)[0], "stats-panel-cores-0");
-
             assert_eq!(card_pitch, Some(dot_px_for(CORES_PER_ROW)));
-            assert_eq!(page_pitch, Some(dot_px_for_in(PAGE_PX, CORES_PER_ROW)));
-            assert!(
-                page_pitch > card_pitch,
-                "the page's row must be the chunkier one: {page_pitch:?} vs {card_pitch:?}",
-            );
         });
 
         // …and the bar's lamps are neither: a fixed pitch, because a chip's
@@ -1985,59 +1801,6 @@ mod tests {
             after,
             "past the wrap boundary the row is still 16 wide — same pitch, same widget",
         );
-    }
-
-    /// **The drawer page's disk lamps draw at the page's own pitch, not the
-    /// bar's floor** (#1295 review LOW 4) —
-    /// `fit_cores_fits_the_card_row_and_the_page_row_separately`'s twin for
-    /// the Disks card.
-    ///
-    /// **Falsified** by pointing `fit_disk_lamps` at [`dot_px_for`] (the
-    /// bar/sidebar budget) instead of [`dot_px_for_in`]`(`[`PAGE_PX`]`, …)`:
-    /// `left: Some(3) / right: Some(6)`.
-    #[test]
-    fn fit_disk_lamps_fits_the_page_row_not_the_bars_floor() {
-        let mut widgets = Widgets::default();
-        // Sixteen mounts, not two: at a small cell count both `CARD_PX` and
-        // `PAGE_PX` clamp to the kit's shared `MAX_DOT_PX` ceiling and the two
-        // budgets are indistinguishable by coincidence (measured: a two-mount
-        // row saturates both to 8 px and this test would stay green under the
-        // LOW 4 mutation) — the same trap `row_cells`'s own doc names for the
-        // per-core row, and the reason `CORES_PER_ROW`-sized fixtures are used
-        // there too.
-        let usages = vec![0.5_f32; CORES_PER_ROW];
-        widgets.fit_disk_lamps(&usages);
-
-        with_render_mode(RenderMode::State, || {
-            let page_pitch = node_dot_px(
-                &widgets.page_disk_lamp_node(
-                    "stats-panel-disk-lamps",
-                    cls("ts-disk"),
-                    &lamp_rows(&usages).join(" "),
-                ),
-                "stats-panel-disk-lamps",
-            );
-            let bar_pitch = node_dot_px(
-                &widgets.lamp_node(
-                    "stats-disk-lamps",
-                    cls("ts-disk"),
-                    &lamp_rows(&usages).join(" "),
-                ),
-                "stats-disk-lamps",
-            );
-
-            assert_eq!(bar_pitch, Some(CHIP_DOT_PX), "left: {bar_pitch:?}");
-            assert_eq!(
-                page_pitch,
-                Some(dot_px_for_in(PAGE_PX, row_cells(&usages))),
-                "right: {page_pitch:?}",
-            );
-            assert!(
-                page_pitch > bar_pitch,
-                "the page's disk row must be the chunkier one: \
-                 left: {bar_pitch:?} / right: {page_pitch:?}",
-            );
-        });
     }
 
     /// **An all-off `[bar]` table renders nothing** (#1295 review LOW 6) — not

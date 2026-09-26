@@ -93,6 +93,13 @@ pub struct Snapshot {
     /// governor (`max_ceiling_hz == 0.0`: VMs and some ARM boards), which is
     /// the native row's own hide rule.
     pub cpu_clock_hz: Option<f64>,
+    /// The highest `cpuinfo_max_freq` across cores in Hz — the fixed top the
+    /// native Clock row's sparkline is normalised against
+    /// (`CpuFreq::max_ceiling_hz`, "a fixed 0→max-clock domain that shows
+    /// headroom rather than auto-scaling"), so the drawer page's line can
+    /// draw on the same axis (#1252). `Some` exactly when
+    /// [`cpu_clock_hz`](Self::cpu_clock_hz) is.
+    pub cpu_clock_ceiling_hz: Option<f64>,
     /// Aggregate disk-throughput history — the native Disks card's I/O row
     /// (`stats.rs:610` → `:1293`) — or `None` when this instance does not draw
     /// disks (see [`Needs`]). Unlike [`cpu`](Self::cpu) this is never withheld
@@ -362,14 +369,21 @@ impl Sampler {
         } else {
             None
         };
-        let cpu_clock_hz = if self.needs.cpu {
+        let (cpu_clock_hz, cpu_clock_ceiling_hz) = if self.needs.cpu {
             let freq = hytte_sensors::read_cpu_freq();
             // The native row's own hide rule: no `cpufreq` governor at all
             // (VMs, some ARM boards) is `max_ceiling_hz == 0.0`, and the row
             // disappears rather than showing a flat, meaningless `0 Hz`.
-            (freq.max_ceiling_hz > 0.0).then(|| finite_or_zero(freq.max_hz))
+            if freq.max_ceiling_hz > 0.0 {
+                (
+                    Some(finite_or_zero(freq.max_hz)),
+                    Some(finite_or_zero(freq.max_ceiling_hz)),
+                )
+            } else {
+                (None, None)
+            }
         } else {
-            None
+            (None, None)
         };
 
         let memory = if self.needs.memory {
@@ -432,6 +446,7 @@ impl Sampler {
             disks,
             processes,
             cpu_clock_hz,
+            cpu_clock_ceiling_hz,
             disk_io,
         }
     }
@@ -873,6 +888,7 @@ mod tests {
         assert!(s.gpu.is_none());
         assert!(s.processes.is_none());
         assert!(s.cpu_clock_hz.is_none());
+        assert!(s.cpu_clock_ceiling_hz.is_none());
         assert!(s.disk_io.is_none());
     }
 
@@ -1034,6 +1050,7 @@ mod tests {
         assert!(snap.disks.is_empty(), "the mount walk + statvfs are gated");
         assert_eq!(snap.processes, None, "the /proc read_dir walk is gated");
         assert_eq!(snap.cpu_clock_hz, None, "the cpufreq sysfs walk is gated");
+        assert_eq!(snap.cpu_clock_ceiling_hz, None, "…and so is its ceiling");
         assert_eq!(snap.disk_io, None, "the /proc/diskstats read is gated");
     }
 

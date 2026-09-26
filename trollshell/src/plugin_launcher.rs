@@ -5474,20 +5474,27 @@ mod tests {
                 .contains("wait_until_stopped_listing(id, systemd::list_plugin_units)"),
             "the wait must list the real units"
         );
-        let entry = body("pub async fn restart_for_settings(");
+        // Compared with all whitespace squeezed out, so rustfmt re-wrapping a
+        // call over several lines cannot turn this red on its own.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let entry = squash(body("pub async fn restart_for_settings("));
         assert!(
-            entry
-                .contains("restart_for_settings_via(id, load_declared, systemd::list_plugin_units"),
+            entry.contains(&squash(
+                "restart_for_settings_via(id, load_declared, systemd::list_plugin_units,"
+            )),
             "production must hand the seam the real declaration and listing:\n{entry}"
         );
-        assert!(entry.contains("restart(id, &spec, &target)"), "{entry}");
+        assert!(
+            entry.contains(&squash("restart(id, &spec, &target)")),
+            "{entry}"
+        );
         // The guard must be *held*: `let _ = …lock().await` drops it at once
         // and no lint catches that for a tokio guard (#1415 second review
         // B1). `two_restarts_for_settings_run_one_after_the_other` is the
         // behavioural half.
         assert!(
-            body("async fn restart_for_settings_via<")
-                .contains("let _guard = CONVERGE_LOCK.lock().await;"),
+            squash(body("async fn restart_for_settings_via<"))
+                .contains(&squash("let _guard = CONVERGE_LOCK.lock().await;")),
             "the settings restart must hold the convergence lock"
         );
     }

@@ -3,8 +3,8 @@
 //!
 //! [`Manifest::settings`](hytte_plugin_proto::Manifest::settings) is whatever
 //! the connected process put in its `Register` frame, so it is **untrusted**.
-//! [`sanitize`] is the one gate it passes through, applied once at
-//! registration ([`register`]); what survives is remembered per plugin
+//! `sanitize` is the one gate it passes through, applied once at
+//! registration (`register`); what survives is remembered per plugin
 //! **instance id** — the id the connection registered under, which is the
 //! `programs.trollshell.plugins.<id>` attribute name, so the bar and sidebar
 //! `stats` instances each get their own form — and served to the
@@ -15,7 +15,7 @@
 //! The form has to exist for a plugin that is **not** connected: one that is
 //! switched off, or one that cannot start *because* its setting is missing
 //! (vibectl without a reachable `V1BECTL_SERVER`). So the host keeps two maps
-//! ([`Store`]):
+//! (`Store`):
 //!
 //! - **live** — what each id declared this session, in memory;
 //! - **cached** — the last list each id ever declared, persisted to
@@ -23,11 +23,11 @@
 //!   config (#866 decision 3): the shell writes it, nobody edits it, and it is
 //!   re-sanitised when read back all the same.
 //!
-//! [`merged`] lays live over cached, so a plugin upgraded to declare different
+//! `merged` lays live over cached, so a plugin upgraded to declare different
 //! settings shows its new form the moment it registers, and one that stopped
 //! declaring any shows none.
 //!
-//! Recording is the **production host's** only: [`register`] acts only when
+//! Recording is the **production host's** only: `register` acts only when
 //! the connection's runtime store is the one `PluginsService::start` published
 //! (`PLUGIN_RUNTIME`). The per-connection tests build their own store and never
 //! publish it, so driving a `Register` through a test session can neither
@@ -289,8 +289,8 @@ static STORE: Mutex<Option<Store>> = Mutex::new(None);
 
 fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
     let mut guard = STORE.lock().unwrap_or_else(PoisonError::into_inner);
-    let store = guard
-        .get_or_insert_with(|| Store::open(hytte_config::state::path(CACHE_SUBSYSTEM)));
+    let store =
+        guard.get_or_insert_with(|| Store::open(hytte_config::state::path(CACHE_SUBSYSTEM)));
     f(store)
 }
 
@@ -358,10 +358,7 @@ mod tests {
 
     #[test]
     fn a_repeated_variable_keeps_its_first_entry() {
-        let declared = [
-            Setting::text("A", "First"),
-            Setting::bool("A", "Second"),
-        ];
+        let declared = [Setting::text("A", "First"), Setting::bool("A", "Second")];
         let kept = sanitize("p", &declared);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].label, "First");
@@ -424,7 +421,8 @@ mod tests {
         let hopeless = [Setting::choice("MODE", "Mode", ["\n", ""])];
         assert!(sanitize("p", &hopeless).is_empty(), "no usable option left");
         let many: Vec<String> = (0..MAX_OPTIONS + 3).map(|i| format!("o{i}")).collect();
-        let SettingKind::Choice { options } = &sanitize("p", &[Setting::choice("M", "M", many)])[0].kind
+        let SettingKind::Choice { options } =
+            &sanitize("p", &[Setting::choice("M", "M", many)])[0].kind
         else {
             panic!("still a choice");
         };
@@ -465,7 +463,9 @@ mod tests {
 
     fn every_kind() -> Vec<Setting> {
         vec![
-            Setting::path("SCREENS", "Screens").doc("d").default_value("~/s.kdl"),
+            Setting::path("SCREENS", "Screens")
+                .doc("d")
+                .default_value("~/s.kdl"),
             Setting::directory("CACHE", "Cache"),
             Setting::text("SERVER", "Server"),
             Setting::bool("DEBUG", "Debug"),
@@ -477,7 +477,10 @@ mod tests {
     #[test]
     fn a_recorded_declaration_survives_into_the_next_session() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("trollshell").join("plugin-settings-schema.toml");
+        let path = dir
+            .path()
+            .join("trollshell")
+            .join("plugin-settings-schema.toml");
 
         let mut first = Store::open(Some(path.clone()));
         first.record("vibectl", every_kind());
@@ -545,5 +548,32 @@ mod tests {
         // those sessions records nothing and writes nothing.
         let store: PluginRuntimeStore = Arc::new(Mutex::new(BTreeMap::new()));
         assert!(!is_production(&store));
+    }
+
+    /// `register` from a host that is not the production one leaves the
+    /// process-wide store unopened — which is also what keeps every session
+    /// test off the developer's real `$XDG_STATE_HOME`: opening it is the only
+    /// way anything here resolves that path.
+    ///
+    /// Red if `register` loses its production gate (it would spawn the record,
+    /// open the store over the real cache path and persist into it). Run that
+    /// mutation with `XDG_STATE_HOME` pointed at a scratch dir.
+    #[test]
+    fn register_from_a_test_host_leaves_the_real_store_alone() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: PluginRuntimeStore = Arc::new(Mutex::new(BTreeMap::new()));
+        runtime.block_on(async {
+            register(&store, "vibectl", &[Setting::text("SERVER", "Server")]);
+        });
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            STORE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "a test host's registration opened the production store"
+        );
     }
 }

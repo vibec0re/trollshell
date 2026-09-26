@@ -100,8 +100,11 @@ serde.workspace = true
 # `Cargo.lock` entry.
 serde_json.workspace = true
 # A oneshot to carry the Ping/Version reply from the tokio runtime back to the
-# GTK main thread. `sync` only — no runtime features (hytte-reactive owns it).
-tokio = { workspace = true, features = ["sync"] }
+# GTK main thread. No runtime features (hytte-reactive owns the runtime);
+# `time` since #1410, for the Settings group's restart, which waits for a
+# stopped plugin's unit to go down before starting it again. `hytte-reactive`
+# already builds tokio with it, so this names an edge the build had anyway.
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 # Workspace `tracing-subscriber` sets `default-features = false` (what
 # hytte-services' dev-dependency needs); widen back to the full default set

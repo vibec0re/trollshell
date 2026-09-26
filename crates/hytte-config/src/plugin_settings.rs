@@ -301,10 +301,8 @@ mod tests {
 
     #[test]
     fn scalars_become_environment_text() {
-        let all = parse(
-            "[p]\nS = \"x y\"\nI = -3\nF = 1.5\nB = true\nD = 2026-09-26T10:00:00Z\n",
-        )
-        .expect("parses");
+        let all = parse("[p]\nS = \"x y\"\nI = -3\nF = 1.5\nB = true\nD = 2026-09-26T10:00:00Z\n")
+            .expect("parses");
         let p = &all["p"];
         assert_eq!(p["S"], "x y");
         assert_eq!(p["I"], "-3");
@@ -315,9 +313,12 @@ mod tests {
 
     #[test]
     fn a_non_scalar_costs_only_its_own_key() {
-        let all = parse("stray = 1\n[p]\nA = [1, 2]\nT = { x = 1 }\nOK = \"kept\"\n")
-            .expect("parses");
-        assert!(!all.contains_key("stray"), "a top-level scalar is not a plugin");
+        let all =
+            parse("stray = 1\n[p]\nA = [1, 2]\nT = { x = 1 }\nOK = \"kept\"\n").expect("parses");
+        assert!(
+            !all.contains_key("stray"),
+            "a top-level scalar is not a plugin"
+        );
         assert_eq!(
             all["p"],
             Values::from([("OK".to_owned(), "kept".to_owned())])
@@ -359,7 +360,10 @@ mod tests {
     fn a_first_save_creates_the_plugins_table() {
         let out = apply("", "vibectl", &[set("V1BECTL_SCREENS", "/s.kdl")]).expect("ok");
         assert_eq!(out, "[vibectl]\nV1BECTL_SCREENS = \"/s.kdl\"\n");
-        assert_eq!(parse(&out).expect("parses")["vibectl"]["V1BECTL_SCREENS"], "/s.kdl");
+        assert_eq!(
+            parse(&out).expect("parses")["vibectl"]["V1BECTL_SCREENS"],
+            "/s.kdl"
+        );
     }
 
     #[test]
@@ -385,12 +389,8 @@ HAND_ADDED = \"x\"
     #[test]
     fn an_unchanged_value_keeps_its_spelling() {
         let before = "[pet]\nPET_NAME = 'nisse' # hi\nN = 0x10\n";
-        let after = apply(
-            before,
-            "pet",
-            &[set("PET_NAME", "nisse"), set("N", 16_i64)],
-        )
-        .expect("ok");
+        let after =
+            apply(before, "pet", &[set("PET_NAME", "nisse"), set("N", 16_i64)]).expect("ok");
         assert_eq!(after, before);
     }
 
@@ -402,7 +402,10 @@ HAND_ADDED = \"x\"
             &[set("STATS_PER_CORE", true), set("STATS_COLUMNS", 4_i64)],
         )
         .expect("ok");
-        assert_eq!(out, "[stats-bar]\nSTATS_PER_CORE = true\nSTATS_COLUMNS = 4\n");
+        assert_eq!(
+            out,
+            "[stats-bar]\nSTATS_PER_CORE = true\nSTATS_COLUMNS = 4\n"
+        );
     }
 
     #[test]
@@ -422,7 +425,10 @@ HAND_ADDED = \"x\"
     #[test]
     fn clearing_a_plugin_with_no_table_writes_nothing_new() {
         let before = "[other]\nX = \"1\"\n";
-        assert_eq!(apply(before, "p", &[unset("A"), set("B", "")]).expect("ok"), before);
+        assert_eq!(
+            apply(before, "p", &[unset("A"), set("B", "")]).expect("ok"),
+            before
+        );
     }
 
     #[test]
@@ -458,10 +464,16 @@ HAND_ADDED = \"x\"
         assert_eq!(all["vibectl"]["V1BECTL_DEBUG"], "true");
 
         // A no-op save does not rewrite the file.
-        let before = std::fs::metadata(&path).expect("stat").modified().expect("mtime");
+        let before = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
         std::thread::sleep(std::time::Duration::from_millis(20));
         save_at(&path, "vibectl", &[set("V1BECTL_SCREENS", "/s.kdl")]).expect("saved");
-        let after = std::fs::metadata(&path).expect("stat").modified().expect("mtime");
+        let after = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
         assert_eq!(before, after, "an unchanged save writes nothing");
     }
 }

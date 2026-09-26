@@ -4950,9 +4950,14 @@ mod tests {
         declared
             .plugins
             .insert("vibectl".to_owned(), spec("/bin/vibectl", true));
-        declared.plugins.insert("pet".to_owned(), spec("/bin/pet", true));
+        declared
+            .plugins
+            .insert("pet".to_owned(), spec("/bin/pet", true));
         let file = hytte_config::plugin_settings::AllValues::from([
-            ("vibectl".to_owned(), values(&[("V1BECTL_SCREENS", "/s.kdl")])),
+            (
+                "vibectl".to_owned(),
+                values(&[("V1BECTL_SCREENS", "/s.kdl")]),
+            ),
             ("ghost".to_owned(), values(&[("GHOST", "boo")])),
         ]);
         fold_settings(&mut declared, &file);
@@ -4976,7 +4981,10 @@ mod tests {
             }}"#,
         );
         let settings = sources.settings.clone().expect("scratch settings path");
-        assert!(settings.starts_with(dir.path()), "rail: never the real config");
+        assert!(
+            settings.starts_with(dir.path()),
+            "rail: never the real config"
+        );
         hytte_config::plugin_settings::save_at(
             &settings,
             "vibectl",
@@ -5007,7 +5015,10 @@ mod tests {
         s.settings = values(&[("V1BECTL_SCREENS", "/home/u/screens.kdl")]);
         let args = run_argv("vibectl", &s, &[], DEFAULT_TARGET);
         assert!(args.contains(&"--setenv=V1BECTL_SERVER=host:1".to_owned()));
-        assert!(args.contains(&"--setenv=V1BECTL_SCREENS".to_owned()), "{args:?}");
+        assert!(
+            args.contains(&"--setenv=V1BECTL_SCREENS".to_owned()),
+            "{args:?}"
+        );
         assert!(
             !args.iter().any(|a| a.contains("screens.kdl")),
             "a settings value never rides the argv: {args:?}"
@@ -5022,22 +5033,17 @@ mod tests {
         );
     }
 
-    /// A plugin with no settings digests exactly as before #1410 (no bounce on
-    /// upgrade); a value changes the digest (a reconcile relaunches it); and a
-    /// settings pair cannot digest like the same `env` pair.
+    /// A value changes the digest (a reconcile relaunches the plugin), and a
+    /// settings pair cannot digest like the same `env` pair. That a plugin
+    /// with **no** settings digests exactly as before #1410 — no bounce on
+    /// upgrade — is the literal `963338d3f7f67d63` the two fingerprint pins
+    /// above still hold to.
     #[test]
     fn the_fingerprint_covers_settings_only_when_there_are_any() {
         let plain = spec_env("/bin/vibectl", &[]);
         let mut with = plain.clone();
         with.settings = values(&[("A", "1")]);
         let as_env = spec_env("/bin/vibectl", &[("A", "1")]);
-        assert_eq!(
-            fp(&plain),
-            fp(&PluginSpec {
-                settings: BTreeMap::new(),
-                ..plain.clone()
-            })
-        );
         assert_ne!(fp(&with), fp(&plain));
         assert_ne!(fp(&with), fp(&as_env));
         let mut other = plain.clone();

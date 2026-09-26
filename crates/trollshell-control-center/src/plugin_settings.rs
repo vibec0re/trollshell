@@ -459,7 +459,8 @@ impl SettingsForm {
     pub(crate) fn save(&self) -> Result<(), String> {
         let Some(path) = self.inner.path.as_deref() else {
             return Err(
-                "Neither $XDG_CONFIG_HOME nor $HOME is set, so there is nowhere to save.".to_owned(),
+                "Neither $XDG_CONFIG_HOME nor $HOME is set, so there is nowhere to save."
+                    .to_owned(),
             );
         };
         let changes: Vec<(String, Option<toml_edit::Value>)> = self
@@ -589,14 +590,18 @@ impl SettingsForm {
                         connect_chooser(&row.widget, entry, chooser);
                     }
                 }
-                Editor::Switch { row: switch, reset, .. } => {
+                Editor::Switch {
+                    row: switch, reset, ..
+                } => {
                     switch.connect_active_notify(move |_| edited());
                     let with_form = with_form.clone();
                     reset.connect_clicked(move |_| {
                         with_form(&|form: &SettingsForm| form.unset(index));
                     });
                 }
-                Editor::Spin { row: spin, reset, .. } => {
+                Editor::Spin {
+                    row: spin, reset, ..
+                } => {
                     spin.connect_value_notify(move |_| edited());
                     let with_form = with_form.clone();
                     reset.connect_clicked(move |_| {
@@ -638,12 +643,16 @@ impl SettingsForm {
         }
         let row = &self.inner.rows[index];
         match &row.editor {
-            Editor::Switch { row: w, reset, own, .. } => {
+            Editor::Switch {
+                row: w, reset, own, ..
+            } => {
                 own.set(true);
                 reset.set_sensitive(true);
                 w.set_subtitle(&own_subtitle(&row.setting, true));
             }
-            Editor::Spin { row: w, reset, own, .. } => {
+            Editor::Spin {
+                row: w, reset, own, ..
+            } => {
                 own.set(true);
                 reset.set_sensitive(true);
                 w.set_subtitle(&own_subtitle(&row.setting, true));
@@ -909,7 +918,9 @@ mod tests {
 
     #[test]
     fn the_unset_subtitle_names_the_default() {
-        let s = Setting::bool("A", "A").doc("Does a thing.").default_value("true");
+        let s = Setting::bool("A", "A")
+            .doc("Does a thing.")
+            .default_value("true");
         assert_eq!(own_subtitle(&s, true), "Does a thing.");
         assert_eq!(
             own_subtitle(&s, false),
@@ -943,11 +954,7 @@ mod gtk_tests {
         Rc::new(|_: &str, _: &SettingsForm| {})
     }
 
-    fn form_at(
-        path: Option<PathBuf>,
-        nix: &[(&str, &str)],
-        on_saved: OnSaved,
-    ) -> SettingsForm {
+    fn form_at(path: Option<PathBuf>, nix: &[(&str, &str)], on_saved: OnSaved) -> SettingsForm {
         let nix: BTreeMap<String, String> = nix
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -979,13 +986,17 @@ mod gtk_tests {
                 (
                     "V1BECTL_SERVER".to_owned(),
                     RowView::Nix {
-                        subtitle: "Set in nix — programs.trollshell.plugins.vibectl.env.V1BECTL_SERVER"
-                            .to_owned(),
+                        subtitle:
+                            "Set in nix — programs.trollshell.plugins.vibectl.env.V1BECTL_SERVER"
+                                .to_owned(),
                         sensitive: false,
                     }
                 ),
                 ("V1BECTL_DEBUG".to_owned(), RowView::Switch),
-                ("V1BECTL_COLUMNS".to_owned(), RowView::Spin { min: 1, max: 8 }),
+                (
+                    "V1BECTL_COLUMNS".to_owned(),
+                    RowView::Spin { min: 1, max: 8 }
+                ),
                 (
                     "V1BECTL_THEME".to_owned(),
                     RowView::Combo {
@@ -1019,7 +1030,11 @@ V1BECTL_SERVER = \"stale\"
             let saved = saved.clone();
             Rc::new(move |id: &str, _: &SettingsForm| saved.borrow_mut().push(id.to_owned()))
         };
-        let form = form_at(Some(path.clone()), &[("V1BECTL_SERVER", "host:1")], on_saved);
+        let form = form_at(
+            Some(path.clone()),
+            &[("V1BECTL_SERVER", "host:1")],
+            on_saved,
+        );
         assert_eq!(form.buttons(), (false, false));
 
         form.type_into("V1BECTL_SCREENS", "/home/u/screens.kdl");
@@ -1065,7 +1080,11 @@ V1BECTL_THEME = \"light\"
         let path = dir.path().join("plugin-settings.toml");
         std::fs::write(&path, "[vibectl]\nV1BECTL_COLUMNS = 5\n").expect("seed");
         let form = form_at(Some(path.clone()), &[], no_op());
-        assert_eq!(form.buttons(), (false, false), "a loaded Int is not an edit");
+        assert_eq!(
+            form.buttons(),
+            (false, false),
+            "a loaded Int is not an edit"
+        );
         form.type_into("V1BECTL_SERVER", "typed, never saved");
         assert!(form.is_dirty());
         form.load();
@@ -1090,7 +1109,11 @@ V1BECTL_THEME = \"light\"
         let form = form_at(Some(path.clone()), &[], on_saved);
         form.type_into("V1BECTL_SERVER", "x");
         form.press_save();
-        assert!(form.status().contains("does not parse"), "{}", form.status());
+        assert!(
+            form.status().contains("does not parse"),
+            "{}",
+            form.status()
+        );
         assert!(!saved.get(), "no restart after a refused save");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "[vibectl\n");
     }

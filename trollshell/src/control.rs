@@ -350,8 +350,7 @@ impl ControlIface {
     /// plugin that declares none is absent. Every list is already sanitised
     /// (`plugins::settings`).
     async fn list_plugin_settings(&self) -> std::collections::HashMap<String, String> {
-        let schemas = match tokio::task::spawn_blocking(crate::plugins::settings::snapshot).await
-        {
+        let schemas = match tokio::task::spawn_blocking(crate::plugins::settings::snapshot).await {
             Ok(schemas) => schemas,
             Err(err) => {
                 tracing::warn!(%err, "ListPluginSettings: reading the settings store failed");

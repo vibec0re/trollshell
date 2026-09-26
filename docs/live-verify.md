@@ -6070,11 +6070,11 @@ Verified with the **pet**, which is the first plugin to declare settings
 Plugins tab first if it is off.
 
 - [ ] **The group appears.** Control center → Plugins → `pet`. Below Status
-      there is a **Settings** group with three rows: *Name* and *Persona* as
+      there is a **Settings** group with three rows: _Name_ and _Persona_ as
       entries whose placeholders read `nisse` and `playful, a little sassy`,
-      and *Kaomoji face* as a switch whose subtitle says the plugin's default
+      and _Kaomoji face_ as a switch whose subtitle says the plugin's default
       (`false`) applies. Select `timer`: no Settings group at all.
-- [ ] **Save restarts a running plugin.** Type a name into *Name*; Save and
+- [ ] **Save restarts a running plugin.** Type a name into _Name_; Save and
       Revert light up. Press Save. The status line under the rows reads
       "Saved. Restarting the plugin…", then "Saved, and the plugin restarted."
       `cat ~/.config/trollshell/plugin-settings.toml` shows `[pet]` with
@@ -6083,12 +6083,12 @@ Plugins tab first if it is off.
       `ps -o args= -C systemd-run` during a save (or the journal's
       `systemd-run` line) must **not** show the value — only
       `--setenv=PET_NAME`.
-- [ ] **The switch row unsets.** Flip *Kaomoji face* on and Save: the pet
+- [ ] **The switch row unsets.** Flip _Kaomoji face_ on and Save: the pet
       shows the text face after its restart. Press the row's undo button and
       Save: the key is gone from the file and the pixel cat is back.
 - [ ] **Nix wins, and says so.** Set
       `programs.trollshell.plugins.pet.env.PET_NAME = "nixcat";` and switch.
-      The *Name* row is greyed, shows `nixcat`, and reads "Set in nix —
+      The _Name_ row is greyed, shows `nixcat`, and reads "Set in nix —
       programs.trollshell.plugins.pet.env.PET_NAME". A `PET_NAME` still in
       `plugin-settings.toml` is ignored (the pet answers to `nixcat`).
 - [ ] **The form outlives the plugin.** Switch `pet` off and restart the

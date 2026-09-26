@@ -24,8 +24,7 @@
 
 use hytte_plugin_proto::manifest::{MAX_SETTING_ENV_BYTES, Setting, SettingKind};
 use hytte_plugin_proto::{
-    Capability, Manifest, Mount, PROTO_VERSION, StateKey, decode, decode_body, encode,
-    encode_body,
+    Capability, Manifest, Mount, PROTO_VERSION, StateKey, decode, decode_body, encode, encode_body,
 };
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -118,7 +117,10 @@ fn the_settings_fixture_is_pinned_both_ways() {
 fn regenerate_settings_fixture() {
     let hex = to_hex(&encode(&settings_manifest()));
     std::fs::write(fixture_path(), format!("{hex}\n")).expect("write fixture");
-    panic!("wrote {} — inspect the diff, then commit", fixture_path().display());
+    panic!(
+        "wrote {} — inspect the diff, then commit",
+        fixture_path().display()
+    );
 }
 
 // ── compat ──────────────────────────────────────────────────────────────────

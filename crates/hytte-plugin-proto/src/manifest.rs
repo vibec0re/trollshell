@@ -711,7 +711,9 @@ impl Setting {
             return Some("a session variable (XDG_*, PATH, HOME)");
         }
         if name.ends_with("_API_KEY") {
-            return Some("*_API_KEY is a keyring secret's name (#392); keys never go in a settings file");
+            return Some(
+                "*_API_KEY is a keyring secret's name (#392); keys never go in a settings file",
+            );
         }
         None
     }

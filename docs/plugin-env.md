@@ -66,7 +66,7 @@ non-obvious way.
 
 A plugin can **declare** the variables it reads, and the control-center's
 Plugins tab then shows a **Settings** group for it: an entry per text or path
-setting (with a *Choose…* button for a path), a switch, a number, or a
+setting (with a _Choose…_ button for a path), a switch, a number, or a
 drop-down. Nothing else about the plugin changes; it still reads its
 environment.
 
@@ -92,7 +92,7 @@ effect at once. Precedence for one variable:
    read-only, "Set in nix".
 2. `plugin-settings.toml`.
 3. The plugin's own default, when neither sets it. Clearing a field (or
-   choosing *Default*, or the reset button on a switch or number) is how you
+   choosing _Default_, or the reset button on a switch or number) is how you
    get back here.
 
 The launcher reads the file for every plugin it launches, before that plugin

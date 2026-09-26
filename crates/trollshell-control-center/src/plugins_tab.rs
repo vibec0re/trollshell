@@ -2494,35 +2494,37 @@ fn refresh_settings(state: &PluginsState, id: &str) {
 /// start, and says so.
 fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
     let weak = state.downgrade();
-    Rc::new(move |id: &str, form: &crate::plugin_settings::SettingsForm| {
-        let Some(state) = weak.upgrade() else {
-            return;
-        };
-        let running = state
-            .snapshot
-            .borrow()
-            .get(id)
-            .is_some_and(|snap| is_running(&snap.active_state));
-        if !running {
-            form.set_status("Saved. The plugin reads it the next time it starts.", false);
-            return;
-        }
-        form.set_status("Saved. Restarting the plugin…", false);
-        let form = form.clone();
-        let weak = state.downgrade();
-        spawn_on_runtime(restart_plugin(id.to_owned()), move |res| {
-            match res {
-                Ok(()) => form.set_status("Saved, and the plugin restarted.", false),
-                Err(err) => form.set_status(
-                    &format!("Saved, but restarting the plugin failed: {err}"),
-                    true,
-                ),
+    Rc::new(
+        move |id: &str, form: &crate::plugin_settings::SettingsForm| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let running = state
+                .snapshot
+                .borrow()
+                .get(id)
+                .is_some_and(|snap| is_running(&snap.active_state));
+            if !running {
+                form.set_status("Saved. The plugin reads it the next time it starts.", false);
+                return;
             }
-            if let Some(state) = weak.upgrade() {
-                refresh_plugins_soon(&state);
-            }
-        });
-    })
+            form.set_status("Saved. Restarting the plugin…", false);
+            let form = form.clone();
+            let weak = state.downgrade();
+            spawn_on_runtime(restart_plugin(id.to_owned()), move |res| {
+                match res {
+                    Ok(()) => form.set_status("Saved, and the plugin restarted.", false),
+                    Err(err) => form.set_status(
+                        &format!("Saved, but restarting the plugin failed: {err}"),
+                        true,
+                    ),
+                }
+                if let Some(state) = weak.upgrade() {
+                    refresh_plugins_soon(&state);
+                }
+            });
+        },
+    )
 }
 
 fn refresh_config(state: &PluginsState, id: &str) {
@@ -3278,13 +3280,43 @@ async fn list_plugin_settings() -> Result<HashMap<String, String>, hytte_bus::Bu
 /// own `StopPlugin` then `StartPlugin`, which for a declared plugin relaunches
 /// it through the launcher with `plugin-settings.toml` read afresh. A stop
 /// that finds the unit already gone is not a failure, as for the switch.
+///
+/// The two are **not** sent back to back. `StopPlugin` returns once systemd
+/// has queued the stop, and a transient unit's name is free only once the
+/// unit is actually down — `systemd-run` refuses to start a unit that is
+/// still stopping. So between them this waits, the way the launcher's own
+/// restart does ([`wait_until_stopped`]).
 async fn restart_plugin(id: String) -> Result<(), hytte_bus::BusError> {
     if let Err(err) = plugin_id_call("StopPlugin", &id).await
         && !already_stopped(&err)
     {
         return Err(err);
     }
+    wait_until_stopped(&id).await;
     plugin_id_call("StartPlugin", &id).await
+}
+
+/// Poll `ListPlugins` until `id` is no longer running (inactive, failed, or
+/// gone — a collected transient unit vanishes), for ~5 s at most: the
+/// launcher's `wait_until_stopped`, from this side of the bus. A listing
+/// error returns at once and leaves the `StartPlugin` to report whatever
+/// is wrong.
+async fn wait_until_stopped(id: &str) {
+    for _ in 0..25 {
+        match list_plugins().await {
+            Ok(units)
+                if !units
+                    .iter()
+                    .any(|(u, state, _)| u == id && is_running(state)) =>
+            {
+                return;
+            }
+            Err(_) => return,
+            Ok(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tracing::warn!(plugin = %id, "the plugin is still running after its stop; starting it anyway");
 }
 
 /// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
@@ -4454,7 +4486,10 @@ mod tests {
             ])
         );
         assert!(!file.env.contains_key("timer"));
-        assert_eq!(file.mounts["vibectl"], "BarLeft", "the #1161 read is unchanged");
+        assert_eq!(
+            file.mounts["vibectl"], "BarLeft",
+            "the #1161 read is unchanged"
+        );
     }
 }
 
@@ -6930,7 +6965,9 @@ mod gtk_tests {
             assert!(
                 form.group()
                     .ancestor(adw::PreferencesPage::static_type())
-                    .is_some_and(|page| page == state.detail.plugin_page.clone().upcast::<gtk::Widget>()),
+                    .is_some_and(
+                        |page| page == state.detail.plugin_page.clone().upcast::<gtk::Widget>()
+                    ),
                 "the group is on the plugin page"
             );
             form.type_into("V1BECTL_SCREENS", "/home/u/screens.kdl");

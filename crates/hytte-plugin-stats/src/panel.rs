@@ -22,8 +22,8 @@
 //!
 //! | native (`panels/stats.rs`) | here |
 //! | --- | --- |
-//! | `page_grid`, `CPU \| Memory` / `GPU \| Disks` | a horizontal [`Node::Box`] of two vertical column boxes — CPU over GPU, Memory over Disk; the wire has no grid, and two columns of independent height is what the grid draws once the Services row is gone |
-//! | `adw::PreferencesGroup` per card | a `boxed-list` [`Node::ListBox`] (not `dense`: the native rows keep libadwaita's row height) |
+//! | `page_grid`, `CPU \| Memory` / `GPU \| Disks` | a **homogeneous** horizontal [`Node::Box`] (the grid is column-homogeneous too) of two vertical column boxes — CPU over GPU, Memory over Disk; the wire has no grid, and two columns of independent height is what the grid draws once the Services row is gone |
+//! | `adw::PreferencesGroup` per card | a `boxed-list` [`Node::ListBox`] (not `dense`: the native rows keep libadwaita's row height), also classed `ts-page-card` so the shell's plugin-page flattening of `boxed-list` leaves this page's cards their card surface |
 //! | `AdwActionRow` / `slim_row` (title, subtitle, suffix) | a [`Node::Row`] classed `header`, so libadwaita's own `row > box.header` rule (12 px margins, 50 px rows) applies to it exactly as to `slim_row`'s box; title, then the subtitle as a `subtitle` label **on the same line** (a two-line title column cannot be vertically centred from the wire), a [`Node::Spacer`], then the suffix |
 //! | `build_history_row`'s `[name 80px \| Sparkline \| value 80px]` | a `ts-history-row` [`Node::Row`] of a `ts-stat-name` label, a [`Node::Sparkline`] — the **same** `hytte_ui::Sparkline` — and a `ts-stat-value` label; the 80 px columns are the `ts-stat-col` rule, since a node cannot call `set_size_request` |
 //! | memory / swap / per-mount `GtkProgressBar` (`ts-stat-progress`) | [`Node::Progress`] with the same class |
@@ -65,10 +65,15 @@
 //!
 //! # The page width
 //!
-//! The page does not choose it: the host mounts a plugin page in its own
-//! drawer frame. Two columns want the wide Stats clamp (#508 measured two
-//! columns inside 680 px squeezing to ~330 px each); that is the host's side
-//! of #1252, not this tree's.
+//! It is **this tree's content**, not the host's frame. The drawer sizes a
+//! plugin page to the page's own natural width, and a host clamp (#1412's
+//! `finish_page_clamped(…, DRAWER_MAX_WIDTH_WIDE)`) only *caps* it: libadwaita's
+//! clamp reports its child's natural width whenever that is under the cap, so
+//! a 1080 px cap never binds here (#1414 review, LOW 7: 736 px as mounted on
+//! main and 758 px inside #1412's frame with unequal columns; 882 px and
+//! 904 px once they are equal). What makes two columns read as two columns is
+//! therefore theirs to decide: the root box is homogeneous, so both columns
+//! take the wider one's width — which is also what sets the page's minimum.
 
 use std::collections::VecDeque;
 
@@ -106,6 +111,15 @@ const STAT_COL: &str = "ts-stat-col";
 
 /// The 88 px indent of the Disk I/O detail lines (`ts-stat-detail`).
 const STAT_DETAIL: &str = "ts-stat-detail";
+
+/// The class that opts a card back into libadwaita's card surface on a plugin
+/// page (`.ts-plugin-panel list.boxed-list.ts-page-card` in the shell's
+/// stylesheet), out-ranking the shell's page-wide `boxed-list` flattening.
+const PAGE_CARD: &str = "ts-page-card";
+
+/// The Disk card's expander hook (`ts-page-expander`): the shell stylesheet
+/// gives its header button a libadwaita row's 50 px height and 12 px inset.
+const PAGE_EXPANDER: &str = "ts-page-expander";
 
 /// The page's history lines, as plain samples — oldest first, each capped at
 /// [`HISTORY_LEN`].
@@ -243,36 +257,46 @@ pub fn panel(
     let columns = [("stats-panel-col-0", left), ("stats-panel-col-1", right)]
         .into_iter()
         .filter(|(_, cards)| !cards.is_empty())
-        .map(|(id, cards)| Node::Box {
-            id: Some(id.to_owned()),
-            dir: Dir::Vertical,
-            spacing: 12,
-            scroll: false,
-            classes: Vec::new(),
-            children: cards,
-            tooltip: None,
+        .map(|(id, cards)| {
+            nodes::container(Dir::Vertical, cards)
+                .id(id)
+                .spacing(12)
+                .build()
         })
         .collect();
 
-    Node::Box {
-        id: Some(ROOT_ID.to_owned()),
-        dir: Dir::Horizontal,
-        spacing: 12,
-        scroll: false,
-        // No `.card` and no `.ts-plugin-card`: the drawer supplies the page
-        // chrome, and a panel root that adds its own reads as a card in a card
-        // — the SDK's *Styling* docs, same rule the sidebar card follows.
-        classes: Vec::new(),
-        children: columns,
-        tooltip: None,
-    }
+    // No `.card` and no `.ts-plugin-card` on the root: the drawer supplies the
+    // page chrome, and a panel root that adds its own reads as a card in a
+    // card — the SDK's *Styling* docs, same rule the sidebar card follows.
+    //
+    // **Homogeneous**, as the native page's grid is: without it each column
+    // takes its own natural width and the spare is split equally on top, so
+    // the left column (short CPU/GPU rows) came out 289 px beside a 435 px
+    // right one and its history lines were 85 px thumbnails (#1414 review,
+    // MEDIUM 2). An older shell ignores the class and draws the unequal
+    // columns it always did.
+    nodes::container(Dir::Horizontal, columns)
+        .id(ROOT_ID)
+        .spacing(12)
+        .homogeneous(true)
+        .build()
 }
 
 /// One card: a `boxed-list` around its rows, the vocabulary's
 /// `adw::PreferencesGroup`. Not `dense` — the native cards keep libadwaita's
 /// row height, and so does this one.
+///
+/// [`PAGE_CARD`] as well as `boxed-list`: the shell flattens every
+/// `boxed-list` on a plugin page onto the drawer surface
+/// (`.ts-plugin-panel list.boxed-list`), which on this page erased the cards
+/// themselves (#1414 review, HIGH 1); the extra class is the page's opt back in
+/// to libadwaita's card look.
 fn boxed(id: &str, rows: Vec<Node>) -> Node {
-    nodes::list(rows).id(id).class("boxed-list").build()
+    nodes::list(rows)
+        .id(id)
+        .class("boxed-list")
+        .class(PAGE_CARD)
+        .build()
 }
 
 /// An `AdwActionRow`, on one line: the title, the subtitle beside it (smaller
@@ -559,7 +583,12 @@ fn disk_rows(snapshot: &Snapshot, history: &History, expanded: bool) -> Vec<Node
         ),
         children: mounts,
         expanded,
-        classes: Vec::new(),
+        // The header is the host's flat button, not a list row, so
+        // libadwaita's `row > box.header` rule (the 50 px, 12 px-inset row every
+        // other title row on the page gets) cannot reach it; `ts-page-expander`
+        // is the shell stylesheet's hook that gives it the same height and
+        // inset (#1414 review, nit — it measured 24 px).
+        classes: vec![PAGE_EXPANDER.to_owned()],
         tooltip: None,
     }];
 
@@ -657,7 +686,7 @@ mod tests {
     use crate::config::Card;
     use crate::sample::{Disk, DiskIo, Gpu, Memory, Snapshot};
     use hytte_plugin::display::testing::with_negotiated_vocab;
-    use hytte_plugin::proto::{Dir, Node, SPARKLINE_VOCAB};
+    use hytte_plugin::proto::{Dir, HOMOGENEOUS_CLASS, Node, SPARKLINE_VOCAB};
 
     /// A machine with something to say about every card.
     fn busy() -> Snapshot {
@@ -835,14 +864,22 @@ mod tests {
     /// `boxed-list`, the root a horizontal box of two vertical ones.
     ///
     /// **Falsified** by laying the cards out in one vertical column again (the
-    /// root-is-horizontal `let … else` panics), or by putting GPU beside CPU.
+    /// root-is-horizontal `let … else` panics), by putting GPU beside CPU, by
+    /// dropping `.homogeneous(true)` from the root (the columns take their own
+    /// widths again — #1414 review, MEDIUM 2), or by dropping `PAGE_CARD` from
+    /// `boxed` (the shell flattens the cards away — #1414 review, HIGH 1; the
+    /// shell side of that is `wire_map`'s render test).
     #[test]
     fn the_page_is_two_columns_of_boxed_list_cards() {
         let node = page(Card::bar_default(), &busy());
-        let Node::Box { id, .. } = &node else {
+        let Node::Box { id, classes, .. } = &node else {
             panic!("root is a box");
         };
         assert_eq!(id.as_deref(), Some(ROOT_ID));
+        assert!(
+            classes.iter().any(|c| c == HOMOGENEOUS_CLASS),
+            "the two columns are one width, like the native grid: {classes:?}",
+        );
         assert_eq!(
             layout(&node),
             vec![
@@ -862,6 +899,10 @@ mod tests {
         for n in nodes_of(&node) {
             if let Node::ListBox { classes, dense, .. } = n {
                 assert!(classes.iter().any(|c| c == "boxed-list"), "{classes:?}");
+                assert!(
+                    classes.iter().any(|c| c == "ts-page-card"),
+                    "each card opts back into its card surface: {classes:?}",
+                );
                 assert!(!dense, "native rows keep libadwaita's row height");
             }
         }
@@ -1231,9 +1272,50 @@ mod tests {
             "header",
             "subtitle",
             "boxed-list",
+            "ts-page-card",
+            "ts-page-expander",
+            HOMOGENEOUS_CLASS,
         ] {
             assert!(got.iter().any(|c| c == want), "{want} missing: {got:?}");
         }
+    }
+
+    /// **Each line carries its own reading** — not merely a reading of the
+    /// right length (#1414 review, MEDIUM 5). The bounded-and-withheld test
+    /// below counts samples; this one reads them, which is what kills a memory
+    /// line plotting swap, an inverted CPU line, a NaN temperature pushed as a
+    /// 0 °C dip, and a disk "min" that is really the running max.
+    ///
+    /// **Falsified** by each of: `fraction(m.swap_used, m.swap_total)` in the
+    /// memory arm, `1.0 - cpu` in the CPU arm, dropping the `is_finite` filter
+    /// on the GPU temperature, and `lo.max(v)` in `disk_io_range`.
+    #[test]
+    fn each_line_carries_its_own_reading() {
+        let mut h = History::default();
+        h.push(&busy());
+        assert_eq!(h.cpu.back().copied(), Some(0.42));
+        let memory = h.memory.back().copied().expect("a memory point");
+        assert!(
+            (memory - 11_999_999_000.0_f32 / 33_500_000_000.0).abs() < 1e-6,
+            "memory used over total, not swap: {memory}",
+        );
+        assert_eq!(h.gpu_load.back().copied(), Some(0.37));
+        assert_eq!(h.gpu_vram.back().copied(), Some(0.25));
+        assert_eq!(h.gpu_temp.back().copied(), Some(52.0));
+
+        let mut nan = busy();
+        nan.gpu.as_mut().expect("busy has a GPU").temperature_c = Some(f32::NAN);
+        h.push(&nan);
+        assert_eq!(h.gpu_temp.len(), 1, "a NaN temperature is not a sample");
+
+        let mut quiet = busy();
+        quiet
+            .disk_io
+            .as_mut()
+            .expect("busy reads disk I/O")
+            .read_bps = 0.0;
+        h.push(&quiet);
+        assert_eq!(h.disk_io_range(), (1_048_576.0, 3_145_728.0));
     }
 
     /// The history rings keep the native rows' sixty samples, and a withheld

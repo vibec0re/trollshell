@@ -1144,31 +1144,47 @@ mod render_tests {
     struct Styled(Vec<gtk::CssProvider>);
 
     impl Styled {
-        fn install() -> Self {
+        /// Install the library sheet, `shell_css` (the shell's own, already
+        /// read — see [`shell_sheet`]) at the priority the shell gives it, and
+        /// the test backdrop.
+        fn install(shell_css: &str) -> Self {
             let display = gdk::Display::default().expect("a display");
-            let root = env!("CARGO_MANIFEST_DIR");
-            let sheet = |path: &str, priority: u32| {
-                let provider = gtk::CssProvider::new();
-                provider.load_from_path(format!("{root}/../assets/{path}"));
-                gtk::style_context_add_provider_for_display(&display, &provider, priority);
-                provider
+            let add = |provider: &gtk::CssProvider, priority: u32| {
+                gtk::style_context_add_provider_for_display(&display, provider, priority);
             };
+            // The library sheet is in crane's source filter (`nix/package.nix`
+            // keeps `assets/hytte-ui/style.css` for `hytte-ui`'s compile-time
+            // fallback), so its source path is there in every sandbox.
+            let library = gtk::CssProvider::new();
+            library.load_from_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../assets/hytte-ui/style.css"
+            ));
+            add(&library, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+            let shell = gtk::CssProvider::new();
+            shell.load_from_string(shell_css);
+            add(&shell, gtk::STYLE_PROVIDER_PRIORITY_USER);
             let backdrop = gtk::CssProvider::new();
             backdrop.load_from_string(".t1252-backdrop { background: #101010; }");
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &backdrop,
-                gtk::STYLE_PROVIDER_PRIORITY_USER + 10,
-            );
-            Self(vec![
-                sheet(
-                    "hytte-ui/style.css",
-                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-                ),
-                sheet("trollshell/style.css", gtk::STYLE_PROVIDER_PRIORITY_USER),
-                backdrop,
-            ])
+            add(&backdrop, gtk::STYLE_PROVIDER_PRIORITY_USER + 10);
+            Self(vec![library, shell, backdrop])
         }
+    }
+
+    /// The shell's own stylesheet, read where the shell itself reads it —
+    /// [`crate::assets::path`]: `TROLLSHELL_DATA_DIR`, else the source tree —
+    /// or `None` when it is not there.
+    ///
+    /// It is **not** there in a `nix flake check` sandbox unless that check
+    /// points `TROLLSHELL_DATA_DIR` at the assets output: crane's source filter
+    /// deliberately keeps no `assets/trollshell/` (#133 keeps the stylesheet out
+    /// of the Rust compile), so the source-tree path this test first read from
+    /// did not exist in CI, `load_from_path` only logged a warning, and the
+    /// test measured libadwaita's cards instead of the shell's (PR #1414's CI
+    /// failure). Reading the text first is what turns "the sheet is missing"
+    /// into a decision this test makes, rather than a silently empty provider.
+    fn shell_sheet() -> Option<String> {
+        std::fs::read_to_string(crate::assets::path("style.css")).ok()
     }
 
     impl Drop for Styled {
@@ -1232,16 +1248,46 @@ mod render_tests {
     /// the flattening rule); the second is the promise that the fix did not
     /// change that rule for every other plugin page.
     ///
+    /// The plain list doubles as the **sentinel** that the shell's stylesheet
+    /// is in effect at all, and is asserted first: only that sheet flattens a
+    /// plugin page's `boxed-list`, so without it both lists wear libadwaita's
+    /// own card and the page-card assertion would pass vacuously.
+    ///
+    /// Where the sheet cannot be read the test **skips** with a line saying so,
+    /// unless `TROLLSHELL_REQUIRE_SHELL_CSS=1` — the `TROLLSHELL_REQUIRE_*`
+    /// convention — turns that into a failure; see [`shell_sheet`] for why a
+    /// `nix flake check` sandbox has no sheet unless the check provides one.
+    ///
     /// **Falsified** by deleting the
     /// `.ts-plugin-panel list.boxed-list.ts-page-card` rule from
-    /// `assets/trollshell/style.css` (the card pixel equals the page), or by
-    /// widening it to every `boxed-list` (the plain list's pixel stops
-    /// matching).
+    /// `assets/trollshell/style.css` (the card pixel equals the page), by
+    /// widening it to every `boxed-list` (the sentinel reds: the plain list is
+    /// painted), and by leaving the shell sheet out of [`Styled::install`] (the
+    /// sentinel reds with the exact pixels PR #1414's first CI run showed).
     #[gtk::test]
     fn a_page_card_paints_a_card_under_the_plugin_page_flattening() {
+        let required =
+            std::env::var_os("TROLLSHELL_REQUIRE_SHELL_CSS").is_some_and(|want| want == "1");
+        let Some(shell_css) = shell_sheet() else {
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_SHELL_CSS=1, but the shell stylesheet is not at {} \
+                 — point TROLLSHELL_DATA_DIR at the `trollshell-assets` output's \
+                 `share/trollshell`; the build that set the variable meant to check \
+                 the rendered cards for real, so skipping here is itself the bug",
+                crate::assets::path("style.css").display(),
+            );
+            eprintln!(
+                "SKIPPED: no shell stylesheet at {} (crane's source filter keeps no \
+                 `assets/trollshell/`; set TROLLSHELL_DATA_DIR) — run this in the \
+                 source tree to check the rendered cards for real",
+                crate::assets::path("style.css").display(),
+            );
+            return;
+        };
         adw::init().expect("libadwaita init");
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
-        let _styled = Styled::install();
+        let _styled = Styled::install(&shell_css);
 
         let tree = wire::Node::Box {
             id: None,
@@ -1322,14 +1368,23 @@ mod render_tests {
         let (card_px, plain_px) = (inside(&lists[0]), inside(&lists[1]));
         window.destroy();
 
+        // The sentinel, and it has to come first. The flattening rule exists
+        // ONLY in the shell's stylesheet, so a plain list painted flat is proof
+        // that sheet is in effect. Without it libadwaita's own `boxed-list`
+        // card paints BOTH lists, and the card assertion below would pass for
+        // the wrong reason — which is exactly how this test first failed in CI
+        // (`nix flake check`'s sandbox had no `assets/trollshell/style.css`).
+        assert!(
+            !differs(plain_px, page),
+            "the shell stylesheet is not in effect — a plain `boxed-list` on a \
+             plugin page must be flattened onto it by `.ts-plugin-panel \
+             list.boxed-list`, and it was painted as a card instead: list \
+             {plain_px:?} vs page {page:?}. Every pixel below would then be \
+             libadwaita's, not the shell's",
+        );
         assert!(
             differs(card_px, page),
             "a `ts-page-card` paints a card surface: card {card_px:?} vs page {page:?}",
-        );
-        assert!(
-            !differs(plain_px, page),
-            "a plain `boxed-list` on a plugin page is still flattened onto it: \
-             list {plain_px:?} vs page {page:?}",
         );
     }
 }

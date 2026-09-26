@@ -5,10 +5,14 @@
 //! The shell sanitises what a plugin declared and serves it as
 //! `Control.ListPluginSettings` (`id → JSON`, decoded by [`decode_schemas`]);
 //! the tab mounts one [`SettingsForm`] for the selected plugin when it
-//! declared anything, and none otherwise. The file itself is read and written
-//! here directly, through the same `hytte_config::plugin_settings` writer the
-//! shell's launcher reads with — the Places tab's #640 shape — so the form
-//! works while the shell is down and a save never goes through the bus.
+//! declared anything, and none otherwise. So the form needs the shell once,
+//! for the declaration. After that it keeps it: a poll that fails (a timeout,
+//! the shell restarting) leaves the form, and any edit in it, where it is and
+//! says the shell is not answering. The file itself is read and written here
+//! directly, through the same `hytte_config::plugin_settings` writer the
+//! shell's launcher reads with — the Places tab's #640 shape — so a Save works
+//! while the shell is unreachable; only the restart that follows it needs the
+//! shell.
 //!
 //! # One row per kind
 //!
@@ -29,15 +33,33 @@
 //! value and the option that sets it — the #1400/#1331 greying — because the
 //! launcher lets nix win and a value saved here would never arrive.
 //!
+//! # A value the row cannot show is left alone
+//!
+//! The file is hand-editable, and a plugin upgrade can rename an option or
+//! narrow a range, so it can hold a value a row cannot represent: a `Choice`
+//! value outside the options, an `Int` outside `min..=max` or not a whole
+//! number, a boolean spelled `yes`. Such a value is **kept exactly as it is**
+//! unless the user changes that row (#1415 review H1):
+//!
+//! - a `Choice` shows it as an extra item, "`value` (not an option)", which
+//!   saves as itself;
+//! - a switch or spin row shows the plugin's default and says in its subtitle
+//!   what the file holds;
+//! - and whatever the row shows, Save writes only the rows the user touched.
+//!
 //! # Save and Revert
 //!
 //! Nothing is written until **Save**, unlike `config_form`'s per-row
 //! autosave: a plugin reads its environment once, at start, so every save
 //! costs a restart, and a restart per keystroke would be worse than a button.
-//! Save writes only the rows it owns (never a nix-set one, never a key the
-//! plugin does not declare), then hands the id to the tab, which restarts the
-//! plugin if it is running. **Revert** re-reads the file. The file is not
-//! polled: a hand edit shows on the next Revert or selection.
+//! Save and Revert start disabled and light up only once a row differs from
+//! the file. Save writes only the rows the user changed — never a nix-set
+//! one, never a key the plugin does not declare, never an untouched row —
+//! refuses a value no environment can carry
+//! (`hytte_config::plugin_settings::value_refusal`), then hands the id to the
+//! tab, which asks the shell to restart the plugin if it is running.
+//! **Revert** re-reads the file. The file is not polled: a hand edit shows on
+//! the next Revert or selection.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -106,23 +128,38 @@ enum Editor {
     Switch {
         row: adw::SwitchRow,
         reset: gtk::Button,
-        own: Rc<Cell<bool>>,
+        own: Cell<bool>,
         default: bool,
     },
     /// `Int`. `own` as for [`Editor::Switch`].
     Spin {
         row: adw::SpinRow,
         reset: gtk::Button,
-        own: Rc<Cell<bool>>,
+        own: Cell<bool>,
         default: f64,
     },
-    /// `Choice`: index 0 is *Default* (unset), `options[i]` is index `i + 1`.
+    /// `Choice`: index 0 is *Default* (unset), `options[i]` is index `i + 1`,
+    /// and a value outside the options, when the file holds one, is one more
+    /// item after them (`foreign`).
     Combo {
         row: adw::ComboRow,
+        model: gtk::StringList,
         options: Vec<String>,
+        foreign: RefCell<Option<String>>,
     },
     /// Set in nix: shown, never written.
     Nix,
+}
+
+/// What a switch or spin row's subtitle says about its value.
+#[derive(Clone, Copy)]
+enum Held<'a> {
+    /// The row holds a value of its own.
+    Own,
+    /// Unset: the plugin's default applies.
+    Unset,
+    /// The file holds this, which the row cannot show.
+    Foreign(&'a str),
 }
 
 /// One setting's row.
@@ -131,6 +168,10 @@ struct Row {
     /// The row as the group holds it.
     widget: adw::PreferencesRow,
     editor: Editor,
+    /// Whether the user changed this row since the last load. Only a touched
+    /// row is saved, and only a touched row can make the form dirty — so a
+    /// value the row cannot show is never rewritten by a Save of another row.
+    touched: Cell<bool>,
 }
 
 /// A row as a test sees it — which kind of row it is and what it offers.
@@ -141,10 +182,13 @@ pub(crate) enum RowView {
         placeholder: Option<String>,
         chooser: Option<Chooser>,
     },
-    Switch,
+    Switch {
+        subtitle: String,
+    },
     Spin {
         min: i64,
         max: i64,
+        subtitle: String,
     },
     Combo {
         items: Vec<String>,
@@ -172,26 +216,31 @@ impl Row {
                 let value = row.value().round() as i64;
                 own.get().then(|| value.into())
             }
-            Editor::Combo { row, options } => {
-                let index = usize::try_from(row.selected()).ok()?;
-                index
-                    .checked_sub(1)
-                    .and_then(|i| options.get(i))
-                    .map(|s| toml_edit::Value::from(s.as_str()))
+            Editor::Combo {
+                row,
+                options,
+                foreign,
+                ..
+            } => {
+                let index = usize::try_from(row.selected()).ok()?.checked_sub(1)?;
+                options
+                    .get(index)
+                    .cloned()
+                    .or_else(|| (index == options.len()).then(|| foreign.borrow().clone())?)
+                    .map(toml_edit::Value::from)
             }
             Editor::Nix => None,
         }
     }
 
     /// Whether this row would save what the file holds, `loaded`, compared
-    /// the way the row reads it: a switch as a boolean (a hand-written `yes`
-    /// is the same as a saved `true`), a spin row as a number, anything else
-    /// as the text the plugin receives.
+    /// the way the row reads it: a switch as a boolean it can show, a spin
+    /// row as a number, anything else as the text the plugin receives.
     fn matches(&self, loaded: Option<&str>) -> bool {
         match (self.draft(), loaded) {
             (None, None) => true,
             (Some(draft), Some(loaded)) => match &self.editor {
-                Editor::Switch { .. } => draft.as_bool() == Some(parse_bool(loaded)),
+                Editor::Switch { .. } => draft.as_bool().is_some() && draft.as_bool() == strict_bool(loaded),
                 Editor::Spin { .. } => draft.as_integer() == loaded.trim().parse::<i64>().ok(),
                 _ => edit_text(&draft) == loaded,
             },
@@ -199,7 +248,9 @@ impl Row {
         }
     }
 
-    /// Show `value` (the file's text for this variable, or `None`).
+    /// Show `value` (the file's text for this variable, or `None`). A value
+    /// the row cannot represent is shown as such (see the module doc) rather
+    /// than coerced into one it can.
     fn show(&self, value: Option<&str>) {
         match &self.editor {
             Editor::Entry { entry, .. } => entry.set_text(value.unwrap_or_default()),
@@ -209,10 +260,11 @@ impl Row {
                 own,
                 default,
             } => {
-                own.set(value.is_some());
-                row.set_active(value.map_or(*default, parse_bool));
-                reset.set_sensitive(own.get());
-                row.set_subtitle(&own_subtitle(&self.setting, own.get()));
+                let parsed = value.and_then(strict_bool);
+                own.set(parsed.is_some());
+                row.set_active(parsed.unwrap_or(*default));
+                reset.set_sensitive(value.is_some());
+                row.set_subtitle(&held_subtitle(&self.setting, held(parsed.is_some(), value)));
             }
             Editor::Spin {
                 row,
@@ -220,18 +272,40 @@ impl Row {
                 own,
                 default,
             } => {
-                let parsed = value.and_then(|v| v.trim().parse::<i64>().ok());
+                let adj = row.adjustment();
+                #[allow(clippy::cast_precision_loss)]
+                let parsed = value
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|v| (adj.lower()..=adj.upper()).contains(&(*v as f64)));
                 own.set(parsed.is_some());
                 #[allow(clippy::cast_precision_loss)]
                 let shown = parsed.map_or(*default, |v| v as f64);
                 row.set_value(shown);
-                reset.set_sensitive(own.get());
-                row.set_subtitle(&own_subtitle(&self.setting, own.get()));
+                reset.set_sensitive(value.is_some());
+                row.set_subtitle(&held_subtitle(&self.setting, held(parsed.is_some(), value)));
             }
-            Editor::Combo { row, options } => {
-                let index = value
-                    .and_then(|v| options.iter().position(|o| o == v))
-                    .map_or(0, |i| i + 1);
+            Editor::Combo {
+                row,
+                model,
+                options,
+                foreign,
+            } => {
+                let base = u32::try_from(options.len() + 1).unwrap_or(u32::MAX);
+                if model.n_items() > base {
+                    model.splice(base, model.n_items() - base, &[]);
+                }
+                let position = value.map(|v| (v, options.iter().position(|o| o == v)));
+                let index = match position {
+                    None => 0,
+                    Some((_, Some(i))) => i + 1,
+                    Some((v, None)) => {
+                        model.append(&format!("{v} (not an option)"));
+                        options.len() + 1
+                    }
+                };
+                *foreign.borrow_mut() = value
+                    .filter(|v| !options.iter().any(|o| o == v))
+                    .map(str::to_owned);
                 row.set_selected(u32::try_from(index).unwrap_or(0));
             }
             Editor::Nix => {}
@@ -245,23 +319,23 @@ impl Row {
                 placeholder: entry.placeholder_text().map(Into::into),
                 chooser: *chooser,
             },
-            Editor::Switch { .. } => RowView::Switch,
+            Editor::Switch { row, .. } => RowView::Switch {
+                subtitle: row.subtitle().map(Into::into).unwrap_or_default(),
+            },
             Editor::Spin { row, .. } => {
                 let adj = row.adjustment();
                 #[allow(clippy::cast_possible_truncation)]
                 let (min, max) = (adj.lower() as i64, adj.upper() as i64);
-                RowView::Spin { min, max }
+                RowView::Spin {
+                    min,
+                    max,
+                    subtitle: row.subtitle().map(Into::into).unwrap_or_default(),
+                }
             }
-            Editor::Combo { row, .. } => RowView::Combo {
-                items: row
-                    .model()
-                    .and_downcast::<gtk::StringList>()
-                    .map(|m| {
-                        (0..m.n_items())
-                            .filter_map(|i| m.string(i).map(Into::into))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+            Editor::Combo { model, .. } => RowView::Combo {
+                items: (0..model.n_items())
+                    .filter_map(|i| model.string(i).map(Into::into))
+                    .collect(),
             },
             Editor::Nix => {
                 let row = self
@@ -277,28 +351,47 @@ impl Row {
     }
 }
 
-/// `"true"`, `"1"`, `"yes"` or `"on"`, any case, is on; anything else is off.
-fn parse_bool(text: &str) -> bool {
-    matches!(
-        text.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "on"
-    )
+/// A switch's value from the file, **only** in a spelling this form writes
+/// or plainly means the same: `true`/`false`/`1`/`0`, any case. Anything else
+/// — `yes`, `on` — is `None`: the plugin's own parser may read it either way
+/// (the pet reads only `1`/`true`), so the row does not guess and does not
+/// rewrite it.
+fn strict_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// What a switch or spin row holds, from whether it could read `value`.
+fn held(readable: bool, value: Option<&str>) -> Held<'_> {
+    match value {
+        Some(_) if readable => Held::Own,
+        Some(raw) => Held::Foreign(raw),
+        None => Held::Unset,
+    }
 }
 
 /// A switch or spin row's subtitle: the setting's doc, plus a line saying the
-/// plugin's default applies while the row holds no value of its own.
-fn own_subtitle(setting: &Setting, own: bool) -> String {
-    if own {
-        return setting.doc.clone();
-    }
-    let unset = match &setting.default {
-        Some(default) => format!("Not set: the plugin's default ({default}) applies."),
-        None => "Not set: the plugin's default applies.".to_owned(),
+/// plugin's default applies while the row holds no value, or what the file
+/// holds when the row cannot show it.
+fn held_subtitle(setting: &Setting, held: Held<'_>) -> String {
+    let note = match held {
+        Held::Own => return setting.doc.clone(),
+        Held::Unset => match &setting.default {
+            Some(default) => format!("Not set: the plugin's default ({default}) applies."),
+            None => "Not set: the plugin's default applies.".to_owned(),
+        },
+        Held::Foreign(raw) => format!(
+            "The file holds \u{201c}{raw}\u{201d}, which this row cannot show; \
+             it is kept unless you change the row."
+        ),
     };
     if setting.doc.is_empty() {
-        unset
+        note
     } else {
-        format!("{}\n{unset}", setting.doc)
+        format!("{}\n{note}", setting.doc)
     }
 }
 
@@ -327,6 +420,8 @@ struct Inner {
     save: gtk::Button,
     revert: gtk::Button,
     status: gtk::Label,
+    /// Shown while the shell is not answering `ListPluginSettings`.
+    offline: gtk::Label,
     /// Set while [`SettingsForm::load`] drives the widgets, so their change
     /// handlers do not read that as an edit.
     loading: Cell<bool>,
@@ -348,7 +443,8 @@ impl SettingsForm {
     /// The group for plugin `id`'s declared `schema`, over the settings file
     /// at `path` (`None` when there is no config directory: the form shows,
     /// and Save says why it cannot). `nix` is the plugin's nix `env`; a
-    /// declared variable in it is read-only.
+    /// declared variable in it is read-only. A setting of a kind this build
+    /// does not know gets no row.
     pub(crate) fn build(
         id: &str,
         schema: &[Setting],
@@ -359,8 +455,8 @@ impl SettingsForm {
         let group = adw::PreferencesGroup::builder()
             .title("Settings")
             .description(
-                "Declared by the plugin, saved to ~/.config/trollshell/plugin-settings.toml. \
-                 A running plugin restarts to pick them up.",
+                "Declared by the plugin, and saved to plugin-settings.toml in your trollshell \
+                 config directory. A running plugin restarts to pick them up.",
             )
             .build();
 
@@ -375,6 +471,9 @@ impl SettingsForm {
             .sensitive(false)
             .build();
         save.add_css_class("suggested-action");
+        if let Some(path) = &path {
+            save.set_tooltip_text(Some(&format!("Writes {}", path.display())));
+        }
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         buttons.append(&revert);
         buttons.append(&save);
@@ -382,21 +481,21 @@ impl SettingsForm {
 
         let rows: Vec<Row> = schema
             .iter()
-            .map(|setting| build_row(id, setting, nix.get(&setting.env)))
+            .filter_map(|setting| build_row(id, setting, nix.get(&setting.env)))
             .collect();
         for row in &rows {
             group.add(&row.widget);
         }
 
         // Below the rows: `AdwPreferencesGroup` renders a child that is not a
-        // list row after its list, which is where a save's outcome belongs.
-        let status = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .visible(false)
-            .margin_top(6)
-            .build();
-        status.add_css_class("dim-label");
+        // list row after its list, which is where these notes belong.
+        let offline = note_label();
+        offline.set_text(
+            "The shell is not answering. This is the last form it sent; Save still \
+             writes the file, and the plugin picks it up when it next starts.",
+        );
+        group.add(&offline);
+        let status = note_label();
         group.add(&status);
 
         let form = Self {
@@ -409,6 +508,7 @@ impl SettingsForm {
                 save,
                 revert,
                 status,
+                offline,
                 loading: Cell::new(false),
             }),
         };
@@ -423,7 +523,7 @@ impl SettingsForm {
     }
 
     /// Re-read this plugin's table from the file and show it; the form is
-    /// clean afterwards.
+    /// clean afterwards and no row counts as touched.
     pub(crate) fn load(&self) {
         let values = self
             .inner
@@ -435,27 +535,29 @@ impl SettingsForm {
         self.inner.loading.set(true);
         for row in &self.inner.rows {
             row.show(values.get(&row.setting.env).map(String::as_str));
+            row.touched.set(false);
         }
         self.inner.loading.set(false);
         *self.inner.loaded.borrow_mut() = values;
         self.refresh_buttons();
     }
 
-    /// Whether any row's value differs from what the file held at the last
-    /// load.
+    /// Whether any row the user touched differs from what the file held at
+    /// the last load. An untouched row never counts, whatever it shows.
     pub(crate) fn is_dirty(&self) -> bool {
         let loaded = self.inner.loaded.borrow();
         self.inner
             .rows
             .iter()
-            .filter(|row| !matches!(row.editor, Editor::Nix))
+            .filter(|row| row.touched.get() && !matches!(row.editor, Editor::Nix))
             .any(|row| !row.matches(loaded.get(&row.setting.env).map(String::as_str)))
     }
 
-    /// Write every row this form owns to the file, then re-read it.
+    /// Write the rows the user touched to the file, then re-read it.
     ///
     /// # Errors
-    /// The writer's refusal, rendered for the status line; nothing is written.
+    /// A value no environment can carry, or the writer's refusal, rendered for
+    /// the status line; nothing is written.
     pub(crate) fn save(&self) -> Result<(), String> {
         let Some(path) = self.inner.path.as_deref() else {
             return Err(
@@ -463,13 +565,24 @@ impl SettingsForm {
                     .to_owned(),
             );
         };
-        let changes: Vec<(String, Option<toml_edit::Value>)> = self
-            .inner
-            .rows
-            .iter()
-            .filter(|row| !matches!(row.editor, Editor::Nix))
-            .map(|row| (row.setting.env.clone(), row.draft()))
-            .collect();
+        let mut changes: Vec<(String, Option<toml_edit::Value>)> = Vec::new();
+        for row in &self.inner.rows {
+            if !row.touched.get() || matches!(row.editor, Editor::Nix) {
+                continue;
+            }
+            let draft = row.draft();
+            if let Some(reason) = draft
+                .as_ref()
+                .and_then(toml_edit::Value::as_str)
+                .and_then(plugin_settings::value_refusal)
+            {
+                return Err(format!(
+                    "{} was not saved: {reason}. Nothing was written.",
+                    row.setting.label
+                ));
+            }
+            changes.push((row.setting.env.clone(), draft));
+        }
         plugin_settings::save_at(path, &self.inner.id, &changes).map_err(|e| e.to_string())?;
         self.load();
         Ok(())
@@ -487,6 +600,13 @@ impl SettingsForm {
             status.remove_css_class("error");
             status.add_css_class("dim-label");
         }
+    }
+
+    /// Say, under the rows, whether the shell answered the last
+    /// `ListPluginSettings` (#1415 review M1). The form itself stays as it is
+    /// either way.
+    pub(crate) fn set_shell_reachable(&self, reachable: bool) {
+        self.inner.offline.set_visible(!reachable);
     }
 
     /// Each row's view, in order, keyed by variable.
@@ -527,6 +647,15 @@ impl SettingsForm {
         row.set_selected(index);
     }
 
+    /// Press the reset button of the switch or spin row for `env`.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(crate) fn reset(&self, env: &str) {
+        match &self.row(env).editor {
+            Editor::Switch { reset, .. } | Editor::Spin { reset, .. } => reset.emit_clicked(),
+            _ => panic!("{env} has no reset button"),
+        }
+    }
+
     /// Whether Save and Revert are offered.
     #[cfg(all(test, feature = "system-tests"))]
     pub(crate) fn buttons(&self) -> (bool, bool) {
@@ -546,6 +675,12 @@ impl SettingsForm {
     #[cfg(all(test, feature = "system-tests"))]
     pub(crate) fn status(&self) -> String {
         self.inner.status.text().into()
+    }
+
+    /// Whether the "shell is not answering" note is up.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(crate) fn says_offline(&self) -> bool {
+        self.inner.offline.is_visible()
     }
 
     #[cfg(all(test, feature = "system-tests"))]
@@ -635,40 +770,57 @@ impl SettingsForm {
         });
     }
 
-    /// Row `index` was edited by hand: a switch or spin row now holds a value
-    /// of its own.
+    /// Row `index` was edited by hand: it is touched, and a switch or spin
+    /// row now holds a value of its own.
     fn edited(&self, index: usize) {
         if self.inner.loading.get() {
             return;
         }
         let row = &self.inner.rows[index];
+        row.touched.set(true);
         match &row.editor {
             Editor::Switch {
                 row: w, reset, own, ..
             } => {
                 own.set(true);
                 reset.set_sensitive(true);
-                w.set_subtitle(&own_subtitle(&row.setting, true));
+                w.set_subtitle(&held_subtitle(&row.setting, Held::Own));
             }
             Editor::Spin {
                 row: w, reset, own, ..
             } => {
                 own.set(true);
                 reset.set_sensitive(true);
-                w.set_subtitle(&own_subtitle(&row.setting, true));
+                w.set_subtitle(&held_subtitle(&row.setting, Held::Own));
             }
             _ => {}
         }
         self.refresh_buttons();
     }
 
-    /// Row `index`'s reset button: back to unset, showing the default.
+    /// Row `index`'s reset button: back to unset, showing the default. That
+    /// is a change like any other, so the row is touched and a Save removes
+    /// the key — the one way to clear a value the row cannot show.
     fn unset(&self, index: usize) {
+        let row = &self.inner.rows[index];
         self.inner.loading.set(true);
-        self.inner.rows[index].show(None);
+        row.show(None);
         self.inner.loading.set(false);
+        row.touched.set(true);
         self.refresh_buttons();
     }
+}
+
+/// A dim, wrapping line under the rows, hidden until it has something to say.
+fn note_label() -> gtk::Label {
+    let label = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .margin_top(6)
+        .build();
+    label.add_css_class("dim-label");
+    label
 }
 
 /// The environment text a saved value becomes — what
@@ -685,28 +837,38 @@ fn edit_text(value: &toml_edit::Value) -> String {
 }
 
 /// Build one setting's row; `nix` is the value nix sets for it, if any.
-fn build_row(id: &str, setting: &Setting, nix: Option<&String>) -> Row {
+/// `None` for a kind this build does not know, which gets no row.
+fn build_row(id: &str, setting: &Setting, nix: Option<&String>) -> Option<Row> {
     let (widget, editor) = match (nix, &setting.kind) {
+        (_, SettingKind::Unknown(_)) => return None,
         (Some(value), _) => (nix_row(id, setting, value), Editor::Nix),
         (None, SettingKind::Text | SettingKind::Path { .. }) => entry_row(setting),
         (None, SettingKind::Bool) => switch_row(setting),
         (None, SettingKind::Int { min, max }) => spin_row(setting, *min, *max),
         (None, SettingKind::Choice { options }) => choice_row(setting, options),
     };
-    Row {
+    Some(Row {
         setting: setting.clone(),
         widget,
         editor,
-    }
+        touched: Cell::new(false),
+    })
+}
+
+/// Make `row` show its title and subtitle as plain text, **before** either is
+/// set: `AdwPreferencesRow:use-markup` defaults to on, so a title set first
+/// is parsed as Pango markup once (#1415 review L5) — a plugin-declared `&`
+/// or `<` would log a warning each time the row is built.
+fn plain_text(row: &impl IsA<adw::PreferencesRow>, title: &str) {
+    row.set_use_markup(false);
+    row.set_title(title);
 }
 
 /// A row nix sets: its value, greyed, and the option that sets it.
 fn nix_row(id: &str, setting: &Setting, value: &str) -> adw::PreferencesRow {
-    let row = adw::ActionRow::builder()
-        .title(setting.label.as_str())
-        .use_markup(false)
-        .subtitle(nix_subtitle(id, &setting.env))
-        .build();
+    let row = adw::ActionRow::new();
+    plain_text(&row, &setting.label);
+    row.set_subtitle(&nix_subtitle(id, &setting.env));
     let shown = gtk::Label::builder()
         .label(value)
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
@@ -721,11 +883,9 @@ fn nix_row(id: &str, setting: &Setting, value: &str) -> adw::PreferencesRow {
 
 /// A `Text` or `Path` row: an entry with the default as its placeholder.
 fn entry_row(setting: &Setting) -> (adw::PreferencesRow, Editor) {
-    let row = adw::ActionRow::builder()
-        .title(setting.label.as_str())
-        .use_markup(false)
-        .subtitle(setting.doc.as_str())
-        .build();
+    let row = adw::ActionRow::new();
+    plain_text(&row, &setting.label);
+    row.set_subtitle(&setting.doc);
     let entry = gtk::Entry::builder()
         .valign(gtk::Align::Center)
         .hexpand(true)
@@ -741,17 +901,15 @@ fn entry_row(setting: &Setting) -> (adw::PreferencesRow, Editor) {
 
 /// A `Bool` row: a switch, plus the reset that unsets it.
 fn switch_row(setting: &Setting) -> (adw::PreferencesRow, Editor) {
-    let row = adw::SwitchRow::builder()
-        .title(setting.label.as_str())
-        .use_markup(false)
-        .build();
+    let row = adw::SwitchRow::new();
+    plain_text(&row, &setting.label);
     let reset = reset_widget();
     row.add_suffix(&reset);
     let editor = Editor::Switch {
         row: row.clone(),
         reset,
-        own: Rc::new(Cell::new(false)),
-        default: setting.default.as_deref().is_some_and(parse_bool),
+        own: Cell::new(false),
+        default: setting.default.as_deref().and_then(strict_bool).unwrap_or(false),
     };
     (row.upcast(), editor)
 }
@@ -763,8 +921,7 @@ fn spin_row(setting: &Setting, min: i64, max: i64) -> (adw::PreferencesRow, Edit
     #[allow(clippy::cast_precision_loss)]
     let (lo, hi) = (min as f64, max as f64);
     let row = adw::SpinRow::with_range(lo, hi, 1.0);
-    row.set_title(&setting.label);
-    row.set_use_markup(false);
+    plain_text(&row, &setting.label);
     row.set_digits(0);
     let reset = reset_widget();
     row.add_suffix(&reset);
@@ -777,26 +934,32 @@ fn spin_row(setting: &Setting, min: i64, max: i64) -> (adw::PreferencesRow, Edit
     let editor = Editor::Spin {
         row: row.clone(),
         reset,
-        own: Rc::new(Cell::new(false)),
+        own: Cell::new(false),
         default,
     };
     (row.upcast(), editor)
 }
 
-/// A `Choice` row: *Default* first, then the options.
+/// A `Choice` row: *Default* first, then the options (and, while the file
+/// holds a value outside them, that value — see [`Row::show`]).
 fn choice_row(setting: &Setting, options: &[String]) -> (adw::PreferencesRow, Editor) {
     let first = match &setting.default {
         Some(default) => format!("Default ({default})"),
         None => "Default".to_owned(),
     };
-    let mut items: Vec<&str> = vec![first.as_str()];
-    items.extend(options.iter().map(String::as_str));
-    let (row, _model) = crate::config_form::combo_row(&setting.label, &items, None);
-    row.set_use_markup(false);
+    let model = gtk::StringList::new(&[first.as_str()]);
+    for option in options {
+        model.append(option);
+    }
+    let row = adw::ComboRow::new();
+    plain_text(&row, &setting.label);
     row.set_subtitle(&setting.doc);
+    row.set_model(Some(&model));
     let editor = Editor::Combo {
         row: row.clone(),
+        model,
         options: options.to_vec(),
+        foreign: RefCell::new(None),
     };
     (row.upcast(), editor)
 }
@@ -899,13 +1062,20 @@ mod tests {
         assert_eq!(chooser_for(&SettingKind::Text), None);
     }
 
+    /// #1415 review H1: a switch reads only the spellings it would write back
+    /// meaning the same thing. `yes`/`on` are not guessed at — the pet reads
+    /// only `1`/`true`, so showing `yes` as on and saving `true` would change
+    /// what the plugin does.
     #[test]
-    fn booleans_read_the_way_people_write_them() {
-        for on in ["true", "TRUE", "1", "yes", "On", " true "] {
-            assert!(parse_bool(on), "{on}");
+    fn a_switch_reads_only_what_it_would_write() {
+        for on in ["true", "TRUE", "1", " true "] {
+            assert_eq!(strict_bool(on), Some(true), "{on}");
         }
-        for off in ["false", "0", "no", "off", "", "maybe"] {
-            assert!(!parse_bool(off), "{off}");
+        for off in ["false", "False", "0"] {
+            assert_eq!(strict_bool(off), Some(false), "{off}");
+        }
+        for foreign in ["yes", "On", "no", "off", "", "maybe"] {
+            assert_eq!(strict_bool(foreign), None, "{foreign}");
         }
     }
 
@@ -921,14 +1091,19 @@ mod tests {
         let s = Setting::bool("A", "A")
             .doc("Does a thing.")
             .default_value("true");
-        assert_eq!(own_subtitle(&s, true), "Does a thing.");
+        assert_eq!(held_subtitle(&s, Held::Own), "Does a thing.");
         assert_eq!(
-            own_subtitle(&s, false),
+            held_subtitle(&s, Held::Unset),
             "Does a thing.\nNot set: the plugin's default (true) applies."
         );
         assert_eq!(
-            own_subtitle(&Setting::int("N", "N", 0, 9), false),
+            held_subtitle(&Setting::int("N", "N", 0, 9), Held::Unset),
             "Not set: the plugin's default applies."
+        );
+        assert_eq!(
+            held_subtitle(&Setting::int("N", "N", 0, 9), Held::Foreign("12")),
+            "The file holds \u{201c}12\u{201d}, which this row cannot show; it is kept unless \
+             you change the row."
         );
     }
 }
@@ -992,10 +1167,19 @@ mod gtk_tests {
                         sensitive: false,
                     }
                 ),
-                ("V1BECTL_DEBUG".to_owned(), RowView::Switch),
+                (
+                    "V1BECTL_DEBUG".to_owned(),
+                    RowView::Switch {
+                        subtitle: "Not set: the plugin's default applies.".to_owned()
+                    }
+                ),
                 (
                     "V1BECTL_COLUMNS".to_owned(),
-                    RowView::Spin { min: 1, max: 8 }
+                    RowView::Spin {
+                        min: 1,
+                        max: 8,
+                        subtitle: "Not set: the plugin's default (3) applies.".to_owned()
+                    }
                 ),
                 (
                     "V1BECTL_THEME".to_owned(),
@@ -1116,5 +1300,135 @@ V1BECTL_THEME = \"light\"
         );
         assert!(!saved.get(), "no restart after a refused save");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "[vibectl\n");
+    }
+
+    /// #1415 review H1 (the reviewer's killing test, adapted): values a row
+    /// cannot show — a `Choice` value outside the options, an `Int` outside
+    /// `min..=max`, a boolean spelled `yes` — open the form **clean** and
+    /// survive a Save of an unrelated row byte for byte.
+    ///
+    /// Red before the fix: the form opened dirty, and the save deleted the
+    /// theme, clamped the columns to 8 and rewrote `yes` as `true`.
+    #[gtk::test]
+    fn unrepresentable_values_survive_an_unrelated_save() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        let before = "[vibectl]\nV1BECTL_THEME = \"solarized\"\nV1BECTL_COLUMNS = 12\nV1BECTL_DEBUG = \"yes\"\n";
+        std::fs::write(&path, before).expect("seed");
+        let form = form_at(Some(path.clone()), &[], no_op());
+        assert_eq!(form.buttons(), (false, false), "the form opens dirty");
+        form.type_into("V1BECTL_SERVER", "h:1");
+        assert_eq!(form.buttons(), (true, true));
+        form.press_save();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            format!("{before}V1BECTL_SERVER = \"h:1\"\n"),
+            "only the touched row was written"
+        );
+    }
+
+    /// The same values are **shown** for what they are, not coerced: the
+    /// combo carries the foreign value as its own item and has it selected,
+    /// and the switch and spin rows say what the file holds.
+    #[gtk::test]
+    fn a_value_the_row_cannot_show_is_shown_as_such() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        std::fs::write(
+            &path,
+            "[vibectl]\nV1BECTL_THEME = \"solarized\"\nV1BECTL_COLUMNS = 3.5\nV1BECTL_DEBUG = \"yes\"\n",
+        )
+        .expect("seed");
+        let form = form_at(Some(path), &[], no_op());
+        let rows: HashMap<String, RowView> = form.rows().into_iter().collect();
+        assert_eq!(
+            rows["V1BECTL_THEME"],
+            RowView::Combo {
+                items: vec![
+                    "Default (dark)".into(),
+                    "dark".into(),
+                    "light".into(),
+                    "solarized (not an option)".into()
+                ]
+            }
+        );
+        let RowView::Spin { subtitle, .. } = &rows["V1BECTL_COLUMNS"] else {
+            panic!("a spin row");
+        };
+        assert!(subtitle.contains("\u{201c}3.5\u{201d}"), "{subtitle}");
+        let RowView::Switch { subtitle } = &rows["V1BECTL_DEBUG"] else {
+            panic!("a switch row");
+        };
+        assert!(subtitle.contains("\u{201c}yes\u{201d}"), "{subtitle}");
+
+        // Picking another option and then the foreign one again is no
+        // change at all.
+        form.select("V1BECTL_THEME", 1);
+        assert!(form.is_dirty());
+        form.select("V1BECTL_THEME", 3);
+        assert!(!form.is_dirty(), "the foreign item saves as itself");
+    }
+
+    /// The reset button is how a value the row cannot show is cleared: it
+    /// touches the row, and Save removes the key.
+    #[gtk::test]
+    fn reset_removes_a_value_the_row_cannot_show() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        std::fs::write(&path, "[vibectl]\nV1BECTL_COLUMNS = 12\nOTHER = \"x\"\n").expect("seed");
+        let form = form_at(Some(path.clone()), &[], no_op());
+        form.reset("V1BECTL_COLUMNS");
+        assert_eq!(form.buttons(), (true, true));
+        form.press_save();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "[vibectl]\nOTHER = \"x\"\n"
+        );
+    }
+
+    /// #1415 review M3, on this side: a value no environment can carry is
+    /// refused before anything is written, naming the row.
+    #[gtk::test]
+    fn a_value_no_environment_can_carry_is_refused_before_writing() {
+        adw::init().expect("libadwaita init");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings.toml");
+        let saved = Rc::new(Cell::new(false));
+        let on_saved: OnSaved = {
+            let saved = saved.clone();
+            Rc::new(move |_: &str, _: &SettingsForm| saved.set(true))
+        };
+        let form = form_at(Some(path.clone()), &[], on_saved);
+        form.type_into("V1BECTL_SCREENS", "/ok");
+        form.type_into(
+            "V1BECTL_SERVER",
+            &"x".repeat(plugin_settings::MAX_VALUE_BYTES + 1),
+        );
+        form.press_save();
+        assert!(
+            form.status().starts_with("Server address was not saved"),
+            "{}",
+            form.status()
+        );
+        assert!(!saved.get(), "no restart after a refused save");
+        assert!(!path.exists(), "nothing was written, not even the good row");
+    }
+
+    /// #1415 review M1, the form's half: the "shell is not answering" note
+    /// comes and goes without touching the rows.
+    #[gtk::test]
+    fn the_offline_note_comes_and_goes() {
+        adw::init().expect("libadwaita init");
+        let form = form_at(None, &[], no_op());
+        assert!(!form.says_offline());
+        form.type_into("V1BECTL_SERVER", "typed");
+        form.set_shell_reachable(false);
+        assert!(form.says_offline());
+        assert!(form.is_dirty(), "the edit is untouched");
+        form.set_shell_reachable(true);
+        assert!(!form.says_offline());
     }
 }

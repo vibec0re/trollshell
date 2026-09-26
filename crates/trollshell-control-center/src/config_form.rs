@@ -1776,7 +1776,7 @@ const CUSTOM_COLOUR: &str = "custom (#rrggbb)";
 /// The model is handed back beside the row because `AdwComboRow` does not give
 /// it back in the type we need it in (`model()` answers a `gio::ListModel`),
 /// and [`Control::Combo`] appends to and truncates it per refresh.
-pub(crate) fn combo_row(
+fn combo_row(
     title: &str,
     options: &[&str],
     extra: Option<&str>,

@@ -699,8 +699,11 @@ struct RetainedNode {
 /// cover every line the node can carry rather than the first one it was
 /// built from. 1024 is the wire's own cap (`MAX_SPARKLINE_SAMPLES` in
 /// `hytte-plugin-proto`, which this crate does not link — the shell's mapping
-/// seam asserts the two agree at compile time), and it costs 8 KiB of ring per
-/// widget. A longer `values` keeps its newest samples, the ring's own rule.
+/// seam asserts the two agree at compile time). It is a **bound, not an
+/// allocation**: the ring grows to the samples it is actually handed (60 on the
+/// stats page), so a tree of empty lines costs no ring memory at all (#1414
+/// review, LOW 8). A longer `values` keeps its newest samples, the ring's own
+/// rule.
 pub const SPARKLINE_CAPACITY: usize = 1024;
 
 /// A [`Node::Sparkline`]'s retained pieces (see [`RetainedNode::sparkline`]).
@@ -1045,6 +1048,31 @@ fn list_row_of(child: &gtk::Widget) -> Option<gtk::ListBoxRow> {
 /// `install_default_css` loads the library sheet at.
 pub const DENSE_ROW_CLASS: &str = "hytte-dense-row";
 
+/// The class that makes a [`Node::Box`] or [`Node::Row`] **homogeneous** —
+/// `gtk_box_set_homogeneous(true)`, every child the same size along the box's
+/// axis (#1252).
+///
+/// The reconciler reads it off the node's own `classes` at build and at every
+/// in-place update, so adding or removing it re-lays the existing box out
+/// rather than rebuilding it. It is also applied as an ordinary CSS class, which
+/// no stylesheet styles.
+///
+/// A class rather than a node field for the reason the wire vocabulary's
+/// `HOMOGENEOUS_CLASS` gives (the same string, held equal by a test at the
+/// shell's mapping seam, since this crate does not link the proto): a field on
+/// `Box`/`Row` would be additive on the wire but a breaking change for every
+/// struct literal that builds one, in this tree and outside it. The motivating
+/// consumer is `hytte-plugin-stats`' two-column drawer page, whose columns
+/// otherwise take their own natural widths — measured 289 px against 435 px —
+/// where the native Stats page's grid is column-homogeneous.
+pub const HOMOGENEOUS_CLASS: &str = "hytte-homogeneous";
+
+/// Whether a box's `classes` ask for [`HOMOGENEOUS_CLASS`] — the one reading
+/// both the build and the update arms share, so they cannot disagree.
+fn wants_homogeneous(classes: &[String]) -> bool {
+    classes.iter().any(|c| c == HOMOGENEOUS_CLASS)
+}
+
 /// Mark (or unmark) every auto-created `GtkListBoxRow` wrapper in `list` for the
 /// dense rule (#966).
 ///
@@ -1095,6 +1123,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let boxw = gtk::Box::new(orientation(*dir), *spacing);
             apply_classes(&boxw, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             // Scroll behaviour is driven purely by `scroll`; `id` (if any)
             // is only along for the ride as the fired event's target.
             if *scroll {
@@ -1111,6 +1140,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let boxw = gtk::Box::new(gtk::Orientation::Horizontal, *spacing);
             apply_classes(&boxw, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             let kids = build_children(&Container::Box(boxw.clone()), children, on_event);
             (boxw.upcast(), kids)
         }
@@ -1252,6 +1282,14 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let bar = gtk::ProgressBar::new();
             bar.set_fraction(*fraction);
+            // Centred on the cross axis, as every native `ts-stat-progress` is
+            // (`panels/stats.rs`' `bar.set_valign(gtk::Align::Center)`). Under
+            // the default FILL a bar in a row taller than itself — a 50 px
+            // libadwaita row header — is allocated the whole height and draws
+            // its trough along the top edge (#1414 review, MEDIUM 3). In a
+            // vertical box, which hands a child exactly its natural height,
+            // this changes nothing.
+            bar.set_valign(gtk::Align::Center);
             apply_classes(&bar, classes);
             (bar.upcast(), Vec::new())
         }
@@ -1491,6 +1529,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             boxw.set_orientation(orientation(*dir));
             boxw.set_spacing(*spacing);
             reconcile_classes(boxw, &retained.desc.classes, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             // `scroll` is a plain mutable property (like `classes`), not
             // part of this node's identity, so a flip attaches/detaches the
             // controller in place rather than forcing a subtree rebuild.
@@ -1521,6 +1560,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             let boxw = downcast::<gtk::Box>(&retained.widget);
             boxw.set_spacing(*spacing);
             reconcile_classes(boxw, &retained.desc.classes, classes);
+            boxw.set_homogeneous(wants_homogeneous(classes));
             diff_children(
                 &Container::Box(boxw.clone()),
                 &mut retained.children,
@@ -3332,6 +3372,184 @@ mod gtk_tests {
         assert_eq!(kept.len(), super::SPARKLINE_CAPACITY);
         assert_eq!(kept.first().copied(), Some(5.0), "the oldest five went");
         assert_eq!(kept.last(), over.last(), "the newest stayed");
+    }
+
+    /// **A warm line moves at a constant length** — the only shape a page ever
+    /// sends once its ring is full: sixty samples, then sixty again one tick
+    /// later, every one shifted by one. Every other test here changes the
+    /// length between renders, so an update gated on the *count* alone passed
+    /// them all and froze every line a minute after the page opened (#1414
+    /// review, MEDIUM 4).
+    ///
+    /// **Falsified** by `if self.values.len() != values.len()` in
+    /// `SparklineState::update`.
+    #[gtk::test]
+    fn a_full_window_that_moved_reaches_the_ring() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(
+            Some("cpu"),
+            vec![0.1, 0.2, 0.3],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        rec.render(&spark(
+            Some("cpu"),
+            vec![0.2, 0.3, 0.4],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        assert_eq!(root_spark(&rec).samples_for_test(), vec![0.2, 0.3, 0.4]);
+    }
+
+    // ── Homogeneous boxes and centred bars (#1252) ─────────────────────────
+
+    fn classed_box(dir: Dir, classes: &[&str], children: Vec<Node>) -> Node {
+        Node::Box {
+            id: Some("cols".to_owned()),
+            dir,
+            spacing: 12,
+            scroll: false,
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            children,
+            tooltip: None,
+        }
+    }
+
+    fn classed_row(classes: &[&str], children: Vec<Node>) -> Node {
+        Node::Row {
+            id: Some("row".to_owned()),
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            spacing: 6,
+            children,
+            tooltip: None,
+        }
+    }
+
+    /// [`HOMOGENEOUS_CLASS`](super::HOMOGENEOUS_CLASS) makes a `Box` and a
+    /// `Row` homogeneous at build, and flipping it on a same-id re-render
+    /// re-lays the **same** box out in both directions.
+    ///
+    /// **Falsified** by dropping `set_homogeneous` from either the build arm
+    /// or the update arm of `Box` (or of `Row`).
+    #[gtk::test]
+    fn the_homogeneous_class_applies_at_build_and_in_place() {
+        let h = super::HOMOGENEOUS_CLASS;
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        rec.render(&classed_box(Dir::Horizontal, &[h], vec![lbl(None, "a")]));
+        let boxw = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::Box>().ok())
+            .expect("a box");
+        assert!(boxw.is_homogeneous(), "built homogeneous");
+
+        rec.render(&classed_box(Dir::Horizontal, &[], vec![lbl(None, "a")]));
+        assert_eq!(root.first_child().as_ref(), Some(boxw.upcast_ref()));
+        assert!(!boxw.is_homogeneous(), "cleared in place");
+
+        rec.render(&classed_box(
+            Dir::Horizontal,
+            &["x", h],
+            vec![lbl(None, "a")],
+        ));
+        assert_eq!(root.first_child().as_ref(), Some(boxw.upcast_ref()));
+        assert!(boxw.is_homogeneous(), "set in place");
+
+        let root = self::root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&classed_row(&[h], vec![lbl(None, "a")]));
+        let row = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::Box>().ok())
+            .expect("a row's box");
+        assert!(row.is_homogeneous(), "a Row honours it at build");
+        rec.render(&classed_row(&[], vec![lbl(None, "a")]));
+        assert!(!row.is_homogeneous(), "and in place");
+        rec.render(&classed_row(&[h], vec![lbl(None, "a")]));
+        assert!(row.is_homogeneous());
+    }
+
+    /// The point of the class, measured: two columns of very different natural
+    /// widths come out the **same** width once the box is homogeneous, and do
+    /// not without it — the stats page's 289 px against 435 px (#1414 review,
+    /// MEDIUM 2).
+    #[gtk::test]
+    fn a_homogeneous_box_gives_its_columns_equal_widths() {
+        let columns = |classes: &[&str]| {
+            classed_box(
+                Dir::Horizontal,
+                classes,
+                vec![
+                    lbl(Some("narrow"), "a"),
+                    lbl(Some("wide"), "a much, much wider column of text"),
+                ],
+            )
+        };
+        let widths = |classes: &[&str]| {
+            let root = root();
+            let mut rec = Reconciler::new(&root, |_, _| {});
+            rec.render(&columns(classes));
+            let window = gtk::Window::new();
+            window.set_child(Some(&root));
+            window.present();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let boxw = root.first_child().expect("the box");
+            while boxw.last_child().is_some_and(|w| w.width() == 0) && Instant::now() < deadline {
+                glib::MainContext::default().iteration(true);
+            }
+            let kids = children(&boxw);
+            let w = (kids[0].width(), kids[1].width());
+            window.destroy();
+            w
+        };
+        let (a, b) = widths(&[]);
+        assert!(a < b, "precondition: natural widths differ ({a} vs {b})");
+        let (a, b) = widths(&[super::HOMOGENEOUS_CLASS]);
+        assert_eq!(a, b, "a homogeneous box splits its width equally");
+    }
+
+    /// A `Progress` is centred on the cross axis, like the native page's bars:
+    /// in a row taller than the bar it gets its own height, centred, rather
+    /// than the whole row with its trough drawn along the top (#1414 review,
+    /// MEDIUM 3).
+    ///
+    /// **Falsified** by dropping `bar.set_valign(gtk::Align::Center)` from the
+    /// `Progress` build arm.
+    #[gtk::test]
+    fn a_progress_bar_is_centred_in_a_taller_row() {
+        let tall = gtk::Label::new(Some("tall"));
+        tall.set_size_request(-1, 50);
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&Node::Progress {
+            id: None,
+            fraction: 0.5,
+            classes: vec![],
+        });
+        root.append(&tall);
+        let bar = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::ProgressBar>().ok())
+            .expect("a progress bar");
+        assert_eq!(bar.valign(), gtk::Align::Center);
+
+        let window = gtk::Window::new();
+        window.set_child(Some(&root));
+        window.present();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bar.height() == 0 && Instant::now() < deadline {
+            glib::MainContext::default().iteration(true);
+        }
+        let row_height = root.height();
+        assert!(row_height >= 50, "the row is as tall as its tallest child");
+        assert!(
+            bar.height() < row_height,
+            "the bar keeps its own height ({}) inside a {row_height} px row",
+            bar.height(),
+        );
+        window.destroy();
     }
 
     #[gtk::test]

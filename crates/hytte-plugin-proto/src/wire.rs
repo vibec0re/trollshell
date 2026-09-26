@@ -1257,6 +1257,36 @@ pub const SHADER_VOCAB: u16 = 3;
 /// what it rendered before #966.
 pub const SCROLLED_VOCAB: u16 = 4;
 
+/// The CSS class that makes a [`Node::Box`] or [`Node::Row`] **homogeneous**:
+/// every child the same size along the box's axis (`gtk_box_set_homogeneous`)
+/// — #1252.
+///
+/// Put it in the node's `classes` like any other class; the host reads it off
+/// them at build and on every in-place update, so adding or dropping it
+/// re-lays the existing box out rather than rebuilding it. The motivating case
+/// is a two-column page: without it each column takes its own natural width and
+/// the extra is split equally on top, so a column of short rows beside a
+/// column of long ones comes out 289 px against 435 px (measured on
+/// `hytte-plugin-stats`' drawer page, #1414 review), where the native page it
+/// mirrors lays the two out on a homogeneous grid. The SDK spells it
+/// `nodes::container(..).homogeneous(true)` / `nodes::row(..).homogeneous(true)`.
+///
+/// # Why a class and not a `homogeneous: bool` field
+///
+/// On the **wire** the two are equally additive: a `#[serde(default)]` field
+/// kept off the wire when `false` would be skipped by an older decoder exactly
+/// as an unknown class is ignored by an older stylesheet, neither moves
+/// [`VOCAB`](crate::VOCAB), and every committed fixture stays byte-identical
+/// either way. The difference is in **Rust**: `Node::Box` and `Node::Row` are
+/// struct variants, and a new field is a compile error at every struct literal
+/// that builds one — in this workspace, dozens of them across every bundled
+/// plugin and the shell's own tests, and in every out-of-tree plugin built on
+/// the SDK. #966 paid that once for `Row::spacing`; a class buys the same
+/// layout switch for none of it. An older shell simply ignores the class and
+/// renders the columns at their natural widths, which is exactly what it
+/// rendered before.
+pub const HOMOGENEOUS_CLASS: &str = "hytte-homogeneous";
+
 /// The [`VOCAB`](crate::VOCAB) generation that carries the flat trend line
 /// ([`Node::Sparkline`]) — #1252.
 ///

@@ -5,13 +5,13 @@
 use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentChoices, ConsentDecision, DEFAULT_SLIDER_MAX,
     DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
-    Effect, EffectOutcome, EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel,
-    MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES, Manifest,
-    MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg,
-    PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB,
-    SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL,
-    decode, decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
-    sane_sparkline_max, sane_sparkline_sample,
+    Effect, EffectOutcome, EventKind, HOMOGENEOUS_CLASS, HostMsg, LedStripConfig, LedStripState,
+    LogLevel, MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES,
+    Manifest, MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page,
+    PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB,
+    SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB,
+    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, sane_fraction,
+    sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1052,6 +1052,55 @@ fn the_clamp_reaches_a_sparkline_inside_a_card() {
     .clamped();
     assert_node_floats_are_sane(&card);
     assert_eq!(card.clone().clamped(), card);
+}
+
+// ── Homogeneous boxes (#1252) ────────────────────────────────────────────────
+
+/// The homogeneous switch is a **class**, so it rides the wire as nothing but
+/// one more string in `classes`: a box carrying it round-trips, and a decoder
+/// that knows only the pre-#1252 `Box` fields — and refuses any other key —
+/// still decodes it. That is the "additive, no `VOCAB` bump, fixtures
+/// byte-identical" claim, stated against a decoder rather than asserted.
+///
+/// The literal is pinned too: host and plugin must spell it identically, and a
+/// test derived from the constant cannot see the constant change (#1026).
+///
+/// **Falsified** by carrying the switch as a `homogeneous` field instead (the
+/// strict old decoder refuses the unknown key).
+#[test]
+fn the_homogeneous_switch_is_a_class_and_adds_no_key() {
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum NodeOld {
+        Box {
+            id: Option<String>,
+            dir: Dir,
+            spacing: i32,
+            scroll: bool,
+            classes: Vec<String>,
+            children: Vec<serde::de::IgnoredAny>,
+        },
+    }
+
+    assert_eq!(HOMOGENEOUS_CLASS, "hytte-homogeneous");
+    let columns = Node::Box {
+        id: Some("stats-panel".into()),
+        dir: Dir::Horizontal,
+        spacing: 12,
+        scroll: false,
+        classes: vec![HOMOGENEOUS_CLASS.into()],
+        children: vec![],
+        tooltip: None,
+    };
+    let body = encode_body(&columns);
+    assert_eq!(decode_body::<Node>(&body).expect("round-trips"), columns);
+    assert!(contains(&body, HOMOGENEOUS_CLASS.as_bytes()));
+    let old = decode_body::<NodeOld>(&body).expect("a pre-#1252 decoder sees no new key");
+    assert!(
+        matches!(&old, NodeOld::Box { classes, .. } if classes == &[HOMOGENEOUS_CLASS.to_owned()]),
+        "{old:?}",
+    );
 }
 
 // ── Slider node + ValueChanged event (#315) ──────────────────────────────────

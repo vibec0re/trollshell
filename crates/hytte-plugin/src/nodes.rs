@@ -19,6 +19,10 @@
 //!   the shell's own flat history line, negotiated on [`SPARKLINE_VOCAB`]: it
 //!   degrades to a [`Node::Progress`] at the newest sample's level against a
 //!   shell that cannot draw one.
+//! - [`container`] builds a [`Node::Box`], and it and [`row`] carry
+//!   `.homogeneous(true)` (#1252): equal-size children, spelt as the
+//!   [`HOMOGENEOUS_CLASS`] the host reads rather than as a field every struct
+//!   literal would have had to grow.
 //!
 //! ```ignore
 //! use hytte_plugin::nodes;
@@ -58,7 +62,37 @@
 //! .build()
 //! ```
 
-use hytte_plugin_proto::{Cls, Node, NodeId, SCROLLED_VOCAB, SPARKLINE_VOCAB};
+use hytte_plugin_proto::{
+    Cls, Dir, HOMOGENEOUS_CLASS, Node, NodeId, SCROLLED_VOCAB, SPARKLINE_VOCAB,
+};
+
+/// Add [`HOMOGENEOUS_CLASS`] to `classes` (once) or take it out — the one
+/// spelling [`Container::homogeneous`] and [`Row::homogeneous`] share.
+fn set_homogeneous(classes: &mut Vec<Cls>, on: bool) {
+    classes.retain(|c| c != HOMOGENEOUS_CLASS);
+    if on {
+        classes.push(HOMOGENEOUS_CLASS.to_owned());
+    }
+}
+
+/// Start a [`Node::Box`] laid out along `dir` with `children`.
+///
+/// Defaults: no id, no classes, `spacing: 0`, not a scroll target, no tooltip,
+/// not homogeneous. The builder exists for [`Container::homogeneous`] (#1252):
+/// a literal can spell every other field, but "make the columns equal" is a
+/// class the host reads, and the builder is where that spelling lives.
+#[must_use]
+pub fn container(dir: Dir, children: Vec<Node>) -> Container {
+    Container {
+        id: None,
+        dir,
+        spacing: 0,
+        scroll: false,
+        classes: Vec::new(),
+        children,
+        tooltip: None,
+    }
+}
 
 /// Start a [`Node::Row`] — a horizontal list row — with `children`.
 ///
@@ -167,6 +201,15 @@ impl Row {
         self
     }
 
+    /// Give every child the same width (#1252) — see
+    /// [`HOMOGENEOUS_CLASS`] for what the host does with it and why it is a
+    /// class. An older shell ignores it and lays the row out as before.
+    #[must_use]
+    pub fn homogeneous(mut self, on: bool) -> Self {
+        set_homogeneous(&mut self.classes, on);
+        self
+    }
+
     /// Finish the node.
     #[must_use]
     pub fn build(self) -> Node {
@@ -174,6 +217,80 @@ impl Row {
             id: self.id,
             classes: self.classes,
             spacing: self.spacing,
+            children: self.children,
+            tooltip: self.tooltip,
+        }
+    }
+}
+
+/// Builder for [`Node::Box`]; see [`container`].
+#[derive(Clone, Debug)]
+pub struct Container {
+    id: Option<NodeId>,
+    dir: Dir,
+    spacing: i32,
+    scroll: bool,
+    classes: Vec<Cls>,
+    children: Vec<Node>,
+    tooltip: Option<String>,
+}
+
+impl Container {
+    /// Set the diff/reorder key.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<NodeId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Set the inter-child gap in pixels.
+    #[must_use]
+    pub fn spacing(mut self, px: i32) -> Self {
+        self.spacing = px;
+        self
+    }
+
+    /// Make the box a scroll **event target** — not a viewport; see
+    /// [`Node::Box`]'s `scroll` and [`scrolled`] for the difference.
+    #[must_use]
+    pub fn scroll(mut self, on: bool) -> Self {
+        self.scroll = on;
+        self
+    }
+
+    /// Set the box's hover text — plain text, never markup.
+    #[must_use]
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+
+    /// Append one CSS class.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<Cls>) -> Self {
+        self.classes.push(class.into());
+        self
+    }
+
+    /// Give every child the same size along the box's axis (#1252) — two
+    /// columns of a page the same width, say, whatever their contents. See
+    /// [`HOMOGENEOUS_CLASS`] for what the host does with it and why it is a
+    /// class; an older shell ignores it and lays the box out as before.
+    #[must_use]
+    pub fn homogeneous(mut self, on: bool) -> Self {
+        set_homogeneous(&mut self.classes, on);
+        self
+    }
+
+    /// Finish the node.
+    #[must_use]
+    pub fn build(self) -> Node {
+        Node::Box {
+            id: self.id,
+            dir: self.dir,
+            spacing: self.spacing,
+            scroll: self.scroll,
+            classes: self.classes,
             children: self.children,
             tooltip: self.tooltip,
         }
@@ -445,8 +562,10 @@ pub fn host_speaks_sparkline() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_speaks_scrolled, host_speaks_sparkline, list, row, scrolled, sparkline};
-    use hytte_plugin_proto::{Node, SCROLLED_VOCAB, SPARKLINE_VOCAB};
+    use super::{
+        container, host_speaks_scrolled, host_speaks_sparkline, list, row, scrolled, sparkline,
+    };
+    use hytte_plugin_proto::{Dir, HOMOGENEOUS_CLASS, Node, SCROLLED_VOCAB, SPARKLINE_VOCAB};
 
     fn label(text: &str) -> Node {
         Node::Label {
@@ -569,6 +688,65 @@ mod tests {
     }
 
     #[test]
+    fn container_defaults_are_a_plain_box() {
+        assert_eq!(
+            container(Dir::Vertical, vec![label("a")]).build(),
+            Node::Box {
+                id: None,
+                dir: Dir::Vertical,
+                spacing: 0,
+                scroll: false,
+                classes: vec![],
+                children: vec![label("a")],
+                tooltip: None,
+            },
+        );
+    }
+
+    /// `.homogeneous(true)` adds the host's class once, `.homogeneous(false)`
+    /// takes it back out, and neither disturbs a class the plugin set itself —
+    /// on a `Box` and on a `Row` alike.
+    ///
+    /// **Falsified** by `set_homogeneous` pushing without the `retain` (the
+    /// class appears twice), or by making `false` a no-op.
+    #[test]
+    fn homogeneous_is_the_hosts_class_set_once_and_cleared() {
+        let classes = |node: Node| match node {
+            Node::Box { classes, .. } | Node::Row { classes, .. } => classes,
+            other => panic!("{other:?}"),
+        };
+        let h = HOMOGENEOUS_CLASS.to_owned();
+        assert_eq!(
+            classes(
+                container(Dir::Horizontal, vec![])
+                    .class("ts-cols")
+                    .homogeneous(true)
+                    .homogeneous(true)
+                    .build()
+            ),
+            vec!["ts-cols".to_owned(), h.clone()],
+        );
+        assert_eq!(
+            classes(
+                container(Dir::Horizontal, vec![])
+                    .homogeneous(true)
+                    .class("ts-cols")
+                    .homogeneous(false)
+                    .build()
+            ),
+            vec!["ts-cols".to_owned()],
+        );
+        assert_eq!(
+            classes(row(vec![]).homogeneous(true).build()),
+            vec![h.clone()]
+        );
+        assert_eq!(
+            classes(row(vec![]).homogeneous(true).homogeneous(false).build()),
+            Vec::<String>::new(),
+        );
+    }
+
+    #[test]
     fn sparkline_defaults_auto_scale_with_no_id_or_classes() {
         assert_eq!(
             sparkline(vec![0.5, 1.5]).build_unnegotiated(),
@@ -652,6 +830,9 @@ mod tests {
         };
         // Auto-scaled: 2 of a peak of 8 is a quarter.
         assert!((fraction(sparkline(vec![8.0, 4.0, 2.0]).build()) - 0.25).abs() < 1e-9);
+        // …and the peak is the largest sample, not the first one (#1414
+        // review, LOW 6 — `[8, 4, 2]` alone cannot tell the two apart).
+        assert!((fraction(sparkline(vec![2.0, 8.0, 4.0]).build()) - 0.5).abs() < 1e-9);
         // Fixed top: 50 of 100.
         assert!((fraction(sparkline(vec![10.0, 50.0]).max(100.0).build()) - 0.5).abs() < 1e-9);
         // Over the top pins full, a negative pins empty — the line's own pin.

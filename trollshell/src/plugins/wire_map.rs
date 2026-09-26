@@ -1083,4 +1083,253 @@ mod tests {
             "a NaN top auto-scales, as the drawing code would"
         );
     }
+
+    /// The wire's homogeneous class and the reconciler's are one string — the
+    /// plugin writes the first, the host reads the second, and neither crate
+    /// links the other's constant (#1252).
+    ///
+    /// **Falsified** by changing either literal.
+    #[test]
+    fn the_homogeneous_class_is_one_string_on_both_sides() {
+        assert_eq!(
+            wire::HOMOGENEOUS_CLASS,
+            hytte::ui::widget_tree::HOMOGENEOUS_CLASS
+        );
+        // …and the mapping hands it through like any other class.
+        let mapped = to_ui_node(
+            &Scope::detached("t1252-homogeneous"),
+            Grants::none(),
+            &wire::Node::Box {
+                id: None,
+                dir: wire::Dir::Horizontal,
+                spacing: 12,
+                scroll: false,
+                classes: vec![wire::HOMOGENEOUS_CLASS.into()],
+                children: vec![],
+                tooltip: None,
+            },
+        );
+        assert!(
+            matches!(&mapped, UiNode::Box { classes, .. }
+                if classes == &[hytte::ui::widget_tree::HOMOGENEOUS_CLASS.to_owned()]),
+            "{mapped:?}",
+        );
+    }
+}
+
+/// The #1414 review's HIGH 1, as a test: what a plugin page's cards look like
+/// **on glass**, under the shell's real stylesheets.
+///
+/// Every other test of the stats page checks class literals, and the class
+/// literal was right all along — `boxed-list` was on every card — while the
+/// shell's `.ts-plugin-panel list.boxed-list` rule flattened every one of them
+/// onto the drawer. Nothing in CI looked at a rendered colour, so this renders
+/// one: a page-card list and a plain `boxed-list` stacked under
+/// `.ts-plugin-panel`, painted to a texture, and a pixel inside each compared
+/// with the page behind them.
+#[cfg(all(test, feature = "system-tests"))]
+mod render_tests {
+    use super::{Grants, Scope, to_ui_node};
+    use hytte::adw;
+    use hytte::gtk::{self, gdk, glib, prelude::*};
+    use hytte::ui::Reconciler;
+    use hytte_plugin_proto::wire;
+    use std::time::{Duration, Instant};
+
+    /// The shipped stylesheets (library below, shell above, as the shell loads
+    /// them) plus a fixed backdrop colour for the test's own page, installed
+    /// for the life of the guard and removed again however the test ends —
+    /// every `#[gtk::test]` shares one display, so a provider left behind would
+    /// restyle the tests after this one.
+    struct Styled(Vec<gtk::CssProvider>);
+
+    impl Styled {
+        fn install() -> Self {
+            let display = gdk::Display::default().expect("a display");
+            let root = env!("CARGO_MANIFEST_DIR");
+            let sheet = |path: &str, priority: u32| {
+                let provider = gtk::CssProvider::new();
+                provider.load_from_path(format!("{root}/../assets/{path}"));
+                gtk::style_context_add_provider_for_display(&display, &provider, priority);
+                provider
+            };
+            let backdrop = gtk::CssProvider::new();
+            backdrop.load_from_string(".t1252-backdrop { background: #101010; }");
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &backdrop,
+                gtk::STYLE_PROVIDER_PRIORITY_USER + 10,
+            );
+            Self(vec![
+                sheet(
+                    "hytte-ui/style.css",
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                ),
+                sheet("trollshell/style.css", gtk::STYLE_PROVIDER_PRIORITY_USER),
+                backdrop,
+            ])
+        }
+    }
+
+    impl Drop for Styled {
+        fn drop(&mut self) {
+            if let Some(display) = gdk::Display::default() {
+                for provider in &self.0 {
+                    gtk::style_context_remove_provider_for_display(&display, provider);
+                }
+            }
+            adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+        }
+    }
+
+    fn card(id: &str, classes: &[&str]) -> wire::Node {
+        wire::Node::ListBox {
+            id: Some(id.to_owned()),
+            classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            dense: false,
+            children: vec![wire::Node::Label {
+                id: None,
+                text: "CPU".to_owned(),
+                classes: vec![],
+                tooltip: None,
+            }],
+        }
+    }
+
+    /// The four bytes at `(x, y)` of a downloaded texture.
+    fn pixel(bytes: &[u8], stride: usize, x: i32, y: i32) -> [u8; 4] {
+        let at = usize::try_from(y).expect("y") * stride + usize::try_from(x).expect("x") * 4;
+        [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    }
+
+    fn differs(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).any(|(x, y)| x.abs_diff(y) > 3)
+    }
+
+    /// Every `GtkListBox` under `root`, top to bottom.
+    fn lists_under(root: &gtk::Widget, relative_to: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(w) = stack.pop() {
+            if w.is::<gtk::ListBox>() {
+                found.push(w.clone());
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                stack.push(c);
+            }
+        }
+        found.sort_by(|a, b| {
+            let y = |w: &gtk::Widget| w.compute_bounds(relative_to).map_or(0.0, |r| r.y());
+            y(a).total_cmp(&y(b))
+        });
+        found
+    }
+
+    /// **A page card paints a card; a plain `boxed-list` on the same page is
+    /// still flattened.** The first half is the fix (`ts-page-card` out-ranks
+    /// the flattening rule); the second is the promise that the fix did not
+    /// change that rule for every other plugin page.
+    ///
+    /// **Falsified** by deleting the
+    /// `.ts-plugin-panel list.boxed-list.ts-page-card` rule from
+    /// `assets/trollshell/style.css` (the card pixel equals the page), or by
+    /// widening it to every `boxed-list` (the plain list's pixel stops
+    /// matching).
+    #[gtk::test]
+    fn a_page_card_paints_a_card_under_the_plugin_page_flattening() {
+        adw::init().expect("libadwaita init");
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        let _styled = Styled::install();
+
+        let tree = wire::Node::Box {
+            id: None,
+            dir: wire::Dir::Vertical,
+            spacing: 24,
+            scroll: false,
+            classes: vec![],
+            children: vec![
+                card("page-card", &["boxed-list", "ts-page-card"]),
+                card("plain", &["boxed-list"]),
+            ],
+            tooltip: None,
+        };
+        let ui = to_ui_node(&Scope::detached("t1252-render"), Grants::none(), &tree);
+
+        let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        backdrop.add_css_class("t1252-backdrop");
+        let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panel.add_css_class("ts-plugin-panel");
+        panel.set_size_request(240, -1);
+        backdrop.append(&panel);
+        let mut rec = Reconciler::new(&panel, |_, _| {});
+        rec.render(&ui);
+
+        let window = gtk::Window::new();
+        window.set_decorated(false);
+        window.set_child(Some(&backdrop));
+        window.present();
+        // A fixed settle rather than "until allocated": the first allocation
+        // can land before the style pass that sizes the rows, and the order
+        // below is read off the settled layout.
+        let settled = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < settled {
+            glib::MainContext::default().iteration(false);
+        }
+        let lists = lists_under(panel.upcast_ref(), backdrop.upcast_ref());
+        assert_eq!(lists.len(), 2, "both cards mounted");
+        assert!(lists.iter().all(|l| l.height() > 0), "both laid out");
+
+        let paintable = gtk::WidgetPaintable::new(Some(&backdrop));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(
+            &snapshot,
+            f64::from(backdrop.width()),
+            f64::from(backdrop.height()),
+        );
+        let node = snapshot.to_node().expect("the page painted something");
+        let texture = window
+            .renderer()
+            .expect("a realized window has a renderer")
+            .render_texture(&node, None);
+        let stride = usize::try_from(texture.width()).expect("width") * 4;
+        let mut bytes = vec![0_u8; stride * usize::try_from(texture.height()).expect("height")];
+        texture.download(&mut bytes, stride);
+
+        // Inside each list: its vertical middle, a little in from the right
+        // edge — clear of the label (left-aligned) and of the rounded corners.
+        let inside = |list: &gtk::Widget| {
+            let b = list.compute_bounds(&backdrop).expect("laid out");
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, y) = (
+                (b.x() + b.width() - 16.0).round() as i32,
+                (b.y() + b.height() / 2.0).round() as i32,
+            );
+            pixel(&bytes, stride, x, y)
+        };
+        // The page itself: the middle of the 24 px gap between the two lists,
+        // which neither list's surface can reach.
+        let page = {
+            let top = lists[0].compute_bounds(&backdrop).expect("laid out");
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, y) = (
+                (top.x() + top.width() / 2.0).round() as i32,
+                (top.y() + top.height() + 12.0).round() as i32,
+            );
+            pixel(&bytes, stride, x, y)
+        };
+        let (card_px, plain_px) = (inside(&lists[0]), inside(&lists[1]));
+        window.destroy();
+
+        assert!(
+            differs(card_px, page),
+            "a `ts-page-card` paints a card surface: card {card_px:?} vs page {page:?}",
+        );
+        assert!(
+            !differs(plain_px, page),
+            "a plain `boxed-list` on a plugin page is still flattened onto it: \
+             list {plain_px:?} vs page {page:?}",
+        );
+    }
 }

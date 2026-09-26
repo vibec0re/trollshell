@@ -262,10 +262,10 @@ pub const VOCAB: u16 = 7;
 /// The two diverge because #882 added a *negotiated* generation; #893's shader
 /// widget ([`SHADER_VOCAB`]) is the second, #966's bounded
 /// viewport ([`SCROLLED_VOCAB`]) the third and #1252's trend line
-/// ([`SPARKLINE_VOCAB`]) the fourth. (#1045's
-/// [`OPEN_URI_VOCAB`] is the fourth to leave this const
-/// alone, on a capability argument rather than a `Hello` one, and #1158's
-/// [`SIDEBAR_RIGHT_VOCAB`] the fifth, on a third
+/// ([`SPARKLINE_VOCAB`]) the fourth negotiated one. Two more generations leave
+/// this const alone without being negotiated at all: #1045's
+/// [`OPEN_URI_VOCAB`], on a capability argument rather than a `Hello` one, and
+/// #1158's [`SIDEBAR_RIGHT_VOCAB`], on a third
 /// argument again: a [`Mount`] rides inside the `Register` frame
 /// that carries the counter, so a handshake refusal is not reachable and bumping
 /// this would only refuse every plugin that never leaves the left sidebar. Read the rule
@@ -273,7 +273,7 @@ pub const VOCAB: u16 = 7;
 /// `OpenUri` with no advertisement — what stops an old host seeing one is the
 /// plugin having declared the gating capability, which nothing enforces. #1045
 /// weighed the residual against refusing every rebuilt plugin and chose to name
-/// it; its docs carry the reasoning and the test that pins it.) A plugin emits
+/// it; its docs carry the reasoning and the test that pins it. A plugin emits
 /// [`Node::Preem`] only after the host advertised
 /// [`PREEM_VOCAB`] in [`HostMsg::Hello`],
 /// so an old host — which never advertises — can never receive one, and the
@@ -322,10 +322,10 @@ pub use state::{
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{
     Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
-    MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
-    MAX_PLUGIN_ID_BYTES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES,
-    Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats,
-    sane_fraction, sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
+    HOMOGENEOUS_CLASS, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES,
+    MAX_NODE_CLASSES, MAX_PLUGIN_ID_BYTES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES,
+    MAX_SPARKLINE_SAMPLES, Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB, SPARKLINE_VOCAB, ShaderData,
+    SliderFloats, sane_fraction, sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
 };
 
 #[cfg(feature = "tokio")]

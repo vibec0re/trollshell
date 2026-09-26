@@ -22,7 +22,9 @@
 //!
 //! [`VOCAB`]: hytte_plugin_proto::VOCAB
 
-use hytte_plugin_proto::manifest::{MAX_SETTING_ENV_BYTES, Setting, SettingKind};
+use hytte_plugin_proto::manifest::{
+    KNOWN_SETTING_KINDS, MAX_SETTING_ENV_BYTES, Setting, SettingKind, UnknownKind,
+};
 use hytte_plugin_proto::{
     Capability, Manifest, Mount, PROTO_VERSION, StateKey, decode, decode_body, encode, encode_body,
 };
@@ -193,14 +195,24 @@ fn future_manifest() -> FutureManifest {
     }
 }
 
+/// The [`SettingKind::Unknown`] payload of `setting`, or a panic naming what
+/// it decoded as instead.
+fn unknown(setting: &Setting) -> &UnknownKind {
+    match &setting.kind {
+        SettingKind::Unknown(why) => why,
+        other => panic!("{} decoded as {other:?}, not as unknown", setting.env),
+    }
+}
+
 /// One setting of a kind this build does not know costs that setting, not
 /// the plugin's registration: the known one decodes as itself, the newer one
-/// as [`SettingKind::Unknown`] (so the host can name it when it drops it), and
-/// an entry with no readable `env` is skipped. Driven from **committed**
-/// bytes, so it is a real newer encoding that is pinned.
+/// as [`SettingKind::Unknown`] saying it is newer, and an entry with no
+/// readable `env` as one saying so — nothing is dropped silently, so the host
+/// can name each one when it drops it. Driven from **committed** bytes, so it
+/// is a real newer encoding that is pinned.
 ///
-/// Red before the fix: the whole `decode` failed with "unknown variant
-/// `Secret`", i.e. the plugin could not register at all.
+/// Red before the first fix round: the whole `decode` failed with "unknown
+/// variant `Secret`", i.e. the plugin could not register at all.
 #[test]
 fn a_newer_setting_kind_costs_only_its_own_setting() {
     let path = named_fixture_path(FUTURE_FIXTURE);
@@ -213,14 +225,108 @@ fn a_newer_setting_kind_costs_only_its_own_setting() {
     );
     let decoded: Manifest = decode(&from_hex(&committed)).expect("the manifest still decodes");
     assert_eq!(decoded.id, "vibectl");
-    assert_eq!(decoded.settings.len(), 2, "{:?}", decoded.settings);
+    assert_eq!(decoded.settings.len(), 3, "{:?}", decoded.settings);
     assert_eq!(decoded.settings[0], Setting::text("V1BECTL_SERVER", "L"));
     assert_eq!(decoded.settings[1].env, "V1BECTL_TOKEN");
-    assert!(
-        matches!(decoded.settings[1].kind, SettingKind::Unknown(_)),
-        "{:?}",
-        decoded.settings[1].kind
+    let newer = unknown(&decoded.settings[1]);
+    assert!(newer.is_newer());
+    assert_eq!(newer.describe(), "its kind `Secret` is newer than this shell");
+    let no_env = unknown(&decoded.settings[2]);
+    assert!(!no_env.is_newer());
+    assert!(no_env.describe().contains("no `env`"), "{}", no_env.describe());
+}
+
+/// #1415 second review L6: a malformed **known** kind is not reported as a
+/// newer one, and a well-formed entry with one bad field (an integer
+/// `default` on a `Text`) is not dropped without a word.
+#[test]
+fn a_malformed_known_kind_is_named_as_such() {
+    /// A setting spelled by hand, the way a plugin without the Rust SDK might.
+    #[derive(serde::Serialize)]
+    struct HandSetting<K: serde::Serialize, D: serde::Serialize> {
+        env: String,
+        label: String,
+        kind: K,
+        default: D,
+    }
+    #[derive(serde::Serialize)]
+    enum HandKind {
+        Int { min: i64 },
+    }
+    #[derive(serde::Serialize)]
+    struct HandManifest<A: serde::Serialize, B: serde::Serialize> {
+        #[serde(flatten)]
+        base: Manifest,
+        settings: (A, B),
+    }
+
+    let body = encode_body(&HandManifest {
+        base: Manifest::new("p", Mount::SidebarTop),
+        settings: (
+            HandSetting {
+                env: "COLUMNS".to_owned(),
+                label: "Columns".to_owned(),
+                kind: HandKind::Int { min: 1 },
+                default: "3",
+            },
+            HandSetting {
+                env: "SERVER".to_owned(),
+                label: "Server".to_owned(),
+                kind: "Text",
+                default: 5_i64,
+            },
+        ),
+    });
+    let decoded: Manifest = decode_body(&body).expect("the manifest still decodes");
+    assert_eq!(decoded.settings.len(), 2, "{:?}", decoded.settings);
+    for (setting, kind) in decoded.settings.iter().zip(["Int", "Text"]) {
+        let why = unknown(setting);
+        assert!(!why.is_newer(), "{} is a known kind", setting.env);
+        assert!(
+            why.describe().contains(&format!("malformed `{kind}`")),
+            "{}",
+            why.describe()
+        );
+    }
+}
+
+/// `KNOWN_SETTING_KINDS` is exactly the names serde puts on the wire for
+/// [`SettingKind`] — read from real encodings, so a new or renamed variant
+/// cannot leave the list (and with it the newer/malformed diagnosis) behind.
+#[test]
+fn the_known_kind_names_are_the_wire_names() {
+    let names: std::collections::BTreeSet<String> = every_kind()
+        .into_iter()
+        .map(|setting| {
+            match rmp_serde::from_slice::<rmpv_like::Value>(
+                &rmp_serde::to_vec_named(&setting.kind).expect("encodes"),
+            )
+            .expect("decodes")
+            {
+                rmpv_like::Value::Name(name) => name,
+                rmpv_like::Value::Tagged(map) => map.into_keys().next().expect("one key"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        names,
+        KNOWN_SETTING_KINDS.iter().map(|k| (*k).to_owned()).collect(),
+        "every constructor's kind, as the wire spells it"
     );
+}
+
+/// Just enough of a generic `MessagePack` value to read an externally tagged
+/// enum's name.
+mod rmpv_like {
+    /// Only a tagged kind's key is wanted; its fields are skipped, which is
+    /// what the zero-sized value type is for.
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    #[allow(clippy::zero_sized_map_values)]
+    pub enum Value {
+        Name(String),
+        Tagged(std::collections::BTreeMap<String, serde::de::IgnoredAny>),
+    }
 }
 
 /// The leniency is decode-only: an `Unknown` kind has no encoding, so a

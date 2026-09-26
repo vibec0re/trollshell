@@ -524,9 +524,9 @@ impl ProvidedDatasource {
 ///   receives, so they are never rewritten: an option that the same treatment
 ///   would change is dropped instead, and a `Choice` left with none is dropped
 ///   whole.
-/// - A setting of a kind this shell does not know
-///   ([`SettingKind::Unknown`]) is dropped, and the rest of the manifest
-///   registers as usual.
+/// - An entry this shell cannot read ([`SettingKind::Unknown`]: a newer kind,
+///   a malformed known kind, or no readable `env`) is dropped with a warning
+///   saying which, and the rest of the manifest registers as usual.
 ///
 /// The host keeps the last list each plugin id declared, so the form is there
 /// for a plugin that is switched off or fails to start without its setting.
@@ -562,9 +562,10 @@ pub struct Setting {
 ///
 /// # Append only, and a new kind costs only its own row
 ///
-/// [`Manifest::settings`] is decoded **per entry**: an entry whose kind this
-/// build does not know becomes [`SettingKind::Unknown`] (or, if even its `env`
-/// is unreadable, is skipped), and the rest of the manifest decodes as usual.
+/// [`Manifest::settings`] is decoded **per entry**: an entry this build cannot
+/// read — a kind it does not know, a malformed known kind, or no readable
+/// `env` at all — becomes [`SettingKind::Unknown`] saying which
+/// ([`UnknownKind::describe`]), and the rest of the manifest decodes as usual.
 /// So a plugin that declares a kind added after a shell was built still
 /// registers with that shell, and only that one setting's row is missing —
 /// unlike a [`Mount`], which is load-bearing and so decoded strictly. The
@@ -610,17 +611,65 @@ pub enum SettingKind {
     Unknown(UnknownKind),
 }
 
-/// The payload of [`SettingKind::Unknown`]. Its field is private, so only this
-/// crate's decoder can make one — a plugin cannot declare an unknown kind by
-/// accident.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownKind(());
 
-/// [`Manifest::settings`]' decoder: one entry at a time, so a kind this build
-/// does not know costs that entry and not the whole `Register` frame (see
-/// [`SettingKind`]'s doc). An entry whose `env` cannot be read at all is
-/// skipped; a well-formed one of an unknown kind is kept as
-/// [`SettingKind::Unknown`] so the host can name it when it drops it.
+/// The payload of [`SettingKind::Unknown`]: why this build could not read the
+/// setting. Its field is private, so only this crate's decoder can make one —
+/// a plugin cannot declare an unknown kind by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownKind(Unreadable);
+
+/// Why a [`SettingKind::Unknown`] entry could not be read (#1415 second review
+/// L6): a newer plugin's kind and a malformed known one call for different
+/// fixes, so the host's warning must not confuse them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unreadable {
+    /// A kind name this build does not know — a plugin built against a newer
+    /// proto.
+    Newer(String),
+    /// A kind name this build knows, in an entry that does not decode as it
+    /// (a missing `max`, a non-string `default`, …) — a plugin whose encoder
+    /// is wrong. An empty name: the kind is missing or unreadable.
+    Malformed(String),
+    /// Not a setting at all: no readable `env`.
+    Entry,
+}
+
+/// The kind names this build decodes — [`SettingKind`]'s variants as serde
+/// spells them. `tests/settings_golden.rs` pins it against real encodings.
+pub const KNOWN_SETTING_KINDS: [&str; 5] = ["Text", "Path", "Bool", "Int", "Choice"];
+
+impl UnknownKind {
+    /// Whether the entry names a kind **newer** than this build, as opposed to
+    /// a malformed known kind or an unreadable entry.
+    #[must_use]
+    pub fn is_newer(&self) -> bool {
+        matches!(self.0, Unreadable::Newer(_))
+    }
+
+    /// One phrase for the host's warning, saying which of the three it is.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match &self.0 {
+            Unreadable::Newer(name) => {
+                format!("its kind `{name}` is newer than this shell")
+            }
+            Unreadable::Malformed(name) if name.is_empty() => {
+                "it has no readable kind".to_owned()
+            }
+            Unreadable::Malformed(name) => {
+                format!("it is a malformed `{name}` setting (a field is missing or of the wrong type)")
+            }
+            Unreadable::Entry => "it is not a readable setting (no `env`)".to_owned(),
+        }
+    }
+}
+
+/// [`Manifest::settings`]' decoder: one entry at a time, so an entry this
+/// build cannot read costs that entry and not the whole `Register` frame (see
+/// [`SettingKind`]'s doc). **Nothing is dropped silently**: every entry this
+/// build cannot read is kept as a [`SettingKind::Unknown`] saying why — a
+/// newer kind, a malformed known one, or not a setting at all — so the host
+/// can name it when it drops it (#1415 second review L6).
 fn lenient_settings<'de, D>(deserializer: D) -> Result<Vec<Setting>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -630,37 +679,70 @@ where
     #[serde(untagged)]
     enum Entry {
         Known(Setting),
-        Newer(NewerSetting),
+        Named(NamedEntry),
         Unreadable(serde::de::IgnoredAny),
     }
 
-    /// Everything of a [`Setting`] but its kind, which this build cannot read.
+    /// An entry that is not a [`Setting`] this build can decode, read only as
+    /// far as its `env` and its kind's **name**. Every other field is skipped,
+    /// so a malformed one (a `default` that is not a string) cannot hide the
+    /// entry.
     #[derive(Deserialize)]
-    struct NewerSetting {
+    struct NamedEntry {
         env: String,
         #[serde(default)]
-        label: String,
-        #[serde(default)]
-        doc: String,
-        #[serde(default)]
-        default: Option<String>,
+        kind: Option<KindName>,
     }
 
+    /// An externally tagged kind's name: a bare string for a unit kind, the
+    /// single key of a map for a kind with fields. The map's values are
+    /// skipped on purpose — only the key names the kind — which is what the
+    /// zero-sized value type is for.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    #[allow(clippy::zero_sized_map_values)]
+    enum KindName {
+        Unit(String),
+        Tagged(std::collections::BTreeMap<String, serde::de::IgnoredAny>),
+    }
+
+    let unknown = |why| SettingKind::Unknown(UnknownKind(why));
     Ok(Vec::<Entry>::deserialize(deserializer)?
         .into_iter()
-        .filter_map(|entry| match entry {
-            Entry::Known(setting) => Some(setting),
-            Entry::Newer(newer) => Some(Setting {
-                env: newer.env,
-                label: newer.label,
-                doc: newer.doc,
-                kind: SettingKind::Unknown(UnknownKind(())),
-                default: newer.default,
-            }),
-            Entry::Unreadable(_) => None,
+        .map(|entry| match entry {
+            Entry::Known(setting) => setting,
+            Entry::Named(named) => {
+                let name = match named.kind {
+                    Some(KindName::Unit(name)) => name,
+                    Some(KindName::Tagged(map)) if map.len() == 1 => {
+                        map.into_keys().next().unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                let why = if name.is_empty() || KNOWN_SETTING_KINDS.contains(&name.as_str()) {
+                    Unreadable::Malformed(name)
+                } else {
+                    Unreadable::Newer(name)
+                };
+                Setting {
+                    env: named.env,
+                    label: String::new(),
+                    doc: String::new(),
+                    kind: unknown(why),
+                    default: None,
+                }
+            }
+            Entry::Unreadable(_) => Setting {
+                env: String::new(),
+                label: String::new(),
+                doc: String::new(),
+                kind: unknown(Unreadable::Entry),
+                default: None,
+            },
         })
         .collect())
 }
+
 
 /// The longest environment variable name [`Setting::env_refusal`] accepts, in
 /// bytes. Generous for any real name; keeps a hostile manifest from making the

@@ -47,6 +47,7 @@
 //! The launcher cannot know a plugin's schema at its first launch, so it does
 //! not consult this module at all.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -162,7 +163,7 @@ pub(super) fn sanitize(id: &str, declared: &[Setting]) -> Vec<Setting> {
                     drops.note(&clean.env, "declared twice; the first one is kept");
                 }
             }
-            Err(reason) => drops.note(&setting.env, reason),
+            Err(reason) => drops.note(&setting.env, &reason),
         }
     }
     if kept.len() > MAX_SETTINGS {
@@ -178,22 +179,25 @@ pub(super) fn sanitize(id: &str, declared: &[Setting]) -> Vec<Setting> {
 
 /// One entry of [`sanitize`]: the cleaned setting and how many of its
 /// `Choice` options were dropped, or why the whole setting is.
-fn sanitize_one(setting: &Setting) -> Result<(Setting, usize), &'static str> {
+fn sanitize_one(setting: &Setting) -> Result<(Setting, usize), Cow<'static, str>> {
+    // First, so an unreadable entry (which may have no `env` at all) is
+    // reported for what it is: a newer kind, a malformed known one, or not a
+    // setting (#1415 second review L6).
+    if let SettingKind::Unknown(why) = &setting.kind {
+        return Err(Cow::Owned(why.describe()));
+    }
     if let Some(reason) = Setting::env_refusal(&setting.env) {
-        return Err(reason);
+        return Err(Cow::Borrowed(reason));
     }
     let mut lost_options = 0;
     let kind = match &setting.kind {
-        SettingKind::Unknown(_) => {
-            return Err("its kind is newer than this shell");
-        }
         SettingKind::Int { min, max } if min > max => {
-            return Err("its Int range is empty (min > max)");
+            return Err(Cow::Borrowed("its Int range is empty (min > max)"));
         }
         SettingKind::Choice { options } => {
             let (options, lost) = sanitize_options(options);
             if options.is_empty() {
-                return Err("its Choice has no usable options");
+                return Err(Cow::Borrowed("its Choice has no usable options"));
             }
             lost_options = lost;
             SettingKind::Choice { options }
@@ -530,13 +534,24 @@ mod tests {
             .expect("a newer kind does not cost the registration");
         assert_eq!(
             decoded.settings.len(),
-            2,
-            "the fixture's two readable entries"
+            3,
+            "the fixture's three entries, none dropped by the decoder"
         );
-        assert_eq!(
-            ids(&sanitize("vibectl", &decoded.settings)),
-            ["V1BECTL_SERVER"]
-        );
+        let (captured, guard) = hytte_config::test_support::capture();
+        let kept = sanitize("vibectl", &decoded.settings);
+        drop(guard);
+        assert_eq!(ids(&kept), ["V1BECTL_SERVER"]);
+        // Each dropped entry is named, for what it is (#1415 second review
+        // L6): the newer kind as newer, the env-less entry as unreadable.
+        let events = captured.events();
+        let reasons: Vec<String> = events
+            .iter()
+            .filter(|e| e.message == "plugin setting dropped")
+            .map(|e| format!("{:?}", e.fields))
+            .collect();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[0].contains("newer than this shell"), "{reasons:?}");
+        assert!(reasons[1].contains("no `env`"), "{reasons:?}");
     }
 
     /// #1415 review L4: a flood of refused entries is named only up to the

@@ -2031,7 +2031,13 @@ pub async fn list() -> Vec<systemd::PluginUnit> {
 /// (the host's settings cache, #1415 review L3) can tell "declares nothing"
 /// from "could not tell" and leave things alone on the second.
 pub async fn declared_ids() -> Option<BTreeSet<String>> {
-    load_declared()
+    declared_ids_from(&Sources::from_env()).await
+}
+
+/// [`declared_ids`] over explicit [`Sources`], so the `None` contract is
+/// testable against scratch files (#1415 second review B4).
+async fn declared_ids_from(sources: &Sources) -> Option<BTreeSet<String>> {
+    load_declared_from(sources)
         .await
         .map(|declared| declared.plugins.into_keys().collect())
 }
@@ -2251,6 +2257,17 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
 /// ever run from the static unit. Pick one or the other — with both, every
 /// reconcile that decides to restart will bounce the plugin through this
 /// fallback and log it.
+///
+/// Known cost (#1415 second review L3, a follow-up rather than a fix here):
+/// the wait really waits now, under [`CONVERGE_LOCK`], so a unit that never
+/// leaves `deactivating` (a process stuck past its SIGKILL) holds every
+/// queued lock-taker for the full [`STOP_WAIT`], and a reconcile that
+/// restarts several plugins pays their stops one after another. When such a
+/// relaunch then fails, the unit-file fallback below may `StartUnit` the old
+/// transient unit while it is still loaded, which brings the plugin back
+/// with its **old** environment. Stopping every restart first and waiting
+/// for them together would bound the first cost; the second needs the
+/// fallback to skip a unit this launcher stamped.
 async fn restart(id: &str, spec: &PluginSpec, target: &str) -> anyhow::Result<()> {
     stop(id).await?;
     wait_until_stopped(id).await;
@@ -2311,22 +2328,26 @@ where
     L: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
 {
-    let polls = STOP_WAIT.as_millis() / STOP_POLL.as_millis();
+    // A wall-clock deadline, not a count of polls (#1415 second review L2):
+    // each listing is two D-Bus round trips with their own 25 s timeout, so a
+    // slow but answering user manager would stretch a counted loop — and the
+    // `CONVERGE_LOCK` hold it runs under — far past `STOP_WAIT`.
+    let deadline = tokio::time::Instant::now() + STOP_WAIT;
     let mut listings = 0;
-    for _ in 0..polls {
+    while tokio::time::Instant::now() < deadline {
         listings += 1;
-        match list_units().await {
-            Ok(units)
+        match tokio::time::timeout_at(deadline, list_units()).await {
+            Ok(Ok(units))
                 if !units
                     .iter()
                     .any(|u| u.id == id && blocks_relaunch(&u.active_state)) =>
             {
                 return listings;
             }
-            Err(_) => return listings,
-            Ok(_) => {}
+            Ok(Err(_)) => return listings,
+            Ok(Ok(_)) | Err(_) => {}
         }
-        tokio::time::sleep(STOP_POLL).await;
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + STOP_POLL)).await;
     }
     tracing::warn!(plugin = %id, "unit still stopping after the wait; relaunch may fail");
     listings
@@ -2374,25 +2395,64 @@ impl SettingsRestart {
 /// current values) and the live unit list, and starts nothing that was not
 /// already running.
 ///
+/// **Every** Save calls this, whatever the tab last saw (#1415 second review
+/// M1): the tab's own poll can be two seconds stale, and a Save that lands
+/// while an earlier restart is still stopping the unit would otherwise be
+/// written and never applied. Here the question has a current answer — the
+/// call queues behind any restart already under way, and only then reads the
+/// declaration (with the file's newest values) and the unit list. So two
+/// Saves in quick succession end with the plugin running the second one's
+/// values, at the cost of one more bounce.
+///
 /// # Errors
-/// An unreadable `plugins.json` is treated as nothing declared; a failed unit
-/// listing, stop or relaunch is an error.
+/// A `plugins.json` that exists but cannot be read or parsed (never read as
+/// "nothing declared", which would answer `not-declared` for a plugin that
+/// is declared — #1415 second review L5); a failed unit listing, stop or
+/// relaunch.
 pub async fn restart_for_settings(id: &str) -> anyhow::Result<SettingsRestart> {
+    restart_for_settings_via(id, load_declared, systemd::list_plugin_units, |spec, target| {
+        async move { restart(id, &spec, &target).await }
+    })
+    .await
+}
+
+/// [`restart_for_settings`] with its three effects passed in — the
+/// declaration, the unit listing and the relaunch — so a test can drive the
+/// decision and the lock without a user manager (the [`reconcile_listing`]
+/// seam's shape).
+async fn restart_for_settings_via<D, DF, L, LF, R, RF>(
+    id: &str,
+    load: D,
+    list_units: L,
+    relaunch: R,
+) -> anyhow::Result<SettingsRestart>
+where
+    D: FnOnce() -> DF,
+    DF: Future<Output = Option<Declared>>,
+    L: FnOnce() -> LF,
+    LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+    R: FnOnce(PluginSpec, String) -> RF,
+    RF: Future<Output = anyhow::Result<()>>,
+{
     let _guard = CONVERGE_LOCK.lock().await;
-    let declared = load_declared().await.unwrap_or_default();
-    let Some(spec) = declared.plugins.get(id) else {
+    let Some(declared) = load().await else {
+        anyhow::bail!(
+            "plugins.json exists but cannot be read or parsed, so the shell cannot tell how \
+             to launch this plugin; nothing was restarted. Fix the file (or rebuild), then \
+             switch the plugin off and on"
+        );
+    };
+    let Some(spec) = declared.plugins.get(id).cloned() else {
         return Ok(SettingsRestart::NotDeclared);
     };
-    let units = systemd::list_plugin_units()
-        .await
-        .context("listing plugin units")?;
+    let units = list_units().await.context("listing plugin units")?;
     if !units
         .iter()
         .any(|u| u.id == id && is_running(&u.active_state))
     {
         return Ok(SettingsRestart::NotRunning);
     }
-    restart(id, spec, &declared.target).await?;
+    relaunch(spec, declared.target).await?;
     tracing::info!(plugin = %id, "relaunched to apply its saved settings");
     Ok(SettingsRestart::Relaunched)
 }
@@ -4200,7 +4260,7 @@ mod tests {
             "pub async fn list()",
             "pub async fn start(",
             "pub async fn restart_for_settings(",
-            "pub async fn declared_ids(",
+            "async fn declared_ids_from(",
         ] {
             let b = body(sig);
             assert!(
@@ -5412,11 +5472,210 @@ mod tests {
             "the wait must list the real units"
         );
         let entry = body("pub async fn restart_for_settings(");
-        assert!(entry.contains("CONVERGE_LOCK.lock().await"), "{entry}");
-        assert!(entry.contains("load_declared().await"), "{entry}");
         assert!(
-            entry.contains("restart(id, spec, &declared.target)"),
-            "{entry}"
+            entry.contains("restart_for_settings_via(id, load_declared, systemd::list_plugin_units"),
+            "production must hand the seam the real declaration and listing:\n{entry}"
+        );
+        assert!(entry.contains("restart(id, &spec, &target)"), "{entry}");
+        // The guard must be *held*: `let _ = …lock().await` drops it at once
+        // and no lint catches that for a tokio guard (#1415 second review
+        // B1). `two_restarts_for_settings_run_one_after_the_other` is the
+        // behavioural half.
+        assert!(
+            body("async fn restart_for_settings_via<")
+                .contains("let _guard = CONVERGE_LOCK.lock().await;"),
+            "the settings restart must hold the convergence lock"
+        );
+    }
+
+    // ── restart_for_settings' decisions (#1415 second review B1/B2/L5) ──────
+
+    /// A spec whose `settings` say which Save it carries — the one thing the
+    /// ordering test needs to tell two relaunches apart.
+    fn saved(value: &str) -> Declared {
+        let mut spec = spec("/bin/vibectl", true);
+        spec.settings = values(&[("V1BECTL_SERVER", value)]);
+        Declared {
+            plugins: BTreeMap::from([("vibectl".to_owned(), spec)]),
+            ..Declared::default()
+        }
+    }
+
+    /// B2: a declared plugin that is not running is left alone — no relaunch
+    /// is even attempted — and the answer says so. (`deactivating` counts as
+    /// not running here: the unit is on its way down, and starting it is a
+    /// switch's job, not a Save's.)
+    #[tokio::test]
+    async fn a_plugin_that_is_not_running_is_not_restarted() {
+        for state in ["inactive", "failed", "deactivating"] {
+            let relaunched = std::cell::Cell::new(false);
+            let answer = restart_for_settings_via(
+                "vibectl",
+                || async { Some(saved("x")) },
+                || async move { Ok(vec![unit("vibectl", state, true)]) },
+                |_, _| {
+                    relaunched.set(true);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .expect("answers");
+            assert_eq!(answer, SettingsRestart::NotRunning, "{state}");
+            assert!(!relaunched.get(), "{state}: a stopped plugin was started");
+        }
+    }
+
+    /// An undeclared id is a static unit's: answered `not-declared`, and
+    /// neither listed nor relaunched. A running declared one is relaunched
+    /// with its spec and target.
+    #[tokio::test]
+    async fn the_answer_follows_the_declaration_and_the_unit() {
+        let answer = restart_for_settings_via(
+            "hand-made",
+            || async { Some(saved("x")) },
+            || async { panic!("an undeclared id needs no listing") },
+            |_, _| async { panic!("an undeclared id is never relaunched") },
+        )
+        .await
+        .expect("answers");
+        assert_eq!(answer, SettingsRestart::NotDeclared);
+
+        let got = std::cell::RefCell::new(None);
+        let answer = restart_for_settings_via(
+            "vibectl",
+            || async { Some(saved("v")) },
+            || async { Ok(vec![unit("vibectl", "active", true)]) },
+            |spec, target| {
+                *got.borrow_mut() = Some((spec.settings, target));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .expect("answers");
+        assert_eq!(answer, SettingsRestart::Relaunched);
+        assert_eq!(
+            got.into_inner(),
+            Some((values(&[("V1BECTL_SERVER", "v")]), DEFAULT_TARGET.to_owned()))
+        );
+    }
+
+    /// L5: a `plugins.json` that cannot be read is an error, never "nothing
+    /// declared" — which would answer `not-declared` and have the tab call a
+    /// declared plugin a static unit.
+    #[tokio::test]
+    async fn an_unreadable_declaration_is_an_error_not_an_answer() {
+        let err = restart_for_settings_via(
+            "vibectl",
+            || async { None },
+            || async { panic!("nothing is listed") },
+            |_, _| async { panic!("nothing is relaunched") },
+        )
+        .await
+        .expect_err("an unreadable plugins.json is not an answer");
+        assert!(err.to_string().contains("plugins.json"), "{err}");
+    }
+
+    /// B1 and the MEDIUM's ordering, together: two Saves in quick succession
+    /// send two `RestartPlugin`s. The second queues behind the first on the
+    /// convergence lock and only then reads the declaration — so it sees the
+    /// file as the second Save left it, and the plugin ends up running the
+    /// **second** Save's values.
+    ///
+    /// The file changes while the first relaunch is in flight, which is the
+    /// case the review found: a second call that did not wait (`let _ =` on
+    /// the guard, B1) reads the declaration too early and relaunches with the
+    /// first Save's values again.
+    #[tokio::test(start_paused = true)]
+    async fn two_restarts_for_settings_run_one_after_the_other() {
+        let file = std::cell::RefCell::new("first".to_owned());
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let call = |n: u8| {
+            let (file, log) = (&file, &log);
+            restart_for_settings_via(
+                "vibectl",
+                move || {
+                    log.borrow_mut().push(format!("{n}: read"));
+                    let declared = saved(&file.borrow());
+                    async move { Some(declared) }
+                },
+                || async { Ok(vec![unit("vibectl", "active", true)]) },
+                move |spec, _| async move {
+                    log.borrow_mut().push(format!(
+                        "{n}: relaunch with {}",
+                        spec.settings["V1BECTL_SERVER"]
+                    ));
+                    if n == 1 {
+                        // The second Save lands while this relaunch runs.
+                        *file.borrow_mut() = "second".to_owned();
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    log.borrow_mut().push(format!("{n}: up"));
+                    Ok(())
+                },
+            )
+        };
+        let (a, b) = tokio::join!(call(1), async {
+            // Sent a moment later, while the first restart holds the lock.
+            tokio::task::yield_now().await;
+            call(2).await
+        });
+        assert_eq!(a.expect("first"), SettingsRestart::Relaunched);
+        assert_eq!(b.expect("second"), SettingsRestart::Relaunched);
+        assert_eq!(
+            log.into_inner(),
+            [
+                "1: read",
+                "1: relaunch with first",
+                "1: up",
+                "2: read",
+                "2: relaunch with second",
+                "2: up",
+            ],
+            "the second restart must wait for the first and relaunch with the newest file"
+        );
+    }
+
+    /// B4: `declared_ids` tells "declares nothing" from "could not tell", so
+    /// the host's settings cache never forgets every id because
+    /// `plugins.json` was briefly unreadable.
+    #[tokio::test]
+    async fn declared_ids_are_none_when_plugins_json_cannot_be_read() {
+        let (_dir, sources, _toml) = scratch_sources("{ this is not json");
+        assert_eq!(declared_ids_from(&sources).await, None);
+
+        let (dir, sources, _toml) = scratch_sources(TWO_FREE);
+        assert_eq!(
+            declared_ids_from(&sources).await,
+            Some(BTreeSet::from(["pet".to_owned(), "timer".to_owned()]))
+        );
+
+        let missing = Sources {
+            config: vec![dir.path().join("absent/plugins.json")],
+            overrides: None,
+            settings: None,
+        };
+        assert_eq!(
+            declared_ids_from(&missing).await,
+            Some(BTreeSet::new()),
+            "a missing file does declare nothing"
+        );
+    }
+
+    /// L2: the wait is bounded by the clock, not by a count of polls — a user
+    /// manager that answers slowly cannot stretch it (and the lock held
+    /// around it) past `STOP_WAIT`.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_is_bounded_by_the_clock_even_when_listings_are_slow() {
+        let start = tokio::time::Instant::now();
+        wait_until_stopped_listing("vibectl", || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(vec![unit("vibectl", "deactivating", false)])
+        })
+        .await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= STOP_WAIT && waited <= STOP_WAIT + STOP_POLL,
+            "waited {waited:?} for a {STOP_WAIT:?} bound"
         );
     }
 

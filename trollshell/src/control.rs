@@ -389,8 +389,14 @@ impl ControlIface {
     /// - `"not-declared"` — a hand-installed static unit, which the launcher
     ///   does not launch and which never reads the file: left alone.
     ///
+    /// The tab sends this after **every** Save, whatever its own last poll
+    /// said: the answer is decided here, after any restart already under way,
+    /// so a Save made while an earlier one is still restarting the plugin is
+    /// applied too (#1415 second review).
+    ///
     /// # Errors
-    /// A failed unit listing, stop or relaunch.
+    /// A `plugins.json` that exists but cannot be read (never answered as
+    /// `not-declared`), or a failed unit listing, stop or relaunch.
     async fn restart_plugin(&self, id: String) -> zbus::fdo::Result<String> {
         plugin_launcher::restart_for_settings(&id)
             .await

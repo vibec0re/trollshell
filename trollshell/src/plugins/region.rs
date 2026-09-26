@@ -29,9 +29,10 @@
 //!   clicked. The drawer panel is the one mount with no monitor in scope and
 //!   sends `None` (see [`build_panel_child`]).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Instant;
 
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -42,6 +43,8 @@ use hytte::ui::{
 };
 use hytte_plugin_proto::{HostMsg, Mount, wire};
 use tokio::sync::mpsc;
+
+use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, finish_page_clamped};
 
 use super::preem_render::{self, Scope};
 use super::pump::Animator;
@@ -688,7 +691,20 @@ fn reconcile_region(
             // hot-plug path destroys and rebuilds the surface rather than
             // re-pointing it, so there is nothing to re-read.
             let ev_output = connector.map(str::to_owned);
+            // #1252: which of this card's buttons each press lands on, and the
+            // card itself — weakly, since the callback below ends up owned by
+            // the card's own buttons and a strong clone would pin the card —
+            // so a click can be recorded as this plugin's click origin.
+            let pressed = track_pressed_button(&root);
+            let ev_card = root.downgrade();
+            let ev_plugin = render.plugin_id.clone();
             let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
+                // Recorded before the event goes out, though either order is
+                // safe: the effect it may provoke is brokered on this same GTK
+                // thread, i.e. not before this callback has returned.
+                if matches!(kind, UiEventKind::Click) {
+                    note_card_click(&ev_plugin, &ev_card, &pressed);
+                }
                 if let Some(tx) = ev_outbound.borrow().as_ref() {
                     // Non-blocking: a stuck plugin's full outbound queue drops the
                     // event rather than blocking the GTK thread (#435). It's about
@@ -724,6 +740,147 @@ fn reconcile_region(
             cards.push(card);
         }
     }
+}
+
+/// What a card's press tracker remembers (#1252): the button the latest press
+/// landed on, weakly, and a count of presses so a deferred clear can tell
+/// whether the press it was scheduled for is still the latest — see
+/// [`track_pressed_button`].
+#[derive(Default)]
+struct PressTracker {
+    /// The button the latest press landed on, until a click spends it or the
+    /// press ends without one.
+    button: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
+    /// How many presses this card has seen.
+    presses: Cell<u64>,
+}
+
+impl PressTracker {
+    /// Spend the recorded press: the button it landed on, if it is still alive.
+    fn take(&self) -> Option<gtk::Widget> {
+        self.button
+            .borrow_mut()
+            .take()
+            .and_then(|button| button.upgrade())
+    }
+}
+
+/// A card's [`PressTracker`], shared by its gesture and its event callback.
+type PressedButton = Rc<PressTracker>;
+
+/// Watch `card`'s presses and remember which of its buttons each one lands on
+/// (#1252), so a click can anchor the page it opens under **that** button
+/// rather than under the plugin's whole card.
+///
+/// The reconciler's event callback says *which node* was clicked but not which
+/// widget, and `hytte-ui` keeps that mapping private. So the host watches the
+/// press itself: a capture-phase [`gtk::GestureClick`] on the card root sees
+/// every press on the way down to the button, picks the widget under it, and
+/// records the innermost enclosing `gtk::Button`. `hytte_plugin_stats`' bar
+/// instance is the case that needs it — one card, four chips, and centring the
+/// drawer under the card would put it under the middle of the four.
+///
+/// **It never takes the press.** The gesture does not claim its sequence, and an
+/// unclaimed gesture's `handle_event` returns `FALSE` (`gtkgesture.c`, "Only
+/// claimed events should be consumed"), so propagation continues to the button's
+/// own gesture exactly as before; when that one claims the sequence, this one is
+/// denied (capture runs before bubble, so GTK denies rather than cancels it).
+/// `pressed` has already run by then. It listens for the primary button only —
+/// `GestureSingle`'s default, and the only one `GtkButton` emits `clicked` for.
+///
+/// **A press is spent by its click, or forgotten once its sequence ends
+/// without one** (#1252 review, LOW 4). A press dragged off its chip and
+/// released elsewhere clicks nothing; left recorded, it would anchor the *next*
+/// press-less click — a keyboard or accessibility activation of a different
+/// chip — under the chip that was pressed and abandoned. The sequence's end
+/// (`GtkGesture::end`: released, denied or cancelled) cannot clear it on the
+/// spot, because for an ordinary click it fires *before* `GtkButton::clicked`:
+/// the release reaches this capture-phase gesture first. So the clear is
+/// deferred to an idle, which runs only after the whole event — the `clicked`
+/// emission included — has been dispatched: a click spends its press first, and
+/// a press that clicked nothing is gone before any later click can use it. The
+/// press count keeps a stale idle from wiping a *newer* press GTK dispatched
+/// ahead of it (input events outrank idles, so a fast second press can land
+/// between a release and its idle).
+///
+/// A click with no press behind it — a keyboard activation, or a synthetic
+/// `clicked` — finds nothing recorded and falls back to the card root in
+/// [`clicked_widget`].
+fn track_pressed_button(card: &gtk::Box) -> PressedButton {
+    let tracker: PressedButton = Rc::default();
+    let gesture = gtk::GestureClick::new();
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let on_press = tracker.clone();
+    // The card is the gesture's own widget, read back per press rather than
+    // captured: the gesture is owned by the card, so a captured clone would be
+    // the card pinning itself.
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        let Some(card) = gesture.widget() else {
+            return;
+        };
+        on_press.presses.set(on_press.presses.get().wrapping_add(1));
+        *on_press.button.borrow_mut() = card
+            .pick(x, y, gtk::PickFlags::DEFAULT)
+            .and_then(|hit| enclosing_button(&hit, &card))
+            .map(|button| button.downgrade());
+    });
+    let on_end = tracker.clone();
+    gesture.connect_end(move |_, _| {
+        let press = on_end.presses.get();
+        let tracker = on_end.clone();
+        glib::idle_add_local_once(move || {
+            if tracker.presses.get() == press {
+                tracker.button.borrow_mut().take();
+            }
+        });
+    });
+    card.add_controller(gesture);
+    tracker
+}
+
+/// The innermost `gtk::Button` at or above `hit`, looking no further up than
+/// `card` — i.e. the button a press on `hit` would click, or `None` when the
+/// press landed on the card outside any button.
+fn enclosing_button(hit: &gtk::Widget, card: &gtk::Widget) -> Option<gtk::Widget> {
+    let mut widget = Some(hit.clone());
+    while let Some(w) = widget {
+        if w.is::<gtk::Button>() {
+            return Some(w);
+        }
+        if &w == card {
+            return None;
+        }
+        widget = w.parent();
+    }
+    None
+}
+
+/// The widget a click on `card` should be anchored under (#1252): the button
+/// its press landed on, while that button is still inside `card`, else `card`
+/// itself.
+///
+/// "Still inside" because a re-render can replace the subtree between the press
+/// and the click; a button that has left the card no longer marks where the
+/// user clicked.
+fn clicked_widget(pressed: Option<gtk::Widget>, card: &gtk::Widget) -> gtk::Widget {
+    pressed
+        .filter(|button| button.is_ancestor(card))
+        .unwrap_or_else(|| card.clone())
+}
+
+/// Record a click on `plugin_id`'s card as that plugin's **click origin**
+/// (#1252) — what `effects::open_own_page_in_drawer` anchors the plugin's page
+/// under if the click makes the plugin open it.
+///
+/// Consumes the recorded press, so a later click with no press behind it (a
+/// keyboard activation) cannot inherit an old press's button.
+fn note_card_click(plugin_id: &str, card: &glib::WeakRef<gtk::Box>, pressed: &PressedButton) {
+    let pressed = pressed.take();
+    let Some(card) = card.upgrade() else {
+        return;
+    };
+    let widget = clicked_widget(pressed, card.upcast_ref());
+    super::effects::note_click_origin(plugin_id, &widget, Instant::now());
 }
 
 /// Log this card's #1050 per-screen verdict, but only when the frame's
@@ -880,9 +1037,48 @@ fn empty_panel() -> UiNode {
 /// whichever plugin is active, via the same swapped-`outbound` cell as
 /// `MountedCard`, so a fast plugin reconnect redirects panel events without a
 /// dangling send.
+///
+/// Since #1252 the child is returned inside the page frame every built-in
+/// drawer page wears — see `frame_drawer_page`. The frame is put on **here**,
+/// not in `build_panel_child`, because that builder is shared with the dialog,
+/// which frames the same tree its own way.
 #[must_use]
 pub fn plugin_panel_slot() -> gtk::Widget {
-    build_panel_child(panels_render_signal(), active_panel_signal())
+    frame_drawer_page(&build_panel_child(
+        panels_render_signal(),
+        active_panel_signal(),
+    ))
+}
+
+/// Put a plugin's drawer page in the frame a built-in page is built with
+/// (#1252): the page's own `.ts-modal-page` inset, inside an `AdwClamp`.
+///
+/// Before this the drawer mounted the plugin's tree bare, so a plugin page sat
+/// flush against the card's edges while every built-in page is inset by
+/// `.ts-modal-page`'s padding (`page_box`/`page_grid` in
+/// [`crate::components::layout`]), and nothing capped its width: a page whose
+/// natural width outruns its minimum — a wrapping `Node::Text` paragraph asks
+/// for its whole length on one line — widened the drawer toward that length,
+/// past anything a built-in page can reach. (No frame can squeeze content below
+/// its *minimum*; an unwrappable label or a fixed-size surface is as wide here
+/// as on any built-in page.)
+///
+/// The cap is [`DRAWER_MAX_WIDTH_WIDE`] rather than the ordinary
+/// [`DRAWER_MAX_WIDTH`](crate::components::layout::DRAWER_MAX_WIDTH) because a
+/// plugin cannot choose one: the page is a single wire tree with no say over
+/// the frame around it, and the multicolumn native page a plugin page stands in
+/// for (the Stats page, #1248) is built with the wide cap. It is a *ceiling*
+/// only — `finish_page_clamped` sets no floor (unlike the Workspaces page's
+/// #1108 fill), so a single-column page keeps its own natural width below it,
+/// and the centring clamp in `modal.rs` already takes the wide cap as its upper
+/// bound, so a page up to that wide still centres under its chip.
+///
+/// The frame is the drawer's only: the dialog overlay puts the same tree in a
+/// card of its own (`overlays::dialog`), and a second inset there would double
+/// its padding.
+fn frame_drawer_page(child: &gtk::Widget) -> gtk::Widget {
+    child.add_css_class("ts-modal-page");
+    finish_page_clamped(child, DRAWER_MAX_WIDTH_WIDE)
 }
 
 /// The **dialog overlay's** plugin child (#1010): the same body
@@ -939,9 +1135,11 @@ fn build_panel_child(
     // per hot-plug, reconciling into a detached widget tree for the session.
     //
     // Over an inner `canvas` the strong ref points *down* the tree instead of
-    // back at `root`, so `root`'s only holder is its parent (the drawer stack).
-    // It disposes with the drawer, `destroy` fires, the subscription is aborted,
-    // and the closure — with the reconciler and `canvas` inside it — drops.
+    // back at `root`, so `root`'s only holder is its parent (the dialog's
+    // scroller, or — since #1252 — the drawer page frame's `AdwClamp`, itself
+    // held only by the drawer stack). It disposes with the drawer, `destroy`
+    // fires, the subscription is aborted, and the closure — with the reconciler
+    // and `canvas` inside it — drops.
     //
     // Invisible to CSS: `.ts-plugin-panel` styles `root` and reaches the plugin's
     // tree through a *descendant* selector (`assets/trollshell/style.css:570`),
@@ -1395,6 +1593,7 @@ pub(super) fn clear_region_if_owned(
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use crate::plugins::shader_map::{self, Grants};
+    use std::time::{Duration, Instant};
 
     use super::{
         Animator, MountedCard, PluginHandles, Scope, SlotRender, build_panel_child, build_region,
@@ -4894,6 +5093,529 @@ mod gtk_tests {
             Some(&scope),
             "showing the same scope again must keep it, so the animation continues",
         );
+    }
+
+    // ── #1252: the click origin, and the drawer page frame ──────────────────
+
+    /// A `Row` of two `Button`s — `hytte-plugin-stats`' bar instance in
+    /// miniature: several chips, **one** card (#1252). Each button carries a
+    /// label so it has a non-zero allocation to press in.
+    fn two_button_tree() -> wire::Node {
+        let button = |id: &str| wire::Node::Button {
+            id: id.to_owned(),
+            classes: vec![],
+            child: Box::new(wire::Node::Label {
+                id: None,
+                text: format!("{id} chip"),
+                classes: vec![],
+                tooltip: None,
+            }),
+        };
+        wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 6,
+            children: vec![button("cpu"), button("mem")],
+            tooltip: None,
+        }
+    }
+
+    /// Every `gtk::Button` under `root`, depth first, in tree order.
+    fn buttons(root: &gtk::Widget) -> Vec<gtk::Button> {
+        let mut found = Vec::new();
+        if let Ok(button) = root.clone().downcast::<gtk::Button>() {
+            found.push(button);
+        }
+        let mut child = root.first_child();
+        while let Some(node) = child {
+            found.extend(buttons(&node));
+            child = node.next_sibling();
+        }
+        found
+    }
+
+    /// Mount `tree` as plugin `plugin_id`'s bar chip in a presented window and
+    /// wait for it to be laid out, returning the window (to destroy) and the
+    /// card root. Laid out because the press tracker picks the widget under a
+    /// press point, and nothing is under any point of an unallocated card.
+    fn mount_laid_out_card(plugin_id: &str, tree: wire::Node) -> (gtk::Window, gtk::Box) {
+        let (tx, _rx) = mpsc::channel::<HostMsg>(8);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree(plugin_id, &tx, tree)],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        let window = gtk::Window::new();
+        window.set_child(Some(&container));
+        window.present();
+        pump_for(300);
+        let card = card_root(&cards, plugin_id);
+        (window, card)
+    }
+
+    /// The card root's #1252 press tracker, with its **wiring** pinned: every
+    /// test that presses a chip goes through here, so each of them also checks
+    /// the tracker is the one GTK's real dispatch would feed a click's press to.
+    ///
+    /// The two assertions are what a direct `pressed` emission cannot see
+    /// (#1252 review, LOW 2): the signal runs whatever the gesture's phase or
+    /// button filter is, so `PropagationPhase::None` (the tracker never fires)
+    /// or a `set_button(3)` (it fires for right-clicks only) would leave every
+    /// press-driven test green while every real click fell back to the card.
+    fn tracker_of(card: &gtk::Box) -> gtk::GestureClick {
+        let controllers = card.observe_controllers();
+        let gesture = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .find_map(|c| c.downcast::<gtk::GestureClick>().ok())
+            .expect("the card root carries the #1252 press tracker");
+        assert_eq!(
+            gesture.propagation_phase(),
+            gtk::PropagationPhase::Capture,
+            "the tracker must see the press on its way down, before the button's own gesture",
+        );
+        assert_eq!(
+            gesture.button(),
+            gtk::gdk::BUTTON_PRIMARY,
+            "the tracker must listen for the button `GtkButton` clicks on",
+        );
+        gesture
+    }
+
+    /// End the tracker's current press sequence the way GTK does on a release,
+    /// a denial or a cancel: `GtkGesture::end` (#1252 review, LOW 4).
+    fn end_press(card: &gtk::Box) {
+        tracker_of(card).emit_by_name::<()>("end", &[&None::<gtk::gdk::EventSequence>]);
+    }
+
+    /// Press `target` the way a pointer does, as far as the card's own press
+    /// tracker can tell: its capture-phase `GestureClick` emits `pressed` at
+    /// `target`'s centre, in the card's coordinates (#1252).
+    ///
+    /// Emitted on the gesture rather than synthesised as an input event —
+    /// GTK 4 has no public event injection — which exercises everything the
+    /// tracker does with a press (the pick, the walk to the enclosing button,
+    /// the record); [`tracker_of`] pins the wiring that decides whether GTK's
+    /// own dispatch would reach it.
+    fn press_on(card: &gtk::Box, target: &gtk::Button) {
+        let gesture = tracker_of(card);
+        let (w, h) = (target.width(), target.height());
+        assert!(
+            w > 0 && h > 0,
+            "the chip must be laid out before it can be pressed (got {w}×{h})",
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let centre = gtk::graphene::Point::new(w as f32 / 2.0, h as f32 / 2.0);
+        let at = target
+            .compute_point(card, &centre)
+            .expect("the chip is inside its card");
+        gesture.emit_by_name::<()>("pressed", &[&1i32, &f64::from(at.x()), &f64::from(at.y())]);
+    }
+
+    /// A click on one chip of a several-chip card is recorded under **that
+    /// chip**, not under the card — the case the brief calls out, and the one
+    /// `hytte-plugin-stats` needs: its four chips are one card, and a drawer
+    /// centred under the card sits under the middle of the four (#1252).
+    ///
+    /// **Falsification:** make `clicked_widget` return the card
+    /// unconditionally → the chip assertion reds; delete the
+    /// `note_card_click` call from the card's event callback → the `expect`
+    /// reds (nothing recorded at all).
+    #[gtk::test]
+    fn a_click_is_recorded_under_the_chip_its_press_landed_on() {
+        adw::init().expect("libadwaita init");
+        let (window, card) = mount_laid_out_card("click-origin-chip", two_button_tree());
+        let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+            .expect("the card holds exactly the two chips");
+
+        press_on(&card, &mem);
+        mem.emit_clicked();
+        let origin = super::super::effects::take_click_origin("click-origin-chip", Instant::now())
+            .expect("a click on a mounted, rooted chip is recorded as its plugin's origin");
+        assert_eq!(
+            origin,
+            mem.clone().upcast::<gtk::Widget>(),
+            "the page must hang off the chip that was pressed, not the card around it",
+        );
+
+        // …and the other chip, pressed next, is recorded under itself.
+        press_on(&card, &cpu);
+        cpu.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-chip", Instant::now()),
+            Some(cpu.upcast::<gtk::Widget>()),
+        );
+        window.destroy();
+    }
+
+    /// A click with no press behind it — a keyboard activation — is recorded
+    /// under the whole card, and a press is spent by the click it produced: a
+    /// later press-less click cannot inherit it (#1252).
+    ///
+    /// **Falsification:** read the recorded press without taking it
+    /// (`borrow().clone()` for `borrow_mut().take()` in `note_card_click`) → the
+    /// second assertion reds, recording the earlier `mem` press for a `cpu`
+    /// click.
+    #[gtk::test]
+    fn a_click_with_no_press_behind_it_is_recorded_under_the_whole_card() {
+        adw::init().expect("libadwaita init");
+        let (window, card) = mount_laid_out_card("click-origin-card", two_button_tree());
+        let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+            .expect("the card holds exactly the two chips");
+
+        cpu.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-card", Instant::now()),
+            Some(card.clone().upcast::<gtk::Widget>()),
+            "with no press to go by, the card is the best anchor there is",
+        );
+
+        press_on(&card, &mem);
+        mem.emit_clicked();
+        let _ = super::super::effects::take_click_origin("click-origin-card", Instant::now());
+        cpu.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-card", Instant::now()),
+            Some(card.upcast::<gtk::Widget>()),
+            "a press is spent by its click; the next click without one falls back to the card",
+        );
+        window.destroy();
+    }
+
+    /// A press that never became a click — dragged off its chip and released
+    /// elsewhere — is forgotten, so a later press-less activation of a
+    /// **different** chip (keyboard, accessibility) anchors under the card, not
+    /// under the chip that was pressed and abandoned (#1252 review, LOW 4: the
+    /// reviewer measured exactly that with real X11 test input on the first cut).
+    ///
+    /// **Falsification:** delete the tracker's `connect_end` handler → the
+    /// origin is recorded under `cpu` and this reds.
+    #[gtk::test]
+    fn a_press_that_clicked_nothing_does_not_anchor_a_later_click() {
+        adw::init().expect("libadwaita init");
+        let (window, card) = mount_laid_out_card("click-origin-drag-off", two_button_tree());
+        let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+            .expect("the card holds exactly the two chips");
+
+        // Press `cpu`, then the sequence ends with no click (a drag-off).
+        press_on(&card, &cpu);
+        end_press(&card);
+        pump();
+        // A press-less activation of `mem`.
+        mem.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-drag-off", Instant::now()),
+            Some(card.clone().upcast::<gtk::Widget>()),
+            "an abandoned press on `cpu` must not anchor a later click on `mem`",
+        );
+        window.destroy();
+    }
+
+    /// …but the clear is **deferred**: GTK ends the tracker's sequence on the
+    /// release *before* `GtkButton::clicked` runs (the capture phase sees the
+    /// release first), so the click that release produces must still find its
+    /// press. And a newer press that lands before an older press's deferred
+    /// clear runs is not wiped by it (#1252 review, LOW 4).
+    ///
+    /// **Falsification:** clear the press synchronously in the `end` handler →
+    /// the first assertion reds (the click falls back to the card); drop the
+    /// press-count comparison from the idle → the second reds.
+    #[gtk::test]
+    fn a_click_still_finds_its_press_after_the_sequence_ends() {
+        adw::init().expect("libadwaita init");
+        let (window, card) = mount_laid_out_card("click-origin-end-order", two_button_tree());
+        let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+            .expect("the card holds exactly the two chips");
+
+        // An ordinary click, in GTK's order: press, sequence end, `clicked` —
+        // all inside one event dispatch, so no main-loop turn between them.
+        press_on(&card, &mem);
+        end_press(&card);
+        mem.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            Some(mem.clone().upcast::<gtk::Widget>()),
+            "the click in the same dispatch as its release spends its press",
+        );
+        pump();
+
+        // A fast second press dispatched ahead of the first press's idle.
+        press_on(&card, &cpu);
+        end_press(&card);
+        press_on(&card, &mem);
+        pump();
+        mem.emit_clicked();
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            Some(mem.upcast::<gtk::Widget>()),
+            "an older press's deferred clear must not wipe the newer press",
+        );
+        window.destroy();
+    }
+
+    /// Only a **click** records a click origin: an entry submitted (or a slider
+    /// dragged, or a box scrolled) on a chip causes no page, so it must not
+    /// leave an origin for a page the plugin opens a moment later on its own
+    /// (#1252 review, LOW 3c).
+    ///
+    /// **Falsification:** record on every event kind (drop the `Click` match
+    /// in the card's event callback) → this reds.
+    #[gtk::test]
+    fn only_a_click_records_a_click_origin() {
+        adw::init().expect("libadwaita init");
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(8);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let tree = wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 6,
+            children: vec![wire::Node::Entry {
+                id: "q".to_owned(),
+                text: "search".to_owned(),
+                placeholder: String::new(),
+                classes: vec![],
+            }],
+            tooltip: None,
+        };
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("click-origin-entry", &tx, tree)],
+            FitAxis::Height,
+            "ts-plugin-chip",
+            Some("A"),
+        );
+        let window = gtk::Window::new();
+        window.set_child(Some(&container));
+        let card = card_root(&cards, "click-origin-entry");
+        let entry = {
+            fn find(w: &gtk::Widget) -> Option<gtk::Entry> {
+                if let Ok(e) = w.clone().downcast::<gtk::Entry>() {
+                    return Some(e);
+                }
+                let mut child = w.first_child();
+                while let Some(c) = child {
+                    if let Some(found) = find(&c) {
+                        return Some(found);
+                    }
+                    child = c.next_sibling();
+                }
+                None
+            }
+            find(card.upcast_ref()).expect("the card holds the entry")
+        };
+
+        entry.emit_by_name::<()>("activate", &[]);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(HostMsg::Event {
+                    kind: wire::EventKind::Submitted { .. },
+                    ..
+                })
+            ),
+            "premise: the submit reached the plugin",
+        );
+        assert_eq!(
+            super::super::effects::take_click_origin("click-origin-entry", Instant::now()),
+            None,
+            "a submit is not a click and anchors nothing",
+        );
+        window.destroy();
+    }
+
+    /// [`take_click_origin`](super::super::effects::take_click_origin) hands a
+    /// click to **one** page, and only while the click is recent and its chip
+    /// rooted — the recency rule applied through the store, which the pure
+    /// truth table in `effects::tests` cannot see (#1252).
+    ///
+    /// **Falsification:** have `take_click_origin` ignore the click's age
+    /// (pass `Duration::ZERO` to `anchors_to_click`) → the stale assertion reds;
+    /// read the entry without removing it → the "one page" assertion reds; drop
+    /// the `root()` check → the unrooted assertion reds.
+    #[gtk::test]
+    fn a_click_origin_anchors_one_page_and_only_while_recent_and_rooted() {
+        use super::super::effects::{CLICK_ORIGIN_WINDOW, note_click_origin, take_click_origin};
+
+        adw::init().expect("libadwaita init");
+        let window = gtk::Window::new();
+        let chip = gtk::Button::new();
+        window.set_child(Some(&chip));
+        let chip: gtk::Widget = chip.upcast();
+        let now = Instant::now();
+        let ago = |d: Duration| now.checked_sub(d).expect("the clock is past the window");
+
+        note_click_origin(
+            "click-origin-age",
+            &chip,
+            ago(CLICK_ORIGIN_WINDOW + Duration::from_millis(1)),
+        );
+        assert_eq!(
+            take_click_origin("click-origin-age", now),
+            None,
+            "a click older than the window caused nothing opening now",
+        );
+
+        note_click_origin("click-origin-age", &chip, ago(CLICK_ORIGIN_WINDOW));
+        assert_eq!(
+            take_click_origin("click-origin-age", now),
+            Some(chip.clone()),
+            "the window is inclusive",
+        );
+        assert_eq!(
+            take_click_origin("click-origin-age", now),
+            None,
+            "one click anchors one page",
+        );
+
+        let unrooted: gtk::Widget = gtk::Button::new().upcast();
+        note_click_origin("click-origin-age", &unrooted, now);
+        assert_eq!(
+            take_click_origin("click-origin-age", now),
+            None,
+            "a chip on no surface has nothing to measure",
+        );
+        window.destroy();
+    }
+
+    /// The drawer's plugin page wears a built-in page's frame (#1252): the
+    /// `.ts-modal-page` inset on the page root and an `AdwClamp` capped at
+    /// `DRAWER_MAX_WIDTH_WIDE` — a ceiling (`threshold == maximum`, #134) and
+    /// not a floor (no width request, unlike Workspaces' #1108 fill).
+    ///
+    /// Drives the real [`plugin_panel_slot`](super::plugin_panel_slot), the
+    /// function `modal.rs` mounts, so the frame is pinned where it is put on.
+    ///
+    /// **Falsification:** return `build_panel_child(…)` bare from
+    /// `plugin_panel_slot` → the downcast reds; frame with `finish_page` (680)
+    /// → the cap reds; drop the class → the class assertion reds.
+    #[gtk::test]
+    fn the_drawer_frames_a_plugin_page_the_way_it_frames_a_built_in_one() {
+        adw::init().expect("libadwaita init");
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let clamp = super::plugin_panel_slot()
+            .downcast::<adw::Clamp>()
+            .expect("the drawer's plugin page is framed in an AdwClamp");
+        let cap = crate::scale::scale(crate::components::layout::DRAWER_MAX_WIDTH_WIDE);
+        assert_eq!(clamp.maximum_size(), cap, "capped at the wide drawer width");
+        assert_eq!(
+            clamp.tightening_threshold(),
+            cap,
+            "threshold == maximum, or the clamp over-requests past the cap (#134)",
+        );
+        assert_eq!(clamp.width_request(), -1, "a ceiling, not a floor");
+        let page = clamp.child().expect("the plugin page is the clamp's child");
+        assert!(
+            page.has_css_class("ts-plugin-panel") && page.has_css_class("ts-modal-page"),
+            "the page root keeps its plugin hook and gains the built-in page inset",
+        );
+    }
+
+    /// …and the dialog's copy is **not** framed that way: `build_panel_child`
+    /// is shared with `overlays::dialog`, which puts the tree in a card of its
+    /// own, so the drawer frame has to stay out of the shared builder (#1252).
+    ///
+    /// **Falsification:** move the `ts-modal-page` class (or the clamp) into
+    /// `build_panel_child` → this reds.
+    #[gtk::test]
+    fn the_dialogs_shared_panel_builder_stays_unframed() {
+        adw::init().expect("libadwaita init");
+        let panels: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        let active: Mutable<Option<String>> = Mutable::new(None);
+        let child = build_panel_child(panels.signal_cloned(), active.signal_cloned());
+        assert!(
+            child.is::<gtk::Box>(),
+            "the shared builder returns the bare page root, no clamp",
+        );
+        assert!(child.has_css_class("ts-plugin-panel"));
+        assert!(
+            !child.has_css_class("ts-modal-page"),
+            "the dialog card insets its body itself; a second inset would double it",
+        );
+    }
+
+    /// What the frame does to a page's **width**, measured (#1252): a page
+    /// whose natural width runs past the cap is held at it, and a page narrower
+    /// than the cap keeps exactly its own natural width — no floor, so a
+    /// single-column plugin page is not stretched to 1080 px.
+    ///
+    /// The wide page is a wrapping `Node::Text` paragraph — natural width the
+    /// whole paragraph on one line, minimum one word — because that is the
+    /// shape a clamp *can* hold: `AdwClampLayout` never allocates a child below
+    /// its minimum, so content that cannot wrap (a bare `Label`) is as wide as
+    /// it is in any frame, built-in pages included. It is also the shape
+    /// `finish_page`'s own doc names as the reason built-in pages are clamped.
+    ///
+    /// Measured against the framed page's own child rather than a hand-computed
+    /// width, so the assertion holds whether or not a stylesheet has put
+    /// `.ts-modal-page`'s padding on it in this test binary.
+    ///
+    /// **Falsification:** frame with `set_page_width` (a floor) instead of
+    /// `finish_page_clamped` → the narrow half reds; drop the clamp → the wide
+    /// half reds.
+    #[gtk::test]
+    fn a_framed_plugin_page_is_capped_but_never_stretched() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let label_page = |text: &str| SlotRender {
+            panel: Some(wire::Node::Text {
+                id: Some("page".to_owned()),
+                text: text.to_owned(),
+                max_width_chars: None,
+                ellipsize: false,
+                classes: vec![],
+                tooltip: None,
+            }),
+            ..render_of("framed-width", &tx)
+        };
+        let panels = Mutable::new(vec![label_page(&"wide ".repeat(600))]);
+        let active = Mutable::new(Some("framed-width".to_owned()));
+        let framed = super::frame_drawer_page(&build_panel_child(
+            panels.signal_cloned(),
+            active.signal_cloned(),
+        ));
+        let window = gtk::Window::new();
+        window.set_child(Some(&framed));
+        pump();
+
+        let cap = crate::scale::scale(crate::components::layout::DRAWER_MAX_WIDTH_WIDE);
+        let page = framed
+            .clone()
+            .downcast::<adw::Clamp>()
+            .expect("framed in an AdwClamp")
+            .child()
+            .expect("the page is the clamp's child");
+        let natural = |w: &gtk::Widget| w.measure(gtk::Orientation::Horizontal, -1).1;
+        let minimum = |w: &gtk::Widget| w.measure(gtk::Orientation::Horizontal, -1).0;
+
+        assert!(
+            natural(&page) > cap && minimum(&page) < cap,
+            "premise: the wide page wants more than the cap ({} px) but can wrap \
+             inside it ({} px)",
+            natural(&page),
+            minimum(&page),
+        );
+        assert_eq!(natural(&framed), cap, "a wide page is held at the cap");
+
+        panels.set(vec![label_page("cpu 12%")]);
+        pump();
+        assert!(
+            natural(&page) < cap,
+            "premise: this page is narrower than the cap"
+        );
+        assert_eq!(
+            natural(&framed),
+            natural(&page),
+            "a narrow page keeps its own natural width — the frame is no floor",
+        );
+        window.destroy();
     }
 }
 

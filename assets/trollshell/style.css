@@ -599,12 +599,18 @@ label.ts-gpu-temp {
 }
 
 /* Plugin drawer PANEL (#349 PR2). The per-monitor plugin drawer child gets
- * `.ts-plugin-panel` (`trollshell/src/plugins.rs` `plugin_panel_slot`) and sits
- * inside the drawer's `.ts-drawer-content`, which already supplies the dark card
- * surface + the flare inset margins. So this is deliberately near-empty: no
- * background and no extra padding (the plugin owns its inner spacing, same "no
- * host padding" rule as `.ts-plugin-card`) — it exists mainly as a styling hook
- * and to flatten a panel's own boxed-list. */
+ * `.ts-plugin-panel` (`trollshell/src/plugins/region.rs` `build_panel_child`) and
+ * sits inside the drawer's `.ts-drawer-content`, which already supplies the dark
+ * card surface + the flare inset margins. So this is deliberately near-empty: no
+ * background and no padding of its own — it exists mainly as a styling hook and
+ * to flatten a panel's own boxed-list.
+ *
+ * The page *inset* is not this rule's job (#1252): in the drawer the same root
+ * also wears `.ts-modal-page` (`plugin_panel_slot`'s `frame_drawer_page`), the
+ * class every built-in page is built with, so a plugin page sits the same
+ * distance from the card's edge as a native one and follows that rule if it
+ * ever moves. The dialog frames the tree in its own card instead and does not
+ * add it. */
 .ts-plugin-panel {
     background: transparent;
 }

@@ -688,6 +688,31 @@ pub(crate) fn install_test_handles() {
     registry::install(Box::new(TestService), hytte::reactive::runtime::handle());
 }
 
+// The two halves of #1252's click-origin hand-off, reachable from `modal`'s
+// drawer tests: a recorded chip click, and the effect broker answering a bar
+// plugin's `OpenPage(PluginSelf)`. The drawer those tests observe
+// (`ModalPanel`'s `current`/`anchor`) is private to `modal`, so the end-to-end
+// test lives there and reaches the broker through here — through
+// `broker_effect` itself rather than the drawer opener it calls, so a broker
+// that stopped passing that opener is what the test catches.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) use effects::{CLICK_ORIGIN_WINDOW, note_click_origin};
+
+/// Broker `Effect::OpenPage(Page::PluginSelf)` for `plugin_id` mounted at
+/// `mount`, exactly as the effect drain in [`install`] does for a live plugin —
+/// see the re-export above for why this exists (#1252).
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn broker_own_page_for_test(plugin_id: &str, mount: Mount) {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(1);
+    effects::broker_effect(
+        plugin_id,
+        &Effect::OpenPage(hytte_plugin_proto::Page::PluginSelf),
+        mount,
+        &tx,
+        &DatasourceRouter::default(),
+    );
+}
+
 impl Service for PluginsService {
     type Handles = PluginHandles;
 

@@ -5,14 +5,17 @@
 //! **upstream** in the connection reader ([`super::session::enforce_capabilities`]),
 //! so an effect arriving here is always one the plugin was granted.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hytte::gtk::gio::prelude::CancellableExt;
-use hytte::gtk::{gio, glib};
+use hytte::gtk::prelude::*;
+use hytte::gtk::{self, gio, glib};
 use hytte::services::{mpris, niri, notifications, pipewire, systemd};
 use hytte_plugin_proto::{
     AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, Mount, NiriAction, Page,
@@ -147,13 +150,18 @@ pub(super) fn broker_effect(
             // centered dialog overlay, a bar chip's keeps the drawer. Built-in
             // pages are untouched — they hang off the bar and that placement is
             // right.
+            //
+            // Since #1252 a bar chip's page no longer goes straight to the
+            // focused output: `open_own_page_in_drawer` first asks whether one
+            // of this plugin's chips was just clicked, and if so opens the page
+            // under that chip, on that chip's monitor.
             let focused = crate::components::focused_output::current();
             broker_open_page_with(
                 plugin_id,
                 *page,
                 mount,
                 focused.as_deref(),
-                crate::modal::open_plugin_on_focused,
+                open_own_page_in_drawer,
                 crate::overlays::dialog::open_on_focused,
             );
         }
@@ -576,6 +584,123 @@ fn broker_open_page_with(
             }
         },
     }
+}
+
+// ── Click origin: a bar chip's page opens under the chip (#1252) ─────────────
+
+/// How long after a click on one of a plugin's chips the page that plugin opens
+/// still counts as *opened from that chip* (#1252).
+///
+/// The click and the page are two ends of a round trip — the host sends the
+/// plugin `HostMsg::Event`, the plugin's `update` answers with
+/// `Effect::OpenPage(Page::PluginSelf)` — so the effect cannot carry the chip
+/// and the host has to pair the two by time. A live round trip is a few
+/// milliseconds; two seconds is generous for a plugin whose `update` is slow
+/// and still short enough that a page a plugin opens *on its own schedule* a
+/// while later (a timer, a notification) is not mistaken for a click's and
+/// dragged under a chip nobody just pressed.
+pub(crate) const CLICK_ORIGIN_WINDOW: Duration = Duration::from_secs(2);
+
+/// The chip one plugin was last clicked on, and when (#1252).
+struct ClickOrigin {
+    /// The clicked widget — the exact `gtk::Button` when the host saw the press
+    /// land on one, else the plugin's whole card root — held weakly, so a bar
+    /// torn down by a hot-plug is not kept alive by a click nobody followed up.
+    widget: glib::WeakRef<gtk::Widget>,
+    /// When the click happened.
+    at: Instant,
+}
+
+thread_local! {
+    /// The last click origin per plugin id (#1252). Written by every mounted
+    /// card's event callback (`region::reconcile_region`), consumed by the one
+    /// route that anchors a page on it, [`open_own_page_in_drawer`].
+    /// GTK-main-thread only, like both of those. One entry per plugin id,
+    /// overwritten per click and removed when taken, so it is bounded by the
+    /// number of plugins that have ever been clicked and never holds a widget
+    /// strongly.
+    static CLICK_ORIGINS: RefCell<HashMap<String, ClickOrigin>> = RefCell::new(HashMap::new());
+}
+
+/// Record that `plugin_id`'s card or chip was clicked on `widget` at `at`
+/// (#1252). Called from the card's event callback on every `Click`; the latest
+/// click wins.
+///
+/// Recorded for **every** mount, sidebar cards included, because the callback
+/// that records it is shared by every region and a sidebar card's click costs
+/// one map write. Only the drawer route consumes it today — a sidebar card's
+/// page opens in the centred dialog, which has no chip to hang off — and an
+/// unconsumed entry simply ages out of [`CLICK_ORIGIN_WINDOW`].
+pub(crate) fn note_click_origin(plugin_id: &str, widget: &gtk::Widget, at: Instant) {
+    CLICK_ORIGINS.with(|origins| {
+        origins.borrow_mut().insert(
+            plugin_id.to_owned(),
+            ClickOrigin {
+                widget: widget.downgrade(),
+                at,
+            },
+        );
+    });
+}
+
+/// Take `plugin_id`'s click origin if a page opened `now` should hang off it
+/// (#1252): the click is at most [`CLICK_ORIGIN_WINDOW`] old and its widget is
+/// still alive **and** rooted in a window — see [`anchors_to_click`].
+///
+/// Removes the entry whatever the answer, so one click anchors at most one
+/// page: a second `OpenPage` a moment later (a plugin that emits the effect
+/// twice, or opens its page again on a timer) takes the unanchored route rather
+/// than re-using a chip press that has already been answered.
+pub(super) fn take_click_origin(plugin_id: &str, now: Instant) -> Option<gtk::Widget> {
+    let origin = CLICK_ORIGINS.with(|origins| origins.borrow_mut().remove(plugin_id))?;
+    let widget = origin.widget.upgrade();
+    let rooted = widget.as_ref().is_some_and(|w| w.root().is_some());
+    anchors_to_click(now.saturating_duration_since(origin.at), rooted)
+        .then_some(widget)
+        .flatten()
+}
+
+/// Whether a page may anchor on a click that is `age` old and whose widget is
+/// (`rooted`) or is not still on a live surface — the pure half of
+/// [`take_click_origin`] (#1252).
+///
+/// Both conditions, not either: a fresh click on a chip whose bar a hot-plug has
+/// just torn down has nothing to measure, and a still-mounted chip clicked
+/// minutes ago did not cause this page. The window is inclusive, so a round trip
+/// of exactly [`CLICK_ORIGIN_WINDOW`] still anchors.
+pub(super) fn anchors_to_click(age: Duration, rooted: bool) -> bool {
+    rooted && age <= CLICK_ORIGIN_WINDOW
+}
+
+/// The drawer arm of a plugin's own page (#1252), i.e. what
+/// [`broker_open_page_with`] runs for a **bar**-mounted plugin's
+/// `OpenPage(PluginSelf)`: anchored under the chip that was just clicked when
+/// there is one, else the pre-#1252 unanchored open on the focused output.
+///
+/// Three routes, in order:
+///
+/// 1. **Anchored** — [`crate::modal::toggle_plugin_under`], the native chip's
+///    own toggle, on the drawer of the bar the clicked chip lives in.
+/// 2. **Already open** — [`crate::modal::reshow_plugin_if_open`]: the page is
+///    up on some drawer and asked for again with no chip click behind it (a
+///    button *inside* the page navigating it), so it stays where it is, under
+///    the chip it was opened from. Without this the third route re-placed the
+///    card flush in the corner (#1252 review, MEDIUM).
+/// 3. **Unanchored** — [`crate::modal::open_plugin_on_focused`], exactly the
+///    pre-#1252 behaviour: the focused output, flush with the bar's trailing
+///    edge. Also where a click lands whose chip is on no drawer's bar any more.
+fn open_own_page_in_drawer(focused: Option<&str>, plugin_id: &str) {
+    if let Some(chip) = take_click_origin(plugin_id, Instant::now())
+        && crate::modal::toggle_plugin_under(&chip, plugin_id)
+    {
+        tracing::debug!(plugin = %plugin_id, "plugin page anchored under the clicked chip (#1252)");
+        return;
+    }
+    if crate::modal::reshow_plugin_if_open(plugin_id) {
+        tracing::debug!(plugin = %plugin_id, "plugin page already open; re-shown in place (#1252)");
+        return;
+    }
+    crate::modal::open_plugin_on_focused(focused, plugin_id);
 }
 
 // ── RunCommand round-trip (#510) ─────────────────────────────────────────────
@@ -2475,12 +2600,13 @@ impl AuditLog {
 mod tests {
     use super::DatasourceRouter;
     use super::{
-        AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, LaunchReport, MAX_URI_BYTES,
-        MAX_VOLUME, MIN_VOLUME, PageSurface, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id,
-        audit_effect_uri, broker_effect, broker_open_page_with, broker_open_uri_with, check_uri,
-        clamp_volume, command_outcome, effect_kind, filter_forwarded_env, format_audit_line,
-        launch_outcome, launch_with_timeout, open_uri_with, page_surface, start_detached_with,
-        truncate_on_char_boundary, truncate_uri_for_log,
+        AuditDecision, AuditLog, CLICK_ORIGIN_WINDOW, EffectOutcome, FORWARDED_ENV, LaunchReport,
+        MAX_URI_BYTES, MAX_VOLUME, MIN_VOLUME, PageSurface, RUN_COMMAND_MAX_OUTPUT, UriRefusal,
+        anchors_to_click, audit_effect_id, audit_effect_uri, broker_effect, broker_open_page_with,
+        broker_open_uri_with, check_uri, clamp_volume, command_outcome, effect_kind,
+        filter_forwarded_env, format_audit_line, launch_outcome, launch_with_timeout,
+        open_uri_with, page_surface, start_detached_with, truncate_on_char_boundary,
+        truncate_uri_for_log,
     };
     use hytte_plugin_proto::{
         AudioAction, ConsentChoices, ConsentDecision, Effect, HostMsg, MediaAction, Mount,
@@ -4024,5 +4150,48 @@ mod tests {
             Some(hytte_plugin_proto::Capability::RunCommand),
             "…and it is gated on a different capability than a page is",
         );
+    }
+
+    // ── The click origin (#1252) ────────────────────────────────────────────
+
+    /// [`anchors_to_click`] over both of its inputs: a page hangs off the chip
+    /// that was clicked only while the click is at most [`CLICK_ORIGIN_WINDOW`]
+    /// old **and** the chip is still rooted in a window — the window inclusive.
+    ///
+    /// **Falsification:** drop the `age <= CLICK_ORIGIN_WINDOW` term (a page opened
+    /// on a timer minutes later lands under an old click) → the two just-past-the-
+    /// window rows red; drop `rooted` (a chip a hot-plug tore down gets measured)
+    /// → the unrooted rows red; make the window exclusive → the edge row reds.
+    #[test]
+    fn a_page_anchors_on_a_click_only_while_it_is_recent_and_its_chip_rooted() {
+        let window = CLICK_ORIGIN_WINDOW;
+        let past = window + Duration::from_millis(1);
+        let rows = [
+            (Duration::ZERO, true, true),
+            (Duration::from_millis(40), true, true),
+            (window, true, true),
+            (past, true, false),
+            (Duration::from_mins(10), true, false),
+            (Duration::ZERO, false, false),
+            (window, false, false),
+            (past, false, false),
+        ];
+        for (age, rooted, anchors) in rows {
+            assert_eq!(
+                anchors_to_click(age, rooted),
+                anchors,
+                "a click {age:?} old on a chip that is{} rooted",
+                if rooted { "" } else { " not" },
+            );
+        }
+    }
+
+    /// The window is a round trip plus slack, not a user-visible delay: long
+    /// enough for a slow plugin `update`, short enough that a page opened on a
+    /// plugin's own schedule is not mistaken for a click's (#1252). Pinned so a
+    /// change to it is a decision someone reads the doc of, not a drive-by.
+    #[test]
+    fn the_click_origin_window_is_two_seconds() {
+        assert_eq!(CLICK_ORIGIN_WINDOW, Duration::from_secs(2));
     }
 }

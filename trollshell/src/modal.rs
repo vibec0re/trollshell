@@ -3672,6 +3672,22 @@ mod gtk_tests {
         (panel, chip)
     }
 
+    /// [`drop_plugin_drawers`] when dropped — so a #1413 test that fails
+    /// half-way still takes its drawers out of `PANELS`, rather than leaving
+    /// them for whichever test runs next on this thread to open its page on
+    /// (every `#[gtk::test]` here shares that thread-local).
+    struct Mounted {
+        keys: &'static [&'static str],
+        panels: Vec<Rc<ModalPanel>>,
+    }
+
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let panels: Vec<&Rc<ModalPanel>> = self.panels.iter().collect();
+            drop_plugin_drawers(self.keys, &panels);
+        }
+    }
+
     /// Of `panels`, the ones showing anything, with their anchors.
     fn shown(panels: &[&Rc<ModalPanel>]) -> Vec<(Option<Active>, Option<gtk::Widget>)> {
         panels
@@ -3710,6 +3726,10 @@ mod gtk_tests {
         let monitor = test_monitor();
         let (a, chip_a) = builtin_drawer(&monitor, "test-1413-builtin-a");
         let (b, chip_b) = builtin_drawer(&monitor, "test-1413-builtin-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-builtin-a", "test-1413-builtin-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
 
         for (opened, other, chip) in [(&b, &a, &chip_b), (&a, &b, &chip_a)] {
             note_click_origin("mixer", chip.upcast_ref(), None, Instant::now());
@@ -3741,11 +3761,6 @@ mod gtk_tests {
             *opened.current.borrow_mut() = None;
             *opened.anchor.borrow_mut() = None;
         }
-
-        drop_plugin_drawers(
-            &["test-1413-builtin-a", "test-1413-builtin-b"],
-            &[&a, &b],
-        );
     }
 
     /// With no click behind it — a click older than the window, or none at all,
@@ -3770,6 +3785,10 @@ mod gtk_tests {
         let monitor = test_monitor();
         let (a, _chip_a) = builtin_drawer(&monitor, "test-1413-stale-a");
         let (b, chip_b) = builtin_drawer(&monitor, "test-1413-stale-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-stale-a", "test-1413-stale-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
 
         let stale = Instant::now()
             .checked_sub(CLICK_ORIGIN_WINDOW + Duration::from_secs(1))
@@ -3789,8 +3808,6 @@ mod gtk_tests {
                 *panel.anchor.borrow_mut() = None;
             }
         }
-
-        drop_plugin_drawers(&["test-1413-stale-a", "test-1413-stale-b"], &[&a, &b]);
     }
 
     /// A **sidebar** card whose click opens a built-in page: the card is on no
@@ -3818,6 +3835,10 @@ mod gtk_tests {
         let monitor = test_monitor();
         let (a, _) = builtin_drawer(&monitor, "test-1413-sidebar-a");
         let (b, _) = builtin_drawer(&monitor, "test-1413-sidebar-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-sidebar-a", "test-1413-sidebar-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
         // A card in a sidebar: rooted, but in a window no drawer hangs off.
         let sidebar = gtk::Window::new();
         let card = gtk::Button::new();
@@ -3838,11 +3859,6 @@ mod gtk_tests {
             assert_eq!(*other.current.borrow(), None);
             *opened.current.borrow_mut() = None;
         }
-
-        drop_plugin_drawers(
-            &["test-1413-sidebar-a", "test-1413-sidebar-b"],
-            &[&a, &b],
-        );
         sidebar.destroy();
     }
 }

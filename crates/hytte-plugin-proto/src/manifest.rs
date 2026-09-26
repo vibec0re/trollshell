@@ -516,11 +516,17 @@ impl ProvidedDatasource {
 ///   variable name, and not one the session, the loader or the plugin runtime
 ///   owns.
 /// - At most 32 settings are kept, and a repeated `env` keeps its first entry.
-/// - [`label`](Setting::label), [`doc`](Setting::doc), a
-///   [`Choice`](SettingKind::Choice)'s options and [`default`](Setting::default)
-///   are display text: control, bidi and zero-width characters are stripped and
-///   each is capped in length, the same treatment the host gives
-///   [`Manifest::version`].
+/// - [`label`](Setting::label), [`doc`](Setting::doc) and
+///   [`default`](Setting::default) are display text: control, bidi and
+///   zero-width characters are stripped and each is capped in length, the same
+///   treatment the host gives [`Manifest::version`].
+/// - A [`Choice`](SettingKind::Choice)'s options are **values** the plugin
+///   receives, so they are never rewritten: an option that the same treatment
+///   would change is dropped instead, and a `Choice` left with none is dropped
+///   whole.
+/// - A setting of a kind this shell does not know
+///   ([`SettingKind::Unknown`]) is dropped, and the rest of the manifest
+///   registers as usual.
 ///
 /// The host keeps the last list each plugin id declared, so the form is there
 /// for a plugin that is switched off or fails to start without its setting.
@@ -554,13 +560,19 @@ pub struct Setting {
 ///
 /// Externally tagged, like every enum on this wire (see the crate root).
 ///
-/// # Append only, and appending is not free
+/// # Append only, and a new kind costs only its own row
 ///
-/// A new kind is a new variant inside the `Register` frame, so an older host
-/// fails that frame's decode and drops the connection — the same trade
-/// [`Mount`] documents at length. A plugin that declares a kind a shell does not
-/// know therefore does not register with that shell at all. Append at the end
-/// and bump [`VOCAB`] like any other variant.
+/// [`Manifest::settings`] is decoded **per entry**: an entry whose kind this
+/// build does not know becomes [`SettingKind::Unknown`] (or, if even its `env`
+/// is unreadable, is skipped), and the rest of the manifest decodes as usual.
+/// So a plugin that declares a kind added after a shell was built still
+/// registers with that shell, and only that one setting's row is missing —
+/// unlike a [`Mount`], which is load-bearing and so decoded strictly. The
+/// leniency is on the decode side only; the bytes a known kind encodes to do
+/// not depend on it (`tests/settings_golden.rs` pins both).
+///
+/// Append a new kind before `Unknown`, and bump [`VOCAB`] like any other
+/// variant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettingKind {
     /// Free text: an entry row.
@@ -590,6 +602,64 @@ pub enum SettingKind {
         /// The values to pick from, in display order.
         options: Vec<String>,
     },
+    /// A kind this build does not know, read out of a newer plugin's manifest
+    /// (see the enum's own doc). Never on the wire: it cannot be constructed
+    /// outside this crate ([`UnknownKind`]), and encoding one is an error. The
+    /// host drops such a setting with a warning.
+    #[serde(skip)]
+    Unknown(UnknownKind),
+}
+
+/// The payload of [`SettingKind::Unknown`]. Its field is private, so only this
+/// crate's decoder can make one — a plugin cannot declare an unknown kind by
+/// accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownKind(());
+
+/// [`Manifest::settings`]' decoder: one entry at a time, so a kind this build
+/// does not know costs that entry and not the whole `Register` frame (see
+/// [`SettingKind`]'s doc). An entry whose `env` cannot be read at all is
+/// skipped; a well-formed one of an unknown kind is kept as
+/// [`SettingKind::Unknown`] so the host can name it when it drops it.
+fn lenient_settings<'de, D>(deserializer: D) -> Result<Vec<Setting>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// One entry, as far as this build can read it.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Known(Setting),
+        Newer(NewerSetting),
+        Unreadable(serde::de::IgnoredAny),
+    }
+
+    /// Everything of a [`Setting`] but its kind, which this build cannot read.
+    #[derive(Deserialize)]
+    struct NewerSetting {
+        env: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        doc: String,
+        #[serde(default)]
+        default: Option<String>,
+    }
+
+    Ok(Vec::<Entry>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::Known(setting) => Some(setting),
+            Entry::Newer(newer) => Some(Setting {
+                env: newer.env,
+                label: newer.label,
+                doc: newer.doc,
+                kind: SettingKind::Unknown(UnknownKind(())),
+                default: newer.default,
+            }),
+            Entry::Unreadable(_) => None,
+        })
+        .collect())
 }
 
 /// The longest environment variable name [`Setting::env_refusal`] accepts, in
@@ -688,6 +758,22 @@ impl Setting {
     ///   plugin finds the host socket, its own files and its programs;
     /// - `*_API_KEY` — the names the launcher injects keyring secrets under
     ///   (#392). A key must never sit in a plain-text settings file.
+    /// - `SYSTEMD_*` and `NOTIFY_SOCKET` — systemd's. The launcher hands a
+    ///   saved value to `systemd-run` through that tool's **own** environment
+    ///   (the #984 channel), so these would configure the launcher's tool
+    ///   rather than the plugin: `SYSTEMD_LOG_TARGET=null` would silence the
+    ///   very error a failed launch reports.
+    ///
+    /// # A footgun guard, not a sandbox
+    ///
+    /// A plugin is already arbitrary code running as the user, its unit has no
+    /// sandboxing, and whoever edits `plugin-settings.toml` *is* the user. So
+    /// this list does not try to refuse every variable that loads code into a
+    /// process (`GIO_EXTRA_MODULES`, `GTK_MODULES`, `PYTHONPATH`,
+    /// `GCONV_PATH`, …): a plugin that declared one would gain nothing it did
+    /// not already have, and refusing them would be theatre. What it refuses
+    /// is what would quietly break the session or the launch, or put a key in
+    /// a plain-text file.
     #[must_use]
     pub fn env_refusal(name: &str) -> Option<&'static str> {
         if name.len() > MAX_SETTING_ENV_BYTES {
@@ -709,6 +795,9 @@ impl Setting {
         }
         if name.starts_with("XDG_") || name == "PATH" || name == "HOME" {
             return Some("a session variable (XDG_*, PATH, HOME)");
+        }
+        if name.starts_with("SYSTEMD_") || name == "NOTIFY_SOCKET" {
+            return Some("SYSTEMD_* and NOTIFY_SOCKET configure systemd-run, not the plugin");
         }
         if name.ends_with("_API_KEY") {
             return Some(
@@ -838,7 +927,14 @@ pub struct Manifest {
     /// byte-identical on the wire to a pre-#1410 one. A field, not a variant,
     /// so it does not move [`VOCAB`]: an older host skips the unknown key along
     /// with everything inside it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Decoded per entry (see [`SettingKind`]'s doc): an entry of a kind this
+    /// build does not know costs that entry, never the registration.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_settings"
+    )]
     pub settings: Vec<Setting>,
 }
 

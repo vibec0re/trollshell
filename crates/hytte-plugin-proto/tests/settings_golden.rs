@@ -31,8 +31,18 @@ use std::path::{Path, PathBuf};
 
 const FIXTURE: &str = "manifest_settings_v1";
 
+/// A manifest as a **newer** plugin would send it: one known setting, one of
+/// a kind this build does not know, and one entry with no readable `env`
+/// (#1415 review M2). Committed bytes, so the leniency is pinned against a
+/// real encoding and not only against today's encoder.
+const FUTURE_FIXTURE: &str = "manifest_settings_future_kind_v1";
+
 fn fixture_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{FIXTURE}.hex"))
+    named_fixture_path(FIXTURE)
+}
+
+fn named_fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.hex"))
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -117,10 +127,108 @@ fn the_settings_fixture_is_pinned_both_ways() {
 fn regenerate_settings_fixture() {
     let hex = to_hex(&encode(&settings_manifest()));
     std::fs::write(fixture_path(), format!("{hex}\n")).expect("write fixture");
+    let future = to_hex(&encode(&future_manifest()));
+    std::fs::write(named_fixture_path(FUTURE_FIXTURE), format!("{future}\n"))
+        .expect("write fixture");
     panic!(
         "wrote {} — inspect the diff, then commit",
         fixture_path().display()
     );
+}
+
+// ── a newer plugin's kinds (#1415 review M2) ─────────────────────────────────
+
+/// A kind added after this build — what a plugin on a newer SDK would put in
+/// its manifest.
+#[derive(serde::Serialize)]
+enum FutureKind {
+    Text,
+    Secret { reveal: bool },
+}
+
+#[derive(serde::Serialize)]
+struct FutureSetting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env: Option<String>,
+    label: String,
+    doc: String,
+    kind: FutureKind,
+}
+
+/// [`Manifest`]'s own fields plus a `settings` list this build can only
+/// partly read.
+#[derive(serde::Serialize)]
+struct FutureManifest {
+    #[serde(flatten)]
+    base: Manifest,
+    settings: Vec<FutureSetting>,
+}
+
+fn future_manifest() -> FutureManifest {
+    let setting = |env: Option<&str>, kind| FutureSetting {
+        env: env.map(Into::into),
+        label: "L".into(),
+        doc: String::new(),
+        kind,
+    };
+    FutureManifest {
+        base: Manifest {
+            id: "vibectl".into(),
+            proto: PROTO_VERSION,
+            vocab: 1,
+            vocab_max: Some(6),
+            subscribes: Vec::new(),
+            capabilities: Vec::new(),
+            mount: Mount::SidebarTop,
+            order: None,
+            provides: Vec::new(),
+            version: None,
+            settings: Vec::new(),
+        },
+        settings: vec![
+            setting(Some("V1BECTL_SERVER"), FutureKind::Text),
+            setting(Some("V1BECTL_TOKEN"), FutureKind::Secret { reveal: false }),
+            setting(None, FutureKind::Text),
+        ],
+    }
+}
+
+/// One setting of a kind this build does not know costs that setting, not
+/// the plugin's registration: the known one decodes as itself, the newer one
+/// as [`SettingKind::Unknown`] (so the host can name it when it drops it), and
+/// an entry with no readable `env` is skipped. Driven from **committed**
+/// bytes, so it is a real newer encoding that is pinned.
+///
+/// Red before the fix: the whole `decode` failed with "unknown variant
+/// `Secret`", i.e. the plugin could not register at all.
+#[test]
+fn a_newer_setting_kind_costs_only_its_own_setting() {
+    let path = named_fixture_path(FUTURE_FIXTURE);
+    let committed = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("missing {} ({e})", path.display()));
+    assert_eq!(
+        to_hex(&encode(&future_manifest())),
+        committed.trim(),
+        "the probe encoding drifted"
+    );
+    let decoded: Manifest = decode(&from_hex(&committed)).expect("the manifest still decodes");
+    assert_eq!(decoded.id, "vibectl");
+    assert_eq!(decoded.settings.len(), 2, "{:?}", decoded.settings);
+    assert_eq!(decoded.settings[0], Setting::text("V1BECTL_SERVER", "L"));
+    assert_eq!(decoded.settings[1].env, "V1BECTL_TOKEN");
+    assert!(
+        matches!(decoded.settings[1].kind, SettingKind::Unknown(_)),
+        "{:?}",
+        decoded.settings[1].kind
+    );
+}
+
+/// The leniency is decode-only: an `Unknown` kind has no encoding, so a
+/// shell can never forward one it read.
+#[test]
+fn an_unknown_kind_has_no_encoding() {
+    let decoded: Manifest = decode_body(&encode_body(&future_manifest())).expect("decodes");
+    assert!(rmp_serde::to_vec_named(&decoded.settings[1]).is_err());
 }
 
 // ── compat ──────────────────────────────────────────────────────────────────
@@ -314,6 +422,11 @@ fn reserved_names_are_refused() {
         "HOME",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_API_KEY",
+        // #1415 review L1: these would configure `systemd-run` itself, whose
+        // own environment carries a saved value.
+        "SYSTEMD_LOG_LEVEL",
+        "SYSTEMD_LOG_TARGET",
+        "NOTIFY_SOCKET",
     ] {
         assert!(
             Setting::env_refusal(name).is_some(),
@@ -322,7 +435,14 @@ fn reserved_names_are_refused() {
     }
     // Only the exact session names and the listed prefixes/suffix: a name
     // that merely contains one is a plugin's own.
-    for name in ["MY_PATH", "HOMEPAGE", "PLUGIN_XDG_MODE", "API_KEY_HINT"] {
+    for name in [
+        "MY_PATH",
+        "HOMEPAGE",
+        "PLUGIN_XDG_MODE",
+        "API_KEY_HINT",
+        "MY_SYSTEMD_UNIT",
+        "NOTIFY_SOCKET_PATH",
+    ] {
         assert_eq!(Setting::env_refusal(name), None, "{name} is a plugin's own");
     }
 }

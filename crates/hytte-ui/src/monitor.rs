@@ -23,6 +23,14 @@ impl Monitor {
     /// this driver does not name — **including one it names with the empty
     /// string**.
     ///
+    /// On a monitor reached through [`App::monitors`](crate::App::monitors)
+    /// or [`App::monitors_changed`](crate::App::monitors_changed), `None`
+    /// means the compositor does not name it, never that the name is still
+    /// in flight: those list a hot-plugged output only once GTK has applied
+    /// its first `done`, which `wl_output` v4 sends after `name` (#1368).
+    /// Before that, a returning output could be listed nameless and stay
+    /// that way until a restart.
+    ///
     /// That fold is the whole of #1180 item 6. GDK's own `connector()` can
     /// answer `Some("")`, and this doc used to say so ("may be empty on some
     /// drivers; callers should fall back") and leave the handling to seven

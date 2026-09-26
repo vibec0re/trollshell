@@ -5527,7 +5527,7 @@ mod gtk_tests {
     // (comment 5847338182, then the fix round's table), committed.
 
     /// Whether this test can drive **real** pointer input: `xdotool` on `PATH`
-    /// and GTK on an X11 display (`xdotool` speaks XTest, so a Wayland display
+    /// and GTK on an X11 display (`xdotool` speaks `XTest`, so a Wayland display
     /// — a `cargo test` run inside a live session without `xvfb-run` — is out of
     /// its reach).
     ///
@@ -5742,7 +5742,7 @@ mod gtk_tests {
     /// **Falsification:** have the tracker record only the first press of a
     /// sequence (`if n_press > 1 { return; }`) → the second click falls back
     /// to the card and this reds. Not the press-count check in the deferred
-    /// clear: XTest queues the whole double click before GTK dispatches any of
+    /// clear: `XTest` queues the whole double click before GTK dispatches any of
     /// it, and GTK drains queued input before an idle runs, so that race does
     /// not arise here — `a_click_still_finds_its_press_after_the_sequence_ends`
     /// is what pins it.

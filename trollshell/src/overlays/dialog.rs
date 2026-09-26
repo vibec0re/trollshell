@@ -1072,6 +1072,34 @@ mod tests {
         assert_eq!(seq(None, &[None, Some("A")]), [false, true]);
     }
 
+    /// …and the real watcher **is** seeded with the focus the shell knew at
+    /// build time. A source scan, on this module's own
+    /// `the_shell_prompts_yield_the_dialog_before_they_raise` precedent:
+    /// `watch_focused_output` subscribes to `niri::focused_output()`, which needs
+    /// the niri service, inside a window only a Wayland compositor can build,
+    /// so no test reaches the call; the sequence test above pins what a seed
+    /// does, and this pins that the one shipped call passes it.
+    ///
+    /// **Falsification:** seed with `None`
+    /// (`FocusWatch::new(connector, None)`) → this reds; the sequence test
+    /// alone stays green under that mutation (measured).
+    #[test]
+    fn the_real_watcher_is_seeded_with_the_focus_known_at_build() {
+        let src = include_str!("dialog.rs");
+        let body: String = src
+            .split("fn watch_focused_output(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("dialog.rs defines watch_focused_output")
+            .split_whitespace()
+            .collect();
+        assert!(
+            body.contains("FocusWatch::new(connector,crate::components::focused_output::current())"),
+            "watch_focused_output must seed its FocusWatch with the focused output the shell \
+             knew when the window was built (#1416 review, L3)",
+        );
+    }
+
     /// HIGH-1's second half is only a rule if the two shell surfaces actually
     /// call it. A source scan, on `consent.rs`'s own
     /// `request_never_names_a_decision_of_its_own` precedent: the *behaviour* of

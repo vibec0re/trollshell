@@ -1475,6 +1475,12 @@ pub fn open_on_focused(preferred: Option<&str>, page: Page) {
 /// presenting so the per-monitor plugin drawer child reconciles the panel tree as
 /// early as possible (risk #1 in the PR: measure-before-show). No-op if no drawer
 /// is mounted for `key`.
+///
+/// Since #1252 this is the **fallback** for a plugin's page, not its usual
+/// route: a page a plugin chip's own click produced goes through
+/// [`toggle_plugin_under`] instead and lands under that chip. What still comes
+/// here is a page with no recent click behind it — a plugin opening its page
+/// on its own schedule, or a click whose chip is gone.
 fn open_plugin_by_key(key: &str, plugin_id: &str) {
     // Owned handle, no live `PANELS` borrow (#643) — as in [`open_by_key`],
     // plus `set_active_panel`, which publishes into the plugin host.
@@ -1504,6 +1510,49 @@ pub fn open_plugin_on_focused(preferred: Option<&str>, plugin_id: &str) {
     if let Some(key) = key {
         open_plugin_by_key(&key, plugin_id);
     }
+}
+
+/// Toggle a plugin's **own** page on the drawer hanging off the bar `trigger`
+/// sits in, centred under `trigger` — what [`toggle`] does for a native chip,
+/// for a plugin chip (#1252).
+///
+/// A native chip hands itself to [`toggle`]; a plugin chip's click comes back
+/// from the plugin as `Effect::OpenPage(Page::PluginSelf)`, which names no chip,
+/// so the effect broker used to open the page through [`open_plugin_on_focused`]
+/// and the card sat flush with the bar's trailing edge — the right screen corner
+/// Annika reported on #1252. The broker now remembers which chip was just
+/// clicked (`plugins::effects`' click origin) and hands it here. From that point
+/// on it is the native path, the same `toggle_panel` body [`toggle`] runs:
+/// `set_anchor` records the chip, and `reposition_card` / `live_center` centre,
+/// clamp and re-measure the card off it exactly as they do for a native one.
+///
+/// **Which drawer.** The one whose bar *is* `trigger`'s root window, not niri's
+/// focused output: the chip was clicked on the screen it lives on, which is the
+/// screen its page belongs on even when keyboard focus is elsewhere. Matched by
+/// window identity rather than by connector name, so a connector-less monitor
+/// (whose `monitor_key` is a fallback key no region knows) resolves too.
+///
+/// Returns `false`, having touched nothing, when `trigger` is on no mounted
+/// drawer's bar — unrooted, or torn down by a hot-plug since the click — so the
+/// caller can take the unanchored [`open_plugin_on_focused`] route instead.
+pub fn toggle_plugin_under(trigger: &gtk::Widget, plugin_id: &str) -> bool {
+    let Some(panel) = panel_under(trigger) else {
+        return false;
+    };
+    toggle_panel(&panel, Active::Plugin(plugin_id.to_owned()), trigger, true);
+    recompute_gates();
+    true
+}
+
+/// The mounted drawer whose bar `trigger` lives in, as an owned handle (#643):
+/// the one whose [`BarGeometry::bar_window`] is `trigger`'s root. `None` when
+/// `trigger` is unrooted or rooted in any other window.
+fn panel_under(trigger: &gtk::Widget) -> Option<Rc<ModalPanel>> {
+    let root = trigger.root()?;
+    let root: &gtk::Widget = root.upcast_ref();
+    live_panels()
+        .into_iter()
+        .find(|panel| panel.geometry.bar_window.upcast_ref::<gtk::Widget>() == root)
 }
 
 /// Toggle the drawer on `monitor` to the given `page`, centering the drawer
@@ -1545,42 +1594,62 @@ fn toggle_inner(
     // it is also the one most worth not making conditional on whether GTK
     // happens to emit synchronously today.
     if let Some(panel) = live_panel(&key) {
-        let current = panel.current.borrow().clone();
-        match current {
-            // Same built-in page already open → retract (`toggle`) or re-run
-            // the on-show hook in place (`toggle_keep_open`). A plugin panel
-            // showing is never the same as a built-in `page`, so it falls to
-            // the swap arm.
-            Some(Active::Builtin(p)) if p == page => {
-                if retract_on_same {
-                    panel.revealer.set_reveal_child(false);
-                } else {
-                    on_page_show(&panel, page);
-                }
-            }
-            Some(_) => {
-                set_stack_page(&panel, page);
-                *panel.current.borrow_mut() = Some(Active::Builtin(page));
-                on_page_show(&panel, page);
-            }
-            None => {
-                // Build + set the visible child first so `measure` reflects the
-                // target page's natural size, not whatever was last shown, and
-                // so `show_panel`'s margin measure below sees the real page.
-                // `show_panel` re-sets it (idempotent).
-                set_stack_page(&panel, page);
-                // Record the chip, then let `show_panel` place the card off it.
-                // The placement is best-effort at this point (a pre-map measure
-                // can underestimate the card); the window-map handler recomputes
-                // from the real allocation once the surface is mapped.
-                set_anchor(&panel, trigger.upcast_ref());
-                show_panel(&panel, page);
-            }
-        }
+        toggle_panel(
+            &panel,
+            Active::Builtin(page),
+            trigger.upcast_ref(),
+            retract_on_same,
+        );
     }
     // Swap/open may have changed which page is visible; the same-page retract
     // branch is recomputed later by `wire_retract_finish`. Idempotent.
     recompute_gates();
+}
+
+/// The three arms a chip click takes on one drawer — shared by [`toggle_inner`]
+/// (a native chip; `active` is a built-in page) and [`toggle_plugin_under`] (a
+/// plugin chip; `active` is that plugin's own page, #1252), so the two cannot
+/// drift apart on what a second click does or on how the card is placed. The
+/// caller has already resolved which drawer and recomputes the gates after.
+///
+/// - The same target already showing → retract (`retract_on_same`) or re-run
+///   its on-show hook in place (`toggle_keep_open`). A plugin page and a
+///   built-in page are never the same target, so either showing when the other
+///   is asked for falls to the swap arm.
+/// - Something else showing → swap the stack child in place; the card keeps
+///   the position it opened at.
+/// - Closed → anchor on `trigger`, present, reveal.
+fn toggle_panel(panel: &ModalPanel, active: Active, trigger: &gtk::Widget, retract_on_same: bool) {
+    let current = panel.current.borrow().clone();
+    match current {
+        Some(shown) if shown == active => {
+            if retract_on_same {
+                panel.revealer.set_reveal_child(false);
+            } else {
+                on_active_show(panel, &active);
+            }
+        }
+        Some(_) => {
+            set_stack_active(panel, &active);
+            *panel.current.borrow_mut() = Some(active.clone());
+            on_active_show(panel, &active);
+        }
+        None => {
+            // Build + set the visible child first so `measure` reflects the
+            // target page's natural size, not whatever was last shown, and so
+            // `show_panel_active`'s margin measure below sees the real page. It
+            // re-sets it (idempotent).
+            set_stack_active(panel, &active);
+            // Record the chip, then let `show_panel_active` place the card off
+            // it. The placement is best-effort at this point (a pre-map measure
+            // can underestimate the card — and a plugin page has not even
+            // reconciled yet, its selection is published inside the call below);
+            // the window-map handler recomputes from the real allocation once the
+            // surface is mapped.
+            set_anchor(panel, trigger);
+            show_panel_active(panel, active);
+        }
+    }
 }
 
 /// Present the drawer on `page`, positioned off whatever [`ModalPanel::anchor`]
@@ -2892,7 +2961,7 @@ mod tests {
 mod gtk_tests {
     use super::{
         Active, BarGeometry, ModalPanel, PANELS, Page, drawer_open_state, monitor_key,
-        on_page_show, recompute_gates, toggle,
+        on_page_show, recompute_gates, toggle, toggle_plugin_under,
     };
     use crate::components::layout::{EDIT_FORM_WIDTH, set_page_width, workspaces_page_width};
     use crate::scale::scale;
@@ -3194,5 +3263,181 @@ mod gtk_tests {
             panels.borrow_mut().remove(&key);
         });
         recompute_gates();
+    }
+
+    // ── #1252: a plugin chip's page opens under the chip ─────────────────────
+
+    /// A [`harness_panel`] mounted in `PANELS` under `key`, with a chip in its
+    /// bar and a stand-in plugin page in its stack — one monitor's worth of
+    /// drawer for the #1252 tests.
+    ///
+    /// The chip is the bar window's child, which is all
+    /// [`super::panel_under`] matches on: a real bar nests its chips deeper, but
+    /// `root()` answers the same window at any depth. The stand-in page is there
+    /// because `set_stack_active` names `PLUGIN_STACK_CHILD`, which a real drawer
+    /// adds eagerly in `build_pages_stack`.
+    fn plugin_drawer(monitor: &Monitor, key: &str) -> (Rc<ModalPanel>, gtk::Button) {
+        let panel = harness_panel(monitor);
+        panel.stack.add_named(
+            &gtk::Box::new(gtk::Orientation::Vertical, 0),
+            Some(super::PLUGIN_STACK_CHILD),
+        );
+        let chip = gtk::Button::new();
+        panel.geometry.bar_window.set_child(Some(&chip));
+        PANELS.with(|panels| {
+            panels.borrow_mut().insert(key.to_owned(), panel.clone());
+        });
+        (panel, chip)
+    }
+
+    /// The widget `panel`'s card is anchored on, if any.
+    fn anchored_on(panel: &ModalPanel) -> Option<gtk::Widget> {
+        panel
+            .anchor
+            .borrow()
+            .as_ref()
+            .and_then(|anchor| anchor.widget.upgrade())
+    }
+
+    /// Put `panels` back the way a finished retract leaves them (the harness
+    /// wires no `wire_retract_finish`) and take them out of `PANELS`.
+    fn drop_plugin_drawers(keys: &[&str], panels: &[&Rc<ModalPanel>]) {
+        for panel in panels {
+            *panel.current.borrow_mut() = None;
+            *panel.anchor.borrow_mut() = None;
+            panel.window.set_visible(false);
+        }
+        PANELS.with(|map| {
+            let mut map = map.borrow_mut();
+            for key in keys {
+                map.remove(*key);
+            }
+        });
+        crate::plugins::set_active_panel(None);
+        recompute_gates();
+    }
+
+    /// [`toggle_plugin_under`] opens the plugin's page on the drawer hanging
+    /// off **the chip's own bar**, anchored on the chip, and a second click on
+    /// that chip retracts it — a native chip's toggle, for a plugin chip
+    /// (#1252). A chip on no drawer's bar opens nothing and says so.
+    ///
+    /// Both drawers are opened in turn, each from its own chip, so the drawer
+    /// choice cannot pass by `PANELS`' iteration order happening to agree.
+    ///
+    /// **Falsification:** have `panel_under` return any mounted drawer (the
+    /// pre-#1252 "focused, else any" shape) → one of the two rounds reds;
+    /// `*panel.anchor.borrow_mut() = None` in place of `set_anchor` (the
+    /// `open_plugin_by_key` shape) → the anchor assertion reds; pass
+    /// `retract_on_same = false` → the second-click assertion reds.
+    #[gtk::test]
+    fn a_plugin_page_opens_under_its_chip_on_that_chips_own_drawer() {
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, chip_a) = plugin_drawer(&monitor, "test-1252-a");
+        let (b, chip_b) = plugin_drawer(&monitor, "test-1252-b");
+        let plugin = Active::Plugin("stats-bar".to_owned());
+
+        for (opened, other, chip) in [(&b, &a, &chip_b), (&a, &b, &chip_a)] {
+            assert!(
+                toggle_plugin_under(chip.upcast_ref(), "stats-bar"),
+                "a chip on a mounted bar resolves to that bar's drawer",
+            );
+            assert_eq!(*opened.current.borrow(), Some(plugin.clone()));
+            assert!(opened.revealer.reveals_child(), "…and the page is revealed");
+            assert_eq!(
+                anchored_on(opened),
+                Some(chip.clone().upcast::<gtk::Widget>()),
+                "the card is centred under the chip that was clicked",
+            );
+            assert_eq!(
+                *other.current.borrow(),
+                None,
+                "the other monitor's drawer stays shut — the page belongs on the \
+                 screen that was clicked, whatever has keyboard focus",
+            );
+
+            assert!(toggle_plugin_under(chip.upcast_ref(), "stats-bar"));
+            assert!(
+                !opened.revealer.reveals_child(),
+                "a second click on the same chip closes its page, like a native chip",
+            );
+            // The harness has no `wire_retract_finish`; finish the retract.
+            *opened.current.borrow_mut() = None;
+        }
+
+        let stray = gtk::Button::new();
+        assert!(
+            !toggle_plugin_under(stray.upcast_ref(), "stats-bar"),
+            "a chip on no drawer's bar resolves to nothing, so the caller falls back",
+        );
+        assert_eq!(*a.current.borrow(), None);
+        assert_eq!(*b.current.borrow(), None);
+
+        drop_plugin_drawers(&["test-1252-a", "test-1252-b"], &[&a, &b]);
+    }
+
+    /// End to end through the **effect broker** (#1252): a click recorded on a
+    /// bar plugin's chip, then that plugin's `OpenPage(PluginSelf)`, opens the
+    /// page on the chip's drawer under the chip. A click older than the window
+    /// does not — the page still opens, flush with the bar's edge as before
+    /// #1252, on whichever drawer the unanchored route picks.
+    ///
+    /// Through `broker_effect` itself, so what is pinned is the broker's own
+    /// choice of drawer opener, not a function it might stop calling.
+    ///
+    /// **Falsification:** hand `broker_open_page_with` the pre-#1252
+    /// `crate::modal::open_plugin_on_focused` → the anchored half reds (the page
+    /// opens unanchored, possibly on the wrong drawer); have `take_click_origin`
+    /// ignore the click's age → the stale half reds.
+    #[gtk::test]
+    fn a_plugin_chips_click_anchors_the_page_the_broker_opens() {
+        use crate::plugins::{CLICK_ORIGIN_WINDOW, broker_own_page_for_test, note_click_origin};
+        use hytte_plugin_proto::Mount;
+        use std::time::{Duration, Instant};
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _chip_a) = plugin_drawer(&monitor, "test-1252-broker-a");
+        let (b, chip_b) = plugin_drawer(&monitor, "test-1252-broker-b");
+
+        note_click_origin("stats-broker", chip_b.upcast_ref(), Instant::now());
+        broker_own_page_for_test("stats-broker", Mount::BarRight);
+        assert_eq!(
+            *b.current.borrow(),
+            Some(Active::Plugin("stats-broker".to_owned())),
+            "the page opens on the drawer of the bar that was clicked",
+        );
+        assert_eq!(
+            anchored_on(&b),
+            Some(chip_b.clone().upcast::<gtk::Widget>()),
+            "…under the chip that was clicked",
+        );
+        assert_eq!(*a.current.borrow(), None);
+
+        // Reset, then a click from well before the window.
+        *b.current.borrow_mut() = None;
+        *b.anchor.borrow_mut() = None;
+        let stale = Instant::now()
+            .checked_sub(CLICK_ORIGIN_WINDOW + Duration::from_secs(1))
+            .expect("the clock is past the window");
+        note_click_origin("stats-broker", chip_b.upcast_ref(), stale);
+        broker_own_page_for_test("stats-broker", Mount::BarRight);
+        let opened: Vec<&Rc<ModalPanel>> = [&a, &b]
+            .into_iter()
+            .filter(|panel| panel.current.borrow().is_some())
+            .collect();
+        assert_eq!(opened.len(), 1, "a stale click still opens the page, once");
+        assert_eq!(
+            anchored_on(opened[0]),
+            None,
+            "…flush with the bar, not under a chip whose click did not cause it",
+        );
+
+        drop_plugin_drawers(&["test-1252-broker-a", "test-1252-broker-b"], &[&a, &b]);
     }
 }

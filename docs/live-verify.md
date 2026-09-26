@@ -2406,6 +2406,49 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       machine, `[bar] gpu = false` is the mitigation until P3 (#1252) retires
       the native GPU chip and removes the third poller.
 
+#### A plugin chip's page opens under the chip, in a page frame (#1252)
+
+Annika on #1252: _"Drawer does not open below chip but right screen corner."_
+A bar plugin's page now hangs off the chip whose click opened it, on that
+chip's monitor, and wears the built-in pages' frame. Run the bar instance as
+above (`HYTTE_PLUGIN_ID=stats-bar HYTTE_PLUGIN_MOUNT=BarRight`).
+
+- [ ] **(#1252)** **Each chip centres the drawer under itself.** Click `CPU`:
+      the card slides out centred under the **`CPU`** chip — not under the
+      middle of the four-chip group, and not flush with the right screen edge.
+      Close it (click outside, or `Esc`) and do the same for `MEM`, `DSK` and
+      `GPU`: the card moves to sit under each one in turn, exactly the way it
+      sits under a native chip (compare the native CPU chip's drawer beside
+      it). Near the right edge the card may clamp to stay on screen, again
+      exactly as a native chip's does.
+- [ ] **(#1252)** **On the monitor the chip is on.** With two outputs, focus a
+      window on output A and click the stats chip on output **B**'s bar: the
+      drawer opens on **B**, under the chip. (Before #1252 it opened on niri's
+      focused output.)
+- [ ] **(#1252)** **A second click closes it.** With the page open, click the
+      same chip again: the drawer retracts, like a native chip. (The drawer's
+      full-screen catcher usually takes that click before the chip sees it;
+      either way the drawer must close and not re-open.)
+- [ ] **(#1252)** **A keybind open stays flush.** Open a page with no chip
+      behind it:
+      `busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell org.gtk.Actions Activate 'sava{sv}' open-page 1 s stats 0`
+      — the drawer opens **flush with the bar's right edge** on niri's focused
+      output, exactly as before #1252. Then the plugin-page flavour of the same
+      thing: click a stats chip while the plugin is stopped
+      (`systemctl --user kill -s STOP trollshell-plugin-stats-bar`), wait 3 s,
+      resume it (`… -s CONT …`). The page it opens late must also land
+      **flush** (the click is older than the 2 s window), not under the chip.
+- [ ] **(#1252)** **The page has a native page's margins.** The plugin page's
+      content is inset from the card's edge by the same margin a built-in page
+      has (`.ts-modal-page`, ~12 px at the default font), instead of touching
+      the card edge. A very wide plugin page stops growing at the wide drawer
+      width (1080 px at the default font) instead of widening the card to the
+      screen; a narrow one keeps its own width.
+- [ ] **(#1252)** **The sidebar dialog is unchanged.** Click a
+      **sidebar**-mounted plugin card that opens its page (the clock demo's
+      sidebar card, #1408): it still opens in the centred dialog, with the same
+      padding as before — the drawer's page frame must not appear there.
+
 ## Audio & media
 
 - [ ] **(#470)** Drag-safe seek slider: open the Media drawer on an active

@@ -4333,8 +4333,8 @@ mod tests {
     /// output.
     ///
     /// **Falsification:** prefer `focused` (`focused.or(clicked)`) → the
-    /// "focus elsewhere" row reds; ignore the click (`focused` alone) → both
-    /// clicked rows red.
+    /// "focus still on A" row reds; ignore the click (`focused` alone) → that
+    /// row and the "no focus" row red.
     #[test]
     fn a_page_opens_on_the_clicked_output_else_the_focused_one() {
         let rows = [

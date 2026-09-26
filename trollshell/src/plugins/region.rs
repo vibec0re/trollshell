@@ -5516,6 +5516,286 @@ mod gtk_tests {
         window.destroy();
     }
 
+    // ── #1413: the press tracker under real pointer input ────────────────────
+    //
+    // Every test above feeds the tracker by emitting its gesture's signals, and
+    // `tracker_of` pins the wiring that decides whether GTK's own dispatch would
+    // reach it. These four drive the pointer for real instead — XTest input into
+    // the test's X display through `xdotool`, so the press goes down GTK's own
+    // capture/target/bubble dispatch, meets the chip's own `GtkButton` gesture,
+    // and ends the way GTK ends it. They are what #1252's reviewer ran by hand
+    // (comment 5847338182, then the fix round's table), committed.
+
+    /// Whether this test can drive **real** pointer input: `xdotool` on `PATH`
+    /// and GTK on an X11 display (`xdotool` speaks XTest, so a Wayland display
+    /// — a `cargo test` run inside a live session without `xvfb-run` — is out of
+    /// its reach).
+    ///
+    /// Honours `TROLLSHELL_REQUIRE_XDOTOOL` the way `plugins::tests`'
+    /// `systemd_run_on_path_or_skip` honours `TROLLSHELL_REQUIRE_SYSTEMD_RUN`
+    /// (itself on `hytte-ui`'s `TROLLSHELL_REQUIRE_GL` precedent): a skip is
+    /// indistinguishable from a pass in captured output, so the build that means
+    /// these to run — CI's `system-tests` check, which carries `pkgs.xdotool`
+    /// and exports the variable — **fails** naming the reason, while a bare
+    /// local run without `xdotool` skips.
+    fn real_pointer_or_skip(test_name: &str) -> bool {
+        use std::process::{Command, Stdio};
+
+        let xdotool = Command::new("xdotool")
+            .arg("version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let on_x11 = gtk::gdk::Display::default()
+            .is_some_and(|display| display.type_().name() == "GdkX11Display");
+        if xdotool && on_x11 {
+            return true;
+        }
+        let reason = if xdotool {
+            "GTK is not on an X11 display, and xdotool drives X11 only"
+        } else {
+            "xdotool is not on PATH"
+        };
+        let required =
+            std::env::var_os("TROLLSHELL_REQUIRE_XDOTOOL").is_some_and(|want| want == "1");
+        assert!(
+            !required,
+            "TROLLSHELL_REQUIRE_XDOTOOL=1, but {reason} for {test_name}",
+        );
+        eprintln!("SKIPPED {test_name}: {reason}");
+        false
+    }
+
+    /// A two-chip plugin card on screen, and the X window it is in — what the
+    /// real-pointer tests click on.
+    struct RealPointer {
+        window: gtk::Window,
+        card: gtk::Box,
+        /// The card's X window, as `xdotool` names it.
+        xid: String,
+        cpu: gtk::Button,
+        mem: gtk::Button,
+    }
+
+    impl RealPointer {
+        /// Mount [`two_button_tree`] as `plugin_id`'s card, laid out and mapped,
+        /// and find its X window by a title nothing else in the run carries.
+        fn mount(plugin_id: &str) -> Self {
+            use std::process::Command;
+
+            let (window, card) = mount_laid_out_card(plugin_id, two_button_tree());
+            let title = format!("trollshell-real-pointer-{}-{plugin_id}", std::process::id());
+            window.set_title(Some(&title));
+            let pattern = format!("^{title}$");
+            let mut xid = None;
+            for _ in 0..40 {
+                pump_for(50);
+                let found = Command::new("xdotool")
+                    .args(["search", "--onlyvisible", "--name", &pattern])
+                    .output()
+                    .expect("xdotool runs");
+                xid = String::from_utf8_lossy(&found.stdout)
+                    .lines()
+                    .next()
+                    .map(|line| line.trim().to_owned())
+                    .filter(|line| !line.is_empty());
+                if xid.is_some() {
+                    break;
+                }
+            }
+            let xid = xid.unwrap_or_else(|| panic!("xdotool found no mapped window titled {title}"));
+            // Nothing else should be over it, but a test that left a window up
+            // must not be able to take these clicks.
+            Self::run_xdotool(&["windowraise", &xid]);
+            let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+                .expect("the card holds exactly the two chips");
+            Self {
+                window,
+                card,
+                xid,
+                cpu,
+                mem,
+            }
+        }
+
+        /// Run one `xdotool` command line, then let GTK dispatch what it sent.
+        fn run_xdotool(args: &[&str]) {
+            let status = std::process::Command::new("xdotool")
+                .args(args)
+                .status()
+                .expect("xdotool runs");
+            assert!(status.success(), "xdotool {args:?} failed: {status}");
+            pump_for(250);
+        }
+
+        /// `target`'s centre in its X window's pixels — the window's own
+        /// coordinates, offset by wherever GTK put the window widget inside its
+        /// surface and scaled to device pixels.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "a chip's size and position are small pixel counts"
+        )]
+        fn centre_of(&self, target: &gtk::Button) -> [String; 2] {
+            let (w, h) = (target.width(), target.height());
+            assert!(w > 0 && h > 0, "the chip must be laid out (got {w}×{h})");
+            let centre = gtk::graphene::Point::new(w as f32 / 2.0, h as f32 / 2.0);
+            let at = target
+                .compute_point(&self.window, &centre)
+                .expect("the chip is inside its window");
+            let (dx, dy) = self.window.surface_transform();
+            let scale = f64::from(self.window.scale_factor());
+            [
+                (((f64::from(at.x()) + dx) * scale).round() as i32).to_string(),
+                (((f64::from(at.y()) + dy) * scale).round() as i32).to_string(),
+            ]
+        }
+
+        /// Move the pointer onto `target`'s centre, then run `then` there.
+        fn at(&self, target: &gtk::Button, then: &[&str]) {
+            let [x, y] = self.centre_of(target);
+            let mut args = vec!["mousemove", "--window", self.xid.as_str(), &x, &y];
+            args.extend_from_slice(then);
+            Self::run_xdotool(&args);
+        }
+    }
+
+    impl Drop for RealPointer {
+        fn drop(&mut self) {
+            self.window.destroy();
+        }
+    }
+
+    /// A **real** click on one chip of a two-chip card is recorded under that
+    /// chip, and a real click on the other under the other — the #1252
+    /// behaviour, through GTK's own dispatch rather than an emitted `pressed`
+    /// (#1413 item 3).
+    ///
+    /// **Falsification:** set the tracker's phase to `PropagationPhase::None`
+    /// or its button to 3 (the two mutations #1252's review found only real
+    /// dispatch could see) → the chip assertion reds, the click falling back to
+    /// the card.
+    #[gtk::test]
+    fn a_real_click_is_recorded_under_the_chip_it_landed_on() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_click_is_recorded_under_the_chip_it_landed_on") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-click");
+
+        pointer.at(&pointer.mem, &["click", "1"]);
+        assert_eq!(
+            taken("real-pointer-click"),
+            Some(pointer.mem.clone().upcast::<gtk::Widget>()),
+            "a real click on `mem` is recorded under `mem`",
+        );
+        pointer.at(&pointer.cpu, &["click", "1"]);
+        assert_eq!(
+            taken("real-pointer-click"),
+            Some(pointer.cpu.clone().upcast::<gtk::Widget>()),
+            "…and one on `cpu` under `cpu`",
+        );
+    }
+
+    /// A real press on `cpu`, dragged onto `mem` and released there, clicks
+    /// **nothing** and records nothing; and it is forgotten, so a press-less
+    /// activation of `mem` right after (keyboard, accessibility — simulated with
+    /// `emit_clicked`, which is what those are to a `GtkButton`) anchors under
+    /// the card, not under the abandoned `cpu` (#1252 review, LOW 4; #1413 item
+    /// 3).
+    ///
+    /// **Falsification:** delete the tracker's `connect_end` handler → the
+    /// second assertion reds with `cpu`.
+    #[gtk::test]
+    fn a_real_drag_off_records_nothing_and_leaves_no_press_behind() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_drag_off_records_nothing_and_leaves_no_press_behind") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-drag-off");
+
+        pointer.at(&pointer.cpu, &["mousedown", "1"]);
+        pointer.at(&pointer.mem, &[]);
+        RealPointer::run_xdotool(&["mouseup", "1"]);
+        assert_eq!(
+            taken("real-pointer-drag-off"),
+            None,
+            "a press dragged off its chip and released elsewhere clicked nothing",
+        );
+
+        pointer.mem.emit_clicked();
+        assert_eq!(
+            taken("real-pointer-drag-off"),
+            Some(pointer.card.clone().upcast::<gtk::Widget>()),
+            "the abandoned press on `cpu` must not anchor a later press-less click",
+        );
+    }
+
+    /// A real **double** click on `mem` is two clicks to the button and both
+    /// are recorded under `mem` — the second press of a double click reaches
+    /// the tracker as its own press (`n_press` 2), and the first click's
+    /// deferred clear does not wipe it (#1413 item 3).
+    ///
+    /// **Falsification:** drop the press-count comparison from the tracker's
+    /// deferred clear → the second press can be wiped before its click, which
+    /// falls back to the card.
+    #[gtk::test]
+    fn a_real_double_click_is_recorded_under_its_chip() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_double_click_is_recorded_under_its_chip") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-double");
+        let clicks = Rc::new(std::cell::Cell::new(0u32));
+        let counter = clicks.clone();
+        pointer
+            .mem
+            .connect_clicked(move |_| counter.set(counter.get() + 1));
+
+        pointer.at(
+            &pointer.mem,
+            &["click", "--repeat", "2", "--delay", "80", "1"],
+        );
+        assert_eq!(clicks.get(), 2, "premise: GTK saw a double click as two clicks");
+        assert_eq!(
+            taken("real-pointer-double"),
+            Some(pointer.mem.clone().upcast::<gtk::Widget>()),
+            "a double click on `mem` is recorded under `mem`",
+        );
+    }
+
+    /// A real **right** click on `mem` records nothing: `GtkButton` clicks on
+    /// the primary button only, and the tracker listens for that one only. The
+    /// control — a primary click at the very same spot, recorded under `mem` —
+    /// is what makes the `None` about the button rather than the aim (#1413
+    /// item 3).
+    ///
+    /// **Falsification:** set the tracker's button to 0 (any) and record the
+    /// origin on any event → the first assertion reds.
+    #[gtk::test]
+    fn a_real_right_click_records_nothing() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_right_click_records_nothing") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-right");
+
+        pointer.at(&pointer.mem, &["click", "3"]);
+        assert_eq!(
+            taken("real-pointer-right"),
+            None,
+            "a right click is no click and records nothing",
+        );
+        pointer.at(&pointer.mem, &["click", "1"]);
+        assert_eq!(
+            taken("real-pointer-right"),
+            Some(pointer.mem.clone().upcast::<gtk::Widget>()),
+            "control: a primary click on the same spot is recorded under `mem`",
+        );
+    }
+
     /// The drawer's plugin page wears a built-in page's frame (#1252): the
     /// `.ts-modal-page` inset on the page root and an `AdwClamp` capped at
     /// `DRAWER_MAX_WIDTH_WIDE` — a ceiling (`threshold == maximum`, #134) and

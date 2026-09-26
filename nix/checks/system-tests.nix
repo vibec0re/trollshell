@@ -115,12 +115,20 @@ craneLib.mkCargoDerivation (
     # window's trust path had no tests. It buys
     # `verify.rs`'s `tls_tests` module: a real `GTlsServerConnection`
     # on loopback and the window's own `probe` against it.
+    #
+    # `xdotool` since #1413: the four real-pointer tests in
+    # `trollshell/src/plugins/region.rs` (`a_real_click_is_recorded_under_the_chip_it_landed_on`
+    # and its three siblings) drive XTest clicks into the `xvfb-run` display,
+    # so #1252's press tracker is exercised through GTK's own event dispatch
+    # rather than only by emitted gesture signals. `TROLLSHELL_REQUIRE_XDOTOOL`
+    # below makes a missing binary fail them here instead of skipping.
     nativeCheckInputs = [
       pkgs.dbus
       pkgs.xvfb-run
       pkgs.mesa
       pkgs.systemd
       pkgs.glib-networking
+      pkgs.xdotool
     ];
     doCheck = true;
     # Leaf/terminal check: nothing consumes its target dir. crane
@@ -246,6 +254,13 @@ craneLib.mkCargoDerivation (
       # whichever `LaunchReport` fallback the sandbox produces
       # (`NoSystemdRun` or `NoUserManager`).
       export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
+      # #1413, on the same precedent: `pkgs.xdotool` above is what drives the
+      # real-pointer press-tracker tests (`plugins/region.rs`'s
+      # `real_pointer_or_skip`). Without it they skip — and a skip reads as a
+      # pass — so here, where they are meant to run, a missing `xdotool` or a
+      # GTK that did not come up on the `xvfb-run` X11 display fails them,
+      # naming which.
+      export TROLLSHELL_REQUIRE_XDOTOOL=1
       # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
       # CPU/GL parity harness) runs through the same llvmpipe context
       # as the three `hytte-ui` GL tests. Under llvmpipe every *scope*

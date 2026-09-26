@@ -6015,7 +6015,7 @@ clicked on. A page with no recent click behind it (a keybind, a timer, a
 plugin opening its page on its own schedule) opens exactly where it did
 before.
 
-No in-tree plugin opens a built-in page today, so the first two items need a
+No in-tree plugin opens a built-in page today, so the first three items need a
 throwaway one: in `crates/hytte-plugin-clock-demo/src/main.rs`, change the bar
 chip's arm of `update` (`(true, CHIP_BTN) | (false, CARD_BTN) =>`) so a
 `CHIP_BTN` click returns `vec![Effect::OpenPage(Page::Audio)]`, build it, and

@@ -5568,6 +5568,56 @@ mod gtk_tests {
         false
     }
 
+    /// How long a real-pointer test waits for input it sent to arrive — a
+    /// bound on a failure, never a delay on a pass: every wait below returns
+    /// the moment what it waits for has been dispatched (#1416 review,
+    /// MEDIUM 2).
+    const INPUT_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Pointer button events the test window has seen, counted in the capture
+    /// phase — i.e. by GTK's own dispatch, before any widget can claim them.
+    #[derive(Default)]
+    struct SeenButtons {
+        presses: std::cell::Cell<u32>,
+        releases: std::cell::Cell<u32>,
+    }
+
+    /// Iterate the main context until `done`, then [`pump`] once more so the
+    /// idles that dispatch queued (the press tracker's deferred clear among
+    /// them) have run too. Panics naming `what` and `report()` past
+    /// [`INPUT_DEADLINE`].
+    ///
+    /// This, and not a fixed sleep, is what makes the real-pointer tests
+    /// independent of how loaded the machine is: `run_xdotool` used to
+    /// `pump_for(250)` after each command, and under `stress-ng` a release could
+    /// still be in flight at the end of it — the review measured 1 red in 85
+    /// runs that way.
+    fn wait_for(what: &str, done: impl Fn() -> bool, report: impl Fn() -> String) {
+        let deadline = Instant::now() + INPUT_DEADLINE;
+        let context = glib::MainContext::default();
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not arrive within {INPUT_DEADLINE:?}: {}",
+                report(),
+            );
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        pump();
+    }
+
+    /// Run one `xdotool` command line to completion and check its status.
+    /// What it sends is not waited for here — see [`RealPointer::send`].
+    fn xdotool(args: &[&str]) {
+        let status = std::process::Command::new("xdotool")
+            .args(args)
+            .status()
+            .expect("xdotool runs");
+        assert!(status.success(), "xdotool {args:?} failed: {status}");
+    }
+
     /// A two-chip plugin card on screen, and the X window it is in — what the
     /// real-pointer tests click on.
     struct RealPointer {
@@ -5577,58 +5627,107 @@ mod gtk_tests {
         xid: String,
         cpu: gtk::Button,
         mem: gtk::Button,
+        /// The button presses and releases the window has seen so far.
+        seen: Rc<SeenButtons>,
     }
 
     impl RealPointer {
         /// Mount [`two_button_tree`] as `plugin_id`'s card, laid out and mapped,
         /// and find its X window by a title nothing else in the run carries.
         fn mount(plugin_id: &str) -> Self {
-            use std::process::Command;
-
             let (window, card) = mount_laid_out_card(plugin_id, two_button_tree());
             let title = format!("trollshell-real-pointer-{}-{plugin_id}", std::process::id());
             window.set_title(Some(&title));
+
+            // Count every press and release GTK dispatches to this window, on
+            // the way down and whatever claims it later, so a test can wait for
+            // the input it sent rather than for a clock.
+            let seen: Rc<SeenButtons> = Rc::default();
+            let counter = gtk::EventControllerLegacy::new();
+            counter.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let counts = seen.clone();
+            counter.connect_event(move |_, event| {
+                match event.event_type() {
+                    gtk::gdk::EventType::ButtonPress => {
+                        counts.presses.set(counts.presses.get() + 1);
+                    }
+                    gtk::gdk::EventType::ButtonRelease => {
+                        counts.releases.set(counts.releases.get() + 1);
+                    }
+                    _ => {}
+                }
+                glib::Propagation::Proceed
+            });
+            window.add_controller(counter);
+
+            let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+                .expect("the card holds exactly the two chips");
+            wait_for(
+                "the card's layout",
+                || window.is_mapped() && cpu.width() > 0 && mem.width() > 0,
+                || format!("mapped {}, cpu {}, mem {}", window.is_mapped(), cpu.width(), mem.width()),
+            );
+
             let pattern = format!("^{title}$");
-            let mut xid = None;
-            for _ in 0..40 {
-                pump_for(50);
-                let found = Command::new("xdotool")
+            let search = || {
+                let found = std::process::Command::new("xdotool")
                     .args(["search", "--onlyvisible", "--name", &pattern])
                     .output()
                     .expect("xdotool runs");
-                xid = String::from_utf8_lossy(&found.stdout)
+                String::from_utf8_lossy(&found.stdout)
                     .lines()
                     .next()
                     .map(|line| line.trim().to_owned())
-                    .filter(|line| !line.is_empty());
-                if xid.is_some() {
-                    break;
-                }
-            }
-            let xid =
-                xid.unwrap_or_else(|| panic!("xdotool found no mapped window titled {title}"));
+                    .filter(|line| !line.is_empty())
+            };
+            let xid = std::cell::RefCell::new(None);
+            wait_for(
+                "the card's X window",
+                || {
+                    *xid.borrow_mut() = search();
+                    xid.borrow().is_some()
+                },
+                || format!("no mapped window titled {title}"),
+            );
+            let xid = xid.into_inner().expect("found above");
             // Nothing else should be over it, but a test that left a window up
             // must not be able to take these clicks.
-            Self::run_xdotool(&["windowraise", &xid]);
-            let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
-                .expect("the card holds exactly the two chips");
+            xdotool(&["windowraise", &xid]);
+            pump();
             Self {
                 window,
                 card,
                 xid,
                 cpu,
                 mem,
+                seen,
             }
         }
 
-        /// Run one `xdotool` command line, then let GTK dispatch what it sent.
-        fn run_xdotool(args: &[&str]) {
-            let status = std::process::Command::new("xdotool")
-                .args(args)
-                .status()
-                .expect("xdotool runs");
-            assert!(status.success(), "xdotool {args:?} failed: {status}");
-            pump_for(250);
+        /// Run one `xdotool` command line, then wait until the window has seen
+        /// `presses` more button presses and `releases` more releases than
+        /// before it — i.e. until GTK has dispatched them, `clicked` included,
+        /// which runs inside the release's dispatch.
+        fn send(&self, args: &[&str], presses: u32, releases: u32) {
+            let (want_presses, want_releases) = (
+                self.seen.presses.get() + presses,
+                self.seen.releases.get() + releases,
+            );
+            xdotool(args);
+            wait_for(
+                &format!("the input `xdotool {}` sent", args.join(" ")),
+                || {
+                    self.seen.presses.get() >= want_presses
+                        && self.seen.releases.get() >= want_releases
+                },
+                || {
+                    format!(
+                        "{} of {want_presses} presses and {} of {want_releases} releases",
+                        self.seen.presses.get(),
+                        self.seen.releases.get(),
+                    )
+                },
+            );
         }
 
         /// `target`'s centre in its X window's pixels — the window's own
@@ -5654,18 +5753,50 @@ mod gtk_tests {
             ]
         }
 
-        /// Move the pointer onto `target`'s centre, then run `then` there.
-        fn at(&self, target: &gtk::Button, then: &[&str]) {
+        /// Move the pointer onto `target`'s centre, then run `then` there, and
+        /// wait for the `presses` and `releases` that sends.
+        fn at(&self, target: &gtk::Button, then: &[&str], presses: u32, releases: u32) {
             let [x, y] = self.centre_of(target);
             let mut args = vec!["mousemove", "--window", self.xid.as_str(), &x, &y];
             args.extend_from_slice(then);
-            Self::run_xdotool(&args);
+            self.send(&args, presses, releases);
         }
     }
 
+    /// Leave the X display the way the next test expects to find it, pass or
+    /// fail (#1416 review, MEDIUM 2): no button held — a panic between a
+    /// `mousedown` and its `mouseup` would otherwise leave button 1 down for
+    /// every later test in the binary — and the pointer parked in the far
+    /// corner, not over the top-left one where every WM-less window maps, where
+    /// it would hover-light whatever the next test put there. Nothing here may
+    /// panic: this runs while a failed test unwinds.
     impl Drop for RealPointer {
         fn drop(&mut self) {
+            let quiet = |args: &[&str]| {
+                std::process::Command::new("xdotool")
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+            };
+            let _ = quiet(&["mouseup", "1"]);
             self.window.destroy();
+            let corner = std::process::Command::new("xdotool")
+                .arg("getdisplaygeometry")
+                .output()
+                .ok()
+                .and_then(|out| {
+                    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let mut size = text.split_whitespace().map(str::parse::<u32>);
+                    match (size.next(), size.next()) {
+                        (Some(Ok(w)), Some(Ok(h))) if w > 0 && h > 0 => Some((w - 1, h - 1)),
+                        _ => None,
+                    }
+                });
+            if let Some((x, y)) = corner {
+                let _ = quiet(&["mousemove", &x.to_string(), &y.to_string()]);
+            }
+            pump();
         }
     }
 
@@ -5686,13 +5817,13 @@ mod gtk_tests {
         }
         let pointer = RealPointer::mount("real-pointer-click");
 
-        pointer.at(&pointer.mem, &["click", "1"]);
+        pointer.at(&pointer.mem, &["click", "1"], 1, 1);
         assert_eq!(
             taken("real-pointer-click"),
             Some(pointer.mem.clone().upcast::<gtk::Widget>()),
             "a real click on `mem` is recorded under `mem`",
         );
-        pointer.at(&pointer.cpu, &["click", "1"]);
+        pointer.at(&pointer.cpu, &["click", "1"], 1, 1);
         assert_eq!(
             taken("real-pointer-click"),
             Some(pointer.cpu.clone().upcast::<gtk::Widget>()),
@@ -5707,6 +5838,11 @@ mod gtk_tests {
     /// the card, not under the abandoned `cpu` (#1252 review, LOW 4; #1413 item
     /// 3).
     ///
+    /// The first `None` means something because each step waits for its input
+    /// to be dispatched (`RealPointer::send`): the press on `cpu` has landed and
+    /// the release has arrived, so "nothing was clicked" cannot be "nothing had
+    /// arrived yet" (#1416 review, MEDIUM 2).
+    ///
     /// **Falsification:** delete the tracker's `connect_end` handler → the
     /// second assertion reds with `cpu`.
     #[gtk::test]
@@ -5717,9 +5853,9 @@ mod gtk_tests {
         }
         let pointer = RealPointer::mount("real-pointer-drag-off");
 
-        pointer.at(&pointer.cpu, &["mousedown", "1"]);
-        pointer.at(&pointer.mem, &[]);
-        RealPointer::run_xdotool(&["mouseup", "1"]);
+        pointer.at(&pointer.cpu, &["mousedown", "1"], 1, 0);
+        pointer.at(&pointer.mem, &[], 0, 0);
+        pointer.send(&["mouseup", "1"], 0, 1);
         assert_eq!(
             taken("real-pointer-drag-off"),
             None,
@@ -5762,6 +5898,8 @@ mod gtk_tests {
         pointer.at(
             &pointer.mem,
             &["click", "--repeat", "2", "--delay", "80", "1"],
+            2,
+            2,
         );
         assert_eq!(
             clicks.get(),
@@ -5795,13 +5933,13 @@ mod gtk_tests {
         }
         let pointer = RealPointer::mount("real-pointer-right");
 
-        pointer.at(&pointer.mem, &["click", "3"]);
+        pointer.at(&pointer.mem, &["click", "3"], 1, 1);
         assert_eq!(
             taken("real-pointer-right"),
             None,
             "a right click is no click and records nothing",
         );
-        pointer.at(&pointer.mem, &["click", "1"]);
+        pointer.at(&pointer.mem, &["click", "1"], 1, 1);
         assert_eq!(
             taken("real-pointer-right"),
             Some(pointer.mem.clone().upcast::<gtk::Widget>()),

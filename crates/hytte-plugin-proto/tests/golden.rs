@@ -206,6 +206,7 @@ fn full_manifest() -> Manifest {
         // `None` keeps this golden frame byte-identical to its pre-#887 recording.
         // The field itself is pinned by `tests/proto.rs`' version round-trips.
         version: None,
+        settings: Vec::new(),
     }
 }
 

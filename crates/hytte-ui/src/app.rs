@@ -276,7 +276,7 @@ fn monitor_is_ready(monitor: &gdk::Monitor) -> bool {
 const MONITOR_READY_NOTIFY: &[&str] = &["geometry", "connector"];
 
 /// Set `out` to `ready` unless it already holds exactly those objects, in that
-/// order (GObject equality is identity). Returns whether it published.
+/// order (`GObject` equality is identity). Returns whether it published.
 ///
 /// A re-read that finds nothing new — a hot-plugged monitor still held back,
 /// or a watch firing before the `done` that makes it ready — would otherwise

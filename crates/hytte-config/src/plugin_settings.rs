@@ -43,7 +43,9 @@
 //! number as an integer — and [`scalar_text`] is the one spelling of each
 //! scalar as environment text (`true`/`false`, decimal). An array or a table
 //! has no such spelling, so it is dropped with a warning, costing that key and
-//! nothing else.
+//! nothing else — and so is a value no environment can carry
+//! ([`value_refusal`]: a NUL byte, or more than [`MAX_VALUE_BYTES`]), which
+//! would otherwise make the plugin's whole launch fail (#1415 review M3).
 //!
 //! This module does not decide which variable names are acceptable: the
 //! launcher applies the proto's `Setting::env_refusal` to every key it reads,
@@ -65,6 +67,35 @@ pub type Values = BTreeMap<String, String>;
 
 /// Every plugin's values, by instance id.
 pub type AllValues = BTreeMap<String, Values>;
+
+/// The longest value a setting may carry, in bytes: 32 KiB.
+///
+/// A value reaches `systemd-run` as an environment string, and the kernel
+/// refuses to `execve` with any single one longer than `MAX_ARG_STRLEN`
+/// (128 KiB), failing the plugin's **whole** launch rather than the one key.
+/// A quarter of that leaves room for the name and for everything else in the
+/// environment, and is still far more than any path or address needs.
+pub const MAX_VALUE_BYTES: usize = 32 * 1024;
+
+/// Why `value` cannot be passed to a plugin as an environment variable, or
+/// `None` when it can.
+///
+/// One rule for both ends of the file (#1415 review M3): [`parse`] drops such
+/// a value with a warning, the shell's launcher checks what it is about to
+/// pass again, and the control-center refuses to save one. A NUL is valid
+/// TOML (`"\u0000"`) but no environment string can hold it — the spawn fails
+/// with `InvalidInput` — and an over-long value makes `execve` fail with
+/// `E2BIG`; either would cost the plugin every other value with it.
+#[must_use]
+pub fn value_refusal(value: &str) -> Option<&'static str> {
+    if value.contains('\0') {
+        Some("it contains a NUL byte, which no environment variable can hold")
+    } else if value.len() > MAX_VALUE_BYTES {
+        Some("it is longer than 32 KiB")
+    } else {
+        None
+    }
+}
 
 /// `$XDG_CONFIG_HOME/trollshell/plugin-settings.toml`, or `None` when neither
 /// `$XDG_CONFIG_HOME` nor `$HOME` is set.
@@ -112,15 +143,24 @@ pub fn parse(text: &str) -> Result<AllValues, toml::de::Error> {
         };
         let mut values = Values::new();
         for (key, value) in entries {
-            if let Some(text) = scalar_text(&value) {
-                values.insert(key, text);
-            } else {
+            let Some(text) = scalar_text(&value) else {
                 tracing::warn!(
                     plugin = %id,
                     %key,
                     "plugin-settings.toml: an array or table cannot be an environment value; ignored"
                 );
+                continue;
+            };
+            if let Some(reason) = value_refusal(&text) {
+                tracing::warn!(
+                    plugin = %id,
+                    %key,
+                    reason,
+                    "plugin-settings.toml: this value cannot be passed to the plugin; ignored"
+                );
+                continue;
             }
+            values.insert(key, text);
         }
         all.insert(id, values);
     }
@@ -323,6 +363,24 @@ mod tests {
             all["p"],
             Values::from([("OK".to_owned(), "kept".to_owned())])
         );
+    }
+
+    /// #1415 review M3: a NUL (valid TOML) or an over-long value costs its
+    /// own key, never its neighbours — the launcher would otherwise fail the
+    /// plugin's whole spawn.
+    #[test]
+    fn a_value_no_environment_can_carry_costs_only_its_own_key() {
+        let long = "x".repeat(MAX_VALUE_BYTES + 1);
+        let text = format!("[p]\nNUL = \"a\\u0000b\"\nLONG = \"{long}\"\nOK = \"fine\"\n");
+        assert_eq!(
+            parse(&text).expect("parses")["p"],
+            Values::from([("OK".to_owned(), "fine".to_owned())])
+        );
+        let at_cap = "x".repeat(MAX_VALUE_BYTES);
+        assert_eq!(value_refusal(&at_cap), None, "the cap is inclusive");
+        assert!(value_refusal(&long).is_some());
+        assert!(value_refusal("a\0b").is_some());
+        assert_eq!(value_refusal(""), None);
     }
 
     #[test]

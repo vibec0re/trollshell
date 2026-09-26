@@ -1282,6 +1282,9 @@ pub(super) async fn serve_conn(
     // connection still owns the id (its `IdGuard` above hasn't released), so a
     // fast-reconnect successor never clobbers the wrong entry.
     super::runtime_register(&ctx.runtime, &plugin_id, mount, manifest.version.as_deref());
+    // The settings it declares (#1410): sanitised here, remembered per instance id
+    // live and across sessions, and served to the control-center's Plugins tab.
+    super::settings::register(&ctx.runtime, &plugin_id, &manifest.settings);
 
     // Outbound writer: the single point that serializes host→plugin frames. The
     // queue is **bounded** (#435): a plugin that stops reading its socket can no

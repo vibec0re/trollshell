@@ -329,6 +329,47 @@ impl ControlIface {
             .collect()
     }
 
+    /// The settings each plugin declared in its manifest (#1410), as
+    /// `id → JSON` (`a{ss}`): the value is a JSON array of
+    /// `hytte_plugin_proto::manifest::Setting`, exactly as serde spells that
+    /// type (`{"env":…,"label":…,"doc":…,"kind":{"Path":{"directory":false}},
+    /// "default":…}`, a unit kind as the bare string `"Text"`).
+    ///
+    /// JSON rather than a D-Bus struct because a setting's `kind` is a tagged
+    /// union with per-variant fields, which a D-Bus signature can only carry
+    /// as a variant the control-center would then unpick by hand; serde's own
+    /// spelling lets it decode straight into the proto's types, so the two ends
+    /// share one definition. Additive beside
+    /// [`list_plugin_versions`](Self::list_plugin_versions), so no existing
+    /// signature changes.
+    ///
+    /// Every id the host has **ever** seen declare settings is here, not only
+    /// the connected ones: the list a live connection declared this session,
+    /// else the last one cached under `$XDG_STATE_HOME` — so a plugin that is
+    /// switched off, or cannot start without its setting, still has a form. A
+    /// plugin that declares none is absent. Every list is already sanitised
+    /// (`plugins::settings`).
+    async fn list_plugin_settings(&self) -> std::collections::HashMap<String, String> {
+        let schemas = match tokio::task::spawn_blocking(crate::plugins::settings::snapshot).await
+        {
+            Ok(schemas) => schemas,
+            Err(err) => {
+                tracing::warn!(%err, "ListPluginSettings: reading the settings store failed");
+                return std::collections::HashMap::new();
+            }
+        };
+        schemas
+            .into_iter()
+            .filter_map(|(id, list)| match serde_json::to_string(&list) {
+                Ok(json) => Some((id, json)),
+                Err(err) => {
+                    tracing::warn!(plugin = %id, %err, "ListPluginSettings: could not encode a plugin's settings");
+                    None
+                }
+            })
+            .collect()
+    }
+
     // ── AI keys (#392) ──────────────────────────────────────────────────────
     //
     // Store the LLM-backed plugins' API keys in the login keyring

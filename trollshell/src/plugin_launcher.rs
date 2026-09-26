@@ -315,6 +315,42 @@
 //! static unit's file exists. To hand an id to a static unit entirely, drop it
 //! from `availablePlugins` (and `plugins`), so it is undeclared again.
 //!
+//! ## Plugin settings (#1410)
+//!
+//! A plugin may declare the environment variables it reads in its manifest,
+//! and the control-center's Plugins tab turns those into a form whose values
+//! land in `$XDG_CONFIG_HOME/trollshell/plugin-settings.toml`
+//! ([`hytte_config::plugin_settings`]), one table per plugin id. This module
+//! is the file's reader: [`load_declared_from`] folds each id's table into its
+//! spec ([`fold_settings`]), so every launch, and the fingerprint a reconcile
+//! diffs, sees the same values. Four rules, all in [`settings_env`]:
+//!
+//! - **nix wins.** A variable the plugin's `plugins.json` `env` sets is not
+//!   taken from the file; the tab shows that row read-only as "set in nix".
+//! - **The name rule is applied here too.** The launcher launches a plugin
+//!   before that plugin has ever told anyone its schema, so it cannot check a
+//!   key against what the plugin declared; it accepts any key in the plugin's
+//!   table instead, and applies the proto's `Setting::env_refusal` to each —
+//!   the same rule the host applies to a manifest — because the file is
+//!   hand-editable and must not become a way to set `LD_PRELOAD` or `PATH`. A
+//!   refused key is skipped and warned about once per session.
+//! - **Empty means unset.** A key whose value is empty is not passed, so the
+//!   plugin falls back to its own default.
+//! - **A keyring secret wins** over a file value of the same name (the
+//!   `*_API_KEY` refusal already makes that unreachable; the rule is here so
+//!   the order does not depend on it).
+//!
+//! The values ride [`Launch::secret_env`], the owner-only channel #984 built
+//! for secrets, rather than the world-readable argv. They are not secrets, but
+//! unlike the nix `env` they are not already public either — they come from the
+//! user's own config directory — and the stricter channel costs nothing.
+//! They are part of the spec fingerprint ([`spec_fingerprint`]), so a
+//! reconcile after the file changed relaunches the plugin with the new values;
+//! the Plugins tab's Save restarts it directly. A plugin with no values in the
+//! file digests exactly as before.
+//!
+//! A legacy static unit is not launched here, so the file does not reach it.
+//!
 //! ## Why the `systemd-run` CLI, not D-Bus `StartTransientUnit`
 //!
 //! Per the #419/#392 thread's letter. The CLI does the transient-unit property
@@ -394,6 +430,12 @@ struct PluginSpec {
     /// ignored, so a later module pinning another key cannot break it.
     #[serde(default, rename = "_locked")]
     locked: Vec<String>,
+    /// The values `plugin-settings.toml` sets for this plugin (#1410), as they
+    /// will be passed: already through [`settings_env`], so nothing here is
+    /// refused, empty, or shadowed by [`env`](Self::env). Never read from
+    /// `plugins.json` — [`fold_settings`] fills it in [`load_declared_from`].
+    #[serde(skip)]
+    settings: BTreeMap<String, String>,
 }
 
 /// The `_locked` entry that pins [`PluginSpec::enabled`] (#1400) — the JSON
@@ -582,15 +624,20 @@ struct Sources {
     /// or `None` when neither `$XDG_STATE_HOME` nor `$HOME` is set — then
     /// nothing is overridden and the switch cannot persist.
     overrides: Option<PathBuf>,
+    /// `$XDG_CONFIG_HOME/trollshell/plugin-settings.toml` (#1410), or `None`
+    /// when neither `$XDG_CONFIG_HOME` nor `$HOME` is set — then no plugin
+    /// gets a value from it.
+    settings: Option<PathBuf>,
 }
 
 impl Sources {
-    /// This process's own sources — the one place the launcher resolves both
-    /// halves from the environment.
+    /// This process's own sources — the one place the launcher resolves all
+    /// three from the environment.
     fn from_env() -> Self {
         Self {
             config: state_file_paths(),
             overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
+            settings: hytte_config::plugin_settings::path(),
         }
     }
 }
@@ -602,7 +649,8 @@ async fn load_declared() -> Option<Declared> {
 
 /// The **effective** declaration: what nix declares ([`load_nix_declared`]),
 /// with the Plugins tab's persisted switch folded into each plugin's
-/// `enabled` ([`fold_overrides`], #1400).
+/// `enabled` ([`fold_overrides`], #1400) and `plugin-settings.toml`'s values
+/// into its `settings` ([`fold_settings`], #1410).
 ///
 /// `None` exactly when [`load_nix_declared`] says so — a `plugins.json` that
 /// exists but cannot be read or parsed. The override file never makes this
@@ -618,6 +666,9 @@ async fn load_declared() -> Option<Declared> {
 async fn load_declared_from(sources: &Sources) -> Option<Declared> {
     let mut declared = load_nix_declared(&sources.config).await?;
     fold_overrides(&mut declared, &read_overrides(sources.overrides.as_deref()));
+    if let Some(path) = &sources.settings {
+        fold_settings(&mut declared, &hytte_config::plugin_settings::load_at(path));
+    }
     Some(declared)
 }
 
@@ -784,6 +835,75 @@ fn pinned_error(id: &str) -> anyhow::Error {
     )
 }
 
+// ── Plugin settings (#1410) ──────────────────────────────────────────────────
+
+/// Fold `plugin-settings.toml` into every declared plugin's
+/// [`settings`](PluginSpec::settings) ([`settings_env`]). Iterates the
+/// **declared** set, so a table for an id `plugins.json` does not declare is
+/// ignored by construction — the [`fold_overrides`] shape. Pure but for the
+/// once-per-session warnings.
+fn fold_settings(declared: &mut Declared, file: &hytte_config::plugin_settings::AllValues) {
+    for (id, spec) in &mut declared.plugins {
+        spec.settings = file
+            .get(id)
+            .map(|values| settings_env(id, spec, values))
+            .unwrap_or_default();
+    }
+}
+
+/// The subset of plugin `id`'s `plugin-settings.toml` table it is launched
+/// with — the module doc's four rules: a key must pass
+/// [`Setting::env_refusal`](hytte_plugin_proto::manifest::Setting::env_refusal),
+/// carry a non-empty value, and name a variable neither `spec.env` (nix wins)
+/// nor one of `spec.secrets` (the keyring wins) already sets.
+///
+/// A refused key is warned about once per session per `(id, key)`, not on
+/// every call: [`list`] runs this on the Plugins tab's 2 s poll.
+fn settings_env(
+    id: &str,
+    spec: &PluginSpec,
+    values: &hytte_config::plugin_settings::Values,
+) -> BTreeMap<String, String> {
+    let secret_names: BTreeSet<String> = spec
+        .secrets
+        .iter()
+        .map(|slot| crate::secrets::env_var_for(slot))
+        .collect();
+    values
+        .iter()
+        .filter(|(key, value)| {
+            if let Some(reason) = hytte_plugin_proto::manifest::Setting::env_refusal(key) {
+                warn_refused_setting(id, key, reason);
+                return false;
+            }
+            !value.is_empty() && !spec.env.contains_key(*key) && !secret_names.contains(*key)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// The `(plugin id, key)` pairs [`settings_env`] has already warned about
+/// this session.
+static WARNED_SETTINGS: std::sync::Mutex<BTreeSet<(String, String)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// One `warn!` per session for a key `plugin-settings.toml` sets that the
+/// launcher refuses to pass.
+fn warn_refused_setting(id: &str, key: &str, reason: &str) {
+    let first = WARNED_SETTINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((id.to_owned(), key.to_owned()));
+    if first {
+        tracing::warn!(
+            plugin = %id,
+            key = ?key,
+            reason,
+            "plugin-settings.toml: this variable is not passed to the plugin"
+        );
+    }
+}
+
 // ── Spec fingerprint (#695) ──────────────────────────────────────────────────
 
 /// Opening delimiter of the spec fingerprint inside a launched unit's
@@ -811,8 +931,9 @@ fn fnv1a(bytes: &[u8], hash: u64) -> u64 {
 /// in at spawn: the `exec` path (so a rebuilt `package` shows up), the declared
 /// `env` (`BTreeMap`, so iteration order is the sort order — a map with the same
 /// pairs always digests the same), the `secrets` slot list (adding or dropping a
-/// slot changes which key is injected), and the session `target` the unit's
-/// `PartOf=` was set from (#707).
+/// slot changes which key is injected), the `plugin-settings.toml` values it
+/// was passed ([`PluginSpec::settings`], #1410 — folded in only when there are
+/// any), and the session `target` the unit's `PartOf=` was set from (#707).
 ///
 /// The target is folded in **only when it differs from [`DEFAULT_TARGET`]**, so
 /// the default canonicalizes as "absent" and a default-configured session
@@ -848,6 +969,15 @@ fn spec_fingerprint(spec: &PluginSpec, target: &str) -> String {
     for slot in &spec.secrets {
         h = fnv1a(b"\x1d", h);
         h = fnv1a(slot.as_bytes(), h);
+    }
+    // `plugin-settings.toml`'s values (#1410), under their own separator (SUB,
+    // 0x1a) so a settings pair can never digest like an `env` pair. A plugin
+    // with none folds nothing in, so its digest is exactly the pre-#1410 one.
+    for (k, v) in &spec.settings {
+        h = fnv1a(b"\x1a", h);
+        h = fnv1a(k.as_bytes(), h);
+        h = fnv1a(b"\x1f", h);
+        h = fnv1a(v.as_bytes(), h);
     }
     // The default target digests as absent — see the doc comment.
     if target != DEFAULT_TARGET {
@@ -901,10 +1031,15 @@ fn parse_fingerprint(description: &str) -> Option<&str> {
 ///   nix-rendered into the world-readable state file, so the argv discloses
 ///   nothing new, and an explicit value can't be shadowed by whatever the shell
 ///   inherited under the same name.
-/// - `extra_env` (the #392 secret hook) goes in [`Launch::secret_env`], which is
-///   rendered as the **bare** `--setenv=<NAME>` form with the value carried on
-///   `systemd-run`'s own environment (#984), after the declared env so an
-///   injected secret still overrides a stale declared value.
+/// - the spec's [`settings`](PluginSpec::settings) (`plugin-settings.toml`,
+///   #1410) and then `extra_env` (the #392 secret hook) go in
+///   [`Launch::secret_env`], which is rendered as the **bare** `--setenv=<NAME>`
+///   form with the value carried on `systemd-run`'s own environment (#984),
+///   after the declared env so an injected secret still overrides a stale
+///   declared value. The settings are already free of any name the declared
+///   env or a secret sets ([`settings_env`]), so their place in that order
+///   decides nothing; they ride this channel because they come from the
+///   user's own config rather than the world-readable `plugins.json`.
 /// - `--description=` carries the spec fingerprint (#695) so a later
 ///   [`reconcile`] can tell this unit's spec from the currently declared one.
 ///
@@ -932,7 +1067,12 @@ fn plugin_launch(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        secret_env: extra_env.to_vec(),
+        secret_env: spec
+            .settings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .chain(extra_env.iter().cloned())
+            .collect(),
         argv: vec![spec.exec.clone()],
     }
 }
@@ -2100,6 +2240,7 @@ mod tests {
             secrets: Vec::new(),
             enabled,
             locked: Vec::new(),
+            settings: BTreeMap::new(),
         }
     }
 
@@ -2118,6 +2259,7 @@ mod tests {
         Sources {
             config: paths.to_vec(),
             overrides: None,
+            settings: None,
         }
     }
 
@@ -3445,6 +3587,7 @@ mod tests {
             let sources = Sources {
                 config: paths.clone(),
                 overrides: hytte_config::state::path(OVERRIDES_SUBSYSTEM),
+                settings: None,
             };
             assert!(
                 sources
@@ -3687,6 +3830,7 @@ mod tests {
         let sources = Sources {
             config: vec![json],
             overrides: Some(toml.clone()),
+            settings: Some(dir.path().join("config/trollshell/plugin-settings.toml")),
         };
         (dir, sources, toml)
     }
@@ -4762,5 +4906,142 @@ mod tests {
             ..unit("gone", "inactive", false)
         }];
         assert!(plan(&Declared::default(), &units).is_empty());
+    }
+
+    // ── plugin settings (#1410) ──────────────────────────────────────────────
+
+    fn values(pairs: &[(&str, &str)]) -> hytte_config::plugin_settings::Values {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// The four rules, as a truth table. Red if nix stops winning, if the
+    /// name rule is not applied to the hand-editable file, if an empty value
+    /// is passed rather than left unset, or if a file value can shadow an
+    /// injected secret.
+    #[test]
+    fn settings_env_keeps_only_what_the_file_may_set() {
+        let mut s = spec_env("/bin/vibectl", &[("V1BECTL_SERVER", "from-nix")]);
+        s.secrets = vec!["openrouter".to_owned()];
+        let file = values(&[
+            ("V1BECTL_SERVER", "from-file"),
+            ("V1BECTL_SCREENS", "/home/u/screens.kdl"),
+            ("V1BECTL_EMPTY", ""),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("PATH", "/tmp"),
+            ("XDG_RUNTIME_DIR", "/tmp"),
+            ("HYTTE_PLUGIN_ID", "other"),
+            ("lower_case", "x"),
+            ("OPENROUTER_API_KEY", "sk-plain-text"),
+        ]);
+        assert_eq!(
+            settings_env("vibectl", &s, &file),
+            values(&[("V1BECTL_SCREENS", "/home/u/screens.kdl")]),
+        );
+    }
+
+    /// The fold reads the file for the declared ids only, and a plugin with no
+    /// table gets nothing.
+    #[test]
+    fn fold_settings_applies_each_plugins_own_table() {
+        let mut declared = Declared::default();
+        declared
+            .plugins
+            .insert("vibectl".to_owned(), spec("/bin/vibectl", true));
+        declared.plugins.insert("pet".to_owned(), spec("/bin/pet", true));
+        let file = hytte_config::plugin_settings::AllValues::from([
+            ("vibectl".to_owned(), values(&[("V1BECTL_SCREENS", "/s.kdl")])),
+            ("ghost".to_owned(), values(&[("GHOST", "boo")])),
+        ]);
+        fold_settings(&mut declared, &file);
+        assert_eq!(
+            declared.plugins["vibectl"].settings,
+            values(&[("V1BECTL_SCREENS", "/s.kdl")])
+        );
+        assert!(declared.plugins["pet"].settings.is_empty());
+        assert!(!declared.plugins.contains_key("ghost"));
+    }
+
+    /// End to end through the effective loader every launch path uses: a value
+    /// saved in the scratch `plugin-settings.toml` is on the spec that
+    /// [`launch`] would run, and nix's `env` still wins on its own key.
+    #[tokio::test]
+    async fn load_declared_from_folds_the_settings_file() {
+        let (dir, sources, _toml) = scratch_sources(
+            r#"{"version":1,"plugins":{
+                "vibectl":{"exec":"/bin/vibectl","enabled":true,
+                           "env":{"V1BECTL_SERVER":"from-nix"}}
+            }}"#,
+        );
+        let settings = sources.settings.clone().expect("scratch settings path");
+        assert!(settings.starts_with(dir.path()), "rail: never the real config");
+        hytte_config::plugin_settings::save_at(
+            &settings,
+            "vibectl",
+            &[
+                (
+                    "V1BECTL_SCREENS".to_owned(),
+                    Some(hytte_config::toml_edit::Value::from("/s.kdl")),
+                ),
+                (
+                    "V1BECTL_SERVER".to_owned(),
+                    Some(hytte_config::toml_edit::Value::from("from-file")),
+                ),
+            ],
+        )
+        .expect("save");
+
+        let declared = load_declared_from(&sources).await.expect("parses");
+        let spec = &declared.plugins["vibectl"];
+        assert_eq!(spec.settings, values(&[("V1BECTL_SCREENS", "/s.kdl")]));
+        assert_eq!(spec.env["V1BECTL_SERVER"], "from-nix");
+    }
+
+    /// A saved value reaches the launched unit's environment, by name only on
+    /// the argv — the #984 channel — and the nix `env` stays inline as before.
+    #[test]
+    fn a_settings_value_reaches_the_launch_off_the_argv() {
+        let mut s = spec_env("/bin/vibectl", &[("V1BECTL_SERVER", "host:1")]);
+        s.settings = values(&[("V1BECTL_SCREENS", "/home/u/screens.kdl")]);
+        let args = run_argv("vibectl", &s, &[], DEFAULT_TARGET);
+        assert!(args.contains(&"--setenv=V1BECTL_SERVER=host:1".to_owned()));
+        assert!(args.contains(&"--setenv=V1BECTL_SCREENS".to_owned()), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains("screens.kdl")),
+            "a settings value never rides the argv: {args:?}"
+        );
+        let cmd = run_command("vibectl", &s, &[], DEFAULT_TARGET);
+        assert_eq!(
+            command_envs(&cmd),
+            vec![(
+                "V1BECTL_SCREENS".to_owned(),
+                Some("/home/u/screens.kdl".to_owned())
+            )],
+        );
+    }
+
+    /// A plugin with no settings digests exactly as before #1410 (no bounce on
+    /// upgrade); a value changes the digest (a reconcile relaunches it); and a
+    /// settings pair cannot digest like the same `env` pair.
+    #[test]
+    fn the_fingerprint_covers_settings_only_when_there_are_any() {
+        let plain = spec_env("/bin/vibectl", &[]);
+        let mut with = plain.clone();
+        with.settings = values(&[("A", "1")]);
+        let as_env = spec_env("/bin/vibectl", &[("A", "1")]);
+        assert_eq!(
+            fp(&plain),
+            fp(&PluginSpec {
+                settings: BTreeMap::new(),
+                ..plain.clone()
+            })
+        );
+        assert_ne!(fp(&with), fp(&plain));
+        assert_ne!(fp(&with), fp(&as_env));
+        let mut other = plain.clone();
+        other.settings = values(&[("A", "2")]);
+        assert_ne!(fp(&with), fp(&other));
     }
 }

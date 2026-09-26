@@ -2331,7 +2331,7 @@ systemd-run --user --unit=trollshell-plugin-stats-bar \
       contract Annika asked for on #1235 ("the skins carry over"): the plugin's
       nodes carry `ts-cpu`/`ts-memory`/`ts-disk`/`ts-gpu` and `ts-cpu-temp`/
       `ts-gpu-temp` verbatim.
-- [ ] **(#1251 — the page's *contents* are superseded by #1252 below: it is
+- [ ] **(#1251 — the page's _contents_ are superseded by #1252 below: it is
       no longer preem and no longer one column)** **A click opens the
       plugin's own page.** Click any of the
       four chips: the drawer opens on a page with a CPU card (load, process

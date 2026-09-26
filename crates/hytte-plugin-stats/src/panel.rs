@@ -1268,7 +1268,10 @@ mod tests {
         let mut one = History::default();
         one.push(&busy());
         let clock = one.clock.back().copied().expect("one clock point");
-        assert!((clock - 0.76).abs() < 1e-6, "3.8 GHz of a 5 GHz ceiling: {clock}");
+        assert!(
+            (clock - 0.76).abs() < 1e-6,
+            "3.8 GHz of a 5 GHz ceiling: {clock}"
+        );
         assert_eq!(
             one.disk_io.back().map(|v| v.to_bits()),
             Some(3_145_728.0_f32.to_bits()),

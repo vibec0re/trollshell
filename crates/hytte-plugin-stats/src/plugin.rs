@@ -685,7 +685,11 @@ mod tests {
             })
         };
         let (mut model, _rx) = fresh_bar(Card::bar_default());
-        assert_eq!(line_len(&model), Some(0), "the seed page draws an empty line");
+        assert_eq!(
+            line_len(&model),
+            Some(0),
+            "the seed page draws an empty line"
+        );
 
         let _ = model.update(Input::App(Msg::Sampled(Box::default())));
         assert_eq!(line_len(&model), Some(0), "a cold tick is not a sample");
@@ -706,9 +710,7 @@ mod tests {
             } if found == id => Some(values.len()),
             Node::Box { children, .. }
             | Node::Row { children, .. }
-            | Node::ListBox { children, .. } => {
-                children.iter().find_map(|c| find_sparkline(c, id))
-            }
+            | Node::ListBox { children, .. } => children.iter().find_map(|c| find_sparkline(c, id)),
             Node::Expander {
                 header, children, ..
             } => find_sparkline(header, id)
@@ -746,7 +748,10 @@ mod tests {
         let (mut model, _rx) = fresh_bar(Card::bar_default());
         assert!(!disks_open(&model), "collapsed by default, as native");
         let click = || Input::event(crate::panel::DISKS_EXPANDER_ID, EventKind::Click);
-        assert!(model.update(click()).is_empty(), "no effect for a page-local toggle");
+        assert!(
+            model.update(click()).is_empty(),
+            "no effect for a page-local toggle"
+        );
         assert!(disks_open(&model));
         assert!(model.update(click()).is_empty());
         assert!(!disks_open(&model));

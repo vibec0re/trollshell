@@ -1078,6 +1078,9 @@ mod tests {
             Some(f64::from(-f32::MAX)),
             "an infinity pins to the edge",
         );
-        assert_eq!(max, None, "a NaN top auto-scales, as the drawing code would");
+        assert_eq!(
+            max, None,
+            "a NaN top auto-scales, as the drawing code would"
+        );
     }
 }

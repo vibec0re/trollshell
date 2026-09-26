@@ -6,12 +6,12 @@ use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentChoices, ConsentDecision, DEFAULT_SLIDER_MAX,
     DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
     Effect, EffectOutcome, EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel,
-    MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount,
-    MAX_SPARKLINE_SAMPLES, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page,
-    PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB,
-    SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB,
-    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, sane_fraction,
-    sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
+    MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES, Manifest,
+    MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg,
+    PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB,
+    SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL,
+    decode, decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
+    sane_sparkline_max, sane_sparkline_sample,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1024,7 +1024,10 @@ fn the_clamp_keeps_the_newest_samples_and_sanitises_them() {
         values[MAX_SPARKLINE_SAMPLES - 2].to_bits(),
         f32::MAX.to_bits()
     );
-    assert_eq!(values[MAX_SPARKLINE_SAMPLES - 1].to_bits(), 0.0_f32.to_bits());
+    assert_eq!(
+        values[MAX_SPARKLINE_SAMPLES - 1].to_bits(),
+        0.0_f32.to_bits()
+    );
     assert_eq!(*max, None, "a NaN top auto-scales");
     assert_node_floats_are_sane(&clamped);
     assert_eq!(clamped.clone().clamped(), clamped, "fixpoint");

@@ -821,9 +821,8 @@ pub fn chips(cfg: crate::config::Card, snapshot: &Snapshot, widgets: &Widgets) -
 mod tests {
     use super::{
         CARD_PX, CHIP_CLASSES, CORES_PER_ROW, DASH_CELLS, LAMPS, Widgets, card, chip_button_id,
-        chips, cpu_tooltip, disk_tooltip, dot_px_for,
-        gpu_tooltip, is_chip_button, lamp, lamp_rows, memory_tooltip, percent_text, row_cells,
-        temp_text, trace_sample,
+        chips, cpu_tooltip, disk_tooltip, dot_px_for, gpu_tooltip, is_chip_button, lamp, lamp_rows,
+        memory_tooltip, percent_text, row_cells, temp_text, trace_sample,
     };
     use crate::config::Card;
     use crate::sample::{Disk, Gpu, Memory, Snapshot};

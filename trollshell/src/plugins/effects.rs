@@ -732,7 +732,10 @@ fn clicked_output(click: Option<&Click>) -> Option<&str> {
 /// shell learns that over IPC, and the plugin round trip that produces the
 /// page can beat it — and a compositor that does not move focus on a click at
 /// all leaves the focused output on another screen for good.
-pub(super) fn page_output<'a>(clicked: Option<&'a str>, focused: Option<&'a str>) -> Option<&'a str> {
+pub(super) fn page_output<'a>(
+    clicked: Option<&'a str>,
+    focused: Option<&'a str>,
+) -> Option<&'a str> {
     clicked.or(focused)
 }
 
@@ -766,7 +769,10 @@ fn open_own_page_in_drawer(focused: Option<&str>, plugin_id: &str) {
         tracing::debug!(plugin = %plugin_id, "plugin page already open; re-shown in place (#1252)");
         return;
     }
-    crate::modal::open_plugin_on_focused(page_output(clicked_output(click.as_ref()), focused), plugin_id);
+    crate::modal::open_plugin_on_focused(
+        page_output(clicked_output(click.as_ref()), focused),
+        plugin_id,
+    );
 }
 
 /// The built-in arm (#1413), i.e. what [`broker_open_page_with`] runs for a
@@ -4332,11 +4338,36 @@ mod tests {
     #[test]
     fn a_page_opens_on_the_clicked_output_else_the_focused_one() {
         let rows = [
-            (Some("B"), Some("A"), Some("B"), "clicked on B, focus still on A"),
-            (Some("B"), Some("B"), Some("B"), "clicked on B, focus followed"),
-            (Some("B"), None, Some("B"), "clicked on B, niri reports no focus"),
-            (None, Some("A"), Some("A"), "no click: a keybind, a timer, a stale click"),
-            (None, None, None, "nothing known: the opener's own fallback decides"),
+            (
+                Some("B"),
+                Some("A"),
+                Some("B"),
+                "clicked on B, focus still on A",
+            ),
+            (
+                Some("B"),
+                Some("B"),
+                Some("B"),
+                "clicked on B, focus followed",
+            ),
+            (
+                Some("B"),
+                None,
+                Some("B"),
+                "clicked on B, niri reports no focus",
+            ),
+            (
+                None,
+                Some("A"),
+                Some("A"),
+                "no click: a keybind, a timer, a stale click",
+            ),
+            (
+                None,
+                None,
+                None,
+                "nothing known: the opener's own fallback decides",
+            ),
         ];
         for (clicked, focused, expected, case) in rows {
             assert_eq!(page_output(clicked, focused), expected, "{case}");

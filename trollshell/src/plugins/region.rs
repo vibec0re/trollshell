@@ -5196,7 +5196,8 @@ mod gtk_tests {
     /// `plugin_id`'s click origin, taken as a page opened now would take it —
     /// just the widget, which is all the press-tracker tests are about.
     fn taken(plugin_id: &str) -> Option<gtk::Widget> {
-        super::super::effects::take_click_origin(plugin_id, Instant::now()).map(|click| click.widget)
+        super::super::effects::take_click_origin(plugin_id, Instant::now())
+            .map(|click| click.widget)
     }
 
     /// End the tracker's current press sequence the way GTK does on a release,
@@ -5250,9 +5251,8 @@ mod gtk_tests {
 
         press_on(&card, &mem);
         mem.emit_clicked();
-        let origin =
-            super::super::effects::take_click_origin("click-origin-chip", Instant::now())
-                .expect("a click on a mounted, rooted chip is recorded as its plugin's origin");
+        let origin = super::super::effects::take_click_origin("click-origin-chip", Instant::now())
+            .expect("a click on a mounted, rooted chip is recorded as its plugin's origin");
         assert_eq!(
             origin.widget,
             mem.clone().upcast::<gtk::Widget>(),
@@ -5605,7 +5605,8 @@ mod gtk_tests {
                     break;
                 }
             }
-            let xid = xid.unwrap_or_else(|| panic!("xdotool found no mapped window titled {title}"));
+            let xid =
+                xid.unwrap_or_else(|| panic!("xdotool found no mapped window titled {title}"));
             // Nothing else should be over it, but a test that left a window up
             // must not be able to take these clicks.
             Self::run_xdotool(&["windowraise", &xid]);
@@ -5762,7 +5763,11 @@ mod gtk_tests {
             &pointer.mem,
             &["click", "--repeat", "2", "--delay", "80", "1"],
         );
-        assert_eq!(clicks.get(), 2, "premise: GTK saw a double click as two clicks");
+        assert_eq!(
+            clicks.get(),
+            2,
+            "premise: GTK saw a double click as two clicks"
+        );
         assert_eq!(
             taken("real-pointer-double"),
             Some(pointer.mem.clone().upcast::<gtk::Widget>()),

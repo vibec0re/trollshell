@@ -982,17 +982,52 @@ mod tests {
         let rows = [
             // First value: the focus the dialog was built under.
             (First, Some("B"), false, "built on the focused output"),
-            (First, Some("A"), false, "built on B for a click there, focus still on A"),
+            (
+                First,
+                Some("A"),
+                false,
+                "built on B for a click there, focus still on A",
+            ),
             (First, None, false, "built while niri reports no focus"),
             // Later values: a move, or not.
             (Was(Some("B")), Some("A"), true, "focus moved from B to A"),
             (Was(Some("B")), Some("B"), false, "a repeat of B"),
-            (Was(Some("B")), None, false, "no focus is not somewhere else"),
-            (Was(Some("A")), Some("A"), false, "a repeat of A: the focus never moved"),
-            (Was(Some("A")), Some("B"), false, "focus follows the click to B"),
-            (Was(Some("A")), Some("C"), true, "focus moved from A to a third screen"),
-            (Was(None), Some("A"), true, "focus appeared on another screen"),
-            (Was(None), Some("B"), false, "focus appeared on the dialog's screen"),
+            (
+                Was(Some("B")),
+                None,
+                false,
+                "no focus is not somewhere else",
+            ),
+            (
+                Was(Some("A")),
+                Some("A"),
+                false,
+                "a repeat of A: the focus never moved",
+            ),
+            (
+                Was(Some("A")),
+                Some("B"),
+                false,
+                "focus follows the click to B",
+            ),
+            (
+                Was(Some("A")),
+                Some("C"),
+                true,
+                "focus moved from A to a third screen",
+            ),
+            (
+                Was(None),
+                Some("A"),
+                true,
+                "focus appeared on another screen",
+            ),
+            (
+                Was(None),
+                Some("B"),
+                false,
+                "focus appeared on the dialog's screen",
+            ),
         ];
         for (seen, focused, closes, case) in rows {
             assert_eq!(focus_moved_off("B", seen, focused), closes, "{case}");

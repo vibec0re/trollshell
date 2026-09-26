@@ -3856,7 +3856,11 @@ mod gtk_tests {
                 Some(Active::Builtin(Page::Audio)),
                 "the page opens on the drawer of the monitor the card was clicked on",
             );
-            assert_eq!(anchored_on(opened), None, "…flush: a card is no chip to hang under");
+            assert_eq!(
+                anchored_on(opened),
+                None,
+                "…flush: a card is no chip to hang under"
+            );
             assert_eq!(*other.current.borrow(), None);
             *opened.current.borrow_mut() = None;
         }

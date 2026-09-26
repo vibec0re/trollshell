@@ -6055,7 +6055,7 @@ Revert the edit afterwards.
 - [ ] **(#1413)** **The dialog still closes when the focus leaves its
       screen.** With the dialog up on B, move the focus to a window on A
       (`Mod+<direction>` or a click on A): the dialog closes, as #1361's
-      MEDIUM-3 has it. Moving the focus *to* B while the dialog is up must not
+      MEDIUM-3 has it. Moving the focus _to_ B while the dialog is up must not
       close it.
 - [ ] **(#1413)** **A sidebar dialog with no click behind it stays on the
       focused output.** Anything that opens a sidebar plugin's page without a

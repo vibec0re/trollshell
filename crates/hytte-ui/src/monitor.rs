@@ -23,6 +23,16 @@ impl Monitor {
     /// this driver does not name — **including one it names with the empty
     /// string**.
     ///
+    /// On a monitor reached through [`App::monitors`](crate::App::monitors)
+    /// or [`App::monitors_changed`](crate::App::monitors_changed), `None`
+    /// means GTK has no name for it, never that the name is still in flight:
+    /// those list a hot-plugged output only once GTK has applied its first
+    /// `done`, which `wl_output` v4 sends after `name` (#1368). Below v4 it
+    /// is GTK, not the compositor, that leaves the output nameless — GTK 4.22
+    /// ignores `zxdg_output_v1.name` (`gdk/wayland/gdkmonitor-wayland.c:117-122`).
+    /// Before #1368, a returning output could be listed nameless and stay
+    /// that way until a restart.
+    ///
     /// That fold is the whole of #1180 item 6. GDK's own `connector()` can
     /// answer `Some("")`, and this doc used to say so ("may be empty on some
     /// drivers; callers should fall back") and leave the handling to seven

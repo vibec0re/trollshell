@@ -8,7 +8,7 @@
 use crate::error::{Error, Result};
 use crate::monitor::Monitor;
 use adw::prelude::*;
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
@@ -106,28 +106,21 @@ impl AppBuilder {
             // Set up the monitors Mutable + listener BEFORE handing the
             // body the App, so the initial body sees the current set and
             // any later body subscription receives hot-plug updates.
-            let monitors = Mutable::new(read_monitors());
+            // `watch_ready` reads the display's list once now (synchronously)
+            // and again, debounced, on every hot-plug — publishing only the
+            // monitors GTK has applied a `done` to (#1368).
+            let monitors = Mutable::new(Vec::new());
             if let Some(display) = gdk::Display::default() {
-                let model = display.monitors();
                 let writer = monitors.clone();
-                // Coalesce a burst of `items_changed` into a single update on
-                // the next main-loop iteration. A replug is delivered as
-                // remove-then-add — two signals — and each raw emission would
-                // otherwise drive a full teardown/rebuild of every bar and all
-                // five overlay families. Debouncing one tick collapses that to
-                // one rebuild; consumers see one `monitors_changed`, not two.
-                let scheduled = Rc::new(Cell::new(false));
-                model.connect_items_changed(move |_, _, _, _| {
-                    if scheduled.replace(true) {
-                        return;
-                    }
-                    let writer = writer.clone();
-                    let scheduled = scheduled.clone();
-                    glib::idle_add_local_once(move || {
-                        scheduled.set(false);
-                        writer.set(read_monitors());
-                    });
-                });
+                watch_ready(
+                    &display.monitors(),
+                    &glib::MainContext::default(),
+                    monitor_is_ready,
+                    MONITOR_READY_NOTIFY,
+                    move |ready| {
+                        publish_if_changed(&writer, ready);
+                    },
+                );
             }
 
             let app = App {
@@ -171,7 +164,9 @@ impl AppBuilder {
 /// body closure.
 pub struct App {
     inner: adw::Application,
-    monitors: Mutable<Vec<Monitor>>,
+    /// The published monitor list: only monitors [`monitor_is_ready`] passes,
+    /// written only by [`publish_if_changed`] (#1368).
+    monitors: Mutable<Vec<gdk::Monitor>>,
 }
 
 impl App {
@@ -189,19 +184,50 @@ impl App {
     }
 
     /// Snapshot of the currently connected monitors.
+    ///
+    /// **Every monitor listed here has completed its first `done`** (#1368):
+    /// its geometry is set and, on a compositor that names its outputs
+    /// (`wl_output` v4 sends `name` before that `done`), so is its
+    /// [`connector`](Monitor::connector). GTK's Wayland backend appends a
+    /// hot-plugged monitor to the display's list the moment it binds the
+    /// `wl_output` — before either has arrived — so a monitor still waiting
+    /// on that round trip is left out and listed once it lands. A compositor
+    /// that never names its outputs still gets them listed, nameless, once
+    /// their geometry is known.
     #[must_use]
     pub fn monitors(&self) -> Vec<Monitor> {
-        self.monitors.lock_ref().clone()
+        self.monitors
+            .lock_ref()
+            .iter()
+            .cloned()
+            .map(Monitor::new)
+            .collect()
     }
 
     /// Signal of the current monitor list. Emits the initial value on
     /// subscribe and again on every hot-plug (monitor connect/disconnect).
+    /// Carries the same guarantee as [`monitors`](Self::monitors): a
+    /// hot-plugged output appears in the first emission after GTK applies
+    /// its `done`, never in one before it — and an emission is skipped when
+    /// the list it would carry is the one already published (the same
+    /// `gdk::Monitor`s in the same order).
+    ///
+    /// So a hot-plug **add** costs one emission: the read that holds the new
+    /// output back re-publishes nothing. A **replug** whose remove and add
+    /// land in the same debounce tick (a resume re-probe, a kanshi profile
+    /// that turns an output off and on) costs two when the new `gdk::Monitor` is not
+    /// ready by that tick's read: one without the output (with a single
+    /// output, that emission is the empty list), then one with it once its
+    /// `done` lands. Before #1368 that was one emission, carrying a nameless
+    /// monitor; the second emission is the price of never publishing one.
     ///
     /// The returned signal owns a reference to the internal state, so it
     /// stays alive past `App` being dropped — safe to move into a
     /// `glib::MainContext::spawn_local` future from the body closure.
     pub fn monitors_changed(&self) -> impl Signal<Item = Vec<Monitor>> + 'static {
-        self.monitors.signal_cloned()
+        self.monitors
+            .signal_cloned()
+            .map(|monitors| monitors.into_iter().map(Monitor::new).collect())
     }
 
     /// Underlying `adw::Application`, exposed for advanced use.
@@ -233,20 +259,220 @@ impl App {
     }
 }
 
-fn read_monitors() -> Vec<Monitor> {
-    let Some(display) = gdk::Display::default() else {
-        return Vec::new();
-    };
-    let model = display.monitors();
-    let mut out = Vec::with_capacity(crate::cast::u32_to_usize(model.n_items()));
-    for i in 0..model.n_items() {
-        if let Some(obj) = model.item(i)
-            && let Ok(monitor) = obj.downcast::<gdk::Monitor>()
+/// Whether GTK has applied this monitor's first `done` (#1368).
+///
+/// GTK 4.22's Wayland backend appends a hot-plugged monitor to
+/// `display.monitors()` as soon as it binds the `wl_output`
+/// (`gdk/wayland/gdkmonitor-wayland.c:376`); the connector name arrives later
+/// with the `name` event (`:282-292`) and the geometry later still, set only
+/// by `done` (`output_handle_done` → `apply_monitor_change`, `:237-245`). Both
+/// need a compositor round trip, and the one-tick debounce in [`watch_ready`]
+/// can win that race — which is how a returning output used to be published
+/// with no connector and stay that way (every connector-keyed overlay skipped
+/// it; nothing re-read the list when the name landed). A 0×0 geometry is the
+/// tell: `wl_output` v4 sends `name` before `done`, so a non-zero geometry
+/// means the name, if the compositor sends one, is in too.
+fn monitor_is_ready(monitor: &gdk::Monitor) -> bool {
+    let geometry = monitor.geometry();
+    geometry.width() > 0 && geometry.height() > 0
+}
+
+/// The properties a not-yet-ready monitor is watched on. `geometry` is the
+/// one that flips [`monitor_is_ready`]; `connector` rides along so a name that
+/// lands in a dispatch of its own also re-reads — which on a v4 compositor
+/// finds the monitor still waiting on `done` and publishes nothing new
+/// ([`publish_if_changed`]), so it costs no rebuild.
+const MONITOR_READY_NOTIFY: &[&str] = &["geometry", "connector"];
+
+/// Set `out` to `ready` unless it already holds exactly those objects, in that
+/// order (`GObject` equality is identity). Returns whether it published.
+///
+/// A re-read that finds nothing new — a hot-plugged monitor still held back,
+/// or a watch firing before the `done` that makes it ready — would otherwise
+/// re-emit the same list and drive a full per-monitor teardown/rebuild for
+/// nothing; with it, a hot-plug add costs one rebuild (#1368). A same-tick
+/// replug can still cost two — see [`App::monitors_changed`].
+fn publish_if_changed<O: PartialEq + Clone>(out: &Mutable<Vec<O>>, ready: Vec<O>) -> bool {
+    if *out.lock_ref() == ready {
+        return false;
+    }
+    out.set(ready);
+    true
+}
+
+/// Mirror the **ready** items of `model` into `publish` (#1368).
+///
+/// Reads `model` once now, synchronously, and again one idle tick after any
+/// burst of `items_changed` — coalesced, so a replug (remove-then-add, two
+/// signals) is one read, not two. Each read hands `publish` the items
+/// `is_ready` passes, in model order, and leaves the rest out. An item left
+/// out is **watched**: a `notify` handler on each property in `notify`
+/// schedules the same debounced read, so the read that finds it ready is the
+/// one that publishes it — with no other change to the model needed.
+///
+/// A watch is armed once per item however many reads find it unready, and is
+/// disconnected by the first read that finds the item ready or gone from the
+/// model. It holds the item only weakly: an item removed before it was ever
+/// ready is not kept alive by its watch.
+///
+/// Generic over the item type, rather than tied to `gdk::Monitor`, so it can
+/// be driven with no display: the tests feed it a `gio::ListStore` of
+/// `gio::SimpleAction`s and step a private `glib::MainContext` (`ctx`, where
+/// the debounced read is scheduled) by hand. `App` calls it with the display's
+/// monitor list, [`monitor_is_ready`] and [`MONITOR_READY_NOTIFY`].
+///
+/// The returned feed is kept alive by `model`'s `items_changed` handler; the
+/// caller may drop it.
+fn watch_ready<O, P>(
+    model: &impl IsA<gio::ListModel>,
+    ctx: &glib::MainContext,
+    is_ready: fn(&O) -> bool,
+    notify: &'static [&'static str],
+    publish: P,
+) -> Rc<ReadyFeed<O>>
+where
+    O: IsA<glib::Object>,
+    P: Fn(Vec<O>) + 'static,
+{
+    let model = model.upcast_ref::<gio::ListModel>();
+    let feed = Rc::new(ReadyFeed {
+        model: model.downgrade(),
+        ctx: ctx.clone(),
+        is_ready,
+        notify,
+        publish: Box::new(publish),
+        scheduled: Cell::new(false),
+        watching: RefCell::new(Vec::new()),
+    });
+    feed.read();
+    let on_change = Rc::clone(&feed);
+    model.connect_items_changed(move |_, _, _, _| on_change.schedule());
+    feed
+}
+
+/// The state behind one [`watch_ready`] call.
+struct ReadyFeed<O: IsA<glib::Object>> {
+    /// Weak so the feed (held by the model's own `items_changed` handler) does
+    /// not keep its model alive in a cycle.
+    model: glib::WeakRef<gio::ListModel>,
+    ctx: glib::MainContext,
+    is_ready: fn(&O) -> bool,
+    notify: &'static [&'static str],
+    publish: Box<dyn Fn(Vec<O>)>,
+    /// A read is already queued on `ctx`; further triggers ride it.
+    scheduled: Cell<bool>,
+    /// One entry per item the last read left out.
+    watching: RefCell<Vec<Watch<O>>>,
+}
+
+/// The `notify` handlers armed on one not-yet-ready item.
+struct Watch<O: IsA<glib::Object>> {
+    item: glib::WeakRef<O>,
+    handlers: Vec<glib::SignalHandlerId>,
+}
+
+impl<O: IsA<glib::Object>> ReadyFeed<O> {
+    /// Queue one read on the next idle tick, unless one is already queued —
+    /// the single scheduler both `items_changed` and every watch feed.
+    fn schedule(self: &Rc<Self>) {
+        if self.scheduled.replace(true) {
+            return;
+        }
+        let feed = Rc::clone(self);
+        self.ctx
+            .spawn_local_with_priority(glib::Priority::DEFAULT_IDLE, async move {
+                feed.scheduled.set(false);
+                feed.read();
+            });
+    }
+
+    /// Read the model, re-arm the watches, publish the ready items.
+    fn read(self: &Rc<Self>) {
+        let Some(model) = self.model.upgrade() else {
+            return;
+        };
+        let n_items = model.n_items();
+        let mut ready = Vec::with_capacity(crate::cast::u32_to_usize(n_items));
+        let mut unready = Vec::new();
+        for item in (0..n_items)
+            .filter_map(|i| model.item(i))
+            .filter_map(|obj| obj.downcast::<O>().ok())
         {
-            out.push(Monitor::new(monitor));
+            if (self.is_ready)(&item) {
+                ready.push(item);
+            } else {
+                unready.push(item);
+            }
+        }
+        self.watch(&unready);
+        (self.publish)(ready);
+    }
+
+    /// Make `watching` cover exactly `unready`: drop the watch of every item
+    /// that is now ready or gone, and arm one on each item not yet watched.
+    fn watch(self: &Rc<Self>, unready: &[O]) {
+        let mut watching = self.watching.borrow_mut();
+        watching.retain_mut(|watch| {
+            // Finalized: its handlers went with it.
+            let Some(item) = watch.item.upgrade() else {
+                return false;
+            };
+            if unready.contains(&item) {
+                return true;
+            }
+            tracing::info!(
+                item = ?item,
+                ready = (self.is_ready)(&item),
+                "held-back list item released: ready, or gone from the list"
+            );
+            for handler in watch.handlers.drain(..) {
+                item.disconnect(handler);
+            }
+            false
+        });
+        for item in unready {
+            if watching
+                .iter()
+                .any(|watch| watch.item.upgrade().as_ref() == Some(item))
+            {
+                continue;
+            }
+            // `info`, not `debug`: for a monitor that never becomes ready this
+            // is the only trace of why its output got no bar (#1368 review).
+            tracing::info!(
+                item = ?item,
+                notify = ?self.notify,
+                "list item not ready yet; holding it back until it is"
+            );
+            let handlers = self
+                .notify
+                .iter()
+                .map(|&property| {
+                    let feed = Rc::downgrade(self);
+                    item.connect_notify_local(Some(property), move |_, _| {
+                        if let Some(feed) = feed.upgrade() {
+                            feed.schedule();
+                        }
+                    })
+                })
+                .collect();
+            watching.push(Watch {
+                item: item.downgrade(),
+                handlers,
+            });
         }
     }
-    out
+
+    /// How many `notify` handlers the feed holds — including a finalized
+    /// item's, until a read prunes its watch.
+    #[cfg(test)]
+    fn armed(&self) -> usize {
+        self.watching
+            .borrow()
+            .iter()
+            .map(|watch| watch.handlers.len())
+            .sum()
+    }
 }
 
 /// The shipped default stylesheet, compiled into the binary as a last-resort
@@ -320,6 +546,336 @@ fn install_user_css(path: &Path) {
             &display,
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! #1368's readiness gate, driven with no display: `gio::SimpleAction`s
+    //! stand in for `gdk::Monitor`s (`enabled` for "GTK has applied `done`"),
+    //! a `gio::ListStore` for `display.monitors()`, and a private
+    //! `glib::MainContext`, stepped by hand, for the main loop.
+
+    use super::{ReadyFeed, publish_if_changed, watch_ready};
+    use adw::prelude::*;
+    use futures_signals::signal::{Mutable, Signal};
+    use gtk::{gio, glib};
+    use std::cell::RefCell;
+    use std::pin::pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    /// Two properties, like the shipped [`MONITOR_READY_NOTIFY`](super::MONITOR_READY_NOTIFY):
+    /// `enabled` flips readiness, `state` (a property every `GAction` has,
+    /// null on a stateless one) never does — the `connector` of the rig. With
+    /// one property, disconnecting only a watch's *first* handler would pass.
+    const NOTIFY: &[&str] = &["enabled", "state"];
+
+    fn output(name: &str, ready: bool) -> gio::SimpleAction {
+        let item = gio::SimpleAction::new(name, None);
+        item.set_enabled(ready);
+        item
+    }
+
+    fn is_ready(item: &gio::SimpleAction) -> bool {
+        item.is_enabled()
+    }
+
+    fn names(reads: &[&[&str]]) -> Vec<Vec<String>> {
+        reads
+            .iter()
+            .map(|read| read.iter().map(|&name| name.to_owned()).collect())
+            .collect()
+    }
+
+    /// A [`watch_ready`] over a store of stand-ins, recording every read.
+    struct Rig {
+        ctx: glib::MainContext,
+        store: gio::ListStore,
+        /// Every read the feed made, as the names it published.
+        reads: Rc<RefCell<Vec<Vec<String>>>>,
+        feed: Rc<ReadyFeed<gio::SimpleAction>>,
+    }
+
+    impl Rig {
+        fn new(items: &[&gio::SimpleAction]) -> Self {
+            let ctx = glib::MainContext::new();
+            let store = gio::ListStore::new::<gio::SimpleAction>();
+            for &item in items {
+                store.append(item);
+            }
+            let reads = Rc::new(RefCell::new(Vec::new()));
+            let sink = Rc::clone(&reads);
+            let feed = watch_ready(
+                &store,
+                &ctx,
+                is_ready,
+                NOTIFY,
+                move |ready: Vec<gio::SimpleAction>| {
+                    sink.borrow_mut()
+                        .push(ready.iter().map(|item| item.name().to_string()).collect());
+                },
+            );
+            Self {
+                ctx,
+                store,
+                reads,
+                feed,
+            }
+        }
+
+        /// Dispatch everything queued on the rig's context, as the main loop
+        /// would between two frames.
+        fn settle(&self) {
+            while self.ctx.iteration(false) {}
+        }
+
+        fn reads(&self) -> Vec<Vec<String>> {
+            self.reads.borrow().clone()
+        }
+    }
+
+    /// **#1368.** A listed item that is not ready is left out of what
+    /// [`watch_ready`] publishes, and its becoming ready — with no change to
+    /// the list itself — triggers exactly one re-read, which publishes it.
+    /// That is the hot-plugged monitor GTK lists before its `name`/`done`
+    /// arrive: before the fix it was published nameless and nothing re-read
+    /// the list when the name landed.
+    ///
+    /// **Falsified** by treating every item as ready in `ReadyFeed::read`
+    /// ("b" is in the first read) and by deleting the `notify` handler in
+    /// `ReadyFeed::watch` (no second read).
+    #[test]
+    fn an_unready_item_is_held_back_until_it_is_ready() {
+        let a = output("a", true);
+        let b = output("b", false);
+        let rig = Rig::new(&[&a, &b]);
+        assert_eq!(
+            rig.reads(),
+            names(&[&["a"]]),
+            "the initial read is synchronous and leaves the unready item out",
+        );
+        rig.settle();
+        assert_eq!(rig.reads().len(), 1, "nothing re-reads while b waits");
+
+        b.set_enabled(true);
+        rig.settle();
+        assert_eq!(
+            rig.reads(),
+            names(&[&["a"], &["a", "b"]]),
+            "b turning ready re-reads exactly once, and that read publishes it",
+        );
+        assert_eq!(
+            rig.feed.armed(),
+            0,
+            "b's watch is disarmed once it is ready"
+        );
+    }
+
+    /// The hot-plug path proper: an item that arrives unready through
+    /// `items_changed` is read (debounced, one read for the burst), held
+    /// back, and published by the read its readiness schedules — the same
+    /// scheduler, so two items turning ready in one turn share one read.
+    ///
+    /// **Falsified** with the other two: no readiness filter publishes "b"
+    /// and "c" in the second read; no `notify` handler leaves them out for
+    /// good.
+    #[test]
+    fn a_hot_plugged_item_is_published_by_the_read_that_finds_it_ready() {
+        let a = output("a", true);
+        let rig = Rig::new(&[&a]);
+        let b = output("b", false);
+        let c = output("c", false);
+        rig.store.append(&b);
+        rig.store.append(&c);
+        rig.settle();
+        assert_eq!(
+            rig.reads(),
+            names(&[&["a"], &["a"]]),
+            "two appends in one turn are one read, and it publishes neither unready item",
+        );
+        assert_eq!(rig.feed.armed(), 2 * NOTIFY.len(), "one watch each");
+
+        c.set_enabled(true);
+        b.set_enabled(true);
+        rig.settle();
+        assert_eq!(
+            rig.reads(),
+            names(&[&["a"], &["a"], &["a", "b", "c"]]),
+            "both turning ready in one turn is one read, in model order",
+        );
+        assert_eq!(rig.feed.armed(), 0);
+    }
+
+    /// A burst of reads before an item is ready arms **one** watch on it,
+    /// not one per read — and once the item is published, its watch is gone:
+    /// a notify on it re-reads nothing.
+    ///
+    /// **Falsified** by deleting the "already watched" check in
+    /// `ReadyFeed::watch` (three reads leave three watches on "b"), by
+    /// dropping a ready item's handlers without `disconnect`, and by
+    /// disconnecting only the first of them (`drain(..1)`: the `state`
+    /// handler survives and re-reads).
+    #[test]
+    fn reads_before_readiness_arm_one_watch() {
+        let a = output("a", true);
+        let b = output("b", false);
+        let rig = Rig::new(&[&a, &b]);
+        // b's own watch fires while b is still unready: one re-read, which
+        // must neither publish b nor arm a second watch on it.
+        b.notify("enabled");
+        rig.settle();
+        // An unrelated change: a third read that finds b unready.
+        rig.store.append(&output("c", true));
+        rig.settle();
+        assert_eq!(rig.reads(), names(&[&["a"], &["a"], &["a", "c"]]));
+        assert_eq!(
+            rig.feed.armed(),
+            NOTIFY.len(),
+            "three reads found b unready; it carries one watch, not three",
+        );
+
+        b.set_enabled(true);
+        rig.settle();
+        assert_eq!(
+            rig.reads(),
+            names(&[&["a"], &["a"], &["a", "c"], &["a", "b", "c"]]),
+            "exactly one read for b turning ready",
+        );
+        assert_eq!(rig.feed.armed(), 0);
+
+        // Every handler of the watch is gone, not just the first: a notify
+        // on any watched property of the published item re-reads nothing.
+        for &property in NOTIFY {
+            b.notify(property);
+            rig.settle();
+            assert_eq!(
+                rig.reads().len(),
+                4,
+                "a published item keeps no handler on `{property}`: its notify re-reads nothing",
+            );
+        }
+    }
+
+    /// A watch holds its item weakly: an item removed from the model before
+    /// it was ever ready — a monitor unplugged mid-round-trip — is freed, and
+    /// the next read prunes the watch.
+    #[test]
+    fn an_item_removed_before_it_is_ready_is_not_kept_alive() {
+        let a = output("a", true);
+        let rig = Rig::new(&[&a]);
+        let b = output("b", false);
+        rig.store.append(&b);
+        rig.settle();
+        assert_eq!(rig.feed.armed(), NOTIFY.len());
+
+        let gone = b.downgrade();
+        drop(b);
+        rig.store.remove(1);
+        assert!(
+            gone.upgrade().is_none(),
+            "the watch must not keep the item it waits on alive",
+        );
+        rig.settle();
+        assert_eq!(rig.reads(), names(&[&["a"], &["a"], &["a"]]));
+        assert_eq!(rig.feed.armed(), 0, "the dead item's watch is pruned");
+    }
+
+    /// **#1368, the shipped pair.** The tests above drive [`watch_ready`] with
+    /// stand-ins; this one drives it with what `App` passes —
+    /// [`monitor_is_ready`](super::monitor_is_ready) and
+    /// [`MONITOR_READY_NOTIFY`](super::MONITOR_READY_NOTIFY) over a real
+    /// `gdk::Monitor`. No display needed: `GdkMonitor` is a plain
+    /// instantiable type, and a bare one is 0×0 — exactly GTK's state between
+    /// binding a hot-plugged `wl_output` and applying its `done`. It must be
+    /// held back, and a `notify::geometry` (what `done` emits) must re-read.
+    ///
+    /// `app_smoke` under Xvfb only ever sees monitors that are ready at
+    /// startup, so without this test the predicate could become `true` — the
+    /// #1368 fix reverted — with the whole suite green (PR #1411 review, M1).
+    ///
+    /// **Falsified** by `true || …` in `monitor_is_ready` (the monitor is
+    /// published), by `MONITOR_READY_NOTIFY = &["connector"]` (no re-read on
+    /// `geometry`) and by a typo'd `"geometery"` (not a `GdkMonitor`
+    /// property).
+    #[test]
+    fn the_shipped_monitor_wiring_holds_back_a_0x0_monitor_and_rereads_on_geometry() {
+        use super::{MONITOR_READY_NOTIFY, monitor_is_ready};
+        use gtk::gdk;
+
+        let monitor: gdk::Monitor = glib::Object::new();
+        assert!(
+            !monitor_is_ready(&monitor),
+            "a 0x0 GdkMonitor (GTK before `done`) is not ready",
+        );
+        for &property in MONITOR_READY_NOTIFY {
+            assert!(
+                monitor.find_property(property).is_some(),
+                "`{property}` is not a GdkMonitor property: its watch would never fire",
+            );
+        }
+
+        let ctx = glib::MainContext::new();
+        let store = gio::ListStore::new::<gdk::Monitor>();
+        store.append(&monitor);
+        // How many monitors each read published — recorded, not asserted in
+        // the sink, so a failure reports here rather than inside a dispatch.
+        let reads = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&reads);
+        let _feed = watch_ready(
+            &store,
+            &ctx,
+            monitor_is_ready,
+            MONITOR_READY_NOTIFY,
+            move |ready: Vec<gdk::Monitor>| sink.borrow_mut().push(ready.len()),
+        );
+        assert_eq!(*reads.borrow(), [0], "the 0x0 monitor is held back");
+
+        monitor.notify("geometry");
+        while ctx.iteration(false) {}
+        assert_eq!(
+            *reads.borrow(),
+            [0, 0],
+            "GTK's `done` notifies `geometry`, and that must re-read the list",
+        );
+    }
+
+    /// The optional half of #1368: a re-read that finds the same objects in
+    /// the same order does not re-emit, so a hot-plug — whose first read
+    /// finds the new monitor still held back — costs one rebuild, not two.
+    /// Identity, not value: a replugged output is a new `GdkMonitor`, and
+    /// order is part of the list (the first monitor hosts the password prompt).
+    #[test]
+    fn an_identical_list_is_not_republished() {
+        let a = output("a", true);
+        let b = output("b", true);
+        let out = Mutable::new(vec![a.clone()]);
+        let mut changes = pin!(out.signal_cloned());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            changes.as_mut().poll_change(&mut cx),
+            Poll::Ready(Some(_))
+        ));
+
+        assert!(!publish_if_changed(&out, vec![a.clone()]));
+        assert!(
+            changes.as_mut().poll_change(&mut cx).is_pending(),
+            "the same objects re-read are not an emission",
+        );
+
+        assert!(publish_if_changed(&out, vec![a.clone(), b.clone()]));
+        assert!(matches!(
+            changes.as_mut().poll_change(&mut cx),
+            Poll::Ready(Some(list)) if list == [a.clone(), b.clone()]
+        ));
+        assert!(
+            publish_if_changed(&out, vec![b.clone(), a.clone()]),
+            "a reorder is a change",
+        );
+        assert!(
+            publish_if_changed(&out, vec![b, output("a", true)]),
+            "an equal-looking but different object is a change",
         );
     }
 }

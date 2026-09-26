@@ -3815,17 +3815,20 @@ mod gtk_tests {
     /// says which monitor it was on, and the page opens on **that** monitor's
     /// drawer, flush with its bar, rather than on niri's focused output (#1413).
     ///
-    /// Run once per drawer, naming each as the clicked output in turn, so the
-    /// "any mounted drawer" fallback (the test thread has no focused output)
-    /// cannot pass it by iteration order.
+    /// Run once per drawer, naming each as the clicked output in turn **and the
+    /// other one as niri's focused output**, so neither the "any mounted
+    /// drawer" fallback nor a focused output that happens to agree can pass it
+    /// (#1416 review, L4: through `broker_effect` the test thread's focused
+    /// output is `None`, which let the two be swapped unseen).
     ///
     /// **Falsification:** pass `focused` in place of `page_output(…)` in
-    /// `open_builtin_page`'s fallback → one of the two rounds opens on the
-    /// wrong drawer; ignore `toggle_builtin_under`'s `false`
-    /// (`|| true`) → nothing opens at all.
+    /// `open_builtin_page`'s fallback → both rounds open on the focused
+    /// drawer; swap `page_output`'s arguments there (the review's E7) → the
+    /// same; ignore `toggle_builtin_under`'s `false` (`|| true`) → nothing
+    /// opens at all.
     #[gtk::test]
     fn a_sidebar_cards_click_opens_a_builtin_page_on_its_own_monitor() {
-        use crate::plugins::effects::broker_page_for_test;
+        use crate::plugins::effects::broker_page_focused_for_test;
         use crate::plugins::note_click_origin;
         use hytte_plugin_proto::{Mount, Page as WirePage};
         use std::time::Instant;
@@ -3845,12 +3848,17 @@ mod gtk_tests {
         let card = gtk::Button::new();
         sidebar.set_child(Some(&card));
 
-        for (key, opened, other) in [
-            ("test-1413-sidebar-b", &b, &a),
-            ("test-1413-sidebar-a", &a, &b),
+        for (key, focused, opened, other) in [
+            ("test-1413-sidebar-b", "test-1413-sidebar-a", &b, &a),
+            ("test-1413-sidebar-a", "test-1413-sidebar-b", &a, &b),
         ] {
             note_click_origin("card", card.upcast_ref(), Some(key), Instant::now());
-            broker_page_for_test("card", WirePage::Audio, Mount::SidebarBottom);
+            broker_page_focused_for_test(
+                "card",
+                WirePage::Audio,
+                Mount::SidebarBottom,
+                Some(focused),
+            );
             assert_eq!(
                 *opened.current.borrow(),
                 Some(Active::Builtin(Page::Audio)),
@@ -3865,5 +3873,64 @@ mod gtk_tests {
             *opened.current.borrow_mut() = None;
         }
         sidebar.destroy();
+    }
+
+    /// #1412's drawer arm, its last route (#1416 review, L4 — the E2 half): a
+    /// bar plugin's own page, provoked by a recent click whose widget is on
+    /// **no** drawer's bar, opens flush on the drawer of the output the click
+    /// was on, not on niri's focused output — the same `page_output` rule as
+    /// the built-in arm above. Not reachable from a real bar, where every chip's
+    /// window has a drawer; pinned so the two arms cannot drift apart.
+    ///
+    /// Each drawer is the clicked output in one round and the focused one in
+    /// the other, as in the built-in test.
+    ///
+    /// **Falsification:** revert `open_own_page_in_drawer`'s last route to
+    /// `open_plugin_on_focused(focused, …)` (the review's E2) → both rounds
+    /// open on the focused drawer.
+    #[gtk::test]
+    fn a_plugin_page_clicked_off_every_bar_opens_on_the_clicked_monitor() {
+        use crate::plugins::effects::broker_page_focused_for_test;
+        use crate::plugins::note_click_origin;
+        use hytte_plugin_proto::{Mount, Page as WirePage};
+        use std::time::Instant;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _) = plugin_drawer(&monitor, "test-1413-offbar-a");
+        let (b, _) = plugin_drawer(&monitor, "test-1413-offbar-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-offbar-a", "test-1413-offbar-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
+        // Rooted, but in a window no drawer hangs off.
+        let elsewhere = gtk::Window::new();
+        let chip = gtk::Button::new();
+        elsewhere.set_child(Some(&chip));
+
+        for (key, focused, opened, other) in [
+            ("test-1413-offbar-b", "test-1413-offbar-a", &b, &a),
+            ("test-1413-offbar-a", "test-1413-offbar-b", &a, &b),
+        ] {
+            note_click_origin("offbar", chip.upcast_ref(), Some(key), Instant::now());
+            broker_page_focused_for_test(
+                "offbar",
+                WirePage::PluginSelf,
+                Mount::BarRight,
+                Some(focused),
+            );
+            assert_eq!(
+                *opened.current.borrow(),
+                Some(Active::Plugin("offbar".to_owned())),
+                "the page opens on the drawer of the monitor that was clicked",
+            );
+            assert_eq!(anchored_on(opened), None, "…flush: the chip is on no bar");
+            assert_eq!(*other.current.borrow(), None);
+            *opened.current.borrow_mut() = None;
+            opened.revealer.set_reveal_child(false);
+        }
+        elsewhere.destroy();
     }
 }

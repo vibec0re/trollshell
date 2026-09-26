@@ -6028,13 +6028,14 @@ Revert the edit afterwards.
       clock chip**, the way it does under the native volume chip, not flush
       with the bar's right edge. Near a screen edge it may clamp to stay on
       screen, as a native chip's does.
-- [ ] **(#1413)** **On the chip's monitor, and a second click closes it.**
-      With two outputs, focus a window on output A and click the clock chip on
-      output **B**'s bar: Audio opens on **B**, under the chip. Click the chip
-      again with it open: the drawer retracts, as it does for the native
-      volume chip. Open Audio from the native volume chip first, then click the
-      clock chip: that also closes it. A built-in page is shared, and this is
-      what a second click on the native chip does too.
+- [ ] **(#1413)** **On the chip's monitor.** With two outputs, focus a
+      window on output A and click the clock chip on output **B**'s bar: Audio
+      opens on **B**, under the chip. (Not a check here: a second click on the
+      chip with the page open. The open drawer's full-screen click-catcher
+      takes that click and closes the drawer before the chip sees it, however
+      the toggle is wired, so on glass it cannot fail; the toggle's own
+      retract is pinned by
+      `modal::gtk_tests::a_plugin_chips_click_opens_a_builtin_page_under_the_chip`.)
 - [ ] **(#1413)** **A keybind open of Audio is unchanged.**
       `busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell org.gtk.Actions Activate 'sava{sv}' open-page 1 s audio 0`
       opens Audio **flush with the bar's right edge** on niri's focused output,

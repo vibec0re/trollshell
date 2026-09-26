@@ -279,7 +279,11 @@ craneLib.mkCargoDerivation (
       # `gtk::Image::from_file(assets::path("icons/…"))` read, which now find
       # real files where they found none; no test asserts on either outcome
       # (measured: the whole `trollshell` system-tests run is identical with
-      # and without it).
+      # and without it). Two consequences worth knowing: `cargo test` compiles
+      # *after* this `preCheck` (`buildPhaseCargoCommand = ""`), so
+      # `assets.rs`'s compile-time `option_env!` tier is baked with the same
+      # path; and an asset-only edit now rehashes this one check, undoing
+      # #133's decoupling here (and only here) on purpose.
       export TROLLSHELL_DATA_DIR="${assets}/share/trollshell"
       # …and, on the `TROLLSHELL_REQUIRE_GL` precedent above, the render test
       # skips when the stylesheet is missing (a local `cargo test` with no

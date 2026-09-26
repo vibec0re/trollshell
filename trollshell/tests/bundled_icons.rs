@@ -24,13 +24,16 @@
 //!
 //! ## Why the fixture is a temp dir and not `assets/trollshell/icons/`
 //!
-//! Because the CI sandbox does not have that directory. `nix/package.nix`'s
-//! crane source filter deliberately strips `assets/` (bar one stylesheet) so an
-//! icon edit can't invalidate the expensive Rust compile (#133) — and
-//! `checks.system-tests` in `flake.nix` inherits that same filtered `src`. A
-//! test that read the real icon dir would therefore pass here and fail in
-//! `nix flake check`, or (worse) be quietly written to skip there, which is
-//! where it most needs to run.
+//! Because the CI sandbox does not have that directory **in the source tree**.
+//! `nix/package.nix`'s crane source filter deliberately strips `assets/` (bar
+//! one stylesheet) so an icon edit can't invalidate the expensive Rust compile
+//! (#133) — and `checks.system-tests` in `flake.nix` inherits that same
+//! filtered `src`. Since #1413 that check does point `TROLLSHELL_DATA_DIR` at
+//! the shipped `trollshell-assets` derivation, so `assets::icons_dir()` names a
+//! real directory there; but a test that read it would still depend on
+//! whichever of the three `assets.rs` tiers a given run resolves, where a
+//! fixture depends on none, and would read the shipped files rather than prove
+//! the lookup rule this test is about.
 //!
 //! So fact 1 is proved against a **fixture** written into a `TempDir` under the
 //! icon's real name, and fact 2 against the search path itself — neither needs

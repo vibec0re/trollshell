@@ -833,6 +833,32 @@ pub(crate) fn broker_page_for_test(plugin_id: &str, page: Page, mount: Mount) {
     );
 }
 
+/// [`broker_page_for_test`] with niri's focused output **named** instead of
+/// read from the shared cache (#1416 review, L4): the same `OpenPage` arm with
+/// the same real openers, entered one level down at [`broker_open_page_with`]
+/// so `focused` can be set.
+///
+/// On a test thread the cache is `None`, so through [`broker_effect`] the
+/// fallback cannot tell "the clicked output" from "the focused output" apart
+/// — swapping the two at a call site survived the whole suite. With a focused
+/// output that differs from the clicked one, it cannot.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn broker_page_focused_for_test(
+    plugin_id: &str,
+    page: Page,
+    mount: Mount,
+    focused: Option<&str>,
+) {
+    broker_open_page_with(
+        plugin_id,
+        page,
+        mount,
+        focused,
+        open_own_page_in_drawer,
+        crate::overlays::dialog::open_on_focused,
+    );
+}
+
 // ── RunCommand round-trip (#510) ─────────────────────────────────────────────
 
 /// How long a plugin-spawned command may run before it is killed and reported

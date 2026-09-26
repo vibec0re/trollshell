@@ -502,7 +502,10 @@ mod tests {
         let kept = &sanitize("p", &[Setting::text("A", "x".repeat(1000))])[0];
         assert_eq!(kept.label.chars().count(), 64);
         assert!(kept.label.ends_with('…'));
-        let default = &sanitize("p", &[Setting::text("A", "a").default_value("y".repeat(1000))])[0];
+        let default = &sanitize(
+            "p",
+            &[Setting::text("A", "a").default_value("y".repeat(1000))],
+        )[0];
         assert_eq!(
             default.default.as_ref().map(|d| d.chars().count()),
             Some(256)
@@ -523,10 +526,17 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
             .collect();
-        let decoded: hytte_plugin_proto::Manifest =
-            hytte_plugin_proto::decode(&bytes).expect("a newer kind does not cost the registration");
-        assert_eq!(decoded.settings.len(), 2, "the fixture's two readable entries");
-        assert_eq!(ids(&sanitize("vibectl", &decoded.settings)), ["V1BECTL_SERVER"]);
+        let decoded: hytte_plugin_proto::Manifest = hytte_plugin_proto::decode(&bytes)
+            .expect("a newer kind does not cost the registration");
+        assert_eq!(
+            decoded.settings.len(),
+            2,
+            "the fixture's two readable entries"
+        );
+        assert_eq!(
+            ids(&sanitize("vibectl", &decoded.settings)),
+            ["V1BECTL_SERVER"]
+        );
     }
 
     /// #1415 review L4: a flood of refused entries is named only up to the
@@ -552,7 +562,10 @@ mod tests {
             .count();
         assert_eq!(named, MAX_DROP_WARNINGS, "{lines:?}");
         assert_eq!(
-            lines.iter().filter(|l| l.contains("more of this plugin")).count(),
+            lines
+                .iter()
+                .filter(|l| l.contains("more of this plugin"))
+                .count(),
             1,
             "{lines:?}"
         );

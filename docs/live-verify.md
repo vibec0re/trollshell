@@ -6074,8 +6074,9 @@ Plugins tab first if it is off.
       entries whose placeholders read `nisse` and `playful, a little sassy`,
       and _Kaomoji face_ as a switch whose subtitle says the plugin's default
       (`false`) applies. Select `timer`: no Settings group at all.
-- [ ] **Save restarts a running plugin.** Type a name into _Name_; Save and
-      Revert light up. Press Save. The status line under the rows reads
+- [ ] **Save restarts a running plugin.** Save and Revert are disabled until
+      you change something. Type a name into _Name_; they light up. Press
+      Save. The status line under the rows reads
       "Saved. Restarting the plugin…", then "Saved, and the plugin restarted."
       `cat ~/.config/trollshell/plugin-settings.toml` shows `[pet]` with
       `PET_NAME = "…"`, and
@@ -6100,8 +6101,24 @@ Plugins tab first if it is off.
 - [ ] **Hand edits are kept.** Add a comment line and a key of your own under
       `[pet]` in `plugin-settings.toml`, then save a change from the tab. The
       comment and your key are still there, byte for byte.
-- [ ] **The file cannot set anything.** Add `LD_PRELOAD = "/nonexistent.so"`
-      under `[pet]` by hand and restart the pet from the tab. It starts
-      normally, the environment (`systemctl --user show -p Environment …`)
-      has no `LD_PRELOAD`, and the shell's journal has one line saying the
-      variable is not passed.
+- [ ] **(#1415 H1) A value the tab cannot show is left alone.** Write
+      `TROLLSHELL_PET_KAOMOJI = "yes"` under `[pet]` by hand and reopen the
+      pet. The form opens with Save and Revert **disabled**, and the
+      _Kaomoji face_ row's subtitle says the file holds “yes”. Change _Name_
+      and Save: `TROLLSHELL_PET_KAOMOJI = "yes"` is still in the file,
+      unchanged.
+- [ ] **(#1415 H2) Save's restart does not race the stop.** With the pet
+      running, change _Name_ and Save, three times in a row, quickly. Each
+      ends with "Saved, and the plugin restarted.", and
+      `systemctl --user is-active trollshell-plugin-pet` says `active` after
+      the last one — never a stopped pet and a "restarting the plugin
+      failed" line.
+- [ ] **(#1415 M1) The shell going away keeps the form.** Type into _Name_
+      without saving, then `systemctl --user stop trollshell`. Within a few
+      seconds the group says the shell is not answering, and your text is
+      still in the row. Start the shell again: the note goes, the text stays.
+- [ ] **The file cannot set the refused names.** Add
+      `LD_PRELOAD = "/nonexistent.so"` under `[pet]` by hand and restart the
+      pet from the tab. It starts normally, the environment
+      (`systemctl --user show -p Environment …`) has no `LD_PRELOAD`, and the
+      shell's journal has one line saying the variable is not passed.

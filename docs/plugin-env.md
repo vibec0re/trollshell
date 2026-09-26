@@ -85,8 +85,11 @@ V1BECTL_SCREENS = "/home/me/.config/v1bectl/screens.kdl"
 ```
 
 The shell's launcher passes each value as that variable the next time it
-starts the plugin, and **Save** restarts a running plugin so the change takes
-effect at once. Precedence for one variable:
+starts the plugin, and **Save** asks the shell to restart a running plugin
+(`Control.RestartPlugin`) so the change takes effect at once. A hand edit is
+not watched: it applies the next time the plugin starts, like any change to
+the environment of a process that is already running. Precedence for one
+variable:
 
 1. `programs.trollshell.plugins.<id>.env` in nix. The tab shows that row
    read-only, "Set in nix".
@@ -95,12 +98,21 @@ effect at once. Precedence for one variable:
    choosing _Default_, or the reset button on a switch or number) is how you
    get back here.
 
+Save writes only the rows you changed. A value the tab cannot show — a choice
+that is not one of the plugin's options, a number outside its range, a switch
+written as `yes` — is shown for what it is and kept exactly as the file has
+it until you change that row.
+
 The launcher reads the file for every plugin it launches, before that plugin
 has ever said what it declares, so it accepts any key in the plugin's table —
 but never one of the names below, so the file cannot become a way to set
-`LD_PRELOAD` or `PATH`. The values reach `systemd-run` through its own
-environment, like a secret (#984), not through its world-readable argv. A
-legacy static unit is not launched by the launcher and does not see the file.
+`LD_PRELOAD` or `PATH`. A value no environment can carry (one with a NUL in
+it, or longer than 32 KiB) is skipped with a warning rather than failing the
+plugin's whole launch. The values reach `systemd-run` through its own
+environment, like a secret (#984), not through its world-readable argv, and
+they are not part of the unit's fingerprint either (that also rides the
+argv). A legacy static unit is not launched by the launcher and does not see
+the file; the tab's Save says so.
 
 **Secrets still don't belong here**: the file is plain text. API keys go
 through `secrets` and the keyring, as above.
@@ -136,8 +148,15 @@ warning in its journal, any setting whose variable:
 
 - is not `[A-Z_][A-Z0-9_]*`, or is longer than 128 bytes;
 - is `HYTTE_*` (the plugin runtime's own), `LD_*`, `XDG_*`, `PATH` or `HOME`;
+- is `SYSTEMD_*` or `NOTIFY_SOCKET` (these would configure `systemd-run`
+  itself, which carries the values);
 - ends in `_API_KEY` (the keyring's names, #392);
 - repeats an earlier one.
+
+That list is a guard against footguns, **not a sandbox**. A plugin is already
+code running as you, so it deliberately does not refuse the variables that
+load code into a process (`GIO_EXTRA_MODULES`, `GTK_MODULES`, `PYTHONPATH`, …):
+a plugin declaring one would gain nothing it did not already have.
 
 It keeps at most 32, strips control and bidi characters from labels and docs,
 drops a `Choice` option that isn't plain text (rather than change a value the
@@ -147,10 +166,15 @@ plugin would receive), and drops an `Int` whose `min` exceeds its `max`.
 The shell remembers the last list each plugin id declared
 (`$XDG_STATE_HOME/trollshell/plugin-settings-schema.toml`), so the form is
 there for a plugin that is switched off, or one that cannot start without its
-setting. A plugin has to have registered once for its form to appear.
+setting. A plugin has to have registered once for its form to appear, and an
+id is forgotten once `plugins.json` stops declaring it (unless it registered
+this session).
 
 Declaring settings needs no protocol bump: an older shell ignores the list,
-and a plugin that declares none sends exactly the bytes it sent before.
+and a plugin that declares none sends exactly the bytes it sent before. A
+shell that does not know one of your setting **kinds** drops that one setting
+and registers the plugin as usual, so adding a kind later never locks a
+plugin out of an older shell.
 
 ## New-install checklist
 

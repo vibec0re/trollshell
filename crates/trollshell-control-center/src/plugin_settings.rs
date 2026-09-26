@@ -240,7 +240,9 @@ impl Row {
         match (self.draft(), loaded) {
             (None, None) => true,
             (Some(draft), Some(loaded)) => match &self.editor {
-                Editor::Switch { .. } => draft.as_bool().is_some() && draft.as_bool() == strict_bool(loaded),
+                Editor::Switch { .. } => {
+                    draft.as_bool().is_some() && draft.as_bool() == strict_bool(loaded)
+                }
                 Editor::Spin { .. } => draft.as_integer() == loaded.trim().parse::<i64>().ok(),
                 _ => edit_text(&draft) == loaded,
             },
@@ -909,7 +911,11 @@ fn switch_row(setting: &Setting) -> (adw::PreferencesRow, Editor) {
         row: row.clone(),
         reset,
         own: Cell::new(false),
-        default: setting.default.as_deref().and_then(strict_bool).unwrap_or(false),
+        default: setting
+            .default
+            .as_deref()
+            .and_then(strict_bool)
+            .unwrap_or(false),
     };
     (row.upcast(), editor)
 }

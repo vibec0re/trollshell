@@ -3363,7 +3363,6 @@ async fn restart_plugin(id: String) -> Result<String, hytte_bus::BusError> {
         .await
 }
 
-
 /// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
 async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
@@ -7174,7 +7173,10 @@ mod gtk_tests {
         );
         let kept = form(&state).expect("one failed poll unmounted the form");
         assert!(kept.is_dirty(), "the edit survived");
-        assert!(kept.says_offline(), "and the group says the shell is not answering");
+        assert!(
+            kept.says_offline(),
+            "and the group says the shell is not answering"
+        );
 
         super::on_settings_result(
             &state,
@@ -7182,7 +7184,10 @@ mod gtk_tests {
             Ok(HashMap::from([("vibectl".to_owned(), declared)])),
         );
         let back = form(&state).expect("still mounted");
-        assert!(back.is_dirty() && !back.says_offline(), "the note goes, the edit stays");
+        assert!(
+            back.is_dirty() && !back.says_offline(),
+            "the note goes, the edit stays"
+        );
 
         super::on_settings_result(
             &state,
@@ -7192,7 +7197,10 @@ mod gtk_tests {
                 dbus_name: Some("org.freedesktop.DBus.Error.UnknownMethod".to_owned()),
             }),
         );
-        assert!(form(&state).is_none(), "an older shell has no Settings group");
+        assert!(
+            form(&state).is_none(),
+            "an older shell has no Settings group"
+        );
         dismiss(&window);
     }
 
@@ -7206,7 +7214,10 @@ mod gtk_tests {
         let older = state.schema_polls.issue();
         let newer = state.schema_polls.issue();
         super::on_settings_result(&state, newer, Ok(HashMap::new()));
-        assert!(state.detail.settings.borrow().is_none(), "the newer answer declares nothing");
+        assert!(
+            state.detail.settings.borrow().is_none(),
+            "the newer answer declares nothing"
+        );
         super::on_settings_result(
             &state,
             older,
@@ -7256,7 +7267,13 @@ mod gtk_tests {
         super::refresh_declared(&state);
         refresh_detail(&state);
         assert!(
-            matches!(server_row(&state), RowView::Nix { sensitive: false, .. }),
+            matches!(
+                server_row(&state),
+                RowView::Nix {
+                    sensitive: false,
+                    ..
+                }
+            ),
             "{:?}",
             server_row(&state)
         );

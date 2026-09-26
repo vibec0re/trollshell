@@ -5204,7 +5204,6 @@ mod tests {
         );
     }
 
-
     /// #1415 review L2: the settings never reach the fingerprint, which rides
     /// `systemd-run`'s world-readable argv — an unkeyed hash of a switch or a
     /// short choice would give the value away. So a plugin digests the same
@@ -5253,7 +5252,10 @@ mod tests {
         assert_eq!(spec.settings, values(&[("V1BECTL_OTHER", "fine")]));
         let launch = plugin_launch("vibectl", spec, &[], DEFAULT_TARGET);
         let out = launch::command("true", &launch).output().await;
-        assert!(out.is_ok(), "one bad value made the launch unspawnable: {out:?}");
+        assert!(
+            out.is_ok(),
+            "one bad value made the launch unspawnable: {out:?}"
+        );
     }
 
     /// The launcher applies the value rule itself too, not only the reader:
@@ -5306,7 +5308,11 @@ mod tests {
         }
         assert_eq!(first_report(&mut seen, "p", "LAST"), Report::WarnLast);
         assert_eq!(first_report(&mut seen, "p", "PAST"), Report::Quiet);
-        assert_eq!(seen.len(), MAX_SETTING_WARNINGS, "the set stops growing too");
+        assert_eq!(
+            seen.len(),
+            MAX_SETTING_WARNINGS,
+            "the set stops growing too"
+        );
     }
 
     // ── the restart's wait (#1415 review H2) ────────────────────────────────
@@ -5339,7 +5345,10 @@ mod tests {
             calls.set(n);
             async move {
                 let state = if n <= 3 { "deactivating" } else { "inactive" };
-                Ok(vec![unit("vibectl", state, false), unit("pet", "active", true)])
+                Ok(vec![
+                    unit("vibectl", state, false),
+                    unit("pet", "active", true),
+                ])
             }
         })
         .await;
@@ -5361,7 +5370,10 @@ mod tests {
             Ok(vec![unit("vibectl", "deactivating", false)])
         })
         .await;
-        assert_eq!(listings as u128, STOP_WAIT.as_millis() / STOP_POLL.as_millis());
+        assert_eq!(
+            listings as u128,
+            STOP_WAIT.as_millis() / STOP_POLL.as_millis()
+        );
         assert!(start.elapsed() >= STOP_WAIT, "{:?}", start.elapsed());
     }
 
@@ -5386,7 +5398,9 @@ mod tests {
             &prod[start..start + len]
         };
         let restart = body("async fn restart(id: &str");
-        let stop = restart.find("stop(id).await?").expect("restart stops first");
+        let stop = restart
+            .find("stop(id).await?")
+            .expect("restart stops first");
         let wait = restart
             .find("wait_until_stopped(id).await")
             .expect("restart waits for the stop");
@@ -5400,7 +5414,10 @@ mod tests {
         let entry = body("pub async fn restart_for_settings(");
         assert!(entry.contains("CONVERGE_LOCK.lock().await"), "{entry}");
         assert!(entry.contains("load_declared().await"), "{entry}");
-        assert!(entry.contains("restart(id, spec, &declared.target)"), "{entry}");
+        assert!(
+            entry.contains("restart(id, spec, &declared.target)"),
+            "{entry}"
+        );
     }
 
     /// The words `Control.RestartPlugin` answers with; the control-center

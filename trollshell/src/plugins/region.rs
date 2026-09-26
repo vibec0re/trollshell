@@ -703,7 +703,7 @@ fn reconcile_region(
                 // safe: the effect it may provoke is brokered on this same GTK
                 // thread, i.e. not before this callback has returned.
                 if matches!(kind, UiEventKind::Click) {
-                    note_card_click(&ev_plugin, &ev_card, &pressed);
+                    note_card_click(&ev_plugin, &ev_card, &pressed, ev_output.as_deref());
                 }
                 if let Some(tx) = ev_outbound.borrow().as_ref() {
                     // Non-blocking: a stuck plugin's full outbound queue drops the
@@ -869,18 +869,25 @@ fn clicked_widget(pressed: Option<gtk::Widget>, card: &gtk::Widget) -> gtk::Widg
 }
 
 /// Record a click on `plugin_id`'s card as that plugin's **click origin**
-/// (#1252) — what `effects::open_own_page_in_drawer` anchors the plugin's page
-/// under if the click makes the plugin open it.
+/// (#1252) — what the effect broker places the page under if the click makes
+/// the plugin open one: a drawer page (its own or a built-in) anchors under the
+/// clicked widget, and a sidebar card's dialog opens on `output`, this region's
+/// own connector (#1413) — the same value the click's `HostMsg::Event` carries.
 ///
 /// Consumes the recorded press, so a later click with no press behind it (a
 /// keyboard activation) cannot inherit an old press's button.
-fn note_card_click(plugin_id: &str, card: &glib::WeakRef<gtk::Box>, pressed: &PressedButton) {
+fn note_card_click(
+    plugin_id: &str,
+    card: &glib::WeakRef<gtk::Box>,
+    pressed: &PressedButton,
+    output: Option<&str>,
+) {
     let pressed = pressed.take();
     let Some(card) = card.upgrade() else {
         return;
     };
     let widget = clicked_widget(pressed, card.upcast_ref());
-    super::effects::note_click_origin(plugin_id, &widget, Instant::now());
+    super::effects::note_click_origin(plugin_id, &widget, output, Instant::now());
 }
 
 /// Log this card's #1050 per-screen verdict, but only when the frame's
@@ -5186,6 +5193,13 @@ mod gtk_tests {
         gesture
     }
 
+    /// `plugin_id`'s click origin, taken as a page opened now would take it —
+    /// just the widget, which is all the press-tracker tests are about.
+    fn taken(plugin_id: &str) -> Option<gtk::Widget> {
+        super::super::effects::take_click_origin(plugin_id, Instant::now())
+            .map(|click| click.widget)
+    }
+
     /// End the tracker's current press sequence the way GTK does on a release,
     /// a denial or a cancel: `GtkGesture::end` (#1252 review, LOW 4).
     fn end_press(card: &gtk::Box) {
@@ -5219,12 +5233,15 @@ mod gtk_tests {
     /// A click on one chip of a several-chip card is recorded under **that
     /// chip**, not under the card — the case the brief calls out, and the one
     /// `hytte-plugin-stats` needs: its four chips are one card, and a drawer
-    /// centred under the card sits under the middle of the four (#1252).
+    /// centred under the card sits under the middle of the four (#1252). It is
+    /// recorded on **this region's output**, too — what a sidebar card's dialog
+    /// opens on (#1413).
     ///
     /// **Falsification:** make `clicked_widget` return the card
     /// unconditionally → the chip assertion reds; delete the
     /// `note_card_click` call from the card's event callback → the `expect`
-    /// reds (nothing recorded at all).
+    /// reds (nothing recorded at all); pass `None` for the output in the
+    /// callback → the output assertion reds.
     #[gtk::test]
     fn a_click_is_recorded_under_the_chip_its_press_landed_on() {
         adw::init().expect("libadwaita init");
@@ -5237,16 +5254,21 @@ mod gtk_tests {
         let origin = super::super::effects::take_click_origin("click-origin-chip", Instant::now())
             .expect("a click on a mounted, rooted chip is recorded as its plugin's origin");
         assert_eq!(
-            origin,
+            origin.widget,
             mem.clone().upcast::<gtk::Widget>(),
             "the page must hang off the chip that was pressed, not the card around it",
+        );
+        assert_eq!(
+            origin.output.as_deref(),
+            Some("A"),
+            "…on the output of the region it was clicked in (#1413)",
         );
 
         // …and the other chip, pressed next, is recorded under itself.
         press_on(&card, &cpu);
         cpu.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-chip", Instant::now()),
+            taken("click-origin-chip"),
             Some(cpu.upcast::<gtk::Widget>()),
         );
         window.destroy();
@@ -5269,17 +5291,17 @@ mod gtk_tests {
 
         cpu.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-card", Instant::now()),
+            taken("click-origin-card"),
             Some(card.clone().upcast::<gtk::Widget>()),
             "with no press to go by, the card is the best anchor there is",
         );
 
         press_on(&card, &mem);
         mem.emit_clicked();
-        let _ = super::super::effects::take_click_origin("click-origin-card", Instant::now());
+        let _ = taken("click-origin-card");
         cpu.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-card", Instant::now()),
+            taken("click-origin-card"),
             Some(card.upcast::<gtk::Widget>()),
             "a press is spent by its click; the next click without one falls back to the card",
         );
@@ -5308,7 +5330,7 @@ mod gtk_tests {
         // A press-less activation of `mem`.
         mem.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-drag-off", Instant::now()),
+            taken("click-origin-drag-off"),
             Some(card.clone().upcast::<gtk::Widget>()),
             "an abandoned press on `cpu` must not anchor a later click on `mem`",
         );
@@ -5337,7 +5359,7 @@ mod gtk_tests {
         end_press(&card);
         mem.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            taken("click-origin-end-order"),
             Some(mem.clone().upcast::<gtk::Widget>()),
             "the click in the same dispatch as its release spends its press",
         );
@@ -5350,7 +5372,7 @@ mod gtk_tests {
         pump();
         mem.emit_clicked();
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-end-order", Instant::now()),
+            taken("click-origin-end-order"),
             Some(mem.upcast::<gtk::Widget>()),
             "an older press's deferred clear must not wipe the newer press",
         );
@@ -5422,7 +5444,7 @@ mod gtk_tests {
             "premise: the submit reached the plugin",
         );
         assert_eq!(
-            super::super::effects::take_click_origin("click-origin-entry", Instant::now()),
+            taken("click-origin-entry"),
             None,
             "a submit is not a click and anchors nothing",
         );
@@ -5440,7 +5462,9 @@ mod gtk_tests {
     /// the `root()` check → the unrooted assertion reds.
     #[gtk::test]
     fn a_click_origin_anchors_one_page_and_only_while_recent_and_rooted() {
-        use super::super::effects::{CLICK_ORIGIN_WINDOW, note_click_origin, take_click_origin};
+        use super::super::effects::{
+            CLICK_ORIGIN_WINDOW, Click, note_click_origin, take_click_origin,
+        };
 
         adw::init().expect("libadwaita init");
         let window = gtk::Window::new();
@@ -5453,34 +5477,481 @@ mod gtk_tests {
         note_click_origin(
             "click-origin-age",
             &chip,
+            None,
             ago(CLICK_ORIGIN_WINDOW + Duration::from_millis(1)),
         );
         assert_eq!(
-            take_click_origin("click-origin-age", now),
+            take_click_origin("click-origin-age", now).map(|click| click.widget),
             None,
             "a click older than the window caused nothing opening now",
         );
 
-        note_click_origin("click-origin-age", &chip, ago(CLICK_ORIGIN_WINDOW));
-        assert_eq!(
-            take_click_origin("click-origin-age", now),
-            Some(chip.clone()),
-            "the window is inclusive",
+        note_click_origin(
+            "click-origin-age",
+            &chip,
+            Some("B"),
+            ago(CLICK_ORIGIN_WINDOW),
         );
         assert_eq!(
             take_click_origin("click-origin-age", now),
+            Some(Click {
+                widget: chip.clone(),
+                output: Some("B".to_owned()),
+            }),
+            "the window is inclusive, and the click keeps the output it was on (#1413)",
+        );
+        assert_eq!(
+            take_click_origin("click-origin-age", now).map(|click| click.widget),
             None,
             "one click anchors one page",
         );
 
         let unrooted: gtk::Widget = gtk::Button::new().upcast();
-        note_click_origin("click-origin-age", &unrooted, now);
+        note_click_origin("click-origin-age", &unrooted, Some("B"), now);
         assert_eq!(
-            take_click_origin("click-origin-age", now),
+            take_click_origin("click-origin-age", now).map(|click| click.widget),
             None,
             "a chip on no surface has nothing to measure",
         );
         window.destroy();
+    }
+
+    // ── #1413: the press tracker under real pointer input ────────────────────
+    //
+    // Every test above feeds the tracker by emitting its gesture's signals, and
+    // `tracker_of` pins the wiring that decides whether GTK's own dispatch would
+    // reach it. These four drive the pointer for real instead — XTest input into
+    // the test's X display through `xdotool`, so the press goes down GTK's own
+    // capture/target/bubble dispatch, meets the chip's own `GtkButton` gesture,
+    // and ends the way GTK ends it. They are what #1252's reviewer ran by hand
+    // (comment 5847338182, then the fix round's table), committed.
+
+    /// Whether this test can drive **real** pointer input: `xdotool` on `PATH`
+    /// and GTK on an X11 display (`xdotool` speaks `XTest`, so a Wayland display
+    /// — a `cargo test` run inside a live session without `xvfb-run` — is out of
+    /// its reach).
+    ///
+    /// Honours `TROLLSHELL_REQUIRE_XDOTOOL` the way `plugins::tests`'
+    /// `systemd_run_on_path_or_skip` honours `TROLLSHELL_REQUIRE_SYSTEMD_RUN`
+    /// (itself on `hytte-ui`'s `TROLLSHELL_REQUIRE_GL` precedent): a skip is
+    /// indistinguishable from a pass in captured output, so the build that means
+    /// these to run — CI's `system-tests` check, which carries `pkgs.xdotool`
+    /// and exports the variable — **fails** naming the reason, while a bare
+    /// local run without `xdotool` skips.
+    fn real_pointer_or_skip(test_name: &str) -> bool {
+        use std::process::{Command, Stdio};
+
+        let xdotool = Command::new("xdotool")
+            .arg("version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        let on_x11 = gtk::gdk::Display::default()
+            .is_some_and(|display| display.type_().name() == "GdkX11Display");
+        if xdotool && on_x11 {
+            return true;
+        }
+        let reason = if xdotool {
+            "GTK is not on an X11 display, and xdotool drives X11 only"
+        } else {
+            "xdotool is not on PATH"
+        };
+        let required =
+            std::env::var_os("TROLLSHELL_REQUIRE_XDOTOOL").is_some_and(|want| want == "1");
+        assert!(
+            !required,
+            "TROLLSHELL_REQUIRE_XDOTOOL=1, but {reason} for {test_name}",
+        );
+        eprintln!("SKIPPED {test_name}: {reason}");
+        false
+    }
+
+    /// How long a real-pointer test waits for input it sent to arrive — a
+    /// bound on a failure, never a delay on a pass: every wait below returns
+    /// the moment what it waits for has been dispatched (#1416 review,
+    /// MEDIUM 2).
+    const INPUT_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Pointer button events the test window has seen, counted in the capture
+    /// phase — i.e. by GTK's own dispatch, before any widget can claim them.
+    #[derive(Default)]
+    struct SeenButtons {
+        presses: std::cell::Cell<u32>,
+        releases: std::cell::Cell<u32>,
+    }
+
+    /// Iterate the main context until `done`, then [`pump`] once more so the
+    /// idles that dispatch queued (the press tracker's deferred clear among
+    /// them) have run too. Panics naming `what` and `report()` past
+    /// [`INPUT_DEADLINE`].
+    ///
+    /// This, and not a fixed sleep, is what makes the real-pointer tests
+    /// independent of how loaded the machine is: `run_xdotool` used to
+    /// `pump_for(250)` after each command, and under `stress-ng` a release could
+    /// still be in flight at the end of it — the review measured 1 red in 85
+    /// runs that way.
+    fn wait_for(what: &str, done: impl Fn() -> bool, report: impl Fn() -> String) {
+        let deadline = Instant::now() + INPUT_DEADLINE;
+        let context = glib::MainContext::default();
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not arrive within {INPUT_DEADLINE:?}: {}",
+                report(),
+            );
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        pump();
+    }
+
+    /// Run one `xdotool` command line to completion and check its status.
+    /// What it sends is not waited for here — see [`RealPointer::send`].
+    fn xdotool(args: &[&str]) {
+        let status = std::process::Command::new("xdotool")
+            .args(args)
+            .status()
+            .expect("xdotool runs");
+        assert!(status.success(), "xdotool {args:?} failed: {status}");
+    }
+
+    /// A two-chip plugin card on screen, and the X window it is in — what the
+    /// real-pointer tests click on.
+    struct RealPointer {
+        window: gtk::Window,
+        card: gtk::Box,
+        /// The card's X window, as `xdotool` names it.
+        xid: String,
+        cpu: gtk::Button,
+        mem: gtk::Button,
+        /// The button presses and releases the window has seen so far.
+        seen: Rc<SeenButtons>,
+    }
+
+    impl RealPointer {
+        /// Mount [`two_button_tree`] as `plugin_id`'s card, laid out and mapped,
+        /// and find its X window by a title nothing else in the run carries.
+        fn mount(plugin_id: &str) -> Self {
+            let (window, card) = mount_laid_out_card(plugin_id, two_button_tree());
+            let title = format!("trollshell-real-pointer-{}-{plugin_id}", std::process::id());
+            window.set_title(Some(&title));
+
+            // Count every press and release GTK dispatches to this window, on
+            // the way down and whatever claims it later, so a test can wait for
+            // the input it sent rather than for a clock.
+            let seen: Rc<SeenButtons> = Rc::default();
+            let counter = gtk::EventControllerLegacy::new();
+            counter.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let counts = seen.clone();
+            counter.connect_event(move |_, event| {
+                match event.event_type() {
+                    gtk::gdk::EventType::ButtonPress => {
+                        counts.presses.set(counts.presses.get() + 1);
+                    }
+                    gtk::gdk::EventType::ButtonRelease => {
+                        counts.releases.set(counts.releases.get() + 1);
+                    }
+                    _ => {}
+                }
+                glib::Propagation::Proceed
+            });
+            window.add_controller(counter);
+
+            let [cpu, mem] = <[gtk::Button; 2]>::try_from(buttons(card.upcast_ref()))
+                .expect("the card holds exactly the two chips");
+            wait_for(
+                "the card's layout",
+                || window.is_mapped() && cpu.width() > 0 && mem.width() > 0,
+                || {
+                    format!(
+                        "mapped {}, cpu {}, mem {}",
+                        window.is_mapped(),
+                        cpu.width(),
+                        mem.width()
+                    )
+                },
+            );
+
+            let pattern = format!("^{title}$");
+            let search = || {
+                let found = std::process::Command::new("xdotool")
+                    .args(["search", "--onlyvisible", "--name", &pattern])
+                    .output()
+                    .expect("xdotool runs");
+                String::from_utf8_lossy(&found.stdout)
+                    .lines()
+                    .next()
+                    .map(|line| line.trim().to_owned())
+                    .filter(|line| !line.is_empty())
+            };
+            let xid = std::cell::RefCell::new(None);
+            wait_for(
+                "the card's X window",
+                || {
+                    *xid.borrow_mut() = search();
+                    xid.borrow().is_some()
+                },
+                || format!("no mapped window titled {title}"),
+            );
+            let xid = xid.into_inner().expect("found above");
+            // Nothing else should be over it, but a test that left a window up
+            // must not be able to take these clicks.
+            xdotool(&["windowraise", &xid]);
+            pump();
+            Self {
+                window,
+                card,
+                xid,
+                cpu,
+                mem,
+                seen,
+            }
+        }
+
+        /// Run one `xdotool` command line, then wait until the window has seen
+        /// `presses` more button presses and `releases` more releases than
+        /// before it — i.e. until GTK has dispatched them, `clicked` included,
+        /// which runs inside the release's dispatch.
+        fn send(&self, args: &[&str], presses: u32, releases: u32) {
+            let (want_presses, want_releases) = (
+                self.seen.presses.get() + presses,
+                self.seen.releases.get() + releases,
+            );
+            xdotool(args);
+            wait_for(
+                &format!("the input `xdotool {}` sent", args.join(" ")),
+                || {
+                    self.seen.presses.get() >= want_presses
+                        && self.seen.releases.get() >= want_releases
+                },
+                || {
+                    format!(
+                        "{} of {want_presses} presses and {} of {want_releases} releases",
+                        self.seen.presses.get(),
+                        self.seen.releases.get(),
+                    )
+                },
+            );
+        }
+
+        /// `target`'s centre in its X window's pixels — the window's own
+        /// coordinates, offset by wherever GTK put the window widget inside its
+        /// surface and scaled to device pixels.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "a chip's size and position are small pixel counts"
+        )]
+        fn centre_of(&self, target: &gtk::Button) -> [String; 2] {
+            let (w, h) = (target.width(), target.height());
+            assert!(w > 0 && h > 0, "the chip must be laid out (got {w}×{h})");
+            let centre = gtk::graphene::Point::new(w as f32 / 2.0, h as f32 / 2.0);
+            let at = target
+                .compute_point(&self.window, &centre)
+                .expect("the chip is inside its window");
+            let (dx, dy) = self.window.surface_transform();
+            let scale = f64::from(self.window.scale_factor());
+            [
+                (((f64::from(at.x()) + dx) * scale).round() as i32).to_string(),
+                (((f64::from(at.y()) + dy) * scale).round() as i32).to_string(),
+            ]
+        }
+
+        /// Move the pointer onto `target`'s centre, then run `then` there, and
+        /// wait for the `presses` and `releases` that sends.
+        fn at(&self, target: &gtk::Button, then: &[&str], presses: u32, releases: u32) {
+            let [x, y] = self.centre_of(target);
+            let mut args = vec!["mousemove", "--window", self.xid.as_str(), &x, &y];
+            args.extend_from_slice(then);
+            self.send(&args, presses, releases);
+        }
+    }
+
+    /// Leave the X display the way the next test expects to find it, pass or
+    /// fail (#1416 review, MEDIUM 2): no button held — a panic between a
+    /// `mousedown` and its `mouseup` would otherwise leave button 1 down for
+    /// every later test in the binary — and the pointer parked in the far
+    /// corner, not over the top-left one where every WM-less window maps, where
+    /// it would hover-light whatever the next test put there. Nothing here may
+    /// panic: this runs while a failed test unwinds.
+    impl Drop for RealPointer {
+        fn drop(&mut self) {
+            let quiet = |args: &[&str]| {
+                std::process::Command::new("xdotool")
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+            };
+            let _ = quiet(&["mouseup", "1"]);
+            self.window.destroy();
+            let corner = std::process::Command::new("xdotool")
+                .arg("getdisplaygeometry")
+                .output()
+                .ok()
+                .and_then(|out| {
+                    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    let mut size = text.split_whitespace().map(str::parse::<u32>);
+                    match (size.next(), size.next()) {
+                        (Some(Ok(w)), Some(Ok(h))) if w > 0 && h > 0 => Some((w - 1, h - 1)),
+                        _ => None,
+                    }
+                });
+            if let Some((x, y)) = corner {
+                let _ = quiet(&["mousemove", &x.to_string(), &y.to_string()]);
+            }
+            pump();
+        }
+    }
+
+    /// A **real** click on one chip of a two-chip card is recorded under that
+    /// chip, and a real click on the other under the other — the #1252
+    /// behaviour, through GTK's own dispatch rather than an emitted `pressed`
+    /// (#1413 item 3).
+    ///
+    /// **Falsification:** set the tracker's phase to `PropagationPhase::None`
+    /// or its button to 3 (the two mutations #1252's review found only real
+    /// dispatch could see) → the chip assertion reds, the click falling back to
+    /// the card.
+    #[gtk::test]
+    fn a_real_click_is_recorded_under_the_chip_it_landed_on() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_click_is_recorded_under_the_chip_it_landed_on") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-click");
+
+        pointer.at(&pointer.mem, &["click", "1"], 1, 1);
+        assert_eq!(
+            taken("real-pointer-click"),
+            Some(pointer.mem.clone().upcast::<gtk::Widget>()),
+            "a real click on `mem` is recorded under `mem`",
+        );
+        pointer.at(&pointer.cpu, &["click", "1"], 1, 1);
+        assert_eq!(
+            taken("real-pointer-click"),
+            Some(pointer.cpu.clone().upcast::<gtk::Widget>()),
+            "…and one on `cpu` under `cpu`",
+        );
+    }
+
+    /// A real press on `cpu`, dragged onto `mem` and released there, clicks
+    /// **nothing** and records nothing; and it is forgotten, so a press-less
+    /// activation of `mem` right after (keyboard, accessibility — simulated with
+    /// `emit_clicked`, which is what those are to a `GtkButton`) anchors under
+    /// the card, not under the abandoned `cpu` (#1252 review, LOW 4; #1413 item
+    /// 3).
+    ///
+    /// The first `None` means something because each step waits for its input
+    /// to be dispatched (`RealPointer::send`): the press on `cpu` has landed and
+    /// the release has arrived, so "nothing was clicked" cannot be "nothing had
+    /// arrived yet" (#1416 review, MEDIUM 2).
+    ///
+    /// **Falsification:** delete the tracker's `connect_end` handler → the
+    /// second assertion reds with `cpu`.
+    #[gtk::test]
+    fn a_real_drag_off_records_nothing_and_leaves_no_press_behind() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_drag_off_records_nothing_and_leaves_no_press_behind") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-drag-off");
+
+        pointer.at(&pointer.cpu, &["mousedown", "1"], 1, 0);
+        pointer.at(&pointer.mem, &[], 0, 0);
+        pointer.send(&["mouseup", "1"], 0, 1);
+        assert_eq!(
+            taken("real-pointer-drag-off"),
+            None,
+            "a press dragged off its chip and released elsewhere clicked nothing",
+        );
+
+        pointer.mem.emit_clicked();
+        assert_eq!(
+            taken("real-pointer-drag-off"),
+            Some(pointer.card.clone().upcast::<gtk::Widget>()),
+            "the abandoned press on `cpu` must not anchor a later press-less click",
+        );
+    }
+
+    /// A real **double** click on `mem` is two clicks to the button and both
+    /// are recorded under `mem` — the second press of a double click reaches
+    /// the tracker as its own press (`n_press` 2), and the first click spent
+    /// the first press, so nothing else could anchor the second (#1413 item 3).
+    ///
+    /// **Falsification:** have the tracker record only the first press of a
+    /// sequence (`if n_press > 1 { return; }`) → the second click falls back
+    /// to the card and this reds. Not the press-count check in the deferred
+    /// clear: `XTest` queues the whole double click before GTK dispatches any of
+    /// it, and GTK drains queued input before an idle runs, so that race does
+    /// not arise here — `a_click_still_finds_its_press_after_the_sequence_ends`
+    /// is what pins it.
+    #[gtk::test]
+    fn a_real_double_click_is_recorded_under_its_chip() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_double_click_is_recorded_under_its_chip") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-double");
+        let clicks = Rc::new(std::cell::Cell::new(0u32));
+        let counter = clicks.clone();
+        pointer
+            .mem
+            .connect_clicked(move |_| counter.set(counter.get() + 1));
+
+        pointer.at(
+            &pointer.mem,
+            &["click", "--repeat", "2", "--delay", "80", "1"],
+            2,
+            2,
+        );
+        assert_eq!(
+            clicks.get(),
+            2,
+            "premise: GTK saw a double click as two clicks"
+        );
+        assert_eq!(
+            taken("real-pointer-double"),
+            Some(pointer.mem.clone().upcast::<gtk::Widget>()),
+            "a double click on `mem` is recorded under `mem`",
+        );
+    }
+
+    /// A real **right** click on `mem` records nothing: `GtkButton` clicks on
+    /// the primary button only, and the tracker listens for that one only. The
+    /// control — a primary click at the very same spot, recorded under `mem` —
+    /// is what makes the `None` about the button rather than the aim (#1413
+    /// item 3).
+    ///
+    /// **Falsification:** set the tracker's button to 3 → the control reds (the
+    /// primary click falls back to the card). The `None` half is the contract
+    /// itself — no path turns a secondary click into a click origin — and has
+    /// no one-line mutation in this file today, because nothing here sees a
+    /// secondary click as a `Click` at all; it is what would catch one that
+    /// started to (a context-menu binding in `hytte-ui`, say).
+    #[gtk::test]
+    fn a_real_right_click_records_nothing() {
+        adw::init().expect("libadwaita init");
+        if !real_pointer_or_skip("a_real_right_click_records_nothing") {
+            return;
+        }
+        let pointer = RealPointer::mount("real-pointer-right");
+
+        pointer.at(&pointer.mem, &["click", "3"], 1, 1);
+        assert_eq!(
+            taken("real-pointer-right"),
+            None,
+            "a right click is no click and records nothing",
+        );
+        pointer.at(&pointer.mem, &["click", "1"], 1, 1);
+        assert_eq!(
+            taken("real-pointer-right"),
+            Some(pointer.mem.clone().upcast::<gtk::Widget>()),
+            "control: a primary click on the same spot is recorded under `mem`",
+        );
     }
 
     /// The drawer's plugin page wears a built-in page's frame (#1252): the

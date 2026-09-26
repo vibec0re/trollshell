@@ -39,6 +39,12 @@ pkgs.mkShell {
     # just makes the devShell able to run the same commands locally (#684).
     dbus
     xvfb-run
+    # Real pointer input for the press-tracker tests in
+    # `trollshell/src/plugins/region.rs` (#1413): XTest clicks into the
+    # `xvfb-run` display. CI's `system-tests` check carries it too and exports
+    # `TROLLSHELL_REQUIRE_XDOTOOL=1`; here it only means those tests run
+    # locally instead of skipping.
+    xdotool
 
     # The reference GLSL ES compiler, for the `glsl` flake check
     # (`nix/lint-glsl.py`, #893 stage B). Same reason as the two above: CI's

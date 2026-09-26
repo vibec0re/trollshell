@@ -30,12 +30,16 @@
 # what the block closed over in flake.nix: `craneLib`, `pkgs`, and the two
 # `trollshell.passthru.*` values (`commonArgs`/`cargoArtifacts`) it read off
 # the package derivation there — passed in directly rather than the whole
-# `trollshell` value, since those two fields are all this ever used.
+# `trollshell` value, since those two fields are all this ever used. Since
+# #1413 it also takes `assets` (`trollshell.passthru.assets`, the cheap
+# `trollshell-assets` derivation in `nix/package.nix`) for the
+# `TROLLSHELL_DATA_DIR` export in `preCheck` below.
 {
   craneLib,
   pkgs,
   commonArgs,
   cargoArtifacts,
+  assets,
 }:
 let
   # The one place the parity-harness case count lives on the nix side
@@ -115,12 +119,20 @@ craneLib.mkCargoDerivation (
     # window's trust path had no tests. It buys
     # `verify.rs`'s `tls_tests` module: a real `GTlsServerConnection`
     # on loopback and the window's own `probe` against it.
+    #
+    # `xdotool` since #1413: the four real-pointer tests in
+    # `trollshell/src/plugins/region.rs` (`a_real_click_is_recorded_under_the_chip_it_landed_on`
+    # and its three siblings) drive XTest clicks into the `xvfb-run` display,
+    # so #1252's press tracker is exercised through GTK's own event dispatch
+    # rather than only by emitted gesture signals. `TROLLSHELL_REQUIRE_XDOTOOL`
+    # below makes a missing binary fail them here instead of skipping.
     nativeCheckInputs = [
       pkgs.dbus
       pkgs.xvfb-run
       pkgs.mesa
       pkgs.systemd
       pkgs.glib-networking
+      pkgs.xdotool
     ];
     doCheck = true;
     # Leaf/terminal check: nothing consumes its target dir. crane
@@ -246,6 +258,38 @@ craneLib.mkCargoDerivation (
       # whichever `LaunchReport` fallback the sandbox produces
       # (`NoSystemdRun` or `NoUserManager`).
       export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
+      # #1413, on the same precedent: `pkgs.xdotool` above is what drives the
+      # real-pointer press-tracker tests (`plugins/region.rs`'s
+      # `real_pointer_or_skip`). Without it they skip — and a skip reads as a
+      # pass — so here, where they are meant to run, a missing `xdotool` or a
+      # GTK that did not come up on the `xvfb-run` X11 display fails them,
+      # naming which.
+      export TROLLSHELL_REQUIRE_XDOTOOL=1
+      # #1413, for #1414's pixel render test
+      # (`plugins::wire_map::render_tests::a_page_card_paints_a_card_under_the_plugin_page_flattening`),
+      # which paints a plugin page card under the **shell's own** stylesheet,
+      # read through `crate::assets::path("style.css")`. The crane source
+      # filter strips `assets/trollshell/` (`nix/package.nix`, #133 — so an
+      # asset edit never rehashes the Rust compile), so here the dev fallback
+      # (`CARGO_MANIFEST_DIR/../assets/trollshell`) names a directory that is
+      # not there. The runtime tier of `assets.rs` is pointed at the shipped
+      # `trollshell-assets` derivation instead — the very directory the
+      # packaged wrapper's `--set TROLLSHELL_DATA_DIR` names, so the test
+      # paints with the bytes that ship. It is also what the native chips'
+      # `gtk::Image::from_file(assets::path("icons/…"))` read, which now find
+      # real files where they found none; no test asserts on either outcome
+      # (measured: the whole `trollshell` system-tests run is identical with
+      # and without it). Two consequences worth knowing: `cargo test` compiles
+      # *after* this `preCheck` (`buildPhaseCargoCommand = ""`), so
+      # `assets.rs`'s compile-time `option_env!` tier is baked with the same
+      # path; and an asset-only edit now rehashes this one check, undoing
+      # #133's decoupling here (and only here) on purpose.
+      export TROLLSHELL_DATA_DIR="${assets}/share/trollshell"
+      # …and, on the `TROLLSHELL_REQUIRE_GL` precedent above, the render test
+      # skips when the stylesheet is missing (a local `cargo test` with no
+      # assets dir) unless this is set — a skip reads as a pass, and this is
+      # the build that means it to run, so a missing sheet fails it here.
+      export TROLLSHELL_REQUIRE_SHELL_CSS=1
       # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
       # CPU/GL parity harness) runs through the same llvmpipe context
       # as the three `hytte-ui` GL tests. Under llvmpipe every *scope*

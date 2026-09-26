@@ -173,11 +173,13 @@ let
     # The claude-bridge chip names this glyph through the *icon theme* rather
     # than loading it by path (#957) — it is an out-of-process plugin, and
     # `Node::Icon` carries a name, never pixels. A rename or a deletion would
-    # therefore surface as `image-missing` on the bar with nothing red anywhere,
-    # and no Rust test can catch it: the crane source filter above strips
-    # `assets/`, so `checks.system-tests` never sees this directory. Assert it
-    # here, where the file is actually shipped — this derivation is trivial, so
-    # the check costs nothing and couples nothing to the Rust compile.
+    # therefore surface as `image-missing` on the bar with nothing red anywhere.
+    # The crane source filter above strips `assets/`, so no test sees it in the
+    # source tree; since #1413 `checks.system-tests` does get this very
+    # derivation (as `TROLLSHELL_DATA_DIR`), but no test there asks for this
+    # glyph by name. Assert it here, where the file is actually shipped — this
+    # derivation is trivial, so the check costs nothing and couples nothing to
+    # the Rust compile.
     test -f $out/share/trollshell/icons/claude-symbolic.svg
   '';
 

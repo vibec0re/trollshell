@@ -6004,3 +6004,61 @@ and at least two agents that can be started.
       than the focused one (so its trailing empty workspace has a higher
       `idx`) and press the button. The windows must land on the screen you
       are looking at.
+
+## A plugin's click places every page it opens (#1413)
+
+#1252 hung a bar plugin's **own** page under the chip that was clicked. #1413
+does the same for the other two things a plugin click can open: a **built-in**
+page (Audio, the power menu, …) opened from a plugin chip, and a **sidebar**
+card's page, which opens in the centred dialog on the monitor the card was
+clicked on. A page with no recent click behind it (a keybind, a timer, a
+plugin opening its page on its own schedule) opens exactly where it did
+before.
+
+No in-tree plugin opens a built-in page today, so the first three items need a
+throwaway one: in `crates/hytte-plugin-clock-demo/src/main.rs`, change the bar
+chip's arm of `update` (`(true, CHIP_BTN) | (false, CARD_BTN) =>`) so a
+`CHIP_BTN` click returns `vec![Effect::OpenPage(Page::Audio)]`, build it, and
+run it as a bar chip
+(`HYTTE_PLUGIN_ID=clock-bar HYTTE_PLUGIN_MOUNT=BarCenter target/debug/hytte-plugin-clock-demo`).
+Revert the edit afterwards.
+
+- [ ] **(#1413)** **A plugin chip that opens Audio opens it under that chip.**
+      Click the clock chip: the Audio page slides out **centred under the
+      clock chip**, the way it does under the native volume chip, not flush
+      with the bar's right edge. Near a screen edge it may clamp to stay on
+      screen, as a native chip's does.
+- [ ] **(#1413)** **On the chip's monitor.** With two outputs, focus a
+      window on output A and click the clock chip on output **B**'s bar: Audio
+      opens on **B**, under the chip. (Not a check here: a second click on the
+      chip with the page open. The open drawer's full-screen click-catcher
+      takes that click and closes the drawer before the chip sees it, however
+      the toggle is wired, so on glass it cannot fail; the toggle's own
+      retract is pinned by
+      `modal::gtk_tests::a_plugin_chips_click_opens_a_builtin_page_under_the_chip`.)
+- [ ] **(#1413)** **A keybind open of Audio is unchanged.**
+      `busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell org.gtk.Actions Activate 'sava{sv}' open-page 1 s audio 0`
+      opens Audio **flush with the bar's right edge** on niri's focused output,
+      as before. The late-click flavour: `systemctl --user kill -s STOP` the
+      clock plugin's unit (or `kill -STOP` its pid), click the chip, wait 3 s,
+      `-s CONT`. The page it opens late must land **flush**, not under the
+      chip, because the click is older than the 2 s window.
+- [ ] **(#1413)** **A sidebar card's dialog opens on the monitor it was
+      clicked on.** Unmodified clock demo, sidebar instance (the default
+      `SidebarTop` mount; #1408's preem clock card), sidebar open on **both**
+      outputs. Focus a window on output **A**, then click the clock card in
+      **B**'s sidebar: the centred dialog opens on **B**, not on A. It must
+      **stay up**. Before #1413's watcher change, a dialog built while the
+      shell still believed the focus was on A closed the instant it opened.
+      `Esc` closes it once niri's focus is on B. A click on a layer surface
+      moves niri's focus to that output, so this is normally immediate. The
+      close button and a click outside close it either way.
+- [ ] **(#1413)** **The dialog still closes when the focus leaves its
+      screen.** With the dialog up on B, move the focus to a window on A
+      (`Mod+<direction>` or a click on A): the dialog closes, as #1361's
+      MEDIUM-3 has it. Moving the focus _to_ B while the dialog is up must not
+      close it.
+- [ ] **(#1413)** **A sidebar dialog with no click behind it stays on the
+      focused output.** Anything that opens a sidebar plugin's page without a
+      click (a plugin timer, or the late-click trick above against the sidebar
+      instance) opens the dialog on niri's focused output, as before.

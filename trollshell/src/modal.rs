@@ -1452,9 +1452,12 @@ fn open_by_key(key: &str, page: Page) {
 /// Command-surface entry point (no `&Monitor` in hand): open `page` on the
 /// `preferred` connector if a drawer is mounted there, else on any mounted
 /// drawer. Backs the `open-page` / `power-menu` `GActions` driven by niri
-/// keybinds — `preferred` is niri's focused output. Falls back to any panel so
-/// an unknown/absent focused output still opens *a* drawer rather than
-/// silently no-op'ing. No-op only when no drawers are mounted at all.
+/// keybinds — `preferred` is niri's focused output — and a plugin's
+/// `OpenPage(<built-in>)` with no chip to hang the page under, where
+/// `preferred` is the output a sidebar card was clicked on, else the focused
+/// one (#1413). Falls back to any panel so an unknown/absent focused output
+/// still opens *a* drawer rather than silently no-op'ing. No-op only when no
+/// drawers are mounted at all.
 pub fn open_on_focused(preferred: Option<&str>, page: Page) {
     let key = PANELS.with(|panels| {
         let panels = panels.borrow();
@@ -1545,10 +1548,43 @@ pub fn open_plugin_on_focused(preferred: Option<&str>, plugin_id: &str) {
 /// that click first — it closes the drawer too — so the difference only shows on
 /// a compositor that stacks the bar above the drawer.
 pub fn toggle_plugin_under(trigger: &gtk::Widget, plugin_id: &str) -> bool {
+    toggle_under(trigger, Active::Plugin(plugin_id.to_owned()))
+}
+
+/// Toggle a **built-in** `page` on the drawer hanging off the bar `trigger` sits
+/// in, centred under `trigger` — [`toggle_plugin_under`] for a plugin chip whose
+/// click asks for a built-in page (`Effect::OpenPage(Page::Audio)` and the
+/// like) rather than its own (#1413).
+///
+/// Until #1413 that effect went through [`open_on_focused`], so the page
+/// opened on niri's focused output, flush with the bar's trailing edge, even
+/// when a chip click caused it. Now it is what a native chip's
+/// `toggle(monitor, page, &chip)` does, down to the arm: the same three
+/// `toggle_panel` branches (same page → retract, another page → swap in place,
+/// closed → anchor on `trigger` and open), on the drawer found the way
+/// [`toggle_plugin_under`] finds it — by `trigger`'s root window, so the page
+/// opens on the monitor that was clicked.
+///
+/// The one behavioural difference from [`toggle_plugin_under`] is what "the
+/// same target" can be: a plugin page is only ever asked for by that plugin,
+/// but a built-in page is shared, so a plugin chip asking for Audio while the
+/// native volume chip's Audio is open closes it — as a second click on the
+/// native chip would.
+///
+/// Returns `false`, having touched nothing, when `trigger` is on no mounted
+/// drawer's bar (a sidebar card, or a bar torn down since the click), so the
+/// caller can take the unanchored route instead.
+pub fn toggle_builtin_under(trigger: &gtk::Widget, page: Page) -> bool {
+    toggle_under(trigger, Active::Builtin(page))
+}
+
+/// The body [`toggle_plugin_under`] and [`toggle_builtin_under`] share: resolve
+/// the drawer `trigger`'s bar hangs over, then run a native chip's toggle on it.
+fn toggle_under(trigger: &gtk::Widget, active: Active) -> bool {
     let Some(panel) = panel_under(trigger) else {
         return false;
     };
-    toggle_panel(&panel, Active::Plugin(plugin_id.to_owned()), trigger, true);
+    toggle_panel(&panel, active, trigger, true);
     recompute_gates();
     true
 }
@@ -1645,10 +1681,11 @@ fn toggle_inner(
 }
 
 /// The three arms a chip click takes on one drawer — shared by [`toggle_inner`]
-/// (a native chip; `active` is a built-in page) and [`toggle_plugin_under`] (a
-/// plugin chip; `active` is that plugin's own page, #1252), so the two cannot
-/// drift apart on what a second click does or on how the card is placed. The
-/// caller has already resolved which drawer and recomputes the gates after.
+/// (a native chip; `active` is a built-in page) and [`toggle_under`] (a plugin
+/// chip; `active` is that plugin's own page, #1252, or the built-in page it
+/// asked for, #1413), so the two cannot drift apart on what a second click does
+/// or on how the card is placed. The caller has already resolved which drawer
+/// and recomputes the gates after.
 ///
 /// - The same target already showing → retract (`retract_on_same`) or re-run
 ///   its on-show hook in place (`toggle_keep_open`). A plugin page and a
@@ -3443,7 +3480,7 @@ mod gtk_tests {
         let (a, _chip_a) = plugin_drawer(&monitor, "test-1252-broker-a");
         let (b, chip_b) = plugin_drawer(&monitor, "test-1252-broker-b");
 
-        note_click_origin("stats-broker", chip_b.upcast_ref(), Instant::now());
+        note_click_origin("stats-broker", chip_b.upcast_ref(), None, Instant::now());
         broker_own_page_for_test("stats-broker", Mount::BarRight);
         assert_eq!(
             *b.current.borrow(),
@@ -3463,7 +3500,7 @@ mod gtk_tests {
         let stale = Instant::now()
             .checked_sub(CLICK_ORIGIN_WINDOW + Duration::from_secs(1))
             .expect("the clock is past the window");
-        note_click_origin("stats-broker", chip_b.upcast_ref(), stale);
+        note_click_origin("stats-broker", chip_b.upcast_ref(), None, stale);
         broker_own_page_for_test("stats-broker", Mount::BarRight);
         let opened: Vec<&Rc<ModalPanel>> = [&a, &b]
             .into_iter()
@@ -3573,7 +3610,7 @@ mod gtk_tests {
             crate::plugins::install_test_handles();
         }
         let (b, chip_b) = plugin_drawer(&test_monitor(), "test-1252-other");
-        note_click_origin("plugin-a", chip_b.upcast_ref(), Instant::now());
+        note_click_origin("plugin-a", chip_b.upcast_ref(), None, Instant::now());
         broker_own_page_for_test("plugin-b", Mount::BarRight);
         let (opened, anchor) = (b.current.borrow().clone(), anchored_on(&b));
         drop_plugin_drawers(&["test-1252-other"], &[&b]);
@@ -3605,7 +3642,7 @@ mod gtk_tests {
         let stray_window = gtk::Window::new();
         let stray = gtk::Button::new();
         stray_window.set_child(Some(&stray));
-        note_click_origin("fallback", stray.upcast_ref(), Instant::now());
+        note_click_origin("fallback", stray.upcast_ref(), None, Instant::now());
         broker_own_page_for_test("fallback", Mount::BarRight);
         let (opened, anchor) = (b.current.borrow().clone(), anchored_on(&b));
         drop_plugin_drawers(&["test-1252-fallback"], &[&b]);
@@ -3617,5 +3654,283 @@ mod gtk_tests {
             "a chip on no drawer's bar falls back to the unanchored open",
         );
         assert_eq!(anchor, None, "…unanchored, as before #1252");
+    }
+
+    // ── #1413: a plugin chip's built-in page opens under the chip ────────────
+
+    /// A [`plugin_drawer`] whose stack also carries a stand-in `Page::Audio`
+    /// child, so a built-in page can be shown on it without building the real
+    /// Audio panel (which wants the pipewire service registered). The same
+    /// stand-in shape `toggle_opens_workspaces_and_fills_the_drawer_to_the_cap`
+    /// uses: `ensure_page` builds nothing for a name the stack already has.
+    fn builtin_drawer(monitor: &Monitor, key: &str) -> (Rc<ModalPanel>, gtk::Button) {
+        let (panel, chip) = plugin_drawer(monitor, key);
+        panel.stack.add_named(
+            &gtk::Box::new(gtk::Orientation::Vertical, 0),
+            Some(Page::Audio.stack_name()),
+        );
+        (panel, chip)
+    }
+
+    /// [`drop_plugin_drawers`] when dropped — so a #1413 test that fails
+    /// half-way still takes its drawers out of `PANELS`, rather than leaving
+    /// them for whichever test runs next on this thread to open its page on
+    /// (every `#[gtk::test]` here shares that thread-local).
+    struct Mounted {
+        keys: &'static [&'static str],
+        panels: Vec<Rc<ModalPanel>>,
+    }
+
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let panels: Vec<&Rc<ModalPanel>> = self.panels.iter().collect();
+            drop_plugin_drawers(self.keys, &panels);
+        }
+    }
+
+    /// Of `panels`, the ones showing anything, with their anchors.
+    fn shown(panels: &[&Rc<ModalPanel>]) -> Vec<(Option<Active>, Option<gtk::Widget>)> {
+        panels
+            .iter()
+            .filter(|panel| panel.current.borrow().is_some())
+            .map(|panel| (panel.current.borrow().clone(), anchored_on(panel)))
+            .collect()
+    }
+
+    /// End to end through the **effect broker** (#1413): a click recorded on a
+    /// bar plugin's chip, then that plugin's `OpenPage(Audio)` — a *built-in*
+    /// page — opens Audio on the chip's drawer, centred under the chip, the way
+    /// the native volume chip's own `toggle(monitor, Page::Audio, &chip)` does;
+    /// and a second click on that chip with Audio open closes it, as a second
+    /// click on the native chip would (the toggle `toggle_plugin_under` runs
+    /// for a plugin's own page, #1252).
+    ///
+    /// Both drawers are opened in turn, each from its own chip, so the drawer
+    /// choice cannot pass by `PANELS`' iteration order happening to agree.
+    ///
+    /// **Falsification:** have `open_builtin_page` skip the hand-off and call
+    /// `modal::open_on_focused` straight away (the pre-#1413 arm) → the anchor
+    /// assertion reds, and one of the two rounds opens on the wrong drawer; run
+    /// the anchored route through `toggle_panel(…, false)` → the second-click
+    /// assertion reds.
+    #[gtk::test]
+    fn a_plugin_chips_click_opens_a_builtin_page_under_the_chip() {
+        use crate::plugins::effects::broker_page_for_test;
+        use crate::plugins::note_click_origin;
+        use hytte_plugin_proto::{Mount, Page as WirePage};
+        use std::time::Instant;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, chip_a) = builtin_drawer(&monitor, "test-1413-builtin-a");
+        let (b, chip_b) = builtin_drawer(&monitor, "test-1413-builtin-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-builtin-a", "test-1413-builtin-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
+
+        for (opened, other, chip) in [(&b, &a, &chip_b), (&a, &b, &chip_a)] {
+            note_click_origin("mixer", chip.upcast_ref(), None, Instant::now());
+            broker_page_for_test("mixer", WirePage::Audio, Mount::BarRight);
+            assert_eq!(
+                *opened.current.borrow(),
+                Some(Active::Builtin(Page::Audio)),
+                "the built-in page opens on the drawer of the bar that was clicked",
+            );
+            assert!(opened.revealer.reveals_child(), "…and is revealed");
+            assert_eq!(
+                anchored_on(opened),
+                Some(chip.clone().upcast::<gtk::Widget>()),
+                "…centred under the chip that was clicked, like a native chip's page",
+            );
+            assert_eq!(
+                *other.current.borrow(),
+                None,
+                "the other monitor's drawer stays shut",
+            );
+
+            note_click_origin("mixer", chip.upcast_ref(), None, Instant::now());
+            broker_page_for_test("mixer", WirePage::Audio, Mount::BarRight);
+            assert!(
+                !opened.revealer.reveals_child(),
+                "a second click on the same chip closes the page, like a native chip",
+            );
+            // The harness has no `wire_retract_finish`; finish the retract.
+            *opened.current.borrow_mut() = None;
+            *opened.anchor.borrow_mut() = None;
+        }
+    }
+
+    /// With no click behind it — a click older than the window, or none at all,
+    /// which is what a keybind, a timer or a page's own button looks like —
+    /// a plugin's `OpenPage(Audio)` takes exactly the pre-#1413 route: it opens
+    /// once, flush with the bar's trailing edge (#1413 acceptance: "keybind and
+    /// timer opens keep today's behaviour").
+    ///
+    /// **Falsification:** have `take_click_origin` ignore the click's age (pass
+    /// `Duration::ZERO` to `anchors_to_click`) → the stale half reds, the page
+    /// hanging under a chip whose click did not cause it.
+    #[gtk::test]
+    fn a_builtin_page_with_no_recent_click_opens_as_before() {
+        use crate::plugins::effects::broker_page_for_test;
+        use crate::plugins::{CLICK_ORIGIN_WINDOW, note_click_origin};
+        use hytte_plugin_proto::{Mount, Page as WirePage};
+        use std::time::{Duration, Instant};
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _chip_a) = builtin_drawer(&monitor, "test-1413-stale-a");
+        let (b, chip_b) = builtin_drawer(&monitor, "test-1413-stale-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-stale-a", "test-1413-stale-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
+
+        let stale = Instant::now()
+            .checked_sub(CLICK_ORIGIN_WINDOW + Duration::from_secs(1))
+            .expect("the clock is past the window");
+        for (why, origin) in [("a stale click", Some(stale)), ("no click at all", None)] {
+            if let Some(at) = origin {
+                note_click_origin("mixer-late", chip_b.upcast_ref(), None, at);
+            }
+            broker_page_for_test("mixer-late", WirePage::Audio, Mount::BarRight);
+            assert_eq!(
+                shown(&[&a, &b]),
+                vec![(Some(Active::Builtin(Page::Audio)), None)],
+                "{why}: the page opens once, unanchored, as before #1413",
+            );
+            for panel in [&a, &b] {
+                *panel.current.borrow_mut() = None;
+                *panel.anchor.borrow_mut() = None;
+            }
+        }
+    }
+
+    /// A **sidebar** card whose click opens a built-in page: the card is on no
+    /// drawer's bar, so there is nothing to centre under — but the click still
+    /// says which monitor it was on, and the page opens on **that** monitor's
+    /// drawer, flush with its bar, rather than on niri's focused output (#1413).
+    ///
+    /// Run once per drawer, naming each as the clicked output in turn **and the
+    /// other one as niri's focused output**, so neither the "any mounted
+    /// drawer" fallback nor a focused output that happens to agree can pass it
+    /// (#1416 review, L4: through `broker_effect` the test thread's focused
+    /// output is `None`, which let the two be swapped unseen).
+    ///
+    /// **Falsification:** pass `focused` in place of `page_output(…)` in
+    /// `open_builtin_page`'s fallback → both rounds open on the focused
+    /// drawer; swap `page_output`'s arguments there (the review's E7) → the
+    /// same; ignore `toggle_builtin_under`'s `false` (`|| true`) → nothing
+    /// opens at all.
+    #[gtk::test]
+    fn a_sidebar_cards_click_opens_a_builtin_page_on_its_own_monitor() {
+        use crate::plugins::effects::broker_page_focused_for_test;
+        use crate::plugins::note_click_origin;
+        use hytte_plugin_proto::{Mount, Page as WirePage};
+        use std::time::Instant;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _) = builtin_drawer(&monitor, "test-1413-sidebar-a");
+        let (b, _) = builtin_drawer(&monitor, "test-1413-sidebar-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-sidebar-a", "test-1413-sidebar-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
+        // A card in a sidebar: rooted, but in a window no drawer hangs off.
+        let sidebar = gtk::Window::new();
+        let card = gtk::Button::new();
+        sidebar.set_child(Some(&card));
+
+        for (key, focused, opened, other) in [
+            ("test-1413-sidebar-b", "test-1413-sidebar-a", &b, &a),
+            ("test-1413-sidebar-a", "test-1413-sidebar-b", &a, &b),
+        ] {
+            note_click_origin("card", card.upcast_ref(), Some(key), Instant::now());
+            broker_page_focused_for_test(
+                "card",
+                WirePage::Audio,
+                Mount::SidebarBottom,
+                Some(focused),
+            );
+            assert_eq!(
+                *opened.current.borrow(),
+                Some(Active::Builtin(Page::Audio)),
+                "the page opens on the drawer of the monitor the card was clicked on",
+            );
+            assert_eq!(
+                anchored_on(opened),
+                None,
+                "…flush: a card is no chip to hang under"
+            );
+            assert_eq!(*other.current.borrow(), None);
+            *opened.current.borrow_mut() = None;
+        }
+        sidebar.destroy();
+    }
+
+    /// #1412's drawer arm, its last route (#1416 review, L4 — the E2 half): a
+    /// bar plugin's own page, provoked by a recent click whose widget is on
+    /// **no** drawer's bar, opens flush on the drawer of the output the click
+    /// was on, not on niri's focused output — the same `page_output` rule as
+    /// the built-in arm above. Not reachable from a real bar, where every chip's
+    /// window has a drawer; pinned so the two arms cannot drift apart.
+    ///
+    /// Each drawer is the clicked output in one round and the focused one in
+    /// the other, as in the built-in test.
+    ///
+    /// **Falsification:** revert `open_own_page_in_drawer`'s last route to
+    /// `open_plugin_on_focused(focused, …)` (the review's E2) → both rounds
+    /// open on the focused drawer.
+    #[gtk::test]
+    fn a_plugin_page_clicked_off_every_bar_opens_on_the_clicked_monitor() {
+        use crate::plugins::effects::broker_page_focused_for_test;
+        use crate::plugins::note_click_origin;
+        use hytte_plugin_proto::{Mount, Page as WirePage};
+        use std::time::Instant;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _) = plugin_drawer(&monitor, "test-1413-offbar-a");
+        let (b, _) = plugin_drawer(&monitor, "test-1413-offbar-b");
+        let _mounted = Mounted {
+            keys: &["test-1413-offbar-a", "test-1413-offbar-b"],
+            panels: vec![a.clone(), b.clone()],
+        };
+        // Rooted, but in a window no drawer hangs off.
+        let elsewhere = gtk::Window::new();
+        let chip = gtk::Button::new();
+        elsewhere.set_child(Some(&chip));
+
+        for (key, focused, opened, other) in [
+            ("test-1413-offbar-b", "test-1413-offbar-a", &b, &a),
+            ("test-1413-offbar-a", "test-1413-offbar-b", &a, &b),
+        ] {
+            note_click_origin("offbar", chip.upcast_ref(), Some(key), Instant::now());
+            broker_page_focused_for_test(
+                "offbar",
+                WirePage::PluginSelf,
+                Mount::BarRight,
+                Some(focused),
+            );
+            assert_eq!(
+                *opened.current.borrow(),
+                Some(Active::Plugin("offbar".to_owned())),
+                "the page opens on the drawer of the monitor that was clicked",
+            );
+            assert_eq!(anchored_on(opened), None, "…flush: the chip is on no bar");
+            assert_eq!(*other.current.borrow(), None);
+            *opened.current.borrow_mut() = None;
+            opened.revealer.set_reveal_child(false);
+        }
+        elsewhere.destroy();
     }
 }

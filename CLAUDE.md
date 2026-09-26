@@ -292,6 +292,7 @@ inline in `flake.nix` as one-liners.
   `$out/parity` (`PREEM_GL_DIFF_OUT`) instead of the default `gates/`, so a
   build's own output carries them. No new closure inputs — it runs through
   the same `mesa`/`xvfb-run` the GL tests already pulled in.
+  Since #1413 the closure also carries `xdotool`, with `TROLLSHELL_REQUIRE_XDOTOOL=1` failing rather than skipping the four real-pointer press-tracker tests in `trollshell/src/plugins/region.rs` (XTest clicks into the `xvfb-run` display), and `preCheck` exports `TROLLSHELL_DATA_DIR` at the `trollshell-assets` derivation plus `TROLLSHELL_REQUIRE_SHELL_CSS=1`, so #1414's render test reads the shipped stylesheet the crane filter otherwise strips.
 
 Since #1231 the workflow (`.github/workflows/nix-flake-check.yml`) no longer
 runs those checks as one `nix flake check` on one runner. Five of them are

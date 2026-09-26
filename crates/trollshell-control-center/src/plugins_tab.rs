@@ -2629,7 +2629,7 @@ fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
                         true,
                     ),
                     Err(err) => {
-                        form.set_status(&format!("Saved, but applying it failed: {err}"), true)
+                        form.set_status(&format!("Saved, but applying it failed: {err}"), true);
                     }
                 }
             });

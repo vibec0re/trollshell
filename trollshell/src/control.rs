@@ -343,14 +343,18 @@ impl ControlIface {
     /// [`list_plugin_versions`](Self::list_plugin_versions), so no existing
     /// signature changes.
     ///
-    /// Every id the host has **ever** seen declare settings is here, not only
-    /// the connected ones: the list a live connection declared this session,
-    /// else the last one cached under `$XDG_STATE_HOME` — so a plugin that is
-    /// switched off, or cannot start without its setting, still has a form. A
-    /// plugin that declares none is absent. Every list is already sanitised
-    /// (`plugins::settings`).
+    /// Not only the connected plugins are here: each id's last declaration is
+    /// remembered under `$XDG_STATE_HOME`, so a plugin that is switched off,
+    /// or cannot start without its setting, still has a form. An id is
+    /// forgotten once `plugins.json` stops declaring it and it has not
+    /// registered this session (#1415 review L3). A plugin that declares none
+    /// is absent. Every list is already sanitised (`plugins::settings`).
     async fn list_plugin_settings(&self) -> std::collections::HashMap<String, String> {
-        let schemas = match tokio::task::spawn_blocking(crate::plugins::settings::snapshot).await {
+        let declared = plugin_launcher::declared_ids().await;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            crate::plugins::settings::snapshot(declared.as_ref())
+        });
+        let schemas = match snapshot.await {
             Ok(schemas) => schemas,
             Err(err) => {
                 tracing::warn!(%err, "ListPluginSettings: reading the settings store failed");
@@ -367,6 +371,31 @@ impl ControlIface {
                 }
             })
             .collect()
+    }
+
+    /// Restart plugin `id` so it reads `plugin-settings.toml` again (#1410) —
+    /// what the Plugins tab's Settings group calls once after a Save.
+    ///
+    /// One call, where the tab used to send `StopPlugin` then `StartPlugin`
+    /// itself (#1415 review H2): the launcher runs the stop, the wait for the
+    /// unit to be really down (through `deactivating`) and the relaunch under
+    /// its own convergence lock, so no reconcile or second Save lands in
+    /// between. Answers what it did, as a word
+    /// ([`plugin_launcher::SettingsRestart::wire_name`]):
+    ///
+    /// - `"relaunched"` — it was running, and now runs with the saved values;
+    /// - `"not-running"` — declared but stopped: nothing was started, and the
+    ///   values apply at its next start;
+    /// - `"not-declared"` — a hand-installed static unit, which the launcher
+    ///   does not launch and which never reads the file: left alone.
+    ///
+    /// # Errors
+    /// A failed unit listing, stop or relaunch.
+    async fn restart_plugin(&self, id: String) -> zbus::fdo::Result<String> {
+        plugin_launcher::restart_for_settings(&id)
+            .await
+            .map(|outcome| outcome.wire_name().to_owned())
+            .map_err(|err| fail(&id, &err, "RestartPlugin"))
     }
 
     // ── AI keys (#392) ──────────────────────────────────────────────────────

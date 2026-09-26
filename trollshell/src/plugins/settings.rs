@@ -10,22 +10,25 @@
 //! `stats` instances each get their own form — and served to the
 //! control-center by `Control.ListPluginSettings` ([`snapshot`]).
 //!
-//! # Two halves: live and cached
+//! # Remembered across sessions, forgotten with the plugin
 //!
 //! The form has to exist for a plugin that is **not** connected: one that is
 //! switched off, or one that cannot start *because* its setting is missing
-//! (vibectl without a reachable `V1BECTL_SERVER`). So the host keeps two maps
-//! (`Store`):
+//! (vibectl without a reachable `V1BECTL_SERVER`). So the host keeps the last
+//! list each id declared (`Store`), persisted to
+//! `$XDG_STATE_HOME/trollshell/plugin-settings-schema.toml`. State, not config
+//! (#866 decision 3): the shell writes it, nobody edits it, and it is
+//! re-sanitised when read back all the same.
 //!
-//! - **live** — what each id declared this session, in memory;
-//! - **cached** — the last list each id ever declared, persisted to
-//!   `$XDG_STATE_HOME/trollshell/plugin-settings-schema.toml`. State, not
-//!   config (#866 decision 3): the shell writes it, nobody edits it, and it is
-//!   re-sanitised when read back all the same.
-//!
-//! `merged` lays live over cached, so a plugin upgraded to declare different
-//! settings shows its new form the moment it registers, and one that stopped
-//! declaring any shows none.
+//! A registration replaces its id's entry, so a plugin upgraded to declare
+//! different settings shows its new form the moment it registers, and one that
+//! stopped declaring any shows none. An id is **forgotten** when
+//! `plugins.json` no longer declares it and it has not registered this session
+//! (#1415 review L3): a renamed instance or a removed plugin does not keep a
+//! form, and the cache stays as small as the set of plugins actually in use.
+//! Registering this session is enough on its own, so a hand-installed static
+//! unit — which `plugins.json` never declares — keeps its form while it runs.
+//! When `plugins.json` cannot be read, nothing is forgotten.
 //!
 //! Recording is the **production host's** only: `register` acts only when
 //! the connection's runtime store is the one `PluginsService::start` published
@@ -74,18 +77,55 @@ const MAX_OPTION_CHARS: usize = 64;
 /// The most options a [`SettingKind::Choice`] keeps.
 const MAX_OPTIONS: usize = 32;
 
+/// How many things one registration's [`sanitize`] names in the journal before
+/// it summarises the rest in one line (#1415 review L4). A `Register` frame
+/// can be 16 MiB; filled with refused entries, one warning each would be
+/// hundreds of thousands of lines on every reconnect.
+const MAX_DROP_WARNINGS: usize = 8;
+
 /// `$XDG_STATE_HOME/trollshell/<this>.toml`: the last-seen declarations.
 const CACHE_SUBSYSTEM: &str = "plugin-settings-schema";
 
 /// Every plugin's sanitised declaration, by instance id.
 pub type Schemas = BTreeMap<String, Vec<Setting>>;
 
+/// Counts what one [`sanitize`] pass dropped and names only the first
+/// [`MAX_DROP_WARNINGS`] of them.
+struct Drops<'a> {
+    id: &'a str,
+    count: usize,
+}
+
+impl Drops<'_> {
+    /// One thing dropped: named while under the cap, counted either way.
+    fn note(&mut self, env: &str, reason: &str) {
+        self.count += 1;
+        if self.count <= MAX_DROP_WARNINGS {
+            tracing::warn!(plugin = %self.id, env = ?env, reason, "plugin setting dropped");
+        }
+    }
+
+    /// The one summary line for everything past the cap.
+    fn finish(self) -> usize {
+        if self.count > MAX_DROP_WARNINGS {
+            tracing::warn!(
+                plugin = %self.id,
+                unnamed = self.count - MAX_DROP_WARNINGS,
+                "more of this plugin's settings were dropped than are named above"
+            );
+        }
+        self.count
+    }
+}
+
 /// Reduce a plugin's declared settings to the ones the host will act on.
 ///
-/// Per entry, dropped with one `warn!` naming the plugin and the variable:
+/// Per entry, dropped:
 ///
 /// - an [`env`](Setting::env) that [`Setting::env_refusal`] refuses, or that an
 ///   earlier entry already declared (the first one wins);
+/// - a kind this shell does not know ([`SettingKind::Unknown`], a newer
+///   plugin's);
 /// - an [`Int`](SettingKind::Int) whose `min` exceeds its `max`;
 /// - a [`Choice`](SettingKind::Choice) left with no options.
 ///
@@ -100,57 +140,67 @@ pub type Schemas = BTreeMap<String, Vec<Setting>>;
 ///   (strip, trim or cap) is dropped instead, as is a repeat. Passing the
 ///   plugin a string it never declared would be worse than not offering it.
 ///
-/// At most [`MAX_SETTINGS`] survivors are kept, in declaration order.
+/// At most [`MAX_SETTINGS`] survivors are kept, in declaration order. Each
+/// drop is a warning naming the plugin and the variable, up to
+/// [`MAX_DROP_WARNINGS`] per call and then one summary line.
 pub(super) fn sanitize(id: &str, declared: &[Setting]) -> Vec<Setting> {
+    let mut drops = Drops { id, count: 0 };
     let mut seen = BTreeSet::new();
     let mut kept = Vec::new();
     for setting in declared {
-        match sanitize_one(id, setting) {
-            Ok(clean) if seen.insert(clean.env.clone()) => kept.push(clean),
-            Ok(dup) => tracing::warn!(
-                plugin = %id,
-                env = %dup.env,
-                "plugin declared the same setting twice; the first one is kept"
-            ),
-            Err(reason) => tracing::warn!(
-                plugin = %id,
-                env = ?setting.env,
-                reason,
-                "plugin setting dropped"
-            ),
+        match sanitize_one(setting) {
+            Ok((clean, lost_options)) => {
+                if lost_options > 0 {
+                    drops.note(
+                        &clean.env,
+                        "some Choice options were not plain display text and were dropped",
+                    );
+                }
+                if seen.insert(clean.env.clone()) {
+                    kept.push(clean);
+                } else {
+                    drops.note(&clean.env, "declared twice; the first one is kept");
+                }
+            }
+            Err(reason) => drops.note(&setting.env, reason),
         }
     }
     if kept.len() > MAX_SETTINGS {
-        tracing::warn!(
-            plugin = %id,
-            declared = kept.len(),
-            kept = MAX_SETTINGS,
-            "plugin declared more settings than the host keeps; the rest are dropped"
+        drops.note(
+            &kept[MAX_SETTINGS].env,
+            "past the 32 settings the host keeps; this one and the rest are dropped",
         );
         kept.truncate(MAX_SETTINGS);
     }
+    drops.finish();
     kept
 }
 
-/// One entry of [`sanitize`]: the cleaned setting, or why it is dropped.
-fn sanitize_one(id: &str, setting: &Setting) -> Result<Setting, &'static str> {
+/// One entry of [`sanitize`]: the cleaned setting and how many of its
+/// `Choice` options were dropped, or why the whole setting is.
+fn sanitize_one(setting: &Setting) -> Result<(Setting, usize), &'static str> {
     if let Some(reason) = Setting::env_refusal(&setting.env) {
         return Err(reason);
     }
+    let mut lost_options = 0;
     let kind = match &setting.kind {
+        SettingKind::Unknown(_) => {
+            return Err("its kind is newer than this shell");
+        }
         SettingKind::Int { min, max } if min > max => {
             return Err("its Int range is empty (min > max)");
         }
         SettingKind::Choice { options } => {
-            let options = sanitize_options(id, &setting.env, options);
+            let (options, lost) = sanitize_options(options);
             if options.is_empty() {
                 return Err("its Choice has no usable options");
             }
+            lost_options = lost;
             SettingKind::Choice { options }
         }
         other => other.clone(),
     };
-    Ok(Setting {
+    let clean = Setting {
         env: setting.env.clone(),
         label: sanitize_capped(&setting.label, MAX_LABEL_CHARS)
             .unwrap_or_else(|| setting.env.clone()),
@@ -160,37 +210,25 @@ fn sanitize_one(id: &str, setting: &Setting) -> Result<Setting, &'static str> {
             .default
             .as_deref()
             .and_then(|d| sanitize_capped(d, MAX_DEFAULT_CHARS)),
-    })
+    };
+    Ok((clean, lost_options))
 }
 
 /// A `Choice`'s options, keeping only those that pass the display sanitiser
-/// **unchanged** (see [`sanitize`]), without repeats, at most [`MAX_OPTIONS`].
-fn sanitize_options(id: &str, env: &str, options: &[String]) -> Vec<String> {
+/// **unchanged** (see [`sanitize`]), without repeats, at most [`MAX_OPTIONS`];
+/// and how many that are not plain display text it dropped.
+fn sanitize_options(options: &[String]) -> (Vec<String>, usize) {
     let mut kept: Vec<String> = Vec::new();
+    let mut lost = 0;
     for option in options {
         let intact = sanitize_capped(option, MAX_OPTION_CHARS).as_deref() == Some(option.as_str());
         if !intact {
-            tracing::warn!(plugin = %id, %env, option = ?option, "choice option dropped: it is not plain display text");
+            lost += 1;
         } else if !kept.contains(option) && kept.len() < MAX_OPTIONS {
             kept.push(option.clone());
         }
     }
-    kept
-}
-
-/// `live` laid over `cached`: every id either map knows, with its live list
-/// where it has one. A live **empty** list removes the id — the plugin is
-/// connected and declares nothing, so no stale form may outlive that.
-pub(crate) fn merged(cached: &Schemas, live: &Schemas) -> Schemas {
-    let mut out = cached.clone();
-    for (id, list) in live {
-        if list.is_empty() {
-            out.remove(id);
-        } else {
-            out.insert(id.clone(), list.clone());
-        }
-    }
-    out
+    (kept, lost)
 }
 
 /// The on-disk shape of the cache: one array of settings per id.
@@ -200,14 +238,17 @@ struct Cache {
     plugins: Schemas,
 }
 
-/// The live and cached declarations, and where the cache persists.
+/// The remembered declarations, and where they persist.
 #[derive(Debug)]
 struct Store {
     /// The cache file, or `None` when neither `$XDG_STATE_HOME` nor `$HOME`
     /// is set — then nothing outlives the session.
     path: Option<PathBuf>,
+    /// The last list each id declared, as persisted.
     cached: Schemas,
-    live: Schemas,
+    /// Every id that registered this session. What the prune keeps even when
+    /// `plugins.json` does not declare it — see the module doc.
+    seen: BTreeSet<String>,
 }
 
 impl Store {
@@ -231,23 +272,23 @@ impl Store {
         Self {
             path,
             cached,
-            live: Schemas::new(),
+            seen: BTreeSet::new(),
         }
     }
 
-    /// Record what `id` just declared: live for this session, and in the
-    /// cache — persisted only when the cache actually changed, so the common
-    /// reconnect with an unchanged manifest writes nothing.
+    /// Record what `id` just declared, replacing what it declared before —
+    /// persisted only when that actually changed, so the common reconnect with
+    /// an unchanged manifest writes nothing. An empty list forgets the id.
     fn record(&mut self, id: &str, list: Vec<Setting>) {
+        self.seen.insert(id.to_owned());
         let changed = if list.is_empty() {
             self.cached.remove(id).is_some()
         } else if self.cached.get(id) == Some(&list) {
             false
         } else {
-            self.cached.insert(id.to_owned(), list.clone());
+            self.cached.insert(id.to_owned(), list);
             true
         };
-        self.live.insert(id.to_owned(), list);
         if changed {
             self.persist();
         }
@@ -276,9 +317,20 @@ impl Store {
         }
     }
 
-    /// Every id's declaration as the Plugins tab should see it.
-    fn snapshot(&self) -> Schemas {
-        merged(&self.cached, &self.live)
+    /// Every remembered declaration, after forgetting the ids neither
+    /// `declared` in `plugins.json` nor registered this session (and
+    /// persisting that, when it forgot any). `declared` is `None` when
+    /// `plugins.json` could not be read: then nothing is forgotten.
+    fn snapshot(&mut self, declared: Option<&BTreeSet<String>>) -> Schemas {
+        if let Some(declared) = declared {
+            let before = self.cached.len();
+            self.cached
+                .retain(|id, _| declared.contains(id) || self.seen.contains(id));
+            if self.cached.len() != before {
+                self.persist();
+            }
+        }
+        self.cached.clone()
     }
 }
 
@@ -320,12 +372,15 @@ pub(super) fn register(runtime: &PluginRuntimeStore, id: &str, declared: &[Setti
     tokio::task::spawn_blocking(move || with_store(|store| store.record(&id, clean)));
 }
 
-/// Every plugin's declared settings, live over cached — what
-/// `Control.ListPluginSettings` serves. Blocking (the first call reads the
-/// cache file), so the D-Bus handler runs it off its own task.
+/// Every plugin's declared settings — what `Control.ListPluginSettings`
+/// serves — after forgetting the ids `declared` (the ids `plugins.json`
+/// declares, `None` when it cannot be read) no longer covers and that have
+/// not registered this session. Blocking (the first call reads the cache
+/// file, and a prune writes it), so the D-Bus handler runs it off its own
+/// task.
 #[must_use]
-pub fn snapshot() -> Schemas {
-    with_store(|store| store.snapshot())
+pub fn snapshot(declared: Option<&BTreeSet<String>>) -> Schemas {
+    with_store(|store| store.snapshot(declared))
 }
 
 #[cfg(test)]
@@ -439,24 +494,118 @@ mod tests {
         assert_eq!(kept[1].kind, SettingKind::Path { directory: false });
     }
 
-    // ── live over cached ────────────────────────────────────────────────
-
+    /// #1415 review TS5: the label cap is 64 chars, a row title — not merely
+    /// "some cap". Red if `MAX_LABEL_CHARS` is raised or the label stops going
+    /// through the capping sanitiser.
     #[test]
-    fn live_lists_replace_cached_ones_and_an_empty_live_list_removes_one() {
-        let cached = Schemas::from([
-            ("a".to_owned(), vec![Setting::text("A", "cached a")]),
-            ("b".to_owned(), vec![Setting::text("B", "cached b")]),
-            ("c".to_owned(), vec![Setting::text("C", "cached c")]),
-        ]);
-        let live = Schemas::from([
-            ("b".to_owned(), vec![Setting::bool("B2", "live b")]),
-            ("c".to_owned(), Vec::new()),
-            ("d".to_owned(), vec![Setting::text("D", "live d")]),
-        ]);
-        let out = merged(&cached, &live);
-        assert_eq!(out.keys().collect::<Vec<_>>(), ["a", "b", "d"]);
-        assert_eq!(out["a"][0].label, "cached a");
-        assert_eq!(out["b"][0].label, "live b");
+    fn a_label_is_capped_at_a_row_title() {
+        let kept = &sanitize("p", &[Setting::text("A", "x".repeat(1000))])[0];
+        assert_eq!(kept.label.chars().count(), 64);
+        assert!(kept.label.ends_with('…'));
+        let default = &sanitize("p", &[Setting::text("A", "a").default_value("y".repeat(1000))])[0];
+        assert_eq!(
+            default.default.as_ref().map(|d| d.chars().count()),
+            Some(256)
+        );
+    }
+
+    /// #1415 review M2: a setting of a kind this shell does not know is
+    /// dropped, and the plugin's other settings are kept.
+    #[test]
+    fn a_setting_of_a_newer_kind_is_dropped_and_the_rest_kept() {
+        // The proto crate's committed newer-plugin frame: the only way to get
+        // an `Unknown` kind, which nothing outside that crate can construct.
+        let hex = include_str!(
+            "../../../crates/hytte-plugin-proto/tests/fixtures/manifest_settings_future_kind_v1.hex"
+        )
+        .trim();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect();
+        let decoded: hytte_plugin_proto::Manifest =
+            hytte_plugin_proto::decode(&bytes).expect("a newer kind does not cost the registration");
+        assert_eq!(decoded.settings.len(), 2, "the fixture's two readable entries");
+        assert_eq!(ids(&sanitize("vibectl", &decoded.settings)), ["V1BECTL_SERVER"]);
+    }
+
+    /// #1415 review L4: a flood of refused entries is named only up to the
+    /// cap, however many there are — and every one is still dropped.
+    #[test]
+    fn a_flood_of_refused_entries_is_counted_not_logged_one_by_one() {
+        let declared: Vec<Setting> = (0..10_000)
+            .map(|i| Setting::text(format!("LD_{i}"), "x"))
+            .collect();
+        let mut drops = Drops { id: "p", count: 0 };
+        for setting in &declared {
+            drops.note(&setting.env, "refused");
+        }
+        assert_eq!(drops.finish(), 10_000);
+        assert!(sanitize("p", &declared).is_empty());
+        let (captured, guard) = hytte_config::test_support::capture();
+        let _ = sanitize("flood", &declared);
+        drop(guard);
+        let lines = captured.warnings();
+        let named = lines
+            .iter()
+            .filter(|l| l.contains("plugin setting dropped"))
+            .count();
+        assert_eq!(named, MAX_DROP_WARNINGS, "{lines:?}");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("more of this plugin")).count(),
+            1,
+            "{lines:?}"
+        );
+    }
+
+    // ── what is remembered, and what is forgotten ───────────────────────
+
+    /// A registration replaces its id's list outright, and an empty one forgets
+    /// the id — so an upgraded plugin shows its new form at once and one that
+    /// stopped declaring settings shows none.
+    #[test]
+    fn a_registration_replaces_what_the_id_declared_before() {
+        let mut store = Store::open(None);
+        store.record("a", vec![Setting::text("A", "first")]);
+        store.record("b", vec![Setting::text("B", "b")]);
+        store.record("a", vec![Setting::bool("A2", "second")]);
+        store.record("b", Vec::new());
+        let out = store.snapshot(None);
+        assert_eq!(out.keys().collect::<Vec<_>>(), ["a"]);
+        assert_eq!(out["a"][0].label, "second");
+    }
+
+    /// #1415 review L3: an id `plugins.json` no longer declares, and that has
+    /// not registered this session, is forgotten — on disk too. One that
+    /// registered this session (a hand-installed static unit) is kept, and an
+    /// unreadable `plugins.json` forgets nothing.
+    #[test]
+    fn an_id_neither_declared_nor_seen_is_forgotten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin-settings-schema.toml");
+        let mut first = Store::open(Some(path.clone()));
+        for id in ["kept", "renamed", "static"] {
+            first.record(id, vec![Setting::text("A", id)]);
+        }
+
+        let mut next = Store::open(Some(path.clone()));
+        next.record("static", vec![Setting::text("A", "static")]);
+        assert_eq!(
+            next.snapshot(None).len(),
+            3,
+            "no plugins.json reading, nothing forgotten"
+        );
+        let declared = BTreeSet::from(["kept".to_owned()]);
+        let out = next.snapshot(Some(&declared));
+        assert_eq!(out.keys().collect::<Vec<_>>(), ["kept", "static"]);
+        assert_eq!(
+            Store::open(Some(path))
+                .snapshot(None)
+                .keys()
+                .collect::<Vec<_>>(),
+            ["kept", "static"],
+            "the prune reached the disk"
+        );
     }
 
     // ── the cache, under a tempdir ──────────────────────────────────────
@@ -488,9 +637,9 @@ mod tests {
 
         // A new session: nothing is live, the plugin has not connected yet,
         // and the form is still there — every kind round-tripped.
-        let second = Store::open(Some(path));
-        assert!(second.live.is_empty());
-        assert_eq!(second.snapshot()["vibectl"], every_kind());
+        let mut second = Store::open(Some(path));
+        assert!(second.seen.is_empty());
+        assert_eq!(second.snapshot(None)["vibectl"], every_kind());
     }
 
     #[test]
@@ -500,9 +649,9 @@ mod tests {
         let mut store = Store::open(Some(path.clone()));
         store.record("vibectl", every_kind());
         store.record("vibectl", Vec::new());
-        assert!(!store.snapshot().contains_key("vibectl"));
+        assert!(!store.snapshot(None).contains_key("vibectl"));
         assert!(!path.exists(), "an empty cache is deleted, not left behind");
-        assert!(Store::open(Some(path)).snapshot().is_empty());
+        assert!(Store::open(Some(path)).snapshot(None).is_empty());
     }
 
     #[test]
@@ -529,7 +678,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         std::fs::write(&path, text.replace("\"SERVER\"", "\"LD_PRELOAD\"")).expect("tamper");
         assert!(
-            Store::open(Some(path)).snapshot().is_empty(),
+            Store::open(Some(path)).snapshot(None).is_empty(),
             "a refused name read back from the cache is dropped like one from a manifest"
         );
     }
@@ -538,7 +687,7 @@ mod tests {
     fn no_state_directory_still_serves_live_declarations() {
         let mut store = Store::open(None);
         store.record("vibectl", every_kind());
-        assert_eq!(store.snapshot()["vibectl"], every_kind());
+        assert_eq!(store.snapshot(None)["vibectl"], every_kind());
     }
 
     #[test]

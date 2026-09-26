@@ -10,15 +10,16 @@ use hytte_ui::gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+/// (what `App` published, the display's own ready monitors), read inside the
+/// body and asserted after `run` returns — a panic inside the activate
+/// handler would abort across the FFI boundary, not fail a test.
+type Seen = (Vec<gdk::Monitor>, Vec<gdk::Monitor>);
+
 #[test]
 fn body_runs_on_activate() {
     let ran = Rc::new(Cell::new(false));
     let ran_writer = ran.clone();
-    // (what `App` published, the display's own ready monitors), read inside
-    // the body and asserted after `run` returns — a panic inside the
-    // activate handler would abort across the FFI boundary, not fail a test.
-    let seen: Rc<RefCell<Option<(Vec<gdk::Monitor>, Vec<gdk::Monitor>)>>> =
-        Rc::new(RefCell::new(None));
+    let seen: Rc<RefCell<Option<Seen>>> = Rc::new(RefCell::new(None));
     let seen_writer = seen.clone();
 
     App::new("mov.vibec0re.hytte.test")

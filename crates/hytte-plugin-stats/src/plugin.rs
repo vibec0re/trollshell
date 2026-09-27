@@ -410,15 +410,15 @@ impl Plugin for Stats {
     /// change the card #1250 put on glass.
     fn view(&self) -> View {
         match self.family {
-            Family::Bar => View::new(card::chips(self.cfg, &self.snapshot, &self.widgets)).panel(
-                panel::panel(
+            Family::Bar => {
+                View::new(card::chips(self.cfg, &self.snapshot, &self.widgets)).panel(panel::panel(
                     self.cfg,
                     &self.snapshot,
                     &self.page,
                     &self.top_apps,
                     self.expanded,
-                ),
-            ),
+                ))
+            }
             Family::Sidebar => card::card(self.cfg, &self.snapshot, &self.widgets).into(),
         }
     }
@@ -887,7 +887,11 @@ mod tests {
     #[test]
     fn a_click_on_a_top_apps_list_toggles_it_and_gates_the_walker() {
         let (mut model, mut rx) = fresh_bar(Card::bar_default());
-        assert_eq!(drain(&mut rx), vec![Cmd::SetVisible(true)], "the bar's own seed");
+        assert_eq!(
+            drain(&mut rx),
+            vec![Cmd::SetVisible(true)],
+            "the bar's own seed"
+        );
         assert!(!list_state(&model, crate::panel::TOP_APPS_CPU_ID).0);
         assert!(!list_state(&model, crate::panel::TOP_APPS_RAM_ID).0);
 
@@ -937,7 +941,9 @@ mod tests {
             let _ = model.update(input);
         }
         assert!(
-            !drain(&mut rx).iter().any(|cmd| matches!(cmd, Cmd::ShowTopApps(_))),
+            !drain(&mut rx)
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::ShowTopApps(_))),
             "no Top apps switch without a Top apps list",
         );
     }

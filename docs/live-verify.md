@@ -2536,9 +2536,8 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       `.desktop` file shows its id rather than its `Name=`, and a collapsed
       header reads `—` while neither list is open (native keeps it live
       while the drawer is open). Collapse both lists: the bar instance's
-      process (`top`, or `systemctl --user status
-      trollshell-plugin-stats-bar`'s CPU time) stops climbing within a couple
-      of seconds. Known gap: a list left open when the drawer closes
+      CPU time in `top` stops climbing within a couple of seconds. Known
+      gap: a list left open when the drawer closes
       keeps walking every 2 s until it is collapsed, because the plugin is
       not told when its page closes.
 - [ ] **(#1252)** **An older shell still gets a working page.** Against a

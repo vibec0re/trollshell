@@ -265,7 +265,12 @@ mod tests {
 
         assert_eq!(
             *seen.lock().expect("not poisoned"),
-            vec![(None, 0), (Some(250), 1_000), (Some(500), 2_000), (Some(750), 3_000)],
+            vec![
+                (None, 0),
+                (Some(250), 1_000),
+                (Some(500), 2_000),
+                (Some(750), 3_000)
+            ],
             "each walk is handed the jiffies and the total the one before it saw",
         );
     }

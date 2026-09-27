@@ -861,13 +861,13 @@ async fn drive<S: Sample>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, route, spawn,
-        spawn_with, sampler_task_with,
+        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, route,
+        sampler_task_with, spawn, spawn_with,
     };
     use crate::config::Card;
     use crate::top_apps::{TopApps, Walker};
-    use hytte_sensors::app_usage::ProcSample;
     use hytte_plugin::cmd_channel;
+    use hytte_sensors::app_usage::ProcSample;
 
     /// The Clock row's two numbers are the **fastest core now** over the
     /// **highest `cpuinfo_max_freq`** — the native row's fixed 0→max-clock

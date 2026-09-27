@@ -863,15 +863,15 @@ fn top_app_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISKS_EXPANDER_ID, Expanded, HISTORY_LEN, History, ROOT_ID, TOP_APPS_CPU_ID, TOP_APPS_RAM_ID,
-        panel,
+        DISKS_EXPANDER_ID, Expanded, HISTORY_LEN, History, ROOT_ID, TOP_APPS_CPU_ID,
+        TOP_APPS_RAM_ID, panel,
     };
     use crate::config::Card;
     use crate::sample::{Disk, DiskIo, Gpu, Memory, Snapshot};
     use crate::top_apps::{TopApps, app};
-    use hytte_sensors::app_usage::{ProcSample, TOP_N};
     use hytte_plugin::display::testing::with_negotiated_vocab;
     use hytte_plugin::proto::{Dir, HOMOGENEOUS_CLASS, Node, SPARKLINE_VOCAB};
+    use hytte_sensors::app_usage::{ProcSample, TOP_N};
 
     /// A machine with something to say about every card.
     fn busy() -> Snapshot {
@@ -1637,8 +1637,14 @@ mod tests {
         );
         assert_eq!(last_row_of(&seed, "stats-panel-cpu"), TOP_APPS_CPU_ID);
         assert_eq!(last_row_of(&seed, "stats-panel-memory"), TOP_APPS_RAM_ID);
-        assert!(!top_apps_list(&seed, TOP_APPS_CPU_ID).2, "collapsed, as native");
-        assert!(!top_apps_list(&seed, TOP_APPS_RAM_ID).2, "collapsed, as native");
+        assert!(
+            !top_apps_list(&seed, TOP_APPS_CPU_ID).2,
+            "collapsed, as native"
+        );
+        assert!(
+            !top_apps_list(&seed, TOP_APPS_RAM_ID).2,
+            "collapsed, as native"
+        );
 
         for (top_cpu, top_ram) in [(true, false), (false, true)] {
             let node = page_at(
@@ -1663,7 +1669,11 @@ mod tests {
             },
             &busy(),
         );
-        assert!(!nodes_of(&no_cpu).into_iter().any(|n| id_of(n) == Some(TOP_APPS_CPU_ID)));
+        assert!(
+            !nodes_of(&no_cpu)
+                .into_iter()
+                .any(|n| id_of(n) == Some(TOP_APPS_CPU_ID))
+        );
         assert_eq!(top_apps_list(&no_cpu, TOP_APPS_RAM_ID).1.len(), 2);
     }
 
@@ -1689,7 +1699,10 @@ mod tests {
         );
 
         let (header, rows, _) = top_apps_list(&node, TOP_APPS_RAM_ID);
-        assert_eq!(header, vec!["Top apps · RAM", "org.mozilla.firefox · 3.2 GiB"]);
+        assert_eq!(
+            header,
+            vec!["Top apps · RAM", "org.mozilla.firefox · 3.2 GiB"]
+        );
         assert_eq!(
             rows.iter().map(texts).collect::<Vec<_>>(),
             vec![
@@ -1706,7 +1719,10 @@ mod tests {
                 other => panic!("a row is a Row: {other:?}"),
             })
             .collect();
-        assert_eq!(tooltips, vec![Some("org.mozilla.firefox"), Some("pipewire")]);
+        assert_eq!(
+            tooltips,
+            vec![Some("org.mozilla.firefox"), Some("pipewire")]
+        );
     }
 
     /// Nothing measured — both lists parked, or the page's first render — is
@@ -1790,7 +1806,10 @@ mod tests {
                     assert!(
                         matches!(
                             n,
-                            Node::Row { .. } | Node::Label { .. } | Node::Text { .. } | Node::Spacer
+                            Node::Row { .. }
+                                | Node::Label { .. }
+                                | Node::Text { .. }
+                                | Node::Spacer
                         ),
                         "{id}: {n:?}",
                     );

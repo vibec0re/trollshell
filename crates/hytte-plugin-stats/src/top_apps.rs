@@ -30,17 +30,30 @@
 //! against the native page:
 //!
 //! - **Collapsed, which is the default, walks nothing at all** — cheaper than
-//!   native, which walks for as long as the drawer is open.
+//!   native, which walks for as long as the drawer is open. That holds only
+//!   until the first expand; see the known cost below.
 //! - **The collapsed header's summary reads `—` while nothing is being
 //!   measured.** Native shows the heaviest app beside the chevron even when
 //!   the list is collapsed; here the summary only carries a name while one of
 //!   the two lists is open (either one — both lists come out of the same
 //!   walk). Showing the last reading instead would be showing a number
 //!   nobody is measuring any more as if it were live.
-//! - **A list left open keeps the walker running after the drawer closes.**
-//!   That is the half this gate cannot close, and it is what a host push of
-//!   the page's visibility would fix. Until then its cost is the native
-//!   page's, extended from "while the drawer is open" to "while a list is open".
+//!
+//! ## Known cost: a list left open keeps walking after the drawer closes
+//!
+//! The expander state lives in the plugin and survives the drawer closing, so
+//! the ordinary path — expand a list, close the drawer with Esc or a click
+//! outside — leaves the walker running every [`POLL`] until that list is
+//! collapsed again or the plugin restarts. Native parks this same walk
+//! whenever its Stats page is off screen (#50). Every such walk also changes
+//! the page, so the plugin sends a render frame nobody is looking at.
+//!
+//! Measured by the #1426 review (`sample_proc`, release build, one pinned
+//! core, median of 30 walks): 12.8 ms a walk at 341 processes, 23 ms at 638,
+//! 47 ms at 1240 — about **1.2 % of a core** at ~640 processes on the 2 s
+//! cadence, and 2.4 % at ~1240. This PR does not fix it: the fix is the host
+//! telling the plugin when its page is on screen, `PageVisible`, which is
+//! #1427. Until that lands, this cost is accepted, not hidden.
 //!
 //! # A CPU share needs two walks
 //!
@@ -55,16 +68,36 @@
 //! rule), so the first CPU list after a reopen is a share over a fresh window
 //! rather than the mean over however long the lists were shut.
 //!
+//! ## Known wrinkle: a quick close and reopen
+//!
+//! The same rule applies to a close and reopen within one walk (a
+//! double-click on the header). The CPU list then reads `—` for about 2 s,
+//! even though the baseline it dropped was at most 2 s old. If a walk was in
+//! flight across the close, its rows land after the reopen and the cold walk
+//! then blanks them, so the list goes rows → `—` → rows. This is left as is,
+//! deliberately (#1426 review, NIT 8). Keeping a young baseline needs the
+//! loop to know how long the list was closed. Carrying the rows over a cold
+//! walk needs a limit on how many cold walks in a row it may bridge.
+//! Otherwise a reading nobody took could stay on screen. Either is new
+//! timing state in code this plugin's reopen correctness rests on, for a 2 s
+//! cosmetic gap.
+//!
 //! # Not here
 //!
 //! - **Icons.** Native resolves each row's icon through `gio::DesktopAppInfo`;
 //!   the plugin knows the app id but not a `GIcon`. How the page gets one is
 //!   an open question on #1419, so the rows carry no icon node at all.
-//! - **Display names.** For the same reason, a row shows the group's own name
-//!   — the app id for an app scope, the unit name for a service, `System` —
-//!   which is what the native row falls back to when no `.desktop` file
-//!   matches. A `.desktop` file's `Name=` is the same lookup as its `Icon=`,
-//!   so it follows whatever #1419 decides.
+//! - **Display names.** A row shows the group's raw key, not a display name:
+//!   the scope's app id, the unit name for a service, or `System`. On niri
+//!   ≥ 26.04 every `spawn`ed app runs in `app-niri-<bin>-<pid>.scope`, so the
+//!   key is `niri-firefox`, `niri-foot` and so on. Native shows `Firefox`
+//!   there, because its `app_meta` lookup also matches a `.desktop` stem the
+//!   id merely *contains* — so on niri most rows differ from native, not only
+//!   the rare app with no `.desktop` file. The names stay raw ids until a
+//!   follow-up ports `trollshell/src/components/app_meta.rs`'s three layers
+//!   (exact id, id containment, `Exec` basename) to plain `.desktop` parsing
+//!   the plugin can run. That port serves `Name=` now and `Icon=` once #1419
+//!   answers the icon question.
 //! - **The battery-aware cadence.** Native stretches its 2 s poll to 8 s on
 //!   battery (#505), reading `UPower` over D-Bus, which a plugin does not
 //!   have. The walker keeps the AC cadence.

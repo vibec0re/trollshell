@@ -58,14 +58,19 @@
 //!   GTK-free plugin cannot call. The icon column is **pending #1419's
 //!   question** (read the `.desktop` file in the plugin, or a wire node the
 //!   shell resolves), so a row carries no icon node at all rather than a
-//!   placeholder; and a row names its group by its own name — the app id,
-//!   the unit name, `System` — which is what the native row falls back to
-//!   when no `.desktop` file matches.
+//!   placeholder. A row names its group by its raw key — the scope's app id,
+//!   the unit name, `System` — so on niri a row reads `niri-firefox` where
+//!   native reads `Firefox`; most rows differ, not only apps with no
+//!   `.desktop` file. A follow-up ports native's name lookup to the plugin
+//!   (see `crate::top_apps`' module docs).
 //! - **Top apps' collapsed summary while both lists are collapsed.** Native
 //!   shows the heaviest app beside the chevron whenever the drawer is open.
 //!   This plugin cannot see its page open or close, so its walker runs only
 //!   while one of the two lists is expanded, and a collapsed header reads `—`
-//!   while nothing is being measured — see `crate::top_apps`' module docs.
+//!   while nothing is being measured. The flip side is a known cost: a list
+//!   left open keeps walking `/proc` after the drawer closes, until #1427
+//!   tells the plugin when its page is on screen — see `crate::top_apps`'
+//!   module docs for the measured numbers.
 //! - **The per-core LED panel.** Native draws it with `hytte_preem::LedMatrix`,
 //!   which is not on the wire (#1156); the only lamp the wire has is a preem
 //!   `DotMatrix`, which is exactly what this page is no longer allowed to

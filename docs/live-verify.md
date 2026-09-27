@@ -2524,22 +2524,25 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       page.** Open the page from a stats chip. The CPU card ends in a
       `Top apps · CPU` row and the Memory card in a `Top apps · RAM` row,
       both collapsed, each reading `—` beside its chevron. Click
-      `Top apps · CPU`: the RAM row's summary fills in at once (e.g.
-      `org.mozilla.firefox · 3.2 GiB`); the CPU list fills in about 2 s
+      `Top apps · CPU`: the RAM row's summary fills in at once (on niri,
+      e.g. `niri-firefox · 3.2 GiB`); the CPU list fills in about 2 s
       later — the first walk has no CPU baseline and shows nothing rather
-      than a column of `0%`. Up to six rows each, heaviest first: the group's
-      name (app id, service name or `System`), `N processes` beside it when
-      more than one PID folded in, and the value pinned right (`42%` /
-      `3.2 GiB`). Compare with the native page's two lists: the same groups,
-      order and values, give or take the 2 s between two walks. Expected
-      differences: **no icons** (pending #1419's question), an app with a
-      `.desktop` file shows its id rather than its `Name=`, and a collapsed
+      than a column of `0%`. Up to six rows each, heaviest first: the
+      group's raw key (on niri mostly `niri-<program>`, a service's unit
+      name, or `System`), `N processes` beside it when more than one PID
+      folded in, and the value pinned right (`42%` / `3.2 GiB`). Compare
+      with the native page's two lists: the same groups, order and values,
+      give or take the 2 s between two walks. Expected differences: **no
+      icons** (pending #1419's question); **most names differ** — native
+      reads `Firefox` where the plugin reads `niri-firefox`, until a
+      follow-up ports native's `.desktop` name lookup; and a collapsed
       header reads `—` while neither list is open (native keeps it live
       while the drawer is open). Collapse both lists: the bar instance's
       CPU time in `top` stops climbing within a couple of seconds. Known
-      gap: a list left open when the drawer closes
-      keeps walking every 2 s until it is collapsed, because the plugin is
-      not told when its page closes.
+      cost: a list left open when the drawer closes keeps walking `/proc`
+      every 2 s until it is collapsed (about 1.2 % of a core at ~640
+      processes), because the plugin is not told when its page closes —
+      #1427 is the fix.
 - [ ] **(#1252)** **An older shell still gets a working page.** Against a
       shell built before this change (generation 6), the page must still
       open with the same two columns, and each history line must be a slim

@@ -1600,6 +1600,19 @@ mod tests {
         }
     }
 
+    /// Wait for [`spawn_with`]'s three tasks to end after the test dropped the
+    /// lane — **bounded**, so a teardown that stops working fails the test
+    /// instead of hanging the whole binary (measured: a router that kept its
+    /// senders alive left three tests running forever rather than red).
+    async fn join_all(tasks: [tokio::task::JoinHandle<()>; 3]) {
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("every task ends once the lane closes")
+                .expect("and not by panicking");
+        }
+    }
+
     /// A walker that reads nothing and counts what it was asked to do — the
     /// Top apps twin of [`FakeSampler`].
     struct FakeWalker(Arc<Calls>);
@@ -1649,7 +1662,10 @@ mod tests {
             cmd_tx.send(cmd).expect("lane is live");
         }
         drop(cmd_tx);
-        router.await.expect("the router ends when its lane closes");
+        tokio::time::timeout(Duration::from_secs(5), router)
+            .await
+            .expect("the router ends when its lane closes")
+            .expect("and not by panicking");
 
         let drain = |rx: &mut hytte_plugin::CmdReceiver<Cmd>| {
             std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
@@ -1692,10 +1708,15 @@ mod tests {
     /// reopen drops the baseline first (#1277 LOW 4's rule, which the walker
     /// inherits by running through the same loop).
     ///
-    /// **Falsified** by the router or the walker's classifier letting
-    /// `SetVisible` through (the walker ticks with the chips), by the walker's
-    /// classifier ignoring `ShowTopApps(false)` (it keeps walking after the
-    /// close), and by `drive`'s `parked` re-baseline being deleted.
+    /// **Falsified** by the router swapping its two lanes (the walker never
+    /// hears its switch), by the walker's classifier ignoring
+    /// `ShowTopApps(false)` (it keeps walking after the close), and by
+    /// `drive`'s `parked` re-baseline being deleted. **Not** by letting
+    /// `SetVisible` through at only one of its two stops — the router, or the
+    /// walker's classifier — since the other still holds it back (measured:
+    /// both stay green here); those are what
+    /// `the_router_sends_each_command_to_its_own_task` and
+    /// `each_classifier_answers_only_its_own_switch` are for.
     #[tokio::test(start_paused = true)]
     async fn the_walker_runs_only_while_a_list_is_open_never_for_the_chips() {
         let sensors = Arc::new(Calls::default());
@@ -1767,9 +1788,7 @@ mod tests {
         );
 
         drop(cmd_tx);
-        for task in tasks {
-            let _ = task.await;
-        }
+        join_all(tasks).await;
     }
 
     /// **The walker keeps its baseline across the task's ticks.** `drive`
@@ -1819,8 +1838,6 @@ mod tests {
         assert_eq!(sensors.ticks(), 0, "the sensors gate was never opened");
 
         drop(cmd_tx);
-        for task in tasks {
-            let _ = task.await;
-        }
+        join_all(tasks).await;
     }
 }

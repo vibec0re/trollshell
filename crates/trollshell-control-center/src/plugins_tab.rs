@@ -53,11 +53,27 @@
 //! the opposite. `connect_switch` records that ask as a [`PendingToggle`]
 //! the instant the switch flips, and [`resolve_pending`] keeps
 //! `refresh_detail` from driving the switch off a stale snapshot while it's
-//! live: showing the wanted state instead until a poll agrees or
-//! [`PENDING_TOGGLE_TIMEOUT`] admits the transition never happened. The
-//! `syncing` guard (already needed so a fetched state doesn't loop back into
-//! a Start/Stop call) is what stops `refresh_detail`'s own `set_active` from
-//! recording a bogus intent of its own.
+//! live, showing the wanted state instead. The `syncing` guard (already
+//! needed so a fetched state doesn't loop back into a Start/Stop call) is
+//! what stops `refresh_detail`'s own `set_active` from recording a bogus
+//! intent of its own.
+//!
+//! How long it holds is the toggle's own round trip, not a number of its own
+//! (#1417 item 2) — see [`ToggleCall`]:
+//!
+//! - **Until the shell answers**, no poll moves the switch. The round trip,
+//!   each call's own client timeout and the hold all run out at one instant,
+//!   [`toggle_deadline`] ([`TOGGLE_TIMEOUT`] after the flip), so they cannot
+//!   drift apart. They did before: a fixed 10 s hold against calls #1415 let
+//!   wait 30 s each, so a slow call let the poll snap the switch back before
+//!   it answered.
+//! - **A failed answer** drops the hold at once, and the poll's truth shows.
+//!   A timeout is a failure of its own kind: *unanswered*, not "not done",
+//!   since the shell still carries a queued call out later
+//!   ([`ToggleError::Unanswered`]).
+//! - **A successful answer** holds only against a poll that was already on
+//!   its way before it ([`PollGenerations`]); the first poll issued after it
+//!   has the last word.
 //!
 //! # What the switch means depends on who declared the plugin (#1400)
 //!
@@ -149,18 +165,6 @@ use crate::{
 /// number of their own, because they answer the same question about the same
 /// endpoint and them disagreeing was the defect.
 pub(crate) const PLUGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// How long a user-initiated toggle holds the switch against a poll that
-/// hasn't caught up yet (#944), before "truth wins" regardless.
-///
-/// `systemd-run` starts a transient unit in well under this — the 1.2 s
-/// settle re-poll in [`refresh_plugins_soon`] already catches the common
-/// case — so this is purely a backstop for a start/stop that hangs or
-/// genuinely fails. At that point a switch frozen on what the user asked for
-/// is a worse lie than showing the real (stuck) state, so 10 s is short
-/// enough that a real failure surfaces quickly and long enough that no normal
-/// transition ever hits it.
-const PENDING_TOGGLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The width at or below which the split view collapses to one pane at a time
 /// (#887).
@@ -350,7 +354,7 @@ struct PluginDetail {
 /// finding 3): an "unavailable" placeholder is exactly the kind of transient
 /// failure the selection itself is parked against, and dropping the intent
 /// along with the rows would re-expose the very bounce #944 fixed the moment
-/// the poll recovers — a stale poll inside [`PENDING_TOGGLE_TIMEOUT`] would
+/// the poll recovers — a stale poll while the toggle is still held would
 /// snap the just-restored switch back to whatever it read before the outage.
 struct ParkedSelection {
     /// The plugin that was selected when the poll failed.
@@ -360,8 +364,10 @@ struct ParkedSelection {
     /// navigation back where it was and not merely the highlight.
     pushed: bool,
     /// The intent that was pending for [`id`](Self::id), if any, moved here
-    /// wholesale — including its original `since` — so the timeout keeps
-    /// counting from when the user actually toggled, not from the restore.
+    /// wholesale — including its original `since` and its [`ToggleCall`] —
+    /// so the timeout keeps counting from when the user actually toggled,
+    /// not from the restore, and an answer that lands while it is parked
+    /// still reaches it ([`on_toggle_result`]).
     pending: Option<PendingToggle>,
 }
 
@@ -374,6 +380,7 @@ struct ParkedSelection {
 /// tick catches up. Recorded by `connect_switch` the instant the switch
 /// flips, and consulted (and cleared) by [`resolve_pending`] on every
 /// `refresh_detail` for the plugin it names.
+#[derive(Debug)]
 struct PendingToggle {
     /// The plugin this intent is about. A `refresh_detail` for any other
     /// plugin drops it outright — see [`resolve_pending`].
@@ -381,12 +388,119 @@ struct PendingToggle {
     /// The state the user asked for: `true` = start+enable, `false` =
     /// stop+disable.
     wanted: bool,
-    /// When the toggle happened, for [`PENDING_TOGGLE_TIMEOUT`].
+    /// When the toggle happened: what [`toggle_deadline`] counts from, and the
+    /// identity [`on_toggle_result`] checks, so an answer only ever reaches
+    /// the toggle that asked the question.
     since: Instant,
+    /// Where this toggle's own round trip is — what decides how long it
+    /// holds ([`PendingToggle::holds`]).
+    call: ToggleCall,
 }
 
-/// The switch's most recent toggle, and whether its `SetPluginEnabled` failed
-/// (#1400 review, finding 5).
+/// Where a switch toggle's round trip is ([`set_plugin_state`]), which is
+/// what decides how long its [`PendingToggle`] holds the switch (#1417
+/// item 2).
+///
+/// A fixed hold is what #1417 was about. It was 10 s, and #1415 let the
+/// calls behind it wait 30 s each for the shell's convergence lock, so a
+/// slow call let the poll snap the switch back to the old state before the
+/// shell answered, and the answer then flipped it again. The hold now ends
+/// on the answer instead, with the round trip's own timeout as its bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToggleCall {
+    /// The shell has not answered yet.
+    ///
+    /// No poll moves the switch, not even one that agrees: the change is
+    /// still queued in the shell, and a poll here reads the plugin in the
+    /// middle of whatever else holds the lock — a Save's restart can stop
+    /// it and start it again under a switch the user just flipped off.
+    /// Bounded by [`toggle_deadline`]`(since)`, the one instant the round
+    /// trip itself is held to ([`set_plugin_state`]), so the hold and the
+    /// call give up together. It is a backstop: the answer — at the latest
+    /// the round trip's own [`ToggleError::Unanswered`] — ends this state in
+    /// every case where the completion runs at all.
+    InFlight,
+    /// The shell answered success after polls up to `newest_stale_poll`
+    /// ([`PollGenerations::issue`]) had been spawned.
+    ///
+    /// Those polls may have read the plugin before the change, so they
+    /// still cannot move the switch. The first poll issued after the answer
+    /// releases the hold whatever it reads, and [`on_toggle_result`] spawns
+    /// one at once, so this lasts one round trip of the poll.
+    Answered {
+        /// The last generation [`PollGenerations::issue`] handed out before
+        /// the answer arrived.
+        newest_stale_poll: u64,
+    },
+}
+
+impl PendingToggle {
+    /// A toggle the user just made, whose round trip has not answered yet.
+    fn in_flight(plugin_id: String, wanted: bool, since: Instant) -> Self {
+        Self {
+            plugin_id,
+            wanted,
+            since,
+            call: ToggleCall::InFlight,
+        }
+    }
+
+    /// Whether this intent still holds the switch at `now`, when the snapshot
+    /// on screen came from poll generation `applied_poll`
+    /// ([`PollGenerations::applied`]). Pure; [`ToggleCall`] has the rule.
+    ///
+    /// What the poll reads does not enter into it: before the answer no poll
+    /// counts, and after it the first new poll counts whatever it says.
+    fn holds(&self, now: Instant, applied_poll: u64) -> bool {
+        match self.call {
+            ToggleCall::InFlight => now < toggle_deadline(self.since),
+            ToggleCall::Answered { newest_stale_poll } => applied_poll <= newest_stale_poll,
+        }
+    }
+}
+
+/// What a toggle's round trip ended with, as far as its [`PendingToggle`]
+/// cares — see [`answer_intent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToggleAnswer {
+    /// Kept, and started or stopped.
+    Done,
+    /// Any error, a timeout included: the switch goes to what the poll
+    /// reports.
+    Failed,
+}
+
+/// Hand a toggle's answer to its intent in `slot` — either of the intent's
+/// two homes, [`PluginsState::pending`] or a [`ParkedSelection`]'s. Pure.
+///
+/// Only the intent recorded at `since` is touched. If the user flipped the
+/// switch again while this call was in flight, `slot` holds that newer
+/// toggle, which is still waiting for its own answer, and an older toggle's
+/// answer — success or failure — says nothing about it.
+///
+/// `newest_poll` is the last generation [`PollGenerations::issue`] handed
+/// out when the answer arrived ([`ToggleCall::Answered`]).
+fn answer_intent(
+    slot: &mut Option<PendingToggle>,
+    since: Instant,
+    answer: ToggleAnswer,
+    newest_poll: u64,
+) {
+    let Some(intent) = slot.as_mut().filter(|intent| intent.since == since) else {
+        return;
+    };
+    match answer {
+        ToggleAnswer::Done => {
+            intent.call = ToggleCall::Answered {
+                newest_stale_poll: newest_poll,
+            };
+        }
+        ToggleAnswer::Failed => *slot = None,
+    }
+}
+
+/// The switch's most recent toggle, and what the row should say about how it
+/// ended (#1400 review, finding 5; #1417 item 2).
 ///
 /// Since the switch persists before it starts or stops anything
 /// ([`set_plugin_state`]), a refused persist changes nothing, and the switch
@@ -396,7 +510,7 @@ struct PendingToggle {
 /// Its own cell rather than a field of [`PendingToggle`]: an intent is cleared
 /// the moment its call fails (that is what makes the switch snap back), while
 /// the reason has to outlive it until the user toggles again or looks at
-/// another plugin ([`persist_error_for`]). Recorded by [`connect_switch`] with
+/// another plugin ([`toggle_note_for`]). Recorded by [`connect_switch`] with
 /// the same `since` as the intent, which is the identity [`on_toggle_result`]
 /// checks, so a late failure cannot annotate a newer toggle.
 struct LastToggle {
@@ -404,9 +518,24 @@ struct LastToggle {
     plugin_id: String,
     /// When it happened: the same instant as its [`PendingToggle::since`].
     since: Instant,
-    /// `SetPluginEnabled`'s error, once it failed. `None` while the call is in
-    /// flight, and after it succeeded.
-    persist_error: Option<String>,
+    /// What went wrong, once something did. `None` while the round trip is in
+    /// flight, after it succeeded, and after a start or stop the shell
+    /// refused (the choice was kept, so the ordinary line is still true).
+    note: Option<ToggleNote>,
+}
+
+/// What the switch row says about a toggle that did not simply work — see
+/// [`LastToggle`] and [`switch_row_subtitle`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToggleNote {
+    /// `SetPluginEnabled` answered with an error: nothing was kept, so
+    /// nothing was started or stopped either. Carries the error.
+    NotKept(String),
+    /// The shell did not answer in time ([`ToggleError::Unanswered`]). That
+    /// is not "not done": a call the tab gives up on still runs in the shell
+    /// once its lock frees (#1415 second review, L1), so the change may yet
+    /// happen, and the row says only what is known.
+    Unanswered,
 }
 
 /// What the sidebar list is currently showing, so a poll only rebuilds on a
@@ -532,7 +661,7 @@ struct PluginsState {
     view: Rc<Cell<PluginsView>>,
     /// Ordering over the overlapping polls (#983) — see [`PollGenerations`].
     polls: Rc<PollGenerations>,
-    /// A user toggle the poll hasn't confirmed yet (#944) — see
+    /// A user toggle still holding the switch (#944, #1417 item 2) — see
     /// [`PendingToggle`]. `None` whenever the shown plugin's switch is free to
     /// follow the snapshot.
     pending: Rc<RefCell<Option<PendingToggle>>>,
@@ -1284,8 +1413,9 @@ fn connect_selection(state: &PluginsState) {
 ///
 /// Weakly, for [`connect_selection`]'s reason: the switch is inside the tab the
 /// state holds. The strong clone the async completion takes is a *bounded*
-/// hold (one `Control` round trip plus the 1.2 s settle poll), not an
-/// ownership edge — and it wants the tab alive to refresh it.
+/// hold (one toggle round trip, at most [`TOGGLE_TIMEOUT`], plus the 1.2 s
+/// settle poll), not an ownership edge — and it wants the tab alive to
+/// refresh it.
 fn connect_switch(state: &PluginsState) {
     let weak = state.downgrade();
     state.detail.switch.connect_active_notify(move |sw| {
@@ -1302,53 +1432,55 @@ fn connect_switch(state: &PluginsState) {
         let want_on = sw.is_active();
         // Record the intent before the round trip even starts (#944): a poll
         // that lands before `StartPlugin`/`StopPlugin` has taken effect must
-        // not read as the truth until either a poll agrees or the timeout
-        // gives up. `syncing` above is what keeps this arm from firing at all
-        // for `refresh_detail`'s own programmatic `set_active`, so every
-        // intent recorded here really did come from the user.
+        // not read as the truth until the shell has answered (#1417 item 2,
+        // see `ToggleCall`). `syncing` above is what keeps this arm from
+        // firing at all for `refresh_detail`'s own programmatic `set_active`,
+        // so every intent recorded here really did come from the user.
         //
         // `since` is captured here, not re-read from `state.pending` in the
         // completion below, because the switch can be flipped again before
         // this round trip lands — `on_toggle_result` needs to tell "this
         // call's own intent" from "a newer one" apart, and a timestamp taken
-        // at record time is what makes that comparison exact.
+        // at record time is what makes that comparison exact. It is also
+        // what `set_plugin_state` counts its deadline from, so the hold and
+        // the round trip run out at the same instant (`toggle_deadline`).
         let since = Instant::now();
-        *state.pending.borrow_mut() = Some(PendingToggle {
-            plugin_id: id.clone(),
-            wanted: want_on,
-            since,
-        });
+        *state.pending.borrow_mut() = Some(PendingToggle::in_flight(id.clone(), want_on, since));
         // A new toggle retires the last one's persist error, whichever plugin
         // it was for (#1400 review, finding 5).
         *state.last_toggle.borrow_mut() = Some(LastToggle {
             plugin_id: id.clone(),
             since,
-            persist_error: None,
+            note: None,
         });
-        spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
+        spawn_on_runtime(set_plugin_state(id, want_on, since), move |res| {
             on_toggle_result(&state, since, res);
         });
     });
 }
 
-/// The completion half of the round trip [`connect_switch`] starts (#945
-/// review, finding 1): a failed `SetPluginEnabled` or `StartPlugin`/
-/// `StopPlugin` already knows — at the call's own `RetryPolicy::Never`
-/// timeout, well inside [`PENDING_TOGGLE_TIMEOUT`] — that the transition it
-/// recorded an intent for never happened, so it must clear that intent rather
-/// than let [`resolve_pending`] keep answering `wanted` for the full 10s
-/// window on a switch that is never coming back on its own.
+/// The completion half of the round trip [`connect_switch`] starts: hand the
+/// answer to the intent it recorded ([`answer_intent`]), then re-poll.
 ///
-/// A failed **persist** is also recorded on [`LastToggle`] (#1400 review,
-/// finding 5), guarded on the same `since`, so the switch row can name the
-/// error: nothing was started or stopped, and nothing was kept.
+/// - **A failure** (#945 review, finding 1) clears the intent at once, and
+///   the switch goes to what the poll reports rather than keep answering
+///   `wanted` on a switch that may never come back on its own. The row is
+///   told why on [`LastToggle`], guarded on the same `since`: a refused
+///   **persist** (#1400 review, finding 5) says nothing was kept, and an
+///   **unanswered** round trip (#1417 item 2) says only that the shell did
+///   not answer in time — not that nothing changed, since the shell still
+///   carries a queued call out once its lock frees.
+/// - **A success** (#1417 item 2) marks the intent
+///   [`ToggleCall::Answered`] with the newest poll generation issued so
+///   far, *before* the re-poll below issues its own. Until then no poll
+///   could move the switch, however long the shell took.
 ///
 /// Guarded on identity: `since` is the timestamp *this* call's intent was
 /// recorded with, captured by `connect_switch` before the round trip started.
 /// If the user flipped the switch again while this call was in flight,
 /// `state.pending` now holds a newer intent with a different `since` — a
-/// later toggle the user asked for after this one — and this completion must
-/// not clobber it.
+/// later toggle the user asked for after this one, still waiting for its own
+/// answer — and this completion must not touch it, whichever way it went.
 ///
 /// Split out of the `connect_switch` closure so it can be driven directly in
 /// tests with a fabricated `res`, with no session bus needed — see
@@ -1357,55 +1489,56 @@ fn connect_switch(state: &PluginsState) {
 ///
 /// #945 re-check: the intent isn't always in `state.pending` by the time this
 /// runs. `set_placeholder` moves it wholesale into `state.parked`'s
-/// [`ParkedSelection::pending`] the moment a poll failure parks the selection
-/// (`:1134`), and a correlated outage — `ListPlugins` and `StartPlugin` hit
-/// the same `Control` endpoint, so one dead shell fails both — typically parks
-/// it before this completion arrives. The identity guard above then finds
-/// `state.pending == None`, clears nothing, and the definitively failed
-/// intent would otherwise be restored with the selection on the next good
-/// poll (the switch lies again until [`PENDING_TOGGLE_TIMEOUT`]). So this also
-/// checks the park for the same `since` and drops the intent there — leaving
-/// the parked selection itself alone, same as `set_placeholder`'s own
-/// `take()`. The two homes are mutually exclusive (an intent lives in exactly
-/// one), so at most one of the two clears ever fires.
+/// [`ParkedSelection::pending`] the moment a poll failure parks the selection,
+/// and a correlated outage — `ListPlugins` and `StartPlugin` hit the same
+/// `Control` endpoint, so one dead shell fails both — typically parks it
+/// before this completion arrives. So the answer goes to both homes, each
+/// under the same identity guard: a failed intent must not be restored with
+/// the selection on the next good poll, and an answered one must not be
+/// restored still in flight. The two homes are mutually exclusive (an intent
+/// lives in exactly one), so at most one of the two ever matches.
 fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), ToggleError>) {
-    if let Err(err) = res {
-        match err {
-            ToggleError::Persist(err) => {
-                tracing::info!(
-                    %err,
-                    "the Plugins tab switch was not kept, so nothing was started or stopped"
-                );
-                if let Some(last) = state.last_toggle.borrow_mut().as_mut()
-                    && last.since == since
-                {
-                    last.persist_error = Some(err.to_string());
+    let answer = match res {
+        Ok(()) => ToggleAnswer::Done,
+        Err(err) => {
+            let note = match err {
+                ToggleError::Persist(err) => {
+                    tracing::info!(
+                        %err,
+                        "the Plugins tab switch was not kept, so nothing was started or stopped"
+                    );
+                    Some(ToggleNote::NotKept(err.to_string()))
                 }
+                ToggleError::Apply(err) => {
+                    tracing::info!(
+                        %err,
+                        "the Plugins tab switch was kept, but starting or stopping the plugin failed"
+                    );
+                    None
+                }
+                ToggleError::Unanswered => {
+                    tracing::info!(
+                        timeout = ?TOGGLE_TIMEOUT,
+                        "the shell did not answer the Plugins tab switch in time; showing what \
+                         it reports, and the change may still be applied"
+                    );
+                    Some(ToggleNote::Unanswered)
+                }
+            };
+            if let Some(last) = state.last_toggle.borrow_mut().as_mut()
+                && last.since == since
+            {
+                last.note = note;
             }
-            ToggleError::Apply(err) => {
-                tracing::info!(
-                    %err,
-                    "the Plugins tab switch was kept, but starting or stopping the plugin failed"
-                );
-            }
+            ToggleAnswer::Failed
         }
-        let still_this_intent = state
-            .pending
-            .borrow()
-            .as_ref()
-            .is_some_and(|intent| intent.since == since);
-        if still_this_intent {
-            state.pending.borrow_mut().take();
-        }
-        let still_parked_intent = state
-            .parked
-            .borrow()
-            .as_ref()
-            .and_then(|parked| parked.pending.as_ref())
-            .is_some_and(|intent| intent.since == since);
-        if still_parked_intent && let Some(parked) = state.parked.borrow_mut().as_mut() {
-            parked.pending = None;
-        }
+    };
+    // Read before `refresh_plugins_soon` below issues its own: those are the
+    // first polls that can see what the answer did.
+    let newest_poll = state.polls.issued.get();
+    answer_intent(&mut state.pending.borrow_mut(), since, answer, newest_poll);
+    if let Some(parked) = state.parked.borrow_mut().as_mut() {
+        answer_intent(&mut parked.pending, since, answer, newest_poll);
     }
     // Either way: an immediate re-poll snaps the switch to the truth as soon
     // as the shell has it, on success or on failure.
@@ -2060,14 +2193,22 @@ fn switch_subtitle(policy: SwitchPolicy, id: &str) -> String {
 }
 
 /// What the switch row's subtitle actually shows: [`switch_subtitle`], or,
-/// after a toggle whose `SetPluginEnabled` failed, that nothing changed and
-/// why (#1400 review, finding 5). A pinned plugin keeps its "Set in nix" line
-/// either way: that already names what to change, and a refused persist on a
-/// pin the tab had not re-read yet is exactly what it explains. Pure.
-fn switch_row_subtitle(policy: SwitchPolicy, id: &str, persist_error: Option<&str>) -> String {
-    match persist_error {
-        Some(err) if policy != SwitchPolicy::Pinned => {
+/// after a toggle that did not simply work, what the tab knows about it
+/// ([`ToggleNote`]): that nothing changed and why, after a refused persist
+/// (#1400 review, finding 5), or only that the shell did not answer in time
+/// (#1417 item 2) — which is not the same claim, since the shell may still
+/// apply it. A pinned plugin keeps its "Set in nix" line either way: that
+/// already names what to change, and a refused persist on a pin the tab had
+/// not re-read yet is exactly what it explains. Pure.
+fn switch_row_subtitle(policy: SwitchPolicy, id: &str, note: Option<&ToggleNote>) -> String {
+    match note {
+        Some(ToggleNote::NotKept(err)) if policy != SwitchPolicy::Pinned => {
             format!("Not changed: the choice could not be kept ({err})")
+        }
+        Some(ToggleNote::Unanswered) if policy != SwitchPolicy::Pinned => {
+            "The shell did not answer in time, so this shows what it reports; the change may \
+             still be applied"
+                .to_owned()
         }
         _ => switch_subtitle(policy, id),
     }
@@ -2269,7 +2410,12 @@ fn clear_selection(state: &PluginsState) {
 }
 
 /// Decide what [`refresh_detail`] should show on the switch for the shown
-/// plugin `id`, resolving `pending` along the way (#944).
+/// plugin `id`, resolving `pending` along the way (#944, #1417 item 2).
+///
+/// `running` is what the snapshot on screen says, `applied_poll` the
+/// generation that snapshot came from ([`PollGenerations::applied`]) and
+/// `now` the clock, passed in so a test can put the toggle anywhere in its
+/// round trip.
 ///
 /// Pure with respect to the widget: this only ever reads/clears `pending` and
 /// returns the boolean to display; `refresh_detail` is the one place that
@@ -2278,27 +2424,34 @@ fn clear_selection(state: &PluginsState) {
 /// * No pending intent (or one that belongs to a *different* plugin than
 ///   `id` — i.e. the shown plugin changed): show the truth (`running`), and
 ///   drop a stale intent for another plugin outright.
-/// * A pending intent for `id` that the poll now agrees with, or that has
-///   outlived [`PENDING_TOGGLE_TIMEOUT`]: clear it and show the truth — this
-///   is the "truth wins" path, whether by confirmation or by timeout.
-/// * A pending intent for `id` that the poll still contradicts, within the
-///   timeout: keep it pending and show what the user asked for instead of the
-///   stale snapshot.
-fn resolve_pending(pending: &RefCell<Option<PendingToggle>>, id: &str, running: bool) -> bool {
+/// * A pending intent for `id` that still [holds](PendingToggle::holds) —
+///   its round trip has not answered and has not timed out, or it answered
+///   after the poll on screen was issued: keep it pending and show what the
+///   user asked for instead of the snapshot.
+/// * One that no longer holds: clear it and show the truth — "truth wins",
+///   whether because the shell answered and a newer poll landed, or because
+///   the round trip ran out its [`TOGGLE_TIMEOUT`].
+fn resolve_pending(
+    pending: &RefCell<Option<PendingToggle>>,
+    id: &str,
+    running: bool,
+    applied_poll: u64,
+    now: Instant,
+) -> bool {
     // Bound rather than matched on directly: a `RefMut` created in a match's
-    // scrutinee lives for the whole match (all arms), and the `else` arm
+    // scrutinee lives for the whole match (all arms), and the holding arm
     // below needs its own `borrow_mut()` — the same "semicolon rule" this
     // file's other `RefCell` juggling already documents (`clear_rows`,
     // `apply_plugins`).
     let taken = pending.borrow_mut().take();
     match taken {
         Some(intent) if intent.plugin_id == id => {
-            if running == intent.wanted || intent.since.elapsed() >= PENDING_TOGGLE_TIMEOUT {
-                running
-            } else {
+            if intent.holds(now, applied_poll) {
                 let wanted = intent.wanted;
                 *pending.borrow_mut() = Some(intent);
                 wanted
+            } else {
+                running
             }
         }
         // Either nothing was pending, or it was pending for a plugin that
@@ -2373,12 +2526,18 @@ fn refresh_detail(state: &PluginsState) {
         .version_row
         .set_subtitle(&version_label(snap.rt.as_ref()));
 
-    // #944: while a user toggle is pending for *this* plugin and the poll
-    // hasn't caught up (or timed out), show what the user asked for instead
+    // #944: while a user toggle is pending for *this* plugin and the shell
+    // hasn't answered it (#1417 item 2), show what the user asked for instead
     // of bouncing back to the stale `ActiveState`. Removing this line and
     // using `is_running(&snap.active_state)` directly is the mutation that
     // must fail `a_pending_toggle_holds_the_switch_against_a_stale_poll`.
-    let show_running = resolve_pending(&state.pending, &id, is_running(&snap.active_state));
+    let show_running = resolve_pending(
+        &state.pending,
+        &id,
+        is_running(&snap.active_state),
+        state.polls.applied.get(),
+        Instant::now(),
+    );
 
     // Under `syncing`, so reflecting the resolved state doesn't fire a
     // Start/Stop back at the shell.
@@ -2395,24 +2554,25 @@ fn refresh_detail(state: &PluginsState) {
         .switch
         .set_sensitive(policy != SwitchPolicy::Pinned);
     // …unless the last toggle for this plugin could not be kept (#1400
-    // review, finding 5): then the row says why instead.
-    let persist_error = persist_error_for(&state.last_toggle, &id);
+    // review, finding 5) or went unanswered (#1417 item 2): then the row says
+    // so instead.
+    let note = toggle_note_for(&state.last_toggle, &id);
     state
         .detail
         .switch
-        .set_subtitle(&switch_row_subtitle(policy, &id, persist_error.as_deref()));
+        .set_subtitle(&switch_row_subtitle(policy, &id, note.as_ref()));
 }
 
-/// The persist error to show for plugin `id`'s switch, if its last toggle's
-/// `SetPluginEnabled` failed — see [`LastToggle`].
+/// What to say about plugin `id`'s last toggle, if it did not simply work —
+/// see [`LastToggle`].
 ///
 /// A [`LastToggle`] for a plugin that is not the one shown is dropped
-/// outright, [`resolve_pending`]'s rule: the error belonged to a switch the
+/// outright, [`resolve_pending`]'s rule: the note belonged to a switch the
 /// user has since looked away from, and must not reappear on a later visit.
-fn persist_error_for(last: &RefCell<Option<LastToggle>>, id: &str) -> Option<String> {
+fn toggle_note_for(last: &RefCell<Option<LastToggle>>, id: &str) -> Option<ToggleNote> {
     let mut last = last.borrow_mut();
     match last.as_ref() {
-        Some(toggle) if toggle.plugin_id == id => toggle.persist_error.clone(),
+        Some(toggle) if toggle.plugin_id == id => toggle.note.clone(),
         Some(_) => {
             *last = None;
             None
@@ -3319,6 +3479,16 @@ enum ToggleError {
     Persist(hytte_bus::BusError),
     /// The choice was kept, but `StartPlugin`/`StopPlugin` failed.
     Apply(hytte_bus::BusError),
+    /// No answer by the round trip's deadline (#1417 item 2): either a call's
+    /// own client timeout ([`timed_out`]) or the round trip's bound
+    /// ([`answered_by`]), which are the same instant ([`toggle_deadline`]).
+    ///
+    /// **Unknown, not "not done"** (#1421 review, M2): a call the tab gives up
+    /// on is not cancelled in the shell, which still carries it out once its
+    /// convergence lock frees. So this neither claims the choice was not kept
+    /// nor sends the second call; the switch shows what the poll reports, and
+    /// the row says the shell did not answer ([`ToggleNote::Unanswered`]).
+    Unanswered,
 }
 
 /// Apply an on/off toggle for plugin `id`: persist it first
@@ -3345,18 +3515,145 @@ enum ToggleError {
 /// launcher's transient one (#1400 review, finding 4), and only the first is
 /// success. It stays a [`ToggleError::Apply`], whose completion re-polls at
 /// once, so a plugin that is in fact running shows as on regardless.
-async fn set_plugin_state(id: String, on: bool) -> Result<(), ToggleError> {
-    set_plugin_enabled(&id, on)
+///
+/// **One deadline** (#1417 item 2): [`toggle_deadline`]`(since)`, the instant
+/// the switch's hold gives up at ([`ToggleCall::InFlight`]). The whole round
+/// trip is held to it ([`answered_by`]), and each call's own client timeout
+/// is whatever is left of it ([`call_budget`]) rather than a fixed number of
+/// its own. So the answer is due exactly when the hold runs out, however
+/// many calls this grows, and a persist queued behind a long restart may use
+/// the whole budget instead of giving up halfway through it.
+///
+/// The calls themselves are [`toggle_round_trip`]'s arguments, which is what
+/// lets a test drive the order, the "already stopped" rule and the
+/// timeout-is-unknown rule without a bus.
+async fn set_plugin_state(id: String, on: bool, since: Instant) -> Result<(), ToggleError> {
+    answered_by(
+        tokio::time::Instant::from_std(toggle_deadline(since)),
+        |deadline| async move {
+            toggle_round_trip(&id, on, set_plugin_enabled(&id, on, deadline), || {
+                plugin_id_call(if on { "StartPlugin" } else { "StopPlugin" }, &id, deadline)
+            })
+            .await
+        },
+    )
+    .await
+}
+
+/// [`set_plugin_state`]'s two calls in order, and what their answers mean.
+/// Generic over the calls so a test can hand it fabricated ones; production
+/// passes `SetPluginEnabled` as `persist` and `StartPlugin`/`StopPlugin` as
+/// `apply`, which is only called once the persist has succeeded.
+///
+/// - A refused persist is [`ToggleError::Persist`] and starts or stops
+///   nothing.
+/// - A stop answered "not loaded" is done ([`already_stopped`]).
+/// - A call that timed out is [`ToggleError::Unanswered`] whichever of the
+///   two it was ([`unanswered_or`]): nothing is known about it yet.
+async fn toggle_round_trip<P, A, AF>(
+    id: &str,
+    on: bool,
+    persist: P,
+    apply: A,
+) -> Result<(), ToggleError>
+where
+    P: Future<Output = Result<(), hytte_bus::BusError>>,
+    A: FnOnce() -> AF,
+    AF: Future<Output = Result<(), hytte_bus::BusError>>,
+{
+    persist
         .await
-        .map_err(ToggleError::Persist)?;
-    let start_stop = if on { "StartPlugin" } else { "StopPlugin" };
-    match plugin_id_call(start_stop, &id).await {
+        .map_err(|err| unanswered_or(err, ToggleError::Persist))?;
+    match apply().await {
         Err(err) if !on && already_stopped(&err) => {
             tracing::debug!(%err, plugin = %id, "switched off a plugin that was already stopped");
             Ok(())
         }
-        res => res.map_err(ToggleError::Apply),
+        res => res.map_err(|err| unanswered_or(err, ToggleError::Apply)),
     }
+}
+
+/// `err` as the [`ToggleError`] it is: [`ToggleError::Unanswered`] if the
+/// call timed out ([`timed_out`]), else `answered(err)`. Pure.
+fn unanswered_or(
+    err: hytte_bus::BusError,
+    answered: fn(hytte_bus::BusError) -> ToggleError,
+) -> ToggleError {
+    if timed_out(&err) {
+        ToggleError::Unanswered
+    } else {
+        answered(err)
+    }
+}
+
+/// The reason `hytte-bus` gives when a call's own client timeout runs out:
+/// `call.rs` maps the elapsed `tokio::time::timeout` to
+/// `zbus::Error::Failure("call timeout")`, zbus 5 displays a `Failure` as its
+/// bare string, and `BusError::from_zbus` carries that into
+/// `BusError::Permanent` with no D-Bus error name. The
+/// `a_call_timeout_is_recognised_as_hytte_bus_spells_it` test reads
+/// `hytte-bus`'s own source, so a change there reddens here.
+const HYTTE_BUS_CALL_TIMEOUT: &str = "call timeout";
+
+/// Whether `err` means the call got **no answer**, rather than an answer
+/// that was an error (#1421 review, M2). Pure.
+///
+/// Two spellings: `hytte-bus`'s own client timeout
+/// ([`HYTTE_BUS_CALL_TIMEOUT`], with no D-Bus error name — an error the shell
+/// sends always carries one, which is what tells the two apart), and the bus
+/// daemon's `org.freedesktop.DBus.Error.NoReply`, which it sends in place of
+/// a reply that never came.
+fn timed_out(err: &hytte_bus::BusError) -> bool {
+    match err {
+        hytte_bus::BusError::Permanent {
+            reason,
+            dbus_name: None,
+        } => reason == HYTTE_BUS_CALL_TIMEOUT,
+        hytte_bus::BusError::Permanent {
+            dbus_name: Some(name),
+            ..
+        } => name == "org.freedesktop.DBus.Error.NoReply",
+        hytte_bus::BusError::Transient { .. } => false,
+    }
+}
+
+/// `round_trip(deadline)`'s own answer, or [`ToggleError::Unanswered`] once
+/// `deadline` has passed without one (#1417 item 2).
+///
+/// The round trip is handed the same deadline, so every call inside it
+/// derives its own client timeout from it ([`call_budget`]) and there is one
+/// bound, not one per call plus one around them. The outer bound is still
+/// needed: time spent outside a call's own timeout — `hytte-bus` connecting
+/// or reconnecting to the session bus — counts against no call. Dropping
+/// the round trip at the deadline abandons the client side of whichever
+/// call is in flight; the shell still carries that call out when its lock
+/// frees, which is why the switch then shows what the poll reports.
+async fn answered_by<F, Fut>(
+    deadline: tokio::time::Instant,
+    round_trip: F,
+) -> Result<(), ToggleError>
+where
+    F: FnOnce(tokio::time::Instant) -> Fut,
+    Fut: Future<Output = Result<(), ToggleError>>,
+{
+    tokio::time::timeout_at(deadline, round_trip(deadline))
+        .await
+        .unwrap_or(Err(ToggleError::Unanswered))
+}
+
+/// What is left of the round trip's budget at `now`: one call's own client
+/// timeout. Zero once `deadline` has passed, which makes that call answer
+/// [`HYTTE_BUS_CALL_TIMEOUT`] at once — i.e. [`ToggleError::Unanswered`].
+/// Pure.
+fn call_budget(deadline: tokio::time::Instant, now: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
+/// When a toggle recorded at `since` stops waiting for the shell: the one
+/// instant both the switch's hold ([`PendingToggle::holds`]) and the round
+/// trip itself ([`set_plugin_state`]) are held to. Pure.
+fn toggle_deadline(since: Instant) -> Instant {
+    since + TOGGLE_TIMEOUT
 }
 
 /// Whether a `StopPlugin` error means the unit was already gone: systemd's
@@ -3366,29 +3663,48 @@ fn already_stopped(err: &hytte_bus::BusError) -> bool {
     err.to_string().contains(" not loaded.")
 }
 
-/// How long the tab waits for a call that takes the shell's plugin
-/// convergence lock — `StartPlugin`, `SetPluginEnabled` — before it gives up
-/// (#1415 second review L1).
+/// How long a switch toggle may wait for the shell: its whole round trip
+/// ([`set_plugin_state`]: `SetPluginEnabled`, then `StartPlugin`/
+/// `StopPlugin`), and so how long the switch holds what the user asked for
+/// meanwhile (#1417 item 2).
 ///
-/// It must outlast the longest the lock can be held by a restart already
-/// under way — the stop, the wait of up to 12 s for the unit to go down, the
-/// keyring read, `systemd-run` — because a call the tab gives up on is **not**
-/// cancelled in the shell: it still runs when the lock frees. A shorter wait
-/// would report "not changed" for a change the shell then makes anyway (a
-/// switch flipped off during a stuck restart, persisted seconds after the tab
-/// said it was not).
-const LOCKED_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// **One budget, not one per call.** Both ends read it through
+/// [`toggle_deadline`]: the hold gives up at that instant, the round trip is
+/// cut off at it, and each call's own client timeout is what is left of it
+/// ([`call_budget`]). Two numbers were the bug: the hold was a fixed 10 s
+/// while #1415 let each call wait 30 s for the shell's convergence lock, so a
+/// slow call let the poll snap the switch back before it answered. And a
+/// fixed per-call timeout under a larger round-trip bound was the second
+/// half of it (#1421 review, M2): a persist that gave up at 30 s while the
+/// round trip allowed 60 reported "not kept" for a choice the shell then
+/// kept.
+///
+/// One minute: what #1415's two 30 s calls already allowed, so no toggle
+/// holds the switch (or the tab's state) longer than it could before. It
+/// has to outlast the longest the lock can be held ahead of the toggle — a
+/// restart's stop, the wait of up to 12 s for the unit to go down, the
+/// keyring read, `systemd-run` — because a call the tab gives up on is
+/// **not** cancelled in the shell: it still runs when the lock frees. The
+/// lock itself has no aggregate bound (#1417 item 1), so a queue longer than
+/// this is possible; it is reported as unanswered, not as not done
+/// ([`ToggleError::Unanswered`]).
+const TOGGLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`,
-/// with [`LOCKED_CALL_TIMEOUT`]: the shell drives a systemd job to apply it,
-/// and a start queues behind any restart holding the convergence lock.
-async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusError> {
+/// with what is left of the toggle's budget ([`call_budget`]): the shell
+/// drives a systemd job to apply it, and a start queues behind any restart
+/// holding the convergence lock.
+async fn plugin_id_call(
+    method: &str,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method(method)
         .args((id.to_owned(),))
-        .timeout(LOCKED_CALL_TIMEOUT)
+        .timeout(call_budget(deadline, tokio::time::Instant::now()))
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
@@ -3437,15 +3753,20 @@ async fn restart_plugin(id: String) -> Result<String, hytte_bus::BusError> {
 }
 
 /// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state,
-/// with [`LOCKED_CALL_TIMEOUT`] — the shell persists it under the convergence
-/// lock.
-async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::BusError> {
+/// with what is left of the toggle's budget ([`call_budget`]) — the shell
+/// persists it under the convergence lock, so this is the call that waits
+/// out a restart already holding it, and it may use the whole budget to.
+async fn set_plugin_enabled(
+    id: &str,
+    enabled: bool,
+    deadline: tokio::time::Instant,
+) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetPluginEnabled")
         .args((id.to_owned(), enabled))
-        .timeout(LOCKED_CALL_TIMEOUT)
+        .timeout(call_budget(deadline, tokio::time::Instant::now()))
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
@@ -3453,21 +3774,426 @@ async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::Bu
 
 #[cfg(test)]
 mod tests {
-    use std::cell::OnceCell;
+    use std::cell::{OnceCell, RefCell};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use super::{
-        DeclaredFile, DeclaredPlugins, LastToggle, PluginRuntime, PluginsJson, PollGenerations,
-        PollStates, SwitchPolicy, VersionsOutcome, already_stopped, classify_versions,
-        declared_from_json, declared_mounts_from_json, is_running, manifest_id_of_exec,
-        mount_display, mount_or_unknown, persist_error_for, plugin_subtitle, probe_candidates,
-        probe_plugins_json, read_declared_at, resolved_search_path, runtime_overlay,
-        runtime_states, same_plugin_set, seen_suffix, status_cell, switch_policy,
-        switch_row_subtitle, switch_subtitle, version_label, versions_log, versions_or_empty,
+        DeclaredFile, DeclaredPlugins, HYTTE_BUS_CALL_TIMEOUT, LastToggle, PendingToggle,
+        PluginRuntime, PluginsJson, PollGenerations, PollStates, SwitchPolicy, TOGGLE_TIMEOUT,
+        ToggleAnswer, ToggleCall, ToggleError, ToggleNote, VersionsOutcome, already_stopped,
+        answer_intent, answered_by, call_budget, classify_versions, declared_from_json,
+        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
+        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json, read_declared_at,
+        resolve_pending, resolved_search_path, runtime_overlay, runtime_states, same_plugin_set,
+        seen_suffix, status_cell, switch_policy, switch_row_subtitle, switch_subtitle, timed_out,
+        toggle_note_for, toggle_round_trip, version_label, versions_log, versions_or_empty,
         violations_suffix,
     };
+
+    // ── The switch holds until the shell answers (#1417 item 2) ─────────────
+    //
+    // `resolve_pending` and `answer_intent` are the whole rule, and both are
+    // pure over plain data, so the timeline is driven here with an explicit
+    // clock and explicit poll generations. `gtk_tests` drives the same rule
+    // through `refresh_detail` and `on_toggle_result`.
+
+    /// A toggle of the `clock` plugin to `wanted`, recorded at `since`, whose
+    /// round trip has not answered yet — what `connect_switch` records.
+    fn toggle(wanted: bool, since: Instant) -> RefCell<Option<PendingToggle>> {
+        RefCell::new(Some(PendingToggle::in_flight(
+            "clock".to_owned(),
+            wanted,
+            since,
+        )))
+    }
+
+    /// The bug: before the shell answers, no poll moves the switch — not a
+    /// stale one, and not one that agrees either — for as long as the round
+    /// trip may take. That is past the old fixed 10 s hold and past #1415's
+    /// 30 s per call, since the persist may now use the whole budget.
+    ///
+    /// Red with the 10 s hold back (at 11 s), with the hold bounded by one
+    /// old per-call timeout (at 31 s), or with an agreeing poll releasing an
+    /// unanswered intent.
+    #[test]
+    fn before_the_answer_no_poll_moves_the_switch() {
+        let since = Instant::now();
+        let pending = toggle(true, since);
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_secs(11),
+            Duration::from_secs(31),
+            TOGGLE_TIMEOUT
+                .checked_sub(Duration::from_millis(1))
+                .expect("the round trip's bound is longer than a millisecond"),
+        ] {
+            for (poll, running) in [(1, false), (2, true), (3, false)] {
+                assert!(
+                    resolve_pending(&pending, "clock", running, poll, since + elapsed),
+                    "{elapsed:?} in, poll {poll} reading running={running} moved the switch"
+                );
+                assert!(
+                    pending.borrow().is_some(),
+                    "{elapsed:?} in, poll {poll} reading running={running} released the hold"
+                );
+            }
+        }
+    }
+
+    /// The round trip's own timeout is the upper bound: past it, what the
+    /// poll reports wins, and the intent is gone rather than ignored once.
+    #[test]
+    fn the_round_trips_own_timeout_releases_the_hold() {
+        let since = Instant::now();
+        let pending = toggle(true, since);
+        assert!(!resolve_pending(
+            &pending,
+            "clock",
+            false,
+            1,
+            since + TOGGLE_TIMEOUT
+        ));
+        assert!(pending.borrow().is_none());
+    }
+
+    /// A successful answer: a poll spawned before it may have read the plugin
+    /// before the change, so it still cannot move the switch; the first poll
+    /// spawned after it can, whatever it reads. No clock is involved — 20 s
+    /// in or a minute in, it is the poll after the answer that releases it.
+    ///
+    /// Red if the answer leaves the intent in flight (the poll after it
+    /// cannot release it), or drops it outright (the poll before it moves the
+    /// switch).
+    #[test]
+    fn a_successful_answer_hands_the_switch_to_the_next_poll() {
+        let since = Instant::now();
+        let pending = toggle(true, since);
+        answer_intent(&mut pending.borrow_mut(), since, ToggleAnswer::Done, 7);
+        assert_eq!(
+            pending.borrow().as_ref().map(|intent| intent.call),
+            Some(ToggleCall::Answered {
+                newest_stale_poll: 7
+            })
+        );
+
+        let later = since + Duration::from_secs(20);
+        assert!(
+            resolve_pending(&pending, "clock", false, 7, later),
+            "poll 7 was spawned before the answer"
+        );
+        assert!(pending.borrow().is_some());
+        assert!(
+            !resolve_pending(&pending, "clock", false, 8, later),
+            "poll 8 is the first after the answer, and its reading is what shows"
+        );
+        assert!(pending.borrow().is_none());
+    }
+
+    /// A failed answer — a refused persist, a failed start or stop, or the
+    /// round trip timing out — releases the switch at once: the next
+    /// resolve shows what the poll reports, even a poll from before the
+    /// answer.
+    #[test]
+    fn a_failed_answer_releases_the_switch_at_once() {
+        let since = Instant::now();
+        let pending = toggle(true, since);
+        answer_intent(&mut pending.borrow_mut(), since, ToggleAnswer::Failed, 7);
+        assert!(pending.borrow().is_none());
+        assert!(!resolve_pending(&pending, "clock", false, 7, since));
+    }
+
+    /// A stale answer: the user flipped the switch again while the first
+    /// call was in flight. The first call's answer, either way, belongs to a
+    /// toggle that is gone, and the newer one keeps holding until its own.
+    ///
+    /// Red without the `since` identity check in `answer_intent`.
+    #[test]
+    fn an_older_toggles_answer_leaves_a_newer_toggle_alone() {
+        let first = Instant::now();
+        let second = first + Duration::from_millis(300);
+        for answer in [ToggleAnswer::Done, ToggleAnswer::Failed] {
+            let pending = toggle(false, second);
+            answer_intent(&mut pending.borrow_mut(), first, answer, 7);
+            let held = pending.borrow();
+            let intent = held
+                .as_ref()
+                .unwrap_or_else(|| panic!("{answer:?} for the first toggle dropped the second"));
+            assert_eq!(intent.since, second);
+            assert_eq!(
+                intent.call,
+                ToggleCall::InFlight,
+                "{answer:?} for the first toggle answered the second"
+            );
+            drop(held);
+            assert!(
+                !resolve_pending(&pending, "clock", true, 8, second + Duration::from_secs(20)),
+                "after {answer:?} for the first toggle, the second still shows what it asked for"
+            );
+        }
+    }
+
+    /// Showing another plugin drops the intent, whatever its round trip is
+    /// doing (#944): it was never about that plugin's switch.
+    #[test]
+    fn an_intent_for_another_plugin_is_dropped() {
+        let since = Instant::now();
+        let pending = toggle(true, since);
+        assert!(!resolve_pending(&pending, "departures", false, 1, since));
+        assert!(pending.borrow().is_none());
+    }
+
+    /// Run `fut` to completion on a throwaway current-thread runtime with a
+    /// clock — what the round-trip tests below need, and nothing more.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(fut)
+    }
+
+    /// `hytte-bus`'s own client timeout, exactly as `call.rs` produces it
+    /// and `BusError::from_zbus` carries it — see [`HYTTE_BUS_CALL_TIMEOUT`].
+    fn call_timed_out() -> hytte_bus::BusError {
+        hytte_bus::BusError::Permanent {
+            reason: "call timeout".to_owned(),
+            dbus_name: None,
+        }
+    }
+
+    /// An error the shell answered with: it always carries a D-Bus name.
+    fn refused(reason: &str) -> hytte_bus::BusError {
+        hytte_bus::BusError::Permanent {
+            reason: reason.to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.Failed".to_owned()),
+        }
+    }
+
+    /// The other end of the one bound: the round trip answers by its
+    /// deadline, with [`ToggleError::Unanswered`] if the shell has not, and
+    /// otherwise passes its own answer through. The round trip is handed the
+    /// same deadline, which is what its calls take their timeouts from.
+    #[test]
+    fn a_round_trip_answers_by_its_deadline() {
+        let res = block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+            answered_by(deadline, |handed| {
+                assert_eq!(
+                    handed, deadline,
+                    "the calls get the round trip's own deadline"
+                );
+                std::future::pending()
+            })
+            .await
+        });
+        assert!(matches!(res, Err(ToggleError::Unanswered)), "{res:?}");
+        let far = || tokio::time::Instant::now() + Duration::from_secs(5);
+        let res = block_on(async { answered_by(far(), |_| async { Ok(()) }).await });
+        assert!(res.is_ok(), "{res:?}");
+        let res = block_on(async {
+            answered_by(far(), |_| async {
+                Err(ToggleError::Apply(refused("no user manager")))
+            })
+            .await
+        });
+        assert!(matches!(res, Err(ToggleError::Apply(_))), "{res:?}");
+    }
+
+    /// Each call's own client timeout is what is left of the one budget, not
+    /// a fixed number: the persist may wait out the whole minute, and a call
+    /// made past the deadline gets none.
+    #[test]
+    fn each_call_gets_what_is_left_of_the_one_budget() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + TOGGLE_TIMEOUT;
+        assert_eq!(call_budget(deadline, start), TOGGLE_TIMEOUT);
+        assert_eq!(
+            call_budget(deadline, start + Duration::from_secs(50)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            call_budget(deadline, deadline + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    /// #1421 review M2: a call that got **no answer** is unknown, not "not
+    /// done". A persist that timed out is [`ToggleError::Unanswered`], not a
+    /// refused persist — the row must not claim nothing was kept — and it
+    /// sends no start or stop, whose answer would mean nothing either. A
+    /// start or stop that timed out is unanswered too. An answer that is an
+    /// error keeps its own kind.
+    ///
+    /// Red if either call's timeout goes back to being its error.
+    #[test]
+    fn a_call_that_timed_out_is_unanswered_not_refused() {
+        fn round_trip(
+            on: bool,
+            persist: Result<(), hytte_bus::BusError>,
+            apply: Result<(), hytte_bus::BusError>,
+        ) -> (Result<(), ToggleError>, bool) {
+            let applied = std::cell::Cell::new(false);
+            let res = block_on(toggle_round_trip("pet", on, async move { persist }, || {
+                applied.set(true);
+                async move { apply }
+            }));
+            (res, applied.get())
+        }
+
+        let (res, applied) = round_trip(false, Err(call_timed_out()), Ok(()));
+        assert!(matches!(res, Err(ToggleError::Unanswered)), "{res:?}");
+        assert!(!applied, "a persist with no answer sends no stop");
+
+        let (res, applied) = round_trip(false, Err(refused("disk full")), Ok(()));
+        assert!(matches!(res, Err(ToggleError::Persist(_))), "{res:?}");
+        assert!(!applied, "a refused persist sends no stop");
+
+        let (res, applied) = round_trip(true, Ok(()), Err(call_timed_out()));
+        assert!(matches!(res, Err(ToggleError::Unanswered)), "{res:?}");
+        assert!(applied);
+
+        let (res, _) = round_trip(true, Ok(()), Err(refused("no user manager")));
+        assert!(matches!(res, Err(ToggleError::Apply(_))), "{res:?}");
+
+        let (res, _) = round_trip(
+            false,
+            Ok(()),
+            Err(refused("Unit trollshell-plugin-pet.service not loaded.")),
+        );
+        assert!(
+            res.is_ok(),
+            "a stop of a unit already gone is done: {res:?}"
+        );
+
+        let (res, applied) = round_trip(true, Ok(()), Ok(()));
+        assert!(res.is_ok() && applied, "{res:?}");
+    }
+
+    /// What counts as no answer, pinned to `hytte-bus`'s own source rather
+    /// than to a copy of its string: `call.rs` gives up with
+    /// `zbus::Error::Failure("call timeout")`, and `error.rs` carries a
+    /// `Failure` into `BusError::Permanent` with no D-Bus error name. An
+    /// error *from the shell* always has a name, so one that happens to say
+    /// "call timeout" is still an answer. The bus daemon's `NoReply` is no
+    /// answer whatever it says.
+    #[test]
+    fn a_call_timeout_is_recognised_as_hytte_bus_spells_it() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let call_rs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hytte-bus/src/call.rs"
+        ));
+        // Not squashed: the literal's own space is part of what is pinned.
+        assert!(
+            call_rs.contains(&format!(
+                "zbus::Error::Failure({HYTTE_BUS_CALL_TIMEOUT:?}.into())"
+            )),
+            "hytte-bus no longer spells its client timeout {HYTTE_BUS_CALL_TIMEOUT:?}"
+        );
+        let error_rs = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../hytte-bus/src/error.rs"
+        ));
+        assert!(
+            squash(error_rs).contains("_=>Self::Permanent{reason:err.to_string(),dbus_name:None,}"),
+            "hytte-bus no longer carries a zbus Failure as a nameless Permanent"
+        );
+
+        assert!(timed_out(&call_timed_out()));
+        assert!(!timed_out(&refused(HYTTE_BUS_CALL_TIMEOUT)));
+        assert!(!timed_out(&refused("disk full")));
+        assert!(!timed_out(&hytte_bus::BusError::Permanent {
+            reason: "disk full".to_owned(),
+            dbus_name: None,
+        }));
+        assert!(timed_out(&hytte_bus::BusError::Permanent {
+            reason: "Did not receive a reply".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.NoReply".to_owned()),
+        }));
+    }
+
+    /// `name`'s source, from `async fn name(` to the end of its body, with
+    /// all whitespace and every trailing comma before a `)` removed — so a
+    /// rustfmt re-wrap does not redden a scan (#1415's `775f47d1` lesson).
+    fn squashed_fn(name: &str) -> String {
+        let src = include_str!("plugins_tab.rs");
+        let head = format!("async fn {name}(");
+        let start = src
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is defined"));
+        let len = src[start..].find("\n}\n").expect("its body ends");
+        src[start..start + len]
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")")
+    }
+
+    /// The whole round trip — the persist **and** the start or stop — runs
+    /// inside the one bounded call, held to the same [`toggle_deadline`] the
+    /// hold gives up at, and nothing runs after it (#1421 review, L2). A
+    /// source scan, for `the_switch_persists_before_it_starts_or_stops`'
+    /// reason: the calls go to a `Control` endpoint no hermetic test has.
+    ///
+    /// Red if the start or stop moves out of the bound, if the bound is not
+    /// `toggle_deadline(since)`, or if anything follows it.
+    #[test]
+    fn the_switch_round_trip_is_one_bounded_call() {
+        let body = squashed_fn("set_plugin_state");
+        let open = "->Result<(),ToggleError>{answered_by(\
+                    tokio::time::Instant::from_std(toggle_deadline(since)),|deadline|";
+        let at = body
+            .find(open)
+            .unwrap_or_else(|| panic!("the body must open with the bounded call:\n{body}"));
+        // Match `answered_by(`'s parenthesis: everything the round trip does
+        // is inside it, and the body is nothing but it, awaited.
+        let args = at + open.find("answered_by(").expect("literal") + "answered_by".len();
+        let mut depth = 0_usize;
+        let mut close = None;
+        for (i, c) in body[args..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(args + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.expect("answered_by's arguments close");
+        let inside = &body[args..=close];
+        assert_eq!(
+            &body[close + 1..],
+            ".await",
+            "nothing may run after the bounded call:\n{body}"
+        );
+        assert!(
+            inside.contains("set_plugin_enabled(&id,on,deadline)")
+                && inside.contains("plugin_id_call(")
+                && inside.contains("&id,deadline)"),
+            "the persist and the start or stop both run inside the bound, on its deadline:\n\
+             {body}"
+        );
+    }
+
+    /// …and each of those calls takes its client timeout from that deadline
+    /// ([`call_budget`]), not from a number of its own (#1421 review, M2).
+    ///
+    /// Red if either goes back to a fixed timeout.
+    #[test]
+    fn each_toggle_call_times_out_at_the_round_trips_deadline() {
+        for name in ["set_plugin_enabled", "plugin_id_call"] {
+            let body = squashed_fn(name);
+            assert!(
+                body.contains(".timeout(call_budget(deadline,tokio::time::Instant::now()))"),
+                "{name} must take its timeout from the round trip's deadline:\n{body}"
+            );
+        }
+    }
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
     //
@@ -3851,26 +4577,25 @@ mod tests {
     // ── The switch persists first (#1400 review, finding 5) ─────────────────
 
     /// The order itself: `SetPluginEnabled` before `StartPlugin`/`StopPlugin`,
-    /// so a refused persist starts or stops nothing. A source scan, on the
-    /// launcher's `launch_at_startup_spawns_the_supervised_watch` precedent:
-    /// both calls go to the shell's `Control` endpoint, which no hermetic
-    /// test has.
+    /// so a refused persist starts or stops nothing.
+    /// [`toggle_round_trip`] awaits its `persist` argument before it even
+    /// builds `apply` (`a_call_that_timed_out_is_unanswered_not_refused`
+    /// proves a refused persist sends nothing), so what is left to pin is
+    /// that `set_plugin_state` hands it the right call in each slot. A source
+    /// scan, on the launcher's `launch_at_startup_spawns_the_supervised_watch`
+    /// precedent: both calls go to the shell's `Control` endpoint, which no
+    /// hermetic test has.
     ///
     /// Red if the two calls swap back.
     #[test]
     fn the_switch_persists_before_it_starts_or_stops() {
-        let src = include_str!("plugins_tab.rs");
-        let start = src
-            .find("async fn set_plugin_state(")
-            .expect("set_plugin_state is defined");
-        let len = src[start..].find("\n}\n").expect("its body ends");
-        let body = &src[start..start + len];
+        let body = squashed_fn("set_plugin_state");
         let persist = body
-            .find("set_plugin_enabled(&id, on)")
-            .expect("set_plugin_state persists");
+            .find("toggle_round_trip(&id,on,set_plugin_enabled(")
+            .expect("set_plugin_state persists first");
         let apply = body
-            .find("plugin_id_call(start_stop, &id)")
-            .expect("set_plugin_state starts or stops");
+            .find("||{plugin_id_call(")
+            .expect("set_plugin_state starts or stops second");
         assert!(persist < apply, "persist first:\n{body}");
     }
 
@@ -3901,44 +4626,66 @@ mod tests {
     /// except under a pin, whose "Set in nix" line already says what to do.
     #[test]
     fn a_failed_persist_replaces_the_kept_subtitle_except_under_a_pin() {
+        let not_kept = |err: &str| ToggleNote::NotKept(err.to_owned());
         assert_eq!(
             switch_row_subtitle(SwitchPolicy::Kept, "timer", None),
             switch_subtitle(SwitchPolicy::Kept, "timer")
         );
-        let kept = switch_row_subtitle(SwitchPolicy::Kept, "timer", Some("disk full"));
+        let kept = switch_row_subtitle(SwitchPolicy::Kept, "timer", Some(&not_kept("disk full")));
         assert!(kept.starts_with("Not changed"), "{kept}");
         assert!(kept.contains("disk full"), "{kept}");
         assert!(!kept.contains("kept across restarts"), "{kept}");
         assert!(
-            switch_row_subtitle(SwitchPolicy::UnitFile, "hand-made", Some("no manager"))
-                .contains("no manager")
+            switch_row_subtitle(
+                SwitchPolicy::UnitFile,
+                "hand-made",
+                Some(&not_kept("no manager"))
+            )
+            .contains("no manager")
         );
         assert_eq!(
-            switch_row_subtitle(SwitchPolicy::Pinned, "niri-layouts", Some("pinned")),
+            switch_row_subtitle(
+                SwitchPolicy::Pinned,
+                "niri-layouts",
+                Some(&not_kept("pinned"))
+            ),
             switch_subtitle(SwitchPolicy::Pinned, "niri-layouts")
         );
     }
 
-    /// A persist error shows for its own plugin only, and is dropped the first
+    /// #1421 review M2: a toggle the shell did not answer is not reported as
+    /// "Not changed" — it may still be applied — nor as kept. The row says
+    /// only what is known.
+    #[test]
+    fn an_unanswered_toggle_says_so_and_claims_nothing_else() {
+        for policy in [SwitchPolicy::Kept, SwitchPolicy::UnitFile] {
+            let line = switch_row_subtitle(policy, "pet", Some(&ToggleNote::Unanswered));
+            assert!(line.contains("did not answer in time"), "{line}");
+            assert!(line.contains("may still be applied"), "{line}");
+            assert!(!line.contains("Not changed"), "{line}");
+            assert!(!line.contains("kept across restarts"), "{line}");
+        }
+        assert_eq!(
+            switch_row_subtitle(SwitchPolicy::Pinned, "pet", Some(&ToggleNote::Unanswered)),
+            switch_subtitle(SwitchPolicy::Pinned, "pet")
+        );
+    }
+
+    /// A toggle's note shows for its own plugin only, and is dropped the first
     /// time another plugin is shown, so it cannot reappear on a later visit.
     #[test]
-    fn a_persist_error_is_dropped_once_another_plugin_is_shown() {
+    fn a_toggle_note_is_dropped_once_another_plugin_is_shown() {
+        let disk_full = ToggleNote::NotKept("disk full".to_owned());
         let last = std::cell::RefCell::new(Some(LastToggle {
             plugin_id: "timer".to_owned(),
             since: std::time::Instant::now(),
-            persist_error: Some("disk full".to_owned()),
+            note: Some(disk_full.clone()),
         }));
-        assert_eq!(
-            persist_error_for(&last, "timer").as_deref(),
-            Some("disk full")
-        );
-        assert_eq!(
-            persist_error_for(&last, "timer").as_deref(),
-            Some("disk full")
-        );
-        assert_eq!(persist_error_for(&last, "pet"), None);
+        assert_eq!(toggle_note_for(&last, "timer"), Some(disk_full.clone()));
+        assert_eq!(toggle_note_for(&last, "timer"), Some(disk_full));
+        assert_eq!(toggle_note_for(&last, "pet"), None);
         assert!(last.borrow().is_none(), "another plugin shown: dropped");
-        assert_eq!(persist_error_for(&last, "timer"), None);
+        assert_eq!(toggle_note_for(&last, "timer"), None);
     }
 
     // ── The declared-mount map reaches `PluginRuntime` (#1161) ───────────────
@@ -4675,9 +5422,9 @@ mod gtk_tests {
     use gtk::glib;
 
     use super::{
-        BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, LastToggle, PENDING_TOGGLE_TIMEOUT, PendingToggle,
-        PluginRuntime, PluginsState, PollResult, ToggleError, apply_plugins, build_tab_in,
-        on_poll_result, on_toggle_result, refresh_detail,
+        BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, LastToggle, PendingToggle, PluginRuntime,
+        PluginsState, PollResult, TOGGLE_TIMEOUT, ToggleCall, ToggleError, apply_plugins,
+        build_tab_in, on_poll_result, on_toggle_result, refresh_detail,
     };
     use crate::test_support::captured_logs;
 
@@ -5523,6 +6270,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: Instant::now(),
+            call: ToggleCall::InFlight,
         });
 
         // A stale poll: systemd hasn't caught up yet, still "inactive".
@@ -5540,49 +6288,135 @@ mod gtk_tests {
         dismiss(&window);
     }
 
-    /// Once a poll actually agrees with what the user asked for, the intent is
-    /// spent — the switch should read that as confirmation, not merely as one
-    /// more poll to ignore.
+    /// #1417 item 2, through the real `refresh_detail`: a round trip that has
+    /// been waiting on the shell's lock for 25 s — past the old fixed 10 s
+    /// hold, well inside [`TOGGLE_TIMEOUT`] — still holds the switch, and not
+    /// even a poll that happens to agree releases it.
+    ///
+    /// The polls are #1415's L1 sequence: the user flips a plugin off while a
+    /// Save's restart holds the lock. The restart's stop reads as agreement,
+    /// then its relaunch reads `active`, and only then does the shell get to
+    /// the switch. Released on agreement, the switch would go off, then on,
+    /// then off again.
+    ///
+    /// Falsified by putting the fixed 10 s hold back (red at the first
+    /// assertion), or by letting an agreeing poll release an unanswered
+    /// intent (red at the `active` poll).
     #[gtk::test]
-    fn a_confirming_poll_clears_the_pending_intent() {
+    fn a_slow_round_trip_holds_the_switch_until_it_answers() {
         adw::init().expect("libadwaita init");
         let (bin, state) = build_tab();
-        apply_state(&state, &["clock"], "inactive");
+        apply_state(&state, &["clock"], "active");
         let window = present(&bin, 640);
+        assert!(state.detail.switch.is_active(), "clock starts running");
 
         *state.pending.borrow_mut() = Some(PendingToggle {
             plugin_id: "clock".to_owned(),
-            wanted: true,
-            since: Instant::now(),
+            wanted: false,
+            since: Instant::now()
+                .checked_sub(Duration::from_secs(25))
+                .expect("machine has been up for over 25 s"),
+            call: ToggleCall::InFlight,
         });
-        apply_state(&state, &["clock"], "inactive");
+
+        apply_state(&state, &["clock"], "active");
+        assert!(
+            !state.detail.switch.is_active(),
+            "25 s into an unanswered round trip, a stale poll must not move the switch"
+        );
+
+        // The restart's stop: agrees with the user, and releases nothing.
+        apply_state(&state, &["clock"], "deactivating");
+        assert!(!state.detail.switch.is_active());
         assert!(
             state.pending.borrow().is_some(),
-            "sanity: still pending before the confirming poll"
+            "an agreeing poll is still not the shell's answer"
         );
 
-        // The unit has caught up.
+        // The restart's relaunch, before the shell has got to the switch.
         apply_state(&state, &["clock"], "active");
-
         assert!(
-            state.detail.switch.is_active(),
-            "the switch must stay on once the poll agrees"
-        );
-        assert!(
-            state.pending.borrow().is_none(),
-            "a poll that matches the wanted state must clear the intent"
+            !state.detail.switch.is_active(),
+            "the switch must not flap back on while the call is still queued"
         );
 
         dismiss(&window);
     }
 
-    /// The backstop: a transition that never actually happens (crashed unit,
-    /// hung `systemd-run`) must not freeze the switch on the user's wish
-    /// forever. Past `PENDING_TOGGLE_TIMEOUT`, truth wins even though the poll
-    /// never agreed.
+    /// The answer, end to end through [`on_toggle_result`]: a poll that was
+    /// already on its way when the shell answered still cannot move the
+    /// switch, and the first poll issued after the answer can, whatever it
+    /// reads.
+    ///
+    /// Asserted without pumping the main loop: `on_toggle_result` spawns a
+    /// real re-poll with no `Control` endpoint behind it, and its failure
+    /// landing mid-test would put the "unavailable" placeholder up. It is
+    /// older than the last poll applied here, so when `dismiss` pumps, it is
+    /// dropped.
+    ///
+    /// Falsified by an `Ok` answer that leaves the intent in flight (red at
+    /// the last poll, which then has to wait out the timeout), by one that
+    /// drops the intent outright (red at the stale poll), or by reading the
+    /// newest generation after `refresh_plugins_soon` has issued its own.
+    #[gtk::test]
+    fn an_answered_toggle_is_released_by_the_first_poll_after_the_answer() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock"], "inactive"));
+        pump();
+        let window = present(&bin, 640);
+
+        let since = Instant::now();
+        *state.pending.borrow_mut() =
+            Some(PendingToggle::in_flight("clock".to_owned(), true, since));
+        // A poll spawned while the call is in flight.
+        let before_the_answer = state.polls.issue();
+
+        on_toggle_result(&state, since, Ok(()));
+        assert_eq!(
+            state.pending.borrow().as_ref().map(|intent| intent.call),
+            Some(ToggleCall::Answered {
+                newest_stale_poll: before_the_answer
+            }),
+            "the answer marks the intent with the newest poll spawned before it, not the \
+             re-poll it spawns itself"
+        );
+        // #1421 review N-b: that re-poll is what ends the answered phase
+        // within one poll round trip rather than at the next 2 s tick.
+        assert!(
+            state.polls.issued.get() > before_the_answer,
+            "the answer must spawn a poll of its own at once"
+        );
+
+        // …which lands after the answer, still reading the old state.
+        on_poll_result(&state, before_the_answer, poll_ok(&["clock"], "inactive"));
+        assert!(
+            state.detail.switch.is_active(),
+            "a poll spawned before the answer must not move the switch"
+        );
+
+        let after_the_answer = state.polls.issue();
+        on_poll_result(&state, after_the_answer, poll_ok(&["clock"], "inactive"));
+        assert!(
+            state.pending.borrow().is_none(),
+            "the first poll after the answer releases the hold"
+        );
+        assert!(
+            !state.detail.switch.is_active(),
+            "and what it reads is what the switch shows"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The backstop: a round trip whose completion never runs (a panicked
+    /// runtime task) must not freeze the switch on the user's wish forever.
+    /// Past [`TOGGLE_TIMEOUT`] — the round trip's own bound — truth wins even
+    /// though nothing answered.
     ///
     /// The intent is backdated rather than slept for — the injected clock
-    /// this timeout needs to be testable without a real 10 s wait.
+    /// this timeout needs to be testable without a real minute's wait.
     #[gtk::test]
     fn a_timed_out_intent_lets_a_stale_poll_through() {
         adw::init().expect("libadwaita init");
@@ -5594,11 +6428,13 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: Instant::now()
-                .checked_sub(PENDING_TOGGLE_TIMEOUT + Duration::from_millis(50))
+                .checked_sub(TOGGLE_TIMEOUT + Duration::from_millis(50))
                 // `Instant` is `CLOCK_MONOTONIC`, anchored to boot, not to
                 // process start — the precondition is "the machine has been
-                // up for over 10s", trivially true anywhere this test runs.
-                .expect("machine has been up for over 10s"),
+                // up for over a minute", trivially true anywhere this test
+                // runs.
+                .expect("machine has been up for over a minute"),
+            call: ToggleCall::InFlight,
         });
 
         // Still stale — the unit never actually started — but the intent has
@@ -5631,6 +6467,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: Instant::now(),
+            call: ToggleCall::InFlight,
         });
 
         click(&state, "departures");
@@ -5651,11 +6488,10 @@ mod gtk_tests {
 
     // ── #945 review fixes ────────────────────────────────────────────────────
 
-    /// Finding 1: a failed `StartPlugin`/`StopPlugin` already knows — at its
-    /// own `RetryPolicy::Never` timeout, well inside `PENDING_TOGGLE_TIMEOUT`
-    /// — that the transition it recorded an intent for never happened, and
-    /// must clear that intent rather than leave `resolve_pending` answering
-    /// `wanted` for the full 10s window.
+    /// Finding 1: a failed `StartPlugin`/`StopPlugin` already knows that the
+    /// transition it recorded an intent for never happened, and must clear
+    /// that intent rather than leave `resolve_pending` answering `wanted`
+    /// until `TOGGLE_TIMEOUT`.
     ///
     /// Drives `on_toggle_result` directly (the completion half of
     /// `connect_switch`, with the D-Bus round trip removed) rather than a real
@@ -5677,6 +6513,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since,
+            call: ToggleCall::InFlight,
         });
 
         on_toggle_result(
@@ -5726,6 +6563,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: since_a,
+            call: ToggleCall::InFlight,
         });
 
         // Intent B: the user flips the switch again before A's round trip
@@ -5736,6 +6574,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: false,
             since: since_b,
+            call: ToggleCall::InFlight,
         });
 
         // A's call finally completes — and fails.
@@ -5773,11 +6612,12 @@ mod gtk_tests {
             plugin_id: id.to_owned(),
             wanted,
             since,
+            call: ToggleCall::InFlight,
         });
         *state.last_toggle.borrow_mut() = Some(LastToggle {
             plugin_id: id.to_owned(),
             since,
-            persist_error: None,
+            note: None,
         });
         since
     }
@@ -5794,7 +6634,7 @@ mod gtk_tests {
     /// **and** the row has to stop claiming the choice is kept. It names the
     /// error instead, until the next toggle.
     ///
-    /// Falsified by dropping the `persist_error` write in
+    /// Falsified by dropping the `NotKept` note in
     /// `on_toggle_result`'s `Persist` arm, or by `refresh_detail` setting
     /// `switch_subtitle` directly: either way the row keeps "kept across
     /// restarts".
@@ -5870,8 +6710,131 @@ mod gtk_tests {
         let recorded = state.last_toggle.borrow();
         let last = recorded.as_ref().expect("B's toggle is still recorded");
         assert_eq!(last.since, since_b);
-        assert!(last.persist_error.is_none(), "A's failure is not B's");
+        assert!(last.note.is_none(), "A's failure is not B's");
         drop(recorded);
+
+        dismiss(&window);
+    }
+
+    /// #1421 review M2 and N-a: a round trip the shell did not answer — a
+    /// call's own timeout, or the round trip's bound — releases the switch
+    /// **at once** (unknown, so the poll decides), not after the next poll as
+    /// an answered toggle would, and the row says the shell did not answer
+    /// rather than "Not changed". The shell may still apply the change.
+    ///
+    /// Not pumped before the assertions, for
+    /// `an_answered_toggle_is_released_by_the_first_poll_after_the_answer`'s
+    /// reason; the poll that follows is issued after the answer's own
+    /// re-poll, so that one is dropped when `dismiss` pumps.
+    ///
+    /// Falsified by counting `Unanswered` as done (the intent survives the
+    /// answer, answered), or by giving it the persist wording or none.
+    #[gtk::test]
+    fn an_unanswered_toggle_is_released_at_once_and_says_so() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock"], "active"));
+        pump();
+        let window = present(&bin, 640);
+
+        let since = record_toggle(&state, "clock", false);
+        let before_the_answer = state.polls.issued.get();
+        on_toggle_result(&state, since, Err(ToggleError::Unanswered));
+        assert!(
+            state.pending.borrow().is_none(),
+            "an unanswered round trip releases the switch at once"
+        );
+        assert!(
+            state.polls.issued.get() > before_the_answer,
+            "and re-polls at once, so the switch shows the truth soon"
+        );
+        assert_eq!(
+            state
+                .last_toggle
+                .borrow()
+                .as_ref()
+                .and_then(|last| last.note.clone()),
+            Some(super::ToggleNote::Unanswered)
+        );
+
+        // The shell has not got to it yet: the plugin still runs.
+        let after = state.polls.issue();
+        on_poll_result(&state, after, poll_ok(&["clock"], "active"));
+        assert!(
+            state.detail.switch.is_active(),
+            "the switch shows what the shell reports"
+        );
+        let subtitle = state.detail.switch.subtitle().map(|s| s.to_string());
+        let subtitle = subtitle.as_deref().unwrap_or_default();
+        assert!(subtitle.contains("did not answer in time"), "{subtitle}");
+        assert!(!subtitle.starts_with("Not changed"), "{subtitle}");
+
+        dismiss(&window);
+    }
+
+    /// #1417 item 2 (#1421 review L1): a *successful* answer that lands while
+    /// a poll failure has parked the selection must reach the parked intent
+    /// too, so the intent comes back answered and the first poll after the
+    /// answer has the last word. Restored still in flight, it would hold the
+    /// switch on the user's wish for the rest of `TOGGLE_TIMEOUT` whatever
+    /// the shell reports.
+    ///
+    /// Falsified by letting the parked home hear only failures (the pre-#1417
+    /// shape of `on_toggle_result`): the restored intent is `InFlight`, the
+    /// switch shows `wanted` (on) over a poll that reads `inactive`.
+    #[gtk::test]
+    fn a_successful_answer_while_parked_is_restored_answered() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock"], "inactive"));
+        pump();
+        let window = present(&bin, 640);
+        click(&state, "clock");
+
+        let since = Instant::now();
+        *state.pending.borrow_mut() =
+            Some(PendingToggle::in_flight("clock".to_owned(), true, since));
+
+        // The poll fails first and parks the intent with the selection.
+        let failed = state.polls.issue();
+        on_poll_result(&state, failed, poll_err());
+        assert!(
+            state.pending.borrow().is_none(),
+            "sanity: the placeholder moved the intent into the park"
+        );
+
+        // Then the shell answers the toggle: kept, and started.
+        on_toggle_result(&state, since, Ok(()));
+        assert_eq!(
+            state
+                .parked
+                .borrow()
+                .as_ref()
+                .and_then(|park| park.pending.as_ref())
+                .map(|intent| intent.call),
+            Some(ToggleCall::Answered {
+                newest_stale_poll: failed
+            }),
+            "the answer must reach the parked intent"
+        );
+
+        // The first good poll after the answer restores the selection and
+        // decides — here the plugin died right after its start. Not pumped:
+        // `on_toggle_result` spawned a real re-poll with no `Control` behind
+        // it, and it is older than this one, so `dismiss`'s pump drops it.
+        let after = state.polls.issue();
+        on_poll_result(&state, after, poll_ok(&["clock"], "inactive"));
+        assert_eq!(state.selected.borrow().as_deref(), Some("clock"));
+        assert!(
+            state.pending.borrow().is_none(),
+            "the answered intent is released by the poll that restores it"
+        );
+        assert!(
+            !state.detail.switch.is_active(),
+            "the switch shows the poll, not the parked wish"
+        );
 
         dismiss(&window);
     }
@@ -5896,6 +6859,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: Instant::now(),
+            call: ToggleCall::InFlight,
         });
 
         // The ctrl-click deselect path: `connect_selection`'s `row-selected`
@@ -5914,7 +6878,7 @@ mod gtk_tests {
 
     /// Finding 3: an "unavailable" placeholder must park a live intent
     /// alongside the selection it already parks, not drop it — a poll failure
-    /// inside `PENDING_TOGGLE_TIMEOUT` must not re-expose the very bounce
+    /// while the toggle still holds must not re-expose the very bounce
     /// #944 fixed the moment the selection is restored. The restored intent
     /// must also keep counting from its original `since`, not the restore.
     ///
@@ -5933,6 +6897,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since,
+            call: ToggleCall::InFlight,
         });
 
         // One failed poll: the shell went briefly unreachable.
@@ -5975,7 +6940,7 @@ mod gtk_tests {
     /// `state.pending` alone finds nothing to clear in that ordering, so the
     /// definitively failed intent would otherwise be restored with the
     /// selection on the next good poll — the switch lying again until
-    /// `PENDING_TOGGLE_TIMEOUT`.
+    /// `TOGGLE_TIMEOUT`.
     ///
     /// Falsified by removing the park-inspection clause from
     /// `on_toggle_result`'s `Err` arm: `pending` stays `Some` in the park,
@@ -5994,6 +6959,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since,
+            call: ToggleCall::InFlight,
         });
 
         // The poll fails first and parks the live intent along with the
@@ -6062,6 +7028,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: since_a,
+            call: ToggleCall::InFlight,
         });
         poll_failed(&state);
 
@@ -6078,6 +7045,7 @@ mod gtk_tests {
                 plugin_id: "clock".to_owned(),
                 wanted: false,
                 since: since_b,
+                call: ToggleCall::InFlight,
             });
         }
 
@@ -6192,17 +7160,22 @@ mod gtk_tests {
         pump();
         let window = present(&bin, 640);
 
-        // t=0 — the user flips the switch on; `refresh_plugins_soon` spawns a
-        // poll (P0) whose `ListPluginStates` half will drag.
+        // t=0 — the user flips the switch on while a tick's poll (P0) is on
+        // its way, and its `ListPluginStates` half will drag. The shell
+        // answers the toggle at once, so the intent is answered with P0
+        // counted as stale (#1417 item 2).
+        let p0 = state.polls.issue();
         *state.pending.borrow_mut() = Some(PendingToggle {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: Instant::now(),
+            call: ToggleCall::Answered {
+                newest_stale_poll: p0,
+            },
         });
-        let p0 = state.polls.issue();
 
-        // t=1.4 — P1 comes back `activating`: `is_running` agrees with the
-        // wanted state, so `resolve_pending` retires the intent.
+        // t=1.4 — P1 comes back `activating`: the first poll after the
+        // answer, so `resolve_pending` retires the intent.
         let p1 = state.polls.issue();
         on_poll_result(&state, p1, poll_ok(&["clock"], "activating"));
         pump();
@@ -6695,6 +7668,7 @@ mod gtk_tests {
             plugin_id: "clock".to_owned(),
             wanted: true,
             since: Instant::now(),
+            call: ToggleCall::InFlight,
         });
 
         let row = state.shell_list.row_at_index(0).expect("the Shell row");

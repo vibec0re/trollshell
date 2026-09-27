@@ -994,9 +994,17 @@ mod tests {
         let shown = list_state(&model, ram);
         assert_ne!(shown.1, "\u{2014}", "the RAM list is populated");
         let _ = model.update(Input::event(cpu, EventKind::Click));
-        assert_eq!(list_state(&model, ram), shown, "opening CPU keeps RAM's rows");
+        assert_eq!(
+            list_state(&model, ram),
+            shown,
+            "opening CPU keeps RAM's rows"
+        );
         let _ = model.update(Input::event(cpu, EventKind::Click));
-        assert_eq!(list_state(&model, ram), shown, "closing CPU keeps RAM's rows");
+        assert_eq!(
+            list_state(&model, ram),
+            shown,
+            "closing CPU keeps RAM's rows"
+        );
     }
 
     /// **A withheld reading is not a sample**: the cold tick, whose `cpu` is

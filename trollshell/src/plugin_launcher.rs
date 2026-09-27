@@ -170,6 +170,24 @@
 //! rather than deleted, so a pin relaxed back to `lib.mkDefault` finds the
 //! switch's last choice again.
 //!
+//! **A switched-off plugin is never relaunched** (#1417 item 1b). The two
+//! paths that relaunch a running plugin to apply a change — a Save's
+//! [`restart_for_settings`] and a key change's [`relaunch_for_secret`] — read
+//! the effective declaration under [`CONVERGE_LOCK`] and skip a plugin the
+//! switch turned off; one still running from a unit this launcher started is
+//! stopped instead, the way a reconcile would ([`Reapply`]). Before, either
+//! one queued behind the switch's `SetPluginEnabled(false)` relaunched the
+//! plugin just before the switch's `StopPlugin` arrived, and it ran on with
+//! "off" persisted. [`stop`] takes the same lock since then, so that
+//! `StopPlugin` also lands after any start still under way, not inside it.
+//!
+//! The cost falls on a switched-off plugin someone started by hand
+//! (`busctl … StartPlugin`): it is stopped by whichever of these runs next —
+//! a Save, a key change (`SetAiKey`/`ClearAiKey`), a reconcile, or,
+//! unattended, the secret watcher's next pass ([`SECRET_POLL_INTERVAL`])
+//! after a slot the plugin launched without becomes available, e.g. when the
+//! keyring unlocks. A reconcile already treated that state as not converged.
+//!
 //! ## The session target (#707)
 //!
 //! The transient unit's `PartOf=` used to be hardcoded to
@@ -376,7 +394,7 @@
 //! directly on the D-Bus task, and the startup launch runs on the shared
 //! runtime.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1052,8 +1070,8 @@ fn unit_description(id: &str, fingerprint: &str) -> String {
 /// description this launcher didn't write — a legacy static unit, or a
 /// transient unit from a pre-#695 shell. Inverse of [`unit_description`]. Pure.
 fn parse_fingerprint(description: &str) -> Option<&str> {
-    let start = description.rfind(FP_OPEN)? + FP_OPEN.len();
-    description[start..].strip_suffix(FP_CLOSE)
+    let from = description.rfind(FP_OPEN)? + FP_OPEN.len();
+    description[from..].strip_suffix(FP_CLOSE)
 }
 
 // ── systemd-run launch ───────────────────────────────────────────────────────
@@ -1542,8 +1560,10 @@ fn is_running(active_state: &str) -> bool {
 
 // ── Reconcile (#695) ─────────────────────────────────────────────────────────
 
-/// Serialises every path that drives a plugin's unit through a **multi-step**
-/// transition — [`reconcile`], [`relaunch_for_secret`] and [`start`].
+/// Serialises every path that changes whether a plugin's unit runs, or reads
+/// the switch's persisted choice to decide it — [`reconcile`],
+/// [`relaunch_for_secret`], [`restart_for_settings`], [`start`], [`stop`]
+/// and [`set_enabled`].
 ///
 /// #866's F6. Before this only `reconcile` was serialised, and `relaunch_for_secret`
 /// grew a second caller: the control-center's `SetAiKey`/`ClearAiKey` already
@@ -1556,11 +1576,72 @@ fn is_running(active_state: &str) -> bool {
 /// systemd's "unit already exists" → the static-unit fallback in [`restart`] →
 /// `Err`, i.e. the bridge simply gone for the session.
 ///
-/// **Held only at the top-level entry points.** [`restart`] and [`stop`] are
-/// reached from inside those, and a tokio `Mutex` is not reentrant, so taking it
-/// there too would deadlock instantly. `stop` on its own (the Plugins tab's Stop
-/// button) is a single call with no window to interleave and stays outside.
+/// **Held only at the top-level entry points, and only through
+/// [`converge_locked`].** [`restart`] and [`stop_unit`] are reached from
+/// inside those, and a tokio `Mutex` is not reentrant, so taking it there too
+/// would deadlock instantly. Two guards keep it that way (#1424 review,
+/// finding 1): `converge_locked` panics instead of waiting when the task
+/// already holds the lock, and the `only_the_reviewed_calls_reach_a_lock_taker`
+/// source scan holds every call into a lock-taker in this module to a
+/// reviewed list.
+///
+/// [`stop`] takes it since #1417 item 1b. It used to stay outside as "a
+/// single call with no window to interleave", but the window is the *other*
+/// path's: a `StopPlugin` that lands while a [`start`] is between its keyring
+/// read and `systemd-run`, or while a [`restart`] is between its stop and its
+/// relaunch, finds no unit to stop (or one already stopping) and answers at
+/// once, and then the launch brings the plugin back. The Plugins tab's switch
+/// reaches the first of those by being flipped on and straight off again: the
+/// off's `StopPlugin` arrives while the on's `StartPlugin` is launching, and
+/// the plugin ends up running with "off" persisted. Queued on this lock, the
+/// stop lands after whatever was already under way, which is the order the
+/// requests were made in.
 static CONVERGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+tokio::task_local! {
+    /// Set, on the task that holds [`CONVERGE_LOCK`], for exactly as long as
+    /// [`converge_locked`] runs its body. It is how a second
+    /// `converge_locked` on the same task knows it would wait for itself.
+    static HOLDING_CONVERGE_LOCK: ();
+}
+
+/// Run `body` holding [`CONVERGE_LOCK`]. Every lock-taker goes through this,
+/// and nothing else in the module names the lock.
+///
+/// tokio's mutex is not reentrant. A lock-taker reached from under the lock
+/// would wait forever for a guard its own task holds, whatever route reached
+/// it: a direct call, an alias, a function pointer, a helper added later.
+/// Every plugin operation after it would then queue behind it for the rest
+/// of the session, and nothing would be logged (#1424 review, finding 1). So
+/// `body` runs inside [`HOLDING_CONVERGE_LOCK`]'s scope, and a nested call
+/// panics here, before it waits.
+///
+/// The panic unwinds through the outer call, which drops its guard, so the
+/// lock is free again for whoever queued behind it. The task that panics is
+/// a zbus method call's, a spawned relaunch's, or the supervised `plugins.json`
+/// watch's, and tokio contains the panic in that task; the watch restarts
+/// (`hytte::reactive::spawn_supervised`). The check runs in every build, not
+/// only in debug: it is one task-local read, and the alternative is a
+/// silent wedge.
+///
+/// What it cannot see is a lock-taker handed to **another** task and awaited
+/// from under the lock, since that task has no scope. Nothing here does
+/// that. The source scan `only_the_reviewed_calls_reach_a_lock_taker` pins
+/// this module's calls into lock-takers, including the one spawn among them
+/// ([`note_resolution`] spawning the secret watcher, which it never awaits).
+///
+/// # Panics
+/// If the calling task is already inside a `converge_locked` body.
+async fn converge_locked<T>(body: impl Future<Output = T>) -> T {
+    assert!(
+        HOLDING_CONVERGE_LOCK.try_with(|()| {}).is_err(),
+        "CONVERGE_LOCK taken again by the task that already holds it. tokio's mutex is \
+         not reentrant, so this would wait forever and wedge every plugin operation: a \
+         path under the lock must call the unlocked helper (`stop_unit`, not `stop`)"
+    );
+    let _guard = CONVERGE_LOCK.lock().await;
+    HOLDING_CONVERGE_LOCK.scope((), body).await
+}
 
 /// What [`reconcile`] decided to do about one plugin. Ordered as executed —
 /// stops first, so a disabled/removed plugin releases its unit name before
@@ -1775,82 +1856,83 @@ where
     L: FnOnce() -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
 {
-    let _guard = CONVERGE_LOCK.lock().await;
-
-    let Some(declared) = load_declared_from(&sources).await else {
-        // Unreadable/unparsable state file — leave the running set alone.
-        return Outcome::Settled;
-    };
-    // One list call up front beats racing systemd-run's "unit already exists"
-    // error per plugin — and it carries the fingerprints the diff runs on.
-    let (units, outcome) = match list_units().await {
-        Ok(units) => (units, Outcome::Settled),
-        Err(err) if trigger.launches_blind() => {
-            // No reachable user manager: fall through with an empty live set,
-            // which can only ever plan launches (each of which surfaces its own
-            // error) — never a stop of something we failed to see. What it
-            // cannot see is still owed, so the pass reports it (#1404).
-            tracing::warn!(
-                %err,
-                "listing plugin units failed; launching blind, and reconciling again on the watch's next tick",
-            );
-            (
-                Vec::new(),
-                Outcome::Unlisted {
+    converge_locked(async move {
+        let Some(declared) = load_declared_from(&sources).await else {
+            // Unreadable/unparsable state file — leave the running set alone.
+            return Outcome::Settled;
+        };
+        // One list call up front beats racing systemd-run's "unit already exists"
+        // error per plugin — and it carries the fingerprints the diff runs on.
+        let (units, outcome) = match list_units().await {
+            Ok(units) => (units, Outcome::Settled),
+            Err(err) if trigger.launches_blind() => {
+                // No reachable user manager: fall through with an empty live set,
+                // which can only ever plan launches (each of which surfaces its own
+                // error) — never a stop of something we failed to see. What it
+                // cannot see is still owed, so the pass reports it (#1404).
+                tracing::warn!(
+                    %err,
+                    "listing plugin units failed; launching blind, and reconciling again on the watch's next tick",
+                );
+                (
+                    Vec::new(),
+                    Outcome::Unlisted {
+                        error: err.to_string(),
+                    },
+                )
+            }
+            // The watch logs this itself, once per outage rather than per tick.
+            Err(err) => {
+                return Outcome::Unlisted {
                     error: err.to_string(),
-                },
-            )
-        }
-        // The watch logs this itself, once per outage rather than per tick.
-        Err(err) => {
-            return Outcome::Unlisted {
-                error: err.to_string(),
-            };
-        }
-    };
-    let actions = plan(&declared, &units);
-    // No early return: once the listing is answered this fn has one exit, so
-    // the test that drives a failed listing (an empty plan) pins the same
-    // `outcome` a blind pass with launches to make returns (#1407 review,
-    // finding 1).
-    if actions.is_empty() && outcome == Outcome::Settled {
-        tracing::debug!(
-            declared = declared.plugins.len(),
-            target = %declared.target,
-            "plugins already match the declared state"
-        );
-    }
-    // Per-plugin failures below are logged, not reported back: see this
-    // fn's doc for why a retry here would be #880's bounce loop.
-    for (id, action) in actions {
-        match action {
-            Action::Stop => {
-                tracing::info!(plugin = %id, "no longer declared as enabled; stopping");
-                if let Err(err) = stop(&id).await {
-                    tracing::warn!(plugin = %id, %err, "stopping the plugin failed");
-                }
-            }
-            Action::Restart => {
-                let Some(spec) = declared.plugins.get(&id) else {
-                    continue;
                 };
-                tracing::info!(plugin = %id, exec = %spec.exec, "declared spec changed; restarting");
-                if let Err(err) = restart(&id, spec, &declared.target).await {
-                    tracing::warn!(plugin = %id, %err, "restarting the plugin failed");
-                }
             }
-            Action::Launch => {
-                let Some(spec) = declared.plugins.get(&id) else {
-                    continue;
-                };
-                let extra_env = resolve_secret_env(&id, spec).await;
-                if let Err(err) = launch(&id, spec, &extra_env, &declared.target).await {
-                    tracing::warn!(plugin = %id, %err, "plugin launch failed");
+        };
+        let actions = plan(&declared, &units);
+        // No early return: once the listing is answered this fn has one exit, so
+        // the test that drives a failed listing (an empty plan) pins the same
+        // `outcome` a blind pass with launches to make returns (#1407 review,
+        // finding 1).
+        if actions.is_empty() && outcome == Outcome::Settled {
+            tracing::debug!(
+                declared = declared.plugins.len(),
+                target = %declared.target,
+                "plugins already match the declared state"
+            );
+        }
+        // Per-plugin failures below are logged, not reported back: see this
+        // fn's doc for why a retry here would be #880's bounce loop.
+        for (id, action) in actions {
+            match action {
+                Action::Stop => {
+                    tracing::info!(plugin = %id, "no longer declared as enabled; stopping");
+                    if let Err(err) = stop_unit(&id).await {
+                        tracing::warn!(plugin = %id, %err, "stopping the plugin failed");
+                    }
+                }
+                Action::Restart => {
+                    let Some(spec) = declared.plugins.get(&id) else {
+                        continue;
+                    };
+                    tracing::info!(plugin = %id, exec = %spec.exec, "declared spec changed; restarting");
+                    if let Err(err) = restart(&id, spec, &declared.target).await {
+                        tracing::warn!(plugin = %id, %err, "restarting the plugin failed");
+                    }
+                }
+                Action::Launch => {
+                    let Some(spec) = declared.plugins.get(&id) else {
+                        continue;
+                    };
+                    let extra_env = resolve_secret_env(&id, spec).await;
+                    if let Err(err) = launch(&id, spec, &extra_env, &declared.target).await {
+                        tracing::warn!(plugin = %id, %err, "plugin launch failed");
+                    }
                 }
             }
         }
-    }
-    outcome
+        outcome
+    })
+    .await
 }
 
 /// Kick off the startup reconcile, and the `plugins.json` watch behind it
@@ -2075,23 +2157,73 @@ fn merge_declared(
 /// # Errors
 /// Unknown/invalid id, a still-running unit, or an unreachable user manager.
 pub async fn start(id: &str) -> anyhow::Result<()> {
-    let _guard = CONVERGE_LOCK.lock().await;
-    let declared = load_declared().await.unwrap_or_default();
-    match declared.plugins.get(id) {
-        Some(spec) => {
-            let extra_env = resolve_secret_env(id, spec).await;
-            launch(id, spec, &extra_env, &declared.target).await
+    converge_locked(async {
+        let declared = load_declared().await.unwrap_or_default();
+        match declared.plugins.get(id) {
+            Some(spec) => {
+                let extra_env = resolve_secret_env(id, spec).await;
+                launch(id, spec, &extra_env, &declared.target).await
+            }
+            None => systemd::start_plugin(id).await,
         }
-        None => systemd::start_plugin(id).await,
-    }
+    })
+    .await
 }
 
 /// Stop plugin `id`'s unit now (`StopUnit` — works for transient and static
-/// units alike; a stopped `--collect` transient unit is then released).
+/// units alike; a stopped `--collect` transient unit is then released) — the
+/// Plugins tab's switch-off, over `Control.StopPlugin`.
+///
+/// Queues on [`CONVERGE_LOCK`] (#1417 item 1b), so it lands **after** any
+/// start, relaunch or reconcile already under way or already queued, rather
+/// than in the middle of one where there is nothing yet to stop; see the
+/// lock's doc for the interleavings.
+///
+/// **What that costs is the wait, and nothing here bounds it.** The lock is
+/// FIFO, so a stop waits for everything queued ahead of it, not just the
+/// restart in progress:
+/// - a reconcile's restarts, each up to [`STOP_WAIT`] for a unit slow to stop;
+/// - the keyring reads of every launch and relaunch, each of which can sit
+///   out an unlock prompt;
+/// - `systemd-run` itself;
+/// - a secret-watcher pass, queued Saves, and other plugins' switches.
+///
+/// #1417 item 1 leaves that queue unbounded. What the caller is told is
+/// decided by the caller's own timeout. The Plugins tab holds the switch's
+/// whole round trip, `SetPluginEnabled` and then this call, to one deadline
+/// (#1421, #1417 item 2), so this call gets whatever the persist left of that
+/// budget. A long queue therefore shows in the tab as a call the shell did
+/// not answer, and the stop still runs once it reaches the lock.
+///
+/// Never call this from under the lock; that is [`stop_unit`]'s job. From
+/// there it would panic in [`converge_locked`] rather than wait for itself.
 ///
 /// # Errors
 /// Invalid id, no such unit, or an unreachable user manager.
 pub async fn stop(id: &str) -> anyhow::Result<()> {
+    stop_via(|| stop_unit(id)).await
+}
+
+/// [`stop`] with the stop itself passed in, so a test can see it wait for
+/// [`CONVERGE_LOCK`] without a user manager (the [`restart_for_settings_via`]
+/// seam's shape).
+async fn stop_via<S, SF>(stop_unit: S) -> anyhow::Result<()>
+where
+    S: FnOnce() -> SF,
+    SF: Future<Output = anyhow::Result<()>>,
+{
+    // Called inside the body, not before it: a stand-in's side effects must
+    // happen under the lock too, where the real `StopUnit` does.
+    converge_locked(async { stop_unit().await }).await
+}
+
+/// `StopUnit` for plugin `id`'s unit, **without** taking [`CONVERGE_LOCK`]:
+/// what every path that already holds the lock stops a unit with
+/// ([`reconcile`], [`restart`], and the relaunch paths' switched-off arm).
+///
+/// # Errors
+/// Invalid id, no such unit, or an unreachable user manager.
+async fn stop_unit(id: &str) -> anyhow::Result<()> {
     systemd::stop_plugin(id).await
 }
 
@@ -2125,54 +2257,60 @@ pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
 /// The declared-plugin arms run under [`CONVERGE_LOCK`]: the override file is
 /// a read-modify-write, so two switches flipped in quick succession must not
 /// lose one of the two, and a reconcile must not read the file between the
-/// two halves of either. The legacy arm drops the lock before its D-Bus call;
-/// it touches nothing a reconcile reads.
+/// two halves of either. The legacy arm's D-Bus call runs after the lock is
+/// released; it touches nothing a reconcile reads.
 async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::Result<()> {
-    let guard = CONVERGE_LOCK.lock().await;
-    // Nix's own declaration, not the effective one: an override is stored
-    // relative to what nix declares.
-    let Some(nix) = load_nix_declared(&sources.config).await else {
-        anyhow::bail!(
-            "plugins.json exists but cannot be read; not persisting plugin {id}'s switch \
-             (the journal names the file)"
-        );
-    };
-    let declared = match persist_decision(&nix, id) {
-        Persist::UnitFile => {
-            drop(guard);
-            return systemd::set_plugin_enabled(id, enabled).await;
+    let unit_file = converge_locked(async {
+        // Nix's own declaration, not the effective one: an override is stored
+        // relative to what nix declares.
+        let Some(nix) = load_nix_declared(&sources.config).await else {
+            anyhow::bail!(
+                "plugins.json exists but cannot be read; not persisting plugin {id}'s switch \
+                 (the journal names the file)"
+            );
+        };
+        let declared = match persist_decision(&nix, id) {
+            Persist::UnitFile => return Ok(true),
+            Persist::Pinned => return Err(pinned_error(id)),
+            Persist::Override { declared } => declared,
+        };
+        let path = sources.overrides.as_deref().with_context(|| {
+            format!("cannot persist plugin {id}'s switch: neither $XDG_STATE_HOME nor $HOME is set")
+        })?;
+        let mut overrides = read_overrides(Some(path));
+        if record_override(&mut overrides, id, declared, enabled) {
+            write_overrides(path, &overrides)
+                .with_context(|| format!("writing {}", path.display()))?;
+            tracing::info!(
+                plugin = %id,
+                enabled,
+                declared,
+                path = %path.display(),
+                "Plugins tab switch persisted (#1400)"
+            );
         }
-        Persist::Pinned => return Err(pinned_error(id)),
-        Persist::Override { declared } => declared,
-    };
-    let path = sources.overrides.as_deref().with_context(|| {
-        format!("cannot persist plugin {id}'s switch: neither $XDG_STATE_HOME nor $HOME is set")
-    })?;
-    let mut overrides = read_overrides(Some(path));
-    if record_override(&mut overrides, id, declared, enabled) {
-        write_overrides(path, &overrides).with_context(|| format!("writing {}", path.display()))?;
-        tracing::info!(
-            plugin = %id,
-            enabled,
-            declared,
-            path = %path.display(),
-            "Plugins tab switch persisted (#1400)"
-        );
+        Ok::<bool, anyhow::Error>(false)
+    })
+    .await?;
+    if unit_file {
+        systemd::set_plugin_enabled(id, enabled).await?;
     }
     Ok(())
 }
 
 // ── Secret rotation (#392): relaunch to re-inject a changed key ───────────────
 
-/// Relaunch every **running** declared plugin whose `secrets` allowlist
-/// includes `slot`, so a just-changed key (set or cleared in the control-center)
-/// takes effect — rotation is stop + relaunch, re-reading the slot from the
-/// keyring. Called from the `SetAiKey`/`ClearAiKey` control handlers after the
-/// keyring write.
+/// Relaunch every **running, switched-on** declared plugin whose `secrets`
+/// allowlist includes `slot`, so a just-changed key (set or cleared in the
+/// control-center) takes effect — rotation is stop + relaunch, re-reading the
+/// slot from the keyring. Called from the `SetAiKey`/`ClearAiKey` control
+/// handlers after the keyring write.
 ///
-/// Stopped plugins and legacy static units are left alone: a stopped plugin
-/// re-reads the key on its next start, and a static unit gets no injection at
-/// all. Best-effort — each plugin's failure is logged, never propagated.
+/// Stopped plugins are left alone: a stopped plugin re-reads the key on its
+/// next start. A **switched-off** plugin is never relaunched (#1417 item 1b,
+/// [`reapply`]): if its unit is still running and this launcher started it,
+/// it is stopped instead, and a unit it did not start is left alone.
+/// Best-effort — each plugin's failure is logged, never propagated.
 ///
 /// Serialised on [`CONVERGE_LOCK`] (#866's F6): this now has two callers that
 /// collide on the happy path, and two interleaved `stop → wait → launch`
@@ -2198,49 +2336,161 @@ pub async fn relaunch_for_secret(slot: &str) {
 ///
 /// A failure to even list the units reports **every** affected id against that
 /// same listing error: nothing was attempted, so nothing should stop being
-/// watched.
+/// watched. So does a switched-off plugin whose stop failed: it is still
+/// running with the old key.
 async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
-    let _guard = CONVERGE_LOCK.lock().await;
+    relaunch_for_secret_via(
+        slot,
+        load_declared,
+        systemd::list_plugin_units,
+        |id, spec, target| async move { restart(&id, &spec, &target).await },
+        |id| async move { stop_unit(&id).await },
+    )
+    .await
+}
 
-    let declared = load_declared().await.unwrap_or_default();
-    let affected: Vec<(&String, &PluginSpec)> = declared
-        .plugins
+/// [`relaunch_for_secret_inner`] with its four effects passed in — the
+/// declaration, the unit listing, one plugin's relaunch and one plugin's
+/// stop — so a test can drive the decision and the lock without a user
+/// manager or a keyring (the [`restart_for_settings_via`] seam's shape).
+///
+/// The declaration is read **after** the lock is taken, so a switch-off
+/// persisted by a [`set_enabled`] queued ahead of this call is what it sees
+/// (#1417 item 1b).
+async fn relaunch_for_secret_via<D, DF, L, LF, R, RF, S, SF>(
+    slot: &str,
+    load: D,
+    list_units: L,
+    mut relaunch: R,
+    mut stop_off: S,
+) -> Vec<(String, String)>
+where
+    D: FnOnce() -> DF,
+    DF: Future<Output = Option<Declared>>,
+    L: FnOnce() -> LF,
+    LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+    R: FnMut(String, PluginSpec, String) -> RF,
+    RF: Future<Output = anyhow::Result<()>>,
+    S: FnMut(String) -> SF,
+    SF: Future<Output = anyhow::Result<()>>,
+{
+    converge_locked(async move {
+        let declared = load().await.unwrap_or_default();
+        let affected: Vec<(&String, &PluginSpec)> = declared
+            .plugins
+            .iter()
+            .filter(|(_, spec)| spec.secrets.iter().any(|s| s == slot))
+            .collect();
+        if affected.is_empty() {
+            tracing::debug!(%slot, "no declared plugin uses this secret slot; nothing to relaunch");
+            return Vec::new();
+        }
+        let units = match list_units().await {
+            Ok(units) => units,
+            Err(err) => {
+                tracing::warn!(%err, %slot, "listing plugin units for relaunch failed; skipping");
+                let reason = err.to_string();
+                return affected
+                    .into_iter()
+                    .map(|(id, _)| (id.clone(), reason.clone()))
+                    .collect();
+            }
+        };
+        let mut failed = Vec::new();
+        for (id, spec) in affected {
+            match reapply(spec, running_unit(&units, id)) {
+                Reapply::NotRunning => {
+                    tracing::debug!(plugin = %id, %slot, "not running; new key applies on next start");
+                }
+                Reapply::Relaunch => {
+                    if let Err(err) = relaunch(id.clone(), spec.clone(), declared.target.clone()).await
+                    {
+                        tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
+                        failed.push((id.clone(), err.to_string()));
+                    } else {
+                        tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
+                    }
+                }
+                Reapply::Stop => {
+                    if let Err(err) = stop_off(id.clone()).await {
+                        tracing::warn!(
+                            plugin = %id,
+                            %slot,
+                            %err,
+                            "switched off but still running; stopping it failed, so it keeps the old key",
+                        );
+                        failed.push((id.clone(), err.to_string()));
+                    } else {
+                        tracing::info!(
+                            plugin = %id,
+                            %slot,
+                            "switched off but still running; stopped it instead of relaunching \
+                             (the new key applies at its next start)",
+                        );
+                    }
+                }
+                Reapply::Leave => {
+                    tracing::info!(
+                        plugin = %id,
+                        %slot,
+                        "switched off, and its running unit is not one this launcher started \
+                         (a hand-installed static unit?); left it alone",
+                    );
+                }
+            }
+        }
+        failed
+    })
+    .await
+}
+
+/// What a relaunch path — [`restart_for_settings`] or [`relaunch_for_secret`]
+/// — does about one declared plugin to apply its change (#1417 item 1b).
+///
+/// Both run under [`CONVERGE_LOCK`], and both used to relaunch any running
+/// declared plugin without asking whether it is still switched on. The lock is
+/// FIFO, so one queued behind the Plugins tab's `SetPluginEnabled(false)` ran
+/// **after** the switch-off was persisted and **before** the tab's
+/// `StopPlugin`, found the plugin running, and relaunched it; the stop then
+/// landed inside the relaunch and did nothing. The plugin ran on with "off"
+/// persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reapply {
+    /// Not running: nothing to do, and the change applies at its next start.
+    NotRunning,
+    /// Running and switched on: stop, wait, relaunch ([`restart`]).
+    Relaunch,
+    /// Running, switched **off**, and stamped by this launcher: stop it and
+    /// relaunch nothing. This is [`plan`]'s own row for that state, applied to
+    /// the one plugin, so the relaunch path converges onto the switch rather
+    /// than waiting on a `StopPlugin` that a timed-out or closed tab never
+    /// sends; and a key cleared with `ClearAiKey` does not stay in a
+    /// switched-off plugin's environment.
+    Stop,
+    /// Running, switched **off**, and **not** stamped: a unit this launcher
+    /// never started (a hand-installed static unit for a declared-off id).
+    /// Left alone, as [`plan`] leaves it (#1400 review, finding 4).
+    Leave,
+}
+
+/// Decide [`Reapply`] for a plugin from its **effective** spec (the switch
+/// folded in, [`load_declared_from`]) and its running unit, if it has one
+/// ([`running_unit`]). Pure.
+fn reapply(spec: &PluginSpec, running: Option<&systemd::PluginUnit>) -> Reapply {
+    match running {
+        None => Reapply::NotRunning,
+        Some(_) if spec.enabled => Reapply::Relaunch,
+        Some(unit) if parse_fingerprint(&unit.description).is_some() => Reapply::Stop,
+        Some(_) => Reapply::Leave,
+    }
+}
+
+/// Plugin `id`'s unit in `units` if it is running ([`is_running`]):
+/// `deactivating` is not, since the unit is already on its way down. Pure.
+fn running_unit<'a>(units: &'a [systemd::PluginUnit], id: &str) -> Option<&'a systemd::PluginUnit> {
+    units
         .iter()
-        .filter(|(_, spec)| spec.secrets.iter().any(|s| s == slot))
-        .collect();
-    if affected.is_empty() {
-        tracing::debug!(%slot, "no declared plugin uses this secret slot; nothing to relaunch");
-        return Vec::new();
-    }
-    let running: HashSet<String> = match systemd::list_plugin_units().await {
-        Ok(units) => units
-            .into_iter()
-            .filter(|u| is_running(&u.active_state))
-            .map(|u| u.id)
-            .collect(),
-        Err(err) => {
-            tracing::warn!(%err, %slot, "listing plugin units for relaunch failed; skipping");
-            let reason = err.to_string();
-            return affected
-                .into_iter()
-                .map(|(id, _)| (id.clone(), reason.clone()))
-                .collect();
-        }
-    };
-    let mut failed = Vec::new();
-    for (id, spec) in affected {
-        if !running.contains(id) {
-            tracing::debug!(plugin = %id, %slot, "not running; new key applies on next start");
-            continue;
-        }
-        if let Err(err) = restart(id, spec, &declared.target).await {
-            tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
-            failed.push((id.clone(), err.to_string()));
-        } else {
-            tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
-        }
-    }
-    failed
+        .find(|u| u.id == id && is_running(&u.active_state))
 }
 
 /// Stop a declared plugin's transient unit, wait for it to actually go down (so
@@ -2269,7 +2519,7 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
 /// for them together would bound the first cost; the second needs the
 /// fallback to skip a unit this launcher stamped.
 async fn restart(id: &str, spec: &PluginSpec, target: &str) -> anyhow::Result<()> {
-    stop(id).await?;
+    stop_unit(id).await?;
     wait_until_stopped(id).await;
     let extra_env = resolve_secret_env(id, spec).await;
     let Err(err) = launch(id, spec, &extra_env, target).await else {
@@ -2366,6 +2616,12 @@ pub enum SettingsRestart {
     /// launcher does not launch and which therefore never reads the file.
     /// Left alone.
     NotDeclared,
+    /// The plugin is declared and running, but switched **off** (#1417 item
+    /// 1b): nothing was relaunched. A unit this launcher started was stopped
+    /// ([`Reapply::Stop`]); one it did not start was left alone
+    /// ([`Reapply::Leave`]). Either way the plugin reads the file when it is
+    /// next started.
+    SwitchedOff,
 }
 
 impl SettingsRestart {
@@ -2376,6 +2632,7 @@ impl SettingsRestart {
             SettingsRestart::Relaunched => "relaunched",
             SettingsRestart::NotRunning => "not-running",
             SettingsRestart::NotDeclared => "not-declared",
+            SettingsRestart::SwitchedOff => "switched-off",
         }
     }
 }
@@ -2394,6 +2651,14 @@ impl SettingsRestart {
 /// Reads the effective declaration (so the relaunch carries the file's
 /// current values) and the live unit list, and starts nothing that was not
 /// already running.
+///
+/// Nor does it relaunch a plugin that is **switched off** (#1417 item 1b,
+/// [`Reapply`]). The declaration is read under the lock, so it includes a
+/// switch-off persisted by a `SetPluginEnabled(false)` queued ahead of this
+/// call — the Save-then-flip-off sequence, where this call used to find the
+/// plugin still running and relaunch it just before the tab's `StopPlugin`
+/// arrived. A switched-off plugin this launcher started is stopped instead
+/// and the answer is [`SettingsRestart::SwitchedOff`].
 ///
 /// **Every** Save calls this, whatever the tab last saw (#1415 second review
 /// M1): the tab's own poll can be two seconds stale, and a Save that lands
@@ -2415,19 +2680,21 @@ pub async fn restart_for_settings(id: &str) -> anyhow::Result<SettingsRestart> {
         load_declared,
         systemd::list_plugin_units,
         |spec, target| async move { restart(id, &spec, &target).await },
+        || stop_unit(id),
     )
     .await
 }
 
-/// [`restart_for_settings`] with its three effects passed in — the
-/// declaration, the unit listing and the relaunch — so a test can drive the
-/// decision and the lock without a user manager (the [`reconcile_listing`]
-/// seam's shape).
-async fn restart_for_settings_via<D, DF, L, LF, R, RF>(
+/// [`restart_for_settings`] with its four effects passed in — the
+/// declaration, the unit listing, the relaunch and the stop of a switched-off
+/// plugin — so a test can drive the decision and the lock without a user
+/// manager (the [`reconcile_listing`] seam's shape).
+async fn restart_for_settings_via<D, DF, L, LF, R, RF, S, SF>(
     id: &str,
     load: D,
     list_units: L,
     relaunch: R,
+    stop_off: S,
 ) -> anyhow::Result<SettingsRestart>
 where
     D: FnOnce() -> DF,
@@ -2436,28 +2703,50 @@ where
     LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
     R: FnOnce(PluginSpec, String) -> RF,
     RF: Future<Output = anyhow::Result<()>>,
+    S: FnOnce() -> SF,
+    SF: Future<Output = anyhow::Result<()>>,
 {
-    let _guard = CONVERGE_LOCK.lock().await;
-    let Some(declared) = load().await else {
-        anyhow::bail!(
-            "plugins.json exists but cannot be read or parsed, so the shell cannot tell how \
-             to launch this plugin; nothing was restarted. Fix the file (or rebuild), then \
-             switch the plugin off and on"
-        );
-    };
-    let Some(spec) = declared.plugins.get(id).cloned() else {
-        return Ok(SettingsRestart::NotDeclared);
-    };
-    let units = list_units().await.context("listing plugin units")?;
-    if !units
-        .iter()
-        .any(|u| u.id == id && is_running(&u.active_state))
-    {
-        return Ok(SettingsRestart::NotRunning);
-    }
-    relaunch(spec, declared.target).await?;
-    tracing::info!(plugin = %id, "relaunched to apply its saved settings");
-    Ok(SettingsRestart::Relaunched)
+    converge_locked(async move {
+        let Some(declared) = load().await else {
+            anyhow::bail!(
+                "plugins.json exists but cannot be read or parsed, so the shell cannot tell how \
+                 to launch this plugin; nothing was restarted. Fix the file (or rebuild), then \
+                 switch the plugin off and on"
+            );
+        };
+        let Some(spec) = declared.plugins.get(id).cloned() else {
+            return Ok(SettingsRestart::NotDeclared);
+        };
+        let units = list_units().await.context("listing plugin units")?;
+        match reapply(&spec, running_unit(&units, id)) {
+            Reapply::NotRunning => Ok(SettingsRestart::NotRunning),
+            Reapply::Relaunch => {
+                relaunch(spec, declared.target).await?;
+                tracing::info!(plugin = %id, "relaunched to apply its saved settings");
+                Ok(SettingsRestart::Relaunched)
+            }
+            Reapply::Stop => {
+                stop_off()
+                    .await
+                    .context("stopping the plugin, which is switched off but was still running")?;
+                tracing::info!(
+                    plugin = %id,
+                    "switched off but still running; stopped it instead of relaunching \
+                     (its saved settings apply at its next start)",
+                );
+                Ok(SettingsRestart::SwitchedOff)
+            }
+            Reapply::Leave => {
+                tracing::info!(
+                    plugin = %id,
+                    "switched off, and its running unit is not one this launcher started \
+                     (a hand-installed static unit?); left it alone",
+                );
+                Ok(SettingsRestart::SwitchedOff)
+            }
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -4263,6 +4552,7 @@ mod tests {
             "pub async fn list()",
             "pub async fn start(",
             "pub async fn restart_for_settings(",
+            "async fn relaunch_for_secret_inner(",
             "async fn declared_ids_from(",
         ] {
             let b = body(sig);
@@ -4284,7 +4574,8 @@ mod tests {
     /// the file between its two halves, and two quick switches cannot lose
     /// one. Nothing else pins that the lock is taken at all.
     ///
-    /// Falsified by `let guard = ();` in `set_enabled_in`.
+    /// Falsified by `set_enabled_in` awaiting its body without
+    /// `converge_locked`.
     #[tokio::test]
     async fn the_switch_waits_for_the_converge_lock() {
         let (_dir, sources, toml) = scratch_sources(TWO_FREE);
@@ -5462,8 +5753,8 @@ mod tests {
         };
         let restart = body("async fn restart(id: &str");
         let stop = restart
-            .find("stop(id).await?")
-            .expect("restart stops first");
+            .find("stop_unit(id).await?")
+            .expect("restart stops first, without retaking the lock");
         let wait = restart
             .find("wait_until_stopped(id).await")
             .expect("restart waits for the stop");
@@ -5488,13 +5779,17 @@ mod tests {
             entry.contains(&squash("restart(id, &spec, &target)")),
             "{entry}"
         );
-        // The guard must be *held*: `let _ = …lock().await` drops it at once
-        // and no lint catches that for a tokio guard (#1415 second review
-        // B1). `two_restarts_for_settings_run_one_after_the_other` is the
+        // #1417 item 1b: the switched-off arm's stop is the real, unlocked
+        // one; a stand-in that does nothing would leave that arm inert.
+        assert!(entry.contains(&squash("|| stop_unit(id),")), "{entry}");
+        // The whole seam runs under the lock (#1415 second review B1).
+        // `converge_locked` holding its guard, rather than `let _ = …`
+        // dropping it at once, is `only_the_reviewed_calls_reach_a_lock_taker`'s
+        // to pin; `two_restarts_for_settings_run_one_after_the_other` is the
         // behavioural half.
         assert!(
             squash(body("async fn restart_for_settings_via<"))
-                .contains(&squash("let _guard = CONVERGE_LOCK.lock().await;")),
+                .contains(&squash("converge_locked(async move {")),
             "the settings restart must hold the convergence lock"
         );
     }
@@ -5528,6 +5823,7 @@ mod tests {
                     relaunched.set(true);
                     async { Ok(()) }
                 },
+                || async { panic!("a plugin that is not running is never stopped") },
             )
             .await
             .expect("answers");
@@ -5546,6 +5842,7 @@ mod tests {
             || async { Some(saved("x")) },
             || async { panic!("an undeclared id needs no listing") },
             |_, _| async { panic!("an undeclared id is never relaunched") },
+            || async { panic!("an undeclared id is never stopped") },
         )
         .await
         .expect("answers");
@@ -5560,6 +5857,7 @@ mod tests {
                 *got.borrow_mut() = Some((spec.settings, target));
                 async { Ok(()) }
             },
+            || async { panic!("a switched-on plugin is never stopped") },
         )
         .await
         .expect("answers");
@@ -5583,6 +5881,7 @@ mod tests {
             || async { None },
             || async { panic!("nothing is listed") },
             |_, _| async { panic!("nothing is relaunched") },
+            || async { panic!("nothing is stopped") },
         )
         .await
         .expect_err("an unreadable plugins.json is not an answer");
@@ -5626,6 +5925,7 @@ mod tests {
                     log.borrow_mut().push(format!("{n}: up"));
                     Ok(())
                 },
+                || async { panic!("a switched-on plugin is never stopped") },
             )
         };
         let (a, b) = tokio::join!(call(1), async {
@@ -5700,5 +6000,909 @@ mod tests {
         assert_eq!(SettingsRestart::Relaunched.wire_name(), "relaunched");
         assert_eq!(SettingsRestart::NotRunning.wire_name(), "not-running");
         assert_eq!(SettingsRestart::NotDeclared.wire_name(), "not-declared");
+        assert_eq!(SettingsRestart::SwitchedOff.wire_name(), "switched-off");
+    }
+
+    // ── a switched-off plugin is never relaunched (#1417 item 1b) ──────────
+
+    /// Poll `fut` once, so the [`CONVERGE_LOCK`] acquire at its top joins the
+    /// lock's queue now: tokio's mutex is FIFO, and the order the futures are
+    /// enqueued in here is the order the shell's handlers would reach the lock
+    /// in. Panics if `fut` got past the lock, which would mean the lock was
+    /// not held.
+    async fn enqueue<F: Future>(mut fut: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "the call must wait for the lock the test holds"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// `pet` and `caw`, both declared on and both reading the `openrouter`
+    /// key — the fixture for the key-change relaunch.
+    const TWO_KEYED: &str = r#"{"version":1,"plugins":{
+        "pet":{"exec":"/bin/pet","enabled":true,"secrets":["openrouter"]},
+        "caw":{"exec":"/bin/caw","enabled":true,"secrets":["openrouter"]}
+    }}"#;
+
+    /// The race #1417 item 1b is about, through the settings restart: a Save's
+    /// `RestartPlugin` holds the lock; the switch is flipped off, so the tab's
+    /// `SetPluginEnabled(false)` queues; a second Save's `RestartPlugin`
+    /// queues behind that. The persist runs first and writes "off"; then the
+    /// queued restart must see "off" and relaunch nothing. It stops the unit
+    /// instead, since this launcher started it ([`Reapply::Stop`]), and the
+    /// tab's `StopPlugin` that follows finds it stopping or gone.
+    ///
+    /// Red before the fix: the queued restart found the plugin running and
+    /// relaunched it (`["relaunch"]`, answer `Relaunched`), and the stop the
+    /// tab sent next landed inside that relaunch. Also red if the declaration
+    /// is read before the lock is taken, or read from nix's half alone.
+    #[tokio::test]
+    async fn a_save_queued_behind_a_switch_off_stops_the_plugin_instead_of_relaunching_it() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let pet = spec("/bin/pet", true);
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+
+        // The first Save's restart, still under way.
+        let held = CONVERGE_LOCK.lock().await;
+        let persist = set_enabled_in(&sources, "pet", false);
+        let save = restart_for_settings_via(
+            "pet",
+            || load_declared_from(&sources),
+            || async { Ok(vec![unit_for("pet", "active", &pet)]) },
+            |_, _| {
+                log.borrow_mut().push("relaunch");
+                async { Ok(()) }
+            },
+            || {
+                log.borrow_mut().push("stop");
+                async { Ok(()) }
+            },
+        );
+        tokio::pin!(persist, save);
+        enqueue(persist.as_mut()).await;
+        enqueue(save.as_mut()).await;
+        drop(held);
+
+        let (persisted, answer) = tokio::join!(persist, save);
+        persisted.expect("the switch-off persists");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("persisted"),
+            "[enabled]\npet = false\n"
+        );
+        assert_eq!(answer.expect("answers"), SettingsRestart::SwitchedOff);
+        assert_eq!(
+            *log.borrow(),
+            ["stop"],
+            "a switched-off plugin must not be relaunched by a Save queued behind the switch"
+        );
+    }
+
+    /// The control: the same queue with the switch flipped **on** — `timer`
+    /// is declared off, so its "on" is an override in `plugins.toml` — and a
+    /// running unit (the `StartPlugin` that followed). The queued Save
+    /// relaunches it, so the check reads the *effective* switch, not nix's
+    /// value, and does not stop Saves from applying.
+    #[tokio::test]
+    async fn a_save_queued_behind_a_switch_on_still_relaunches() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let timer = spec("/bin/timer", true);
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+
+        let held = CONVERGE_LOCK.lock().await;
+        let persist = set_enabled_in(&sources, "timer", true);
+        let save = restart_for_settings_via(
+            "timer",
+            || load_declared_from(&sources),
+            || async { Ok(vec![unit_for("timer", "active", &timer)]) },
+            |_, _| {
+                log.borrow_mut().push("relaunch");
+                async { Ok(()) }
+            },
+            || {
+                log.borrow_mut().push("stop");
+                async { Ok(()) }
+            },
+        );
+        tokio::pin!(persist, save);
+        enqueue(persist.as_mut()).await;
+        enqueue(save.as_mut()).await;
+        drop(held);
+
+        let (persisted, answer) = tokio::join!(persist, save);
+        persisted.expect("the switch-on persists");
+        assert!(toml.exists(), "timer's on is an override");
+        assert_eq!(answer.expect("answers"), SettingsRestart::Relaunched);
+        assert_eq!(*log.borrow(), ["relaunch"]);
+    }
+
+    /// The same race through the key-change relaunch — the 30 s secret
+    /// watcher's pass or `SetAiKey`'s, queued behind the switch-off. `pet` is
+    /// switched off and must be stopped, not relaunched; `caw`, on and reading
+    /// the same key, is still relaunched with its own spec and target; and
+    /// neither is reported failed, so the watcher stops waiting on both.
+    ///
+    /// Red before the fix: both were relaunched.
+    #[tokio::test]
+    async fn a_key_relaunch_queued_behind_a_switch_off_stops_the_plugin_instead() {
+        let (_dir, sources, _toml) = scratch_sources(TWO_KEYED);
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let live = load_declared_from(&sources).await.expect("parses").plugins;
+        let units: Vec<_> = live
+            .iter()
+            .map(|(id, spec)| unit_for(id, "active", spec))
+            .collect();
+
+        let held = CONVERGE_LOCK.lock().await;
+        let persist = set_enabled_in(&sources, "pet", false);
+        let relaunch = relaunch_for_secret_via(
+            "openrouter",
+            || load_declared_from(&sources),
+            || async { Ok(units.clone()) },
+            |id, spec, target| {
+                log.borrow_mut()
+                    .push(format!("relaunch {id} {} {target}", spec.exec));
+                async { Ok(()) }
+            },
+            |id| {
+                log.borrow_mut().push(format!("stop {id}"));
+                async { Ok(()) }
+            },
+        );
+        tokio::pin!(persist, relaunch);
+        enqueue(persist.as_mut()).await;
+        enqueue(relaunch.as_mut()).await;
+        drop(held);
+
+        let (persisted, failed) = tokio::join!(persist, relaunch);
+        persisted.expect("the switch-off persists");
+        assert_eq!(failed, Vec::<(String, String)>::new());
+        assert_eq!(
+            *log.borrow(),
+            [
+                format!("relaunch caw /bin/caw {DEFAULT_TARGET}"),
+                "stop pet".to_owned(),
+            ]
+        );
+    }
+
+    /// A switched-off plugin whose stop fails is still running with the old
+    /// key, so it is reported failed: the secret watcher keeps it for its next
+    /// pass (bounded by [`MAX_RELAUNCH_FAILURES`]) rather than forgetting it.
+    #[tokio::test]
+    async fn a_switched_off_plugin_whose_stop_failed_stays_watched() {
+        let off = PluginSpec {
+            secrets: vec!["openrouter".to_owned()],
+            ..spec("/bin/pet", false)
+        };
+        let failed = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit_for("pet", "active", &off)]) },
+            |_, _, _| async { panic!("a switched-off plugin is never relaunched") },
+            |_| async { anyhow::bail!("user manager went away") },
+        )
+        .await;
+        assert_eq!(
+            failed,
+            [("pet".to_owned(), "user manager went away".to_owned())]
+        );
+    }
+
+    /// A switched-off plugin running from a unit this launcher did not start
+    /// — a hand-installed static unit for a declared-off id — is neither
+    /// relaunched nor stopped by either path: reconcile never stops a unit it
+    /// did not stamp (#1400 review, finding 4), and neither may these.
+    #[tokio::test]
+    async fn a_switched_off_unit_the_launcher_did_not_start_is_left_alone() {
+        let off = PluginSpec {
+            secrets: vec!["openrouter".to_owned()],
+            ..spec("/bin/pet", false)
+        };
+        let answer = restart_for_settings_via(
+            "pet",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit("pet", "active", true)]) },
+            |_, _| async { panic!("a switched-off plugin is never relaunched") },
+            || async { panic!("an unstamped unit is never stopped") },
+        )
+        .await
+        .expect("answers");
+        assert_eq!(answer, SettingsRestart::SwitchedOff);
+
+        let failed = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit("pet", "active", true)]) },
+            |_, _, _| async { panic!("a switched-off plugin is never relaunched") },
+            |_| async { panic!("an unstamped unit is never stopped") },
+        )
+        .await;
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// [`reapply`]'s whole table, and its two switched-off rows are exactly
+    /// what [`plan`] does with the same plugin and unit: the relaunch paths
+    /// converge a switched-off plugin the way a reconcile would, and cannot
+    /// drift from it. `deactivating` is not running ([`running_unit`]).
+    ///
+    /// Red if the enabled check is dropped (the off rows read `Relaunch`), or
+    /// if the stamp check is (an unstamped unit is stopped, or a stamped one
+    /// left).
+    #[test]
+    fn reapply_is_plans_rule_for_one_plugin() {
+        let on = spec("/bin/pet", true);
+        let off = spec("/bin/pet", false);
+        let stamped = unit_for("pet", "active", &on);
+        let bare = unit("pet", "active", false);
+        assert_eq!(reapply(&on, None), Reapply::NotRunning);
+        assert_eq!(reapply(&off, None), Reapply::NotRunning);
+        assert_eq!(reapply(&on, Some(&stamped)), Reapply::Relaunch);
+        assert_eq!(reapply(&on, Some(&bare)), Reapply::Relaunch);
+        assert_eq!(reapply(&off, Some(&stamped)), Reapply::Stop);
+        assert_eq!(reapply(&off, Some(&bare)), Reapply::Leave);
+
+        let d = declared(&[("pet", off.clone())]);
+        for live in [stamped.clone(), bare.clone()] {
+            let planned = plan(&d, std::slice::from_ref(&live));
+            let reapplied = reapply(&off, running_unit(std::slice::from_ref(&live), "pet"));
+            assert_eq!(
+                planned == [("pet".to_owned(), Action::Stop)],
+                reapplied == Reapply::Stop,
+                "plan {planned:?} vs reapply {reapplied:?} for {live:?}"
+            );
+        }
+
+        let stopping = unit_for("pet", "deactivating", &on);
+        assert_eq!(running_unit(&[stopping], "pet"), None);
+        assert_eq!(running_unit(std::slice::from_ref(&stamped), "caw"), None);
+    }
+
+    /// Decision 2 of #1417 item 1b: `StopPlugin` queues on [`CONVERGE_LOCK`]
+    /// and lands **after** a launch already under way. The shape is the
+    /// switch flipped on and straight off: the off's `StopPlugin` arrives
+    /// while the on's `StartPlugin` holds the lock between its keyring read
+    /// and `systemd-run`. Unqueued, the stop found no unit yet (the tab counts
+    /// systemd's "not loaded" as done) and the launch then brought the plugin
+    /// up with "off" persisted.
+    ///
+    /// Falsified by dropping the guard from `stop_via`: the log reads
+    /// `["stopped", "launched"]`.
+    #[tokio::test]
+    async fn a_stop_queued_behind_a_launch_lands_after_it() {
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+        // `StartPlugin`, mid-launch.
+        let start = CONVERGE_LOCK.lock().await;
+        let stop = stop_via(|| {
+            log.borrow_mut().push("stopped");
+            async { Ok(()) }
+        });
+        tokio::pin!(stop);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut stop)
+                .await
+                .is_err(),
+            "the stop must wait for the launch holding the lock"
+        );
+        log.borrow_mut().push("launched");
+        drop(start);
+        stop.await.expect("stops once the lock is free");
+        assert_eq!(*log.borrow(), ["launched", "stopped"]);
+    }
+
+    /// The wiring the behavioural tests above stand in for, which a stand-in
+    /// cannot check (#1417 item 1b):
+    /// - `stop` goes through the locking seam with the real `StopUnit`;
+    /// - the key-change relaunch hands its seam the real declaration, listing,
+    ///   relaunch and stop.
+    ///
+    /// That both seams hold the lock, and that nothing under it calls the
+    /// locking `stop`, is `only_the_reviewed_calls_reach_a_lock_taker`'s.
+    ///
+    /// Falsified by `stop` handing `stop_via` a stop that does nothing, or by
+    /// the production relaunch doing so.
+    #[test]
+    fn stop_and_the_key_relaunch_hand_their_seams_the_real_effects() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+
+        assert!(
+            squash(body("pub async fn stop(id: &str)"))
+                .contains(&squash("stop_via(|| stop_unit(id))")),
+            "StopPlugin must go through the locking seam with the real stop"
+        );
+        assert!(
+            body("async fn stop_unit(id: &str)").contains("systemd::stop_plugin(id)"),
+            "stop_unit is the real StopUnit"
+        );
+        let inner = squash(body("async fn relaunch_for_secret_inner("));
+        for wiring in [
+            "relaunch_for_secret_via(slot, load_declared, systemd::list_plugin_units,",
+            "restart(&id, &spec, &target)",
+            "stop_unit(&id)",
+        ] {
+            assert!(inner.contains(&squash(wiring)), "{wiring}:\n{inner}");
+        }
+    }
+
+    // ── nothing under the lock takes it again (#1424 review, finding 1) ─────
+
+    /// `src` with its comments, and the contents of its string and char
+    /// literals, blanked to spaces. Every byte keeps its offset, so a line
+    /// number in the result is a line number in `src`. What is left is code
+    /// only: a word in a log message or a doc link is not a call.
+    fn code_only(src: &str) -> String {
+        fn blank(out: &mut [u8], span: std::ops::Range<usize>) {
+            for c in &mut out[span] {
+                if *c != b'\n' {
+                    *c = b' ';
+                }
+            }
+        }
+        let b = src.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        // `r"…"`, `r#"…"#`: how many `#`s, if a raw string starts here.
+        let raw_hashes = |rest: &[u8]| {
+            let hashes = rest[1..].iter().take_while(|&&c| c == b'#').count();
+            (rest[0] == b'r' && rest.get(1 + hashes) == Some(&b'"')).then_some(hashes)
+        };
+        let mut out = b.to_vec();
+        let mut i = 0;
+        while i < b.len() {
+            let rest = &b[i..];
+            let end = if rest.starts_with(b"//") {
+                rest.iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |n| i + n)
+            } else if rest.starts_with(b"/*") {
+                let (mut j, mut depth) = (i + 2, 1);
+                while depth > 0 && j < b.len() {
+                    if b[j..].starts_with(b"/*") {
+                        depth += 1;
+                        j += 2;
+                    } else if b[j..].starts_with(b"*/") {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                j
+            } else if let Some(hashes) = raw_hashes(rest).filter(|_| i == 0 || !ident(b[i - 1])) {
+                let close = [b"\"".as_slice(), &b"#".repeat(hashes)].concat();
+                let from = i + 2 + hashes;
+                b[from..]
+                    .windows(close.len())
+                    .position(|w| w == close.as_slice())
+                    .map_or(b.len(), |n| from + n + close.len())
+            } else if rest[0] == b'"' {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                j + 1
+            } else if rest[0] == b'\'' {
+                // `'x'` and `'\n'` are char literals; `'a` with no quote
+                // right after one char is a lifetime or a label.
+                let width = src[i + 1..].chars().next().map_or(0, char::len_utf8);
+                if rest.get(1) == Some(&b'\\') {
+                    rest[3..]
+                        .iter()
+                        .position(|&c| c == b'\'')
+                        .map_or(b.len(), |n| i + 4 + n)
+                } else if rest.get(1 + width) == Some(&b'\'') {
+                    i + 2 + width
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                i += 1;
+                continue;
+            };
+            let end = end.min(b.len());
+            blank(&mut out, i..end);
+            i = end;
+        }
+        String::from_utf8(out).expect("only whole characters were blanked")
+    }
+
+    /// The identifiers in `code`, with their byte offsets.
+    fn idents(code: &str) -> Vec<(usize, &str)> {
+        let b = code.as_bytes();
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if !word(b[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < b.len() && word(b[i]) {
+                i += 1;
+            }
+            if !b[start].is_ascii_digit() {
+                out.push((start, &code[start..i]));
+            }
+        }
+        out
+    }
+
+    /// The reviewed calls into a lock-taker: each is made where
+    /// [`CONVERGE_LOCK`] is **not** held, so it can wait for the lock.
+    /// `(caller, callee)`, by function name.
+    const REVIEWED_LOCK_CALLS: &[(&str, &str)] = &[
+        // The lock-takers themselves, each through the one helper.
+        ("reconcile_listing", "converge_locked"),
+        ("start", "converge_locked"),
+        ("stop_via", "converge_locked"),
+        ("set_enabled_in", "converge_locked"),
+        ("relaunch_for_secret_via", "converge_locked"),
+        ("restart_for_settings_via", "converge_locked"),
+        // Entry points and wrappers, each one call down towards its seam.
+        ("reconcile", "reconcile_from"),
+        ("reconcile_from", "reconcile_listing"),
+        ("reconcile_then_watch", "reconcile_from"),
+        // `launch_at_startup` is synchronous and holds nothing; the watch it
+        // hands this to runs as its own supervised task.
+        ("launch_at_startup", "reconcile_then_watch"),
+        ("stop", "stop_via"),
+        ("set_enabled", "set_enabled_in"),
+        ("restart_for_settings", "restart_for_settings_via"),
+        ("relaunch_for_secret", "relaunch_for_secret_inner"),
+        ("relaunch_for_secret_inner", "relaunch_for_secret_via"),
+        // The secret watcher's own task, between passes, holding nothing.
+        ("watch_outstanding_secrets", "relaunch_for_secret_inner"),
+    ];
+
+    /// Calls into a lock-taker that only **spawn** it, onto a task of its
+    /// own that the caller never awaits. The caller does not wait for the
+    /// lock, so it is not a lock-taker itself, and it may run under the
+    /// lock: [`note_resolution`] does, from every launch's keyring read.
+    const SPAWNED_LOCK_CALLS: &[(&str, &str)] = &[("note_resolution", "watch_outstanding_secrets")];
+
+    /// This file's production half, as [`code_only`] code.
+    fn production_code() -> String {
+        let src = include_str!("plugin_launcher.rs");
+        code_only(&src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")])
+    }
+
+    /// The functions defined in `code` (with `tokens`, its [`idents`]): the
+    /// offset of every `fn <name>`'s name, and the body of each one that has
+    /// a body, braces included.
+    fn functions<'a>(
+        code: &'a str,
+        tokens: &[(usize, &'a str)],
+    ) -> (BTreeSet<usize>, Vec<(&'a str, std::ops::Range<usize>)>) {
+        let b = code.as_bytes();
+        let mut defs = BTreeSet::new();
+        let mut bodies = Vec::new();
+        for pair in tokens.windows(2) {
+            let [(fn_at, keyword), (at, name)] = pair else {
+                continue;
+            };
+            if *keyword != "fn" || !code[fn_at + 2..*at].trim().is_empty() {
+                continue;
+            }
+            defs.insert(*at);
+            // The body opens at the first `{` outside the parameter list and
+            // any `[T; N]`; a `;` there first means there is no body.
+            let mut nest = 0_i32;
+            let Some(open) = (*at..b.len()).find(|&j| {
+                match b[j] {
+                    b'(' | b'[' => nest += 1,
+                    b')' | b']' => nest -= 1,
+                    _ => {}
+                }
+                nest == 0 && matches!(b[j], b'{' | b';')
+            }) else {
+                continue;
+            };
+            if b[open] == b';' {
+                continue;
+            }
+            let mut depth = 0_i32;
+            let close = (open..b.len())
+                .find(|&j| {
+                    match b[j] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .unwrap_or_else(|| panic!("fn {name}'s body closes"));
+            bodies.push((*name, open..close + 1));
+        }
+        (defs, bodies)
+    }
+
+    /// The innermost function in `bodies` whose body holds offset `at`.
+    fn enclosing<'a>(bodies: &[(&'a str, std::ops::Range<usize>)], at: usize) -> &'a str {
+        bodies
+            .iter()
+            .filter(|(_, span)| span.contains(&at))
+            .min_by_key(|(_, span)| span.len())
+            .map_or("<module>", |(name, _)| *name)
+    }
+
+    /// `name`'s body in `code`.
+    fn body_in<'a>(
+        code: &'a str,
+        bodies: &[(&str, std::ops::Range<usize>)],
+        name: &str,
+    ) -> &'a str {
+        let (_, span) = bodies
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("fn {name} is defined"));
+        &code[span.clone()]
+    }
+
+    /// Whether the identifier `name` at offset `at` in `code` is called.
+    fn is_called(code: &str, at: usize, name: &str) -> bool {
+        let after = code[at + name.len()..].trim_start();
+        after.starts_with('(') || after.starts_with("::<")
+    }
+
+    /// #1424 review, finding 1: **nothing under [`CONVERGE_LOCK`] can reach
+    /// something that takes it.** tokio's mutex is not reentrant, so one such
+    /// call wedges every plugin operation for the rest of the session.
+    /// [`converge_locked`] turns that into a panic at run time; this pins it
+    /// at build time, for every path, including the ones only a live user
+    /// manager reaches.
+    ///
+    /// It reads this module's production half as code (comments and
+    /// literals blanked, [`code_only`]) and works out:
+    /// - **the lock-takers**: [`converge_locked`], and every function that
+    ///   calls a lock-taker, transitively, except through a
+    ///   [`SPAWNED_LOCK_CALLS`] spawn;
+    /// - **every call into one**, keyed by the function it is made from.
+    ///
+    /// Those calls must be exactly [`REVIEWED_LOCK_CALLS`] and
+    /// [`SPAWNED_LOCK_CALLS`], in both directions: a new call is a new review,
+    /// and a vanished one (a lock-taker that stopped taking the lock) is too.
+    /// A lock-taker named anywhere without being called (an alias, a function
+    /// pointer, a re-export) fails, because that would hide its calls. So
+    /// does a local variable or a field that shares a lock-taker's name
+    /// (`start`, `stop`, …): the scan cannot tell the two apart, so it errs
+    /// towards failing, and the fix is a different name.
+    ///
+    /// Falsified by the review's four deadlocks, none of which the old
+    /// `stop(` count saw: reconcile's `Stop` through `stop_via` (S1), `stop`
+    /// through a `use … as` alias (S2) or a function pointer (S3), and
+    /// `restart`'s unit-file fallback through [`start`] (S4).
+    #[test]
+    fn only_the_reviewed_calls_reach_a_lock_taker() {
+        let code = production_code();
+        let tokens = idents(&code);
+        let (defs, bodies) = functions(&code, &tokens);
+        let line = |at: usize| code[..at].matches('\n').count() + 1;
+
+        // Every call from one function defined here to another.
+        let names: BTreeSet<&str> = bodies.iter().map(|(name, _)| *name).collect();
+        let mut calls = BTreeSet::new();
+        for &(at, name) in &tokens {
+            if names.contains(name) && !defs.contains(&at) && is_called(&code, at, name) {
+                calls.insert((enclosing(&bodies, at), name));
+            }
+        }
+        let mut takers = BTreeSet::from(["converge_locked"]);
+        loop {
+            let before = takers.len();
+            for &(caller, callee) in &calls {
+                if takers.contains(callee) && !SPAWNED_LOCK_CALLS.contains(&(caller, callee)) {
+                    takers.insert(caller);
+                }
+            }
+            if takers.len() == before {
+                break;
+            }
+        }
+
+        let mut problems = Vec::new();
+        let reached: BTreeSet<(&str, &str)> = calls
+            .iter()
+            .copied()
+            .filter(|(_, callee)| takers.contains(callee))
+            .collect();
+        let reviewed: BTreeSet<(&str, &str)> = REVIEWED_LOCK_CALLS
+            .iter()
+            .chain(SPAWNED_LOCK_CALLS)
+            .copied()
+            .collect();
+        for (caller, callee) in reached.difference(&reviewed) {
+            problems.push(format!(
+                "{caller} calls {callee}, which takes CONVERGE_LOCK. If {caller} can run under \
+                 the lock, this deadlocks every plugin operation for the session: call the \
+                 unlocked helper instead (`stop_unit`, not `stop`). If it cannot, add the call \
+                 to REVIEWED_LOCK_CALLS with the reason."
+            ));
+        }
+        for (caller, callee) in reviewed.difference(&reached) {
+            problems.push(format!(
+                "{caller} no longer calls {callee} as a lock-taker: take it off the reviewed \
+                 list, or put the lock back if {caller} is meant to hold it."
+            ));
+        }
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for &(caller, callee) in SPAWNED_LOCK_CALLS {
+            if !squash(body_in(&code, &bodies, caller)).contains(&format!("spawn({callee}(")) {
+                problems.push(format!(
+                    "{caller} is listed as only spawning {callee}, but its body no longer does"
+                ));
+            }
+        }
+        for &(at, name) in &tokens {
+            if takers.contains(name) && !defs.contains(&at) && !is_called(&code, at, name) {
+                problems.push(format!(
+                    "line {}: the lock-taker `{name}` is named without being called (an alias, a \
+                     function pointer or a re-export?), which hides its calls from this scan",
+                    line(at)
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The other half of finding 1's guard: [`CONVERGE_LOCK`] is taken in one
+    /// place, [`converge_locked`], which every lock-taker goes through
+    /// (`only_the_reviewed_calls_reach_a_lock_taker` pins that each one does).
+    /// Nothing else names the lock or the task-local that marks it held. And
+    /// the helper does its three things in order: it checks for re-entry
+    /// before it waits, it holds its guard (`let _ = …` would drop it at once,
+    /// and no lint catches that for a tokio guard), and it marks the task
+    /// while the body runs.
+    ///
+    /// Falsified by a lock-taker going back to `CONVERGE_LOCK.lock()` itself,
+    /// or by the helper's `let _ = …`, or by it checking after it waits.
+    #[test]
+    fn the_lock_is_taken_only_in_converge_locked() {
+        let code = production_code();
+        let tokens = idents(&code);
+        let (_, bodies) = functions(&code, &tokens);
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+
+        for (k, &(at, name)) in tokens.iter().enumerate() {
+            if matches!(name, "CONVERGE_LOCK" | "HOLDING_CONVERGE_LOCK") {
+                let declared = k.checked_sub(1).map(|p| tokens[p].1) == Some("static");
+                assert!(
+                    declared || enclosing(&bodies, at) == "converge_locked",
+                    "line {}: `{name}` named outside `converge_locked`",
+                    code[..at].matches('\n').count() + 1
+                );
+            }
+        }
+        let helper = squash(body_in(&code, &bodies, "converge_locked"));
+        let order: Vec<Option<usize>> = [
+            "HOLDING_CONVERGE_LOCK.try_with(|()| {}).is_err(),",
+            "let _guard = CONVERGE_LOCK.lock().await;",
+            "HOLDING_CONVERGE_LOCK.scope((), body).await",
+        ]
+        .iter()
+        .map(|needle| helper.find(&squash(needle)))
+        .collect();
+        assert!(
+            !order.contains(&None) && order.is_sorted(),
+            "converge_locked must check for re-entry, then hold the guard, then run the body \
+             in the task-local scope: {order:?}\n{helper}"
+        );
+    }
+
+    /// Runs `code_only` over the shapes the scan above relies on it for:
+    /// a call spelled in a comment, a doc comment, a string (with an escaped
+    /// quote), a raw string or a char literal is not code, and a lifetime is
+    /// not the start of a char literal.
+    #[test]
+    fn code_only_keeps_code_and_blanks_the_rest() {
+        let src = "fn a<'x>(s: &'x str) { stop(s); } // stop(1)\n\
+                   /// stop(2)\n\
+                   fn b() { let _ = \"stop(\\\"3\\\")\"; let _ = r#\"stop(\"4\")\"#; let _ = '\"'; start(); }\n\
+                   /* stop(5) /* stop(6) */ */ fn c() {}";
+        let code = code_only(src);
+        assert_eq!(code.len(), src.len());
+        assert_eq!(code.lines().count(), src.lines().count());
+        let words: Vec<&str> = idents(&code).into_iter().map(|(_, w)| w).collect();
+        assert_eq!(
+            words,
+            [
+                "fn", "a", "x", "s", "x", "str", "stop", "s", "fn", "b", "let", "_", "let", "_",
+                "let", "_", "start", "fn", "c"
+            ]
+        );
+    }
+
+    /// The run-time half of finding 1's guard: a lock-taker reached from
+    /// under [`CONVERGE_LOCK`] panics instead of waiting forever for the guard
+    /// its own task holds, and the panic frees the lock for whoever queued
+    /// behind it. The route is the one the review's S1 took: the locking stop
+    /// from inside a path that holds the lock, here a Save's relaunch.
+    ///
+    /// Falsified by dropping the `try_with` assertion from `converge_locked`,
+    /// by running its body outside the task-local scope, or by checking only
+    /// after taking the lock: each then waits for itself, and the timeout
+    /// fires.
+    #[tokio::test]
+    async fn a_lock_taker_reached_under_the_lock_panics_instead_of_waiting() {
+        let on = spec("/bin/pet", true);
+        let mut reentered = tokio::spawn(async move {
+            restart_for_settings_via(
+                "pet",
+                || async { Some(declared(&[("pet", on.clone())])) },
+                || async { Ok(vec![unit_for("pet", "active", &on)]) },
+                |_, _| stop_via(|| async { Ok(()) }),
+                || async { panic!("a switched-on plugin is not stopped off") },
+            )
+            .await
+        });
+        let Ok(joined) = tokio::time::timeout(Duration::from_secs(20), &mut reentered).await else {
+            // Drop the wedged task, and with it the guard it holds, so one
+            // red test does not hang every other test that takes the lock.
+            reentered.abort();
+            panic!("a re-entry must panic, not wait for itself");
+        };
+        let panic = joined.expect_err("the re-entry panics").into_panic();
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(ToString::to_string)
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("taken again by the task that already holds it"),
+            "{message}"
+        );
+        drop(
+            tokio::time::timeout(Duration::from_secs(20), CONVERGE_LOCK.lock())
+                .await
+                .expect("the panic released the lock"),
+        );
+    }
+
+    /// The guard's other edge: it is per task, not "someone holds the lock".
+    /// A lock-taker **spawned** from under the lock, which is how
+    /// [`note_resolution`] starts the secret watcher from inside a launch,
+    /// runs on a task of its own and queues for the lock as usual. (The race
+    /// tests above, which hold the raw lock and poll lock-takers from the
+    /// same task, are the same edge from the other side.)
+    ///
+    /// Falsified by a process-wide flag in place of the task-local: the
+    /// spawned stop panics.
+    #[tokio::test]
+    async fn a_lock_taker_spawned_from_under_the_lock_queues_for_it() {
+        let mut queued = None;
+        converge_locked(async {
+            queued = Some(tokio::spawn(stop_via(|| async { Ok(()) })));
+            // Let the spawned stop run while this task still holds the lock.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(20), queued.expect("spawned"))
+            .await
+            .expect("the spawned stop runs once the lock is free")
+            .expect("and does not panic")
+            .expect("and stops");
+    }
+
+    // ── the key and Save seams' remaining edges (#1424 review, finding 2) ───
+
+    /// A key change relaunches exactly the running, switched-on plugins that
+    /// declare the slot, onto the declared target: a stopped plugin (on or
+    /// off) is not started, and a plugin that does not read the slot is not
+    /// touched.
+    ///
+    /// Falsified by the `NotRunning` arm relaunching (N1), by dropping the
+    /// slot filter (N2), or by relaunching onto [`DEFAULT_TARGET`] instead of
+    /// the declared one (N4).
+    #[tokio::test]
+    async fn a_key_change_relaunches_only_running_switched_on_readers_of_the_slot() {
+        let keyed = |exec: &str, enabled: bool| PluginSpec {
+            secrets: vec!["openrouter".to_owned()],
+            ..spec(exec, enabled)
+        };
+        let d = Declared {
+            plugins: BTreeMap::from([
+                ("pet".to_owned(), keyed("/bin/pet", true)),
+                ("caw".to_owned(), keyed("/bin/caw", true)),
+                ("timer".to_owned(), keyed("/bin/timer", false)),
+                ("weather".to_owned(), spec("/bin/weather", true)),
+            ]),
+            target: "niri-session.target".to_owned(),
+        };
+        let units = vec![
+            unit_for("pet", "active", &d.plugins["pet"]),
+            unit_for("weather", "active", &d.plugins["weather"]),
+        ];
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let failed = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(d.clone()) },
+            || async { Ok(units.clone()) },
+            |id, _, target| {
+                log.borrow_mut().push(format!("relaunch {id} {target}"));
+                async { Ok(()) }
+            },
+            |id| {
+                log.borrow_mut().push(format!("stop {id}"));
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(*log.borrow(), ["relaunch pet niri-session.target"]);
+    }
+
+    /// #866's F7 through the new seam: a listing that fails reports every
+    /// plugin that reads the slot, so the watcher keeps them all; and a
+    /// relaunch that fails is reported with its error.
+    ///
+    /// Falsified by a failed listing reporting nothing (N3), or a failed
+    /// relaunch going unreported (N8).
+    #[tokio::test]
+    async fn a_key_change_that_could_not_act_keeps_its_plugins_watched() {
+        let keyed = |exec: &str| PluginSpec {
+            secrets: vec!["openrouter".to_owned()],
+            ..spec(exec, true)
+        };
+        let d = declared(&[("pet", keyed("/bin/pet")), ("caw", keyed("/bin/caw"))]);
+        let unlisted = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(d.clone()) },
+            || async { anyhow::bail!("no user manager") },
+            |_, _, _| async { panic!("nothing is relaunched blind") },
+            |_| async { panic!("nothing is stopped blind") },
+        )
+        .await;
+        assert_eq!(
+            unlisted,
+            [
+                ("caw".to_owned(), "no user manager".to_owned()),
+                ("pet".to_owned(), "no user manager".to_owned()),
+            ]
+        );
+
+        let units = vec![unit_for("pet", "active", &d.plugins["pet"])];
+        let failed = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(d.clone()) },
+            || async { Ok(units.clone()) },
+            |_, _, _| async { anyhow::bail!("unit already exists") },
+            |_| async { panic!("a switched-on plugin is never stopped") },
+        )
+        .await;
+        assert_eq!(
+            failed,
+            [("pet".to_owned(), "unit already exists".to_owned())]
+        );
+    }
+
+    /// The Save path's switched-off arm: a stop that fails is an error the
+    /// tab shows, not `switched-off`, which the tab renders as "Saved." while
+    /// the plugin keeps running with "off" persisted (#1417 item 1b's own
+    /// end state).
+    ///
+    /// Falsified by that arm discarding the stop's result (N7).
+    #[tokio::test]
+    async fn a_save_whose_switched_off_stop_failed_says_so() {
+        let off = spec("/bin/pet", false);
+        let err = restart_for_settings_via(
+            "pet",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit_for("pet", "active", &off)]) },
+            |_, _| async { panic!("a switched-off plugin is never relaunched") },
+            || async { anyhow::bail!("user manager went away") },
+        )
+        .await
+        .expect_err("a failed stop is not an answer");
+        assert!(format!("{err:#}").contains("switched off"), "{err:#}");
     }
 }

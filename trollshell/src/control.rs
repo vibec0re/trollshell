@@ -229,6 +229,17 @@ impl ControlIface {
     /// Stop plugin `id`'s user unit now (transient or static alike). Does not
     /// change its enabled state.
     ///
+    /// Queues behind any start, relaunch or reconcile the launcher already
+    /// has under way or queued (#1417 item 1b), so a stop sent right after a
+    /// `StartPlugin` stops what that start launched instead of landing before
+    /// the unit exists. It therefore waits for everything queued on the
+    /// launcher's lock ahead of it: a reconcile's restarts, keyring reads,
+    /// queued Saves and switches. #1417 item 1 leaves that unbounded, so the
+    /// caller's timeout decides what it is told. The control-center's switch
+    /// gives its whole round trip, `SetPluginEnabled` and then this, one
+    /// deadline (#1421), so a long queue reads there as unanswered, and the
+    /// stop still runs when the lock frees. See [`plugin_launcher::stop`].
+    ///
     /// # Errors
     /// Invalid id, no such unit, or an unreachable user manager.
     async fn stop_plugin(&self, id: String) -> zbus::fdo::Result<()> {
@@ -387,7 +398,11 @@ impl ControlIface {
     /// - `"not-running"` — declared but stopped: nothing was started, and the
     ///   values apply at its next start;
     /// - `"not-declared"` — a hand-installed static unit, which the launcher
-    ///   does not launch and which never reads the file: left alone.
+    ///   does not launch and which never reads the file: left alone;
+    /// - `"switched-off"` — declared and running, but switched off (#1417
+    ///   item 1b): nothing was relaunched, a unit the launcher started was
+    ///   stopped, and the values apply when the plugin is next started. A
+    ///   switch flipped off while this call waited is what reaches it.
     ///
     /// The tab sends this after **every** Save, whatever its own last poll
     /// said: the answer is decided here, after any restart already under way,

@@ -268,6 +268,14 @@ jobs:
           # the cache). nix.conf holds no secret; the token is in netrc.
           timeout 60 attic cache info preem:grid || true
           cat ~/.config/nix/nix.conf
+          # attic authenticates with its own bearer token, but nix reads the
+          # grid through the netrc `attic use` wrote. This makes nix itself
+          # open the store, which fetches `nix-cache-info`. The grid answers
+          # that with 401 to a request without the token, so success here
+          # means nix's own curl sends it. A failure costs only the warning:
+          # nix then reads every grid path as missing and builds it.
+          timeout 60 nix store info --store https://preem-bincache.trollhive.monster/grid \
+            || echo "::warning::nix could not open the preem grid with the netrc attic wrote; this run builds cold (#1418)"
       # `timeout` (rather than only `timeout-minutes`) so a hang fails the
       # step from *inside* the job, where we can still print diagnostics:
       # the fourth occurrence (2026-09-13, run 34760575142) showed every

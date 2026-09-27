@@ -361,6 +361,11 @@
 //! (same "don't double-card" caution as the sidebar-mount section above) — it
 //! owns only its inner content and spacing.
 //!
+//! The host tells you when that page opens and closes if you ask: subscribe
+//! [`StateKey::PageVisible`](proto::StateKey::PageVisible) and implement
+//! [`Plugin::page_visible`] (#1427). Nothing else reports it — the close paths
+//! (a second chip click, `Esc`, a click outside) all happen in the shell.
+//!
 //! ## `Node::Pixels` paints no CSS background
 //!
 //! `classes` still attach to a [`Node::Pixels`]'s widget the same way as
@@ -1095,6 +1100,40 @@ pub trait Plugin: Sized {
     /// every call and dedups identical trees — return effects, not render
     /// decisions.
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect>;
+
+    /// The plugin's **own page** opened (`true`) or closed (`false`) — the host
+    /// [`PageVisibility`](proto::HostMsg::PageVisibility) push (#1427). Called
+    /// once at register with the page's current state, then on every edge; the
+    /// runtime re-renders after it exactly as after [`update`](Plugin::update),
+    /// and the effects it returns ride the next frame the same way.
+    ///
+    /// "The page" is the one [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf)
+    /// opens: the drawer page under a bar chip, or the dialog over a sidebar
+    /// card. It is on screen while it shows on **any** monitor, and it closes
+    /// however it closes — a second chip click, `Esc`, a click outside, another
+    /// page replacing it, a dialog dismissed, a monitor unplugged. That makes it
+    /// the gate for work only the page needs: a list the page shows, a history
+    /// only the page draws. Hand the value to your I/O task and let a
+    /// [`poll::Gate`] park on it — see that module's *Gating on your own page*.
+    ///
+    /// **Subscribe [`StateKey::PageVisible`](proto::StateKey::PageVisible) or
+    /// this is never called.** The host sends the push only to a plugin that
+    /// asks (#305), and the SDK does not ask for you: a `Register` naming the key
+    /// cannot be decoded by a shell older than #1427, so subscribing costs
+    /// registering with one — see the key's doc.
+    ///
+    /// **Latest-wins.** Visibility is state: act on the value you are handed,
+    /// never on how many calls you saw.
+    ///
+    /// A hook with a default rather than an [`Input`] variant on purpose: most
+    /// plugins list every `Input` arm instead of writing a wildcard, so a new
+    /// variant is a compile error in each of them — for a push only a
+    /// subscriber can receive. The default does nothing, which is exactly what
+    /// a plugin that did not subscribe needs.
+    fn page_visible(&mut self, visible: bool) -> Vec<Effect> {
+        let _ = visible;
+        Vec::new()
+    }
 
     /// Project the model into everything rendered: the mounted widget tree the
     /// host reconciles into GTK, plus the optional drawer panel — one [`View`].

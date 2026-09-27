@@ -615,6 +615,10 @@ impl Redial {
 /// changes whether [`display`](crate::display) widgets rasterise or emit state.
 enum Step<M> {
     Update(Input<M>),
+    /// The host's [`HostMsg::PageVisibility`] push (#1427), folded through
+    /// [`Plugin::page_visible`] rather than `update`: it has no [`Input`]
+    /// variant, for the reason that hook's doc gives.
+    Page(bool),
     Rerender,
     /// The view-rate cap's deferred-render deadline fired (#560): recompute the
     /// view and send the coalesced trailing frame, with no `update` — like
@@ -955,6 +959,9 @@ where
                     Step::Update(Input::EffectResult { id, outcome })
                 }
                 Some(Ok(HostMsg::SlotVisibility { visible })) => Step::Update(Input::SlotVisible(visible)),
+                // #1427: the plugin's own page opened or closed. Sent only to a
+                // plugin that subscribed `StateKey::PageVisible`.
+                Some(Ok(HostMsg::PageVisibility { visible })) => Step::Page(visible),
                 Some(Ok(HostMsg::AudioSpectrum { spectrum })) => {
                     // #405: an audio-reactive frame (peak + bands), delivered only
                     // to a plugin that subscribed the key. Surface it to the model
@@ -1089,6 +1096,7 @@ where
         // cap deadline) refreshes the view without an `update`.
         let effects = match step {
             Step::Update(input) => model.update(input),
+            Step::Page(visible) => model.page_visible(visible),
             Step::Rerender | Step::Flush => Vec::new(),
         };
         let mut view = model.view();
@@ -1766,6 +1774,54 @@ mod tests {
             Node::Label {
                 id: None,
                 text: if self.visible { "visible" } else { "hidden" }.to_owned(),
+                classes: Vec::new(),
+                tooltip: None,
+            }
+            .into()
+        }
+    }
+
+    /// Reflects the latest page-visibility push (#1427) in its view, and opens a
+    /// built-in page on the rising edge, so a session test can see both halves
+    /// of [`Plugin::page_visible`]: the fold (a re-render) and the effects it
+    /// returns (riding that frame).
+    struct PageWatcher {
+        page: bool,
+    }
+
+    impl Plugin for PageWatcher {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            let mut m = Manifest::new("page-watcher-test", Mount::BarRight);
+            m.subscribes = vec![StateKey::PageVisible];
+            m.capabilities = vec![Capability::OpenPage];
+            m
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { page: false }
+        }
+
+        fn update(&mut self, _input: Input<Self::Msg>) -> Vec<Effect> {
+            Vec::new()
+        }
+
+        fn page_visible(&mut self, visible: bool) -> Vec<Effect> {
+            let opened = visible && !self.page;
+            self.page = visible;
+            if opened {
+                vec![Effect::OpenPage(Page::Media)]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn view(&self) -> View {
+            Node::Label {
+                id: None,
+                text: if self.page { "page open" } else { "page shut" }.to_owned(),
                 classes: Vec::new(),
                 tooltip: None,
             }
@@ -3020,6 +3076,89 @@ mod tests {
             };
             assert!(matches!(tree, Node::Label { ref text, .. } if text == "hidden"));
 
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) =
+            tokio::join!(session::<Watcher, _, _>(prd, pwr, never_shuts_down()), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::PageVisibility`] push (#1427) reaches
+    /// [`Plugin::page_visible`] — not `update` — and re-renders, and the effects
+    /// that hook returns ride the frame exactly as `update`'s do.
+    ///
+    /// **Falsified** by routing the push to `Step::Rerender` (no fold: the tree
+    /// stays "page shut"), or by discarding the hook's return in the session
+    /// loop (`{ model.page_visible(v); Vec::new() }` — the effect assertion
+    /// reds).
+    #[tokio::test]
+    async fn page_visibility_push_reaches_the_page_visible_hook() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let seed = eat_handshake(&mut hrd, "page-watcher-test").await;
+            assert!(
+                matches!(seed, Node::Label { ref text, .. } if text == "page shut"),
+                "the fresh model starts with its page shut",
+            );
+
+            // The register seed says the page is up (a reconnect while it was
+            // open): the hook folds it, and its effect rides the re-render.
+            send(&mut hwr, &HostMsg::PageVisibility { visible: true }).await;
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a page push must reach page_visible() and re-render");
+            };
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "page open"),
+                "PageVisibility(true) reached Plugin::page_visible(true)",
+            );
+            assert_eq!(
+                effects,
+                vec![Effect::OpenPage(Page::Media)],
+                "the hook's effects ride the frame",
+            );
+
+            send(&mut hwr, &HostMsg::PageVisibility { visible: false }).await;
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("the close push must re-render");
+            };
+            assert!(matches!(tree, Node::Label { ref text, .. } if text == "page shut"));
+            assert!(effects.is_empty());
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(
+            session::<PageWatcher, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
+        assert!(result.is_ok());
+    }
+
+    /// A plugin that keeps the default [`Plugin::page_visible`] survives the push:
+    /// the default does nothing, the view is unchanged so no frame goes out, and
+    /// the session carries on to the next input. (A host sends the push only to
+    /// a subscriber, so this is the "subscribed but never overrode the hook"
+    /// case.)
+    #[tokio::test]
+    async fn the_default_page_visible_hook_ignores_the_push() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let _ = eat_handshake(&mut hrd, "watcher-test").await;
+            send(&mut hwr, &HostMsg::PageVisibility { visible: true }).await;
+            // The next frame is the slot push's re-render, not anything the page
+            // push produced: the default hook left the model alone.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("the session must carry on past the page push");
+            };
+            assert!(matches!(tree, Node::Label { ref text, .. } if text == "visible"));
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 

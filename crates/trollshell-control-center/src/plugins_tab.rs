@@ -4526,7 +4526,12 @@ mod tests {
 
     /// `test`, failed rather than hung if a turn is never released.
     async fn bounded<F: Future>(test: F) -> F::Output {
-        tokio::time::timeout(Duration::from_secs(10), test)
+        bounded_by(Duration::from_secs(10), test).await
+    }
+
+    /// [`bounded`], with a bound of `limit` on the runtime's own clock.
+    async fn bounded_by<F: Future>(limit: Duration, test: F) -> F::Output {
+        tokio::time::timeout(limit, test)
             .await
             .expect("a round trip waited on a turn that never ended")
     }
@@ -4716,7 +4721,10 @@ mod tests {
     /// previous persist waits in the shell. A cap shorter than the minute
     /// would let a start or stop overtake the previous toggle's whenever
     /// that one is slower than the cap. On a paused clock, so the 55 s cost
-    /// nothing.
+    /// nothing. [`bounded`]'s 10 s would fire before those 55 s, so this has
+    /// a bound of ten minutes on the same paused clock instead: a turn that
+    /// never ends fails the test rather than hang it, because the clock jumps
+    /// to that timer once nothing else can run.
     ///
     /// Red if the wait gets a timeout of its own that is shorter than the
     /// minute.
@@ -4727,7 +4735,7 @@ mod tests {
             .start_paused(true)
             .build()
             .expect("a current-thread runtime")
-            .block_on(async {
+            .block_on(bounded_by(Duration::from_mins(10), async {
                 let order = ToggleOrder::default();
                 let log = Sent::default();
                 let (answer_on, on_answered) = tokio::sync::oneshot::channel();
@@ -4764,7 +4772,7 @@ mod tests {
                     sent(&log),
                     ["persist pet on #1", "persist pet off #2", "stop pet #2"]
                 );
-            });
+            }));
     }
 
     /// A flip made after the previous round trip is over supersedes nothing

@@ -18,6 +18,9 @@
 //!   decides which of the two tables above it reads.
 //! - `sample` — the `/proc` and `/sys` reads (through `hytte-sensors`, the
 //!   shell's own samplers) and the visibility-gated task that drives them.
+//! - `top_apps` — the drawer page's Top apps · CPU / RAM lists (#1419 item 3):
+//!   the native page's own `/proc` + cgroup walker, gated on the page's two
+//!   list expanders and driven by the same gated loop as `sample`.
 //! - `card` — the geometry, the per-core lamp ramp, the sidebar card and the
 //!   bar chips.
 //! - `panel` — the drawer page a chip click opens (#1251), in the native Stats
@@ -66,14 +69,15 @@
 //! `main.rs` is the subscriber plus one call into the SDK.
 
 // Only what a *consumer* of this library needs is public: `config` for #888
-// P1's settings form, `plugin` for the binary beside this file. The four
-// rendering modules stay crate-private, which is exactly what they were while
-// this crate was bin-only — publishing them would export a plugin's internal
-// geometry as API, and rustdoc would then (rightly) complain about every doc
-// link they make to a private helper.
+// P1's settings form, `plugin` for the binary beside this file. The rendering
+// and sampling modules stay crate-private, which is exactly what they were
+// while this crate was bin-only — publishing them would export a plugin's
+// internal geometry as API, and rustdoc would then (rightly) complain about
+// every doc link they make to a private helper.
 mod card;
 pub mod config;
 mod format;
 mod panel;
 pub mod plugin;
 mod sample;
+mod top_apps;

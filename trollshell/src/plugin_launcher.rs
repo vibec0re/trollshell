@@ -170,6 +170,17 @@
 //! rather than deleted, so a pin relaxed back to `lib.mkDefault` finds the
 //! switch's last choice again.
 //!
+//! **A switched-off plugin is never relaunched** (#1417 item 1b). The two
+//! paths that relaunch a running plugin to apply a change — a Save's
+//! [`restart_for_settings`] and a key change's [`relaunch_for_secret`] — read
+//! the effective declaration under [`CONVERGE_LOCK`] and skip a plugin the
+//! switch turned off; one still running from a unit this launcher started is
+//! stopped instead, the way a reconcile would ([`Reapply`]). Before, either
+//! one queued behind the switch's `SetPluginEnabled(false)` relaunched the
+//! plugin just before the switch's `StopPlugin` arrived, and it ran on with
+//! "off" persisted. [`stop`] takes the same lock since then, so that
+//! `StopPlugin` also lands after any start still under way, not inside it.
+//!
 //! ## The session target (#707)
 //!
 //! The transient unit's `PartOf=` used to be hardcoded to
@@ -376,7 +387,7 @@
 //! directly on the D-Bus task, and the startup launch runs on the shared
 //! runtime.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1542,8 +1553,10 @@ fn is_running(active_state: &str) -> bool {
 
 // ── Reconcile (#695) ─────────────────────────────────────────────────────────
 
-/// Serialises every path that drives a plugin's unit through a **multi-step**
-/// transition — [`reconcile`], [`relaunch_for_secret`] and [`start`].
+/// Serialises every path that changes whether a plugin's unit runs, or reads
+/// the switch's persisted choice to decide it — [`reconcile`],
+/// [`relaunch_for_secret`], [`restart_for_settings`], [`start`], [`stop`]
+/// and [`set_enabled`].
 ///
 /// #866's F6. Before this only `reconcile` was serialised, and `relaunch_for_secret`
 /// grew a second caller: the control-center's `SetAiKey`/`ClearAiKey` already
@@ -1556,10 +1569,21 @@ fn is_running(active_state: &str) -> bool {
 /// systemd's "unit already exists" → the static-unit fallback in [`restart`] →
 /// `Err`, i.e. the bridge simply gone for the session.
 ///
-/// **Held only at the top-level entry points.** [`restart`] and [`stop`] are
-/// reached from inside those, and a tokio `Mutex` is not reentrant, so taking it
-/// there too would deadlock instantly. `stop` on its own (the Plugins tab's Stop
-/// button) is a single call with no window to interleave and stays outside.
+/// **Held only at the top-level entry points.** [`restart`] and [`stop_unit`]
+/// are reached from inside those, and a tokio `Mutex` is not reentrant, so
+/// taking it there too would deadlock instantly.
+///
+/// [`stop`] takes it since #1417 item 1b. It used to stay outside as "a
+/// single call with no window to interleave", but the window is the *other*
+/// path's: a `StopPlugin` that lands while a [`start`] is between its keyring
+/// read and `systemd-run`, or while a [`restart`] is between its stop and its
+/// relaunch, finds no unit to stop (or one already stopping) and answers at
+/// once, and then the launch brings the plugin back. The Plugins tab's switch
+/// reaches the first of those by being flipped on and straight off again: the
+/// off's `StopPlugin` arrives while the on's `StartPlugin` is launching, and
+/// the plugin ends up running with "off" persisted. Queued on this lock, the
+/// stop lands after whatever was already under way, which is the order the
+/// requests were made in.
 static CONVERGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What [`reconcile`] decided to do about one plugin. Ordered as executed —
@@ -1826,7 +1850,7 @@ where
         match action {
             Action::Stop => {
                 tracing::info!(plugin = %id, "no longer declared as enabled; stopping");
-                if let Err(err) = stop(&id).await {
+                if let Err(err) = stop_unit(&id).await {
                     tracing::warn!(plugin = %id, %err, "stopping the plugin failed");
                 }
             }
@@ -2087,11 +2111,45 @@ pub async fn start(id: &str) -> anyhow::Result<()> {
 }
 
 /// Stop plugin `id`'s unit now (`StopUnit` — works for transient and static
-/// units alike; a stopped `--collect` transient unit is then released).
+/// units alike; a stopped `--collect` transient unit is then released) — the
+/// Plugins tab's switch-off, over `Control.StopPlugin`.
+///
+/// Queues on [`CONVERGE_LOCK`] (#1417 item 1b), so it lands **after** any
+/// start, relaunch or reconcile already under way or already queued, rather
+/// than in the middle of one where there is nothing yet to stop; see the
+/// lock's doc for the interleavings. The cost is that a stop waits out a
+/// restart in progress, up to [`STOP_WAIT`] per unit that restart is waiting
+/// on; the control-center gives `StopPlugin` the same 30 s it gives the other
+/// calls that take this lock.
+///
+/// Never call this from under the lock: that is [`stop_unit`]'s job, and this
+/// would deadlock there.
 ///
 /// # Errors
 /// Invalid id, no such unit, or an unreachable user manager.
 pub async fn stop(id: &str) -> anyhow::Result<()> {
+    stop_via(|| stop_unit(id)).await
+}
+
+/// [`stop`] with the stop itself passed in, so a test can see it wait for
+/// [`CONVERGE_LOCK`] without a user manager (the [`restart_for_settings_via`]
+/// seam's shape).
+async fn stop_via<S, SF>(stop_unit: S) -> anyhow::Result<()>
+where
+    S: FnOnce() -> SF,
+    SF: Future<Output = anyhow::Result<()>>,
+{
+    let _guard = CONVERGE_LOCK.lock().await;
+    stop_unit().await
+}
+
+/// `StopUnit` for plugin `id`'s unit, **without** taking [`CONVERGE_LOCK`]:
+/// what every path that already holds the lock stops a unit with
+/// ([`reconcile`], [`restart`], and the relaunch paths' switched-off arm).
+///
+/// # Errors
+/// Invalid id, no such unit, or an unreachable user manager.
+async fn stop_unit(id: &str) -> anyhow::Result<()> {
     systemd::stop_plugin(id).await
 }
 
@@ -2164,15 +2222,17 @@ async fn set_enabled_in(sources: &Sources, id: &str, enabled: bool) -> anyhow::R
 
 // ── Secret rotation (#392): relaunch to re-inject a changed key ───────────────
 
-/// Relaunch every **running** declared plugin whose `secrets` allowlist
-/// includes `slot`, so a just-changed key (set or cleared in the control-center)
-/// takes effect — rotation is stop + relaunch, re-reading the slot from the
-/// keyring. Called from the `SetAiKey`/`ClearAiKey` control handlers after the
-/// keyring write.
+/// Relaunch every **running, switched-on** declared plugin whose `secrets`
+/// allowlist includes `slot`, so a just-changed key (set or cleared in the
+/// control-center) takes effect — rotation is stop + relaunch, re-reading the
+/// slot from the keyring. Called from the `SetAiKey`/`ClearAiKey` control
+/// handlers after the keyring write.
 ///
-/// Stopped plugins and legacy static units are left alone: a stopped plugin
-/// re-reads the key on its next start, and a static unit gets no injection at
-/// all. Best-effort — each plugin's failure is logged, never propagated.
+/// Stopped plugins are left alone: a stopped plugin re-reads the key on its
+/// next start. A **switched-off** plugin is never relaunched (#1417 item 1b,
+/// [`reapply`]): if its unit is still running and this launcher started it,
+/// it is stopped instead, and a unit it did not start is left alone.
+/// Best-effort — each plugin's failure is logged, never propagated.
 ///
 /// Serialised on [`CONVERGE_LOCK`] (#866's F6): this now has two callers that
 /// collide on the happy path, and two interleaved `stop → wait → launch`
@@ -2198,11 +2258,47 @@ pub async fn relaunch_for_secret(slot: &str) {
 ///
 /// A failure to even list the units reports **every** affected id against that
 /// same listing error: nothing was attempted, so nothing should stop being
-/// watched.
+/// watched. So does a switched-off plugin whose stop failed: it is still
+/// running with the old key.
 async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
+    relaunch_for_secret_via(
+        slot,
+        load_declared,
+        systemd::list_plugin_units,
+        |id, spec, target| async move { restart(&id, &spec, &target).await },
+        |id| async move { stop_unit(&id).await },
+    )
+    .await
+}
+
+/// [`relaunch_for_secret_inner`] with its four effects passed in — the
+/// declaration, the unit listing, one plugin's relaunch and one plugin's
+/// stop — so a test can drive the decision and the lock without a user
+/// manager or a keyring (the [`restart_for_settings_via`] seam's shape).
+///
+/// The declaration is read **after** the lock is taken, so a switch-off
+/// persisted by a [`set_enabled`] queued ahead of this call is what it sees
+/// (#1417 item 1b).
+async fn relaunch_for_secret_via<D, DF, L, LF, R, RF, S, SF>(
+    slot: &str,
+    load: D,
+    list_units: L,
+    mut relaunch: R,
+    mut stop_off: S,
+) -> Vec<(String, String)>
+where
+    D: FnOnce() -> DF,
+    DF: Future<Output = Option<Declared>>,
+    L: FnOnce() -> LF,
+    LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
+    R: FnMut(String, PluginSpec, String) -> RF,
+    RF: Future<Output = anyhow::Result<()>>,
+    S: FnMut(String) -> SF,
+    SF: Future<Output = anyhow::Result<()>>,
+{
     let _guard = CONVERGE_LOCK.lock().await;
 
-    let declared = load_declared().await.unwrap_or_default();
+    let declared = load().await.unwrap_or_default();
     let affected: Vec<(&String, &PluginSpec)> = declared
         .plugins
         .iter()
@@ -2212,12 +2308,8 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
         tracing::debug!(%slot, "no declared plugin uses this secret slot; nothing to relaunch");
         return Vec::new();
     }
-    let running: HashSet<String> = match systemd::list_plugin_units().await {
-        Ok(units) => units
-            .into_iter()
-            .filter(|u| is_running(&u.active_state))
-            .map(|u| u.id)
-            .collect(),
+    let units = match list_units().await {
+        Ok(units) => units,
         Err(err) => {
             tracing::warn!(%err, %slot, "listing plugin units for relaunch failed; skipping");
             let reason = err.to_string();
@@ -2229,18 +2321,97 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
     };
     let mut failed = Vec::new();
     for (id, spec) in affected {
-        if !running.contains(id) {
-            tracing::debug!(plugin = %id, %slot, "not running; new key applies on next start");
-            continue;
-        }
-        if let Err(err) = restart(id, spec, &declared.target).await {
-            tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
-            failed.push((id.clone(), err.to_string()));
-        } else {
-            tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
+        match reapply(spec, running_unit(&units, id)) {
+            Reapply::NotRunning => {
+                tracing::debug!(plugin = %id, %slot, "not running; new key applies on next start");
+            }
+            Reapply::Relaunch => {
+                if let Err(err) = relaunch(id.clone(), spec.clone(), declared.target.clone()).await
+                {
+                    tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
+                    failed.push((id.clone(), err.to_string()));
+                } else {
+                    tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
+                }
+            }
+            Reapply::Stop => {
+                if let Err(err) = stop_off(id.clone()).await {
+                    tracing::warn!(
+                        plugin = %id,
+                        %slot,
+                        %err,
+                        "switched off but still running; stopping it failed, so it keeps the old key",
+                    );
+                    failed.push((id.clone(), err.to_string()));
+                } else {
+                    tracing::info!(
+                        plugin = %id,
+                        %slot,
+                        "switched off but still running; stopped it instead of relaunching \
+                         (the new key applies at its next start)",
+                    );
+                }
+            }
+            Reapply::Leave => {
+                tracing::info!(
+                    plugin = %id,
+                    %slot,
+                    "switched off, and its running unit is not one this launcher started \
+                     (a hand-installed static unit?); left it alone",
+                );
+            }
         }
     }
     failed
+}
+
+/// What a relaunch path — [`restart_for_settings`] or [`relaunch_for_secret`]
+/// — does about one declared plugin to apply its change (#1417 item 1b).
+///
+/// Both run under [`CONVERGE_LOCK`], and both used to relaunch any running
+/// declared plugin without asking whether it is still switched on. The lock is
+/// FIFO, so one queued behind the Plugins tab's `SetPluginEnabled(false)` ran
+/// **after** the switch-off was persisted and **before** the tab's
+/// `StopPlugin`, found the plugin running, and relaunched it; the stop then
+/// landed inside the relaunch and did nothing. The plugin ran on with "off"
+/// persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reapply {
+    /// Not running: nothing to do, and the change applies at its next start.
+    NotRunning,
+    /// Running and switched on: stop, wait, relaunch ([`restart`]).
+    Relaunch,
+    /// Running, switched **off**, and stamped by this launcher: stop it and
+    /// relaunch nothing. This is [`plan`]'s own row for that state, applied to
+    /// the one plugin, so the relaunch path converges onto the switch rather
+    /// than waiting on a `StopPlugin` that a timed-out or closed tab never
+    /// sends; and a key cleared with `ClearAiKey` does not stay in a
+    /// switched-off plugin's environment.
+    Stop,
+    /// Running, switched **off**, and **not** stamped: a unit this launcher
+    /// never started (a hand-installed static unit for a declared-off id).
+    /// Left alone, as [`plan`] leaves it (#1400 review, finding 4).
+    Leave,
+}
+
+/// Decide [`Reapply`] for a plugin from its **effective** spec (the switch
+/// folded in, [`load_declared_from`]) and its running unit, if it has one
+/// ([`running_unit`]). Pure.
+fn reapply(spec: &PluginSpec, running: Option<&systemd::PluginUnit>) -> Reapply {
+    match running {
+        None => Reapply::NotRunning,
+        Some(_) if spec.enabled => Reapply::Relaunch,
+        Some(unit) if parse_fingerprint(&unit.description).is_some() => Reapply::Stop,
+        Some(_) => Reapply::Leave,
+    }
+}
+
+/// Plugin `id`'s unit in `units` if it is running ([`is_running`]):
+/// `deactivating` is not, since the unit is already on its way down. Pure.
+fn running_unit<'a>(units: &'a [systemd::PluginUnit], id: &str) -> Option<&'a systemd::PluginUnit> {
+    units
+        .iter()
+        .find(|u| u.id == id && is_running(&u.active_state))
 }
 
 /// Stop a declared plugin's transient unit, wait for it to actually go down (so
@@ -2269,7 +2440,7 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
 /// for them together would bound the first cost; the second needs the
 /// fallback to skip a unit this launcher stamped.
 async fn restart(id: &str, spec: &PluginSpec, target: &str) -> anyhow::Result<()> {
-    stop(id).await?;
+    stop_unit(id).await?;
     wait_until_stopped(id).await;
     let extra_env = resolve_secret_env(id, spec).await;
     let Err(err) = launch(id, spec, &extra_env, target).await else {
@@ -2366,6 +2537,12 @@ pub enum SettingsRestart {
     /// launcher does not launch and which therefore never reads the file.
     /// Left alone.
     NotDeclared,
+    /// The plugin is declared and running, but switched **off** (#1417 item
+    /// 1b): nothing was relaunched. A unit this launcher started was stopped
+    /// ([`Reapply::Stop`]); one it did not start was left alone
+    /// ([`Reapply::Leave`]). Either way the plugin reads the file when it is
+    /// next started.
+    SwitchedOff,
 }
 
 impl SettingsRestart {
@@ -2376,6 +2553,7 @@ impl SettingsRestart {
             SettingsRestart::Relaunched => "relaunched",
             SettingsRestart::NotRunning => "not-running",
             SettingsRestart::NotDeclared => "not-declared",
+            SettingsRestart::SwitchedOff => "switched-off",
         }
     }
 }
@@ -2394,6 +2572,14 @@ impl SettingsRestart {
 /// Reads the effective declaration (so the relaunch carries the file's
 /// current values) and the live unit list, and starts nothing that was not
 /// already running.
+///
+/// Nor does it relaunch a plugin that is **switched off** (#1417 item 1b,
+/// [`Reapply`]). The declaration is read under the lock, so it includes a
+/// switch-off persisted by a `SetPluginEnabled(false)` queued ahead of this
+/// call — the Save-then-flip-off sequence, where this call used to find the
+/// plugin still running and relaunch it just before the tab's `StopPlugin`
+/// arrived. A switched-off plugin this launcher started is stopped instead
+/// and the answer is [`SettingsRestart::SwitchedOff`].
 ///
 /// **Every** Save calls this, whatever the tab last saw (#1415 second review
 /// M1): the tab's own poll can be two seconds stale, and a Save that lands
@@ -2415,19 +2601,21 @@ pub async fn restart_for_settings(id: &str) -> anyhow::Result<SettingsRestart> {
         load_declared,
         systemd::list_plugin_units,
         |spec, target| async move { restart(id, &spec, &target).await },
+        || stop_unit(id),
     )
     .await
 }
 
-/// [`restart_for_settings`] with its three effects passed in — the
-/// declaration, the unit listing and the relaunch — so a test can drive the
-/// decision and the lock without a user manager (the [`reconcile_listing`]
-/// seam's shape).
-async fn restart_for_settings_via<D, DF, L, LF, R, RF>(
+/// [`restart_for_settings`] with its four effects passed in — the
+/// declaration, the unit listing, the relaunch and the stop of a switched-off
+/// plugin — so a test can drive the decision and the lock without a user
+/// manager (the [`reconcile_listing`] seam's shape).
+async fn restart_for_settings_via<D, DF, L, LF, R, RF, S, SF>(
     id: &str,
     load: D,
     list_units: L,
     relaunch: R,
+    stop_off: S,
 ) -> anyhow::Result<SettingsRestart>
 where
     D: FnOnce() -> DF,
@@ -2436,6 +2624,8 @@ where
     LF: Future<Output = anyhow::Result<Vec<systemd::PluginUnit>>>,
     R: FnOnce(PluginSpec, String) -> RF,
     RF: Future<Output = anyhow::Result<()>>,
+    S: FnOnce() -> SF,
+    SF: Future<Output = anyhow::Result<()>>,
 {
     let _guard = CONVERGE_LOCK.lock().await;
     let Some(declared) = load().await else {
@@ -2449,15 +2639,33 @@ where
         return Ok(SettingsRestart::NotDeclared);
     };
     let units = list_units().await.context("listing plugin units")?;
-    if !units
-        .iter()
-        .any(|u| u.id == id && is_running(&u.active_state))
-    {
-        return Ok(SettingsRestart::NotRunning);
+    match reapply(&spec, running_unit(&units, id)) {
+        Reapply::NotRunning => Ok(SettingsRestart::NotRunning),
+        Reapply::Relaunch => {
+            relaunch(spec, declared.target).await?;
+            tracing::info!(plugin = %id, "relaunched to apply its saved settings");
+            Ok(SettingsRestart::Relaunched)
+        }
+        Reapply::Stop => {
+            stop_off()
+                .await
+                .context("stopping the plugin, which is switched off but was still running")?;
+            tracing::info!(
+                plugin = %id,
+                "switched off but still running; stopped it instead of relaunching \
+                 (its saved settings apply at its next start)",
+            );
+            Ok(SettingsRestart::SwitchedOff)
+        }
+        Reapply::Leave => {
+            tracing::info!(
+                plugin = %id,
+                "switched off, and its running unit is not one this launcher started \
+                 (a hand-installed static unit?); left it alone",
+            );
+            Ok(SettingsRestart::SwitchedOff)
+        }
     }
-    relaunch(spec, declared.target).await?;
-    tracing::info!(plugin = %id, "relaunched to apply its saved settings");
-    Ok(SettingsRestart::Relaunched)
 }
 
 #[cfg(test)]
@@ -4263,6 +4471,7 @@ mod tests {
             "pub async fn list()",
             "pub async fn start(",
             "pub async fn restart_for_settings(",
+            "async fn relaunch_for_secret_inner(",
             "async fn declared_ids_from(",
         ] {
             let b = body(sig);
@@ -5462,8 +5671,8 @@ mod tests {
         };
         let restart = body("async fn restart(id: &str");
         let stop = restart
-            .find("stop(id).await?")
-            .expect("restart stops first");
+            .find("stop_unit(id).await?")
+            .expect("restart stops first, without retaking the lock");
         let wait = restart
             .find("wait_until_stopped(id).await")
             .expect("restart waits for the stop");
@@ -5488,6 +5697,9 @@ mod tests {
             entry.contains(&squash("restart(id, &spec, &target)")),
             "{entry}"
         );
+        // #1417 item 1b: the switched-off arm's stop is the real, unlocked
+        // one; a stand-in that does nothing would leave that arm inert.
+        assert!(entry.contains(&squash("|| stop_unit(id),")), "{entry}");
         // The guard must be *held*: `let _ = …lock().await` drops it at once
         // and no lint catches that for a tokio guard (#1415 second review
         // B1). `two_restarts_for_settings_run_one_after_the_other` is the
@@ -5528,6 +5740,7 @@ mod tests {
                     relaunched.set(true);
                     async { Ok(()) }
                 },
+                || async { panic!("a plugin that is not running is never stopped") },
             )
             .await
             .expect("answers");
@@ -5546,6 +5759,7 @@ mod tests {
             || async { Some(saved("x")) },
             || async { panic!("an undeclared id needs no listing") },
             |_, _| async { panic!("an undeclared id is never relaunched") },
+            || async { panic!("an undeclared id is never stopped") },
         )
         .await
         .expect("answers");
@@ -5560,6 +5774,7 @@ mod tests {
                 *got.borrow_mut() = Some((spec.settings, target));
                 async { Ok(()) }
             },
+            || async { panic!("a switched-on plugin is never stopped") },
         )
         .await
         .expect("answers");
@@ -5583,6 +5798,7 @@ mod tests {
             || async { None },
             || async { panic!("nothing is listed") },
             |_, _| async { panic!("nothing is relaunched") },
+            || async { panic!("nothing is stopped") },
         )
         .await
         .expect_err("an unreadable plugins.json is not an answer");
@@ -5626,6 +5842,7 @@ mod tests {
                     log.borrow_mut().push(format!("{n}: up"));
                     Ok(())
                 },
+                || async { panic!("a switched-on plugin is never stopped") },
             )
         };
         let (a, b) = tokio::join!(call(1), async {
@@ -5700,5 +5917,366 @@ mod tests {
         assert_eq!(SettingsRestart::Relaunched.wire_name(), "relaunched");
         assert_eq!(SettingsRestart::NotRunning.wire_name(), "not-running");
         assert_eq!(SettingsRestart::NotDeclared.wire_name(), "not-declared");
+        assert_eq!(SettingsRestart::SwitchedOff.wire_name(), "switched-off");
+    }
+
+    // ── a switched-off plugin is never relaunched (#1417 item 1b) ──────────
+
+    /// Poll `fut` once, so the [`CONVERGE_LOCK`] acquire at its top joins the
+    /// lock's queue now: tokio's mutex is FIFO, and the order the futures are
+    /// enqueued in here is the order the shell's handlers would reach the lock
+    /// in. Panics if `fut` got past the lock, which would mean the lock was
+    /// not held.
+    async fn enqueue<F: Future>(mut fut: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "the call must wait for the lock the test holds"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// `pet` and `caw`, both declared on and both reading the `openrouter`
+    /// key — the fixture for the key-change relaunch.
+    const TWO_KEYED: &str = r#"{"version":1,"plugins":{
+        "pet":{"exec":"/bin/pet","enabled":true,"secrets":["openrouter"]},
+        "caw":{"exec":"/bin/caw","enabled":true,"secrets":["openrouter"]}
+    }}"#;
+
+    /// The race #1417 item 1b is about, through the settings restart: a Save's
+    /// `RestartPlugin` holds the lock; the switch is flipped off, so the tab's
+    /// `SetPluginEnabled(false)` queues; a second Save's `RestartPlugin`
+    /// queues behind that. The persist runs first and writes "off"; then the
+    /// queued restart must see "off" and relaunch nothing. It stops the unit
+    /// instead, since this launcher started it ([`Reapply::Stop`]), and the
+    /// tab's `StopPlugin` that follows finds it stopping or gone.
+    ///
+    /// Red before the fix: the queued restart found the plugin running and
+    /// relaunched it (`["relaunch"]`, answer `Relaunched`), and the stop the
+    /// tab sent next landed inside that relaunch. Also red if the declaration
+    /// is read before the lock is taken, or read from nix's half alone.
+    #[tokio::test]
+    async fn a_save_queued_behind_a_switch_off_stops_the_plugin_instead_of_relaunching_it() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let pet = spec("/bin/pet", true);
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+
+        // The first Save's restart, still under way.
+        let held = CONVERGE_LOCK.lock().await;
+        let persist = set_enabled_in(&sources, "pet", false);
+        let save = restart_for_settings_via(
+            "pet",
+            || load_declared_from(&sources),
+            || async { Ok(vec![unit_for("pet", "active", &pet)]) },
+            |_, _| {
+                log.borrow_mut().push("relaunch");
+                async { Ok(()) }
+            },
+            || {
+                log.borrow_mut().push("stop");
+                async { Ok(()) }
+            },
+        );
+        tokio::pin!(persist, save);
+        enqueue(persist.as_mut()).await;
+        enqueue(save.as_mut()).await;
+        drop(held);
+
+        let (persisted, answer) = tokio::join!(persist, save);
+        persisted.expect("the switch-off persists");
+        assert_eq!(
+            std::fs::read_to_string(&toml).expect("persisted"),
+            "[enabled]\npet = false\n"
+        );
+        assert_eq!(answer.expect("answers"), SettingsRestart::SwitchedOff);
+        assert_eq!(
+            *log.borrow(),
+            ["stop"],
+            "a switched-off plugin must not be relaunched by a Save queued behind the switch"
+        );
+    }
+
+    /// The control: the same queue with the switch flipped **on** — `timer`
+    /// is declared off, so its "on" is an override in `plugins.toml` — and a
+    /// running unit (the `StartPlugin` that followed). The queued Save
+    /// relaunches it, so the check reads the *effective* switch, not nix's
+    /// value, and does not stop Saves from applying.
+    #[tokio::test]
+    async fn a_save_queued_behind_a_switch_on_still_relaunches() {
+        let (_dir, sources, toml) = scratch_sources(TWO_FREE);
+        let timer = spec("/bin/timer", true);
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+
+        let held = CONVERGE_LOCK.lock().await;
+        let persist = set_enabled_in(&sources, "timer", true);
+        let save = restart_for_settings_via(
+            "timer",
+            || load_declared_from(&sources),
+            || async { Ok(vec![unit_for("timer", "active", &timer)]) },
+            |_, _| {
+                log.borrow_mut().push("relaunch");
+                async { Ok(()) }
+            },
+            || {
+                log.borrow_mut().push("stop");
+                async { Ok(()) }
+            },
+        );
+        tokio::pin!(persist, save);
+        enqueue(persist.as_mut()).await;
+        enqueue(save.as_mut()).await;
+        drop(held);
+
+        let (persisted, answer) = tokio::join!(persist, save);
+        persisted.expect("the switch-on persists");
+        assert!(toml.exists(), "timer's on is an override");
+        assert_eq!(answer.expect("answers"), SettingsRestart::Relaunched);
+        assert_eq!(*log.borrow(), ["relaunch"]);
+    }
+
+    /// The same race through the key-change relaunch — the 30 s secret
+    /// watcher's pass or `SetAiKey`'s, queued behind the switch-off. `pet` is
+    /// switched off and must be stopped, not relaunched; `caw`, on and reading
+    /// the same key, is still relaunched with its own spec and target; and
+    /// neither is reported failed, so the watcher stops waiting on both.
+    ///
+    /// Red before the fix: both were relaunched.
+    #[tokio::test]
+    async fn a_key_relaunch_queued_behind_a_switch_off_stops_the_plugin_instead() {
+        let (_dir, sources, _toml) = scratch_sources(TWO_KEYED);
+        let log = std::cell::RefCell::new(Vec::<String>::new());
+        let live = load_declared_from(&sources).await.expect("parses").plugins;
+        let units: Vec<_> = live
+            .iter()
+            .map(|(id, spec)| unit_for(id, "active", spec))
+            .collect();
+
+        let held = CONVERGE_LOCK.lock().await;
+        let persist = set_enabled_in(&sources, "pet", false);
+        let relaunch = relaunch_for_secret_via(
+            "openrouter",
+            || load_declared_from(&sources),
+            || async { Ok(units.clone()) },
+            |id, spec, target| {
+                log.borrow_mut()
+                    .push(format!("relaunch {id} {} {target}", spec.exec));
+                async { Ok(()) }
+            },
+            |id| {
+                log.borrow_mut().push(format!("stop {id}"));
+                async { Ok(()) }
+            },
+        );
+        tokio::pin!(persist, relaunch);
+        enqueue(persist.as_mut()).await;
+        enqueue(relaunch.as_mut()).await;
+        drop(held);
+
+        let (persisted, failed) = tokio::join!(persist, relaunch);
+        persisted.expect("the switch-off persists");
+        assert_eq!(failed, Vec::<(String, String)>::new());
+        assert_eq!(
+            *log.borrow(),
+            [
+                format!("relaunch caw /bin/caw {DEFAULT_TARGET}"),
+                "stop pet".to_owned(),
+            ]
+        );
+    }
+
+    /// A switched-off plugin whose stop fails is still running with the old
+    /// key, so it is reported failed: the secret watcher keeps it for its next
+    /// pass (bounded by [`MAX_RELAUNCH_FAILURES`]) rather than forgetting it.
+    #[tokio::test]
+    async fn a_switched_off_plugin_whose_stop_failed_stays_watched() {
+        let off = PluginSpec {
+            secrets: vec!["openrouter".to_owned()],
+            ..spec("/bin/pet", false)
+        };
+        let failed = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit_for("pet", "active", &off)]) },
+            |_, _, _| async { panic!("a switched-off plugin is never relaunched") },
+            |_| async { anyhow::bail!("user manager went away") },
+        )
+        .await;
+        assert_eq!(
+            failed,
+            [("pet".to_owned(), "user manager went away".to_owned())]
+        );
+    }
+
+    /// A switched-off plugin running from a unit this launcher did not start
+    /// — a hand-installed static unit for a declared-off id — is neither
+    /// relaunched nor stopped by either path: reconcile never stops a unit it
+    /// did not stamp (#1400 review, finding 4), and neither may these.
+    #[tokio::test]
+    async fn a_switched_off_unit_the_launcher_did_not_start_is_left_alone() {
+        let off = PluginSpec {
+            secrets: vec!["openrouter".to_owned()],
+            ..spec("/bin/pet", false)
+        };
+        let answer = restart_for_settings_via(
+            "pet",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit("pet", "active", true)]) },
+            |_, _| async { panic!("a switched-off plugin is never relaunched") },
+            || async { panic!("an unstamped unit is never stopped") },
+        )
+        .await
+        .expect("answers");
+        assert_eq!(answer, SettingsRestart::SwitchedOff);
+
+        let failed = relaunch_for_secret_via(
+            "openrouter",
+            || async { Some(declared(&[("pet", off.clone())])) },
+            || async { Ok(vec![unit("pet", "active", true)]) },
+            |_, _, _| async { panic!("a switched-off plugin is never relaunched") },
+            |_| async { panic!("an unstamped unit is never stopped") },
+        )
+        .await;
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// [`reapply`]'s whole table, and its two switched-off rows are exactly
+    /// what [`plan`] does with the same plugin and unit: the relaunch paths
+    /// converge a switched-off plugin the way a reconcile would, and cannot
+    /// drift from it. `deactivating` is not running ([`running_unit`]).
+    ///
+    /// Red if the enabled check is dropped (the off rows read `Relaunch`), or
+    /// if the stamp check is (an unstamped unit is stopped, or a stamped one
+    /// left).
+    #[test]
+    fn reapply_is_plans_rule_for_one_plugin() {
+        let on = spec("/bin/pet", true);
+        let off = spec("/bin/pet", false);
+        let stamped = unit_for("pet", "active", &on);
+        let bare = unit("pet", "active", false);
+        assert_eq!(reapply(&on, None), Reapply::NotRunning);
+        assert_eq!(reapply(&off, None), Reapply::NotRunning);
+        assert_eq!(reapply(&on, Some(&stamped)), Reapply::Relaunch);
+        assert_eq!(reapply(&on, Some(&bare)), Reapply::Relaunch);
+        assert_eq!(reapply(&off, Some(&stamped)), Reapply::Stop);
+        assert_eq!(reapply(&off, Some(&bare)), Reapply::Leave);
+
+        let d = declared(&[("pet", off.clone())]);
+        for live in [stamped.clone(), bare.clone()] {
+            let planned = plan(&d, std::slice::from_ref(&live));
+            let reapplied = reapply(&off, running_unit(std::slice::from_ref(&live), "pet"));
+            assert_eq!(
+                planned == [("pet".to_owned(), Action::Stop)],
+                reapplied == Reapply::Stop,
+                "plan {planned:?} vs reapply {reapplied:?} for {live:?}"
+            );
+        }
+
+        let stopping = unit_for("pet", "deactivating", &on);
+        assert_eq!(running_unit(&[stopping], "pet"), None);
+        assert_eq!(running_unit(std::slice::from_ref(&stamped), "caw"), None);
+    }
+
+    /// Decision 2 of #1417 item 1b: `StopPlugin` queues on [`CONVERGE_LOCK`]
+    /// and lands **after** a launch already under way. The shape is the
+    /// switch flipped on and straight off: the off's `StopPlugin` arrives
+    /// while the on's `StartPlugin` holds the lock between its keyring read
+    /// and `systemd-run`. Unqueued, the stop found no unit yet (the tab counts
+    /// systemd's "not loaded" as done) and the launch then brought the plugin
+    /// up with "off" persisted.
+    ///
+    /// Falsified by dropping the guard from `stop_via`: the log reads
+    /// `["stopped", "launched"]`.
+    #[tokio::test]
+    async fn a_stop_queued_behind_a_launch_lands_after_it() {
+        let log = std::cell::RefCell::new(Vec::<&str>::new());
+        // `StartPlugin`, mid-launch.
+        let start = CONVERGE_LOCK.lock().await;
+        let stop = stop_via(|| {
+            log.borrow_mut().push("stopped");
+            async { Ok(()) }
+        });
+        tokio::pin!(stop);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut stop)
+                .await
+                .is_err(),
+            "the stop must wait for the launch holding the lock"
+        );
+        log.borrow_mut().push("launched");
+        drop(start);
+        stop.await.expect("stops once the lock is free");
+        assert_eq!(*log.borrow(), ["launched", "stopped"]);
+    }
+
+    /// The wiring the behavioural tests above stand in for, which a stand-in
+    /// cannot check (#1417 item 1b):
+    /// - `stop` goes through the locking seam with the real `StopUnit`, and
+    ///   the seam holds the guard (`let _ = …` would drop it at once);
+    /// - nothing in this module calls the locking `stop` — every caller that
+    ///   stops a unit already holds the lock and would deadlock on it, so they
+    ///   call `stop_unit`;
+    /// - the key-change relaunch hands its seam the real declaration, listing,
+    ///   relaunch and stop, and holds the lock.
+    ///
+    /// Falsified by `reconcile_listing` calling `stop(&id)` again, by
+    /// `stop_via`'s `let _ = CONVERGE_LOCK…`, or by the production relaunch
+    /// passing a stop that does nothing.
+    #[test]
+    fn stops_under_the_lock_do_not_retake_it() {
+        let src = include_str!("plugin_launcher.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let body = |sig: &str| {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} is defined"));
+            let len = prod[start..].find("\n}\n").expect("its body ends");
+            &prod[start..start + len]
+        };
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let guard = squash("let _guard = CONVERGE_LOCK.lock().await;");
+
+        assert!(
+            squash(body("pub async fn stop(id: &str)"))
+                .contains(&squash("stop_via(|| stop_unit(id))")),
+            "StopPlugin must go through the locking seam with the real stop"
+        );
+        assert!(
+            squash(body("async fn stop_via<")).contains(&guard),
+            "the stop must hold the convergence lock"
+        );
+        assert!(
+            body("async fn stop_unit(id: &str)").contains("systemd::stop_plugin(id)"),
+            "stop_unit is the real StopUnit"
+        );
+
+        let code = prod
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let locking_stops: Vec<usize> = code
+            .match_indices("stop(")
+            .map(|(at, _)| at)
+            .filter(|&at| !code[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+            .collect();
+        assert_eq!(
+            locking_stops.len(),
+            1,
+            "only `stop`'s own definition may spell `stop(`; a call from inside this module \
+             would run under the lock and deadlock on it"
+        );
+
+        let inner = squash(body("async fn relaunch_for_secret_inner("));
+        for wiring in [
+            "relaunch_for_secret_via(slot, load_declared, systemd::list_plugin_units,",
+            "restart(&id, &spec, &target)",
+            "stop_unit(&id)",
+        ] {
+            assert!(inner.contains(&squash(wiring)), "{wiring}:\n{inner}");
+        }
+        assert!(
+            squash(body("async fn relaunch_for_secret_via<")).contains(&guard),
+            "the key-change relaunch must hold the convergence lock"
+        );
     }
 }

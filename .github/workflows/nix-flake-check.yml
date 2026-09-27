@@ -50,8 +50,10 @@ concurrency:
 # what they built to it. So a run whose deps derivations match the last
 # main run's (same `Cargo.lock`, the same `Cargo.toml`s, the same nix
 # inputs) substitutes both deps stages instead of compiling them. A run
-# without the `PREEM_BINCACHE_TOKEN` secret (a fork PR) skips every grid
-# step and still pays the duplication.
+# that GitHub gives no `PREEM_BINCACHE_TOKEN` (a fork PR) skips every
+# grid step and still pays the duplication. Which token a run gets, and
+# why main's is a different one, is under `environment:` on the heavy
+# job.
 #
 # THE REQUIRED CHECK IS THE `flake-check` JOB AT THE BOTTOM. Branch
 # protection and the local merge poller both key on a check run named
@@ -86,6 +88,46 @@ jobs:
     # 15 + 5 + 20 = 40. GitHub has no arithmetic in expressions, so each
     # leg spells out its own `timeout`. Keep it at `soft + 40`.
     timeout-minutes: ${{ matrix.timeout }}
+    # WHICH GRID TOKEN A RUN GETS (#1418). Two tokens, one secret name,
+    # and GitHub picks between them by ref, not this file:
+    #
+    # - The repo secret `PREEM_BINCACHE_TOKEN` is PULL-ONLY. Every
+    #   same-repo run reads it, PRs included, and anyone who can push a
+    #   branch here can write a workflow on that branch that sends it
+    #   anywhere. Minted on the cache host with
+    #     atticd-atticadm make-token --sub trollshell-ci-pull --validity 1y --pull grid
+    # - The environment `preem-push` holds an environment secret of the
+    #   SAME name with the push+pull token, and its deployment branches
+    #   are `main` only. An environment secret wins over a repo secret of
+    #   the same name, and only a job that names the environment sees it.
+    #   Minted with
+    #     atticd-atticadm make-token --sub trollshell-ci-push --validity 1y --pull grid --push grid
+    #   (attic's push needs `--pull` too: it asks the grid what it already
+    #   has before uploading).
+    #
+    # This job names `preem-push` only on main's own push runs; on every
+    # other run the name is '' and the job has no environment at all. A
+    # branch that edits this line to name it anyway is refused by the
+    # environment's branch rule, which GitHub matches against the run's
+    # `GITHUB_REF` before the job reaches a runner. That rule, not the
+    # push step's `if:` below, is the credential boundary: the `if:`
+    # lives in a file every branch can edit.
+    #
+    # `deployment: false`: the environment is a secret scope here, not a
+    # deploy target, so no deployment record is created per leg (six per
+    # main commit otherwise). The branch rule still applies.
+    #
+    # Until `preem-push` carries its own secret, main reads the repo
+    # secret like every other run. If that is already the pull-only
+    # token, main's push fails with a warning and the gate stays green.
+    # Set the branch rule BEFORE adding the push token: an environment
+    # GitHub creates because a run named it starts with no rules.
+    #
+    # Paste each token as one line. Both are attic JWTs, which contain no
+    # whitespace; the pull step strips any anyway (#1420's first run).
+    environment:
+      name: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'preem-push' || '' }}
+      deployment: false
     env:
       # Whether this run can reach the preem grid (#1418). A step's `if:`
       # cannot read `secrets`, but it can read `env`, so the grid steps
@@ -199,26 +241,27 @@ jobs:
       # prints a line per crate, and both nixosTest VMs narrate — so the
       # headroom is for a slow runner, not for a quiet phase.
       #
-      # `connect-timeout` and `fallback` are there for the grid step below
-      # (#1418): the grid is a cache, and a down or broken cache must cost a
-      # cold build, never a red gate. `connect-timeout = 5` caps what an
-      # unreachable host costs per connection (nix 2.34's default is 15 s).
-      # `fallback = true` makes nix build a derivation whose substitute
-      # failed to download, and log a failed substituter query instead of
-      # aborting on it. With `fallback` set, nix also switches a failing
-      # HTTP cache off for 60 s, so a dead grid is not asked again for
-      # every path. A 401 or 403 (a revoked token) needs neither: nix reads
-      # it as "not in this cache", or drops the substituter with a warning,
-      # and builds the path. Both settings are set unconditionally, so a
-      # run with no grid behaves as before, apart from the 5 s connect cap
-      # on cache.nixos.org.
+      # `install_url` pins the nix every job runs to 2.35.2, which is what
+      # install-nix-action@v31 installs by default today (`nix_version` in
+      # its install-nix.sh at tag commit 13d8dd58). The pin exists because
+      # of the grid (#1418): how nix treats a failing substituter changed
+      # between releases (2.34 read a 401 as "not in this cache", 2.35
+      # reads it as an error; see the pull step), and the grid settings
+      # below were checked against 2.35.2's source. Without the pin a
+      # retag of @v31 could change that under us. Bump it on purpose,
+      # re-reading libstore's http-binary-cache-store.cc when you do.
+      #
+      # The grid's own nix settings (`fallback`, `connect-timeout`, the
+      # per-store retry cap) are not here. The pull step writes them to
+      # the runner user's nix.conf once the grid is configured, so a run
+      # without the grid (a fork PR) runs the same nix config as before
+      # #1418. See the pull step for why.
       - uses: cachix/install-nix-action@v31
         with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
           extra_nix_config: |
             experimental-features = nix-command flakes
             max-silent-time = 1800
-            connect-timeout = 5
-            fallback = true
       # PULL FROM THE PREEM GRID (#1418, #1231 item 2). Mara's attic cache
       # (forge.darkest.space/mara/preem-nix-bincache) is private, so even
       # reading it needs the token. This step installs the attic client
@@ -238,51 +281,115 @@ jobs:
       # `trusted-users = root $USER` by default (`set_as_trusted_user`, in
       # its install-nix.sh). For a trusted client, the daemon applies every
       # forwarded setting, `netrc-file` included (libstore/daemon.cc, in
-      # nix 2.34). Without that it would drop the substituter with
+      # nix 2.35.2). Without that it would drop the substituter with
       # "ignoring untrusted substituter".
       #
       # The grid's priority is attic's default 41, and cache.nixos.org's is
       # 40, so nix asks cache.nixos.org first. The grid answers only for
       # paths cache.nixos.org does not have, which are ours.
       #
-      # Every failure here is `continue-on-error`. A step that dies before
-      # `attic use` finishes leaves nix.conf untouched, and the build runs
-      # cold, as it did before #1418. The `attic` output gates the push
-      # step at the bottom: it is set only once the login has succeeded.
+      # WHAT A BROKEN GRID COSTS. Once the grid is in nix.conf, this step
+      # appends three settings there, and only there:
+      #
+      # - `fallback = true` is required, not tuning. In nix 2.35.2 a
+      #   substituter error that is not a 404 or 403 (a 401 from an expired
+      #   or rotated token, any 5xx, a timeout) fails the build unless
+      #   `fallback` is set. With it, nix logs the error, builds what it
+      #   could not fetch, and switches the failing cache off for 60 s.
+      #   (http-binary-cache-store.cc reads only NotFound and Forbidden as
+      #   "absent"; misc.cc and substitution-goal.cc rethrow the rest when
+      #   `fallback` is off. 2.34 filed a 401 under Forbidden; 2.35 does not.)
+      #   It applies to cache.nixos.org too: on a grid run, an outage there
+      #   that exhausts nix's five attempts builds from source instead of
+      #   failing fast. That is why it is written here and not in
+      #   `extra_nix_config` above, where it would also reach fork PRs and
+      #   the cheap job, which have no grid to fall back from.
+      # - `connect-timeout = 5` caps what an unreachable host costs per
+      #   connection (2.35.2's default is 15 s).
+      # - `?retry-attempts=2` on the grid's substituter URL caps nix's
+      #   attempts per grid request at two (the global default is five).
+      #   A grid whose atticd hangs behind its nginx answers each request
+      #   with a 504 after nginx's 60 s read timeout; two attempts make one
+      #   such episode cost about two minutes instead of five, before the
+      #   60 s switch-off. Checked against a local server that answers
+      #   every request with a 504: 5 requests unset, 2 with this, 1 with
+      #   `=1`. Two rather than one so a single blip on a large NAR still
+      #   gets one retry.
+      #
+      # So: a grid that is down, refuses the connection or rejects the
+      # token when this step runs costs nothing but a cold build, because
+      # `attic use` fails and nix.conf keeps no grid. A grid that starts
+      # failing during the build costs time, and a grid that keeps hanging
+      # through the whole build can still push a slow leg past `soft`,
+      # which is red. That is the one way a failing grid can turn a leg
+      # red. (What the grid serves is trusted outright; who may write to
+      # it is the `environment:` comment on the job.)
+      #
+      # Every failure here is `continue-on-error`. The `attic` output gates
+      # the push step at the bottom. It is set only after `attic use` has
+      # fetched the cache's config from the server, which is the first
+      # command here that talks to the grid at all (`attic login` only
+      # writes a file).
+      #
+      # `shell: bash` so these steps run with `-o pipefail` (a bare `run:`
+      # is `bash -e` only).
       - name: Pull from the preem grid
         id: preem
         if: env.HAVE_PREEM == 'true'
         continue-on-error: true
         timeout-minutes: 5
+        shell: bash
         env:
           PREEM_TOKEN: ${{ secrets.PREEM_BINCACHE_TOKEN }}
         run: |
-          nix build --inputs-from . nixpkgs#attic-client --out-link "${RUNNER_TEMP}/attic-client"
-          echo "${RUNNER_TEMP}/attic-client/bin" >> "$GITHUB_PATH"
-          PATH="${RUNNER_TEMP}/attic-client/bin:$PATH"
           # The secret as stored carries a character HTTP headers refuse,
           # most likely a newline from the paste. On #1420's first run,
           # attic panicked building its `Authorization` header with
           # `InvalidHeaderValue`. An attic token is a JWT, which has no
           # whitespace, so strip all of it. The netrc `attic use` writes
           # below gets the same clean token.
+          #
+          # The runner masks the secret as stored, and each of its lines;
+          # it does not know the stripped string, so register that before
+          # anything else runs.
           token="$(printf '%s' "$PREEM_TOKEN" | tr -d '[:space:]')"
+          echo "::add-mask::${token}"
           echo "token: stripped $(( ${#PREEM_TOKEN} - ${#token} )) whitespace character(s)"
+          nix build --inputs-from . nixpkgs#attic-client --out-link "${RUNNER_TEMP}/attic-client"
+          echo "${RUNNER_TEMP}/attic-client/bin" >> "$GITHUB_PATH"
+          PATH="${RUNNER_TEMP}/attic-client/bin:$PATH"
           attic login preem https://preem-bincache.trollhive.monster "$token"
+          grid=https://preem-bincache.trollhive.monster/grid
+          conf=~/.config/nix/nix.conf
+          use_rc=0
+          timeout 60 attic use preem:grid || use_rc=$?
+          # `attic use` writes nix.conf last, so a failure normally leaves
+          # no grid in it. If one got there anyway (a kill mid-write), it
+          # must not stay without `fallback`: see the comment above.
+          if grep -qF "$grid" "$conf" 2>/dev/null; then
+            printf '%s\n' 'fallback = true' 'connect-timeout = 5' >> "$conf"
+            sed -i "/^substituters = /s#${grid}\( \|$\)#${grid}?retry-attempts=2\1#" "$conf"
+            grep -q '^substituters = .*retry-attempts=2' "$conf" \
+              || echo "::warning::could not add retry-attempts=2 to the grid substituter; nix retries it 5 times (#1418)"
+          fi
+          if [ "$use_rc" != 0 ]; then
+            echo "::warning::attic use failed (exit ${use_rc}); this run builds cold and pushes nothing (#1418)"
+            exit "$use_rc"
+          fi
           echo attic=ready >> "$GITHUB_OUTPUT"
-          timeout 60 attic use preem:grid
           # For the log: the priority, and the upstream key names the push
           # step's filter reads (`cache.nixos.org-1` unless someone changed
           # the cache). nix.conf holds no secret; the token is in netrc.
           timeout 60 attic cache info preem:grid || true
-          cat ~/.config/nix/nix.conf
+          cat "$conf"
           # attic authenticates with its own bearer token, but nix reads the
           # grid through the netrc `attic use` wrote. This makes nix itself
           # open the store, which fetches `nix-cache-info`. The grid answers
           # that with 401 to a request without the token, so success here
           # means nix's own curl sends it. A failure costs only the warning:
-          # nix then reads every grid path as missing and builds it.
-          timeout 60 nix store info --store https://preem-bincache.trollhive.monster/grid \
+          # nix then fails every grid request, `fallback` builds the path,
+          # and the grid is switched off for 60 s at a time.
+          timeout 60 nix store info --store "$grid" \
             || echo "::warning::nix could not open the preem grid with the netrc attic wrote; this run builds cold (#1418)"
       # `timeout` (rather than only `timeout-minutes`) so a hang fails the
       # step from *inside* the job, where we can still print diagnostics:
@@ -414,19 +521,35 @@ jobs:
       # `cache.nixos.org-1`. It also drops what the grid already holds.
       # What is left is ours: the crane deps caches `trollshell-deps` and
       # `trollshell-workspace-bin-deps`, the unpacked crates, the workspace
-      # compile, the slices, the filtered sources, and the checks' own
-      # outputs. Pushing the check outputs means a later run whose check
-      # derivation is unchanged substitutes that result instead of running
-      # it again. That is the standard nix trade: the same derivation has
-      # already passed once.
+      # compile, the slices, the `probes` compile and the filtered sources.
+      #
+      # WITHOUT the checks' own outputs, except on the `packages` leg. A
+      # check's output is its verdict: a pushed `system-tests` output would
+      # be substituted by the next run whose derivation is unchanged, and
+      # that leg would go green without running a test. That verdict is
+      # hardware-dependent here (llvmpipe parity on whichever CPU the
+      # runner has, #1298; the VMs under KVM), and the `lscpu` line in the
+      # build step would then name a CPU that ran nothing. It would also
+      # make "green" mean "some grid pusher had this path", and the grid
+      # has pushers other than this workflow. So every leg but `packages`
+      # holds back every output of the derivations it names in `checks`.
+      # The `packages` leg pushes its outputs because they are the
+      # packages: compute1 and the hosts substitute `packages.trollshell`
+      # from the grid instead of compiling it. Its two assertion checks
+      # (`shell-has-no-web-engine`, `workspace-ships-no-probes`) ride
+      # along; they are closure greps over those same packages.
       #
       # `!cancelled()` so a red build still pushes what it did build. A
       # failed test on main should not cost the next run its deps caches.
-      # The push can never make this job red: `continue-on-error`, a
-      # 20-minute step bound, and an 18-minute `timeout` inside it so the
-      # log says what happened. What went up before a timeout stays up, and
-      # the next main run pushes the rest. The job-level `timeout` above
-      # already counts these 20 minutes.
+      # The push cannot make this job red: `continue-on-error`, a 20-minute
+      # step bound, and an 18-minute `timeout` inside it so the log says
+      # what happened. What went up before a timeout stays up, and the next
+      # main run pushes the rest. The job-level `timeout` above already
+      # counts these 20 minutes. Before it starts, one `attic cache info`
+      # bounded at 60 s checks that the grid still answers: the pull step
+      # talked to it up to `soft` minutes ago, and the attic client sets
+      # no timeouts of its own, so a grid that went quiet since would
+      # otherwise hold this step for the full 18 minutes.
       #
       # `xargs` because the list runs to thousands of paths. Each `attic
       # push` it runs prints its own count: "Pushing N paths … (M already
@@ -435,19 +558,42 @@ jobs:
         if: ${{ !cancelled() && steps.preem.outputs.attic == 'ready' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         continue-on-error: true
         timeout-minutes: 20
+        shell: bash
         env:
+          NAME: ${{ matrix.name }}
           CHECKS: ${{ matrix.checks }}
         run: |
           out="${RUNNER_TEMP}/preem-push"
           # shellcheck disable=SC2086  # $CHECKS is a deliberate list of installables
           nix path-info --derivation $CHECKS > "${out}.drvs"
+          # Every output of the check derivations themselves, whether or not
+          # it was built: `--outputs` reads the .drv, not the store.
+          xargs nix-store -q --outputs < "${out}.drvs" | sort -u > "${out}.leaves"
           xargs nix-store -qR --include-outputs < "${out}.drvs" \
-            | { grep -v '[.]drv$' || true; } | sort -u > "${out}.paths"
-          echo "handing $(wc -l < "${out}.paths") store paths to attic (it skips what cache.nixos.org signs and what the grid already has)"
+            | { grep -v '[.]drv$' || true; } | sort -u > "${out}.closure"
+          if [ "$NAME" = packages ]; then
+            cp "${out}.closure" "${out}.paths"
+          else
+            { grep -vxFf "${out}.leaves" "${out}.closure" || true; } > "${out}.paths"
+          fi
+          paths=$(wc -l < "${out}.paths")
+          echo "${NAME}: handing ${paths} store paths to attic, holding back $(( $(wc -l < "${out}.closure") - paths )) check output(s) (attic skips what cache.nixos.org signs and what the grid already has)"
+          # An empty list is a broken list, not a clean push: every leg
+          # depends on at least a filtered source and a deps cache.
+          if [ "$paths" -eq 0 ]; then
+            echo "::warning::the push list for ${NAME} is empty, so nothing was pushed; the list computation above is broken (#1418)"
+            exit 1
+          fi
+          if ! timeout 60 attic cache info preem:grid > /dev/null; then
+            echo "::warning::the preem grid did not answer within 60 s, so nothing was pushed; the next main run pushes this (#1418)"
+            exit 1
+          fi
           rc=0
           timeout 18m xargs -r -a "${out}.paths" attic push preem:grid || rc=$?
           if [ "$rc" = 124 ]; then
             echo "::warning::the push to the preem grid did not finish within 18 min; what went up stays up, and the next main run pushes the rest (#1418)"
+          elif [ "$rc" != 0 ]; then
+            echo "::warning::attic push failed (exit ${rc}); see its output above (#1418)"
           fi
           exit "$rc"
 
@@ -469,17 +615,17 @@ jobs:
       # for how 1800 s was sized. This job runs `--no-build`, so nothing it
       # does should come near it; it is set here so the two nix
       # installations do not drift, and so a check that *does* build
-      # something in future inherits the bound. The same goes for
-      # `connect-timeout` and `fallback` (#1418). This job neither pulls
-      # from nor pushes to the preem grid (nothing here is heavy enough to
-      # be worth caching), so here they only ever meet cache.nixos.org.
+      # something in future inherits the bound. The `install_url` pin is
+      # the heavy job's, for the same reason: one nix version everywhere.
+      # This job neither pulls from nor pushes to the preem grid (nothing
+      # here is heavy enough to be worth caching), so it gets none of the
+      # grid's settings (#1418).
       - uses: cachix/install-nix-action@v31
         with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
           extra_nix_config: |
             experimental-features = nix-command flakes
             max-silent-time = 1800
-            connect-timeout = 5
-            fallback = true
       # `nix flake check` itself is still here — it is the *builds* that
       # moved out to the jobs above, not the evaluation. `--no-build` keeps
       # everything that never needed a runner-hour: every output leaf on

@@ -29,6 +29,8 @@
 //! | memory / swap / per-mount `GtkProgressBar` (`ts-stat-progress`) | [`Node::Progress`] with the same class |
 //! | the Disk `AdwExpanderRow`, collapsed | a [`Node::Expander`], collapsed until clicked (the plugin holds the flag — see [`DISKS_EXPANDER_ID`]) |
 //! | Disk I/O's `↓ … ↑ …` / `min … · max …` / `total ↓ … ↑ …` lines, indented 88 px | three `ts-stat-value` labels under the line, indented by the `ts-stat-detail` rule |
+//! | `build_top_apps_expander`'s "Top apps · CPU" / "Top apps · RAM" `AdwExpanderRow`s, last in the CPU and Memory cards, collapsed, the heaviest app's `name · value` dimmed beside the chevron | a [`Node::Expander`] each, in the same two places, collapsed until clicked (the plugin holds both flags — [`TOP_APPS_CPU_ID`], [`TOP_APPS_RAM_ID`]), the same `name · value` or `—` in a 20-character ellipsizing `dim-label` [`Node::Text`] pinned right of the title |
+//! | `rebuild_top_apps`' `slim_row` per app: name (20 characters), `N processes` when a group has more than one, the `42%` / `1.2 GiB` suffix | a `ts-history-row` [`Node::Row`] per app, at most [`hytte_sensors::app_usage::TOP_N`] (the walker's own cap): the name as a 20-character ellipsizing `Text`, the `N processes` subtitle on the same line, a [`Node::Spacer`], then the value — **no icon** (below) |
 //!
 //! The history lines keep [`HISTORY_LEN`] samples, the native rows' 60, on the
 //! native rows' axes: load, memory, GPU usage and VRAM on a fixed `0..=1`, the
@@ -49,9 +51,26 @@
 //!   client and flapping shell tasks are the shell's own task supervisor; a
 //!   plugin process can reach neither. Epic #1248 has that card staying
 //!   native.
-//! - **Top apps · CPU / RAM**: `app_usage` (`crates/hytte-services`) walks
-//!   `/proc` by systemd cgroup and resolves icons through `gio::AppInfo` — a
-//!   `hytte-services` module a GTK-free plugin never links.
+//! - **Top apps' icons and display names.** The rows themselves are here
+//!   (#1419 item 3), sampled in this process by the native page's own walker
+//!   (`crate::top_apps`, a crate-private module). What is not: native resolves
+//!   each row's icon and display name through `gio::DesktopAppInfo`, which a
+//!   GTK-free plugin cannot call. The icon column is **pending #1419's
+//!   question** (read the `.desktop` file in the plugin, or a wire node the
+//!   shell resolves), so a row carries no icon node at all rather than a
+//!   placeholder. A row names its group by its raw key — the scope's app id,
+//!   the unit name, `System` — so on niri a row reads `niri-firefox` where
+//!   native reads `Firefox`; most rows differ, not only apps with no
+//!   `.desktop` file. A follow-up ports native's name lookup to the plugin
+//!   (see `crate::top_apps`' module docs).
+//! - **Top apps' collapsed summary while both lists are collapsed.** Native
+//!   shows the heaviest app beside the chevron whenever the drawer is open.
+//!   This plugin cannot see its page open or close, so its walker runs only
+//!   while one of the two lists is expanded, and a collapsed header reads `—`
+//!   while nothing is being measured. The flip side is a known cost: a list
+//!   left open keeps walking `/proc` after the drawer closes, until #1427
+//!   tells the plugin when its page is on screen — see `crate::top_apps`'
+//!   module docs for the measured numbers.
 //! - **The per-core LED panel.** Native draws it with `hytte_preem::LedMatrix`,
 //!   which is not on the wire (#1156); the only lamp the wire has is a preem
 //!   `DotMatrix`, which is exactly what this page is no longer allowed to
@@ -79,20 +98,61 @@ use std::collections::VecDeque;
 
 use hytte_plugin::nodes;
 use hytte_plugin::proto::{Dir, Node};
+use hytte_sensors::app_usage::{ProcSample, TOP_N};
 
 use crate::card::{label, percent_text};
 use crate::format;
 use crate::sample::{Disk, Snapshot};
+use crate::top_apps::TopApps;
 
 /// The page's root node id.
 pub const ROOT_ID: &str = "stats-panel";
 
-/// The id of the Disk card's expander — the one click target on the page.
+/// The id of the Disk card's expander — one of the page's three click targets.
 ///
 /// The wire's [`Node::Expander`] is **plugin-driven**: the host fires a click
 /// at this id and the plugin flips its own `expanded` flag and re-renders
 /// (`Stats::update`), so the model is the only place the state lives.
 pub const DISKS_EXPANDER_ID: &str = "stats-panel-disks-mounts";
+
+/// The id of the CPU card's "Top apps · CPU" expander (#1419 item 3), and the
+/// prefix of its rows' ids. Plugin-driven like [`DISKS_EXPANDER_ID`].
+pub const TOP_APPS_CPU_ID: &str = "stats-panel-top-apps-cpu";
+
+/// The id of the Memory card's "Top apps · RAM" expander (#1419 item 3), and
+/// the prefix of its rows' ids.
+pub const TOP_APPS_RAM_ID: &str = "stats-panel-top-apps-ram";
+
+/// The natural width, in characters, of a Top apps row's name and of the
+/// collapsed summary beside the chevron — native `TOP_APPS_TITLE_CHARS`, so a
+/// long app id costs an ellipsis rather than the page's width.
+const TOP_APPS_CHARS: i32 = 20;
+
+/// Which of the page's expanders are open — held by the plugin, because the
+/// wire's [`Node::Expander`] is plugin-driven, and collapsed by default like
+/// every native one.
+///
+/// Three independent flags, one per expander on the page: the Disk card's
+/// mounts and the two Top apps lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Expanded {
+    /// The Disk card's mount list ([`DISKS_EXPANDER_ID`]).
+    pub disks: bool,
+    /// The CPU card's Top apps list ([`TOP_APPS_CPU_ID`]).
+    pub top_cpu: bool,
+    /// The Memory card's Top apps list ([`TOP_APPS_RAM_ID`]).
+    pub top_ram: bool,
+}
+
+impl Expanded {
+    /// Whether either Top apps list is open — which is what gates the `/proc`
+    /// walker (see `crate::top_apps`), since the plugin cannot see its page
+    /// open or close.
+    #[must_use]
+    pub const fn top_apps(self) -> bool {
+        self.top_cpu || self.top_ram
+    }
+}
 
 /// How many samples each history line keeps: the native page's 60 (one a
 /// second for a minute at the default cadence — `build_history_row`'s
@@ -212,26 +272,37 @@ impl History {
 ///
 /// Pure, like [`card::card`](crate::card::card) and
 /// [`card::chips`](crate::card::chips): every branch is decided by `cfg`, by
-/// what the snapshot and the history hold, and by whether the Disk card is
-/// open, so the whole page is testable from literals.
+/// what the snapshot, the history and the latest Top apps walk hold, and by
+/// which expanders are open, so the whole page is testable from literals.
 ///
 /// Of `cfg`'s keys, the page reads `cpu` / `memory` / `gpu` / `disk` (a card
-/// each) and `temperature` (every `°C` reading). `per_core` and `history` are
-/// the **chips'** switches — the per-core lamp row and the chip's scope sweep —
-/// and the page, which draws neither, ignores them: its history lines are the
+/// each — the two Top apps lists ride the CPU and Memory cards, as native)
+/// and `temperature` (every `°C` reading). `per_core` and `history` are the
+/// **chips'** switches — the per-core lamp row and the chip's scope sweep — and
+/// the page, which draws neither, ignores them: its history lines are the
 /// native page's, and the native page does not make them optional.
 #[must_use]
 pub fn panel(
     cfg: crate::config::Card,
     snapshot: &Snapshot,
     history: &History,
-    disks_expanded: bool,
+    top_apps: &TopApps,
+    expanded: Expanded,
 ) -> Node {
     let mut left = Vec::new();
     let mut right = Vec::new();
 
     if cfg.cpu {
-        left.push(boxed("stats-panel-cpu", cpu_rows(cfg, snapshot, history)));
+        let mut rows = cpu_rows(cfg, snapshot, history);
+        // Last in the CPU card, as native `build_stats_cpu_card` adds it.
+        rows.push(top_apps_expander(
+            TOP_APPS_CPU_ID,
+            "Top apps \u{00b7} CPU",
+            &top_apps.by_cpu,
+            cpu_share,
+            expanded.top_cpu,
+        ));
+        left.push(boxed("stats-panel-cpu", rows));
     }
     // The GPU card hides itself entirely when there is nothing to read — the
     // native page's `bind(sensors::gpu().map(|g| g.is_some()), &group, …)`,
@@ -241,12 +312,21 @@ pub fn panel(
         left.push(boxed("stats-panel-gpu", gpu_rows(cfg, snapshot, history)));
     }
     if cfg.memory {
-        right.push(boxed("stats-panel-memory", memory_rows(snapshot, history)));
+        let mut rows = memory_rows(snapshot, history);
+        // Last in the Memory card, as native `build_stats_memory_card` adds it.
+        rows.push(top_apps_expander(
+            TOP_APPS_RAM_ID,
+            "Top apps \u{00b7} RAM",
+            &top_apps.by_mem,
+            ram_size,
+            expanded.top_ram,
+        ));
+        right.push(boxed("stats-panel-memory", rows));
     }
     if cfg.disk {
         right.push(boxed(
             "stats-panel-disks",
-            disk_rows(snapshot, history, disks_expanded),
+            disk_rows(snapshot, history, expanded.disks),
         ));
     }
 
@@ -680,13 +760,123 @@ fn mount_row(index: usize, disk: &Disk) -> Node {
     .build()
 }
 
+/// The "Top apps · CPU" value — native `build_stats_cpu_card`'s formatter,
+/// `format!("{:.0}%", s.cpu_frac * 100.0)`, in the same `f64` arithmetic so the
+/// two pages round a share identically.
+fn cpu_share(app: &ProcSample) -> String {
+    format!("{:.0}%", app.cpu_frac * 100.0)
+}
+
+/// The "Top apps · RAM" value — native `build_stats_memory_card`'s
+/// `fmt_bytes(s.mem_bytes)`, which [`format::bytes`] mirrors.
+fn ram_size(app: &ProcSample) -> String {
+    format::bytes(app.mem_bytes)
+}
+
+/// One Top apps list — native `build_top_apps_expander` plus the rows
+/// `rebuild_top_apps` puts in it: `title`, the heaviest app's
+/// `name · value` (or `—` with nothing measured) dimmed beside the chevron,
+/// and one row per app, heaviest first, at most [`TOP_N`].
+///
+/// The cap is the walker's own constant rather than a copy of it: the walker
+/// already truncates to it, and taking it again here is what bounds the frame
+/// whatever reaches the model, without letting the two pages drift apart.
+fn top_apps_expander(
+    id: &str,
+    title: &str,
+    list: &[ProcSample],
+    value: fn(&ProcSample) -> String,
+    expanded: bool,
+) -> Node {
+    // Native `rebuild_top_apps`' collapsed summary, character for character.
+    let summary = list.first().map_or_else(
+        || "\u{2014}".to_owned(),
+        |app| format!("{} \u{00b7} {}", app.name, value(app)),
+    );
+    Node::Expander {
+        id: id.to_owned(),
+        header: Box::new(
+            nodes::row(vec![
+                label(title, &[]),
+                Node::Spacer,
+                // The native summary is a fixed-width `dim-label` suffix that
+                // hugs the chevron; an ellipsizing `Text` tooltips its own full
+                // string, as native sets the summary's tooltip to it.
+                Node::Text {
+                    id: None,
+                    text: summary,
+                    max_width_chars: Some(TOP_APPS_CHARS),
+                    ellipsize: true,
+                    classes: vec!["dim-label".to_owned()],
+                    tooltip: None,
+                },
+            ])
+            .spacing(6)
+            .build(),
+        ),
+        children: list
+            .iter()
+            .take(TOP_N)
+            .enumerate()
+            .map(|(index, app)| top_app_row(id, index, app, value))
+            .collect(),
+        expanded,
+        // The same header hook as the Disk card's (see `disk_rows`).
+        classes: vec![PAGE_EXPANDER.to_owned()],
+        tooltip: None,
+    }
+}
+
+/// One app in a Top apps list — native `rebuild_top_apps`' `slim_row`: the
+/// group's name, `N processes` only when more than one PID collapsed into it,
+/// and the value pinned right, with the name as the row's hover.
+///
+/// Classed `ts-history-row` rather than `header` for [`mount_row`]'s reason:
+/// it sits in the expander's body box, where libadwaita's `row > box.header`
+/// rule cannot reach it. **No icon** — the icon column is pending #1419's
+/// question, so there is no node for it, placeholder or otherwise.
+fn top_app_row(
+    expander_id: &str,
+    index: usize,
+    app: &ProcSample,
+    value: fn(&ProcSample) -> String,
+) -> Node {
+    let mut children = vec![Node::Text {
+        id: None,
+        text: app.name.clone(),
+        max_width_chars: Some(TOP_APPS_CHARS),
+        ellipsize: true,
+        classes: Vec::new(),
+        tooltip: None,
+    }];
+    if app.procs > 1 {
+        children.push(label(
+            format!("{} processes", app.procs),
+            &["subtitle", "numeric"],
+        ));
+    }
+    children.push(Node::Spacer);
+    children.push(label(value(app), &["numeric"]));
+    nodes::row(children)
+        .id(format!("{expander_id}-{index}"))
+        .class("ts-history-row")
+        .spacing(6)
+        .tooltip(app.name.clone())
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DISKS_EXPANDER_ID, HISTORY_LEN, History, ROOT_ID, panel};
+    use super::{
+        DISKS_EXPANDER_ID, Expanded, HISTORY_LEN, History, ROOT_ID, TOP_APPS_CPU_ID,
+        TOP_APPS_RAM_ID, panel,
+    };
     use crate::config::Card;
     use crate::sample::{Disk, DiskIo, Gpu, Memory, Snapshot};
+    use crate::top_apps::{TopApps, app};
     use hytte_plugin::display::testing::with_negotiated_vocab;
     use hytte_plugin::proto::{Dir, HOMOGENEOUS_CLASS, Node, SPARKLINE_VOCAB};
+    use hytte_sensors::app_usage::{ProcSample, TOP_N};
 
     /// A machine with something to say about every card.
     fn busy() -> Snapshot {
@@ -734,6 +924,31 @@ mod tests {
         }
     }
 
+    /// A walk with something in both lists: a group of three processes on
+    /// top of the CPU list, a lone `System` bucket (no app id) below it, and
+    /// a RAM list headed by the same browser.
+    fn busy_apps() -> TopApps {
+        TopApps {
+            by_cpu: vec![
+                ProcSample {
+                    procs: 3,
+                    ..app("org.mozilla.firefox", 0.42, 3_435_973_837)
+                },
+                ProcSample {
+                    app_id: None,
+                    ..app("System", 0.07, 734_003_200)
+                },
+            ],
+            by_mem: vec![
+                ProcSample {
+                    procs: 3,
+                    ..app("org.mozilla.firefox", 0.42, 3_435_973_837)
+                },
+                app("pipewire", 0.01, 52_428_800),
+            ],
+        }
+    }
+
     /// A history with a few ticks of [`busy`] in it.
     fn warm() -> History {
         let mut history = History::default();
@@ -745,12 +960,21 @@ mod tests {
 
     /// The page against a shell that draws sparklines (today's), or against
     /// the newest one that does not.
-    fn page_at(vocab: u16, cfg: Card, snapshot: &Snapshot, expanded: bool) -> Node {
-        with_negotiated_vocab(vocab, || panel(cfg, snapshot, &warm(), expanded))
+    fn page_at(vocab: u16, cfg: Card, snapshot: &Snapshot, expanded: Expanded) -> Node {
+        with_negotiated_vocab(vocab, || {
+            panel(cfg, snapshot, &warm(), &busy_apps(), expanded)
+        })
     }
 
+    /// Every expander on the page open, so every row it can draw is in the tree.
+    const ALL_OPEN: Expanded = Expanded {
+        disks: true,
+        top_cpu: true,
+        top_ram: true,
+    };
+
     fn page(cfg: Card, snapshot: &Snapshot) -> Node {
-        page_at(SPARKLINE_VOCAB, cfg, snapshot, true)
+        page_at(SPARKLINE_VOCAB, cfg, snapshot, ALL_OPEN)
     }
 
     /// Every node in tree order, the expander's header and body included.
@@ -922,7 +1146,7 @@ mod tests {
         cfg.per_core = true;
         cfg.history = true;
         for vocab in [SPARKLINE_VOCAB, SPARKLINE_VOCAB - 1, 0] {
-            let node = page_at(vocab, cfg, &busy(), true);
+            let node = page_at(vocab, cfg, &busy(), ALL_OPEN);
             let preem: Vec<_> = nodes_of(&node)
                 .into_iter()
                 .filter(|n| matches!(n, Node::Preem { .. } | Node::Pixels { .. }))
@@ -955,7 +1179,7 @@ mod tests {
     #[test]
     fn the_history_lines_are_sparklines_on_the_native_axes() {
         let lines = |vocab| {
-            nodes_of(&page_at(vocab, Card::bar_default(), &busy(), true))
+            nodes_of(&page_at(vocab, Card::bar_default(), &busy(), ALL_OPEN))
                 .into_iter()
                 .filter_map(|n| match n {
                     Node::Sparkline { id, max, .. } => Some((id.clone().unwrap(), *max)),
@@ -979,7 +1203,7 @@ mod tests {
             lines(SPARKLINE_VOCAB - 1).is_empty(),
             "an older shell is never sent a variant it cannot decode",
         );
-        let old = page_at(SPARKLINE_VOCAB - 1, Card::bar_default(), &busy(), true);
+        let old = page_at(SPARKLINE_VOCAB - 1, Card::bar_default(), &busy(), ALL_OPEN);
         assert!(
             nodes_of(&old)
                 .iter()
@@ -1202,7 +1426,8 @@ mod tests {
                 Card::bar_default(),
                 &Snapshot::default(),
                 &History::default(),
-                false,
+                &TopApps::default(),
+                Expanded::default(),
             )
         });
         let texts = texts(&node);
@@ -1216,7 +1441,14 @@ mod tests {
     #[test]
     fn the_mounts_live_in_the_disk_expander() {
         for expanded in [false, true] {
-            let node = page_at(SPARKLINE_VOCAB, Card::bar_default(), &busy(), expanded);
+            // The two Top apps lists the other way round, so the Disk card is
+            // shown to read its own flag and not a sibling's.
+            let flags = Expanded {
+                disks: expanded,
+                top_cpu: !expanded,
+                top_ram: !expanded,
+            };
+            let node = page_at(SPARKLINE_VOCAB, Card::bar_default(), &busy(), flags);
             let expander = nodes_of(&node)
                 .into_iter()
                 .find_map(|n| match n {
@@ -1225,7 +1457,7 @@ mod tests {
                         expanded,
                         children,
                         ..
-                    } => Some((id.clone(), *expanded, children.len())),
+                    } if id == DISKS_EXPANDER_ID => Some((id.clone(), *expanded, children.len())),
                     _ => None,
                 })
                 .expect("the Disk card has an expander");
@@ -1359,5 +1591,235 @@ mod tests {
             Some(3_145_728.0_f32.to_bits()),
             "read + write, in bytes/s",
         );
+    }
+
+    // ── Top apps · CPU / RAM (#1419 item 3) ──────────────────────────────────
+
+    /// The expander `id` on `node`: its header's texts, its body and its flag.
+    fn top_apps_list<'a>(node: &'a Node, want: &str) -> (Vec<String>, &'a [Node], bool) {
+        nodes_of(node)
+            .into_iter()
+            .find_map(|n| match n {
+                Node::Expander {
+                    id,
+                    header,
+                    children,
+                    expanded,
+                    ..
+                } if id == want => Some((texts(header), children.as_slice(), *expanded)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no expander {want} on the page"))
+    }
+
+    /// The id of the last row of the card `card`.
+    fn last_row_of(node: &Node, card: &str) -> String {
+        nodes_of(node)
+            .into_iter()
+            .find_map(|n| match n {
+                Node::ListBox { id, children, .. } if id.as_deref() == Some(card) => {
+                    children.last().and_then(id_of).map(ToOwned::to_owned)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no card {card} on the page"))
+    }
+
+    /// **Where the lists sit and how they start**: "Top apps · CPU" is the
+    /// CPU card's last row and "Top apps · RAM" the Memory card's — where
+    /// native `build_stats_cpu_card` / `build_stats_memory_card` add them —
+    /// both collapsed by default, and each open exactly when its own flag is.
+    ///
+    /// **Falsified** by hard-wiring either `expanded` to `true`, by swapping
+    /// the two flags, or by moving a list out of its card.
+    #[test]
+    fn the_top_apps_lists_close_the_cpu_and_memory_cards_collapsed() {
+        let seed = page_at(
+            SPARKLINE_VOCAB,
+            Card::bar_default(),
+            &busy(),
+            Expanded::default(),
+        );
+        assert_eq!(last_row_of(&seed, "stats-panel-cpu"), TOP_APPS_CPU_ID);
+        assert_eq!(last_row_of(&seed, "stats-panel-memory"), TOP_APPS_RAM_ID);
+        assert!(
+            !top_apps_list(&seed, TOP_APPS_CPU_ID).2,
+            "collapsed, as native"
+        );
+        assert!(
+            !top_apps_list(&seed, TOP_APPS_RAM_ID).2,
+            "collapsed, as native"
+        );
+
+        for (top_cpu, top_ram) in [(true, false), (false, true)] {
+            let node = page_at(
+                SPARKLINE_VOCAB,
+                Card::bar_default(),
+                &busy(),
+                Expanded {
+                    disks: false,
+                    top_cpu,
+                    top_ram,
+                },
+            );
+            assert_eq!(top_apps_list(&node, TOP_APPS_CPU_ID).2, top_cpu);
+            assert_eq!(top_apps_list(&node, TOP_APPS_RAM_ID).2, top_ram);
+        }
+
+        // Each list rides its card's switch, as native: no CPU card, no CPU list.
+        let no_cpu = page(
+            Card {
+                cpu: false,
+                ..Card::bar_default()
+            },
+            &busy(),
+        );
+        assert!(
+            !nodes_of(&no_cpu)
+                .into_iter()
+                .any(|n| id_of(n) == Some(TOP_APPS_CPU_ID))
+        );
+        assert_eq!(top_apps_list(&no_cpu, TOP_APPS_RAM_ID).1.len(), 2);
+    }
+
+    /// **The native strings**, as literals (#1026): the two titles, the
+    /// collapsed summary `name · value`, `N processes` only for a group of
+    /// more than one, the CPU value as native's `{:.0}%` of the share and the
+    /// RAM value as native's `fmt_bytes`, heaviest first.
+    ///
+    /// **Falsified** by `{:.1}%`, by a `1 processes` subtitle, by dropping the
+    /// `·` summary for the bare name, or by the RAM list printing the share.
+    #[test]
+    fn the_top_apps_lists_print_the_native_strings() {
+        let node = page(Card::bar_default(), &busy());
+
+        let (header, rows, _) = top_apps_list(&node, TOP_APPS_CPU_ID);
+        assert_eq!(header, vec!["Top apps · CPU", "org.mozilla.firefox · 42%"]);
+        assert_eq!(
+            rows.iter().map(texts).collect::<Vec<_>>(),
+            vec![
+                vec!["org.mozilla.firefox", "3 processes", "42%"],
+                vec!["System", "7%"],
+            ],
+        );
+
+        let (header, rows, _) = top_apps_list(&node, TOP_APPS_RAM_ID);
+        assert_eq!(
+            header,
+            vec!["Top apps · RAM", "org.mozilla.firefox · 3.2 GiB"]
+        );
+        assert_eq!(
+            rows.iter().map(texts).collect::<Vec<_>>(),
+            vec![
+                vec!["org.mozilla.firefox", "3 processes", "3.2 GiB"],
+                vec!["pipewire", "50.0 MiB"],
+            ],
+        );
+
+        // Each row's hover is the group's full name, as native.
+        let tooltips: Vec<Option<&str>> = rows
+            .iter()
+            .map(|row| match row {
+                Node::Row { tooltip, .. } => tooltip.as_deref(),
+                other => panic!("a row is a Row: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tooltips,
+            vec![Some("org.mozilla.firefox"), Some("pipewire")]
+        );
+    }
+
+    /// Nothing measured — both lists parked, or the page's first render — is
+    /// a dash beside each title and no rows, not an invented app; and a cold
+    /// walk, which carries the RAM list but withholds the CPU one, draws
+    /// exactly that.
+    #[test]
+    fn nothing_measured_reads_as_a_dash_beside_each_title() {
+        let empty = with_negotiated_vocab(SPARKLINE_VOCAB, || {
+            panel(
+                Card::bar_default(),
+                &busy(),
+                &warm(),
+                &TopApps::default(),
+                ALL_OPEN,
+            )
+        });
+        for id in [TOP_APPS_CPU_ID, TOP_APPS_RAM_ID] {
+            let (header, rows, _) = top_apps_list(&empty, id);
+            assert_eq!(header[1], "\u{2014}", "{id}");
+            assert!(rows.is_empty(), "{id}");
+        }
+
+        let cold = with_negotiated_vocab(SPARKLINE_VOCAB, || {
+            panel(
+                Card::bar_default(),
+                &busy(),
+                &warm(),
+                &TopApps {
+                    by_cpu: Vec::new(),
+                    ..busy_apps()
+                },
+                ALL_OPEN,
+            )
+        });
+        assert_eq!(top_apps_list(&cold, TOP_APPS_CPU_ID).0[1], "\u{2014}");
+        assert_eq!(
+            top_apps_list(&cold, TOP_APPS_RAM_ID).0[1],
+            "org.mozilla.firefox · 3.2 GiB",
+        );
+    }
+
+    /// **The row cap**: a list never draws more rows than the walker keeps —
+    /// six, native's `TOP_N` — whatever reaches the model.
+    ///
+    /// **Falsified** by dropping the `.take(TOP_N)` in `top_apps_expander`.
+    #[test]
+    fn a_top_apps_list_draws_at_most_six_rows() {
+        let many: Vec<ProcSample> = (0..10_u32)
+            .map(|i| app(&format!("app{i}"), 0.01, u64::from(10 - i) << 20))
+            .collect();
+        let node = with_negotiated_vocab(SPARKLINE_VOCAB, || {
+            panel(
+                Card::bar_default(),
+                &busy(),
+                &warm(),
+                &TopApps {
+                    by_cpu: many.clone(),
+                    by_mem: many,
+                },
+                ALL_OPEN,
+            )
+        });
+        assert_eq!(TOP_N, 6, "the walker's own cap, as native");
+        for id in [TOP_APPS_CPU_ID, TOP_APPS_RAM_ID] {
+            let (_, rows, _) = top_apps_list(&node, id);
+            assert_eq!(rows.len(), 6, "{id}");
+            assert_eq!(texts(&rows[0])[0], "app0", "heaviest first, in walk order");
+        }
+    }
+
+    /// **No icon, and no placeholder for one** — the icon column is pending
+    /// #1419's question. A list's rows are text all the way down.
+    #[test]
+    fn the_top_apps_rows_carry_no_icon() {
+        let node = page(Card::bar_default(), &busy());
+        for id in [TOP_APPS_CPU_ID, TOP_APPS_RAM_ID] {
+            let (_, rows, _) = top_apps_list(&node, id);
+            for row in rows {
+                for n in nodes_of(row) {
+                    assert!(
+                        matches!(
+                            n,
+                            Node::Row { .. }
+                                | Node::Label { .. }
+                                | Node::Text { .. }
+                                | Node::Spacer
+                        ),
+                        "{id}: {n:?}",
+                    );
+                }
+            }
+        }
     }
 }

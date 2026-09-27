@@ -32,7 +32,13 @@ use std::collections::HashMap;
 const PAGE_SIZE: u64 = 4096;
 
 /// Rows kept in each list.
-const TOP_N: usize = 6;
+///
+/// Public (#1419 item 3, additive visibility only — `hytte-preem`'s
+/// `Gauge::dial` made the same move in #1148) so `hytte-plugin-stats`' page
+/// caps its "Top apps" rows at the walker's own count rather than at a copy of
+/// it: the native page and the plugin page then cannot disagree about how many
+/// rows a list has.
+pub const TOP_N: usize = 6;
 
 /// Synthetic group key for all pids that don't belong to a recognised app scope
 /// or systemd service.

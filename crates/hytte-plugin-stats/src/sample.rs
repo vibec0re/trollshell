@@ -45,6 +45,8 @@ use hytte_plugin::poll::{Gate, Wake};
 use hytte_plugin::{CmdReceiver, CmdSender};
 use hytte_sensors::GpuCache;
 
+use crate::top_apps::{self, TopApps, Walker};
+
 /// One tick's worth of the machine, as the card consumes it.
 ///
 /// Deliberately **not** `hytte_sensors`' own shapes re-exported: this is the
@@ -190,18 +192,60 @@ pub struct Gpu {
     pub memory_total_bytes: Option<u64>,
 }
 
-/// The command lane: the host's slot-visibility push, forwarded by the reducer.
+/// The command lane: what the reducer tells the two sampling tasks.
+///
+/// One lane, because the SDK hands [`Plugin::sources`](hytte_plugin::Plugin)
+/// exactly one receiver; [`route`] splits it so each task's
+/// [`Gate`] sees only its own switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
-    /// The mount surface became visible / hidden (#288).
+    /// The mount surface became visible / hidden (#288) — the sensors
+    /// sampler's gate.
     SetVisible(bool),
+    /// Whether either of the drawer page's "Top apps" lists is open — the
+    /// `/proc` walker's gate (#1419 item 3; see `crate::top_apps`, a
+    /// crate-private module, for why it is not the page's visibility).
+    ShowTopApps(bool),
 }
 
-/// The message lane: one sample per tick, back to the reducer.
+impl Cmd {
+    /// The sensors sampler's classifier: the surface's visibility, and nothing
+    /// about the Top apps lists.
+    ///
+    /// Spelled without a wildcard on purpose, like its sibling: a third
+    /// variant is a compile error here, which is the place to decide which
+    /// gate it opens.
+    #[must_use]
+    pub const fn surface(self) -> Option<bool> {
+        match self {
+            Self::SetVisible(visible) => Some(visible),
+            Self::ShowTopApps(_) => None,
+        }
+    }
+
+    /// The walker's classifier: whether a Top apps list is open, and nothing
+    /// about the surface.
+    ///
+    /// **Not** the surface's visibility, and that is the whole point: a bar
+    /// instance opens its own sensors gate at `init` and never closes it, so a
+    /// walker that answered `SetVisible` would walk `/proc` for as long as the
+    /// bar chips are on screen — i.e. forever.
+    #[must_use]
+    pub const fn top_apps(self) -> Option<bool> {
+        match self {
+            Self::ShowTopApps(open) => Some(open),
+            Self::SetVisible(_) => None,
+        }
+    }
+}
+
+/// The message lane: one reading per tick, back to the reducer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     /// A fresh sample landed.
     Sampled(Box<Snapshot>),
+    /// A fresh walk of `/proc` landed — the page's Top apps lists.
+    TopApps(TopApps),
 }
 
 /// Which sensors this instance actually draws — so it does not pay for the
@@ -554,8 +598,8 @@ fn finite_or_zero(v: f64) -> f64 {
     if v.is_finite() { v } else { 0.0 }
 }
 
-/// What [`sampler_task`] needs of the thing it drives: read the machine, and
-/// forget the cumulative baselines.
+/// What [`drive`] needs of the thing it drives: read the machine, and forget
+/// the cumulative baselines.
 ///
 /// A trait rather than a hard-wired [`Sampler`] for one reason: the gate test.
 /// `a_hidden_card_never_samples` is the *only* evidence for the module doc's
@@ -566,16 +610,25 @@ fn finite_or_zero(v: f64) -> f64 {
 /// observable, and lets the positive control — the gate opens and a sample
 /// reaches the reducer — exist at all.
 ///
+/// Generic over its [`Reading`](Sample::Reading) since #1419 item 3, so the
+/// Top apps walker ([`Walker`], whose reading is a [`TopApps`]) runs through
+/// the same loop as the sensors [`Sampler`] rather than through a second copy
+/// of it — the loop's ordering invariant (#1313) then exists once.
+///
 /// `Send + 'static` because the implementor is moved into and back out of a
 /// `spawn_blocking`.
 pub trait Sample: Send + 'static {
+    /// What one tick produces.
+    type Reading: Send + 'static;
     /// One reading of the machine. **Blocking.**
-    fn tick(&mut self) -> Snapshot;
+    fn tick(&mut self) -> Self::Reading;
     /// Drop the cumulative baselines — see [`Sampler::reset`].
     fn reset(&mut self);
 }
 
 impl Sample for Sampler {
+    type Reading = Snapshot;
+
     // Not recursive: an inherent method shadows a trait method of the same
     // name in path resolution, so both of these are the `impl Sampler` bodies
     // above.
@@ -588,8 +641,85 @@ impl Sample for Sampler {
     }
 }
 
-/// The sampler task: park while the card is off screen, sample on the cadence
-/// while it is on, and post each sample to the reducer.
+/// Start everything this plugin samples with: the sensors [`Sampler`] on
+/// `period`, the Top apps [`Walker`] on [`top_apps::POLL`], and the [`route`]
+/// that splits the reducer's one command lane between them.
+///
+/// Returns the three tasks' handles, which production drops (the tasks end on
+/// their own when the session's lane closes) and a test awaits.
+pub fn spawn(
+    cmds: CmdReceiver<Cmd>,
+    msgs: CmdSender<Msg>,
+    period: Duration,
+    needs: Needs,
+) -> [tokio::task::JoinHandle<()>; 3] {
+    spawn_with(
+        cmds,
+        msgs,
+        period,
+        move || Sampler::new(needs),
+        <Walker>::default,
+    )
+}
+
+/// [`spawn`] over arbitrary samplers — the seam the composition tests drive
+/// with counting fakes, so none of them reads the host's `/proc`.
+pub(crate) fn spawn_with<S, W>(
+    cmds: CmdReceiver<Cmd>,
+    msgs: CmdSender<Msg>,
+    period: Duration,
+    make_sensors: impl FnMut() -> S + Send + 'static,
+    make_walker: impl FnMut() -> W + Send + 'static,
+) -> [tokio::task::JoinHandle<()>; 3]
+where
+    S: Sample<Reading = Snapshot>,
+    W: Sample<Reading = TopApps>,
+{
+    let (sensors_tx, sensors_rx) = hytte_plugin::cmd_channel();
+    let (walker_tx, walker_rx) = hytte_plugin::cmd_channel();
+    [
+        tokio::spawn(route(cmds, sensors_tx, walker_tx)),
+        tokio::spawn(sampler_task_with(
+            sensors_rx,
+            msgs.clone(),
+            period,
+            make_sensors,
+        )),
+        tokio::spawn(drive(
+            walker_rx,
+            msgs,
+            top_apps::POLL,
+            |cmd: &Cmd| cmd.top_apps(),
+            Msg::TopApps,
+            make_walker,
+        )),
+    ]
+}
+
+/// Split the reducer's one command lane into the two tasks' lanes: the
+/// surface's visibility to the sensors sampler, the Top apps switch to the
+/// walker.
+///
+/// Each task's classifier ([`Cmd::surface`], [`Cmd::top_apps`]) would ignore
+/// the other's command anyway; routing means neither lane carries a command
+/// its task has no use for, and it is the one place the split is spelled out.
+/// Ends — dropping both lanes, which ends both tasks — when the reducer's lane
+/// closes, i.e. when the session tears down.
+async fn route(mut cmds: CmdReceiver<Cmd>, sensors: CmdSender<Cmd>, walker: CmdSender<Cmd>) {
+    while let Some(cmd) = cmds.recv().await {
+        let lane = match cmd {
+            Cmd::SetVisible(_) => &sensors,
+            Cmd::ShowTopApps(_) => &walker,
+        };
+        // A task that has ended only ever did so because its lane closed,
+        // which is this function's own teardown — nothing is left to gate.
+        let _ = lane.send(cmd);
+    }
+}
+
+/// The sensors sampler task: park while the card is off screen, sample on the
+/// cadence while it is on, and post each sample to the reducer — [`drive`]
+/// over the surface's visibility.
 ///
 /// Drives [`Gate`] directly rather than calling
 /// [`poll::gated`](hytte_plugin::poll::gated) because the [`Sampler`]'s caches
@@ -599,22 +729,32 @@ impl Sample for Sampler {
 /// park on hidden, refresh on the hidden→visible **edge**, `MissedTickBehavior::Delay`,
 /// a close beating a due tick, no cancellation of work in flight — is unchanged
 /// and is what makes a closed sidebar genuinely free.
-pub async fn sampler_task(
-    cmds: CmdReceiver<Cmd>,
-    msgs: CmdSender<Msg>,
-    period: Duration,
-    needs: Needs,
-) {
-    sampler_task_with(cmds, msgs, period, move || Sampler::new(needs)).await;
-}
-
-/// [`sampler_task`] over an arbitrary [`Sample`] — the seam the gate tests
-/// drive, so none of them touches the host's `/proc`.
 ///
 /// `make` is a **factory**, not a value, because the sampler is moved into the
 /// `spawn_blocking` and is therefore gone if that task panics or is cancelled:
-/// recovering from that without ending the whole task (see the `Err` arm) needs
-/// a way to build a fresh one.
+/// recovering from that without ending the whole task (see [`drive`]'s `Err`
+/// arm) needs a way to build a fresh one. It is also the seam the gate tests
+/// drive, so none of them touches the host's `/proc`.
+async fn sampler_task_with<S: Sample<Reading = Snapshot>>(
+    cmds: CmdReceiver<Cmd>,
+    msgs: CmdSender<Msg>,
+    period: Duration,
+    make: impl FnMut() -> S + Send + 'static,
+) {
+    drive(
+        cmds,
+        msgs,
+        period,
+        |cmd: &Cmd| cmd.surface(),
+        |snapshot| Msg::Sampled(Box::new(snapshot)),
+        make,
+    )
+    .await;
+}
+
+/// The gated sampling loop both tasks run: park while `visibility` says
+/// closed, read on the open edge and then on the cadence, re-baseline on a
+/// reopen, and post each reading to the reducer through `wrap`.
 ///
 /// # Invariant: the reset happens-before the read it guards (#1313)
 ///
@@ -644,27 +784,29 @@ pub async fn sampler_task(
 /// `reopening_the_sidebar_re_baselines_before_it_reads`'s own notes and
 /// `a_tick_due_while_hidden_never_reads_before_the_unpark_reset`, which pins
 /// the ordering directly instead.
-async fn sampler_task_with<S: Sample>(
+async fn drive<S: Sample>(
     cmds: CmdReceiver<Cmd>,
     msgs: CmdSender<Msg>,
     period: Duration,
+    visibility: fn(&Cmd) -> Option<bool>,
+    wrap: fn(S::Reading) -> Msg,
     mut make: impl FnMut() -> S + Send + 'static,
 ) {
-    // The gate absorbs every `SetVisible` itself and answers only the *open*
-    // edge, so the loop below cannot otherwise see a close — and a close is
-    // exactly what invalidates the `/proc/stat` baseline (#1277 LOW 4). The
-    // classifier is the one place that sees every visibility command, so it
-    // raises the flag and the next refresh lowers it. An `AtomicBool` rather
-    // than a `Cell` because the task is `tokio::spawn`ed and must be `Send`.
+    // The gate absorbs every visibility command itself and answers only the
+    // *open* edge, so the loop below cannot otherwise see a close — and a
+    // close is exactly what invalidates the cumulative baseline (#1277 LOW 4).
+    // The classifier is the one place that sees every visibility command, so
+    // it raises the flag and the next refresh lowers it. An `AtomicBool`
+    // rather than a `Cell` because the task is `tokio::spawn`ed and must be
+    // `Send`.
     let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen_close = std::sync::Arc::clone(&parked);
-    let mut gate = Gate::new(cmds, period, move |cmd: &Cmd| match cmd {
-        Cmd::SetVisible(visible) => {
-            if !*visible {
-                seen_close.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            Some(*visible)
+    let mut gate = Gate::new(cmds, period, move |cmd: &Cmd| {
+        let want = visibility(cmd);
+        if want == Some(false) {
+            seen_close.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        want
     });
     let mut sampler = make();
     while let Some(wake) = gate.next().await {
@@ -681,14 +823,14 @@ async fn sampler_task_with<S: Sample>(
                 // without an `Arc<Mutex<…>>` around a value only this task ever
                 // touches.
                 let joined = tokio::task::spawn_blocking(move || {
-                    let snapshot = sampler.tick();
-                    (sampler, snapshot)
+                    let reading = sampler.tick();
+                    (sampler, reading)
                 })
                 .await;
                 match joined {
-                    Ok((back, snapshot)) => {
+                    Ok((back, reading)) => {
                         sampler = back;
-                        if msgs.send(Msg::Sampled(Box::new(snapshot))).is_err() {
+                        if msgs.send(wrap(reading)).is_err() {
                             // The reducer is gone: the session is tearing down.
                             return;
                         }
@@ -705,10 +847,12 @@ async fn sampler_task_with<S: Sample>(
                     }
                 }
             }
-            // Unreachable: the classifier above answers `Some` for the lane's
-            // only variant, so the gate absorbs the whole lane. Spelled as an
-            // irrefutable pattern there on purpose — a second `Cmd` variant
-            // becomes a compile error here rather than a misclassified command.
+            // The other task's command: `route` never sends one down this
+            // lane, and if it did, it would not be this task's business. The
+            // classifiers (`Cmd::surface`, `Cmd::top_apps`) are exhaustive
+            // matches without a wildcard, so a new `Cmd` variant is a compile
+            // error there — the place to decide which gate it opens — rather
+            // than a command silently dropped here.
             Wake::Cmd(_) => {}
         }
     }
@@ -717,11 +861,13 @@ async fn sampler_task_with<S: Sample>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, sampler_task,
-        sampler_task_with,
+        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, route,
+        sampler_task_with, spawn, spawn_with,
     };
     use crate::config::Card;
+    use crate::top_apps::{TopApps, Walker};
     use hytte_plugin::cmd_channel;
+    use hytte_sensors::app_usage::ProcSample;
 
     /// The Clock row's two numbers are the **fastest core now** over the
     /// **highest `cpuinfo_max_freq`** — the native row's fixed 0→max-clock
@@ -800,6 +946,8 @@ mod tests {
     struct FakeSampler(Arc<Calls>);
 
     impl Sample for FakeSampler {
+        type Reading = Snapshot;
+
         fn tick(&mut self) -> Snapshot {
             // Recorded *before* the counter: a test polls `ticks()` in a busy
             // loop (`pump_until`), and the two writes are not one atomic
@@ -1170,7 +1318,9 @@ mod tests {
         let first = next_sample(&mut msg_rx)
             .await
             .expect("the open edge must sample immediately and the sample must reach the reducer");
-        let Msg::Sampled(snapshot) = first;
+        let Msg::Sampled(snapshot) = first else {
+            panic!("the sensors lane carries sensor samples, not a Top apps walk");
+        };
         assert_eq!(snapshot.per_core.len(), 2);
         assert!(
             (snapshot.per_core[0] - 0.25).abs() < 1e-6 && (snapshot.per_core[1] - 0.5).abs() < 1e-6,
@@ -1426,22 +1576,446 @@ mod tests {
         let _ = task.await;
     }
 
-    /// …and a closed command lane ends the task, rather than polling on against
-    /// a dropped reducer.
+    /// …and a closed command lane ends **every** task — the router, the
+    /// sensors sampler and the walker — rather than leaving one polling on
+    /// against a dropped reducer.
+    ///
+    /// Through [`spawn`], the production wrapper, with the real samplers: the
+    /// lane closes before either gate has opened, so nothing reads `/proc`.
+    ///
+    /// **Falsified** by `route` holding on to its two senders after its own
+    /// lane closes (e.g. looping on a `sleep` instead of returning): the two
+    /// sampling tasks then never see their lanes close.
     #[tokio::test(start_paused = true)]
-    async fn a_closed_lane_ends_the_task() {
+    async fn a_closed_lane_ends_every_task() {
         let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
         let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
-        let task = tokio::spawn(sampler_task(
+        let tasks = spawn(cmd_rx, msg_tx, Duration::from_secs(1), Needs::default());
+        drop(cmd_tx);
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("every task must return when the lane closes")
+                .expect("and not by panicking");
+        }
+    }
+
+    /// Wait for [`spawn_with`]'s three tasks to end after the test dropped the
+    /// lane — **bounded**, so a teardown that stops working fails the test
+    /// instead of hanging the whole binary (measured: a router that kept its
+    /// senders alive left three tests running forever rather than red).
+    async fn join_all(tasks: [tokio::task::JoinHandle<()>; 3]) {
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("every task ends once the lane closes")
+                .expect("and not by panicking");
+        }
+    }
+
+    /// A walker that reads nothing and counts what it was asked to do — the
+    /// Top apps twin of [`FakeSampler`].
+    struct FakeWalker(Arc<Calls>);
+
+    impl Sample for FakeWalker {
+        type Reading = TopApps;
+
+        fn tick(&mut self) -> TopApps {
+            self.0.record("walk");
+            self.0.ticks.fetch_add(1, Ordering::SeqCst);
+            TopApps {
+                by_cpu: Vec::new(),
+                by_mem: vec![ProcSample {
+                    name: "firefox".to_owned(),
+                    app_id: Some("firefox".to_owned()),
+                    cpu_frac: 0.0,
+                    mem_bytes: 1 << 30,
+                    procs: 3,
+                }],
+            }
+        }
+
+        fn reset(&mut self) {
+            self.0.record("reset");
+            self.0.resets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// **Each command goes to its own task, and only there**: the surface's
+    /// visibility to the sensors sampler, the Top apps switch to the walker.
+    ///
+    /// **Falsified** by routing either variant to the other lane, or by
+    /// fanning every command out to both (the walker lane then carries the
+    /// bar's own `SetVisible(true)` seed).
+    #[tokio::test]
+    async fn the_router_sends_each_command_to_its_own_task() {
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (sensors_tx, mut sensors_rx) = cmd_channel::<Cmd>();
+        let (walker_tx, mut walker_rx) = cmd_channel::<Cmd>();
+        let router = tokio::spawn(route(cmd_rx, sensors_tx, walker_tx));
+        for cmd in [
+            Cmd::SetVisible(true),
+            Cmd::ShowTopApps(true),
+            Cmd::SetVisible(false),
+            Cmd::ShowTopApps(false),
+        ] {
+            cmd_tx.send(cmd).expect("lane is live");
+        }
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), router)
+            .await
+            .expect("the router ends when its lane closes")
+            .expect("and not by panicking");
+
+        let drain = |rx: &mut hytte_plugin::CmdReceiver<Cmd>| {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            drain(&mut sensors_rx),
+            vec![Cmd::SetVisible(true), Cmd::SetVisible(false)],
+        );
+        assert_eq!(
+            drain(&mut walker_rx),
+            vec![Cmd::ShowTopApps(true), Cmd::ShowTopApps(false)],
+        );
+    }
+
+    /// Each task's classifier answers **only its own switch** — the second
+    /// line of defence behind the router, and the one that keeps a bar
+    /// instance's permanently-open surface from opening the walker.
+    ///
+    /// **Falsified** by `Cmd::top_apps` answering `SetVisible`, or
+    /// `Cmd::surface` answering `ShowTopApps`.
+    #[test]
+    fn each_classifier_answers_only_its_own_switch() {
+        for on in [false, true] {
+            assert_eq!(Cmd::SetVisible(on).surface(), Some(on));
+            assert_eq!(Cmd::SetVisible(on).top_apps(), None);
+            assert_eq!(Cmd::ShowTopApps(on).top_apps(), Some(on));
+            assert_eq!(Cmd::ShowTopApps(on).surface(), None);
+        }
+    }
+
+    /// **The walker does not run for the bar chips — only for an open list.**
+    /// End to end through [`spawn_with`]'s router and both gates, with counting
+    /// fakes.
+    ///
+    /// A bar instance opens its sensors gate at `init` and never closes it,
+    /// so this drives exactly that — `SetVisible(true)` and nothing else — and
+    /// shows the sensors sampler ticking away (the control: the pump did move
+    /// time) while the walker is never called. Opening a list then starts the
+    /// walker and delivers its lists; closing it parks the walker again; and a
+    /// reopen drops the baseline first (#1277 LOW 4's rule, which the walker
+    /// inherits by running through the same loop).
+    ///
+    /// **Falsified** by the router swapping its two lanes (the walker never
+    /// hears its switch), by the walker's classifier ignoring
+    /// `ShowTopApps(false)` (it keeps walking after the close), and by
+    /// `drive`'s `parked` re-baseline being deleted. **Not** by letting
+    /// `SetVisible` through at only one of its two stops — the router, or the
+    /// walker's classifier — since the other still holds it back (measured:
+    /// both stay green here); those are what
+    /// `the_router_sends_each_command_to_its_own_task` and
+    /// `each_classifier_answers_only_its_own_switch` are for.
+    #[tokio::test(start_paused = true)]
+    async fn the_walker_runs_only_while_a_list_is_open_never_for_the_chips() {
+        let sensors = Arc::new(Calls::default());
+        let walker = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (made_s, made_w) = (Arc::clone(&sensors), Arc::clone(&walker));
+        let tasks = spawn_with(
             cmd_rx,
             msg_tx,
             Duration::from_secs(1),
-            Needs::default(),
-        ));
+            move || FakeSampler(Arc::clone(&made_s)),
+            move || FakeWalker(Arc::clone(&made_w)),
+        );
+
+        // What a bar instance's `init` puts on the lane, and then nothing.
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        assert!(
+            pump_until(|| sensors.ticks() >= 5).await,
+            "the chips' own sampler runs — the control that time moved",
+        );
+        pump_ten_periods(crate::top_apps::POLL).await;
+        assert_eq!(
+            walker.ticks(),
+            0,
+            "an open surface is not an open list: the walker never ran",
+        );
+
+        // A list opens: the walker walks, and its lists reach the reducer.
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        let mut landed = None;
+        assert!(
+            pump_until(|| {
+                while let Ok(msg) = msg_rx.try_recv() {
+                    if let Msg::TopApps(apps) = msg {
+                        landed = Some(apps);
+                    }
+                }
+                landed.is_some()
+            })
+            .await,
+            "an open list walks, and the walk reaches the reducer",
+        );
+        assert_eq!(landed.expect("landed").by_mem[0].procs, 3);
+
+        // The last list closes: the walker parks. One walk may already have
+        // been in flight on the blocking pool — the gate never cancels one —
+        // so the bound is one more, not none; ten periods of an open gate
+        // would be ten.
+        cmd_tx.send(Cmd::ShowTopApps(false)).expect("lane is live");
+        tokio::task::yield_now().await;
+        let parked_at = walker.ticks();
+        pump_ten_periods(crate::top_apps::POLL).await;
+        assert!(
+            walker.ticks() <= parked_at + 1,
+            "a closed list must park the walker: {} walks after the close",
+            walker.ticks() - parked_at,
+        );
+
+        // Reopening re-baselines before it walks.
+        assert_eq!(walker.resets(), 0);
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        assert!(pump_until(|| walker.resets() >= 1).await);
+        assert_eq!(walker.resets(), 1, "exactly one re-baseline per reopen");
+        assert_eq!(
+            sensors.resets(),
+            0,
+            "…and the chips' sampler, never parked, never re-baselined",
+        );
+
         drop(cmd_tx);
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("the task must return when its lane closes")
-            .expect("and not by panicking");
+        join_all(tasks).await;
+    }
+
+    /// **The walker keeps its baseline across the task's ticks.** `drive`
+    /// moves the walker into a `spawn_blocking` and back out every tick; this
+    /// runs a real [`Walker`] over a `/proc` stand-in whose shares are computed
+    /// from the baseline it is handed, and checks the CPU list the reducer
+    /// receives is a real share from the second walk on.
+    ///
+    /// **Falsified** by `drive` keeping a fresh sampler each tick
+    /// (`sampler = make()` in place of `sampler = back`): every walk is then
+    /// cold and every CPU list is withheld. The walker's own threading is
+    /// pinned by `crate::top_apps`' tests; this is the task's half.
+    #[allow(clippy::float_cmp)]
+    #[tokio::test(start_paused = true)]
+    async fn the_walker_keeps_its_baseline_across_the_tasks_ticks() {
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let sensors = Arc::new(Calls::default());
+        let made = Arc::clone(&sensors);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            move || FakeSampler(Arc::clone(&made)),
+            || Walker::over(crate::top_apps::fake_proc().0),
+        );
+
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        let mut walks: Vec<TopApps> = Vec::new();
+        assert!(
+            pump_until(|| {
+                while let Ok(msg) = msg_rx.try_recv() {
+                    if let Msg::TopApps(apps) = msg {
+                        walks.push(apps);
+                    }
+                }
+                walks.len() >= 3
+            })
+            .await,
+            "three walks reach the reducer",
+        );
+        assert!(walks[0].by_cpu.is_empty(), "the first walk is cold");
+        for walk in &walks[1..3] {
+            assert_eq!(walk.by_cpu.len(), 1, "{walks:?}");
+            assert_eq!(walk.by_cpu[0].cpu_frac, 0.25, "{walks:?}");
+        }
+        assert_eq!(sensors.ticks(), 0, "the sensors gate was never opened");
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **The real walker re-baselines on a reopen, through the shared loop.**
+    /// A real [`Walker`] is closed and reopened; the first walk after the
+    /// reopen must be cold (no CPU list) and handed no baseline, so its CPU
+    /// share is never the mean over the collapsed gap (#1277 LOW 4). From the
+    /// #1426 review, LOW 2: `Walker::reset` was tested directly and `drive`'s
+    /// reset only with a fake, so the one line joining them was not.
+    ///
+    /// **Falsified** by making `impl Sample for Walker`'s `reset` a no-op.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopened_list_measures_cpu_over_a_fresh_window() {
+        async fn next_walk(rx: &mut hytte_plugin::CmdReceiver<Msg>) -> TopApps {
+            let mut got = None;
+            pump_until(|| {
+                while got.is_none() {
+                    match rx.try_recv() {
+                        Ok(Msg::TopApps(apps)) => got = Some(apps),
+                        Ok(Msg::Sampled(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                got.is_some()
+            })
+            .await;
+            got.expect("a walk lands")
+        }
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        assert!(
+            next_walk(&mut msg_rx).await.by_cpu.is_empty(),
+            "cold first walk"
+        );
+        assert_eq!(
+            next_walk(&mut msg_rx).await.by_cpu.len(),
+            1,
+            "warm second walk"
+        );
+
+        cmd_tx.send(Cmd::ShowTopApps(false)).expect("lane is live");
+        tokio::task::yield_now().await;
+        pump_ten_periods(crate::top_apps::POLL).await;
+        while msg_rx.try_recv().is_ok() {}
+        let before = handed.lock().expect("not poisoned").len();
+
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        let reopened = next_walk(&mut msg_rx).await;
+        assert!(
+            reopened.by_cpu.is_empty(),
+            "the reopen's walk must be cold, not a share over the gap: {reopened:?}",
+        );
+        assert_eq!(
+            handed.lock().expect("not poisoned")[before],
+            (None, 0),
+            "the reopen's walk must be handed no baseline",
+        );
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **The walker keeps native's 2 s cadence** even when the sensors
+    /// sampler runs faster: ten seconds of an open list is at most six walks
+    /// (the open edge plus one every 2 s), never one a second. From the #1426
+    /// review, LOW 4 — a faster walker silently multiplies the cost of a list
+    /// left open.
+    ///
+    /// Only an upper bound: a walk runs on a blocking-pool thread, which under
+    /// load lags virtual time, so fewer walks is not a failure (the reviewer
+    /// measured 1–3 under four pinned burners, and a lower bound failed 172 of
+    /// 200 loaded runs).
+    ///
+    /// **Falsified** by handing the walker the sensors' `period` instead of
+    /// `top_apps::POLL` in `spawn_with` (10 walks here, idle).
+    #[tokio::test(start_paused = true)]
+    async fn the_walker_walks_on_its_own_two_second_cadence() {
+        let walker = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+        let made = Arc::clone(&walker);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || FakeWalker(Arc::clone(&made)),
+        );
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        // Ten one-second steps of virtual time.
+        pump_ten_periods(Duration::from_secs(1)).await;
+        let walks = walker.ticks();
+        assert!(walks >= 1, "the open list walked at all");
+        assert!(
+            walks <= 6,
+            "10 s of an open list at a 2 s cadence is at most 6 walks, got {walks}",
+        );
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **A slow walk never stalls the chips.** The walk runs off the
+    /// session's one thread (`spawn_blocking`), so the sensors sampler keeps
+    /// its cadence *while a walk is still in progress*. Walked inline, a
+    /// 12–50 ms `/proc` walk would hold the current-thread runtime, and the
+    /// chips and the socket loop with it. From the #1426 review, LOW 3.
+    ///
+    /// **Falsified** by dropping `drive`'s `spawn_blocking` and calling
+    /// `sampler.tick()` inline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_walk_never_stalls_the_chips() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        struct SlowWalker {
+            walking: Arc<AtomicBool>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Sample for SlowWalker {
+            type Reading = TopApps;
+            fn tick(&mut self) -> TopApps {
+                self.walking.store(true, Ordering::SeqCst);
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                self.walking.store(false, Ordering::SeqCst);
+                TopApps::default()
+            }
+            fn reset(&mut self) {}
+        }
+
+        let sensors = Arc::new(Calls::default());
+        let walking = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release_rx = Some(release_rx);
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+        let (made_s, made_w) = (Arc::clone(&sensors), Arc::clone(&walking));
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            move || FakeSampler(Arc::clone(&made_s)),
+            move || SlowWalker {
+                walking: Arc::clone(&made_w),
+                release: release_rx.take().expect("the walker is built once"),
+            },
+        );
+
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        assert!(
+            pump_until(|| walking.load(Ordering::SeqCst)).await,
+            "a walk must be observable in progress from the session's thread",
+        );
+        let before = sensors.ticks();
+        assert!(
+            pump_until(|| sensors.ticks() >= before + 3).await,
+            "the chips keep sampling while a walk is in flight",
+        );
+        assert!(
+            walking.load(Ordering::SeqCst),
+            "…and the walk is still running"
+        );
+
+        release_tx.send(()).expect("the walker is waiting");
+        drop(cmd_tx);
+        join_all(tasks).await;
     }
 }

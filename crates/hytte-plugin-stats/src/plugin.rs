@@ -4,9 +4,10 @@
 //! everything it does about it is a fold into the model plus a re-projection —
 //! so the whole plugin is testable by handing [`Stats::update`] a snapshot
 //! literal, which is what the tests here do. No `/proc` is read in any of them;
-//! the one thing that touches the filesystem is `sample::Sampler` (a
-//! crate-private module, so this is a plain name rather than a link), which
-//! lives behind the command lane in [`Stats::sources`].
+//! the two things that touch the filesystem are `sample::Sampler` and the Top
+//! apps `top_apps::Walker` (crate-private modules, so these are plain names
+//! rather than links), which live behind the command lane in
+//! [`Stats::sources`].
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -20,6 +21,7 @@ use crate::config::{self, Family};
 use crate::panel;
 use crate::sample;
 use crate::sample::{Cmd, Msg, Snapshot};
+use crate::top_apps::TopApps;
 
 /// The manifest id this binary ships with — the **first** instance's identity.
 ///
@@ -120,16 +122,24 @@ pub struct Stats {
     /// and the session-peak denominator the disk ring needed — an auto-scaled
     /// sparkline over the window *is* the native row's windowed max.
     page: panel::History,
-    /// Whether the drawer page's Disk card is expanded — the one piece of UI
+    /// The drawer page's latest Top apps walk (#1419 item 3). Empty while
+    /// neither list is open — the walker is parked then, and a reading nobody
+    /// is taking any more is not drawn as if it were live.
+    top_apps: TopApps,
+    /// Which of the drawer page's expanders are open — the one piece of UI
     /// state this plugin holds, because the wire's `Node::Expander` is
-    /// plugin-driven: a click on [`panel::DISKS_EXPANDER_ID`] flips it and the
-    /// next render carries it. Collapsed by default, like the native row.
-    disks_expanded: bool,
+    /// plugin-driven: a click on an expander's id flips its flag and the next
+    /// render carries it. All collapsed by default, like the native rows.
+    ///
+    /// The two Top apps flags double as the `/proc` walker's gate: see
+    /// [`Stats::toggle_top_apps`].
+    expanded: panel::Expanded,
     /// The preem widgets, held across renders so the shell keeps one renderer
     /// instance per node (and so the raster fallback keeps its animation).
     widgets: Widgets,
-    /// The command lane to the sampler task: the host's visibility push,
-    /// forwarded so a closed sidebar parks the poller.
+    /// The command lane to the sampling tasks: the host's visibility push,
+    /// forwarded so a closed sidebar parks the poller, and the Top apps
+    /// switch, so collapsed lists park the `/proc` walker.
     cmds: CmdSender<Cmd>,
 }
 
@@ -216,9 +226,37 @@ impl Stats {
             snapshot: Snapshot::default(),
             ring: VecDeque::new(),
             page: panel::History::default(),
-            disks_expanded: false,
+            top_apps: TopApps::default(),
+            expanded: panel::Expanded::default(),
             widgets: Widgets::default(),
             cmds,
+        }
+    }
+
+    /// Flip one Top apps list open or shut, and gate the `/proc` walker on
+    /// the result.
+    ///
+    /// The walker runs while **either** list is open — both lists come out of
+    /// one walk — so the lane only hears about the edges of that "either":
+    /// the first list opening sends `ShowTopApps(true)`, the last one closing
+    /// sends `ShowTopApps(false)`, and flipping one list while the other stays
+    /// open sends nothing. On that last close the lists are dropped, so a
+    /// collapsed header reads `—` rather than a reading nobody is taking.
+    ///
+    /// Why a list and not the page: this plugin is never told when its page
+    /// opens or closes (`crate::top_apps` has the whole argument).
+    fn toggle_top_apps(&mut self, list: fn(&mut panel::Expanded) -> &mut bool) {
+        let was = self.expanded.top_apps();
+        let flag = list(&mut self.expanded);
+        *flag = !*flag;
+        let now = self.expanded.top_apps();
+        if now != was {
+            // A dropped receiver means the session is tearing down, which is
+            // fine to ignore — the same tolerance `update` has.
+            let _ = self.cmds.send(Cmd::ShowTopApps(now));
+            if !now {
+                self.top_apps = TopApps::default();
+            }
         }
     }
 }
@@ -262,18 +300,23 @@ impl Plugin for Stats {
         Self::with_config(settings.family, settings.card, cmds)
     }
 
-    /// The sampler task: one per session, owning the `/proc` reads and the
-    /// visibility gate. Its messages come back as `Msg::Sampled` (the message
-    /// type is crate-private, so this is a plain name rather than a link).
+    /// The sampling tasks: one set per session — the sensors sampler behind
+    /// the surface's visibility gate, and the Top apps `/proc` walker behind
+    /// the page's list expanders — plus the router that splits this session's
+    /// one command lane between them. Their messages come back as
+    /// `Msg::Sampled` and `Msg::TopApps` (the message type is crate-private,
+    /// so these are plain names rather than links).
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = hytte_plugin::cmd_channel::<Msg>();
         let settings = settings();
-        tokio::spawn(crate::sample::sampler_task(
+        // The handles are dropped: every task ends by itself when this
+        // session's lane closes.
+        let _ = sample::spawn(
             cmds,
             msg_tx,
             settings.card.poll,
             sample::Needs::of(settings.card),
-        ));
+        );
         Some(Box::pin(UnboundedReceiverStream::new(msg_rx)))
     }
 
@@ -281,6 +324,15 @@ impl Plugin for Stats {
         match input {
             // A fresh sample: the only thing that moves this card.
             Input::App(Msg::Sampled(snapshot)) => self.apply(*snapshot),
+            // A fresh Top apps walk (#1419 item 3) — kept only while a list is
+            // open. The gate never cancels a walk already in flight, so one can
+            // land just after the last list closed; drawing it would put a
+            // reading back on a header `toggle_top_apps` has just cleared.
+            Input::App(Msg::TopApps(apps)) => {
+                if self.expanded.top_apps() {
+                    self.top_apps = apps;
+                }
+            }
             // The visibility gate (#288): forward down the command lane so the
             // sampler parks and resumes. A dropped receiver means the session is
             // tearing down, which is fine to ignore.
@@ -314,7 +366,20 @@ impl Plugin for Stats {
                 node,
                 kind: EventKind::Click,
                 ..
-            } if node == panel::DISKS_EXPANDER_ID => self.disks_expanded = !self.disks_expanded,
+            } if node == panel::DISKS_EXPANDER_ID => self.expanded.disks = !self.expanded.disks,
+            // The two Top apps lists (#1419 item 3): plugin-driven like the
+            // Disk card, and also the `/proc` walker's gate — see
+            // `toggle_top_apps`. No effect either.
+            Input::Event {
+                node,
+                kind: EventKind::Click,
+                ..
+            } if node == panel::TOP_APPS_CPU_ID => self.toggle_top_apps(|e| &mut e.top_cpu),
+            Input::Event {
+                node,
+                kind: EventKind::Click,
+                ..
+            } if node == panel::TOP_APPS_RAM_ID => self.toggle_top_apps(|e| &mut e.top_ram),
             // Everything else is a push this plugin never subscribed to, or an
             // answer to an effect it never emits. Listed rather than wildcarded
             // so a new host→plugin frame is a compile error here — the place to
@@ -345,9 +410,15 @@ impl Plugin for Stats {
     /// change the card #1250 put on glass.
     fn view(&self) -> View {
         match self.family {
-            Family::Bar => View::new(card::chips(self.cfg, &self.snapshot, &self.widgets)).panel(
-                panel::panel(self.cfg, &self.snapshot, &self.page, self.disks_expanded),
-            ),
+            Family::Bar => {
+                View::new(card::chips(self.cfg, &self.snapshot, &self.widgets)).panel(panel::panel(
+                    self.cfg,
+                    &self.snapshot,
+                    &self.page,
+                    &self.top_apps,
+                    self.expanded,
+                ))
+            }
             Family::Sidebar => card::card(self.cfg, &self.snapshot, &self.widgets).into(),
         }
     }
@@ -359,6 +430,7 @@ mod tests {
     use crate::card::HISTORY_COLS;
     use crate::config::{self, Card, Family};
     use crate::sample::{Cmd, Gpu, Msg, Snapshot};
+    use crate::top_apps::TopApps;
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Mount, Node, Page, PluginMsg, SPARKLINE_VOCAB, StateKey,
         decode, encode,
@@ -755,6 +827,184 @@ mod tests {
         assert!(disks_open(&model));
         assert!(model.update(click()).is_empty());
         assert!(!disks_open(&model));
+    }
+
+    /// Whether the page's expander `id` is open, and its header's summary (the
+    /// last text in it: the `name · value` or the `—`).
+    fn list_state(model: &Stats, want: &str) -> (bool, String) {
+        fn find<'a>(node: &'a Node, want: &str) -> Option<(&'a Node, bool)> {
+            match node {
+                Node::Expander {
+                    id,
+                    header,
+                    expanded,
+                    ..
+                } if id == want => Some((header, *expanded)),
+                Node::Box { children, .. }
+                | Node::Row { children, .. }
+                | Node::ListBox { children, .. } => children.iter().find_map(|c| find(c, want)),
+                _ => None,
+            }
+        }
+        fn last_text(node: &Node) -> Option<String> {
+            match node {
+                Node::Text { text, .. } | Node::Label { text, .. } => Some(text.clone()),
+                Node::Row { children, .. } | Node::Box { children, .. } => {
+                    children.iter().rev().find_map(last_text)
+                }
+                _ => None,
+            }
+        }
+        let panel = model.view().panel.expect("a bar instance publishes a page");
+        let (header, open) = find(&panel, want).expect("the page has the list");
+        (open, last_text(header).expect("a summary"))
+    }
+
+    /// What a walk of `/proc` delivers, as the task would post it.
+    fn walked() -> Input<Msg> {
+        Input::App(Msg::TopApps(TopApps {
+            by_cpu: vec![crate::top_apps::app("firefox", 0.5, 1 << 30)],
+            by_mem: vec![crate::top_apps::app("firefox", 0.5, 1 << 30)],
+        }))
+    }
+
+    /// Everything waiting on the lane.
+    fn drain(rx: &mut CmdReceiver<Cmd>) -> Vec<Cmd> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// **The Top apps lists are plugin-driven, and they are the walker's
+    /// gate** (#1419 item 3): each starts collapsed, a click on its id flips
+    /// it with no effect emitted, and the lane hears only the edges of
+    /// "either list open" — the first to open sends `ShowTopApps(true)`, the
+    /// last to close sends `ShowTopApps(false)`, and a flip in between sends
+    /// nothing.
+    ///
+    /// **Falsified** by dropping either list's arm from `update` (the click
+    /// falls through to the no-op arm), by sending a command on every flip
+    /// rather than on the edge, and by gating on one list only (the second
+    /// list's opening would then walk nothing).
+    #[test]
+    fn a_click_on_a_top_apps_list_toggles_it_and_gates_the_walker() {
+        let (mut model, mut rx) = fresh_bar(Card::bar_default());
+        assert_eq!(
+            drain(&mut rx),
+            vec![Cmd::SetVisible(true)],
+            "the bar's own seed"
+        );
+        assert!(!list_state(&model, crate::panel::TOP_APPS_CPU_ID).0);
+        assert!(!list_state(&model, crate::panel::TOP_APPS_RAM_ID).0);
+
+        let click = |id: &str| Input::event(id, EventKind::Click);
+        let cpu = crate::panel::TOP_APPS_CPU_ID;
+        let ram = crate::panel::TOP_APPS_RAM_ID;
+
+        assert!(model.update(click(cpu)).is_empty(), "a page-local toggle");
+        assert!(list_state(&model, cpu).0);
+        assert_eq!(drain(&mut rx), vec![Cmd::ShowTopApps(true)], "first open");
+
+        assert!(model.update(click(ram)).is_empty());
+        assert!(list_state(&model, ram).0);
+        assert_eq!(drain(&mut rx), Vec::new(), "already walking");
+
+        assert!(model.update(click(cpu)).is_empty());
+        assert!(!list_state(&model, cpu).0);
+        assert_eq!(drain(&mut rx), Vec::new(), "the RAM list is still open");
+
+        assert!(model.update(click(ram)).is_empty());
+        assert!(!list_state(&model, ram).0);
+        assert_eq!(drain(&mut rx), vec![Cmd::ShowTopApps(false)], "last close");
+
+        // …and the RAM list alone opens the walker too.
+        let _ = model.update(click(ram));
+        assert_eq!(drain(&mut rx), vec![Cmd::ShowTopApps(true)]);
+    }
+
+    /// **Nothing but a list opens the walker.** A chip click, the Disk card's
+    /// expander and any number of visibility pushes leave the walker's lane
+    /// silent — the "not for the bar chips" half of the gate, at the reducer.
+    ///
+    /// **Falsified** by opening the walker from the chip-click arm (or on the
+    /// `init` seed), which would walk `/proc` for as long as the bar is on
+    /// screen.
+    #[test]
+    fn nothing_but_a_top_apps_list_opens_the_walker() {
+        let (mut model, mut rx) = fresh_bar(Card::bar_default());
+        let _ = model.update(sample(0.5));
+        for input in [
+            Input::event(crate::card::chip_button_id("cpu"), EventKind::Click),
+            Input::event(crate::panel::DISKS_EXPANDER_ID, EventKind::Click),
+            Input::SlotVisible(true),
+            Input::SlotVisible(false),
+            Input::event(crate::panel::DISKS_EXPANDER_ID, EventKind::Click),
+        ] {
+            let _ = model.update(input);
+        }
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::ShowTopApps(_))),
+            "no Top apps switch without a Top apps list",
+        );
+    }
+
+    /// **A walk lands only while a list is open, and closing the last list
+    /// clears the lists** — so a collapsed header never shows a reading nobody
+    /// is taking any more, even the one walk that was already in flight when
+    /// the list closed (the gate never cancels one).
+    ///
+    /// **Falsified** by dropping the `expanded.top_apps()` guard on
+    /// `Msg::TopApps` (the late walk lands on a closed page), and by dropping
+    /// the clear in `toggle_top_apps` (the header keeps the last name).
+    #[test]
+    fn a_walk_lands_only_while_a_list_is_open() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let cpu = crate::panel::TOP_APPS_CPU_ID;
+        let dash = "\u{2014}".to_owned();
+
+        // Before any list is open, a stray walk is not drawn.
+        let _ = model.update(walked());
+        assert_eq!(list_state(&model, cpu), (false, dash.clone()));
+
+        let _ = model.update(Input::event(cpu, EventKind::Click));
+        let _ = model.update(walked());
+        assert_eq!(list_state(&model, cpu), (true, "firefox · 50%".to_owned()));
+
+        // Closing the last list clears the reading…
+        let _ = model.update(Input::event(cpu, EventKind::Click));
+        assert_eq!(list_state(&model, cpu), (false, dash.clone()));
+        // …and the walk that was already in flight is dropped when it lands.
+        let _ = model.update(walked());
+        assert_eq!(list_state(&model, cpu), (false, dash));
+    }
+
+    /// **Only the last close clears the lists.** Flipping one list while the
+    /// other stays open keeps the open list's reading, rather than blanking
+    /// it until the next walk (from the #1426 review, NIT 6).
+    ///
+    /// **Falsified** by moving the clear in `toggle_top_apps` out of its
+    /// `now != was` edge check, so every flip clears.
+    #[test]
+    fn a_flip_while_the_other_list_is_open_keeps_the_reading() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let cpu = crate::panel::TOP_APPS_CPU_ID;
+        let ram = crate::panel::TOP_APPS_RAM_ID;
+        let _ = model.update(Input::event(ram, EventKind::Click));
+        let _ = model.update(walked());
+        let shown = list_state(&model, ram);
+        assert_ne!(shown.1, "\u{2014}", "the RAM list is populated");
+        let _ = model.update(Input::event(cpu, EventKind::Click));
+        assert_eq!(
+            list_state(&model, ram),
+            shown,
+            "opening CPU keeps RAM's rows"
+        );
+        let _ = model.update(Input::event(cpu, EventKind::Click));
+        assert_eq!(
+            list_state(&model, ram),
+            shown,
+            "closing CPU keeps RAM's rows"
+        );
     }
 
     /// **A withheld reading is not a sample**: the cold tick, whose `cpu` is

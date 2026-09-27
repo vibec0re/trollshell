@@ -122,12 +122,16 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 # `hytte-reactive` runtime and needs none of these features of its own. Since
 # #1260 it also backs the Plugins tab's XDG search-path tests (review F8):
 # two temp dirs standing in for `$XDG_CONFIG_HOME` and an `$XDG_CONFIG_DIRS`
-# entry, so those never touch the real config.
+# entry, so those never touch the real config. `test-util` is the paused clock
+# for the Plugins tab's toggle-order tests (#1417 item 4), which wait out most
+# of a minute; `hytte-bus` and `hytte-config` take it the same way, so it adds
+# no `Cargo.lock` entry.
 tempfile.workspace = true
 tokio = { workspace = true, features = [
   "io-util",
   "macros",
   "net",
   "rt",
+  "test-util",
   "time",
 ] }

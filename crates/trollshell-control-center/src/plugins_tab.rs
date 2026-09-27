@@ -92,6 +92,66 @@
 //! `Control` change. An undeclared plugin (a hand-installed static unit)
 //! keeps its unit file's enable/disable. [`switch_policy`] is the rule.
 //!
+//! # One plugin's toggles run in order (#1417 item 4)
+//!
+//! Each flip is its own round trip, off the GTK thread, so two quick flips of
+//! one plugin's switch used to run side by side. Since #1424 the shell's
+//! `StopPlugin` queues on the launcher's lock like `StartPlugin` does, but a
+//! lock can only keep the order in which calls reach it. Right after two
+//! back-to-back persists, an off's `StopPlugin` could still reach it before
+//! the on's `StartPlugin`, and the plugin stayed up with "off" saved.
+//!
+//! [`ToggleOrder`] closes that on the tab's side. The persist is left alone:
+//! it goes out at the flip, so it keeps its place in the lock's queue and the
+//! whole of its own minute (#1425 review, M1). Flips are a person's reaction
+//! time apart, so the persists reach the first-come, first-served lock in
+//! flip order. Two rules then govern the start or stop that follows:
+//!
+//! - **One start or stop at a time per plugin.** Once its persist has
+//!   answered, a toggle sends its start or stop only after the previous
+//!   toggle of the same plugin is over: answered, failed, or cut off at its
+//!   deadline. The order is fixed at the flip, on the GTK thread, not by
+//!   which task the runtime happens to run first.
+//! - **A superseded toggle leaves its start or stop to the newer one.** Once
+//!   its persist has answered and the previous toggle is over, a round trip
+//!   checks whether a newer toggle of the same plugin has been recorded. If
+//!   one has, it sends no start or stop. The order alone would already leave
+//!   the plugin right; this saves starting it only to stop it again.
+//!
+//! "Recorded" means [`connect_switch`] has run for the newer flip. If it has
+//! not run yet when the older toggle checks, the older toggle sends its start
+//! or stop, and the newer toggle's start or stop waits for that call's
+//! answer. Either way the newest toggle's start or stop is sent last.
+//!
+//! The wait usually costs nothing. The lock runs the previous toggle's calls
+//! before this toggle's persist whenever they reached it first, so they have
+//! answered by the time this persist does. It waits only when the previous
+//! toggle's start or stop reached the lock after this persist: the flip came
+//! between that toggle's check and its send. It then waits for that call's
+//! answer, which the lock would have made it wait for anyway, and the wait
+//! comes out of this toggle's own minute ([`toggle_deadline`]).
+//!
+//! What this does not cover:
+//!
+//! - **The persists' order rests on timing.** Each persist is sent when its
+//!   round trip's task first runs, which is at the flip. For a newer persist
+//!   to overtake an older one, the older task would have to stall for a
+//!   flip's worth of time before it writes to the socket. A `hytte-bus`
+//!   reconnect is not such a stall: it fails the call at once instead of
+//!   queueing it.
+//! - **A call cut off at its deadline** may still be queued in the shell
+//!   when the next toggle's start or stop goes out. It was sent first and
+//!   has waited on the launcher's first-come, first-served lock since, so it
+//!   still runs first.
+//! - **A refused newer persist.** If the older toggle's persist was kept and
+//!   the newer one's is refused, nothing is started or stopped: the older
+//!   toggle left its call to the newer one, which has nothing to apply. The
+//!   older choice is then saved while the plugin stays as it was, and the
+//!   switch shows the plugin as it is. In practice both persists fail for
+//!   the same reasons: a pin, an unreadable `plugins.json`, a failed write.
+//! - **Other clients.** The order is kept per tab. A second Control Center
+//!   window, or `busctl`, is not ordered with this one.
+//!
 //! # Polls are ordered, not serialised (#983)
 //!
 //! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
@@ -140,7 +200,8 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use adw::prelude::*;
@@ -463,7 +524,9 @@ impl PendingToggle {
 /// cares — see [`answer_intent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToggleAnswer {
-    /// Kept, and started or stopped.
+    /// Kept, and started or stopped — or the start or stop was left to a
+    /// newer toggle of the same plugin (#1417 item 4), whose intent has
+    /// replaced this one's by then, so the answer finds nothing to touch.
     Done,
     /// Any error, a timeout included: the switch goes to what the poll
     /// reports.
@@ -536,6 +599,102 @@ enum ToggleNote {
     /// once its lock frees (#1415 second review, L1), so the change may yet
     /// happen, and the row says only what is known.
     Unanswered,
+}
+
+/// The order the switch's round trips run in, per plugin (#1417 item 4). See
+/// the module doc, "One plugin's toggles run in order".
+///
+/// [`connect_switch`] records each flip here, on the GTK thread, before it
+/// spawns the flip's round trip, and hands that round trip the
+/// [`ToggleTurn`] it gets back. Recording is what fixes the order: the
+/// runtime may start two spawned round trips either way round, but each turn
+/// waits for the one recorded before it.
+#[derive(Default)]
+struct ToggleOrder {
+    /// The newest toggle of every plugin that has been toggled. Only
+    /// [`ToggleOrder::record`] touches it.
+    plugins: RefCell<HashMap<String, NewestToggle>>,
+}
+
+/// One plugin's newest toggle, as [`ToggleOrder`] keeps it.
+struct NewestToggle {
+    /// Its generation. Shared with every [`ToggleTurn`] of the plugin,
+    /// which read it off the GTK thread ([`ToggleTurn::superseded`]).
+    generation: Arc<AtomicU64>,
+    /// Resolves once its round trip is over: what the next toggle of the
+    /// plugin waits for.
+    over: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// One toggle's place in its plugin's line: what [`toggle_round_trip`]
+/// needs to wait for the toggle before it
+/// ([`wait_for_previous`](Self::wait_for_previous)) and to leave the start
+/// or stop to a newer one ([`superseded`](Self::superseded)).
+struct ToggleTurn {
+    /// This toggle's generation: 1 for the plugin's first toggle, then
+    /// counting up.
+    generation: u64,
+    /// The plugin's newest generation, which [`ToggleOrder::record`] bumps.
+    newest: Arc<AtomicU64>,
+    /// The end of the previous toggle's round trip, or `None` for the
+    /// plugin's first toggle.
+    previous: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Never sent on. It is dropped with this turn when the round trip is
+    /// over, however it ended: answered, failed, or dropped at its deadline
+    /// by [`answered_by`]. That drop is what the next toggle's
+    /// [`previous`](Self::previous) resolves on.
+    _over: tokio::sync::oneshot::Sender<()>,
+}
+
+impl ToggleOrder {
+    /// Record a flip of plugin `id`'s switch: it becomes the plugin's newest
+    /// toggle, and its turn comes after the one recorded before it. On the
+    /// GTK thread, at the flip.
+    fn record(&self, id: &str) -> ToggleTurn {
+        let (over, over_rx) = tokio::sync::oneshot::channel();
+        let mut plugins = self.plugins.borrow_mut();
+        let (newest, previous) = if let Some(last) = plugins.get_mut(id) {
+            (
+                Arc::clone(&last.generation),
+                Some(std::mem::replace(&mut last.over, over_rx)),
+            )
+        } else {
+            let generation = Arc::new(AtomicU64::new(0));
+            plugins.insert(
+                id.to_owned(),
+                NewestToggle {
+                    generation: Arc::clone(&generation),
+                    over: over_rx,
+                },
+            );
+            (generation, None)
+        };
+        // Wrapping only to keep the arithmetic total, on `PollGenerations`'
+        // argument: nobody flips a switch 2⁶⁴ times.
+        let generation = newest.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        ToggleTurn {
+            generation,
+            newest,
+            previous,
+            _over: over,
+        }
+    }
+}
+
+impl ToggleTurn {
+    /// Wait until the previous toggle of the same plugin is over.
+    async fn wait_for_previous(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            // Its sender is only ever dropped, so `Err` is how "over" arrives.
+            let _ = previous.await;
+        }
+    }
+
+    /// Whether a newer toggle of the same plugin has been recorded since
+    /// this one.
+    fn superseded(&self) -> bool {
+        self.newest.load(Ordering::SeqCst) != self.generation
+    }
 }
 
 /// What the sidebar list is currently showing, so a poll only rebuilds on a
@@ -668,6 +827,9 @@ struct PluginsState {
     /// The switch's most recent toggle and whether its persist failed (#1400
     /// review, finding 5) — see [`LastToggle`].
     last_toggle: Rc<RefCell<Option<LastToggle>>>,
+    /// The order the switch's round trips run in, per plugin (#1417 item 4)
+    /// — see [`ToggleOrder`].
+    toggles: Rc<ToggleOrder>,
     /// Guard so programmatically setting the detail switch from a fetched state
     /// doesn't loop back into a Start/Stop call (mirrors the Places tab's).
     syncing: Rc<Cell<bool>>,
@@ -777,6 +939,7 @@ struct WeakPluginsState {
     polls: Rc<PollGenerations>,
     pending: Rc<RefCell<Option<PendingToggle>>>,
     last_toggle: Rc<RefCell<Option<LastToggle>>>,
+    toggles: Rc<ToggleOrder>,
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
     last_failing: Rc<Cell<Option<bool>>>,
@@ -840,6 +1003,7 @@ impl PluginsState {
             polls: self.polls.clone(),
             pending: self.pending.clone(),
             last_toggle: self.last_toggle.clone(),
+            toggles: self.toggles.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
@@ -888,6 +1052,7 @@ impl WeakPluginsState {
             polls: self.polls.clone(),
             pending: self.pending.clone(),
             last_toggle: self.last_toggle.clone(),
+            toggles: self.toggles.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
             last_failing: self.last_failing.clone(),
@@ -1046,6 +1211,7 @@ fn build_tab_in(env: Rc<hytte_config::xdg::Env>) -> (adw::BreakpointBin, Plugins
         polls: Rc::new(PollGenerations::default()),
         pending: Rc::new(RefCell::new(None)),
         last_toggle: Rc::new(RefCell::new(None)),
+        toggles: Rc::new(ToggleOrder::default()),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
         last_failing: Rc::new(Cell::new(None)),
@@ -1445,6 +1611,11 @@ fn connect_switch(state: &PluginsState) {
         // what `set_plugin_state` counts its deadline from, so the hold and
         // the round trip run out at the same instant (`toggle_deadline`).
         let since = Instant::now();
+        // This flip's place in the plugin's line (#1417 item 4), taken here
+        // and not in the round trip: the runtime may start two round trips
+        // either way round, but the user flipped the switch in one order,
+        // and that is the order the shell must see.
+        let turn = state.toggles.record(&id);
         *state.pending.borrow_mut() = Some(PendingToggle::in_flight(id.clone(), want_on, since));
         // A new toggle retires the last one's persist error, whichever plugin
         // it was for (#1400 review, finding 5).
@@ -1453,7 +1624,7 @@ fn connect_switch(state: &PluginsState) {
             since,
             note: None,
         });
-        spawn_on_runtime(set_plugin_state(id, want_on, since), move |res| {
+        spawn_on_runtime(set_plugin_state(id, want_on, since, turn), move |res| {
             on_toggle_result(&state, since, res);
         });
     });
@@ -2693,6 +2864,12 @@ const APPLYING: &str = "Saved. Asking the shell to apply it…";
 ///   exited, very likely for want of this very setting — would otherwise wait
 ///   for the next login, so the line says how to start it now (#1415 second
 ///   review L7).
+/// - `switched-off` (#1417 item 6) is a plugin the shell found running but
+///   switched off (#1424): it was not restarted, and it reads the values when
+///   it next starts. The shell stopped it if its launcher had started it, and
+///   left a unit file of its own alone; the answer does not say which, so the
+///   line claims neither. `enabled` does not enter into it: the shell read
+///   the switch after any queued toggle, and the tab's poll may be older.
 fn restart_status(answer: &str, enabled: bool) -> &'static str {
     match answer {
         "relaunched" => "Saved, and the plugin restarted.",
@@ -2701,6 +2878,10 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
              switch it off and on to start it with the new values."
         }
         "not-running" => "Saved. The plugin reads it the next time it starts.",
+        "switched-off" => {
+            "Saved. The plugin is switched off, so it was not restarted; it reads the new values \
+             the next time it starts."
+        }
         "not-declared" => {
             "Saved, but this plugin runs from a unit file of its own, which does not read \
              plugin-settings.toml. Nothing was restarted."
@@ -3524,14 +3705,24 @@ enum ToggleError {
 /// many calls this grows, and a persist queued behind a long restart may use
 /// the whole budget instead of giving up halfway through it.
 ///
+/// The start or stop first waits for the previous toggle of the same plugin
+/// (`turn`, #1417 item 4); the persist does not. That wait is inside the one
+/// bound too, so it counts against this toggle's deadline and cannot hold
+/// the switch longer.
+///
 /// The calls themselves are [`toggle_round_trip`]'s arguments, which is what
 /// lets a test drive the order, the "already stopped" rule and the
 /// timeout-is-unknown rule without a bus.
-async fn set_plugin_state(id: String, on: bool, since: Instant) -> Result<(), ToggleError> {
+async fn set_plugin_state(
+    id: String,
+    on: bool,
+    since: Instant,
+    turn: ToggleTurn,
+) -> Result<(), ToggleError> {
     answered_by(
         tokio::time::Instant::from_std(toggle_deadline(since)),
         |deadline| async move {
-            toggle_round_trip(&id, on, set_plugin_enabled(&id, on, deadline), || {
+            toggle_round_trip(&id, on, turn, set_plugin_enabled(&id, on, deadline), || {
                 plugin_id_call(if on { "StartPlugin" } else { "StopPlugin" }, &id, deadline)
             })
             .await
@@ -3545,14 +3736,27 @@ async fn set_plugin_state(id: String, on: bool, since: Instant) -> Result<(), To
 /// passes `SetPluginEnabled` as `persist` and `StartPlugin`/`StopPlugin` as
 /// `apply`, which is only called once the persist has succeeded.
 ///
+/// - The persist goes out at once, so it keeps its place in the shell's lock
+///   queue (#1425 review, M1).
 /// - A refused persist is [`ToggleError::Persist`] and starts or stops
 ///   nothing.
+/// - The start or stop is not sent until the previous toggle of the same
+///   plugin is over ([`ToggleTurn::wait_for_previous`], #1417 item 4).
+/// - If a newer toggle of the same plugin has been recorded by then, the
+///   start or stop is left to it
+///   ([`ToggleTurn::superseded`]), and this answers `Ok`: its choice was
+///   kept, and the newer toggle's intent has already replaced its own.
 /// - A stop answered "not loaded" is done ([`already_stopped`]).
 /// - A call that timed out is [`ToggleError::Unanswered`] whichever of the
 ///   two it was ([`unanswered_or`]): nothing is known about it yet.
+///
+/// `turn` is dropped when this returns, or when [`answered_by`] drops this
+/// at its deadline. Either way that ends the turn, and the next toggle of
+/// the plugin goes ahead.
 async fn toggle_round_trip<P, A, AF>(
     id: &str,
     on: bool,
+    mut turn: ToggleTurn,
     persist: P,
     apply: A,
 ) -> Result<(), ToggleError>
@@ -3564,6 +3768,20 @@ where
     persist
         .await
         .map_err(|err| unanswered_or(err, ToggleError::Persist))?;
+    // Only the start or stop waits its turn: the persist went out at the
+    // flip, in flip order, and the shell's lock keeps that order.
+    turn.wait_for_previous().await;
+    // Checked here, once the persist has answered and the previous toggle is
+    // over, not when the round trip started: the race this closes has the
+    // newer flip made while this persist waited in the shell.
+    if turn.superseded() {
+        tracing::debug!(
+            plugin = %id,
+            "the switch was flipped again while this toggle was persisted; leaving the \
+             start or stop to the newer toggle"
+        );
+        return Ok(());
+    }
     match apply().await {
         Err(err) if !on && already_stopped(&err) => {
             tracing::debug!(%err, plugin = %id, "switched off a plugin that was already stopped");
@@ -3734,8 +3952,8 @@ const RESTART_TIMEOUT: Duration = Duration::from_mins(1);
 /// `RestartPlugin(id)` → what the shell did (#1410, #1415 review H2): one
 /// call, which runs the stop, the wait through `deactivating` and the
 /// relaunch under the launcher's convergence lock. The answer is a word —
-/// `relaunched`, `not-running`, `not-declared` — that [`restart_status`]
-/// turns into the line under the group.
+/// `relaunched`, `not-running`, `not-declared`, `switched-off` — that
+/// [`restart_status`] turns into the line under the group.
 ///
 /// Not called under `cfg(test)`, where [`send_restart`] records the call
 /// instead of reaching a session bus.
@@ -3782,14 +4000,14 @@ mod tests {
     use super::{
         DeclaredFile, DeclaredPlugins, HYTTE_BUS_CALL_TIMEOUT, LastToggle, PendingToggle,
         PluginRuntime, PluginsJson, PollGenerations, PollStates, SwitchPolicy, TOGGLE_TIMEOUT,
-        ToggleAnswer, ToggleCall, ToggleError, ToggleNote, VersionsOutcome, already_stopped,
-        answer_intent, answered_by, call_budget, classify_versions, declared_from_json,
-        declared_mounts_from_json, is_running, manifest_id_of_exec, mount_display,
-        mount_or_unknown, plugin_subtitle, probe_candidates, probe_plugins_json, read_declared_at,
-        resolve_pending, resolved_search_path, runtime_overlay, runtime_states, same_plugin_set,
-        seen_suffix, status_cell, switch_policy, switch_row_subtitle, switch_subtitle, timed_out,
-        toggle_note_for, toggle_round_trip, version_label, versions_log, versions_or_empty,
-        violations_suffix,
+        ToggleAnswer, ToggleCall, ToggleError, ToggleNote, ToggleOrder, ToggleTurn,
+        VersionsOutcome, already_stopped, answer_intent, answered_by, call_budget,
+        classify_versions, declared_from_json, declared_mounts_from_json, is_running,
+        manifest_id_of_exec, mount_display, mount_or_unknown, plugin_subtitle, probe_candidates,
+        probe_plugins_json, read_declared_at, resolve_pending, resolved_search_path,
+        runtime_overlay, runtime_states, same_plugin_set, seen_suffix, status_cell, switch_policy,
+        switch_row_subtitle, switch_subtitle, timed_out, toggle_note_for, toggle_round_trip,
+        version_label, versions_log, versions_or_empty, violations_suffix,
     };
 
     // ── The switch holds until the shell answers (#1417 item 2) ─────────────
@@ -4035,10 +4253,17 @@ mod tests {
             apply: Result<(), hytte_bus::BusError>,
         ) -> (Result<(), ToggleError>, bool) {
             let applied = std::cell::Cell::new(false);
-            let res = block_on(toggle_round_trip("pet", on, async move { persist }, || {
-                applied.set(true);
-                async move { apply }
-            }));
+            let turn = ToggleOrder::default().record("pet");
+            let res = block_on(toggle_round_trip(
+                "pet",
+                on,
+                turn,
+                async move { persist },
+                || {
+                    applied.set(true);
+                    async move { apply }
+                },
+            ));
             (res, applied.get())
         }
 
@@ -4118,11 +4343,15 @@ mod tests {
     /// all whitespace and every trailing comma before a `)` removed — so a
     /// rustfmt re-wrap does not redden a scan (#1415's `775f47d1` lesson).
     fn squashed_fn(name: &str) -> String {
+        squashed_from(&format!("async fn {name}("))
+    }
+
+    /// [`squashed_fn`] for any definition, from `head` on.
+    fn squashed_from(head: &str) -> String {
         let src = include_str!("plugins_tab.rs");
-        let head = format!("async fn {name}(");
         let start = src
-            .find(&head)
-            .unwrap_or_else(|| panic!("{name} is defined"));
+            .find(head)
+            .unwrap_or_else(|| panic!("{head} is defined"));
         let len = src[start..].find("\n}\n").expect("its body ends");
         src[start..start + len]
             .split_whitespace()
@@ -4178,6 +4407,13 @@ mod tests {
             "the persist and the start or stop both run inside the bound, on its deadline:\n\
              {body}"
         );
+        // #1417 item 4: so does the wait for the previous toggle of the
+        // plugin, which `toggle_round_trip` does with its `turn` before the
+        // start or stop.
+        assert!(
+            inside.contains("toggle_round_trip(&id,on,turn,"),
+            "the wait for the previous toggle runs inside the bound too:\n{body}"
+        );
     }
 
     /// …and each of those calls takes its client timeout from that deadline
@@ -4193,6 +4429,450 @@ mod tests {
                 "{name} must take its timeout from the round trip's deadline:\n{body}"
             );
         }
+    }
+
+    /// #1417 item 4: the round trip gets its turn from the tab's own
+    /// [`ToggleOrder`], taken at the flip before the round trip is spawned.
+    /// The order tests below drive [`toggle_round_trip`] with turns from one
+    /// `ToggleOrder`; what is left to pin is that `connect_switch` does too.
+    /// A source scan, for `the_switch_persists_before_it_starts_or_stops`'
+    /// reason. That `state.toggles` survives the weak hop `connect_switch`
+    /// takes to reach it is `gtk_tests`'
+    /// `every_flip_records_in_the_tabs_one_toggle_order`.
+    ///
+    /// Red if the turn comes from a fresh `ToggleOrder` (every toggle would
+    /// be the plugin's first, so none waits and none is superseded), or if it
+    /// is taken after the spawn.
+    #[test]
+    fn the_switch_takes_its_turn_from_the_tab_at_the_flip() {
+        let body = squashed_from("fn connect_switch(");
+        let record = body
+            .find("letturn=state.toggles.record(&id);")
+            .unwrap_or_else(|| panic!("connect_switch records the flip on the tab:\n{body}"));
+        let spawn = body
+            .find("spawn_on_runtime(set_plugin_state(id,want_on,since,turn)")
+            .unwrap_or_else(|| panic!("connect_switch hands the round trip that turn:\n{body}"));
+        assert!(
+            record < spawn,
+            "the turn is taken before the spawn:\n{body}"
+        );
+    }
+
+    // ── One plugin's toggles run in order (#1417 item 4) ────────────────────
+    //
+    // `toggle_round_trip` with calls that only write down what they were
+    // asked to send, and turns from one `ToggleOrder`, the way
+    // `connect_switch` hands them out. The round trips run as tasks on a
+    // current-thread runtime, as they run as tasks on the shared one.
+
+    /// What the fake calls were asked to send, in order. Shared with round
+    /// trips spawned as tasks.
+    type Sent = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn sent(log: &Sent) -> Vec<String> {
+        log.lock().expect("the log is not poisoned").clone()
+    }
+
+    /// One toggle of `plugin` to `on`, through [`toggle_round_trip`], with
+    /// calls that write to `log` as they are sent, each tagged with the
+    /// flip it belongs to (`#1` for the plugin's first). The persist answers
+    /// once `answer` resolves (at once for `None`); the start or stop answers
+    /// at once. Both succeed.
+    fn logged_round_trip(
+        log: &Sent,
+        plugin: &'static str,
+        on: bool,
+        turn: ToggleTurn,
+        answer: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> impl Future<Output = Result<(), ToggleError>> + Send + 'static {
+        let persist_log = log.clone();
+        let apply_log = log.clone();
+        let (word, call) = if on { ("on", "start") } else { ("off", "stop") };
+        let flip = turn.generation;
+        async move {
+            toggle_round_trip(
+                plugin,
+                on,
+                turn,
+                async move {
+                    persist_log
+                        .lock()
+                        .expect("the log is not poisoned")
+                        .push(format!("persist {plugin} {word} #{flip}"));
+                    if let Some(answer) = answer {
+                        let _ = answer.await;
+                    }
+                    Ok(())
+                },
+                move || async move {
+                    apply_log
+                        .lock()
+                        .expect("the log is not poisoned")
+                        .push(format!("{call} {plugin} #{flip}"));
+                    Ok(())
+                },
+            )
+            .await
+        }
+    }
+
+    /// Let every task that can make progress make it, so a test can then
+    /// assert what has **not** been sent.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// `test`, failed rather than hung if a turn is never released.
+    async fn bounded<F: Future>(test: F) -> F::Output {
+        bounded_by(Duration::from_secs(10), test).await
+    }
+
+    /// [`bounded`], with a bound of `limit` on the runtime's own clock.
+    async fn bounded_by<F: Future>(limit: Duration, test: F) -> F::Output {
+        tokio::time::timeout(limit, test)
+            .await
+            .expect("a round trip waited on a turn that never ended")
+    }
+
+    /// The race itself: `pet` is flipped on, then off again while the on's
+    /// persist still waits in the shell. The off's persist goes out at once,
+    /// so it queues behind the on's in the shell and not in the tab, keeping
+    /// its place in the lock's queue and the whole of its own minute (#1425
+    /// review, M1). Only its stop waits for the on to be over, and the on,
+    /// once its persist answers, leaves the start to the off. So the stop is
+    /// the only start or stop sent, and it is sent last.
+    ///
+    /// Red if the off's persist waits for the on (the shape before the #1425
+    /// review), if the off's stop stops waiting, if the on sends its start
+    /// anyway, or if the on decides whether it is superseded before its
+    /// persist answers.
+    #[test]
+    fn a_flip_back_persists_at_once_and_only_its_stop_waits() {
+        block_on(bounded(async {
+            let order = ToggleOrder::default();
+            let log = Sent::default();
+            let (answer_on, on_answered) = tokio::sync::oneshot::channel();
+            let on = tokio::spawn(logged_round_trip(
+                &log,
+                "pet",
+                true,
+                order.record("pet"),
+                Some(on_answered),
+            ));
+            settle().await;
+            assert_eq!(sent(&log), ["persist pet on #1"]);
+
+            let off = tokio::spawn(logged_round_trip(
+                &log,
+                "pet",
+                false,
+                order.record("pet"),
+                None,
+            ));
+            settle().await;
+            assert_eq!(
+                sent(&log),
+                ["persist pet on #1", "persist pet off #2"],
+                "the off's persist queues behind the on's in the shell, not in the tab, \
+                 and its stop waits for the on"
+            );
+
+            answer_on
+                .send(())
+                .expect("the on waits for its persist's answer");
+            let on = on.await.expect("the on's task finishes");
+            assert!(on.is_ok(), "a superseded toggle answers Ok: {on:?}");
+            let off = off.await.expect("the off's task finishes");
+            assert!(off.is_ok(), "{off:?}");
+            assert_eq!(
+                sent(&log),
+                ["persist pet on #1", "persist pet off #2", "stop pet #2"]
+            );
+        }));
+    }
+
+    /// The starts and stops go in the order of the flips, fixed when each
+    /// is recorded, not in the order the runtime starts the round trips:
+    /// three flips spawned newest first each persist as their task runs, but
+    /// only the newest sends its start, and only once all three persists
+    /// have answered.
+    ///
+    /// Red if the starts and stops stop waiting for each other, or if a
+    /// superseded toggle sends one.
+    #[test]
+    fn starts_and_stops_go_in_the_order_the_switch_was_flipped() {
+        block_on(bounded(async {
+            let order = ToggleOrder::default();
+            let log = Sent::default();
+            let flips = [
+                (true, order.record("pet")),
+                (false, order.record("pet")),
+                (true, order.record("pet")),
+            ];
+            let mut tasks = Vec::new();
+            for (on, turn) in flips.into_iter().rev() {
+                tasks.push(tokio::spawn(logged_round_trip(&log, "pet", on, turn, None)));
+            }
+            for task in tasks {
+                let res = task.await.expect("the task finishes");
+                assert!(res.is_ok(), "{res:?}");
+            }
+            let sent = sent(&log);
+            let (mut persists, calls): (Vec<&str>, Vec<&str>) = sent
+                .iter()
+                .map(String::as_str)
+                .partition(|entry| entry.starts_with("persist"));
+            persists.sort_unstable();
+            assert_eq!(
+                persists,
+                [
+                    "persist pet off #2",
+                    "persist pet on #1",
+                    "persist pet on #3"
+                ],
+                "{sent:?}"
+            );
+            assert_eq!(calls, ["start pet #3"], "{sent:?}");
+            assert_eq!(
+                sent.last().map(String::as_str),
+                Some("start pet #3"),
+                "the newest start goes out after every persist: {sent:?}"
+            );
+        }));
+    }
+
+    /// A flip made while the previous toggle's start is still out: too late
+    /// to supersede it, since that toggle's persist had already answered. The
+    /// flip's persist goes out at once, but its stop waits for the start's
+    /// answer (#1425 review, L1): the module doc's "the newer toggle's start
+    /// or stop waits for that call's answer", and the only test with a start
+    /// or stop that is slow to answer.
+    ///
+    /// Red if the turn ends when the persist answers, not when the round
+    /// trip does.
+    #[test]
+    fn a_flip_made_while_the_last_start_is_out_waits_for_its_answer() {
+        block_on(bounded(async {
+            let order = ToggleOrder::default();
+            let log = Sent::default();
+            let (answer_start, start_answered) = tokio::sync::oneshot::channel::<()>();
+            let persist_log = log.clone();
+            let apply_log = log.clone();
+            let on = tokio::spawn(toggle_round_trip(
+                "pet",
+                true,
+                order.record("pet"),
+                async move {
+                    persist_log
+                        .lock()
+                        .expect("the log is not poisoned")
+                        .push("persist pet on #1".to_owned());
+                    Ok(())
+                },
+                move || async move {
+                    apply_log
+                        .lock()
+                        .expect("the log is not poisoned")
+                        .push("start pet #1".to_owned());
+                    let _ = start_answered.await;
+                    Ok(())
+                },
+            ));
+            settle().await;
+            assert_eq!(sent(&log), ["persist pet on #1", "start pet #1"]);
+
+            let off = tokio::spawn(logged_round_trip(
+                &log,
+                "pet",
+                false,
+                order.record("pet"),
+                None,
+            ));
+            settle().await;
+            assert_eq!(
+                sent(&log),
+                ["persist pet on #1", "start pet #1", "persist pet off #2"],
+                "the off's stop waits while the on's start is out"
+            );
+
+            answer_start
+                .send(())
+                .expect("the on waits for its start's answer");
+            let on = on.await.expect("the on's task finishes");
+            assert!(on.is_ok(), "{on:?}");
+            let off = off.await.expect("the off's task finishes");
+            assert!(off.is_ok(), "{off:?}");
+            assert_eq!(
+                sent(&log),
+                [
+                    "persist pet on #1",
+                    "start pet #1",
+                    "persist pet off #2",
+                    "stop pet #2"
+                ]
+            );
+        }));
+    }
+
+    /// The wait for the previous toggle has no bound of its own (#1425
+    /// review, N1): only the round trip's deadline ends it, however long the
+    /// previous persist waits in the shell. A cap shorter than the minute
+    /// would let a start or stop overtake the previous toggle's whenever
+    /// that one is slower than the cap. On a paused clock, so the 55 s cost
+    /// nothing. [`bounded`]'s 10 s would fire before those 55 s, so this has
+    /// a bound of ten minutes on the same paused clock instead: a turn that
+    /// never ends fails the test rather than hang it, because the clock jumps
+    /// to that timer once nothing else can run.
+    ///
+    /// Red if the wait gets a timeout of its own that is shorter than the
+    /// minute.
+    #[test]
+    fn the_wait_for_the_previous_toggle_has_no_bound_of_its_own() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(bounded_by(Duration::from_mins(10), async {
+                let order = ToggleOrder::default();
+                let log = Sent::default();
+                let (answer_on, on_answered) = tokio::sync::oneshot::channel();
+                let on = tokio::spawn(logged_round_trip(
+                    &log,
+                    "pet",
+                    true,
+                    order.record("pet"),
+                    Some(on_answered),
+                ));
+                settle().await;
+                let off = tokio::spawn(logged_round_trip(
+                    &log,
+                    "pet",
+                    false,
+                    order.record("pet"),
+                    None,
+                ));
+                tokio::time::sleep(Duration::from_secs(55)).await;
+                settle().await;
+                assert_eq!(
+                    sent(&log),
+                    ["persist pet on #1", "persist pet off #2"],
+                    "55 s on, the off's stop still waits for the on"
+                );
+                answer_on
+                    .send(())
+                    .expect("the on waits for its persist's answer");
+                let on = on.await.expect("the on's task finishes");
+                assert!(on.is_ok(), "{on:?}");
+                let off = off.await.expect("the off's task finishes");
+                assert!(off.is_ok(), "{off:?}");
+                assert_eq!(
+                    sent(&log),
+                    ["persist pet on #1", "persist pet off #2", "stop pet #2"]
+                );
+            }));
+    }
+
+    /// A flip made after the previous round trip is over supersedes nothing
+    /// that is still out: each toggle sends its own start or stop.
+    ///
+    /// Red if a toggle leaves its call to a newer one that does not exist.
+    #[test]
+    fn a_flip_after_the_last_one_is_over_sends_its_own_call() {
+        block_on(bounded(async {
+            let order = ToggleOrder::default();
+            let log = Sent::default();
+            let on = logged_round_trip(&log, "pet", true, order.record("pet"), None).await;
+            assert!(on.is_ok(), "{on:?}");
+            let off = logged_round_trip(&log, "pet", false, order.record("pet"), None).await;
+            assert!(off.is_ok(), "{off:?}");
+            assert_eq!(
+                sent(&log),
+                [
+                    "persist pet on #1",
+                    "start pet #1",
+                    "persist pet off #2",
+                    "stop pet #2"
+                ]
+            );
+        }));
+    }
+
+    /// The order is per plugin (#1424 review, finding 4): one switch serves
+    /// every plugin, and flipping `clock` while `pet`'s round trip is out
+    /// neither waits for `pet` nor takes `pet`'s start away.
+    ///
+    /// Red if the generation or the line is kept for all plugins at once.
+    #[test]
+    fn another_plugins_flip_neither_waits_nor_supersedes() {
+        block_on(bounded(async {
+            let order = ToggleOrder::default();
+            let log = Sent::default();
+            let (answer_pet, pet_answered) = tokio::sync::oneshot::channel();
+            let pet = tokio::spawn(logged_round_trip(
+                &log,
+                "pet",
+                true,
+                order.record("pet"),
+                Some(pet_answered),
+            ));
+            settle().await;
+            let clock = logged_round_trip(&log, "clock", true, order.record("clock"), None).await;
+            assert!(clock.is_ok(), "{clock:?}");
+            assert_eq!(
+                sent(&log),
+                ["persist pet on #1", "persist clock on #1", "start clock #1"]
+            );
+
+            answer_pet
+                .send(())
+                .expect("pet waits for its persist's answer");
+            let pet = pet.await.expect("pet's task finishes");
+            assert!(pet.is_ok(), "{pet:?}");
+            assert_eq!(
+                sent(&log),
+                [
+                    "persist pet on #1",
+                    "persist clock on #1",
+                    "start clock #1",
+                    "start pet #1"
+                ]
+            );
+        }));
+    }
+
+    /// A round trip cut off at its deadline ([`answered_by`]) is over too:
+    /// its turn goes with it, and the next flip's stop goes ahead instead of
+    /// waiting on a call nobody waits for any more. The cut-off toggle sends
+    /// no start or stop.
+    ///
+    /// Red if a turn can outlive its round trip.
+    #[test]
+    fn a_round_trip_cut_off_at_its_deadline_lets_the_next_flip_go() {
+        block_on(bounded(async {
+            let order = ToggleOrder::default();
+            let log = Sent::default();
+            let (_never_answered, unanswered) = tokio::sync::oneshot::channel();
+            let on = logged_round_trip(&log, "pet", true, order.record("pet"), Some(unanswered));
+            let off = tokio::spawn(logged_round_trip(
+                &log,
+                "pet",
+                false,
+                order.record("pet"),
+                None,
+            ));
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+            let on = answered_by(deadline, |_| on).await;
+            assert!(matches!(on, Err(ToggleError::Unanswered)), "{on:?}");
+            let off = off.await.expect("the off's task finishes");
+            assert!(off.is_ok(), "{off:?}");
+            assert_eq!(
+                sent(&log),
+                ["persist pet on #1", "persist pet off #2", "stop pet #2"]
+            );
+        }));
     }
 
     // ── Poll ordering (#983) ────────────────────────────────────────────────
@@ -4591,7 +5271,7 @@ mod tests {
     fn the_switch_persists_before_it_starts_or_stops() {
         let body = squashed_fn("set_plugin_state");
         let persist = body
-            .find("toggle_round_trip(&id,on,set_plugin_enabled(")
+            .find("toggle_round_trip(&id,on,turn,set_plugin_enabled(")
             .expect("set_plugin_state persists first");
         let apply = body
             .find("||{plugin_id_call(")
@@ -5349,6 +6029,13 @@ mod tests {
                 "{static_unit}"
             );
             assert_eq!(super::restart_status("something-newer", enabled), "Saved.");
+            // #1417 item 6: the shell found the plugin switched off (#1424).
+            // Whatever the tab's own, possibly older, poll said.
+            assert_eq!(
+                super::restart_status("switched-off", enabled),
+                "Saved. The plugin is switched off, so it was not restarted; it reads the new \
+                 values the next time it starts."
+            );
         }
         assert_eq!(
             super::restart_status("not-running", false),
@@ -5362,6 +6049,41 @@ mod tests {
             failed.contains("switch it off and on") && !failed.contains("next time"),
             "{failed}"
         );
+    }
+
+    /// #1417 item 6: every word the shell can answer `RestartPlugin` with has
+    /// a line of its own, not the generic "Saved." kept for a shell newer
+    /// than this tab. Read out of the shell's own
+    /// `SettingsRestart::wire_name`, on the `hytte-bus` source-pin precedent
+    /// above, so a word the shell grows without a line here reddens this.
+    #[test]
+    fn every_word_restart_plugin_answers_with_has_its_own_line() {
+        let launcher = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../trollshell/src/plugin_launcher.rs"
+        ));
+        let head = "pub fn wire_name(self) -> &'static str {";
+        let start = launcher
+            .find(head)
+            .expect("the shell names its RestartPlugin answers in SettingsRestart::wire_name");
+        let body = &launcher[start..];
+        let body = &body[..body.find("\n    }\n").expect("wire_name's body ends")];
+        // Every string literal in the body, however its arm is laid out
+        // (#1425 review, N2): the body holds no `"` but the words' own quotes.
+        let words: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+        assert!(
+            words.len() >= 4 && words.contains(&"switched-off"),
+            "read the shell's answers wrong: {words:?}"
+        );
+        for word in words {
+            for enabled in [false, true] {
+                assert_ne!(
+                    super::restart_status(word, enabled),
+                    "Saved.",
+                    "the shell's {word:?} (enabled: {enabled}) has no line of its own"
+                );
+            }
+        }
     }
 
     /// Only `UnknownMethod` is "an older shell"; a timeout is not.
@@ -6238,6 +6960,25 @@ mod gtk_tests {
         drop(rows);
 
         dismiss(&window);
+    }
+
+    /// #1425 review, L2: `connect_switch` reaches the tab through
+    /// `WeakPluginsState::upgrade` at every flip, so the `ToggleOrder` it
+    /// records in must be the tab's own, and must survive that hop. The
+    /// source scan `the_switch_takes_its_turn_from_the_tab_at_the_flip` pins
+    /// the spelling `state.toggles.record(&id)`; this pins what
+    /// `state.toggles` is. No test flips the switch through the real handler,
+    /// which would send real `Control` calls, so the link is pinned directly.
+    ///
+    /// Red if `upgrade` hands out a fresh `ToggleOrder`. Every flip would
+    /// then be its plugin's first, so none would wait and none would be
+    /// superseded, and every hermetic test would still pass.
+    #[gtk::test]
+    fn every_flip_records_in_the_tabs_one_toggle_order() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+        let upgraded = state.downgrade().upgrade().expect("the tab is alive");
+        assert!(Rc::ptr_eq(&state.toggles, &upgraded.toggles));
     }
 
     // ── The switch's pending toggle (#944) ───────────────────────────────────

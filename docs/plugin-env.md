@@ -628,6 +628,21 @@ visibility-gated helpers are the shape for that. Moving a card between the two
 sidebars, or a chip between the three bar regions, changes nothing about
 visibility and needs no such care.
 
+**Page visibility is the same in every family** (#1427). `SlotVisible` follows
+the mount surface; a plugin that does work only for its **own page** — the one
+`Effect::OpenPage(Page::PluginSelf)` opens — wants the page instead. It
+subscribes `StateKey::PageVisible` and implements
+`hytte_plugin::Plugin::page_visible`: the host sends `HostMsg::PageVisibility`
+with `true` while that page is on screen in the drawer (a bar chip's page) or
+the dialog (a sidebar card's), on any monitor, and `false` once it shows
+nowhere — seeded at register, then on every edge (a chip re-click, `Esc`, a
+click outside, another page replacing it, a dialog dismissed, a monitor
+unplugged). It means the same for a chip and a card, so moving a plugin across
+families changes nothing about it. Subscribing has one cost: the key rides in
+the `Register` frame, and a shell built before #1427 cannot decode it, so the
+plugin will not register with one. That is why the SDK does not subscribe for
+you.
+
 `hytte-ai-providers` (the shared OpenAI-compatible chat client `pet` and
 `caw`'s brains both use) reads no timeout of its own — the per-request budget
 is `ChatOpts::timeout`, which each plugin resolves (`PET_LLM_TIMEOUT_SECS`;

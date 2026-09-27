@@ -260,7 +260,15 @@ jobs:
           nix build --inputs-from . nixpkgs#attic-client --out-link "${RUNNER_TEMP}/attic-client"
           echo "${RUNNER_TEMP}/attic-client/bin" >> "$GITHUB_PATH"
           PATH="${RUNNER_TEMP}/attic-client/bin:$PATH"
-          attic login preem https://preem-bincache.trollhive.monster "$PREEM_TOKEN"
+          # The secret as stored carries a character HTTP headers refuse,
+          # most likely a newline from the paste. On #1420's first run,
+          # attic panicked building its `Authorization` header with
+          # `InvalidHeaderValue`. An attic token is a JWT, which has no
+          # whitespace, so strip all of it. The netrc `attic use` writes
+          # below gets the same clean token.
+          token="$(printf '%s' "$PREEM_TOKEN" | tr -d '[:space:]')"
+          echo "token: stripped $(( ${#PREEM_TOKEN} - ${#token} )) whitespace character(s)"
+          attic login preem https://preem-bincache.trollhive.monster "$token"
           echo attic=ready >> "$GITHUB_OUTPUT"
           timeout 60 attic use preem:grid
           # For the log: the priority, and the upstream key names the push

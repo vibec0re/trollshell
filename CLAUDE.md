@@ -325,17 +325,32 @@ runners share no Nix store, so each job compiles the deps closure it needs
 rather than one run compiling it once (#1268). A cross-run binary cache
 (#1231 item 2) turns those into hits. Since #1418 that is Mara's attic cache,
 the preem grid (`preem:grid`, `forge.darkest.space/mara/preem-nix-bincache`).
-Every heavy job logs in with the `PREEM_BINCACHE_TOKEN` repo secret and runs
+Every heavy job reads a `PREEM_BINCACHE_TOKEN` secret, logs in and runs
 `attic use`, which relies on install-nix-action making the runner a trusted
-nix user. Only main's runs push, and they push the build-time closure of
-their own checks. `attic push` drops every path cache.nixos.org already signs,
-so what goes up is ours: the two deps caches, the crates, the compile, the
-slices, and the check outputs. A PR whose deps derivations match main's
-therefore substitutes both deps stages. Every grid step is
-`continue-on-error`, and `connect-timeout`/`fallback` are set, so a down grid
-costs a cold build and never a red `flake-check`. A run without the secret (a
-fork PR) skips every grid step. The job-level bounds are `soft + 40`, which
-covers the pull and push step bounds; the workflow comment has the arithmetic.
+nix user. Two tokens share that name: the repo secret is **pull-only**, and
+main's own push runs name the `preem-push` environment (deployment branches:
+`main` only, `deployment: false`), whose environment secret of the same name
+is push+pull and overrides it. So only main can push, and GitHub's branch rule
+enforces that, not the push step's `if:`, which any branch can edit; the
+workflow comment on `environment:` has both `make-token` commands. Main pushes
+the build-time closure of its checks **minus each check's own output**, except
+on the `packages` leg: a test, VM or doc result is never substituted into a
+later run, while the packages are, for the hosts. `attic push` drops every
+path cache.nixos.org already signs, so what goes up is ours: the two deps
+caches, the crates, the compile, the slices, `probes` and the sources. A PR
+whose deps derivations match main's therefore substitutes both deps stages. A
+run without the secret (a fork PR) skips every grid step. Every grid step is
+`continue-on-error` and bounded, and the grid's nix settings (`fallback`,
+which nix 2.35 needs to survive any substituter error but a 404 or 403, plus
+`connect-timeout` and a two-attempt retry cap on the grid URL) are written to
+the runner user's nix.conf only once `attic use` has succeeded, so a run
+without the grid (a fork PR, the cheap job) keeps the pre-#1418 nix config.
+nix itself is pinned to 2.35.2 through `install_url`, the version those
+settings were read against. A grid that fails at pull time costs a cold
+build; one that fails mid-build costs time, and only one that keeps hanging
+through a whole build can push a leg past `soft`. The job-level bounds are
+`soft + 40`, which covers the pull and push step bounds; the workflow comment
+has the arithmetic.
 
 ### Lint — strict, treat as the gate
 

@@ -354,6 +354,9 @@ jobs:
           # anything else runs.
           token="$(printf '%s' "$PREEM_TOKEN" | tr -d '[:space:]')"
           echo "::add-mask::${token}"
+          # `continue-on-error` keeps the job green whatever this step does,
+          # so a failure has to say so where people look: the run summary.
+          trap 'echo "::warning::the pull step failed at line ${LINENO}; this run builds cold and pushes nothing (#1418)"' ERR
           echo "token: stripped $(( ${#PREEM_TOKEN} - ${#token} )) whitespace character(s)"
           nix build --inputs-from . nixpkgs#attic-client --out-link "${RUNNER_TEMP}/attic-client"
           echo "${RUNNER_TEMP}/attic-client/bin" >> "$GITHUB_PATH"
@@ -563,6 +566,9 @@ jobs:
           NAME: ${{ matrix.name }}
           CHECKS: ${{ matrix.checks }}
         run: |
+          # `continue-on-error` keeps the job green whatever this step does,
+          # so a failure has to say so where people look: the run summary.
+          trap 'echo "::warning::the push step failed at line ${LINENO}, so some or all of this leg was not pushed (#1418)"' ERR
           out="${RUNNER_TEMP}/preem-push"
           # shellcheck disable=SC2086  # $CHECKS is a deliberate list of installables
           nix path-info --derivation $CHECKS > "${out}.drvs"
@@ -585,7 +591,7 @@ jobs:
             exit 1
           fi
           if ! timeout 60 attic cache info preem:grid > /dev/null; then
-            echo "::warning::the preem grid did not answer within 60 s, so nothing was pushed; the next main run pushes this (#1418)"
+            echo "::warning::attic could not reach the preem grid (cache info failed, or took over 60 s), so nothing was pushed; the next main run pushes this (#1418)"
             exit 1
           fi
           rc=0

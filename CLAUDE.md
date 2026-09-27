@@ -323,7 +323,19 @@ direction, so a new check nobody adds to a job cannot silently go untested.
 What the split costs is CPU, not wall time:
 runners share no Nix store, so each job compiles the deps closure it needs
 rather than one run compiling it once (#1268). A cross-run binary cache
-(#1231 item 2) is what turns those into hits, and it needs a token.
+(#1231 item 2) turns those into hits. Since #1418 that is Mara's attic cache,
+the preem grid (`preem:grid`, `forge.darkest.space/mara/preem-nix-bincache`).
+Every heavy job logs in with the `PREEM_BINCACHE_TOKEN` repo secret and runs
+`attic use`, which relies on install-nix-action making the runner a trusted
+nix user. Only main's runs push, and they push the build-time closure of
+their own checks. `attic push` drops every path cache.nixos.org already signs,
+so what goes up is ours: the two deps caches, the crates, the compile, the
+slices, and the check outputs. A PR whose deps derivations match main's
+therefore substitutes both deps stages. Every grid step is
+`continue-on-error`, and `connect-timeout`/`fallback` are set, so a down grid
+costs a cold build and never a red `flake-check`. A run without the secret (a
+fork PR) skips every grid step. The job-level bounds are `soft + 40`, which
+covers the pull and push step bounds; the workflow comment has the arithmetic.
 
 ### Lint — strict, treat as the gate
 

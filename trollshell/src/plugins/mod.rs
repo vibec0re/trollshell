@@ -28,6 +28,7 @@
 //! GTK reconciler ──on_event──▶ per-conn outbound (mpsc) ──▶ writer task ──▶ plugin (Event)
 //! GTK clock pump ──▶ watch ──▶ per-conn snapshot task ──▶ writer task ──▶ plugin (StateSnapshot)
 //! GTK sidebar open/close ──▶ watch ──▶ per-conn visibility task ──▶ writer task ──▶ plugin (SlotVisibility)
+//! GTK drawer/dialog page selections ──▶ page publisher ──▶ watch ──▶ per-conn page task ──▶ writer task ──▶ plugin (PageVisibility)
 //! ```
 //!
 //! ## Slot visibility (park pollers while hidden) (#288)
@@ -57,6 +58,33 @@
 //! the latter on monitor hot-unplug, so a disappearing monitor that held the only
 //! open sidebar drops `visible` to `false`) and publishes the aggregate only when
 //! it actually changes.
+//!
+//! ## Page visibility (a plugin's own page) (#1427)
+//!
+//! The sibling push, for the page `Effect::OpenPage(Page::PluginSelf)` opens
+//! rather than the mount surface: `HostMsg::PageVisibility` is `true` while the
+//! plugin's page is on screen in the drawer or the dialog, on any monitor, and
+//! `false` once it shows nowhere. Opt-in on `StateKey::PageVisible` (#305),
+//! seeded at register and sent on every edge — the same shape as slot
+//! visibility, with two differences.
+//!
+//! - **One source, every plugin.** The answer differs per plugin, so the channel
+//!   carries the *selections* (`pump::PanelSelections`: the drawer's and the
+//!   dialog's plugin ids) and each connection's task asks it about its own id.
+//!   A selection moving between two other plugins changes nothing for this one,
+//!   and the task sends nothing.
+//! - **Fed from the handles, not from the writers.** `pump`'s page publisher
+//!   subscribes the drawer's selection, the drawer's shown flag and the dialog's
+//!   selection on the GTK thread, so every path that closes a page — a chip
+//!   re-click, `Esc`, a click outside, another page replacing it, a dialog
+//!   dismiss, a hot-unplug — reaches the push through the handle it already
+//!   writes. Being a GTK-side loop, it also hands over one settled value per
+//!   GTK turn, so a page moving between surfaces in one handler is no edge.
+//!
+//! The drawer's selection counts only while a drawer is showing its plugin
+//! page (`drawer_panel_shown`, set by `modal`): a drawer that switches to a
+//! built-in page does not clear the selection, and would otherwise leave the
+//! page reading "on screen".
 //!
 //! ## Mount regions (#274)
 //!
@@ -114,9 +142,10 @@
 //!   (`panel: None`).
 //! - **State:** `StateKey::Clock` (the snapshot pump), plus the opt-in
 //!   host→plugin pushes gated on their own keys — `StateKey::SlotVisible`
-//!   (#288), `StateKey::Accent` (#376), and `StateKey::AudioSpectrum` (the
+//!   (#288), `StateKey::Accent` (#376), `StateKey::AudioSpectrum` (the
 //!   ~20 Hz audio tap, #405; its capture is demand-gated on the subscriber's
-//!   card being on-screen since #559).
+//!   card being on-screen since #559), and `StateKey::PageVisible` (the
+//!   plugin's own page, #1427).
 //! - **Effects:** the **whole** wire vocabulary is brokered — [`Effect::OpenPage`]
 //!   (→ the modal drawer, incl. `PluginSelf` → the plugin's own panel, #349 PR2),
 //!   [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236), [`Effect::Notify`]
@@ -196,6 +225,11 @@ pub use region::{
 // caller of both — plus `dialog_panel`, which the scope releaser's departure
 // hook reads to decide whether the dialog is showing the plugin that just left.
 pub use region::{dialog_panel, plugin_dialog_slot, set_dialog_panel};
+// `modal`'s half of the page-visibility push (#1427): whether a drawer on any
+// monitor is showing its plugin page, written after every drawer transition.
+pub use region::set_drawer_panel_shown;
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) use region::drawer_panel_shown;
 // The slot-visibility **edge** counter (#1361 review, HIGH-2). Test-only: a
 // `watch` receiver coalesces a `true → false → true` flap into one latest-value
 // read, so the edge is counted where it is emitted instead.
@@ -518,6 +552,24 @@ pub struct PluginHandles {
     /// `pump.rs` sites that ask "is any panel on screen": a plugin whose page is
     /// up only in the dialog must still have its preem repaints pumped.
     dialog_panel_id: Mutable<Option<String>>,
+    /// Whether a drawer on **any** monitor is showing its plugin page right now
+    /// (#1427). Written by `modal`'s `recompute_gates` through
+    /// [`set_drawer_panel_shown`] after every transition that changes what a
+    /// drawer shows; starts `false` (no drawer is open at boot).
+    ///
+    /// The gate on `active_panel_id` that the page-visibility push needs: that
+    /// selection names the plugin the drawer's plugin child renders, and it is
+    /// **not** cleared when a drawer switches to a built-in page — nor, after
+    /// such a switch, when that drawer closes — so on its own it would call a
+    /// page "on screen" that nobody can see. [`pump::PanelSelections::new`] is
+    /// where the two are combined.
+    drawer_panel_shown: Mutable<bool>,
+    /// The page selections (#1427), published by `pump`'s GTK-side page
+    /// publisher whenever `active_panel_id`, `drawer_panel_shown` or
+    /// `dialog_panel_id` settles on a new value, and subscribed from tokio by
+    /// each connection that asked for the page push. Starts empty (no page is
+    /// on screen at boot).
+    page_tx: watch::Sender<pump::PanelSelections>,
     clock_tx: watch::Sender<Option<ClockState>>,
     /// Aggregate slot visibility (OR of every monitor's sidebar open flag),
     /// written on the GTK thread ([`set_sidebar_visibility`]) and subscribed
@@ -591,6 +643,10 @@ struct ListenerCtx {
     /// from the connection's mount, so nothing downstream has to know there are
     /// two sidebars.
     visibility_right_rx: watch::Receiver<bool>,
+    /// Subscriber end of [`PluginHandles::page_tx`] (#1427). One channel for
+    /// every connection: each subscribed connection's task asks it about its
+    /// own id and pushes only when that answer moves.
+    page_rx: watch::Receiver<pump::PanelSelections>,
     /// Subscriber end of [`PluginHandles::accent_tx`] (#376).
     accent_rx: watch::Receiver<Option<[u8; 4]>>,
     /// Subscriber end of [`PluginHandles::spectrum_tx`] (#405).
@@ -671,7 +727,9 @@ pub(crate) fn install_test_handles() {
                 bar_right: Mutable::new(Vec::new()),
                 panels: Mutable::new(Vec::new()),
                 active_panel_id: Mutable::new(None),
+                drawer_panel_shown: Mutable::new(false),
                 dialog_panel_id: Mutable::new(None),
+                page_tx: watch::channel(pump::PanelSelections::default()).0,
                 clock_tx: watch::channel(None).0,
                 visibility_tx: watch::channel(false).0,
                 visibility_right_tx: watch::channel(false).0,
@@ -726,6 +784,9 @@ impl Service for PluginsService {
         // sidebar is open at boot, and the right one additionally has nothing
         // mounted on it until a plugin dials in.
         let (visibility_right_tx, visibility_right_rx) = watch::channel(false);
+        // The page selections (#1427) seed empty: no drawer or dialog is open at
+        // boot, and `install`'s page publisher re-asserts the same as it wires up.
+        let (page_tx, page_rx) = watch::channel(pump::PanelSelections::default());
         // Accent seeds `None` (unresolved): `install` resolves `@accent_color`
         // on the GTK thread and publishes it once the display's CSS is up (#376).
         let (accent_tx, accent_rx) = watch::channel(None);
@@ -762,7 +823,9 @@ impl Service for PluginsService {
             bar_right: Mutable::new(Vec::new()),
             panels: Mutable::new(Vec::new()),
             active_panel_id: Mutable::new(None),
+            drawer_panel_shown: Mutable::new(false),
             dialog_panel_id: Mutable::new(None),
+            page_tx,
             clock_tx,
             visibility_tx,
             visibility_right_tx,
@@ -788,6 +851,7 @@ impl Service for PluginsService {
             clock_rx,
             visibility_rx,
             visibility_right_rx,
+            page_rx,
             accent_rx,
             spectrum_rx,
             calendar_rx,
@@ -912,6 +976,14 @@ pub fn install() {
     // widget's life, which is precisely the monitor-shaped lifetime being fixed
     // — see [`pump::drive_scope_releaser`] for the full argument.
     pump::install_scope_releaser();
+
+    // Page visibility (#1427): publish the page selections — the drawer's, gated
+    // on a drawer actually showing a plugin page, and the dialog's — to the
+    // per-conn page tasks whenever they settle on a new value. Subscribed to the
+    // handles rather than hooked into their writers, so every close path reaches
+    // it; see [`pump::drive_page_selections`]. Monitor-independent for the scope
+    // releaser's reason, one line up.
+    pump::install_page_publisher();
 
     // Audio spectrum pump (#405): project the live `pipewire::audio_spectrum()`
     // (a services `AudioSpectrum`, or `None` while the tap is inactive) onto the

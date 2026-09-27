@@ -35,14 +35,15 @@ use super::listener::{
 };
 use super::preem_render::{self, Scope};
 use super::pump::{
-    any_sidebar_open, apply_forget, apply_open, request_remap, request_remap_holding,
-    tick_decision, tint_in_process_surfaces, to_now_playing, to_upcoming_events,
+    PanelSelections, any_sidebar_open, apply_forget, apply_open, request_remap,
+    request_remap_holding, tick_decision, tint_in_process_surfaces, to_now_playing,
+    to_upcoming_events,
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
     MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, MAX_MISSED_PONGS, OUTBOUND_CAPACITY,
-    PING_INTERVAL, Push, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
+    PING_INTERVAL, PageEdge, Push, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
     push_gate, push_state, state_key_capability,
 };
 use super::shader_map::{self, Grants};
@@ -1101,6 +1102,10 @@ fn ctx_with(
         // left-sidebar and bar mounts, so no task ever reads it; the sender is
         // dropped immediately, which the seeding read tolerates.
         visibility_right_rx: watch::channel(false).1,
+        // #1427: the page selections. No test here subscribes
+        // `StateKey::PageVisible` unless it swaps in a receiver of its own
+        // (`page_ctx`), so the sender is dropped immediately.
+        page_rx: watch::channel(PanelSelections::default()).1,
         accent_rx,
         spectrum_rx,
         calendar_rx,
@@ -1663,6 +1668,236 @@ async fn visibility_is_constant_true_for_bar_mounts() {
     assert!(
         quiet.is_err(),
         "a bar mount receives no sidebar-driven visibility edges (only the seed)",
+    );
+}
+
+// ── Page visibility (#1427): the plugin's own page, per connection ────────
+
+/// A [`ctx_with`] whose page channel the test drives, plus the clock sender for
+/// the tests that need an ordered control frame. The clock is seeded, so a
+/// `Clock` subscriber's seed is a real snapshot.
+fn page_ctx() -> (
+    ListenerCtx,
+    watch::Sender<PanelSelections>,
+    watch::Sender<Option<ClockState>>,
+) {
+    let (clock_tx, clock_rx) = watch::channel(Some(ClockState {
+        iso: "t0".into(),
+        unix: 0,
+    }));
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (mut ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let (page_tx, page_rx) = watch::channel(PanelSelections::default());
+    ctx.page_rx = page_rx;
+    (ctx, page_tx, clock_tx)
+}
+
+/// Register `manifest` on a fresh connection served from `ctx`, returning the
+/// plugin's read half (and its write half, which must stay alive).
+async fn connect_page_plugin(
+    ctx: ListenerCtx,
+    manifest: Manifest,
+) -> (
+    tokio::net::unix::OwnedReadHalf,
+    tokio::net::unix::OwnedWriteHalf,
+) {
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+    let (prd, mut pwr) = plugin_end.into_split();
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("send Register");
+    (prd, pwr)
+}
+
+/// A manifest that subscribes the page push and nothing else, so every frame
+/// after `Hello` is a `PageVisibility` and the order is the host's own.
+fn page_subscriber(id: &str, mount: Mount) -> Manifest {
+    let mut manifest = Manifest::new(id, mount);
+    manifest.subscribes = vec![StateKey::PageVisible];
+    manifest
+}
+
+/// The drawer showing `id`'s page on some monitor.
+fn in_drawer(id: &str) -> PanelSelections {
+    PanelSelections::new(Some(id.to_owned()), true, None)
+}
+
+/// The dialog showing `id`'s page.
+fn in_dialog(id: &str) -> PanelSelections {
+    PanelSelections::new(None, false, Some(id.to_owned()))
+}
+
+/// `recv`, asserting the frame is a `PageVisibility` carrying `want`.
+async fn expect_page<R: tokio::io::AsyncRead + Unpin>(rd: &mut R, want: bool, why: &str) {
+    match recv(rd).await {
+        HostMsg::PageVisibility { visible } => assert_eq!(visible, want, "{why}"),
+        other => panic!("{why}: expected PageVisibility {{ visible: {want} }}, got {other:?}"),
+    }
+}
+
+/// **The seed, and the edges.** A subscriber is told its page's state at
+/// register (`false`: nothing is open), then `true` when its page opens and
+/// `false` when it closes — in the drawer here, a bar chip's page.
+///
+/// **Falsification:** delete the seed (start the task at `changed().await`) →
+/// the first `expect_page` reads the open edge's `true` and reds.
+#[tokio::test]
+async fn page_visibility_is_seeded_then_pushed_on_each_edge() {
+    let (ctx, page_tx, _clock_tx) = page_ctx();
+    let (mut prd, _pwr) =
+        connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+
+    expect_page(&mut prd, false, "the register seed: no page is open").await;
+
+    page_tx.send_replace(in_drawer("stats"));
+    expect_page(&mut prd, true, "the open edge").await;
+
+    page_tx.send_replace(PanelSelections::default());
+    expect_page(&mut prd, false, "the close edge").await;
+}
+
+/// **A reconnect while the page is open starts right.** The seed is the page's
+/// current state, not a hard-coded `false` — here the dialog is already
+/// showing this sidebar card's page when it dials in.
+///
+/// **Falsification:** seed a constant `false` → reds.
+#[tokio::test]
+async fn page_visibility_is_seeded_true_when_the_page_is_already_open() {
+    let (ctx, page_tx, _clock_tx) = page_ctx();
+    page_tx.send_replace(in_dialog("agents"));
+    let (mut prd, _pwr) =
+        connect_page_plugin(ctx, page_subscriber("agents", Mount::SidebarTop)).await;
+
+    expect_page(&mut prd, true, "the seed carries the open page").await;
+}
+
+/// **No push when the selection moves between two other plugins.** The page
+/// channel changes whenever any plugin's page opens or closes; this plugin's
+/// answer does not, so it is sent nothing. The next frame it sees is its own
+/// open edge — a duplicate `false` would arrive first.
+///
+/// **Falsification:** make `page_task` push on every channel change rather than
+/// on `PageEdge::owed` → the `expect_page(true)` reads a `false` and reds.
+#[tokio::test]
+async fn another_plugins_page_is_no_edge_for_this_one() {
+    let (ctx, page_tx, _clock_tx) = page_ctx();
+    let (mut prd, _pwr) =
+        connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+    expect_page(&mut prd, false, "seed").await;
+
+    for other in [in_drawer("clock-demo"), in_dialog("agents"), in_drawer("timer")] {
+        page_tx.send_replace(other);
+        // Let the task observe each change on its own, rather than coalesced.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    page_tx.send_replace(in_drawer("stats"));
+    expect_page(&mut prd, true, "the first frame after the others is this plugin's own edge").await;
+}
+
+/// **Drawer ↔ dialog, and the OR over surfaces.** The page open in both
+/// surfaces at once is one `true`; it leaving one of them is no edge while the
+/// other still shows it, and a single update moving it from the drawer to the
+/// dialog is no edge either. Only it leaving the last surface is `false`.
+///
+/// **Falsification:** as above — any change that re-sends reds the final
+/// `expect_page(false)`, which then reads a `true`.
+#[tokio::test]
+async fn a_page_on_any_surface_is_one_visible_state() {
+    let (ctx, page_tx, _clock_tx) = page_ctx();
+    let (mut prd, _pwr) =
+        connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+    expect_page(&mut prd, false, "seed").await;
+
+    page_tx.send_replace(in_drawer("stats"));
+    expect_page(&mut prd, true, "open in the drawer").await;
+
+    for still_open in [
+        // In both surfaces at once.
+        PanelSelections::new(Some("stats".to_owned()), true, Some("stats".to_owned())),
+        // The drawer let go; the dialog still shows it.
+        in_dialog("stats"),
+        // Straight back to the drawer, in one update.
+        in_drawer("stats"),
+    ] {
+        page_tx.send_replace(still_open);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The drawer switches to a built-in page: the selection stays, the flag
+    // drops, and the page is off screen.
+    page_tx.send_replace(PanelSelections::new(Some("stats".to_owned()), false, None));
+    expect_page(&mut prd, false, "the only edge after the opening one").await;
+}
+
+/// **Opt-in (#305): an unsubscribed plugin never receives the push** — not the
+/// seed, not an edge. The plugin subscribes `Clock` only, so its frames are
+/// clock snapshots; a page edge driven mid-stream produces nothing, and the next
+/// frame is the following snapshot — the edge was filtered, not late. A
+/// pre-#1427 binary receiving the variant would crash-loop (see the proto's
+/// `a_pre_1427_plugin_decodes_every_old_push_but_not_page_visibility`).
+///
+/// **Falsification:** spawn `page_task` for every connection (drop the
+/// `push_gate`) → the `PageVisibility` arm fires and reds.
+#[tokio::test]
+async fn page_visibility_is_never_sent_to_a_plugin_that_did_not_subscribe() {
+    let (ctx, page_tx, clock_tx) = page_ctx();
+    let mut manifest = Manifest::new("legacy", Mount::BarRight);
+    manifest.subscribes = vec![StateKey::Clock];
+    let (mut prd, _pwr) = connect_page_plugin(ctx, manifest).await;
+
+    assert!(
+        matches!(recv(&mut prd).await, HostMsg::StateSnapshot { .. }),
+        "the seed is the clock snapshot, never PageVisibility",
+    );
+
+    page_tx.send_replace(in_drawer("legacy"));
+    clock_tx.send_replace(Some(ClockState {
+        iso: "t1".into(),
+        unix: 1,
+    }));
+    match recv(&mut prd).await {
+        HostMsg::StateSnapshot { snapshot } => assert_eq!(
+            snapshot.clock.map(|c| c.unix),
+            Some(1),
+            "the clock edge came through; the page edge produced no frame",
+        ),
+        HostMsg::PageVisibility { .. } => {
+            panic!("an unsubscribed plugin received a PageVisibility frame (#305)")
+        }
+        other => panic!("unexpected frame: {other:?}"),
+    }
+}
+
+/// [`PageEdge`] on its own: the seed is owed whatever the answer, an unchanged
+/// answer is not, and an answer that never reached the queue is owed again.
+///
+/// **Falsification:** record in `owed` rather than in `told` (i.e. count a push
+/// dropped on a full queue as delivered) → the last assertion reds.
+#[test]
+fn a_page_edge_is_owed_on_the_seed_and_on_each_change_of_its_own_answer() {
+    let mut edge = PageEdge::default();
+    let nothing = PanelSelections::default();
+    assert_eq!(edge.owed("stats", &nothing), Some(false), "the seed is owed");
+    edge.told(false);
+    assert_eq!(edge.owed("stats", &nothing), None);
+    assert_eq!(
+        edge.owed("stats", &in_drawer("clock-demo")),
+        None,
+        "another plugin's page is no edge",
+    );
+
+    let open = in_drawer("stats");
+    assert_eq!(edge.owed("stats", &open), Some(true));
+    // The push hit a full queue: not told, so still owed at the next wake,
+    // even if that wake is another plugin's change.
+    assert_eq!(
+        edge.owed(
+            "stats",
+            &PanelSelections::new(Some("stats".to_owned()), true, Some("agents".to_owned())),
+        ),
+        Some(true),
+        "an answer that never reached the plugin is owed again",
     );
 }
 
@@ -2409,6 +2644,8 @@ fn state_key_capability_gates_only_the_domain_keys() {
     assert_eq!(state_key_capability(StateKey::SlotVisible), None);
     assert_eq!(state_key_capability(StateKey::Accent), None);
     assert_eq!(state_key_capability(StateKey::AudioSpectrum), None);
+    // #1427: whether a plugin's own page is up tells it nothing about anyone else.
+    assert_eq!(state_key_capability(StateKey::PageVisible), None);
     assert_eq!(
         state_key_capability(StateKey::CalendarUpcoming),
         Some(Capability::Calendar)
@@ -3404,6 +3641,10 @@ fn ctx_now_playing_lane() -> (ListenerCtx, watch::Sender<bool>, watch::Sender<No
         // left-sidebar and bar mounts, so no task ever reads it; the sender is
         // dropped immediately, which the seeding read tolerates.
         visibility_right_rx: watch::channel(false).1,
+        // #1427: the page selections. No test here subscribes
+        // `StateKey::PageVisible` unless it swaps in a receiver of its own
+        // (`page_ctx`), so the sender is dropped immediately.
+        page_rx: watch::channel(PanelSelections::default()).1,
         accent_rx,
         spectrum_rx,
         calendar_rx,

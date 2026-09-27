@@ -1,6 +1,7 @@
 //! GTK-side state publishers: the clock / accent / audio-spectrum projections
 //! [`super::install`] wires into `watch` channels, plus the slot-visibility
-//! (#288) aggregation fed from `sidebar.rs`. Each `publish_*` writes a
+//! (#288) aggregation fed from `sidebar.rs` and the page selections (#1427)
+//! read off the drawer's and the dialog's handles. Each `publish_*` writes a
 //! [`super::PluginHandles`] `watch::Sender`; the per-conn tasks in
 //! [`super::session`] subscribe the matching receiver.
 //!
@@ -826,7 +827,9 @@ pub(super) fn install_scope_releaser() {
             bar_right,
             panels,
             active_panel_id: _,
+            drawer_panel_shown: _,
             dialog_panel_id: _,
+            page_tx: _,
             clock_tx: _,
             visibility_tx: _,
             visibility_right_tx: _,
@@ -1032,34 +1035,163 @@ fn request_preem_repaint_all() {
 /// plus up to two `String`s there for a membership test over at most two
 /// entries (#1361 review, LOW). The pre-#1010 code cloned one `Option<String>`;
 /// this clones two and allocates nothing else.
-struct PanelSelections {
+///
+/// Since #1427 it is also the value the page-visibility push is computed from:
+/// [`install_page_publisher`] sends it to every connection, and each one asks
+/// [`shows`](Self::shows) of its own id. That is why it is `pub(super)` and
+/// comparable — the per-connection task keeps no notion of "on screen" of its
+/// own, so it cannot drift from the repaint path's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PanelSelections {
     drawer: Option<String>,
     dialog: Option<String>,
 }
 
 impl PanelSelections {
+    /// The selections from the three handles' values: the drawer's
+    /// `active_panel_id`, whether a drawer is showing its plugin page at all
+    /// (`drawer_panel_shown`), and the dialog's `dialog_panel_id`.
+    ///
+    /// The drawer's selection counts **only while `drawer_shown`** (#1427).
+    /// `active_panel_id` names the plugin the drawer's plugin child renders, and
+    /// a drawer that switches from that child to a built-in page — a keybind's
+    /// `open-page`, a plugin's `OpenPage(<built-in>)` — leaves it set; a close
+    /// after that switch leaves it set for good, since `modal`'s retract only
+    /// clears it when the page it closes is a plugin one. Read bare, it would
+    /// keep a page "on screen" that nobody can see. The dialog needs no such
+    /// gate: every way it goes down clears its selection.
+    pub(super) fn new(drawer: Option<String>, drawer_shown: bool, dialog: Option<String>) -> Self {
+        Self {
+            drawer: drawer.filter(|_| drawer_shown),
+            dialog,
+        }
+    }
+
     /// Nothing is on screen — neither surface has a plugin selected.
     fn is_empty(&self) -> bool {
         self.drawer.is_none() && self.dialog.is_none()
     }
 
-    /// Whether `plugin_id`'s panel is the one on screen in either surface.
-    fn shows(&self, plugin_id: &str) -> bool {
+    /// Whether `plugin_id`'s panel is the one on screen in either surface —
+    /// the drawer **or** the dialog, which between them cover every monitor
+    /// (each selection is one process-wide value, and `modal` sets the drawer's
+    /// shown flag while a drawer on *any* monitor shows a plugin page).
+    pub(super) fn shows(&self, plugin_id: &str) -> bool {
         self.drawer.as_deref() == Some(plugin_id) || self.dialog.as_deref() == Some(plugin_id)
     }
 }
 
-/// Read both panel selections at once.
+/// Read the panel selections at once.
 ///
-/// The one place the two handles are read together, so the two callers above
-/// cannot drift into disagreeing about what "a panel is showing" means. Returns
-/// owned ids with both guards already dropped — every caller goes on to take the
-/// `panels` mailbox's write lock, and holding a `Mutable`'s read guard across
-/// that is the deadlock shape [`request_remap`] documents.
+/// The one place the handles are read together, so the callers above cannot
+/// drift into disagreeing about what "a panel is showing" means — and since
+/// #1427 [`page_selections_signal`] builds the same value through the same
+/// [`PanelSelections::new`]. Returns owned ids with every guard already dropped
+/// — every caller goes on to take the `panels` mailbox's write lock, and holding
+/// a `Mutable`'s read guard across that is the deadlock shape [`request_remap`]
+/// documents.
 fn panel_selections(handles: &PluginHandles) -> PanelSelections {
-    let drawer = handles.active_panel_id.lock_ref().clone();
+    let drawer_shown = handles.drawer_panel_shown.get();
+    // Not cloned when it cannot count — this runs on every animation tick.
+    let drawer = if drawer_shown {
+        handles.active_panel_id.lock_ref().clone()
+    } else {
+        None
+    };
     let dialog = handles.dialog_panel_id.lock_ref().clone();
-    PanelSelections { drawer, dialog }
+    PanelSelections::new(drawer, drawer_shown, dialog)
+}
+
+// ── Page visibility (#1427): the plugin's own page, on the wire ──────────────
+
+/// The three handles [`panel_selections`] reads, as one signal: a change to
+/// any of them re-emits the combined [`PanelSelections`].
+///
+/// The returned signal borrows nothing (`+ use<>`: `signal_cloned` hands back an
+/// owned, `Arc`-backed signal), so it outlives the registry borrow it is built
+/// in.
+pub(super) fn page_selections_signal(
+    active_panel_id: &Mutable<Option<String>>,
+    drawer_panel_shown: &Mutable<bool>,
+    dialog_panel_id: &Mutable<Option<String>>,
+) -> impl Signal<Item = PanelSelections> + use<> {
+    map_ref! {
+        let drawer = active_panel_id.signal_cloned(),
+        let shown = drawer_panel_shown.signal(),
+        let dialog = dialog_panel_id.signal_cloned() =>
+        PanelSelections::new(drawer.clone(), *shown, dialog.clone())
+    }
+}
+
+/// Hand every selection the GTK side settles on to `publish`, for the life of
+/// the process.
+///
+/// **The single seam for every close path.** The drawer's selection is written
+/// from `modal`'s open, swap, retract and teardown paths, its shown flag from
+/// `modal`'s `recompute_gates` after each of them, and the dialog's selection
+/// from every way the dialog goes up or down (`overlays::dialog`'s one
+/// `publish_dismissal`). Subscribing to the handles themselves, rather than
+/// hooking each writer, means a close path added later reaches the push
+/// without anyone remembering to wire it.
+///
+/// **A GTK-side loop, so one GTK turn is one value.** A handler that clears the
+/// drawer and fills the dialog in one go (or the reverse) writes twice before
+/// this loop is polled again, and the signal hands over only the settled
+/// result. A task on the tokio side subscribing the `Mutable`s directly could
+/// be woken between the two writes and tell a plugin whose page never left the
+/// screen that it had.
+///
+/// Generic over `publish` so a test can record every value the loop emits;
+/// [`install_page_publisher`] passes [`publish_page_selections`].
+pub(super) async fn drive_page_selections(
+    selections: impl Signal<Item = PanelSelections>,
+    mut publish: impl FnMut(PanelSelections),
+) {
+    let mut selections = std::pin::pin!(selections);
+    while let Some(next) = std::future::poll_fn(|cx| selections.as_mut().poll_change(cx)).await {
+        publish(next);
+    }
+}
+
+/// Put `next` on the page channel if it differs from what is there — so a
+/// re-selection of the same plugin (the dialog's same-plugin re-open, a drawer
+/// re-show) wakes no connection. Returns whether it sent.
+pub(super) fn publish_page_selections(
+    tx: &watch::Sender<PanelSelections>,
+    next: PanelSelections,
+) -> bool {
+    tx.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    })
+}
+
+/// Subscribe [`drive_page_selections`] to the production handles. Called once
+/// from [`super::install`], on the GTK main thread — a plain `spawn_local` for
+/// the process lifetime, like [`install_scope_releaser`] and for the same
+/// reason: it holds no widget, and anchoring it to one would give it a
+/// monitor-shaped lifetime.
+pub(super) fn install_page_publisher() {
+    let (selections, tx) = registry::with(|r| {
+        let handles = r
+            .get::<PluginHandles>()
+            .expect("plugins::service() not registered");
+        (
+            page_selections_signal(
+                &handles.active_panel_id,
+                &handles.drawer_panel_shown,
+                &handles.dialog_panel_id,
+            ),
+            handles.page_tx.clone(),
+        )
+    });
+    glib::MainContext::default().spawn_local(drive_page_selections(selections, move |next| {
+        publish_page_selections(&tx, next);
+    }));
 }
 
 /// [`request_remap`], but only if `mailbox` actually holds a render for one of

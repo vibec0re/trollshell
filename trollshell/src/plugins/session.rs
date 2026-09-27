@@ -23,6 +23,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{mpsc, watch};
 
+use super::pump::PanelSelections;
 use super::region::{clear_region_if_owned, upsert_region};
 use super::{BrokeredEffect, ListenerCtx, SlotRender};
 
@@ -1002,17 +1003,22 @@ impl Drop for IdGuard {
 
 /// The [`Capability`] a domain [`StateKey`] push additionally requires (#484/#528),
 /// or `None` for an *ambient* key whose subscription alone is the opt-in
-/// (`Clock`/`SlotVisible`/`Accent`/`AudioSpectrum`). Exhaustive over the key
+/// (`Clock`/`SlotVisible`/`Accent`/`AudioSpectrum`/`PageVisible`). Exhaustive over the key
 /// vocabulary so adding a `StateKey` is a compile error here until it declares
 /// whether — and behind which capability — it is gated (the same compiler-forced
 /// mapping shape as [`Effect::required_capability`], per #495). The domain keys carry personal /
 /// privacy-relevant data, so the host requires the capability **on top of** the
 /// subscription — a subscribe-only plugin is refused the push (see [`push_gate`]).
+///
+/// `PageVisible` (#1427) is ambient: all it tells a plugin is whether its *own*
+/// page is on screen, which the plugin could not learn about anyone else.
 pub(super) fn state_key_capability(key: StateKey) -> Option<Capability> {
     match key {
-        StateKey::Clock | StateKey::SlotVisible | StateKey::Accent | StateKey::AudioSpectrum => {
-            None
-        }
+        StateKey::Clock
+        | StateKey::SlotVisible
+        | StateKey::Accent
+        | StateKey::AudioSpectrum
+        | StateKey::PageVisible => None,
         StateKey::CalendarUpcoming => Some(Capability::Calendar),
         StateKey::SessionLocked => Some(Capability::SessionState),
         StateKey::NowPlaying => Some(Capability::NowPlaying),
@@ -1406,6 +1412,20 @@ pub(super) async fn serve_conn(
         None
     };
 
+    // Page visibility (#1427): whether this plugin's *own* page is on screen, in
+    // the drawer or the dialog, on any monitor — seeded at register and pushed
+    // on every edge, ONLY to a plugin that subscribes `StateKey::PageVisible`
+    // (#305, the gate above: a pre-#1427 binary cannot decode the variant). No
+    // bar special case, unlike slot visibility: a page is opened and closed the
+    // same way whatever mount its chip or card sits in.
+    let page = push_gate(&manifest, StateKey::PageVisible).then(|| {
+        tokio::spawn(page_task(
+            ctx.page_rx.clone(),
+            plugin_id.clone(),
+            out_tx.clone(),
+        ))
+    });
+
     // Desktop accent (#376): seed the resolved `@accent_color` at register (and
     // re-send if it lands after connect) — but ONLY to a plugin that subscribes
     // `StateKey::Accent`, the same #305 opt-in gate as visibility above. The
@@ -1715,6 +1735,9 @@ pub(super) async fn serve_conn(
     if let Some(visibility) = visibility {
         visibility.abort();
     }
+    if let Some(page) = page {
+        page.abort();
+    }
     if let Some(accent) = accent {
         accent.abort();
     }
@@ -1858,6 +1881,73 @@ async fn visibility_task(
             if let Push::Stop = push_state(&out, HostMsg::NowPlaying { now_playing }) {
                 break;
             }
+        }
+    }
+}
+
+/// What one connection has last told its plugin about the plugin's own page
+/// (#1427).
+///
+/// The page channel carries the **selections** — which plugin's page the
+/// drawer and the dialog show — so it changes whenever *any* plugin's page
+/// opens or closes. Each connection keeps its own last-told answer and owes a
+/// push only when that answer moves: one plugin's page opening in place of
+/// another's is an edge for those two and nothing for the rest.
+///
+/// Recorded only once a frame is actually queued ([`told`](Self::told)), so a
+/// push dropped on a full outbound queue is owed again at the next selection
+/// change rather than forgotten until the plugin's own next edge.
+#[derive(Debug, Default)]
+pub(super) struct PageEdge {
+    told: Option<bool>,
+}
+
+impl PageEdge {
+    /// The value `selections` owes `plugin_id` a push for: `Some` on the first
+    /// call (the register seed) and whenever the answer differs from the last
+    /// one told; `None` when the selections moved between other plugins, or a
+    /// page moved between the drawer and the dialog without leaving the screen.
+    pub(super) fn owed(&self, plugin_id: &str, selections: &PanelSelections) -> Option<bool> {
+        let visible = selections.shows(plugin_id);
+        (self.told != Some(visible)).then_some(visible)
+    }
+
+    /// `visible` reached the plugin's outbound queue.
+    pub(super) fn told(&mut self, visible: bool) {
+        self.told = Some(visible);
+    }
+}
+
+/// Push whether this connection's plugin has its own page on screen (#1427):
+/// once at register (the current state, so a plugin that reconnects while its
+/// page is open starts right) and on every edge of **its** answer after that.
+/// Spawned only for a connection that subscribes [`StateKey::PageVisible`]
+/// (#305) — an unsubscribed plugin never receives the frame.
+///
+/// Latest-wins like every state push: the `watch` coalesces a burst, and
+/// [`PageEdge`] turns what is left into edges of this plugin's own bool.
+///
+/// Not [`push_state`]: that answers a full queue and a sent frame alike, and
+/// [`PageEdge`] must record only the second — see its doc.
+async fn page_task(
+    mut page_rx: watch::Receiver<PanelSelections>,
+    plugin_id: String,
+    out: mpsc::Sender<HostMsg>,
+) {
+    let mut edge = PageEdge::default();
+    loop {
+        // The guard is a temporary of this statement, released before the send.
+        let owed = edge.owed(&plugin_id, &page_rx.borrow_and_update());
+        if let Some(visible) = owed {
+            match out.try_send(HostMsg::PageVisibility { visible }) {
+                Ok(()) => edge.told(visible),
+                // Left untold, so the next wake re-sends the current answer.
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+        if page_rx.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -2060,6 +2150,7 @@ mod visibility_source_tests {
             clock_rx: watch::channel(None).1,
             visibility_rx,
             visibility_right_rx,
+            page_rx: watch::channel(super::PanelSelections::default()).1,
             accent_rx: watch::channel(None).1,
             spectrum_rx: watch::channel(None).1,
             calendar_rx: watch::channel(Vec::new()).1,

@@ -962,6 +962,36 @@ pub fn set_active_panel(plugin_id: Option<&str>) {
     });
 }
 
+/// Record whether a drawer on **any** monitor is showing its plugin page right
+/// now (#1427). GTK thread. `modal`'s `recompute_gates` calls it after every
+/// transition that changes what a drawer shows — open, swap, deep-link switch,
+/// retract, teardown — with the OR over every live drawer.
+///
+/// The gate the page-visibility push puts on [`set_active_panel`]'s selection,
+/// which names the plugin the drawer child *renders* and is left set when a
+/// drawer switches to a built-in page (see `PluginHandles::drawer_panel_shown`).
+/// `set_neq`, so the flag's subscribers wake only when it actually moves —
+/// every transition calls this, most of them without changing it.
+pub fn set_drawer_panel_shown(shown: bool) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .drawer_panel_shown
+            .set_neq(shown);
+    });
+}
+
+/// The read half of [`set_drawer_panel_shown`], for `modal`'s drawer tests.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn drawer_panel_shown() -> bool {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .drawer_panel_shown
+            .get()
+    })
+}
+
 /// The dialog overlay's own selection (#1010 §2.1) — the plugin whose panel the
 /// centered dialog shows, independent of [`active_panel_signal`].
 ///

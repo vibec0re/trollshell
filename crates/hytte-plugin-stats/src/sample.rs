@@ -1840,4 +1840,182 @@ mod tests {
         drop(cmd_tx);
         join_all(tasks).await;
     }
+
+    /// **The real walker re-baselines on a reopen, through the shared loop.**
+    /// A real [`Walker`] is closed and reopened; the first walk after the
+    /// reopen must be cold (no CPU list) and handed no baseline, so its CPU
+    /// share is never the mean over the collapsed gap (#1277 LOW 4). From the
+    /// #1426 review, LOW 2: `Walker::reset` was tested directly and `drive`'s
+    /// reset only with a fake, so the one line joining them was not.
+    ///
+    /// **Falsified** by making `impl Sample for Walker`'s `reset` a no-op.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopened_list_measures_cpu_over_a_fresh_window() {
+        async fn next_walk(rx: &mut hytte_plugin::CmdReceiver<Msg>) -> TopApps {
+            let mut got = None;
+            pump_until(|| {
+                while got.is_none() {
+                    match rx.try_recv() {
+                        Ok(Msg::TopApps(apps)) => got = Some(apps),
+                        Ok(Msg::Sampled(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                got.is_some()
+            })
+            .await;
+            got.expect("a walk lands")
+        }
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        assert!(
+            next_walk(&mut msg_rx).await.by_cpu.is_empty(),
+            "cold first walk"
+        );
+        assert_eq!(
+            next_walk(&mut msg_rx).await.by_cpu.len(),
+            1,
+            "warm second walk"
+        );
+
+        cmd_tx.send(Cmd::ShowTopApps(false)).expect("lane is live");
+        tokio::task::yield_now().await;
+        pump_ten_periods(crate::top_apps::POLL).await;
+        while msg_rx.try_recv().is_ok() {}
+        let before = handed.lock().expect("not poisoned").len();
+
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        let reopened = next_walk(&mut msg_rx).await;
+        assert!(
+            reopened.by_cpu.is_empty(),
+            "the reopen's walk must be cold, not a share over the gap: {reopened:?}",
+        );
+        assert_eq!(
+            handed.lock().expect("not poisoned")[before],
+            (None, 0),
+            "the reopen's walk must be handed no baseline",
+        );
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **The walker keeps native's 2 s cadence** even when the sensors
+    /// sampler runs faster: ten seconds of an open list is at most six walks
+    /// (the open edge plus one every 2 s), never one a second. From the #1426
+    /// review, LOW 4 — a faster walker silently multiplies the cost of a list
+    /// left open.
+    ///
+    /// Only an upper bound: a walk runs on a blocking-pool thread, which under
+    /// load lags virtual time, so fewer walks is not a failure (the reviewer
+    /// measured 1–3 under four pinned burners, and a lower bound failed 172 of
+    /// 200 loaded runs).
+    ///
+    /// **Falsified** by handing the walker the sensors' `period` instead of
+    /// `top_apps::POLL` in `spawn_with` (10 walks here, idle).
+    #[tokio::test(start_paused = true)]
+    async fn the_walker_walks_on_its_own_two_second_cadence() {
+        let walker = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+        let made = Arc::clone(&walker);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || FakeWalker(Arc::clone(&made)),
+        );
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        // Ten one-second steps of virtual time.
+        pump_ten_periods(Duration::from_secs(1)).await;
+        let walks = walker.ticks();
+        assert!(walks >= 1, "the open list walked at all");
+        assert!(
+            walks <= 6,
+            "10 s of an open list at a 2 s cadence is at most 6 walks, got {walks}",
+        );
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **A slow walk never stalls the chips.** The walk runs off the
+    /// session's one thread (`spawn_blocking`), so the sensors sampler keeps
+    /// its cadence *while a walk is still in progress*. Walked inline, a
+    /// 12–50 ms `/proc` walk would hold the current-thread runtime, and the
+    /// chips and the socket loop with it. From the #1426 review, LOW 3.
+    ///
+    /// **Falsified** by dropping `drive`'s `spawn_blocking` and calling
+    /// `sampler.tick()` inline.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_walk_never_stalls_the_chips() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        struct SlowWalker {
+            walking: Arc<AtomicBool>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Sample for SlowWalker {
+            type Reading = TopApps;
+            fn tick(&mut self) -> TopApps {
+                self.walking.store(true, Ordering::SeqCst);
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                self.walking.store(false, Ordering::SeqCst);
+                TopApps::default()
+            }
+            fn reset(&mut self) {}
+        }
+
+        let sensors = Arc::new(Calls::default());
+        let walking = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut release_rx = Some(release_rx);
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+        let (made_s, made_w) = (Arc::clone(&sensors), Arc::clone(&walking));
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            move || FakeSampler(Arc::clone(&made_s)),
+            move || SlowWalker {
+                walking: Arc::clone(&made_w),
+                release: release_rx.take().expect("the walker is built once"),
+            },
+        );
+
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        assert!(
+            pump_until(|| walking.load(Ordering::SeqCst)).await,
+            "a walk must be observable in progress from the session's thread",
+        );
+        let before = sensors.ticks();
+        assert!(
+            pump_until(|| sensors.ticks() >= before + 3).await,
+            "the chips keep sampling while a walk is in flight",
+        );
+        assert!(
+            walking.load(Ordering::SeqCst),
+            "…and the walk is still running"
+        );
+
+        release_tx.send(()).expect("the walker is waiting");
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
 }

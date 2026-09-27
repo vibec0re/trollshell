@@ -978,6 +978,27 @@ mod tests {
         assert_eq!(list_state(&model, cpu), (false, dash));
     }
 
+    /// **Only the last close clears the lists.** Flipping one list while the
+    /// other stays open keeps the open list's reading, rather than blanking
+    /// it until the next walk (from the #1426 review, NIT 6).
+    ///
+    /// **Falsified** by moving the clear in `toggle_top_apps` out of its
+    /// `now != was` edge check, so every flip clears.
+    #[test]
+    fn a_flip_while_the_other_list_is_open_keeps_the_reading() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let cpu = crate::panel::TOP_APPS_CPU_ID;
+        let ram = crate::panel::TOP_APPS_RAM_ID;
+        let _ = model.update(Input::event(ram, EventKind::Click));
+        let _ = model.update(walked());
+        let shown = list_state(&model, ram);
+        assert_ne!(shown.1, "\u{2014}", "the RAM list is populated");
+        let _ = model.update(Input::event(cpu, EventKind::Click));
+        assert_eq!(list_state(&model, ram), shown, "opening CPU keeps RAM's rows");
+        let _ = model.update(Input::event(cpu, EventKind::Click));
+        assert_eq!(list_state(&model, ram), shown, "closing CPU keeps RAM's rows");
+    }
+
     /// **A withheld reading is not a sample**: the cold tick, whose `cpu` is
     /// `None` and whose `per_core` is empty, leaves the trace alone rather than
     /// stamping a fake rest value on it — and the card still reads as dashes

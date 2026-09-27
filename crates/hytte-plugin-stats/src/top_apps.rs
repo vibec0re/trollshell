@@ -317,4 +317,23 @@ mod tests {
         assert!(failed.by_cpu.is_empty(), "{failed:?}");
         assert_eq!(failed.by_mem.len(), 1);
     }
+
+    /// A total that reads fine but **has not moved** is no measurement
+    /// either: every share would divide by nothing and read `0%`. The test
+    /// above covers a total that fell to `0`; this one covers an equal one
+    /// (from the #1426 review, NIT 7).
+    ///
+    /// **Falsified** by `sample.total_now >= self.prev_total` in `walk`.
+    #[test]
+    fn an_unchanged_total_withholds_the_cpu_list() {
+        let mut walker = Walker::over(|_: &HashMap<u32, u64>, _: u64| ProcWalk {
+            cur_pid: HashMap::new(),
+            total_now: 1_000,
+            by_cpu: vec![app("x", 0.0, 1)],
+            by_mem: vec![app("x", 0.0, 1)],
+        });
+        let _ = walker.walk();
+        let same = walker.walk();
+        assert!(same.by_cpu.is_empty(), "{same:?}");
+    }
 }

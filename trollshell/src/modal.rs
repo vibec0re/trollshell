@@ -3540,6 +3540,14 @@ mod gtk_tests {
         let monitor = test_monitor();
         let (a, chip_a) = plugin_drawer(&monitor, "test-1427-a");
         let (b, chip_b) = plugin_drawer(&monitor, "test-1427-b");
+        // A stand-in for the built-in page, so `ensure_page` finds it built and
+        // never reaches `panels::workspaces` (which needs the niri service) —
+        // `toggle_opens_workspaces_and_fills_the_drawer_to_the_cap`'s shape.
+        for panel in [&a, &b] {
+            panel
+                .stack
+                .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+        }
 
         assert!(toggle_plugin_under(chip_a.upcast_ref(), "stats-1427"));
         assert!(

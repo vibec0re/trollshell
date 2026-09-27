@@ -43,7 +43,7 @@ use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
     MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, MAX_MISSED_PONGS, OUTBOUND_CAPACITY,
-    PING_INTERVAL, PageEdge, Push, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
+    PING_INTERVAL, PageEdge, Push, page_task, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
     push_gate, push_state, state_key_capability,
 };
 use super::shader_map::{self, Grants};
@@ -1867,6 +1867,42 @@ async fn page_visibility_is_never_sent_to_a_plugin_that_did_not_subscribe() {
         }
         other => panic!("unexpected frame: {other:?}"),
     }
+}
+
+/// **A push dropped on a full queue is re-sent, not forgotten.** A plugin that
+/// is slow to read can have its outbound queue full when its page closes; the
+/// task leaves that answer untold, so the next wake — even one for another
+/// plugin's page — sends it. Were the drop counted as delivered, the plugin
+/// would keep walking for a closed page until its own next edge.
+///
+/// Driven on [`page_task`] directly with a one-slot queue, so "full" is a
+/// state the test sets rather than a race it hopes for.
+///
+/// **Falsification:** record the answer on `TrySendError::Full` too
+/// (`Err(Full(_)) => edge.told(visible)`) → the retried seed never arrives and
+/// the `timeout` reds.
+#[tokio::test]
+async fn a_page_push_dropped_on_a_full_queue_is_sent_at_the_next_wake() {
+    let (page_tx, page_rx) = watch::channel(PanelSelections::default());
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(1);
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    let task = tokio::spawn(page_task(page_rx, "stats".to_owned(), out_tx));
+    // Let the task try its seed against the full queue.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(out_rx.recv().await, Some(HostMsg::Ping { seq: 1 })));
+
+    // Another plugin's page: no edge for "stats", but a wake.
+    page_tx.send_replace(in_dialog("agents"));
+    let resent = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("the seed the full queue dropped is re-sent at the next wake");
+    assert!(
+        matches!(resent, Some(HostMsg::PageVisibility { visible: false })),
+        "…carrying the current answer: {resent:?}",
+    );
+    task.abort();
 }
 
 /// [`PageEdge`] on its own: the seed is owed whatever the answer, an unchanged

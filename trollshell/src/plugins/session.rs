@@ -1929,7 +1929,7 @@ impl PageEdge {
 ///
 /// Not [`push_state`]: that answers a full queue and a sent frame alike, and
 /// [`PageEdge`] must record only the second — see its doc.
-async fn page_task(
+pub(super) async fn page_task(
     mut page_rx: watch::Receiver<PanelSelections>,
     plugin_id: String,
     out: mpsc::Sender<HostMsg>,

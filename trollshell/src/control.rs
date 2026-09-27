@@ -232,8 +232,13 @@ impl ControlIface {
     /// Queues behind any start, relaunch or reconcile the launcher already
     /// has under way or queued (#1417 item 1b), so a stop sent right after a
     /// `StartPlugin` stops what that start launched instead of landing before
-    /// the unit exists. It can therefore take as long as a restart holds the
-    /// launcher's lock — see [`plugin_launcher::stop`].
+    /// the unit exists. It therefore waits for everything queued on the
+    /// launcher's lock ahead of it: a reconcile's restarts, keyring reads,
+    /// queued Saves and switches. #1417 item 1 leaves that unbounded, so the
+    /// caller's timeout decides what it is told. The control-center's switch
+    /// gives its whole round trip, `SetPluginEnabled` and then this, one
+    /// deadline (#1421), so a long queue reads there as unanswered, and the
+    /// stop still runs when the lock frees. See [`plugin_launcher::stop`].
     ///
     /// # Errors
     /// Invalid id, no such unit, or an unreachable user manager.

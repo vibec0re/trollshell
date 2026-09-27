@@ -30,7 +30,14 @@
 //! hytte_sensors::read_disk_for_specs(..) -> DiskUsage
 //! hytte_sensors::read_process_count()   -> u32
 //! ```
+//!
+//! [`app_usage`] is a sibling leaf living in its own public submodule rather
+//! than flattened here (#1419 item 3): the `/proc` + cgroup app-usage walker
+//! moved out of `hytte-services::app_usage` byte-for-byte, on this crate's
+//! own #1249 precedent, so `hytte-plugin-stats` can reuse the same "top apps
+//! by CPU / RAM" grouping without linking `hytte-services`.
 
+pub mod app_usage;
 mod cast;
 mod cpufreq;
 mod disk;

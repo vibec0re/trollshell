@@ -385,6 +385,34 @@ pub enum HostMsg {
     /// sends one, and the plugin runs its fallback path — which is exactly what
     /// it did before #882.
     Hello { vocab: u16 },
+    /// The plugin's **own page** became visible or hidden (#1427): `true` while
+    /// the page [`Effect::OpenPage(Page::PluginSelf)`](crate::effect::Page::PluginSelf)
+    /// opens is on screen — in the drawer (a bar chip's page) or the dialog (a
+    /// sidebar card's) — and `false` once it shows nowhere. Pushed **once at
+    /// register** (so a plugin that reconnects while its page is open starts
+    /// right) and on every edge after that.
+    ///
+    /// Every way a page closes is an edge: a second click on the chip, `Esc`, a
+    /// click outside, another page replacing it, a dialog dismissed, or the
+    /// monitor that held it unplugged. A drawer that switches from the plugin's
+    /// page to a built-in one has taken the page off screen too, and reads
+    /// `false`.
+    ///
+    /// **Any monitor.** A page is on screen if it shows anywhere, so `visible`
+    /// is the OR over the drawer and the dialog on every output, like
+    /// [`SlotVisibility`](HostMsg::SlotVisibility).
+    ///
+    /// **Latest-wins**, for `SlotVisibility`'s reason: this is state, not an
+    /// event. A burst of toggles may coalesce to the newest value; act on the
+    /// value received, never on the number of frames.
+    ///
+    /// **Opt-in (#305):** sent *only* to a plugin that subscribes
+    /// [`StateKey::PageVisible`](crate::manifest::StateKey::PageVisible), so a
+    /// pre-#1427 binary never receives (and never fails to decode) it. Appended
+    /// last, per the crate's compat rules; see
+    /// [`PAGE_VISIBLE_VOCAB`](crate::manifest::PAGE_VISIBLE_VOCAB) for the
+    /// vocabulary census.
+    PageVisibility { visible: bool },
 }
 
 /// Severity for [`PluginMsg::Log`]. Mirrors the host's `tracing` levels.
@@ -521,6 +549,27 @@ mod tests {
             let back = decode::<HostMsg>(&encode(&msg)).expect("now-playing frame decodes");
             assert_eq!(back, msg);
         }
+    }
+
+    /// The #1427 page-visibility push round-trips both states.
+    #[test]
+    fn page_visibility_push_round_trips() {
+        for visible in [true, false] {
+            let msg = HostMsg::PageVisibility { visible };
+            let back = decode::<HostMsg>(&encode(&msg)).expect("page-visibility frame decodes");
+            assert_eq!(back, msg);
+        }
+    }
+
+    /// `StateKey::PageVisible` is a plain name-tagged variant, so a manifest
+    /// declaring it beside the older keys round-trips — the opt-in a plugin
+    /// declares to receive the page push (#1427).
+    #[test]
+    fn page_visible_subscription_round_trips() {
+        let mut manifest = Manifest::new("stats", Mount::BarRight);
+        manifest.subscribes = vec![StateKey::SlotVisible, StateKey::PageVisible];
+        let back = decode::<Manifest>(&encode(&manifest)).expect("manifest decodes");
+        assert_eq!(back, manifest);
     }
 
     /// The three #484/#528 domain subscriptions and their gating capabilities are

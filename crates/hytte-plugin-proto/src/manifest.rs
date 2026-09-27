@@ -97,6 +97,34 @@ pub enum StateKey {
     /// [`Capability::NowPlaying`]. The motivating consumer
     /// is the audio widget's dot-matrix track marquee.
     NowPlaying,
+    /// Opt-in to the page-visibility push
+    /// ([`HostMsg::PageVisibility`](crate::msg::HostMsg::PageVisibility), #1427):
+    /// the host sends `true` while the plugin's **own page** is on screen — the
+    /// drawer page a bar chip opens, or the dialog a sidebar card opens, on any
+    /// monitor — and `false` once it shows nowhere. Seeded once at register and
+    /// sent on every edge after that, so a plugin can do page-only work (a
+    /// `/proc` walk for a page list, a page-only history) only while someone is
+    /// looking at the page.
+    ///
+    /// The sibling of [`SlotVisible`](StateKey::SlotVisible), and not the same
+    /// question: that one follows the plugin's **mount surface** (a bar chip is
+    /// a constant `true`), this one follows the page that
+    /// `Effect::OpenPage(Page::PluginSelf)` opens. It means the same thing for
+    /// every mount, so a plugin moved between a bar and a sidebar keeps it.
+    ///
+    /// An ambient key like `SlotVisible`: no capability gates it, because all
+    /// it says is whether the plugin's own page is up. The #305 gate still
+    /// holds — an unsubscribed plugin never receives the frame, so a binary
+    /// built before #1427 cannot meet a variant it can't decode.
+    ///
+    /// **Declaring it costs a pre-#1427 host.** A `StateKey` rides inside the
+    /// `Register` frame, so an older shell fails to decode the manifest and
+    /// drops the connection — the plugin never registers there. Every appended
+    /// key and capability has had that cost, and it is why the `hytte-plugin`
+    /// SDK does **not** auto-declare this one (it does for
+    /// [`Accent`](StateKey::Accent)): only a plugin that asks pays it. See
+    /// [`PAGE_VISIBLE_VOCAB`].
+    PageVisible,
 }
 
 /// A shell capability a plugin requests in its manifest. The host auto-grants
@@ -442,6 +470,34 @@ impl Mount {
 /// against one number (the [`OPEN_URI_VOCAB`](crate::effect::OPEN_URI_VOCAB)
 /// shape).
 pub const SIDEBAR_RIGHT_VOCAB: u16 = 6;
+
+/// The [`VOCAB`] generation that appended the **page-visibility push**
+/// ([`StateKey::PageVisible`] + [`HostMsg::PageVisibility`](crate::msg::HostMsg::PageVisibility),
+/// #1427).
+///
+/// Census-only, like every generation since #882: it does **not** move
+/// [`VOCAB_UNCONDITIONAL`], so a plugin rebuilt on this SDK still stamps the
+/// generation every older shell accepts. Each half of the pair is kept away
+/// from an old peer by something other than the counter:
+///
+/// - **host → plugin, the push.** Sent only to a connection that subscribed
+///   [`StateKey::PageVisible`] — the #305 opt-in. A plugin built before #1427
+///   cannot subscribe a key it does not have, so it never receives the variant.
+/// - **plugin → host, the key.** A `StateKey` rides inside the `Register`
+///   frame, the same frame that carries [`Manifest::vocab`] — #1158's argument
+///   for [`SIDEBAR_RIGHT_VOCAB`]. A pre-#1427 host fails to decode the frame
+///   and drops the connection before [`Manifest::check_vocab`] runs, so the
+///   handshake refusal the counter exists for is unreachable here, and bumping
+///   the unconditional ceiling would only refuse every rebuilt plugin that
+///   never subscribes. What a plugin that *does* subscribe sees on an older
+///   shell is a registration that fails with the host's own decode error.
+///
+/// The census is bumped anyway, because it is a census: the crate root's rule
+/// counts a `StateKey` and a `HostMsg` variant alike. A const rather than a bare
+/// bump so the "newest appended variant" pin in `tests/proto.rs` compares
+/// against one number (the [`OPEN_URI_VOCAB`](crate::effect::OPEN_URI_VOCAB)
+/// shape).
+pub const PAGE_VISIBLE_VOCAB: u16 = 8;
 
 /// A datasource a plugin serves (#509), declared in
 /// [`Manifest::provides`]. `id` is the datasource name a requester queries

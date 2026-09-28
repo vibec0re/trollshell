@@ -36,10 +36,17 @@
 //! moved out of `hytte-services::app_usage` byte-for-byte, on this crate's
 //! own #1249 precedent, so `hytte-plugin-stats` can reuse the same "top apps
 //! by CPU / RAM" grouping without linking `hytte-services`.
+//!
+//! [`desktop_entry`] is the other half of those rows (#1428): the shell names
+//! an app id through `gio::AppInfo`, which a GTK-free plugin cannot link, so
+//! this module reads the `.desktop` files itself and runs the shell's own
+//! three matching layers over them — `niri-firefox` reads `Firefox` on both
+//! pages.
 
 pub mod app_usage;
 mod cast;
 mod cpufreq;
+pub mod desktop_entry;
 mod disk;
 mod diskio;
 mod gpu;

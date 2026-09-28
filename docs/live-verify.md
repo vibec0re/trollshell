@@ -2525,21 +2525,27 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       `Top apps · CPU` row and the Memory card in a `Top apps · RAM` row,
       both collapsed, each reading `—` beside its chevron. Click
       `Top apps · CPU`: the RAM row's summary fills in at once (on niri,
-      e.g. `niri-firefox · 3.2 GiB`); the CPU list fills in about 2 s
+      e.g. `Firefox · 3.2 GiB`); the CPU list fills in about 2 s
       later — the first walk has no CPU baseline and shows nothing rather
       than a column of `0%`. Up to six rows each, heaviest first: the
-      group's raw key (on niri mostly `niri-<program>`, a service's unit
-      name, or `System`), `N processes` beside it when more than one PID
-      folded in, and the value pinned right (`42%` / `3.2 GiB`). Compare
-      with the native page's two lists: the same groups, order and values,
-      give or take the 2 s between two walks. Expected differences: **no
-      icons** (pending #1419's question); **most names differ** — native
-      reads `Firefox` where the plugin reads `niri-firefox`, until a
-      follow-up ports native's `.desktop` name lookup; and a collapsed
-      header reads `—` while neither list is open (native keeps it live
-      while the drawer is open). Collapse both lists: the bar instance's
-      CPU time in `top` stops climbing within a couple of seconds. Known
-      cost: a list left open when the drawer closes keeps walking `/proc`
+      app's desktop-entry name (`Firefox` — since #1428, where #1426
+      showed the raw `niri-firefox` key), a service's unit name, or
+      `System`; `N processes` beside it when more than one PID folded in,
+      and the value pinned right (`42%` / `3.2 GiB`). Compare with the
+      native page's two lists: the same groups, **names**, order and
+      values, give or take the 2 s between two walks. An app with no
+      `.desktop` file reads its raw id on both pages. Expected differences:
+      **no icons** (pending #1419's question); and a collapsed header reads
+      `—` while neither list is open (native keeps it live while the drawer
+      is open). **(#1428)** If a name still differs, note both spellings and
+      the app's `.desktop` file name: two entries that match the same id in
+      the same lookup layer are the one case the two pages may pick
+      differently (native's order there is GLib's hash order). A
+      `LANG`/`LC_MESSAGES` other than English must give both pages the same
+      translated name (`Filer` for Files under `sv_SE`). Collapse both
+      lists: the bar instance's CPU time in `top` stops climbing within a
+      couple of seconds. Known cost: a list left open when the drawer
+      closes keeps walking `/proc`
       every 2 s until it is collapsed (about 1.2 % of a core at ~640
       processes), because the plugin is not told when its page closes —
       #1427 is the fix.

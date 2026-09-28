@@ -30,7 +30,7 @@
 //! | the Disk `AdwExpanderRow`, collapsed | a [`Node::Expander`], collapsed until clicked (the plugin holds the flag — see [`DISKS_EXPANDER_ID`]) |
 //! | Disk I/O's `↓ … ↑ …` / `min … · max …` / `total ↓ … ↑ …` lines, indented 88 px | three `ts-stat-value` labels under the line, indented by the `ts-stat-detail` rule |
 //! | `build_top_apps_expander`'s "Top apps · CPU" / "Top apps · RAM" `AdwExpanderRow`s, last in the CPU and Memory cards, collapsed, the heaviest app's `name · value` dimmed beside the chevron | a [`Node::Expander`] each, in the same two places, collapsed until clicked (the plugin holds both flags — [`TOP_APPS_CPU_ID`], [`TOP_APPS_RAM_ID`]), the same `name · value` or `—` in a 20-character ellipsizing `dim-label` [`Node::Text`] pinned right of the title |
-//! | `rebuild_top_apps`' `slim_row` per app: name (20 characters), `N processes` when a group has more than one, the `42%` / `1.2 GiB` suffix | a `ts-history-row` [`Node::Row`] per app, at most [`hytte_sensors::app_usage::TOP_N`] (the walker's own cap): the name as a 20-character ellipsizing `Text`, the `N processes` subtitle on the same line, a [`Node::Spacer`], then the value — **no icon** (below) |
+//! | `rebuild_top_apps`' `slim_row` per app: name (20 characters, `sample_display_name`'s desktop-entry name), `N processes` when a group has more than one, the `42%` / `1.2 GiB` suffix | a `ts-history-row` [`Node::Row`] per app, at most [`hytte_sensors::app_usage::TOP_N`] (the walker's own cap): the name — the same desktop-entry name, resolved in the walk (#1428) — as a 20-character ellipsizing `Text`, the `N processes` subtitle on the same line, a [`Node::Spacer`], then the value — **no icon** (below) |
 //!
 //! The history lines keep [`HISTORY_LEN`] samples, the native rows' 60, on the
 //! native rows' axes: load, memory, GPU usage and VRAM on a fixed `0..=1`, the
@@ -51,18 +51,17 @@
 //!   client and flapping shell tasks are the shell's own task supervisor; a
 //!   plugin process can reach neither. Epic #1248 has that card staying
 //!   native.
-//! - **Top apps' icons and display names.** The rows themselves are here
-//!   (#1419 item 3), sampled in this process by the native page's own walker
-//!   (`crate::top_apps`, a crate-private module). What is not: native resolves
-//!   each row's icon and display name through `gio::DesktopAppInfo`, which a
-//!   GTK-free plugin cannot call. The icon column is **pending #1419's
-//!   question** (read the `.desktop` file in the plugin, or a wire node the
-//!   shell resolves), so a row carries no icon node at all rather than a
-//!   placeholder. A row names its group by its raw key — the scope's app id,
-//!   the unit name, `System` — so on niri a row reads `niri-firefox` where
-//!   native reads `Firefox`; most rows differ, not only apps with no
-//!   `.desktop` file. A follow-up ports native's name lookup to the plugin
-//!   (see `crate::top_apps`' module docs).
+//! - **Top apps' icons.** The rows themselves are here (#1419 item 3), sampled
+//!   in this process by the native page's own walker (`crate::top_apps`, a
+//!   crate-private module), and since #1428 they carry native's **names** too:
+//!   the walker runs each app id through `hytte_sensors::desktop_entry`, the
+//!   gio-free port of native's three-layer lookup, so on niri a row reads
+//!   `Firefox` rather than `niri-firefox`, and an app no entry matches keeps
+//!   its raw id as it does natively. What is not here: native draws each
+//!   row's icon from `gio::DesktopAppInfo`, which a GTK-free plugin cannot
+//!   call. The icon column is **pending #1419's question** (read the
+//!   `.desktop` file in the plugin, or a wire node the shell resolves), so a
+//!   row carries no icon node at all rather than a placeholder.
 //! - **Top apps' collapsed summary while both lists are collapsed.** Native
 //!   shows the heaviest app beside the chevron whenever the drawer is open.
 //!   This plugin cannot see its page open or close, so its walker runs only

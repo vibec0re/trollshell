@@ -1961,9 +1961,10 @@ async fn a_page_close_dropped_on_a_full_queue_arrives_with_no_later_page_change(
 /// not the seed it could not send. A later edge still arrives.
 ///
 /// **Falsification:** end the task when the selections move during the wait
-/// (`moved = page_rx.changed() => return`) → no frame arrives and the first
-/// `timeout` reds; drop the `continue` after the wait → the page's `true` is
-/// never re-read and the first assertion reds.
+/// (`_ = page_rx.changed() => return`), or drop the `continue` after the wait
+/// (the task then parks on the *next* selection change with the page's `true`
+/// still unsent) → no frame arrives once the queue drains and the first
+/// `timeout` reds.
 #[tokio::test]
 async fn a_page_change_while_the_queue_is_full_sends_the_newest_answer() {
     let (page_tx, page_rx) = watch::channel(PanelSelections::default());

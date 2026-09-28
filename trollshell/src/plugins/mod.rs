@@ -226,10 +226,11 @@ pub use region::{
 // hook reads to decide whether the dialog is showing the plugin that just left.
 pub use region::{dialog_panel, plugin_dialog_slot, set_dialog_panel};
 // `modal`'s half of the page-visibility push (#1427): whether a drawer on any
-// monitor is showing its plugin page, written after every drawer transition.
-pub use region::set_drawer_panel_shown;
+// monitor is showing its plugin page, written after every drawer transition —
+// plus, test-only, the reader `modal`'s GTK test checks that write through.
 #[cfg(all(test, feature = "system-tests"))]
 pub(crate) use region::drawer_panel_shown;
+pub use region::set_drawer_panel_shown;
 // The slot-visibility **edge** counter (#1361 review, HIGH-2). Test-only: a
 // `watch` receiver coalesces a `true → false → true` flap into one latest-value
 // read, so the edge is counted where it is emitted instead.

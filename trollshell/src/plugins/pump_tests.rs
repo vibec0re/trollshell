@@ -1012,14 +1012,23 @@ fn the_page_publisher_follows_all_three_handles() {
     let handles = PageHandles::new();
     let (driver, published) = recording(&handles);
     let mut driver = pin!(driver);
-    let last = || published.borrow().last().cloned().expect("a published value");
+    let last = || {
+        published
+            .borrow()
+            .last()
+            .cloned()
+            .expect("a published value")
+    };
 
     poll_once(driver.as_mut());
     assert_eq!(last(), PanelSelections::default(), "the seed: nothing open");
 
     handles.open_in_drawer("stats");
     poll_once(driver.as_mut());
-    assert!(last().shows("stats"), "the drawer's selection and flag are heard");
+    assert!(
+        last().shows("stats"),
+        "the drawer's selection and flag are heard"
+    );
 
     // A keybind switches the drawer to a built-in page: only the flag moves.
     handles.shown.set_neq(false);

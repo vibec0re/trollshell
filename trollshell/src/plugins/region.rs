@@ -6149,7 +6149,10 @@ mod gtk_tests {
 
         crate::plugins::set_dialog_panel(Some("agents"));
         pump();
-        assert!(rx.borrow().shows("agents"), "a dialog opening reaches the channel");
+        assert!(
+            rx.borrow().shows("agents"),
+            "a dialog opening reaches the channel"
+        );
         crate::plugins::set_dialog_panel(None);
         pump();
         assert!(!rx.borrow().shows("agents"), "…and its dismissal");
@@ -6157,7 +6160,10 @@ mod gtk_tests {
         crate::plugins::set_active_panel(Some("stats"));
         crate::plugins::set_drawer_panel_shown(true);
         pump();
-        assert!(rx.borrow().shows("stats"), "a drawer showing the page reaches it");
+        assert!(
+            rx.borrow().shows("stats"),
+            "a drawer showing the page reaches it"
+        );
         crate::plugins::set_drawer_panel_shown(false);
         pump();
         assert!(

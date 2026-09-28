@@ -43,8 +43,8 @@ use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
     MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, MAX_MISSED_PONGS, OUTBOUND_CAPACITY,
-    PING_INTERVAL, PageEdge, Push, page_task, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
-    push_gate, push_state, state_key_capability,
+    PING_INTERVAL, PageEdge, Push, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities,
+    handle_conn, page_task, push_gate, push_state, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{
@@ -1745,8 +1745,7 @@ async fn expect_page<R: tokio::io::AsyncRead + Unpin>(rd: &mut R, want: bool, wh
 #[tokio::test]
 async fn page_visibility_is_seeded_then_pushed_on_each_edge() {
     let (ctx, page_tx, _clock_tx) = page_ctx();
-    let (mut prd, _pwr) =
-        connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+    let (mut prd, _pwr) = connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
 
     expect_page(&mut prd, false, "the register seed: no page is open").await;
 
@@ -1782,17 +1781,25 @@ async fn page_visibility_is_seeded_true_when_the_page_is_already_open() {
 #[tokio::test]
 async fn another_plugins_page_is_no_edge_for_this_one() {
     let (ctx, page_tx, _clock_tx) = page_ctx();
-    let (mut prd, _pwr) =
-        connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+    let (mut prd, _pwr) = connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
     expect_page(&mut prd, false, "seed").await;
 
-    for other in [in_drawer("clock-demo"), in_dialog("agents"), in_drawer("timer")] {
+    for other in [
+        in_drawer("clock-demo"),
+        in_dialog("agents"),
+        in_drawer("timer"),
+    ] {
         page_tx.send_replace(other);
         // Let the task observe each change on its own, rather than coalesced.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     page_tx.send_replace(in_drawer("stats"));
-    expect_page(&mut prd, true, "the first frame after the others is this plugin's own edge").await;
+    expect_page(
+        &mut prd,
+        true,
+        "the first frame after the others is this plugin's own edge",
+    )
+    .await;
 }
 
 /// **Drawer ↔ dialog, and the OR over surfaces.** The page open in both
@@ -1805,8 +1812,7 @@ async fn another_plugins_page_is_no_edge_for_this_one() {
 #[tokio::test]
 async fn a_page_on_any_surface_is_one_visible_state() {
     let (ctx, page_tx, _clock_tx) = page_ctx();
-    let (mut prd, _pwr) =
-        connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+    let (mut prd, _pwr) = connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
     expect_page(&mut prd, false, "seed").await;
 
     page_tx.send_replace(in_drawer("stats"));
@@ -1891,7 +1897,10 @@ async fn a_page_push_dropped_on_a_full_queue_is_sent_at_the_next_wake() {
     let task = tokio::spawn(page_task(page_rx, "stats".to_owned(), out_tx));
     // Let the task try its seed against the full queue.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(matches!(out_rx.recv().await, Some(HostMsg::Ping { seq: 1 })));
+    assert!(matches!(
+        out_rx.recv().await,
+        Some(HostMsg::Ping { seq: 1 })
+    ));
 
     // Another plugin's page: no edge for "stats", but a wake.
     page_tx.send_replace(in_dialog("agents"));
@@ -1914,7 +1923,11 @@ async fn a_page_push_dropped_on_a_full_queue_is_sent_at_the_next_wake() {
 fn a_page_edge_is_owed_on_the_seed_and_on_each_change_of_its_own_answer() {
     let mut edge = PageEdge::default();
     let nothing = PanelSelections::default();
-    assert_eq!(edge.owed("stats", &nothing), Some(false), "the seed is owed");
+    assert_eq!(
+        edge.owed("stats", &nothing),
+        Some(false),
+        "the seed is owed"
+    );
     edge.told(false);
     assert_eq!(edge.owed("stats", &nothing), None);
     assert_eq!(

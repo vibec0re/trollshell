@@ -3089,9 +3089,13 @@ mod tests {
     /// that hook returns ride the frame exactly as `update`'s do.
     ///
     /// **Falsified** by routing the push to `Step::Rerender` (no fold: the tree
-    /// stays "page shut"), or by discarding the hook's return in the session
-    /// loop (`{ model.page_visible(v); Vec::new() }` — the effect assertion
-    /// reds).
+    /// stays "page shut", so render dedup sends no frame and the bounded read
+    /// reds), or by discarding the hook's return in the session loop
+    /// (`{ model.page_visible(v); Vec::new() }` — the effect assertion reds).
+    ///
+    /// Both reads are bounded, for [`next_render`]'s reason: the `Rerender`
+    /// mutation makes the awaited frame *not arrive at all*. Measured: unbounded,
+    /// it hung `cargo test` past 17 min; bounded, it fails in 5 s.
     #[tokio::test]
     async fn page_visibility_push_reaches_the_page_visible_hook() {
         let (plugin_end, host_end) = duplex(64 * 1024);
@@ -3108,7 +3112,11 @@ mod tests {
             // The register seed says the page is up (a reconnect while it was
             // open): the hook folds it, and its effect rides the re-render.
             send(&mut hwr, &HostMsg::PageVisibility { visible: true }).await;
-            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { tree, effects, .. } =
+                tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                    .await
+                    .expect("a page push must reach page_visible() and re-render (within 5 s)")
+            else {
                 panic!("a page push must reach page_visible() and re-render");
             };
             assert!(
@@ -3122,7 +3130,11 @@ mod tests {
             );
 
             send(&mut hwr, &HostMsg::PageVisibility { visible: false }).await;
-            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { tree, effects, .. } =
+                tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                    .await
+                    .expect("the close push must re-render (within 5 s)")
+            else {
                 panic!("the close push must re-render");
             };
             assert!(matches!(tree, Node::Label { ref text, .. } if text == "page shut"));

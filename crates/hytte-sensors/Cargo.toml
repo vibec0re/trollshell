@@ -11,8 +11,11 @@ description = "GTK-free leaf: procfs/sysfs samplers for CPU/memory/network/disk/
 workspace = true
 
 [dependencies]
-# `disk::read_disk_for_specs`' only dependency: `nix::sys::statvfs::statvfs`
-# for free/used/total bytes per mount point. Same version + the same "fs"
+# Two uses, both under the "fs" feature: `disk::read_disk_for_specs`'
+# `nix::sys::statvfs::statvfs` for free/used/total bytes per mount point, and
+# (#1428) `desktop_entry::exec`'s `nix::unistd::access(X_OK)`, the check GIO's
+# `g_find_program_for_path` makes before it lists a desktop entry (its tests
+# also `mkfifo` through it). Same version + the same "fs"
 # feature `hytte-services` already resolves (its own `nix` dependency also
 # needs "signal", for `recorder.rs`'s SIGINT — unrelated to sensors, so it
 # stays there); pulling "fs" alone here adds no new resolved package. Both

@@ -20,7 +20,8 @@
 //!   shell's own samplers) and the visibility-gated task that drives them.
 //! - `top_apps` — the drawer page's Top apps · CPU / RAM lists (#1419 item 3):
 //!   the native page's own `/proc` + cgroup walker, gated on the page's two
-//!   list expanders and driven by the same gated loop as `sample`.
+//!   list expanders and driven by the same gated loop as `sample`, each app
+//!   named by its desktop entry the way native names it (#1428).
 //! - `card` — the geometry, the per-core lamp ramp, the sidebar card and the
 //!   bar chips.
 //! - `panel` — the drawer page a chip click opens (#1251), in the native Stats

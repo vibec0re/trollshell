@@ -1943,7 +1943,10 @@ async fn a_page_close_dropped_on_a_full_queue_arrives_with_no_later_page_change(
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // The plugin catches up. Nothing else on screen changes after this.
-    assert!(matches!(out_rx.recv().await, Some(HostMsg::Ping { seq: 1 })));
+    assert!(matches!(
+        out_rx.recv().await,
+        Some(HostMsg::Ping { seq: 1 })
+    ));
     let close = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
         .await
         .expect("the dropped close must still reach the plugin");
@@ -1979,7 +1982,10 @@ async fn a_page_change_while_the_queue_is_full_sends_the_newest_answer() {
     page_tx.send_replace(in_drawer("stats"));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    assert!(matches!(out_rx.recv().await, Some(HostMsg::Ping { seq: 1 })));
+    assert!(matches!(
+        out_rx.recv().await,
+        Some(HostMsg::Ping { seq: 1 })
+    ));
     let first = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
         .await
         .expect("a frame once the queue drains");
@@ -2011,7 +2017,10 @@ async fn a_page_task_ends_with_its_connection() {
     let (ctx, page_tx, _clock_tx) = page_ctx();
     let (mut prd, pwr) = connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
     expect_page(&mut prd, false, "seed").await;
-    assert!(page_tx.receiver_count() >= 2, "the listener's and the task's");
+    assert!(
+        page_tx.receiver_count() >= 2,
+        "the listener's and the task's"
+    );
 
     drop(pwr);
     drop(prd);

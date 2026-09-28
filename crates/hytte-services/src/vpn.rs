@@ -67,9 +67,9 @@ pub struct Tunnel {
 /// "header" row that `wg` prints first for each interface.
 ///
 /// `wg show all dump` line format:
-///   header: <iface>\t<priv>\t<pub>\t<port>\t<fwmark>
-///   peer:   <iface>\t<peer-pub>\t<presh>\t<endpoint>\t<allowed-ips>\t
-///           <latest-handshake>\t<rx>\t<tx>\t<keepalive>
+///   `header: <iface>\t<priv>\t<pub>\t<port>\t<fwmark>`
+///   `peer:   <iface>\t<peer-pub>\t<presh>\t<endpoint>\t<allowed-ips>\t`
+///           `<latest-handshake>\t<rx>\t<tx>\t<keepalive>`
 ///
 /// Header rows have 5 tab-separated columns; peer rows have 9. Use the
 /// column count to discriminate.

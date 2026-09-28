@@ -12,7 +12,7 @@
 //!
 //! [`led_strip`] renders are **pure**: it takes the current `level` and the
 //! peak-hold `peak` position and draws one frame — it holds nothing between
-//! frames, exactly like [`dot_matrix`](super::dot_matrix) and the
+//! frames, exactly like [`dot_matrix`](super::dot_matrix()) and the
 //! [`Marquee`](super::Marquee). The peak-hold *value* is modelled by the small
 //! pure [`PeakHold`] helper the plugin drives: [`push`](PeakHold::push) each
 //! fresh level in (the dot only ever rises to it), [`decay`](PeakHold::decay)
@@ -302,8 +302,8 @@ impl LedStrip {
 }
 
 /// Convenience free-function form: render an [`LedStrip`] with the default LED
-/// count in one call, mirroring [`dot_matrix`](super::dot_matrix) /
-/// [`seven_seg`](super::seven_seg).
+/// count in one call, mirroring [`dot_matrix`](super::dot_matrix()) /
+/// [`seven_seg`](super::seven_seg()).
 #[must_use]
 pub fn led_strip(level: f32, peak: f32, style: DisplayStyle) -> Frame {
     LedStrip::new(style).render(level, peak)

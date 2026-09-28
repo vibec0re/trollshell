@@ -735,7 +735,7 @@ pub enum WorkspaceAction {
 ///
 /// The one seam where a mandatory id becomes niri's optional one, so it is the
 /// one place that could reintroduce "whatever is focused" — hence pure, and
-/// pinned by [`tests::every_action_names_its_target`].
+/// pinned by `tests::every_action_names_its_target`.
 fn lower(action: WorkspaceAction) -> Action {
     match action {
         WorkspaceAction::SetName { workspace, name } => Action::SetWorkspaceName {

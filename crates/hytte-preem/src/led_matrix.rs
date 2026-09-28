@@ -10,7 +10,7 @@
 //! Like every other kit surface it renders in a [`DisplayStyle`] skin, so the
 //! ghost matrix, phosphor bloom and the CRT pass's comb/vignette all come along
 //! for free. Unlike every other kit surface it also takes a
-//! [`ColorMap`](super::ColorMap): the panel has many cells, so "what colour is
+//! [`ColorMap`]: the panel has many cells, so "what colour is
 //! a cell?" becomes a real question, and the answer is a **separate axis** from
 //! the skin — see the [`color_map`](super::color_map) module docs for why that
 //! orthogonality is the design rather than an accident.

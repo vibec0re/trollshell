@@ -130,7 +130,7 @@ use super::style::{Bloom, DisplayStyle, Emission, Palette, mix};
 
 /// Default logical pixels per font pixel. At the kit's default
 /// [`scale`](FlipBoard::scale) of 2 this puts a font pixel on a 4 px pitch —
-/// the same pitch as the dot-matrix [`DOT`](super::dot_matrix), so a board
+/// the same pitch as the dot-matrix [`DOT`](super::dot_matrix()), so a board
 /// stacks flush with a ticker.
 pub const DEFAULT_GLYPH_PX: usize = 2;
 /// Smallest accepted [`glyph_px`](FlipBoard::glyph_px).

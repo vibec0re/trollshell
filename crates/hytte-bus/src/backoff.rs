@@ -234,8 +234,8 @@ impl FailureStreak {
 /// Back off from one failed attempt to (re)establish a subscription.
 ///
 /// The loops that rebuild a subscription after the bus or the peer went
-/// away — [`property`](crate::property)'s `PropertiesChanged`,
-/// [`signals`](crate::signals)' `receive_signal`, [`proxy`](crate::proxy)'s
+/// away — [`property`](crate::property())'s `PropertiesChanged`,
+/// [`signals`](crate::signals())' `receive_signal`, [`proxy`](crate::proxy())'s
 /// `NameOwnerChanged` subscribe and its cached-proxy rebuild, and
 /// [`export`](crate::export)'s mount rebuild — each shipped its own
 /// `sleep(Duration::from_millis(250))`. That is the 4 Hz spin this module

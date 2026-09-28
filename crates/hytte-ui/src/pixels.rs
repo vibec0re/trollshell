@@ -5,8 +5,8 @@
 //! A plain [`gtk::Picture`] / [`gtk::Image`] filters linearly and blurs chunky
 //! pixels into mush; the LCD look requires crisp, hard pixel edges. So this is a
 //! minimal `gtk::Widget` subclass whose `snapshot` vfunc uploads the buffer as a
-//! [`gdk::MemoryTexture`] and paints it with
-//! [`gsk::ScalingFilter::Nearest`](gtk::gsk::ScalingFilter::Nearest) via
+//! [`gdk::MemoryTexture`](gtk::gdk::MemoryTexture) and paints it with
+//! [`gsk::ScalingFilter::Nearest`] via
 //! [`append_scaled_texture`](gtk::prelude::SnapshotExt::append_scaled_texture).
 //! (It's the only subclass in `hytte-ui` — the rest of the crate uses
 //! `DrawingArea` + cairo, but cairo can't paint a `GdkTexture` with a chosen
@@ -235,7 +235,7 @@ mod imp {
         /// [`scaled_nat`]), so a freshly-built surface measures at 1×.
         scale: Cell<u32>,
         /// Which axis the mount constrains (#1387). `Default`-derived
-        /// [`FitAxis::Width`] is height-for-width — what this widget measured
+        /// [`FitAxis::Width`](super::FitAxis::Width) is height-for-width — what this widget measured
         /// unconditionally before, so a surface nobody sets it on is unchanged.
         fit: Cell<super::FitAxis>,
         /// Test seam (#902): how many `MemoryTexture`s this surface has built,

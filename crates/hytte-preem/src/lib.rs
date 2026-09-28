@@ -22,9 +22,9 @@
 //! primitives are promoted here — the shared [`Frame`] buffer plus [`font`],
 //! the glyph set — and three predefined display widgets are built on them:
 //!
-//! - [`dot_matrix`] — a single text line as char cells of round-falloff dots,
+//! - [`dot_matrix()`] — a single text line as char cells of round-falloff dots,
 //!   in any [`DisplayStyle`] skin.
-//! - [`Marquee`] — a scrolling [`dot_matrix`] ticker: the message is a
+//! - [`Marquee`] — a scrolling [`dot_matrix()`] ticker: the message is a
 //!   font-space bitmap sampled onto a **fixed** physical dot grid, stepped one
 //!   whole virtual pixel (one dot) at a time, so the grid never moves with the
 //!   text (#839).
@@ -42,9 +42,9 @@
 //! each character advances `6 * dot_px`. The falloff that makes a dot read as
 //! round is computed for whatever pitch is asked for, and reproduces the
 //! hand-tuned 4×4 table exactly at the default — so the free functions
-//! [`dot_matrix`] / [`Marquee::new`], and every caller written before the knob
+//! [`dot_matrix()`] / [`Marquee::new`], and every caller written before the knob
 //! existed, render the same bytes they always did.
-//! - [`seven_seg`] — a classic seven-segment readout (digits, `:`, `-`,
+//! - [`seven_seg()`] — a classic seven-segment readout (digits, `:`, `-`,
 //!   space) with the authentic dim ghost segments behind the lit ones.
 //! - [`TextBox`] — the "8bit textbox": wrapped 5×7 pixel-font text on a
 //!   rounded field (the pet's speech bubble is exactly this, dressed in

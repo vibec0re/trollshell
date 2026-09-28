@@ -261,7 +261,7 @@ impl Agents {
 
     /// The panel's non-model inputs.
     ///
-    /// This is where [`Node::Scrolled`](hytte_plugin::proto::Node::Scrolled)'s
+    /// This is where [`Node::Scrolled`]'s
     /// negotiation is resolved, once, for the whole view: the variant is
     /// vocabulary-gated (#966), so a host that never advertised it gets `0` —
     /// the pre-#969 unbounded panel — and everything downstream just reads a

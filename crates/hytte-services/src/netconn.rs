@@ -47,7 +47,7 @@ pub struct Connection {
 /// lines (we'd rather lose one line than panic the poll loop).
 ///
 /// Expected line format with -tunpH:
-///   <netid> <state> <recv-q> <send-q> <local> <peer> [users:((..pid=N..))]
+///   `<netid> <state> <recv-q> <send-q> <local> <peer> [users:((..pid=N..))]`
 ///
 /// Where:
 /// - netid is one of: tcp, udp

@@ -2166,7 +2166,7 @@ impl SliderCtl {
     }
 
     /// Arm a one-shot trailing flush (unless one is already pending). The timer
-    /// holds only a [`Weak`], so a torn-down slider's flush is a no-op — no post-
+    /// holds only a [`Weak`](std::rc::Weak), so a torn-down slider's flush is a no-op — no post-
     /// teardown emit, no leak.
     fn arm_trailing(self: &Rc<Self>, delay: Duration) {
         if self.armed.replace(true) {

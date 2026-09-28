@@ -515,7 +515,7 @@ fn detail(key: &str, value: &str) -> Node {
 /// # Why there is no disabled variant
 ///
 /// Every caller reaches this inside an `if let Some(url)` over
-/// [`agent_url`](crate::model::agent_url) / [`hive_home`], both of which
+/// [`agent_url`] / [`hive_home`], both of which
 /// already fold an absent **and** an all-whitespace value to `None`. A row
 /// with no URL therefore does not render at all — which is the whole of "no
 /// dead button": there is no state in which this draws something clickable

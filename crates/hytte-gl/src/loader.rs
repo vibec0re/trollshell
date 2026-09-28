@@ -327,8 +327,8 @@ fn load_once() -> Result<&'static str, String> {
 ///
 /// #1070's review (M1) found the hermetic test could not see a `resolve` that
 /// **ignores its own argument** — three separate mutations of exactly that
-/// shape (this closure discarding `symbol`, [`Source::Glvnd::resolve`]
-/// discarding it, [`Source::Epoxy::resolve`] discarding it) left every test
+/// shape (this closure discarding `symbol`, `Source::Glvnd::resolve`
+/// discarding it, `Source::Epoxy::resolve` discarding it) left every test
 /// green, because the old test only ever probed `resolve("glGetString")` and
 /// a discarding mutant answers that one name correctly while silently binding
 /// **every** other entry point to `glGetString`'s dispatch stub —

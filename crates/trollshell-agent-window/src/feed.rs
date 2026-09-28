@@ -471,7 +471,7 @@ async fn write(socket: &std::path::Path, req: &Request) -> Result<(), String> {
 
 /// One poll: `AgentStatus`, sent only when it **changed**, then `Pending`
 /// (#1141) — only once the status call already proved the socket answering,
-/// same order [`hytte_plugin_agents::poll::poll_once`] uses and for the same
+/// same order `hytte_plugin_agents::poll::poll_once` uses and for the same
 /// reason: a dead hive should cost one failed connect, not two.
 ///
 /// Dedup on `Update::State` is not an optimisation: it drives a label rewrite

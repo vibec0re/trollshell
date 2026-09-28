@@ -8,7 +8,7 @@
 //! [`window`](MarqueeStrip::window) paints that grid's unlit (ghost) dots at
 //! their fixed positions and then lights the dots the bitmap says are on at
 //! this offset. The dot *hardware* is
-//! [`dot_matrix`](super::dot_matrix)'s — same pitch, same bezel, same falloff
+//! [`dot_matrix`](super::dot_matrix())'s — same pitch, same bezel, same falloff
 //! painters, all carried in one shared [`Dots`] value — so a scrolled dot is
 //! pixel-for-pixel a static one, and the [`DisplayStyle`] skin, the accent tint
 //! and the ghost/bloom passes are all inherited rather than re-implemented.
@@ -32,7 +32,7 @@
 //!
 //! # A continuous ticker matrix, not travelling char cells
 //!
-//! [`dot_matrix`](super::dot_matrix) models a row of **character cells** — the
+//! [`dot_matrix`](super::dot_matrix()) models a row of **character cells** — the
 //! spacing column between two cells carries no dots, because the hardware has
 //! none there. A scrolling window can't keep that: cell structure that
 //! *travels* is exactly the artefact a fixed grid removes. So the marquee's
@@ -109,7 +109,7 @@ const _: () = assert!(
 
 /// Rasterize `text` into font space: [`GLYPH_W`](font::GLYPH_W) columns per
 /// char with [`SPACING`](font::SPACING) blank columns between chars, exactly
-/// the metrics [`dot_matrix`](super::dot_matrix) advances by. Uncovered chars
+/// the metrics [`dot_matrix`](super::dot_matrix()) advances by. Uncovered chars
 /// (emoji included) become the hollow [`font::NOTDEF`] box, never a panic; an
 /// empty string is an empty bitmap.
 fn rasterize(text: &str) -> Vec<Column> {

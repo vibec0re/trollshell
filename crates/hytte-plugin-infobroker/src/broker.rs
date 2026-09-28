@@ -1294,7 +1294,7 @@ fn prepare_dir(path: &Path) -> std::io::Result<()> {
 /// The probe is the whole point (#995): this is a probe→unlink→bind sequence,
 /// not a lock→probe→bind one — there is no listen lock here (contrast
 /// `hytte_claude_bridge::socket::take_socket_with`, which does take one). This runs from
-/// [`crate::plugin`]'s `sources()`, which the SDK calls **after** it writes
+/// `plugin`'s `sources()`, which the SDK calls **after** it writes
 /// `Register` but **before** it reads a single host frame — so it runs even for
 /// a duplicate the host is about to reject on its `IdGuard`. The old
 /// unconditional `remove_file` → `bind` therefore destroyed the *incumbent*
@@ -1509,7 +1509,7 @@ pub async fn serve_with_shutdown(
 ///
 /// # The starvation this guards against
 ///
-/// `serve` runs from [`crate::plugin`]'s `sources()` under a plain
+/// `serve` runs from `plugin`'s `sources()` under a plain
 /// `tokio::spawn` on the SDK's **current-thread** runtime
 /// (`hytte-plugin/src/runtime.rs`), which is deliberate — the broker is one
 /// plugin session's I/O source, not a second daemon (contrast

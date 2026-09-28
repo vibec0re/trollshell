@@ -128,7 +128,7 @@ const SCALE_STEP: f64 = 0.25;
 /// Number of `SCALE_STEP` increments spanning `SCALE_MIN..=SCALE_MAX`
 /// (`(3.0 - 1.0) / 0.25 = 8`). A `u32` so the loop var maps to `f64` losslessly
 /// (no float cast). Kept in sync with the three constants above by
-/// [`tests::scale_steps_matches_range`].
+/// `tests::scale_steps_matches_range`.
 const SCALE_STEPS: u32 = 8;
 /// Floor on a mode's *logical* width/height (physical ÷ scale) below which we
 /// stop offering a fractional scale. A heuristic bound on the offered list

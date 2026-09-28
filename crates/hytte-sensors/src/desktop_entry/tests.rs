@@ -725,6 +725,51 @@ fn from_process_reads_the_real_environment_inner() {
     println!("{CHILD_OK}");
 }
 
+/// `body` followed by a `#` comment line padded so the file is exactly `len`
+/// bytes long.
+fn padded(body: &str, len: usize) -> String {
+    let pad = len - body.len() - "#\n".len();
+    let text = format!("{body}#{}\n", "x".repeat(pad));
+    assert_eq!(text.len(), len, "fixture length");
+    text
+}
+
+/// **Files over [`super::MAX_FILE_BYTES`] are skipped, and still mask**
+/// (#1431 review, NIT 8): a file of exactly the cap is read and listed; one
+/// byte more and it is not, and its id is still owned, so a lower-precedence
+/// entry of the same id stays hidden, as for any file that fails to load.
+///
+/// **Falsified** by dropping the length check in `read_capped` (the
+/// over-cap file's first `MAX_FILE_BYTES + 1` bytes parse, and it lists),
+/// and by `<` for `<=` there (the at-cap file is skipped).
+#[test]
+fn an_oversized_file_is_skipped_but_still_masks() {
+    let f = Fixture::new();
+    let body = app("Big", "firefox");
+    f.entry(
+        "at-cap",
+        "firefox.desktop",
+        &padded(&body, super::MAX_FILE_BYTES),
+    );
+    f.entry(
+        "over-cap",
+        "firefox.desktop",
+        &padded(&body, super::MAX_FILE_BYTES + 1),
+    );
+    f.entry("share", "firefox.desktop", &app("Firefox", "firefox"));
+
+    assert_eq!(
+        lookup(&f.env(&["at-cap"]), "firefox"),
+        Some(hit("Big", Layer::Exact))
+    );
+    assert_eq!(lookup(&f.env(&["over-cap"]), "firefox"), None);
+    assert_eq!(
+        lookup(&f.env(&["over-cap", "share"]), "firefox"),
+        None,
+        "the skipped file still owns its id",
+    );
+}
+
 // ── From the #1431 adversarial review (comment 5877189602), verbatim ──────────
 
 /// A symlink loop under `applications/` stops at [`super::MAX_DEPTH`]:

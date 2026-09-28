@@ -39,6 +39,19 @@
 //!
 //! # Known gaps
 //!
+//! - **Two processes, two environments.** Parity assumes the resolver sees
+//!   the same `PATH`, `XDG_DATA_HOME`, `XDG_DATA_DIRS`, `HOME` and locale
+//!   variables (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`) as the shell,
+//!   and nothing guarantees it. The shell reads its own process
+//!   environment. A plugin is launched with `systemd-run --user`
+//!   (`trollshell/src/plugin_launcher.rs`), so it gets the
+//!   **user manager's** environment plus the launcher's `--setenv`s, not
+//!   the shell's. A variable set only for the shell — by niri's
+//!   `environment {}` block for a shell niri spawns, or in the shell's own
+//!   unit — then reaches one side and not the other. `PATH` counts as much
+//!   as the data dirs: an entry whose `Exec=` program is not on `PATH` is
+//!   not listed at all. Compare `systemctl --user show-environment` with
+//!   the shell's `/proc/<pid>/environ` when the two pages disagree.
 //! - **The tie-break inside a layer.** Native takes the first match in
 //!   `all()`'s order, which is `GLib` hash-table iteration order —
 //!   unspecified. Here it is search-path order, then id order. Only an app
@@ -55,14 +68,26 @@
 //!   between the shell and a plugin anyway.
 //! - **Subdirectories deeper than [`MAX_DEPTH`]** are not scanned, where
 //!   `GLib` recurses until `readdir` fails. It only matters for a symlink
-//!   loop, and there the bound turns an exponential walk into a bounded one.
+//!   loop, and there the bound makes the walk **bounded, not cheap**: `k`
+//!   loop symlinks in one directory still mean `k^8` paths and as many ids.
+//!   Without it, one loop runs until the kernel answers `ELOOP` (40
+//!   levels).
+//! - **Files larger than [`MAX_FILE_BYTES`]** are skipped, where `GLib`
+//!   reads any size. A skipped file still masks its id further down the
+//!   search path, as an unloadable one does. Real entries are a few KiB;
+//!   the cap exists so a `*.desktop` symlink to a multi-gigabyte file costs
+//!   a bounded read rather than that file in memory, inside the walker.
 //! - **A file name that is not UTF-8** is skipped; no app id can equal it.
 //! - **An entry with no `Exec=` line** has no executable here, so layer 3
 //!   skips it. Natively `AppInfo::executable()` then hands gio-rs a `NULL`
 //!   path, which `from_glib_none` only `debug_assert`s against — so on the
 //!   native side layer 3 reaching such an entry is a debug-build panic and a
-//!   release-build null dereference. That is a latent native bug, not a
-//!   behaviour to copy.
+//!   release-build null dereference. That is a latent native bug (#1434),
+//!   not a behaviour to copy.
+//! - **A FIFO named `*.desktop`** masks its id and is never opened: the
+//!   regular-file check runs before the read. `GLib` opens the file first
+//!   and checks after, so natively a FIFO blocks `open()` until a writer
+//!   appears; here that would stall the walker's blocking task.
 //! - **Freshness.** Like native, an app installed after its id was first
 //!   looked up keeps the answer that lookup got until the [`Resolver`] is
 //!   dropped.
@@ -72,6 +97,7 @@ mod keyfile;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use keyfile::{DESKTOP_ENTRY, KeyFile};
@@ -80,6 +106,12 @@ use keyfile::{DESKTOP_ENTRY, KeyFile};
 /// (`applications/a/b.desktop` is depth 1). Real ids nest one level
 /// (`kde4/`); see the module docs' gaps for why there is a bound at all.
 pub const MAX_DEPTH: usize = 8;
+
+/// The largest `.desktop` file the scan reads, in bytes: 1 MiB. A larger
+/// one is skipped (it still masks its id), and the read itself stops one
+/// byte past this, so even a file that grows while being read costs at
+/// most that much memory. See the module docs' gaps.
+pub const MAX_FILE_BYTES: usize = 1 << 20;
 
 /// What a desktop entry says about an app id: the name to show for it, and
 /// its `Icon=` value — the gio-free half of `app_meta.rs`'s `AppMeta`.
@@ -327,11 +359,12 @@ fn collect(dir: &Path, prefix: &str, depth: usize, files: &mut BTreeMap<String, 
 /// `g_desktop_app_info_new_from_filename` plus `add_to_table_if_appropriate`:
 /// the entry at `path`, or `None` where GIO lists nothing for it.
 fn load(id: String, path: &Path, env: &Env) -> Option<Entry> {
-    // `g_key_file_load_from_fd`: "Not a regular file".
+    // `g_key_file_load_from_fd`: "Not a regular file". Checked before the
+    // file is opened, unlike `GLib` — see the module docs on a FIFO.
     if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
         return None;
     }
-    let file = KeyFile::parse(&std::fs::read(path).ok()?)?;
+    let file = KeyFile::parse(&read_capped(path)?)?;
     if file.start_group() != Some(DESKTOP_ENTRY)
         || file.string("Type").ok().flatten().as_deref() != Some("Application")
     {
@@ -367,6 +400,19 @@ fn load(id: String, path: &Path, env: &Env) -> Option<Entry> {
             .as_deref()
             .map(|line| exec::binary(line).to_owned()),
     })
+}
+
+/// The whole file at `path`, or `None` when it cannot be read or holds more
+/// than [`MAX_FILE_BYTES`]. The read stops one byte past the cap, so the
+/// answer costs at most that much memory whatever the file's size.
+fn read_capped(path: &Path) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    (data.len() <= MAX_FILE_BYTES).then_some(data)
 }
 
 /// App id → [`AppMeta`], cached — the gio-free `resolve_app_meta` plus the

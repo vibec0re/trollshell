@@ -2540,7 +2540,13 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       is open). **(#1428)** If a name still differs, note both spellings and
       the app's `.desktop` file name: two entries that match the same id in
       the same lookup layer are the one case the two pages may pick
-      differently (native's order there is GLib's hash order). A
+      differently (native's order there is GLib's hash order). The other
+      is the two processes' environments: the plugin runs under
+      `systemd-run --user` and sees the user manager's, not the shell's —
+      compare `systemctl --user show-environment` with
+      `tr '\0' '\n' < /proc/$(pidof trollshell)/environ` for `PATH`,
+      `XDG_DATA_HOME`, `XDG_DATA_DIRS`, `HOME`, `LANGUAGE`, `LC_ALL`,
+      `LC_MESSAGES` and `LANG`. A
       `LANG`/`LC_MESSAGES` other than English must give both pages the same
       translated name (`Filer` for Files under `sv_SE`). Collapse both
       lists: the bar instance's CPU time in `top` stops climbing within a

@@ -3576,6 +3576,55 @@ mod gtk_tests {
         drop_plugin_drawers(&["test-1427-a", "test-1427-b"], &[&a, &b]);
     }
 
+    /// #1427, the chipless paths: every drawer transition that is not a chip
+    /// toggle must report the flag too — a plugin opening its own page with no
+    /// click behind it (`open_plugin_by_key`), the `open-page` keybind and a
+    /// chipless `OpenPage(<built-in>)` (`open_by_key`), and a deep-link switch
+    /// (`switch_active`). The test above drives only the chip toggles (#1433
+    /// review, LOW 1).
+    ///
+    /// **Falsification:** delete the `recompute_gates()` at the end of
+    /// `open_plugin_by_key` (first assertion reds), `open_by_key` (second) or
+    /// `switch_active` (last).
+    #[gtk::test]
+    fn every_chipless_drawer_path_reports_whether_a_plugin_page_is_shown() {
+        use super::{open_on_focused, open_plugin_on_focused, switch_active};
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _chip) = plugin_drawer(&monitor, "test-1427-r");
+        a.stack
+            .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+
+        open_plugin_on_focused(Some("test-1427-r"), "stats-1427-r");
+        assert!(
+            crate::plugins::drawer_panel_shown(),
+            "a plugin opening its own page with no chip behind it",
+        );
+
+        open_on_focused(Some("test-1427-r"), Page::Workspaces);
+        assert!(
+            !crate::plugins::drawer_panel_shown(),
+            "the open-page keybind swaps that drawer to a built-in page",
+        );
+
+        open_plugin_on_focused(Some("test-1427-r"), "stats-1427-r");
+        assert!(
+            crate::plugins::drawer_panel_shown(),
+            "…and back to the plugin page",
+        );
+
+        switch_active(Page::Workspaces);
+        assert!(
+            !crate::plugins::drawer_panel_shown(),
+            "a deep-link switch takes the plugin page off screen",
+        );
+
+        drop_plugin_drawers(&["test-1427-r"], &[&a]);
+    }
+
     /// End to end through the **effect broker** (#1252): a click recorded on a
     /// bar plugin's chip, then that plugin's `OpenPage(PluginSelf)`, opens the
     /// page on the chip's drawer under the chip. A click older than the window

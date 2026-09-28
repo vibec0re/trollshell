@@ -7,11 +7,11 @@ use hytte_plugin_proto::{
     DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
     Effect, EffectOutcome, EventKind, HOMOGENEOUS_CLASS, HostMsg, LedStripConfig, LedStripState,
     LogLevel, MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES,
-    Manifest, MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page,
-    PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB,
-    SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB,
-    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, sane_fraction,
-    sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
+    Manifest, MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PAGE_VISIBLE_VOCAB,
+    PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB,
+    SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey,
+    StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
+    sane_fraction, sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1952,15 +1952,15 @@ fn the_per_screen_fields_bump_no_vocabulary_generation() {
     // #1050 adds two defaulted **fields**, not variants. The crate root's rule
     // ("appending a wire variant ⇒ bump `VOCAB`") therefore does not fire, and
     // the counter must not have moved for them. Pinned as an equality against
-    // the newest *variant* generation (`SPARKLINE_VOCAB`, #1252) rather than
+    // the newest *variant* generation (`PAGE_VISIBLE_VOCAB`, #1427) rather than
     // a bare literal: a later PR that legitimately appends a variant bumps both
     // together and this stays green, while a reflexive `VOCAB += 1` for a field
     // addition — the mistake this test exists to catch — turns it red. The pin
     // moved here from `OPEN_URI_VOCAB` when #1158 appended the next variant, as
-    // that const's own doc said it would, and on from `SIDEBAR_RIGHT_VOCAB`
-    // when #1252 appended the one after.
+    // that const's own doc said it would, on from `SIDEBAR_RIGHT_VOCAB` when
+    // #1252 appended the one after, and on from `SPARKLINE_VOCAB` with #1427.
     assert_eq!(
-        VOCAB, SPARKLINE_VOCAB,
+        VOCAB, PAGE_VISIBLE_VOCAB,
         "#1050's fields must not have advanced VOCAB past the newest appended variant",
     );
     assert_eq!(
@@ -4023,10 +4023,14 @@ fn the_sidebar_right_generation_bumps_the_census_only() {
 #[test]
 fn the_sparkline_generation_bumps_the_census_only() {
     assert_eq!(SPARKLINE_VOCAB, 7, "#1252 is generation 7");
-    assert_eq!(
-        VOCAB, SPARKLINE_VOCAB,
-        "the census reaches the newest appended variant",
-    );
+    // `<=`, not `==` since #1427: the "census reaches the newest variant" pin
+    // moved on to `the_page_visible_generation_bumps_the_census_only`.
+    const {
+        assert!(
+            SPARKLINE_VOCAB <= VOCAB,
+            "the census counts it, and never un-counts a shipped generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "a negotiated variant does not move the unconditional ceiling",
@@ -4039,10 +4043,14 @@ fn the_sparkline_generation_bumps_the_census_only() {
     );
     m.check_vocab()
         .expect("a plugin rebuilt on this SDK still clears a same-vocab host");
-    assert_eq!(
-        m.negotiated_vocab(VOCAB),
-        SPARKLINE_VOCAB,
+    assert!(
+        m.negotiated_vocab(VOCAB) >= SPARKLINE_VOCAB,
         "a host advertising today's census negotiates the trend line",
+    );
+    assert_eq!(
+        m.negotiated_vocab(SPARKLINE_VOCAB),
+        SPARKLINE_VOCAB,
+        "…and so does a generation-7 shell, which advertises exactly it",
     );
     assert!(
         m.negotiated_vocab(SIDEBAR_RIGHT_VOCAB) < SPARKLINE_VOCAB,
@@ -4056,6 +4064,197 @@ fn the_sparkline_generation_bumps_the_census_only() {
         m.negotiated_vocab(VOCAB_UNCONDITIONAL) < SPARKLINE_VOCAB,
         "and a host that advertises nothing",
     );
+}
+
+/// #1427's page-visibility push is generation **8**, it bumps the census, and it
+/// leaves `VOCAB_UNCONDITIONAL` alone — #1158's argument, applied to a
+/// [`StateKey`] rather than a [`Mount`].
+///
+/// The last assertion is that argument as a fact: a manifest subscribing
+/// `PageVisible` still stamps the generation an old host accepts, so
+/// `check_vocab` is not what keeps the key away from a pre-#1427 host — the
+/// `Register` decode is (pinned by
+/// `an_older_host_cannot_decode_a_page_visible_subscription` below).
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 8 (the third assertion
+/// reds, and with it every older shell's acceptance of a rebuilt plugin), by
+/// leaving `VOCAB` at 7 (the second), or by `PAGE_VISIBLE_VOCAB = 7` (the
+/// first).
+#[test]
+fn the_page_visible_generation_bumps_the_census_only() {
+    assert_eq!(PAGE_VISIBLE_VOCAB, 8, "#1427 is generation 8");
+    assert_eq!(
+        VOCAB, PAGE_VISIBLE_VOCAB,
+        "the census reaches the newest appended variant",
+    );
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "an appended variant does not move the unconditional ceiling",
+    );
+
+    let mut m = Manifest::new("stats", Mount::BarRight);
+    m.subscribes = vec![StateKey::PageVisible];
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "a plugin that subscribes stamps the same generation every other plugin does",
+    );
+    m.check_vocab()
+        .expect("…and clears a same-vocab host's check like any other");
+    assert!(
+        m.vocab < PAGE_VISIBLE_VOCAB,
+        "so the handshake counter is NOT what keeps this key away from an \
+         older host — the `Register` decode is (see the const's doc)",
+    );
+}
+
+/// The `HostMsg` set as a **pre-#1427** plugin decodes it: every variant up to
+/// and including `Hello`, and not `PageVisibility`. Only the names matter
+/// (external tagging is by name), so the bodies are catch-alls.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+enum HostMsgPre1427 {
+    StateSnapshot(serde::de::IgnoredAny),
+    Event(serde::de::IgnoredAny),
+    EffectResult(serde::de::IgnoredAny),
+    SlotVisibility(serde::de::IgnoredAny),
+    Accent(serde::de::IgnoredAny),
+    AudioSpectrum(serde::de::IgnoredAny),
+    ConsentDecision(serde::de::IgnoredAny),
+    CalendarUpcoming(serde::de::IgnoredAny),
+    SessionLocked(serde::de::IgnoredAny),
+    NowPlaying(serde::de::IgnoredAny),
+    DatasourceQuery(serde::de::IgnoredAny),
+    DatasourceResult(serde::de::IgnoredAny),
+    Ping(serde::de::IgnoredAny),
+    Shutdown,
+    Hello(serde::de::IgnoredAny),
+}
+
+/// The #305 half of #1427's compat story, pinned rather than asserted in prose.
+///
+/// A plugin built before #1427 keeps decoding every frame the host sent it
+/// before — appending `PageVisibility` moved none of them — and **cannot**
+/// decode `PageVisibility` itself: its `rmp-serde` fails the whole frame, which
+/// with a redialling SDK is the #437 crash-loop. So the host's subscribe gate is
+/// load-bearing, not a nicety: an unsubscribed connection must never be sent
+/// this variant (the host side of that is pinned in `trollshell`'s
+/// `plugins::tests`).
+///
+/// **Falsified** by adding `PageVisibility` to [`HostMsgPre1427`] — the second
+/// half then decodes and reds, which is what shows the test measures the old
+/// decoder and not the new one.
+#[test]
+fn a_pre_1427_plugin_decodes_every_old_push_but_not_page_visibility() {
+    let old_frames = [
+        HostMsg::SlotVisibility { visible: true },
+        HostMsg::SessionLocked { locked: false },
+        HostMsg::Ping { seq: 3 },
+        HostMsg::Shutdown,
+        HostMsg::Hello { vocab: VOCAB },
+    ];
+    for msg in &old_frames {
+        decode_body::<HostMsgPre1427>(&encode_body(msg))
+            .unwrap_or_else(|e| panic!("a pre-#1427 plugin still decodes {msg:?}: {e}"));
+    }
+
+    for visible in [true, false] {
+        let body = encode_body(&HostMsg::PageVisibility { visible });
+        assert!(
+            contains(&body, b"PageVisibility"),
+            "precondition: the variant is tagged by its name",
+        );
+        let err = decode_body::<HostMsgPre1427>(&body)
+            .expect_err("an unknown variant tag must fail the whole frame");
+        assert!(
+            matches!(err, ProtoError::Decode(_)),
+            "…as a decode error, the thing the subscribe gate exists to avoid: {err:?}",
+        );
+    }
+}
+
+/// The plugin → host half: a manifest that **subscribes** `PageVisible` cannot
+/// register with a pre-#1427 host, and one that does not is byte-for-byte a
+/// manifest that host has always accepted.
+///
+/// The first half is the cost [`StateKey::PageVisible`]'s doc names, and the
+/// reason the SDK does not auto-declare the key: an older shell fails to decode
+/// the `Register` frame and drops the connection. The second half is why that
+/// cost is opt-in — appending the variant moved nothing for a plugin that never
+/// names it.
+///
+/// **Falsified** by adding `PageVisible` to the old key list below (the first
+/// half then decodes and reds).
+#[test]
+fn an_older_host_cannot_decode_a_page_visible_subscription() {
+    /// `StateKey` as a pre-#1427 host decodes it.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum StateKeyPre1427 {
+        Clock,
+        SlotVisible,
+        Accent,
+        AudioSpectrum,
+        CalendarUpcoming,
+        SessionLocked,
+        NowPlaying,
+    }
+    /// The slice of a `Register` manifest this test reads; every other key is
+    /// skipped, as a named-map decode does.
+    #[derive(Debug, serde::Deserialize)]
+    struct ManifestPre1427 {
+        subscribes: Vec<StateKeyPre1427>,
+    }
+
+    let mut subscribing = Manifest::new("stats", Mount::BarRight);
+    subscribing.subscribes = vec![StateKey::SlotVisible, StateKey::PageVisible];
+    let err = decode_body::<ManifestPre1427>(&encode_body(&subscribing))
+        .expect_err("a pre-#1427 host cannot decode a PageVisible subscription");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "…and says so with a decode error, not a misread key: {err:?}",
+    );
+
+    let mut plain = Manifest::new("stats", Mount::BarRight);
+    plain.subscribes = vec![StateKey::SlotVisible];
+    let old = decode_body::<ManifestPre1427>(&encode_body(&plain))
+        .expect("a manifest that does not name the new key decodes on an old host");
+    assert_eq!(old.subscribes, vec![StateKeyPre1427::SlotVisible]);
+}
+
+/// A **new** decoder still reads what an older peer sends: a pre-#1427 plugin's
+/// manifest (no `PageVisible` anywhere) and a pre-#1427 host's frames decode on
+/// this build unchanged. The committed-bytes form of the same claim is
+/// `tests/golden.rs`, whose `host_msgs_v1` / `manifest_full_v1` fixtures predate
+/// the variant; this is the per-key form, in the same file as the other half.
+#[test]
+fn a_new_decoder_reads_pre_1427_frames() {
+    /// What a pre-#1427 plugin encodes for its subscriptions: the same names,
+    /// minus the new one.
+    #[derive(serde::Serialize)]
+    enum StateKeyPre1427 {
+        Clock,
+        SlotVisible,
+    }
+    #[derive(serde::Serialize)]
+    struct ManifestPre1427 {
+        id: &'static str,
+        proto: u16,
+        vocab: u16,
+        subscribes: Vec<StateKeyPre1427>,
+        capabilities: Vec<Capability>,
+        mount: Mount,
+    }
+
+    let body = encode_body(&ManifestPre1427 {
+        id: "departures",
+        proto: PROTO_VERSION,
+        vocab: VOCAB_UNCONDITIONAL,
+        subscribes: vec![StateKeyPre1427::Clock, StateKeyPre1427::SlotVisible],
+        capabilities: vec![Capability::OpenPage],
+        mount: Mount::SidebarBottom,
+    });
+    let m: Manifest = decode_body(&body).expect("a pre-#1427 manifest decodes on this build");
+    assert_eq!(m.subscribes, vec![StateKey::Clock, StateKey::SlotVisible]);
+    assert!(!m.subscribes.contains(&StateKey::PageVisible));
 }
 
 /// `Capability::OpenUri` parses out of a manifest like the fourteen before it —

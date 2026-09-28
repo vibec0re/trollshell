@@ -123,7 +123,9 @@ fn fixture_handles(
         bar_right: Mutable::new(Vec::new()),
         panels: Mutable::new(Vec::new()),
         active_panel_id: Mutable::new(None),
+        drawer_panel_shown: Mutable::new(false),
         dialog_panel_id: Mutable::new(None),
+        page_tx: tokio::sync::watch::channel(PanelSelections::default()).0,
         clock_tx: tokio::sync::watch::channel(None).0,
         visibility_tx: tokio::sync::watch::channel(false).0,
         visibility_right_tx: tokio::sync::watch::channel(false).0,
@@ -903,4 +905,257 @@ fn shader_node(id: &str) -> wire::Node {
         classes: vec![],
         tooltip: None,
     }
+}
+
+// ── #1427: the page selections the page-visibility push is computed from ────
+
+/// Poll `fut` once with a no-op waker — enough to drain a signal loop that has
+/// a value ready, and to stop at `Pending` once it has none. The loop under
+/// test never finishes on its own, so `Ready` would be a bug.
+fn poll_once(fut: std::pin::Pin<&mut impl Future<Output = ()>>) {
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        fut.poll(&mut cx).is_pending(),
+        "the publisher runs for the life of the process"
+    );
+}
+
+/// The three handles the publisher reads, standalone — no registry, no GTK.
+struct PageHandles {
+    drawer: Mutable<Option<String>>,
+    shown: Mutable<bool>,
+    dialog: Mutable<Option<String>>,
+}
+
+impl PageHandles {
+    fn new() -> Self {
+        Self {
+            drawer: Mutable::new(None),
+            shown: Mutable::new(false),
+            dialog: Mutable::new(None),
+        }
+    }
+
+    fn signal(&self) -> impl Signal<Item = PanelSelections> + use<> {
+        page_selections_signal(&self.drawer, &self.shown, &self.dialog)
+    }
+
+    /// A drawer on some monitor opens `id`'s page — what `modal`'s open path
+    /// leaves behind: the selection, then `recompute_gates`' flag.
+    fn open_in_drawer(&self, id: &str) {
+        self.drawer.set(Some(id.to_owned()));
+        self.shown.set_neq(true);
+    }
+}
+
+/// A publisher over `handles` recording every value it emits.
+type Published = std::rc::Rc<RefCell<Vec<PanelSelections>>>;
+
+fn recording(handles: &PageHandles) -> (impl Future<Output = ()> + use<>, Published) {
+    let published: Published = std::rc::Rc::default();
+    let sink = published.clone();
+    let driver = drive_page_selections(handles.signal(), move |next| {
+        sink.borrow_mut().push(next);
+    });
+    (driver, published)
+}
+
+/// **The drawer's selection counts only while a drawer shows it.** A drawer
+/// that switched to a built-in page leaves `active_panel_id` naming the plugin;
+/// read bare, that page would stay "on screen" — and after the drawer closed,
+/// stay there for good.
+///
+/// **Falsification:** drop the `.filter(|_| drawer_shown)` in
+/// `PanelSelections::new` → the first assertion reds.
+#[test]
+fn a_drawer_selection_counts_only_while_a_drawer_shows_it() {
+    let hidden = PanelSelections::new(Some("stats".to_owned()), false, None);
+    assert!(
+        !hidden.shows("stats"),
+        "a selection a drawer switched away from is not on screen",
+    );
+    assert!(hidden.is_empty(), "…and repaints nothing either");
+
+    let shown = PanelSelections::new(Some("stats".to_owned()), true, None);
+    assert!(shown.shows("stats"));
+    assert!(!shown.shows("clock-demo"));
+}
+
+/// **The union of the drawer and the dialog.** Each surface is one
+/// process-wide selection covering every monitor, so "on screen anywhere" is
+/// the OR of the two; a third plugin is on screen in neither.
+///
+/// **Falsification:** narrow `shows` to the drawer (or to the dialog) → one of
+/// the first two assertions reds.
+#[test]
+fn a_page_shows_in_the_drawer_or_the_dialog() {
+    let both = PanelSelections::new(Some("stats".to_owned()), true, Some("agents".to_owned()));
+    assert!(both.shows("stats"), "the drawer's page is on screen");
+    assert!(both.shows("agents"), "…and so is the dialog's");
+    assert!(!both.shows("clock-demo"), "a third plugin's is not");
+
+    let dialog_only = PanelSelections::new(None, false, Some("agents".to_owned()));
+    assert!(dialog_only.shows("agents"));
+    assert!(!dialog_only.is_empty());
+}
+
+/// **One seam for every writer.** The publisher follows all three handles: the
+/// drawer's selection, the drawer's shown flag (`modal`'s swap-away and close
+/// paths land here) and the dialog's selection (every dialog dismissal lands
+/// here). A write to any one of them reaches the published value.
+///
+/// **Falsification:** replace any one of the three signals in
+/// `page_selections_signal`'s `map_ref!` with a constant → the matching step
+/// reds.
+#[test]
+fn the_page_publisher_follows_all_three_handles() {
+    let handles = PageHandles::new();
+    let (driver, published) = recording(&handles);
+    let mut driver = pin!(driver);
+    let last = || {
+        published
+            .borrow()
+            .last()
+            .cloned()
+            .expect("a published value")
+    };
+
+    poll_once(driver.as_mut());
+    assert_eq!(last(), PanelSelections::default(), "the seed: nothing open");
+
+    handles.open_in_drawer("stats");
+    poll_once(driver.as_mut());
+    assert!(
+        last().shows("stats"),
+        "the drawer's selection and flag are heard"
+    );
+
+    // A keybind switches the drawer to a built-in page: only the flag moves.
+    handles.shown.set_neq(false);
+    poll_once(driver.as_mut());
+    assert!(!last().shows("stats"), "the drawer's shown flag is heard");
+
+    handles.dialog.set(Some("agents".to_owned()));
+    poll_once(driver.as_mut());
+    assert!(last().shows("agents"), "the dialog's selection is heard");
+
+    handles.dialog.set(None);
+    poll_once(driver.as_mut());
+    assert!(!last().shows("agents"), "…and its dismissal");
+}
+
+/// **One GTK turn is one value — no false `false` on a surface handoff.** A
+/// handler that takes a plugin's page out of the drawer and puts it in the
+/// dialog writes three handles before the publisher is polled again; the
+/// publisher hands over only the settled result, so no value in between says
+/// the page left the screen.
+///
+/// The per-connection side of the same property (a change between two values
+/// that both show the page is no edge) is `PageEdge`'s, pinned in
+/// `plugins::tests`.
+///
+/// **Falsification:** publish from the handles' writers (a synchronous call per
+/// write) instead of off the combined signal — the intermediate
+/// `drawer: None, dialog: None` reaches `published` and the "never hidden"
+/// assertion reds.
+#[test]
+fn a_page_moving_between_surfaces_in_one_turn_publishes_no_gap() {
+    let handles = PageHandles::new();
+    let (driver, published) = recording(&handles);
+    let mut driver = pin!(driver);
+
+    handles.open_in_drawer("stats");
+    poll_once(driver.as_mut());
+    let opened = published.borrow().len();
+    assert!(published.borrow().last().expect("published").shows("stats"));
+
+    // One GTK turn: the drawer lets go, the dialog takes it.
+    handles.drawer.set(None);
+    handles.shown.set_neq(false);
+    handles.dialog.set(Some("stats".to_owned()));
+    poll_once(driver.as_mut());
+
+    let after = published.borrow()[opened..].to_vec();
+    assert_eq!(after.len(), 1, "one turn, one value: {after:?}");
+    assert!(
+        after.iter().all(|s| s.shows("stats")),
+        "the page never left the screen, so no value may say it did: {after:?}",
+    );
+}
+
+/// **The channel wakes only on a real change.** Re-selecting the plugin that is
+/// already shown — the dialog's same-plugin re-open, a drawer re-show — puts
+/// nothing on the page channel, so no connection is woken for it.
+///
+/// **Falsification:** make `publish_page_selections` send unconditionally
+/// (`send_replace`) → the second assertion reds.
+#[test]
+fn an_unchanged_selection_is_not_republished() {
+    let (tx, mut rx) = tokio::sync::watch::channel(PanelSelections::default());
+    let open = PanelSelections::new(None, false, Some("agents".to_owned()));
+    assert!(publish_page_selections(&tx, open.clone()));
+    assert!(rx.has_changed().expect("sender alive"));
+    let _ = rx.borrow_and_update();
+
+    assert!(!publish_page_selections(&tx, open), "the same value again");
+    assert!(
+        !rx.has_changed().expect("sender alive"),
+        "a re-selection of the shown plugin must wake no connection",
+    );
+}
+
+/// The repaint path reads the same gate: a drawer selection nobody can see —
+/// the drawer switched to a built-in page — has its panel left alone by the
+/// animation tick, where before #1427 it was re-mapped every frame for a page
+/// that was not on screen.
+///
+/// **Falsification:** make `panel_selections` ignore `drawer_panel_shown` → the
+/// "left alone" assertion reds (`Ready`).
+#[test]
+fn a_drawer_panel_nobody_can_see_is_not_repainted() {
+    registry::reset_for_tests();
+
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let panel = Scope::panel("t1427-hidden");
+    let _ = to_ui_node(&panel, Grants::none(), &marquee_node("panel"));
+
+    let panels: Mutable<Vec<SlotRender>> =
+        Mutable::new(vec![slot("t1427-hidden", marquee_node("panel"), &tx)]);
+    let mut handles = fixture_handles(Mutable::new(Vec::new()), Mutable::new(Vec::new()));
+    handles.panels = panels.clone();
+    handles.active_panel_id = Mutable::new(Some("t1427-hidden".to_owned()));
+    let shown = handles.drawer_panel_shown.clone();
+    registry::install(
+        Box::new(FixtureService(handles)),
+        hytte::reactive::runtime::handle(),
+    );
+
+    let mut panels_sig = pin!(panels.signal_cloned());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        panels_sig.as_mut().poll_change(&mut cx),
+        Poll::Ready(Some(_))
+    ));
+
+    // The drawer shows a built-in page: the selection is stale.
+    shown.set(false);
+    request_preem_repaint(&preem_render::advance_all(preem_render::ANIM_STEP_SECS));
+    assert!(
+        panels_sig.as_mut().poll_change(&mut cx).is_pending(),
+        "a panel no drawer is showing must be left alone by the tick",
+    );
+
+    // Control: the same selection while a drawer does show it is repainted.
+    shown.set(true);
+    request_preem_repaint(&preem_render::advance_all(preem_render::ANIM_STEP_SECS));
+    assert!(
+        matches!(
+            panels_sig.as_mut().poll_change(&mut cx),
+            Poll::Ready(Some(_))
+        ),
+        "…and the same panel on screen is repainted",
+    );
+
+    preem_render::forget_scope(&panel);
+    registry::reset_for_tests();
 }

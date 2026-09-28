@@ -54,6 +54,72 @@
 //! driver underneath it, for a lane that carries more (`agents`, whose
 //! `Cmd::Send` writes to the hive and then forces a re-poll) or a task that
 //! needs to re-arm the cadence from a reloaded config.
+//!
+//! # Gating on your own page (#1427)
+//!
+//! The gate reads one `bool` out of whatever the lane carries, so it does not
+//! care which host signal that bool came from. The mount surface's
+//! [`Input::SlotVisible`](crate::Input::SlotVisible) is one source; the page's
+//! [`Plugin::page_visible`](crate::Plugin::page_visible) is another — subscribe
+//! [`StateKey::PageVisible`](crate::proto::StateKey::PageVisible) and forward it
+//! down the lane exactly the same way.
+//!
+//! Work that needs the page **and** something else — a page list that is only
+//! walked while it is expanded — is the same gate fed a conjunction. Keep each
+//! condition in the model and send the combined value whenever *either* one
+//! changes. The gate acts only on edges of what it is sent, so a send that
+//! does not move the conjunction costs nothing; what must not happen is a
+//! change to one side that forgets to re-send, which is why both paths below
+//! go through one `sync`.
+//!
+//! ```
+//! use hytte_plugin::proto::Effect;
+//!
+//! enum Cmd {
+//!     /// Walk while this is `true`.
+//!     Walk(bool),
+//! }
+//!
+//! struct Model {
+//!     cmds: hytte_plugin::CmdSender<Cmd>,
+//!     page_open: bool,
+//!     list_expanded: bool,
+//! }
+//!
+//! impl Model {
+//!     /// The one place the gate's input is computed.
+//!     fn sync(&self) {
+//!         let _ = self.cmds.send(Cmd::Walk(self.page_open && self.list_expanded));
+//!     }
+//!
+//!     /// What `Plugin::page_visible` does.
+//!     fn page_visible(&mut self, visible: bool) -> Vec<Effect> {
+//!         self.page_open = visible;
+//!         self.sync();
+//!         Vec::new()
+//!     }
+//!
+//!     /// What the expander's click arm in `Plugin::update` does.
+//!     fn toggle_list(&mut self) {
+//!         self.list_expanded = !self.list_expanded;
+//!         self.sync();
+//!     }
+//! }
+//!
+//! let (cmds, mut lane) = hytte_plugin::cmd_channel();
+//! let mut model = Model { cmds, page_open: false, list_expanded: false };
+//! model.toggle_list(); // expanded, page shut: the gate stays closed
+//! model.page_visible(true); // both: the gate opens
+//! model.page_visible(false); // page closed: the gate closes, list still expanded
+//! let sent: Vec<bool> = std::iter::from_fn(|| lane.try_recv().ok())
+//!     .map(|Cmd::Walk(on)| on)
+//!     .collect();
+//! assert_eq!(sent, [false, true, false]);
+//! ```
+//!
+//! Page-only work alone is the same shape with one field. The page seed arrives
+//! at register like the slot's does, so a gate that starts closed opens on the
+//! seed when a plugin reconnects with its page already up.
 
 use std::future::Future;
 use std::time::Duration;
@@ -155,9 +221,10 @@ impl<C, V: Fn(&C) -> Option<bool>> Gate<C, V> {
     /// [`Wake::Cmd`].
     ///
     /// The gate starts **closed** — the runtime's seeded
-    /// [`Input::SlotVisible`](crate::Input::SlotVisible) is whatever the
-    /// surface happens to be, and a task that wants one poll before any edge
-    /// (`agents`' seed poll) does it itself before the loop.
+    /// [`Input::SlotVisible`](crate::Input::SlotVisible) (or, for a page gate,
+    /// the seeded [`Plugin::page_visible`](crate::Plugin::page_visible) call)
+    /// is whatever the surface happens to be, and a task that wants one poll
+    /// before any edge (`agents`' seed poll) does it itself before the loop.
     #[must_use]
     pub fn new(cmds: CmdReceiver<C>, period: Duration, visibility: V) -> Self {
         Self {

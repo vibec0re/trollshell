@@ -55,7 +55,11 @@
 //! encoder change — the census is a `u16` whose *value* moved, not a field whose
 //! shape did. #1252's bump (`06` → `07`, the `Sparkline` node) moved exactly the
 //! same four files by exactly one hex digit each, and pinned its new variant in
-//! a new file (`plugin_render_sparkline_v1`) rather than in any of them.
+//! a new file (`plugin_render_sparkline_v1`) rather than in any of them. #1427's
+//! bump (`07` → `08`, the page-visibility pair) did the same to the same four,
+//! and pinned its two variants in two new files (`host_page_visibility_v1`,
+//! `plugin_register_page_visible_v1` — the latter built from [`Manifest::new`],
+//! so it is a fifth file the *next* bump moves).
 //!
 //! What did **not** move in those files is the `mount` tag, and that is the
 //! point: #1158 pinned its new mount in a **new** fixture
@@ -161,6 +165,12 @@ where
 /// A manifest exercising every [`StateKey`] and every [`Capability`] (the
 /// full subscription/capability vocabulary), a non-default [`Mount`], and a
 /// set placement `order` — the "manifest with capabilities/subscribes" entry.
+///
+/// Every key **but #1427's `PageVisible`**, which is pinned in
+/// `plugin_register_page_visible_v1` instead: appending it here would shift
+/// every byte after the `subscribes` array in this fixture and in
+/// `plugin_register_v1`, retiring the evidence that the bytes a plugin has sent
+/// since #450 did not move.
 fn full_manifest() -> Manifest {
     Manifest {
         id: "vibectl".into(),
@@ -962,6 +972,9 @@ fn hidden_on_tree() -> Node {
     }
 }
 
+// A flat table, one row per pinned fixture; splitting it into helpers gains
+// nothing (the same call as `host_msgs` and `preem_tree` above).
+#[allow(clippy::too_many_lines)]
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
     vec![
         ("manifest_full_v1", Box::new(full_manifest())),
@@ -1087,6 +1100,29 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 panel: None,
                 effects: vec![],
                 hidden_on: Vec::new(),
+            }),
+        ),
+        // #1427's page-visibility pair, one new file per direction, for #1158's
+        // reason: `full_manifest()` and `host_msgs()` pin the bytes every plugin
+        // and host already exchange, and appending the new key or push to them
+        // would move those bytes (a new `subscribes` entry shifts everything
+        // after it in the manifest). Both files are new, so every pre-existing
+        // fixture moving by nothing but the census byte is the evidence that
+        // the append is additive.
+        (
+            "host_page_visibility_v1",
+            Box::new(vec![
+                HostMsg::PageVisibility { visible: true },
+                HostMsg::PageVisibility { visible: false },
+            ]),
+        ),
+        (
+            "plugin_register_page_visible_v1",
+            Box::new(PluginMsg::Register {
+                manifest: Manifest {
+                    subscribes: vec![StateKey::SlotVisible, StateKey::PageVisible],
+                    ..Manifest::new("page-watcher", Mount::BarRight)
+                },
             }),
         ),
     ]

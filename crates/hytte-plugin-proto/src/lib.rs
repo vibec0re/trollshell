@@ -13,7 +13,8 @@
 //! - host → plugin: [`HostMsg`] — a full subscribed-state snapshot on change, a
 //!   user [`Event`](HostMsg::Event), an [`EffectResult`](HostMsg::EffectResult),
 //!   a [`SlotVisibility`](HostMsg::SlotVisibility) push (park pollers while
-//!   hidden), liveness, or `Shutdown`.
+//!   hidden), a [`PageVisibility`](HostMsg::PageVisibility) push (the plugin's
+//!   own page opened or closed), liveness, or `Shutdown`.
 //! - plugin → host: [`PluginMsg`] — a one-time [`Register`](PluginMsg::Register),
 //!   then a [`Render { tree, effects }`](PluginMsg::Render) pushed on the
 //!   plugin's own schedule (host state change, timer, external fetch), plus logs
@@ -248,7 +249,14 @@ pub const PROTO_VERSION: u16 = 1;
 /// `Hello`-negotiated generation since #966, so a generation-6 shell (which
 /// advertises 6) negotiates below it and a rebuilt plugin falls back rather
 /// than being refused.
-pub const VOCAB: u16 = 7;
+///
+/// Generation `8` is #1427's page-visibility push ([`StateKey::PageVisible`] +
+/// [`HostMsg::PageVisibility`]), marked by [`PAGE_VISIBLE_VOCAB`]. Census-only:
+/// the push is #305-gated on the key, and the key rides inside `Register`, so —
+/// #1158's argument — the counter's handshake check cannot fire for it. Unlike
+/// #1252 it is not `Hello`-negotiated: a plugin subscribes before any `Hello`
+/// can arrive.
+pub const VOCAB: u16 = 8;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -262,13 +270,16 @@ pub const VOCAB: u16 = 7;
 /// The two diverge because #882 added a *negotiated* generation; #893's shader
 /// widget ([`SHADER_VOCAB`]) is the second, #966's bounded
 /// viewport ([`SCROLLED_VOCAB`]) the third and #1252's trend line
-/// ([`SPARKLINE_VOCAB`]) the fourth negotiated one. Two more generations leave
+/// ([`SPARKLINE_VOCAB`]) the fourth negotiated one. Three more generations leave
 /// this const alone without being negotiated at all: #1045's
 /// [`OPEN_URI_VOCAB`], on a capability argument rather than a `Hello` one, and
 /// #1158's [`SIDEBAR_RIGHT_VOCAB`], on a third
 /// argument again: a [`Mount`] rides inside the `Register` frame
 /// that carries the counter, so a handshake refusal is not reachable and bumping
-/// this would only refuse every plugin that never leaves the left sidebar. Read the rule
+/// this would only refuse every plugin that never leaves the left sidebar.
+/// #1427's [`PAGE_VISIBLE_VOCAB`] is the third, on #1158's argument: its
+/// [`StateKey`] rides inside `Register` too, and its push is #305-gated on that
+/// key. Read the rule
 /// below against it before appending the next `Effect`: a plugin *may* emit
 /// `OpenUri` with no advertisement — what stops an old host seeing one is the
 /// plugin having declared the gating capability, which nothing enforces. #1045
@@ -300,7 +311,8 @@ pub use effect::{
     NiriAction, OPEN_URI_VOCAB, Page,
 };
 pub use manifest::{
-    Capability, Manifest, Mount, ProvidedDatasource, SIDEBAR_RIGHT_VOCAB, StateKey,
+    Capability, Manifest, Mount, PAGE_VISIBLE_VOCAB, ProvidedDatasource, SIDEBAR_RIGHT_VOCAB,
+    StateKey,
 };
 pub use msg::{HostMsg, LogLevel, PluginMsg};
 pub use preem::{

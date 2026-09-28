@@ -962,6 +962,36 @@ pub fn set_active_panel(plugin_id: Option<&str>) {
     });
 }
 
+/// Record whether a drawer on **any** monitor is showing its plugin page right
+/// now (#1427). GTK thread. `modal`'s `recompute_gates` calls it after every
+/// transition that changes what a drawer shows — open, swap, deep-link switch,
+/// retract, teardown — with the OR over every live drawer.
+///
+/// The gate the page-visibility push puts on [`set_active_panel`]'s selection,
+/// which names the plugin the drawer child *renders* and is left set when a
+/// drawer switches to a built-in page (see `PluginHandles::drawer_panel_shown`).
+/// `set_neq`, so the flag's subscribers wake only when it actually moves —
+/// every transition calls this, most of them without changing it.
+pub fn set_drawer_panel_shown(shown: bool) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .drawer_panel_shown
+            .set_neq(shown);
+    });
+}
+
+/// The read half of [`set_drawer_panel_shown`], for `modal`'s drawer tests.
+#[cfg(all(test, feature = "system-tests"))]
+pub(crate) fn drawer_panel_shown() -> bool {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .drawer_panel_shown
+            .get()
+    })
+}
+
 /// The dialog overlay's own selection (#1010 §2.1) — the plugin whose panel the
 /// centered dialog shows, independent of [`active_panel_signal`].
 ///
@@ -6087,6 +6117,62 @@ mod gtk_tests {
             "a narrow page keeps its own natural width — the frame is no floor",
         );
         window.destroy();
+    }
+
+    /// #1427, the production publisher end to end on the real glib main loop:
+    /// [`install_page_publisher`](crate::plugins::pump::install_page_publisher)
+    /// over the registered handles, driven through the shipped setters — the
+    /// dialog's (every dialog take-down ends in `set_dialog_panel(None)`) and
+    /// the drawer's selection and shown flag (what `modal`'s paths write) —
+    /// lands on the channel the per-connection page tasks read.
+    ///
+    /// The pure `pump_tests` pin the loop and the combined signal; this pins the
+    /// wiring: which handles the installed loop reads and which channel it
+    /// writes.
+    ///
+    /// **Falsification:** have `install_page_publisher` read `active_panel_id`
+    /// twice in place of `dialog_panel_id` → the dialog assertion reds; hand it
+    /// a fresh channel instead of `handles.page_tx` → every assertion reds.
+    #[gtk::test]
+    fn the_installed_page_publisher_follows_the_shipped_setters() {
+        hytte::reactive::registry::reset_for_tests();
+        crate::plugins::install_test_handles();
+        let rx = hytte::reactive::registry::with(|r| {
+            r.get::<PluginHandles>()
+                .expect("test handles installed")
+                .page_tx
+                .subscribe()
+        });
+        crate::plugins::pump::install_page_publisher();
+        pump();
+        assert!(!rx.borrow().shows("agents"), "nothing is open at install");
+
+        crate::plugins::set_dialog_panel(Some("agents"));
+        pump();
+        assert!(
+            rx.borrow().shows("agents"),
+            "a dialog opening reaches the channel"
+        );
+        crate::plugins::set_dialog_panel(None);
+        pump();
+        assert!(!rx.borrow().shows("agents"), "…and its dismissal");
+
+        crate::plugins::set_active_panel(Some("stats"));
+        crate::plugins::set_drawer_panel_shown(true);
+        pump();
+        assert!(
+            rx.borrow().shows("stats"),
+            "a drawer showing the page reaches it"
+        );
+        crate::plugins::set_drawer_panel_shown(false);
+        pump();
+        assert!(
+            !rx.borrow().shows("stats"),
+            "a drawer that switched to a built-in page takes it off screen",
+        );
+
+        crate::plugins::set_active_panel(None);
+        hytte::reactive::registry::reset_for_tests();
     }
 }
 

@@ -602,19 +602,55 @@ thread_local! {
 /// every transition that changes a panel's `current` page (open, in-place
 /// page swap, deep-link switch, retract-finish). Each gate's `set` is a
 /// no-op-free notify so we recompute unconditionally and let it dedupe.
+///
+/// Since #1427 it also tells the plugin host whether any drawer is showing a
+/// plugin page — the gate on the drawer's plugin selection that the
+/// page-visibility push needs, for the reason [`any_shows_a_plugin_page`]
+/// gives. Same call sites, same "after every transition" contract, so the two
+/// cannot disagree about what a drawer shows.
 fn recompute_gates() {
-    let pages: Vec<Page> = PANELS.with(|panels| {
+    let currents: Vec<Option<Active>> = PANELS.with(|panels| {
         panels
             .borrow()
             .values()
-            .filter_map(|p| p.current.borrow().as_ref().and_then(Active::builtin))
+            .map(|p| p.current.borrow().clone())
             .collect()
     });
+    let pages: Vec<Page> = currents
+        .iter()
+        .filter_map(|c| c.as_ref().and_then(Active::builtin))
+        .collect();
     GATES.with(|gates| {
         for id in [GateId::Netconn, GateId::Stats, GateId::Media] {
             gates.set(id, pages.iter().copied().any(|p| id.matches(p)));
         }
     });
+    // Guarded like `overlays::dialog`'s departure path: a drawer test can drive
+    // these transitions without the plugin host's handles installed, and the
+    // setter `.expect()`s them.
+    if crate::plugins::host_is_live() {
+        crate::plugins::set_drawer_panel_shown(any_shows_a_plugin_page(
+            currents.iter().map(Option::as_ref),
+        ));
+    }
+}
+
+/// Whether any drawer is showing a plugin's page (#1427) — the OR over every
+/// monitor's drawer.
+///
+/// The plugin host needs this *next to* the drawer's plugin selection
+/// (`plugins::set_active_panel`), because that selection is not cleared when a
+/// drawer switches from a plugin page to a built-in one (the swap arm of
+/// [`toggle_panel`], [`switch_active`], a plugin's `OpenPage(<built-in>)`), and
+/// a drawer closed after such a switch leaves it set for good:
+/// `wire_retract_finish` clears it only when the page it closes is a plugin
+/// one. Read alone, the selection would keep telling a plugin its page is on
+/// screen after it left. Pure, so the per-monitor OR is testable without a
+/// display.
+fn any_shows_a_plugin_page<'a>(currents: impl IntoIterator<Item = Option<&'a Active>>) -> bool {
+    currents
+        .into_iter()
+        .any(|current| matches!(current, Some(Active::Plugin(_))))
 }
 
 /// Signal that emits `true` while a netconn-backed drawer page
@@ -2826,6 +2862,33 @@ mod tests {
         }
     }
 
+    /// #1427: the drawer's half of the page-visibility push is the OR over every
+    /// monitor's drawer, and only a *plugin* page counts — a drawer showing a
+    /// built-in page, a Workspaces edit form or nothing at all is not showing
+    /// the plugin selection, whatever that selection still names.
+    ///
+    /// **Falsification:** `all` for `any` → the two-monitor row reds; counting
+    /// any `Some(_)` → the built-in rows red.
+    #[test]
+    fn a_plugin_page_is_shown_while_any_drawer_shows_one() {
+        use super::{Active, any_shows_a_plugin_page};
+
+        let plugin = Active::Plugin("stats".to_owned());
+        let builtin = Active::Builtin(Page::Calendar);
+        let edit = Active::WorkspaceEdit("chat".to_owned());
+
+        assert!(!any_shows_a_plugin_page([]), "no drawer at all");
+        assert!(!any_shows_a_plugin_page([None, None]), "every drawer shut");
+        assert!(
+            !any_shows_a_plugin_page([Some(&builtin), Some(&edit)]),
+            "a drawer that switched to a built-in page is not showing the plugin's",
+        );
+        assert!(
+            any_shows_a_plugin_page([None, Some(&builtin), Some(&plugin)]),
+            "one monitor's drawer showing it is enough",
+        );
+    }
+
     /// Tripwire for `build_pages_stack`'s eager set (#231): as of #338 every
     /// Stats page's sparkline history is hoisted into the `sensors` service (the
     /// CPU page's clock aggregate + per-core `MultiSparkline`s were the last
@@ -3452,6 +3515,114 @@ mod gtk_tests {
         assert_eq!(*b.current.borrow(), None);
 
         drop_plugin_drawers(&["test-1252-a", "test-1252-b"], &[&a, &b]);
+    }
+
+    /// #1427: every drawer transition tells the plugin host whether a drawer on
+    /// **any** monitor is showing a plugin page, which is what gates the
+    /// drawer's selection for the page-visibility push. A built-in page on
+    /// another monitor does not clear it; the drawer that showed the plugin's
+    /// page switching to a built-in one does — the switch that leaves
+    /// `active_panel_id` set, and that a close after it never clears.
+    ///
+    /// Through the public entry points, so what is pinned is that they reach
+    /// `recompute_gates` and that it reaches the host.
+    ///
+    /// **Falsification:** delete the `set_drawer_panel_shown` call from
+    /// `recompute_gates` → the first assertion reds; compute it over the drawer
+    /// just transitioned rather than every live one → the second reds.
+    #[gtk::test]
+    fn the_host_hears_whether_any_drawer_shows_a_plugin_page() {
+        use super::toggle_builtin_under;
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, chip_a) = plugin_drawer(&monitor, "test-1427-a");
+        let (b, chip_b) = plugin_drawer(&monitor, "test-1427-b");
+        // A stand-in for the built-in page, so `ensure_page` finds it built and
+        // never reaches `panels::workspaces` (which needs the niri service) —
+        // `toggle_opens_workspaces_and_fills_the_drawer_to_the_cap`'s shape.
+        for panel in [&a, &b] {
+            panel
+                .stack
+                .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+        }
+
+        assert!(toggle_plugin_under(chip_a.upcast_ref(), "stats-1427"));
+        assert!(
+            crate::plugins::drawer_panel_shown(),
+            "a drawer showing a plugin page is reported to the host",
+        );
+
+        assert!(toggle_builtin_under(chip_b.upcast_ref(), Page::Workspaces));
+        assert!(
+            crate::plugins::drawer_panel_shown(),
+            "another monitor's built-in page leaves the plugin page on screen",
+        );
+
+        // The drawer showing the plugin's page swaps to a built-in one, in place.
+        assert!(toggle_builtin_under(chip_a.upcast_ref(), Page::Workspaces));
+        assert_eq!(
+            *a.current.borrow(),
+            Some(Active::Builtin(Page::Workspaces)),
+            "precondition: a swap, not a close",
+        );
+        assert!(
+            !crate::plugins::drawer_panel_shown(),
+            "no drawer shows a plugin page any more, whatever the selection still names",
+        );
+
+        drop_plugin_drawers(&["test-1427-a", "test-1427-b"], &[&a, &b]);
+    }
+
+    /// #1427, the chipless paths: every drawer transition that is not a chip
+    /// toggle must report the flag too — a plugin opening its own page with no
+    /// click behind it (`open_plugin_by_key`), the `open-page` keybind and a
+    /// chipless `OpenPage(<built-in>)` (`open_by_key`), and a deep-link switch
+    /// (`switch_active`). The test above drives only the chip toggles (#1433
+    /// review, LOW 1).
+    ///
+    /// **Falsification:** delete the `recompute_gates()` at the end of
+    /// `open_plugin_by_key` (first assertion reds), `open_by_key` (second) or
+    /// `switch_active` (last).
+    #[gtk::test]
+    fn every_chipless_drawer_path_reports_whether_a_plugin_page_is_shown() {
+        use super::{open_on_focused, open_plugin_on_focused, switch_active};
+
+        if !crate::plugins::host_is_live() {
+            crate::plugins::install_test_handles();
+        }
+        let monitor = test_monitor();
+        let (a, _chip) = plugin_drawer(&monitor, "test-1427-r");
+        a.stack
+            .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+
+        open_plugin_on_focused(Some("test-1427-r"), "stats-1427-r");
+        assert!(
+            crate::plugins::drawer_panel_shown(),
+            "a plugin opening its own page with no chip behind it",
+        );
+
+        open_on_focused(Some("test-1427-r"), Page::Workspaces);
+        assert!(
+            !crate::plugins::drawer_panel_shown(),
+            "the open-page keybind swaps that drawer to a built-in page",
+        );
+
+        open_plugin_on_focused(Some("test-1427-r"), "stats-1427-r");
+        assert!(
+            crate::plugins::drawer_panel_shown(),
+            "…and back to the plugin page",
+        );
+
+        switch_active(Page::Workspaces);
+        assert!(
+            !crate::plugins::drawer_panel_shown(),
+            "a deep-link switch takes the plugin page off screen",
+        );
+
+        drop_plugin_drawers(&["test-1427-r"], &[&a]);
     }
 
     /// End to end through the **effect broker** (#1252): a click recorded on a

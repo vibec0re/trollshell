@@ -972,6 +972,9 @@ fn hidden_on_tree() -> Node {
     }
 }
 
+// A flat table, one row per pinned fixture; splitting it into helpers gains
+// nothing (the same call as `host_msgs` and `preem_tree` above).
+#[allow(clippy::too_many_lines)]
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
     vec![
         ("manifest_full_v1", Box::new(full_manifest())),

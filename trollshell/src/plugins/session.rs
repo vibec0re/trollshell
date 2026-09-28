@@ -1895,8 +1895,9 @@ async fn visibility_task(
 /// another's is an edge for those two and nothing for the rest.
 ///
 /// Recorded only once a frame is actually queued ([`told`](Self::told)), so a
-/// push dropped on a full outbound queue is owed again at the next selection
-/// change rather than forgotten until the plugin's own next edge.
+/// push dropped on a full outbound queue stays owed rather than forgotten until
+/// the plugin's own next edge; [`page_task`] re-sends it as soon as the queue
+/// has room, or at the next selection change if that comes first.
 #[derive(Debug, Default)]
 pub(super) struct PageEdge {
     told: Option<bool>,
@@ -1929,6 +1930,16 @@ impl PageEdge {
 ///
 /// Not [`push_state`]: that answers a full queue and a sent frame alike, and
 /// [`PageEdge`] must record only the second — see its doc.
+///
+/// A push that meets a full queue waits for **room**, not only for the next
+/// selection change: in a quiet session that change may not come for an hour,
+/// and a plugin never told its page closed keeps its page-only work running
+/// that long (#1433 review). The frame goes out through the slot the wait
+/// reserved, so no other sender can take it first; the ones that `send().await`
+/// on this queue (effect and datasource results) would otherwise win every
+/// round while they keep arriving. Nothing spins: each pass round the loop
+/// waits for a freed slot or a new selection, and the task ends when the
+/// connection's queue closes.
 pub(super) async fn page_task(
     mut page_rx: watch::Receiver<PanelSelections>,
     plugin_id: String,
@@ -1941,8 +1952,25 @@ pub(super) async fn page_task(
         if let Some(visible) = owed {
             match out.try_send(HostMsg::PageVisibility { visible }) {
                 Ok(()) => edge.told(visible),
-                // Left untold, so the next wake re-sends the current answer.
-                Err(mpsc::error::TrySendError::Full(_)) => {}
+                // Left untold: wait for room in the queue or a newer answer,
+                // whichever comes first, then go round again.
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tokio::select! {
+                        room = out.reserve() => {
+                            let Ok(permit) = room else { return };
+                            // Re-read: the selections may have moved while the
+                            // queue was full, and the newest answer is the one
+                            // owed. Nothing owed any more frees the slot.
+                            let owed = edge.owed(&plugin_id, &page_rx.borrow_and_update());
+                            if let Some(visible) = owed {
+                                permit.send(HostMsg::PageVisibility { visible });
+                                edge.told(visible);
+                            }
+                        }
+                        moved = page_rx.changed() => if moved.is_err() { return },
+                    }
+                    continue;
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => return,
             }
         }

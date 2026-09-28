@@ -1877,16 +1877,18 @@ async fn page_visibility_is_never_sent_to_a_plugin_that_did_not_subscribe() {
 
 /// **A push dropped on a full queue is re-sent, not forgotten.** A plugin that
 /// is slow to read can have its outbound queue full when its page closes; the
-/// task leaves that answer untold, so the next wake — even one for another
-/// plugin's page — sends it. Were the drop counted as delivered, the plugin
-/// would keep walking for a closed page until its own next edge.
+/// task leaves that answer untold and re-sends it at the next wake. Here that
+/// wake is the queue draining, and the other plugin's page after it is no edge
+/// for this one, so the next frame is still the seed. Were the drop counted as
+/// delivered, the plugin would keep walking for a closed page until its own
+/// next edge.
 ///
 /// Driven on [`page_task`] directly with a one-slot queue, so "full" is a
 /// state the test sets rather than a race it hopes for.
 ///
 /// **Falsification:** record the answer on `TrySendError::Full` too
-/// (`Err(Full(_)) => edge.told(visible)`) → the retried seed never arrives and
-/// the `timeout` reds.
+/// (`edge.told(visible)` at the top of that arm) → the retried seed never
+/// arrives and the `timeout` reds.
 #[tokio::test]
 async fn a_page_push_dropped_on_a_full_queue_is_sent_at_the_next_wake() {
     let (page_tx, page_rx) = watch::channel(PanelSelections::default());
@@ -1902,7 +1904,7 @@ async fn a_page_push_dropped_on_a_full_queue_is_sent_at_the_next_wake() {
         Some(HostMsg::Ping { seq: 1 })
     ));
 
-    // Another plugin's page: no edge for "stats", but a wake.
+    // Another plugin's page: no edge for "stats", so it adds no frame.
     page_tx.send_replace(in_dialog("agents"));
     let resent = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
         .await
@@ -1912,6 +1914,113 @@ async fn a_page_push_dropped_on_a_full_queue_is_sent_at_the_next_wake() {
         "…carrying the current answer: {resent:?}",
     );
     task.abort();
+}
+
+/// **A page close dropped on a full queue arrives once the queue drains, with
+/// no later page change anywhere** (#1433 review, LOW 2). The task waits for
+/// room, not only for the next selection change: in a quiet session that
+/// change may never come, and a plugin never told its page closed keeps its
+/// page-only work running.
+///
+/// **Falsification:** make the `Full` arm wait on `page_rx.changed()` alone
+/// (the pre-review code: `Err(Full(_)) => {}`) → the close never arrives and
+/// the `timeout` reds.
+#[tokio::test]
+async fn a_page_close_dropped_on_a_full_queue_arrives_with_no_later_page_change() {
+    let (page_tx, page_rx) = watch::channel(in_drawer("stats"));
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(1);
+    let task = tokio::spawn(page_task(page_rx, "stats".to_owned(), out_tx.clone()));
+    assert!(matches!(
+        out_rx.recv().await,
+        Some(HostMsg::PageVisibility { visible: true })
+    ));
+
+    // The plugin is slow: its queue is full when the page closes.
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    page_tx.send_replace(PanelSelections::default());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The plugin catches up. Nothing else on screen changes after this.
+    assert!(matches!(out_rx.recv().await, Some(HostMsg::Ping { seq: 1 })));
+    let close = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("the dropped close must still reach the plugin");
+    assert!(
+        matches!(close, Some(HostMsg::PageVisibility { visible: false })),
+        "{close:?}",
+    );
+    task.abort();
+}
+
+/// **A page change while the queue is still full is not lost, and the task
+/// lives on.** The other way out of the `Full` wait: the selections move before
+/// the queue drains. The task goes round, meets the full queue again with the
+/// newer answer, and sends that one once there is room — the newest answer,
+/// not the seed it could not send. A later edge still arrives.
+///
+/// **Falsification:** end the task when the selections move during the wait
+/// (`moved = page_rx.changed() => return`) → no frame arrives and the first
+/// `timeout` reds; drop the `continue` after the wait → the page's `true` is
+/// never re-read and the first assertion reds.
+#[tokio::test]
+async fn a_page_change_while_the_queue_is_full_sends_the_newest_answer() {
+    let (page_tx, page_rx) = watch::channel(PanelSelections::default());
+    let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(1);
+    out_tx
+        .try_send(HostMsg::Ping { seq: 1 })
+        .expect("the one slot is free");
+    let task = tokio::spawn(page_task(page_rx, "stats".to_owned(), out_tx));
+    // The seed (`false`) meets the full queue.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // The page opens while the queue is still full.
+    page_tx.send_replace(in_drawer("stats"));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(matches!(out_rx.recv().await, Some(HostMsg::Ping { seq: 1 })));
+    let first = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("a frame once the queue drains");
+    assert!(
+        matches!(first, Some(HostMsg::PageVisibility { visible: true })),
+        "the newest answer, not the dropped seed: {first:?}",
+    );
+
+    page_tx.send_replace(PanelSelections::default());
+    let closed = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("the task is still alive for the next edge");
+    assert!(
+        matches!(closed, Some(HostMsg::PageVisibility { visible: false })),
+        "{closed:?}",
+    );
+    task.abort();
+}
+
+/// **The page task ends with its connection** (#1433 review, LOW 3): once the
+/// plugin hangs up, nothing holds a receiver on the page channel but the
+/// listener's own, which goes with the connection's context here.
+///
+/// **Falsification:** replace `page.abort()` in `serve_conn`'s teardown with a
+/// plain `drop(page)` → the task stays parked on `changed()` and the count
+/// never falls.
+#[tokio::test]
+async fn a_page_task_ends_with_its_connection() {
+    let (ctx, page_tx, _clock_tx) = page_ctx();
+    let (mut prd, pwr) = connect_page_plugin(ctx, page_subscriber("stats", Mount::BarRight)).await;
+    expect_page(&mut prd, false, "seed").await;
+    assert!(page_tx.receiver_count() >= 2, "the listener's and the task's");
+
+    drop(pwr);
+    drop(prd);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while page_tx.receiver_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no page task outlives its connection");
 }
 
 /// [`PageEdge`] on its own: the seed is owed whatever the answer, an unchanged

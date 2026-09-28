@@ -35,8 +35,8 @@
 //! # State lives in the plugin (the kit owns no clock)
 //!
 //! Like [`PeakHold`](super::PeakHold), the scope is a small stateful value the
-//! plugin holds in its model and drives at its own cadence: [`advance`] once
-//! per animation tick with the latest samples, [`render`] into the view (or the
+//! plugin holds in its model and drives at its own cadence: [`advance`](Scope::advance) once
+//! per animation tick with the latest samples, [`render`](Scope::render) into the view (or the
 //! [`tick`](Scope::tick) convenience for both at once). The kit owns no clock
 //! (see the `preem` module docs on timing). Because the beam trail is
 //! cross-frame state, the skin is taken at *render* time rather than

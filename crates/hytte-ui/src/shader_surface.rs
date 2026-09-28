@@ -767,8 +767,8 @@ mod imp {
         warned_compile: RefCell<WarnLatch>,
         /// Journal latch for "the **data texture** could not be allocated"
         /// (#977) — a driver refusing the grid the plugin asked for. **Keyed
-        /// by `(width, height, format)`** via [`data_key`] (#1023 item 1),
-        /// the same shape as [`warned_compile`] sixteen lines above — not a
+        /// by `(width, height, format)`** via [`data_key`](super::data_key) (#1023 item 1),
+        /// the same shape as `warned_compile` sixteen lines above — not a
         /// bare `Cell<bool>` for the same reason: a plugin that sends a
         /// driver-refused grid, then a good one, then a **different**
         /// driver-refused grid must get a line for the second refusal too,

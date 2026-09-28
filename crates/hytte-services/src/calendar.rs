@@ -476,7 +476,7 @@ impl Worker {
 /// so the synthesised UIDs [`instance_to_calendar_event`] mints for
 /// UID-less components stay unique across sources.
 ///
-/// Hoisted out of [`Calendar::scan_all`]'s loop to give "the colour is read once
+/// Hoisted out of [`Worker::scan_all`]'s loop to give "the colour is read once
 /// per source per scan and threaded onto *every* event that source yields" a
 /// pure home a test can call: dropping `calendar_color` on the way in fails
 /// `every_event_of_a_source_carries_that_sources_colour`, where inside the loop

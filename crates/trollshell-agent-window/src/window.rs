@@ -594,7 +594,7 @@ impl Window {
     /// **Once only**: a reload on every poll would throw away the scroll
     /// position and any half-typed message on the page, twice a second. That
     /// latch is #1130's M13 and is now pinned by
-    /// [`gtk_tests::the_page_is_built_once_and_not_on_every_poll`].
+    /// `gtk_tests::the_page_is_built_once_and_not_on_every_poll`.
     ///
     /// Since #1246 the latch is two things, because mounting the page is two
     /// steps with a worker thread between them: [`Window::probe`] holds the

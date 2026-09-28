@@ -27,8 +27,8 @@ use super::frame::{Frame, Rgba};
 /// [`HostMsg::Accent`](hytte_plugin_proto::HostMsg::Accent) and read at render
 /// time by [`DisplayStyle::palette`]. It is a process-global because a plugin
 /// process hosts exactly one plugin (one `run`), and threading it out-of-band
-/// keeps the widget entry points ([`dot_matrix`](super::dot_matrix),
-/// [`seven_seg`](super::seven_seg), [`TextBox`](super::TextBox)) signature-free
+/// keeps the widget entry points ([`dot_matrix`](super::dot_matrix()),
+/// [`seven_seg`](super::seven_seg()), [`TextBox`](super::TextBox)) signature-free
 /// of an accent argument.
 static ACCENT: AtomicU32 = AtomicU32::new(0);
 
@@ -497,7 +497,7 @@ impl DisplayStyle {
     }
 
     /// The skin's [`AccentPolicy`] applied to one ink against one ground — the
-    /// single place the policy is *executed*, shared by [`palette_with`] and
+    /// single place the policy is *executed*, shared by [`palette_with`](Self::palette_with) and
     /// the public [`admit_ink`](Self::admit_ink) seam so the two cannot drift.
     fn admit_ink_against(self, ink: Rgba, field: Rgba) -> Rgba {
         match self.accent_policy() {
@@ -1042,7 +1042,7 @@ impl Mask {
     /// that *have* a dot grid call this: `dot_matrix.rs` and `marquee.rs`, at
     /// their `composite` call sites. The [`Scope`](super::Scope),
     /// [`Gauge`](super::Gauge), [`FlipBoard`](super::FlipBoard),
-    /// [`SevenSeg`](super::seven_seg), [`LedStrip`](super::LedStrip) and
+    /// [`SevenSeg`](super::seven_seg()), [`LedStrip`](super::LedStrip) and
     /// [`LedMatrix`](super::LedMatrix) composites are untouched and keep
     /// [`CRT`](Self::CRT) as it stands; [`Emission::composite`] already takes an
     /// `Option<Mask>`, so nothing in the kit grew a pitch argument.

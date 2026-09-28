@@ -2373,7 +2373,7 @@ fn seed_without_locked<S: Subsystem>(locked: &BTreeSet<String>) -> Result<String
 /// item is (probed against `toml_edit` 0.25, not read off the grammar): a
 /// plain `key = value` line's is its [`toml_edit::KeyMut::leaf_decor`], a
 /// `[section]` or `[[array]]` header's is that table's own
-/// [`toml_edit::Table::decor`] (the same field [`crate::places::take_header`]
+/// [`toml_edit::Table::decor`] (the same field `places::take_header`
 /// reads for `places.toml`'s narrower shape, which is always an array of
 /// tables and never a plain key), and a document holding nothing but comments
 /// has no top-level item at all, so the block is

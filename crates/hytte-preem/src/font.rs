@@ -5,7 +5,7 @@
 //! rendered whole text lines into a `Pixels` strip with exactly this data —
 //! it *was* the 8bit textbox, just landlocked `pub(crate)` in one plugin.
 //! [`TextBox`](super::TextBox) is the boxed renderer over this module;
-//! [`dot_matrix`](super::dot_matrix) reuses the same bitmaps as dot grids.
+//! [`dot_matrix`](super::dot_matrix()) reuses the same bitmaps as dot grids.
 //! No font files, no deps: every glyph is a `const` bitmap.
 //!
 //! # Grid

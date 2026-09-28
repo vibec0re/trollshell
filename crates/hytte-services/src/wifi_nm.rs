@@ -1533,7 +1533,7 @@ pub(crate) async fn nm_activate_connection(
 /// device and the specific-object (unlike [`nm_activate_connection`], which
 /// targets a real ethernet device). NM resolves the base device itself and, if
 /// the profile is missing stored secrets, asks the registered secret agent
-/// (our [`crate::wifi::nm_agent`]) for them via the prompt overlay.
+/// (our `wifi::nm_agent`) for them via the prompt overlay.
 ///
 /// # Errors
 ///

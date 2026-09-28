@@ -386,7 +386,7 @@ pub fn is_probe_died(widget: &gtk::Widget) -> bool {
 /// (measured, both). So the day a web process can start where these tests run,
 /// watching what this hands out is the only way to observe the real handler
 /// through `WebKit`'s real dispatch; until then it costs one parameter and
-/// nothing else. See [`gtk_tests`]' module doc for why that day is not today.
+/// nothing else. See `gtk_tests`' module doc for why that day is not today.
 fn install_policy(view: &webkit::WebView, embedded: &str, on_refuse: std::rc::Rc<dyn Fn(&str)>) {
     let origin = embedded.to_owned();
     let refuse = std::rc::Rc::clone(&on_refuse);

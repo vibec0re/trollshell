@@ -43,7 +43,7 @@ const DEFAULT_RATE: u32 = 48_000;
 /// at `1.0` (0 dBFS), so [`linear_to_level`] can map bands and
 /// [`AudioSpectrum::peak`] on one shared dBFS scale. Derived analytically (½ per
 /// exponential of the sine × ½ mean Hann gain = ¼) and pinned by
-/// [`tests::full_scale_tone_reads_unity`].
+/// `tests::full_scale_tone_reads_unity`.
 const FULLSCALE_TONE_MAG: f32 = 0.25;
 
 /// Visible dynamic range, in dB: content from `-DB_RANGE` dBFS up to 0 dBFS

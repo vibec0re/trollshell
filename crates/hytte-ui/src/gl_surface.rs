@@ -466,7 +466,7 @@ pub fn gl_abandoned() -> bool {
 /// trollshell's `preem_gl::RENDERER_ENV` set: a string a *document* tells a
 /// human to grep for has two places to keep in step, and only one of them is
 /// compiled. `docs/live-verify.md`'s #1157 item 3 sends a verifier at this line
-/// by hand, so [`tests::the_context_failure_line_does_not_promise_a_cpu_fallback`]
+/// by hand, so `tests::the_context_failure_line_does_not_promise_a_cpu_fallback`
 /// holds it to the property that matters.
 ///
 /// It promised "falling back to the CPU renderer for the rest of this session"
@@ -601,7 +601,7 @@ pub(crate) fn fit_rect(alloc_w: i32, alloc_h: i32, buf_w: u32, buf_h: u32) -> (i
     )
 }
 
-/// The identity previously-built [`imp::Resources`] must match `grid` and
+/// The identity previously-built `imp::Resources` must match `grid` and
 /// `program` to be reused for a render — extracted out of `ensure_resources`
 /// so the reuse decision itself is unit-tested without a GL context, the same
 /// way [`steps_owed`] is.
@@ -778,7 +778,7 @@ impl WarnLatch {
 /// A failed data-strip reallocation, carrying the length it failed at so the
 /// caller can latch its journal line **per length** (#1023 item 3).
 ///
-/// Mirrors `shader_surface::Failure`: [`imp::Resources::upload_data`] used to
+/// Mirrors `shader_surface::Failure`: `imp::Resources::upload_data` used to
 /// swallow this error entirely (`let Ok(texture) = … else { … return; }`,
 /// no log, no latch) — the sibling of `shader_surface`'s own MEDIUM 1
 /// (#1020 review LOW 2). #977 widened what the underlying

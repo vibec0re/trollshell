@@ -203,7 +203,7 @@ impl SourceFailureStreak {
 /// Run `op` against `uid`'s cached client, lazily opening one via `open` if
 /// none is cached yet. Any failure — including `open`'s own — evicts `uid`
 /// from `clients` and runs `on_evict` (a no-op `|| {}` for a caller with
-/// nothing else tied to the client — `tasks.rs`'s live [`CalClientView`]
+/// nothing else tied to the client — `tasks.rs`'s live [`hytte_ecal::CalClientView`]
 /// cache is the one that needs this: it must drop the view alongside the
 /// client, or `Worker::ensure_watch` can never re-subscribe, per #432). No
 /// retry: the safe default for writes, where a timed-out-but-applied call

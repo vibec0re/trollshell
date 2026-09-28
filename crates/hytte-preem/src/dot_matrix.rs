@@ -250,8 +250,8 @@ fn round_div(num: usize, denom: usize) -> u16 {
 /// The pitch is the only knob — the skin comes from the [`DisplayStyle`] and
 /// everything else is the font's metrics — so this is a two-field builder
 /// rather than a config struct. [`dot_matrix`] is the one-call form at the
-/// default pitch, mirroring [`led_strip`](super::led_strip) /
-/// [`seven_seg`](super::seven_seg).
+/// default pitch, mirroring [`led_strip`](super::led_strip()) /
+/// [`seven_seg`](super::seven_seg()).
 ///
 /// ```
 /// use hytte_preem::{DisplayStyle, DotMatrix};
@@ -441,7 +441,7 @@ pub fn dot_cell(dot_px: usize) -> DotCell {
 /// [`DEFAULT_DOT_PX`] pitch.
 ///
 /// The convenience free-function form of [`DotMatrix`], mirroring
-/// [`led_strip`](super::led_strip) / [`seven_seg`](super::seven_seg). Reach for
+/// [`led_strip`](super::led_strip()) / [`seven_seg`](super::seven_seg()). Reach for
 /// the builder when you need a pitch other than the default.
 #[must_use]
 pub fn dot_matrix(text: &str, style: DisplayStyle) -> Frame {

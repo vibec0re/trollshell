@@ -420,6 +420,32 @@ mod tests {
         assert_eq!(walker.names.scans(), 1);
     }
 
+    /// **A service or `System` row is never looked up**, even where an entry
+    /// would match its name: native's `sample_display_name` resolves only an
+    /// `app_id`. `gnome-system-monitor.desktop`'s stem contains `system`, so a
+    /// lookup by name would turn the `System` bucket into `System Monitor`.
+    #[test]
+    fn a_service_or_system_row_keeps_its_name_where_an_entry_would_match() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let env = firefox_entry(root.path());
+        let apps = root.path().join("share/applications");
+        for (file, name) in [
+            ("gnome-system-monitor.desktop", "System Monitor"),
+            ("networkmanager.desktop", "Network"),
+        ] {
+            std::fs::write(
+                apps.join(file),
+                format!("[Desktop Entry]\nType=Application\nName={name}\nExec=firefox\n"),
+            )
+            .expect("write entry");
+        }
+        let mut walker = Walker::over(mixed_walk()).naming_with(Resolver::new(env));
+        assert_eq!(
+            names(&walker.walk().by_mem),
+            ["Firefox", "NetworkManager", "System", "niri-ghost"],
+        );
+    }
+
     /// `Walker::over` names nothing — the seam every other test here and in
     /// `crate::sample` uses, which is why none of them reads the host's
     /// desktop entries.

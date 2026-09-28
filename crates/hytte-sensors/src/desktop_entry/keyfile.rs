@@ -339,6 +339,21 @@ mod tests {
         }
     }
 
+    /// **`Encoding=` binds the start group only** (`gkeyfile.c`'s
+    /// `start_group == current_group` test): a legacy value in a later group
+    /// is an ordinary key, while the same line in the start group fails the
+    /// file (`a_malformed_line_fails_the_whole_file` covers that half).
+    ///
+    /// **Falsified** by checking `Encoding=` in every group (#1431 review,
+    /// NIT 9).
+    #[test]
+    fn encoding_is_checked_in_the_start_group_only() {
+        let file = parse("[Desktop Entry]\nName=X\n[Other]\nEncoding=Legacy-Mixed\n")
+            .expect("a later group's Encoding= is just a key");
+        assert_eq!(file.string("Name"), Ok(Some("X".to_owned())));
+        assert!(parse("[Desktop Entry]\nEncoding=Legacy-Mixed\nName=X\n").is_none());
+    }
+
     /// The lines `GLib` accepts that a naive parser might not.
     #[test]
     fn the_lines_glib_accepts() {

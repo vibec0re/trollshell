@@ -724,3 +724,108 @@ fn from_process_reads_the_real_environment_inner() {
     );
     println!("{CHILD_OK}");
 }
+
+// ── From the #1431 adversarial review (comment 5877189602), verbatim ──────────
+
+/// A symlink loop under `applications/` stops at [`super::MAX_DEPTH`]:
+/// `foot.desktop` once per level, down to the bound and no further. Without
+/// the bound the walk runs until the kernel answers `ELOOP` (40 levels).
+#[test]
+fn a_symlink_loop_is_walked_to_the_bound_and_no_further() {
+    let f = Fixture::new();
+    f.entry("share", "foot.desktop", &app("Foot", "foot"));
+    let apps = f.root.path().join("share/applications");
+    std::os::unix::fs::symlink(".", apps.join("loop")).expect("symlink");
+    let ids: Vec<String> = scan(&f.env(&["share"])).into_iter().map(|e| e.id).collect();
+    assert_eq!(ids.len(), super::MAX_DEPTH + 1, "{ids:?}");
+}
+
+/// `GLib` recurses without a bound, so an entry two levels down is listed
+/// (`a/b/konsole.desktop` is `a-b-konsole.desktop`).
+#[test]
+fn a_nested_subdirectory_is_scanned_too() {
+    let f = Fixture::new();
+    f.entry("share", "a/b/konsole.desktop", &app("Konsole", "konsole"));
+    let ids: Vec<String> = scan(&f.env(&["share"])).into_iter().map(|e| e.id).collect();
+    assert_eq!(ids, ["a-b-konsole.desktop"]);
+}
+
+/// GIO checks `Exec=`'s first word **after** `g_shell_parse_argv` unquotes
+/// it, so `Exec="firefox" %u` is listed; layer 3 still compares
+/// `binary_from_exec`'s raw token, quote and all, so it does not match
+/// `firefox` there, exactly as natively.
+#[test]
+fn a_quoted_exec_is_listed_by_its_unquoted_program() {
+    let f = Fixture::new();
+    f.entry("share", "web.desktop", &app("Web", "\"firefox\" %u"));
+    let env = f.env(&["share"]);
+    let names: Vec<String> = scan(&env).into_iter().map(|e| e.display_name).collect();
+    assert_eq!(names, ["Web"], "the PATH check sees the unquoted program");
+    assert_eq!(lookup(&env, "firefox"), None, "layer 3 sees the quote");
+}
+
+/// An empty `TryExec=` is skipped (`try_exec[0] != '\0'`), and an unreadable
+/// `Path=` drops the entry (`is_invalid_key_error`).
+#[test]
+fn an_empty_tryexec_lists_and_an_unreadable_path_does_not() {
+    let f = Fixture::new();
+    f.entry(
+        "share",
+        "firefox.desktop",
+        &format!("{}TryExec=\n", app("Firefox", "firefox")),
+    );
+    f.entry(
+        "share",
+        "foot.desktop",
+        &format!("{}Path=bad\\q\n", app("Foot", "foot")),
+    );
+    let names: Vec<String> = scan(&f.env(&["share"]))
+        .into_iter()
+        .map(|e| e.display_name)
+        .collect();
+    assert_eq!(names, ["Firefox"]);
+}
+
+/// A FIFO named `*.desktop` masks like any file but is never opened: an
+/// `open(O_RDONLY)` on it blocks until a writer appears, and this scan runs
+/// inside the walker's `spawn_blocking`.
+#[test]
+fn a_fifo_masks_without_being_opened() {
+    let f = Fixture::new();
+    let home = f.root.path().join("home/applications");
+    std::fs::create_dir_all(&home).expect("mkdir");
+    nix::unistd::mkfifo(&home.join("firefox.desktop"), nix::sys::stat::Mode::S_IRWXU)
+        .expect("mkfifo");
+    f.entry("share", "firefox.desktop", &app("Firefox", "firefox"));
+    let env = f.env(&["home", "share"]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(scan(&env).len()));
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(0),
+        "the FIFO masks the system entry and the scan returns",
+    );
+}
+
+/// The cache is keyed by the id as asked: a Flatpak scope's mixed-case
+/// `org.gnome.Nautilus` is answered from the cache on the next walk, not
+/// missed and rescanned every 2 s.
+#[test]
+fn a_mixed_case_id_is_cached_under_its_own_spelling() {
+    let f = Fixture::new();
+    f.entry(
+        "share",
+        "org.gnome.Nautilus.desktop",
+        &app("Files", "nautilus"),
+    );
+    let mut resolver = Resolver::new(f.env(&["share"]));
+    for _ in 0..2 {
+        assert_eq!(
+            resolver
+                .resolve("org.gnome.Nautilus")
+                .map(|m| m.display_name.as_str()),
+            Some("Files"),
+        );
+    }
+    assert_eq!(resolver.scans(), 1);
+}

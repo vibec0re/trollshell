@@ -35,7 +35,7 @@
 //!    which is what retires #1434's crash along with the gio walk that had it.
 //!
 //! What stays in this file is the one thing a GTK widget needs and a GTK-free
-//! resolver cannot hand over: a `gio::Icon`. [`icon_from_desktop_value`] builds
+//! resolver cannot hand over: a `gio::Icon`. `icon_from_desktop_value` builds
 //! it from the resolver's raw `Icon=` value by GIO's own rule, so no
 //! `AppInfo::all()` scan is left here at all.
 //!

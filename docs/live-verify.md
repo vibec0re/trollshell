@@ -2585,12 +2585,17 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       on the same machine: the same core counts, the same hues in the same
       order (core 0 red, then round the colour wheel), the same shape of
       load and the same clock ceiling — give or take the second between the
-      two samplers. Close the plugin's page (a chip re-click or `Esc`) and
-      reopen it: both rows are collapsed again, as native's are on every
-      open. Expected differences: each row is a flat button, so it
+      two samplers. Leave the CPU row expanded, close the plugin's page (a
+      chip re-click or `Esc`) and reopen it: the row is **still expanded**,
+      with the graph carried on through the close, as the native page's row
+      is (each drawer keeps its Stats page, so do the same there to
+      compare). Expected differences: each row is a flat button, so it
       highlights on hover and its value reads in the button's bold weight,
-      as the Disk and Top apps headers already do; and the chevron sits
-      12 px in from the card's edge rather than flush with it. Against an
+      as the Disk and Top apps headers already do; the chevron sits 12 px
+      in from the card's edge rather than flush with it; and with the page
+      open on two monitors at once, a click expands the row on both (the
+      plugin holds one flag, where native keeps one row per drawer; the Disk
+      and Top apps rows already behave this way). Against an
       older shell (generation 8 or below) there are no chevrons and a click
       on the rows does nothing: the page is exactly the #1252 page.
 - [ ] **(#1252)** **An older shell still gets a working page.** Against a

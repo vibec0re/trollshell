@@ -1714,8 +1714,11 @@ fn build_history_cpu_row() -> gtk::Box {
 /// produced by [`build_history_cpu_row`]; the expanded page inlines the former
 /// `build_history_per_core_row` content so both graphs share one row slot.
 ///
-/// Activating the row (clicking) toggles between states. Expanded state is
-/// **not** persisted across drawer open/close — each rebuild starts collapsed.
+/// Activating the row (clicking) toggles between states. The state lives in
+/// the `Stack` itself, so it lasts as long as the page does: each drawer builds
+/// its Stats page once (`modal::ensure_page`) and keeps it, so an expanded row
+/// is **still expanded** after the drawer closes and reopens. Only a rebuild
+/// (`modal::close_all`, on a monitor hot-plug) starts it collapsed again.
 ///
 /// Returns a [`gtk::ListBoxRow`] so it slots into the [`adw::PreferencesGroup`]
 /// boxed-list in source order (same routing fix as [`history_row_wrapper`]).

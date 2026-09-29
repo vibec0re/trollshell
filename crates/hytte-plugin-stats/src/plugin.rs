@@ -121,6 +121,10 @@ pub struct Stats {
     /// card is not changing. Replaces #1295's disk-I/O and VRAM scope rings
     /// and the session-peak denominator the disk ring needed — an auto-scaled
     /// sparkline over the window *is* the native row's windowed max.
+    ///
+    /// Filled by the **bar** instance only (see [`apply`](Self::apply)): it
+    /// is the one that publishes the page, so a sidebar instance keeps it
+    /// empty.
     page: panel::History,
     /// The drawer page's latest Top apps walk (#1419 item 3). Empty while the
     /// page is shut — the walker is parked then, and a reading nobody is
@@ -136,7 +140,8 @@ pub struct Stats {
     /// on an expander's id flips its flag and the next render carries it. All
     /// collapsed by default, like the native rows. No flag gates any
     /// sampling; the two per-core flags decide only whether a per-core graph
-    /// rides the page, and a page close clears them (`page_visible`).
+    /// rides the page, and only while the page is open (`panel`'s
+    /// `page_open`). Every flag outlives a page close, as native's rows do.
     expanded: panel::Expanded,
     /// The preem widgets, held across renders so the shell keeps one renderer
     /// instance per node (and so the raster fallback keeps its animation).
@@ -164,7 +169,15 @@ impl Stats {
 
         // The drawer page's lines (#1252): one point per reading this tick
         // actually has, none for one it withholds — see `panel::History`.
-        self.page.push(&snapshot);
+        //
+        // Only on the instance that publishes the page (`view` attaches it for
+        // `Family::Bar` alone), which is decided by the effective mount, as
+        // `settings_from` resolves it. A sidebar card draws none of these
+        // lines, and since #1419 item 2 they include two windows per core
+        // (#1442 review, NIT).
+        if self.family == Family::Bar {
+            self.page.push(&snapshot);
+        }
 
         // A withheld reading is not a sample: a cold tick (or one whose
         // `/proc/stat` read failed) must not push a fake rest value onto the
@@ -375,7 +388,7 @@ impl Plugin for Stats {
             // like the expanders above, and page-local, so no effect. The
             // graph itself rides the page only while the page is open too
             // (`panel`'s `page_open`), so a click that lands after a close
-            // costs no traffic; it shows on the next open.
+            // costs no traffic; it shows when the page opens again.
             Input::Event {
                 node,
                 kind: EventKind::Click,
@@ -432,16 +445,15 @@ impl Plugin for Stats {
     /// taken before the close — on purpose, when the reopen is quick: see
     /// `crate::top_apps`, *A quick close and reopen keeps its baseline*.)
     ///
-    /// A close also folds the CPU and Clock history rows back to their
-    /// overall lines (#1419 item 2), as native builds them collapsed on every
-    /// open — and `page_open` is the other half of that: the view draws a
-    /// per-core graph only on an open page, so none rides the wire between
-    /// the close and the next open whatever the flags say.
+    /// A close leaves the CPU and Clock history rows as they were (#1419
+    /// item 2): native builds its Stats page once per drawer and keeps it, so
+    /// an expanded row is still expanded on the next open (#1442 review,
+    /// MEDIUM 1). `page_open` is what keeps its series off the wire meanwhile:
+    /// the view draws a per-core graph only on an open page.
     fn page_visible(&mut self, visible: bool) -> Vec<Effect> {
         self.page_open = visible;
         if !visible {
             self.top_apps = TopApps::default();
-            self.expanded.collapse_per_core();
         }
         // A dropped receiver means the session is tearing down, which is fine
         // to ignore — the same tolerance `update` has.
@@ -481,9 +493,7 @@ mod tests {
     use super::{DEFAULT_MOUNT, PLUGIN_ID, Settings, Stats, settings_from};
     use crate::card::HISTORY_COLS;
     use crate::config::{self, Card, Family};
-    use crate::panel::{
-        CLOCK_CORES_TOGGLE_ID, CPU_CORES_TOGGLE_ID, DISKS_EXPANDER_ID, HISTORY_LEN,
-    };
+    use crate::panel::{CLOCK_CORES_TOGGLE_ID, CPU_CORES_TOGGLE_ID, HISTORY_LEN};
     use crate::sample::{Cmd, Gpu, Msg, Snapshot};
     use crate::top_apps::TopApps;
     use hytte_plugin::display::testing::with_negotiated_vocab;
@@ -1239,40 +1249,65 @@ mod tests {
         assert_eq!(drain(&mut rx), Vec::new(), "a toggle gates no sampling");
     }
 
-    /// **Closing the page collapses both rows, on the close** — native builds
-    /// them collapsed on every open — **and only them**: the Disk card keeps
-    /// its flag across a close, as it always has. The reopened page shows the
-    /// overall lines until a row is clicked again.
-    ///
-    /// **Falsified** by dropping `collapse_per_core` from `page_visible` (the
-    /// flags survive the close and the reopened page draws both graphs), or
-    /// by `collapse_per_core` clearing the Disk card's flag too.
+    /// **An expanded row survives a close and reopen, as native's does, but
+    /// rides no wire while the page is shut.** Native builds its Stats page
+    /// once per drawer (`modal::ensure_page`) and keeps it across closes, so
+    /// its `Stack` stays on `percore`; only `page_open` has to keep the series
+    /// off the wire.
     #[test]
-    fn closing_the_page_collapses_both_per_core_views() {
+    fn an_expanded_row_survives_a_close_but_rides_no_wire_while_shut() {
         let (mut model, _rx) = fresh_bar(Card::bar_default());
         let _ = Plugin::page_visible(&mut model, true);
         let _ = model.update(clocked(0.5));
-        for id in [
-            CPU_CORES_TOGGLE_ID,
-            CLOCK_CORES_TOGGLE_ID,
-            DISKS_EXPANDER_ID,
-        ] {
-            let _ = model.update(Input::event(id, EventKind::Click));
-        }
-        assert_eq!(page_graphs(&model), vec![cpu_graph(1), clock_graph(1)]);
+        let _ = model.update(Input::event(CPU_CORES_TOGGLE_ID, EventKind::Click));
+        assert_eq!(page_graphs(&model), vec![cpu_graph(1)]);
 
         let _ = Plugin::page_visible(&mut model, false);
-        assert!(
-            !model.expanded.cpu_cores && !model.expanded.clock_cores,
-            "collapsed on the close itself, not on the next open",
-        );
-        let _ = Plugin::page_visible(&mut model, true);
+        let _ = model.update(clocked(0.5));
         assert_eq!(
             page_graphs(&model),
             Vec::new(),
-            "the reopened page starts collapsed"
+            "a shut page carries no series"
         );
-        assert!(disks_open(&model), "…and the Disk card keeps its flag");
+
+        let _ = Plugin::page_visible(&mut model, true);
+        assert_eq!(
+            page_graphs(&model),
+            vec![cpu_graph(2)],
+            "the reopened row is still expanded, as native's Stack is",
+        );
+    }
+
+    /// **Only the instance that publishes the page keeps its history** — the
+    /// per-core windows included (#1442 review, NIT). The family is the
+    /// effective mount's, as `settings_from` resolves it, and it is the same
+    /// test `view` makes before attaching the page: a sidebar card draws none
+    /// of these lines, so it keeps none of them, while a bar instance fed the
+    /// same samples keeps them all.
+    ///
+    /// **Falsified** by pushing into the page history on every family.
+    #[test]
+    fn only_the_bar_instance_keeps_the_pages_history() {
+        let mut side = fresh(Card::sidebar_default());
+        let (mut bar, _rx) = fresh_bar(Card::bar_default());
+        for _ in 0..3 {
+            let _ = side.update(clocked(0.5));
+            let _ = bar.update(clocked(0.5));
+        }
+        assert_eq!(
+            side.page,
+            crate::panel::History::default(),
+            "a sidebar card keeps no page lines and no per-core windows",
+        );
+        assert_ne!(
+            bar.page,
+            crate::panel::History::default(),
+            "the bar instance keeps them",
+        );
+        assert!(
+            side.view().panel.is_none(),
+            "…and publishes no page to draw them on"
+        );
     }
 
     /// **A graph rides the page only while the page is open.** A row clicked

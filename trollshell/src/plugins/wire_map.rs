@@ -1341,7 +1341,10 @@ mod tests {
         // beside 191 empty ones keep 1 008 each — the largest common ceiling
         // that fits — not the 256 a division by the series count gives.
         let mut sparse = numbered(65, MAX_SPARKLINE_SAMPLES);
-        sparse.extend(std::iter::repeat_n(Vec::new(), MAX_MULTI_SPARKLINE_SERIES - 65));
+        sparse.extend(std::iter::repeat_n(
+            Vec::new(),
+            MAX_MULTI_SPARKLINE_SERIES - 65,
+        ));
         let (series, _) = mapped_series(to_ui_node(
             &scope,
             Grants::none(),

@@ -403,6 +403,11 @@ impl ControlIface {
     ///   item 1b): nothing was relaunched, a unit the launcher started was
     ///   stopped, and the values apply when the plugin is next started. A
     ///   switch flipped off while this call waited is what reaches it.
+    /// - `"still-stopping"` — declared, running and switched on, but its unit,
+    ///   which the launcher started, did not stop within 12 s (#1417 item 1):
+    ///   nothing was relaunched and nothing started the old unit again, so the
+    ///   plugin is down once its stuck process exits, and the values apply
+    ///   when it is next started.
     ///
     /// The tab sends this after **every** Save, whatever its own last poll
     /// said: the answer is decided here, after any restart already under way,

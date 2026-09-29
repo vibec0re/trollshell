@@ -2,8 +2,13 @@
 //! supervisor that owns reconnect with bounded exponential backoff.
 //!
 //! All five capability primitives sit on top of `SharedConnection`. No
-//! other code in the workspace should call `zbus::Connection::session()`
-//! or `system()`.
+//! other code in the workspace should call `zbus::Connection::session()` /
+//! `system()`, or `zbus::connection::Builder::session()` / `system()`
+//! (`clippy.toml` bans all four; `open_connection` is the one allowed site).
+//!
+//! Every connection this module builds is built through `build_pooled`, which
+//! stages the [`Ready`] placeholder interface so zbus's object server is
+//! dispatching before the first inbound message can be read (#1423).
 
 // The "Task N" cross-references this file carried until #1173 pointed at the
 // numbered steps of the build plan that produced the crate
@@ -18,12 +23,14 @@
 use crate::BusError;
 use crate::backoff::{FailureStreak, RetryStep};
 use crate::error::is_transient_zbus_error;
+use crate::ready::{READY_PATH, Ready};
 use futures_signals::signal::Mutable;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 use zbus::Connection;
+use zbus::connection::Builder;
 
 /// Which D-Bus to connect to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -93,7 +100,7 @@ static SUPERVISOR_NOTIFY: LazyLock<SupervisorNotifyTable> =
     });
 
 /// Test-only side-table: pre-injected connections the supervisor should use
-/// instead of calling `Connection::session/system`. Keyed by the same Arc
+/// instead of calling `open_connection`. Keyed by the same Arc
 /// pointer identity as `SUPERVISOR_NOTIFY`. The value is consumed on first use.
 struct InjectedConnTable {
     inner: StdMutex<HashMap<usize, Connection>>,
@@ -291,50 +298,75 @@ impl SharedConnection {
 #[doc(hidden)]
 pub mod test_support {
     use super::{
-        Arc, AtomicU64, BusKind, Connection, INJECTED_CONN, Inner, Mutable, Mutex, Ordering,
-        SUPERVISOR_NOTIFY,
+        Arc, AtomicU64, Builder, BusKind, Connection, INJECTED_CONN, Inner, Mutable, Mutex,
+        Ordering, SUPERVISOR_NOTIFY,
     };
 
     pub use super::SharedConnection;
+
+    /// Test-only: open a connection to the bus at `address` the way the
+    /// supervisor opens a production one — through `build_pooled`, the same
+    /// function `open_connection` calls — so it serves
+    /// [`READY_INTERFACE`](crate::READY_INTERFACE) at
+    /// [`READY_PATH`](crate::READY_PATH) and its object server is dispatching
+    /// before anything can be read from its socket (#1423).
+    ///
+    /// This is how a test gets a connection to hand to
+    /// [`SharedConnection::for_test_session`] and its siblings. Those accept
+    /// any `Connection`, but only one built here behaves like a production
+    /// one: a connection built with a bare `Builder::address(..).build()` has
+    /// no object server until the first `export`/`own` mount, and a method
+    /// call that reaches it before then is dropped with no reply. That is
+    /// harmless for a test that never receives a call (and is what the
+    /// `for_test_*` constructors themselves no longer paper over — they used
+    /// to start the dispatch task, in the function #1423 removed).
+    ///
+    /// # Errors
+    ///
+    /// Whatever zbus returns for an address it cannot parse or a bus it
+    /// cannot reach.
+    pub async fn connect(address: &str) -> zbus::Result<Connection> {
+        super::build_pooled(Builder::address(address)?).await
+    }
+
+    /// Test-only: the process-wide pooled connection for `kind` — the
+    /// singleton every production builder (`export_object`, `own_name`,
+    /// `call`, …) resolves to, started on first use exactly as those start it,
+    /// so its connection comes from the supervisor's real connect path.
+    ///
+    /// That path reads `DBUS_SESSION_BUS_ADDRESS` / `DBUS_SYSTEM_BUS_ADDRESS`,
+    /// which no test in this crate can point at a test bus for itself
+    /// (`std::env::set_var` is `unsafe`, forbidden workspace-wide). So this is
+    /// only for a process started with both set — `tests/ready.rs` re-execs its
+    /// own binary that way. Anywhere else it would reach the host's buses.
+    #[must_use]
+    pub fn pooled(kind: BusKind) -> SharedConnection {
+        super::for_kind(kind).clone()
+    }
 
     impl SharedConnection {
         /// Construct a `SharedConnection` wrapping an existing test
         /// `Connection`. Bypasses the supervisor — for unit tests of
         /// individual primitives that want full control over reconnect.
         ///
-        /// # Panics
-        ///
-        /// Must be called from inside a tokio runtime context: it starts zbus's
-        /// object-server dispatch task (see `begin_dispatching`, #1011), and
-        /// with zbus's `tokio` feature — the one this workspace pins — that is
-        /// `tokio::task::spawn`, which panics outside a runtime. Every caller is
-        /// an `async fn` test body, so this is a note rather than a hazard;
-        /// neither `clippy::missing_panics_doc` (which cannot see a transitive
-        /// panic, and is `allow` at the workspace root anyway) nor the
-        /// `rustdoc` check would ever have caught its absence.
+        /// Build `conn` with [`connect`] to get a production-shaped connection
+        /// (see there for what one built any other way lacks).
         #[must_use]
         pub fn for_test_session(conn: Connection) -> Self {
             Self::for_test(BusKind::Session, conn)
         }
 
         /// Like `for_test_session` but for the system bus.
-        ///
-        /// # Panics
-        ///
-        /// Same runtime-context requirement as
-        /// [`for_test_session`](Self::for_test_session).
         #[must_use]
         pub fn for_test_system(conn: Connection) -> Self {
             Self::for_test(BusKind::System, conn)
         }
 
         fn for_test(kind: BusKind, conn: Connection) -> Self {
-            // Same contract as the supervisor's install path: a
-            // `SharedConnection` answers method calls from the moment it
-            // exists, not from the first `export`/`own` mount (#1011). Must be
-            // called from inside a tokio runtime — every caller is an
-            // `async fn` test body, as the supervisor's call site is.
-            super::begin_dispatching(&conn);
+            // No dispatch-task kick here any more (#1423): whether a
+            // connection answers method calls from the moment it exists is
+            // decided where it is *built* — `build_pooled`, reached from tests
+            // through `connect` — not where it is installed.
             Self {
                 kind,
                 inner: Arc::new(Mutex::new(Inner {
@@ -350,15 +382,8 @@ pub mod test_support {
         /// on a successful reconnect (bump generation + epoch). Lets a test
         /// deterministically reproduce "a fresh connection was installed while
         /// an old op was still in flight" without racing a real supervisor.
-        ///
-        /// # Panics
-        ///
-        /// Same runtime-context requirement as
-        /// [`for_test_session`](Self::for_test_session) — it reaches the same
-        /// `begin_dispatching`.
         #[doc(hidden)]
         pub async fn install_fresh_connection_for_test(&self, conn: Connection) {
-            super::begin_dispatching(&conn);
             let mut g = self.inner.lock().await;
             g.conn = Some(conn);
             g.generation += 1;
@@ -422,11 +447,12 @@ pub mod test_support {
         /// `dbus-daemon` and then arms a replacement requires the *primitive*
         /// to notice the dead connection, clear it through `with_conn`, and
         /// wake the supervisor on its own; the supervisor then finds this
-        /// injection where it would otherwise call
-        /// `Connection::session`/`system` (which reads
-        /// `$DBUS_SESSION_BUS_ADDRESS`, a variable no test in this crate can
-        /// safely repoint — mutating it needs `unsafe`, forbidden
-        /// workspace-wide).
+        /// injection where it would otherwise call `open_connection` (which
+        /// reads `$DBUS_SESSION_BUS_ADDRESS` / `$DBUS_SYSTEM_BUS_ADDRESS`,
+        /// variables no test in this crate can safely repoint in its own
+        /// process — mutating them needs `unsafe`, forbidden workspace-wide;
+        /// `tests/ready.rs` reaches `open_connection` from a re-exec'd child
+        /// instead).
         #[doc(hidden)]
         pub fn arm_reconnect_for_test(&self, replacement: Connection) {
             INJECTED_CONN.inject(self, replacement);
@@ -444,6 +470,23 @@ pub mod test_support {
             // Release the lock explicitly so a waiting supervisor (if the
             // caller goes on to wake one) can acquire it immediately.
             drop(guard);
+        }
+
+        /// Test-only: drop the cached connection and wake the supervisor with
+        /// **nothing** armed, so it opens the replacement itself — on a
+        /// [`pooled`] singleton, through `open_connection`, the same call the
+        /// first connect made. That is the reconnect path #1423 had to cover.
+        ///
+        /// [`Self::simulate_disconnect_for_test`] is the other way to drive a
+        /// reconnect, and it deliberately skips that path: it arms a
+        /// test-built replacement, which the supervisor installs instead of
+        /// connecting.
+        #[doc(hidden)]
+        pub async fn reconnect_for_test(&self) {
+            self.drop_connection_for_test().await;
+            if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
+                notify.notify_one();
+            }
         }
     }
 }
@@ -612,11 +655,13 @@ async fn supervisor_loop(
 
             match result {
                 Ok(conn) => {
-                    // Before the connection is visible to anything: make it able
-                    // to answer an inbound method call. See `begin_dispatching`
-                    // — until zbus's dispatch task is up, a call addressed to us
-                    // is dropped with no reply at all (#1011).
-                    begin_dispatching(&conn);
+                    // Already able to answer an inbound method call: in
+                    // production this came from `open_connection`, i.e.
+                    // `build_pooled`, whose barrier means zbus was dispatching
+                    // before it read a single message (#1423). Nothing to
+                    // start here. (A test's injected replacement is whatever
+                    // the test built; this crate's suite builds them with
+                    // `test_support::connect`, the same `build_pooled`.)
                     let mut g = inner.lock().await;
                     g.conn = Some(conn);
                     g.generation += 1;
@@ -640,127 +685,127 @@ async fn supervisor_loop(
     }
 }
 
-// Production-allowed: this IS the single centralized site that opens D-Bus
-// connections. All other crates must use hytte::bus::* primitives instead.
-#[allow(clippy::disallowed_methods)]
+/// Open the pooled connection for `kind`.
+///
+/// This is the single site that opens a production D-Bus connection — for the
+/// first connect and for every reconnect alike, since `supervisor_loop` has no
+/// other. All other crates must use the `hytte::bus::*` primitives instead:
+/// `clippy.toml` bans `Connection::session`/`system` and, since #1423, the
+/// `Builder::session`/`system` this calls, so the `allow` below marks the one
+/// place either may appear. It no longer calls `Connection::session`/`system`:
+/// those are `Builder::session()?.build()` and `Builder::system()?.build()`,
+/// which is exactly the shape that cannot stage an interface, so it takes the
+/// builders and hands them to [`build_pooled`] — and builds and mounts nothing
+/// itself, which `tests::open_connection_builds_only_through_build_pooled`
+/// pins.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one production site that opens a pooled connection; the builder goes straight into build_pooled (#1423)"
+)]
 async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
-    match kind {
-        BusKind::Session => Connection::session().await,
-        BusKind::System => Connection::system().await,
-    }
+    let builder = match kind {
+        BusKind::Session => Builder::session()?,
+        BusKind::System => Builder::system()?,
+    };
+    build_pooled(builder).await
 }
 
-/// Start zbus's object-server dispatch task on `conn` **before the connection is
-/// published**, so a `SharedConnection` is able to answer an incoming method
-/// call from the moment anything can reach it.
+/// Build a pooled connection from `builder`, with the [`Ready`] placeholder
+/// staged on it, so zbus's object server is **dispatching before anything is
+/// read from the socket** (#1423).
 ///
-/// ## Why this is not merely tidy (#1011)
+/// The one place a `hytte-bus` connection is built: [`open_connection`] (the
+/// supervisor's connect path, first connect and reconnect alike) and
+/// `test_support::connect` both come through here.
 ///
-/// zbus creates the object server *lazily*: `Connection::object_server()` is
-/// what spawns the dispatch task, and that task is the only consumer of inbound
-/// `MethodCall` messages — it subscribes by adding a
-/// `msg_type=MethodCall, destination=<our unique name>` match rule to the
-/// connection's internal routing table. Until that rule is registered, an
-/// arriving method call matches **no** receiver, and zbus's socket reader drops
-/// it: there is no fallback arm anywhere in `zbus::Connection` that synthesises
-/// an `UnknownMethod`/`UnknownObject` error for an unhandled call. The caller is
-/// simply never answered — and since a zbus method call carries no reply timeout
-/// unless the connection was built with one (`method_timeout` defaults to
-/// `None`), "never answered" means the peer's `Proxy::call` awaits **forever**.
-/// zbus says as much itself, warning at `request_name` time that "method calls
-/// arriving before interfaces are registered may be lost".
+/// All line numbers below are zbus 5.14.0, the version this workspace pins.
 ///
-/// Before this call existed, the first thing to touch `object_server()` on a
-/// hytte connection was whichever [`export`](crate::export) or
-/// [`own`](crate::own) supervisor happened to mount first — a task on the hytte
-/// runtime, scheduled whenever the runtime got round to it. Everything
-/// addressed to our unique name before that moment was dropped with no reply.
-/// That is what #1011 was: `tests/export.rs` captured the unique name, called
-/// `Hello` on it, and lost the race against the export supervisor's first
-/// mount ~5 % of the time under CI load; the call never returned, the test
-/// never finished, and `nix flake check` went silent for 51 minutes. The same
-/// trap is reachable in production — `control.rs`'s `Control` endpoint and
-/// `wifi/nm_agent.rs`'s secret agent are both objects a peer calls on a name it
-/// learned from us, and a peer with no reply timeout would hang rather than
-/// error.
+/// ## The window this closes
 ///
-/// ## What it closes, and what it does not
+/// zbus creates its object server lazily, and the object server's dispatch task
+/// is the only consumer of inbound `MethodCall` messages: it subscribes by adding
+/// a `msg_type=MethodCall, destination=<our unique name>` rule to the
+/// connection's routing table (`connection/mod.rs:960-991`). The socket reader
+/// hands each message to whichever rules exist at that instant and never replays
+/// it (`connection/socket_reader.rs:48-97`), and no arm anywhere answers an
+/// unclaimed call with an error. So a call read before that rule exists is
+/// **dropped with no reply**, and its caller — a zbus call has no reply timeout
+/// unless its connection was built with one — waits forever. That is what #1011
+/// was.
 ///
-/// Registering that rule is **local** — it is not a broker round-trip.
-/// `Connection::add_match` only issues `org.freedesktop.DBus.AddMatch` when
-/// `self.is_bus() && msg_type == Type::Signal`, and the object server's rule is
-/// a `MethodCall` one, so it costs two mutex acquisitions and nothing on the
-/// wire. (An earlier draft of this comment said otherwise; #1011's PR corrected
-/// it against zbus 5.14's source.) What is left is therefore purely a
-/// *scheduling* window — the spawned task has to be polled once — and it does
-/// not *close*: zbus exposes the `started_event` that would prove readiness only
-/// through `connection::Builder`, and only when the connection is built with at
-/// least one already-served interface (`Builder::build_` starts the socket
-/// reader *after* awaiting it). Serving a placeholder interface on both shell
-/// buses to buy that is a bus-surface decision, not a bug fix.
+/// `Builder::build_` (`connection/builder.rs:447-498`) has a barrier against
+/// exactly this, and applies it only when the builder has at least one
+/// interface staged (`Builder::serve_at`, `:345`): it registers the interfaces,
+/// spawns the dispatch task with a `started_event`, awaits that event — which
+/// the task notifies on the line after its `add_match` returns
+/// (`connection/mod.rs:991`) — and only then starts the socket reader
+/// (`builder.rs:464-485`). With nothing staged it skips all of that and starts
+/// the reader at once. Staging [`Ready`] is what buys the barrier: by the time
+/// anything can be read from this connection, every inbound method call has a
+/// consumer. The wait cannot hang: `add_match`'s only early return is "the
+/// socket reader has errored out", read off a sender map `Connection::new`
+/// seeds before any of this (`connection/mod.rs:1053-1059`, `:1167-1181`).
 ///
-/// How wide that window is depends on **which thread calls this**, because
-/// zbus's `tokio` feature makes `Executor::spawn` a plain `tokio::task::spawn`:
-/// called from a runtime worker, the task lands in that worker's LIFO slot and
-/// is polled next; called from outside one — such as the thread a
-/// `#[tokio::test]` body runs `block_on` on — it lands on the global injection
-/// queue, which CPU-starved workers only drain every `global_queue_interval`
-/// ticks. Measured over `tests/export.rs`, 12 concurrent 4-core shards each
-/// contending with 8 busy loops, counting runs whose first `Hello` got no reply
-/// at all:
+/// Three things make that enough for everything mounted *later*, not just for
+/// [`Ready`]:
 ///
-/// | where `begin_dispatching` runs | first `Hello` lost |
-/// |---|---|
-/// | nowhere (the tree before this) | 35 / 900 (3.9 %) |
-/// | `supervisor_loop` — a worker; **the production path** | 9 / 600 (1.5 %) |
-/// | `for_test` — `block_on`'s thread; the test path | 94 / 900 (10.4 %) |
+/// - The rule is per connection, not per path. It matches every `MethodCall`
+///   addressed to us — a well-known destination included
+///   (`match_rule/mod.rs:207-208`) — and `ObjectServer::dispatch_call` looks the
+///   path up only when the message is dispatched (`object_server/mod.rs:343-395`).
+///   So an [`export_object`](crate::export_object) or
+///   [`own_name`](crate::own_name) mounted after the build is served from its
+///   first message.
+/// - A call that lands *before* that mount is not dropped either. It is
+///   dispatched, finds no object, and is answered with
+///   `org.freedesktop.DBus.Error.UnknownObject` (`object_server/mod.rs:384`,
+///   `:440-449`): its caller hears "not there yet", which it can retry, rather
+///   than nothing.
+/// - The unique name is known before the rule is built, because zbus pipelines
+///   `Hello` into the handshake (`connection/handshake/client.rs:203-206`). So
+///   the rule's `destination` is set, and the earliest moment a peer can learn
+///   that name — the broker's `NameOwnerChanged` — is already behind the
+///   barrier.
 ///
-/// So on the path that ships, this is a 2.6x improvement; in the test
-/// constructor it is a regression that the bounded retry absorbs (across 2,400
-/// instrumented runs no run ever needed more than one retry). **Neither number
-/// is what stops #1011 recurring — the bound in the tests is**: with these
-/// bounds and without this function, `tests/export.rs` hung 0 of 300 runs under
-/// that same load, where the unbounded tree hung 10 of 300.
+/// ## What it replaced
 ///
-/// What this function buys that no bound can is the property
-/// `tests/connection_basic.rs`'s
-/// `shared_connection_answers_method_calls_before_anything_is_exported`
-/// asserts — that a `SharedConnection` with nothing exported on it answers a
-/// method call at all — which is deterministically red without it (300 of 300
-/// runs), because there no amount of retrying can help: the object server is
-/// never created, so every call is dropped forever.
+/// From #1011 until #1423 this was `begin_dispatching`: a bare
+/// `conn.object_server()` after `build()`, in `supervisor_loop` and in both
+/// test-support installers. That starts the same task but cannot wait for it,
+/// so the reader was already running while the task waited to be polled. It
+/// narrowed the window — #1392 measured the first call lost 35 / 900 times with
+/// no kick and 9 / 600 with it on the production path — but did not close it,
+/// and on a test body's `block_on` thread, where the task lands on tokio's
+/// global injection queue, it measured worse (94 / 900). With the barrier the
+/// kick is redundant everywhere, so it is gone rather than kept as a second
+/// mechanism nobody could tell was still load-bearing. `tests/ready.rs`
+/// provokes the old window on purpose, and #1423's PR has its campaign against
+/// both trees.
+///
+/// ## Why a placeholder rather than a real interface
+///
+/// A pooled connection is shared, and what is exported on it is decided later
+/// by its callers, so there is no real interface to stage. zbus's own `Peer`
+/// would do, but it is `pub(crate)` (`fdo/peer.rs:8`). The cost is one object
+/// on the bus, [`READY_INTERFACE`](crate::READY_INTERFACE) at
+/// [`READY_PATH`], with no methods and no properties. It
+/// claims no name, so the system bus needs no policy for it.
 ///
 /// ## See also
 ///
-/// `hytte-services`' `wifi/nm_agent.rs` documents this same zbus mechanism
-/// against the same 5.14.0 line numbers, from #714/#743/#756, where it showed
-/// up as a 30-second hang on a `get_secrets` path containing no `await` at
-/// all. That module's `mount_and_proxy` has the fix this function cannot take:
-/// `Builder::serve_at` before `build()`, where `build_` creates a
-/// `started_event`, awaits it, and only *then* starts the socket reader — so
-/// there is no window for a message to arrive into, rather than a narrowed
-/// one. It is unavailable here for one reason: a pooled `SharedConnection` is
-/// not built per interface, and giving both shell buses a placeholder
-/// interface to buy the barrier is a bus-surface decision (see the section
-/// above). `tests/common/mod.rs`'s `CALL_BUDGET` is the third copy of this
-/// mechanism in the tree; all three now point at each other, because three
-/// uncoordinated transcriptions of one upstream behaviour is how drift starts.
+/// `hytte-services`' `wifi/nm_agent.rs` (`mount_and_proxy`, #756) stages its
+/// agent through this same barrier in its tests, which is where the mechanism
+/// was first worked out. `tests/common/mod.rs`'s `CALL_BUDGET` is why a
+/// regression here would fail this crate's suite by name instead of hanging it.
+/// All three point at each other; keep them in step if zbus's internals move.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Must be called from inside a tokio runtime: with zbus's `tokio` feature its
-/// executor is `tokio::task::spawn`, which panics outside a runtime context.
-/// Every call site is a task on the hytte runtime or an `async fn` test body.
-///
-/// Safe to call on every connection: zbus's `object_server()` is idempotent
-/// (`OnceLock`), and hytte-bus never replies to a method call by hand — every
-/// exported interface in the workspace goes through `#[zbus::interface]` plus
-/// [`export_object`](crate::export_object)/[`own_name`](crate::own_name), which
-/// is the object server's own path.
-fn begin_dispatching(conn: &Connection) {
-    // The returned `&ObjectServer` is deliberately unused: constructing it is
-    // the whole point, because that is what spawns the dispatch task.
-    let _ = conn.object_server();
+/// Whatever zbus returns for a bus it cannot reach or a handshake that fails.
+/// Staging [`Ready`] itself cannot fail: [`READY_PATH`] is a valid object path
+/// (`ready.rs`'s tests pin it).
+async fn build_pooled(builder: Builder<'_>) -> Result<Connection, zbus::Error> {
+    builder.serve_at(READY_PATH, Ready)?.build().await
 }
 
 #[cfg(test)]
@@ -879,6 +924,36 @@ mod tests {
             assert!(
                 closes_a_connection_loss(epoch),
                 "epoch {epoch} was reached through a cleared connection, which was reported lost"
+            );
+        }
+    }
+
+    /// `open_connection` must get its connection from `build_pooled` and build
+    /// nothing itself (#1423).
+    ///
+    /// Nothing behavioural can see this. `tests/ready.rs`'s re-exec test proves
+    /// the production connections *serve* `Ready`, but a `Ready` mounted with
+    /// `object_server().at(..)` after a plain `build()` is served too, with no
+    /// barrier; and the race test reaches `build_pooled` only through
+    /// `test_support::connect`. So a production-only bypass that still mounts
+    /// the placeholder leaves the whole suite green. This scan goes red on it.
+    #[test]
+    fn open_connection_builds_only_through_build_pooled() {
+        let src = include_str!("connection.rs");
+        let start = src
+            .find("async fn open_connection(")
+            .expect("open_connection is defined in connection.rs");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("open_connection's body closes")];
+        assert!(
+            body.contains("build_pooled(builder).await"),
+            "open_connection no longer hands its builder to build_pooled (#1423):\n{body}"
+        );
+        for bypass in [".build()", "object_server", "Connection::"] {
+            assert!(
+                !body.contains(bypass),
+                "open_connection builds or mounts on its own (`{bypass}`), so the \
+                 production path can skip build_pooled's Ready barrier (#1423):\n{body}"
             );
         }
     }

@@ -5,7 +5,6 @@ mod common;
 use common::ephemeral_bus;
 use hytte_bus::test_support::SharedConnection;
 use hytte_bus::{BusError, RetryPolicy, call_with};
-use zbus::connection::Builder;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn calls_dbus_list_names() {
@@ -56,11 +55,7 @@ async fn retry_once_recovers_from_transient_disconnect() {
 
     // Inject a replacement connection, then simulate a disconnect so the
     // supervisor immediately uses it on reconnect.
-    let replacement = Builder::address(guard.address.as_str())
-        .expect("parse ephemeral bus address")
-        .build()
-        .await
-        .expect("replacement conn");
+    let replacement = common::connect(guard.address.as_str()).await;
     shared.simulate_disconnect_for_test(replacement).await;
 
     let names: Result<Vec<String>, BusError> = call_with(&shared, "org.freedesktop.DBus")

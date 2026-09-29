@@ -45,19 +45,19 @@ use zbus::connection::Builder;
 const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 
 /// Upper bound on a **single** raw `zbus::Proxy::call` issued by a test in this
-/// crate, and on the retry loop such a call sits in. (#1011)
+/// crate, and on the retry loop such a call sits in. (#1011, #1423)
 ///
 /// ## Why a raw call must never be awaited unbounded here
 ///
 /// A zbus method call carries no reply timeout unless the connection was built
 /// with one, and `Builder`'s `method_timeout` defaults to `None`. So a call
 /// whose reply never arrives does not fail — it parks the awaiting task
-/// **forever**. And a reply can genuinely never arrive: zbus creates its object
-/// server lazily, its dispatch task is the only consumer of inbound
-/// `MethodCall` messages, and until that task has registered its
-/// `msg_type=MethodCall, destination=<unique name>` match rule an arriving call
-/// matches no receiver and is **dropped with no reply at all**. There is no arm
-/// in `zbus::Connection` that synthesises an `UnknownObject`/`UnknownMethod`
+/// **forever**. And a reply can genuinely never arrive: zbus's object-server
+/// dispatch task is the only consumer of inbound `MethodCall` messages, and a
+/// call the socket reader hands over before that task has registered its
+/// `msg_type=MethodCall, destination=<unique name>` match rule matches no
+/// receiver and is **dropped with no reply at all**. There is no arm in
+/// `zbus::Connection` that synthesises an `UnknownObject`/`UnknownMethod`
 /// error for an unhandled call.
 ///
 /// That is what #1011 was, and it cost five `nix flake check` runs ~51 minutes
@@ -68,48 +68,50 @@ const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 /// libtest's `test export_unmounts_on_handle_drop has been running for over 60
 /// seconds`.
 ///
-/// ## Why these two numbers, and why a timeout is retried rather than fatal
+/// ## Why it outlives the fix for that race
 ///
-/// `connection.rs`'s `begin_dispatching` starts the dispatch task as soon as a
-/// `SharedConnection` is built rather than at the first `export`/`own` mount,
-/// which is where the race came from. It cannot *close* the window — zbus
-/// exposes the `started_event` that would prove readiness only through
-/// `connection::Builder`, and only for a connection built with an
-/// already-served interface — so a first call can still be swallowed, and
-/// **this bound, not that fix, is what stops #1011 recurring.** Measured over
-/// `tests/export.rs` on 12 concurrent 4-core shards each contending with 8 busy
-/// loops: the tree without these bounds hung 10 of 300 runs, and the same tree
-/// with them hung 0 of 300 — while the first `Hello` was still lost in 35 of
-/// 900 runs without `begin_dispatching` and 94 of 900 with it (its doc has the
-/// table and why the test constructor is the worse of its two call sites).
+/// Since #1423 there is no window for a call to land in. Every connection this
+/// suite hands a `SharedConnection` comes from [`connect`], which goes through
+/// `hytte-bus`'s `build_pooled` — the same function production connections go
+/// through — and that stages a placeholder interface so zbus's own barrier
+/// applies: the socket reader does not start until the dispatch task is
+/// registered. (Before #1423, `connection.rs`'s `begin_dispatching` only
+/// *narrowed* it; the #1011 campaign still lost the first `Hello` in 94 of 900
+/// runs on this suite's constructor, and every one was answered on the next
+/// attempt.)
 ///
-/// Across all 2,400 instrumented runs, **every** lost call was answered on the
-/// very next attempt — the retry count was never above 1.
+/// This bound stays anyway, because what it guards is not that one mechanism
+/// but **any** call that goes unanswered: a regression of #1423's barrier (the
+/// control tree in #1423's campaign is exactly that), a server a test builds
+/// without [`connect`], or a broker that wedges. Unbounded, each of those is
+/// #1011's signature again — a silent binary and a job timeout. Bounded, it is
+/// [`PROBE_BUDGET`] and a failure that names the call.
 ///
-/// So a call that gets no reply is treated as "not ready yet" and **retried**,
-/// not failed. That is what lets [`CALL_BUDGET`] be short: a swallowed call
-/// costs one second, not the test, and a call that is merely slow under load is
-/// re-issued rather than declared broken. It is emphatically **not** a latency
-/// assertion — nothing here claims a D-Bus call *should* answer within a second
-/// (a healthy run answers in ~1 ms). It is the guard that stops an unanswerable
-/// call from wedging the suite, and [`PROBE_BUDGET`] — 20 attempts' worth — is
-/// what decides that something is actually broken. Tightening `PROBE_BUDGET` is
-/// what would buy false reds under CI contention; tightening `CALL_BUDGET`
-/// only costs extra retries. See [`DBUS_DAEMON_STARTUP_BUDGET`] above for the
-/// same distinction stated at length.
+/// A call that gets no reply is still **retried** rather than failed, and what
+/// that arm absorbs now is a reply that is merely slow under CI contention, not
+/// a swallowed one. That is what lets [`CALL_BUDGET`] be short. It is
+/// emphatically **not** a latency assertion — nothing here claims a D-Bus call
+/// *should* answer within a second (a healthy run answers in ~1 ms).
+/// [`PROBE_BUDGET`] — 20 attempts' worth — is what decides that something is
+/// actually broken. Tightening `PROBE_BUDGET` is what would buy false reds
+/// under CI contention; tightening `CALL_BUDGET` only costs extra retries. See
+/// [`DBUS_DAEMON_STARTUP_BUDGET`] above for the same distinction stated at
+/// length.
+///
+/// Because this loop retries, it does **not** notice a dropped call — which is
+/// right for a liveness guard and wrong for a test of the barrier.
+/// `tests/ready.rs` is where "no call is ever dropped" is asserted, with its own
+/// budget and no retry on silence.
 ///
 /// ## See also
 ///
 /// This is the third place in the tree that writes this zbus mechanism down.
-/// `hytte-bus`'s own `connection.rs`, at `begin_dispatching`, has the
-/// measurements and the argument for starting the dispatch task early;
+/// `hytte-bus`'s own `connection.rs`, at `build_pooled`, has the barrier, the
+/// zbus 5.14.0 line numbers and what `begin_dispatching` measured before it;
 /// `hytte-services`' `wifi/nm_agent.rs` (`mount_and_proxy`, #714/#743/#756)
-/// derived it first, against the same zbus 5.14.0 line numbers, and has the
-/// one fix that closes the window rather than narrowing it —
-/// `Builder::serve_at` before `build()`, which a pooled `SharedConnection`
-/// cannot use because it is not built per interface. All three point at each
-/// other, because three uncoordinated transcriptions of one upstream behaviour
-/// is how drift starts.
+/// derived the mechanism first and stages its agent through the same barrier.
+/// All three point at each other, because three uncoordinated transcriptions of
+/// one upstream behaviour is how drift starts.
 #[allow(dead_code)] // not every test binary that pulls in `common` makes raw calls
 pub const CALL_BUDGET: Duration = Duration::from_secs(1);
 
@@ -127,7 +129,7 @@ pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
 /// two do not, because `dbus-daemon` answers them itself when the destination
 /// name has no owner. Accepting them would let the probe pass on a connection
 /// that is not dispatching at all.
-const BROKER_GENERATED_ERRORS: [&str; 2] = [
+pub const BROKER_GENERATED_ERRORS: [&str; 2] = [
     "org.freedesktop.DBus.Error.ServiceUnknown",
     "org.freedesktop.DBus.Error.NameHasNoOwner",
 ];
@@ -139,22 +141,18 @@ const BROKER_GENERATED_ERRORS: [&str; 2] = [
 /// serves it from the root node with no interface mounted, so a reply proves
 /// the dispatch task is live and proves nothing else.
 ///
-/// Bounded and retried, exactly as [`CALL_BUDGET`] prescribes:
-/// `connection.rs`'s `begin_dispatching` starts the object server's dispatch
-/// task but cannot await it (zbus exposes the `started_event` only through
-/// `connection::Builder`), so the residual is one scheduling hop — the task has
-/// to be polled once before its match rule exists. Registering that rule is
-/// local, not a broker round-trip: zbus only sends `AddMatch` for
-/// `Type::Signal` rules. So a swallowed call costs one retry; a connection that
-/// never dispatches costs the whole [`PROBE_BUDGET`] and returns `false`.
+/// Bounded and retried, exactly as [`CALL_BUDGET`] prescribes. On a connection
+/// built by [`connect`] the first call is answered — #1423's barrier leaves no
+/// window for it to be dropped in — so the retry only covers a slow reply. A
+/// connection that never dispatches (one built without the barrier, with
+/// nothing ever exported on it) costs the whole [`PROBE_BUDGET`] and returns
+/// `false`.
 ///
 /// Returns `(answered, unanswered)` — the second is how many calls got no reply
 /// at all, for the caller's failure message.
 ///
-/// This lives in `common` rather than in the test file because
-/// `connection_basic.rs` has **two** `begin_dispatching` pins — one per call
-/// site that ships or is test-support — and they must not drift on what
-/// "answers" means.
+/// This lives in `common` rather than in the test file so that every test that
+/// asks "does this connection answer at all" means the same thing by it.
 #[allow(dead_code)] // not every test binary that pulls in `common` probes a peer
 pub async fn answers_a_method_call(address: &str, unique: &str) -> (bool, u32) {
     let client = Builder::address(address)
@@ -360,11 +358,18 @@ async fn spawn_daemon(config: &Path) -> Child {
     child
 }
 
-/// Connect to `address`, confirming a daemon is actually listening there.
-async fn connect(address: &str) -> Connection {
-    Builder::address(address)
-        .expect("parse bus address")
-        .build()
+/// Connect to `address` the way `hytte-bus` connects in production — through
+/// [`hytte_bus::test_support::connect`], i.e. `build_pooled`, so the
+/// connection serves the `mov.vibec0re.hytte.Ready` placeholder and its object
+/// server is dispatching before it reads a single message (#1423).
+///
+/// Use this for every connection a test hands to a `SharedConnection` (the one
+/// [`ephemeral_bus`] returns, a reconnect's replacement), so the suite exercises
+/// the connections production builds. A *peer* — a server a test stands up to
+/// be talked to, or a client that probes us — is not a `hytte-bus` connection
+/// and stays a plain `zbus::connection::Builder`.
+pub async fn connect(address: &str) -> Connection {
+    hytte_bus::test_support::connect(address)
         .await
         .expect("connect to ephemeral bus")
 }

@@ -194,11 +194,7 @@ async fn reconnect_emits_stale_then_loaded() {
     // properties_changed_emits_loaded_with_new_value).
     //
     // ── Step 2: open a replacement connection and simulate a disconnect ───────
-    let replacement = zbus::connection::Builder::address(address.as_str())
-        .expect("parse ephemeral bus address")
-        .build()
-        .await
-        .expect("open replacement connection to ephemeral bus");
+    let replacement = common::connect(address.as_str()).await;
 
     shared.simulate_disconnect_for_test(replacement).await;
 

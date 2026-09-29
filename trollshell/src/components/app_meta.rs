@@ -50,10 +50,13 @@
 //! `resolve_app_metas` first, which sends only the ids the cache lacks
 //! through **one** [`Resolver::resolve_all`], and the page's per-row
 //! `resolve_app_meta` calls are then all hits. The three pages that render
-//! app ids from a list — `panels::workspaces`' columns, `panels::stats`' Top
-//! apps and `panels::workspace_edit`'s app list — each do that once per
-//! rebuild. `components::app_picker` needs no batch: `desktop_entry::installed`
-//! seeds its cache from the one scan that lists the rows.
+//! app ids from a list — `panels::workspaces`' columns (every column in one
+//! batch), `panels::stats`' Top apps and `panels::workspace_edit`'s app list
+//! — each do that once per rebuild. The Stats page has two lists, CPU and
+//! RAM; they share one cache and each batches both lists' ids, so a page
+//! build is still one scan. `components::app_picker` needs no batch:
+//! `desktop_entry::installed` seeds its cache from the one scan that lists
+//! the rows.
 //!
 //! The batch does not keep a [`Resolver`] alive between rebuilds. A resolver
 //! keeps its answers, not the entries it scanned, so a new id would scan again
@@ -339,13 +342,16 @@ pub(crate) mod test_support {
 
     /// Keeps a fixture installed on this thread; dropping it (a panic
     /// included) puts production's wrapper back. Not `Send`: the fixture is
-    /// per thread.
+    /// per thread. Borrows its [`Fixture`], so the compiler refuses a guard
+    /// that would outlive the directory it points the lookups at (#1443
+    /// review, N2) — a lookup there would otherwise fail silently as "no
+    /// entry".
     #[must_use = "the fixture is uninstalled when this guard drops"]
-    pub(crate) struct Installed {
-        _per_thread: PhantomData<*const ()>,
+    pub(crate) struct Installed<'f> {
+        _fixture: PhantomData<(&'f Fixture, *const ())>,
     }
 
-    impl Drop for Installed {
+    impl Drop for Installed<'_> {
         fn drop(&mut self) {
             INSTALLED.set(None);
         }
@@ -438,11 +444,11 @@ pub(crate) mod test_support {
         ///
         /// [`resolve_app_meta`]: super::resolve_app_meta
         /// [`resolve_app_metas`]: super::resolve_app_metas
-        pub(crate) fn install(&self) -> Installed {
+        pub(crate) fn install(&self) -> Installed<'_> {
             INSTALLED.set(Some(self.env()));
             SCANS.set(0);
             Installed {
-                _per_thread: PhantomData,
+                _fixture: PhantomData,
             }
         }
 

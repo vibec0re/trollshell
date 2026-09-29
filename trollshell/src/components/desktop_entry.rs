@@ -723,6 +723,126 @@ mod tests {
         println!("{INSTALLED_CHILD_OK}");
     }
 
+    const SUBDIR_CHILD: &str = "TROLLSHELL_DESKTOP_ENTRY_1441_SUBDIR_CHILD";
+    const SUBDIR_CHILD_OK: &str = "desktop-entry-1441-subdir-child-reached-the-end";
+
+    /// **#1441: a non-UTF-8 *subdirectory* of `applications/` makes a
+    /// non-UTF-8 id too.** GIO names `applications/\xff\xfe/ts-sub.desktop`
+    /// `\xff\xfe-ts-sub.desktop`, so both gio walks must skip it although its
+    /// file name is plain ASCII. The other children only carry a non-UTF-8
+    /// *file name*, so a [`super::utf8_id`] that checked the file name alone
+    /// passed all of them.
+    ///
+    /// From the #1443 review (T1, M1). Falsified by `utf8_id` checking only
+    /// the file name (the child aborts in glib-rs's UTF-8 `debug_assert!`).
+    #[test]
+    fn the_gio_scans_skip_an_entry_under_a_non_utf8_subdirectory() {
+        let f = non_utf8_fixture();
+        f.program("ts-1441-sub");
+        let sub = f
+            .root()
+            .join("data-home/applications")
+            .join(OsStr::from_bytes(b"\xff\xfe"));
+        std::fs::create_dir_all(&sub).expect("mkdir the non-UTF-8 subdirectory");
+        std::fs::write(
+            sub.join("ts-sub.desktop"),
+            "[Desktop Entry]\nType=Application\nName=TS 1441 Sub\nExec=ts-1441-sub\n",
+        )
+        .expect("write the entry under it");
+        f.run_child(
+            "components::desktop_entry::tests::the_gio_scans_skip_an_entry_under_a_non_utf8_subdirectory_inner",
+            SUBDIR_CHILD,
+            SUBDIR_CHILD_OK,
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn the_gio_scans_skip_an_entry_under_a_non_utf8_subdirectory_inner() {
+        if std::env::var_os(SUBDIR_CHILD).is_none() {
+            return;
+        }
+        let under_sub = hytte::gtk::gio::AppInfo::all().iter().any(|info| {
+            info.property::<Option<std::path::PathBuf>>("filename")
+                .is_some_and(|path| {
+                    path.parent().and_then(Path::file_name) == Some(OsStr::from_bytes(b"\xff\xfe"))
+                })
+        });
+        assert!(
+            under_sub,
+            "test setup: GIO must list the entry under the subdirectory"
+        );
+        assert!(listed("ts-1441-not-installed.desktop").is_none());
+        let (rows, _) = installed();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["ts-1441-valid"]);
+        println!("{SUBDIR_CHILD_OK}");
+    }
+
+    const DATA_DIR_CHILD: &str = "TROLLSHELL_DESKTOP_ENTRY_1441_DATA_DIR_CHILD";
+    const DATA_DIR_CHILD_OK: &str = "desktop-entry-1441-data-dir-child-reached-the-end";
+
+    /// **#1441: a data dir whose own path is not UTF-8 costs nothing.** Its
+    /// entries' ids are plain ASCII, so `listed` and `installed` must still
+    /// offer them. [`id_is_utf8`]'s own test says so for the pure rule; this
+    /// holds [`super::utf8_id`] to it (a `utf8_id` that checked the whole path
+    /// passes every other test here and hides the entry).
+    ///
+    /// Not [`Fixture::run_child`]: that pins `XDG_DATA_DIRS` to a UTF-8 path.
+    ///
+    /// From the #1443 review (T2, L1). Falsified by `utf8_id` also refusing a
+    /// path that is not UTF-8 as a whole (`listed` answers `None`).
+    #[test]
+    fn the_gio_scans_keep_an_entry_under_a_non_utf8_data_dir() {
+        let f = Fixture::new();
+        f.program("ts-1441-valid");
+        let data = f.root().join(OsStr::from_bytes(b"data-\xff"));
+        let apps = data.join("applications");
+        std::fs::create_dir_all(&apps).expect("mkdir the non-UTF-8 data dir");
+        std::fs::write(
+            apps.join("ts-1441-valid.desktop"),
+            "[Desktop Entry]\nType=Application\nName=TS 1441 Valid\nExec=ts-1441-valid\n",
+        )
+        .expect("write the entry");
+        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "components::desktop_entry::tests::the_gio_scans_keep_an_entry_under_a_non_utf8_data_dir_inner",
+            ])
+            .env(DATA_DIR_CHILD, "1")
+            .env("XDG_DATA_HOME", f.root().join("data-home"))
+            .env("XDG_DATA_DIRS", &data)
+            .env("XDG_CONFIG_HOME", f.root().join("config-home"))
+            .env("XDG_CONFIG_DIRS", f.root().join("config-sys"))
+            .env("HOME", f.root())
+            .env("PATH", f.root().join("bin"))
+            .output()
+            .expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(DATA_DIR_CHILD_OK),
+            "{:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn the_gio_scans_keep_an_entry_under_a_non_utf8_data_dir_inner() {
+        if std::env::var_os(DATA_DIR_CHILD).is_none() {
+            return;
+        }
+        let found = listed("ts-1441-valid.desktop").map(|app| app.display_name().to_string());
+        assert_eq!(found.as_deref(), Some("TS 1441 Valid"));
+        let (rows, _) = installed();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["ts-1441-valid"]);
+        println!("{DATA_DIR_CHILD_OK}");
+    }
+
     /// Review LOW 9 / the reviewer's surviving **M9**: the lowercase retry is
     /// the one behaviour the module doc argues for at length, and `Alacritty` is
     /// the epic's own example id — but `launchable` reaches `$XDG_DATA_DIRS`

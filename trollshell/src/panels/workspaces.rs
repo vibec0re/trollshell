@@ -3676,6 +3676,60 @@ pub(in crate::panels) mod tests {
         assert_eq!(test_support::scans(), 2, "one new id, one more scan");
     }
 
+    /// **#1441: the batch is per page, not per column.** Two monitors' columns,
+    /// six unseen app ids apiece, cost one scan between them. The test above
+    /// renders a single column, so a batch moved into `build_column` (one scan
+    /// per column) passes it; this one does not.
+    ///
+    /// From the #1443 review (T3, L2). Falsified by moving the batch from
+    /// [`bind_columns`] into `build_column` (2 ≠ 1).
+    #[gtk::test]
+    fn a_two_column_page_rebuild_resolves_every_app_id_in_one_scan() {
+        use super::{Card, Column, Kind, StackApp};
+        use crate::components::app_meta::test_support::{self, Fixture};
+        use crate::workspace_stacks::StackState;
+
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        let _installed = f.install();
+
+        let column = |connector: &str, card_name: &str, first: usize| Column {
+            connector: connector.to_owned(),
+            offline: false,
+            cards: vec![Card {
+                name: card_name.to_owned(),
+                kind: Kind::Saved(StackState::Inactive),
+                apps: (first..first + 6)
+                    .map(|n| StackApp {
+                        app_id: format!("no-such-ws-col-app-1441-{n}"),
+                        running: false,
+                    })
+                    .collect(),
+                live: None,
+                monitor: Some(connector.to_owned()),
+            }],
+        };
+        let page = PageModel {
+            columns: vec![column(LEFT, "one", 0), column(RIGHT, "two", 6)],
+            order: vec!["one".to_owned(), "two".to_owned()],
+        };
+
+        let columns_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let model: Mutable<PageModel> = Mutable::new(page);
+        bind_columns(&columns_box, model.signal_cloned());
+        pump();
+        assert_eq!(
+            by_class(&columns_box, "ts-ws-app").len(),
+            12,
+            "one icon per app across both columns"
+        );
+        assert_eq!(
+            test_support::scans(),
+            1,
+            "twelve unseen app ids over two columns, one scan"
+        );
+    }
+
     /// Every connected monitor's column takes a drop; the "Not connected"
     /// column does not (#1071 §5).
     ///

@@ -312,7 +312,7 @@ async fn hello_is_served(peer: &zbus::Connection, target: &UniqueName<'_>) -> bo
 /// the tree before #1423 (`build_pooled` without its `serve_at`,
 /// `begin_dispatching` put back) drops the raced call in round 1, every run;
 /// and `test_support::connect` bypassing `build_pooled` with nothing put back
-/// drops it in round 2, the first export-after round.
+/// drops it by round 2, the first export-after round, in 40 runs of 40.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_fired_the_moment_the_unique_name_appears_is_answered() {
     let (_first, guard) = ephemeral_bus().await;
@@ -450,10 +450,12 @@ const INTROSPECT_BUDGET: Duration = Duration::from_secs(10);
 /// replacement through the same `open_connection` — the reconnect path #1423
 /// had to cover.
 ///
-/// **Falsified**: dropping `build_pooled`'s `serve_at` reds both buses; making
-/// either arm of `open_connection` build without `build_pooled` reds that bus
-/// alone. Both are red on the child's own assertion, surfaced here as a failed
-/// child.
+/// **Falsified** three ways, each red on the child's own assertion and
+/// surfaced here as a failed child: dropping `build_pooled`'s `serve_at`
+/// (red at the first bus checked); making one arm of `open_connection` build
+/// without `build_pooled` (red on that bus alone, session or system); and
+/// bypassing `build_pooled` only when the supervisor reconnects (red "after a
+/// reconnect").
 #[tokio::test(flavor = "multi_thread")]
 async fn the_pooled_connections_serve_ready_on_both_buses() {
     let (_session_conn, session) = ephemeral_bus().await;

@@ -436,10 +436,12 @@ pub(crate) struct PickerEntry {
 ///
 /// # Why it returns the cache too (review MEDIUM 6)
 ///
-/// `resolve_app_meta` scans `AppInfo::all()` on a **cache miss**, and walks it up
-/// to three times. With a fresh cache every offered row is a miss, so rendering
-/// N rows cost N full scans — measured at one scan per row, 25 ms for six rows
-/// against a ~4 ms scan, and a desktop carries hundreds of entries.
+/// `resolve_app_meta` scans every desktop entry on a **cache miss** (through
+/// `hytte_sensors::desktop_entry` since #1432, `AppInfo::all()` before), and
+/// walks the list up to three times. With a fresh cache every offered row is a
+/// miss, so rendering N rows cost N full scans — measured (on the gio scan) at
+/// one scan per row, 25 ms for six rows against a ~4 ms scan, and a desktop
+/// carries hundreds of entries.
 ///
 /// The fix is not to make the lookup cheaper but to stop doing it: this function
 /// already holds every `AppInfo` in its hand, so it fills the cache the rows

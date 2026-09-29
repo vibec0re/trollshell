@@ -2936,7 +2936,7 @@ mod reentrancy_tests {
     /// `count` "System"-bucket samples (`app_id: None`).
     ///
     /// No app-id on purpose: an `app_id: Some(_)` sample sends
-    /// `resolve_app_meta` through `gio::AppInfo::all()`, making the test's
+    /// `resolve_app_meta` to scan the host's desktop entries, making the test's
     /// result depend on which desktop files the host happens to have
     /// installed. `sample_display_name`/`resolve_app_meta` still take
     /// `meta_cache.borrow_mut()` on the `None` path — the borrow is taken

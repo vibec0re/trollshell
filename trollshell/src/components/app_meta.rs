@@ -1,38 +1,97 @@
 //! `app_meta` — resolve a Wayland/`cgroup` app-id to a desktop entry's display
 //! name and icon.
 //!
-//! Extracted verbatim from `panels/stats.rs` (where it served the "Top apps"
-//! expanders alone) when the Workspaces page (#1071 phase 1) became a second
-//! consumer: a workspace card's stack row is a strip of app icons resolved from
-//! the `app_id` niri reports for each window on that workspace. Two panels
-//! resolving app-ids through two copies of these heuristics is exactly the
-//! bug farm `components/` exists to prevent — same reasoning as
-//! `reactive_list` (#174) and `hytte-config` one layer up (#640).
+//! Extracted from `panels/stats.rs` (where it served the "Top apps" expanders
+//! alone) when the Workspaces page (#1071 phase 1) became a second consumer: a
+//! workspace card's stack row is a strip of app icons resolved from the
+//! `app_id` niri reports for each window on that workspace. Two panels
+//! resolving app-ids through two copies of these heuristics is exactly the bug
+//! farm `components/` exists to prevent — same reasoning as `reactive_list`
+//! (#174) and `hytte-config` one layer up (#640).
 //!
-//! Nothing about the lookup changed in the move; `stats.rs` imports it back.
+//! # One copy of the lookup (#1432)
+//!
+//! Which desktop entry an app id means is decided in
+//! [`hytte_sensors::desktop_entry`], not here. That module is a plain-`std`
+//! port of GIO's desktop-entry rules (#1428), written so `hytte-plugin-stats`
+//! — which cannot link gio — names its Top apps rows the way the native Stats
+//! page does. Until #1432 this file carried its own copy of the same three
+//! layers over `gio::AppInfo::all()`, and nothing checked the two copies
+//! agreed. Now the shell asks the resolver too, so a change to a layer
+//! reaches the plugin's rows and every native surface at once. The layers
+//! themselves, in order, stopping at the first hit:
+//!
+//! 1. **Exact id** — an entry whose id is `<app_id>.desktop`, or the same
+//!    with the app id lowercased.
+//! 2. **Id containment** — an entry whose id without `.desktop`, lowercased,
+//!    contains the lowercased app id or is contained in it. This is the layer
+//!    that catches the common cases: reverse-DNS spellings
+//!    (`org.gnome.nautilus` for `org.gnome.Nautilus.desktop`), NixOS wrapper
+//!    names (`firefox-unwrapped`), niri's spawn scopes (`niri-firefox`), and
+//!    a lowercase cgroup leaf (`firefox`) for `Firefox.desktop`.
+//! 3. **Executable basename** — an entry whose `Exec=` program's file stem,
+//!    lowercased, equals the lowercased app id. An entry with no `Exec=` (a
+//!    `DBusActivatable=true` one may have none) has no program and is skipped,
+//!    which is what retires #1434's crash along with the gio walk that had it.
+//!
+//! What stays in this file is the one thing a GTK widget needs and a GTK-free
+//! resolver cannot hand over: a `gio::Icon`. [`icon_from_desktop_value`] builds
+//! it from the resolver's raw `Icon=` value by GIO's own rule, so no
+//! `AppInfo::all()` scan is left here at all.
+//!
+//! # The environment
+//!
+//! The resolver reads this process's environment ([`Env::from_process`]:
+//! `XDG_DATA_HOME`, `HOME`, `XDG_DATA_DIRS`, `PATH` and the locale variables
+//! `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG`) — the same variables GIO's scan
+//! read before. The stats plugin's resolver reads **its** process's
+//! environment, and a plugin is launched through `systemd-run --user`
+//! (`plugin_launcher.rs`), so it gets the user manager's environment rather
+//! than the shell's. So one copy of the lookup is still not one answer: the
+//! plugin's rows and the native Stats page name an app the same only while
+//! both processes see the same values. `hytte_sensors::desktop_entry`'s
+//! "Known gaps" says how to compare the two.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use hytte::gtk::{gio, prelude::*};
+use hytte_sensors::desktop_entry::{self, Env, Resolver};
 
-/// Cached desktop app metadata resolved from `gio::AppInfo`.
-///
-/// Note: `gio::DesktopAppInfo` is not available in gio 0.22 bindings, so we
-/// use the `gio::AppInfo` interface (the abstract interface) via
-/// `gio::AppInfo::all()`, which returns all installed applications with their
-/// ids, display names, and icons. We scan this list lazily (once per new
-/// app-id) and cache the result for the lifetime of the expander widget.
+/// A desktop entry's display name and icon, as the shell's widgets use them.
 #[derive(Clone)]
 pub(crate) struct AppMeta {
+    /// `X-GNOME-FullName`, else `Name`, localised, else `Unnamed` — the
+    /// resolver's [`desktop_entry::AppMeta::display_name`], unchanged.
     pub(crate) display_name: String,
+    /// The entry's `Icon=` as a `gio::Icon` ([`icon_from_desktop_value`]);
+    /// `None` when the entry has no `Icon=` line.
     pub(crate) icon: Option<gio::Icon>,
+}
+
+impl AppMeta {
+    /// The resolver's answer with its `Icon=` value made a `gio::Icon`.
+    fn from_entry(entry: &desktop_entry::AppMeta) -> Self {
+        Self {
+            display_name: entry.display_name.clone(),
+            icon: entry.icon.as_deref().map(icon_from_desktop_value),
+        }
+    }
 }
 
 /// The caller-owned cache [`resolve_app_meta`] fills: app-id → resolution,
 /// with `None` meaning "scanned, no desktop entry" so a miss also costs at
-/// most one `AppInfo::all()` scan.
+/// most one scan.
+///
+/// This **is** the lookup's cache (#1432): [`resolve_app_meta`] builds a
+/// [`Resolver`] for each miss and drops it straight after, so the resolver's
+/// own cache never outlives the one answer copied into this map. It stays the
+/// shell's own map rather than a `Resolver` for two reasons: it holds the
+/// built `gio::Icon`, a `GObject` the GTK-free resolver cannot, and callers
+/// seed it (`components::desktop_entry::installed` fills it from the picker's
+/// one scan; the Stats page's tests fill it so nothing reads the host), which
+/// a `Resolver` has no way in for.
 ///
 /// Caller-owned rather than a module global on purpose: the scan result is
 /// only as fresh as the widget that holds it, and every consumer today scopes
@@ -46,119 +105,70 @@ pub(crate) struct AppMeta {
 /// process. Resolve into a local first, set second.
 pub(crate) type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
 
-/// Resolve display name and icon for an app-id via a layered `gio::AppInfo`
-/// lookup, caching the result so the scan happens at most once per unique
-/// app-id per expander lifetime.
+/// Resolve display name and icon for an app-id through
+/// [`hytte_sensors::desktop_entry`], caching the result so the search path is
+/// scanned at most once per unique app-id per cache lifetime.
 ///
-/// A cache hit costs no scan at all — the cache is checked before
-/// [`gio::AppInfo::all`] is ever called, which is also why this stays a thin
-/// wrapper over [`resolve_in`] rather than folding the cache check into it:
-/// `resolve_in` takes the scanned list as a plain argument, so pushing the
-/// caching down a level would force the scan to run on every call (Rust
-/// evaluates a call's arguments before the call), even on a hit.
+/// A cache hit costs no scan at all: the cache is checked before the
+/// environment is read or a [`Resolver`] exists. A miss reads the
+/// environment, scans every `.desktop` file on the search path once — the
+/// same work `gio::AppInfo::all()` did per miss before #1432, since GIO
+/// re-parses every listed file on each call — and caches the answer, a miss
+/// included.
 ///
-/// See [`resolve_in`] for the three lookup layers themselves.
+/// See the module docs for the three layers and the environment.
 pub(crate) fn resolve_app_meta(
     app_id: &str,
     meta_cache: &mut HashMap<String, Option<AppMeta>>,
 ) -> Option<AppMeta> {
+    resolve_app_meta_in(app_id, meta_cache, Env::from_process)
+}
+
+/// [`resolve_app_meta`] over the environment `env` returns, which is called
+/// only on a cache miss — the seam that lets a test count scans without
+/// reading the real `$XDG_DATA_DIRS`.
+fn resolve_app_meta_in(
+    app_id: &str,
+    meta_cache: &mut HashMap<String, Option<AppMeta>>,
+    env: impl FnOnce() -> Env,
+) -> Option<AppMeta> {
     if let Some(cached) = meta_cache.get(app_id) {
         return cached.clone();
     }
-    let meta = resolve_in(&gio::AppInfo::all(), app_id);
-    meta_cache.insert(app_id.to_string(), meta.clone());
+    let meta = Resolver::new(env())
+        .resolve(app_id)
+        .map(AppMeta::from_entry);
+    meta_cache.insert(app_id.to_owned(), meta.clone());
     meta
 }
 
-/// [`resolve_app_meta`]'s three lookup layers, over a caller-supplied
-/// `AppInfo` list rather than a fresh [`gio::AppInfo::all`] scan — the seam
-/// that lets a test drive them over a hand-picked list (#1434's regression
-/// test is the reason this was split out; see its module-`tests` doc for why
-/// the list still has to come from a real scan rather than an in-memory
-/// fixture).
+/// A desktop entry's `Icon=` value as a `gio::Icon`, by GIO's own rule —
+/// `g_desktop_app_info_load_from_keyfile` in the `GLib` the shell links
+/// (2.88.3, `gio/gdesktopappinfo.c:2033-2057`), i.e. how GIO built the icon
+/// `gio::AppInfo::icon()` handed this file before #1432:
 ///
-/// Tries the following strategies in order, stopping at the first hit:
+/// - **An absolute path** (`g_path_is_absolute`: the first byte is `/` on
+///   Unix, `glib/gfileutils.c:2473-2488`) becomes a `gio::FileIcon` for that
+///   path, extension and all.
+/// - **Anything else** becomes a `gio::ThemedIcon`, after one trailing
+///   `.png`, `.xpm` or `.svg` is dropped — GIO's "common mistake in desktop
+///   files" workaround. The match is `strrchr` + `strcmp`, i.e. the text
+///   after the **last** dot, case-sensitive: `firefox.png` is `firefox`,
+///   `a.svg.png` is `a.svg`, and `org.gnome.Nautilus` and `foo.PNG` are kept
+///   whole. An empty `Icon=` is a themed icon named `""`, as in GIO.
+///   `g_themed_icon_new`, not the `_with_default_fallbacks` variant.
 ///
-/// 1. **Exact id match** — an `all` entry whose id equals `<app_id>.desktop`
-///    (or its lowercase variant). Fast for well-behaved desktop files.
-/// 2. **Case-insensitive id containment** — scans for an entry whose desktop
-///    file id (without the `.desktop` suffix) case-insensitively contains, or
-///    is contained by, the app-id. Catches reverse-DNS mismatches such as
-///    `org.gnome.Nautilus.desktop` for app-id `org.gnome.Nautilus`, and
-///    NixOS wrapper names like `firefox-unwrapped` matching `firefox.desktop`.
-/// 3. **Executable basename match** — entry whose executable file stem
-///    case-insensitively equals the app-id. Catches cgroup scope leaves like
-///    `app-firefox.scope`→`firefox` when the desktop file is `Firefox.desktop`
-///    with executable `/usr/bin/firefox`.
-///
-/// Note: `gio::DesktopAppInfo::search` and `startup_wm_class` are not
-/// available in the gio 0.22 bindings used here, so the above heuristics
-/// approximate their behaviour using the `AppInfo` abstract interface.
-pub(crate) fn resolve_in(all: &[gio::AppInfo], app_id: &str) -> Option<AppMeta> {
-    let app_id_lower = app_id.to_lowercase();
-
-    // Layer 1: exact id match (fast path).
-    let exact = format!("{app_id}.desktop");
-    let exact_lower = format!("{app_id_lower}.desktop");
-    let hit = all.iter().find(|info| {
-        info.id()
-            .is_some_and(|id| id == exact.as_str() || id == exact_lower.as_str())
-    });
-
-    // Layer 2: case-insensitive id containment.
-    // Strips the `.desktop` suffix and checks if the stem contains the app-id
-    // or vice-versa (handles reverse-DNS and wrapper-name mismatches).
-    let hit = hit.or_else(|| {
-        all.iter().find(|info| {
-            info.id().is_some_and(|id| {
-                let stem = id
-                    .as_str()
-                    .strip_suffix(".desktop")
-                    .unwrap_or(id.as_str())
-                    .to_lowercase();
-                stem.contains(app_id_lower.as_str())
-                    || app_id_lower.as_str().contains(stem.as_str())
-            })
-        })
-    });
-
-    // Layer 3: executable basename match.
-    // Catches cases where the desktop file uses a different name but the
-    // binary matches (e.g. `firefox` binary → `Firefox.desktop`).
-    let hit = hit.or_else(|| {
-        all.iter().find(|info| {
-            // #1434: `g_app_info_get_executable()` isn't annotated
-            // `(nullable)`, so gio-rs binds `executable()` as a plain
-            // `PathBuf` — but a `DBusActivatable=true` desktop entry may have
-            // no `Exec=` line at all and GLib still loads it, and its
-            // executable is then genuinely `NULL`. Calling `executable()`
-            // unconditionally aborts a debug build (glib-rs's
-            // `debug_assert!`) and segfaults a release build
-            // (`CStr::from_ptr(NULL)`). `commandline()` reads the same
-            // underlying field (`binary`) but *is* bound `Option`-typed and
-            // is non-`None` exactly when `executable()` would be non-`NULL`,
-            // so checking it first skips exactly the entries that would
-            // otherwise crash.
-            if info.commandline().is_none() {
-                return false;
-            }
-            let exe = info.executable();
-            exe.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|stem| stem.to_lowercase() == app_id_lower.as_str())
-        })
-    });
-
-    // `display_name()` is the file's other non-`Option` `gio::AppInfo`
-    // accessor, but it's safe: `g_desktop_app_info_get_display_name` falls
-    // back to `g_desktop_app_info_get_name`, which itself falls back to the
-    // literal string `"Unnamed"` when the entry has no `Name=` key — so it
-    // never returns `NULL`, unlike `executable()` above. `icon()` is already
-    // `Option`-typed in gio-rs and handled as such.
-    hit.map(|info| AppMeta {
-        display_name: info.display_name().to_string(),
-        icon: info.icon(),
-    })
+/// The value arrives already localised (`Icon[sv]=` over `Icon=`), as GIO
+/// reads it with `g_key_file_get_locale_string`.
+fn icon_from_desktop_value(value: &str) -> gio::Icon {
+    if value.starts_with('/') {
+        return gio::FileIcon::new(&gio::File::for_path(value)).upcast();
+    }
+    let name = [".png", ".xpm", ".svg"]
+        .into_iter()
+        .find_map(|extension| value.strip_suffix(extension))
+        .unwrap_or(value);
+    gio::ThemedIcon::new(name).upcast()
 }
 
 /// The icon shown for an app-id that resolves to no desktop entry (or to an
@@ -169,192 +179,15 @@ pub(crate) fn fallback_icon() -> gio::Icon {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
-    use super::{resolve_app_meta, resolve_in};
-    use hytte::gtk::{gio, prelude::*};
+    use hytte::gtk::{gio, glib, prelude::*};
+    use hytte_sensors::desktop_entry::{Env, Resolver};
 
-    /// #1434 needs a real `gio::AppInfo` whose `commandline()`/`executable()`
-    /// is `NULL` — a `DBusActivatable=true` desktop entry with no `Exec=`
-    /// line. `gio::AppInfo::create_from_commandline` (the in-memory
-    /// constructor `companion.rs`'s tests use) always takes a commandline, so
-    /// it cannot produce that shape; and gio-rs 0.22 has no `DesktopAppInfo`
-    /// binding to build one from a keyfile directly (this file's own doc, and
-    /// `components::desktop_entry`'s). The only thing that *can* produce one
-    /// is GIO's own desktop-file scan (`gio::AppInfo::all()`), which reads
-    /// `$XDG_DATA_HOME`/`$XDG_DATA_DIRS` — and `std::env::set_var` is
-    /// `unsafe` in edition 2024 (this workspace forbids `unsafe_code`
-    /// outright), so no in-process test can point that scan at a fixture
-    /// directory for itself.
-    ///
-    /// Same fix as the established precedents for this exact constraint
-    /// (`hytte-plugin-stats::plugin::tests::settings_reads_the_real_process_environment`,
-    /// `trollshell::plugins::tests::detached_launch_falls_back_without_a_user_manager`):
-    /// re-exec this test binary (`std::env::current_exe`), filtered to
-    /// exactly one inner test, with the fixture directories set on the
-    /// **child** via the safe `Command::env` builder — a brand-new process's
-    /// environment is set before it starts, which needs no `unsafe`.
-    ///
-    /// No display is involved anywhere in this — `gio::AppInfo::all()` is
-    /// plain GIO, not GTK — so both tests below stay hermetic `#[test]`s
-    /// rather than `system-tests`-gated.
-    fn write_desktop_entry(xdg_data_home: &Path, file_name: &str, contents: &str) {
-        let apps_dir = xdg_data_home.join("applications");
-        std::fs::create_dir_all(&apps_dir).expect("create the fixture applications/ directory");
-        std::fs::write(apps_dir.join(file_name), contents)
-            .expect("write the fixture .desktop file");
-    }
-
-    const NO_EXEC_CHILD: &str = "TROLLSHELL_APP_META_1434_NO_EXEC_CHILD";
-    const NO_EXEC_CHILD_OK: &str = "app-meta-1434-no-exec-child-reached-the-end";
-
-    /// The crash regression itself: layer 3 used to call `executable()`
-    /// unconditionally inside `.find()`'s predicate, which aborts a debug
-    /// build and segfaults a release build when the entry has no `Exec=`
-    /// (see `resolve_in`'s layer-3 comment). With the guard, this must
-    /// instead just miss.
-    ///
-    /// **Falsification:** delete the `if info.commandline().is_none() {
-    /// return false; }` guard in `resolve_in`'s layer 3 — the child then
-    /// aborts inside glib-rs's `debug_assert!` instead of printing
-    /// [`NO_EXEC_CHILD_OK`], and this test reds (verified by hand while
-    /// building this fix, then restored).
-    #[test]
-    fn layer_three_skips_a_desktop_entry_with_no_exec_without_crashing() {
-        let inner = "components::app_meta::tests::\
-                      layer_three_skips_a_desktop_entry_with_no_exec_without_crashing_inner";
-        let exe = std::env::current_exe().expect("this test binary's own path");
-        let data_home = tempfile::tempdir().expect("a scratch XDG_DATA_HOME");
-        let data_dirs = tempfile::tempdir().expect("a scratch, empty XDG_DATA_DIRS");
-        write_desktop_entry(
-            data_home.path(),
-            "ts-1434-no-exec.desktop",
-            "[Desktop Entry]\nType=Application\nName=TS 1434 No Exec\nDBusActivatable=true\n",
-        );
-
-        let out = std::process::Command::new(&exe)
-            .args(["--exact", "--nocapture", "--test-threads=1", inner])
-            .env(NO_EXEC_CHILD, "1")
-            .env("XDG_DATA_HOME", data_home.path())
-            .env("XDG_DATA_DIRS", data_dirs.path())
-            .output()
-            .expect("re-exec this test binary with a fixture XDG_DATA_HOME");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "the child must skip the no-Exec entry, not crash ({:?})\n\
-             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-            out.status,
-        );
-        assert!(
-            stdout.contains(NO_EXEC_CHILD_OK),
-            "the child exited 0 without reaching the end of {inner} — a stale filter matches \
-             no test and libtest still reports success\n\
-             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        );
-    }
-
-    /// The child half of the test above. A no-op unless the parent's marker
-    /// is set, so an ordinary `cargo test` run — which discovers it like any
-    /// other test — doesn't try to run the scenario with no fixture directory
-    /// set up.
-    #[test]
-    fn layer_three_skips_a_desktop_entry_with_no_exec_without_crashing_inner() {
-        if std::env::var_os(NO_EXEC_CHILD).is_none() {
-            return;
-        }
-        let all = gio::AppInfo::all();
-        let fixture: Vec<gio::AppInfo> = all
-            .into_iter()
-            .filter(|info| info.id().is_some_and(|id| id == "ts-1434-no-exec.desktop"))
-            .collect();
-        assert_eq!(
-            fixture.len(),
-            1,
-            "test setup: GIO must have picked up exactly the one fixture entry"
-        );
-
-        // An id that cannot match layer 1 (exact) or layer 2 (containment)
-        // against the fixture's own id/stem, so this reaches layer 3 — the
-        // layer that used to crash — for the one entry in `fixture`.
-        let meta = resolve_in(&fixture, "totally-unrelated-app-id-for-1434");
-        assert!(
-            meta.is_none(),
-            "an entry with no Exec= has no executable stem to match, so this must miss safely"
-        );
-        println!("{NO_EXEC_CHILD_OK}");
-    }
-
-    const VALID_CHILD: &str = "TROLLSHELL_APP_META_1434_VALID_CHILD";
-    const VALID_CHILD_OK: &str = "app-meta-1434-valid-child-reached-the-end";
-
-    /// `resolve_app_meta` — the public wrapper, not [`resolve_in`] — must
-    /// still call the seam with a real [`gio::AppInfo::all`] scan; nothing
-    /// upstream of this file's own tests would otherwise notice a wrapper
-    /// whose call site stopped doing that.
-    ///
-    /// **Falsification (verified by hand, then reverted):** change
-    /// `resolve_app_meta`'s call from `resolve_in(&gio::AppInfo::all(), …)`
-    /// to `resolve_in(&[], …)` — the child then finds nothing for the
-    /// fixture id and this test reds, where
-    /// [`layer_three_skips_a_desktop_entry_with_no_exec_without_crashing`]
-    /// (which drives `resolve_in` directly) does not move at all.
-    #[test]
-    fn resolve_app_meta_resolves_a_desktop_entry_through_app_info_all() {
-        let inner = "components::app_meta::tests::\
-                      resolve_app_meta_resolves_a_desktop_entry_through_app_info_all_inner";
-        let exe = std::env::current_exe().expect("this test binary's own path");
-        let data_home = tempfile::tempdir().expect("a scratch XDG_DATA_HOME");
-        let data_dirs = tempfile::tempdir().expect("a scratch, empty XDG_DATA_DIRS");
-        write_desktop_entry(
-            data_home.path(),
-            "ts-1434-valid.desktop",
-            // A bare, `$PATH`-relative `Exec=` — not an absolute path — since
-            // NixOS has no `/usr/bin` and GIO excludes an entry from
-            // `AppInfo::all()`'s results outright when an absolute `Exec=`
-            // target doesn't exist on disk (measured: `/usr/bin/true` here
-            // made this fixture invisible to the very scan under test).
-            "[Desktop Entry]\nType=Application\nName=TS 1434 Valid\nExec=true\n",
-        );
-
-        let out = std::process::Command::new(&exe)
-            .args(["--exact", "--nocapture", "--test-threads=1", inner])
-            .env(VALID_CHILD, "1")
-            .env("XDG_DATA_HOME", data_home.path())
-            .env("XDG_DATA_DIRS", data_dirs.path())
-            .output()
-            .expect("re-exec this test binary with a fixture XDG_DATA_HOME");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success(),
-            "the child must resolve the fixture entry ({:?})\n\
-             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-            out.status,
-        );
-        assert!(
-            stdout.contains(VALID_CHILD_OK),
-            "the child exited 0 without reaching the end of {inner} — a stale filter matches \
-             no test and libtest still reports success\n\
-             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        );
-    }
-
-    /// The child half of the test above.
-    #[test]
-    fn resolve_app_meta_resolves_a_desktop_entry_through_app_info_all_inner() {
-        if std::env::var_os(VALID_CHILD).is_none() {
-            return;
-        }
-        let mut cache = HashMap::new();
-        let meta = resolve_app_meta("ts-1434-valid", &mut cache);
-        let meta = meta.expect("resolve_app_meta must find the fixture through AppInfo::all()");
-        assert_eq!(meta.display_name, "TS 1434 Valid");
-        println!("{VALID_CHILD_OK}");
-    }
+    use super::{AppMeta, icon_from_desktop_value, resolve_app_meta, resolve_app_meta_in};
 
     /// A fixture search path on disk: entries under
     /// `<root>/data-home/applications/`, and `<root>/bin/` as the whole
@@ -368,10 +201,12 @@ mod tests {
     /// forbids `unsafe_code`. That re-execs this test binary, filtered to
     /// exactly one inner test, with the fixture set on the **child** through
     /// the safe `Command::env` builder — the precedent is
-    /// `hytte-plugin-stats::plugin::tests::settings_reads_the_real_process_environment`
-    /// and #1435's tests here. No display is involved (`gio::AppInfo::all()`
-    /// and the icon constructors are plain GIO), so every test in this module
-    /// is a hermetic `#[test]`.
+    /// `hytte-plugin-stats::plugin::tests::settings_reads_the_real_process_environment`,
+    /// and #1435 brought it here. No display is involved
+    /// (`gio::AppInfo::all()` and the icon constructors are plain GIO), so
+    /// every test in this module is a hermetic `#[test]`. None reads the
+    /// host's desktop entries: the child's data, config and `HOME`
+    /// directories all sit under the fixture root.
     struct Fixture {
         root: tempfile::TempDir,
     }
@@ -410,6 +245,16 @@ mod tests {
             let apps = self.data_home().join("applications");
             std::fs::create_dir_all(&apps).expect("mkdir the fixture applications/");
             std::fs::write(apps.join(file_name), contents).expect("write a fixture .desktop file");
+        }
+
+        /// This search path as the resolver's plain data, for the in-process
+        /// tests: no language preference, so no entry is read translated.
+        fn env(&self) -> Env {
+            Env {
+                dirs: vec![self.data_home().join("applications")],
+                path: vec![self.bin()],
+                languages: Vec::new(),
+            }
         }
 
         /// Re-exec this test binary running only `inner`, with `marker` set to
@@ -452,6 +297,68 @@ mod tests {
         }
     }
 
+    /// An environment that must never be asked for.
+    fn no_env() -> Env {
+        panic!("a cache hit must neither read the environment nor scan")
+    }
+
+    /// **A hit costs no scan** — it does not even read the environment, for a
+    /// found entry and for a cached miss alike.
+    ///
+    /// Falsified by deleting the cache check in [`resolve_app_meta_in`]: the
+    /// resolver is then built on every call and [`no_env`] panics.
+    #[test]
+    fn a_cache_hit_reads_no_environment_and_scans_nothing() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "seeded".to_owned(),
+            Some(AppMeta {
+                display_name: "Seeded".to_owned(),
+                icon: None,
+            }),
+        );
+        cache.insert("seeded-miss".to_owned(), None);
+
+        let hit = resolve_app_meta_in("seeded", &mut cache, no_env);
+        assert_eq!(hit.map(|m| m.display_name).as_deref(), Some("Seeded"));
+        assert!(resolve_app_meta_in("seeded-miss", &mut cache, no_env).is_none());
+    }
+
+    /// **A miss scans once and is cached, found or not**: the second lookup
+    /// of the same id, whether it found an entry or nothing, reads nothing.
+    ///
+    /// Falsified by dropping the `meta_cache.insert` (every call scans: 2 ≠
+    /// 1), and by caching only a found entry (the miss scans twice).
+    #[test]
+    fn a_miss_scans_once_and_is_cached_found_or_not() {
+        let f = Fixture::new();
+        f.program("ts-hit");
+        f.entry(
+            "ts-hit.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS Hit\nExec=ts-hit\n",
+        );
+        let scans = Cell::new(0);
+        let env = || {
+            scans.set(scans.get() + 1);
+            f.env()
+        };
+        let mut cache = HashMap::new();
+
+        for _ in 0..2 {
+            let meta = resolve_app_meta_in("ts-hit", &mut cache, env);
+            assert_eq!(meta.map(|m| m.display_name).as_deref(), Some("TS Hit"));
+            assert_eq!(scans.get(), 1, "a found entry is scanned for once");
+        }
+        for _ in 0..2 {
+            assert!(resolve_app_meta_in("no-such-app-anywhere", &mut cache, env).is_none());
+            assert_eq!(scans.get(), 2, "a miss is scanned for once, then cached");
+        }
+        assert!(
+            matches!(cache.get("no-such-app-anywhere"), Some(None)),
+            "the miss is cached as `None`"
+        );
+    }
+
     /// What an icon is, in the terms the comparison below can see: its
     /// `GType`, `g_icon_to_string` and the printed `g_icon_serialize`.
     fn describe(icon: Option<&gio::Icon>) -> Option<(String, Option<String>, Option<String>)> {
@@ -464,11 +371,58 @@ mod tests {
         })
     }
 
+    /// **GIO's icon rule, arm by arm**, as literals — the parity test below
+    /// holds the same rule to GIO's own `AppInfo::icon()`; this one says which
+    /// arm each spelling takes.
+    ///
+    /// Falsified by dropping the absolute-path arm (the path becomes a themed
+    /// name), and by dropping any one extension from the list (that spelling
+    /// keeps it).
+    #[test]
+    fn the_icon_rule_is_gios_arm_by_arm() {
+        for (value, file) in [
+            ("/opt/icons/app.png", "/opt/icons/app.png"),
+            ("/opt/icons/editor.svg", "/opt/icons/editor.svg"),
+        ] {
+            let icon = icon_from_desktop_value(value);
+            let path = icon
+                .downcast_ref::<gio::FileIcon>()
+                .unwrap_or_else(|| panic!("{value}: an absolute path is a file icon"))
+                .file()
+                .path();
+            assert_eq!(path.as_deref(), Some(Path::new(file)), "{value}");
+        }
+        for (value, name) in [
+            ("firefox.png", "firefox"),
+            ("editor.xpm", "editor"),
+            ("editor.svg", "editor"),
+            ("a.svg.png", "a.svg"),
+            ("org.gnome.Nautilus", "org.gnome.Nautilus"),
+            ("foo.PNG", "foo.PNG"),
+            ("icons/rel.png", "icons/rel"),
+            ("firefox", "firefox"),
+        ] {
+            let icon = icon_from_desktop_value(value);
+            let names = icon
+                .downcast_ref::<gio::ThemedIcon>()
+                .unwrap_or_else(|| panic!("{value}: anything else is a themed icon"))
+                .names();
+            assert_eq!(
+                names.first().map(glib::GString::as_str),
+                Some(name),
+                "{value}"
+            );
+        }
+    }
+
+    const PARITY_CHILD: &str = "TROLLSHELL_APP_META_1432_PARITY_CHILD";
+    const PARITY_CHILD_OK: &str = "app-meta-1432-parity-child-reached-the-end";
+
     /// The app ids the module docs name, and the name each must come out as
-    /// under the parity fixture (`LANGUAGE=sv`). These are the answers
-    /// `main`'s gio layers gave over the same fixture before #1432 (the
-    /// one-off oracle in this PR's first commit), so they pin the old gio
-    /// path's behaviour, not just the resolver's.
+    /// under the parity fixture (`LANGUAGE=sv`). These are the answers the
+    /// gio layers this file carried before #1432 gave over the same fixture
+    /// (a one-off oracle run on that code, recorded on #1432's PR), so they
+    /// pin the old gio path's behaviour, not just the resolver's.
     const NAME_CASES: [(&str, Option<&str>); 8] = [
         // Layer 1, localised: `Name[sv]=`.
         ("org.gnome.Nautilus", Some("Filer")),
@@ -541,7 +495,10 @@ mod tests {
             ("ts-svg-icon", "Icon=ts-svg-icon.svg\n"),
             ("ts-upper-icon", "Icon=ts-upper-icon.PNG\n"),
             ("ts-empty-icon", "Icon=\n"),
-            ("ts-localised-icon", "Icon=ts-plain\nIcon[sv]=ts-svensk.png\n"),
+            (
+                "ts-localised-icon",
+                "Icon=ts-plain\nIcon[sv]=ts-svensk.png\n",
+            ),
             ("ts-dotted-icon", "Icon=ts.dotted.name.png\n"),
             ("ts-relative-icon", "Icon=icons/ts-rel.png\n"),
             ("ts-abs-png-icon", &format!("Icon={}\n", abs_png.display())),
@@ -556,64 +513,120 @@ mod tests {
         f
     }
 
-    const ORACLE_CHILD: &str = "TROLLSHELL_APP_META_1432_ORACLE_CHILD";
-    const ORACLE_CHILD_OK: &str = "app-meta-1432-oracle-child-reached-the-end";
-
-    /// #1432's one-off oracle, run on `main`'s code before the switch: over
-    /// the parity fixture, the gio lookup this file ships ([`resolve_in`]
-    /// over `AppInfo::all()`) and `hytte_sensors::desktop_entry::Resolver`
-    /// name every [`NAME_CASES`] id and every [`ENTRY_STEMS`] entry the same,
-    /// and the [`NAME_CASES`] names are the literals it records.
+    /// **The shell names what the resolver names, and names and icons what
+    /// GIO does.** In one fixture environment:
+    ///
+    /// - every [`NAME_CASES`] id resolves through [`resolve_app_meta`] — the
+    ///   real wrapper over the process environment — to the expected name,
+    ///   and to exactly what `hytte_sensors::desktop_entry::Resolver` answers;
+    /// - every fixture entry resolves to the display name and the icon
+    ///   **GIO's own** `AppInfo` for that desktop-file id carries, compared
+    ///   by `GType`, `g_icon_to_string` and `g_icon_serialize`. That covers an
+    ///   absolute path (with and without an extension), a themed name, one
+    ///   with each stripped extension, one with an extension GIO keeps, a
+    ///   dotted name, a relative path, a localised `Icon[sv]=`, an empty
+    ///   `Icon=`, and no `Icon=` at all.
+    ///
+    /// Falsified by a wrapper reading no environment (`Env::default`), by
+    /// naming rows from the raw id, and by either icon arm going wrong — see
+    /// the PR's mutation table.
     #[test]
-    fn the_gio_layers_and_the_resolver_agree_on_the_documented_cases() {
+    fn names_match_the_resolver_and_icons_match_gio() {
         let f = parity_fixture();
         let stdout = f.run_child(
-            "components::app_meta::tests::\
-             the_gio_layers_and_the_resolver_agree_on_the_documented_cases_inner",
-            ORACLE_CHILD,
-            ORACLE_CHILD_OK,
+            "components::app_meta::tests::names_match_the_resolver_and_icons_match_gio_inner",
+            PARITY_CHILD,
+            PARITY_CHILD_OK,
         );
         println!("{stdout}");
     }
 
     /// The child half of the test above; a no-op outside its child.
     #[test]
-    fn the_gio_layers_and_the_resolver_agree_on_the_documented_cases_inner() {
-        if std::env::var_os(ORACLE_CHILD).is_none() {
+    fn names_match_the_resolver_and_icons_match_gio_inner() {
+        if std::env::var_os(PARITY_CHILD).is_none() {
             return;
         }
-        let all = gio::AppInfo::all();
-        let mut listed: Vec<String> = all
-            .iter()
-            .filter_map(|info| info.id().map(|id| id.to_string()))
-            .collect();
-        listed.sort();
-        println!("gio lists: {listed:?}");
-        let mut resolver = hytte_sensors::desktop_entry::Resolver::from_env();
-        let named = NAME_CASES.into_iter().map(|(id, name)| (id, Some(name)));
-        let entries = ENTRY_STEMS.into_iter().map(|stem| (stem, None));
-        for (app_id, expected) in named.chain(entries) {
-            let gio_meta = resolve_in(&all, app_id);
-            let gio_name = gio_meta.as_ref().map(|m| m.display_name.clone());
-            let gio_icon = describe(gio_meta.as_ref().and_then(|m| m.icon.as_ref()));
-            let resolved = resolver.resolve(app_id).cloned();
-            let name = resolved.as_ref().map(|m| m.display_name.clone());
-            let raw_icon = resolved.and_then(|m| m.icon);
-            println!(
-                "{app_id:>22}: gio {gio_name:?} | resolver {name:?}\n\
-                 {:>22}  gio icon {gio_icon:?} | raw Icon= {raw_icon:?}",
-                ""
-            );
+        let mut cache = HashMap::new();
+        let mut resolver = Resolver::from_env();
+        for (app_id, expected) in NAME_CASES {
+            let shell = resolve_app_meta(app_id, &mut cache).map(|m| m.display_name);
+            let sensors = resolver.resolve(app_id).map(|m| m.display_name.clone());
+            println!("{app_id:>22}: shell {shell:?}, resolver {sensors:?}");
+            assert_eq!(shell.as_deref(), expected, "{app_id}");
             assert_eq!(
-                gio_name, name,
-                "{app_id}: the gio layers and the resolver disagree"
+                shell, sensors,
+                "{app_id}: the shell and the resolver disagree"
             );
-            if let Some(expected) = expected {
-                assert_eq!(name.as_deref(), expected, "{app_id}");
-            } else {
-                assert!(name.is_some(), "{app_id}: a fixture entry resolves by its id");
-            }
         }
-        println!("{ORACLE_CHILD_OK}");
+
+        let all = gio::AppInfo::all();
+        for stem in ENTRY_STEMS {
+            let id = format!("{stem}.desktop");
+            let info = all
+                .iter()
+                .find(|info| info.id().is_some_and(|listed| listed == id.as_str()))
+                .unwrap_or_else(|| panic!("test setup: GIO must list the fixture {id}"));
+            let ours = resolve_app_meta(stem, &mut cache)
+                .unwrap_or_else(|| panic!("{stem} must resolve to its own entry"));
+            let gio_icon = describe(info.icon().as_ref());
+            let our_icon = describe(ours.icon.as_ref());
+            println!("{id:>28}: gio {gio_icon:?}\n{:>28}  ours {our_icon:?}", "");
+            assert_eq!(ours.display_name, info.display_name().as_str(), "{id}");
+            assert_eq!(our_icon, gio_icon, "{id}: the icon differs from GIO's");
+        }
+        println!("{PARITY_CHILD_OK}");
+    }
+
+    const NO_EXEC_CHILD: &str = "TROLLSHELL_APP_META_1434_NO_EXEC_CHILD";
+    const NO_EXEC_CHILD_OK: &str = "app-meta-1434-no-exec-child-reached-the-end";
+
+    /// **#1434, through the new path**: a `DBusActivatable=true` entry with no
+    /// `Exec=` line resolves by its id, and an id that falls through to
+    /// layer 3 across it misses — neither crashes.
+    ///
+    /// Before #1432 this crash lived in the gio walk's layer 3, which called
+    /// `gio::AppInfo::executable()` — a `NULL` path for such an entry, which
+    /// gio-rs does not bind as nullable (a debug-build abort, a release-build
+    /// null dereference). #1435 guarded that call; #1432 deleted the walk,
+    /// and the resolver's layer 3 skips an entry with no executable.
+    ///
+    /// Falsified twice: by making the resolver's layer 3 match an entry with
+    /// no executable (the unrelated id then names `TS 1434 No Exec`), and by
+    /// putting an unguarded `executable()` walk back into this file (the child
+    /// aborts in glib-rs's `debug_assert!`).
+    #[test]
+    fn a_desktop_entry_with_no_exec_resolves_without_crashing() {
+        let f = Fixture::new();
+        f.entry(
+            "ts-1434-no-exec.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS 1434 No Exec\nDBusActivatable=true\n",
+        );
+        f.run_child(
+            "components::app_meta::tests::a_desktop_entry_with_no_exec_resolves_without_crashing_inner",
+            NO_EXEC_CHILD,
+            NO_EXEC_CHILD_OK,
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn a_desktop_entry_with_no_exec_resolves_without_crashing_inner() {
+        if std::env::var_os(NO_EXEC_CHILD).is_none() {
+            return;
+        }
+        let mut cache = HashMap::new();
+        let by_id = resolve_app_meta("ts-1434-no-exec", &mut cache);
+        assert_eq!(
+            by_id.as_ref().map(|m| m.display_name.as_str()),
+            Some("TS 1434 No Exec"),
+            "the entry is listed and resolves by its own id",
+        );
+        assert!(by_id.is_some_and(|m| m.icon.is_none()), "it has no Icon=");
+        assert!(
+            resolve_app_meta("totally-unrelated-app-id-for-1434", &mut cache).is_none(),
+            "an entry with no Exec= has no executable stem to match, so layer 3 misses safely",
+        );
+        println!("{NO_EXEC_CHILD_OK}");
     }
 }

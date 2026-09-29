@@ -131,7 +131,7 @@ pub(crate) fn picker_popover(
     // application is re-rendered on every keystroke as the search narrows and
     // widens, and each render resolves an icon. `installed()` filled this from
     // the one scan it had to do anyway, so no row ever reaches
-    // `resolve_app_meta`'s own `AppInfo::all()` walk.
+    // `resolve_app_meta`'s own scan.
     let meta_cache = meta;
     let entries = Rc::new(entries);
     let on_pick = Rc::new(on_pick);
@@ -360,7 +360,7 @@ mod tests {
     ///
     /// Filled with `None` ("scanned, no desktop entry") rather than left empty
     /// on purpose: an empty cache is a **miss**, and a miss is what sends
-    /// `resolve_app_meta` off to scan the real `AppInfo::all()` of whatever
+    /// `resolve_app_meta` off to scan the real desktop entries of whatever
     /// machine is running the suite. That is exactly the cost review MEDIUM 6 is
     /// about, and a test that paid it would be measuring the host.
     fn seeded(entries: &[PickerEntry]) -> MetaCache {

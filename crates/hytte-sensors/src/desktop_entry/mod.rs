@@ -1,6 +1,6 @@
 //! A desktop-entry resolver for app ids, in plain `std` (#1428).
 //!
-//! The native Stats page names each Top apps row through
+//! The native Stats page named each Top apps row through
 //! `trollshell/src/components/app_meta.rs`'s `resolve_app_meta`: three
 //! matching layers over `gio::AppInfo::all()`. `hytte-plugin-stats` cannot
 //! link gio, so its rows read the raw app id — `niri-firefox` where native
@@ -8,13 +8,19 @@
 //! `.desktop` files itself and runs the same three layers over them, so a
 //! plugin gets the name native shows.
 //!
-//! # Parity with `app_meta.rs`
+//! Since #1432 the shell's `resolve_app_meta` takes its names from this
+//! module too, and keeps gio only to turn [`AppMeta::icon`] into a `GIcon` —
+//! so there is one copy of the three layers, and the "native" column below
+//! is what the shell's gio lookup did before that, and what GIO itself
+//! still does.
+//!
+//! # Parity with `app_meta.rs`'s gio lookup
 //!
 //! "The same" is checked against the source of the `GLib` the shell links
 //! (2.88.3: `gio/gdesktopappinfo.c`, `glib/gkeyfile.c`, `glib/gshell.c`,
 //! `glib/gutils.c`, `glib/gcharset.c`), not against the documentation.
 //!
-//! | | native (`resolve_app_meta` over `AppInfo::all()`) | here |
+//! | | native (`resolve_app_meta` over `AppInfo::all()`, before #1432) | here |
 //! | --- | --- | --- |
 //! | **Layer 1** | an entry whose id is `<app_id>.desktop`, or `<lowercased app_id>.desktop`; the comparison itself is case-sensitive | the same two strings, compared the same way |
 //! | **Layer 2** | the id without `.desktop`, lowercased, contains the lowercased app id, or is contained in it | the same, with Rust's `to_lowercase` on both sides as native uses |
@@ -28,7 +34,7 @@
 //! | **Which files are entries** | a regular file whose key file parses, whose first group is `[Desktop Entry]`, `Type=Application`, and whose non-empty `TryExec=` and `Exec=` name a program `g_find_program_for_path` finds on `$PATH` (relative to `Path=` if set) | the same — `keyfile` ports the parser's rules, `exec` the program lookup |
 //! | **Display name** | `X-GNOME-FullName`, else `Name`, each localised for `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG`, else `Unnamed` | the same, `Unnamed` untranslated |
 //! | **Executable** | `binary_from_exec`: `Exec=`'s first space-separated token, verbatim — no quote removal, no `env` skipping, so `Exec=env FOO=1 foot` has the executable `env` | the same |
-//! | **Icon** | a `GIcon` built from the localised `Icon=`, with a trailing `.png`/`.svg`/`.xpm` dropped from a theme name | the localised `Icon=` **raw** — nothing reads it yet (#1419's icon question), and the consumer that does decides what to strip |
+//! | **Icon** | a `GIcon` built from the localised `Icon=`, with a trailing `.png`/`.svg`/`.xpm` dropped from a theme name | the localised `Icon=` **raw**; the consumer decides what to strip — the shell's `app_meta` builds the `GIcon` from it by GIO's rule (#1432), and the stats plugin's rows do not read it yet (#1419's icon question) |
 //! | **Cache** | caller-owned, per app id, a miss cached too — one `all()` scan per unseen id | [`Resolver`] owns it, per app id, a miss cached too — one scan per [`Resolver::resolve_all`] call with any unseen id in it |
 //!
 //! Localised names are honoured rather than documented away: an
@@ -79,11 +85,11 @@
 //!   a bounded read rather than that file in memory, inside the walker.
 //! - **A file name that is not UTF-8** is skipped; no app id can equal it.
 //! - **An entry with no `Exec=` line** has no executable here, so layer 3
-//!   skips it. Natively `AppInfo::executable()` then hands gio-rs a `NULL`
+//!   skips it. Natively `AppInfo::executable()` then handed gio-rs a `NULL`
 //!   path, which `from_glib_none` only `debug_assert`s against — so on the
-//!   native side layer 3 reaching such an entry is a debug-build panic and a
-//!   release-build null dereference. That is a latent native bug (#1434),
-//!   not a behaviour to copy.
+//!   native side layer 3 reaching such an entry was a debug-build panic and
+//!   a release-build null dereference (#1434). #1435 guarded that call, and
+//!   #1432 removed the gio walk that made it: the shell now runs this layer.
 //! - **A FIFO named `*.desktop`** masks its id and is never opened: the
 //!   regular-file check runs before the read. `GLib` opens the file first
 //!   and checks after, so natively a FIFO blocks `open()` until a writer

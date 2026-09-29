@@ -495,7 +495,7 @@ mod tests {
     use hytte::gtk::{gio, glib, prelude::*};
     use hytte_sensors::desktop_entry::Resolver;
 
-    use super::test_support::Fixture;
+    use super::test_support::{self, Fixture};
     use super::{
         AppMeta, icon_from_desktop_value, resolve_app_meta, resolve_app_meta_in,
         resolve_app_metas, resolve_app_metas_in,
@@ -748,6 +748,39 @@ mod tests {
                 "{app_id}: was it sent to the resolver?"
             );
         }
+    }
+
+    /// **An installed fixture answers the production wrappers and counts
+    /// their scans** — the seam the three pages' `#[gtk::test]`s count one
+    /// rebuild's scans through (#1441), pinned here without a display. While
+    /// the guard lives, the real [`resolve_app_metas`] and
+    /// [`resolve_app_meta`] resolve against the fixture, a batch with a miss
+    /// is one counted scan, and the per-row lookups after it are hits; once
+    /// the guard drops, production's wrapper is back.
+    ///
+    /// Falsified by `process_resolver` ignoring the installed fixture (the
+    /// names come from wherever the process environment points, and nothing
+    /// is counted), and by the guard not uninstalling on drop.
+    #[test]
+    fn an_installed_fixture_answers_the_production_wrappers_and_counts_their_scans() {
+        let f = batch_fixture();
+        {
+            let _installed = f.install();
+            let mut cache = HashMap::new();
+            resolve_app_metas(BATCH.map(|(app_id, _)| app_id), &mut cache);
+            assert_eq!(test_support::scans(), 1, "one batch, one scan");
+            for (app_id, name) in BATCH {
+                let meta = resolve_app_meta(app_id, &mut cache);
+                assert_eq!(meta.map(|m| m.display_name).as_deref(), name, "{app_id}");
+            }
+            assert_eq!(test_support::scans(), 1, "the per-row lookups are hits");
+            assert!(resolve_app_meta("ts-1441-late", &mut cache).is_none());
+            assert_eq!(test_support::scans(), 2, "a lookup of a new id scans");
+        }
+        assert!(
+            test_support::installed_resolver().is_none(),
+            "the guard uninstalls the fixture when it drops"
+        );
     }
 
     const FRESH_CHILD: &str = "TROLLSHELL_APP_META_1432_FRESH_CHILD";

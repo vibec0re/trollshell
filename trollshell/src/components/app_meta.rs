@@ -42,14 +42,14 @@
 //! # One scan per page build (#1441)
 //!
 //! A lookup that misses the cache scans every `.desktop` file on the search
-//! path, synchronously, on the GTK main thread. [`resolve_app_meta`] alone
+//! path, synchronously, on the GTK main thread. `resolve_app_meta` alone
 //! does that once **per unseen app id**, so a Workspaces page with twelve
 //! apps nobody had looked up cost twelve full scans — measured at about
 //! 270 ms at 611 entries in a release build (#1439 review, L3). A page that
 //! knows every id it is about to render hands them all to
-//! [`resolve_app_metas`] first, which sends only the ids the cache lacks
+//! `resolve_app_metas` first, which sends only the ids the cache lacks
 //! through **one** [`Resolver::resolve_all`], and the page's per-row
-//! [`resolve_app_meta`] calls are then all hits. The three pages that render
+//! `resolve_app_meta` calls are then all hits. The three pages that render
 //! app ids from a list — `panels::workspaces`' columns, `panels::stats`' Top
 //! apps and `panels::workspace_edit`'s app list — each do that once per
 //! rebuild. `components::app_picker` needs no batch: `desktop_entry::installed`

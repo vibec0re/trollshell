@@ -61,15 +61,10 @@
 //!   row's icon from `gio::DesktopAppInfo`, which a GTK-free plugin cannot
 //!   call. The icon column is **pending #1419's question** (read the
 //!   `.desktop` file in the plugin, or a wire node the shell resolves), so a
-//!   row carries no icon node at all rather than a placeholder.
-//! - **Top apps' collapsed summary while both lists are collapsed.** Native
-//!   shows the heaviest app beside the chevron whenever the drawer is open.
-//!   This plugin cannot see its page open or close, so its walker runs only
-//!   while one of the two lists is expanded, and a collapsed header reads `—`
-//!   while nothing is being measured. The flip side is a known cost: a list
-//!   left open keeps walking `/proc` after the drawer closes, until #1427
-//!   tells the plugin when its page is on screen — see `crate::top_apps`'
-//!   module docs for the measured numbers.
+//!   row carries no icon node at all rather than a placeholder. (The
+//!   collapsed summary *is* here since #1427: the walker follows the page, as
+//!   native's does, so a collapsed header shows the heaviest app whenever the
+//!   page is open — see `crate::top_apps`.)
 //! - **The per-core LED panel.** Native draws it with `hytte_preem::LedMatrix`,
 //!   which is not on the wire (#1156); the only lamp the wire has is a preem
 //!   `DotMatrix`, which is exactly what this page is no longer allowed to
@@ -141,16 +136,6 @@ pub struct Expanded {
     pub top_cpu: bool,
     /// The Memory card's Top apps list ([`TOP_APPS_RAM_ID`]).
     pub top_ram: bool,
-}
-
-impl Expanded {
-    /// Whether either Top apps list is open — which is what gates the `/proc`
-    /// walker (see `crate::top_apps`), since the plugin cannot see its page
-    /// open or close.
-    #[must_use]
-    pub const fn top_apps(self) -> bool {
-        self.top_cpu || self.top_ram
-    }
 }
 
 /// How many samples each history line keeps: the native page's 60 (one a
@@ -1729,7 +1714,31 @@ mod tests {
         );
     }
 
-    /// Nothing measured — both lists parked, or the page's first render — is
+    /// **A collapsed list still carries its summary** — native's
+    /// `name · value` beside the chevron whatever the flag says (#1427: the
+    /// walker follows the page, so a collapsed list has a reading to show).
+    ///
+    /// **Falsified** by drawing the summary only for an expanded list.
+    #[test]
+    fn a_collapsed_list_shows_the_heaviest_app_beside_its_title() {
+        let node = page_at(
+            SPARKLINE_VOCAB,
+            Card::bar_default(),
+            &busy(),
+            Expanded::default(),
+        );
+        let (header, _, open) = top_apps_list(&node, TOP_APPS_CPU_ID);
+        assert!(!open);
+        assert_eq!(header, vec!["Top apps · CPU", "org.mozilla.firefox · 42%"]);
+        let (header, _, open) = top_apps_list(&node, TOP_APPS_RAM_ID);
+        assert!(!open);
+        assert_eq!(
+            header,
+            vec!["Top apps · RAM", "org.mozilla.firefox · 3.2 GiB"]
+        );
+    }
+
+    /// Nothing measured — the page shut, or the page's first render — is
     /// a dash beside each title and no rows, not an invented app; and a cold
     /// walk, which carries the RAM list but withholds the CPU one, draws
     /// exactly that.

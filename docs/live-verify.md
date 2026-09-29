@@ -2523,21 +2523,19 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
 - [ ] **(#1419 item 3)** **Top apps · CPU and Top apps · RAM, on the plugin
       page.** Open the page from a stats chip. The CPU card ends in a
       `Top apps · CPU` row and the Memory card in a `Top apps · RAM` row,
-      both collapsed, each reading `—` beside its chevron. Click
-      `Top apps · CPU`: the RAM row's summary fills in at once (on niri,
-      e.g. `Firefox · 3.2 GiB`); the CPU list fills in about 2 s
-      later — the first walk has no CPU baseline and shows nothing rather
-      than a column of `0%`. Up to six rows each, heaviest first: the
+      both collapsed. **(#1427)** Without expanding either, the RAM row's
+      summary beside its chevron fills in at once (on niri, e.g.
+      `Firefox · 3.2 GiB`) and the CPU row's about 2 s later — the first
+      walk has no CPU baseline and shows `—` rather than a column of `0%`.
+      Expand `Top apps · CPU`. Up to six rows each, heaviest first: the
       app's desktop-entry name (`Firefox` — since #1428, where #1426
       showed the raw `niri-firefox` key), a service's unit name, or
       `System`; `N processes` beside it when more than one PID folded in,
       and the value pinned right (`42%` / `3.2 GiB`). Compare with the
       native page's two lists: the same groups, **names**, order and
       values, give or take the 2 s between two walks. An app with no
-      `.desktop` file reads its raw id on both pages. Expected differences:
-      **no icons** (pending #1419's question); and a collapsed header reads
-      `—` while neither list is open (native keeps it live while the drawer
-      is open). **(#1428)** If a name still differs, note both spellings and
+      `.desktop` file reads its raw id on both pages. Expected difference:
+      **no icons** (pending #1419's question). **(#1428)** If a name still differs, note both spellings and
       the app's `.desktop` file name: two entries that match the same id in
       the same lookup layer are the one case the two pages may pick
       differently (native's order there is GLib's hash order). The other
@@ -2548,13 +2546,29 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       `XDG_DATA_HOME`, `XDG_DATA_DIRS`, `HOME`, `LANGUAGE`, `LC_ALL`,
       `LC_MESSAGES` and `LANG`. A
       `LANG`/`LC_MESSAGES` other than English must give both pages the same
-      translated name (`Filer` for Files under `sv_SE`). Collapse both
-      lists: the bar instance's CPU time in `top` stops climbing within a
-      couple of seconds. Known cost: a list left open when the drawer
-      closes keeps walking `/proc`
-      every 2 s until it is collapsed (about 1.2 % of a core at ~640
-      processes), because the plugin is not told when its page closes —
-      #1427 is the fix.
+      translated name (`Filer` for Files under `sv_SE`).
+- [ ] **(#1427)** **The Top apps walk runs only while the page is on
+      screen.** In a terminal, run
+      `top -p $(systemctl --user show -p MainPID --value trollshell-plugin-stats-bar)`
+      (press `H` for threads if you like). With the page closed the plugin
+      sits near 0 % apart from its 1 s chip tick. Open the page from a
+      chip: its CPU rises by roughly
+      the walk's cost every 2 s (about 1 % of a core at ~640 processes) —
+      with both lists collapsed, too. Close the page each of these ways,
+      one at a time, and watch the CPU drop back within about 2 s every
+      time: a **second click on the same chip**, **`Esc`**, a **click
+      outside** the drawer, and the `open-page` keybind to a built-in page
+      (e.g. Calendar). The chips keep updating once a second throughout.
+      Expand a list, then close the page: the CPU still drops (a list left
+      open no longer keeps the walk alive, which was #1426's known cost).
+      Reopen within a second or two: both lists fill within about a second
+      (the first walk waits until the kept baseline is half a walk old, so
+      its CPU list never covers a sub-second window), with no 2 s `—` on the
+      CPU list; reopen after a longer wait: the CPU list reads `—` for about
+      2 s, as on first open. The
+      **sidebar** instance (`trollshell-plugin-stats-side`) publishes no
+      page, so there is no dialog to open for it: its process must stay
+      idle whatever the bar's page does.
 - [ ] **(#1252)** **An older shell still gets a working page.** Against a
       shell built before this change (generation 6), the page must still
       open with the same two columns, and each history line must be a slim

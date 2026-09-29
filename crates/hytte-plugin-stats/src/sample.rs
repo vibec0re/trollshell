@@ -202,28 +202,34 @@ pub enum Cmd {
     /// The mount surface became visible / hidden (#288) — the sensors
     /// sampler's gate.
     SetVisible(bool),
-    /// Whether either of the drawer page's "Top apps" lists is open — the
-    /// `/proc` walker's gate (#1419 item 3; see `crate::top_apps`, a
-    /// crate-private module, for why it is not the page's visibility).
-    ShowTopApps(bool),
+    /// The plugin's own page opened or closed (#1427, the host's
+    /// `PageVisibility` push through [`Plugin::page_visible`](hytte_plugin::Plugin::page_visible))
+    /// — the `/proc` walker's gate. The page is the only thing that draws the
+    /// Top apps lists, so it is the only thing that runs the walk; see
+    /// `crate::top_apps` (a crate-private module) for why that matches native.
+    PageVisible(bool),
 }
 
 impl Cmd {
     /// The sensors sampler's classifier: the surface's visibility, and nothing
-    /// about the Top apps lists.
+    /// about the page.
     ///
     /// Spelled without a wildcard on purpose, like its sibling: a third
     /// variant is a compile error here, which is the place to decide which
     /// gate it opens.
+    ///
+    /// **Not** the page's visibility either: the bar chips are on screen
+    /// whether or not their drawer page is, so a page close must never park
+    /// the sampler behind them.
     #[must_use]
     pub const fn surface(self) -> Option<bool> {
         match self {
             Self::SetVisible(visible) => Some(visible),
-            Self::ShowTopApps(_) => None,
+            Self::PageVisible(_) => None,
         }
     }
 
-    /// The walker's classifier: whether a Top apps list is open, and nothing
+    /// The walker's classifier: whether the page is on screen, and nothing
     /// about the surface.
     ///
     /// **Not** the surface's visibility, and that is the whole point: a bar
@@ -231,9 +237,9 @@ impl Cmd {
     /// walker that answered `SetVisible` would walk `/proc` for as long as the
     /// bar chips are on screen — i.e. forever.
     #[must_use]
-    pub const fn top_apps(self) -> Option<bool> {
+    pub const fn page(self) -> Option<bool> {
         match self {
-            Self::ShowTopApps(open) => Some(open),
+            Self::PageVisible(open) => Some(open),
             Self::SetVisible(_) => None,
         }
     }
@@ -642,8 +648,9 @@ impl Sample for Sampler {
 }
 
 /// Start everything this plugin samples with: the sensors [`Sampler`] on
-/// `period`, the Top apps [`Walker`] on [`top_apps::POLL`], and the [`route`]
-/// that splits the reducer's one command lane between them.
+/// `period` behind the surface's visibility, the Top apps [`Walker`] on
+/// [`top_apps::POLL`] behind the page's, and the [`route`] that splits the
+/// reducer's one command lane between them.
 ///
 /// Returns the three tasks' handles, which production drops (the tasks end on
 /// their own when the session's lane closes) and a test awaits.
@@ -689,27 +696,50 @@ where
             walker_rx,
             msgs,
             top_apps::POLL,
-            |cmd: &Cmd| cmd.top_apps(),
+            |cmd: &Cmd| cmd.page(),
             Msg::TopApps,
+            Keep {
+                under: top_apps::KEEP_BASELINE,
+                settle: top_apps::MIN_BASELINE_AGE,
+            },
             make_walker,
         )),
     ]
 }
 
+/// What a reopen does with the last read's baseline — see [`drive`]'s
+/// *A young baseline survives a quick reopen*.
+#[derive(Clone, Copy, Debug)]
+struct Keep {
+    /// A baseline whose read started less than this before the reopen is
+    /// kept; an older one is dropped.
+    under: Duration,
+    /// A kept baseline is read against no sooner than this after its read
+    /// started: the reopen's first read is held until then.
+    settle: Duration,
+}
+
+impl Keep {
+    /// Keep nothing: every reopen re-baselines, however quick.
+    const NOTHING: Self = Self {
+        under: Duration::ZERO,
+        settle: Duration::ZERO,
+    };
+}
+
 /// Split the reducer's one command lane into the two tasks' lanes: the
-/// surface's visibility to the sensors sampler, the Top apps switch to the
-/// walker.
+/// surface's visibility to the sensors sampler, the page's to the walker.
 ///
-/// Each task's classifier ([`Cmd::surface`], [`Cmd::top_apps`]) would ignore
-/// the other's command anyway; routing means neither lane carries a command
-/// its task has no use for, and it is the one place the split is spelled out.
+/// Each task's classifier ([`Cmd::surface`], [`Cmd::page`]) would ignore the
+/// other's command anyway; routing means neither lane carries a command its
+/// task has no use for, and it is the one place the split is spelled out.
 /// Ends — dropping both lanes, which ends both tasks — when the reducer's lane
 /// closes, i.e. when the session tears down.
 async fn route(mut cmds: CmdReceiver<Cmd>, sensors: CmdSender<Cmd>, walker: CmdSender<Cmd>) {
     while let Some(cmd) = cmds.recv().await {
         let lane = match cmd {
             Cmd::SetVisible(_) => &sensors,
-            Cmd::ShowTopApps(_) => &walker,
+            Cmd::PageVisible(_) => &walker,
         };
         // A task that has ended only ever did so because its lane closed,
         // which is this function's own teardown — nothing is left to gate.
@@ -747,6 +777,9 @@ async fn sampler_task_with<S: Sample<Reading = Snapshot>>(
         period,
         |cmd: &Cmd| cmd.surface(),
         |snapshot| Msg::Sampled(Box::new(snapshot)),
+        // Every reopen re-baselines, however quick: the sensors' reopen rule
+        // is #1277 LOW 4's as it stands, and #1427 does not touch it.
+        Keep::NOTHING,
         make,
     )
     .await;
@@ -784,14 +817,55 @@ async fn sampler_task_with<S: Sample<Reading = Snapshot>>(
 /// `reopening_the_sidebar_re_baselines_before_it_reads`'s own notes and
 /// `a_tick_due_while_hidden_never_reads_before_the_unpark_reset`, which pins
 /// the ordering directly instead.
+///
+/// # A young baseline survives a quick reopen (`keep`)
+///
+/// The reopen re-baseline exists so the first reading after a reopen is not
+/// the mean over however long the gate was shut. A baseline read less than
+/// `keep.under` before the reopen is not that: a delta from it is a real
+/// reading over a short window. So a reopen re-baselines only when the last
+/// read started `keep.under` or longer ago (or there was none). The walker
+/// passes [`top_apps::KEEP_BASELINE`]: a page closed and reopened within a
+/// couple of walks gets a CPU list on its first walk instead of `—` for a
+/// whole cadence (the #1426 review's NIT 8). The sensors pass
+/// [`Keep::NOTHING`]: `elapsed() < ZERO` is never true.
+///
+/// A kept baseline also has a floor, `keep.settle`: the reopen's first read
+/// is **held** until the baseline's read started at least that long ago, so
+/// it starts at `max(reopen, last read's start + settle)`. Without it a close
+/// just after a read started and a reopen a moment later would measure the
+/// first CPU list over a few hundred milliseconds, where whole-tick jiffy
+/// counts are noisiest (the #1437 review's LOW 1). The walker passes
+/// [`top_apps::MIN_BASELINE_AGE`].
+///
+/// While a read is held the loop still reads the lane through the gate, lane
+/// first (`biased;`, as the gate itself does). `Gate::next` is cancel-safe:
+/// it awaits only a channel `recv` and an `Interval::tick`, and handles a
+/// command it has taken before it awaits again, so dropping it when the hold
+/// ends loses nothing. A close during the hold is absorbed by the gate, so
+/// when the hold ends the gate is closed and the read is dropped. A close and
+/// a reopen during the hold hand back a fresh open edge, which is decided
+/// afresh. The held read stands in for the open edge's, so the cadence
+/// restarts from it (`Gate::reset`), as the gate restarts it from an edge.
+///
+/// The age is measured on tokio's clock from the moment a read is started,
+/// which is no later than the moment its baseline was taken — so a kept
+/// baseline is at most `keep.under` old, never older.
 async fn drive<S: Sample>(
     cmds: CmdReceiver<Cmd>,
     msgs: CmdSender<Msg>,
     period: Duration,
     visibility: fn(&Cmd) -> Option<bool>,
     wrap: fn(S::Reading) -> Msg,
+    keep: Keep,
     mut make: impl FnMut() -> S + Send + 'static,
 ) {
+    /// What woke the loop: the gate, or the end of a held read.
+    enum Due<C> {
+        Gate(Option<Wake<C>>),
+        Held,
+    }
+
     // The gate absorbs every visibility command itself and answers only the
     // *open* edge, so the loop below cannot otherwise see a close — and a
     // close is exactly what invalidates the cumulative baseline (#1277 LOW 4).
@@ -809,51 +883,100 @@ async fn drive<S: Sample>(
         want
     });
     let mut sampler = make();
-    while let Some(wake) = gate.next().await {
-        match wake {
-            Wake::Refresh => {
-                if parked.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    // Re-baseline: the first frame after an unpark must be a
-                    // load measured over a fresh window, not the mean over
-                    // however long the sidebar was shut.
-                    sampler.reset();
-                }
-                // The sampler is moved into the blocking closure and handed
-                // back with the snapshot, which is what keeps its caches warm
-                // without an `Arc<Mutex<…>>` around a value only this task ever
-                // touches.
-                let joined = tokio::task::spawn_blocking(move || {
-                    let reading = sampler.tick();
-                    (sampler, reading)
-                })
-                .await;
-                match joined {
-                    Ok((back, reading)) => {
-                        sampler = back;
-                        if msgs.send(wrap(reading)).is_err() {
-                            // The reducer is gone: the session is tearing down.
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        // The blocking task was cancelled or panicked. Both are
-                        // our bug rather than a machine state, so say so — and
-                        // then carry on with cold caches rather than ending the
-                        // task, because ending it freezes the card for the rest
-                        // of the session while leaving the process looking
-                        // healthy. One tick of stale CPU deltas is the cost.
-                        tracing::warn!(error = %e, "stats sampler tick failed; restarting its caches");
-                        sampler = make();
-                    }
-                }
-            }
+    // When the last read started — the age of the baseline it left, for
+    // `keep`. `None` before the first read and after a sampler is rebuilt.
+    let mut last_read: Option<tokio::time::Instant> = None;
+    // A reopen's first read, held until its kept baseline is `keep.settle`
+    // old: the instant it may start.
+    let mut held: Option<tokio::time::Instant> = None;
+    loop {
+        let due = match held {
+            None => Due::Gate(gate.next().await),
+            Some(at) => tokio::select! {
+                // The lane first, as in the gate: a close already queued when
+                // the hold ends is taken before the read, and cancels it.
+                biased;
+                wake = gate.next() => Due::Gate(wake),
+                () = tokio::time::sleep_until(at) => Due::Held,
+            },
+        };
+        match due {
+            // The lane closed: the session is tearing down.
+            Due::Gate(None) => return,
             // The other task's command: `route` never sends one down this
             // lane, and if it did, it would not be this task's business. The
-            // classifiers (`Cmd::surface`, `Cmd::top_apps`) are exhaustive
+            // classifiers (`Cmd::surface`, `Cmd::page`) are exhaustive
             // matches without a wildcard, so a new `Cmd` variant is a compile
             // error there — the place to decide which gate it opens — rather
             // than a command silently dropped here.
-            Wake::Cmd(_) => {}
+            Due::Gate(Some(Wake::Cmd(_))) => continue,
+            Due::Gate(Some(Wake::Refresh)) => {
+                // A fresh edge (or a tick) decides for itself: whatever was
+                // held is superseded.
+                held = None;
+                let kept = last_read.filter(|at| at.elapsed() < keep.under);
+                // `swap` first, always: the flag must come down on this
+                // refresh whether or not the baseline is kept.
+                let reopened = parked.swap(false, std::sync::atomic::Ordering::Relaxed);
+                if reopened {
+                    match kept {
+                        // Re-baseline: the first frame after an unpark must
+                        // be a load measured over a fresh window, not the mean
+                        // over however long the sidebar was shut.
+                        None => sampler.reset(),
+                        // Kept, but too young to read against yet: hold the
+                        // read until it is `keep.settle` old.
+                        Some(at) => {
+                            let ready = at + keep.settle;
+                            if ready > tokio::time::Instant::now() {
+                                held = Some(ready);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            Due::Held => {
+                held = None;
+                // A close during the hold was absorbed by the gate: the page
+                // is gone, and so is the read it was owed.
+                if !gate.is_visible() {
+                    continue;
+                }
+                // This read stands in for the open edge's: restart the cadence
+                // from it, as the gate restarts it from an edge.
+                gate.reset();
+            }
+        }
+        last_read = Some(tokio::time::Instant::now());
+        // The sampler is moved into the blocking closure and handed back with
+        // the snapshot, which is what keeps its caches warm without an
+        // `Arc<Mutex<…>>` around a value only this task ever touches.
+        let joined = tokio::task::spawn_blocking(move || {
+            let reading = sampler.tick();
+            (sampler, reading)
+        })
+        .await;
+        match joined {
+            Ok((back, reading)) => {
+                sampler = back;
+                if msgs.send(wrap(reading)).is_err() {
+                    // The reducer is gone: the session is tearing down.
+                    return;
+                }
+            }
+            Err(e) => {
+                // The blocking task was cancelled or panicked. Both are our
+                // bug rather than a machine state, so say so — and then carry
+                // on with cold caches rather than ending the task, because
+                // ending it freezes the card for the rest of the session while
+                // leaving the process looking healthy. One tick of stale CPU
+                // deltas is the cost.
+                tracing::warn!(error = %e, "stats sampler tick failed; restarting its caches");
+                sampler = make();
+                // A fresh sampler has no baseline to keep.
+                last_read = None;
+            }
         }
     }
 }
@@ -1358,7 +1481,8 @@ mod tests {
     /// runs on a real blocking-pool thread, so a *regular* cadence tick from
     /// the first open window (queued the instant virtual time crossed its
     /// period, independently of anything below) can finish late — after the
-    /// close, after `pump_ten_periods`, even after the reopen is sent — and
+    /// close, and (while the wait below was the hand-stepped
+    /// `pump_ten_periods`, before #1427) even after the reopen is sent — and
     /// bump `ticks()` past `before` with no reset anywhere near it, because it
     /// was never the reopen's own read. Measured: 25/200 runs (12.5%) red
     /// under `taskset -c 0-3` plus four pinned burners on those cores, 0/200
@@ -1396,7 +1520,17 @@ mod tests {
         let before = calls.ticks();
 
         cmd_tx.send(Cmd::SetVisible(false)).expect("lane is live");
-        pump_ten_periods(period).await;
+        // Ten periods by the runtime's own auto-advance, not
+        // `pump_ten_periods`: the paused clock cannot move while a read is
+        // still on the blocking pool (tokio inhibits auto-advance for a
+        // pending `spawn_blocking` on a current-thread runtime), so this
+        // returns only after any read in flight at the close has landed and
+        // the task has taken the close. The hand-stepped pump never waited in
+        // real time, and with a read starved on one loaded core the reopen
+        // below reached a task still inside that read: `resets()` read 0
+        // (measured on #1427: 2/30 release runs pinned to one core beside
+        // four burners).
+        tokio::time::sleep(period * 10).await;
         cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
 
         // Check the reset *directly*, right after the edge, before ever
@@ -1418,6 +1552,50 @@ mod tests {
             1,
             "…and still exactly once by the time the reopen's own read lands",
         );
+
+        drop(cmd_tx);
+        let _ = task.await;
+    }
+
+    /// **A quick sidebar reopen still re-baselines** — the sensors keep no
+    /// baseline across a reopen, however young (#1427 gave only the Top apps
+    /// walker a `KEEP_BASELINE` window; the sensors' reopen rule is #1277 LOW
+    /// 4's as it stands). Closed and reopened with no time passing at all,
+    /// the sampler is reset before its next read.
+    ///
+    /// Waits with [`settle_until`], so no virtual time passes between the
+    /// close and the reopen: a young-baseline window of any length would keep
+    /// this baseline.
+    ///
+    /// **Falsified** by handing the sensors' `drive` the walker's
+    /// `top_apps::KEEP_BASELINE` in place of `Duration::ZERO`.
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_sidebar_reopen_still_re_baselines() {
+        let period = Duration::from_secs(1);
+        let calls = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let made = Arc::clone(&calls);
+        let task = tokio::spawn(sampler_task_with(cmd_rx, msg_tx, period, move || {
+            FakeSampler(Arc::clone(&made))
+        }));
+
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        // The open edge's sample has reached the reducer, so the task is back
+        // at its gate with a baseline zero seconds old.
+        assert!(
+            settle_until(|| msg_rx.try_recv().is_ok()).await,
+            "the open edge samples",
+        );
+        assert_eq!(calls.resets(), 0, "the first open has nothing to drop");
+
+        cmd_tx.send(Cmd::SetVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        assert!(
+            settle_until(|| calls.resets() >= 1).await,
+            "a zero-second close must still drop the sensors' baseline",
+        );
+        assert_eq!(calls.resets(), 1, "exactly once");
 
         drop(cmd_tx);
         let _ = task.await;
@@ -1642,7 +1820,7 @@ mod tests {
     }
 
     /// **Each command goes to its own task, and only there**: the surface's
-    /// visibility to the sensors sampler, the Top apps switch to the walker.
+    /// visibility to the sensors sampler, the page's to the walker.
     ///
     /// **Falsified** by routing either variant to the other lane, or by
     /// fanning every command out to both (the walker lane then carries the
@@ -1655,9 +1833,9 @@ mod tests {
         let router = tokio::spawn(route(cmd_rx, sensors_tx, walker_tx));
         for cmd in [
             Cmd::SetVisible(true),
-            Cmd::ShowTopApps(true),
+            Cmd::PageVisible(true),
             Cmd::SetVisible(false),
-            Cmd::ShowTopApps(false),
+            Cmd::PageVisible(false),
         ] {
             cmd_tx.send(cmd).expect("lane is live");
         }
@@ -1676,49 +1854,52 @@ mod tests {
         );
         assert_eq!(
             drain(&mut walker_rx),
-            vec![Cmd::ShowTopApps(true), Cmd::ShowTopApps(false)],
+            vec![Cmd::PageVisible(true), Cmd::PageVisible(false)],
         );
     }
 
     /// Each task's classifier answers **only its own switch** — the second
-    /// line of defence behind the router, and the one that keeps a bar
-    /// instance's permanently-open surface from opening the walker.
+    /// line of defence behind the router. One direction keeps a bar
+    /// instance's permanently-open surface from opening the walker; the other
+    /// keeps a page close from parking the bar chips' sampler.
     ///
-    /// **Falsified** by `Cmd::top_apps` answering `SetVisible`, or
-    /// `Cmd::surface` answering `ShowTopApps`.
+    /// **Falsified** by `Cmd::page` answering `SetVisible`, or
+    /// `Cmd::surface` answering `PageVisible`.
     #[test]
     fn each_classifier_answers_only_its_own_switch() {
         for on in [false, true] {
             assert_eq!(Cmd::SetVisible(on).surface(), Some(on));
-            assert_eq!(Cmd::SetVisible(on).top_apps(), None);
-            assert_eq!(Cmd::ShowTopApps(on).top_apps(), Some(on));
-            assert_eq!(Cmd::ShowTopApps(on).surface(), None);
+            assert_eq!(Cmd::SetVisible(on).page(), None);
+            assert_eq!(Cmd::PageVisible(on).page(), Some(on));
+            assert_eq!(Cmd::PageVisible(on).surface(), None);
         }
     }
 
-    /// **The walker does not run for the bar chips — only for an open list.**
-    /// End to end through [`spawn_with`]'s router and both gates, with counting
-    /// fakes.
+    /// **The walker runs only while the page is open — never for the bar
+    /// chips — and the chips keep sampling across a page close.** End to end
+    /// through [`spawn_with`]'s router and both gates, with counting fakes.
     ///
     /// A bar instance opens its sensors gate at `init` and never closes it,
     /// so this drives exactly that — `SetVisible(true)` and nothing else — and
     /// shows the sensors sampler ticking away (the control: the pump did move
-    /// time) while the walker is never called. Opening a list then starts the
-    /// walker and delivers its lists; closing it parks the walker again; and a
-    /// reopen drops the baseline first (#1277 LOW 4's rule, which the walker
-    /// inherits by running through the same loop).
+    /// time) while the walker is never called: a hidden page walks nothing.
+    /// Opening the page then starts the walker and delivers its lists; closing
+    /// it parks the walker again while the sensors sampler keeps its cadence;
+    /// and a reopen after a long close drops the baseline first (#1277 LOW 4's
+    /// rule, which the walker inherits by running through the same loop).
     ///
     /// **Falsified** by the router swapping its two lanes (the walker never
     /// hears its switch), by the walker's classifier ignoring
-    /// `ShowTopApps(false)` (it keeps walking after the close), and by
-    /// `drive`'s `parked` re-baseline being deleted. **Not** by letting
-    /// `SetVisible` through at only one of its two stops — the router, or the
-    /// walker's classifier — since the other still holds it back (measured:
-    /// both stay green here); those are what
-    /// `the_router_sends_each_command_to_its_own_task` and
+    /// `PageVisible(false)` (it keeps walking after the close), by
+    /// `Cmd::surface` answering `PageVisible` together with the router
+    /// fanning out (the page close parks the chips), and by `drive`'s `parked`
+    /// re-baseline being deleted. **Not** by letting `SetVisible` through at
+    /// only one of its two stops — the router, or the walker's classifier —
+    /// since the other still holds it back (measured: both stay green here);
+    /// those are what `the_router_sends_each_command_to_its_own_task` and
     /// `each_classifier_answers_only_its_own_switch` are for.
     #[tokio::test(start_paused = true)]
-    async fn the_walker_runs_only_while_a_list_is_open_never_for_the_chips() {
+    async fn the_walker_runs_only_while_the_page_is_open_never_for_the_chips() {
         let sensors = Arc::new(Calls::default());
         let walker = Arc::new(Calls::default());
         let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
@@ -1742,11 +1923,11 @@ mod tests {
         assert_eq!(
             walker.ticks(),
             0,
-            "an open surface is not an open list: the walker never ran",
+            "an open surface is not an open page: the walker never ran",
         );
 
-        // A list opens: the walker walks, and its lists reach the reducer.
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        // The page opens: the walker walks, and its lists reach the reducer.
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
         let mut landed = None;
         assert!(
             pump_until(|| {
@@ -1758,27 +1939,37 @@ mod tests {
                 landed.is_some()
             })
             .await,
-            "an open list walks, and the walk reaches the reducer",
+            "an open page walks, and the walk reaches the reducer",
         );
         assert_eq!(landed.expect("landed").by_mem[0].procs, 3);
 
-        // The last list closes: the walker parks. One walk may already have
-        // been in flight on the blocking pool — the gate never cancels one —
-        // so the bound is one more, not none; ten periods of an open gate
-        // would be ten.
-        cmd_tx.send(Cmd::ShowTopApps(false)).expect("lane is live");
+        // The page closes: the walker parks. One walk may already have been
+        // in flight on the blocking pool — the gate never cancels one — so
+        // the bound is one more, not none; ten periods of an open gate would
+        // be ten.
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
         tokio::task::yield_now().await;
         let parked_at = walker.ticks();
+        let chips_at = sensors.ticks();
         pump_ten_periods(crate::top_apps::POLL).await;
         assert!(
             walker.ticks() <= parked_at + 1,
-            "a closed list must park the walker: {} walks after the close",
+            "a closed page must park the walker: {} walks after the close",
             walker.ticks() - parked_at,
+        );
+        // …while the chips, which are still on screen, keep their own
+        // cadence. Pumped until rather than counted over the ten periods
+        // above: a blocking-pool read lags virtual time under load, so a
+        // count there would measure the machine, not the gate.
+        assert!(
+            pump_until(|| sensors.ticks() >= chips_at + 3).await,
+            "a page close must not park the chips' sampler: {} samples since",
+            sensors.ticks() - chips_at,
         );
 
         // Reopening re-baselines before it walks.
         assert_eq!(walker.resets(), 0);
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
         assert!(pump_until(|| walker.resets() >= 1).await);
         assert_eq!(walker.resets(), 1, "exactly one re-baseline per reopen");
         assert_eq!(
@@ -1816,7 +2007,7 @@ mod tests {
             || Walker::over(crate::top_apps::fake_proc().0),
         );
 
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
         let mut walks: Vec<TopApps> = Vec::new();
         assert!(
             pump_until(|| {
@@ -1841,16 +2032,18 @@ mod tests {
         join_all(tasks).await;
     }
 
-    /// **The real walker re-baselines on a reopen, through the shared loop.**
-    /// A real [`Walker`] is closed and reopened; the first walk after the
-    /// reopen must be cold (no CPU list) and handed no baseline, so its CPU
-    /// share is never the mean over the collapsed gap (#1277 LOW 4). From the
-    /// #1426 review, LOW 2: `Walker::reset` was tested directly and `drive`'s
-    /// reset only with a fake, so the one line joining them was not.
+    /// **The real walker re-baselines on a reopen after a long close, through
+    /// the shared loop.** A real [`Walker`]'s page is closed for ten walks'
+    /// worth of time and reopened; the first walk after the reopen must be
+    /// cold (no CPU list) and handed no baseline, so its CPU share is never
+    /// the mean over the closed gap (#1277 LOW 4). From the #1426 review, LOW
+    /// 2: `Walker::reset` was tested directly and `drive`'s reset only with a
+    /// fake, so the one line joining them was not.
     ///
-    /// **Falsified** by making `impl Sample for Walker`'s `reset` a no-op.
+    /// **Falsified** by making `impl Sample for Walker`'s `reset` a no-op, and
+    /// by `drive` keeping every baseline (`keep` read as unbounded).
     #[tokio::test(start_paused = true)]
-    async fn a_reopened_list_measures_cpu_over_a_fresh_window() {
+    async fn a_page_reopened_after_a_long_close_measures_cpu_over_a_fresh_window() {
         async fn next_walk(rx: &mut hytte_plugin::CmdReceiver<Msg>) -> TopApps {
             let mut got = None;
             pump_until(|| {
@@ -1867,6 +2060,10 @@ mod tests {
             got.expect("a walk lands")
         }
 
+        // The gap below is ten walks; it must be past the young-baseline
+        // window, or this would be the quick-reopen test.
+        assert!(crate::top_apps::POLL * 10 > crate::top_apps::KEEP_BASELINE);
+
         let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
         let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
         let (walk, handed) = crate::top_apps::fake_proc();
@@ -1879,7 +2076,7 @@ mod tests {
             move || Walker::over(walk.take().expect("the walker is built once")),
         );
 
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
         assert!(
             next_walk(&mut msg_rx).await.by_cpu.is_empty(),
             "cold first walk"
@@ -1890,13 +2087,21 @@ mod tests {
             "warm second walk"
         );
 
-        cmd_tx.send(Cmd::ShowTopApps(false)).expect("lane is live");
-        tokio::task::yield_now().await;
-        pump_ten_periods(crate::top_apps::POLL).await;
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        // Ten walks' worth of closed page by the runtime's own auto-advance,
+        // which tokio holds while a `spawn_blocking` walk is pending: this
+        // returns only once a walk in flight at the close has landed on the
+        // lane, so the drain below takes it. The #1426 version stepped the
+        // clock by hand (`pump_ten_periods`), and a walk starved on a loaded
+        // core landed *after* the drain, where `next_walk` read it as the
+        // reopen's — a warm share, and a red test (measured on #1427, release
+        // build pinned to one core beside four burners: 29 of 30 runs on
+        // `main`, 27 of 30 on this branch before the fix).
+        tokio::time::sleep(crate::top_apps::POLL * 10).await;
         while msg_rx.try_recv().is_ok() {}
         let before = handed.lock().expect("not poisoned").len();
 
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
         let reopened = next_walk(&mut msg_rx).await;
         assert!(
             reopened.by_cpu.is_empty(),
@@ -1912,19 +2117,452 @@ mod tests {
         join_all(tasks).await;
     }
 
-    /// **The walker keeps native's 2 s cadence** even when the sensors
-    /// sampler runs faster: ten seconds of an open list is at most six walks
-    /// (the open edge plus one every 2 s), never one a second. From the #1426
-    /// review, LOW 4 — a faster walker silently multiplies the cost of a list
-    /// left open.
+    /// Turn the runtime over until `done` answers true, **without moving
+    /// virtual time**, or give up after a wall-clock budget.
     ///
-    /// Only an upper bound: a walk runs on a blocking-pool thread, which under
-    /// load lags virtual time, so fewer walks is not a failure (the reviewer
-    /// measured 1–3 under four pinned burners, and a lower bound failed 172 of
-    /// 200 loaded runs).
+    /// [`pump_until`] nudges the clock forward while it waits, and a walk on
+    /// the blocking pool can take long enough in wall-clock terms for that to
+    /// add up to many virtual seconds. That is harmless where a test waits for
+    /// "a walk, whenever" and fatal where it measures a baseline's *age*: the
+    /// young-baseline tests below advance the clock themselves, exactly, and
+    /// wait with this instead.
+    async fn settle_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        done()
+    }
+
+    /// Turn the runtime over a fixed number of times without moving virtual
+    /// time — the negative half of [`settle_until`], where there is nothing
+    /// to wait *for*. The same order of budget [`pump_ten_periods`] gives each
+    /// period, ten times over.
+    async fn quiesce() {
+        for _ in 0..2_000 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Wait (without moving virtual time) until the reducer's lane has
+    /// carried `n` walks in all, collecting them into `walks`, and assert it
+    /// is exactly `n` — no walk the test did not ask for.
+    async fn walks_landed(
+        rx: &mut hytte_plugin::CmdReceiver<Msg>,
+        walks: &mut Vec<TopApps>,
+        n: usize,
+    ) {
+        let landed = settle_until(|| {
+            while let Ok(msg) = rx.try_recv() {
+                if let Msg::TopApps(apps) = msg {
+                    walks.push(apps);
+                }
+            }
+            walks.len() >= n
+        })
+        .await;
+        assert!(landed, "walk {n} lands");
+        assert_eq!(walks.len(), n, "exactly {n} walks: {walks:?}");
+    }
+
+    /// **A quick close and reopen keeps a young baseline** (the #1426
+    /// review's NIT 8, now that a page close parks the walker): a page
+    /// reopened less than `KEEP_BASELINE` after the last walk started gets a
+    /// **warm** first walk — handed the previous walk's baseline, so its CPU
+    /// list is a real share rather than `—` for a whole cadence. At exactly
+    /// `KEEP_BASELINE` the baseline is old enough to drop, and the reopen's
+    /// walk is cold again. (How soon the warm walk may start is
+    /// [`a_kept_baseline_is_read_no_sooner_than_half_a_walk_after_it_was_taken`]'s
+    /// subject; here it is simply waited for.)
+    ///
+    /// Virtual time moves only where this test moves it (see
+    /// [`settle_until`]), so each baseline's age is exact.
+    ///
+    /// **Falsified** by `drive` re-baselining on every reopen (`keep`
+    /// ignored: the quick reopen's walk is handed no baseline), by keeping
+    /// every baseline (the `KEEP_BASELINE` reopen is handed one), by `<=` for
+    /// `<` in the age check (the boundary reopen keeps it), and by stamping
+    /// `last_read` only once (the just-under-the-window reopen then measures
+    /// from the first walk and drops it).
+    #[allow(clippy::float_cmp)]
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_reopen_keeps_a_young_baseline_and_a_slow_one_drops_it() {
+        use crate::top_apps::{KEEP_BASELINE, MIN_BASELINE_AGE, POLL};
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+        let handed_at = |i: usize| handed.lock().expect("not poisoned")[i];
+        let mut walks: Vec<TopApps> = Vec::new();
+
+        // Open: the edge walks at once (cold), and one cadence later again.
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 1).await;
+        assert!(walks[0].by_cpu.is_empty(), "the first walk is cold");
+        tokio::time::advance(POLL).await;
+        walks_landed(&mut msg_rx, &mut walks, 2).await;
+        assert_eq!(walks[1].by_cpu.len(), 1, "the second walk is warm");
+
+        // A close and an immediate reopen: the baseline is 0 s old, so the
+        // walk is held until it is MIN_BASELINE_AGE old.
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        tokio::time::advance(MIN_BASELINE_AGE).await;
+        walks_landed(&mut msg_rx, &mut walks, 3).await;
+        assert_eq!(
+            handed_at(2),
+            (Some(500), 2_000),
+            "the quick reopen's walk is handed the last walk's baseline",
+        );
+        assert_eq!(walks[2].by_cpu.len(), 1, "…so its CPU list is there");
+        assert_eq!(walks[2].by_cpu[0].cpu_frac, 0.25, "…and a real share");
+
+        // Closed for just under the window: still kept.
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        tokio::task::yield_now().await;
+        tokio::time::advance(KEEP_BASELINE.saturating_sub(Duration::from_millis(1))).await;
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 4).await;
+        assert_eq!(
+            handed_at(3),
+            (Some(750), 3_000),
+            "a baseline younger than KEEP_BASELINE survives the reopen",
+        );
+
+        // Closed for exactly the window: dropped, and the walk is cold.
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        tokio::task::yield_now().await;
+        tokio::time::advance(KEEP_BASELINE).await;
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 5).await;
+        assert_eq!(
+            handed_at(4),
+            (None, 0),
+            "a KEEP_BASELINE-old baseline is dropped"
+        );
+        assert!(walks[4].by_cpu.is_empty(), "…so the walk is cold again");
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// Everything the reducer's lane carries by now, added to `walks`.
+    fn drain_walks(rx: &mut hytte_plugin::CmdReceiver<Msg>, walks: &mut Vec<TopApps>) {
+        while let Ok(msg) = rx.try_recv() {
+            if let Msg::TopApps(apps) = msg {
+                walks.push(apps);
+            }
+        }
+    }
+
+    /// **A kept baseline is read against no sooner than `MIN_BASELINE_AGE`
+    /// after its read started** (the #1437 review's LOW 1): a quick reopen's
+    /// first walk is held until `max(reopen, last walk's start +
+    /// MIN_BASELINE_AGE)`, so its CPU list is never a share over a window of a
+    /// few hundred milliseconds — and it still comes well inside a cadence.
+    /// Then the two things the hold must not break:
+    ///
+    /// - **The cadence restarts from the held walk**, a full `POLL` after it,
+    ///   as it does from an open edge.
+    /// - **A close during the hold cancels the walk**: no walk with the page
+    ///   shut, and a later reopen is decided afresh.
+    ///
+    /// The negatives wait with `tokio::time::sleep`, not `advance`: the paused
+    /// runtime will not move its clock while a walk is on the blocking pool,
+    /// so by the time a sleep returns, any walk started before its deadline
+    /// has landed. A walk that should not have started cannot hide.
+    ///
+    /// **Falsified** by not holding the walk (it lands at the reopen), by a
+    /// shorter hold (`settle / 2`: it lands before the floor), by dropping the
+    /// `gate.reset()` after a held walk (the next walk comes 700 ms early), and
+    /// by dropping the `gate.is_visible()` check (the held walk runs with the
+    /// page shut).
+    #[allow(clippy::float_cmp)]
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_baseline_is_read_no_sooner_than_half_a_walk_after_it_was_taken() {
+        use crate::top_apps::{MIN_BASELINE_AGE, POLL};
+        // How long after walk 2 started the page closes and reopens.
+        const EARLY: Duration = Duration::from_millis(300);
+        const MS: Duration = Duration::from_millis(1);
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+        let handed_at = |i: usize| handed.lock().expect("not poisoned")[i];
+        let started = || handed.lock().expect("not poisoned").len();
+        let mut walks: Vec<TopApps> = Vec::new();
+
+        // Walk 1 on the open edge (0 s, cold), walk 2 a cadence later (2 s).
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 1).await;
+        tokio::time::advance(POLL).await;
+        walks_landed(&mut msg_rx, &mut walks, 2).await;
+
+        // 300 ms into walk 2's window the page closes and reopens at once.
+        tokio::time::advance(EARLY).await;
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+
+        // Up to a millisecond short of the floor: nothing starts.
+        tokio::time::sleep(MIN_BASELINE_AGE.saturating_sub(EARLY + MS)).await;
+        drain_walks(&mut msg_rx, &mut walks);
+        assert_eq!(
+            (walks.len(), started()),
+            (2, 2),
+            "no walk before the kept baseline is MIN_BASELINE_AGE old",
+        );
+
+        // At the floor: the held walk, warm, over a window of exactly it.
+        tokio::time::sleep(MS).await;
+        walks_landed(&mut msg_rx, &mut walks, 3).await;
+        assert_eq!(handed_at(2), (Some(500), 2_000), "handed walk 2's baseline");
+        assert_eq!(walks[2].by_cpu.len(), 1, "its CPU list is there");
+        assert_eq!(walks[2].by_cpu[0].cpu_frac, 0.25, "…a real share");
+
+        // The cadence restarts from the held walk: nothing a millisecond
+        // short of a full POLL after it, then the next walk.
+        tokio::time::sleep(POLL.saturating_sub(MS)).await;
+        drain_walks(&mut msg_rx, &mut walks);
+        assert_eq!(
+            (walks.len(), started()),
+            (3, 3),
+            "the next walk is a full POLL after the held one",
+        );
+        tokio::time::sleep(MS).await;
+        walks_landed(&mut msg_rx, &mut walks, 4).await;
+
+        // A close and a reopen hold a walk again; a second close during the
+        // hold cancels it, and nothing walks with the page shut.
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        tokio::time::sleep(POLL * 5).await;
+        drain_walks(&mut msg_rx, &mut walks);
+        assert_eq!(
+            (walks.len(), started()),
+            (4, 4),
+            "a close during the hold cancels the held walk",
+        );
+
+        // Ten seconds later the baseline is too old to keep: the reopen walks
+        // at once, cold.
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 5).await;
+        assert_eq!(handed_at(4), (None, 0), "a stale baseline is dropped");
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **A quick reopen lowers the reopen flag even though it keeps the
+    /// baseline**, so a later cadence tick is never taken for a reopen,
+    /// however late it comes (`drive`'s "`swap` first, always").
+    ///
+    /// **Falsified** by swapping `parked` only when the baseline is dropped:
+    /// the late tick then re-baselines and walks cold.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_tick_after_a_quick_reopen_is_not_a_reopen() {
+        use crate::top_apps::{KEEP_BASELINE, MIN_BASELINE_AGE, POLL};
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+        let mut walks: Vec<TopApps> = Vec::new();
+
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 1).await;
+        // A close and an immediate reopen: young, so the baseline is kept.
+        // (Its walk is held until the baseline is MIN_BASELINE_AGE old.)
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        tokio::time::advance(MIN_BASELINE_AGE).await;
+        walks_landed(&mut msg_rx, &mut walks, 2).await;
+        assert_eq!(walks[1].by_cpu.len(), 1, "the quick reopen's walk is warm");
+
+        // The page stays open and the next cadence tick comes late (a stalled
+        // runtime, say), past KEEP_BASELINE. It is a tick, not a reopen.
+        tokio::time::advance(KEEP_BASELINE + POLL).await;
+        walks_landed(&mut msg_rx, &mut walks, 3).await;
+        assert_eq!(
+            handed.lock().expect("not poisoned")[2],
+            (Some(500), 2_000),
+            "a cadence tick is handed the previous walk's baseline, however late",
+        );
+        assert_eq!(walks[2].by_cpu.len(), 1, "…so its CPU list is there");
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **The page's register seed opens the walker whichever side of the
+    /// first tick it lands on**, and a `false` seed opens nothing.
+    ///
+    /// In a live session a bar instance's `init` puts `SetVisible(true)` on
+    /// the lane before `sources` spawns the tasks, and the host's
+    /// `PageVisibility` seed arrives only after, through the session loop — so
+    /// the chips' sampler may already have ticked any number of times, and
+    /// the walker's own construction-time cadence tick may be long overdue.
+    /// Three launches:
+    ///
+    /// - **Before**: the page seed is queued with the chips' seed, before any
+    ///   task has run. The walker walks at once.
+    /// - **After**: the chips have sampled for ten seconds first. The walker
+    ///   still walks exactly once on the seed and then waits a full cadence —
+    ///   an overdue construction-time tick is not a second walk.
+    /// - **Shut**: the seed says the page is closed. The chips sample; the
+    ///   walker never does, however long it waits.
+    ///
+    /// In both open launches the next walk is one whole cadence after the
+    /// seed's, and then it does come.
+    ///
+    /// **Falsified** by the walker's gate starting open (the shut launch
+    /// walks), by the router or the walker's classifier dropping
+    /// `PageVisible` (no launch walks), and by the gate's open-edge `reset`
+    /// being skipped (the late seed walks twice back to back).
+    #[tokio::test(start_paused = true)]
+    async fn the_page_seed_opens_the_walker_before_or_after_the_first_tick() {
+        /// What one launch saw: the walker's count once the seed settled, a
+        /// hair under one cadence later, and just after it; and the chips'.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Seen {
+            settled: usize,
+            early: usize,
+            cadence: usize,
+            chips: usize,
+        }
+
+        /// One launch: the bar's own seed, then (after `chips_first` of
+        /// virtual time) the host's page seed.
+        async fn launch(chips_first: Duration, seed: bool) -> Seen {
+            let sensors = Arc::new(Calls::default());
+            let walker = Arc::new(Calls::default());
+            let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+            let (msg_tx, _msg_rx) = cmd_channel::<Msg>();
+            let (made_s, made_w) = (Arc::clone(&sensors), Arc::clone(&walker));
+            let tasks = spawn_with(
+                cmd_rx,
+                msg_tx,
+                Duration::from_secs(1),
+                move || FakeSampler(Arc::clone(&made_s)),
+                move || FakeWalker(Arc::clone(&made_w)),
+            );
+            cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+            if !chips_first.is_zero() {
+                assert!(
+                    settle_until(|| sensors.ticks() >= 1).await,
+                    "the chips' open edge samples"
+                );
+                tokio::time::advance(chips_first).await;
+                assert!(
+                    settle_until(|| sensors.ticks() >= 2).await,
+                    "…and the cadence runs before the page seed"
+                );
+            }
+            cmd_tx.send(Cmd::PageVisible(seed)).expect("lane is live");
+            // Wait for what should come, then give what should not a fair
+            // chance to come too — all without moving the clock.
+            let want = usize::from(seed);
+            let _ = settle_until(|| walker.ticks() >= want).await;
+            quiesce().await;
+            let settled = walker.ticks();
+            tokio::time::advance(crate::top_apps::POLL.saturating_sub(Duration::from_millis(1)))
+                .await;
+            quiesce().await;
+            let early = walker.ticks();
+            tokio::time::advance(Duration::from_millis(1)).await;
+            if seed {
+                let _ = settle_until(|| walker.ticks() > early).await;
+            } else {
+                quiesce().await;
+            }
+            let cadence = walker.ticks();
+            let chips = sensors.ticks();
+            drop(cmd_tx);
+            join_all(tasks).await;
+            Seen {
+                settled,
+                early,
+                cadence,
+                chips,
+            }
+        }
+
+        let before = launch(Duration::ZERO, true).await;
+        assert_eq!(
+            (before.settled, before.early, before.cadence),
+            (1, 1, 2),
+            "seed before the first tick: {before:?}",
+        );
+
+        let after = launch(Duration::from_secs(10), true).await;
+        assert!(after.chips >= 2, "the chips ticked first: {after:?}");
+        assert_eq!(
+            (after.settled, after.early, after.cadence),
+            (1, 1, 2),
+            "seed after the first ticks: {after:?}",
+        );
+
+        let shut = launch(Duration::from_secs(10), false).await;
+        assert!(shut.chips >= 2, "the chips ticked: {shut:?}");
+        assert_eq!(
+            (shut.settled, shut.early, shut.cadence),
+            (0, 0, 0),
+            "a shut page walks nothing: {shut:?}",
+        );
+    }
+
+    /// **The walker keeps native's 2 s cadence** even when the sensors
+    /// sampler runs faster: 9.5 s of an open page is **exactly five walks** —
+    /// the open edge at 0 s, then 2, 4, 6 and 8 s — never one a second. From
+    /// the #1426 review, LOW 4 — a faster walker silently multiplies the cost
+    /// of an open page.
+    ///
+    /// # Why the count is exact
+    ///
+    /// The test does not move the clock itself. It sleeps, and the paused
+    /// runtime **auto-advances** to the next timer only once every task is
+    /// idle — and tokio holds that auto-advance for as long as any
+    /// `spawn_blocking` task is still pending on a current-thread runtime
+    /// (`BlockingSchedule::new` → `inhibit_auto_advance`, released when the
+    /// task ends). So virtual time never passes a walk that is still on the
+    /// blocking pool, however slow the machine is.
+    ///
+    /// The #1426 version stepped the clock by hand (`pump_ten_periods`: an
+    /// `advance` plus 200 `yield_now`s per second) and never waited in real
+    /// time for the blocking pool. On a loaded machine the pool could miss
+    /// every step, so it asserted only `1 ≤ walks ≤ 6`, and even the lower
+    /// bound flaked: zero walks in CI on #1435 (run 36476735746). With the
+    /// clock held by the runtime, neither bound needs slack.
     ///
     /// **Falsified** by handing the walker the sensors' `period` instead of
-    /// `top_apps::POLL` in `spawn_with` (10 walks here, idle).
+    /// `top_apps::POLL` in `spawn_with` (ten walks), or any other cadence.
     #[tokio::test(start_paused = true)]
     async fn the_walker_walks_on_its_own_two_second_cadence() {
         let walker = Arc::new(Calls::default());
@@ -1939,14 +2577,15 @@ mod tests {
             move || FakeWalker(Arc::clone(&made)),
         );
         cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
-        // Ten one-second steps of virtual time.
-        pump_ten_periods(Duration::from_secs(1)).await;
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        // Half a second short of the walk due at 10 s, so no walk is due at
+        // the instant this wakes: the count cannot depend on which of two
+        // simultaneous timers the runtime polls first.
+        tokio::time::sleep(Duration::from_millis(9_500)).await;
         let walks = walker.ticks();
-        assert!(walks >= 1, "the open list walked at all");
-        assert!(
-            walks <= 6,
-            "10 s of an open list at a 2 s cadence is at most 6 walks, got {walks}",
+        assert_eq!(
+            walks, 5,
+            "9.5 s of an open page at a 2 s cadence is the edge plus four walks",
         );
         drop(cmd_tx);
         join_all(tasks).await;
@@ -1999,7 +2638,7 @@ mod tests {
         );
 
         cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
-        cmd_tx.send(Cmd::ShowTopApps(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
         assert!(
             pump_until(|| walking.load(Ordering::SeqCst)).await,
             "a walk must be observable in progress from the session's thread",

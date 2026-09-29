@@ -121,6 +121,10 @@ pub struct Stats {
     /// card is not changing. Replaces #1295's disk-I/O and VRAM scope rings
     /// and the session-peak denominator the disk ring needed — an auto-scaled
     /// sparkline over the window *is* the native row's windowed max.
+    ///
+    /// Filled by the **bar** instance only (see [`apply`](Self::apply)): it
+    /// is the one that publishes the page, so a sidebar instance keeps it
+    /// empty.
     page: panel::History,
     /// The drawer page's latest Top apps walk (#1419 item 3). Empty while the
     /// page is shut — the walker is parked then, and a reading nobody is
@@ -131,10 +135,13 @@ pub struct Stats {
     /// until the host's register seed says otherwise.
     page_open: bool,
     /// Which of the drawer page's expanders are open — the one piece of UI
-    /// state this plugin holds, because the wire's `Node::Expander` is
-    /// plugin-driven: a click on an expander's id flips its flag and the next
-    /// render carries it. All collapsed by default, like the native rows.
-    /// Pure presentation: no flag gates any sampling.
+    /// state this plugin holds, because the wire's `Node::Expander` (and the
+    /// history rows' toggle buttons, #1419 item 2) are plugin-driven: a click
+    /// on an expander's id flips its flag and the next render carries it. All
+    /// collapsed by default, like the native rows. No flag gates any
+    /// sampling; the two per-core flags decide only whether a per-core graph
+    /// rides the page, and only while the page is open (`panel`'s
+    /// `page_open`). Every flag outlives a page close, as native's rows do.
     expanded: panel::Expanded,
     /// The preem widgets, held across renders so the shell keeps one renderer
     /// instance per node (and so the raster fallback keeps its animation).
@@ -162,7 +169,15 @@ impl Stats {
 
         // The drawer page's lines (#1252): one point per reading this tick
         // actually has, none for one it withholds — see `panel::History`.
-        self.page.push(&snapshot);
+        //
+        // Only on the instance that publishes the page (`view` attaches it for
+        // `Family::Bar` alone), which is decided by the effective mount, as
+        // `settings_from` resolves it. A sidebar card draws none of these
+        // lines, and since #1419 item 2 they include two windows per core
+        // (#1442 review, NIT).
+        if self.family == Family::Bar {
+            self.page.push(&snapshot);
+        }
 
         // A withheld reading is not a sample: a cold tick (or one whose
         // `/proc/stat` read failed) must not push a fake rest value onto the
@@ -368,6 +383,26 @@ impl Plugin for Stats {
                 kind: EventKind::Click,
                 ..
             } if node == panel::TOP_APPS_RAM_ID => self.expanded.top_ram = !self.expanded.top_ram,
+            // The CPU and Clock history rows (#1419 item 2): each swaps its
+            // overall line for one line per core, and back — plugin-driven
+            // like the expanders above, and page-local, so no effect. The
+            // graph itself rides the page only while the page is open too
+            // (`panel`'s `page_open`), so a click that lands after a close
+            // costs no traffic; it shows when the page opens again.
+            Input::Event {
+                node,
+                kind: EventKind::Click,
+                ..
+            } if node == panel::CPU_CORES_TOGGLE_ID => {
+                self.expanded.cpu_cores = !self.expanded.cpu_cores;
+            }
+            Input::Event {
+                node,
+                kind: EventKind::Click,
+                ..
+            } if node == panel::CLOCK_CORES_TOGGLE_ID => {
+                self.expanded.clock_cores = !self.expanded.clock_cores;
+            }
             // Everything else is a push this plugin never subscribed to, or an
             // answer to an effect it never emits. Listed rather than wildcarded
             // so a new host→plugin frame is a compile error here — the place to
@@ -409,6 +444,12 @@ impl Plugin for Stats {
     /// after it lands. (That walk's CPU list may still measure from a baseline
     /// taken before the close — on purpose, when the reopen is quick: see
     /// `crate::top_apps`, *A quick close and reopen keeps its baseline*.)
+    ///
+    /// A close leaves the CPU and Clock history rows as they were (#1419
+    /// item 2): native builds its Stats page once per drawer and keeps it, so
+    /// an expanded row is still expanded on the next open (#1442 review,
+    /// MEDIUM 1). `page_open` is what keeps its series off the wire meanwhile:
+    /// the view draws a per-core graph only on an open page.
     fn page_visible(&mut self, visible: bool) -> Vec<Effect> {
         self.page_open = visible;
         if !visible {
@@ -439,6 +480,7 @@ impl Plugin for Stats {
                     &self.page,
                     &self.top_apps,
                     self.expanded,
+                    self.page_open,
                 ))
             }
             Family::Sidebar => card::card(self.cfg, &self.snapshot, &self.widgets).into(),
@@ -451,11 +493,13 @@ mod tests {
     use super::{DEFAULT_MOUNT, PLUGIN_ID, Settings, Stats, settings_from};
     use crate::card::HISTORY_COLS;
     use crate::config::{self, Card, Family};
+    use crate::panel::{CLOCK_CORES_TOGGLE_ID, CPU_CORES_TOGGLE_ID, HISTORY_LEN};
     use crate::sample::{Cmd, Gpu, Msg, Snapshot};
     use crate::top_apps::TopApps;
+    use hytte_plugin::display::testing::with_negotiated_vocab;
     use hytte_plugin::proto::{
-        Capability, Effect, EventKind, Mount, Node, Page, PluginMsg, SPARKLINE_VOCAB, StateKey,
-        decode, encode,
+        Capability, Effect, EventKind, MULTI_SPARKLINE_VOCAB, Mount, Node, Page, PluginMsg,
+        SPARKLINE_VOCAB, StateKey, decode, encode,
     };
     use hytte_plugin::{CmdReceiver, Input, Plugin};
 
@@ -1100,6 +1144,217 @@ mod tests {
         assert_eq!(
             list_state(&model, ram),
             (false, "firefox · 1.0 GiB".to_owned())
+        );
+    }
+
+    // ── Per-core history (#1419 item 2) ──────────────────────────────────────
+
+    /// Every node of `node` in tree order — buttons' and expanders' insides
+    /// included, which the finders above do not reach.
+    fn every_node(node: &Node) -> Vec<&Node> {
+        let mut out = vec![node];
+        match node {
+            Node::Box { children, .. }
+            | Node::Row { children, .. }
+            | Node::ListBox { children, .. } => {
+                out.extend(children.iter().flat_map(every_node));
+            }
+            Node::Expander {
+                header, children, ..
+            } => {
+                out.extend(every_node(header));
+                out.extend(children.iter().flat_map(every_node));
+            }
+            Node::Button { child, .. } => out.extend(every_node(child)),
+            _ => {}
+        }
+        out
+    }
+
+    /// The per-core graphs on the bar instance's page against a generation-9
+    /// shell: each one's id and its windows' lengths.
+    fn page_graphs(model: &Stats) -> Vec<(String, Vec<usize>)> {
+        with_negotiated_vocab(MULTI_SPARKLINE_VOCAB, || {
+            let panel = model.view().panel.expect("a bar instance publishes a page");
+            every_node(&panel)
+                .into_iter()
+                .filter_map(|n| match n {
+                    Node::MultiSparkline { id, series, .. } => Some((
+                        id.clone().unwrap_or_default(),
+                        series.iter().map(Vec::len).collect(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    /// A four-core sample with a `cpufreq` governor, so the page has both
+    /// history rows.
+    fn clocked(cpu: f32) -> Input<Msg> {
+        Input::App(Msg::Sampled(Box::new(Snapshot {
+            cpu: Some(cpu),
+            per_core: vec![cpu; 4],
+            cpu_clock_hz: Some(3_000_000_000.0),
+            cpu_clock_ceiling_hz: Some(4_000_000_000.0),
+            per_core_clock: vec![0.75; 4],
+            ..Snapshot::default()
+        })))
+    }
+
+    fn cpu_graph(samples: usize) -> (String, Vec<usize>) {
+        (
+            "stats-panel-cpu-per-core-history".to_owned(),
+            vec![samples; 4],
+        )
+    }
+
+    fn clock_graph(samples: usize) -> (String, Vec<usize>) {
+        (
+            "stats-panel-clock-per-core-history".to_owned(),
+            vec![samples; 4],
+        )
+    }
+
+    /// **A click on a history row toggles its per-core view** (#1419 item 2):
+    /// both start collapsed; a click on a row's id opens that row's graph and
+    /// only that one's, a second click closes it — with no effect, and
+    /// nothing on the lane, since a toggle changes what the page draws and
+    /// never what the sampler reads.
+    ///
+    /// **Falsified** by dropping either toggle arm from `update` (the click
+    /// falls through to the no-op arm), or by the two arms flipping each
+    /// other's flag.
+    #[test]
+    fn a_click_on_a_history_row_toggles_its_per_core_view() {
+        let (mut model, mut rx) = fresh_bar(Card::bar_default());
+        let _ = Plugin::page_visible(&mut model, true);
+        let _ = model.update(clocked(0.5));
+        assert_eq!(
+            drain(&mut rx),
+            vec![Cmd::SetVisible(true), Cmd::PageVisible(true)]
+        );
+        assert_eq!(page_graphs(&model), Vec::new(), "both collapsed, as native");
+
+        let click = |id: &str| Input::event(id, EventKind::Click);
+        for (id, want) in [
+            (CPU_CORES_TOGGLE_ID, vec![cpu_graph(1)]),
+            (CLOCK_CORES_TOGGLE_ID, vec![cpu_graph(1), clock_graph(1)]),
+            (CPU_CORES_TOGGLE_ID, vec![clock_graph(1)]),
+            (CLOCK_CORES_TOGGLE_ID, Vec::new()),
+        ] {
+            assert!(model.update(click(id)).is_empty(), "a page-local toggle");
+            assert_eq!(page_graphs(&model), want, "after a click on {id}");
+        }
+        assert_eq!(drain(&mut rx), Vec::new(), "a toggle gates no sampling");
+    }
+
+    /// **An expanded row survives a close and reopen, as native's does, but
+    /// rides no wire while the page is shut.** Native builds its Stats page
+    /// once per drawer (`modal::ensure_page`) and keeps it across closes, so
+    /// its `Stack` stays on `percore`; only `page_open` has to keep the series
+    /// off the wire.
+    #[test]
+    fn an_expanded_row_survives_a_close_but_rides_no_wire_while_shut() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let _ = Plugin::page_visible(&mut model, true);
+        let _ = model.update(clocked(0.5));
+        let _ = model.update(Input::event(CPU_CORES_TOGGLE_ID, EventKind::Click));
+        assert_eq!(page_graphs(&model), vec![cpu_graph(1)]);
+
+        let _ = Plugin::page_visible(&mut model, false);
+        let _ = model.update(clocked(0.5));
+        assert_eq!(
+            page_graphs(&model),
+            Vec::new(),
+            "a shut page carries no series"
+        );
+
+        let _ = Plugin::page_visible(&mut model, true);
+        assert_eq!(
+            page_graphs(&model),
+            vec![cpu_graph(2)],
+            "the reopened row is still expanded, as native's Stack is",
+        );
+    }
+
+    /// **Only the instance that publishes the page keeps its history** — the
+    /// per-core windows included (#1442 review, NIT). The family is the
+    /// effective mount's, as `settings_from` resolves it, and it is the same
+    /// test `view` makes before attaching the page: a sidebar card draws none
+    /// of these lines, so it keeps none of them, while a bar instance fed the
+    /// same samples keeps them all.
+    ///
+    /// **Falsified** by pushing into the page history on every family.
+    #[test]
+    fn only_the_bar_instance_keeps_the_pages_history() {
+        let mut side = fresh(Card::sidebar_default());
+        let (mut bar, _rx) = fresh_bar(Card::bar_default());
+        for _ in 0..3 {
+            let _ = side.update(clocked(0.5));
+            let _ = bar.update(clocked(0.5));
+        }
+        assert_eq!(
+            side.page,
+            crate::panel::History::default(),
+            "a sidebar card keeps no page lines and no per-core windows",
+        );
+        assert_ne!(
+            bar.page,
+            crate::panel::History::default(),
+            "the bar instance keeps them",
+        );
+        assert!(
+            side.view().panel.is_none(),
+            "…and publishes no page to draw them on"
+        );
+    }
+
+    /// **A graph rides the page only while the page is open.** A row clicked
+    /// open while the page is shut — a click that lands after the close — is
+    /// remembered, but the page carries no series until it opens; the close
+    /// after that takes the graph off the wire again.
+    ///
+    /// **Falsified** by dropping the `page_open &&` in `panel` (the shut page
+    /// then carries the graph).
+    #[test]
+    fn a_graph_rides_the_page_only_while_it_is_open() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let _ = model.update(clocked(0.5));
+        let _ = model.update(Input::event(CPU_CORES_TOGGLE_ID, EventKind::Click));
+        assert!(model.expanded.cpu_cores, "the click is remembered");
+        assert_eq!(
+            page_graphs(&model),
+            Vec::new(),
+            "a shut page carries no series"
+        );
+
+        let _ = Plugin::page_visible(&mut model, true);
+        assert_eq!(page_graphs(&model), vec![cpu_graph(1)]);
+        let _ = Plugin::page_visible(&mut model, false);
+        assert_eq!(page_graphs(&model), Vec::new());
+    }
+
+    /// **An expanded row opens onto the last minute**, as native's does: the
+    /// per-core windows fill on every sample whatever the page shows, so the
+    /// first expand after a stretch with the page shut draws a full
+    /// [`HISTORY_LEN`] samples per core, not one.
+    ///
+    /// **Falsified** by dropping either per-core `push_frame` from
+    /// `History::push`.
+    #[test]
+    fn an_expanded_row_opens_onto_the_last_minute() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        for _ in 0..(HISTORY_LEN + 10) {
+            let _ = model.update(clocked(0.5));
+        }
+        let _ = Plugin::page_visible(&mut model, true);
+        for id in [CPU_CORES_TOGGLE_ID, CLOCK_CORES_TOGGLE_ID] {
+            let _ = model.update(Input::event(id, EventKind::Click));
+        }
+        assert_eq!(
+            page_graphs(&model),
+            vec![cpu_graph(HISTORY_LEN), clock_graph(HISTORY_LEN)],
         );
     }
 

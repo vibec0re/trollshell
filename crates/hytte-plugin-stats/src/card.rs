@@ -1107,6 +1107,7 @@ mod tests {
             processes: None,
             cpu_clock_hz: None,
             cpu_clock_ceiling_hz: None,
+            per_core_clock: Vec::new(),
             disk_io: None,
             disks: vec![
                 Disk {

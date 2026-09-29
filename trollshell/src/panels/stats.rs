@@ -4137,7 +4137,9 @@ mod top_apps_scan_tests {
             .chain([sample(None)])
             .collect();
         let rebuild = |list: &[ProcSample]| {
-            rebuild_top_apps(&expander, &summary, &rows, &meta, &collapsed, cpu_value, list);
+            rebuild_top_apps(
+                &expander, &summary, &rows, &meta, &collapsed, cpu_value, list,
+            );
         };
 
         rebuild(&list);
@@ -4146,7 +4148,11 @@ mod top_apps_scan_tests {
         assert_eq!(rows.borrow().len(), list.len());
 
         rebuild(&list);
-        assert_eq!(test_support::scans(), 1, "a rebuild of the same list scans nothing");
+        assert_eq!(
+            test_support::scans(),
+            1,
+            "a rebuild of the same list scans nothing"
+        );
 
         list.push(sample(Some("ts-top-1441-late")));
         rebuild(&list);

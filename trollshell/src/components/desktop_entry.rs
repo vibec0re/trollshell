@@ -616,7 +616,10 @@ mod tests {
             // A subdirectory is part of the id: `\xff-konsole.desktop`.
             (b"/usr/share/applications/\xff/konsole.desktop", false),
             // The data dir is not.
-            (b"/home/\xff/.local/share/applications/firefox.desktop", true),
+            (
+                b"/home/\xff/.local/share/applications/firefox.desktop",
+                true,
+            ),
             (b"/x/applications/\xff/applications/foo.desktop", false),
             // No `applications` component: all of it.
             (b"/srv/\xff/ts.desktop", false),

@@ -3665,7 +3665,11 @@ pub(in crate::panels) mod tests {
 
         model.set(page(None));
         pump();
-        assert_eq!(test_support::scans(), 1, "a rebuild over cached ids scans nothing");
+        assert_eq!(
+            test_support::scans(),
+            1,
+            "a rebuild over cached ids scans nothing"
+        );
 
         model.set(page(Some("ts-ws-1441-late")));
         pump();

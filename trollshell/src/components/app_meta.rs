@@ -497,8 +497,8 @@ mod tests {
 
     use super::test_support::{self, Fixture};
     use super::{
-        AppMeta, icon_from_desktop_value, resolve_app_meta, resolve_app_meta_in,
-        resolve_app_metas, resolve_app_metas_in,
+        AppMeta, icon_from_desktop_value, resolve_app_meta, resolve_app_meta_in, resolve_app_metas,
+        resolve_app_metas_in,
     };
     use crate::components::desktop_entry;
 
@@ -719,7 +719,13 @@ mod tests {
         let mut resolver = Resolver::new(f.env());
         let handed = &mut resolver;
         resolve_app_metas_in(
-            ["firefox", "ts-edit", "ts-term", "editor", "no-such-app-1441-a"],
+            [
+                "firefox",
+                "ts-edit",
+                "ts-term",
+                "editor",
+                "no-such-app-1441-a",
+            ],
             &mut cache,
             move || handed,
         );
@@ -1057,15 +1063,24 @@ mod tests {
         // answers every id — names, icons and misses — as the one-at-a-time
         // lookups above did.
         let mut batched = HashMap::new();
-        let ids = NAME_CASES.map(|(app_id, _)| app_id).into_iter().chain(ENTRY_STEMS);
+        let ids = NAME_CASES
+            .map(|(app_id, _)| app_id)
+            .into_iter()
+            .chain(ENTRY_STEMS);
         resolve_app_metas(ids.clone(), &mut batched);
         for app_id in ids {
             let answer = |cache: &HashMap<String, Option<AppMeta>>| {
-                let meta = cache.get(app_id).unwrap_or_else(|| panic!("{app_id} was not resolved"));
+                let meta = cache
+                    .get(app_id)
+                    .unwrap_or_else(|| panic!("{app_id} was not resolved"));
                 meta.as_ref()
                     .map(|m| (m.display_name.clone(), describe(m.icon.as_ref())))
             };
-            assert_eq!(answer(&batched), answer(&cache), "{app_id}: batched vs one at a time");
+            assert_eq!(
+                answer(&batched),
+                answer(&cache),
+                "{app_id}: batched vs one at a time"
+            );
         }
         println!("{PARITY_CHILD_OK}");
     }

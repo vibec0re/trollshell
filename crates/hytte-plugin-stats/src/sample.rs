@@ -1395,7 +1395,8 @@ mod tests {
     /// runs on a real blocking-pool thread, so a *regular* cadence tick from
     /// the first open window (queued the instant virtual time crossed its
     /// period, independently of anything below) can finish late — after the
-    /// close, after `pump_ten_periods`, even after the reopen is sent — and
+    /// close, and (while the wait below was the hand-stepped
+    /// `pump_ten_periods`, before #1427) even after the reopen is sent — and
     /// bump `ticks()` past `before` with no reset anywhere near it, because it
     /// was never the reopen's own read. Measured: 25/200 runs (12.5%) red
     /// under `taskset -c 0-3` plus four pinned burners on those cores, 0/200
@@ -1433,7 +1434,17 @@ mod tests {
         let before = calls.ticks();
 
         cmd_tx.send(Cmd::SetVisible(false)).expect("lane is live");
-        pump_ten_periods(period).await;
+        // Ten periods by the runtime's own auto-advance, not
+        // `pump_ten_periods`: the paused clock cannot move while a read is
+        // still on the blocking pool (tokio inhibits auto-advance for a
+        // pending `spawn_blocking` on a current-thread runtime), so this
+        // returns only after any read in flight at the close has landed and
+        // the task has taken the close. The hand-stepped pump never waited in
+        // real time, and with a read starved on one loaded core the reopen
+        // below reached a task still inside that read: `resets()` read 0
+        // (measured on #1427: 2/30 release runs pinned to one core beside
+        // four burners).
+        tokio::time::sleep(period * 10).await;
         cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
 
         // Check the reset *directly*, right after the edge, before ever
@@ -1947,8 +1958,16 @@ mod tests {
         );
 
         cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
-        tokio::task::yield_now().await;
-        pump_ten_periods(crate::top_apps::POLL).await;
+        // Ten walks' worth of closed page by the runtime's own auto-advance,
+        // which tokio holds while a `spawn_blocking` walk is pending: this
+        // returns only once a walk in flight at the close has landed on the
+        // lane, so the drain below takes it. The #1426 version stepped the
+        // clock by hand (`pump_ten_periods`), and a walk starved on a loaded
+        // core landed *after* the drain, where `next_walk` read it as the
+        // reopen's — a warm share, and a red test (measured on #1427, release
+        // build pinned to one core beside four burners: 29 of 30 runs on
+        // `main`, 27 of 30 on this branch before the fix).
+        tokio::time::sleep(crate::top_apps::POLL * 10).await;
         while msg_rx.try_recv().is_ok() {}
         let before = handed.lock().expect("not poisoned").len();
 

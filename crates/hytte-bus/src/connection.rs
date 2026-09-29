@@ -778,7 +778,7 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
 /// by its callers, so there is no real interface to stage. zbus's own `Peer`
 /// would do, but it is `pub(crate)` (`fdo/peer.rs:8`). The cost is one object
 /// on the bus, [`READY_INTERFACE`](crate::READY_INTERFACE) at
-/// [`READY_PATH`](crate::READY_PATH), with no methods and no properties. It
+/// [`READY_PATH`], with no methods and no properties. It
 /// claims no name, so the system bus needs no policy for it.
 ///
 /// ## See also

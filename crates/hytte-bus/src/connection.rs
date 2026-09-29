@@ -653,11 +653,13 @@ async fn supervisor_loop(
 
             match result {
                 Ok(conn) => {
-                    // Already able to answer an inbound method call: every
-                    // connection reaching this arm was built by `build_pooled`
-                    // (production: `open_connection`; tests: `test_support::connect`),
-                    // whose barrier means zbus was dispatching before it read
-                    // a single message (#1423). Nothing to start here.
+                    // Already able to answer an inbound method call: in
+                    // production this came from `open_connection`, i.e.
+                    // `build_pooled`, whose barrier means zbus was dispatching
+                    // before it read a single message (#1423). Nothing to
+                    // start here. (A test's injected replacement is whatever
+                    // the test built; this crate's suite builds them with
+                    // `test_support::connect`, the same `build_pooled`.)
                     let mut g = inner.lock().await;
                     g.conn = Some(conn);
                     g.generation += 1;

@@ -1302,7 +1302,8 @@ mod tests {
     /// series reach the reconciler), by `line[..keep]` in place of
     /// `line[skip..]` (the oldest samples survive), or by trimming each
     /// series to `MAX_SPARKLINE_SAMPLES` instead of `keep` (the point cap is
-    /// never enforced).
+    /// never enforced), or by computing the host's own divisor-based keep
+    /// instead of calling the shared one (the sparse row keeps 256).
     #[test]
     fn a_multi_sparkline_is_trimmed_at_the_seam_as_the_clamp_trims() {
         use hytte_plugin_proto::wire::{MAX_MULTI_SPARKLINE_POINTS, MAX_MULTI_SPARKLINE_SERIES};
@@ -1336,11 +1337,25 @@ mod tests {
             "the newest stayed",
         );
 
+        // The point cap on uneven lines (#1438 review LOW 4): 65 full series
+        // beside 191 empty ones keep 1 008 each — the largest common ceiling
+        // that fits — not the 256 a division by the series count gives.
+        let mut sparse = numbered(65, MAX_SPARKLINE_SAMPLES);
+        sparse.extend(std::iter::repeat_n(Vec::new(), MAX_MULTI_SPARKLINE_SERIES - 65));
+        let (series, _) = mapped_series(to_ui_node(
+            &scope,
+            Grants::none(),
+            &graph(sparse.clone(), None),
+        ));
+        assert!(series[..65].iter().all(|l| l.len() == 1008), "full lines");
+        assert!(series[65..].iter().all(Vec::is_empty), "empty ones");
+
         // …and every one of those agrees with the SDK's clamped copy.
         for raw in [
             graph(numbered(MAX_MULTI_SPARKLINE_SERIES + 1, 2), None),
             graph(numbered(2, MAX_SPARKLINE_SAMPLES + 3), Some(f32::NAN)),
             graph(numbered(100, MAX_SPARKLINE_SAMPLES), Some(1.0)),
+            graph(sparse, None),
             graph(vec![vec![f32::NAN, 1.0], vec![f32::INFINITY]], None),
         ] {
             assert_eq!(

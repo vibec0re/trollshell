@@ -2226,11 +2226,11 @@ pub async fn start(id: &str) -> anyhow::Result<()> {
 /// Each restart gives up on its stop after [`STOP_WAIT`] (#1417 item 1), and
 /// a reconcile's restarts share one such wait (#1444), but nothing bounds the
 /// queue as a whole: each caller queued ahead adds its own. What the caller
-/// is told is decided by the caller's own timeout. The Plugins tab holds the switch's
-/// whole round trip, `SetPluginEnabled` and then this call, to one deadline
-/// (#1421, #1417 item 2), so this call gets whatever the persist left of that
-/// budget. A long queue therefore shows in the tab as a call the shell did
-/// not answer, and the stop still runs once it reaches the lock.
+/// is told is decided by the caller's own timeout. The Plugins tab holds the
+/// switch's whole round trip, `SetPluginEnabled` and then this call, to one
+/// deadline (#1421, #1417 item 2), so this call gets whatever the persist left
+/// of that budget. A long queue therefore shows in the tab as a call the shell
+/// did not answer, and the stop still runs once it reaches the lock.
 ///
 /// Never call this from under the lock; that is [`stop_unit`]'s job. From
 /// there it would panic in [`converge_locked`] rather than wait for itself.
@@ -8413,17 +8413,17 @@ mod tests {
             for id in &ids[1..] {
                 launch_stubborn(&unit_of(id)).await.expect("launched");
             }
-            let running = |units: &[systemd::PluginUnit]| {
-                let mut up: Vec<&str> = units
-                    .iter()
+            let running = |units: Vec<systemd::PluginUnit>| {
+                let mut up: Vec<String> = units
+                    .into_iter()
                     .filter(|u| u.active_state == "active")
-                    .map(|u| u.id.as_str())
+                    .map(|u| u.id)
                     .collect();
                 up.sort_unstable();
                 up
             };
             assert_eq!(
-                running(&list_prefixed(&prefix).await.expect("listed")),
+                running(list_prefixed(&prefix).await.expect("listed")),
                 ids,
                 "rail: all three are running before the restart"
             );
@@ -8454,6 +8454,7 @@ mod tests {
             )
             .await;
             let took = t0.elapsed();
+            eprintln!("three {TAKES} s stops, restarted as one batch, took {took:?}");
 
             for (id, answer) in &answers {
                 assert!(answer.is_ok(), "{id}: {answer:?}");
@@ -8469,7 +8470,7 @@ mod tests {
                 "took {took:?}: three {TAKES} s stops must cost one {TAKES} s wait, not a sum"
             );
             assert_eq!(
-                running(&list_prefixed(&prefix).await.expect("listed")),
+                running(list_prefixed(&prefix).await.expect("listed")),
                 ids,
                 "each is running again, from its relaunch"
             );

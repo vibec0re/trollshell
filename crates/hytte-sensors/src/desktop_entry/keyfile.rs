@@ -12,9 +12,9 @@
 //! native page cannot see. What is ported, rule by rule:
 //!
 //! - **Lines** (`g_key_file_parse_data`): split on `\n`, one `\r` before it
-//!   dropped; leading ASCII whitespace (`GLib`'s `g_ascii_isspace`, which,
-//!   unlike Rust's, includes `\v`) is skipped; empty or `#` lines are
-//!   comments.
+//!   dropped; leading ASCII whitespace (`GLib`'s `g_ascii_isspace`, which
+//!   is Rust's `is_ascii_whitespace`: `\v` is **not** in it) is skipped;
+//!   empty or `#` lines are comments.
 //! - **Groups** (`g_key_file_line_is_group`, `g_key_file_is_group_name`):
 //!   `[name]` with only spaces or tabs after the `]`; the name non-empty and
 //!   free of `[`, `]` and ASCII control characters. A repeated group merges
@@ -25,7 +25,8 @@
 //!   loses trailing whitespace and must be valid — non-empty, no leading or
 //!   trailing space, no `[`/`]` except one trailing `[locale]` of
 //!   alphanumerics and `-_.@`; the value loses leading whitespace and keeps
-//!   the rest. A later duplicate key replaces an earlier one.
+//!   the rest up to the first NUL byte (`g_strndup`). A later duplicate key
+//!   replaces an earlier one.
 //! - **`Encoding=`** in the start group must read `UTF-8` (any case).
 //! - **Strings** (`g_key_file_get_string`, `…_parse_value_as_string`): the
 //!   raw value must be UTF-8, and the escapes `\s \n \t \r \\` are decoded;
@@ -137,6 +138,11 @@ impl KeyFile {
             return None;
         }
         if group == DESKTOP_ENTRY {
+            // `pair->value = g_strndup (value_start, value_len)`
+            // (`glib/gkeyfile.c:1469`): the copy stops at a NUL byte. The
+            // `Encoding=` check above compares the full length, as `GLib`'s
+            // does, so it keeps the uncut value.
+            let value = value.split(|&b| b == 0).next().unwrap_or(value);
             self.entry
                 .insert(String::from_utf8_lossy(key).into_owned(), value.to_vec());
         }
@@ -179,9 +185,12 @@ impl KeyFile {
     }
 }
 
-/// `g_ascii_isspace`: space, `\t`, `\n`, `\v`, `\f`, `\r`.
+/// `g_ascii_isspace`: space, `\t`, `\n`, `\f`, `\r` — the bytes whose entry
+/// in `GLib`'s `ascii_table_data` carries `G_ASCII_SPACE`
+/// (`glib/gstrfuncs.c:264`, the row for `0x08`–`0x0f`). Not `\v`: its entry is `0x004`, a control
+/// character only. That is exactly Rust's `is_ascii_whitespace`.
 fn is_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    b.is_ascii_whitespace()
 }
 
 /// `g_key_file_line_is_group`: `[`, then a `]`, then only spaces or tabs.
@@ -443,5 +452,24 @@ mod tests {
         for key in ["C", "D", "E", "F", "Missing"] {
             assert!(!file.boolean(key), "{key}");
         }
+    }
+
+    /// `g_ascii_isspace` is `GLib`'s own table (`glib/gstrfuncs.c:264`:
+    /// entry `0x0b` is `0x004`, without `G_ASCII_SPACE`), so a vertical tab
+    /// is not whitespace. A `\v`-led line is the key `"\vName"`, not `Name`,
+    /// and a `\v` after `=` stays in the value.
+    #[test]
+    fn a_vertical_tab_is_not_glib_whitespace() {
+        let file = parse("[Desktop Entry]\n\x0bName=X\nIcon=\x0bfoo\n").expect("parses");
+        assert_eq!(file.string("Name"), Ok(None));
+        assert_eq!(file.string("Icon"), Ok(Some("\x0bfoo".to_owned())));
+    }
+
+    /// `GLib` copies a value with `g_strndup` (`g_key_file_parse_key_value_pair`),
+    /// which stops at a NUL byte.
+    #[test]
+    fn a_value_stops_at_a_nul_byte() {
+        let file = parse("[Desktop Entry]\nName=T 24\0tail\n").expect("parses");
+        assert_eq!(file.string("Name"), Ok(Some("T 24".to_owned())));
     }
 }

@@ -1,6 +1,6 @@
 //! A desktop-entry resolver for app ids, in plain `std` (#1428).
 //!
-//! The native Stats page names each Top apps row through
+//! The native Stats page named each Top apps row through
 //! `trollshell/src/components/app_meta.rs`'s `resolve_app_meta`: three
 //! matching layers over `gio::AppInfo::all()`. `hytte-plugin-stats` cannot
 //! link gio, so its rows read the raw app id — `niri-firefox` where native
@@ -8,18 +8,24 @@
 //! `.desktop` files itself and runs the same three layers over them, so a
 //! plugin gets the name native shows.
 //!
-//! # Parity with `app_meta.rs`
+//! Since #1432 the shell's `resolve_app_meta` takes its names from this
+//! module too, and keeps gio only to turn [`AppMeta::icon`] into a `GIcon` —
+//! so there is one copy of the three layers, and the "native" column below
+//! is what the shell's gio lookup did before that, and what GIO itself
+//! still does.
+//!
+//! # Parity with `app_meta.rs`'s gio lookup
 //!
 //! "The same" is checked against the source of the `GLib` the shell links
 //! (2.88.3: `gio/gdesktopappinfo.c`, `glib/gkeyfile.c`, `glib/gshell.c`,
 //! `glib/gutils.c`, `glib/gcharset.c`), not against the documentation.
 //!
-//! | | native (`resolve_app_meta` over `AppInfo::all()`) | here |
+//! | | native (`resolve_app_meta` over `AppInfo::all()`, before #1432) | here |
 //! | --- | --- | --- |
 //! | **Layer 1** | an entry whose id is `<app_id>.desktop`, or `<lowercased app_id>.desktop`; the comparison itself is case-sensitive | the same two strings, compared the same way |
 //! | **Layer 2** | the id without `.desktop`, lowercased, contains the lowercased app id, or is contained in it | the same, with Rust's `to_lowercase` on both sides as native uses |
 //! | **Layer 3** | the executable's file stem, lowercased, equals the lowercased app id | the same, over the same executable string (below) |
-//! | **Order** | layer 1 over every entry, then layer 2, then layer 3; within a layer the first entry in `all()`'s order | the same layering; "first" is the first in search-path order, then by id (see the gaps) |
+//! | **Order** | layer 1 over every entry, then layer 2, then layer 3; within a layer the first entry in `all()`'s order | the same layering; a tie inside a layer goes to the shortest id, then search-path order, then byte order (see the gaps) |
 //! | **Search path** | `$XDG_DATA_HOME` (default `$HOME/.local/share`), then each `$XDG_DATA_DIRS` entry (default `/usr/local/share/:/usr/share/`), each with `applications/` appended | the same |
 //! | **Desktop-file id** | the path under `applications/` with `/` turned into `-`, so `kde/konsole.desktop` is `kde-konsole.desktop` | the same, recursing into subdirectories as `get_apps_from_dir` does |
 //! | **Shadowing** | the first directory to hold an id owns it: a same-id file in a later directory is ignored, **even when the first one fails to load or is `Hidden`** — a file masks by existing | the same |
@@ -28,7 +34,7 @@
 //! | **Which files are entries** | a regular file whose key file parses, whose first group is `[Desktop Entry]`, `Type=Application`, and whose non-empty `TryExec=` and `Exec=` name a program `g_find_program_for_path` finds on `$PATH` (relative to `Path=` if set) | the same — `keyfile` ports the parser's rules, `exec` the program lookup |
 //! | **Display name** | `X-GNOME-FullName`, else `Name`, each localised for `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG`, else `Unnamed` | the same, `Unnamed` untranslated |
 //! | **Executable** | `binary_from_exec`: `Exec=`'s first space-separated token, verbatim — no quote removal, no `env` skipping, so `Exec=env FOO=1 foot` has the executable `env` | the same |
-//! | **Icon** | a `GIcon` built from the localised `Icon=`, with a trailing `.png`/`.svg`/`.xpm` dropped from a theme name | the localised `Icon=` **raw** — nothing reads it yet (#1419's icon question), and the consumer that does decides what to strip |
+//! | **Icon** | a `GIcon` built from the localised `Icon=`, with a trailing `.png`/`.svg`/`.xpm` dropped from a theme name | the localised `Icon=` **raw**; the consumer decides what to strip — the shell's `app_meta` builds the `GIcon` from it by GIO's rule (#1432), and the stats plugin's rows do not read it yet (#1419's icon question) |
 //! | **Cache** | caller-owned, per app id, a miss cached too — one `all()` scan per unseen id | [`Resolver`] owns it, per app id, a miss cached too — one scan per [`Resolver::resolve_all`] call with any unseen id in it |
 //!
 //! Localised names are honoured rather than documented away: an
@@ -52,11 +58,20 @@
 //!   as the data dirs: an entry whose `Exec=` program is not on `PATH` is
 //!   not listed at all. Compare `systemctl --user show-environment` with
 //!   the shell's `/proc/<pid>/environ` when the two pages disagree.
-//! - **The tie-break inside a layer.** Native takes the first match in
+//! - **The tie-break inside a layer.** Native took the first match in
 //!   `all()`'s order, which is `GLib` hash-table iteration order —
-//!   unspecified. Here it is search-path order, then id order. Only an app
-//!   id that two entries both match *in the same layer* can come out
-//!   differently, and for those native itself has no stable answer.
+//!   unspecified, though stable on one install. Here a tie goes to the
+//!   **shortest** desktop-file id, then search-path order, then byte order
+//!   (`pick`). Byte order alone put `-` before `.`, so a helper such as
+//!   `org.xfce.mousepad-settings` beat `org.xfce.mousepad` and the app id
+//!   `mousepad` read `Text Editor Settings` (#1439 review L2); shortest
+//!   first picks the main entry its siblings extend. It cannot settle a tie
+//!   between equally short ids: nixpkgs' `LibreOffice` ships `base`, `calc`,
+//!   `draw` and `math` entries that all run `libreoffice`, so that app id
+//!   falls to byte order (Base) where `GLib`'s hash order happened to give
+//!   Writer. Only an app id that two entries both match *in the same
+//!   layer* can come out differently, and for those native itself has no
+//!   stable answer.
 //! - **`/usr/share/locale/locale.alias`** (`unalias_lang`) is not read, so a
 //!   locale alias such as `LANG=swedish` is not expanded. `NixOS` ships no
 //!   such file.
@@ -79,11 +94,11 @@
 //!   a bounded read rather than that file in memory, inside the walker.
 //! - **A file name that is not UTF-8** is skipped; no app id can equal it.
 //! - **An entry with no `Exec=` line** has no executable here, so layer 3
-//!   skips it. Natively `AppInfo::executable()` then hands gio-rs a `NULL`
+//!   skips it. Natively `AppInfo::executable()` then handed gio-rs a `NULL`
 //!   path, which `from_glib_none` only `debug_assert`s against — so on the
-//!   native side layer 3 reaching such an entry is a debug-build panic and a
-//!   release-build null dereference. That is a latent native bug (#1434),
-//!   not a behaviour to copy.
+//!   native side layer 3 reaching such an entry was a debug-build panic and
+//!   a release-build null dereference (#1434). #1435 guarded that call, and
+//!   #1432 removed the gio walk that made it: the shell now runs this layer.
 //! - **A FIFO named `*.desktop`** masks its id and is never opened: the
 //!   regular-file check runs before the read. `GLib` opens the file first
 //!   and checks after, so natively a FIFO blocks `open()` until a writer
@@ -274,44 +289,61 @@ enum Layer {
     Executable,
 }
 
-/// `resolve_app_meta`'s three layers over `entries`, in order.
+/// `resolve_app_meta`'s three layers over `entries`, in order; a tie inside
+/// a layer goes to [`pick`].
 fn find<'e>(app_id: &str, entries: &'e [Entry]) -> Option<(&'e Entry, Layer)> {
     let app_id_lower = app_id.to_lowercase();
 
     // Layer 1: exact id match.
     let exact = format!("{app_id}.desktop");
     let exact_lower = format!("{app_id_lower}.desktop");
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.id == exact || entry.id == exact_lower)
-    {
+    if let Some(entry) = pick(entries, |entry| {
+        entry.id == exact || entry.id == exact_lower
+    }) {
         return Some((entry, Layer::Exact));
     }
 
     // Layer 2: case-insensitive id containment, either way round.
-    if let Some(entry) = entries.iter().find(|entry| {
-        let stem = entry
-            .id
-            .strip_suffix(".desktop")
-            .unwrap_or(&entry.id)
-            .to_lowercase();
+    if let Some(entry) = pick(entries, |entry| {
+        let stem = stem(&entry.id).to_lowercase();
         stem.contains(app_id_lower.as_str()) || app_id_lower.contains(stem.as_str())
     }) {
         return Some((entry, Layer::Contains));
     }
 
     // Layer 3: executable basename match.
+    pick(entries, |entry| {
+        entry
+            .executable
+            .as_deref()
+            .and_then(|exe| Path::new(exe).file_stem())
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.to_lowercase() == app_id_lower)
+    })
+    .map(|entry| (entry, Layer::Executable))
+}
+
+/// A desktop-file id without its `.desktop` suffix.
+fn stem(id: &str) -> &str {
+    id.strip_suffix(".desktop").unwrap_or(id)
+}
+
+/// The entry one layer settles on among the `entries` it `matches`: the
+/// **shortest** desktop-file id (its stem's length in bytes), and among
+/// equally short ones the first in `entries` — search-path order, then byte
+/// order within one directory (`min_by_key` keeps the first of equal keys).
+///
+/// Shortest first because byte order alone put `-` (0x2d) before `.`
+/// (0x2e), so a `-settings`, `-previewer` or `-handler` sibling scanned
+/// before its main entry and won the layer: the app id `mousepad` read
+/// `Text Editor Settings` (#1439 review L2). A main entry's id is the
+/// shortest one its siblings extend. See the module docs' gaps for the ties
+/// this still leaves to byte order.
+fn pick(entries: &[Entry], matches: impl Fn(&Entry) -> bool) -> Option<&Entry> {
     entries
         .iter()
-        .find(|entry| {
-            entry
-                .executable
-                .as_deref()
-                .and_then(|exe| Path::new(exe).file_stem())
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.to_lowercase() == app_id_lower)
-        })
-        .map(|entry| (entry, Layer::Executable))
+        .filter(|entry| matches(entry))
+        .min_by_key(|entry| stem(&entry.id).len())
 }
 
 /// Every entry `g_app_info_get_all()` would list for `env`, in search-path

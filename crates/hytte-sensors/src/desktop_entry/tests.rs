@@ -233,6 +233,79 @@ fn an_earlier_layer_wins_over_an_earlier_entry() {
     );
 }
 
+/// **A tie inside one layer goes to the shortest desktop-file id** (#1439
+/// review L2). Byte order alone put `-` (0x2d) before `.` (0x2e), so a
+/// `-settings` sibling scanned first and won: the app id `mousepad` read
+/// `Text Editor Settings`, where the gio path gave `Mousepad`. Layer 2 is
+/// where that showed on real files; layer 3 has the same shape whenever a
+/// main entry and a helper run the same program, so the rule covers it too.
+/// (Layer 1 cannot tie on length: its two candidates are one id in two
+/// spellings.)
+#[test]
+fn a_tie_inside_a_layer_goes_to_the_shortest_id() {
+    let f = Fixture::new();
+    f.program("mousepad");
+    f.program("ts-pad");
+    // Layer 2: both stems contain `mousepad`; the helper sorts first.
+    f.entry(
+        "share",
+        "org.xfce.mousepad-settings.desktop",
+        &app("Text Editor Settings", "mousepad --preferences"),
+    );
+    f.entry(
+        "share",
+        "org.xfce.mousepad.desktop",
+        &app("Mousepad", "mousepad %U"),
+    );
+    // Layer 3: both run `ts-pad`, and neither id contains it.
+    f.entry(
+        "share",
+        "com.example.Pad-settings.desktop",
+        &app("Pad Settings", "ts-pad --settings"),
+    );
+    f.entry("share", "com.example.Pad.desktop", &app("Pad", "ts-pad %F"));
+    let env = f.env(&["share"]);
+
+    let ids: Vec<String> = scan(&env).into_iter().map(|e| e.id).collect();
+    assert_eq!(
+        ids,
+        [
+            "com.example.Pad-settings.desktop",
+            "com.example.Pad.desktop",
+            "org.xfce.mousepad-settings.desktop",
+            "org.xfce.mousepad.desktop",
+        ],
+        "test setup: each helper scans before its main entry",
+    );
+    assert_eq!(
+        lookup(&env, "mousepad"),
+        Some(hit("Mousepad", Layer::Contains))
+    );
+    assert_eq!(lookup(&env, "ts-pad"), Some(hit("Pad", Layer::Executable)));
+}
+
+/// **Equal lengths fall to search-path order, then byte order** — and only
+/// equal lengths: a shorter id in a later directory still wins.
+#[test]
+fn an_equal_length_tie_goes_to_search_path_then_bytes() {
+    let f = Fixture::new();
+    // All three contain `foot` (layer 2) and are 6 bytes long.
+    f.entry("sys-a", "foot-b.desktop", &app("Foot B", "foot"));
+    f.entry("sys-a", "foot-c.desktop", &app("Foot C", "foot"));
+    f.entry("sys-b", "foot-a.desktop", &app("Foot A", "foot"));
+    let env = f.env(&["sys-a", "sys-b"]);
+    // Not `Foot A` (search path beats bytes), not `Foot C` (bytes within
+    // one directory).
+    assert_eq!(lookup(&env, "foot"), Some(hit("Foot B", Layer::Contains)));
+
+    f.entry("sys-b", "xfoot.desktop", &app("Foot X", "foot"));
+    assert_eq!(
+        lookup(&env, "foot"),
+        Some(hit("Foot X", Layer::Contains)),
+        "a shorter id wins from a later directory",
+    );
+}
+
 /// **Precedence**: the first directory that holds an id owns it, so the
 /// user's entry shadows the system's and an earlier `$XDG_DATA_DIRS` entry
 /// shadows a later one.

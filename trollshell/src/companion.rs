@@ -52,10 +52,10 @@
 //!
 //! `gio::DesktopAppInfo` is not available in the gio 0.22 bindings this
 //! workspace vendors — `components/desktop_entry.rs`'s module doc records the
-//! same constraint, and `components/app_meta.rs` / `widgets::calendar`'s
-//! `launch_gnome_calendar` hit it too. So, like those, the desktop-entry route
-//! is resolved by scanning `gio::AppInfo::all()` for the desktop id rather
-//! than constructing a `GDesktopAppInfo` directly.
+//! same constraint, and `widgets::calendar`'s `launch_gnome_calendar` hits it
+//! too. So, like that one, the desktop-entry route is resolved by scanning
+//! `gio::AppInfo::all()` for the desktop id rather than constructing a
+//! `GDesktopAppInfo` directly.
 
 use std::path::{Path, PathBuf};
 

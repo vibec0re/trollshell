@@ -1056,9 +1056,9 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
 /// child itself, so no thread is needed here.
 ///
 /// `gio::DesktopAppInfo` is not available in the gio 0.22 bindings this
-/// workspace vendors (see `panels/stats.rs`'s `resolve_app_meta` doc for the
+/// workspace vendors (see `components/desktop_entry.rs`'s module doc for the
 /// same constraint), so this scans `gio::AppInfo::all()` for the desktop id
-/// instead — the same lookup idiom already used there. Logs a warning if
+/// instead — the same lookup idiom `companion.rs` uses. Logs a warning if
 /// the desktop entry isn't installed or the launch otherwise fails; never
 /// panics.
 fn launch_gnome_calendar() {

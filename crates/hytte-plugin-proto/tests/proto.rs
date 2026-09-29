@@ -6,12 +6,14 @@ use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentChoices, ConsentDecision, DEFAULT_SLIDER_MAX,
     DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
     Effect, EffectOutcome, EventKind, HOMOGENEOUS_CLASS, HostMsg, LedStripConfig, LedStripState,
-    LogLevel, MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES,
+    LogLevel, MAX_FRAME_LEN, MAX_MULTI_SPARKLINE_POINTS, MAX_MULTI_SPARKLINE_SERIES,
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES, MULTI_SPARKLINE_VOCAB,
     Manifest, MediaAction, Mount, NiriAction, Node, NodeId, OPEN_URI_VOCAB, PAGE_VISIBLE_VOCAB,
     PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB,
     SHADER_VOCAB, SIDEBAR_RIGHT_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats, StateKey,
     StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
-    sane_fraction, sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
+    multi_sparkline_keep, sane_fraction, sane_slider_floats, sane_sparkline_max,
+    sane_sparkline_sample,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1055,6 +1057,484 @@ fn the_clamp_reaches_a_sparkline_inside_a_card() {
     assert_eq!(card.clone().clamped(), card);
 }
 
+// ── MultiSparkline node (#1419) ──────────────────────────────────────────────
+
+fn multi(series: Vec<Vec<f32>>, max: Option<f32>) -> Node {
+    Node::MultiSparkline {
+        id: Some("per-core-load".into()),
+        series,
+        max,
+        classes: vec!["ts-cores".into()],
+    }
+}
+
+/// `count` series of `len` samples each, series `s` sample `i` holding
+/// `s * 10_000 + i` — so a survivor can be told apart by its value, both which
+/// series it came from and which end of the window it is.
+fn numbered_series(count: usize, len: usize) -> Vec<Vec<f32>> {
+    #[allow(clippy::cast_precision_loss)]
+    (0..count)
+        .map(|s| (0..len).map(|i| (s * 10_000 + i) as f32).collect())
+        .collect()
+}
+
+#[test]
+fn multi_sparkline_round_trips_with_and_without_a_fixed_top() {
+    for max in [None, Some(1.0_f32), Some(100.0)] {
+        let node = multi(vec![vec![0.0, 0.25], vec![0.5, 1.0]], max);
+        let back: Node = decode(&encode(&node)).expect("decode MultiSparkline");
+        assert_eq!(node, back, "max={max:?} round-trips");
+    }
+    // No series at all, and a series with an empty window, are legal nodes —
+    // a graph before its first sample, and a core that has not reported yet.
+    for series in [Vec::new(), vec![Vec::new(), vec![0.5]]] {
+        let node = multi(series, None);
+        assert_eq!(node, decode::<Node>(&encode(&node)).expect("decode"));
+    }
+}
+
+/// `max: None` stays off the wire (`skip_serializing_if`), and a frame without
+/// the key decodes to `None` — the `Sparkline` shape, restated for this
+/// variant because each carries its own attribute.
+///
+/// **Falsified** by dropping `skip_serializing_if` from the variant's `max`
+/// (the key rides as `nil`), or `#[serde(default)]` (the hand frame fails).
+#[test]
+fn a_multi_sparkline_without_a_fixed_top_carries_no_max_key() {
+    #[derive(serde::Serialize)]
+    enum Hand {
+        MultiSparkline {
+            id: Option<String>,
+            series: Vec<Vec<f32>>,
+            classes: Vec<String>,
+        },
+    }
+
+    let auto = encode_body(&multi(vec![vec![1.0]], None));
+    assert!(contains(&auto, b"MultiSparkline"), "tagged by variant name");
+    assert!(contains(&auto, b"series"));
+    assert!(!contains(&auto, b"max"), "None is kept off the wire");
+    let fixed = encode_body(&multi(vec![vec![1.0]], Some(1.0)));
+    assert!(contains(&fixed, b"max"), "Some rides as a named key");
+
+    let hand = encode_body(&Hand::MultiSparkline {
+        id: None,
+        series: vec![vec![0.5], vec![0.25]],
+        classes: vec![],
+    });
+    assert_eq!(
+        decode_body::<Node>(&hand).expect("a frame without `max` decodes"),
+        Node::MultiSparkline {
+            id: None,
+            series: vec![vec![0.5], vec![0.25]],
+            max: None,
+            classes: vec![],
+        },
+    );
+}
+
+/// Why the variant is **negotiated**: a shell on generation 7 or 8 — one that
+/// decodes `Sparkline` perfectly well — has no `MultiSparkline` arm and fails
+/// the whole frame on it, #437's reconnect loop. The old decoder here knows
+/// `Sparkline`, and decoding one through it first is what shows the refusal is
+/// about this variant, not about a decoder that knows nothing.
+///
+/// **Falsified** by adding a `MultiSparkline` arm to `NodeOld` (the second
+/// decode succeeds).
+#[test]
+fn an_older_host_cannot_decode_a_multi_sparkline() {
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    enum NodeOld {
+        Label {
+            id: Option<String>,
+            text: String,
+            classes: Vec<String>,
+        },
+        Sparkline {
+            id: Option<String>,
+            values: Vec<f32>,
+            #[serde(default)]
+            max: Option<f32>,
+            classes: Vec<String>,
+        },
+    }
+    decode_body::<NodeOld>(&encode_body(&sparkline(vec![0.1], Some(1.0))))
+        .expect("precondition: the old decoder is a generation-7 one, and reads a Sparkline");
+    let err = decode_body::<NodeOld>(&encode_body(&multi(vec![vec![0.1]], Some(1.0))))
+        .expect_err("a pre-#1419 host cannot decode the appended variant");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "the frame fails to decode: {err:?}",
+    );
+}
+
+/// The float arm: every sample of every series goes through
+/// `sane_sparkline_sample` and the top through `sane_sparkline_max` — the
+/// `Sparkline` mapping, one series at a time.
+///
+/// **Falsified** by dropping the per-sample loop from the `MultiSparkline` arm
+/// of `clamp_in_place` (the `NaN` survives), or the `max` line (the `NaN` top
+/// survives).
+#[test]
+fn the_multi_sparkline_clamp_sanitises_every_sample_and_the_top() {
+    let clamped = multi(
+        vec![
+            vec![0.5, f32::NAN],
+            vec![f32::INFINITY, -1.0, f32::NEG_INFINITY],
+        ],
+        Some(f32::NAN),
+    )
+    .clamped();
+    let Node::MultiSparkline { series, max, .. } = &clamped else {
+        panic!("still a multi-sparkline: {clamped:?}");
+    };
+    let bits = |line: &[f32]| line.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&series[0]),
+        bits(&[0.5, 0.0]),
+        "a NaN is the bottom rail"
+    );
+    assert_eq!(
+        bits(&series[1]),
+        bits(&[f32::MAX, -1.0, -f32::MAX]),
+        "the infinities saturate, a finite negative is left alone",
+    );
+    assert_eq!(*max, None, "a NaN top auto-scales");
+    assert_node_floats_are_sane(&clamped);
+
+    let top = |max| match multi(vec![vec![1.0]], max).clamped() {
+        Node::MultiSparkline { max, .. } => max,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(top(Some(f32::INFINITY)), Some(f32::MAX));
+    assert_eq!(top(Some(0.0)), None);
+    assert_eq!(top(Some(-2.0)), None);
+    assert_eq!(top(Some(100.0)), Some(100.0));
+}
+
+/// The series cap drops the **last** series — the order is the hue order, so
+/// the survivors keep their colours — and leaves the survivors whole.
+///
+/// **Falsified** by dropping `series.truncate(..)` (259 series survive), or by
+/// draining from the front (the first survivor is series 3, not series 0).
+#[test]
+fn the_multi_sparkline_clamp_drops_the_series_past_the_cap() {
+    let clamped = multi(numbered_series(MAX_MULTI_SPARKLINE_SERIES + 3, 2), None).clamped();
+    let Node::MultiSparkline { series, .. } = &clamped else {
+        panic!("{clamped:?}");
+    };
+    assert_eq!(series.len(), MAX_MULTI_SPARKLINE_SERIES);
+    assert_eq!(series[0], vec![0.0, 1.0], "series 0 survives, whole");
+    #[allow(clippy::cast_precision_loss)]
+    let last = ((MAX_MULTI_SPARKLINE_SERIES - 1) * 10_000) as f32;
+    assert_eq!(
+        series[MAX_MULTI_SPARKLINE_SERIES - 1],
+        vec![last, last + 1.0],
+        "and the last survivor is the last series under the cap",
+    );
+    assert_node_floats_are_sane(&clamped);
+}
+
+/// Each series keeps its **newest** `MAX_SPARKLINE_SAMPLES` — the single
+/// line's cap and its keep-the-newest rule, per series — when the graph is
+/// under the point cap, and a short series beside a long one is untouched.
+///
+/// **Falsified** by `line.truncate(keep)` in place of `line.drain(..excess)`
+/// (the oldest samples survive).
+#[test]
+fn the_multi_sparkline_clamp_keeps_each_series_newest_samples() {
+    let mut series = numbered_series(2, MAX_SPARKLINE_SAMPLES + 10);
+    series.push(vec![7.0, 8.0]);
+    let clamped = multi(series, None).clamped();
+    let Node::MultiSparkline { series, .. } = &clamped else {
+        panic!("{clamped:?}");
+    };
+    assert_eq!(series.len(), 3);
+    for (s, line) in series.iter().take(2).enumerate() {
+        assert_eq!(line.len(), MAX_SPARKLINE_SAMPLES);
+        #[allow(clippy::cast_precision_loss)]
+        let base = (s * 10_000) as f32;
+        assert_eq!(
+            line[0].to_bits(),
+            (base + 10.0).to_bits(),
+            "series {s}: the ten OLDEST went"
+        );
+    }
+    assert_eq!(series[2], vec![7.0, 8.0], "a short series is left whole");
+}
+
+/// Past the point cap every survivor longer than one common ceiling is
+/// trimmed to its newest samples at that ceiling — for these rows, whose
+/// lines are all at least that long, `MAX_MULTI_SPARKLINE_POINTS / series` —
+/// so the lines keep a common time span; and exactly at the cap nothing is
+/// cut.
+///
+/// **Falsified** by `<` in place of `<=` in `multi_sparkline_keep`'s early
+/// return (the uneven graph exactly at the cap has its full line cut — the
+/// same boundary mutant, then `>=` for `>`, that the first version of this
+/// test, with only even full lines at the boundary, let survive), or by
+/// trimming only the longest series (the uneven case past the cap keeps a
+/// 700-sample line whole).
+#[test]
+fn the_point_cap_trims_every_series_evenly() {
+    // Exactly at the cap: 64 full lines.
+    assert_eq!(
+        64 * MAX_SPARKLINE_SAMPLES,
+        MAX_MULTI_SPARKLINE_POINTS,
+        "precondition: 64 full series are exactly the point cap",
+    );
+    assert_eq!(
+        multi_sparkline_keep(&numbered_series(64, MAX_SPARKLINE_SAMPLES)),
+        MAX_SPARKLINE_SAMPLES,
+        "at the cap is not past it",
+    );
+    // …and exactly at the cap with UNEVEN lines: one full line and 64 of 1008
+    // samples is 65 536 on the nose, so nothing is cut — treating "at" as
+    // "past" would cut the full line. (This row was added when a `>=` mutant
+    // survived 64 full lines alone, #1438.)
+    let mut at_cap = numbered_series(1, MAX_SPARKLINE_SAMPLES);
+    at_cap.extend(numbered_series(64, 1008));
+    assert_eq!(
+        at_cap.iter().map(Vec::len).sum::<usize>(),
+        MAX_MULTI_SPARKLINE_POINTS,
+        "precondition: exactly the point cap",
+    );
+    assert_eq!(multi_sparkline_keep(&at_cap), MAX_SPARKLINE_SAMPLES);
+    let Node::MultiSparkline { series, .. } = multi(at_cap.clone(), None).clamped() else {
+        unreachable!()
+    };
+    assert_eq!(series, at_cap, "a graph exactly at the cap is left whole");
+
+    // One series past it: 65 full lines keep 65 536 / 65 = 1008 each.
+    let keep = MAX_MULTI_SPARKLINE_POINTS / 65;
+    assert_eq!(
+        multi_sparkline_keep(&numbered_series(65, MAX_SPARKLINE_SAMPLES)),
+        keep
+    );
+    let clamped = multi(numbered_series(65, MAX_SPARKLINE_SAMPLES), None).clamped();
+    let Node::MultiSparkline { series, .. } = &clamped else {
+        panic!("{clamped:?}");
+    };
+    assert!(series.iter().all(|line| line.len() == keep), "an even cut");
+    #[allow(clippy::cast_precision_loss)]
+    let dropped = (MAX_SPARKLINE_SAMPLES - keep) as f32;
+    assert_eq!(
+        series[0][0].to_bits(),
+        dropped.to_bits(),
+        "the oldest samples went"
+    );
+    assert_eq!(series[0].last().copied(), Some(1023.0), "the newest stayed");
+    assert_node_floats_are_sane(&clamped);
+
+    // Uneven: one full line and 99 of 700 samples is 70 324 > 65 536, so every
+    // line keeps 655 — the 700-sample ones are cut too, not only the long one.
+    let mut uneven = numbered_series(1, MAX_SPARKLINE_SAMPLES);
+    uneven.extend(numbered_series(99, 700));
+    let keep = MAX_MULTI_SPARKLINE_POINTS / 100;
+    assert_eq!(multi_sparkline_keep(&uneven), keep);
+    let Node::MultiSparkline { series, .. } = multi(uneven, None).clamped() else {
+        unreachable!()
+    };
+    assert!(series.iter().all(|line| line.len() == keep), "{keep} each");
+
+    // At the series cap, the point cap's share is what every line keeps.
+    let full = numbered_series(MAX_MULTI_SPARKLINE_SERIES + 1, MAX_SPARKLINE_SAMPLES);
+    assert_eq!(
+        multi_sparkline_keep(&full),
+        MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES,
+        "the dropped series count toward nothing",
+    );
+}
+
+/// A series longer than the per-series cap counts toward the point cap **at**
+/// the per-series cap, not at its raw length (#1438 review): two 40 000-sample
+/// lines are 2 048 drawn samples, nowhere near the point cap, so each keeps
+/// its newest `MAX_SPARKLINE_SAMPLES` and never more.
+///
+/// **Falsified** by summing raw lengths in `multi_sparkline_keep` (the keep
+/// becomes 65 536 / 2 = 32 768, and each series leaves the clamp 32× over the
+/// per-series cap).
+#[test]
+fn an_over_long_series_counts_at_the_per_series_cap() {
+    let long = numbered_series(2, 40_000);
+    assert_eq!(multi_sparkline_keep(&long), MAX_SPARKLINE_SAMPLES);
+    let clamped = multi(long, None).clamped();
+    let Node::MultiSparkline { series, .. } = &clamped else {
+        panic!("{clamped:?}");
+    };
+    assert!(
+        series.iter().all(|l| l.len() == MAX_SPARKLINE_SAMPLES),
+        "each keeps its newest {MAX_SPARKLINE_SAMPLES}",
+    );
+    assert_node_floats_are_sane(&clamped);
+}
+
+/// Empty and short series do not starve full ones (#1438 review LOW 4, the
+/// two cases it measured): the point cut is the largest common ceiling that
+/// fits, so a series counts for the samples it actually draws, not as a full
+/// line.
+///
+/// - 65 full lines beside 191 empty ones keep 1 008 each — what 65 full lines
+///   alone keep — not the 256 a division by all 256 series gave.
+/// - 64 full lines plus one one-sample series keep 1 023 each — one sample
+///   less, the least the cap allows (64 × 1 024 + 1 is one over) — not the
+///   1 008 a division by 65 non-empty series would still give.
+///
+/// **Falsified** by dividing the point cap by the survivor count (the first
+/// case keeps 256), or by the non-empty survivor count (the second keeps
+/// 1 008).
+#[test]
+fn empty_and_short_series_do_not_starve_full_ones() {
+    let mut sparse = numbered_series(65, MAX_SPARKLINE_SAMPLES);
+    sparse.extend(std::iter::repeat_n(Vec::new(), 191));
+    assert_eq!(sparse.len(), MAX_MULTI_SPARKLINE_SERIES, "precondition");
+    assert_eq!(multi_sparkline_keep(&sparse), 1008);
+    let Node::MultiSparkline { series, .. } = multi(sparse, None).clamped() else {
+        unreachable!()
+    };
+    assert!(series[..65].iter().all(|l| l.len() == 1008), "full lines");
+    assert!(
+        series[65..].iter().all(Vec::is_empty),
+        "empty ones stay empty"
+    );
+    assert!(series.iter().map(Vec::len).sum::<usize>() <= MAX_MULTI_SPARKLINE_POINTS);
+
+    let mut one_more = numbered_series(64, MAX_SPARKLINE_SAMPLES);
+    one_more.push(vec![42.0]);
+    assert_eq!(multi_sparkline_keep(&one_more), MAX_SPARKLINE_SAMPLES - 1);
+    let Node::MultiSparkline { series, .. } = multi(one_more, None).clamped() else {
+        unreachable!()
+    };
+    assert!(
+        series[..64]
+            .iter()
+            .all(|l| l.len() == MAX_SPARKLINE_SAMPLES - 1),
+        "each full line loses one sample, its oldest",
+    );
+    assert_eq!(series[64], vec![42.0], "the short series is kept whole");
+    assert_eq!(
+        series.iter().map(Vec::len).sum::<usize>(),
+        MAX_MULTI_SPARKLINE_POINTS - 63,
+        "64 × 1 023 + 1",
+    );
+}
+
+/// `multi_sparkline_keep` answers the **largest** ceiling that fits, over a
+/// table of shapes: its drawn total fits the point cap, and one sample more a
+/// line would not (or it is already the per-series cap).
+///
+/// **Falsified** by an off-by-one in the search (`fits` one short, `over`
+/// returned, or a strict `<` that rejects an exact fit — the 128-line row),
+/// or by any divisor-based answer on the uneven rows.
+#[test]
+fn multi_sparkline_keep_is_the_largest_ceiling_that_fits() {
+    let drawn = |series: &[Vec<f32>], k: usize| -> usize {
+        series
+            .iter()
+            .take(MAX_MULTI_SPARKLINE_SERIES)
+            .map(|s| s.len().min(k))
+            .sum()
+    };
+    let mut shapes: Vec<Vec<Vec<f32>>> = vec![
+        Vec::new(),
+        numbered_series(64, MAX_SPARKLINE_SAMPLES),
+        numbered_series(65, MAX_SPARKLINE_SAMPLES),
+        numbered_series(MAX_MULTI_SPARKLINE_SERIES, MAX_SPARKLINE_SAMPLES),
+        numbered_series(300, 2_000),
+    ];
+    // Uneven: lengths 0, 7, 14, … across 256 series.
+    shapes.push(
+        (0..MAX_MULTI_SPARKLINE_SERIES)
+            .map(|s| vec![0.5; (s * 7) % 1_500])
+            .collect(),
+    );
+    // Half full, half 300 samples.
+    let mut half = numbered_series(100, MAX_SPARKLINE_SAMPLES);
+    half.extend(numbered_series(100, 300));
+    shapes.push(half);
+    // A ceiling whose total lands **exactly** on the cap inside the search
+    // (128 × 512 = 65 536): it fits, so it is the answer, not 511. The rows
+    // above only meet the cap exactly at the search's starting bound, which
+    // is how a strict `<` in the search first survived this test (#1438).
+    let exact = numbered_series(128, MAX_SPARKLINE_SAMPLES);
+    assert_eq!(multi_sparkline_keep(&exact), 512, "an exact fit is a fit");
+    shapes.push(exact);
+
+    for series in &shapes {
+        let k = multi_sparkline_keep(series);
+        assert!(k <= MAX_SPARKLINE_SAMPLES, "never past the per-series cap");
+        assert!(
+            k >= MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES,
+            "never below the series cap's share"
+        );
+        assert!(drawn(series, k) <= MAX_MULTI_SPARKLINE_POINTS, "fits");
+        assert!(
+            k == MAX_SPARKLINE_SAMPLES || drawn(series, k + 1) > MAX_MULTI_SPARKLINE_POINTS,
+            "the largest that fits: k = {k} for {} series",
+            series.len(),
+        );
+    }
+}
+
+/// The clamp is a fixpoint on a trimmed graph (the SDK's pass and the host's
+/// must agree), and a legal graph comes through it bit-identical.
+#[test]
+fn the_multi_sparkline_clamp_is_a_fixpoint_and_leaves_a_legal_graph_alone() {
+    let trimmed = multi(numbered_series(300, MAX_SPARKLINE_SAMPLES + 1), Some(1.0)).clamped();
+    assert_eq!(trimmed.clone().clamped(), trimmed, "fixpoint");
+
+    let legal = multi(vec![vec![0.0, -0.0, 0.5], vec![1e30, 0.25]], Some(2.0));
+    let clamped = legal.clone().clamped();
+    assert_eq!(node_float_bits(&clamped), node_float_bits(&legal));
+    assert_eq!(clamped, legal);
+}
+
+/// The largest graph that survives the caps still fits a frame with room to
+/// spare — the spec's "about 320 KiB", measured rather than asserted in prose.
+#[test]
+fn the_largest_multi_sparkline_fits_a_frame() {
+    let biggest = multi(
+        numbered_series(
+            MAX_MULTI_SPARKLINE_SERIES,
+            MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES,
+        ),
+        Some(f32::MAX),
+    );
+    assert_eq!(biggest.clone().clamped(), biggest, "already at every cap");
+    let len = encode_body(&biggest).len();
+    assert!(
+        len < 400 * 1024,
+        "{len} B — the caps were sized for ~320 KiB"
+    );
+    assert!(
+        len < MAX_FRAME_LEN / 32,
+        "{len} B against {MAX_FRAME_LEN} B"
+    );
+}
+
+/// A graph nested in a list card is reached by the same recursion as every
+/// other leaf.
+#[test]
+fn the_clamp_reaches_a_multi_sparkline_inside_a_card() {
+    let card = Node::ListBox {
+        id: None,
+        classes: vec!["boxed-list".into()],
+        dense: false,
+        children: vec![Node::Expander {
+            id: "cpu".into(),
+            expanded: true,
+            header: Box::new(sparkline(vec![0.5], Some(1.0))),
+            children: vec![multi(vec![vec![f32::NAN, 0.5]], None)],
+            classes: vec![],
+            tooltip: None,
+        }],
+    }
+    .clamped();
+    assert_node_floats_are_sane(&card);
+    assert_eq!(card.clone().clamped(), card);
+}
+
 // ── Homogeneous boxes (#1252) ────────────────────────────────────────────────
 
 /// The homogeneous switch is a **class**, so it rides the wire as nothing but
@@ -1952,15 +2432,16 @@ fn the_per_screen_fields_bump_no_vocabulary_generation() {
     // #1050 adds two defaulted **fields**, not variants. The crate root's rule
     // ("appending a wire variant ⇒ bump `VOCAB`") therefore does not fire, and
     // the counter must not have moved for them. Pinned as an equality against
-    // the newest *variant* generation (`PAGE_VISIBLE_VOCAB`, #1427) rather than
-    // a bare literal: a later PR that legitimately appends a variant bumps both
-    // together and this stays green, while a reflexive `VOCAB += 1` for a field
-    // addition — the mistake this test exists to catch — turns it red. The pin
-    // moved here from `OPEN_URI_VOCAB` when #1158 appended the next variant, as
-    // that const's own doc said it would, on from `SIDEBAR_RIGHT_VOCAB` when
-    // #1252 appended the one after, and on from `SPARKLINE_VOCAB` with #1427.
+    // the newest *variant* generation (`MULTI_SPARKLINE_VOCAB`, #1419) rather
+    // than a bare literal: a later PR that legitimately appends a variant bumps
+    // both together and this stays green, while a reflexive `VOCAB += 1` for a
+    // field addition — the mistake this test exists to catch — turns it red.
+    // The pin moved here from `OPEN_URI_VOCAB` when #1158 appended the next
+    // variant, as that const's own doc said it would, on from
+    // `SIDEBAR_RIGHT_VOCAB` when #1252 appended the one after, on from
+    // `SPARKLINE_VOCAB` with #1427, and on from `PAGE_VISIBLE_VOCAB` with #1419.
     assert_eq!(
-        VOCAB, PAGE_VISIBLE_VOCAB,
+        VOCAB, MULTI_SPARKLINE_VOCAB,
         "#1050's fields must not have advanced VOCAB past the newest appended variant",
     );
     assert_eq!(
@@ -2997,6 +3478,31 @@ fn assert_node_floats_are_sane(node: &Node) {
                 assert!(m.is_finite() && *m > 0.0, "an unusable top survived: {m}");
             }
         }
+        Node::MultiSparkline { series, max, .. } => {
+            assert!(
+                series.len() <= MAX_MULTI_SPARKLINE_SERIES,
+                "{} series survived the clamp",
+                series.len()
+            );
+            let points: usize = series.iter().map(Vec::len).sum();
+            assert!(
+                points <= MAX_MULTI_SPARKLINE_POINTS,
+                "{points} samples survived the clamp"
+            );
+            for line in series {
+                assert!(
+                    line.len() <= MAX_SPARKLINE_SAMPLES,
+                    "a {}-sample series survived the clamp",
+                    line.len()
+                );
+                for v in line {
+                    assert!(v.is_finite(), "a non-finite sample survived: {v}");
+                }
+            }
+            if let Some(m) = max {
+                assert!(m.is_finite() && *m > 0.0, "an unusable top survived: {m}");
+            }
+        }
         Node::Box { children, .. }
         | Node::Row { children, .. }
         | Node::ListBox { children, .. } => {
@@ -3050,6 +3556,12 @@ fn node_float_bits(node: &Node) -> Vec<u64> {
         // payload survives into the identity comparison.
         Node::Sparkline { values, max, .. } => values
             .iter()
+            .chain(max)
+            .map(|v| u64::from(v.to_bits()))
+            .collect(),
+        Node::MultiSparkline { series, max, .. } => series
+            .iter()
+            .flatten()
             .chain(max)
             .map(|v| u64::from(v.to_bits()))
             .collect(),
@@ -4083,10 +4595,14 @@ fn the_sparkline_generation_bumps_the_census_only() {
 #[test]
 fn the_page_visible_generation_bumps_the_census_only() {
     assert_eq!(PAGE_VISIBLE_VOCAB, 8, "#1427 is generation 8");
-    assert_eq!(
-        VOCAB, PAGE_VISIBLE_VOCAB,
-        "the census reaches the newest appended variant",
-    );
+    // `<=`, not `==` since #1419: the "census reaches the newest variant" pin
+    // moved on to `the_multi_sparkline_generation_bumps_the_census_only`.
+    const {
+        assert!(
+            PAGE_VISIBLE_VOCAB <= VOCAB,
+            "the census counts it, and never un-counts a shipped generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "an appended variant does not move the unconditional ceiling",
@@ -4104,6 +4620,58 @@ fn the_page_visible_generation_bumps_the_census_only() {
         m.vocab < PAGE_VISIBLE_VOCAB,
         "so the handshake counter is NOT what keeps this key away from an \
          older host — the `Register` decode is (see the const's doc)",
+    );
+}
+
+/// #1419's multi-series graph is generation **9**, it bumps the census, and it
+/// leaves `VOCAB_UNCONDITIONAL` alone — the `Hello`-negotiated rule
+/// #882/#893/#966/#1252 set, applied a fifth time.
+///
+/// Its predecessor (#1427's push) is census-only, so — as for #1252 over
+/// #1158 — a shell on the previous generation advertises 8 and the arithmetic
+/// keeps the variant away from it with no special case. The single-line
+/// generation is checked too: a generation-7 shell draws a `Sparkline` and
+/// must still negotiate below this one.
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 9 (the third assertion
+/// reds, and with it every older shell's acceptance of a rebuilt plugin), by
+/// leaving `VOCAB` at 8 (the second), or by `MULTI_SPARKLINE_VOCAB = 8` (the
+/// first, and the generation-8 assertion).
+#[test]
+fn the_multi_sparkline_generation_bumps_the_census_only() {
+    assert_eq!(MULTI_SPARKLINE_VOCAB, 9, "#1419 is generation 9");
+    assert_eq!(
+        VOCAB, MULTI_SPARKLINE_VOCAB,
+        "the census reaches the newest appended variant",
+    );
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "a negotiated variant does not move the unconditional ceiling",
+    );
+
+    let m = Manifest::new("stats", Mount::BarRight);
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "the stamped generation an old host exact-checks did not move",
+    );
+    m.check_vocab()
+        .expect("a plugin rebuilt on this SDK still clears a same-vocab host");
+    assert_eq!(
+        m.negotiated_vocab(VOCAB),
+        MULTI_SPARKLINE_VOCAB,
+        "a host advertising today's census negotiates the multi-series graph",
+    );
+    assert!(
+        m.negotiated_vocab(PAGE_VISIBLE_VOCAB) < MULTI_SPARKLINE_VOCAB,
+        "a generation-8 shell negotiates below it, so the plugin falls back",
+    );
+    assert!(
+        m.negotiated_vocab(SPARKLINE_VOCAB) < MULTI_SPARKLINE_VOCAB,
+        "…as does a generation-7 shell, which draws one line and not several",
+    );
+    assert!(
+        m.negotiated_vocab(VOCAB_UNCONDITIONAL) < MULTI_SPARKLINE_VOCAB,
+        "and a host that advertises nothing",
     );
 }
 

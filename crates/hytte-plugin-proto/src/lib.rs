@@ -256,7 +256,13 @@ pub const PROTO_VERSION: u16 = 1;
 /// #1158's argument — the counter's handshake check cannot fire for it. Unlike
 /// #1252 it is not `Hello`-negotiated: a plugin subscribes before any `Hello`
 /// can arrive.
-pub const VOCAB: u16 = 8;
+///
+/// Generation `9` is #1419's multi-series graph ([`Node::MultiSparkline`]),
+/// negotiated against [`MULTI_SPARKLINE_VOCAB`] exactly as #1252's single line
+/// was on [`SPARKLINE_VOCAB`]. Its predecessor is census-only, as #1252's was,
+/// so a generation-8 shell (which advertises 8) negotiates below it and a
+/// rebuilt plugin falls back to a single line rather than being refused.
+pub const VOCAB: u16 = 9;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -269,8 +275,9 @@ pub const VOCAB: u16 = 8;
 ///
 /// The two diverge because #882 added a *negotiated* generation; #893's shader
 /// widget ([`SHADER_VOCAB`]) is the second, #966's bounded
-/// viewport ([`SCROLLED_VOCAB`]) the third and #1252's trend line
-/// ([`SPARKLINE_VOCAB`]) the fourth negotiated one. Three more generations leave
+/// viewport ([`SCROLLED_VOCAB`]) the third, #1252's trend line
+/// ([`SPARKLINE_VOCAB`]) the fourth and #1419's multi-series graph
+/// ([`MULTI_SPARKLINE_VOCAB`]) the fifth negotiated one. Three more generations leave
 /// this const alone without being negotiated at all: #1045's
 /// [`OPEN_URI_VOCAB`], on a capability argument rather than a `Hello` one, and
 /// #1158's [`SIDEBAR_RIGHT_VOCAB`], on a third
@@ -335,9 +342,11 @@ pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{
     Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
     HOMOGENEOUS_CLASS, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES,
-    MAX_NODE_CLASSES, MAX_PLUGIN_ID_BYTES, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES,
-    MAX_SPARKLINE_SAMPLES, Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB, SPARKLINE_VOCAB, ShaderData,
-    SliderFloats, sane_fraction, sane_slider_floats, sane_sparkline_max, sane_sparkline_sample,
+    MAX_MULTI_SPARKLINE_POINTS, MAX_MULTI_SPARKLINE_SERIES, MAX_NODE_CLASSES, MAX_PLUGIN_ID_BYTES,
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SPARKLINE_SAMPLES, MULTI_SPARKLINE_VOCAB,
+    Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB, SPARKLINE_VOCAB, ShaderData, SliderFloats,
+    multi_sparkline_keep, sane_fraction, sane_slider_floats, sane_sparkline_max,
+    sane_sparkline_sample,
 };
 
 #[cfg(feature = "tokio")]

@@ -290,6 +290,18 @@
 //! degrades to a [`Node::Progress`] at the newest sample's level against a
 //! shell too old to decode it (negotiated, like [`Node::Scrolled`]).
 //!
+//! ## Several lines in one graph: [`Node::MultiSparkline`] (#1419)
+//!
+//! The native page's per-core history is `hytte_ui::MultiSparkline`: one
+//! smoothed line per series in its own generated hue, all on one shared axis.
+//! [`Node::MultiSparkline`] is that widget on the wire — one window per series,
+//! each oldest first, the whole window every render.
+//! `nodes::multi_sparkline(per_core).id("per-core-load").max(1.0).build()`
+//! builds one, and against a shell too old to decode it degrades to a
+//! [`Node::Sparkline`] — the per-sample mean of the series by default, or the
+//! line you hand `.fallback(..)` — which itself degrades to a
+//! [`Node::Progress`] on a shell older still.
+//!
 //! For a **collapsible** section, reach for [`Node::Expander`] instead of
 //! hand-rolling a button + chevron + revealer. It renders a flat, full-width
 //! header (your `header` node, with a trailing disclosure chevron) over a

@@ -8,12 +8,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use hytte::ui::widget_tree::SPARKLINE_CAPACITY;
+use hytte::ui::widget_tree::{MULTI_SPARKLINE_CAPACITY, SPARKLINE_CAPACITY};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, FitAxis, Node as UiNode};
 use hytte_plugin_proto::Mount;
 use hytte_plugin_proto::wire::{
-    self, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
-    MAX_NODES_PER_TREE, MAX_SPARKLINE_SAMPLES, MAX_TREE_DEPTH,
+    self, MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_MULTI_SPARKLINE_POINTS,
+    MAX_MULTI_SPARKLINE_SERIES, MAX_NODE_CLASSES, MAX_NODES_PER_TREE, MAX_SPARKLINE_SAMPLES,
+    MAX_TREE_DEPTH,
 };
 
 // The reconciler builds a `Node::Sparkline`'s ring once, at
@@ -24,6 +25,17 @@ use hytte_plugin_proto::wire::{
 const _: () = assert!(
     MAX_SPARKLINE_SAMPLES <= SPARKLINE_CAPACITY,
     "the wire's sparkline cap must fit the reconciler's ring",
+);
+
+// The same argument per series for #1419's `Node::MultiSparkline`: its rings
+// are built once at `MULTI_SPARKLINE_CAPACITY` a series and never rebuilt on a
+// value change, and the most samples a series can keep through this seam is
+// the per-series cap (`wire::multi_sparkline_keep` never answers more). The
+// series and total-point caps have no reconciler counterpart — they are
+// enforced here, before the node exists — so this is the one pair to order.
+const _: () = assert!(
+    MAX_SPARKLINE_SAMPLES <= MULTI_SPARKLINE_CAPACITY,
+    "the wire's per-series cap must fit the reconciler's multi-series rings",
 );
 
 use super::effects::truncate_on_char_boundary;
@@ -441,6 +453,27 @@ fn warn_once_sparkline(scope: &Scope) -> bool {
     })
 }
 
+thread_local! {
+    /// Per-scope latch for a sanitised [`wire::Node::MultiSparkline`] (#1419)
+    /// — [`WARNED_SPARKLINE`]'s shape, kept separate from it so a tree with a
+    /// bad single line *and* a bad graph names both, since they are two
+    /// different nodes to fix.
+    static WARNED_MULTI_SPARKLINE: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the multi-series latch for `scope`: `true` the first time it is
+/// asked for, `false` for the rest of the shell's run. See
+/// [`WARNED_MULTI_SPARKLINE`].
+fn warn_once_multi_sparkline(scope: &Scope) -> bool {
+    WARNED_MULTI_SPARKLINE.with_borrow_mut(|warned| {
+        if warned.contains(scope) {
+            return false;
+        }
+        warned.insert(scope.clone());
+        true
+    })
+}
+
 /// Map a wire [`wire::Node`] onto the reconciler's `hytte_ui::Node`. The two
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
 /// is written exhaustively so adding a node variant to either side is a compile
@@ -735,6 +768,63 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             UiNode::Sparkline {
                 id: id.clone(),
                 values,
+                max: sane_max.map(f64::from),
+                classes: walk.classes(classes),
+            }
+        }
+        wire::Node::MultiSparkline {
+            id,
+            series,
+            max,
+            classes,
+        } => {
+            // #1419's multi-series graph: the `Sparkline` arm above, per series.
+            // The caps are the proto's own — the series past
+            // `MAX_MULTI_SPARKLINE_SERIES` go, and each survivor keeps its
+            // newest `wire::multi_sparkline_keep` samples, the one function
+            // `wire::Node::clamp_in_place` trims with too, so the SDK's pass and
+            // this one cannot disagree — and the floats go through the same two
+            // sanitisers while widening to the reconciler's `f64`. Warned once
+            // per plugin tree, for the `Sparkline` arm's reason: a graph is a
+            // window of windows, and one bad sample rides every frame for a
+            // minute.
+            let survivors = &series[..series.len().min(MAX_MULTI_SPARKLINE_SERIES)];
+            let keep = wire::multi_sparkline_keep(series);
+            let mut rewritten = survivors.len() < series.len();
+            let mut mapped: Vec<Vec<f64>> = Vec::with_capacity(survivors.len());
+            for line in survivors {
+                let skip = line.len().saturating_sub(keep);
+                rewritten |= skip > 0;
+                let mut window = Vec::with_capacity(line.len() - skip);
+                for v in &line[skip..] {
+                    let sane = wire::sane_sparkline_sample(*v);
+                    rewritten |= sane.to_bits() != v.to_bits();
+                    window.push(f64::from(sane));
+                }
+                mapped.push(window);
+            }
+            let sane_max = wire::sane_sparkline_max(*max);
+            rewritten |= sane_max.map(f32::to_bits) != max.map(f32::to_bits);
+            if rewritten && warn_once_multi_sparkline(walk.scope) {
+                tracing::warn!(
+                    plugin = walk.scope.plugin_id(),
+                    tree = ?walk.scope.role(),
+                    node = ?id,
+                    series = series.len(),
+                    points = series.iter().map(Vec::len).sum::<usize>(),
+                    series_cap = MAX_MULTI_SPARKLINE_SERIES,
+                    series_samples_cap = MAX_SPARKLINE_SAMPLES,
+                    points_cap = MAX_MULTI_SPARKLINE_POINTS,
+                    "plugin MultiSparkline carries a non-finite sample or top, or more series or \
+                     samples than the host draws; sanitised (a NaN draws at the bottom, an \
+                     infinity at the edge, the series past the cap are dropped and each series \
+                     keeps only its newest samples). Further occurrences in this tree are \
+                     silenced for the rest of this shell run",
+                );
+            }
+            UiNode::MultiSparkline {
+                id: id.clone(),
+                series: mapped,
                 max: sane_max.map(f64::from),
                 classes: walk.classes(classes),
             }
@@ -1114,6 +1204,244 @@ mod tests {
                 if classes == &[hytte::ui::widget_tree::HOMOGENEOUS_CLASS.to_owned()]),
             "{mapped:?}",
         );
+    }
+
+    // ── MultiSparkline (#1419) ────────────────────────────────────────────
+
+    fn graph(series: Vec<Vec<f32>>, max: Option<f32>) -> wire::Node {
+        wire::Node::MultiSparkline {
+            id: Some("per-core-load".into()),
+            series,
+            max,
+            classes: vec!["ts-cores".into()],
+        }
+    }
+
+    /// `count` series of `len` samples, series `s` sample `i` holding
+    /// `s * 10_000 + i`, so a survivor names its series and its end.
+    fn numbered(count: usize, len: usize) -> Vec<Vec<f32>> {
+        #[allow(clippy::cast_precision_loss)]
+        (0..count)
+            .map(|s| (0..len).map(|i| (s * 10_000 + i) as f32).collect())
+            .collect()
+    }
+
+    fn mapped_series(node: UiNode) -> (Vec<Vec<f64>>, Option<f64>) {
+        match node {
+            UiNode::MultiSparkline { series, max, .. } => (series, max),
+            other => panic!("a MultiSparkline must map to a MultiSparkline, got {other:?}"),
+        }
+    }
+
+    /// The wire's `MultiSparkline` is the reconciler's, field for field: the id
+    /// is the key, every series widens `f32` → `f64` without moving, in order,
+    /// the top rides through and the classes are the node's.
+    ///
+    /// **Falsified** by mapping it to a `UiNode::Sparkline` (or anything else),
+    /// by dropping `max` to `None`, or by reversing the series.
+    #[test]
+    fn a_multi_sparkline_maps_to_the_reconcilers_multi_sparkline() {
+        let scope = Scope::detached("t1419-map");
+        let mapped = to_ui_node(
+            &scope,
+            Grants::none(),
+            &graph(vec![vec![0.0, 0.25], vec![0.5], vec![]], Some(1.0)),
+        );
+        assert_eq!(
+            mapped,
+            UiNode::MultiSparkline {
+                id: Some("per-core-load".into()),
+                series: vec![vec![0.0, 0.25], vec![0.5], vec![]],
+                max: Some(1.0),
+                classes: vec!["ts-cores".into()],
+            },
+        );
+        let (_, max) = mapped_series(to_ui_node(
+            &scope,
+            Grants::none(),
+            &graph(vec![vec![4096.0]], None),
+        ));
+        assert_eq!(max, None, "auto-scaled stays auto-scaled");
+    }
+
+    /// The host re-runs the proto's sanitisers per sample and on the top — an
+    /// SDK-built plugin is not the only thing that can dial the socket — so
+    /// the reconciler never meets a `NaN`, an infinity or an unusable top.
+    ///
+    /// **Falsified** by widening without `sane_sparkline_sample` (the `NaN`
+    /// survives into the host node), or without `sane_sparkline_max`.
+    #[test]
+    fn a_multi_sparkline_is_sanitised_at_the_seam() {
+        let (series, max) = mapped_series(to_ui_node(
+            &Scope::detached("t1419-sane"),
+            Grants::none(),
+            &graph(
+                vec![vec![0.5, f32::NAN], vec![f32::INFINITY, f32::NEG_INFINITY]],
+                Some(f32::NAN),
+            ),
+        ));
+        assert_eq!(series[0], vec![0.5, 0.0], "a NaN draws at the bottom");
+        assert_eq!(
+            series[1],
+            vec![f64::from(f32::MAX), f64::from(-f32::MAX)],
+            "an infinity pins to the edge",
+        );
+        assert!(series.iter().flatten().all(|v| v.is_finite()));
+        assert_eq!(
+            max, None,
+            "a NaN top auto-scales, as the drawing code would"
+        );
+    }
+
+    /// The seam trims exactly as the proto's clamp does — the series past the
+    /// cap dropped (the last ones), each survivor cut to its newest
+    /// `multi_sparkline_keep` samples — so mapping a raw tree and mapping the
+    /// SDK's clamped copy of it give the **same** host node.
+    ///
+    /// **Falsified** by iterating `series` rather than the survivors (257
+    /// series reach the reconciler), by `line[..keep]` in place of
+    /// `line[skip..]` (the oldest samples survive), or by trimming each
+    /// series to `MAX_SPARKLINE_SAMPLES` instead of `keep` (the point cap is
+    /// never enforced), or by computing the host's own divisor-based keep
+    /// instead of calling the shared one (the sparse row keeps 256).
+    #[test]
+    fn a_multi_sparkline_is_trimmed_at_the_seam_as_the_clamp_trims() {
+        use hytte_plugin_proto::wire::{MAX_MULTI_SPARKLINE_POINTS, MAX_MULTI_SPARKLINE_SERIES};
+        let scope = Scope::detached("t1419-trim");
+
+        // The series cap: the last series go, the first survive whole.
+        let raw = graph(numbered(MAX_MULTI_SPARKLINE_SERIES + 1, 2), None);
+        let (series, _) = mapped_series(to_ui_node(&scope, Grants::none(), &raw));
+        assert_eq!(series.len(), MAX_MULTI_SPARKLINE_SERIES);
+        assert_eq!(series[0], vec![0.0, 1.0]);
+
+        // The per-series cap: the newest `MAX_SPARKLINE_SAMPLES` of each.
+        let raw = graph(numbered(2, MAX_SPARKLINE_SAMPLES + 3), None);
+        let (series, _) = mapped_series(to_ui_node(&scope, Grants::none(), &raw));
+        assert!(series.iter().all(|l| l.len() == MAX_SPARKLINE_SAMPLES));
+        assert_eq!(
+            series[1].first().copied(),
+            Some(10_003.0),
+            "the three OLDEST went"
+        );
+
+        // The point cap: 100 full series keep 655 each, newest.
+        let raw = graph(numbered(100, MAX_SPARKLINE_SAMPLES), Some(1.0));
+        let (series, _) = mapped_series(to_ui_node(&scope, Grants::none(), &raw));
+        let keep = MAX_MULTI_SPARKLINE_POINTS / 100;
+        assert!(series.iter().all(|l| l.len() == keep), "an even cut");
+        assert!(series.iter().map(Vec::len).sum::<usize>() <= MAX_MULTI_SPARKLINE_POINTS);
+        assert_eq!(
+            series[0].last().copied(),
+            Some(f64::from(u16::try_from(MAX_SPARKLINE_SAMPLES - 1).unwrap())),
+            "the newest stayed",
+        );
+
+        // The point cap on uneven lines (#1438 review LOW 4): 65 full series
+        // beside 191 empty ones keep 1 008 each — the largest common ceiling
+        // that fits — not the 256 a division by the series count gives.
+        let mut sparse = numbered(65, MAX_SPARKLINE_SAMPLES);
+        sparse.extend(std::iter::repeat_n(
+            Vec::new(),
+            MAX_MULTI_SPARKLINE_SERIES - 65,
+        ));
+        let (series, _) = mapped_series(to_ui_node(
+            &scope,
+            Grants::none(),
+            &graph(sparse.clone(), None),
+        ));
+        assert!(series[..65].iter().all(|l| l.len() == 1008), "full lines");
+        assert!(series[65..].iter().all(Vec::is_empty), "empty ones");
+
+        // …and every one of those agrees with the SDK's clamped copy.
+        for raw in [
+            graph(numbered(MAX_MULTI_SPARKLINE_SERIES + 1, 2), None),
+            graph(numbered(2, MAX_SPARKLINE_SAMPLES + 3), Some(f32::NAN)),
+            graph(numbered(100, MAX_SPARKLINE_SAMPLES), Some(1.0)),
+            graph(sparse, None),
+            graph(vec![vec![f32::NAN, 1.0], vec![f32::INFINITY]], None),
+        ] {
+            assert_eq!(
+                to_ui_node(&scope, Grants::none(), &raw),
+                to_ui_node(&scope, Grants::none(), &raw.clone().clamped()),
+                "the host seam and the proto clamp disagree",
+            );
+        }
+    }
+
+    /// The seam's warning is latched **per plugin tree for the life of the
+    /// shell**: a poisoned graph is poisoned on every frame, on every monitor.
+    /// A clean graph warns nothing, and a second tree gets its own line.
+    ///
+    /// **Falsified** by dropping the `&& warn_once_multi_sparkline(..)`
+    /// conjunct (five lines for five passes), or by warning whether or not
+    /// anything was rewritten (the clean graph warns).
+    #[test]
+    fn the_multi_sparkline_warn_latches_per_tree() {
+        let warns = |captured: &hytte_config::test_support::Captured| {
+            captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key("points_cap"))
+                .count()
+        };
+        let poisoned = graph(vec![vec![f32::NAN]], None);
+        let (captured, _guard) = hytte_config::test_support::capture();
+
+        let clean = Scope::detached("t1419-warn-clean");
+        let _ = to_ui_node(&clean, Grants::none(), &graph(vec![vec![0.5]], Some(1.0)));
+        assert_eq!(warns(&captured), 0, "nothing rewritten, nothing said");
+
+        let scope = Scope::detached("t1419-warn");
+        for _ in 0..5 {
+            let _ = to_ui_node(&scope, Grants::none(), &poisoned);
+        }
+        assert_eq!(
+            warns(&captured),
+            1,
+            "five poisoned frames, one journal line"
+        );
+
+        let other = Scope::detached("t1419-warn-other");
+        let _ = to_ui_node(&other, Grants::none(), &poisoned);
+        assert_eq!(warns(&captured), 2, "a second tree gets its own line");
+    }
+
+    /// The seam warns for **every** kind of rewrite it makes, not only a
+    /// non-finite sample: a dropped series, a trimmed window and an unusable
+    /// top each earn their tree one line (#1438 review).
+    ///
+    /// **Falsified** by dropping any of the three `rewritten` terms other than
+    /// the per-sample one.
+    #[test]
+    fn the_multi_sparkline_warns_for_each_kind_of_rewrite() {
+        use hytte_plugin_proto::wire::MAX_MULTI_SPARKLINE_SERIES;
+        let warns = |captured: &hytte_config::test_support::Captured| {
+            captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key("points_cap"))
+                .count()
+        };
+        let (captured, _guard) = hytte_config::test_support::capture();
+        let _ = to_ui_node(
+            &Scope::detached("t1438-warn-series"),
+            Grants::none(),
+            &graph(numbered(MAX_MULTI_SPARKLINE_SERIES + 1, 1), None),
+        );
+        assert_eq!(warns(&captured), 1, "series past the cap");
+        let _ = to_ui_node(
+            &Scope::detached("t1438-warn-window"),
+            Grants::none(),
+            &graph(numbered(1, MAX_SPARKLINE_SAMPLES + 1), None),
+        );
+        assert_eq!(warns(&captured), 2, "a window past the per-series cap");
+        let _ = to_ui_node(
+            &Scope::detached("t1438-warn-top"),
+            Grants::none(),
+            &graph(vec![vec![0.5]], Some(f32::INFINITY)),
+        );
+        assert_eq!(warns(&captured), 3, "an unusable top");
     }
 }
 

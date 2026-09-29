@@ -468,6 +468,32 @@ pub enum Node {
         /// widget's own `hytte-sparkline`.
         classes: Vec<String>,
     },
+    /// Several trend lines in one graph: a
+    /// [`MultiSparkline`](crate::MultiSparkline) — the widget the shell's own
+    /// Stats page draws its per-core history with — over `series` (#1419).
+    ///
+    /// One smoothed line per series, each in the generated hue `i / n` (the
+    /// widget's palette, not CSS). The widget fills its row's width (`hexpand`,
+    /// as the native per-core graph does) and takes its height from the
+    /// `hytte-multi-sparkline` stylesheet rule. `series` and `max` are
+    /// **mutable props**, exactly [`Sparkline`](Node::Sparkline)'s: a same-id
+    /// re-render hands the existing widget the new windows and queues one
+    /// redraw — a changed series count included — and one restating what it
+    /// already holds touches nothing. It never rebuilds on a value change.
+    MultiSparkline {
+        /// Optional diff/reorder key (see [`NodeId`]).
+        id: Option<NodeId>,
+        /// One window per series, each oldest first (mutable prop). At most
+        /// [`MULTI_SPARKLINE_CAPACITY`] samples of each are drawn — the newest.
+        series: Vec<Vec<f64>>,
+        /// The shared y axis' top: `Some(m)` draws `0..=m`, `None` auto-scales
+        /// to the largest sample across all series (mutable prop) —
+        /// `MultiSparkline::set_domain_max`.
+        max: Option<f64>,
+        /// GTK CSS classes applied verbatim (`add_css_class`), on top of the
+        /// widget's own `hytte-multi-sparkline`.
+        classes: Vec<String>,
+    },
     /// An interactive horizontal `gtk::Scale` — the writable counterpart to
     /// [`Node::Progress`]. `id` is **required** (like [`Node::Button`]): it is
     /// the [`EventKind::ValueChanged`] target. `min`/`max`/`step`/`value` set the
@@ -689,6 +715,11 @@ struct RetainedNode {
     /// ring copy and the redraw when a re-render restates them. Always `None`
     /// for every other node kind.
     sparkline: Option<Box<SparklineState>>,
+    /// A [`Node::MultiSparkline`]'s widget handle and the props it last
+    /// applied — [`RetainedNode::sparkline`]'s reasoning, for the multi-series
+    /// widget (also a plain struct around a `gtk::DrawingArea`, so nothing to
+    /// `downcast` back to). Always `None` for every other node kind.
+    multi_sparkline: Option<Box<MultiSparklineState>>,
 }
 
 /// The largest number of samples a reconciled [`Node::Sparkline`] draws — the
@@ -744,6 +775,66 @@ impl SparklineState {
         if self.values != values {
             self.spark.set_samples(&values.iter().copied().collect());
             values.clone_into(&mut self.values);
+        }
+    }
+}
+
+/// The most samples **per series** a reconciled [`Node::MultiSparkline`]
+/// draws — the per-series capacity its [`MultiSparkline`](crate::MultiSparkline)
+/// is built with (#1419).
+///
+/// [`SPARKLINE_CAPACITY`]'s argument, per series: `MultiSparkline::new` fixes
+/// the capacity for the widget's life and the reconciler never rebuilds on a
+/// value change, so it has to cover every window the node can carry. 1024 is
+/// the wire's per-series cap (`MAX_SPARKLINE_SAMPLES` in `hytte-plugin-proto`,
+/// which the shell's mapping seam asserts fits here at compile time; the
+/// wire's series and total-point caps have no counterpart in the widget and
+/// are enforced before a node reaches it). A **bound, not an allocation**: each
+/// ring grows to the window it is handed. A longer window keeps its newest
+/// samples, the ring's own rule.
+pub const MULTI_SPARKLINE_CAPACITY: usize = 1024;
+
+/// A [`Node::MultiSparkline`]'s retained pieces (see
+/// [`RetainedNode::multi_sparkline`]).
+struct MultiSparklineState {
+    /// The widget handle — cheap to clone, shares the rings with the draw
+    /// function.
+    graph: crate::MultiSparkline,
+    /// The `series` prop as last applied.
+    series: Vec<Vec<f64>>,
+    /// The `max` prop as last applied.
+    max: Option<f64>,
+}
+
+impl MultiSparklineState {
+    /// Build the widget and apply the node's props once.
+    fn build(series: &[Vec<f64>], max: Option<f64>) -> Self {
+        let graph = crate::MultiSparkline::new(MULTI_SPARKLINE_CAPACITY);
+        // The native per-core graph's layout (`panels/stats.rs` in the shell):
+        // the graph takes the whole width of the row it sits in.
+        graph.widget().set_hexpand(true);
+        graph.set_domain_max(max);
+        graph.set_series(series);
+        Self {
+            graph,
+            series: series.to_vec(),
+            max,
+        }
+    }
+
+    /// Re-point the existing widget at the node's props, touching only what
+    /// changed — `SparklineState::update`'s rule: each setter queues a redraw,
+    /// and a frame that restates the same graph should cost none. The whole
+    /// window list is compared, so a changed series count, a changed length
+    /// and a same-length window that moved all reach the widget.
+    fn update(&mut self, series: &[Vec<f64>], max: Option<f64>) {
+        if self.max != max {
+            self.graph.set_domain_max(max);
+            self.max = max;
+        }
+        if self.series != series {
+            self.graph.set_series(series);
+            series.clone_into(&mut self.series);
         }
     }
 }
@@ -831,6 +922,7 @@ enum NodeKind {
     Button,
     Progress,
     Sparkline,
+    MultiSparkline,
     Slider,
     Revealer,
     Separator,
@@ -1109,6 +1201,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut entry_text = None;
     let mut entry_submitted = None;
     let mut sparkline = None;
+    let mut multi_sparkline = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
@@ -1305,6 +1398,18 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             sparkline = Some(Box::new(state));
             (area.upcast(), Vec::new())
         }
+        Node::MultiSparkline {
+            series,
+            max,
+            classes,
+            ..
+        } => {
+            let state = MultiSparklineState::build(series, *max);
+            let area = state.graph.widget().clone();
+            apply_classes(&area, classes);
+            multi_sparkline = Some(Box::new(state));
+            (area.upcast(), Vec::new())
+        }
         Node::Slider {
             id,
             min,
@@ -1470,6 +1575,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         entry_text,
         entry_submitted,
         sparkline,
+        multi_sparkline,
     }
 }
 
@@ -1722,6 +1828,21 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
                 .as_mut()
                 .expect("kind invariant: a Sparkline node retains its SparklineState")
                 .update(values, *max);
+            reconcile_classes(&retained.widget, &retained.desc.classes, classes);
+        }
+        Node::MultiSparkline {
+            series,
+            max,
+            classes,
+            ..
+        } => {
+            // In place, never a rebuild — the `Sparkline` arm's contract, a
+            // changed series count included (the widget re-seeds its rings).
+            retained
+                .multi_sparkline
+                .as_mut()
+                .expect("kind invariant: a MultiSparkline node retains its MultiSparklineState")
+                .update(series, *max);
             reconcile_classes(&retained.widget, &retained.desc.classes, classes);
         }
         Node::Slider {
@@ -2274,6 +2395,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Button { .. } => NodeKind::Button,
         Node::Progress { .. } => NodeKind::Progress,
         Node::Sparkline { .. } => NodeKind::Sparkline,
+        Node::MultiSparkline { .. } => NodeKind::MultiSparkline,
         Node::Slider { .. } => NodeKind::Slider,
         Node::Revealer { .. } => NodeKind::Revealer,
         Node::Separator { .. } => NodeKind::Separator,
@@ -2296,6 +2418,7 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Shader { id, .. }
         | Node::Progress { id, .. }
         | Node::Sparkline { id, .. }
+        | Node::MultiSparkline { id, .. }
         | Node::Revealer { id, .. }
         | Node::Scrolled { id, .. } => id.as_deref(),
         // `Button`, `Slider`, `Expander`, and `Entry` all require an id — it is
@@ -2323,6 +2446,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
         | Node::Sparkline { classes, .. }
+        | Node::MultiSparkline { classes, .. }
         | Node::Slider { classes, .. }
         | Node::Expander { classes, .. }
         | Node::Entry { classes, .. }
@@ -2856,6 +2980,51 @@ mod diff_tests {
             let plan = plan_diff(from, to);
             assert_eq!(plan.ops, vec![SlotOp::Create], "{what}");
             assert_eq!(plan.removals, vec![0], "{what}");
+        }
+    }
+
+    /// #1419's multi-series graph keys as its **own** kind, by its id, with its
+    /// classes — the same three accessors, each with the same
+    /// wrong-but-compiling arm to land in.
+    ///
+    /// **Falsified** by folding it into `NodeKind::Sparkline` in `node_kind`,
+    /// or moving it to the `None` arm of `node_id`.
+    #[test]
+    fn a_multi_sparkline_node_carries_its_kind_id_and_classes() {
+        let node = Node::MultiSparkline {
+            id: Some("per-core-load".to_owned()),
+            series: vec![vec![0.1], vec![0.4]],
+            max: Some(1.0),
+            classes: vec!["ts-cores".to_owned()],
+        };
+        assert_eq!(node_kind(&node), NodeKind::MultiSparkline);
+        assert_eq!(node_id(&node), Some("per-core-load"));
+        assert_eq!(node_classes(&node), ["ts-cores".to_owned()]);
+        assert_eq!(
+            child_key(&node),
+            key(Some("per-core-load"), NodeKind::MultiSparkline)
+        );
+    }
+
+    /// A same-id graph re-render **reuses** its widget, and a same-id graph
+    /// never reuses the `Sparkline` (or the `Progress` bar) the SDK falls back
+    /// to — the flip a plugin makes across a shell upgrade. Each retained state
+    /// exists only on its own kind, so a cross-kind reuse would reach the other
+    /// arm's kind-invariant `expect`.
+    #[test]
+    fn a_multi_sparkline_reuses_itself_and_never_its_fallbacks() {
+        let graph = vec![key(Some("per-core"), NodeKind::MultiSparkline)];
+        let plan = plan_diff(&graph, &graph.clone());
+        assert_eq!(plan.ops, vec![SlotOp::Reuse(0)], "same id, same kind");
+        assert!(plan.removals.is_empty());
+
+        for fallback in [NodeKind::Sparkline, NodeKind::Progress] {
+            let other = vec![key(Some("per-core"), fallback)];
+            for (from, to) in [(&other, &graph), (&graph, &other)] {
+                let plan = plan_diff(from, to);
+                assert_eq!(plan.ops, vec![SlotOp::Create], "{fallback:?}");
+                assert_eq!(plan.removals, vec![0], "{fallback:?}");
+            }
         }
     }
 
@@ -3400,6 +3569,406 @@ mod gtk_tests {
             "ts-cpu",
         ));
         assert_eq!(root_spark(&rec).samples_for_test(), vec![0.2, 0.3, 0.4]);
+    }
+
+    // ── MultiSparkline (#1419) ─────────────────────────────────────────────
+
+    fn graph(id: Option<&str>, series: Vec<Vec<f64>>, max: Option<f64>, class: &str) -> Node {
+        Node::MultiSparkline {
+            id: id.map(ToOwned::to_owned),
+            series,
+            max,
+            classes: vec![class.to_owned()],
+        }
+    }
+
+    /// The retained widget handle of the tree's root graph.
+    fn root_graph(rec: &Reconciler) -> crate::MultiSparkline {
+        rec.tree
+            .as_ref()
+            .and_then(|t| t.multi_sparkline.as_ref())
+            .expect("the root is a multi-sparkline")
+            .graph
+            .clone()
+    }
+
+    /// A `Node::MultiSparkline` is the library's own `MultiSparkline`: its
+    /// drawing area, wearing `hytte-multi-sparkline` *and* the node's classes,
+    /// filling its row (`hexpand`, as the native per-core graph does), with
+    /// the node's windows and top in the rings the draw function reads.
+    ///
+    /// **Falsified** by dropping `set_hexpand(true)` from
+    /// `MultiSparklineState::build`, or the `set_series` call there.
+    #[gtk::test]
+    fn a_multi_sparkline_builds_the_native_widget() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&graph(
+            None,
+            vec![vec![0.1, 0.5], vec![0.9, 0.2]],
+            Some(1.0),
+            "ts-cores",
+        ));
+
+        let area = root
+            .first_child()
+            .and_then(|w| w.downcast::<gtk::DrawingArea>().ok())
+            .expect("a GtkDrawingArea");
+        assert!(
+            area.has_css_class("hytte-multi-sparkline"),
+            "the library's class"
+        );
+        assert!(area.has_css_class("ts-cores"), "and the node's");
+        assert!(area.hexpands(), "fills its row like the native one");
+
+        let handle = root_graph(&rec);
+        assert_eq!(
+            handle.widget().upcast_ref::<gtk::Widget>(),
+            area.upcast_ref::<gtk::Widget>(),
+            "the retained handle is the mounted widget",
+        );
+        assert_eq!(
+            handle.series_for_test(),
+            vec![vec![0.1, 0.5], vec![0.9, 0.2]]
+        );
+        assert_eq!(handle.domain_max_for_test(), Some(1.0));
+    }
+
+    /// **The #1419 contract**: new windows, a new top and a new class list on
+    /// a re-render reach the **same** widget. Pinned as a tree's root
+    /// (`Reconciler::render`'s `reusable`) and as a keyed child beside a
+    /// sibling that changes (`diff_children`'s `plan_diff`) — the native
+    /// "Per-core history · N cores" header over the graph.
+    ///
+    /// **Falsified** by making `update_in_place`'s `MultiSparkline` arm skip
+    /// `MultiSparklineState::update` (the series assertion reds — the
+    /// bookkeeping alone moving is not enough).
+    #[gtk::test]
+    fn a_multi_sparkline_updates_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.1], vec![0.2]],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        let before = root.first_child().expect("mounted");
+
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.1, 0.3], vec![0.2, 0.4]],
+            None,
+            "ts-clock",
+        ));
+        let after = root.first_child().expect("still mounted");
+        assert_eq!(before, after, "the same widget, not a rebuild");
+        let handle = root_graph(&rec);
+        assert_eq!(
+            handle.series_for_test(),
+            vec![vec![0.1, 0.3], vec![0.2, 0.4]]
+        );
+        assert_eq!(handle.domain_max_for_test(), None, "the top moved too");
+        assert!(after.has_css_class("ts-clock") && !after.has_css_class("ts-cpu"));
+        assert!(
+            after.has_css_class("hytte-multi-sparkline"),
+            "a class reconcile never strips the library's own class",
+        );
+
+        // …and as a keyed child of the per-core block, under a header whose
+        // text changes every frame.
+        let block = |series: Vec<Vec<f64>>, header: &str| Node::Box {
+            id: None,
+            dir: Dir::Vertical,
+            spacing: 4,
+            scroll: false,
+            classes: vec![],
+            children: vec![
+                lbl(Some("header"), header),
+                graph(Some("load"), series, Some(1.0), "ts-cpu"),
+            ],
+            tooltip: None,
+        };
+        let root = self::root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&block(vec![vec![0.5]], "2 cores · 50%"));
+        let block_box = root.first_child().expect("the block");
+        let area = block_box.last_child().expect("the graph");
+        rec.render(&block(
+            vec![vec![0.5, 0.6], vec![0.1, 0.2]],
+            "2 cores · 40%",
+        ));
+        assert_eq!(
+            block_box.last_child().as_ref(),
+            Some(&area),
+            "a keyed child keeps its widget too",
+        );
+        let child = &rec.tree.as_ref().expect("rendered").children[1];
+        let handle = &child
+            .multi_sparkline
+            .as_ref()
+            .expect("a multi-sparkline")
+            .graph;
+        assert_eq!(
+            handle.series_for_test(),
+            vec![vec![0.5, 0.6], vec![0.1, 0.2]]
+        );
+    }
+
+    /// A changed **series count** — a CPU hot-plug, or a plugin that learnt
+    /// the core count one frame late — is an in-place update like any other:
+    /// the same widget, holding exactly the new windows, wider and narrower.
+    ///
+    /// **Falsified** by gating `MultiSparklineState::update` on the series
+    /// count being unchanged (the widget keeps the two old series), or by a
+    /// widget setter that appends rather than replaces.
+    #[gtk::test]
+    fn a_multi_sparkline_changes_its_series_count_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.1], vec![0.2]],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        let widget = root.first_child().expect("mounted");
+
+        let four = vec![vec![0.1], vec![0.2], vec![0.3], vec![0.4]];
+        rec.render(&graph(Some("load"), four.clone(), Some(1.0), "ts-cpu"));
+        assert_eq!(
+            root.first_child().as_ref(),
+            Some(&widget),
+            "2 → 4, in place"
+        );
+        assert_eq!(root_graph(&rec).series_for_test(), four);
+
+        rec.render(&graph(Some("load"), vec![vec![0.9]], Some(1.0), "ts-cpu"));
+        assert_eq!(
+            root.first_child().as_ref(),
+            Some(&widget),
+            "4 → 1, in place"
+        );
+        assert_eq!(root_graph(&rec).series_for_test(), vec![vec![0.9]]);
+
+        rec.render(&graph(Some("load"), Vec::new(), Some(1.0), "ts-cpu"));
+        assert_eq!(
+            root.first_child().as_ref(),
+            Some(&widget),
+            "1 → 0, in place"
+        );
+        assert!(root_graph(&rec).series_for_test().is_empty());
+    }
+
+    /// **A warm graph moves at a constant shape** — the same series count and
+    /// the same window length every tick, every sample shifted by one: the
+    /// `Sparkline` #1414 review's MEDIUM 4, for this node. An update gated on
+    /// the shape alone would freeze the graph a minute after the page opened.
+    ///
+    /// **Falsified** by comparing only the series count (or each series'
+    /// length) in `MultiSparklineState::update`.
+    #[gtk::test]
+    fn a_full_graph_that_moved_reaches_the_rings() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.2, 0.3, 0.4], vec![0.5, 0.6, 0.7]],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        assert_eq!(
+            root_graph(&rec).series_for_test(),
+            vec![vec![0.2, 0.3, 0.4], vec![0.5, 0.6, 0.7]]
+        );
+    }
+
+    /// Each series' ring is built at [`super::MULTI_SPARKLINE_CAPACITY`] — the
+    /// wire's per-series cap — so a window longer than the one the graph was
+    /// built from still fits after an in-place update, and one past the cap
+    /// keeps its **newest** samples.
+    ///
+    /// **Falsified** by building the widget at the first window's length (the
+    /// second render is cut to two samples a series).
+    #[gtk::test]
+    fn a_multi_sparkline_grows_in_place_up_to_the_cap() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&graph(
+            Some("clock"),
+            vec![vec![1.0, 2.0]],
+            None,
+            "ts-clock",
+        ));
+        let sixty: Vec<f64> = (0..60).map(f64::from).collect();
+        rec.render(&graph(
+            Some("clock"),
+            vec![sixty.clone(), sixty.clone()],
+            None,
+            "ts-clock",
+        ));
+        assert_eq!(
+            root_graph(&rec).series_for_test(),
+            vec![sixty.clone(), sixty],
+            "grew in place"
+        );
+
+        let over: Vec<f64> = (0..u32::try_from(super::MULTI_SPARKLINE_CAPACITY + 5).unwrap())
+            .map(f64::from)
+            .collect();
+        rec.render(&graph(Some("clock"), vec![over.clone()], None, "ts-clock"));
+        let kept = root_graph(&rec).series_for_test();
+        assert_eq!(kept[0].len(), super::MULTI_SPARKLINE_CAPACITY);
+        assert_eq!(kept[0].first().copied(), Some(5.0), "the oldest five went");
+        assert_eq!(kept[0].last(), over.last(), "the newest stayed");
+    }
+
+    /// The bookkeeping `update` compares against moves with the widget, and a
+    /// frame that restates what the graph already holds touches nothing
+    /// (#1438 review).
+    ///
+    /// **Falsified** by dropping `self.max = max` or
+    /// `series.clone_into(&mut self.series)` from `MultiSparklineState::update`
+    /// (an A → B → A render ends on B), by applying the top only when the
+    /// series changed too (a top-only change is lost), or by dropping either
+    /// `!=` guard (the restatement re-applies what the widget was handed
+    /// behind the reconciler's back).
+    #[gtk::test]
+    fn a_multi_sparkline_returns_to_an_earlier_graph_and_ignores_a_restatement() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let one = vec![vec![0.1, 0.2], vec![0.3, 0.4]];
+        let two = vec![vec![0.5, 0.6], vec![0.7, 0.8]];
+        rec.render(&graph(Some("load"), one.clone(), Some(1.0), "ts-cpu"));
+        rec.render(&graph(Some("load"), two.clone(), None, "ts-cpu"));
+        rec.render(&graph(Some("load"), one.clone(), Some(1.0), "ts-cpu"));
+        let handle = root_graph(&rec);
+        assert_eq!(handle.series_for_test(), one, "A → B → A ends on A");
+        assert_eq!(handle.domain_max_for_test(), Some(1.0), "…its top too");
+
+        rec.render(&graph(Some("load"), one.clone(), Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(2.0),
+            "a top-only change lands"
+        );
+
+        // Re-point the widget behind the reconciler's back: restating what
+        // the reconciler last applied must leave the widget alone.
+        handle.set_series(&two);
+        handle.set_domain_max(Some(5.0));
+        rec.render(&graph(Some("load"), one, Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.series_for_test(),
+            two,
+            "a restated graph is not re-applied"
+        );
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(5.0),
+            "nor a restated top"
+        );
+    }
+
+    /// `SparklineState::update`'s twin of the test above — the same gap, from
+    /// #1414, which the #1438 review measured: two mutants survived there too.
+    ///
+    /// **Falsified** by dropping `self.max = max` or
+    /// `values.clone_into(&mut self.values)` from `SparklineState::update` (an
+    /// A → B → A render ends on B), by applying the top only when the samples
+    /// changed too, or by dropping either `!=` guard.
+    #[gtk::test]
+    fn a_sparkline_returns_to_an_earlier_line_and_ignores_a_restatement() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let one = vec![0.1, 0.2, 0.3];
+        let two = vec![0.5, 0.6, 0.7];
+        rec.render(&spark(Some("cpu"), one.clone(), Some(1.0), "ts-cpu"));
+        rec.render(&spark(Some("cpu"), two.clone(), None, "ts-cpu"));
+        rec.render(&spark(Some("cpu"), one.clone(), Some(1.0), "ts-cpu"));
+        let handle = root_spark(&rec);
+        assert_eq!(handle.samples_for_test(), one, "A → B → A ends on A");
+        assert_eq!(handle.domain_max_for_test(), Some(1.0), "…its top too");
+
+        rec.render(&spark(Some("cpu"), one.clone(), Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(2.0),
+            "a top-only change lands"
+        );
+
+        handle.set_samples(&two.iter().copied().collect());
+        handle.set_domain_max(Some(5.0));
+        rec.render(&spark(Some("cpu"), one, Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.samples_for_test(),
+            two,
+            "a restated line is not re-applied"
+        );
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(5.0),
+            "nor a restated top"
+        );
+    }
+
+    /// The swap every session makes (#1438 review): the SDK's first frame goes
+    /// out before the host's `Hello`, so a graph arrives as its fallback line
+    /// first and as the graph one frame later, at the same id. The two kinds
+    /// never reuse each other's widget — each swap builds the new kind's, as a
+    /// root and as a keyed child — so neither kind-invariant `expect` is
+    /// reached with the other kind's state.
+    #[gtk::test]
+    fn a_multi_sparkline_and_its_fallback_line_swap_at_one_id() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(Some("load"), vec![0.5], Some(1.0), "ts-cpu"));
+        let line = root.first_child().expect("the line");
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.1], vec![0.9]],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        let multi = root.first_child().expect("the graph");
+        assert_ne!(line, multi, "a new widget for the new kind");
+        assert_eq!(
+            root_graph(&rec).series_for_test(),
+            vec![vec![0.1], vec![0.9]]
+        );
+        rec.render(&spark(Some("load"), vec![0.4], Some(1.0), "ts-cpu"));
+        assert_ne!(root.first_child().expect("the line again"), multi);
+
+        let block = |child: Node| Node::Box {
+            id: None,
+            dir: Dir::Vertical,
+            spacing: 0,
+            scroll: false,
+            classes: vec![],
+            children: vec![lbl(Some("header"), "h"), child],
+            tooltip: None,
+        };
+        let root = self::root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&block(spark(Some("load"), vec![0.5], Some(1.0), "ts-cpu")));
+        let block_box = root.first_child().expect("the block");
+        let line = block_box.last_child().expect("the line");
+        rec.render(&block(graph(
+            Some("load"),
+            vec![vec![0.2]],
+            Some(1.0),
+            "ts-cpu",
+        )));
+        let multi = block_box.last_child().expect("the graph");
+        assert_ne!(line, multi);
+        rec.render(&block(spark(Some("load"), vec![0.6], Some(1.0), "ts-cpu")));
+        assert_ne!(block_box.last_child().expect("the line again"), multi);
     }
 
     // ── Homogeneous boxes and centred bars (#1252) ─────────────────────────

@@ -1264,15 +1264,18 @@ fn the_multi_sparkline_clamp_keeps_each_series_newest_samples() {
     assert_eq!(series[2], vec![7.0, 8.0], "a short series is left whole");
 }
 
-/// Past the point cap every survivor is trimmed to its newest
-/// `MAX_MULTI_SPARKLINE_POINTS / series` — a uniform cut, so the lines keep a
-/// common time span — and exactly at the cap nothing is cut.
+/// Past the point cap every survivor longer than one common ceiling is
+/// trimmed to its newest samples at that ceiling — for these rows, whose
+/// lines are all at least that long, `MAX_MULTI_SPARKLINE_POINTS / series` —
+/// so the lines keep a common time span; and exactly at the cap nothing is
+/// cut.
 ///
-/// **Falsified** by `>=` in place of `>` in `multi_sparkline_keep` (the uneven
-/// graph exactly at the cap has its full line cut — a mutation the first
-/// version of this test, with only even full lines at the boundary, let
-/// survive), or by trimming only the longest series (the uneven case past the
-/// cap keeps a 700-sample line whole).
+/// **Falsified** by `<` in place of `<=` in `multi_sparkline_keep`'s early
+/// return (the uneven graph exactly at the cap has its full line cut — the
+/// same boundary mutant, then `>=` for `>`, that the first version of this
+/// test, with only even full lines at the boundary, let survive), or by
+/// trimming only the longest series (the uneven case past the cap keeps a
+/// 700-sample line whole).
 #[test]
 fn the_point_cap_trims_every_series_evenly() {
     // Exactly at the cap: 64 full lines.
@@ -1286,11 +1289,10 @@ fn the_point_cap_trims_every_series_evenly() {
         MAX_SPARKLINE_SAMPLES,
         "at the cap is not past it",
     );
-    // …and exactly at the cap with UNEVEN lines, where "at" and "past" give
-    // different answers: one full line and 64 of 1008 samples is 65 536 on
-    // the nose, so nothing is cut — `>=` would cut the full line to
-    // 65 536 / 65 = 1008. (Full lines alone cannot tell the two apart: at 64
-    // of them the even share *is* the per-series cap.)
+    // …and exactly at the cap with UNEVEN lines: one full line and 64 of 1008
+    // samples is 65 536 on the nose, so nothing is cut — treating "at" as
+    // "past" would cut the full line. (This row was added when a `>=` mutant
+    // survived 64 full lines alone, #1438.)
     let mut at_cap = numbered_series(1, MAX_SPARKLINE_SAMPLES);
     at_cap.extend(numbered_series(64, 1008));
     assert_eq!(
@@ -1343,6 +1345,128 @@ fn the_point_cap_trims_every_series_evenly() {
         MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES,
         "the dropped series count toward nothing",
     );
+}
+
+/// A series longer than the per-series cap counts toward the point cap **at**
+/// the per-series cap, not at its raw length (#1438 review): two 40 000-sample
+/// lines are 2 048 drawn samples, nowhere near the point cap, so each keeps
+/// its newest `MAX_SPARKLINE_SAMPLES` and never more.
+///
+/// **Falsified** by summing raw lengths in `multi_sparkline_keep` (the keep
+/// becomes 65 536 / 2 = 32 768, and each series leaves the clamp 32× over the
+/// per-series cap).
+#[test]
+fn an_over_long_series_counts_at_the_per_series_cap() {
+    let long = numbered_series(2, 40_000);
+    assert_eq!(multi_sparkline_keep(&long), MAX_SPARKLINE_SAMPLES);
+    let clamped = multi(long, None).clamped();
+    let Node::MultiSparkline { series, .. } = &clamped else {
+        panic!("{clamped:?}");
+    };
+    assert!(
+        series.iter().all(|l| l.len() == MAX_SPARKLINE_SAMPLES),
+        "each keeps its newest {MAX_SPARKLINE_SAMPLES}",
+    );
+    assert_node_floats_are_sane(&clamped);
+}
+
+/// Empty and short series do not starve full ones (#1438 review LOW 4, the
+/// two cases it measured): the point cut is the largest common ceiling that
+/// fits, so a series counts for the samples it actually draws, not as a full
+/// line.
+///
+/// - 65 full lines beside 191 empty ones keep 1 008 each — what 65 full lines
+///   alone keep — not the 256 a division by all 256 series gave.
+/// - 64 full lines plus one one-sample series keep 1 023 each — one sample
+///   less, the least the cap allows (64 × 1 024 + 1 is one over) — not the
+///   1 008 a division by 65 non-empty series would still give.
+///
+/// **Falsified** by dividing the point cap by the survivor count (the first
+/// case keeps 256), or by the non-empty survivor count (the second keeps
+/// 1 008).
+#[test]
+fn empty_and_short_series_do_not_starve_full_ones() {
+    let mut sparse = numbered_series(65, MAX_SPARKLINE_SAMPLES);
+    sparse.extend(std::iter::repeat_n(Vec::new(), 191));
+    assert_eq!(sparse.len(), MAX_MULTI_SPARKLINE_SERIES, "precondition");
+    assert_eq!(multi_sparkline_keep(&sparse), 1008);
+    let Node::MultiSparkline { series, .. } = multi(sparse, None).clamped() else {
+        unreachable!()
+    };
+    assert!(series[..65].iter().all(|l| l.len() == 1008), "full lines");
+    assert!(
+        series[65..].iter().all(Vec::is_empty),
+        "empty ones stay empty"
+    );
+    assert!(series.iter().map(Vec::len).sum::<usize>() <= MAX_MULTI_SPARKLINE_POINTS);
+
+    let mut one_more = numbered_series(64, MAX_SPARKLINE_SAMPLES);
+    one_more.push(vec![42.0]);
+    assert_eq!(multi_sparkline_keep(&one_more), MAX_SPARKLINE_SAMPLES - 1);
+    let Node::MultiSparkline { series, .. } = multi(one_more, None).clamped() else {
+        unreachable!()
+    };
+    assert!(
+        series[..64]
+            .iter()
+            .all(|l| l.len() == MAX_SPARKLINE_SAMPLES - 1),
+        "each full line loses one sample, its oldest",
+    );
+    assert_eq!(series[64], vec![42.0], "the short series is kept whole");
+    assert_eq!(
+        series.iter().map(Vec::len).sum::<usize>(),
+        MAX_MULTI_SPARKLINE_POINTS - 63,
+        "64 × 1 023 + 1",
+    );
+}
+
+/// `multi_sparkline_keep` answers the **largest** ceiling that fits, over a
+/// table of shapes: its drawn total fits the point cap, and one sample more a
+/// line would not (or it is already the per-series cap).
+///
+/// **Falsified** by an off-by-one in the search (`fits` one short, or `over`
+/// returned), or by any divisor-based answer on the uneven rows.
+#[test]
+fn multi_sparkline_keep_is_the_largest_ceiling_that_fits() {
+    let drawn = |series: &[Vec<f32>], k: usize| -> usize {
+        series
+            .iter()
+            .take(MAX_MULTI_SPARKLINE_SERIES)
+            .map(|s| s.len().min(k))
+            .sum()
+    };
+    let mut shapes: Vec<Vec<Vec<f32>>> = vec![
+        Vec::new(),
+        numbered_series(64, MAX_SPARKLINE_SAMPLES),
+        numbered_series(65, MAX_SPARKLINE_SAMPLES),
+        numbered_series(MAX_MULTI_SPARKLINE_SERIES, MAX_SPARKLINE_SAMPLES),
+        numbered_series(300, 2_000),
+    ];
+    // Uneven: lengths 0, 7, 14, … across 256 series.
+    shapes.push(
+        (0..MAX_MULTI_SPARKLINE_SERIES)
+            .map(|s| vec![0.5; (s * 7) % 1_500])
+            .collect(),
+    );
+    // Half full, half 300 samples.
+    let mut half = numbered_series(100, MAX_SPARKLINE_SAMPLES);
+    half.extend(numbered_series(100, 300));
+    shapes.push(half);
+
+    for series in &shapes {
+        let k = multi_sparkline_keep(series);
+        assert!(k <= MAX_SPARKLINE_SAMPLES, "never past the per-series cap");
+        assert!(
+            k >= MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES,
+            "never below the series cap's share"
+        );
+        assert!(drawn(series, k) <= MAX_MULTI_SPARKLINE_POINTS, "fits");
+        assert!(
+            k == MAX_SPARKLINE_SAMPLES || drawn(series, k + 1) > MAX_MULTI_SPARKLINE_POINTS,
+            "the largest that fits: k = {k} for {} series",
+            series.len(),
+        );
+    }
 }
 
 /// The clamp is a fixpoint on a trimmed graph (the SDK's pass and the host's

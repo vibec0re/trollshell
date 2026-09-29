@@ -1388,6 +1388,43 @@ mod tests {
         let _ = to_ui_node(&other, Grants::none(), &poisoned);
         assert_eq!(warns(&captured), 2, "a second tree gets its own line");
     }
+
+    /// The seam warns for **every** kind of rewrite it makes, not only a
+    /// non-finite sample: a dropped series, a trimmed window and an unusable
+    /// top each earn their tree one line (#1438 review).
+    ///
+    /// **Falsified** by dropping any of the three `rewritten` terms other than
+    /// the per-sample one.
+    #[test]
+    fn the_multi_sparkline_warns_for_each_kind_of_rewrite() {
+        use hytte_plugin_proto::wire::MAX_MULTI_SPARKLINE_SERIES;
+        let warns = |captured: &hytte_config::test_support::Captured| {
+            captured
+                .events()
+                .into_iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key("points_cap"))
+                .count()
+        };
+        let (captured, _guard) = hytte_config::test_support::capture();
+        let _ = to_ui_node(
+            &Scope::detached("t1438-warn-series"),
+            Grants::none(),
+            &graph(numbered(MAX_MULTI_SPARKLINE_SERIES + 1, 1), None),
+        );
+        assert_eq!(warns(&captured), 1, "series past the cap");
+        let _ = to_ui_node(
+            &Scope::detached("t1438-warn-window"),
+            Grants::none(),
+            &graph(numbered(1, MAX_SPARKLINE_SAMPLES + 1), None),
+        );
+        assert_eq!(warns(&captured), 2, "a window past the per-series cap");
+        let _ = to_ui_node(
+            &Scope::detached("t1438-warn-top"),
+            Grants::none(),
+            &graph(vec![vec![0.5]], Some(f32::INFINITY)),
+        );
+        assert_eq!(warns(&captured), 3, "an unusable top");
+    }
 }
 
 /// The #1414 review's HIGH 1, as a test: what a plugin page's cards look like

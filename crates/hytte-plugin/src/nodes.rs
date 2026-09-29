@@ -412,11 +412,16 @@ impl Scrolled {
     /// The fallback returns the **child alone**, so this node's own
     /// [`id`](Self::id) and [`class`](Self::class)es go with the frame they
     /// described — an old host sees neither. That is deliberate rather than
-    /// lossy: negotiation is fixed for the life of a session, so the degraded
-    /// tree is consistently shaped and matches itself render to render through
-    /// `plan_diff`'s keyless positional path; and the classes styled a viewport
-    /// that no longer exists. Put anything the *card* needs on the child, not
-    /// here. (Contrast [`shader`](crate::shader), which hands the fallback back
+    /// lossy: the degraded tree is consistently shaped for as long as the host's
+    /// answer holds, so it matches itself render to render through `plan_diff`'s
+    /// keyless positional path; and the classes styled a viewport that no longer
+    /// exists. (The answer is not fixed from a session's first frame, though:
+    /// the seed render goes out before the host's `Hello` arrives, at the
+    /// unconditional floor, so the first frame is always this fallback and the
+    /// viewport arrives with the next one. The reconciler builds the new shape
+    /// rather than reusing the old one across that swap.) Put anything the
+    /// *card* needs on the child, not here. (Contrast
+    /// [`shader`](crate::shader), which hands the fallback back
     /// to the plugin as an `Option` rather than choosing one — the right shape
     /// there, because a shader's fallback is a whole second rendering.)
     ///
@@ -476,8 +481,9 @@ impl Sparkline {
     }
 
     /// Fix the top of the y axis at `max` (the line draws `0..=max`), instead
-    /// of auto-scaling to the largest sample. A `max` that is not a positive
-    /// finite number auto-scales anyway — see
+    /// of auto-scaling to the largest sample. A `max` of zero, a negative one
+    /// or `NaN` auto-scales anyway, and `+inf` becomes `f32::MAX` — a fixed
+    /// top, which draws every finite sample on the bottom rail; see
     /// [`sane_sparkline_max`](hytte_plugin_proto::sane_sparkline_max).
     #[must_use]
     pub fn max(mut self, max: f32) -> Self {
@@ -516,9 +522,14 @@ impl Sparkline {
     /// point is high. What it loses is the history itself, and nothing on an
     /// older shell can draw that except the scope this is avoiding.
     ///
-    /// The fallback keeps this node's `id` and `class`es — negotiation is
-    /// fixed for the life of a session, so the degraded tree is consistently
-    /// shaped and diffs against itself by the same key.
+    /// The fallback keeps this node's `id` and `class`es, so the degraded tree
+    /// diffs against itself by the same key for as long as the host's answer
+    /// holds. That answer is **not** fixed from a session's first frame: the
+    /// seed render goes out before the host's `Hello` arrives, at the
+    /// unconditional floor, so the first frame of every session is this bar
+    /// and the next one is the line, at the same id. The reconciler keys by id
+    /// *and* kind, so it builds a new widget for the line rather than handing
+    /// it the bar's.
     ///
     /// Use [`build_unnegotiated`](Self::build_unnegotiated) only where the wire
     /// shape itself is under test.
@@ -607,8 +618,10 @@ impl MultiSparkline {
 
     /// Fix the top of the shared y axis at `max` (every series draws
     /// `0..=max`), instead of auto-scaling to the largest sample across all of
-    /// them. A `max` that is not a positive finite number auto-scales anyway —
-    /// see [`sane_sparkline_max`](hytte_plugin_proto::sane_sparkline_max). The
+    /// them. A `max` of zero, a negative one or `NaN` auto-scales anyway, and
+    /// `+inf` becomes `f32::MAX` — a fixed top, which draws every finite sample
+    /// on the bottom rail; see
+    /// [`sane_sparkline_max`](hytte_plugin_proto::sane_sparkline_max). The
     /// fallback line uses the same axis.
     #[must_use]
     pub fn max(mut self, max: f32) -> Self {
@@ -633,8 +646,13 @@ impl MultiSparkline {
     /// Unset, the fallback is the **per-sample mean** of the series, aligned
     /// at the newest sample: its last point is the mean of every series' last
     /// sample, the one before it the mean of every series long enough to have
-    /// one, and so on back to the longest series' oldest. Each sample is
-    /// sanitised first ([`sane_sparkline_sample`](hytte_plugin_proto::sane_sparkline_sample)),
+    /// one, and so on back to the longest series' oldest. It averages exactly
+    /// the samples a current shell would **draw** — the series past
+    /// [`MAX_MULTI_SPARKLINE_SERIES`](hytte_plugin_proto::MAX_MULTI_SPARKLINE_SERIES)
+    /// and the samples [`multi_sparkline_keep`](hytte_plugin_proto::multi_sparkline_keep)
+    /// cuts feed nothing, so the older shell's line summarises the graph a
+    /// newer one shows. Each sample is sanitised first
+    /// ([`sane_sparkline_sample`](hytte_plugin_proto::sane_sparkline_sample)),
     /// so a `NaN` counts as a zero in its slot's mean rather than poisoning it.
     #[must_use]
     pub fn fallback(mut self, values: impl Into<Vec<f32>>) -> Self {
@@ -659,9 +677,15 @@ impl MultiSparkline {
     /// the overall load). The fallback goes through [`Sparkline::build`], so it
     /// is negotiated in turn and becomes a [`Node::Progress`] on a shell older
     /// than [`SPARKLINE_VOCAB`]: one call is safe against every shell. It
-    /// keeps this node's `id`, `max` and `class`es — negotiation is fixed for
-    /// the life of a session, so the degraded tree diffs against itself by the
-    /// same key.
+    /// keeps this node's `id`, `max` and `class`es, so the degraded tree diffs
+    /// against itself by the same key for as long as the host's answer holds.
+    ///
+    /// That answer is **not** fixed from a session's first frame: the seed
+    /// render goes out before the host's `Hello` arrives, at the unconditional
+    /// floor, so the first frame of every session is the fallback (a
+    /// `Progress` bar, there) and the next one is the graph, at the same id.
+    /// The reconciler keys by id *and* kind, so each swap builds the new
+    /// kind's widget rather than reusing the old one's.
     ///
     /// Use [`build_unnegotiated`](Self::build_unnegotiated) only where the wire
     /// shape itself is under test.
@@ -692,9 +716,7 @@ impl MultiSparkline {
     /// The older-shell arm of [`build`](Self::build): the fallback line (or
     /// the newest-aligned mean) as a [`sparkline`], which negotiates itself.
     fn build_fallback(self) -> Node {
-        let values = self
-            .fallback
-            .unwrap_or_else(|| newest_aligned_mean(&self.series));
+        let values = self.fallback.unwrap_or_else(|| drawn_mean(&self.series));
         Sparkline {
             id: self.id,
             values,
@@ -705,21 +727,39 @@ impl MultiSparkline {
     }
 }
 
-/// The per-sample mean of `series`, aligned at the newest sample, oldest first
-/// — [`MultiSparkline`]'s default fallback line (see
-/// [`MultiSparkline::fallback`]).
+/// [`MultiSparkline`]'s default fallback line (see
+/// [`MultiSparkline::fallback`]): the [`newest_aligned_mean`] of exactly the
+/// windows a current shell draws — the first
+/// [`MAX_MULTI_SPARKLINE_SERIES`](hytte_plugin_proto::MAX_MULTI_SPARKLINE_SERIES)
+/// series, each cut to its newest
+/// [`multi_sparkline_keep`](hytte_plugin_proto::multi_sparkline_keep) samples,
+/// the trim `Node::clamp_in_place` and the host apply (#1438 review NIT 5).
+fn drawn_mean(series: &[Vec<f32>]) -> Vec<f32> {
+    use hytte_plugin_proto::{MAX_MULTI_SPARKLINE_SERIES, multi_sparkline_keep};
+
+    let keep = multi_sparkline_keep(series);
+    let windows: Vec<&[f32]> = series
+        .iter()
+        .take(MAX_MULTI_SPARKLINE_SERIES)
+        .map(|s| &s[s.len().saturating_sub(keep)..])
+        .collect();
+    newest_aligned_mean(&windows)
+}
+
+/// The per-sample mean of `series`, aligned at the newest sample, oldest first.
 ///
 /// As long as the longest series. Slot `k` from the end averages every series
 /// that has a sample `k` from its own end, in `f64` so a column of saturated
 /// samples cannot overflow before the division.
-fn newest_aligned_mean(series: &[Vec<f32>]) -> Vec<f32> {
+fn newest_aligned_mean<S: AsRef<[f32]>>(series: &[S]) -> Vec<f32> {
     use hytte_plugin_proto::sane_sparkline_sample;
 
-    let longest = series.iter().map(Vec::len).max().unwrap_or(0);
+    let longest = series.iter().map(|s| s.as_ref().len()).max().unwrap_or(0);
     let mut line = vec![0.0_f32; longest];
     for (back, slot) in line.iter_mut().rev().enumerate() {
         let (sum, count) = series
             .iter()
+            .map(<S as AsRef<[f32]>>::as_ref)
             .filter_map(|s| s.len().checked_sub(back + 1).map(|i| s[i]))
             .fold((0.0_f64, 0.0_f64), |(sum, count), sample| {
                 (sum + f64::from(sane_sparkline_sample(sample)), count + 1.0)
@@ -1192,10 +1232,62 @@ mod tests {
             vec![f32::MAX],
             "saturated samples do not overflow the sum",
         );
-        assert!(newest_aligned_mean(&[]).is_empty(), "no series, no line");
         assert!(
-            newest_aligned_mean(&[vec![], vec![]]).is_empty(),
+            newest_aligned_mean::<Vec<f32>>(&[]).is_empty(),
+            "no series, no line"
+        );
+        assert!(
+            newest_aligned_mean(&[Vec::<f32>::new(), Vec::new()]).is_empty(),
             "empty windows"
         );
+    }
+
+    /// The default fallback averages exactly what a current shell would
+    /// **draw** — the series cap, the per-series cap and the point cap all
+    /// apply first, through the proto's own `multi_sparkline_keep` (#1438
+    /// review NIT 5) — so an older shell's line summarises the graph a newer
+    /// one shows, and is never longer than a single line's cap.
+    ///
+    /// **Falsified** by averaging the raw series (every assertion below reds:
+    /// the dropped 257th series moves the mean, the long window comes back
+    /// 2 000 samples long, and the point-cut samples show up at the front).
+    #[test]
+    fn the_default_fallback_averages_only_what_the_shell_would_draw() {
+        use hytte_plugin_proto::{MAX_MULTI_SPARKLINE_SERIES, MAX_SPARKLINE_SAMPLES};
+        let line = |series: Vec<Vec<f32>>| match multi_sparkline(series).build() {
+            Node::Sparkline { values, .. } => values,
+            other => panic!("a single-line shell gets the line, got {other:?}"),
+        };
+        crate::display::set_negotiated(SPARKLINE_VOCAB);
+
+        // The series cap: a 257th series is never drawn, so it moves nothing.
+        let mut capped = vec![vec![1.0_f32; 2]; MAX_MULTI_SPARKLINE_SERIES];
+        capped.push(vec![1_000.0; 2]);
+        assert_eq!(
+            line(capped),
+            vec![1.0, 1.0],
+            "the dropped series is not averaged"
+        );
+
+        // The per-series cap: a 2 000-sample window is drawn as its newest
+        // `MAX_SPARKLINE_SAMPLES`, and so is its fallback line.
+        let long: Vec<f32> = (0..2_000_u16).map(f32::from).collect();
+        let fallback = line(vec![long]);
+        assert_eq!(fallback.len(), MAX_SPARKLINE_SAMPLES);
+        assert_eq!(fallback.first().copied(), Some(976.0), "the newest 1 024");
+
+        // The point cap: 65 full lines keep their newest 1 008, so the 16
+        // oldest samples of each — 1 000 here, 0 everywhere else — are cut
+        // before the average, not averaged in.
+        let mut full = vec![0.0_f32; MAX_SPARKLINE_SAMPLES];
+        full[..16].fill(1_000.0);
+        let fallback = line(vec![full; 65]);
+        assert_eq!(fallback.len(), 1008);
+        assert!(
+            fallback.iter().all(|v| v.abs() < f32::EPSILON),
+            "{fallback:?}"
+        );
+
+        crate::display::set_negotiated(0);
     }
 }

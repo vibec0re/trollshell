@@ -1205,10 +1205,12 @@ pub enum Node {
     /// 2. Each series keeps at most its **newest** [`MAX_SPARKLINE_SAMPLES`],
     ///    the same per-line cap a [`Sparkline`](Node::Sparkline) has.
     /// 3. If the survivors still carry more than [`MAX_MULTI_SPARKLINE_POINTS`]
-    ///    samples between them, **every** series is trimmed to its newest
-    ///    `MAX_MULTI_SPARKLINE_POINTS / series` — a uniform cut, so the lines
-    ///    keep a common time span rather than the longest ones being cut
-    ///    alone.
+    ///    samples between them, every series longer than one common ceiling
+    ///    is trimmed to its newest samples at that ceiling — the **largest**
+    ///    ceiling whose total fits the point cap. The long lines therefore keep
+    ///    a common time span, and an empty or short series neither loses
+    ///    anything nor costs the long ones more than the samples it actually
+    ///    draws.
     ///
     /// # Floats
     ///
@@ -1499,21 +1501,23 @@ pub const MULTI_SPARKLINE_VOCAB: u16 = 9;
 pub const MAX_MULTI_SPARKLINE_SERIES: usize = 256;
 
 /// The most samples one [`Node::MultiSparkline`] draws across **all** its
-/// series; past it every series is trimmed to its newest
-/// `MAX_MULTI_SPARKLINE_POINTS / series` (see [`multi_sparkline_keep`]).
+/// series; past it the longest series are trimmed to one common length, the
+/// largest that fits (see [`multi_sparkline_keep`]).
 ///
 /// **65 536** — 64 series of [`MAX_SPARKLINE_SAMPLES`] each, so the cut never
 /// fires for a graph of up to 64 full-length lines, and a 256-thread machine
 /// keeps 256 samples a line (over four minutes at the native page's 1 Hz).
-/// It bounds the host's per-widget copy at 512 KiB of `f64`, and the largest
-/// node that survives the cut encodes to about 320 KiB, far inside
-/// [`MAX_FRAME_LEN`](crate::codec::MAX_FRAME_LEN).
+/// It bounds each of the host's **two** per-widget copies — the reconciler's
+/// last-applied bookkeeping and the widget's own rings — at 512 KiB of `f64`,
+/// so 1 MiB a widget, and the largest node that survives the cut encodes to
+/// about 320 KiB, far inside [`MAX_FRAME_LEN`](crate::codec::MAX_FRAME_LEN).
 pub const MAX_MULTI_SPARKLINE_POINTS: usize = 65_536;
 
 // The three caps compose, checked where the constants live: at the series cap
-// every survivor still keeps at least one sample, and the series cap times the
-// per-series cap passes the point cap, so `multi_sparkline_keep`'s point cut is
-// a real rule rather than dead code.
+// every survivor can still keep `POINTS / SERIES` samples (the lower bound
+// `multi_sparkline_keep`'s search starts from, so it must be at least one),
+// and the series cap times the per-series cap passes the point cap, so the
+// point cut is a real rule rather than dead code.
 const _: () = assert!(
     MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES >= 1,
     "at the series cap every series keeps at least one sample",
@@ -1524,32 +1528,62 @@ const _: () = assert!(
 );
 
 /// How many of its **newest** samples each surviving series of a
-/// [`Node::MultiSparkline`] keeps — the one definition
-/// [`Node::clamp_in_place`] and the host's mapping seam both trim with, so the
-/// two cannot disagree.
+/// [`Node::MultiSparkline`] keeps — one ceiling for every series, and the one
+/// definition [`Node::clamp_in_place`], the host's mapping seam and the SDK's
+/// older-shell fallback all trim with, so none of them can disagree.
 ///
 /// Only the first [`MAX_MULTI_SPARKLINE_SERIES`] of `series` survive at all.
-/// Each of those keeps [`MAX_SPARKLINE_SAMPLES`] — unless, after that per-line
-/// cut, they still carry more than [`MAX_MULTI_SPARKLINE_POINTS`] between them,
-/// in which case each keeps `MAX_MULTI_SPARKLINE_POINTS / survivors`, which
-/// bounds the total by the point cap. The answer never exceeds
-/// [`MAX_SPARKLINE_SAMPLES`], and it is a fixpoint: a trimmed graph is under
-/// the point cap, so asking again answers the per-series cap, which the
-/// trimmed series already fit.
+/// Each of those keeps [`MAX_SPARKLINE_SAMPLES`] — unless, with every survivor
+/// cut to that, they still carry more than [`MAX_MULTI_SPARKLINE_POINTS`]
+/// between them. Then the answer is the **largest** ceiling `k` whose drawn
+/// total `Σ min(len, k)` fits the point cap (a water-fill): a series already
+/// shorter than `k` keeps all of it, and only the lines longer than `k` are
+/// cut, all to the same length, so they keep a common time span.
+///
+/// Why the largest fitting ceiling rather than the point cap divided by the
+/// series count (the first version, #1438 review LOW 4): a division counts an
+/// empty or short series as if it were full, so 65 full lines beside 191 empty
+/// ones kept 256 samples each where 1,008 fit, and adding one one-sample
+/// series to 64 full lines cut every one of them by 16. Under the water-fill
+/// the first keeps 1,008 and the second 1,023 — the least the point cap
+/// allows. For equal-length windows (the stats plugin's case) the two agree.
+///
+/// Three properties the callers rely on: the answer never exceeds
+/// [`MAX_SPARKLINE_SAMPLES`]; it never falls below
+/// `MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES` (256), since the
+/// survivors can draw no more than that each; and it is a fixpoint — a trimmed
+/// graph is under the point cap, so asking again answers the per-series cap,
+/// which the trimmed series already fit.
 #[must_use]
 pub fn multi_sparkline_keep<S: AsRef<[f32]>>(series: &[S]) -> usize {
     let survivors = &series[..series.len().min(MAX_MULTI_SPARKLINE_SERIES)];
-    let points: usize = survivors
-        .iter()
-        .map(|s| s.as_ref().len().min(MAX_SPARKLINE_SAMPLES))
-        .sum();
-    if points > MAX_MULTI_SPARKLINE_POINTS {
-        // `points > POINTS` needs more than `POINTS / MAX_SPARKLINE_SAMPLES`
-        // (64) survivors, so this divides by at least 65.
-        MAX_MULTI_SPARKLINE_POINTS / survivors.len()
-    } else {
-        MAX_SPARKLINE_SAMPLES
+    // The samples the survivors draw when each keeps at most `ceiling` —
+    // monotone in `ceiling`, which is what the search below needs.
+    let drawn = |ceiling: usize| -> usize {
+        survivors
+            .iter()
+            .map(|s| s.as_ref().len().min(ceiling))
+            .sum()
+    };
+    if drawn(MAX_SPARKLINE_SAMPLES) <= MAX_MULTI_SPARKLINE_POINTS {
+        return MAX_SPARKLINE_SAMPLES;
     }
+    // Invariant: `drawn(fits) <= POINTS < drawn(over)`. It holds at the start:
+    // at most `MAX_MULTI_SPARKLINE_SERIES` survivors keeping at most
+    // `POINTS / SERIES` each draw at most `POINTS`, and `over` was just
+    // measured. At most ten halvings of 256..=1024, each a pass over at most
+    // 256 series.
+    let mut fits = MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES;
+    let mut over = MAX_SPARKLINE_SAMPLES;
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if drawn(mid) <= MAX_MULTI_SPARKLINE_POINTS {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    fits
 }
 
 /// The largest [`Node::Shader::fragment`] the host will hand a driver, in bytes.
@@ -2191,8 +2225,8 @@ impl Node {
             // #1419's multi-series graph: `Sparkline`'s float half per sample,
             // and the three caps in the order the variant documents — drop the
             // series past the series cap, then keep each survivor's newest
-            // `multi_sparkline_keep` samples (the per-series cap, or the point
-            // cap's even share when the survivors are over it).
+            // `multi_sparkline_keep` samples (the per-series cap, or the largest
+            // common ceiling that fits the point cap when they are over it).
             Self::MultiSparkline { series, max, .. } => {
                 series.truncate(MAX_MULTI_SPARKLINE_SERIES);
                 let keep = multi_sparkline_keep(series);

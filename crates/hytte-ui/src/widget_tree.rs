@@ -3829,6 +3829,148 @@ mod gtk_tests {
         assert_eq!(kept[0].last(), over.last(), "the newest stayed");
     }
 
+    /// The bookkeeping `update` compares against moves with the widget, and a
+    /// frame that restates what the graph already holds touches nothing
+    /// (#1438 review).
+    ///
+    /// **Falsified** by dropping `self.max = max` or
+    /// `series.clone_into(&mut self.series)` from `MultiSparklineState::update`
+    /// (an A → B → A render ends on B), by applying the top only when the
+    /// series changed too (a top-only change is lost), or by dropping either
+    /// `!=` guard (the restatement re-applies what the widget was handed
+    /// behind the reconciler's back).
+    #[gtk::test]
+    fn a_multi_sparkline_returns_to_an_earlier_graph_and_ignores_a_restatement() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let one = vec![vec![0.1, 0.2], vec![0.3, 0.4]];
+        let two = vec![vec![0.5, 0.6], vec![0.7, 0.8]];
+        rec.render(&graph(Some("load"), one.clone(), Some(1.0), "ts-cpu"));
+        rec.render(&graph(Some("load"), two.clone(), None, "ts-cpu"));
+        rec.render(&graph(Some("load"), one.clone(), Some(1.0), "ts-cpu"));
+        let handle = root_graph(&rec);
+        assert_eq!(handle.series_for_test(), one, "A → B → A ends on A");
+        assert_eq!(handle.domain_max_for_test(), Some(1.0), "…its top too");
+
+        rec.render(&graph(Some("load"), one.clone(), Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(2.0),
+            "a top-only change lands"
+        );
+
+        // Re-point the widget behind the reconciler's back: restating what
+        // the reconciler last applied must leave the widget alone.
+        handle.set_series(&two);
+        handle.set_domain_max(Some(5.0));
+        rec.render(&graph(Some("load"), one, Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.series_for_test(),
+            two,
+            "a restated graph is not re-applied"
+        );
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(5.0),
+            "nor a restated top"
+        );
+    }
+
+    /// `SparklineState::update`'s twin of the test above — the same gap, from
+    /// #1414, which the #1438 review measured: two mutants survived there too.
+    ///
+    /// **Falsified** by dropping `self.max = max` or
+    /// `values.clone_into(&mut self.values)` from `SparklineState::update` (an
+    /// A → B → A render ends on B), by applying the top only when the samples
+    /// changed too, or by dropping either `!=` guard.
+    #[gtk::test]
+    fn a_sparkline_returns_to_an_earlier_line_and_ignores_a_restatement() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let one = vec![0.1, 0.2, 0.3];
+        let two = vec![0.5, 0.6, 0.7];
+        rec.render(&spark(Some("cpu"), one.clone(), Some(1.0), "ts-cpu"));
+        rec.render(&spark(Some("cpu"), two.clone(), None, "ts-cpu"));
+        rec.render(&spark(Some("cpu"), one.clone(), Some(1.0), "ts-cpu"));
+        let handle = root_spark(&rec);
+        assert_eq!(handle.samples_for_test(), one, "A → B → A ends on A");
+        assert_eq!(handle.domain_max_for_test(), Some(1.0), "…its top too");
+
+        rec.render(&spark(Some("cpu"), one.clone(), Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(2.0),
+            "a top-only change lands"
+        );
+
+        handle.set_samples(&two.iter().copied().collect());
+        handle.set_domain_max(Some(5.0));
+        rec.render(&spark(Some("cpu"), one, Some(2.0), "ts-cpu"));
+        assert_eq!(
+            handle.samples_for_test(),
+            two,
+            "a restated line is not re-applied"
+        );
+        assert_eq!(
+            handle.domain_max_for_test(),
+            Some(5.0),
+            "nor a restated top"
+        );
+    }
+
+    /// The swap every session makes (#1438 review): the SDK's first frame goes
+    /// out before the host's `Hello`, so a graph arrives as its fallback line
+    /// first and as the graph one frame later, at the same id. The two kinds
+    /// never reuse each other's widget — each swap builds the new kind's, as a
+    /// root and as a keyed child — so neither kind-invariant `expect` is
+    /// reached with the other kind's state.
+    #[gtk::test]
+    fn a_multi_sparkline_and_its_fallback_line_swap_at_one_id() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&spark(Some("load"), vec![0.5], Some(1.0), "ts-cpu"));
+        let line = root.first_child().expect("the line");
+        rec.render(&graph(
+            Some("load"),
+            vec![vec![0.1], vec![0.9]],
+            Some(1.0),
+            "ts-cpu",
+        ));
+        let multi = root.first_child().expect("the graph");
+        assert_ne!(line, multi, "a new widget for the new kind");
+        assert_eq!(
+            root_graph(&rec).series_for_test(),
+            vec![vec![0.1], vec![0.9]]
+        );
+        rec.render(&spark(Some("load"), vec![0.4], Some(1.0), "ts-cpu"));
+        assert_ne!(root.first_child().expect("the line again"), multi);
+
+        let block = |child: Node| Node::Box {
+            id: None,
+            dir: Dir::Vertical,
+            spacing: 0,
+            scroll: false,
+            classes: vec![],
+            children: vec![lbl(Some("header"), "h"), child],
+            tooltip: None,
+        };
+        let root = self::root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&block(spark(Some("load"), vec![0.5], Some(1.0), "ts-cpu")));
+        let block_box = root.first_child().expect("the block");
+        let line = block_box.last_child().expect("the line");
+        rec.render(&block(graph(
+            Some("load"),
+            vec![vec![0.2]],
+            Some(1.0),
+            "ts-cpu",
+        )));
+        let multi = block_box.last_child().expect("the graph");
+        assert_ne!(line, multi);
+        rec.render(&block(spark(Some("load"), vec![0.6], Some(1.0), "ts-cpu")));
+        assert_ne!(block_box.last_child().expect("the line again"), multi);
+    }
+
     // ── Homogeneous boxes and centred bars (#1252) ─────────────────────────
 
     fn classed_box(dir: Dir, classes: &[&str], children: Vec<Node>) -> Node {

@@ -1471,6 +1471,50 @@ mod tests {
         let _ = task.await;
     }
 
+    /// **A quick sidebar reopen still re-baselines** — the sensors keep no
+    /// baseline across a reopen, however young (#1427 gave only the Top apps
+    /// walker a `KEEP_BASELINE` window; the sensors' reopen rule is #1277 LOW
+    /// 4's as it stands). Closed and reopened with no time passing at all,
+    /// the sampler is reset before its next read.
+    ///
+    /// Waits with [`settle_until`], so no virtual time passes between the
+    /// close and the reopen: a young-baseline window of any length would keep
+    /// this baseline.
+    ///
+    /// **Falsified** by handing the sensors' `drive` the walker's
+    /// `top_apps::KEEP_BASELINE` in place of `Duration::ZERO`.
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_sidebar_reopen_still_re_baselines() {
+        let period = Duration::from_secs(1);
+        let calls = Arc::new(Calls::default());
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let made = Arc::clone(&calls);
+        let task = tokio::spawn(sampler_task_with(cmd_rx, msg_tx, period, move || {
+            FakeSampler(Arc::clone(&made))
+        }));
+
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        // The open edge's sample has reached the reducer, so the task is back
+        // at its gate with a baseline zero seconds old.
+        assert!(
+            settle_until(|| msg_rx.try_recv().is_ok()).await,
+            "the open edge samples",
+        );
+        assert_eq!(calls.resets(), 0, "the first open has nothing to drop");
+
+        cmd_tx.send(Cmd::SetVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::SetVisible(true)).expect("lane is live");
+        assert!(
+            settle_until(|| calls.resets() >= 1).await,
+            "a zero-second close must still drop the sensors' baseline",
+        );
+        assert_eq!(calls.resets(), 1, "exactly once");
+
+        drop(cmd_tx);
+        let _ = task.await;
+    }
+
     /// **The ordering, pinned directly rather than inferred from a count**
     /// (#1313): a tick that was "due" while the gate was hidden — by the
     /// wall the interval would have crossed, had it been polled — must not

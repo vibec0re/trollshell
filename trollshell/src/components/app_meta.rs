@@ -170,7 +170,8 @@ pub(crate) fn fallback_icon() -> gio::Icon {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
     use super::{resolve_app_meta, resolve_in};
     use hytte::gtk::{gio, prelude::*};
@@ -353,5 +354,266 @@ mod tests {
         let meta = meta.expect("resolve_app_meta must find the fixture through AppInfo::all()");
         assert_eq!(meta.display_name, "TS 1434 Valid");
         println!("{VALID_CHILD_OK}");
+    }
+
+    /// A fixture search path on disk: entries under
+    /// `<root>/data-home/applications/`, and `<root>/bin/` as the whole
+    /// `$PATH`, holding the programs their `Exec=` lines name — GIO and the
+    /// resolver both drop an entry whose program is not there.
+    ///
+    /// The in-process tests hand the resolver [`Fixture::env`]; the tests that
+    /// need GIO (or [`resolve_app_meta`] itself, which reads the process
+    /// environment) go through [`Fixture::run_child`] instead, because
+    /// `std::env::set_var` is `unsafe` in edition 2024 and this workspace
+    /// forbids `unsafe_code`. That re-execs this test binary, filtered to
+    /// exactly one inner test, with the fixture set on the **child** through
+    /// the safe `Command::env` builder — the precedent is
+    /// `hytte-plugin-stats::plugin::tests::settings_reads_the_real_process_environment`
+    /// and #1435's tests here. No display is involved (`gio::AppInfo::all()`
+    /// and the icon constructors are plain GIO), so every test in this module
+    /// is a hermetic `#[test]`.
+    struct Fixture {
+        root: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                root: tempfile::tempdir().expect("a scratch fixture root"),
+            }
+        }
+
+        fn root(&self) -> &Path {
+            self.root.path()
+        }
+
+        fn bin(&self) -> PathBuf {
+            self.root().join("bin")
+        }
+
+        fn data_home(&self) -> PathBuf {
+            self.root().join("data-home")
+        }
+
+        /// An executable at `bin/<name>`, returning its absolute path.
+        fn program(&self, name: &str) -> PathBuf {
+            let path = self.bin().join(name);
+            std::fs::create_dir_all(self.bin()).expect("mkdir the fixture bin/");
+            std::fs::write(&path, "#!/bin/sh\n").expect("write a fixture program");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod a fixture program");
+            path
+        }
+
+        /// `contents` at `data-home/applications/<file_name>`.
+        fn entry(&self, file_name: &str, contents: &str) {
+            let apps = self.data_home().join("applications");
+            std::fs::create_dir_all(&apps).expect("mkdir the fixture applications/");
+            std::fs::write(apps.join(file_name), contents).expect("write a fixture .desktop file");
+        }
+
+        /// Re-exec this test binary running only `inner`, with `marker` set to
+        /// the fixture root and the whole environment GIO and the resolver
+        /// read pointed at the fixture — the data and config directories,
+        /// `HOME`, `PATH`, and `LANGUAGE=sv` with the other locale variables
+        /// removed. Returns the child's stdout once it exited 0 **and** printed
+        /// `ok` (a stale filter matches no test, and libtest still exits 0).
+        fn run_child(&self, inner: &str, marker: &str, ok: &str) -> String {
+            let out = std::process::Command::new(
+                std::env::current_exe().expect("this test binary's own path"),
+            )
+            .args(["--exact", "--nocapture", "--test-threads=1", inner])
+            .env(marker, self.root())
+            .env("XDG_DATA_HOME", self.data_home())
+            .env("XDG_DATA_DIRS", self.root().join("data-sys"))
+            .env("XDG_CONFIG_HOME", self.root().join("config-home"))
+            .env("XDG_CONFIG_DIRS", self.root().join("config-sys"))
+            .env("HOME", self.root())
+            .env("PATH", self.bin())
+            .env("LANGUAGE", "sv")
+            .env_remove("LC_ALL")
+            .env_remove("LC_MESSAGES")
+            .env_remove("LANG")
+            .output()
+            .expect("re-exec this test binary with a fixture environment");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "the child failed ({:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status,
+            );
+            assert!(
+                stdout.contains(ok),
+                "the child exited 0 without reaching the end of {inner}\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            );
+            stdout
+        }
+    }
+
+    /// What an icon is, in the terms the comparison below can see: its
+    /// `GType`, `g_icon_to_string` and the printed `g_icon_serialize`.
+    fn describe(icon: Option<&gio::Icon>) -> Option<(String, Option<String>, Option<String>)> {
+        icon.map(|icon| {
+            (
+                icon.type_().name().to_owned(),
+                IconExt::to_string(icon).map(|s| s.to_string()),
+                icon.serialize().map(|v| v.print(true).to_string()),
+            )
+        })
+    }
+
+    /// The app ids the module docs name, and the name each must come out as
+    /// under the parity fixture (`LANGUAGE=sv`). These are the answers
+    /// `main`'s gio layers gave over the same fixture before #1432 (the
+    /// one-off oracle in this PR's first commit), so they pin the old gio
+    /// path's behaviour, not just the resolver's.
+    const NAME_CASES: [(&str, Option<&str>); 8] = [
+        // Layer 1, localised: `Name[sv]=`.
+        ("org.gnome.Nautilus", Some("Filer")),
+        // Layer 2: a reverse-DNS id in another case.
+        ("org.gnome.nautilus", Some("Filer")),
+        // Layer 2: a lowercase cgroup leaf for `Firefox.desktop`.
+        ("firefox", Some("Firefox")),
+        // Layer 2: niri's spawn scope.
+        ("niri-firefox", Some("Firefox")),
+        // Layer 2: the NixOS wrapper name.
+        ("firefox-unwrapped", Some("Firefox")),
+        // Layer 3: the `Exec=` program's file stem.
+        ("ts-edit", Some("Editor")),
+        // The no-`Exec=` entry itself, by id (#1434).
+        ("ts-dbus-only", Some("DBus Only")),
+        // Every layer, the third across the no-`Exec=` entry (#1434).
+        ("unrelated-app-id-1434", None),
+    ];
+
+    /// The parity fixture's entries, by desktop-file id without `.desktop`;
+    /// each covers one icon spelling, and every one resolves through layer 1
+    /// under its own id.
+    const ENTRY_STEMS: [&str; 12] = [
+        "org.gnome.Nautilus",
+        "Firefox",
+        "com.example.Editor",
+        "ts-dbus-only",
+        "ts-xpm-icon",
+        "ts-svg-icon",
+        "ts-upper-icon",
+        "ts-empty-icon",
+        "ts-localised-icon",
+        "ts-dotted-icon",
+        "ts-relative-icon",
+        "ts-abs-png-icon",
+    ];
+
+    /// The parity fixture: one entry per [`ENTRY_STEMS`] row.
+    fn parity_fixture() -> Fixture {
+        let f = Fixture::new();
+        f.program("nautilus");
+        f.program("firefox");
+        f.program("ts-icon-host");
+        let editor = f.program("ts-edit");
+        let icons = f.root().join("icons");
+        f.entry(
+            "org.gnome.Nautilus.desktop",
+            "[Desktop Entry]\nType=Application\nName=Files\nName[sv]=Filer\n\
+             Exec=nautilus --new-window %U\nIcon=org.gnome.Nautilus\n",
+        );
+        f.entry(
+            "Firefox.desktop",
+            "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox %u\nIcon=firefox.png\n",
+        );
+        f.entry(
+            "com.example.Editor.desktop",
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=Editor\nExec={} %F\nIcon={}\n",
+                editor.display(),
+                icons.join("ts-editor.svg").display(),
+            ),
+        );
+        f.entry(
+            "ts-dbus-only.desktop",
+            "[Desktop Entry]\nType=Application\nName=DBus Only\nDBusActivatable=true\n",
+        );
+        let abs_png = icons.join("ts-abs.png");
+        for (stem, icon) in [
+            ("ts-xpm-icon", "Icon=ts-xpm-icon.xpm\n"),
+            ("ts-svg-icon", "Icon=ts-svg-icon.svg\n"),
+            ("ts-upper-icon", "Icon=ts-upper-icon.PNG\n"),
+            ("ts-empty-icon", "Icon=\n"),
+            ("ts-localised-icon", "Icon=ts-plain\nIcon[sv]=ts-svensk.png\n"),
+            ("ts-dotted-icon", "Icon=ts.dotted.name.png\n"),
+            ("ts-relative-icon", "Icon=icons/ts-rel.png\n"),
+            ("ts-abs-png-icon", &format!("Icon={}\n", abs_png.display())),
+        ] {
+            f.entry(
+                &format!("{stem}.desktop"),
+                &format!(
+                    "[Desktop Entry]\nType=Application\nName=Entry {stem}\nExec=ts-icon-host\n{icon}"
+                ),
+            );
+        }
+        f
+    }
+
+    const ORACLE_CHILD: &str = "TROLLSHELL_APP_META_1432_ORACLE_CHILD";
+    const ORACLE_CHILD_OK: &str = "app-meta-1432-oracle-child-reached-the-end";
+
+    /// #1432's one-off oracle, run on `main`'s code before the switch: over
+    /// the parity fixture, the gio lookup this file ships ([`resolve_in`]
+    /// over `AppInfo::all()`) and `hytte_sensors::desktop_entry::Resolver`
+    /// name every [`NAME_CASES`] id and every [`ENTRY_STEMS`] entry the same,
+    /// and the [`NAME_CASES`] names are the literals it records.
+    #[test]
+    fn the_gio_layers_and_the_resolver_agree_on_the_documented_cases() {
+        let f = parity_fixture();
+        let stdout = f.run_child(
+            "components::app_meta::tests::\
+             the_gio_layers_and_the_resolver_agree_on_the_documented_cases_inner",
+            ORACLE_CHILD,
+            ORACLE_CHILD_OK,
+        );
+        println!("{stdout}");
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn the_gio_layers_and_the_resolver_agree_on_the_documented_cases_inner() {
+        if std::env::var_os(ORACLE_CHILD).is_none() {
+            return;
+        }
+        let all = gio::AppInfo::all();
+        let mut listed: Vec<String> = all
+            .iter()
+            .filter_map(|info| info.id().map(|id| id.to_string()))
+            .collect();
+        listed.sort();
+        println!("gio lists: {listed:?}");
+        let mut resolver = hytte_sensors::desktop_entry::Resolver::from_env();
+        let named = NAME_CASES.into_iter().map(|(id, name)| (id, Some(name)));
+        let entries = ENTRY_STEMS.into_iter().map(|stem| (stem, None));
+        for (app_id, expected) in named.chain(entries) {
+            let gio_meta = resolve_in(&all, app_id);
+            let gio_name = gio_meta.as_ref().map(|m| m.display_name.clone());
+            let gio_icon = describe(gio_meta.as_ref().and_then(|m| m.icon.as_ref()));
+            let resolved = resolver.resolve(app_id).cloned();
+            let name = resolved.as_ref().map(|m| m.display_name.clone());
+            let raw_icon = resolved.and_then(|m| m.icon);
+            println!(
+                "{app_id:>22}: gio {gio_name:?} | resolver {name:?}\n\
+                 {:>22}  gio icon {gio_icon:?} | raw Icon= {raw_icon:?}",
+                ""
+            );
+            assert_eq!(
+                gio_name, name,
+                "{app_id}: the gio layers and the resolver disagree"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(name.as_deref(), expected, "{app_id}");
+            } else {
+                assert!(name.is_some(), "{app_id}: a fixture entry resolves by its id");
+            }
+        }
+        println!("{ORACLE_CHILD_OK}");
     }
 }

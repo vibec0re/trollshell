@@ -3116,6 +3116,7 @@ dependencies = [
  "hytte-gl",
  "hytte-plugin-proto",
  "hytte-preem",
+ "hytte-sensors",
  "oo7",
  "serde",
  "serde_json",

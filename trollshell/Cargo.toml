@@ -52,6 +52,13 @@ hytte-config = { path = "../crates/hytte-config", features = ["watch"] }
 # move is invisible to every reader. Adds no resolved package — a workspace
 # path member whose only dependency is `hytte-config`, already here.
 hytte-config-families.workspace = true
+# The app-id → desktop-entry name lookup (#1432): `components/app_meta.rs`
+# takes its display names from `hytte_sensors::desktop_entry`, so the shell and
+# `hytte-plugin-stats` share one copy of the three matching layers instead of
+# each carrying its own. A GTK-free leaf like `hytte-config`, linked directly
+# rather than through a `hytte` re-export for the same reason. Adds no resolved
+# package: `hytte-services` already links it.
+hytte-sensors.workspace = true
 # Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
 # framing helpers. GTK/adw/futures-signals still go through `hytte`'s
 # re-exports; tokio + the proto crate aren't re-exported, so they're direct.

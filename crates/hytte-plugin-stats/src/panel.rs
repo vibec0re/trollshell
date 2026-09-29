@@ -26,6 +26,7 @@
 //! | `adw::PreferencesGroup` per card | a `boxed-list` [`Node::ListBox`] (not `dense`: the native rows keep libadwaita's row height), also classed `ts-page-card` so the shell's plugin-page flattening of `boxed-list` leaves this page's cards their card surface |
 //! | `AdwActionRow` / `slim_row` (title, subtitle, suffix) | a [`Node::Row`] classed `header`, so libadwaita's own `row > box.header` rule (12 px margins, 50 px rows) applies to it exactly as to `slim_row`'s box; title, then the subtitle as a `subtitle` label **on the same line** (a two-line title column cannot be vertically centred from the wire), a [`Node::Spacer`], then the suffix |
 //! | `build_history_row`'s `[name 80px \| Sparkline \| value 80px]` | a `ts-history-row` [`Node::Row`] of a `ts-stat-name` label, a [`Node::Sparkline`] — the **same** `hytte_ui::Sparkline` — and a `ts-stat-value` label; the 80 px columns are the `ts-stat-col` rule, since a node cannot call `set_size_request` |
+//! | `build_expandable_cpu_history_row` / `build_expandable_cpu_clock_row`: a `Stack` of the overall line and a per-core page, a trailing `pan-end`/`pan-down` chevron, a click toggling the two | a flat [`Node::Button`] (the click target, [`CPU_CORES_TOGGLE_ID`] / [`CLOCK_CORES_TOGGLE_ID`]; the plugin holds both flags) around `Row[content, chevron Icon]`, where the content is the overall history row collapsed and, expanded, native's `percore_box`: a "Per-core history" (or "Per-core clock") / `N cores · X%` header over a [`Node::MultiSparkline`] — the **same** `hytte_ui::MultiSparkline`, one line per core on the fixed `0..=1` axis (#1419 item 2). The row's `ts-history-row` padding moves from the content to the button, so its columns stay in line with the rows around it |
 //! | memory / swap / per-mount `GtkProgressBar` (`ts-stat-progress`) | [`Node::Progress`] with the same class |
 //! | the Disk `AdwExpanderRow`, collapsed | a [`Node::Expander`], collapsed until clicked (the plugin holds the flag — see [`DISKS_EXPANDER_ID`]) |
 //! | Disk I/O's `↓ … ↑ …` / `min … · max …` / `total ↓ … ↑ …` lines, indented 88 px | three `ts-stat-value` labels under the line, indented by the `ts-stat-detail` rule |
@@ -72,9 +73,29 @@
 //!   strip #702 removed for its minimum width. So the page omits it (and the
 //!   "Per-core · N cores" header row that only introduced it). The sidebar card
 //!   still draws the lamp row.
-//! - **The per-core history** (native's expandable CPU and Clock rows switch
-//!   to a `MultiSparkline`): one line per node, and N lines is N nodes; the
-//!   overall line is the one that fits.
+//!
+//! # The per-core history (#1419 item 2)
+//!
+//! Native's CPU and Clock history rows expand on click into one line per core,
+//! and so do these, on the wire's [`Node::MultiSparkline`] (a negotiated,
+//! generation-9 node). Three rules keep that from costing what it could — at
+//! 64 cores a graph is about 19 KB a frame, once a second:
+//!
+//! - **Series ride the wire only while they are on screen**: the row is
+//!   expanded **and** the page is open ([`panel`]'s `page_open`, the host's
+//!   `PageVisibility` push, #1427). Anything else draws the overall line and
+//!   builds no series at all.
+//! - **Both rows collapse when the page closes**, as native's do (it rebuilds
+//!   them collapsed on every open), so an expanded row never outlives the
+//!   visit it was expanded on.
+//! - **An older shell never sees a toggle.** Below
+//!   [`MULTI_SPARKLINE_VOCAB`](hytte_plugin::proto::MULTI_SPARKLINE_VOCAB) the
+//!   rows are exactly the history rows they were — a toggle there could only
+//!   reveal the SDK's fallback line, which is the overall line again.
+//!
+//! The windows themselves ([`History`]'s per-core rings) fill on every sample
+//! whatever the page does, as the native service's do, so an expanded row
+//! shows the last minute at once rather than a graph that starts empty.
 //!
 //! # The page width
 //!
@@ -122,13 +143,38 @@ pub const TOP_APPS_RAM_ID: &str = "stats-panel-top-apps-ram";
 /// long app id costs an ellipsis rather than the page's width.
 const TOP_APPS_CHARS: i32 = 20;
 
+/// The id of the CPU card's CPU history row toggle (#1419 item 2) — the flat
+/// button whose click swaps the overall load line for one line per core, and
+/// back. Plugin-driven like [`DISKS_EXPANDER_ID`]: the host fires a click at
+/// this id and `Stats::update` flips [`Expanded::cpu_cores`].
+pub const CPU_CORES_TOGGLE_ID: &str = "stats-panel-cpu-history-toggle";
+
+/// The id of the CPU card's Clock history row toggle (#1419 item 2): the same
+/// swap for the clock, one line per core that exposes `cpufreq`
+/// ([`Expanded::clock_cores`]).
+pub const CLOCK_CORES_TOGGLE_ID: &str = "stats-panel-clock-history-toggle";
+
+/// The chevron a collapsed history row ends in — native's `pan-end-symbolic`.
+const CHEVRON_COLLAPSED: &str = "pan-end-symbolic";
+
+/// The chevron an expanded history row ends in — native's `pan-down-symbolic`.
+const CHEVRON_EXPANDED: &str = "pan-down-symbolic";
+
+/// The gap between a toggle's content and its chevron, in pixels: native's
+/// `ts-history-row` right padding (`0.923em`, 12 px at the default font), which
+/// sat between the two there and moves to the button here — see
+/// [`expandable_history_row`].
+const CHEVRON_GAP: u16 = 12;
+
 /// Which of the page's expanders are open — held by the plugin, because the
 /// wire's [`Node::Expander`] is plugin-driven, and collapsed by default like
 /// every native one.
 ///
-/// Three independent flags, one per expander on the page: the Disk card's
-/// mounts and the two Top apps lists.
+/// Five independent flags, one per click target on the page that opens
+/// something: the Disk card's mounts, the two Top apps lists, and the CPU
+/// and Clock history rows' per-core views.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // five independent UI switches, not a state machine
 pub struct Expanded {
     /// The Disk card's mount list ([`DISKS_EXPANDER_ID`]).
     pub disks: bool,
@@ -136,6 +182,29 @@ pub struct Expanded {
     pub top_cpu: bool,
     /// The Memory card's Top apps list ([`TOP_APPS_RAM_ID`]).
     pub top_ram: bool,
+    /// The CPU history row's per-core view ([`CPU_CORES_TOGGLE_ID`], #1419
+    /// item 2). Cleared when the page closes — see
+    /// [`collapse_per_core`](Self::collapse_per_core).
+    pub cpu_cores: bool,
+    /// The Clock history row's per-core view ([`CLOCK_CORES_TOGGLE_ID`]).
+    /// Cleared when the page closes, like [`cpu_cores`](Self::cpu_cores).
+    pub clock_cores: bool,
+}
+
+impl Expanded {
+    /// Fold both history rows back to their overall lines — what a page close
+    /// does, because native builds them collapsed on every open
+    /// (`build_expandable_cpu_history_row`: "not persisted across drawer
+    /// open/close"), and because an expanded row is the one thing on the
+    /// page that puts a per-core series on the wire.
+    ///
+    /// The Disk card and the two Top apps lists keep their flags: they carry
+    /// nothing the page does not already send, and the plugin has always
+    /// remembered them across a close.
+    pub fn collapse_per_core(&mut self) {
+        self.cpu_cores = false;
+        self.clock_cores = false;
+    }
 }
 
 /// How many samples each history line keeps: the native page's 60 (one a
@@ -155,6 +224,10 @@ const STAT_COL: &str = "ts-stat-col";
 
 /// The 88 px indent of the Disk I/O detail lines (`ts-stat-detail`).
 const STAT_DETAIL: &str = "ts-stat-detail";
+
+/// A history row's padding (`ts-history-row` in the shell's stylesheet, native
+/// `build_history_row`'s class).
+const HISTORY_ROW: &str = "ts-history-row";
 
 /// The class that opts a card back into libadwaita's card surface on a plugin
 /// page (`.ts-plugin-panel list.boxed-list.ts-page-card` in the shell's
@@ -189,6 +262,14 @@ pub struct History {
     gpu_temp: VecDeque<f32>,
     /// Combined disk read + write rate, bytes/s (auto-scaled).
     disk_io: VecDeque<f32>,
+    /// Per-core load, one window per logical core in the kernel's order, each
+    /// `0.0..=1.0` and capped at [`HISTORY_LEN`] — the expanded CPU row's
+    /// series (#1419 item 2), native `cpu_per_core_history`.
+    per_core: Vec<VecDeque<f32>>,
+    /// Per-core clock over the shared ceiling, one window per core that
+    /// exposes `cpufreq` — the expanded Clock row's series, native
+    /// `cpu_freq_per_core_history`.
+    per_core_clock: Vec<VecDeque<f32>>,
 }
 
 /// Append one sample to a ring, dropping the oldest past [`HISTORY_LEN`].
@@ -197,6 +278,41 @@ fn push_capped(ring: &mut VecDeque<f32>, sample: f32) {
         ring.pop_front();
     }
     ring.push_back(sample);
+}
+
+/// Append one per-core frame — one sample per core — to a set of windows.
+///
+/// **A change in the core count starts every window over**, native's rule
+/// (`hytte-services`' `spawn_per_core_history`, after `MultiSparkline`'s own
+/// `push_frame`): a CPU hot-plug, or a `cpufreq` node appearing, would
+/// otherwise shift every later core's history onto its neighbour's line and
+/// hue. The fresh windows then fill from this frame on.
+///
+/// **An empty frame is not a sample** and moves nothing — not even the reset.
+/// It is the snapshot withholding its reading (the cold first tick has no
+/// per-core loads; a machine with no `cpufreq` governor has no per-core
+/// clock), the rule every other line here follows, not a machine that has
+/// lost its cores.
+///
+/// Each sample is clamped onto the graph's fixed `0..=1` axis, and a `NaN`
+/// reads as `0.0` rather than reaching the tree, where it would defeat the
+/// render dedup (#896/#898).
+fn push_frame(windows: &mut Vec<VecDeque<f32>>, frame: &[f32]) {
+    if frame.is_empty() {
+        return;
+    }
+    if windows.len() != frame.len() {
+        windows.clear();
+        windows.resize_with(frame.len(), VecDeque::new);
+    }
+    for (window, &sample) in windows.iter_mut().zip(frame) {
+        let sample = if sample.is_nan() {
+            0.0
+        } else {
+            sample.clamp(0.0, 1.0)
+        };
+        push_capped(window, sample);
+    }
 }
 
 impl History {
@@ -238,6 +354,12 @@ impl History {
             #[allow(clippy::cast_possible_truncation)]
             push_capped(&mut self.disk_io, (io.read_bps + io.write_bps) as f32);
         }
+        // The per-core windows (#1419 item 2), on every sample whatever the
+        // page shows — native keeps them in its sensors service for the same
+        // reason: an expanded row opens onto the last minute, not onto an
+        // empty graph. Two small rings per core, no read of their own.
+        push_frame(&mut self.per_core, &snapshot.per_core);
+        push_frame(&mut self.per_core_clock, &snapshot.per_core_clock);
     }
 
     /// The `(min, max)` combined disk rate over the window, in bytes/s — the
@@ -264,7 +386,15 @@ impl History {
 /// and `temperature` (every `°C` reading). `per_core` and `history` are the
 /// **chips'** switches — the per-core lamp row and the chip's scope sweep — and
 /// the page, which draws neither, ignores them: its history lines are the
-/// native page's, and the native page does not make them optional.
+/// native page's, and the native page does not make them optional. (The
+/// per-core *history* is not the chips' `per_core` either: it is a click on
+/// the page, as native's is.)
+///
+/// `page_open` is whether the page is on screen — the host's `PageVisibility`
+/// push (#1427). The page is rendered either way (the host parks it until a
+/// chip opens it), but only an open page draws a per-core graph: an expanded
+/// history row on a page nobody is looking at draws its overall line and
+/// builds no series, so none rides the wire (#1419 item 2).
 #[must_use]
 pub fn panel(
     cfg: crate::config::Card,
@@ -272,12 +402,19 @@ pub fn panel(
     history: &History,
     top_apps: &TopApps,
     expanded: Expanded,
+    page_open: bool,
 ) -> Node {
     let mut left = Vec::new();
     let mut right = Vec::new();
 
     if cfg.cpu {
-        let mut rows = cpu_rows(cfg, snapshot, history);
+        // Each per-core view is shown only while it is both expanded and on
+        // screen; `cpu_rows` never sees the two apart.
+        let per_core = PerCore {
+            load: page_open && expanded.cpu_cores,
+            clock: page_open && expanded.clock_cores,
+        };
+        let mut rows = cpu_rows(cfg, snapshot, history, per_core);
         // Last in the CPU card, as native `build_stats_cpu_card` adds it.
         rows.push(top_apps_expander(
             TOP_APPS_CPU_ID,
@@ -382,13 +519,139 @@ fn subtitle(text: impl Into<String>, class: &str) -> Node {
 /// `build_history_row`: `[name | line | value]`, the value column dropped for
 /// the one native row that hides it (Disk I/O).
 fn history_row(id: &str, name: &str, line: Node, value: Option<Node>) -> Node {
+    history_line(id, name, line, value, true)
+}
+
+/// [`history_row`]'s cells, with or without the row's own `ts-history-row`
+/// padding: an [`expandable_history_row`] draws the same cells with the
+/// padding on its button instead.
+fn history_line(id: &str, name: &str, line: Node, value: Option<Node>, padded: bool) -> Node {
     let mut children = vec![label(name, &["ts-stat-name", STAT_COL]), line];
     children.extend(value);
-    nodes::row(children)
-        .id(id)
-        .class("ts-history-row")
-        .spacing(8)
-        .build()
+    let row = nodes::row(children).id(id).spacing(8);
+    let row = if padded { row.class(HISTORY_ROW) } else { row };
+    row.build()
+}
+
+/// Which of the CPU card's two expandable history rows show their per-core
+/// view this render: expanded **and** on an open page (see [`panel`]).
+#[derive(Clone, Copy, Debug)]
+struct PerCore {
+    /// The CPU history row.
+    load: bool,
+    /// The Clock history row.
+    clock: bool,
+}
+
+/// One expandable history row (#1419 item 2) — native
+/// `build_expandable_cpu_history_row` / `build_expandable_cpu_clock_row`: a
+/// `Stack` of the overall line and the per-core page, a trailing chevron, and
+/// a click that swaps the two.
+///
+/// Here that is a flat [`Node::Button`] — `toggle_id`, the click target —
+/// around `Row[content, chevron]`: the content is `overall` collapsed and
+/// `per_core` expanded, the chevron native's `pan-end` / `pan-down`. `overall`
+/// is handed whether to carry its own padding; `per_core` is called **only**
+/// when `open`, so a collapsed row builds no series at all.
+///
+/// The `ts-history-row` padding moves from the content to the button. Inside
+/// a button the content cannot carry it too — the button's own padding
+/// (libadwaita's `5px 10px`) would stack on it and push the row's name column
+/// 10 px right of every other history row's; on the button, the shell
+/// stylesheet's (user-priority) padding replaces libadwaita's. The chevron
+/// then sits [`CHEVRON_GAP`] after the content, where native's padding put it.
+///
+/// **Against a shell that cannot draw a [`Node::MultiSparkline`]** this is
+/// just `overall`, padded — the row as it was before #1419 item 2, with no
+/// button and no chevron: a toggle there could only reveal the SDK's fallback
+/// line, which is the overall line again.
+fn expandable_history_row(
+    toggle_id: &str,
+    open: bool,
+    overall: impl FnOnce(bool) -> Node,
+    per_core: impl FnOnce() -> Node,
+) -> Node {
+    if !nodes::host_speaks_multi_sparkline() {
+        return overall(true);
+    }
+    let (content, chevron) = if open {
+        (per_core(), CHEVRON_EXPANDED)
+    } else {
+        (overall(false), CHEVRON_COLLAPSED)
+    };
+    Node::Button {
+        id: toggle_id.to_owned(),
+        classes: vec!["flat".to_owned(), HISTORY_ROW.to_owned()],
+        child: Box::new(
+            nodes::row(vec![
+                content,
+                Node::Icon {
+                    id: None,
+                    name: chevron.to_owned(),
+                    classes: Vec::new(),
+                    tooltip: None,
+                },
+            ])
+            .spacing(CHEVRON_GAP)
+            .build(),
+        ),
+    }
+}
+
+/// The ids and words of one per-core view.
+struct PerCoreView<'a> {
+    /// The view's own box.
+    id: &'a str,
+    /// The graph's id.
+    graph_id: &'a str,
+    /// The header's name — native "Per-core history" / "Per-core clock".
+    title: &'a str,
+    /// The header's reading after `N cores · ` — the load or the clock.
+    reading: String,
+    /// The tint class the row's other readings carry (`ts-cpu`).
+    class: &'a str,
+}
+
+/// An expanded history row's content — native's `percore_box`: a header of
+/// the view's name and `N cores · reading`, over a [`Node::MultiSparkline`] of
+/// `windows` on the fixed `0..=1` axis (native `set_domain_max(Some(1.0))` for
+/// both the load and the clock).
+///
+/// `N` is the number of lines drawn, which is the core count of the newest
+/// frame (a changed count restarts the windows, see [`push_frame`]); before
+/// the first frame it is `0`.
+///
+/// The graph goes through [`nodes::multi_sparkline`]'s negotiated `build`,
+/// though [`expandable_history_row`] only calls this against a shell that
+/// draws one: one call that is safe against every shell costs nothing here.
+fn per_core_view(view: &PerCoreView<'_>, windows: &[VecDeque<f32>]) -> Node {
+    let series: Vec<Vec<f32>> = windows
+        .iter()
+        .map(|window| window.iter().copied().collect())
+        .collect();
+    nodes::container(
+        Dir::Vertical,
+        vec![
+            nodes::row(vec![
+                label(view.title, &["ts-stat-name"]),
+                Node::Spacer,
+                label(
+                    format!("{} cores \u{00b7} {}", windows.len(), view.reading),
+                    &["ts-stat-value", view.class],
+                ),
+            ])
+            .spacing(8)
+            .build(),
+            nodes::multi_sparkline(series)
+                .id(view.graph_id)
+                .max(1.0)
+                .class(view.class)
+                .build(),
+        ],
+    )
+    .id(view.id)
+    .spacing(4)
+    .build()
 }
 
 /// A history row's right-hand reading.
@@ -417,8 +680,14 @@ fn celsius(c: f32) -> String {
 
 /// The CPU card: the headline row (load as the subtitle, the package
 /// temperature as the suffix), Processes, the CPU history line and — with a
-/// `cpufreq` governor — the Clock line.
-fn cpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, history: &History) -> Vec<Node> {
+/// `cpufreq` governor — the Clock line, each of the two lines expandable to
+/// one line per core (#1419 item 2) as `per_core` says.
+fn cpu_rows(
+    cfg: crate::config::Card,
+    snapshot: &Snapshot,
+    history: &History,
+    per_core: PerCore,
+) -> Vec<Node> {
     let temperature = snapshot
         .cpu_temp_c
         .filter(|c| cfg.temperature && c.is_finite());
@@ -445,29 +714,69 @@ fn cpu_rows(cfg: crate::config::Card, snapshot: &Snapshot, history: &History) ->
                 &["numeric", "ts-cpu"],
             )],
         ),
-        history_row(
-            "stats-panel-cpu-history-row",
-            "CPU",
-            line("stats-panel-cpu-history", &history.cpu, Some(1.0), "ts-cpu"),
-            Some(stat_value(percent_text(snapshot.cpu), "ts-cpu")),
+        // CPU — native `build_expandable_cpu_history_row`: the overall load,
+        // or one line per core.
+        expandable_history_row(
+            CPU_CORES_TOGGLE_ID,
+            per_core.load,
+            |padded| {
+                history_line(
+                    "stats-panel-cpu-history-row",
+                    "CPU",
+                    line("stats-panel-cpu-history", &history.cpu, Some(1.0), "ts-cpu"),
+                    Some(stat_value(percent_text(snapshot.cpu), "ts-cpu")),
+                    padded,
+                )
+            },
+            || {
+                per_core_view(
+                    &PerCoreView {
+                        id: "stats-panel-cpu-per-core",
+                        graph_id: "stats-panel-cpu-per-core-history",
+                        title: "Per-core history",
+                        reading: percent_text(snapshot.cpu),
+                        class: "ts-cpu",
+                    },
+                    &history.per_core,
+                )
+            },
         ),
     ];
 
-    // Clock — native `build_expandable_cpu_clock_row`'s collapsed line: the
-    // aggregate clock over the highest `cpuinfo_max_freq`, hidden with no
-    // `cpufreq` governor (`snapshot.cpu_clock_hz` is `None` then — see
-    // `Sampler::tick`).
+    // Clock — native `build_expandable_cpu_clock_row`: the aggregate clock
+    // over the highest `cpuinfo_max_freq`, or each core's over the same
+    // ceiling; the whole row hidden with no `cpufreq` governor
+    // (`snapshot.cpu_clock_hz` is `None` then — see `Sampler::tick`).
     if let Some(hz) = snapshot.cpu_clock_hz {
-        rows.push(history_row(
-            "stats-panel-clock-history-row",
-            "Clock",
-            line(
-                "stats-panel-clock-history",
-                &history.clock,
-                Some(1.0),
-                "ts-cpu",
-            ),
-            Some(stat_value(format::hz(hz), "ts-cpu")),
+        rows.push(expandable_history_row(
+            CLOCK_CORES_TOGGLE_ID,
+            per_core.clock,
+            |padded| {
+                history_line(
+                    "stats-panel-clock-history-row",
+                    "Clock",
+                    line(
+                        "stats-panel-clock-history",
+                        &history.clock,
+                        Some(1.0),
+                        "ts-cpu",
+                    ),
+                    Some(stat_value(format::hz(hz), "ts-cpu")),
+                    padded,
+                )
+            },
+            || {
+                per_core_view(
+                    &PerCoreView {
+                        id: "stats-panel-clock-per-core",
+                        graph_id: "stats-panel-clock-per-core-history",
+                        title: "Per-core clock",
+                        reading: format::hz(hz),
+                        class: "ts-cpu",
+                    },
+                    &history.per_core_clock,
+                )
+            },
         ));
     }
     rows
@@ -852,14 +1161,16 @@ fn top_app_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        DISKS_EXPANDER_ID, Expanded, HISTORY_LEN, History, ROOT_ID, TOP_APPS_CPU_ID,
-        TOP_APPS_RAM_ID, panel,
+        CLOCK_CORES_TOGGLE_ID, CPU_CORES_TOGGLE_ID, DISKS_EXPANDER_ID, Expanded, HISTORY_LEN,
+        History, ROOT_ID, TOP_APPS_CPU_ID, TOP_APPS_RAM_ID, panel,
     };
     use crate::config::Card;
     use crate::sample::{Disk, DiskIo, Gpu, Memory, Snapshot};
     use crate::top_apps::{TopApps, app};
     use hytte_plugin::display::testing::with_negotiated_vocab;
-    use hytte_plugin::proto::{Dir, HOMOGENEOUS_CLASS, Node, SPARKLINE_VOCAB};
+    use hytte_plugin::proto::{
+        Dir, HOMOGENEOUS_CLASS, MULTI_SPARKLINE_VOCAB, Node, SPARKLINE_VOCAB,
+    };
     use hytte_sensors::app_usage::{ProcSample, TOP_N};
 
     /// A machine with something to say about every card.
@@ -899,6 +1210,8 @@ mod tests {
             processes: Some(287),
             cpu_clock_hz: Some(3_800_000_000.0),
             cpu_clock_ceiling_hz: Some(5_000_000_000.0),
+            // Four cores, the fastest at 3.8 GHz of the 5 GHz ceiling.
+            per_core_clock: vec![0.24, 0.76, 0.5, 0.3],
             disk_io: Some(DiskIo {
                 read_bps: 2_097_152.0,
                 write_bps: 1_048_576.0,
@@ -946,7 +1259,7 @@ mod tests {
     /// the newest one that does not.
     fn page_at(vocab: u16, cfg: Card, snapshot: &Snapshot, expanded: Expanded) -> Node {
         with_negotiated_vocab(vocab, || {
-            panel(cfg, snapshot, &warm(), &busy_apps(), expanded)
+            panel(cfg, snapshot, &warm(), &busy_apps(), expanded, true)
         })
     }
 
@@ -955,6 +1268,8 @@ mod tests {
         disks: true,
         top_cpu: true,
         top_ram: true,
+        cpu_cores: true,
+        clock_cores: true,
     };
 
     fn page(cfg: Card, snapshot: &Snapshot) -> Node {
@@ -1003,7 +1318,9 @@ mod tests {
             | Node::Progress { id, .. }
             | Node::Sparkline { id, .. }
             | Node::Preem { id, .. }
-            | Node::Pixels { id, .. } => id.as_deref(),
+            | Node::Pixels { id, .. }
+            | Node::MultiSparkline { id, .. }
+            | Node::Icon { id, .. } => id.as_deref(),
             Node::Expander { id, .. } | Node::Button { id, .. } => Some(id.as_str()),
             _ => None,
         }
@@ -1030,7 +1347,10 @@ mod tests {
                 | Node::Text { classes, .. }
                 | Node::Progress { classes, .. }
                 | Node::Sparkline { classes, .. }
-                | Node::Expander { classes, .. } => classes.clone(),
+                | Node::Expander { classes, .. }
+                | Node::MultiSparkline { classes, .. }
+                | Node::Icon { classes, .. }
+                | Node::Button { classes, .. } => classes.clone(),
                 _ => Vec::new(),
             })
             .collect()
@@ -1129,7 +1449,12 @@ mod tests {
         let mut cfg = Card::bar_default();
         cfg.per_core = true;
         cfg.history = true;
-        for vocab in [SPARKLINE_VOCAB, SPARKLINE_VOCAB - 1, 0] {
+        for vocab in [
+            MULTI_SPARKLINE_VOCAB,
+            SPARKLINE_VOCAB,
+            SPARKLINE_VOCAB - 1,
+            0,
+        ] {
             let node = page_at(vocab, cfg, &busy(), ALL_OPEN);
             let preem: Vec<_> = nodes_of(&node)
                 .into_iter()
@@ -1412,6 +1737,7 @@ mod tests {
                 &History::default(),
                 &TopApps::default(),
                 Expanded::default(),
+                true,
             )
         });
         let texts = texts(&node);
@@ -1431,6 +1757,7 @@ mod tests {
                 disks: expanded,
                 top_cpu: !expanded,
                 top_ram: !expanded,
+                ..Expanded::default()
             };
             let node = page_at(SPARKLINE_VOCAB, Card::bar_default(), &busy(), flags);
             let expander = nodes_of(&node)
@@ -1644,6 +1971,7 @@ mod tests {
                     disks: false,
                     top_cpu,
                     top_ram,
+                    ..Expanded::default()
                 },
             );
             assert_eq!(top_apps_list(&node, TOP_APPS_CPU_ID).2, top_cpu);
@@ -1751,6 +2079,7 @@ mod tests {
                 &warm(),
                 &TopApps::default(),
                 ALL_OPEN,
+                true,
             )
         });
         for id in [TOP_APPS_CPU_ID, TOP_APPS_RAM_ID] {
@@ -1769,6 +2098,7 @@ mod tests {
                     ..busy_apps()
                 },
                 ALL_OPEN,
+                true,
             )
         });
         assert_eq!(top_apps_list(&cold, TOP_APPS_CPU_ID).0[1], "\u{2014}");
@@ -1797,6 +2127,7 @@ mod tests {
                     by_mem: many,
                 },
                 ALL_OPEN,
+                true,
             )
         });
         assert_eq!(TOP_N, 6, "the walker's own cap, as native");
@@ -1828,6 +2159,395 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ── Per-core history (#1419 item 2) ──────────────────────────────────────
+
+    /// The page against a shell that draws the per-core graph (generation 9),
+    /// with the given flags and page visibility, over [`warm`]'s three ticks
+    /// of [`busy`].
+    fn page_at_9(expanded: Expanded, page_open: bool) -> Node {
+        page_open_at(MULTI_SPARKLINE_VOCAB, expanded, page_open)
+    }
+
+    fn page_open_at(vocab: u16, expanded: Expanded, page_open: bool) -> Node {
+        with_negotiated_vocab(vocab, || {
+            panel(
+                Card::bar_default(),
+                &busy(),
+                &warm(),
+                &busy_apps(),
+                expanded,
+                page_open,
+            )
+        })
+    }
+
+    /// The node with id `id` on `node`, if any.
+    fn find<'a>(node: &'a Node, id: &str) -> Option<&'a Node> {
+        nodes_of(node).into_iter().find(|n| id_of(n) == Some(id))
+    }
+
+    /// A toggle's three parts: the button's classes, the content it wraps (the
+    /// row's first child) and its chevron's icon name (the row's second).
+    fn toggle<'a>(node: &'a Node, id: &str) -> (&'a [String], &'a Node, &'a str) {
+        let Some(Node::Button { classes, child, .. }) = find(node, id) else {
+            panic!("no toggle {id} on the page");
+        };
+        let Node::Row { children, .. } = child.as_ref() else {
+            panic!("{id}'s button wraps a row: {child:?}");
+        };
+        let [content, Node::Icon { name, .. }] = children.as_slice() else {
+            panic!("{id}'s row is [content, chevron]: {children:?}");
+        };
+        (classes, content, name)
+    }
+
+    /// Every multi-series graph on `node`: its id, its top and its series.
+    fn graphs(node: &Node) -> Vec<(String, Option<f32>, Vec<Vec<f32>>)> {
+        nodes_of(node)
+            .into_iter()
+            .filter_map(|n| match n {
+                Node::MultiSparkline {
+                    id, max, series, ..
+                } => Some((id.clone().unwrap_or_default(), *max, series.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **Each history row swaps its line for one line per core** — native's
+    /// `Stack` of `overall` and `percore`. Collapsed, the CPU and Clock rows
+    /// draw their overall line and a `pan-end` chevron; expanded, native's
+    /// "Per-core history" / "Per-core clock" header with `N cores · reading`
+    /// over a `MultiSparkline` of the per-core windows on the fixed `0..=1`
+    /// axis, a `pan-down` chevron, and the overall line gone. Each row reads
+    /// its own flag.
+    ///
+    /// **Falsified** by hard-wiring either row open or shut, by swapping the
+    /// two flags, by drawing the overall line beside the graph rather than
+    /// instead of it, by dropping the graph's fixed top, by feeding the clock
+    /// graph the load windows, and by swapping the two chevrons.
+    #[test]
+    fn each_history_row_swaps_its_line_for_one_line_per_core() {
+        let collapsed = page_at_9(Expanded::default(), true);
+        for (toggle_id, line_id) in [
+            (CPU_CORES_TOGGLE_ID, "stats-panel-cpu-history"),
+            (CLOCK_CORES_TOGGLE_ID, "stats-panel-clock-history"),
+        ] {
+            let (_, content, chevron) = toggle(&collapsed, toggle_id);
+            assert_eq!(chevron, "pan-end-symbolic", "{toggle_id}");
+            assert!(
+                matches!(find(content, line_id), Some(Node::Sparkline { .. })),
+                "{toggle_id} draws its overall line collapsed",
+            );
+        }
+        assert!(
+            graphs(&collapsed).is_empty(),
+            "a collapsed row sends no series"
+        );
+
+        let cpu_open = page_at_9(
+            Expanded {
+                cpu_cores: true,
+                ..Expanded::default()
+            },
+            true,
+        );
+        let (_, content, chevron) = toggle(&cpu_open, CPU_CORES_TOGGLE_ID);
+        assert_eq!(chevron, "pan-down-symbolic");
+        assert_eq!(id_of(content), Some("stats-panel-cpu-per-core"));
+        assert_eq!(texts(content), vec!["Per-core history", "4 cores · 42%"]);
+        assert!(
+            find(&cpu_open, "stats-panel-cpu-history").is_none(),
+            "the overall line is swapped out, not drawn beside the graph",
+        );
+        assert_eq!(
+            graphs(&cpu_open),
+            vec![(
+                "stats-panel-cpu-per-core-history".to_owned(),
+                Some(1.0),
+                vec![vec![0.1; 3], vec![0.5; 3], vec![0.9; 3], vec![0.3; 3]],
+            )],
+        );
+        assert_eq!(
+            toggle(&cpu_open, CLOCK_CORES_TOGGLE_ID).2,
+            "pan-end-symbolic",
+            "the Clock row reads its own flag",
+        );
+
+        let clock_open = page_at_9(
+            Expanded {
+                clock_cores: true,
+                ..Expanded::default()
+            },
+            true,
+        );
+        let (_, content, chevron) = toggle(&clock_open, CLOCK_CORES_TOGGLE_ID);
+        assert_eq!(chevron, "pan-down-symbolic");
+        assert_eq!(id_of(content), Some("stats-panel-clock-per-core"));
+        assert_eq!(texts(content), vec!["Per-core clock", "4 cores · 3.8 GHz"]);
+        assert!(find(&clock_open, "stats-panel-clock-history").is_none());
+        assert_eq!(
+            graphs(&clock_open),
+            vec![(
+                "stats-panel-clock-per-core-history".to_owned(),
+                Some(1.0),
+                vec![vec![0.24; 3], vec![0.76; 3], vec![0.5; 3], vec![0.3; 3]],
+            )],
+        );
+        assert_eq!(
+            toggle(&clock_open, CPU_CORES_TOGGLE_ID).2,
+            "pan-end-symbolic",
+            "the CPU row reads its own flag",
+        );
+    }
+
+    /// **Collapsed, a toggle wraps today's history row** — the same cells,
+    /// id and spacing an older shell gets — with the row's `ts-history-row`
+    /// padding moved onto the flat button around it, so the name column lines
+    /// up with every other history row's instead of sitting libadwaita's
+    /// button padding further in.
+    ///
+    /// **Falsified** by leaving the padding on the content as well, by
+    /// dropping it from the button, or by dropping `flat`.
+    #[test]
+    fn a_collapsed_toggle_wraps_todays_row_and_carries_its_padding() {
+        let today = page_open_at(MULTI_SPARKLINE_VOCAB - 1, Expanded::default(), true);
+        let collapsed = page_at_9(Expanded::default(), true);
+        for (toggle_id, row_id) in [
+            (CPU_CORES_TOGGLE_ID, "stats-panel-cpu-history-row"),
+            (CLOCK_CORES_TOGGLE_ID, "stats-panel-clock-history-row"),
+        ] {
+            let (classes, content, _) = toggle(&collapsed, toggle_id);
+            assert_eq!(classes, ["flat", "ts-history-row"], "{toggle_id}");
+            let Some(Node::Row {
+                id,
+                classes,
+                spacing,
+                children,
+                tooltip,
+            }) = find(&today, row_id)
+            else {
+                panic!("today's page has the {row_id} row");
+            };
+            assert_eq!(classes, &["ts-history-row"], "{row_id} today");
+            assert_eq!(
+                content,
+                &Node::Row {
+                    id: id.clone(),
+                    classes: Vec::new(),
+                    spacing: *spacing,
+                    children: children.clone(),
+                    tooltip: tooltip.clone(),
+                },
+                "{toggle_id} wraps today's row, minus the padding it now carries",
+            );
+        }
+    }
+
+    /// **No series is built while the page is hidden.** Every row expanded,
+    /// the page shut (the host still holds the rendered page): both rows draw
+    /// their overall line and collapsed chevron, and the tree carries no
+    /// `MultiSparkline` — the same flags on an open page carry two.
+    ///
+    /// **Falsified** by dropping the `page_open &&` from either flag in
+    /// `panel`.
+    #[test]
+    fn no_series_is_built_while_the_page_is_hidden() {
+        let everything = Expanded {
+            disks: true,
+            top_cpu: true,
+            top_ram: true,
+            cpu_cores: true,
+            clock_cores: true,
+        };
+        let hidden = page_at_9(everything, false);
+        assert!(graphs(&hidden).is_empty(), "{:?}", graphs(&hidden));
+        for toggle_id in [CPU_CORES_TOGGLE_ID, CLOCK_CORES_TOGGLE_ID] {
+            assert_eq!(toggle(&hidden, toggle_id).2, "pan-end-symbolic");
+        }
+        assert!(find(&hidden, "stats-panel-cpu-history").is_some());
+        assert!(find(&hidden, "stats-panel-clock-history").is_some());
+
+        let shown: Vec<String> = graphs(&page_at_9(everything, true))
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                "stats-panel-cpu-per-core-history".to_owned(),
+                "stats-panel-clock-per-core-history".to_owned(),
+            ],
+        );
+    }
+
+    /// **An older shell never sees a toggle**: below generation 9 — a
+    /// generation-8 shell that draws single lines, a generation-7 one, one
+    /// that draws no line at all, and no `Hello` — the page is exactly the
+    /// page with both per-core flags down, however they are set: no button,
+    /// no chevron, no graph, and each history row a direct list row carrying
+    /// its own padding.
+    ///
+    /// **Falsified** by dropping the `host_speaks_multi_sparkline` check, or
+    /// by checking against `SPARKLINE_VOCAB` (the generation-8 row then gets
+    /// a toggle that could only reveal the fallback line).
+    #[test]
+    fn an_older_shell_sees_no_toggle() {
+        for vocab in [
+            MULTI_SPARKLINE_VOCAB - 1,
+            SPARKLINE_VOCAB,
+            SPARKLINE_VOCAB - 1,
+            0,
+        ] {
+            let flat = page_open_at(vocab, ALL_OPEN, true);
+            assert_eq!(
+                flat,
+                page_open_at(
+                    vocab,
+                    Expanded {
+                        cpu_cores: false,
+                        clock_cores: false,
+                        ..ALL_OPEN
+                    },
+                    true,
+                ),
+                "vocab {vocab}: the per-core flags change nothing",
+            );
+            assert!(
+                !nodes_of(&flat).into_iter().any(|n| matches!(
+                    n,
+                    Node::Button { .. } | Node::Icon { .. } | Node::MultiSparkline { .. }
+                )),
+                "vocab {vocab}: no toggle, no chevron, no graph",
+            );
+            for row_id in [
+                "stats-panel-cpu-history-row",
+                "stats-panel-clock-history-row",
+            ] {
+                let Some(Node::Row { classes, .. }) = find(&flat, row_id) else {
+                    panic!("vocab {vocab}: {row_id} is a row");
+                };
+                assert_eq!(classes, &["ts-history-row"], "vocab {vocab}: {row_id}");
+            }
+        }
+    }
+
+    /// **The per-core windows**: each capped at [`HISTORY_LEN`], one per core
+    /// in core order; a change in the core count — either way — starts every
+    /// window over from the frame that changed it, native's rule; an empty
+    /// frame (a withheld reading) moves nothing, not even that reset; and a
+    /// sample is clamped onto the `0..=1` axis, a `NaN` to `0.0`. The load and
+    /// clock windows follow their own frames.
+    ///
+    /// **Falsified** by dropping `windows.clear()` (the surviving cores keep
+    /// their history across a resize), by dropping the empty-frame guard (a
+    /// cold tick then erases every window), by dropping `push_capped`'s
+    /// `pop_front`, and by dropping the `NaN` arm.
+    #[test]
+    fn the_per_core_windows_are_capped_and_restart_on_a_new_core_count() {
+        let frame = |per_core: Vec<f32>, per_core_clock: Vec<f32>| Snapshot {
+            per_core,
+            per_core_clock,
+            ..Snapshot::default()
+        };
+        let lens = |windows: &[std::collections::VecDeque<f32>]| {
+            windows
+                .iter()
+                .map(std::collections::VecDeque::len)
+                .collect::<Vec<_>>()
+        };
+
+        let mut h = History::default();
+        for _ in 0..(HISTORY_LEN * 3) {
+            h.push(&frame(vec![0.1, 0.2, 0.3, 0.4], vec![0.5, 0.6]));
+        }
+        assert_eq!(lens(&h.per_core), vec![HISTORY_LEN; 4]);
+        assert_eq!(lens(&h.per_core_clock), vec![HISTORY_LEN; 2]);
+
+        // A cold tick: nothing moves, and nothing is reset.
+        let before = h.clone();
+        h.push(&Snapshot::default());
+        assert_eq!(h, before, "an empty frame is not a sample");
+
+        // Six cores where there were four: every load window starts over; the
+        // clock windows, whose frame did not change width, keep theirs.
+        h.push(&frame(vec![0.9; 6], vec![0.5, 0.6]));
+        assert_eq!(lens(&h.per_core), vec![1; 6]);
+        assert!(h.per_core.iter().all(|w| w.back() == Some(&0.9)));
+        assert_eq!(lens(&h.per_core_clock), vec![HISTORY_LEN; 2]);
+
+        // …and back down to two: the survivors start over too.
+        h.push(&frame(vec![0.7, 0.8], vec![0.5, 0.6]));
+        assert_eq!(lens(&h.per_core), vec![1; 2]);
+
+        // Clamped onto the fixed axis, a NaN a zero.
+        let mut h = History::default();
+        h.push(&frame(vec![f32::NAN, 1.5, -0.5], vec![f32::NAN]));
+        let newest = |w: &[std::collections::VecDeque<f32>]| {
+            w.iter().map(|w| w.back().copied()).collect::<Vec<_>>()
+        };
+        assert_eq!(newest(&h.per_core), vec![Some(0.0), Some(1.0), Some(0.0)]);
+        assert_eq!(newest(&h.per_core_clock), vec![Some(0.0)]);
+    }
+
+    /// **The header's words**, as literals (#1026): native's
+    /// `{n} cores · {:.0}%` and `{n} cores · {hz}` — and, before the first
+    /// frame, `0 cores` beside a dash rather than an invented load.
+    #[test]
+    fn the_per_core_headers_print_the_native_strings() {
+        let everything = Expanded {
+            cpu_cores: true,
+            clock_cores: true,
+            ..Expanded::default()
+        };
+        let got = texts(&page_at_9(everything, true));
+        for want in [
+            "Per-core history",
+            "4 cores · 42%",
+            "Per-core clock",
+            "4 cores · 3.8 GHz",
+        ] {
+            assert!(got.iter().any(|t| t == want), "{want:?} in {got:?}");
+        }
+
+        let seed = with_negotiated_vocab(MULTI_SPARKLINE_VOCAB, || {
+            panel(
+                Card::bar_default(),
+                &Snapshot::default(),
+                &History::default(),
+                &TopApps::default(),
+                everything,
+                true,
+            )
+        });
+        let (_, content, _) = toggle(&seed, CPU_CORES_TOGGLE_ID);
+        assert_eq!(texts(content), vec!["Per-core history", "0 cores · —"]);
+        assert_eq!(
+            graphs(&seed),
+            vec![(
+                "stats-panel-cpu-per-core-history".to_owned(),
+                Some(1.0),
+                Vec::new(),
+            )],
+            "no frame yet, no lines — and no Clock row without a governor reading",
+        );
+    }
+
+    /// Every id stays unique with the toggles on the page, collapsed and
+    /// expanded — the reconciler's key (see
+    /// [`every_id_on_the_page_is_unique`]).
+    #[test]
+    fn every_id_is_unique_with_the_toggles_too() {
+        for expanded in [Expanded::default(), ALL_OPEN] {
+            let node = page_at_9(expanded, true);
+            let mut ids: Vec<&str> = nodes_of(&node).into_iter().filter_map(id_of).collect();
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), total, "duplicate ids on the page: {expanded:?}");
         }
     }
 }

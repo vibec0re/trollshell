@@ -25,7 +25,8 @@
 //! - `card` — the geometry, the per-core lamp ramp, the sidebar card and the
 //!   bar chips.
 //! - `panel` — the drawer page a chip click opens (#1251), in the native Stats
-//!   page's own two-column layout and widgets since #1252.
+//!   page's own two-column layout and widgets since #1252, its CPU and Clock
+//!   history rows expanding to one line per core since #1419 item 2.
 //! - `format` — the byte and `used / total` strings the native Stats page
 //!   prints, mirrored.
 //! - [`plugin`] — the TEA core: manifest, `update`, `view`.
@@ -39,9 +40,9 @@
 //! this plugin has one code path for both.
 //!
 //! The **drawer page** is the exception, deliberately (#1252): it mirrors the
-//! native Stats page — `boxed-list` cards in two columns, `Progress` bars and
-//! the shell's own flat `Node::Sparkline` history lines — and carries no preem
-//! at all.
+//! native Stats page — `boxed-list` cards in two columns, `Progress` bars, the
+//! shell's own flat `Node::Sparkline` history lines and its per-core
+//! `Node::MultiSparkline` graphs — and carries no preem at all.
 //!
 //! # Four chips, not five
 //!

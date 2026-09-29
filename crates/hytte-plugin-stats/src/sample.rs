@@ -102,6 +102,17 @@ pub struct Snapshot {
     /// draw on the same axis (#1252). `Some` exactly when
     /// [`cpu_clock_hz`](Self::cpu_clock_hz) is.
     pub cpu_clock_ceiling_hz: Option<f64>,
+    /// Per-core clock, each core's current frequency over
+    /// [`cpu_clock_ceiling_hz`](Self::cpu_clock_ceiling_hz), `0.0..=1.0`, in
+    /// the kernel's `cpufreq` order — the native expanded Clock row's series
+    /// (`hytte-services`' `cpu_freq_per_core_history`: `hz / max_ceiling_hz`
+    /// per core), for the drawer page's per-core clock graph (#1419 item 2).
+    ///
+    /// One entry per core **that exposes a `cpufreq` node**, which is not
+    /// always every core [`per_core`](Self::per_core) counts. Empty exactly
+    /// when [`cpu_clock_hz`](Self::cpu_clock_hz) is `None`: no governor, or an
+    /// instance that does not draw the CPU half.
+    pub per_core_clock: Vec<f32>,
     /// Aggregate disk-throughput history — the native Disks card's I/O row
     /// (`stats.rs:610` → `:1293`) — or `None` when this instance does not draw
     /// disks (see [`Needs`]). Unlike [`cpu`](Self::cpu) this is never withheld
@@ -419,10 +430,14 @@ impl Sampler {
         } else {
             None
         };
-        let (cpu_clock_hz, cpu_clock_ceiling_hz) = if self.needs.cpu {
-            clock_of(&hytte_sensors::read_cpu_freq())
+        // One `cpufreq` walk feeds the aggregate and the per-core series alike,
+        // so the page's collapsed and expanded Clock rows are one observation.
+        let (cpu_clock_hz, cpu_clock_ceiling_hz, per_core_clock) = if self.needs.cpu {
+            let freq = hytte_sensors::read_cpu_freq();
+            let (hz, ceiling) = clock_of(&freq);
+            (hz, ceiling, per_core_clock_of(&freq))
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
 
         let memory = if self.needs.memory {
@@ -486,6 +501,7 @@ impl Sampler {
             processes,
             cpu_clock_hz,
             cpu_clock_ceiling_hz,
+            per_core_clock,
             disk_io,
         }
     }
@@ -590,6 +606,28 @@ fn clock_of(freq: &hytte_sensors::CpuFreq) -> (Option<f64>, Option<f64>) {
         )
     } else {
         (None, None)
+    }
+}
+
+/// The per-core half of the CPU clock: each core's current frequency over the
+/// shared `max_ceiling_hz`, as a `0.0..=1.0` fraction — or nothing on a
+/// machine with no `cpufreq` governor, [`clock_of`]'s hide rule, so the two
+/// halves of the Clock row appear and disappear together.
+///
+/// The native accumulator (`hytte-services`' `cpu_freq_per_core_history`)
+/// divides the same two numbers. The fraction goes through [`as_unit`] here,
+/// so it is clamped to the fixed axis the graph draws (a core reporting a
+/// boost above `cpuinfo_max_freq` sits on the top rail, as the aggregate line
+/// does — `panel::History::push` clamps that one) and a `NaN` reads as `0.0`
+/// rather than defeating the render dedup (#896/#898).
+fn per_core_clock_of(freq: &hytte_sensors::CpuFreq) -> Vec<f32> {
+    if freq.max_ceiling_hz > 0.0 {
+        freq.per_core
+            .iter()
+            .map(|&hz| as_unit(hz / freq.max_ceiling_hz))
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -984,8 +1022,8 @@ async fn drive<S: Sample>(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, route,
-        sampler_task_with, spawn, spawn_with,
+        Cmd, Msg, Needs, Sample, Sampler, Snapshot, as_unit, clock_of, cpu_half, per_core_clock_of,
+        route, sampler_task_with, spawn, spawn_with,
     };
     use crate::config::Card;
     use crate::top_apps::{TopApps, Walker};
@@ -1019,6 +1057,33 @@ mod tests {
             ..freq
         };
         assert_eq!(clock_of(&poisoned), (Some(0.0), Some(5_000_000_000.0)));
+    }
+
+    /// **The per-core clock is each core over the shared ceiling** (#1419
+    /// item 2) — the native expanded Clock row's `hz / max_ceiling_hz` per
+    /// core, in core order, on the fixed `0..=1` axis — and a machine with no
+    /// `cpufreq` governor has no series at all, the aggregate's hide rule.
+    ///
+    /// **Falsified** by dividing by the fastest core (`max_hz`) instead of the
+    /// ceiling (every series then peaks at the top rail), by dropping the
+    /// zero-ceiling hide, or by skipping `as_unit` (the boosted core leaves the
+    /// axis and the `NaN` one reaches the tree).
+    #[test]
+    fn the_per_core_clock_is_each_core_over_the_shared_ceiling() {
+        let freq = hytte_sensors::CpuFreq {
+            max_hz: 4_000_000_000.0,
+            per_core: vec![1_250_000_000.0, 4_000_000_000.0, 5_500_000_000.0, f64::NAN],
+            max_ceiling_hz: 5_000_000_000.0,
+        };
+        assert_eq!(per_core_clock_of(&freq), vec![0.25, 0.8, 1.0, 0.0]);
+        assert_eq!(
+            per_core_clock_of(&hytte_sensors::CpuFreq {
+                max_ceiling_hz: 0.0,
+                ..freq
+            }),
+            Vec::<f32>::new(),
+            "no governor, no per-core clock",
+        );
     }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1363,6 +1428,10 @@ mod tests {
         assert_eq!(snap.processes, None, "the /proc read_dir walk is gated");
         assert_eq!(snap.cpu_clock_hz, None, "the cpufreq sysfs walk is gated");
         assert_eq!(snap.cpu_clock_ceiling_hz, None, "…and so is its ceiling");
+        assert!(
+            snap.per_core_clock.is_empty(),
+            "…and the per-core clock (#1419 item 2)"
+        );
         assert_eq!(snap.disk_io, None, "the /proc/diskstats read is gated");
     }
 

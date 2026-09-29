@@ -2512,8 +2512,8 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       systemd's failed units or the shell's task supervisor — #1251; the
       **Top apps** rows arrived with #1419 item 3, see below); no per-core LED panel (its native
       widget is not on the wire, #1156, and the only wire lamp is a preem
-      one); no per-core expansion of the CPU and Clock lines (one line per
-      node); the value column's text starts at the column's left edge rather
+      one; the CPU and Clock lines' per-core expansion arrived with #1419
+      item 2, see below); the value column's text starts at the column's left edge rather
       than ending at its right (a wire label cannot be right-aligned); the
       Disk expander's header is a flat button rather than an `AdwExpanderRow`
       row (same height and inset, but it highlights on hover like a button);
@@ -2569,6 +2569,30 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       **sidebar** instance (`trollshell-plugin-stats-side`) publishes no
       page, so there is no dialog to open for it: its process must stay
       idle whatever the bar's page does.
+- [ ] **(#1419 item 2)** **The CPU and Clock rows expand to one line per
+      core, like the native ones.** Needs a shell and a plugin built from
+      #1438 or later (the graph is a negotiated generation-9 node). Open the
+      page from a stats chip. The CPU card's `CPU [line] 42%` and
+      `Clock [line] 3.8 GHz` rows each end in a `›` chevron. Click the CPU
+      row: its line gives way to a `Per-core history … N cores · 42%`
+      header over a graph with one coloured line per core, and the chevron
+      turns down. The graph is a minute wide at once, not one sample (the
+      plugin fills the per-core windows whether a row is open or not, as
+      the native service does). Click again: back to the single line. The
+      Clock row does the same (`Per-core clock … N cores · 3.8 GHz`, each
+      core's clock over the highest `cpuinfo_max_freq`). Now open the
+      **native** Stats page from the native chips and expand its two rows
+      on the same machine: the same core counts, the same hues in the same
+      order (core 0 red, then round the colour wheel), the same shape of
+      load and the same clock ceiling — give or take the second between the
+      two samplers. Close the plugin's page (a chip re-click or `Esc`) and
+      reopen it: both rows are collapsed again, as native's are on every
+      open. Expected differences: each row is a flat button, so it
+      highlights on hover and its value reads in the button's bold weight,
+      as the Disk and Top apps headers already do; and the chevron sits
+      12 px in from the card's edge rather than flush with it. Against an
+      older shell (generation 8 or below) there are no chevrons and a click
+      on the rows does nothing: the page is exactly the #1252 page.
 - [ ] **(#1252)** **An older shell still gets a working page.** Against a
       shell built before this change (generation 6), the page must still
       open with the same two columns, and each history line must be a slim

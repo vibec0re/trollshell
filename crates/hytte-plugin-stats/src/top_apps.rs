@@ -11,49 +11,41 @@
 //! ranking and the six-row cap are the native page's, not a second
 //! implementation that agrees by coincidence.
 //!
-//! # What gates the walk: an open list, not the page
+//! # What gates the walk: the page, as native (#1427)
 //!
 //! The walk is the heaviest read this plugin makes — two or three small files
-//! per PID, hundreds of PIDs — so it must not run while nobody is looking. The
-//! native poller parks while the Stats drawer is hidden. **This plugin cannot
-//! see its page's visibility**: the host tells a plugin when its *mount
-//! surface* shows or hides (`SlotVisibility`, which for a bar mount is a
-//! constant `true`), but not when the drawer opens or closes on its page. A
-//! chip click toggles the drawer, and Esc or a click outside closes it, and
-//! none of that reaches the plugin. Growing the wire a panel-visibility push is
-//! a protocol change, and out of scope here.
-//!
-//! So the gate is the one piece of page state the plugin *does* hold: the two
-//! lists' expander flags (the wire's `Node::Expander` is plugin-driven, so the
-//! plugin is the only place they live). The walker runs while **either list is
-//! expanded** and parks the moment both are collapsed. What that buys and costs
-//! against the native page:
-//!
-//! - **Collapsed, which is the default, walks nothing at all** — cheaper than
-//!   native, which walks for as long as the drawer is open. That holds only
-//!   until the first expand; see the known cost below.
-//! - **The collapsed header's summary reads `—` while nothing is being
-//!   measured.** Native shows the heaviest app beside the chevron even when
-//!   the list is collapsed; here the summary only carries a name while one of
-//!   the two lists is open (either one — both lists come out of the same
-//!   walk). Showing the last reading instead would be showing a number
-//!   nobody is measuring any more as if it were live.
-//!
-//! ## Known cost: a list left open keeps walking after the drawer closes
-//!
-//! The expander state lives in the plugin and survives the drawer closing, so
-//! the ordinary path — expand a list, close the drawer with Esc or a click
-//! outside — leaves the walker running every [`POLL`] until that list is
-//! collapsed again or the plugin restarts. Native parks this same walk
-//! whenever its Stats page is off screen (#50). Every such walk also changes
-//! the page, so the plugin sends a render frame nobody is looking at.
-//!
+//! per PID, hundreds of PIDs — so it must not run while nobody is looking.
 //! Measured by the #1426 review (`sample_proc`, release build, one pinned
 //! core, median of 30 walks): 12.8 ms a walk at 341 processes, 23 ms at 638,
 //! 47 ms at 1240 — about **1.2 % of a core** at ~640 processes on the 2 s
-//! cadence, and 2.4 % at ~1240. This PR does not fix it: the fix is the host
-//! telling the plugin when its page is on screen, `PageVisible`, which is
-//! #1427. Until that lands, this cost is accepted, not hidden.
+//! cadence, and 2.4 % at ~1240.
+//!
+//! The native poller walks exactly while the Stats drawer page is on screen
+//! (`app_usage::set_active`, wired to `modal::stats_visible_signal` in the
+//! shell's `main.rs`, #50) and parks the rest of the time. This plugin does the
+//! same: it subscribes `StateKey::PageVisible`, the host tells it through
+//! `Plugin::page_visible` whenever its **own page** opens or closes — a chip
+//! click, `Esc`, a click outside, another page replacing it, a dialog
+//! dismissed, a monitor unplugged — and the reducer forwards that one bool to
+//! this walker's gate. Nothing else opens it: not the bar chips (which are
+//! always on screen), and not the two lists' expanders.
+//!
+//! Why the page alone, and not "the page **and** a list expanded": both lists
+//! come out of one walk, and the collapsed headers show the heaviest app's
+//! `name · value` beside the chevron — native does, and keeps it live for as
+//! long as the drawer is open. A walker that ran only for an expanded list
+//! would leave both headers reading `—` on every visit that does not expand
+//! one, which is the one thing #1426 could not match. Page-only also costs no
+//! more than native: the walker parks on the same edge native's does.
+//!
+//! A sidebar instance publishes no page today (its card is not a click
+//! target), so the host only ever tells it `false` and its walker never runs.
+//! It still forwards the push, so the day its card opens a page the gate
+//! already follows it.
+//!
+//! When the page closes the reducer drops the lists, so a reopen never shows a
+//! reading taken before the close; a walk already in flight at the close is
+//! dropped when it lands (the gate never cancels one).
 //!
 //! # A CPU share needs two walks
 //!
@@ -64,23 +56,24 @@
 //! first after the gate opens) it publishes the RAM list but **withholds the
 //! CPU list**, the same rule `sample.rs`'s `cpu_half` follows for the CPU
 //! headline (#1277 MEDIUM 3): every share on a cold walk is `0`, a measurement
-//! it never made. The baseline is dropped when the gate reopens (#1277 LOW 4's
-//! rule), so the first CPU list after a reopen is a share over a fresh window
-//! rather than the mean over however long the lists were shut.
+//! it never made. The baseline is dropped when the page reopens (#1277 LOW
+//! 4's rule), so the first CPU list after a reopen is a share over a fresh
+//! window rather than the mean over however long the page was shut. (Native
+//! keeps its baseline across a close, so its first list after a reopen is
+//! that mean.)
 //!
-//! ## Known wrinkle: a quick close and reopen
+//! ## A quick close and reopen keeps its baseline
 //!
-//! The same rule applies to a close and reopen within one walk (a
-//! double-click on the header). The CPU list then reads `—` for about 2 s,
-//! even though the baseline it dropped was at most 2 s old. If a walk was in
-//! flight across the close, its rows land after the reopen and the cold walk
-//! then blanks them, so the list goes rows → `—` → rows. This is left as is,
-//! deliberately (#1426 review, NIT 8). Keeping a young baseline needs the
-//! loop to know how long the list was closed. Carrying the rows over a cold
-//! walk needs a limit on how many cold walks in a row it may bridge.
-//! Otherwise a reading nobody took could stay on screen. Either is new
-//! timing state in code this plugin's reopen correctness rests on, for a 2 s
-//! cosmetic gap.
+//! Closing the page and reopening it within a couple of walks — a second chip
+//! click, `Esc` and straight back — used to drop a baseline at most one walk
+//! old, so the CPU list read `—` for a whole [`POLL`] (#1426 review, NIT 8).
+//! Now the gated loop keeps a baseline whose read started less than
+//! [`KEEP_BASELINE`] before the reopen, so that reopen's first walk is warm:
+//! both lists fill as soon as it lands. A delta from such a baseline is a real
+//! reading over a window at most twice the usual one — not a mean over a long
+//! close, which is what the re-baseline exists to prevent. Past
+//! [`KEEP_BASELINE`] the reopen re-baselines as before. The age lives in the
+//! loop (`crate::sample`'s `drive`), which already sees every read.
 //!
 //! # Names: the desktop entry's, as native shows them (#1428)
 //!
@@ -131,6 +124,12 @@ use crate::sample::Sample;
 /// sensors' cadence there, since the walk reads files per PID rather than one
 /// aggregate file.
 pub const POLL: Duration = Duration::from_secs(2);
+
+/// How young a baseline must be to survive a page reopen: two walks' worth of
+/// [`POLL`]. A reopen within this long of the last walk's start keeps it, so
+/// the reopen's first walk publishes a CPU list; an older one is dropped and
+/// that walk is cold (see the [module docs](self)).
+pub const KEEP_BASELINE: Duration = Duration::from_secs(POLL.as_secs() * 2);
 
 /// One walk's two ranked lists — at most [`app_usage::TOP_N`] rows each,
 /// heaviest first, each app row's `name` already its desktop entry's display

@@ -7,9 +7,10 @@
 //! Two tests, for two different claims:
 //!
 //! * [`a_call_fired_the_moment_the_unique_name_appears_is_answered`] — the
-//!   window is closed. A peer races a call at every new connection and the
-//!   connection's runtime is held busy until that call is in its socket, which
-//!   is the schedule under which the old `begin_dispatching` lost it.
+//!   window is closed. A peer races a call at every new connection, the
+//!   connection's runtime is held busy until that call is in its socket — the
+//!   schedule under which the old `begin_dispatching` lost it — and the object
+//!   the call is for is exported either at once or only after it is answered.
 //! * [`the_pooled_connections_serve_ready_on_both_buses`] — the placeholder is
 //!   on the connections production actually builds: the real `session()` and
 //!   `system()` singletons, on their first connect and after a reconnect,
@@ -33,7 +34,8 @@ use zbus::zvariant::OwnedValue;
 
 // ── The race ──────────────────────────────────────────────────────────────────
 
-/// How many fresh connections the peer races per run.
+/// How many fresh connections the peer races per run: half with the export
+/// started before the call lands, half after (see [`exports_first`]).
 const RACE_ITERATIONS: u32 = 20;
 
 /// How long the raced call may go unanswered before it counts as **dropped**.
@@ -45,7 +47,7 @@ const RACE_ITERATIONS: u32 = 20;
 /// the exact thing this test exists to catch.
 const DROP_BUDGET: Duration = Duration::from_secs(10);
 
-/// Where the connection under test exports [`Raced`] right after it is built.
+/// Where the connection under test exports [`Raced`].
 const RACED_PATH: &str = "/mov/vibec0re/test/Raced";
 const RACED_IFACE: &str = "mov.vibec0re.test.Raced";
 
@@ -58,6 +60,30 @@ impl Raced {
     fn hello(&self) -> String {
         "world".to_string()
     }
+}
+
+/// Whether round `round` starts its export **before** the raced call lands
+/// (odd rounds) or only once that call has been answered (even rounds).
+///
+/// The two shapes catch the two ways the window can come back:
+///
+/// * **Export first** is the shape the issue names — a peer calls an object
+///   the connection exports immediately after it is built. It catches the tree
+///   before #1423, where `begin_dispatching` kicked the dispatch task onto the
+///   connection's own runtime: held still, that task is queued behind the
+///   socket reader, which reads the call first and drops it.
+/// * **Export after** leaves nothing mounted when the call lands, so only the
+///   way the connection was *built* can have given it a consumer. It catches
+///   the barrier removed with nothing put back. The export-first shape only
+///   catches that by luck: there the export's supervisor, on the hytte
+///   runtime, creates the object server while the owner is held, and it
+///   usually wins (measured with `test_support::connect` bypassing
+///   `build_pooled`: red in 5 of 40 runs with export-first rounds alone).
+///
+/// In both shapes the fixed tree answers every call: `Hello` if the export was
+/// already mounted, `UnknownObject` from the connection itself if not.
+const fn exports_first(round: u32) -> bool {
+    round % 2 == 1
 }
 
 /// What the connection under test did with the peer's first call.
@@ -73,8 +99,21 @@ enum FirstCall {
     Dropped,
 }
 
-/// The owner's side of one race: build a pooled connection, export on it at
-/// once, then hold its runtime until the peer's call is in its socket.
+/// What the peer tells the owner as a round goes on.
+#[derive(Debug)]
+enum Verdict {
+    /// The raced call was answered. An export-after round starts its export
+    /// now.
+    Answered,
+    /// The export is served; the round is over. `true` if another follows.
+    Settled(bool),
+    /// A call was dropped: the test is failing, stop building connections.
+    Stop,
+}
+
+/// The owner's side of the race: per round, build a pooled connection, maybe
+/// export on it at once, then hold its runtime until the peer's call is in its
+/// socket.
 ///
 /// Runs on its **own current-thread runtime** on its own thread, so every task
 /// zbus spawns for the connection — its socket reader and, before #1423, the
@@ -91,7 +130,7 @@ enum FirstCall {
 fn own_and_export(
     address: &str,
     fired: &std_mpsc::Receiver<()>,
-    mut settled: mpsc::UnboundedReceiver<bool>,
+    mut verdicts: mpsc::UnboundedReceiver<Verdict>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -99,12 +138,14 @@ fn own_and_export(
         .expect("owner runtime");
     runtime.block_on(async move {
         let mut keep = Vec::new();
-        for _ in 0..RACE_ITERATIONS {
-            // The production build path (`build_pooled`), then straight into an
-            // export — nothing between them yields to this runtime.
+        for round in 1..=RACE_ITERATIONS {
+            // The production build path (`build_pooled`), then — in an
+            // export-first round — straight into an export. Nothing between
+            // them yields to this runtime.
             let conn = common::connect(address).await;
             let shared = SharedConnection::for_test_session(conn);
-            let handle = export_object_with(&shared, RACED_PATH).start(Raced);
+            let mut export =
+                exports_first(round).then(|| export_object_with(&shared, RACED_PATH).start(Raced));
 
             // The hold. Blocking, not awaiting: this runtime must not run a
             // single task until the peer's call has reached our socket.
@@ -112,10 +153,25 @@ fn own_and_export(
                 .recv_timeout(PROBE_BUDGET)
                 .expect("the peer never fired at this connection");
 
-            let more = settled.recv().await.expect("the peer went away mid-race");
-            keep.push((shared, handle));
-            if !more {
+            let verdict = verdicts.recv().await.expect("the peer went away mid-race");
+            if matches!(verdict, Verdict::Stop) {
+                keep.push((shared, export));
                 break;
+            }
+            assert!(
+                matches!(verdict, Verdict::Answered),
+                "round {round}: expected the peer's first verdict, got {verdict:?}"
+            );
+            if export.is_none() {
+                export = Some(export_object_with(&shared, RACED_PATH).start(Raced));
+            }
+
+            let verdict = verdicts.recv().await.expect("the peer went away mid-race");
+            keep.push((shared, export));
+            match verdict {
+                Verdict::Settled(true) => {}
+                Verdict::Settled(false) | Verdict::Stop => break,
+                Verdict::Answered => panic!("round {round}: the peer answered twice"),
             }
         }
         // Let the export supervisors unmount while this runtime still drives
@@ -238,29 +294,25 @@ async fn hello_is_served(peer: &zbus::Connection, target: &UniqueName<'_>) -> bo
 }
 
 /// A method call fired at a pooled connection the moment its unique name
-/// appears on the bus — at an object the connection exports immediately after
-/// it is built — is **answered**, every time, however late the connection's
-/// runtime gets round to reading it (#1423).
+/// appears on the bus is **answered**, every time, however late the
+/// connection's runtime gets round to reading it (#1423).
 ///
 /// Each of [`RACE_ITERATIONS`] rounds: the owner thread builds a connection
-/// through `common::connect` (i.e. `build_pooled`, the production build path),
-/// wraps it in a `SharedConnection` and starts an `export_object` on it in the
-/// same breath; the peer, watching `NameOwnerChanged`, fires `Hello` at the new
-/// unique name as soon as the broker announces it; and the owner's runtime is
-/// held still until that call is in the connection's socket (see
-/// [`own_and_export`]). The first call may land before the export is mounted —
-/// then the connection answers `UnknownObject` and the peer retries until it is
-/// served — but it must never go unanswered.
+/// through `common::connect` (i.e. `build_pooled`, the production build path)
+/// and wraps it in a `SharedConnection`; the peer, watching `NameOwnerChanged`,
+/// fires `Hello` at the new unique name as soon as the broker announces it; and
+/// the owner's runtime is held still until that call is in the connection's
+/// socket (see [`own_and_export`]). The object the call is for is exported
+/// either in the same breath as the build or only after the call is answered,
+/// alternating ([`exports_first`] has why both). The call may land before the
+/// export is mounted — then the connection answers `UnknownObject` and the
+/// peer retries until it is served — but it must never go unanswered.
 ///
-/// **Falsified** by the control tree #1423's PR measured: `build_pooled`
-/// without its `serve_at`, and `begin_dispatching` put back where it was. That
-/// is the tree before #1423, and it drops the raced call. What this test does
-/// *not* see is the barrier removed with nothing put back: then the export
-/// supervisor, running on the hytte runtime, is the first thing to create the
-/// object server, so its dispatch task runs there while the owner is held and
-/// the call finds it. `connection_basic.rs`'s
-/// `shared_connection_answers_method_calls_before_anything_is_exported` and
-/// the re-exec'd test below are what go red for that one.
+/// **Falsified** both ways [`exports_first`] names, as #1423's PR measured:
+/// the tree before #1423 (`build_pooled` without its `serve_at`,
+/// `begin_dispatching` put back) drops the raced call in round 1, every run;
+/// and `test_support::connect` bypassing `build_pooled` with nothing put back
+/// drops it in round 2, the first export-after round.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_fired_the_moment_the_unique_name_appears_is_answered() {
     let (_first, guard) = ephemeral_bus().await;
@@ -280,40 +332,53 @@ async fn a_call_fired_the_moment_the_unique_name_appears_is_answered() {
         .expect("subscribe to NameOwnerChanged");
 
     let (fired_tx, fired_rx) = std_mpsc::channel::<()>();
-    let (settled_tx, settled_rx) = mpsc::unbounded_channel::<bool>();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel::<Verdict>();
     let owner_address = address.clone();
-    let owner = std::thread::spawn(move || own_and_export(&owner_address, &fired_rx, settled_rx));
+    let owner = std::thread::spawn(move || own_and_export(&owner_address, &fired_rx, verdict_rx));
 
-    let mut served_first = 0u32;
-    let mut refused_first = Vec::new();
+    // First-call outcomes, for the failure message and the campaign line.
+    let mut first_calls: Vec<(u32, String)> = Vec::new();
     for round in 1..=RACE_ITERATIONS {
         let target = next_new_unique_name(&mut appeared).await;
         let first = race_one(&peer, &dbus, &target, &fired_tx).await;
-        match first {
+        let refused = match first {
             FirstCall::Dropped => {
-                let _ = settled_tx.send(false);
+                let _ = verdict_tx.send(Verdict::Stop);
                 let _ = tokio::task::spawn_blocking(move || owner.join()).await;
                 panic!(
-                    "round {round} of {RACE_ITERATIONS}: a Hello fired at {target} the \
-                     moment it appeared got no reply at all within {DROP_BUDGET:?}. \
-                     The connection read it before anything could consume it and zbus \
-                     dropped it — the window #1423's `Ready` barrier closes (#1011). \
-                     Earlier rounds: {served_first} served first time, refused first \
-                     time with {refused_first:?}"
+                    "round {round} of {RACE_ITERATIONS} (export {}): a Hello fired at \
+                     {target} the moment it appeared got no reply at all within \
+                     {DROP_BUDGET:?}. The connection read it before anything could \
+                     consume it and zbus dropped it — the window #1423's `Ready` \
+                     barrier closes (#1011). Earlier rounds' first calls: {first_calls:?}",
+                    if exports_first(round) {
+                        "first"
+                    } else {
+                        "after"
+                    },
                 );
             }
-            FirstCall::Served => served_first += 1,
+            FirstCall::Served => {
+                first_calls.push((round, "served".to_string()));
+                false
+            }
             FirstCall::Refused(name) => {
-                assert!(
-                    hello_is_served(&peer, &target).await,
-                    "round {round}: the connection answered the first call ({name}) \
-                     but never served the export within {PROBE_BUDGET:?}"
-                );
-                refused_first.push(name);
+                first_calls.push((round, name));
+                true
             }
+        };
+        verdict_tx
+            .send(Verdict::Answered)
+            .expect("owner went away mid-race");
+        if refused {
+            assert!(
+                hello_is_served(&peer, &target).await,
+                "round {round}: the connection answered the first call but never \
+                 served the export within {PROBE_BUDGET:?}"
+            );
         }
-        settled_tx
-            .send(round < RACE_ITERATIONS)
+        verdict_tx
+            .send(Verdict::Settled(round < RACE_ITERATIONS))
             .expect("owner went away mid-race");
     }
 
@@ -322,12 +387,23 @@ async fn a_call_fired_the_moment_the_unique_name_appears_is_answered() {
         .expect("join the owner thread")
         .expect("the owner thread panicked");
 
-    // Only visible under `--nocapture`: how often the raced call beat the
-    // export's mount, which is what a campaign reads to see the race was run.
+    // Only visible under `--nocapture`: how the raced calls were answered, by
+    // round shape — what a campaign reads to see the race was really run.
+    let count = |first: bool, served: bool| {
+        first_calls
+            .iter()
+            .filter(|(round, outcome)| {
+                exports_first(*round) == first && (outcome == "served") == served
+            })
+            .count()
+    };
     println!(
-        "race: {RACE_ITERATIONS} rounds, none dropped; first call served {served_first}, \
-         refused {} ({refused_first:?})",
-        refused_first.len()
+        "race: {RACE_ITERATIONS} rounds, none dropped; export first: served {}, refused {}; \
+         export after: served {}, refused {}",
+        count(true, true),
+        count(true, false),
+        count(false, true),
+        count(false, false),
     );
 }
 

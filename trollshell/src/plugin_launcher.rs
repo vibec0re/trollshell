@@ -6990,9 +6990,8 @@ mod tests {
             Ok(())
         }
 
-        fn fallback(&self, id: &str) -> anyhow::Result<()> {
+        fn fallback(&self, id: &str) {
             self.note(format!("fallback {id}"));
-            Ok(())
         }
 
         /// [`restart_all_via`] against this manager.
@@ -7005,7 +7004,10 @@ mod tests {
                 |r| std::future::ready(self.stop_unit(r.id)),
                 || std::future::ready(Ok(self.listing())),
                 |r| std::future::ready(self.relaunch(r.id)),
-                |r| std::future::ready(self.fallback(r.id)),
+                |r| {
+                    self.fallback(r.id);
+                    std::future::ready(Ok(()))
+                },
             )
             .await
         }
@@ -7187,7 +7189,10 @@ mod tests {
             answered,
             [
                 ("a", Ok(())),
-                ("b", Err("StopUnit for plugin b: no user manager".to_owned())),
+                (
+                    "b",
+                    Err("StopUnit for plugin b: no user manager".to_owned())
+                ),
                 ("c", Ok(())),
             ]
         );

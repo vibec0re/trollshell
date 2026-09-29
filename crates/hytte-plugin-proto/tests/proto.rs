@@ -1268,9 +1268,11 @@ fn the_multi_sparkline_clamp_keeps_each_series_newest_samples() {
 /// `MAX_MULTI_SPARKLINE_POINTS / series` — a uniform cut, so the lines keep a
 /// common time span — and exactly at the cap nothing is cut.
 ///
-/// **Falsified** by `>=` in place of `>` in `multi_sparkline_keep` (the
-/// 64-by-1024 graph, exactly at the cap, is cut), or by trimming only the
-/// longest series (the uneven case keeps a 700-sample line whole).
+/// **Falsified** by `>=` in place of `>` in `multi_sparkline_keep` (the uneven
+/// graph exactly at the cap has its full line cut — a mutation the first
+/// version of this test, with only even full lines at the boundary, let
+/// survive), or by trimming only the longest series (the uneven case past the
+/// cap keeps a 700-sample line whole).
 #[test]
 fn the_point_cap_trims_every_series_evenly() {
     // Exactly at the cap: 64 full lines.
@@ -1284,6 +1286,23 @@ fn the_point_cap_trims_every_series_evenly() {
         MAX_SPARKLINE_SAMPLES,
         "at the cap is not past it",
     );
+    // …and exactly at the cap with UNEVEN lines, where "at" and "past" give
+    // different answers: one full line and 64 of 1008 samples is 65 536 on
+    // the nose, so nothing is cut — `>=` would cut the full line to
+    // 65 536 / 65 = 1008. (Full lines alone cannot tell the two apart: at 64
+    // of them the even share *is* the per-series cap.)
+    let mut at_cap = numbered_series(1, MAX_SPARKLINE_SAMPLES);
+    at_cap.extend(numbered_series(64, 1008));
+    assert_eq!(
+        at_cap.iter().map(Vec::len).sum::<usize>(),
+        MAX_MULTI_SPARKLINE_POINTS,
+        "precondition: exactly the point cap",
+    );
+    assert_eq!(multi_sparkline_keep(&at_cap), MAX_SPARKLINE_SAMPLES);
+    let Node::MultiSparkline { series, .. } = multi(at_cap.clone(), None).clamped() else {
+        unreachable!()
+    };
+    assert_eq!(series, at_cap, "a graph exactly at the cap is left whole");
 
     // One series past it: 65 full lines keep 65 536 / 65 = 1008 each.
     let keep = MAX_MULTI_SPARKLINE_POINTS / 65;

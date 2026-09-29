@@ -137,15 +137,16 @@ pub(crate) fn resolve() -> Route {
     resolve_control_center(lookup_desktop_entry, move |_| Some(bin.clone()))
 }
 
-/// [`gio::AppInfo::all`] scan for `id`, the same idiom
+/// [`gio::AppInfo::all`] scan for `id`, through
+/// `components::desktop_entry::listed` — the one lookup by id that
 /// `components::desktop_entry::activate` and `widgets::calendar`'s
-/// `launch_gnome_calendar` already use for the same `gio::DesktopAppInfo`
-/// gap — see the module doc. [`resolve`]'s doc records why this scan is
-/// skipped whenever [`which`] already answered `None` for [`BINARY`].
+/// `launch_gnome_calendar` share for the same `gio::DesktopAppInfo` gap (see
+/// the module doc), and which skips a desktop file whose name is not UTF-8
+/// rather than panicking a debug build on it (#1441). [`resolve`]'s doc
+/// records why this scan is skipped whenever [`which`] already answered
+/// `None` for [`BINARY`].
 fn lookup_desktop_entry(id: &str) -> Option<gio::AppInfo> {
-    gio::AppInfo::all()
-        .into_iter()
-        .find(|info| info.id().is_some_and(|found| found == id))
+    crate::components::desktop_entry::listed(id)
 }
 
 /// `name` resolved to an absolute path on `$PATH`: the first directory entry
@@ -420,5 +421,52 @@ mod tests {
             &["/usr/bin/trollshell-control-center".to_owned()],
             "the resolved binary path is the whole argv after --"
         );
+    }
+
+    const LOOKUP_CHILD: &str = "TROLLSHELL_COMPANION_1441_LOOKUP_CHILD";
+    const LOOKUP_CHILD_OK: &str = "companion-1441-lookup-child-reached-the-end";
+
+    /// **#1441: the desktop-entry route's lookup skips a desktop file whose
+    /// name is not UTF-8.** Next to one named `ts-\xff\xfe.desktop`, the
+    /// installed [`super::DESKTOP_ID`] entry is still found, and an id nothing
+    /// installs walks every listed entry and answers `None` — where the old
+    /// `info.id()` walk panicked a debug build in glib-rs's UTF-8
+    /// `debug_assert!`.
+    ///
+    /// Falsified by putting that walk back in `lookup_desktop_entry` (the miss
+    /// panics in the child), and by `desktop_entry::utf8_id` calling `id()`
+    /// unchecked (the same).
+    #[test]
+    fn the_desktop_entry_lookup_skips_a_file_name_that_is_not_utf8() {
+        let f = crate::components::app_meta::test_support::Fixture::new();
+        f.non_utf8_entry();
+        f.program(super::BINARY);
+        f.entry(
+            super::DESKTOP_ID,
+            "[Desktop Entry]\nType=Application\nName=Control Center\nExec=trollshell-control-center\n",
+        );
+        f.run_child(
+            "companion::tests::the_desktop_entry_lookup_skips_a_file_name_that_is_not_utf8_inner",
+            LOOKUP_CHILD,
+            LOOKUP_CHILD_OK,
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn the_desktop_entry_lookup_skips_a_file_name_that_is_not_utf8_inner() {
+        use hytte::gtk::prelude::*;
+        if std::env::var_os(LOOKUP_CHILD).is_none() {
+            return;
+        }
+        crate::components::app_meta::test_support::Fixture::assert_gio_lists_the_non_utf8_entry();
+        assert!(
+            super::lookup_desktop_entry("ts-1441-not-installed.desktop").is_none(),
+            "an id nothing installs is a miss"
+        );
+        let found = super::lookup_desktop_entry(super::DESKTOP_ID)
+            .map(|app| app.display_name().to_string());
+        assert_eq!(found.as_deref(), Some("Control Center"));
+        println!("{LOOKUP_CHILD_OK}");
     }
 }

@@ -47,7 +47,7 @@ use hytte_preem::{LedMatrix, palette_snapshot};
 // The app-id → desktop-entry resolver used to live in this file; #1071 moved it
 // to `components/` when the Workspaces page became a second consumer. Imported
 // back under its original names so every call site below reads unchanged.
-use crate::components::app_meta::{AppMeta, fallback_icon, resolve_app_meta};
+use crate::components::app_meta::{AppMeta, fallback_icon, resolve_app_meta, resolve_app_metas};
 use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
@@ -764,6 +764,15 @@ fn rebuild_top_apps(
     for row in rows_track.take() {
         expander.remove(&row);
     }
+    // #1441: every app id in `list`, resolved together — one desktop-entry
+    // scan for all the ids the cache lacks, where the summary's and each
+    // row's own lookups would scan once per unseen id. Those lookups are then
+    // all cache hits. A statement of its own, so the `RefMut` is gone before
+    // any widget is touched (#643/#663/#832).
+    resolve_app_metas(
+        list.iter().filter_map(|s| s.app_id.as_deref()),
+        &mut meta_cache.borrow_mut(),
+    );
     // Collapsed summary: the heaviest entry's display name, or an em-dash.
     let subtitle = list.first().map_or_else(
         || "\u{2014}".to_string(),
@@ -4063,5 +4072,84 @@ mod stats_grid_tests {
         gpu.set_visible(true);
         assert_eq!(cell(&grid, disks).0, 1, "Disks must return to column 1");
         assert_eq!(occupied(&grid, &cards, 1), vec![0, 1]);
+    }
+}
+
+/// #1441: what one "Top apps" rebuild costs in desktop-entry scans.
+///
+/// Needs a display for the same reason [`reentrancy_tests`] does — the rows
+/// are real `adw`/`gtk` widgets — hence the `system-tests` gate. Every lookup
+/// goes to an installed fixture (`app_meta::test_support`), so no test here
+/// reads the host's desktop entries.
+#[cfg(all(test, feature = "system-tests"))]
+mod top_apps_scan_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw;
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+
+    use super::{TOP_APPS_TITLE_CHARS, fixed_width_label, rebuild_top_apps};
+    use crate::components::app_meta::test_support::{self, Fixture};
+
+    fn sample(app_id: Option<&str>) -> ProcSample {
+        ProcSample {
+            name: "proc".to_owned(),
+            app_id: app_id.map(str::to_owned),
+            cpu_frac: 0.5,
+            mem_bytes: 1024,
+            procs: 1,
+        }
+    }
+
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// **One rebuild costs one desktop-entry scan**, however many unseen app
+    /// ids the list carries — twelve here, plus the "System" bucket, which
+    /// has none — and a rebuild of the same list costs none. The collapsed
+    /// summary, the first lookup a rebuild makes, is a hit too.
+    ///
+    /// Falsified by deleting the `resolve_app_metas` call in
+    /// [`rebuild_top_apps`] (the summary's and each row's own lookups scan for
+    /// their unseen ids: 12 ≠ 1), and by moving it below the summary (2 ≠ 1).
+    #[gtk::test]
+    fn a_top_apps_rebuild_resolves_every_app_id_in_one_scan() {
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        f.program("ts-top-1441");
+        f.entry(
+            "ts-top-1441-a.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS Top A\nExec=ts-top-1441\n",
+        );
+        let _installed = f.install();
+
+        let expander = adw::ExpanderRow::builder().title("Top apps").build();
+        let summary = fixed_width_label(TOP_APPS_TITLE_CHARS);
+        let rows: Rc<RefCell<Vec<gtk::ListBoxRow>>> = Rc::new(RefCell::new(Vec::new()));
+        let meta = Rc::new(RefCell::new(HashMap::new()));
+        let collapsed = Rc::new(Cell::new(false));
+        let mut list: Vec<ProcSample> = std::iter::once(sample(Some("ts-top-1441-a")))
+            .chain((1..12).map(|n| sample(Some(&format!("no-such-top-app-1441-{n}")))))
+            .chain([sample(None)])
+            .collect();
+        let rebuild = |list: &[ProcSample]| {
+            rebuild_top_apps(&expander, &summary, &rows, &meta, &collapsed, cpu_value, list);
+        };
+
+        rebuild(&list);
+        assert_eq!(test_support::scans(), 1, "twelve unseen app ids, one scan");
+        assert_eq!(summary.text().as_str(), "TS Top A \u{00b7} 50%");
+        assert_eq!(rows.borrow().len(), list.len());
+
+        rebuild(&list);
+        assert_eq!(test_support::scans(), 1, "a rebuild of the same list scans nothing");
+
+        list.push(sample(Some("ts-top-1441-late")));
+        rebuild(&list);
+        assert_eq!(test_support::scans(), 2, "one new id, one more scan");
     }
 }

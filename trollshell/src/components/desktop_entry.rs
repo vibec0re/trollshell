@@ -43,6 +43,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use hytte::gtk::{gio, glib, prelude::*};
@@ -393,16 +395,87 @@ pub(crate) fn strip_field_codes(words: &[String]) -> Vec<String> {
 /// # Errors
 /// A missing entry, or whatever GIO said about the launch.
 pub(crate) fn activate(id: &str) -> Result<(), String> {
-    let wanted = format!("{id}.desktop");
-    let found = gio::AppInfo::all()
-        .into_iter()
-        .find(|info| info.id().is_some_and(|got| got == wanted.as_str()));
-    match found {
+    match listed(&format!("{id}.desktop")) {
         Some(info) => info
             .launch(&[], gio::AppLaunchContext::NONE)
             .map_err(|e| format!("activating {id}: {e}")),
         None => Err(format!("{id} has no desktop entry to activate")),
     }
+}
+
+/// The entry `gio::AppInfo::all()` lists under exactly `desktop_id`
+/// (`.desktop` included), or `None`.
+///
+/// The one gio lookup by id the shell has: [`activate`], `companion`'s desktop
+/// entry and `widgets::calendar`'s gnome-calendar launch each used to spell it
+/// out as `all().find(|info| info.id() == …)`, and each walked every listed
+/// entry's `id()` on a miss — so each could panic a debug build on a file name
+/// that is not UTF-8. This asks [`utf8_id`] instead (#1441).
+pub(crate) fn listed(desktop_id: &str) -> Option<gio::AppInfo> {
+    gio::AppInfo::all()
+        .into_iter()
+        .find(|info| utf8_id(info).is_some_and(|id| id == desktop_id))
+}
+
+/// `info`'s desktop-file id, or `None` when it has none — **or when the id is
+/// not UTF-8** (#1441).
+///
+/// # Why not `info.id()`
+///
+/// gio-rs converts `g_app_info_get_id`'s `const char *` with `from_glib_none`,
+/// which only `debug_assert!`s that the bytes are UTF-8
+/// (`glib-0.22.5/src/gstring.rs:650`). A debug build panics — inside a GTK
+/// callback, which aborts the shell — and a release build hands back a
+/// `GString` whose `&str` is not UTF-8. GIO lists a desktop file whatever its
+/// name's bytes, and its id is built from exactly those bytes: the path below
+/// `<data dir>/applications/`, each directory joined on with a `-`
+/// (`get_apps_from_dir`, `gio/gdesktopappinfo.c:769-807` in the `GLib` the
+/// shell links, 2.88.3). A file named `ts-\xff\xfe.desktop` is enough (the
+/// #1439 review's L4). Every safe spelling of the id goes through that same
+/// conversion, and the workspace forbids the `unsafe` a raw read would need.
+///
+/// # What it checks instead
+///
+/// The entry's **file name**, the `GDesktopAppInfo` `filename` property,
+/// which glib-rs hands over as a `PathBuf` — raw bytes, never checked as UTF-8
+/// (`c_to_path_buf`, `glib-0.22.5/src/translate.rs:1735-1744`). `id()` is
+/// called only once every component the id is made of is valid UTF-8, i.e.
+/// when [`id_is_utf8`] says so. An entry with no file name to check — not a
+/// `GDesktopAppInfo`, which `all()` never lists on Unix — is skipped too, as
+/// is any other entry whose id this cannot vouch for.
+///
+/// The resolver the shell names apps with (`hytte_sensors::desktop_entry`)
+/// skips the same files, for the same reason; this is the gio half.
+pub(crate) fn utf8_id(info: &gio::AppInfo) -> Option<glib::GString> {
+    if !info.has_property_with_type("filename", String::static_type()) {
+        return None;
+    }
+    let filename: Option<PathBuf> = info.property("filename");
+    if !id_is_utf8(&filename?) {
+        return None;
+    }
+    info.id()
+}
+
+/// Whether the desktop-file id GIO derives from `filename` is UTF-8: every
+/// component after the path's **first** one named `applications`, or every
+/// component when there is none.
+///
+/// GIO's id is the components below `<data dir>/applications/`. That
+/// directory is the first `applications` component or a later one, so the
+/// id's components are always among the ones checked, whatever the data dir
+/// is called. A data dir whose own path is not UTF-8 costs nothing; the one
+/// false refusal left is a non-UTF-8 directory *between* two `applications`
+/// components, which no real search path has.
+fn id_is_utf8(filename: &Path) -> bool {
+    let components: Vec<&OsStr> = filename.iter().collect();
+    let below = components
+        .iter()
+        .position(|component| *component == "applications")
+        .map_or(0, |at| at + 1);
+    components[below..]
+        .iter()
+        .all(|component| component.to_str().is_some())
 }
 
 /// One row the **Add app** picker can offer (#1071 §5).
@@ -432,7 +505,8 @@ pub(crate) struct PickerEntry {
 /// Reads `gio::AppInfo::all()`, so it must run on the GTK main thread — and it
 /// deliberately does **not** filter: [`filtered`] does, from plain data, where a
 /// test can see it happen. Entries with no id at all are dropped here, since an
-/// id is the whole thing being picked.
+/// id is the whole thing being picked — and so is an entry whose id is not
+/// UTF-8, which could not be stored or matched anyway ([`utf8_id`], #1441).
 ///
 /// # Why it returns the cache too (review MEDIUM 6)
 ///
@@ -455,7 +529,11 @@ pub(crate) fn installed() -> (Vec<PickerEntry>, MetaCache) {
     {
         let mut cache = cache.borrow_mut();
         for info in all {
-            let Some(full_id) = info.id() else { continue };
+            // Not `info.id()`: that panics a debug build on a file name that
+            // is not UTF-8, and this walk reaches every listed entry (#1441).
+            let Some(full_id) = utf8_id(&info) else {
+                continue;
+            };
             let id = full_id.strip_suffix(".desktop").unwrap_or(full_id.as_str());
             if id.is_empty() {
                 continue;
@@ -508,10 +586,139 @@ pub(crate) fn filtered<'e>(entries: &'e [PickerEntry], query: &str) -> Vec<&'e P
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use hytte::gtk::prelude::*;
+
     use super::{
-        PickerEntry, exec_words, filtered, is_valid_bus_name, spellings, strip_field_codes,
-        try_exec_ok,
+        PickerEntry, activate, exec_words, filtered, id_is_utf8, installed, is_valid_bus_name,
+        listed, spellings, strip_field_codes, try_exec_ok,
     };
+    use crate::components::app_meta::test_support::Fixture;
+
+    /// **Which file names make a UTF-8 desktop-file id** (#1441): GIO's id is
+    /// the path below `<data dir>/applications/`, so the check covers every
+    /// component after the first `applications` — the file name and any
+    /// subdirectory — and not the data dir's own path.
+    ///
+    /// Falsified by checking only the file name (the subdirectory row), by
+    /// checking the whole path (the data-dir row), and by starting after the
+    /// **last** `applications` (the nested row, whose GIO id is
+    /// `\xff-applications-foo.desktop`).
+    #[test]
+    fn a_desktop_id_is_utf8_when_every_component_below_applications_is() {
+        for (bytes, utf8) in [
+            (&b"/usr/share/applications/firefox.desktop"[..], true),
+            (b"/usr/share/applications/kde4/konsole.desktop", true),
+            (b"/usr/share/applications/ts-\xff\xfe.desktop", false),
+            // A subdirectory is part of the id: `\xff-konsole.desktop`.
+            (b"/usr/share/applications/\xff/konsole.desktop", false),
+            // The data dir is not.
+            (b"/home/\xff/.local/share/applications/firefox.desktop", true),
+            (b"/x/applications/\xff/applications/foo.desktop", false),
+            // No `applications` component: all of it.
+            (b"/srv/\xff/ts.desktop", false),
+            (b"/srv/entries/ts.desktop", true),
+        ] {
+            let path = Path::new(OsStr::from_bytes(bytes));
+            assert_eq!(id_is_utf8(path), utf8, "{}", path.display());
+        }
+    }
+
+    const ACTIVATE_CHILD: &str = "TROLLSHELL_DESKTOP_ENTRY_1441_ACTIVATE_CHILD";
+    const ACTIVATE_CHILD_OK: &str = "desktop-entry-1441-activate-child-reached-the-end";
+
+    /// A fixture holding [`Fixture::non_utf8_entry`] and one valid entry,
+    /// `ts-1441-valid.desktop`.
+    fn non_utf8_fixture() -> Fixture {
+        let f = Fixture::new();
+        f.non_utf8_entry();
+        f.program("ts-1441-valid");
+        f.entry(
+            "ts-1441-valid.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS 1441 Valid\nExec=ts-1441-valid\n",
+        );
+        f
+    }
+
+    /// **#1441: `activate`'s lookup skips a desktop file whose name is not
+    /// UTF-8.** Next to one named `ts-\xff\xfe.desktop`, the valid entry is
+    /// still found by its id ([`listed`], the lookup `activate` runs), and an
+    /// id nothing installs walks every listed entry and fails as "no desktop
+    /// entry" — where the old `info.id()` walk panicked a debug build in
+    /// glib-rs's UTF-8 `debug_assert!`. No entry is launched.
+    ///
+    /// Falsified by putting that walk back in `activate` (the miss panics in
+    /// the child), and by [`super::utf8_id`] calling `id()` unchecked (the
+    /// same).
+    #[test]
+    fn activate_skips_a_desktop_file_whose_name_is_not_utf8() {
+        non_utf8_fixture().run_child(
+            "components::desktop_entry::tests::activate_skips_a_desktop_file_whose_name_is_not_utf8_inner",
+            ACTIVATE_CHILD,
+            ACTIVATE_CHILD_OK,
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn activate_skips_a_desktop_file_whose_name_is_not_utf8_inner() {
+        if std::env::var_os(ACTIVATE_CHILD).is_none() {
+            return;
+        }
+        Fixture::assert_gio_lists_the_non_utf8_entry();
+        let err = activate("ts-1441-not-installed").expect_err("nothing installs it");
+        assert!(err.contains("has no desktop entry"), "{err}");
+        let valid = listed("ts-1441-valid.desktop").map(|app| app.display_name().to_string());
+        assert_eq!(valid.as_deref(), Some("TS 1441 Valid"));
+        println!("{ACTIVATE_CHILD_OK}");
+    }
+
+    const INSTALLED_CHILD: &str = "TROLLSHELL_DESKTOP_ENTRY_1441_INSTALLED_CHILD";
+    const INSTALLED_CHILD_OK: &str = "desktop-entry-1441-installed-child-reached-the-end";
+
+    /// **#1441: the app picker's listing skips a desktop file whose name is
+    /// not UTF-8.** `installed` walks every listed entry, so next to one named
+    /// `ts-\xff\xfe.desktop` it must offer the valid entry — row and cache
+    /// both — and nothing else, rather than panicking a debug build.
+    ///
+    /// Falsified by putting `info.id()` back in `installed` (the child
+    /// panics), and by [`super::utf8_id`] calling `id()` unchecked (the same).
+    #[test]
+    fn installed_skips_a_desktop_file_whose_name_is_not_utf8() {
+        non_utf8_fixture().run_child(
+            "components::desktop_entry::tests::installed_skips_a_desktop_file_whose_name_is_not_utf8_inner",
+            INSTALLED_CHILD,
+            INSTALLED_CHILD_OK,
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn installed_skips_a_desktop_file_whose_name_is_not_utf8_inner() {
+        if std::env::var_os(INSTALLED_CHILD).is_none() {
+            return;
+        }
+        Fixture::assert_gio_lists_the_non_utf8_entry();
+        let (rows, cache) = installed();
+        let rows: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.name.as_str()))
+            .collect();
+        assert_eq!(rows, [("ts-1441-valid", "TS 1441 Valid")]);
+        let cache = cache.borrow();
+        assert_eq!(
+            cache
+                .get("ts-1441-valid")
+                .and_then(Option::as_ref)
+                .map(|meta| meta.display_name.as_str()),
+            Some("TS 1441 Valid")
+        );
+        assert_eq!(cache.len(), 1, "the non-UTF-8 entry has no cache slot");
+        println!("{INSTALLED_CHILD_OK}");
+    }
 
     /// Review LOW 9 / the reviewer's surviving **M9**: the lowercase retry is
     /// the one behaviour the module doc argues for at length, and `Alacritty` is

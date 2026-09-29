@@ -39,6 +39,27 @@
 //! it from the resolver's raw `Icon=` value by GIO's own rule, so no
 //! `AppInfo::all()` scan is left here at all.
 //!
+//! # One scan per page build (#1441)
+//!
+//! A lookup that misses the cache scans every `.desktop` file on the search
+//! path, synchronously, on the GTK main thread. [`resolve_app_meta`] alone
+//! does that once **per unseen app id**, so a Workspaces page with twelve
+//! apps nobody had looked up cost twelve full scans — measured at about
+//! 270 ms at 611 entries in a release build (#1439 review, L3). A page that
+//! knows every id it is about to render hands them all to
+//! [`resolve_app_metas`] first, which sends only the ids the cache lacks
+//! through **one** [`Resolver::resolve_all`], and the page's per-row
+//! [`resolve_app_meta`] calls are then all hits. The three pages that render
+//! app ids from a list — `panels::workspaces`' columns, `panels::stats`' Top
+//! apps and `panels::workspace_edit`'s app list — each do that once per
+//! rebuild. `components::app_picker` needs no batch: `desktop_entry::installed`
+//! seeds its cache from the one scan that lists the rows.
+//!
+//! The batch does not keep a [`Resolver`] alive between rebuilds. A resolver
+//! keeps its answers, not the entries it scanned, so a new id would scan again
+//! anyway; and one kept for the life of the cache (or the process) would keep
+//! answering from before an app was installed.
+//!
 //! # The environment
 //!
 //! The resolver reads this process's environment
@@ -86,9 +107,10 @@ impl AppMeta {
 /// with `None` meaning "scanned, no desktop entry" so a miss also costs at
 /// most one scan.
 ///
-/// This **is** the lookup's cache (#1432): [`resolve_app_meta`] builds a
-/// [`Resolver`] for each miss and drops it straight after, so the resolver's
-/// own cache never outlives the one answer copied into this map. It stays the
+/// This **is** the lookup's cache (#1432): [`resolve_app_meta`] and
+/// [`resolve_app_metas`] build a [`Resolver`] for each call that has a miss in
+/// it and drop it straight after, so the resolver's own cache never outlives
+/// the answers copied into this map. It stays the
 /// shell's own map rather than a `Resolver` for two reasons: it holds the
 /// built `gio::Icon`, a `GObject` the GTK-free resolver cannot, and callers
 /// seed it (`components::desktop_entry::installed` fills it from the picker's
@@ -118,39 +140,102 @@ pub(crate) type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
 /// re-parses every listed file on each call — and caches the answer, a miss
 /// included.
 ///
+/// A page rendering several app ids resolves them with [`resolve_app_metas`]
+/// first, so this is a hit for each of them (#1441).
+///
 /// See the module docs for the three layers and the environment.
 pub(crate) fn resolve_app_meta(
     app_id: &str,
     meta_cache: &mut HashMap<String, Option<AppMeta>>,
 ) -> Option<AppMeta> {
-    resolve_app_meta_in(app_id, meta_cache, Resolver::from_env)
+    resolve_app_meta_in(app_id, meta_cache, process_resolver)
 }
 
-/// [`resolve_app_meta`] through the [`Resolver`] that `resolver` hands over,
-/// which is called only on a cache miss and asked exactly once.
+/// Resolve every id in `app_ids` into `meta_cache` with **at most one scan**
+/// for all the ids it does not hold yet (#1441), so the caller's per-row
+/// [`resolve_app_meta`] calls that follow are all hits.
 ///
-/// Production passes [`Resolver::from_env`], so the resolver — and the
-/// environment read that builds it — exists only for a miss. A test passes a
-/// `&mut Resolver` over a fixture search path instead, and reads
-/// [`Resolver::scans`] afterwards: the count is then taken on the very
-/// resolver the lookup used, not inferred from how often something was
-/// asked for (#1439 review N2). The seam hands this function no `Env`, so
-/// it has nothing to build a second resolver from.
+/// Exactly [`resolve_app_meta`]'s semantics, for many ids at once: the same
+/// names and icons, a miss cached as `None`, and an id already in the cache
+/// never sent to the resolver — so a batch the cache already answers reads no
+/// environment and scans nothing. See the module docs for why a page calls
+/// this once per rebuild and does not keep a [`Resolver`] instead.
+///
+/// Takes the cache as `&mut`, like [`resolve_app_meta`]: call it as a
+/// statement of its own (`resolve_app_metas(ids, &mut cache.borrow_mut());`),
+/// never inside a GTK setter — [`MetaCache`]'s borrow discipline.
+pub(crate) fn resolve_app_metas<'a>(
+    app_ids: impl IntoIterator<Item = &'a str>,
+    meta_cache: &mut HashMap<String, Option<AppMeta>>,
+) {
+    resolve_app_metas_in(app_ids, meta_cache, process_resolver);
+}
+
+/// The resolver a production lookup scans with: [`Resolver::from_env`], over
+/// this process's environment.
+///
+/// Under `cfg(test)` a thread that installed a fixture
+/// (`test_support::Fixture::install`) gets a resolver over that fixture
+/// instead, and the build is counted (`test_support::scans`) — how a page's
+/// `#[gtk::test]` asks how many scans one rebuild cost without reading the
+/// host's desktop entries. The same shape as `plugins::preem_gl::arm`'s
+/// `TEST_ARM`. With no fixture installed, a test gets the real wrapper.
+fn process_resolver() -> Resolver {
+    #[cfg(test)]
+    if let Some(resolver) = test_support::installed_resolver() {
+        return resolver;
+    }
+    Resolver::from_env()
+}
+
+/// [`resolve_app_meta`] through the [`Resolver`] that `resolver` hands over —
+/// a batch of one, through [`resolve_app_metas_in`], so the single lookup and
+/// the batch are one code path.
 fn resolve_app_meta_in<R: BorrowMut<Resolver>>(
     app_id: &str,
     meta_cache: &mut HashMap<String, Option<AppMeta>>,
     resolver: impl FnOnce() -> R,
 ) -> Option<AppMeta> {
-    if let Some(cached) = meta_cache.get(app_id) {
-        return cached.clone();
+    resolve_app_metas_in([app_id], meta_cache, resolver);
+    meta_cache.get(app_id).cloned().flatten()
+}
+
+/// [`resolve_app_metas`] through the [`Resolver`] that `resolver` hands over,
+/// which is called only when some id misses the cache, and at most once.
+///
+/// Production passes [`process_resolver`], so the resolver — and the
+/// environment read that builds it — exists only for a batch with a miss in
+/// it. A test passes a `&mut Resolver` over a fixture search path instead,
+/// and reads [`Resolver::scans`] afterwards: the count is then taken on the
+/// very resolver the lookup used, not inferred from how often something was
+/// asked for (#1439 review N2). The seam hands this function no `Env`, so it
+/// has nothing to build a second resolver from.
+///
+/// Only the misses reach the resolver, once each: [`Resolver::resolve_all`]
+/// scans for all of them together, and the [`Resolver::resolve`] that copies
+/// each answer out is a hit in the resolver's own cache, so it scans nothing.
+fn resolve_app_metas_in<'a, R: BorrowMut<Resolver>>(
+    app_ids: impl IntoIterator<Item = &'a str>,
+    meta_cache: &mut HashMap<String, Option<AppMeta>>,
+    resolver: impl FnOnce() -> R,
+) {
+    let mut misses: Vec<&str> = app_ids
+        .into_iter()
+        .filter(|app_id| !meta_cache.contains_key(*app_id))
+        .collect();
+    if misses.is_empty() {
+        return;
     }
+    // An app on two cards is one id, and one answer to copy out.
+    misses.sort_unstable();
+    misses.dedup();
     let mut resolver = resolver();
-    let meta = resolver
-        .borrow_mut()
-        .resolve(app_id)
-        .map(AppMeta::from_entry);
-    meta_cache.insert(app_id.to_owned(), meta.clone());
-    meta
+    let resolver = resolver.borrow_mut();
+    resolver.resolve_all(misses.iter().copied());
+    for app_id in misses {
+        let meta = resolver.resolve(app_id).map(AppMeta::from_entry);
+        meta_cache.insert(app_id.to_owned(), meta);
+    }
 }
 
 /// A desktop entry's `Icon=` value as a `gio::Icon`, by GIO's own rule —
@@ -188,47 +273,100 @@ pub(crate) fn fallback_icon() -> gio::Icon {
     gio::ThemedIcon::new("application-x-executable-symbolic").upcast::<gio::Icon>()
 }
 
+/// The desktop-entry fixture shared by this module's tests, by the pages that
+/// batch their lookups through it (#1441) and by the shell's gio scans'
+/// non-UTF-8 tests (#1441 item 2).
+///
+/// Two ways in, and neither reads the host's desktop entries:
+///
+/// - **In process**, through the resolver's plain data: [`Fixture::env`]
+///   hands a test's own `Resolver` the fixture search path, and
+///   [`Fixture::install`] points every *production* lookup on the calling
+///   thread at it for as long as the guard lives, counting each resolver it
+///   builds ([`scans`]). That second one is how a page's `#[gtk::test]` asks
+///   how many scans one rebuild cost.
+/// - **In a child process**, through the real environment:
+///   [`Fixture::run_child`], for the tests that need GIO itself, or
+///   [`resolve_app_meta`](super::resolve_app_meta)'s real wrapper over
+///   `Env::from_process`. `std::env::set_var` is `unsafe` in edition 2024 and
+///   this workspace forbids `unsafe_code`, so the fixture is set on the
+///   **child** through the safe `Command::env` builder — the precedent is
+///   `hytte-plugin-stats::plugin::tests::settings_reads_the_real_process_environment`,
+///   and #1435 brought it here. No display is involved (`gio::AppInfo::all()`
+///   and the icon constructors are plain GIO). The child's data, config and
+///   `HOME` directories all sit under the fixture root.
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
+pub(crate) mod test_support {
+    use std::cell::{Cell, RefCell};
+    use std::ffi::OsStr;
+    use std::marker::PhantomData;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
-    use hytte::gtk::{gio, glib, prelude::*};
+    use hytte::gtk::{gio, prelude::*};
     use hytte_sensors::desktop_entry::{Env, Resolver};
 
-    use super::{AppMeta, icon_from_desktop_value, resolve_app_meta, resolve_app_meta_in};
+    /// [`Fixture::non_utf8_entry`]'s file name.
+    const NON_UTF8_NAME: &[u8] = b"ts-\xff\xfe.desktop";
+
+    thread_local! {
+        /// The search path this thread's production lookups scan instead of
+        /// the process environment's, while an [`Installed`] guard lives.
+        static INSTALLED: RefCell<Option<Env>> = const { RefCell::new(None) };
+        /// Resolvers built over [`INSTALLED`] since it was installed.
+        static SCANS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A resolver over the installed fixture, counted — `None` when this
+    /// thread has none installed, so production's wrapper runs.
+    pub(super) fn installed_resolver() -> Option<Resolver> {
+        let env = INSTALLED.with_borrow(Clone::clone)?;
+        SCANS.set(SCANS.get() + 1);
+        Some(Resolver::new(env))
+    }
+
+    /// How many scans this thread's production lookups made since the fixture
+    /// was installed.
+    ///
+    /// Counted as resolvers built, which is the same number:
+    /// `resolve_app_metas_in` builds one only for a batch with a miss in it
+    /// and scans it exactly once, which
+    /// `a_batch_of_unseen_ids_scans_once` pins on the resolver itself.
+    pub(crate) fn scans() -> usize {
+        SCANS.get()
+    }
+
+    /// Keeps a fixture installed on this thread; dropping it (a panic
+    /// included) puts production's wrapper back. Not `Send`: the fixture is
+    /// per thread.
+    #[must_use = "the fixture is uninstalled when this guard drops"]
+    pub(crate) struct Installed {
+        _per_thread: PhantomData<*const ()>,
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            INSTALLED.set(None);
+        }
+    }
 
     /// A fixture search path on disk: entries under
     /// `<root>/data-home/applications/`, and `<root>/bin/` as the whole
     /// `$PATH`, holding the programs their `Exec=` lines name — GIO and the
     /// resolver both drop an entry whose program is not there.
-    ///
-    /// The in-process tests hand the resolver [`Fixture::env`]; the tests that
-    /// need GIO (or [`resolve_app_meta`] itself, which reads the process
-    /// environment) go through [`Fixture::run_child`] instead, because
-    /// `std::env::set_var` is `unsafe` in edition 2024 and this workspace
-    /// forbids `unsafe_code`. That re-execs this test binary, filtered to
-    /// exactly one inner test, with the fixture set on the **child** through
-    /// the safe `Command::env` builder — the precedent is
-    /// `hytte-plugin-stats::plugin::tests::settings_reads_the_real_process_environment`,
-    /// and #1435 brought it here. No display is involved
-    /// (`gio::AppInfo::all()` and the icon constructors are plain GIO), so
-    /// every test in this module is a hermetic `#[test]`. None reads the
-    /// host's desktop entries: the child's data, config and `HOME`
-    /// directories all sit under the fixture root.
-    struct Fixture {
+    pub(crate) struct Fixture {
         root: tempfile::TempDir,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 root: tempfile::tempdir().expect("a scratch fixture root"),
             }
         }
 
-        fn root(&self) -> &Path {
+        pub(crate) fn root(&self) -> &Path {
             self.root.path()
         }
 
@@ -241,7 +379,7 @@ mod tests {
         }
 
         /// An executable at `bin/<name>`, returning its absolute path.
-        fn program(&self, name: &str) -> PathBuf {
+        pub(crate) fn program(&self, name: &str) -> PathBuf {
             let path = self.bin().join(name);
             std::fs::create_dir_all(self.bin()).expect("mkdir the fixture bin/");
             std::fs::write(&path, "#!/bin/sh\n").expect("write a fixture program");
@@ -251,19 +389,60 @@ mod tests {
         }
 
         /// `contents` at `data-home/applications/<file_name>`.
-        fn entry(&self, file_name: &str, contents: &str) {
+        pub(crate) fn entry(&self, file_name: impl AsRef<Path>, contents: &str) {
             let apps = self.data_home().join("applications");
             std::fs::create_dir_all(&apps).expect("mkdir the fixture applications/");
             std::fs::write(apps.join(file_name), contents).expect("write a fixture .desktop file");
         }
 
+        /// A listable entry whose **file name** is not UTF-8 —
+        /// `ts-\xff\xfe.desktop`, the #1439 review's reproduction (L4) — with
+        /// its `Exec=` program on the fixture `PATH`, so GIO lists it. Calling
+        /// `gio::AppInfo`'s `id()` on it trips glib-rs's
+        /// `debug_assert!(… "C string is not valid utf-8")`
+        /// (`glib-0.22.5/src/gstring.rs:650`), so a gio scan that reaches it
+        /// unguarded panics a debug build.
+        pub(crate) fn non_utf8_entry(&self) {
+            self.program("ts-1441-bad-name");
+            self.entry(
+                OsStr::from_bytes(NON_UTF8_NAME),
+                "[Desktop Entry]\nType=Application\nName=TS 1441 Bad Name\nExec=ts-1441-bad-name\n",
+            );
+        }
+
+        /// Test setup, in a [`Fixture::run_child`] child: GIO really lists the
+        /// [`Fixture::non_utf8_entry`], so a scan that skips it has something
+        /// to skip. Read through the entry's `filename` property as a
+        /// `PathBuf` — raw bytes, the one accessor that is safe on it.
+        pub(crate) fn assert_gio_lists_the_non_utf8_entry() {
+            let listed = gio::AppInfo::all().iter().any(|info| {
+                info.property::<Option<PathBuf>>("filename")
+                    .is_some_and(|path| path.file_name() == Some(OsStr::from_bytes(NON_UTF8_NAME)))
+            });
+            assert!(listed, "test setup: GIO must list the non-UTF-8 file name");
+        }
+
         /// This search path as the resolver's plain data, for the in-process
         /// tests: no language preference, so no entry is read translated.
-        fn env(&self) -> Env {
+        pub(crate) fn env(&self) -> Env {
             Env {
                 dirs: vec![self.data_home().join("applications")],
                 path: vec![self.bin()],
                 languages: Vec::new(),
+            }
+        }
+
+        /// Point this thread's production lookups ([`resolve_app_meta`],
+        /// [`resolve_app_metas`]) at [`Fixture::env`] until the guard drops,
+        /// with [`scans`] starting from zero.
+        ///
+        /// [`resolve_app_meta`]: super::resolve_app_meta
+        /// [`resolve_app_metas`]: super::resolve_app_metas
+        pub(crate) fn install(&self) -> Installed {
+            INSTALLED.set(Some(self.env()));
+            SCANS.set(0);
+            Installed {
+                _per_thread: PhantomData,
             }
         }
 
@@ -273,7 +452,7 @@ mod tests {
         /// `HOME`, `PATH`, and `LANGUAGE=sv` with the other locale variables
         /// removed. Returns the child's stdout once it exited 0 **and** printed
         /// `ok` (a stale filter matches no test, and libtest still exits 0).
-        fn run_child(&self, inner: &str, marker: &str, ok: &str) -> String {
+        pub(crate) fn run_child(&self, inner: &str, marker: &str, ok: &str) -> String {
             let out = std::process::Command::new(
                 std::env::current_exe().expect("this test binary's own path"),
             )
@@ -306,6 +485,22 @@ mod tests {
             stdout
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use hytte::gtk::{gio, glib, prelude::*};
+    use hytte_sensors::desktop_entry::Resolver;
+
+    use super::test_support::Fixture;
+    use super::{
+        AppMeta, icon_from_desktop_value, resolve_app_meta, resolve_app_meta_in,
+        resolve_app_metas, resolve_app_metas_in,
+    };
+    use crate::components::desktop_entry;
 
     /// A resolver that must never be built. Production's is
     /// `Resolver::from_env`, so not building one is not reading the
@@ -398,6 +593,161 @@ mod tests {
             scans += resolver.scans();
         }
         assert_eq!(scans, 1, "a mixed-case id is scanned for once");
+    }
+
+    /// Twelve app ids one page might render at once, and the name each must
+    /// resolve to over [`batch_fixture`]: every layer, and three misses.
+    const BATCH: [(&str, Option<&str>); 12] = [
+        // Layer 1, as written and lowercased.
+        ("org.example.Files", Some("Files")),
+        ("TS-Term", Some("Terminal")),
+        ("ts-term", Some("Terminal")),
+        // Layer 2: another case, a cgroup leaf, a spawn scope, a wrapper, a
+        // last dotted part.
+        ("org.example.files", Some("Files")),
+        ("firefox", Some("Firefox")),
+        ("niri-firefox", Some("Firefox")),
+        ("firefox-unwrapped", Some("Firefox")),
+        ("editor", Some("Editor")),
+        // Layer 3: the `Exec=` program's stem.
+        ("ts-edit", Some("Editor")),
+        // No entry at all.
+        ("no-such-app-1441-a", None),
+        ("no-such-app-1441-b", None),
+        ("no-such-app-1441-c", None),
+    ];
+
+    /// The entries [`BATCH`] resolves against.
+    fn batch_fixture() -> Fixture {
+        let f = Fixture::new();
+        for (file, name, program) in [
+            ("org.example.Files.desktop", "Files", "ts-files"),
+            ("Firefox.desktop", "Firefox", "firefox"),
+            ("ts-term.desktop", "Terminal", "ts-term"),
+            ("com.example.Editor.desktop", "Editor", "ts-edit"),
+        ] {
+            f.program(program);
+            f.entry(
+                file,
+                &format!("[Desktop Entry]\nType=Application\nName={name}\nExec={program}\n"),
+            );
+        }
+        f
+    }
+
+    /// **A batch of unseen ids costs one scan** (#1441), counted on the
+    /// resolver the batch used, and leaves every id answered in the cache — a
+    /// miss as `None` — so the per-row lookups that follow never build a
+    /// resolver. An id the batch names twice is still one answer.
+    ///
+    /// Falsified by resolving each miss on its own (the `resolve_all` dropped,
+    /// so each `resolve` copy-out scans: 12 ≠ 1), and by caching only the
+    /// found ids (a miss's row lookup reaches [`no_resolver`]).
+    #[test]
+    fn a_batch_of_unseen_ids_scans_once() {
+        let f = batch_fixture();
+        let mut cache = HashMap::new();
+        let mut resolver = Resolver::new(f.env());
+        let handed = &mut resolver;
+        let ids = BATCH.iter().map(|(app_id, _)| *app_id).chain(["firefox"]);
+        resolve_app_metas_in(ids, &mut cache, move || handed);
+        assert_eq!(resolver.scans(), 1, "twelve unseen ids, one scan");
+        assert_eq!(cache.len(), BATCH.len(), "one answer per id");
+        for (app_id, name) in BATCH {
+            let meta = resolve_app_meta_in(app_id, &mut cache, no_resolver);
+            assert_eq!(meta.map(|m| m.display_name).as_deref(), name, "{app_id}");
+        }
+    }
+
+    /// **A batch the cache already answers scans nothing** — it does not even
+    /// build a resolver, whether the ids were seeded, answered by an earlier
+    /// batch, or a cached miss — and leaves their answers alone.
+    ///
+    /// Falsified by dropping the early return on an empty miss list (the
+    /// resolver is built anyway: [`no_resolver`] panics).
+    #[test]
+    fn a_batch_the_cache_already_answers_scans_nothing() {
+        let f = batch_fixture();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "seeded".to_owned(),
+            Some(AppMeta {
+                display_name: "Seeded".to_owned(),
+                icon: None,
+            }),
+        );
+        cache.insert("seeded-miss".to_owned(), None);
+        resolve_app_metas_in(["seeded", "seeded-miss", "seeded"], &mut cache, no_resolver);
+        resolve_app_metas_in(std::iter::empty(), &mut cache, no_resolver);
+
+        let mut resolver = Resolver::new(f.env());
+        let handed = &mut resolver;
+        resolve_app_metas_in(BATCH.map(|(app_id, _)| app_id), &mut cache, move || handed);
+        assert_eq!(resolver.scans(), 1);
+        resolve_app_metas_in(BATCH.map(|(app_id, _)| app_id), &mut cache, no_resolver);
+
+        assert_eq!(
+            cache["seeded"].as_ref().map(|m| m.display_name.as_str()),
+            Some("Seeded")
+        );
+        assert!(matches!(cache.get("seeded-miss"), Some(None)));
+        assert_eq!(cache.len(), BATCH.len() + 2);
+    }
+
+    /// **A mixed batch scans once, for its misses only.** The ids the cache
+    /// holds keep the answers it holds — seeded here with answers the fixture
+    /// would not give, so a re-resolve would show — and the resolver is never
+    /// told about them: asking it one afterwards scans again, while a miss it
+    /// was sent is already its own hit.
+    ///
+    /// Falsified by sending every id through the resolver, cached or not (the
+    /// seeded `firefox` comes back `Firefox`, and asking the resolver about it
+    /// afterwards scans nothing).
+    #[test]
+    fn a_mixed_batch_scans_once_for_its_misses_only() {
+        let f = batch_fixture();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "firefox".to_owned(),
+            Some(AppMeta {
+                display_name: "Seeded Firefox".to_owned(),
+                icon: None,
+            }),
+        );
+        cache.insert("ts-term".to_owned(), None);
+
+        let mut resolver = Resolver::new(f.env());
+        let handed = &mut resolver;
+        resolve_app_metas_in(
+            ["firefox", "ts-edit", "ts-term", "editor", "no-such-app-1441-a"],
+            &mut cache,
+            move || handed,
+        );
+        assert_eq!(resolver.scans(), 1, "three misses, one scan");
+
+        let name = |cache: &HashMap<String, Option<AppMeta>>, app_id: &str| {
+            cache[app_id].as_ref().map(|m| m.display_name.clone())
+        };
+        assert_eq!(name(&cache, "firefox").as_deref(), Some("Seeded Firefox"));
+        assert_eq!(name(&cache, "ts-term"), None, "a cached miss stays one");
+        assert_eq!(name(&cache, "ts-edit").as_deref(), Some("Editor"));
+        assert_eq!(name(&cache, "editor").as_deref(), Some("Editor"));
+        assert_eq!(name(&cache, "no-such-app-1441-a"), None);
+
+        for (app_id, scans) in [
+            ("ts-edit", 1),
+            ("editor", 1),
+            ("no-such-app-1441-a", 1),
+            ("firefox", 2),
+            ("ts-term", 3),
+        ] {
+            resolver.resolve(app_id);
+            assert_eq!(
+                resolver.scans(),
+                scans,
+                "{app_id}: was it sent to the resolver?"
+            );
+        }
     }
 
     const FRESH_CHILD: &str = "TROLLSHELL_APP_META_1432_FRESH_CHILD";
@@ -598,7 +948,7 @@ mod tests {
             ("ts-abs-png-icon", &format!("Icon={}\n", abs_png.display())),
         ] {
             f.entry(
-                &format!("{stem}.desktop"),
+                format!("{stem}.desktop"),
                 &format!(
                     "[Desktop Entry]\nType=Application\nName=Entry {stem}\nExec=ts-icon-host\n{icon}"
                 ),
@@ -619,11 +969,14 @@ mod tests {
     ///   absolute path (with and without an extension), a themed name, one
     ///   with each stripped extension, one with an extension GIO keeps, a
     ///   dotted name, a relative path, a localised `Icon[sv]=`, an empty
-    ///   `Icon=`, and no `Icon=` at all.
+    ///   `Icon=`, and no `Icon=` at all;
+    /// - [`resolve_app_metas`], the batch's own real wrapper (#1441), answers
+    ///   every one of those ids exactly as the one-at-a-time lookups did.
     ///
     /// Falsified by a wrapper reading no environment (`Env::default`), by
     /// naming rows from the raw id, and by either icon arm going wrong — see
-    /// the PR's mutation table.
+    /// the PR's mutation table — and, for the batch, by its wrapper reading
+    /// no environment either.
     #[test]
     fn names_match_the_resolver_and_icons_match_gio() {
         let f = parity_fixture();
@@ -654,12 +1007,9 @@ mod tests {
             );
         }
 
-        let all = gio::AppInfo::all();
         for stem in ENTRY_STEMS {
             let id = format!("{stem}.desktop");
-            let info = all
-                .iter()
-                .find(|info| info.id().is_some_and(|listed| listed == id.as_str()))
+            let info = desktop_entry::listed(&id)
                 .unwrap_or_else(|| panic!("test setup: GIO must list the fixture {id}"));
             let ours = resolve_app_meta(stem, &mut cache)
                 .unwrap_or_else(|| panic!("{stem} must resolve to its own entry"));
@@ -668,6 +1018,21 @@ mod tests {
             println!("{id:>28}: gio {gio_icon:?}\n{:>28}  ours {our_icon:?}", "");
             assert_eq!(ours.display_name, info.display_name().as_str(), "{id}");
             assert_eq!(our_icon, gio_icon, "{id}: the icon differs from GIO's");
+        }
+
+        // #1441: the batch, through its own real wrapper into a fresh cache,
+        // answers every id — names, icons and misses — as the one-at-a-time
+        // lookups above did.
+        let mut batched = HashMap::new();
+        let ids = NAME_CASES.map(|(app_id, _)| app_id).into_iter().chain(ENTRY_STEMS);
+        resolve_app_metas(ids.clone(), &mut batched);
+        for app_id in ids {
+            let answer = |cache: &HashMap<String, Option<AppMeta>>| {
+                let meta = cache.get(app_id).unwrap_or_else(|| panic!("{app_id} was not resolved"));
+                meta.as_ref()
+                    .map(|m| (m.display_name.clone(), describe(m.icon.as_ref())))
+            };
+            assert_eq!(answer(&batched), answer(&cache), "{app_id}: batched vs one at a time");
         }
         println!("{PARITY_CHILD_OK}");
     }

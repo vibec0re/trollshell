@@ -116,7 +116,7 @@ use hytte::prelude::*;
 use hytte::services::displays::{self, Output as DisplayOutput};
 use hytte::services::niri::{self, Window, Workspace};
 
-use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
+use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta, resolve_app_metas};
 use crate::components::layout::{
     WORKSPACES_COLUMN_SPACING, finish_page_clamped, page_box, set_page_width, toggle_class,
     workspaces_page_width,
@@ -715,8 +715,9 @@ fn bind_columns<S>(columns_box: &gtk::Box, model: S)
 where
     S: Signal<Item = PageModel> + 'static,
 {
-    // One cache for the whole page: an app on two workspaces costs one
-    // desktop-entry scan, not one per card. Lives as long as the binding.
+    // One cache for the whole page: an app on two workspaces is looked up
+    // once, not once per card, and each rebuild resolves every app id it is
+    // about to render in one batch (below). Lives as long as the binding.
     let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
     bind(model, columns_box, move |columns_box, page| {
         // #1219: the page's width follows the number of columns it is about to
@@ -752,6 +753,19 @@ where
             columns_box.append(&hint(NO_OUTPUTS_HINT));
             return;
         }
+        // #1441: every app id the cards below render, resolved together — one
+        // desktop-entry scan for all the ids the cache lacks, where
+        // `build_app_icon`'s own lookup would scan once per unseen id. Those
+        // lookups are then all cache hits. A statement of its own, so the
+        // `RefMut` is gone before any widget is built (#643/#663/#832).
+        resolve_app_metas(
+            page.columns
+                .iter()
+                .flat_map(|column| &column.cards)
+                .flat_map(|card| &card.apps)
+                .map(|app| app.app_id.as_str()),
+            &mut meta_cache.borrow_mut(),
+        );
         // A card dropped on a column or on another card may have come from
         // **any** column, so the facts a drop decides from have to be page-wide
         // rather than per column. Rebuilt with the model, so it is never more
@@ -3577,6 +3591,85 @@ pub(in crate::panels) mod tests {
              from `bind`) would keep this alive for the life of the binding, \
              defeating #224's WeakRef contract"
         );
+    }
+
+    /// **#1441: one page rebuild costs one desktop-entry scan**, however many
+    /// unseen app ids its cards carry — twelve here, one of them on two cards
+    /// — and a rebuild whose ids are all cached costs none. The fixture is
+    /// installed for this thread's production lookups, so nothing reads the
+    /// host's desktop entries.
+    ///
+    /// Falsified by deleting the `resolve_app_metas` call in [`bind_columns`]
+    /// (each icon's own lookup scans for its unseen id: 12 ≠ 1).
+    #[gtk::test]
+    fn a_page_rebuild_resolves_every_app_id_in_one_scan() {
+        use super::{Card, Column, Kind, StackApp};
+        use crate::components::app_meta::test_support::{self, Fixture};
+        use crate::workspace_stacks::StackState;
+
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        f.program("ts-ws-1441");
+        f.entry(
+            "ts-ws-1441-a.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS WS A\nExec=ts-ws-1441\n",
+        );
+        let _installed = f.install();
+
+        let card = |name: &str, ids: &[String]| Card {
+            name: name.to_owned(),
+            kind: Kind::Saved(StackState::Inactive),
+            apps: ids
+                .iter()
+                .map(|app_id| StackApp {
+                    app_id: app_id.clone(),
+                    running: false,
+                })
+                .collect(),
+            live: None,
+            monitor: Some(LEFT.to_owned()),
+        };
+        let ids: Vec<String> = std::iter::once("ts-ws-1441-a".to_owned())
+            .chain((1..12).map(|n| format!("no-such-ws-app-1441-{n}")))
+            .collect();
+        let page = |late: Option<&str>| {
+            let mut second = ids[6..].to_vec();
+            second.push(ids[0].clone());
+            second.extend(late.map(str::to_owned));
+            PageModel {
+                columns: vec![Column {
+                    connector: LEFT.to_owned(),
+                    offline: false,
+                    cards: vec![card("one", &ids[..6]), card("two", &second)],
+                }],
+                order: vec!["one".to_owned(), "two".to_owned()],
+            }
+        };
+
+        let columns_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let model: Mutable<PageModel> = Mutable::new(page(None));
+        bind_columns(&columns_box, model.signal_cloned());
+        pump();
+        assert_eq!(test_support::scans(), 1, "twelve unseen app ids, one scan");
+        let tooltips: Vec<String> = by_class(&columns_box, "ts-ws-app")
+            .iter()
+            .filter_map(gtk::Widget::tooltip_text)
+            .map(String::from)
+            .collect();
+        assert_eq!(tooltips.len(), 13, "one icon per window: {tooltips:?}");
+        assert_eq!(
+            tooltips.iter().filter(|t| *t == "TS WS A").count(),
+            2,
+            "the resolved app reads its name on both cards: {tooltips:?}"
+        );
+
+        model.set(page(None));
+        pump();
+        assert_eq!(test_support::scans(), 1, "a rebuild over cached ids scans nothing");
+
+        model.set(page(Some("ts-ws-1441-late")));
+        pump();
+        assert_eq!(test_support::scans(), 2, "one new id, one more scan");
     }
 
     /// Every connected monitor's column takes a drop; the "Not connected"

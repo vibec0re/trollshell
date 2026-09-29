@@ -2902,6 +2902,15 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
     }
 }
 
+/// Whether [`restart_status`]'s line for `answer` asks the user to act, so
+/// the form shows it in the style its other "Saved, but …" lines already use
+/// (`set_status`'s `error`) rather than as a quiet success (#1445 review,
+/// N1). Only `still-stopping` does: the plugin is about to be down, and
+/// nothing brings it back until someone switches it off and on.
+fn restart_status_warns(answer: &str) -> bool {
+    answer == "still-stopping"
+}
+
 /// The `RestartPlugin` a Save sends. A seam, so no test ever sends one to a
 /// real session bus: under `cfg(test)` it records the id and answers that no
 /// shell is there.
@@ -2969,7 +2978,10 @@ fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
                 });
                 match res {
                     Ok(answer) => {
-                        form.set_status(restart_status(&answer, enabled), false);
+                        form.set_status(
+                            restart_status(&answer, enabled),
+                            restart_status_warns(&answer),
+                        );
                         // Only an answer can have moved the unit; re-poll so
                         // the row and the switch catch up with it.
                         if let Some(state) = &state {
@@ -6128,6 +6140,34 @@ mod tests {
         assert!(
             line.contains(&format!("within {secs} s")),
             "the shell waits {secs} s: {line}"
+        );
+    }
+
+    /// #1445 review, N1: the `still-stopping` line asks the user to act, so
+    /// it is shown like the form's other "Saved, but …" lines, and every
+    /// other answer's line stays a quiet one. The Save's handler shows each
+    /// answer's line in the style this picks.
+    ///
+    /// Falsified by `still-stopping` in the success style, or by the handler
+    /// passing a constant style.
+    #[test]
+    fn the_still_stopping_line_is_shown_as_a_warning() {
+        assert!(super::restart_status_warns("still-stopping"));
+        for quiet in [
+            "relaunched",
+            "not-running",
+            "not-declared",
+            "switched-off",
+            "something-newer",
+        ] {
+            assert!(!super::restart_status_warns(quiet), "{quiet}");
+        }
+        let handler = squashed_from("fn settings_saved(");
+        assert!(
+            handler.contains(
+                "form.set_status(restart_status(&answer,enabled),restart_status_warns(&answer))"
+            ),
+            "the Save's line takes its style from restart_status_warns:\n{handler}"
         );
     }
 

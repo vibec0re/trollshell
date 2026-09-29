@@ -730,6 +730,8 @@ where
 /// resolves the ids of its own list **and** of `also` — the page's other
 /// list — in one batch (#1441), so a rebuild that shows an unseen app-id costs
 /// one desktop-entry scan for both lists, and a rebuild with none costs none.
+/// The rows themselves are rebuilt only when this list changed: an emission
+/// where only `also` moved resolves its ids and leaves the rows alone.
 /// A single-list page passes an `also` that never has ids. The name field is
 /// rendered with markup off so an adversarial scope id can't inject Pango
 /// markup (cf. #30).
@@ -790,15 +792,32 @@ fn build_top_apps_expander(
         let list = signal,
         let also = also => (list.clone(), also.clone())
     };
+    // This list as its rows last showed it — the retained last-applied copy
+    // `hytte_ui`'s `SparklineState` keeps (#1414), so an emission where only
+    // `also` moved rebuilds nothing. `None` until the first apply, which
+    // always rebuilds (an empty list included: the summary's em-dash).
+    let applied: RefCell<Option<Vec<ProcSample>>> = RefCell::new(None);
     bind(lists, &expander, move |expander, (list, also)| {
         // #1441: this list's ids and the page's other list's, into the cache
         // the two share — one scan for every unseen id on the page, so the
-        // other list's rebuild is all hits. A statement of its own, so the
-        // `RefMut` is gone before any widget is touched (#643/#663/#832).
+        // other list's rebuild is all hits. Runs on every emission, `also`'s
+        // alone included, so the cache has the other list's ids before that
+        // list rebuilds. A statement of its own, so the `RefMut` is gone
+        // before any widget is touched (#643/#663/#832).
         resolve_app_metas(
             list.iter().chain(&also).filter_map(|s| s.app_id.as_deref()),
             &mut meta_cache.borrow_mut(),
         );
+        // The rows only when this list moved. An emission where only `also`
+        // changed has nothing new to show here, and a rebuild would replace
+        // every row widget for the same rows. A sample whose `cpu_frac` is
+        // NaN never equals itself, so that list rebuilds every time — the
+        // safe direction. The `Ref` ends with this statement, before any
+        // widget is touched.
+        let unchanged = applied.borrow().as_ref() == Some(&list);
+        if unchanged {
+            return;
+        }
         rebuild_top_apps(
             expander,
             &summary_for_bind,
@@ -808,6 +827,7 @@ fn build_top_apps_expander(
             value,
             &list,
         );
+        *applied.borrow_mut() = Some(list);
     });
 
     expander
@@ -4348,5 +4368,106 @@ mod top_apps_scan_tests {
             2,
             "one new id, one more scan, although both lists rebuild"
         );
+    }
+
+    /// The label under `root` whose text is exactly `text` — a row's title.
+    fn label_reading(root: &gtk::Widget, text: &str) -> gtk::Label {
+        fn walk(widget: &gtk::Widget, text: &str) -> Option<gtk::Label> {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>()
+                && label.text() == text
+            {
+                return Some(label.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                if let Some(found) = walk(&c, text) {
+                    return Some(found);
+                }
+                child = c.next_sibling();
+            }
+            None
+        }
+        walk(root, text).unwrap_or_else(|| panic!("no label reads {text:?}"))
+    }
+
+    /// **An emission where only `also` moved resolves its ids but rebuilds
+    /// no rows** (the #1443 fix round). The page's other list changing is
+    /// what feeds this list's batch, not a reason to redraw this list: the
+    /// new id reaches the shared cache (one scan, and the other list's
+    /// rebuild would be a hit), while this list's row widgets stay the very
+    /// same objects. A change to this list does rebuild them — the positive
+    /// control that shows the identity check can see a rebuild at all.
+    ///
+    /// Falsified by dropping the "unchanged since the last apply" skip in
+    /// `build_top_apps_expander` (the row's label is a new widget).
+    #[gtk::test]
+    fn a_change_to_the_other_list_alone_resolves_but_rebuilds_no_rows() {
+        use hytte::futures_signals::signal::Mutable;
+
+        use super::build_top_apps_expander;
+        use crate::components::app_meta::MetaCache;
+
+        fn pump() {
+            while gtk::glib::MainContext::default().iteration(false) {}
+        }
+
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        f.program("ts-top-1441");
+        for (id, name) in [("ts-top-1441-a", "TS Top A"), ("ts-top-1441-b", "TS Top B")] {
+            f.entry(
+                format!("{id}.desktop"),
+                &format!("[Desktop Entry]\nType=Application\nName={name}\nExec=ts-top-1441\n"),
+            );
+        }
+        let _installed = f.install();
+
+        let list = Mutable::new(vec![sample(Some("ts-top-1441-a"))]);
+        let also = Mutable::new(Vec::<ProcSample>::new());
+        let cache = MetaCache::default();
+        let expander = build_top_apps_expander(
+            "Top apps",
+            list.signal_cloned(),
+            also.signal_cloned(),
+            cpu_value,
+            Rc::clone(&cache),
+        );
+        pump();
+        assert_eq!(test_support::scans(), 1);
+        let row = label_reading(expander.upcast_ref(), "TS Top A");
+
+        also.set(vec![sample(Some("ts-top-1441-b"))]);
+        pump();
+        assert_eq!(
+            test_support::scans(),
+            2,
+            "the other list's new id is resolved"
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .get("ts-top-1441-b")
+                .and_then(Option::as_ref)
+                .map(|meta| meta.display_name.clone())
+                .as_deref(),
+            Some("TS Top B"),
+            "the other list's id is in the shared cache"
+        );
+        assert!(
+            label_reading(expander.upcast_ref(), "TS Top A") == row,
+            "only `also` moved, so this list's rows are the same widgets"
+        );
+
+        list.set(vec![
+            sample(Some("ts-top-1441-a")),
+            sample(Some("ts-top-1441-b")),
+        ]);
+        pump();
+        assert_eq!(test_support::scans(), 2, "this list's new row is a hit");
+        assert!(
+            label_reading(expander.upcast_ref(), "TS Top A") != row,
+            "this list moved, so its rows are rebuilt"
+        );
+        label_reading(expander.upcast_ref(), "TS Top B");
     }
 }

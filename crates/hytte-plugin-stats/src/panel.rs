@@ -2444,8 +2444,9 @@ mod tests {
     ///
     /// **Falsified** by dropping `windows.clear()` (the surviving cores keep
     /// their history across a resize), by dropping the empty-frame guard (a
-    /// cold tick then erases every window), by dropping `push_capped`'s
-    /// `pop_front`, and by dropping the `NaN` arm.
+    /// cold tick then erases every window), by resetting only when the count
+    /// grows, by dropping `push_capped`'s cap loop, and by dropping the `NaN`
+    /// arm.
     #[test]
     fn the_per_core_windows_are_capped_and_restart_on_a_new_core_count() {
         let frame = |per_core: Vec<f32>, per_core_clock: Vec<f32>| Snapshot {

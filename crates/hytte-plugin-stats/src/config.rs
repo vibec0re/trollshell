@@ -205,7 +205,7 @@ poll_seconds = 1
 /// (#888's erratum to §3). The control center composes it in at the top of the
 /// graph, where it already links this crate as a library.
 ///
-/// The fields are generated table by table with [`card_fields`], which is what
+/// The fields are generated table by table with `card_fields!`, which is what
 /// makes this file's own rule — *no key is read by only one of the two
 /// surfaces* (see the module docs) — structurally true of the schema rather
 /// than a thing sixteen hand-written entries could quietly stop obeying.

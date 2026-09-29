@@ -348,7 +348,7 @@ pub(crate) fn header(
 /// These are the **sidebar card's and the bar chips'** widgets only. The
 /// drawer page stopped drawing preem in #1252 (Annika: "maybe not use preem
 /// widgets here?") and keeps its history in `crate::panel::History` instead,
-/// as plain samples for [`Node::Sparkline`](hytte_plugin::proto::Node::Sparkline)s.
+/// as plain samples for [`Node::Sparkline`]s.
 #[derive(Debug)]
 pub struct Widgets {
     cores: DotMatrix,

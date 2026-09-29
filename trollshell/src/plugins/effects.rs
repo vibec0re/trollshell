@@ -1476,7 +1476,7 @@ fn launch_with_timeout(
 /// [`open_uri_with`] (#1045).
 ///
 /// `gio::AppInfo` over shelling out to `xdg-open`, for the reason
-/// [`crate::main`]'s `open_screenshot` gives: the same desktop-portal-backed
+/// `main`'s `open_screenshot` gives: the same desktop-portal-backed
 /// resolution with no subprocess of our own. The **`_async`** entry point
 /// specifically, because the sync one does blocking content-type I/O on the URI
 /// and this one is plugin-supplied — see [`open_uri_with`]. It returns

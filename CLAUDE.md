@@ -267,7 +267,17 @@ inline in `flake.nix` as one-liners.
   by hand from the devShell with
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps && for pkg in trollshell hytte-plugin-agents hytte-plugin-stats trollshell-agent-window hytte-plugin-infobroker; do RUSTDOCFLAGS="-D warnings" cargo rustdoc -p "$pkg" --bin "$pkg" -- --document-private-items; done`
   — that package list is `checks.rustdoc`'s own derived set as of #1406, not
-  a second hand-kept copy of it.
+  a second hand-kept copy of it. Since #1429 it also runs
+  `cargo rustdoc -p <pkg> --lib -- --document-private-items` for every package
+  with a `lib` target: the bin pass above only reaches a same-named **bin**
+  target's own private tree (it compiles the sibling lib as an ordinary
+  external dependency), so a lib's own private items — and a lib-only crate's,
+  which the bin pass never reaches at all — went unchecked by either pass.
+  Part 1 (#1430) measured 81 such warnings nobody had seen, across the
+  workspace's 19 lib-carrying crates; part 2 fixed the rest. Run it by hand,
+  chained onto the command above, with
+  `&& for pkg in $(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.targets[] | .kind | index("lib")) | .name'); do RUSTDOCFLAGS="-D warnings" cargo rustdoc -p "$pkg" --lib -- --document-private-items; done`
+  — again `checks.rustdoc`'s own derived set, not hand-kept.
 - Since #1036, the `system-tests` check's closure carries `mesa` (llvmpipe) and
   its `preCheck` exports the software-GL env plus `TROLLSHELL_REQUIRE_GL=1`,
   so the three GL-context tests in `hytte-ui` (`gl_surface.rs`) actually run

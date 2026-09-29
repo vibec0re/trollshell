@@ -52,7 +52,7 @@ async fn shutdown_fired(shutdown: &mut watch::Receiver<bool>) -> Option<()> {
 }
 
 /// The launch-time mount override (#1159, epic #1158): a wire
-/// [`Mount`](hytte_plugin_proto::Mount) name that replaces whatever the plugin's
+/// [`Mount`] name that replaces whatever the plugin's
 /// own [`manifest`](Plugin::manifest) asked for.
 ///
 /// An **environment variable** rather than an argv flag, settled on #866: two
@@ -1402,7 +1402,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 
 /// Run a [`Plugin`] against the trollshell host socket — forever. Owns the
 /// process: builds a current-thread tokio runtime, dials
-/// [`socket_path`](hytte_plugin_proto::socket_path) with bounded exponential
+/// [`socket_path`] with bounded exponential
 /// backoff (a host that isn't up yet — both start under the same session
 /// target — or a host restart is a transient we ride out here rather than
 /// exiting into systemd's start-limit), and drives one session per
@@ -1413,7 +1413,7 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 ///
 /// **Placement is a launch argument** (#1159, epic #1158). Before the first dial,
 /// `run` reads `MOUNT_ENV` (`HYTTE_PLUGIN_MOUNT`); a value naming one of the
-/// nine wire [`Mount`](hytte_plugin_proto::Mount)s replaces
+/// nine wire [`Mount`]s replaces
 /// [`Plugin::manifest`]'s own `mount` in every `Register` this process sends,
 /// including after a reconnect. An unknown or empty value is a **startup
 /// failure** whose message names all nine spellings — never a silent fallback to

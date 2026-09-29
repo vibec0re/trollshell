@@ -13,7 +13,7 @@
 //! [`PluginMsg`](crate::msg::PluginMsg) / [`HostMsg`](crate::msg::HostMsg) — or
 //! any `Serialize` type. [`encode`] emits a whole frame; [`decode`] parses
 //! exactly one. For streaming I/O, the optional `tokio` feature adds
-//! [`read_frame`] / [`write_frame`].
+//! `read_frame` / `write_frame`.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -23,7 +23,7 @@ pub const LEN_PREFIX: usize = 4;
 
 /// Hard cap on a single frame's body, to bound memory against a hostile or
 /// buggy peer that declares a huge length. 16 MiB is far above any real view
-/// tree; enforced only on the **read** side ([`decode`] / [`read_frame`]).
+/// tree; enforced only on the **read** side ([`decode`] / `read_frame`).
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Everything that can go wrong framing/decoding a message.
@@ -139,7 +139,7 @@ pub fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ProtoError> {
 /// Decode exactly one whole length-prefixed frame into `T`.
 ///
 /// Strict: `frame` must be exactly the prefix plus the declared body (use
-/// [`read_frame`] for streaming, where boundaries are handled for you). A short
+/// `read_frame` for streaming, where boundaries are handled for you). A short
 /// or over-long buffer, or a declared length past [`MAX_FRAME_LEN`], is an
 /// error rather than a partial/oversized decode.
 pub fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtoError> {

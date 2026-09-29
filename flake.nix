@@ -852,6 +852,36 @@
           # -Zfeature-unification`. Affordable on this check's own runner, so
           # left as a known, growing cost rather than a reason to check only
           # one package.
+          #
+          # #1429: neither pass above ever checks a **lib** target's own
+          # private items. The workspace `cargo doc --no-deps` pass documents
+          # every lib crate but only its `pub` surface; `same_name_bins`'s
+          # `--document-private-items` pass documents a **bin** target's own
+          # private tree, but a bin target compiles its same-named lib as an
+          # ordinary external dependency — only the lib's `pub` items are
+          # visible to it, same as any other consumer — so a package whose
+          # `main.rs` is a thin wrapper around its own lib
+          # (`hytte-plugin-stats`, `hytte-plugin-agents`, …) had its lib's
+          # private items checked nowhere at all, and neither did a lib-only
+          # crate with no bin (`hytte-bus`, `hytte-preem`, …), which
+          # `same_name_bins` never reaches in the first place. Measured: 81
+          # warnings across the 19 workspace members that carry a `lib`
+          # target, none of them caught by either pass above (#1429/#1430).
+          #
+          # `lib_pkgs` below asks `cargo metadata` for that condition directly
+          # (`.targets[] | .kind | index("lib")`) instead of a hand-kept list,
+          # on `same_name_bins`'s own precedent just above — a new lib crate
+          # is covered the day it lands. The `grep -qx hytte` guard is the
+          # same "assert the derivation, not a hand list" check
+          # `same_name_bins` already makes, against a *different*
+          # always-true member on purpose: `hytte` carries no bin target at
+          # all, so its presence proves this query is finding lib crates and
+          # not silently reusing `same_name_bins`'s own list. Each pass writes
+          # into the same `docRoot/<crate>/` the workspace and bin passes
+          # already used, so — same reasoning as the bin loop above — the
+          # install phase below saves each package's output aside into
+          # `lib-doc/<pkg>/<crate>/` right after its own `cargo rustdoc` call,
+          # before the next package's call reuses `target/doc` again.
           rustdoc = craneLib.mkCargoDerivation (
             trollshell.passthru.commonArgs
             // {
@@ -888,23 +918,42 @@
                   mkdir -p "bin-doc/$pkg"
                   cp -r "$docRoot/$crate" "bin-doc/$pkg/$crate"
                 done
+
+                lib_pkgs=$(cargo metadata --offline --no-deps --format-version 1 | jq -r '
+                  .packages[] | select(.targets[] | .kind | index("lib")) | .name
+                ')
+                if ! grep -qx hytte <<< "$lib_pkgs"; then
+                  echo "checks.rustdoc: lib-package derivation did not include hytte (cargo metadata/jq query broken)" >&2
+                  exit 1
+                fi
+
+                mkdir -p lib-doc
+                for pkg in $lib_pkgs; do
+                  cargoWithProfile rustdoc -p "$pkg" --locked --lib -- --document-private-items
+                  crate="$(printf '%s' "$pkg" | tr '-' '_')"
+                  mkdir -p "lib-doc/$pkg"
+                  cp -r "$docRoot/$crate" "lib-doc/$pkg/$crate"
+                done
               '';
               # Leaf/terminal check: nothing consumes its target dir (this
               # already matches `cargoDoc`'s own default, spelled out here
               # for the same reason `workspace-tests` above does).
               doInstallCargoArtifacts = false;
               # See the long comment above `rustdoc` for why this installs
-              # two trees rather than `lib/cargoDoc.nix`'s single `mv`:
+              # three trees rather than `lib/cargoDoc.nix`'s single `mv`:
               # `$out/share/doc` is the workspace pass's own output (every
-              # lib crate, `--no-deps`), saved aside before any bin pass
-              # could overwrite it; `$out/share/doc-bins/<pkg>/<crate>/` is
-              # that one package's bin-only pages, saved right after its own
-              # `cargo rustdoc` call and before the next package's call
-              # reuses `target/doc`.
+              # lib crate, `--no-deps`), saved aside before any bin or lib
+              # private-items pass could overwrite it; `$out/share/doc-bins/
+              # <pkg>/<crate>/` is one same-name-bin package's bin-only pages;
+              # `$out/share/doc-libs/<pkg>/<crate>/` is one lib package's own
+              # private-items pages (#1429) — both saved right after their own
+              # `cargo rustdoc` call and before the next package's call reuses
+              # `target/doc`.
               installPhaseCommand = ''
                 mkdir -p $out/share
                 mv workspace-doc $out/share/doc
                 mv bin-doc $out/share/doc-bins
+                mv lib-doc $out/share/doc-libs
               '';
             }
           );

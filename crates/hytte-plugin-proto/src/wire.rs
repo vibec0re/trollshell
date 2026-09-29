@@ -155,7 +155,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 ///   input; `set_tooltip_markup` would hand it a parser.)
 /// - It is **not** part of a node's identity: only `kind` and `id` decide reuse,
 ///   so changing a tooltip never rebuilds a widget.
-/// - **Seven** of the nineteen variants, not all of them — the ones a chip or a
+/// - **Seven** of the twenty variants, not all of them — the ones a chip or a
 ///   list card is made of: [`Box`](Node::Box), [`Label`](Node::Label),
 ///   [`Icon`](Node::Icon) and [`Shader`](Node::Shader) (#893, a picture with
 ///   nowhere else to say what it is), then — since #961 — [`Row`](Node::Row),
@@ -296,6 +296,15 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// two vertical [`Box`](Node::Box)es in a horizontal one for the columns, it is
 /// everything `hytte-plugin-stats`' drawer page needed to mirror the native
 /// multicolumn Stats page card for card.
+///
+/// # Several lines in one graph (#1419)
+///
+/// [`MultiSparkline`](Node::MultiSparkline) is the fifth negotiated variant,
+/// on [`MULTI_SPARKLINE_VOCAB`]: the per-core history graph the native Stats
+/// page swaps in when a CPU or clock row is expanded — one smoothed line per
+/// series, each in its own generated hue. It is [`Sparkline`](Node::Sparkline)
+/// with a list of windows where that has one, and it reuses that variant's
+/// float seam and per-series sample cap rather than growing its own.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
@@ -1150,6 +1159,95 @@ pub enum Node {
         /// the line.
         classes: Vec<Cls>,
     },
+    /// **Several trend lines in one graph**: the native Stats page's per-core
+    /// history, drawn by the shell from one list of samples per series
+    /// (#1419).
+    ///
+    /// The host materializes it as `hytte_ui::MultiSparkline` — the *same*
+    /// widget the shell's own Stats page draws its per-core CPU load and clock
+    /// history with — so a plugin's graph and the native one are one widget.
+    /// Each series is an anti-aliased, Catmull-Rom-smoothed stroke with no
+    /// fill (a fill per line would stack to near-opaque across 64 cores), and
+    /// series `i` of `n` draws in the hue `i / n` around the colour circle at a
+    /// fixed saturation and lightness. The colours are the widget's, generated
+    /// in Rust, **not** CSS: a class cannot recolour one series, and adding or
+    /// removing a series moves every hue. It **fills its row's width**
+    /// (`hexpand`) and takes its height from the `hytte-multi-sparkline`
+    /// stylesheet rule, like [`Sparkline`](Node::Sparkline); it is a row
+    /// widget, not a chip.
+    ///
+    /// - **`series`** is one window per line, each **oldest first**, newest
+    ///   last — the whole window every time, as for
+    ///   [`Sparkline::values`](Node::Sparkline): the host holds no history. The
+    ///   x axis is each series' own sample index spread across the full width,
+    ///   so two series of different lengths are each stretched to fit; send
+    ///   equal lengths for lines that line up in time. The series order is the
+    ///   hue order.
+    /// - **`max`** is the shared y axis' top: `Some(m)` draws `0..=m` for every
+    ///   series, `None` **auto-scales** to the largest sample across **all**
+    ///   series (so the lines stay comparable with each other). A sample
+    ///   outside `0..=max` is pinned to the nearest edge.
+    ///
+    /// Both are **mutable props**: a same-id re-render hands the existing
+    /// widget the new windows and queues one redraw, including when the series
+    /// count changes (a CPU hot-plug); the widget is never rebuilt on a value
+    /// change.
+    ///
+    /// # Caps
+    ///
+    /// Three, applied in this order by [`clamp_in_place`](Node::clamp_in_place)
+    /// and again by the host, through the one function
+    /// [`multi_sparkline_keep`] so the two cannot disagree:
+    ///
+    /// 1. At most [`MAX_MULTI_SPARKLINE_SERIES`] series; the ones past it are
+    ///    **dropped** (the last ones — the order is the hue order, so the
+    ///    survivors keep their colours).
+    /// 2. Each series keeps at most its **newest** [`MAX_SPARKLINE_SAMPLES`],
+    ///    the same per-line cap a [`Sparkline`](Node::Sparkline) has.
+    /// 3. If the survivors still carry more than [`MAX_MULTI_SPARKLINE_POINTS`]
+    ///    samples between them, **every** series is trimmed to its newest
+    ///    `MAX_MULTI_SPARKLINE_POINTS / series` — a uniform cut, so the lines
+    ///    keep a common time span rather than the longest ones being cut
+    ///    alone.
+    ///
+    /// # Floats
+    ///
+    /// Exactly [`Sparkline`](Node::Sparkline)'s: every sample goes through
+    /// [`sane_sparkline_sample`] and `max` through [`sane_sparkline_max`]. The
+    /// multi-series drawing code normalises a sample with the same
+    /// `(sample / top).clamp(0.0, 1.0)` and picks its top by the same
+    /// `Some(m) if m > 0.0` rule, so the derivation carries over unchanged —
+    /// the auto-scaled top is simply taken across every series.
+    ///
+    /// # Negotiated (#1419)
+    ///
+    /// Appending this variant bumps [`VOCAB`](crate::VOCAB) to
+    /// [`MULTI_SPARKLINE_VOCAB`], and a plugin must only emit it once the host
+    /// has advertised that generation in
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello). An older shell cannot
+    /// decode the variant at all: one on the wire fails the whole frame with
+    /// ``unknown variant `MultiSparkline` `` and puts the plugin in #437's 5 s
+    /// reconnect loop. The SDK's `hytte_plugin::nodes::multi_sparkline` does
+    /// the check and degrades to a [`Sparkline`](Node::Sparkline) — by default
+    /// the per-sample mean of the series, aligned at the newest sample — which
+    /// itself degrades to a [`Progress`](Node::Progress) bar on a shell older
+    /// than [`SPARKLINE_VOCAB`].
+    MultiSparkline {
+        /// Optional reconciliation key (see [`NodeId`]).
+        id: Option<NodeId>,
+        /// One window per series, each oldest first. Series `i` of `n` draws in
+        /// hue `i / n`. Capped as the variant's docs say.
+        series: Vec<Vec<f32>>,
+        /// The shared y axis' top: `Some(m)` draws `0..=m`, `None` auto-scales
+        /// to the largest sample across all series. Defaulted and kept off the
+        /// wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f32>,
+        /// GTK CSS classes applied verbatim (`add_css_class`), on top of the
+        /// widget's own `hytte-multi-sparkline`. They style the widget (its
+        /// height, margins), not the lines' colours.
+        classes: Vec<Cls>,
+    },
 }
 
 /// How the host reads a [`Node::Shader`]'s data buffer into the `u_data`
@@ -1365,6 +1463,92 @@ pub fn sane_sparkline_max(max: Option<f32>) -> Option<f32> {
         Some(m) if m.is_finite() && m > 0.0 => Some(m),
         Some(m) if m.is_infinite() && m > 0.0 => Some(f32::MAX),
         _ => None,
+    }
+}
+
+/// The [`VOCAB`](crate::VOCAB) generation that carries the multi-series graph
+/// ([`Node::MultiSparkline`]) — #1419.
+///
+/// **Negotiated**, exactly like [`SPARKLINE_VOCAB`], [`SCROLLED_VOCAB`],
+/// [`SHADER_VOCAB`] and [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB): a plugin
+/// emits [`Node::MultiSparkline`] only once
+/// [`Manifest::negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab)
+/// has reached this number, so an old host — which advertises something lower
+/// in [`HostMsg::Hello`](crate::msg::HostMsg::Hello), or nothing at all — can
+/// never receive a variant it cannot decode. Generation 9 therefore bumps
+/// [`VOCAB`](crate::VOCAB) (the census) and leaves
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) alone; see that const
+/// for the rule.
+///
+/// Its predecessor, generation 8 (#1427's page-visibility push), is census-only
+/// and not `Hello`-negotiated, the same position [`SPARKLINE_VOCAB`] was in
+/// over generation 6: a generation-8 shell advertises 8, which is below this,
+/// and the arithmetic keeps the variant away from it with no special case. The
+/// check is against **this** constant, never against [`SPARKLINE_VOCAB`]: a
+/// generation-7 or -8 shell draws a single line and cannot decode this one.
+pub const MULTI_SPARKLINE_VOCAB: u16 = 9;
+
+/// The most series one [`Node::MultiSparkline`] draws; past it the **last**
+/// series are dropped (by [`Node::clamp_in_place`] and again by the host).
+///
+/// **256.** The graph's use is one line per CPU thread, and 256 covers a
+/// 256-thread machine — well past the 64-thread workstation the native page is
+/// tuned on. Past a few dozen series the per-series hues are already too close
+/// to tell apart, so the cap is about bounding the host's work, not about what
+/// is legible.
+pub const MAX_MULTI_SPARKLINE_SERIES: usize = 256;
+
+/// The most samples one [`Node::MultiSparkline`] draws across **all** its
+/// series; past it every series is trimmed to its newest
+/// `MAX_MULTI_SPARKLINE_POINTS / series` (see [`multi_sparkline_keep`]).
+///
+/// **65 536** — 64 series of [`MAX_SPARKLINE_SAMPLES`] each, so the cut never
+/// fires for a graph of up to 64 full-length lines, and a 256-thread machine
+/// keeps 256 samples a line (over four minutes at the native page's 1 Hz).
+/// It bounds the host's per-widget copy at 512 KiB of `f64`, and the largest
+/// node that survives the cut encodes to about 320 KiB, far inside
+/// [`MAX_FRAME_LEN`](crate::codec::MAX_FRAME_LEN).
+pub const MAX_MULTI_SPARKLINE_POINTS: usize = 65_536;
+
+// The three caps compose, checked where the constants live: at the series cap
+// every survivor still keeps at least one sample, and the series cap times the
+// per-series cap passes the point cap, so `multi_sparkline_keep`'s point cut is
+// a real rule rather than dead code.
+const _: () = assert!(
+    MAX_MULTI_SPARKLINE_POINTS / MAX_MULTI_SPARKLINE_SERIES >= 1,
+    "at the series cap every series keeps at least one sample",
+);
+const _: () = assert!(
+    MAX_MULTI_SPARKLINE_SERIES * MAX_SPARKLINE_SAMPLES > MAX_MULTI_SPARKLINE_POINTS,
+    "the point cap binds below the series cap times the per-series cap",
+);
+
+/// How many of its **newest** samples each surviving series of a
+/// [`Node::MultiSparkline`] keeps — the one definition
+/// [`Node::clamp_in_place`] and the host's mapping seam both trim with, so the
+/// two cannot disagree.
+///
+/// Only the first [`MAX_MULTI_SPARKLINE_SERIES`] of `series` survive at all.
+/// Each of those keeps [`MAX_SPARKLINE_SAMPLES`] — unless, after that per-line
+/// cut, they still carry more than [`MAX_MULTI_SPARKLINE_POINTS`] between them,
+/// in which case each keeps `MAX_MULTI_SPARKLINE_POINTS / survivors`, which
+/// bounds the total by the point cap. The answer never exceeds
+/// [`MAX_SPARKLINE_SAMPLES`], and it is a fixpoint: a trimmed graph is under
+/// the point cap, so asking again answers the per-series cap, which the
+/// trimmed series already fit.
+#[must_use]
+pub fn multi_sparkline_keep<S: AsRef<[f32]>>(series: &[S]) -> usize {
+    let survivors = &series[..series.len().min(MAX_MULTI_SPARKLINE_SERIES)];
+    let points: usize = survivors
+        .iter()
+        .map(|s| s.as_ref().len().min(MAX_SPARKLINE_SAMPLES))
+        .sum();
+    if points > MAX_MULTI_SPARKLINE_POINTS {
+        // `points > POINTS` needs more than `POINTS / MAX_SPARKLINE_SAMPLES`
+        // (64) survivors, so this divides by at least 65.
+        MAX_MULTI_SPARKLINE_POINTS / survivors.len()
+    } else {
+        MAX_SPARKLINE_SAMPLES
     }
 }
 
@@ -1848,7 +2032,9 @@ impl Node {
     /// Afterwards, **every** `f64` this tree carries is finite and within its
     /// documented bounds, so is every [`Sparkline`](Node::Sparkline) `f32`
     /// (#1252, whose count is trimmed to [`MAX_SPARKLINE_SAMPLES`] in the same
-    /// pass), and every [`Preem`](Node::Preem) child satisfies
+    /// pass) and every [`MultiSparkline`](Node::MultiSparkline) `f32` (#1419,
+    /// whose series and samples are trimmed by [`multi_sparkline_keep`]'s rules
+    /// in the same pass), and every [`Preem`](Node::Preem) child satisfies
     /// [`PreemWidget::clamp_in_place`](crate::preem::PreemWidget::clamp_in_place)'s
     /// own invariant. That makes the derived `PartialEq` on [`Node`] a usable
     /// *did anything change?* test: `NaN != NaN`, so before this a single
@@ -2002,6 +2188,23 @@ impl Node {
                 }
                 *max = sane_sparkline_max(*max);
             }
+            // #1419's multi-series graph: `Sparkline`'s float half per sample,
+            // and the three caps in the order the variant documents — drop the
+            // series past the series cap, then keep each survivor's newest
+            // `multi_sparkline_keep` samples (the per-series cap, or the point
+            // cap's even share when the survivors are over it).
+            Self::MultiSparkline { series, max, .. } => {
+                series.truncate(MAX_MULTI_SPARKLINE_SERIES);
+                let keep = multi_sparkline_keep(series);
+                for line in series.iter_mut() {
+                    let excess = line.len().saturating_sub(keep);
+                    line.drain(..excess);
+                    for sample in line.iter_mut() {
+                        *sample = sane_sparkline_sample(*sample);
+                    }
+                }
+                *max = sane_sparkline_max(*max);
+            }
             Self::Box { children, .. }
             | Self::Row { children, .. }
             | Self::ListBox { children, .. } => {
@@ -2028,8 +2231,8 @@ impl Node {
             // are the host's (`trollshell/src/plugins/shader_map.rs`), on the
             // same reasoning `Pixels`'s `len == w*h*4` check is host-side — the
             // host is the trust boundary and the layer with `tracing`.
-            // (`Sparkline` is *not* here: it carries `f32`s, and is sanitised
-            // in its own arm above.)
+            // (`Sparkline` and `MultiSparkline` are *not* here: they carry
+            // `f32`s, and are sanitised in their own arms above.)
             Self::Label { .. }
             | Self::Text { .. }
             | Self::Icon { .. }

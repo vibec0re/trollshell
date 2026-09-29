@@ -11,8 +11,10 @@
 //! UI — so the palette scales to any series count (8, 16, 32+ cores) without
 //! repeating, matching GNOME System Monitor's per-core hue spread.
 //!
-//! Used by `trollshell`'s stats page CPU card for the per-core history graph;
-//! designed to be reusable for any future multi-series history surface.
+//! Used by `trollshell`'s stats page CPU card for the per-core history graph,
+//! and by the plugin reconciler's `Node::MultiSparkline` (#1419), so a plugin
+//! page draws the same graph; designed to be reusable for any future
+//! multi-series history surface.
 //!
 //! # Example
 //!
@@ -147,6 +149,33 @@ impl MultiSparkline {
         self.inner.queue_draw();
     }
 
+    /// [`set_frames`](Self::set_frames) over plain slices: replace every
+    /// series' ring with `series` (one window per series, oldest first),
+    /// keeping at most `capacity` trailing samples per series, and queue a
+    /// redraw.
+    ///
+    /// The form a caller holding `Vec<Vec<f64>>` wants — the plugin reconciler
+    /// (#1419) holds the wire's windows that way, and `set_frames` would make
+    /// it copy each one into a `VecDeque` only to have it copied again here.
+    /// It also **reuses** the rings it already has: a graph re-pointed at a
+    /// same-width snapshot every second clears and refills its buffers in
+    /// place rather than reallocating one per series, and a ring still grows
+    /// only to what it is handed, never to `capacity` up front. A differing
+    /// width re-seeds to the new width, as `set_frames` does.
+    pub fn set_series<S: AsRef<[f64]>>(&self, series: &[S]) {
+        {
+            let mut rings = self.series.borrow_mut();
+            rings.resize_with(series.len(), VecDeque::new);
+            for (ring, window) in rings.iter_mut().zip(series) {
+                let window = window.as_ref();
+                let skip = window.len().saturating_sub(self.capacity);
+                ring.clear();
+                ring.extend(&window[skip..]);
+            }
+        }
+        self.inner.queue_draw();
+    }
+
     /// Set a fixed domain max (e.g. `Some(1.0)` for 0..=1 fractions).
     /// `None` enables auto-scaling to the max sample across all series.
     pub fn set_domain_max(&self, max: Option<f64>) {
@@ -158,6 +187,27 @@ impl MultiSparkline {
     pub fn clear(&self) {
         self.series.borrow_mut().clear();
         self.inner.queue_draw();
+    }
+}
+
+/// Read-back for this crate's own tests: the rings and the domain exactly as
+/// the draw function will read them. `widget_tree`'s reconciler tests (#1419)
+/// assert through these that a re-render reached the **widget** and not just
+/// the reconciler's bookkeeping of it — `Sparkline`'s hook, for the
+/// multi-series widget. Test-only (and only in the display-server bucket those
+/// tests live in), so no public API grows.
+#[cfg(all(test, feature = "system-tests"))]
+impl MultiSparkline {
+    pub(crate) fn series_for_test(&self) -> Vec<Vec<f64>> {
+        self.series
+            .borrow()
+            .iter()
+            .map(|ring| ring.iter().copied().collect())
+            .collect()
+    }
+
+    pub(crate) fn domain_max_for_test(&self) -> Option<f64> {
+        self.domain_max.get()
     }
 }
 
@@ -520,6 +570,48 @@ mod widget_tests {
         assert_eq!(series.len(), 1);
         let got: Vec<f64> = series[0].iter().copied().collect();
         assert_eq!(got, vec![7.0, 8.0]);
+    }
+
+    /// The slice form (#1419) keeps each series' trailing `capacity`, replaces
+    /// rather than appends, and re-seeds to a new width — `set_frames`'
+    /// contract over `&[Vec<f64>]`.
+    ///
+    /// **Falsified** by dropping the `skip` (the oldest two survive), or by
+    /// resizing only when the snapshot is wider (a narrower one leaves the old
+    /// second series behind).
+    #[gtk::test]
+    fn set_series_keeps_trailing_capacity_and_reseeds_width() {
+        let g = MultiSparkline::new(3);
+        g.set_series(&[vec![0.0, 1.0, 2.0, 3.0, 4.0], vec![9.0]]);
+        assert_eq!(g.series_for_test(), vec![vec![2.0, 3.0, 4.0], vec![9.0]]);
+        g.set_series(&[vec![7.0, 8.0]]);
+        assert_eq!(g.series_for_test(), vec![vec![7.0, 8.0]], "2 → 1 series");
+        g.set_series(&[vec![1.0], vec![2.0], vec![3.0]]);
+        assert_eq!(
+            g.series_for_test(),
+            vec![vec![1.0], vec![2.0], vec![3.0]],
+            "1 → 3 series",
+        );
+        g.set_series::<Vec<f64>>(&[]);
+        assert!(g.series_for_test().is_empty());
+    }
+
+    /// A ring grows only to what it is handed — the capacity is a bound, not
+    /// an allocation — so a reconciled graph built at the wire's 1024-sample
+    /// cap costs what it carries (`Sparkline`'s #1414 LOW 8, for this widget).
+    ///
+    /// **Falsified** by `resize_with(.., || VecDeque::with_capacity(self.capacity))`.
+    #[gtk::test]
+    fn set_series_allocates_lazily() {
+        let g = MultiSparkline::new(1024);
+        g.set_series(&[vec![1.0, 2.0, 3.0], vec![4.0]]);
+        for ring in g.series.borrow().iter() {
+            assert!(
+                ring.capacity() < 1024,
+                "a short series does not reserve the whole capacity ({})",
+                ring.capacity(),
+            );
+        }
     }
 
     #[gtk::test]

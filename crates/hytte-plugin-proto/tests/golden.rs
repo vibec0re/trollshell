@@ -59,7 +59,10 @@
 //! bump (`07` → `08`, the page-visibility pair) did the same to the same four,
 //! and pinned its two variants in two new files (`host_page_visibility_v1`,
 //! `plugin_register_page_visible_v1` — the latter built from [`Manifest::new`],
-//! so it is a fifth file the *next* bump moves).
+//! so it is a fifth file the *next* bump moves). #1419's bump (`08` → `09`, the
+//! `MultiSparkline` node) was that next bump: it moved exactly those five files
+//! by exactly one hex digit each, and pinned its new variant in a new file
+//! (`plugin_render_multi_sparkline_v1`) rather than in any of them.
 //!
 //! What did **not** move in those files is the `mount` tag, and that is the
 //! point: #1158 pinned its new mount in a **new** fixture
@@ -1125,7 +1128,50 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 },
             }),
         ),
+        // #1419's multi-series graph, in its own file for #1050's reason: an
+        // appended variant pinned here cannot move a pre-existing fixture, so
+        // the five census-stamping files above moving by nothing but the
+        // census byte is the evidence that nothing else changed shape.
+        (
+            "plugin_render_multi_sparkline_v1",
+            Box::new(PluginMsg::Render {
+                tree: multi_sparkline_tree(),
+                panel: None,
+                effects: vec![],
+                hidden_on: Vec::new(),
+            }),
+        ),
     ]
+}
+
+/// A per-core history block (#1419): one graph on a fixed `0..=1` top over two
+/// series of unequal length, and one auto-scaled graph (no `max` key on the
+/// wire at all) whose second series is an empty window — so the fixture pins
+/// the variant tag, the `skip_serializing_if` on `max`, and the nested
+/// `Vec<Vec<f32>>` encoding, including an empty inner array.
+fn multi_sparkline_tree() -> Node {
+    Node::Box {
+        id: Some("per-core".into()),
+        dir: Dir::Vertical,
+        spacing: 6,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            Node::MultiSparkline {
+                id: Some("per-core-load".into()),
+                series: vec![vec![0.0, 0.25, 0.5], vec![1.0, 0.75]],
+                max: Some(1.0),
+                classes: vec!["ts-cores".into()],
+            },
+            Node::MultiSparkline {
+                id: Some("per-core-clock".into()),
+                series: vec![vec![2.4e9, 3.6e9], vec![]],
+                max: None,
+                classes: vec![],
+            },
+        ],
+        tooltip: None,
+    }
 }
 
 /// A native-look history row (#1252): `[name | Sparkline | value]`, with one

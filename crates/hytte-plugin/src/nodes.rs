@@ -19,6 +19,10 @@
 //!   the shell's own flat history line, negotiated on [`SPARKLINE_VOCAB`]: it
 //!   degrades to a [`Node::Progress`] at the newest sample's level against a
 //!   shell that cannot draw one.
+//! - [`multi_sparkline`] (#1419) is the same again for
+//!   [`Node::MultiSparkline`], the shell's per-core history graph, negotiated
+//!   on [`MULTI_SPARKLINE_VOCAB`]: it degrades to a [`sparkline`] — which
+//!   degrades in turn — so one call is safe against every shell.
 //! - [`container`] builds a [`Node::Box`], and it and [`row`] carry
 //!   `.homogeneous(true)` (#1252): equal-size children, spelt as the
 //!   [`HOMOGENEOUS_CLASS`] the host reads rather than as a field every struct
@@ -63,7 +67,8 @@
 //! ```
 
 use hytte_plugin_proto::{
-    Cls, Dir, HOMOGENEOUS_CLASS, Node, NodeId, SCROLLED_VOCAB, SPARKLINE_VOCAB,
+    Cls, Dir, HOMOGENEOUS_CLASS, MULTI_SPARKLINE_VOCAB, Node, NodeId, SCROLLED_VOCAB,
+    SPARKLINE_VOCAB,
 };
 
 /// Add [`HOMOGENEOUS_CLASS`] to `classes` (once) or take it out — the one
@@ -155,6 +160,28 @@ pub fn sparkline(values: impl Into<Vec<f32>>) -> Sparkline {
         values: values.into(),
         max: None,
         classes: Vec::new(),
+    }
+}
+
+/// Start a [`Node::MultiSparkline`] — the shell's multi-series history graph
+/// — over `series`, one window per line, each **oldest first**.
+///
+/// Defaults: no id, no classes, `max: None` (auto-scale to the largest sample
+/// across every series), and the older-shell fallback line is the per-sample
+/// mean of the series (see [`MultiSparkline::fallback`]). Set
+/// [`MultiSparkline::max`] for a quantity with a natural ceiling — `1.0` for a
+/// per-core load fraction.
+///
+/// Read [`MultiSparkline::build`] before using it: the node is
+/// **negotiated**, and `build` is where that is handled.
+#[must_use]
+pub fn multi_sparkline(series: impl Into<Vec<Vec<f32>>>) -> MultiSparkline {
+    MultiSparkline {
+        id: None,
+        series: series.into(),
+        max: None,
+        classes: Vec::new(),
+        fallback: None,
     }
 }
 
@@ -560,12 +587,175 @@ pub fn host_speaks_sparkline() -> bool {
     crate::display::negotiated_vocab() >= SPARKLINE_VOCAB
 }
 
+/// Builder for [`Node::MultiSparkline`]; see [`multi_sparkline`].
+#[derive(Clone, Debug)]
+pub struct MultiSparkline {
+    id: Option<NodeId>,
+    series: Vec<Vec<f32>>,
+    max: Option<f32>,
+    classes: Vec<Cls>,
+    fallback: Option<Vec<f32>>,
+}
+
+impl MultiSparkline {
+    /// Set the diff/reorder key. The older-shell fallback keeps it too.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<NodeId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Fix the top of the shared y axis at `max` (every series draws
+    /// `0..=max`), instead of auto-scaling to the largest sample across all of
+    /// them. A `max` that is not a positive finite number auto-scales anyway —
+    /// see [`sane_sparkline_max`](hytte_plugin_proto::sane_sparkline_max). The
+    /// fallback line uses the same axis.
+    #[must_use]
+    pub fn max(mut self, max: f32) -> Self {
+        self.max = Some(max);
+        self
+    }
+
+    /// Append one CSS class. It styles the widget (its height, its margins);
+    /// the lines' colours are the widget's own per-series hues and no class
+    /// changes them. The fallback keeps the classes too.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<Cls>) -> Self {
+        self.classes.push(class.into());
+        self
+    }
+
+    /// The single line an older shell draws **instead** of this graph, oldest
+    /// first — for when the plugin already has a better summary than the
+    /// default, such as the overall CPU load it keeps beside its per-core
+    /// windows.
+    ///
+    /// Unset, the fallback is the **per-sample mean** of the series, aligned
+    /// at the newest sample: its last point is the mean of every series' last
+    /// sample, the one before it the mean of every series long enough to have
+    /// one, and so on back to the longest series' oldest. Each sample is
+    /// sanitised first ([`sane_sparkline_sample`](hytte_plugin_proto::sane_sparkline_sample)),
+    /// so a `NaN` counts as a zero in its slot's mean rather than poisoning it.
+    #[must_use]
+    pub fn fallback(mut self, values: impl Into<Vec<f32>>) -> Self {
+        self.fallback = Some(values.into());
+        self
+    }
+
+    /// Finish the node — **or fall back to a [`Node::Sparkline`]** (built with
+    /// [`sparkline`]) if this session's host never advertised
+    /// [`MULTI_SPARKLINE_VOCAB`].
+    ///
+    /// [`Node::MultiSparkline`] is a negotiated variant (#1419): a host that
+    /// predates it cannot decode the frame at all, so emitting one
+    /// unconditionally would turn a richer picture into #437's silent 5 s
+    /// reconnect loop. The check is against [`MULTI_SPARKLINE_VOCAB`] and
+    /// nothing earlier — a generation-7 or -8 shell draws a single line and
+    /// cannot decode this node.
+    ///
+    /// **Why a single line.** It is the closest thing an older shell draws: the
+    /// same history, on the same axis, in the same flat native look, only
+    /// summarised to one series (by default the mean — for per-core loads,
+    /// the overall load). The fallback goes through [`Sparkline::build`], so it
+    /// is negotiated in turn and becomes a [`Node::Progress`] on a shell older
+    /// than [`SPARKLINE_VOCAB`]: one call is safe against every shell. It
+    /// keeps this node's `id`, `max` and `class`es — negotiation is fixed for
+    /// the life of a session, so the degraded tree diffs against itself by the
+    /// same key.
+    ///
+    /// Use [`build_unnegotiated`](Self::build_unnegotiated) only where the wire
+    /// shape itself is under test.
+    #[must_use]
+    pub fn build(self) -> Node {
+        if host_speaks_multi_sparkline() {
+            self.build_unnegotiated()
+        } else {
+            self.build_fallback()
+        }
+    }
+
+    /// The [`Node::MultiSparkline`] itself, with no host check.
+    ///
+    /// For tests that pin the wire shape. In a live plugin this is only correct
+    /// behind your own [`host_speaks_multi_sparkline`] branch — see
+    /// [`build`](Self::build).
+    #[must_use]
+    pub fn build_unnegotiated(self) -> Node {
+        Node::MultiSparkline {
+            id: self.id,
+            series: self.series,
+            max: self.max,
+            classes: self.classes,
+        }
+    }
+
+    /// The older-shell arm of [`build`](Self::build): the fallback line (or
+    /// the newest-aligned mean) as a [`sparkline`], which negotiates itself.
+    fn build_fallback(self) -> Node {
+        let values = self
+            .fallback
+            .unwrap_or_else(|| newest_aligned_mean(&self.series));
+        Sparkline {
+            id: self.id,
+            values,
+            max: self.max,
+            classes: self.classes,
+        }
+        .build()
+    }
+}
+
+/// The per-sample mean of `series`, aligned at the newest sample, oldest first
+/// — [`MultiSparkline`]'s default fallback line (see
+/// [`MultiSparkline::fallback`]).
+///
+/// As long as the longest series. Slot `k` from the end averages every series
+/// that has a sample `k` from its own end, in `f64` so a column of saturated
+/// samples cannot overflow before the division.
+fn newest_aligned_mean(series: &[Vec<f32>]) -> Vec<f32> {
+    use hytte_plugin_proto::sane_sparkline_sample;
+
+    let longest = series.iter().map(Vec::len).max().unwrap_or(0);
+    let mut line = vec![0.0_f32; longest];
+    for (back, slot) in line.iter_mut().rev().enumerate() {
+        let (sum, count) = series
+            .iter()
+            .filter_map(|s| s.len().checked_sub(back + 1).map(|i| s[i]))
+            .fold((0.0_f64, 0.0_f64), |(sum, count), sample| {
+                (sum + f64::from(sane_sparkline_sample(sample)), count + 1.0)
+            });
+        // `back < longest`, so the longest series always contributes and
+        // `count >= 1`. The mean of finite `f32`s is within `f32`'s range, so
+        // the narrowing only rounds.
+        #[allow(clippy::cast_possible_truncation)]
+        let mean = (sum / count) as f32;
+        *slot = mean;
+    }
+    line
+}
+
+/// Whether this session's host advertised the multi-series graph (#1419) —
+/// i.e. whether [`negotiated_vocab`](crate::display::negotiated_vocab) has
+/// reached [`MULTI_SPARKLINE_VOCAB`].
+///
+/// [`MultiSparkline::build`] consults this for you; call it directly only to
+/// skip work of your own — the per-core windows an older shell would never
+/// see drawn, say, or a toggle that would only reveal the fallback line.
+#[must_use]
+pub fn host_speaks_multi_sparkline() -> bool {
+    crate::display::negotiated_vocab() >= MULTI_SPARKLINE_VOCAB
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        container, host_speaks_scrolled, host_speaks_sparkline, list, row, scrolled, sparkline,
+        container, host_speaks_multi_sparkline, host_speaks_scrolled, host_speaks_sparkline, list,
+        multi_sparkline, newest_aligned_mean, row, scrolled, sparkline,
     };
-    use hytte_plugin_proto::{Dir, HOMOGENEOUS_CLASS, Node, SCROLLED_VOCAB, SPARKLINE_VOCAB};
+    use hytte_plugin_proto::{
+        Dir, HOMOGENEOUS_CLASS, MULTI_SPARKLINE_VOCAB, Node, PAGE_VISIBLE_VOCAB, SCROLLED_VOCAB,
+        SPARKLINE_VOCAB,
+    };
 
     fn label(text: &str) -> Node {
         Node::Label {
@@ -843,5 +1033,169 @@ mod tests {
         assert!(fraction(sparkline(vec![0.0, 0.0]).build()).abs() < 1e-9);
         assert!(fraction(sparkline(vec![f32::NAN]).build()).abs() < 1e-9);
         assert!(fraction(sparkline(vec![1.0, f32::NAN]).max(f32::NAN).build()).abs() < 1e-9);
+    }
+
+    // ── MultiSparkline (#1419) ─────────────────────────────────────────────
+
+    #[test]
+    fn multi_sparkline_defaults_auto_scale_with_no_id_or_classes() {
+        assert_eq!(
+            multi_sparkline(vec![vec![0.5], vec![1.5]]).build_unnegotiated(),
+            Node::MultiSparkline {
+                id: None,
+                series: vec![vec![0.5], vec![1.5]],
+                max: None,
+                classes: vec![],
+            },
+        );
+    }
+
+    /// The whole fallback chain on one thread (the `NEGOTIATED` thread-local):
+    /// a generation-9 host gets the graph; a generation-7 or -8 one the mean
+    /// `Sparkline`, id, top and classes kept; anything older a `Progress` at
+    /// the mean line's newest level.
+    ///
+    /// **Falsified** by making `build` return `build_unnegotiated()`
+    /// unconditionally (a generation-8 shell is sent a variant it cannot
+    /// decode), or by building the fallback as a bare `Node::Sparkline` literal
+    /// instead of through `Sparkline::build` (a generation-6 shell is sent a
+    /// `Sparkline` it cannot decode either).
+    #[test]
+    fn multi_sparkline_falls_back_a_generation_at_a_time() {
+        let graph = || {
+            multi_sparkline(vec![vec![0.2, 0.4], vec![0.6, 0.8]])
+                .id("per-core-load")
+                .max(1.0)
+                .class("ts-cores")
+        };
+
+        crate::display::set_negotiated(MULTI_SPARKLINE_VOCAB);
+        assert!(host_speaks_multi_sparkline());
+        assert_eq!(
+            graph().build(),
+            Node::MultiSparkline {
+                id: Some("per-core-load".into()),
+                series: vec![vec![0.2, 0.4], vec![0.6, 0.8]],
+                max: Some(1.0),
+                classes: vec!["ts-cores".into()],
+            },
+        );
+
+        for single_line_shell in [SPARKLINE_VOCAB, PAGE_VISIBLE_VOCAB] {
+            crate::display::set_negotiated(single_line_shell);
+            assert!(!host_speaks_multi_sparkline(), "gen {single_line_shell}");
+            assert_eq!(
+                graph().build(),
+                Node::Sparkline {
+                    id: Some("per-core-load".into()),
+                    values: vec![0.4, 0.6],
+                    max: Some(1.0),
+                    classes: vec!["ts-cores".into()],
+                },
+                "a generation-{single_line_shell} shell draws the mean line, id, top and \
+                 classes kept",
+            );
+        }
+
+        crate::display::set_negotiated(SPARKLINE_VOCAB - 1);
+        match graph().build() {
+            Node::Progress {
+                id,
+                fraction,
+                classes,
+            } => {
+                assert_eq!(id.as_deref(), Some("per-core-load"));
+                assert!(
+                    (fraction - 0.6).abs() < 1e-6,
+                    "the mean line's newest sample, 0.6 of 1.0: {fraction}"
+                );
+                assert_eq!(classes, vec!["ts-cores".to_owned()]);
+            }
+            other => panic!("an older shell still gets a bar, got {other:?}"),
+        }
+        crate::display::set_negotiated(0);
+        assert!(!host_speaks_multi_sparkline(), "no Hello, no graph");
+        assert!(matches!(graph().build(), Node::Progress { .. }));
+    }
+
+    /// Generation 8 — #1427's push, the generation right before this one and
+    /// not itself `Hello`-negotiated — is still an older shell: `>=` against
+    /// `MULTI_SPARKLINE_VOCAB`, not against the single line's marker or
+    /// whichever came last.
+    ///
+    /// **Falsified** by comparing against `SPARKLINE_VOCAB` (or
+    /// `PAGE_VISIBLE_VOCAB`) in `host_speaks_multi_sparkline`.
+    #[test]
+    fn vocab_eight_does_not_unlock_the_multi_sparkline() {
+        assert_eq!(
+            MULTI_SPARKLINE_VOCAB - 1,
+            PAGE_VISIBLE_VOCAB,
+            "precondition"
+        );
+        crate::display::set_negotiated(MULTI_SPARKLINE_VOCAB - 1);
+        assert!(!host_speaks_multi_sparkline());
+        assert!(host_speaks_sparkline(), "…though it does draw one line");
+        assert!(matches!(
+            multi_sparkline(vec![vec![1.0]]).build(),
+            Node::Sparkline { .. }
+        ));
+        crate::display::set_negotiated(0);
+    }
+
+    /// An explicit fallback line replaces the mean, on the same axis and key.
+    #[test]
+    fn an_explicit_fallback_line_replaces_the_mean() {
+        crate::display::set_negotiated(SPARKLINE_VOCAB);
+        assert_eq!(
+            multi_sparkline(vec![vec![0.9, 0.9]])
+                .fallback(vec![0.1, 0.2, 0.3])
+                .id("load")
+                .build(),
+            Node::Sparkline {
+                id: Some("load".into()),
+                values: vec![0.1, 0.2, 0.3],
+                max: None,
+                classes: vec![],
+            },
+        );
+        // …and the explicit line is what an older shell's bar reads, too.
+        crate::display::set_negotiated(0);
+        assert!(matches!(
+            multi_sparkline(vec![vec![0.9]]).fallback(vec![0.25]).max(1.0).build(),
+            Node::Progress { fraction, .. } if (fraction - 0.25).abs() < 1e-9
+        ));
+    }
+
+    /// The default fallback is the per-sample mean **aligned at the newest
+    /// sample**: series of unequal length line up at their right-hand ends,
+    /// a slot averages only the series that reach it, and a poisoned sample
+    /// counts as zero rather than poisoning its slot.
+    ///
+    /// **Falsified** by aligning at the oldest sample (index from the front:
+    /// the last slot reads 4.0, not 3.0), or by dividing every slot by the
+    /// series count (the oldest slot, reached by one series, halves), or by
+    /// averaging unsanitised samples (the `NaN` slot is `NaN`).
+    #[test]
+    fn the_default_fallback_is_the_newest_aligned_mean() {
+        // [1, 2, 3, 4] and [2, 2]: the last two slots average both series
+        // (4 and 2 → 3; 3 and 2 → 2.5), the first two only the long one.
+        assert_eq!(
+            newest_aligned_mean(&[vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 2.0]]),
+            vec![1.0, 2.0, 2.5, 3.0],
+        );
+        assert_eq!(
+            newest_aligned_mean(&[vec![f32::NAN, 1.0], vec![1.0, 1.0]]),
+            vec![0.5, 1.0],
+        );
+        assert_eq!(
+            newest_aligned_mean(&[vec![f32::INFINITY], vec![f32::INFINITY]]),
+            vec![f32::MAX],
+            "saturated samples do not overflow the sum",
+        );
+        assert!(newest_aligned_mean(&[]).is_empty(), "no series, no line");
+        assert!(
+            newest_aligned_mean(&[vec![], vec![]]).is_empty(),
+            "empty windows"
+        );
     }
 }

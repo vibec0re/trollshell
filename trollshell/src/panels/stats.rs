@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
-use hytte::futures_signals::signal::Signal;
+use hytte::futures_signals::signal::{Signal, always};
 use hytte::gtk::{self, gio, glib};
 use hytte::prelude::*;
 use hytte::reactive::health::{self, TaskHealth, TaskState};
@@ -47,7 +47,9 @@ use hytte_preem::{LedMatrix, palette_snapshot};
 // The app-id → desktop-entry resolver used to live in this file; #1071 moved it
 // to `components/` when the Workspaces page became a second consumer. Imported
 // back under its original names so every call site below reads unchanged.
-use crate::components::app_meta::{AppMeta, fallback_icon, resolve_app_meta};
+use crate::components::app_meta::{
+    AppMeta, MetaCache, fallback_icon, resolve_app_meta, resolve_app_metas,
+};
 use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
@@ -197,8 +199,12 @@ pub fn panel_stats() -> gtk::Widget {
     column.add_css_class("ts-popup-column");
     column.set_spacing(16);
 
-    let cpu_card = build_stats_cpu_card();
-    let memory_card = build_stats_memory_card();
+    // One lookup cache for both Top apps lists (#1441): a page build costs
+    // one desktop-entry scan, not one per list.
+    let (cpu_top_apps, mem_top_apps) =
+        build_top_apps_pair(app_usage::top_by_cpu, app_usage::top_by_mem);
+    let cpu_card = build_stats_cpu_card(&cpu_top_apps);
+    let memory_card = build_stats_memory_card(&mem_top_apps);
     let gpu_card = build_stats_gpu_card();
     let disks_card = build_stats_disks_card();
     let services_card = build_stats_services_card();
@@ -257,8 +263,12 @@ pub fn panel_stats() -> gtk::Widget {
 pub fn panel_stats_multicolumn() -> gtk::Widget {
     let grid = page_grid();
 
-    let cpu_card = build_stats_cpu_card();
-    let memory_card = build_stats_memory_card();
+    // One lookup cache for both Top apps lists (#1441): a page build costs
+    // one desktop-entry scan, not one per list.
+    let (cpu_top_apps, mem_top_apps) =
+        build_top_apps_pair(app_usage::top_by_cpu, app_usage::top_by_mem);
+    let cpu_card = build_stats_cpu_card(&cpu_top_apps);
+    let memory_card = build_stats_memory_card(&mem_top_apps);
     let gpu_card = build_stats_gpu_card();
     let disks_card = build_stats_disks_card();
     let services_card = build_stats_services_card();
@@ -474,12 +484,28 @@ fn single_card_page(card: &gtk::Widget) -> gtk::Widget {
 
 /// CPU stats flyout — opened from the CPU bar chip in `split` layout.
 pub fn panel_stats_cpu() -> gtk::Widget {
-    single_card_page(build_stats_cpu_card().upcast_ref::<gtk::Widget>())
+    // One list on this page, so no other list to batch beside it.
+    let top_apps = build_top_apps_expander(
+        TOP_APPS_CPU_TITLE,
+        app_usage::top_by_cpu(),
+        always(Vec::new()),
+        top_apps_cpu_value,
+        MetaCache::default(),
+    );
+    single_card_page(build_stats_cpu_card(&top_apps).upcast_ref::<gtk::Widget>())
 }
 
 /// Memory stats flyout — opened from the memory bar chip in `split` layout.
 pub fn panel_stats_memory() -> gtk::Widget {
-    single_card_page(build_stats_memory_card().upcast_ref::<gtk::Widget>())
+    // One list on this page, so no other list to batch beside it.
+    let top_apps = build_top_apps_expander(
+        TOP_APPS_RAM_TITLE,
+        app_usage::top_by_mem(),
+        always(Vec::new()),
+        top_apps_mem_value,
+        MetaCache::default(),
+    );
+    single_card_page(build_stats_memory_card(&top_apps).upcast_ref::<gtk::Widget>())
 }
 
 /// GPU stats flyout — opened from the GPU bar chip in `split` layout.
@@ -569,7 +595,10 @@ fn history_row_wrapper(child: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
 /// CPU card — live CPU + per-core + processes, CPU history sparkline, and the
 /// CPU top-apps expander. Processes (a system-load metric) lives here; this is
 /// the one placement Mara didn't pin (flagged in the PR for relocation).
-fn build_stats_cpu_card() -> adw::PreferencesGroup {
+///
+/// `top_apps` comes from the page, which builds its two Top apps lists
+/// together so they share one lookup cache ([`build_top_apps_pair`]).
+fn build_stats_cpu_card(top_apps: &adw::ExpanderRow) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
 
     group.add(&build_live_cpu_row());
@@ -578,28 +607,22 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
     group.add(&build_live_processes_row());
     group.add(&build_expandable_cpu_history_row());
     group.add(&build_expandable_cpu_clock_row());
-    group.add(&build_top_apps_expander(
-        "Top apps \u{00b7} CPU",
-        app_usage::top_by_cpu(),
-        |s| format!("{:.0}%", s.cpu_frac * 100.0),
-    ));
+    group.add(top_apps);
 
     group
 }
 
 /// Memory card — live memory + swap, memory history sparkline, and the RAM
 /// top-apps expander. The swap row self-hides when no swap is configured.
-fn build_stats_memory_card() -> adw::PreferencesGroup {
+///
+/// `top_apps` comes from the page, as for [`build_stats_cpu_card`].
+fn build_stats_memory_card(top_apps: &adw::ExpanderRow) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
 
     group.add(&build_live_memory_row());
     group.add(&build_live_swap_row());
     group.add(&history_row_wrapper(&build_history_memory_row()));
-    group.add(&build_top_apps_expander(
-        "Top apps \u{00b7} RAM",
-        app_usage::top_by_mem(),
-        |s| fmt_bytes(s.mem_bytes),
-    ));
+    group.add(top_apps);
 
     group
 }
@@ -645,15 +668,73 @@ const TOP_APPS_TITLE_CHARS: i32 = 20;
 /// subtitle — short by construction, but bounded on the same principle.
 const TOP_APPS_SUBTITLE_CHARS: i32 = 14;
 
+/// The CPU list's title.
+const TOP_APPS_CPU_TITLE: &str = "Top apps \u{00b7} CPU";
+/// The RAM list's title.
+const TOP_APPS_RAM_TITLE: &str = "Top apps \u{00b7} RAM";
+
+/// The CPU list's right-hand value: the app's CPU share.
+fn top_apps_cpu_value(s: &ProcSample) -> String {
+    format!("{:.0}%", s.cpu_frac * 100.0)
+}
+
+/// The RAM list's right-hand value: the app's resident memory.
+fn top_apps_mem_value(s: &ProcSample) -> String {
+    fmt_bytes(s.mem_bytes)
+}
+
+/// A page's two "Top apps" lists, CPU and RAM, over **one** [`MetaCache`]
+/// (#1441, the #1443 review's L3).
+///
+/// Each list batches both lists' app ids before it rebuilds (see
+/// [`build_top_apps_expander`]'s `also`), into the cache the two share. So
+/// whichever list rebuilds first scans once for every unseen id on the page,
+/// and the other list's lookups are all hits. A Stats page build costs one
+/// desktop-entry scan, not one per list. Each list takes its signal twice,
+/// once as its own and once as the other list's `also`, hence the
+/// factories.
+fn build_top_apps_pair<C, M>(
+    cpu: impl Fn() -> C,
+    mem: impl Fn() -> M,
+) -> (adw::ExpanderRow, adw::ExpanderRow)
+where
+    C: Signal<Item = Vec<ProcSample>> + 'static,
+    M: Signal<Item = Vec<ProcSample>> + 'static,
+{
+    let meta_cache = MetaCache::default();
+    let cpu_list = build_top_apps_expander(
+        TOP_APPS_CPU_TITLE,
+        cpu(),
+        mem(),
+        top_apps_cpu_value,
+        Rc::clone(&meta_cache),
+    );
+    let mem_list = build_top_apps_expander(
+        TOP_APPS_RAM_TITLE,
+        mem(),
+        cpu(),
+        top_apps_mem_value,
+        meta_cache,
+    );
+    (cpu_list, mem_list)
+}
+
 /// A collapsible "Top apps" list (CPU or RAM) bound to an [`app_usage`] signal.
 /// `value` formats each row's right-hand value. Mirrors
 /// [`build_live_disk_expander`]'s drain-and-rebuild pattern.
 ///
 /// Each row gets a leading icon resolved from the app-id through
 /// `components::app_meta` (its desktop entry's `Icon=`). Icons and display
-/// names are cached per app-id (one desktop-entry scan per unique app-id per
-/// expander lifetime). The name field is rendered with markup
-/// off so an adversarial scope id can't inject Pango markup (cf. #30).
+/// names are cached per app-id in `meta_cache`, which the caller owns so a
+/// page's two lists can share one ([`build_top_apps_pair`]). Each rebuild
+/// resolves the ids of its own list **and** of `also` — the page's other
+/// list — in one batch (#1441), so a rebuild that shows an unseen app-id costs
+/// one desktop-entry scan for both lists, and a rebuild with none costs none.
+/// The rows themselves are rebuilt only when this list changed: an emission
+/// where only `also` moved resolves its ids and leaves the rows alone.
+/// A single-list page passes an `also` that never has ids. The name field is
+/// rendered with markup off so an adversarial scope id can't inject Pango
+/// markup (cf. #30).
 ///
 /// The "System" bucket (all non-app-scope PIDs) gets a `computer-symbolic` icon.
 ///
@@ -669,7 +750,9 @@ const TOP_APPS_SUBTITLE_CHARS: i32 = 14;
 fn build_top_apps_expander(
     title: &str,
     signal: impl Signal<Item = Vec<ProcSample>> + 'static,
+    also: impl Signal<Item = Vec<ProcSample>> + 'static,
     value: fn(&ProcSample) -> String,
+    meta_cache: MetaCache,
 ) -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title(title).build();
     markup::plain_text(&expander);
@@ -688,11 +771,6 @@ fn build_top_apps_expander(
     summary.set_halign(gtk::Align::End);
     expander.add_suffix(&summary);
 
-    // Metadata cache: app-id → AppMeta (None = no desktop file found).
-    // Lives for the lifetime of this expander's bind closure.
-    let meta_cache: Rc<RefCell<HashMap<String, Option<AppMeta>>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-
     let rows_track: Rc<RefCell<Vec<gtk::ListBoxRow>>> = Rc::new(RefCell::new(Vec::new()));
     // One-shot guard: collapse the expander the first time rows actually arrive.
     // We must not call set_expanded(false) on every tick — that would fight the
@@ -708,7 +786,38 @@ fn build_top_apps_expander(
     // is already owned by `expander`'s widget tree via `add_suffix`, so this
     // clone doesn't change its lifetime.
     let summary_for_bind = summary.clone();
-    bind(signal, &expander, move |expander, list| {
+    // Both lists arrive together: `app_usage` publishes them from one
+    // `Mutable`, so a tick is one emission here, not two.
+    let lists = map_ref! {
+        let list = signal,
+        let also = also => (list.clone(), also.clone())
+    };
+    // This list as its rows last showed it — the retained last-applied copy
+    // `hytte_ui`'s `SparklineState` keeps (#1414), so an emission where only
+    // `also` moved rebuilds nothing. `None` until the first apply, which
+    // always rebuilds (an empty list included: the summary's em-dash).
+    let applied: RefCell<Option<Vec<ProcSample>>> = RefCell::new(None);
+    bind(lists, &expander, move |expander, (list, also)| {
+        // #1441: this list's ids and the page's other list's, into the cache
+        // the two share — one scan for every unseen id on the page, so the
+        // other list's rebuild is all hits. Runs on every emission, `also`'s
+        // alone included, so the cache has the other list's ids before that
+        // list rebuilds. A statement of its own, so the `RefMut` is gone
+        // before any widget is touched (#643/#663/#832).
+        resolve_app_metas(
+            list.iter().chain(&also).filter_map(|s| s.app_id.as_deref()),
+            &mut meta_cache.borrow_mut(),
+        );
+        // The rows only when this list moved. An emission where only `also`
+        // changed has nothing new to show here, and a rebuild would replace
+        // every row widget for the same rows. A sample whose `cpu_frac` is
+        // NaN never equals itself, so that list rebuilds every time — the
+        // safe direction. The `Ref` ends with this statement, before any
+        // widget is touched.
+        let unchanged = applied.borrow().as_ref() == Some(&list);
+        if unchanged {
+            return;
+        }
         rebuild_top_apps(
             expander,
             &summary_for_bind,
@@ -718,6 +827,7 @@ fn build_top_apps_expander(
             value,
             &list,
         );
+        *applied.borrow_mut() = Some(list);
     });
 
     expander
@@ -764,6 +874,17 @@ fn rebuild_top_apps(
     for row in rows_track.take() {
         expander.remove(&row);
     }
+    // #1441: every app id in `list`, resolved together — one desktop-entry
+    // scan for all the ids the cache lacks, where the summary's and each
+    // row's own lookups would scan once per unseen id. Those lookups are then
+    // all cache hits. `build_top_apps_expander` has already batched these
+    // ids with the other list's, so from there this finds nothing to scan;
+    // it keeps a rebuild correct on its own. A statement of its own, so the
+    // `RefMut` is gone before any widget is touched (#643/#663/#832).
+    resolve_app_metas(
+        list.iter().filter_map(|s| s.app_id.as_deref()),
+        &mut meta_cache.borrow_mut(),
+    );
     // Collapsed summary: the heaviest entry's display name, or an em-dash.
     let subtitle = list.first().map_or_else(
         || "\u{2014}".to_string(),
@@ -3234,8 +3355,13 @@ mod width_tests {
         let long = "x".repeat(LONG);
 
         let samples: Mutable<Vec<ProcSample>> = Mutable::new(vec![proc_sample(&long)]);
-        let expander =
-            build_top_apps_expander("Top apps \u{00b7} RAM", samples.signal_cloned(), cpu_value);
+        let expander = build_top_apps_expander(
+            "Top apps \u{00b7} RAM",
+            samples.signal_cloned(),
+            hytte::futures_signals::signal::always(Vec::new()),
+            cpu_value,
+            MetaCache::default(),
+        );
         pump();
         let page = single_card_page(expander.upcast_ref());
         let nat_long = natural_width(&page);
@@ -3721,7 +3847,13 @@ mod pin_tests {
     fn top_apps_binding_does_not_pin_expander() {
         adw::init().expect("libadwaita init");
         let samples: Mutable<Vec<ProcSample>> = Mutable::new(Vec::new());
-        let expander = build_top_apps_expander("Top apps", samples.signal_cloned(), cpu_value);
+        let expander = build_top_apps_expander(
+            "Top apps",
+            samples.signal_cloned(),
+            hytte::futures_signals::signal::always(Vec::new()),
+            cpu_value,
+            crate::components::app_meta::MetaCache::default(),
+        );
         let weak = expander.downgrade();
         pump();
 
@@ -4066,5 +4198,279 @@ mod stats_grid_tests {
         gpu.set_visible(true);
         assert_eq!(cell(&grid, disks).0, 1, "Disks must return to column 1");
         assert_eq!(occupied(&grid, &cards, 1), vec![0, 1]);
+    }
+}
+
+/// #1441: what one "Top apps" rebuild costs in desktop-entry scans.
+///
+/// Needs a display for the same reason [`reentrancy_tests`] does — the rows
+/// are real `adw`/`gtk` widgets — hence the `system-tests` gate. Every lookup
+/// goes to an installed fixture (`app_meta::test_support`), so no test here
+/// reads the host's desktop entries.
+#[cfg(all(test, feature = "system-tests"))]
+mod top_apps_scan_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+
+    use super::{TOP_APPS_TITLE_CHARS, fixed_width_label, rebuild_top_apps};
+    use crate::components::app_meta::test_support::{self, Fixture};
+
+    fn sample(app_id: Option<&str>) -> ProcSample {
+        ProcSample {
+            name: "proc".to_owned(),
+            app_id: app_id.map(str::to_owned),
+            cpu_frac: 0.5,
+            mem_bytes: 1024,
+            procs: 1,
+        }
+    }
+
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// **One rebuild costs one desktop-entry scan**, however many unseen app
+    /// ids the list carries — twelve here, plus the "System" bucket, which
+    /// has none — and a rebuild of the same list costs none. The collapsed
+    /// summary, the first lookup a rebuild makes, is a hit too.
+    ///
+    /// Falsified by deleting the `resolve_app_metas` call in
+    /// [`rebuild_top_apps`] (the summary's and each row's own lookups scan for
+    /// their unseen ids: 12 ≠ 1), and by moving it below the summary (2 ≠ 1).
+    #[gtk::test]
+    fn a_top_apps_rebuild_resolves_every_app_id_in_one_scan() {
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        f.program("ts-top-1441");
+        f.entry(
+            "ts-top-1441-a.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS Top A\nExec=ts-top-1441\n",
+        );
+        let _installed = f.install();
+
+        let expander = adw::ExpanderRow::builder().title("Top apps").build();
+        let summary = fixed_width_label(TOP_APPS_TITLE_CHARS);
+        let rows: Rc<RefCell<Vec<gtk::ListBoxRow>>> = Rc::new(RefCell::new(Vec::new()));
+        let meta = Rc::new(RefCell::new(HashMap::new()));
+        let collapsed = Rc::new(Cell::new(false));
+        let mut list: Vec<ProcSample> = std::iter::once(sample(Some("ts-top-1441-a")))
+            .chain((1..12).map(|n| sample(Some(&format!("no-such-top-app-1441-{n}")))))
+            .chain([sample(None)])
+            .collect();
+        let rebuild = |list: &[ProcSample]| {
+            rebuild_top_apps(
+                &expander, &summary, &rows, &meta, &collapsed, cpu_value, list,
+            );
+        };
+
+        rebuild(&list);
+        assert_eq!(test_support::scans(), 1, "twelve unseen app ids, one scan");
+        assert_eq!(summary.text().as_str(), "TS Top A \u{00b7} 50%");
+        assert_eq!(rows.borrow().len(), list.len());
+
+        rebuild(&list);
+        assert_eq!(
+            test_support::scans(),
+            1,
+            "a rebuild of the same list scans nothing"
+        );
+
+        list.push(sample(Some("ts-top-1441-late")));
+        rebuild(&list);
+        assert_eq!(test_support::scans(), 2, "one new id, one more scan");
+    }
+
+    /// Every label's text under `root`, depth-first.
+    fn label_texts(root: &gtk::Widget) -> Vec<String> {
+        fn walk(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                out.push(label.text().to_string());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                walk(&c, out);
+                child = c.next_sibling();
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    /// **#1443 review L3: a Stats page's two Top apps lists cost one scan
+    /// between them.** The CPU list and the RAM list share one cache
+    /// ([`build_top_apps_pair`]), and each rebuild batches both lists' ids,
+    /// so the first population — six unseen ids apiece, one of them on both
+    /// lists — is one scan, however the two rebuilds are ordered. A tick that
+    /// brings one new id is one more scan, although both lists rebuild.
+    ///
+    /// Falsified by giving each list its own cache in [`build_top_apps_pair`]
+    /// (2 ≠ 1), and by dropping the other list's ids from
+    /// `build_top_apps_expander`'s batch (the RAM-only ids scan a second
+    /// time: 2 ≠ 1).
+    #[gtk::test]
+    fn the_cpu_and_ram_lists_resolve_the_whole_page_in_one_scan() {
+        use hytte::futures_signals::signal::Mutable;
+
+        use super::build_top_apps_pair;
+
+        fn pump() {
+            while gtk::glib::MainContext::default().iteration(false) {}
+        }
+
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        f.program("ts-top-1441");
+        f.entry(
+            "ts-top-1441-a.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS Top A\nExec=ts-top-1441\n",
+        );
+        let _installed = f.install();
+
+        let list = |prefix: &str| -> Vec<ProcSample> {
+            std::iter::once(sample(Some("ts-top-1441-a")))
+                .chain((1..6).map(|n| sample(Some(&format!("no-such-{prefix}-app-1441-{n}")))))
+                .collect()
+        };
+        let cpu = Mutable::new(list("cpu"));
+        let mem = Mutable::new(list("ram"));
+        let (cpu_list, mem_list) =
+            build_top_apps_pair(|| cpu.signal_cloned(), || mem.signal_cloned());
+        pump();
+        assert_eq!(
+            test_support::scans(),
+            1,
+            "eleven unseen app ids over two lists, one scan"
+        );
+        for (expander, raw) in [
+            (&cpu_list, "no-such-cpu-app-1441-1"),
+            (&mem_list, "no-such-ram-app-1441-1"),
+        ] {
+            let texts = label_texts(expander.upcast_ref());
+            assert!(
+                texts.iter().any(|t| t.starts_with("TS Top A")),
+                "the resolved app reads its name: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t == raw),
+                "an unresolved app reads its raw id: {texts:?}"
+            );
+        }
+
+        let mut more = list("ram");
+        more.push(sample(Some("no-such-ram-app-1441-late")));
+        mem.set(more);
+        pump();
+        assert_eq!(
+            test_support::scans(),
+            2,
+            "one new id, one more scan, although both lists rebuild"
+        );
+    }
+
+    /// The label under `root` whose text is exactly `text` — a row's title.
+    fn label_reading(root: &gtk::Widget, text: &str) -> gtk::Label {
+        fn walk(widget: &gtk::Widget, text: &str) -> Option<gtk::Label> {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>()
+                && label.text() == text
+            {
+                return Some(label.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                if let Some(found) = walk(&c, text) {
+                    return Some(found);
+                }
+                child = c.next_sibling();
+            }
+            None
+        }
+        walk(root, text).unwrap_or_else(|| panic!("no label reads {text:?}"))
+    }
+
+    /// **An emission where only `also` moved resolves its ids but rebuilds
+    /// no rows** (the #1443 fix round). The page's other list changing is
+    /// what feeds this list's batch, not a reason to redraw this list: the
+    /// new id reaches the shared cache (one scan, and the other list's
+    /// rebuild would be a hit), while this list's row widgets stay the very
+    /// same objects. A change to this list does rebuild them — the positive
+    /// control that shows the identity check can see a rebuild at all.
+    ///
+    /// Falsified by dropping the "unchanged since the last apply" skip in
+    /// `build_top_apps_expander` (the row's label is a new widget).
+    #[gtk::test]
+    fn a_change_to_the_other_list_alone_resolves_but_rebuilds_no_rows() {
+        use hytte::futures_signals::signal::Mutable;
+
+        use super::build_top_apps_expander;
+        use crate::components::app_meta::MetaCache;
+
+        fn pump() {
+            while gtk::glib::MainContext::default().iteration(false) {}
+        }
+
+        adw::init().expect("libadwaita init");
+        let f = Fixture::new();
+        f.program("ts-top-1441");
+        for (id, name) in [("ts-top-1441-a", "TS Top A"), ("ts-top-1441-b", "TS Top B")] {
+            f.entry(
+                format!("{id}.desktop"),
+                &format!("[Desktop Entry]\nType=Application\nName={name}\nExec=ts-top-1441\n"),
+            );
+        }
+        let _installed = f.install();
+
+        let list = Mutable::new(vec![sample(Some("ts-top-1441-a"))]);
+        let also = Mutable::new(Vec::<ProcSample>::new());
+        let cache = MetaCache::default();
+        let expander = build_top_apps_expander(
+            "Top apps",
+            list.signal_cloned(),
+            also.signal_cloned(),
+            cpu_value,
+            Rc::clone(&cache),
+        );
+        pump();
+        assert_eq!(test_support::scans(), 1);
+        let row = label_reading(expander.upcast_ref(), "TS Top A");
+
+        also.set(vec![sample(Some("ts-top-1441-b"))]);
+        pump();
+        assert_eq!(
+            test_support::scans(),
+            2,
+            "the other list's new id is resolved"
+        );
+        assert_eq!(
+            cache
+                .borrow()
+                .get("ts-top-1441-b")
+                .and_then(Option::as_ref)
+                .map(|meta| meta.display_name.clone())
+                .as_deref(),
+            Some("TS Top B"),
+            "the other list's id is in the shared cache"
+        );
+        assert!(
+            label_reading(expander.upcast_ref(), "TS Top A") == row,
+            "only `also` moved, so this list's rows are the same widgets"
+        );
+
+        list.set(vec![
+            sample(Some("ts-top-1441-a")),
+            sample(Some("ts-top-1441-b")),
+        ]);
+        pump();
+        assert_eq!(test_support::scans(), 2, "this list's new row is a hit");
+        assert!(
+            label_reading(expander.upcast_ref(), "TS Top A") != row,
+            "this list moved, so its rows are rebuilt"
+        );
+        label_reading(expander.upcast_ref(), "TS Top B");
     }
 }

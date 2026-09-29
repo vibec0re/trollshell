@@ -1058,21 +1058,28 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
 /// `gio::DesktopAppInfo` is not available in the gio 0.22 bindings this
 /// workspace vendors (see `components/desktop_entry.rs`'s module doc for the
 /// same constraint), so this scans `gio::AppInfo::all()` for the desktop id
-/// instead — the same lookup idiom `companion.rs` uses. Logs a warning if
-/// the desktop entry isn't installed or the launch otherwise fails; never
-/// panics.
+/// instead ([`gnome_calendar_entry`]). Logs a warning if the desktop entry
+/// isn't installed or the launch otherwise fails; never panics.
 fn launch_gnome_calendar() {
-    let app = gio::AppInfo::all().into_iter().find(|info| {
-        info.id()
-            .is_some_and(|id| id == "org.gnome.Calendar.desktop")
-    });
-    let Some(app) = app else {
+    let Some(app) = gnome_calendar_entry() else {
         tracing::warn!("gnome-calendar desktop entry not found");
         return;
     };
     if let Err(e) = app.launch(&[], gio::AppLaunchContext::NONE) {
         tracing::warn!(error = %e, "could not launch gnome-calendar");
     }
+}
+
+/// gnome-calendar's desktop-file id.
+const GNOME_CALENDAR_DESKTOP_ID: &str = "org.gnome.Calendar.desktop";
+
+/// gnome-calendar's installed desktop entry, through
+/// `components::desktop_entry::listed` — the shell's one gio lookup by id,
+/// which skips a desktop file whose name is not UTF-8 instead of panicking a
+/// debug build on it, as the `info.id()` walk this used to spell out did when
+/// the entry was missing (#1441).
+fn gnome_calendar_entry() -> Option<gio::AppInfo> {
+    crate::components::desktop_entry::listed(GNOME_CALENDAR_DESKTOP_ID)
 }
 
 /// How long a clicked day's matching row stays highlighted.
@@ -1458,6 +1465,62 @@ mod tests {
             by_day.contains_key(&anchor),
             "browsed day's events must stay visible regardless of the live clock"
         );
+    }
+
+    const LOOKUP_CHILD: &str = "TROLLSHELL_CALENDAR_1441_LOOKUP_CHILD";
+    const LOOKUP_CHILD_OK: &str = "calendar-1441-lookup-child-reached-the-end";
+
+    /// **#1441: the gnome-calendar lookup skips a desktop file whose name is
+    /// not UTF-8**, next to it and without it: with the entry installed it is
+    /// found, and without it the lookup walks every listed entry — the one
+    /// named `ts-\xff\xfe.desktop` included — and answers `None` rather than
+    /// panicking a debug build in glib-rs's UTF-8 `debug_assert!`.
+    ///
+    /// Two children, because GIO keeps its listing for the life of a process:
+    /// the inner test reads which fixture it got from the disk.
+    ///
+    /// Falsified by putting the old `info.id()` walk back in
+    /// [`gnome_calendar_entry`] (the child without the entry panics), and by
+    /// `desktop_entry::utf8_id` calling `id()` unchecked (the same).
+    #[test]
+    fn the_gnome_calendar_lookup_skips_a_file_name_that_is_not_utf8() {
+        use crate::components::app_meta::test_support::Fixture;
+        for installed in [false, true] {
+            let f = Fixture::new();
+            f.non_utf8_entry();
+            if installed {
+                f.program("gnome-calendar");
+                f.entry(
+                    GNOME_CALENDAR_DESKTOP_ID,
+                    "[Desktop Entry]\nType=Application\nName=Calendar\nExec=gnome-calendar\n",
+                );
+            }
+            f.run_child(
+                "widgets::calendar::tests::the_gnome_calendar_lookup_skips_a_file_name_that_is_not_utf8_inner",
+                LOOKUP_CHILD,
+                LOOKUP_CHILD_OK,
+            );
+        }
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn the_gnome_calendar_lookup_skips_a_file_name_that_is_not_utf8_inner() {
+        let Some(root) = std::env::var_os(LOOKUP_CHILD) else {
+            return;
+        };
+        crate::components::app_meta::test_support::Fixture::assert_gio_lists_the_non_utf8_entry();
+        let installed = std::path::Path::new(&root)
+            .join("data-home/applications")
+            .join(GNOME_CALENDAR_DESKTOP_ID)
+            .exists();
+        let found = gnome_calendar_entry().map(|app| app.display_name().to_string());
+        assert_eq!(
+            found.as_deref(),
+            installed.then_some("Calendar"),
+            "installed: {installed}"
+        );
+        println!("{LOOKUP_CHILD_OK}");
     }
 }
 

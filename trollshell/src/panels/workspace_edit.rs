@@ -74,7 +74,7 @@ use hytte::prelude::*;
 use hytte::services::niri::{self, Window, Workspace};
 use hytte::services::systemd;
 
-use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
+use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta, resolve_app_metas};
 use crate::components::app_picker::add_app_button;
 use crate::components::desktop_entry::{self, Launchable};
 use crate::components::layout::{
@@ -1112,6 +1112,15 @@ fn build_app_list(draft: &Rc<RefCell<Draft>>, seams: &RowSeams) -> (gtk::ListBox
                 apps.append(&empty);
                 return;
             }
+            // #1441: every row's app id, resolved together — one
+            // desktop-entry scan for all the ids the cache lacks, where
+            // `app_row`'s own lookup would scan once per unseen id. Those
+            // lookups are then all cache hits. A statement of its own, so the
+            // `RefMut` is gone before any row is built (#643/#663/#832).
+            resolve_app_metas(
+                rows.iter().map(|app| app.id.as_str()),
+                &mut meta_cache.borrow_mut(),
+            );
             for (index, app) in rows.iter().enumerate() {
                 apps.append(&app_row(index, app, &meta_cache, &draft, &redraw, &seams));
             }
@@ -1884,6 +1893,69 @@ mod tests {
                 saved_stack: no_saved_stack(),
             },
         )
+    }
+
+    /// **#1441: building the app list costs one desktop-entry scan** for all
+    /// its rows' app ids — twelve unseen ones here — and a rebuild (an
+    /// override toggled, a row removed) over cached ids costs none. The
+    /// fixture is installed for this thread's production lookups, so nothing
+    /// reads the host's desktop entries.
+    ///
+    /// Falsified by deleting the `resolve_app_metas` call in
+    /// [`super::build_app_list`] (each row's own lookup scans for its unseen
+    /// id: 12 ≠ 1).
+    #[gtk::test]
+    fn the_app_list_resolves_every_app_id_in_one_scan() {
+        use crate::components::app_meta::test_support::{self, Fixture};
+
+        fn label_texts_under(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                out.push(label.text().to_string());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                label_texts_under(&c, out);
+                child = c.next_sibling();
+            }
+        }
+
+        let f = Fixture::new();
+        f.program("ts-edit-1441");
+        f.entry(
+            "ts-edit-1441-a.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS Edit A\nExec=ts-edit-1441\n",
+        );
+        let _installed = f.install();
+
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        // The override toggle below asks this, not the host's desktop entries.
+        let page = slot_with_resolver(&target, Rc::new(|_: &str| "ts-edit-1441".to_owned()));
+        let apps = std::iter::once(app("ts-edit-1441-a", None))
+            .chain((1..12).map(|n| app(&format!("no-such-edit-app-1441-{n}"), None)))
+            .collect();
+        target.set(Some(Draft {
+            apps,
+            ..saved_draft()
+        }));
+        pump();
+        assert_eq!(test_support::scans(), 1, "twelve unseen app ids, one scan");
+        let rows = app_rows(&page);
+        assert_eq!(rows.len(), 12);
+        let mut first = Vec::new();
+        label_texts_under(&rows[0], &mut first);
+        assert!(
+            first.iter().any(|text| text == "TS Edit A"),
+            "the resolved row reads its name: {first:?}"
+        );
+
+        // A rebuild of the same list: toggling an override redraws every row.
+        override_toggles(&page)[0].set_active(true);
+        pump();
+        assert_eq!(
+            test_support::scans(),
+            1,
+            "a rebuild over cached ids scans nothing"
+        );
     }
 
     /// §5: the sub-page opens **from a saved card**, showing every field of the

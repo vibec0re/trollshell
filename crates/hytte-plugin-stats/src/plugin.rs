@@ -395,7 +395,7 @@ impl Plugin for Stats {
     /// Every family forwards it. The bar instance's page is its chips' drawer
     /// page; the sidebar instance publishes none, so the host only ever seeds
     /// it `false` and its walker stays parked. Either way it is a separate
-    /// lane from the surface's [`Cmd::SetVisible`]: a page close never parks
+    /// lane from the surface's `Cmd::SetVisible`: a page close never parks
     /// the sensors sampler, so a bar chip keeps sampling on its own tick
     /// whatever the drawer does.
     ///

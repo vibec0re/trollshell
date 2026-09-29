@@ -8,7 +8,6 @@ use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
 use hytte_bus::{BusError, PropState, RetryPolicy, call_with, property_with};
 use std::time::Duration;
-use zbus::connection::Builder;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn epoch_bumps_after_supervised_reconnect() {
@@ -24,11 +23,7 @@ async fn epoch_bumps_after_supervised_reconnect() {
     // inject this as the "replacement" connection so the supervisor reconnects
     // without needing to open a real session bus. This avoids mutating
     // DBUS_SESSION_BUS_ADDRESS (which would require unsafe code).
-    let replacement = Builder::address(guard.address.as_str())
-        .expect("parse ephemeral bus address")
-        .build()
-        .await
-        .expect("open replacement connection to ephemeral bus");
+    let replacement = common::connect(guard.address.as_str()).await;
 
     // Simulate a disconnect: inject the replacement, clear the cached conn,
     // and wake the supervisor. The supervisor will find the injected connection
@@ -63,11 +58,7 @@ async fn late_transient_failure_does_not_clobber_fresh_connection() {
 
     // A replacement connection standing in for the one the supervisor would
     // install after a disconnect.
-    let fresh = Builder::address(guard.address.as_str())
-        .expect("parse ephemeral bus address")
-        .build()
-        .await
-        .expect("open replacement connection to ephemeral bus");
+    let fresh = common::connect(guard.address.as_str()).await;
 
     // Run an op that, mid-flight, sees a *fresh* connection installed
     // (generation bump) and only then fails transiently — exactly the "late

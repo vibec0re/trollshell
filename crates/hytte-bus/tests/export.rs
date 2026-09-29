@@ -27,8 +27,10 @@ impl Greeter {
 /// reply at all" as *retry*, never as an answer. This test is where #1011 was
 /// found: an unbounded raw call here parked forever on a `Hello` that zbus had
 /// dropped, and because a loop re-checks its deadline only between iterations,
-/// the 2 s budget it used to carry was unreachable. See `common`'s
-/// `CALL_BUDGET` for the mechanism and the measurements.
+/// the 2 s budget it used to carry was unreachable. Since #1423 the shared
+/// connection cannot drop that call any more (`connection.rs`'s
+/// `build_pooled`); the bound stays as the liveness guard `common`'s
+/// `CALL_BUDGET` describes, with the mechanism and the measurements.
 #[tokio::test(flavor = "multi_thread")]
 async fn export_unmounts_on_handle_drop() {
     let (conn, guard) = ephemeral_bus().await;
@@ -72,10 +74,11 @@ async fn export_unmounts_on_handle_drop() {
             }
             // An error reply — the object is not mounted *yet*. Retry.
             Ok(Err(_)) => {}
-            // No reply at all within the budget: the connection was not yet
-            // dispatching when this call landed, so zbus dropped it. Not a pass
-            // and not a fail — count it, retry, and let the assertion below
-            // report it if the whole budget goes this way.
+            // No reply at all within the budget. Before #1423 this was zbus
+            // dropping a call that landed before the connection was
+            // dispatching; now it can only be a slow reply (or a regression of
+            // that fix). Not a pass and not a fail — count it, retry, and let
+            // the assertion below report it if the whole budget goes this way.
             Err(_elapsed) => unanswered += 1,
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

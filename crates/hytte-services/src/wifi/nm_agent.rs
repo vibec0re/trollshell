@@ -1146,15 +1146,20 @@ mod system_tests {
     ///
     /// **See also**, because this is not the only transcription of that
     /// mechanism in the tree: `hytte-bus`'s `connection.rs` documents it at
-    /// `begin_dispatching` and its `tests/common/mod.rs` at `CALL_BUDGET`,
-    /// both from #1011 — the same race, reached through the pooled
-    /// `SharedConnection`, where it cost five `nix flake check` runs ~51
-    /// minutes of silence apiece instead of a 30-second hang. Those two cannot
-    /// take the barrier this function has: a pooled connection is not built
-    /// per interface, so `Builder::serve_at` has nothing to stage, and what
-    /// #1011 shipped instead is an early `object_server()` that narrows the
-    /// window plus bounded, retried calls that survive it. Keep the three
-    /// accounts in step if zbus's internals move.
+    /// `build_pooled` and its `tests/common/mod.rs` at `CALL_BUDGET` — the same
+    /// race, reached through the pooled `SharedConnection` (#1011), where it
+    /// cost five `nix flake check` runs ~51 minutes of silence apiece instead
+    /// of a 30-second hang. Since #1423 those connections take this function's
+    /// barrier too. A pooled connection is not built per interface, so it has
+    /// no real interface to stage; `build_pooled` stages a placeholder instead
+    /// (`mov.vibec0re.hytte.Ready` at `/mov/vibec0re/hytte`, no members), which
+    /// is enough to send `build_` down the same `started_event` path. That
+    /// replaced #1011's early `object_server()`, which only narrowed the window.
+    /// Production's secret agent rides one of those pooled connections (it is
+    /// mounted through `hytte_bus::export_object` on the system bus), so what
+    /// this harness gets from staging the agent on its builder, production now
+    /// gets from the placeholder. Keep the three accounts in step if zbus's
+    /// internals move.
     async fn mount_and_proxy(
         guard: &BusGuard,
         agent: NmAgent,

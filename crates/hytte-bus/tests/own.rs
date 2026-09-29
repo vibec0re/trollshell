@@ -309,18 +309,16 @@ async fn at_path_mounts_iface_callable() {
     // Bounded **and retried**, which is the shape `common::CALL_BUDGET`'s doc
     // prescribes and the only shape that keeps that doc true: a raw
     // `zbus::Proxy::call` has no reply timeout (`method_timeout` defaults to
-    // `None`), and an inbound call that zbus's object-server dispatch task has
-    // not subscribed to yet is dropped with no reply at all — so an unbounded
-    // call here does not fail, it parks the test forever (#1011, which cost
-    // five `nix flake check` runs ~51 minutes of silence apiece in
-    // `tests/export.rs`'s copy of this shape).
+    // `None`), so a call nobody answers does not fail, it parks the test
+    // forever (#1011, which cost five `nix flake check` runs ~51 minutes of
+    // silence apiece in `tests/export.rs`'s copy of this shape). Until #1423
+    // the pooled connection could drop an early call outright; its `Ready`
+    // barrier closed that, and the bound stays for whatever else goes silent.
     //
-    // Spending the whole `PROBE_BUDGET` on ONE call would instead convert that
-    // hang into a *false red*: `CALL_BUDGET` bounds a single call and
-    // `PROBE_BUDGET` bounds the loop built out of them, and a swallowed call is
-    // "not ready yet", to be retried, never an answer. Across the 2,400
-    // instrumented runs the #1011 campaign measured, every lost call was
-    // answered on the very next attempt.
+    // Spending the whole `PROBE_BUDGET` on ONE call would instead convert a
+    // slow reply into a *false red*: `CALL_BUDGET` bounds a single call and
+    // `PROBE_BUDGET` bounds the loop built out of them, and a call with no
+    // reply yet is retried, never taken as an answer.
     let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
     let mut reply: Option<String> = None;
     let mut unanswered = 0u32;
@@ -341,9 +339,9 @@ async fn at_path_mounts_iface_callable() {
         Some("world"),
         "Hello on the mounted object was never answered within {PROBE_BUDGET:?} \
          ({unanswered} calls got no reply at all within {CALL_BUDGET:?} each) — \
-         zbus drops an inbound call its object-server dispatch task has not \
-         subscribed to yet, and a raw call has no reply timeout (see \
-         common::CALL_BUDGET, #1011)"
+         calls with no reply at all mean the connection is not dispatching, \
+         which #1423's `Ready` barrier should make impossible (see \
+         common::CALL_BUDGET, #1011, #1423)"
     );
 }
 

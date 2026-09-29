@@ -341,7 +341,7 @@ The workspace lint config (`Cargo.toml`) is deliberately severe; a violation fai
 
 - `unsafe_code = "forbid"` workspace-wide. **Only `hytte-ecal` and `hytte-gl`** override this — the two islands (FFI to libecal; OpenGL entry points), each confining its unsafety to safe wrappers and each hand-mirroring the root lints table because workspace-lints inheritance is all-or-nothing. Keep the three tables in sync — `checks.lints-tables` (#1179) fails if you don't.
 - clippy `all` **and** `pedantic` at `deny`. Code must be pedantic-clean.
-- `disallowed_methods`: `zbus::Connection::session`/`::system` are **banned** (see `clippy.toml`). All D-Bus access goes through the `hytte-bus` primitives, never a raw zbus connection.
+- `disallowed_methods`: `zbus::Connection::session`/`::system` and, since #1423, `zbus::connection::Builder::session`/`::system` are **banned** (see `clippy.toml`); `hytte-bus`'s `open_connection` is the one allowed site, where the builder goes straight into `build_pooled`'s `Ready` barrier. All D-Bus access goes through the `hytte-bus` primitives, never a raw zbus connection.
 
 ```sh
 cargo clippy --workspace --all-targets        # must be clean

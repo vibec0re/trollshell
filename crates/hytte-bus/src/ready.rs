@@ -10,12 +10,15 @@
 //! it stages this one. `connection.rs`'s `build_pooled` has the whole argument.
 //!
 //! It is a real object on the bus, so it has a real name:
-//! [`READY_INTERFACE`] at [`READY_PATH`], on both the session and the system
-//! connection of every process that uses `hytte-bus`. It has no methods, no
-//! properties and no signals. Like every object zbus serves, it also answers
-//! the standard `org.freedesktop.DBus.Introspectable`, `Peer` and `Properties`
-//! interfaces — and nothing more. It owns no bus name, so the system bus needs
-//! no policy entry for it.
+//! [`READY_INTERFACE`] at [`READY_PATH`], on every pooled connection a process
+//! opens. The pools are lazy, so that is each bus the process actually uses:
+//! the shell serves it on the session and the system bus, and the control
+//! center, whose every `hytte-bus` call is on the session bus, on the session
+//! bus only. It has no methods, no properties and no signals. Like every object
+//! zbus serves, it also answers the standard
+//! `org.freedesktop.DBus.Introspectable`, `Peer` and `Properties` interfaces —
+//! and nothing more. It owns no bus name, so the system bus needs no policy
+//! entry for it.
 
 /// The D-Bus interface name of the placeholder object every `hytte-bus` pooled
 /// connection serves at [`READY_PATH`] (#1423).
@@ -33,8 +36,9 @@
 /// attribute, which cannot name a const; a unit test pins the two together.
 pub const READY_INTERFACE: &str = "mov.vibec0re.hytte.Ready";
 
-/// The object path the [`READY_INTERFACE`] placeholder is served at, on both
-/// the session and the system connection (#1423).
+/// The object path the [`READY_INTERFACE`] placeholder is served at, on every
+/// pooled connection — session, system, or both, as the process uses them
+/// (#1423).
 ///
 /// Nothing calls it. Exporting an object claims no bus name, so this path adds
 /// nothing a system-bus policy has to permit.

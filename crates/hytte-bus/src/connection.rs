@@ -2,8 +2,9 @@
 //! supervisor that owns reconnect with bounded exponential backoff.
 //!
 //! All five capability primitives sit on top of `SharedConnection`. No
-//! other code in the workspace should call `zbus::Connection::session()`
-//! or `system()`.
+//! other code in the workspace should call `zbus::Connection::session()` /
+//! `system()`, or `zbus::connection::Builder::session()` / `system()`
+//! (`clippy.toml` bans all four; `open_connection` is the one allowed site).
 //!
 //! Every connection this module builds is built through `build_pooled`, which
 //! stages the [`Ready`] placeholder interface so zbus's object server is
@@ -99,7 +100,7 @@ static SUPERVISOR_NOTIFY: LazyLock<SupervisorNotifyTable> =
     });
 
 /// Test-only side-table: pre-injected connections the supervisor should use
-/// instead of calling `Connection::session/system`. Keyed by the same Arc
+/// instead of calling `open_connection`. Keyed by the same Arc
 /// pointer identity as `SUPERVISOR_NOTIFY`. The value is consumed on first use.
 struct InjectedConnTable {
     inner: StdMutex<HashMap<usize, Connection>>,
@@ -446,11 +447,12 @@ pub mod test_support {
         /// `dbus-daemon` and then arms a replacement requires the *primitive*
         /// to notice the dead connection, clear it through `with_conn`, and
         /// wake the supervisor on its own; the supervisor then finds this
-        /// injection where it would otherwise call
-        /// `Connection::session`/`system` (which reads
-        /// `$DBUS_SESSION_BUS_ADDRESS`, a variable no test in this crate can
-        /// safely repoint — mutating it needs `unsafe`, forbidden
-        /// workspace-wide).
+        /// injection where it would otherwise call `open_connection` (which
+        /// reads `$DBUS_SESSION_BUS_ADDRESS` / `$DBUS_SYSTEM_BUS_ADDRESS`,
+        /// variables no test in this crate can safely repoint in its own
+        /// process — mutating them needs `unsafe`, forbidden workspace-wide;
+        /// `tests/ready.rs` reaches `open_connection` from a re-exec'd child
+        /// instead).
         #[doc(hidden)]
         pub fn arm_reconnect_for_test(&self, replacement: Connection) {
             INJECTED_CONN.inject(self, replacement);
@@ -687,11 +689,19 @@ async fn supervisor_loop(
 ///
 /// This is the single site that opens a production D-Bus connection — for the
 /// first connect and for every reconnect alike, since `supervisor_loop` has no
-/// other. All other crates must use the `hytte::bus::*` primitives instead
-/// (`clippy.toml` bans `Connection::session`/`system`). It no longer calls
-/// those two: they are `Builder::session()?.build()` and
-/// `Builder::system()?.build()`, which is exactly the shape that cannot stage an
-/// interface, so it takes the builders and hands them to [`build_pooled`].
+/// other. All other crates must use the `hytte::bus::*` primitives instead:
+/// `clippy.toml` bans `Connection::session`/`system` and, since #1423, the
+/// `Builder::session`/`system` this calls, so the `allow` below marks the one
+/// place either may appear. It no longer calls `Connection::session`/`system`:
+/// those are `Builder::session()?.build()` and `Builder::system()?.build()`,
+/// which is exactly the shape that cannot stage an interface, so it takes the
+/// builders and hands them to [`build_pooled`] — and builds and mounts nothing
+/// itself, which `tests::open_connection_builds_only_through_build_pooled`
+/// pins.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one production site that opens a pooled connection; the builder goes straight into build_pooled (#1423)"
+)]
 async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
     let builder = match kind {
         BusKind::Session => Builder::session()?,
@@ -723,7 +733,7 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
 /// unless its connection was built with one — waits forever. That is what #1011
 /// was.
 ///
-/// `Builder::build_` (`connection/builder.rs:447-491`) has a barrier against
+/// `Builder::build_` (`connection/builder.rs:447-498`) has a barrier against
 /// exactly this, and applies it only when the builder has at least one
 /// interface staged (`Builder::serve_at`, `:345`): it registers the interfaces,
 /// spawns the dispatch task with a `started_event`, awaits that event — which
@@ -914,6 +924,36 @@ mod tests {
             assert!(
                 closes_a_connection_loss(epoch),
                 "epoch {epoch} was reached through a cleared connection, which was reported lost"
+            );
+        }
+    }
+
+    /// `open_connection` must get its connection from `build_pooled` and build
+    /// nothing itself (#1423).
+    ///
+    /// Nothing behavioural can see this. `tests/ready.rs`'s re-exec test proves
+    /// the production connections *serve* `Ready`, but a `Ready` mounted with
+    /// `object_server().at(..)` after a plain `build()` is served too, with no
+    /// barrier; and the race test reaches `build_pooled` only through
+    /// `test_support::connect`. So a production-only bypass that still mounts
+    /// the placeholder leaves the whole suite green. This scan goes red on it.
+    #[test]
+    fn open_connection_builds_only_through_build_pooled() {
+        let src = include_str!("connection.rs");
+        let start = src
+            .find("async fn open_connection(")
+            .expect("open_connection is defined in connection.rs");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("open_connection's body closes")];
+        assert!(
+            body.contains("build_pooled(builder).await"),
+            "open_connection no longer hands its builder to build_pooled (#1423):\n{body}"
+        );
+        for bypass in [".build()", "object_server", "Connection::"] {
+            assert!(
+                !body.contains(bypass),
+                "open_connection builds or mounts on its own (`{bypass}`), so the \
+                 production path can skip build_pooled's Ready barrier (#1423):\n{body}"
             );
         }
     }

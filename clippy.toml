@@ -1,4 +1,6 @@
 disallowed-methods = [
   { path = "zbus::Connection::session", reason = "use hytte::bus::* primitives instead — see docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md" },
   { path = "zbus::Connection::system", reason = "use hytte::bus::* primitives instead — see docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md" },
+  { path = "zbus::connection::Builder::session", reason = "use hytte::bus::* primitives instead — hytte-bus's open_connection is the one site that builds a pooled connection, through build_pooled's Ready barrier (#1423)" },
+  { path = "zbus::connection::Builder::system", reason = "use hytte::bus::* primitives instead — hytte-bus's open_connection is the one site that builds a pooled connection, through build_pooled's Ready barrier (#1423)" },
 ]

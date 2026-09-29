@@ -54,9 +54,11 @@ async fn with_conn_returns_connection_on_healthy_bus() {
 ///
 /// Until #1423 the same property was held by `begin_dispatching` in `for_test`,
 /// and a sibling test pinned its second copy in `supervisor_loop`. Both copies
-/// are gone; the production connect path is pinned per bus, and across a
-/// reconnect, by `tests/ready.rs`'s re-exec'd child against the real
-/// `session()`/`system()` singletons.
+/// are gone. On the production connect path, `tests/ready.rs`'s re-exec'd
+/// child pins that the real `session()`/`system()` singletons serve `Ready`
+/// per bus and across a reconnect, and `connection.rs`'s
+/// `open_connection_builds_only_through_build_pooled` pins that they get it
+/// from `build_pooled`'s barrier rather than from a mount after `build()`.
 ///
 /// The probe is `common::answers_a_method_call`, so "answers" means the same
 /// thing here as everywhere else in the suite.

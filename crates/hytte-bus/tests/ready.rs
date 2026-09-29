@@ -450,12 +450,16 @@ const INTROSPECT_BUDGET: Duration = Duration::from_secs(10);
 /// replacement through the same `open_connection` — the reconnect path #1423
 /// had to cover.
 ///
-/// **Falsified** three ways, each red on the child's own assertion and
+/// **Falsified** four ways, each red on the child's own assertion and
 /// surfaced here as a failed child: dropping `build_pooled`'s `serve_at`
 /// (red at the first bus checked); making one arm of `open_connection` build
-/// without `build_pooled` (red on that bus alone, session or system); and
+/// without `build_pooled` (red on that bus alone, session or system);
 /// bypassing `build_pooled` only when the supervisor reconnects (red "after a
-/// reconnect").
+/// reconnect"); and swapping `open_connection`'s two arms, which
+/// `assert_on_its_own_bus` names as the wrong bus rather than a missing
+/// barrier. What this test cannot see is `open_connection` building plainly
+/// and mounting `Ready` afterwards — served, but with no barrier — which is
+/// why `connection.rs` also carries a source scan of that function.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_pooled_connections_serve_ready_on_both_buses() {
     let (_session_conn, session) = ephemeral_bus().await;
@@ -513,10 +517,12 @@ async fn the_pooled_connections_serve_ready_on_both_buses_inner() {
         let shared = pooled(kind);
 
         let first = unique_name_at_epoch(&shared, 1).await;
+        assert_on_its_own_bus(&shared, &address, kind).await;
         assert_ready_is_served(&address, &first, kind, "its first connect").await;
 
         shared.reconnect_for_test().await;
         let second = unique_name_at_epoch(&shared, 2).await;
+        assert_on_its_own_bus(&shared, &address, kind).await;
         assert_ne!(
             first, second,
             "{kind:?}: the supervisor did not open a new connection"
@@ -525,6 +531,27 @@ async fn the_pooled_connections_serve_ready_on_both_buses_inner() {
     }
 
     println!("{CHILD_OK}");
+}
+
+/// The pooled connection for `kind` is on the test bus the parent gave that
+/// kind, compared by the daemon's server GUID (one per daemon). A singleton
+/// that dialled the other bus fails here by name, instead of on an `Introspect`
+/// sent to a unique name that happens to exist on the wrong daemon.
+async fn assert_on_its_own_bus(shared: &SharedConnection, address: &str, kind: BusKind) {
+    let pooled = shared
+        .with_conn(|c| async move { Ok::<_, zbus::Error>(c.server_guid().to_string()) })
+        .await
+        .expect("with_conn on the pooled connection");
+    let probe = Builder::address(address)
+        .expect("parse bus address")
+        .build()
+        .await
+        .expect("probe connection");
+    assert_eq!(
+        pooled,
+        probe.server_guid().to_string(),
+        "{kind:?}: the pooled connection is not on the {kind:?} test bus"
+    );
 }
 
 /// Wait for `shared`'s supervisor to have installed connection number `epoch`,

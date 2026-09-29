@@ -27,7 +27,7 @@ async fn epoch_bumps_after_supervised_reconnect() {
 
     // Simulate a disconnect: inject the replacement, clear the cached conn,
     // and wake the supervisor. The supervisor will find the injected connection
-    // and use it instead of calling Connection::session().
+    // and use it instead of calling open_connection().
     shared.simulate_disconnect_for_test(replacement).await;
 
     let mut epoch_stream = shared.epoch_signal().to_stream();

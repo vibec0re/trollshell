@@ -1424,8 +1424,9 @@ fn empty_and_short_series_do_not_starve_full_ones() {
 /// table of shapes: its drawn total fits the point cap, and one sample more a
 /// line would not (or it is already the per-series cap).
 ///
-/// **Falsified** by an off-by-one in the search (`fits` one short, or `over`
-/// returned), or by any divisor-based answer on the uneven rows.
+/// **Falsified** by an off-by-one in the search (`fits` one short, `over`
+/// returned, or a strict `<` that rejects an exact fit — the 128-line row),
+/// or by any divisor-based answer on the uneven rows.
 #[test]
 fn multi_sparkline_keep_is_the_largest_ceiling_that_fits() {
     let drawn = |series: &[Vec<f32>], k: usize| -> usize {
@@ -1452,6 +1453,13 @@ fn multi_sparkline_keep_is_the_largest_ceiling_that_fits() {
     let mut half = numbered_series(100, MAX_SPARKLINE_SAMPLES);
     half.extend(numbered_series(100, 300));
     shapes.push(half);
+    // A ceiling whose total lands **exactly** on the cap inside the search
+    // (128 × 512 = 65 536): it fits, so it is the answer, not 511. The rows
+    // above only meet the cap exactly at the search's starting bound, which
+    // is how a strict `<` in the search first survived this test (#1438).
+    let exact = numbered_series(128, MAX_SPARKLINE_SAMPLES);
+    assert_eq!(multi_sparkline_keep(&exact), 512, "an exact fit is a fit");
+    shapes.push(exact);
 
     for series in &shapes {
         let k = multi_sparkline_keep(series);

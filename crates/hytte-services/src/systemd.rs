@@ -208,6 +208,16 @@ pub struct PluginUnit {
     /// systemd `ActiveState` — `active` / `inactive` / `failed` / `activating` /
     /// `deactivating` / …
     pub active_state: String,
+    /// systemd `SubState`, the finer state inside `active_state`: `running`,
+    /// or for a unit still stopping, how far its stop got (`stop-sigterm`,
+    /// `stop-sigkill`, `final-sigterm`, `final-sigkill`). `dead` for a unit
+    /// systemd has not loaded, as for `active_state`'s `inactive`.
+    ///
+    /// Carried for the declarative launcher's restart (#1417 item 1): when a
+    /// stop outlasts its wait, the answer names this state, taken from the
+    /// same listing the wait decided on. `ListUnitsByPatterns` already
+    /// returns it, so it costs no extra D-Bus call.
+    pub sub_state: String,
     /// Whether the unit file is enabled (persisted to auto-start at login).
     pub enabled: bool,
     /// The unit's `Description=`, verbatim (empty for a unit systemd hasn't
@@ -270,23 +280,24 @@ pub(crate) fn is_enabled_state(state: &str) -> bool {
 }
 
 /// Merge the *installed* plugin unit files (enablement) with the currently
-/// *loaded* units (runtime `ActiveState` + `Description`) into one
+/// *loaded* units (runtime `ActiveState`, `SubState` + `Description`) into one
 /// `Vec<PluginUnit>` sorted by id. `files` enumerates every installed
 /// `trollshell-plugin-*` unit (running or not); `loaded` carries live
-/// `ActiveState`/`Description` for those systemd has loaded. A unit file with no
-/// loaded entry is reported `inactive` with an empty description (systemd GCs
-/// loaded state for a long-stopped unit, and unit-file enumeration carries no
-/// description); a loaded unit with no file is still surfaced
-/// (`enabled = false`). Pure, so the merge is unit-testable without a bus.
+/// `ActiveState`/`SubState`/`Description` for those systemd has loaded. A unit
+/// file with no loaded entry is reported `inactive`/`dead` with an empty
+/// description (systemd GCs loaded state for a long-stopped unit, and
+/// unit-file enumeration carries no description); a loaded unit with no file
+/// is still surfaced (`enabled = false`). Pure, so the merge is unit-testable
+/// without a bus.
 pub(crate) fn merge_plugin_units(
     files: Vec<UnitFileTuple>,
     loaded: Vec<UnitTuple>,
 ) -> Vec<PluginUnit> {
-    // id → (active_state, description) from the loaded set.
-    let loaded_by_id: std::collections::HashMap<String, (String, String)> = loaded
+    // id → (active_state, sub_state, description) from the loaded set.
+    let loaded_by_id: std::collections::HashMap<String, (String, String, String)> = loaded
         .into_iter()
-        .filter_map(|(name, desc, _load, active, ..)| {
-            parse_plugin_id(&name).map(|id| (id, (active, desc)))
+        .filter_map(|(name, desc, _load, active, sub, ..)| {
+            parse_plugin_id(&name).map(|id| (id, (active, sub, desc)))
         })
         .collect();
     // BTreeMap keeps the output sorted by id and dedups a unit reported under
@@ -295,15 +306,16 @@ pub(crate) fn merge_plugin_units(
         std::collections::BTreeMap::new();
     for (path, enable_state) in files {
         if let Some(id) = parse_plugin_id(&path) {
-            let (active_state, description) = loaded_by_id
+            let (active_state, sub_state, description) = loaded_by_id
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| ("inactive".to_owned(), String::new()));
+                .unwrap_or_else(|| ("inactive".to_owned(), "dead".to_owned(), String::new()));
             by_id.insert(
                 id.clone(),
                 PluginUnit {
                     id,
                     active_state,
+                    sub_state,
                     enabled: is_enabled_state(&enable_state),
                     description,
                 },
@@ -313,10 +325,11 @@ pub(crate) fn merge_plugin_units(
     // Union in any loaded plugin unit that has no unit file (transient / linked
     // without a persistent [Install]) so a running-but-file-less plugin shows.
     // This is the normal case for the declarative launcher's transient units.
-    for (id, (active_state, description)) in loaded_by_id {
+    for (id, (active_state, sub_state, description)) in loaded_by_id {
         by_id.entry(id.clone()).or_insert(PluginUnit {
             id,
             active_state,
+            sub_state,
             enabled: false,
             description,
         });
@@ -327,8 +340,8 @@ pub(crate) fn merge_plugin_units(
 /// Enumerate the installed `trollshell-plugin-*` **user** units with their
 /// runtime + enablement state (#348). Two one-shot calls to the *user* manager
 /// (`systemd --user`, session bus): `ListUnitFilesByPatterns` for the installed
-/// set + enablement, `ListUnitsByPatterns` for live `ActiveState` +
-/// `Description`, merged by `merge_plugin_units`.
+/// set + enablement, `ListUnitsByPatterns` (`list_loaded_units`) for live
+/// `ActiveState`, `SubState` + `Description`, merged by `merge_plugin_units`.
 ///
 /// # Errors
 /// Propagates any `hytte_bus` call error (e.g. no user manager reachable).
@@ -342,15 +355,23 @@ pub async fn list_plugin_units() -> Result<Vec<PluginUnit>> {
         .send()
         .await
         .context("ListUnitFilesByPatterns")?;
-    let loaded: Vec<UnitTuple> = call(BusKind::Session, SYSTEMD_NAME)
+    let loaded = list_loaded_units(pattern).await?;
+    Ok(merge_plugin_units(files, loaded))
+}
+
+/// `ListUnitsByPatterns` for the loaded user units whose names match
+/// `pattern`: [`list_plugin_units`]'s second call, apart so the gated test can
+/// make the same call, decoded the same way, for a unit not named like a
+/// plugin's (#1417 item 1).
+async fn list_loaded_units(pattern: String) -> Result<Vec<UnitTuple>> {
+    call(BusKind::Session, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("ListUnitsByPatterns")
         .args((Vec::<String>::new(), vec![pattern]))
         .send()
         .await
-        .context("ListUnitsByPatterns")?;
-    Ok(merge_plugin_units(files, loaded))
+        .context("ListUnitsByPatterns")
 }
 
 /// Start plugin `id`'s user unit now (`StartUnit(<unit>, "replace")`). Does not
@@ -942,6 +963,50 @@ mod tests {
         );
     }
 
+    /// The launcher's restart names a stuck unit's `SubState` (#1417 item 1),
+    /// so the merge carries field 5 of the loaded tuple through, for a
+    /// file-less transient unit and a unit-file one alike; a unit file with
+    /// no loaded entry reads `dead`, beside its `inactive`.
+    ///
+    /// Falsified by taking another field (the `ActiveState`, the follower), or
+    /// by dropping the loaded value for a unit that also has a file.
+    #[test]
+    fn merge_carries_the_loaded_units_sub_state() {
+        let stuck = |name: &str, sub: &str| {
+            let mut tuple = plugin_tuple(name, "deactivating");
+            tuple.4 = sub.to_owned();
+            tuple
+        };
+        let out = merge_plugin_units(
+            vec![
+                (
+                    "trollshell-plugin-pet.service".to_owned(),
+                    "disabled".to_owned(),
+                ),
+                (
+                    "trollshell-plugin-weather.service".to_owned(),
+                    "enabled".to_owned(),
+                ),
+            ],
+            vec![
+                stuck("trollshell-plugin-pet.service", "stop-sigkill"),
+                stuck("trollshell-plugin-timer.service", "final-sigterm"),
+            ],
+        );
+        let states: Vec<(&str, &str, &str)> = out
+            .iter()
+            .map(|u| (u.id.as_str(), u.active_state.as_str(), u.sub_state.as_str()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("pet", "deactivating", "stop-sigkill"),
+                ("timer", "deactivating", "final-sigterm"),
+                ("weather", "inactive", "dead"),
+            ]
+        );
+    }
+
     #[test]
     fn merge_ignores_non_plugin_units() {
         let files = vec![("trollshell.service".to_string(), "enabled".to_string())];
@@ -1137,6 +1202,110 @@ mod tests {
             parse_workspace_unit("trollshell-ws-chat-dev-0.service").as_deref(),
             Some("chat-dev"),
             "…but an unescaped one still reads sensibly rather than panicking"
+        );
+    }
+}
+
+/// Against a real user manager, where one runs: this container has one, the
+/// nix sandbox does not, so each test here skips when `systemd-run --user`
+/// cannot start a unit.
+#[cfg(all(test, feature = "system-tests"))]
+mod user_manager_tests {
+    use super::*;
+
+    /// SIGKILLs, stops and resets a unit, ignoring every answer: the unit may
+    /// already be gone.
+    struct Cleanup(String);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for verb in [
+                &["kill", "--signal=KILL"][..],
+                &["stop"][..],
+                &["reset-failed"][..],
+            ] {
+                let _ = std::process::Command::new("systemctl")
+                    .arg("--user")
+                    .args(verb)
+                    .arg(&self.0)
+                    .output();
+            }
+        }
+    }
+
+    /// #1417 item 1: when a restart's stop outlasts its wait, the answer
+    /// names the `SubState` of the wait's last listing, i.e. field 5 of
+    /// [`list_plugin_units`]'s `ListUnitsByPatterns` reply. This makes that
+    /// call ([`list_loaded_units`], decoded as [`UnitTuple`]) for a real unit
+    /// stuck in its stop, and runs the reply through [`merge_plugin_units`].
+    ///
+    /// The unit is `ts1445-sub-<pid>.service`, never named like a plugin's,
+    /// with `TimeoutStopSec=60`, so it cannot finish stopping during the
+    /// test. Its stop signal is `SIGWINCH`, which `sh` and `sleep` ignore
+    /// from the moment they exist; a SIGTERM trap could be installed after
+    /// the stop lands (#1445 review, L4). A guard SIGKILLs, stops and resets
+    /// it however the test ends. The reply is given a plugin-shaped name
+    /// before the merge, since the pattern is the only thing
+    /// [`list_plugin_units`] asks for differently.
+    #[tokio::test]
+    async fn a_real_stuck_units_listing_carries_its_sub_state() {
+        let unit = format!("ts1445-sub-{}.service", std::process::id());
+        let _cleanup = Cleanup(unit.clone());
+        let launched = tokio::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--quiet",
+                "--collect",
+                &format!("--unit={unit}"),
+                "--property=TimeoutStopSec=60",
+                "--property=KillSignal=SIGWINCH",
+                // The caller's PATH, so the unit finds `sleep`.
+                "--setenv=PATH",
+                "--",
+                "/bin/sh",
+                "-c",
+                "while :; do sleep 1; done",
+            ])
+            .output()
+            .await;
+        match launched {
+            Ok(out) if out.status.success() => {}
+            other => {
+                eprintln!("skipping: systemd-run --user could not start {unit}: {other:?}");
+                return;
+            }
+        }
+        stop_unit(&unit).await.expect("StopUnit");
+
+        // `StopUnit` returns once the job is queued; the state follows.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut tuple = None;
+        while tokio::time::Instant::now() < deadline {
+            let loaded = list_loaded_units(unit.clone())
+                .await
+                .expect("ListUnitsByPatterns");
+            tuple = loaded.into_iter().find(|t| t.0 == unit);
+            if tuple.as_ref().is_some_and(|t| t.4 == "stop-sigterm") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut tuple = tuple.expect("the unit is still listed while it stops");
+        assert_eq!(
+            (tuple.3.as_str(), tuple.4.as_str()),
+            ("deactivating", "stop-sigterm"),
+            "SIGWINCH is ignored, and 60 s is far off"
+        );
+
+        tuple.0 = plugin_unit_name("ts1445-sub");
+        let merged = merge_plugin_units(Vec::new(), vec![tuple]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            (
+                merged[0].active_state.as_str(),
+                merged[0].sub_state.as_str()
+            ),
+            ("deactivating", "stop-sigterm")
         );
     }
 }

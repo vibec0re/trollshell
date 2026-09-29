@@ -2870,6 +2870,13 @@ const APPLYING: &str = "Saved. Asking the shell to apply it…";
 ///   left a unit file of its own alone; the answer does not say which, so the
 ///   line claims neither. `enabled` does not enter into it: the shell read
 ///   the switch after any queued toggle, and the tab's poll may be older.
+/// - `still-stopping` (#1417 item 1) is a plugin whose unit did not stop
+///   within the shell's 12 s wait. The shell then relaunches nothing and
+///   starts nothing, so the plugin is down once its stuck process exits, and
+///   nothing brings it back on its own. It is switched on (the shell only
+///   restarts a switched-on plugin), so the line says how to start it, as
+///   `not-running`'s does, and when: a switch flipped before the old unit is
+///   gone would be refused.
 fn restart_status(answer: &str, enabled: bool) -> &'static str {
     match answer {
         "relaunched" => "Saved, and the plugin restarted.",
@@ -2882,12 +2889,26 @@ fn restart_status(answer: &str, enabled: bool) -> &'static str {
             "Saved. The plugin is switched off, so it was not restarted; it reads the new values \
              the next time it starts."
         }
+        "still-stopping" => {
+            "Saved, but the running plugin did not stop within 12 s, so it was not restarted. It \
+             reads the new values the next time it starts: once it has stopped, switch it off and \
+             on to start it now."
+        }
         "not-declared" => {
             "Saved, but this plugin runs from a unit file of its own, which does not read \
              plugin-settings.toml. Nothing was restarted."
         }
         _ => "Saved.",
     }
+}
+
+/// Whether [`restart_status`]'s line for `answer` asks the user to act, so
+/// the form shows it in the style its other "Saved, but …" lines already use
+/// (`set_status`'s `error`) rather than as a quiet success (#1445 review,
+/// N1). Only `still-stopping` does: the plugin is about to be down, and
+/// nothing brings it back until someone switches it off and on.
+fn restart_status_warns(answer: &str) -> bool {
+    answer == "still-stopping"
 }
 
 /// The `RestartPlugin` a Save sends. A seam, so no test ever sends one to a
@@ -2957,7 +2978,10 @@ fn settings_saved(state: &PluginsState) -> crate::plugin_settings::OnSaved {
                 });
                 match res {
                     Ok(answer) => {
-                        form.set_status(restart_status(&answer, enabled), false);
+                        form.set_status(
+                            restart_status(&answer, enabled),
+                            restart_status_warns(&answer),
+                        );
                         // Only an answer can have moved the unit; re-poll so
                         // the row and the switch catch up with it.
                         if let Some(state) = &state {
@@ -3952,8 +3976,9 @@ const RESTART_TIMEOUT: Duration = Duration::from_mins(1);
 /// `RestartPlugin(id)` → what the shell did (#1410, #1415 review H2): one
 /// call, which runs the stop, the wait through `deactivating` and the
 /// relaunch under the launcher's convergence lock. The answer is a word —
-/// `relaunched`, `not-running`, `not-declared`, `switched-off` — that
-/// [`restart_status`] turns into the line under the group.
+/// `relaunched`, `not-running`, `not-declared`, `switched-off`,
+/// `still-stopping` — that [`restart_status`] turns into the line under the
+/// group.
 ///
 /// Not called under `cfg(test)`, where [`send_restart`] records the call
 /// instead of reaching a session bus.
@@ -6036,6 +6061,17 @@ mod tests {
                 "Saved. The plugin is switched off, so it was not restarted; it reads the new \
                  values the next time it starts."
             );
+            // #1417 item 1: the old unit did not stop in time, so the shell
+            // relaunched nothing and started nothing. Never "restarted", and
+            // it says how to start the plugin once it is down.
+            let still = super::restart_status("still-stopping", enabled);
+            assert!(
+                still.contains("did not stop within 12 s")
+                    && still.contains("not restarted")
+                    && still.contains("switch it off and on")
+                    && !still.contains("plugin restarted"),
+                "{still}"
+            );
         }
         assert_eq!(
             super::restart_status("not-running", false),
@@ -6072,7 +6108,9 @@ mod tests {
         // (#1425 review, N2): the body holds no `"` but the words' own quotes.
         let words: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
         assert!(
-            words.len() >= 4 && words.contains(&"switched-off"),
+            words.len() >= 5
+                && words.contains(&"switched-off")
+                && words.contains(&"still-stopping"),
             "read the shell's answers wrong: {words:?}"
         );
         for word in words {
@@ -6084,6 +6122,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1417 item 1: the `still-stopping` line names the shell's own wait,
+    /// read out of `plugin_launcher.rs`'s `STOP_WAIT` on the source-pin
+    /// precedent above, so the two cannot drift apart unnoticed.
+    #[test]
+    fn the_still_stopping_line_names_the_shells_own_wait() {
+        let launcher = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../trollshell/src/plugin_launcher.rs"
+        ));
+        let head = "const STOP_WAIT: Duration = Duration::from_secs(";
+        let from = launcher.find(head).expect("the shell declares STOP_WAIT") + head.len();
+        let secs = &launcher[from..from + launcher[from..].find(')').expect("closes")];
+        let line = super::restart_status("still-stopping", true);
+        assert!(
+            line.contains(&format!("within {secs} s")),
+            "the shell waits {secs} s: {line}"
+        );
+    }
+
+    /// #1445 review, N1: the `still-stopping` line asks the user to act, so
+    /// it is shown like the form's other "Saved, but …" lines, and every
+    /// other answer's line stays a quiet one. The Save's handler shows each
+    /// answer's line in the style this picks.
+    ///
+    /// Falsified by `still-stopping` in the success style, or by the handler
+    /// passing a constant style.
+    #[test]
+    fn the_still_stopping_line_is_shown_as_a_warning() {
+        assert!(super::restart_status_warns("still-stopping"));
+        for quiet in [
+            "relaunched",
+            "not-running",
+            "not-declared",
+            "switched-off",
+            "something-newer",
+        ] {
+            assert!(!super::restart_status_warns(quiet), "{quiet}");
+        }
+        let handler = squashed_from("fn settings_saved(");
+        assert!(
+            handler.contains(
+                "form.set_status(restart_status(&answer,enabled),restart_status_warns(&answer))"
+            ),
+            "the Save's line takes its style from restart_status_warns:\n{handler}"
+        );
     }
 
     /// Only `UnknownMethod` is "an older shell"; a timeout is not.

@@ -716,7 +716,7 @@ where
     S: Signal<Item = PageModel> + 'static,
 {
     // One cache for the whole page: an app on two workspaces costs one
-    // `AppInfo::all()` scan, not one per card. Lives as long as the binding.
+    // desktop-entry scan, not one per card. Lives as long as the binding.
     let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
     bind(model, columns_box, move |columns_box, page| {
         // #1219: the page's width follows the number of columns it is about to

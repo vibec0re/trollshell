@@ -41,7 +41,8 @@
 //!
 //! # The environment
 //!
-//! The resolver reads this process's environment ([`Env::from_process`]:
+//! The resolver reads this process's environment
+//! ([`desktop_entry::Env::from_process`]:
 //! `XDG_DATA_HOME`, `HOME`, `XDG_DATA_DIRS`, `PATH` and the locale variables
 //! `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG`) — the same variables GIO's scan
 //! read before. The stats plugin's resolver reads **its** process's
@@ -52,12 +53,13 @@
 //! both processes see the same values. `hytte_sensors::desktop_entry`'s
 //! "Known gaps" says how to compare the two.
 
+use std::borrow::BorrowMut;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use hytte::gtk::{gio, prelude::*};
-use hytte_sensors::desktop_entry::{self, Env, Resolver};
+use hytte_sensors::desktop_entry::{self, Resolver};
 
 /// A desktop entry's display name and icon, as the shell's widgets use them.
 #[derive(Clone)]
@@ -121,21 +123,30 @@ pub(crate) fn resolve_app_meta(
     app_id: &str,
     meta_cache: &mut HashMap<String, Option<AppMeta>>,
 ) -> Option<AppMeta> {
-    resolve_app_meta_in(app_id, meta_cache, Env::from_process)
+    resolve_app_meta_in(app_id, meta_cache, Resolver::from_env)
 }
 
-/// [`resolve_app_meta`] over the environment `env` returns, which is called
-/// only on a cache miss — the seam that lets a test count scans without
-/// reading the real `$XDG_DATA_DIRS`.
-fn resolve_app_meta_in(
+/// [`resolve_app_meta`] through the [`Resolver`] that `resolver` hands over,
+/// which is called only on a cache miss and asked exactly once.
+///
+/// Production passes [`Resolver::from_env`], so the resolver — and the
+/// environment read that builds it — exists only for a miss. A test passes a
+/// `&mut Resolver` over a fixture search path instead, and reads
+/// [`Resolver::scans`] afterwards: the count is then taken on the very
+/// resolver the lookup used, not inferred from how often something was
+/// asked for (#1439 review N2). The seam hands this function no `Env`, so
+/// it has nothing to build a second resolver from.
+fn resolve_app_meta_in<R: BorrowMut<Resolver>>(
     app_id: &str,
     meta_cache: &mut HashMap<String, Option<AppMeta>>,
-    env: impl FnOnce() -> Env,
+    resolver: impl FnOnce() -> R,
 ) -> Option<AppMeta> {
     if let Some(cached) = meta_cache.get(app_id) {
         return cached.clone();
     }
-    let meta = Resolver::new(env())
+    let mut resolver = resolver();
+    let meta = resolver
+        .borrow_mut()
         .resolve(app_id)
         .map(AppMeta::from_entry);
     meta_cache.insert(app_id.to_owned(), meta.clone());
@@ -179,7 +190,6 @@ pub(crate) fn fallback_icon() -> gio::Icon {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -297,16 +307,19 @@ mod tests {
         }
     }
 
-    /// An environment that must never be asked for.
-    fn no_env() -> Env {
-        panic!("a cache hit must neither read the environment nor scan")
+    /// A resolver that must never be built. Production's is
+    /// `Resolver::from_env`, so not building one is not reading the
+    /// environment either.
+    fn no_resolver() -> Resolver {
+        panic!("a cache hit must neither build a resolver nor scan")
     }
 
-    /// **A hit costs no scan** — it does not even read the environment, for a
-    /// found entry and for a cached miss alike.
+    /// **A hit costs no scan** — it does not even build a resolver (so, in
+    /// production, does not read the environment), for a found entry and for
+    /// a cached miss alike.
     ///
     /// Falsified by deleting the cache check in [`resolve_app_meta_in`]: the
-    /// resolver is then built on every call and [`no_env`] panics.
+    /// resolver is then built on every call and [`no_resolver`] panics.
     #[test]
     fn a_cache_hit_reads_no_environment_and_scans_nothing() {
         let mut cache = HashMap::new();
@@ -319,16 +332,19 @@ mod tests {
         );
         cache.insert("seeded-miss".to_owned(), None);
 
-        let hit = resolve_app_meta_in("seeded", &mut cache, no_env);
+        let hit = resolve_app_meta_in("seeded", &mut cache, no_resolver);
         assert_eq!(hit.map(|m| m.display_name).as_deref(), Some("Seeded"));
-        assert!(resolve_app_meta_in("seeded-miss", &mut cache, no_env).is_none());
+        assert!(resolve_app_meta_in("seeded-miss", &mut cache, no_resolver).is_none());
     }
 
-    /// **A miss scans once and is cached, found or not**: the second lookup
-    /// of the same id, whether it found an entry or nothing, reads nothing.
+    /// **A miss scans exactly once and is cached, found or not** — counted
+    /// on the resolver itself (#1439 review N2): each lookup is handed a
+    /// fresh resolver over the fixture, and [`Resolver::scans`] is read
+    /// afterwards, so a miss must leave it at 1 and a hit at 0.
     ///
-    /// Falsified by dropping the `meta_cache.insert` (every call scans: 2 ≠
-    /// 1), and by caching only a found entry (the miss scans twice).
+    /// Falsified by dropping the `meta_cache.insert` (the repeat scans: 1 ≠
+    /// 0), by caching only a found entry (the repeated miss scans), and by a
+    /// second scan on the miss path (2 ≠ 1).
     #[test]
     fn a_miss_scans_once_and_is_cached_found_or_not() {
         let f = Fixture::new();
@@ -337,26 +353,104 @@ mod tests {
             "ts-hit.desktop",
             "[Desktop Entry]\nType=Application\nName=TS Hit\nExec=ts-hit\n",
         );
-        let scans = Cell::new(0);
-        let env = || {
-            scans.set(scans.get() + 1);
-            f.env()
-        };
         let mut cache = HashMap::new();
 
-        for _ in 0..2 {
-            let meta = resolve_app_meta_in("ts-hit", &mut cache, env);
-            assert_eq!(meta.map(|m| m.display_name).as_deref(), Some("TS Hit"));
-            assert_eq!(scans.get(), 1, "a found entry is scanned for once");
-        }
-        for _ in 0..2 {
-            assert!(resolve_app_meta_in("no-such-app-anywhere", &mut cache, env).is_none());
-            assert_eq!(scans.get(), 2, "a miss is scanned for once, then cached");
+        for (app_id, name, scans) in [
+            ("ts-hit", Some("TS Hit"), 1),
+            ("ts-hit", Some("TS Hit"), 0),
+            ("no-such-app-anywhere", None, 1),
+            ("no-such-app-anywhere", None, 0),
+        ] {
+            let mut resolver = Resolver::new(f.env());
+            let handed = &mut resolver;
+            let meta = resolve_app_meta_in(app_id, &mut cache, move || handed);
+            assert_eq!(meta.map(|m| m.display_name).as_deref(), name, "{app_id}");
+            assert_eq!(resolver.scans(), scans, "{app_id}: scans for this lookup");
         }
         assert!(
             matches!(cache.get("no-such-app-anywhere"), Some(None)),
             "the miss is cached as `None`"
         );
+    }
+
+    /// **A mixed-case id is a hit on its second lookup too.** niri reports
+    /// most GTK apps by a reverse-DNS id (`org.gnome.Nautilus`), so a cache
+    /// keyed by anything but the id as given would scan on every render.
+    ///
+    /// From the #1439 review (T1), adapted to count on each lookup's own
+    /// resolver. Falsified by keying the cache on `app_id.to_lowercase()`
+    /// (3 scans ≠ 1).
+    #[test]
+    fn a_mixed_case_id_is_cached_under_its_own_spelling() {
+        let f = Fixture::new();
+        f.program("ts-hit");
+        f.entry(
+            "Org.Example.Mixed.desktop",
+            "[Desktop Entry]\nType=Application\nName=TS Mixed\nExec=ts-hit\n",
+        );
+        let mut cache = HashMap::new();
+        let mut scans = 0;
+        for _ in 0..3 {
+            let mut resolver = Resolver::new(f.env());
+            let handed = &mut resolver;
+            let meta = resolve_app_meta_in("Org.Example.Mixed", &mut cache, move || handed);
+            assert_eq!(meta.map(|m| m.display_name).as_deref(), Some("TS Mixed"));
+            scans += resolver.scans();
+        }
+        assert_eq!(scans, 1, "a mixed-case id is scanned for once");
+    }
+
+    const FRESH_CHILD: &str = "TROLLSHELL_APP_META_1432_FRESH_CHILD";
+    const FRESH_CHILD_OK: &str = "app-meta-1432-fresh-child-reached-the-end";
+
+    /// **A new cache sees an entry installed after an old cache's miss**,
+    /// through the real wrapper; the old cache keeps its miss. That is the
+    /// freshness the gio path had, and what a process-wide resolver loses.
+    ///
+    /// From the #1439 review (T2). Falsified by one `thread_local!`
+    /// `Resolver` shared by every call (the new cache is answered from the
+    /// old resolver's miss).
+    #[test]
+    fn a_new_cache_sees_an_entry_installed_after_a_miss() {
+        let f = Fixture::new();
+        f.program("ts-late");
+        f.entry(
+            "ts-other.desktop",
+            "[Desktop Entry]\nType=Application\nName=Other\nExec=ts-late\n",
+        );
+        f.run_child(
+            "components::app_meta::tests::a_new_cache_sees_an_entry_installed_after_a_miss_inner",
+            FRESH_CHILD,
+            FRESH_CHILD_OK,
+        );
+    }
+
+    /// The child half of the test above; a no-op outside its child.
+    #[test]
+    fn a_new_cache_sees_an_entry_installed_after_a_miss_inner() {
+        let Some(root) = std::env::var_os(FRESH_CHILD) else {
+            return;
+        };
+        let mut old = HashMap::new();
+        assert!(resolve_app_meta("ts-late-app", &mut old).is_none());
+        std::fs::write(
+            Path::new(&root).join("data-home/applications/ts-late-app.desktop"),
+            "[Desktop Entry]\nType=Application\nName=TS Late\nExec=ts-late\n",
+        )
+        .expect("install the late entry");
+        assert!(
+            resolve_app_meta("ts-late-app", &mut old).is_none(),
+            "a cached miss stays a miss for its cache's life"
+        );
+        let mut new = HashMap::new();
+        assert_eq!(
+            resolve_app_meta("ts-late-app", &mut new)
+                .map(|m| m.display_name)
+                .as_deref(),
+            Some("TS Late"),
+            "a fresh cache reads the entry installed since"
+        );
+        println!("{FRESH_CHILD_OK}");
     }
 
     /// What an icon is, in the terms the comparison below can see: its

@@ -66,7 +66,7 @@
 //!   `org.xfce.mousepad-settings` beat `org.xfce.mousepad` and the app id
 //!   `mousepad` read `Text Editor Settings` (#1439 review L2); shortest
 //!   first picks the main entry its siblings extend. It cannot settle a tie
-//!   between equally short ids: nixpkgs' LibreOffice ships `base`, `calc`,
+//!   between equally short ids: nixpkgs' `LibreOffice` ships `base`, `calc`,
 //!   `draw` and `math` entries that all run `libreoffice`, so that app id
 //!   falls to byte order (Base) where `GLib`'s hash order happened to give
 //!   Writer. Only an app id that two entries both match *in the same
@@ -339,7 +339,7 @@ fn stem(id: &str) -> &str {
 /// `Text Editor Settings` (#1439 review L2). A main entry's id is the
 /// shortest one its siblings extend. See the module docs' gaps for the ties
 /// this still leaves to byte order.
-fn pick<'e>(entries: &'e [Entry], matches: impl Fn(&Entry) -> bool) -> Option<&'e Entry> {
+fn pick(entries: &[Entry], matches: impl Fn(&Entry) -> bool) -> Option<&Entry> {
     entries
         .iter()
         .filter(|entry| matches(entry))

@@ -649,9 +649,10 @@ const TOP_APPS_SUBTITLE_CHARS: i32 = 14;
 /// `value` formats each row's right-hand value. Mirrors
 /// [`build_live_disk_expander`]'s drain-and-rebuild pattern.
 ///
-/// Each row gets a leading icon resolved from the app-id via `gio::AppInfo`.
-/// Icons and display names are cached per app-id (one `AppInfo::all()` scan per
-/// unique app-id per expander lifetime). The name field is rendered with markup
+/// Each row gets a leading icon resolved from the app-id through
+/// `components::app_meta` (its desktop entry's `Icon=`). Icons and display
+/// names are cached per app-id (one desktop-entry scan per unique app-id per
+/// expander lifetime). The name field is rendered with markup
 /// off so an adversarial scope id can't inject Pango markup (cf. #30).
 ///
 /// The "System" bucket (all non-app-scope PIDs) gets a `computer-symbolic` icon.

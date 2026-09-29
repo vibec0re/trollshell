@@ -2734,10 +2734,16 @@ const SUB_STATE_READ: Duration = Duration::from_secs(2);
 /// cannot be read within [`SUB_STATE_READ`], e.g. because the unit was
 /// collected in the meantime.
 ///
+/// Both calls keep `hytte_bus`'s default retry, as `unit_for_pid`'s do: one
+/// retry after a transient failure, once the pooled session connection is
+/// back. With no retry, a read that lands while that connection is being
+/// (re)made answers `unknown` at once; the gated test below measured that
+/// on a first call, "no cached connection (mid-reconnect)".
+///
 /// Takes a full unit name rather than a plugin id, so the gated test can read
 /// a unit that is not named like a plugin's.
 async fn unit_sub_state(unit: &str) -> String {
-    use hytte::bus::{BusKind, RetryPolicy, call};
+    use hytte::bus::{BusKind, call};
     const SYSTEMD: &str = "org.freedesktop.systemd1";
     let read = async {
         let path: zbus::zvariant::OwnedObjectPath = call(BusKind::Session, SYSTEMD)
@@ -2745,7 +2751,6 @@ async fn unit_sub_state(unit: &str) -> String {
             .iface("org.freedesktop.systemd1.Manager")
             .method("GetUnit")
             .args((unit.to_owned(),))
-            .retry(RetryPolicy::Never)
             .send()
             .await
             .context("GetUnit")?;
@@ -2757,7 +2762,6 @@ async fn unit_sub_state(unit: &str) -> String {
                 "org.freedesktop.systemd1.Unit".to_owned(),
                 "SubState".to_owned(),
             ))
-            .retry(RetryPolicy::Never)
             .send()
             .await
             .context("Unit.SubState")?;

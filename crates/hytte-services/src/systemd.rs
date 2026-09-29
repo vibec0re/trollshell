@@ -340,7 +340,7 @@ pub(crate) fn merge_plugin_units(
 /// Enumerate the installed `trollshell-plugin-*` **user** units with their
 /// runtime + enablement state (#348). Two one-shot calls to the *user* manager
 /// (`systemd --user`, session bus): `ListUnitFilesByPatterns` for the installed
-/// set + enablement, `ListUnitsByPatterns` ([`list_loaded_units`]) for live
+/// set + enablement, `ListUnitsByPatterns` (`list_loaded_units`) for live
 /// `ActiveState`, `SubState` + `Description`, merged by `merge_plugin_units`.
 ///
 /// # Errors

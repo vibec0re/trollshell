@@ -698,10 +698,33 @@ where
             top_apps::POLL,
             |cmd: &Cmd| cmd.page(),
             Msg::TopApps,
-            top_apps::KEEP_BASELINE,
+            Keep {
+                under: top_apps::KEEP_BASELINE,
+                settle: top_apps::MIN_BASELINE_AGE,
+            },
             make_walker,
         )),
     ]
+}
+
+/// What a reopen does with the last read's baseline — see [`drive`]'s
+/// *A young baseline survives a quick reopen*.
+#[derive(Clone, Copy, Debug)]
+struct Keep {
+    /// A baseline whose read started less than this before the reopen is
+    /// kept; an older one is dropped.
+    under: Duration,
+    /// A kept baseline is read against no sooner than this after its read
+    /// started: the reopen's first read is held until then.
+    settle: Duration,
+}
+
+impl Keep {
+    /// Keep nothing: every reopen re-baselines, however quick.
+    const NOTHING: Self = Self {
+        under: Duration::ZERO,
+        settle: Duration::ZERO,
+    };
 }
 
 /// Split the reducer's one command lane into the two tasks' lanes: the
@@ -756,7 +779,7 @@ async fn sampler_task_with<S: Sample<Reading = Snapshot>>(
         |snapshot| Msg::Sampled(Box::new(snapshot)),
         // Every reopen re-baselines, however quick: the sensors' reopen rule
         // is #1277 LOW 4's as it stands, and #1427 does not touch it.
-        Duration::ZERO,
+        Keep::NOTHING,
         make,
     )
     .await;
@@ -799,26 +822,50 @@ async fn sampler_task_with<S: Sample<Reading = Snapshot>>(
 ///
 /// The reopen re-baseline exists so the first reading after a reopen is not
 /// the mean over however long the gate was shut. A baseline read less than
-/// `keep` before the reopen is not that: a delta from it is a real reading
-/// over a short window. So a reopen re-baselines only when the last read
-/// started `keep` or longer ago (or there was none). The walker passes
-/// [`top_apps::KEEP_BASELINE`]: a page closed and reopened within a couple of
-/// walks gets a CPU list on its first walk instead of `—` for a whole cadence
-/// (the #1426 review's NIT 8). The sensors pass [`Duration::ZERO`], which
-/// keeps nothing: `elapsed() < ZERO` is never true.
+/// `keep.under` before the reopen is not that: a delta from it is a real
+/// reading over a short window. So a reopen re-baselines only when the last
+/// read started `keep.under` or longer ago (or there was none). The walker
+/// passes [`top_apps::KEEP_BASELINE`]: a page closed and reopened within a
+/// couple of walks gets a CPU list on its first walk instead of `—` for a
+/// whole cadence (the #1426 review's NIT 8). The sensors pass
+/// [`Keep::NOTHING`]: `elapsed() < ZERO` is never true.
+///
+/// A kept baseline also has a floor, `keep.settle`: the reopen's first read
+/// is **held** until the baseline's read started at least that long ago, so
+/// it starts at `max(reopen, last read's start + settle)`. Without it a close
+/// just after a read started and a reopen a moment later would measure the
+/// first CPU list over a few hundred milliseconds, where whole-tick jiffy
+/// counts are noisiest (the #1437 review's LOW 1). The walker passes
+/// [`top_apps::MIN_BASELINE_AGE`].
+///
+/// While a read is held the loop still reads the lane through the gate, lane
+/// first (`biased;`, as the gate itself does). `Gate::next` is cancel-safe:
+/// it awaits only a channel `recv` and an `Interval::tick`, and handles a
+/// command it has taken before it awaits again, so dropping it when the hold
+/// ends loses nothing. A close during the hold is absorbed by the gate, so
+/// when the hold ends the gate is closed and the read is dropped. A close and
+/// a reopen during the hold hand back a fresh open edge, which is decided
+/// afresh. The held read stands in for the open edge's, so the cadence
+/// restarts from it (`Gate::reset`), as the gate restarts it from an edge.
 ///
 /// The age is measured on tokio's clock from the moment a read is started,
 /// which is no later than the moment its baseline was taken — so a kept
-/// baseline is at most `keep` old, never older.
+/// baseline is at most `keep.under` old, never older.
 async fn drive<S: Sample>(
     cmds: CmdReceiver<Cmd>,
     msgs: CmdSender<Msg>,
     period: Duration,
     visibility: fn(&Cmd) -> Option<bool>,
     wrap: fn(S::Reading) -> Msg,
-    keep: Duration,
+    keep: Keep,
     mut make: impl FnMut() -> S + Send + 'static,
 ) {
+    /// What woke the loop: the gate, or the end of a held read.
+    enum Due<C> {
+        Gate(Option<Wake<C>>),
+        Held,
+    }
+
     // The gate absorbs every visibility command itself and answers only the
     // *open* edge, so the loop below cannot otherwise see a close — and a
     // close is exactly what invalidates the cumulative baseline (#1277 LOW 4).
@@ -839,58 +886,97 @@ async fn drive<S: Sample>(
     // When the last read started — the age of the baseline it left, for
     // `keep`. `None` before the first read and after a sampler is rebuilt.
     let mut last_read: Option<tokio::time::Instant> = None;
-    while let Some(wake) = gate.next().await {
-        match wake {
-            Wake::Refresh => {
-                // `swap` first, always: the flag must come down on this
-                // refresh whether or not the baseline is kept.
-                let reopened = parked.swap(false, std::sync::atomic::Ordering::Relaxed);
-                let young = last_read.is_some_and(|at| at.elapsed() < keep);
-                if reopened && !young {
-                    // Re-baseline: the first frame after an unpark must be a
-                    // load measured over a fresh window, not the mean over
-                    // however long the sidebar was shut.
-                    sampler.reset();
-                }
-                last_read = Some(tokio::time::Instant::now());
-                // The sampler is moved into the blocking closure and handed
-                // back with the snapshot, which is what keeps its caches warm
-                // without an `Arc<Mutex<…>>` around a value only this task ever
-                // touches.
-                let joined = tokio::task::spawn_blocking(move || {
-                    let reading = sampler.tick();
-                    (sampler, reading)
-                })
-                .await;
-                match joined {
-                    Ok((back, reading)) => {
-                        sampler = back;
-                        if msgs.send(wrap(reading)).is_err() {
-                            // The reducer is gone: the session is tearing down.
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        // The blocking task was cancelled or panicked. Both are
-                        // our bug rather than a machine state, so say so — and
-                        // then carry on with cold caches rather than ending the
-                        // task, because ending it freezes the card for the rest
-                        // of the session while leaving the process looking
-                        // healthy. One tick of stale CPU deltas is the cost.
-                        tracing::warn!(error = %e, "stats sampler tick failed; restarting its caches");
-                        sampler = make();
-                        // A fresh sampler has no baseline to keep.
-                        last_read = None;
-                    }
-                }
-            }
+    // A reopen's first read, held until its kept baseline is `keep.settle`
+    // old: the instant it may start.
+    let mut held: Option<tokio::time::Instant> = None;
+    loop {
+        let due = match held {
+            None => Due::Gate(gate.next().await),
+            Some(at) => tokio::select! {
+                // The lane first, as in the gate: a close already queued when
+                // the hold ends is taken before the read, and cancels it.
+                biased;
+                wake = gate.next() => Due::Gate(wake),
+                () = tokio::time::sleep_until(at) => Due::Held,
+            },
+        };
+        match due {
+            // The lane closed: the session is tearing down.
+            Due::Gate(None) => return,
             // The other task's command: `route` never sends one down this
             // lane, and if it did, it would not be this task's business. The
-            // classifiers (`Cmd::surface`, `Cmd::top_apps`) are exhaustive
+            // classifiers (`Cmd::surface`, `Cmd::page`) are exhaustive
             // matches without a wildcard, so a new `Cmd` variant is a compile
             // error there — the place to decide which gate it opens — rather
             // than a command silently dropped here.
-            Wake::Cmd(_) => {}
+            Due::Gate(Some(Wake::Cmd(_))) => continue,
+            Due::Gate(Some(Wake::Refresh)) => {
+                // A fresh edge (or a tick) decides for itself: whatever was
+                // held is superseded.
+                held = None;
+                let kept = last_read.filter(|at| at.elapsed() < keep.under);
+                // `swap` first, always: the flag must come down on this
+                // refresh whether or not the baseline is kept.
+                let reopened = parked.swap(false, std::sync::atomic::Ordering::Relaxed);
+                if reopened {
+                    match kept {
+                        // Re-baseline: the first frame after an unpark must
+                        // be a load measured over a fresh window, not the mean
+                        // over however long the sidebar was shut.
+                        None => sampler.reset(),
+                        // Kept, but too young to read against yet: hold the
+                        // read until it is `keep.settle` old.
+                        Some(at) => {
+                            let ready = at + keep.settle;
+                            if ready > tokio::time::Instant::now() {
+                                held = Some(ready);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            Due::Held => {
+                held = None;
+                // A close during the hold was absorbed by the gate: the page
+                // is gone, and so is the read it was owed.
+                if !gate.is_visible() {
+                    continue;
+                }
+                // This read stands in for the open edge's: restart the cadence
+                // from it, as the gate restarts it from an edge.
+                gate.reset();
+            }
+        }
+        last_read = Some(tokio::time::Instant::now());
+        // The sampler is moved into the blocking closure and handed back with
+        // the snapshot, which is what keeps its caches warm without an
+        // `Arc<Mutex<…>>` around a value only this task ever touches.
+        let joined = tokio::task::spawn_blocking(move || {
+            let reading = sampler.tick();
+            (sampler, reading)
+        })
+        .await;
+        match joined {
+            Ok((back, reading)) => {
+                sampler = back;
+                if msgs.send(wrap(reading)).is_err() {
+                    // The reducer is gone: the session is tearing down.
+                    return;
+                }
+            }
+            Err(e) => {
+                // The blocking task was cancelled or panicked. Both are our
+                // bug rather than a machine state, so say so — and then carry
+                // on with cold caches rather than ending the task, because
+                // ending it freezes the card for the rest of the session while
+                // leaving the process looking healthy. One tick of stale CPU
+                // deltas is the cost.
+                tracing::warn!(error = %e, "stats sampler tick failed; restarting its caches");
+                sampler = make();
+                // A fresh sampler has no baseline to keep.
+                last_read = None;
+            }
         }
     }
 }
@@ -2088,7 +2174,9 @@ mod tests {
     /// **warm** first walk — handed the previous walk's baseline, so its CPU
     /// list is a real share rather than `—` for a whole cadence. At exactly
     /// `KEEP_BASELINE` the baseline is old enough to drop, and the reopen's
-    /// walk is cold again.
+    /// walk is cold again. (How soon the warm walk may start is
+    /// [`a_kept_baseline_is_read_no_sooner_than_half_a_walk_after_it_was_taken`]'s
+    /// subject; here it is simply waited for.)
     ///
     /// Virtual time moves only where this test moves it (see
     /// [`settle_until`]), so each baseline's age is exact.
@@ -2102,7 +2190,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     #[tokio::test(start_paused = true)]
     async fn a_quick_reopen_keeps_a_young_baseline_and_a_slow_one_drops_it() {
-        use crate::top_apps::{KEEP_BASELINE, POLL};
+        use crate::top_apps::{KEEP_BASELINE, MIN_BASELINE_AGE, POLL};
 
         let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
         let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
@@ -2126,9 +2214,11 @@ mod tests {
         walks_landed(&mut msg_rx, &mut walks, 2).await;
         assert_eq!(walks[1].by_cpu.len(), 1, "the second walk is warm");
 
-        // A close and an immediate reopen: the baseline is 0 s old.
+        // A close and an immediate reopen: the baseline is 0 s old, so the
+        // walk is held until it is MIN_BASELINE_AGE old.
         cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
         cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        tokio::time::advance(MIN_BASELINE_AGE).await;
         walks_landed(&mut msg_rx, &mut walks, 3).await;
         assert_eq!(
             handed_at(2),
@@ -2162,6 +2252,170 @@ mod tests {
             "a KEEP_BASELINE-old baseline is dropped"
         );
         assert!(walks[4].by_cpu.is_empty(), "…so the walk is cold again");
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// Everything the reducer's lane carries by now, added to `walks`.
+    fn drain_walks(rx: &mut hytte_plugin::CmdReceiver<Msg>, walks: &mut Vec<TopApps>) {
+        while let Ok(msg) = rx.try_recv() {
+            if let Msg::TopApps(apps) = msg {
+                walks.push(apps);
+            }
+        }
+    }
+
+    /// **A kept baseline is read against no sooner than `MIN_BASELINE_AGE`
+    /// after its read started** (the #1437 review's LOW 1): a quick reopen's
+    /// first walk is held until `max(reopen, last walk's start +
+    /// MIN_BASELINE_AGE)`, so its CPU list is never a share over a window of a
+    /// few hundred milliseconds — and it still comes well inside a cadence.
+    /// Then the two things the hold must not break:
+    ///
+    /// - **The cadence restarts from the held walk**, a full `POLL` after it,
+    ///   as it does from an open edge.
+    /// - **A close during the hold cancels the walk**: no walk with the page
+    ///   shut, and a later reopen is decided afresh.
+    ///
+    /// The negatives wait with `tokio::time::sleep`, not `advance`: the paused
+    /// runtime will not move its clock while a walk is on the blocking pool,
+    /// so by the time a sleep returns, any walk started before its deadline
+    /// has landed. A walk that should not have started cannot hide.
+    ///
+    /// **Falsified** by not holding the walk (it lands at the reopen), by a
+    /// shorter hold (`settle / 2`: it lands before the floor), by dropping the
+    /// `gate.reset()` after a held walk (the next walk comes 700 ms early), and
+    /// by dropping the `gate.is_visible()` check (the held walk runs with the
+    /// page shut).
+    #[allow(clippy::float_cmp)]
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_baseline_is_read_no_sooner_than_half_a_walk_after_it_was_taken() {
+        use crate::top_apps::{MIN_BASELINE_AGE, POLL};
+        // How long after walk 2 started the page closes and reopens.
+        const EARLY: Duration = Duration::from_millis(300);
+        const MS: Duration = Duration::from_millis(1);
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+        let handed_at = |i: usize| handed.lock().expect("not poisoned")[i];
+        let started = || handed.lock().expect("not poisoned").len();
+        let mut walks: Vec<TopApps> = Vec::new();
+
+        // Walk 1 on the open edge (0 s, cold), walk 2 a cadence later (2 s).
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 1).await;
+        tokio::time::advance(POLL).await;
+        walks_landed(&mut msg_rx, &mut walks, 2).await;
+
+        // 300 ms into walk 2's window the page closes and reopens at once.
+        tokio::time::advance(EARLY).await;
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+
+        // Up to a millisecond short of the floor: nothing starts.
+        tokio::time::sleep(MIN_BASELINE_AGE.saturating_sub(EARLY + MS)).await;
+        drain_walks(&mut msg_rx, &mut walks);
+        assert_eq!(
+            (walks.len(), started()),
+            (2, 2),
+            "no walk before the kept baseline is MIN_BASELINE_AGE old",
+        );
+
+        // At the floor: the held walk, warm, over a window of exactly it.
+        tokio::time::sleep(MS).await;
+        walks_landed(&mut msg_rx, &mut walks, 3).await;
+        assert_eq!(handed_at(2), (Some(500), 2_000), "handed walk 2's baseline");
+        assert_eq!(walks[2].by_cpu.len(), 1, "its CPU list is there");
+        assert_eq!(walks[2].by_cpu[0].cpu_frac, 0.25, "…a real share");
+
+        // The cadence restarts from the held walk: nothing a millisecond
+        // short of a full POLL after it, then the next walk.
+        tokio::time::sleep(POLL.saturating_sub(MS)).await;
+        drain_walks(&mut msg_rx, &mut walks);
+        assert_eq!(
+            (walks.len(), started()),
+            (3, 3),
+            "the next walk is a full POLL after the held one",
+        );
+        tokio::time::sleep(MS).await;
+        walks_landed(&mut msg_rx, &mut walks, 4).await;
+
+        // A close and a reopen hold a walk again; a second close during the
+        // hold cancels it, and nothing walks with the page shut.
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        tokio::time::sleep(POLL * 5).await;
+        drain_walks(&mut msg_rx, &mut walks);
+        assert_eq!(
+            (walks.len(), started()),
+            (4, 4),
+            "a close during the hold cancels the held walk",
+        );
+
+        // Ten seconds later the baseline is too old to keep: the reopen walks
+        // at once, cold.
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 5).await;
+        assert_eq!(handed_at(4), (None, 0), "a stale baseline is dropped");
+
+        drop(cmd_tx);
+        join_all(tasks).await;
+    }
+
+    /// **A quick reopen lowers the reopen flag even though it keeps the
+    /// baseline**, so a later cadence tick is never taken for a reopen,
+    /// however late it comes (`drive`'s "`swap` first, always").
+    ///
+    /// **Falsified** by swapping `parked` only when the baseline is dropped:
+    /// the late tick then re-baselines and walks cold.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_tick_after_a_quick_reopen_is_not_a_reopen() {
+        use crate::top_apps::{KEEP_BASELINE, MIN_BASELINE_AGE, POLL};
+
+        let (cmd_tx, cmd_rx) = cmd_channel::<Cmd>();
+        let (msg_tx, mut msg_rx) = cmd_channel::<Msg>();
+        let (walk, handed) = crate::top_apps::fake_proc();
+        let mut walk = Some(walk);
+        let tasks = spawn_with(
+            cmd_rx,
+            msg_tx,
+            Duration::from_secs(1),
+            || FakeSampler(Arc::new(Calls::default())),
+            move || Walker::over(walk.take().expect("the walker is built once")),
+        );
+        let mut walks: Vec<TopApps> = Vec::new();
+
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        walks_landed(&mut msg_rx, &mut walks, 1).await;
+        // A close and an immediate reopen: young, so the baseline is kept.
+        // (Its walk is held until the baseline is MIN_BASELINE_AGE old.)
+        cmd_tx.send(Cmd::PageVisible(false)).expect("lane is live");
+        cmd_tx.send(Cmd::PageVisible(true)).expect("lane is live");
+        tokio::time::advance(MIN_BASELINE_AGE).await;
+        walks_landed(&mut msg_rx, &mut walks, 2).await;
+        assert_eq!(walks[1].by_cpu.len(), 1, "the quick reopen's walk is warm");
+
+        // The page stays open and the next cadence tick comes late (a stalled
+        // runtime, say), past KEEP_BASELINE. It is a tick, not a reopen.
+        tokio::time::advance(KEEP_BASELINE + POLL).await;
+        walks_landed(&mut msg_rx, &mut walks, 3).await;
+        assert_eq!(
+            handed.lock().expect("not poisoned")[2],
+            (Some(500), 2_000),
+            "a cadence tick is handed the previous walk's baseline, however late",
+        );
+        assert_eq!(walks[2].by_cpu.len(), 1, "…so its CPU list is there");
 
         drop(cmd_tx);
         join_all(tasks).await;

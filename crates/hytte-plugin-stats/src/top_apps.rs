@@ -43,9 +43,11 @@
 //! It still forwards the push, so the day its card opens a page the gate
 //! already follows it.
 //!
-//! When the page closes the reducer drops the lists, so a reopen never shows a
-//! reading taken before the close; a walk already in flight at the close is
-//! dropped when it lands (the gate never cancels one).
+//! When the page closes the reducer drops the lists, so a reopen shows nothing
+//! until a walk started after it lands. A walk already in flight at the close
+//! (the gate never cancels one) is dropped if it lands while the page is still
+//! closed. If the page has already reopened by then, it is drawn: it started
+//! with the page open, over a normal window, a moment earlier.
 //!
 //! # A CPU share needs two walks
 //!
@@ -68,12 +70,26 @@
 //! click, `Esc` and straight back — used to drop a baseline at most one walk
 //! old, so the CPU list read `—` for a whole [`POLL`] (#1426 review, NIT 8).
 //! Now the gated loop keeps a baseline whose read started less than
-//! [`KEEP_BASELINE`] before the reopen, so that reopen's first walk is warm:
-//! both lists fill as soon as it lands. A delta from such a baseline is a real
-//! reading over a window at most twice the usual one — not a mean over a long
-//! close, which is what the re-baseline exists to prevent. Past
-//! [`KEEP_BASELINE`] the reopen re-baselines as before. The age lives in the
-//! loop (`crate::sample`'s `drive`), which already sees every read.
+//! [`KEEP_BASELINE`] before the reopen, so that reopen's first walk is warm.
+//! Past [`KEEP_BASELINE`] the reopen re-baselines as before, so a kept
+//! baseline is never a mean over a long close, which is what the re-baseline
+//! exists to prevent.
+//!
+//! A kept baseline has a **floor** as well as a ceiling. A close just after a
+//! walk started, and a reopen a moment later, would otherwise measure the
+//! reopen's CPU list over a few hundred milliseconds. Each PID's jiffies are
+//! whole ticks, so a group of N processes can be off by up to N ticks, and
+//! over 250 ms on an 8-thread machine that is up to 7.5 % for a 15-process
+//! browser (#1437 review, LOW 1). So the reopen's first walk is **held** until
+//! the baseline is [`MIN_BASELINE_AGE`] old (half a [`POLL`]): it starts at
+//! `max(reopen, last walk's start + MIN_BASELINE_AGE)`. A quick reopen then
+//! shows its CPU list within about a second, never after a blank [`POLL`], and
+//! never from a window under half a walk. The window of that first walk is
+//! between half a walk and two walks long. A close while the walk is held
+//! cancels it.
+//!
+//! The ages and the hold live in the loop (`crate::sample`'s `drive`), which
+//! already sees every read.
 //!
 //! # Names: the desktop entry's, as native shows them (#1428)
 //!
@@ -127,9 +143,19 @@ pub const POLL: Duration = Duration::from_secs(2);
 
 /// How young a baseline must be to survive a page reopen: two walks' worth of
 /// [`POLL`]. A reopen within this long of the last walk's start keeps it, so
-/// the reopen's first walk publishes a CPU list; an older one is dropped and
-/// that walk is cold (see the [module docs](self)).
-pub const KEEP_BASELINE: Duration = Duration::from_secs(POLL.as_secs() * 2);
+/// the reopen's first walk (held until [`MIN_BASELINE_AGE`]) publishes a CPU
+/// list; an older one is dropped and that walk is cold (see the
+/// [module docs](self)).
+pub const KEEP_BASELINE: Duration = POLL.saturating_mul(2);
+
+/// How old a kept baseline must be before the reopen's first walk reads
+/// against it: half a [`POLL`]. Until then that walk is held, so its CPU list
+/// is never a share over a window of a few hundred milliseconds (see the
+/// [module docs](self)).
+pub const MIN_BASELINE_AGE: Duration = match POLL.checked_div(2) {
+    Some(half) => half,
+    None => POLL,
+};
 
 /// One walk's two ranked lists — at most [`app_usage::TOP_N`] rows each,
 /// heaviest first, each app row's `name` already its desktop entry's display
@@ -619,5 +645,26 @@ mod tests {
         let _ = walker.walk();
         let same = walker.walk();
         assert!(same.by_cpu.is_empty(), "{same:?}");
+    }
+
+    /// A young baseline is **two walks**, the value the live-verify item and
+    /// CLAUDE.md promise; every other test reads the constant, so none of them
+    /// notices it changing.
+    ///
+    /// **Falsified** by `KEEP_BASELINE` of one walk, or by a `POLL` that is
+    /// not a whole number of seconds (`as_secs` truncates it).
+    #[test]
+    fn a_young_baseline_is_two_walks() {
+        assert_eq!(super::KEEP_BASELINE, super::POLL * 2);
+    }
+
+    /// A kept baseline is read against no sooner than **half a walk** after
+    /// it was taken (#1437 review, LOW 1) — pinned for the same reason as
+    /// [`a_young_baseline_is_two_walks`]: the hold tests read the constant.
+    ///
+    /// **Falsified** by any other `MIN_BASELINE_AGE`.
+    #[test]
+    fn a_kept_baseline_settles_for_half_a_walk() {
+        assert_eq!(super::MIN_BASELINE_AGE * 2, super::POLL);
     }
 }

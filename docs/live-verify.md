@@ -2561,9 +2561,11 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       (e.g. Calendar). The chips keep updating once a second throughout.
       Expand a list, then close the page: the CPU still drops (a list left
       open no longer keeps the walk alive, which was #1426's known cost).
-      Reopen within a second or two: both lists fill as soon as the first
-      walk lands, with no 2 s `—` on the CPU list; reopen after a longer
-      wait: the CPU list reads `—` for about 2 s, as on first open. The
+      Reopen within a second or two: both lists fill within about a second
+      (the first walk waits until the kept baseline is half a walk old, so
+      its CPU list never covers a sub-second window), with no 2 s `—` on the
+      CPU list; reopen after a longer wait: the CPU list reads `—` for about
+      2 s, as on first open. The
       **sidebar** instance (`trollshell-plugin-stats-side`) publishes no
       page, so there is no dialog to open for it: its process must stay
       idle whatever the bar's page does.

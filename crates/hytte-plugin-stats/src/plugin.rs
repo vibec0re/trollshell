@@ -312,7 +312,9 @@ impl Plugin for Stats {
             // A fresh Top apps walk (#1419 item 3) — kept only while the page
             // is open. The gate never cancels a walk already in flight, so one
             // can land just after the page closed; drawing it would put a
-            // reading back on the lists `page_visible` has just cleared.
+            // reading back on the lists `page_visible` has just cleared. (If
+            // the page has reopened by the time it lands, it is drawn: it
+            // started with the page open, a moment earlier.)
             Input::App(Msg::TopApps(apps)) => {
                 if self.page_open {
                     self.top_apps = apps;
@@ -403,8 +405,10 @@ impl Plugin for Stats {
     /// and then edges, [`hytte_plugin::poll::Gate`] acts on edges of what it is
     /// sent, and the SDK's rule for this hook is latest-wins.
     ///
-    /// A close drops the lists, so a reopen never shows a reading taken before
-    /// it; the walk that lands next is measured after the reopen.
+    /// A close drops the lists, so a reopen shows nothing until a walk started
+    /// after it lands. (That walk's CPU list may still measure from a baseline
+    /// taken before the close — on purpose, when the reopen is quick: see
+    /// `crate::top_apps`, *A quick close and reopen keeps its baseline*.)
     fn page_visible(&mut self, visible: bool) -> Vec<Effect> {
         self.page_open = visible;
         if !visible {
@@ -995,10 +999,11 @@ mod tests {
     }
 
     /// **A walk lands only while the page is open, and a page close clears
-    /// the lists** — so a reopened page never shows a reading taken before
-    /// the close, and the one walk that was already in flight when the page
-    /// closed (the gate never cancels one) is dropped when it lands. The
-    /// seed may arrive before or after a sample; neither order matters.
+    /// the lists** — so a reopened page shows nothing until a walk started
+    /// after the reopen lands, and a walk that was already in flight when the
+    /// page closed (the gate never cancels one) is dropped if it lands while
+    /// the page is still closed. The seed may arrive before or after a
+    /// sample; neither order matters.
     ///
     /// **Falsified** by dropping the `page_open` guard on `Msg::TopApps` (the
     /// late walk lands on a shut page), by dropping the clear in
@@ -1027,7 +1032,7 @@ mod tests {
         // Closing the page clears the reading…
         let _ = Plugin::page_visible(&mut model, false);
         assert_eq!(list_state(&model, cpu), (false, dash.clone()));
-        // …the walk already in flight is dropped when it lands…
+        // …a walk in flight that lands while the page is shut is dropped…
         let _ = model.update(walked());
         assert_eq!(list_state(&model, cpu), (false, dash.clone()));
         // …and a reopen shows nothing until a walk after it lands.
@@ -1035,6 +1040,31 @@ mod tests {
         assert_eq!(list_state(&model, cpu), (false, dash));
         let _ = model.update(walked());
         assert_eq!(list_state(&model, cpu), (false, summary));
+    }
+
+    /// **A page close drops the RAM list too, not only the CPU one.** A RAM
+    /// list is valid from a cold walk, so a close that kept it would show the
+    /// last visit's heaviest app on the reopened page until the first walk
+    /// after the reopen lands.
+    ///
+    /// **Falsified** by clearing only `by_cpu` in `page_visible`.
+    #[test]
+    fn a_page_close_drops_the_ram_list_too() {
+        let (mut model, _rx) = fresh_bar(Card::bar_default());
+        let ram = crate::panel::TOP_APPS_RAM_ID;
+        let _ = Plugin::page_visible(&mut model, true);
+        let _ = model.update(walked());
+        assert_eq!(
+            list_state(&model, ram),
+            (false, "firefox · 1.0 GiB".to_owned())
+        );
+        let _ = Plugin::page_visible(&mut model, false);
+        let _ = Plugin::page_visible(&mut model, true);
+        assert_eq!(
+            list_state(&model, ram),
+            (false, "\u{2014}".to_owned()),
+            "the reopened RAM header waits for a walk after the reopen",
+        );
     }
 
     /// **A collapsed list keeps its header summary while the page is open** —

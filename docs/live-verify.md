@@ -2548,10 +2548,11 @@ node is negotiated, so an older shell gets `Progress` bars instead of lines
       `LANG`/`LC_MESSAGES` other than English must give both pages the same
       translated name (`Filer` for Files under `sv_SE`).
 - [ ] **(#1427)** **The Top apps walk runs only while the page is on
-      screen.** In a terminal, `top -p $(systemctl --user show -p MainPID
-      --value trollshell-plugin-stats-bar)` (press `H` for threads if you
-      like). With the page closed the plugin sits near 0 % apart from its
-      1 s chip tick. Open the page from a chip: its CPU rises by roughly
+      screen.** In a terminal, run
+      `top -p $(systemctl --user show -p MainPID --value trollshell-plugin-stats-bar)`
+      (press `H` for threads if you like). With the page closed the plugin
+      sits near 0 % apart from its 1 s chip tick. Open the page from a
+      chip: its CPU rises by roughly
       the walk's cost every 2 s (about 1 % of a core at ~640 processes) —
       with both lists collapsed, too. Close the page each of these ways,
       one at a time, and watch the CPU drop back within about 2 s every

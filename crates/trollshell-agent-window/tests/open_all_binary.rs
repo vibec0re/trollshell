@@ -55,18 +55,25 @@ const EXIT_USAGE: i32 = 2;
 /// this machine. `socket`, when given, is written into an `agents.toml` the
 /// child will read.
 fn run(args: &[&str], socket: Option<&Path>) -> Output {
+    run_with(args, socket.map(socket_line))
+}
+
+/// `socket = "<path>"` as a line of `agents.toml`.
+fn socket_line(socket: &Path) -> String {
+    // `{:?}` on the path's string is a TOML basic string, and a tempdir path
+    // carries nothing that needs escaping beyond it.
+    format!("socket = {:?}\n", socket.display().to_string())
+}
+
+/// [`run`] with the child's whole `agents.toml` handed in, for a test that
+/// needs more in the file than the socket.
+fn run_with(args: &[&str], agents_toml: Option<String>) -> Output {
     let home = tempfile::tempdir().expect("a tempdir");
     let empty = tempfile::tempdir().expect("a tempdir");
-    if let Some(socket) = socket {
+    if let Some(body) = agents_toml {
         let dir = home.path().join("trollshell");
         std::fs::create_dir_all(&dir).expect("the config dir");
-        std::fs::write(
-            dir.join("agents.toml"),
-            // `{:?}` on the path's string is a TOML basic string, and a
-            // tempdir path carries nothing that needs escaping beyond it.
-            format!("socket = {:?}\n", socket.display().to_string()),
-        )
-        .expect("agents.toml");
+        std::fs::write(dir.join("agents.toml"), body).expect("agents.toml");
     }
     Command::new(BIN)
         .args(args)
@@ -236,6 +243,45 @@ fn main_hands_open_all_to_the_fan_out_and_never_builds_a_window() {
     assert!(
         said(&out).contains(&socket.display().to_string()),
         "it read OUR agents.toml and dialled the socket in it: {}",
+        said(&out)
+    );
+}
+
+/// **`config::load()` judges `agents.toml` per key, and says so** (#1451; the
+/// #1457 review's MEDIUM 1).
+///
+/// This binary, the control center's Agents tab and the plugin's seed config
+/// all read through that one wrapper, and nothing else pinned it: the unit
+/// tests drive `hytte_config::subsystem::assemble` directly, and the plugin's
+/// reload test drives `ConfigSource::read`. So the file here is #1451's own
+/// case — a good socket beside a wrong-typed display `label` — and the child
+/// must both dial **the file's** socket (whole-file would have reverted it to
+/// the built-in `/run/hyperhive/host.sock`) and **name** the rejected key on
+/// its own log (`initial_load` is where that line is emitted; the issue's
+/// severity was that the failure was silent).
+///
+/// Falsification (verified red): rewrite `config::load` as whole-file
+/// (`load_from`, then the built-in default on any rejection) and the hive is
+/// never dialled; make it per-key but silent (`load_from` + `parsed().0`)
+/// and the line goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_load_keeps_the_socket_past_a_bad_display_value_and_names_it() {
+    let hive = FakeHive::script(&[r#"{"version":1,"ok":true,"agent_statuses":[]}"#]);
+    let body = format!("{}[display.argus]\nlabel = 5\n", socket_line(hive.path()));
+    let out = tokio::task::spawn_blocking(move || run_with(&["--open-all"], Some(body)))
+        .await
+        .expect("the child ran");
+
+    assert_eq!(out.status.code(), Some(EXIT_OK), "{}", said(&out));
+    assert_eq!(
+        hive.seen().len(),
+        1,
+        "it dialled the FILE's socket, not the built-in one: {}",
+        said(&out)
+    );
+    assert!(
+        said(&out).contains("display.*.label = argus: 5 is not valid; expected a string"),
+        "the rejected key is named on the shipped path: {}",
         said(&out)
     );
 }

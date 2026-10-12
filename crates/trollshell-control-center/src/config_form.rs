@@ -289,7 +289,7 @@ static FAMILIES: [FamilyOps; 4] = [
         &hytte_plugin_stats::config::FAMILY,
         RELOAD_AT_PLUGIN_START,
     ),
-    FamilyOps::of::<hytte_plugin_agents::config::AgentsConfig>(
+    FamilyOps::of::<hytte_plugin_agents::config::AgentsFile>(
         &hytte_plugin_agents::config::FAMILY,
         RELOAD_LIVE_PLUGIN,
     ),

@@ -18,9 +18,10 @@
 //! went by and the socket was untouched" a statement about the loop rather
 //! than about how long the test slept.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
+use hytte_config::test_support::{Captured, capture};
 use hytte_plugin::cmd_channel;
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::wire::Request;
@@ -299,6 +300,185 @@ async fn an_agents_toml_edit_is_picked_up_on_the_next_poll() {
 
     assert_eq!(reloaded.label_for("trollshell-choom"), "choom");
     assert_eq!(reloaded.project_for("trollshell-choom"), Some("viberoot"));
+    task.abort();
+}
+
+/// **A live reload keeps the file's socket past a bad display value** (#1451)
+/// — the per-key rule pinned on the path that actually ships, not only on
+/// `config.rs`'s own `assemble` seam: `ConfigSource::read` is what a running
+/// plugin re-reads `agents.toml` through.
+///
+/// The edited file points the socket at the fake hive and carries one
+/// wrong-typed `label`. Whole-file, that `label` failed the layer and the
+/// reload published the built-in default instead — `/run/hyperhive/host.sock`,
+/// the 2 s cadence, no decorations — so the rows silently went looking for a
+/// different hive. Per key, it costs that one label.
+///
+/// Falsification: point `ConfigSource::read` back at a whole-file reader (give
+/// `AgentsFile::validate` an error whenever `parsed` rejects anything) and the
+/// socket assertion reds.
+#[tokio::test(start_paused = true)]
+async fn a_reload_with_a_bad_display_value_keeps_the_files_socket() {
+    let hive = FakeHive::serve(replies(&[(
+        "agent_status",
+        &fixture("agent_status_grouped.json"),
+    )]));
+    let socket = hive.path().display().to_string();
+    let layer_dir = tempfile::tempdir().expect("a tempdir");
+    let layer: PathBuf = layer_dir.path().join("agents.toml");
+
+    let (tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg_for(&hive),
+        ConfigSource::over(vec![layer.clone()]),
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    tx.send(Cmd::SetVisible(true)).expect("the lane is open");
+    assert!(matches!(
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
+
+    std::fs::write(
+        &layer,
+        format!(
+            "socket = {}\npoll_seconds = 1\n\
+             [display.trollshell-choom]\nlabel = 5\nproject = \"viberoot\"\n\
+             [display.argus]\nlabel = \"Argus\"\n",
+            toml::Value::from(socket.as_str())
+        ),
+    )
+    .expect("write the overlay");
+
+    let reloaded = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+            while let Ok(msg) = msg_rx.try_recv() {
+                if let Msg::Config(cfg) = msg {
+                    return cfg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("an edited layer must be re-read");
+
+    assert_eq!(reloaded.socket, socket, "the file's socket survives");
+    assert_eq!(reloaded.poll_seconds, 1, "…and so does its cadence");
+    assert_eq!(
+        reloaded.project_for("trollshell-choom"),
+        Some("viberoot"),
+        "the bad label's own entry keeps its good key"
+    );
+    assert_eq!(
+        reloaded.label_for("trollshell-choom"),
+        "trollshell-choom",
+        "the bad label falls back to the hive's name"
+    );
+    assert_eq!(
+        reloaded.label_for("argus"),
+        "Argus",
+        "another agent's entry applies"
+    );
+    task.abort();
+}
+
+/// How many times the journal named `trollshell-choom`'s bad `label`.
+fn label_lines(log: &Captured) -> usize {
+    log.warnings()
+        .iter()
+        .filter(|w| w.contains("display.*.label = trollshell-choom: 5 is not valid"))
+        .count()
+}
+
+/// Write `body` to `path` and set its mtime explicitly, so two edits can never
+/// share an mtime granule and read as one.
+fn write_at(path: &Path, body: &str, secs: u64) {
+    std::fs::write(path, body).expect("write");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+        .expect("set mtime");
+}
+
+/// **A live reload names a rejected key once per edit, not once per tick**
+/// (#1457 review, MEDIUM 1) — the journal half of #1451 on the reload path.
+///
+/// `a_reload_with_a_bad_display_value_keeps_the_files_socket` pins the
+/// reload's *values*; this pins that the rejection is *said*, and said once.
+/// Twelve ticks after one edit give exactly one line (the reload only
+/// re-reads when a stamp moved), and a second edit gives a second line — the
+/// control that makes the first count a statement about ticks rather than a
+/// capture that saw nothing.
+///
+/// Falsification (verified red): make `ConfigSource::read` silent
+/// (`load_from` + `parsed().0`, no line) or whole-file (the built-in default
+/// on any rejection) and the count is 0; make `ConfigSource::changed` always
+/// `true` and it is one per tick.
+#[tokio::test(start_paused = true)]
+async fn a_live_reload_reports_a_bad_key_once_per_edit_not_once_per_tick() {
+    let (log, _guard) = capture();
+    let hive = FakeHive::serve(replies(&[(
+        "agent_status",
+        &fixture("agent_status_grouped.json"),
+    )]));
+    let socket = hive.path().display().to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layer = dir.path().join("agents.toml");
+    let body = format!(
+        "socket = {}\npoll_seconds = 1\n[display.trollshell-choom]\nlabel = 5\n",
+        toml::Value::from(socket.as_str())
+    );
+
+    let (tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Msg>();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        AgentsConfig {
+            socket: socket.clone(),
+            poll_seconds: 1,
+            ..AgentsConfig::default()
+        },
+        ConfigSource::over(vec![layer.clone()]),
+    ));
+    tx.send(Cmd::SetVisible(true)).expect("the lane is open");
+    settle().await;
+
+    write_at(&layer, &body, 1_000_000);
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        while msg_rx.try_recv().is_ok() {}
+    }
+    assert_eq!(
+        label_lines(&log),
+        1,
+        "one line for one edit across 12 ticks: {:?}",
+        log.warnings()
+    );
+    assert!(
+        !hive.seen().is_empty(),
+        "the file's socket is the one polled"
+    );
+
+    // Control: a second edit (a new mtime) is a second line.
+    write_at(&layer, &body, 1_000_001);
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        while msg_rx.try_recv().is_ok() {}
+    }
+    assert_eq!(label_lines(&log), 2, "{:?}", log.warnings());
     task.abort();
 }
 

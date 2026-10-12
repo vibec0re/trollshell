@@ -9,6 +9,7 @@
 //! *visible* result is a re-render, but its *consequential* result is the JSON
 //! line that reaches `host.sock`, so these pin the bytes.
 
+use hytte_config::subsystem::Subsystem as _;
 use hytte_plugin::proto::{
     ConsentChoices, ConsentDecision, Effect, EffectOutcome, EventKind, Page,
 };
@@ -627,12 +628,14 @@ fn the_toast_uses_the_configured_display_label() {
 }
 
 fn toml_config(body: &str) -> hytte_plugin_agents::config::AgentsConfig {
-    hytte_config::subsystem::assemble::<hytte_plugin_agents::config::AgentsConfig>(&[(
+    hytte_config::subsystem::assemble::<hytte_plugin_agents::config::AgentsFile>(&[(
         std::path::PathBuf::from("overlay.toml"),
         body.to_owned(),
     )])
     .expect("the test config assembles")
     .config
+    .parsed()
+    .0
 }
 
 // ── group expanders ──────────────────────────────────────────────────────────
@@ -2146,7 +2149,7 @@ fn a_runaway_display_label_cannot_grow_the_card() {
     m.update(clock(1_000));
     m.update(status(roster("agent_status_grouped.json")));
     m.update(Input::App(Msg::Config(Box::new(
-        hytte_config::subsystem::assemble::<hytte_plugin_agents::config::AgentsConfig>(&[(
+        hytte_config::subsystem::assemble::<hytte_plugin_agents::config::AgentsFile>(&[(
             std::path::PathBuf::from("overlay.toml"),
             format!(
                 "[display.trollshell-choom]\nlabel = \"{}\"\n",
@@ -2154,7 +2157,9 @@ fn a_runaway_display_label_cannot_grow_the_card() {
             ),
         )])
         .expect("the config assembles")
-        .config,
+        .config
+        .parsed()
+        .0,
     ))));
 
     let fx = m.update(pending(vec![approval(7, "trollshell-choom")]));

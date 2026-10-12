@@ -79,8 +79,8 @@ stdenv.mkDerivation {
   # creates — never as a compile-time env, which would rehash the one expensive
   # `workspace` compile on every commit (see nix/package.nix). Injected here so
   # the companion app can report the revision of the tree it was built from
-  # independently of the shell's own `Control.Revision` D-Bus method; which of
-  # the two a future UI surface uses is still open (#601).
+  # independently of the shell's own `Control.Revision` D-Bus method; the control-center footer (#836, #962) settled it: it shows the running
+  # shell's revision over Control.Revision and never resolves this one.
   preFixup = ''
     gappsWrapperArgs+=(
       --set TROLLSHELL_REV "${revision}"

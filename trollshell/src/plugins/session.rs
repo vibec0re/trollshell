@@ -1700,7 +1700,7 @@ pub(super) async fn serve_conn(
     // here, which turned "a right-mounted plugin is not tracked by the scope
     // releaser" into the strictly worse "tracked, and permanently stuck" — an id
     // that can never leave the union, so `forget_scope` never fires for it, and
-    // (once #1160 mounts the surface) a dead plugin's card on glass forever.
+    // (now that #1160/#1244 mounts the surface) a dead plugin's card on glass forever.
     // `every_mount_clears_its_mailbox_on_connection_teardown` in `tests.rs` drives
     // `Mount::ALL` through a real socketpair and names every mount missing from
     // this list, so the tenth mount arrives here as a failing test rather than as

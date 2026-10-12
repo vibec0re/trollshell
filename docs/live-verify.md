@@ -3369,7 +3369,7 @@ session.
      "might" resting on nothing.
 
 - [ ] **(#1143 / #865 / #1090)** **`Gauge` renders on a `GtkGLArea`, at the
-      surface's native resolution — and that is what #1090 is waiting on.**
+      surface's native resolution — and that is what #1090 asked for (fixed in #1350).**
       Second kind on the `Scope` seam, same context-failure fallback (the kill
       switch they shared went with the CPU renderer in #1157). The difference that matters is the **grid**: a scope's
       offscreen passes run at its pre-upscale `cols × rows`, a gauge's run at
@@ -4675,13 +4675,12 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       this a failure: as of **#634** the _backend probe_ no longer runs only
       once at startup — it retries at capped backoff while inconclusive, so a
       manager that was merely slow to answer (bus still coming up, a
-      transient `ListNames` failure) is picked up without a restart. What is
-      still deliberately untouched: a manager that appears **after** the
+      transient `ListNames` failure) is picked up without a restart. The remaining case: a manager that appears **after** the
       probe has already committed to a verdict — e.g. installing
       NetworkManager mid-session on a host that booted with only iwd, or vice
-      versa. That gap is now tracked as **#633**, not #613 — #613 is closed;
-      #633 split off it as the genuinely-deferred half, and is blocked on a
-      cancellation primitive `spawn_supervised` doesn't have yet.
+      versa. That gap was tracked as **#633** (split off #613, now closed) and
+      is closed: #820 added `spawn_supervised_handle`, the cancellation primitive, and
+      the wireless backend now switches at runtime.
 - [ ] **(#610)** With `RUST_LOG=hytte_services=debug`, confirm no new log noise
       — `link_source()` uses `set_neq`, so it must not re-emit on every 5 s
       poll.

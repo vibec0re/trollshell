@@ -114,14 +114,12 @@ fn exit_for_parse_error(e: &clap::Error) -> ! {
 /// runs an unconditional `loop { … sleep(1s) }`, and several of its
 /// per-tick `/proc`-read failure branches (`apply_cpu_load`,
 /// `apply_memory`, `apply_network`, the panicked-blocking-task arm) each
-/// `warn!` uncapped — unlike `hytte_bus::own::log_give_up`, which
-/// deliberately rate-caps the same class of repeating-failure signal to one
-/// line per 5-minute cooldown. A persistent `/proc` read failure would now
-/// log multiple lines per second, indefinitely. Not rate-capped here: the
-/// shipped `etc/systemd/user/trollshell.service` has no
-/// `ProcSubset=`/`ProtectProc=` hardening, so a healthy host never takes
-/// those branches today, and fixing it would expand this PR beyond
-/// `main.rs` into `hytte-services` — tracked instead as #770.
+/// `warn!` uncapped when this floor was raised (#746) — unlike
+/// `hytte_bus::own::log_give_up`, which deliberately rate-caps the same class
+/// of repeating-failure signal to one line per 5-minute cooldown. A persistent
+/// `/proc` read failure would have logged multiple lines per second,
+/// indefinitely. That was fixed separately in `hytte-services` rather than
+/// here (#770, #774): the four per-tick `warn!` sites are now rate-capped.
 const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
     tracing_subscriber::filter::LevelFilter::INFO;
 
@@ -599,14 +597,6 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
     // Install the drawer *after* the bar so its window exists to be measured
     // for the perpendicular (bar-thickness) margin at open time.
     modal::install(monitor, &bar, BAR_EDGE, BAR_EDGE_OFFSET);
-
-    // When the drawer is open on this monitor, mark the bar window so CSS
-    // can square off the bottom-right corner (seam between bar and drawer).
-    bind_class(
-        modal::drawer_open_signal(monitor),
-        bar.window(),
-        "drawer-open",
-    );
 
     bar
 }

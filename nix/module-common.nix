@@ -1540,27 +1540,26 @@ in
         options = {
           socket = lib.mkOption {
             # Checked HERE, unlike `core-leds.color` above — deliberately
-            # the opposite call, because the two keys fail differently
-            # (#1237 review MEDIUM-2). `color`'s bad value costs `color`
-            # and nothing else: `CoreLeds::validate` is unconditionally
-            # `Ok(())` and every word is judged per-key in
-            # `core_leds.rs`'s `CoreLedsConfig::parsed`, so an open string
-            # there is a typo an operator pays for once. `socket` is a
-            # WHOLE-FILE rule — `AgentsConfig::validate`
-            # (`crates/hytte-plugin-agents/src/config.rs`) rejects a
-            # relative path, `hytte_config::subsystem::assemble` turns that
-            # into `ConfigError::Invalid`, and `load_or_default` then
-            # discards the entire merged file back to `DEFAULT_TOML`. A
-            # relative `socket` set here would therefore silently revert
-            # `poll_seconds` and every `[display.*]` entry too — #1040 V1's
-            # named anti-pattern, reached from a surface where nix can
-            # simply refuse the value in front of the operator who typed
-            # it, at eval, naming the option path.
+            # the opposite call (#1237 review MEDIUM-2). Both keys cost only
+            # themselves at load time: `color` is judged per key in
+            # `core_leds.rs`'s `CoreLedsConfig::parsed`, and since #1451 so
+            # is `socket`, in `crates/hytte-plugin-agents/src/config.rs`'s
+            # `AgentsFile::parsed`. What differs is what that costs. A bad
+            # `color` is a cosmetic typo an operator pays for once; a
+            # rejected `socket` falls back to the plugin's BUILT-IN path —
+            # not to anything a lower layer set — so the rows would quietly
+            # go and ask a different hive, with only a journal line saying
+            # why. Nix can simply refuse the value in front of the operator
+            # who typed it, at eval, naming the option path. (Before #1451
+            # it was worse, and the reason this check exists: `socket` was a
+            # WHOLE-FILE rule, so a relative path reverted `poll_seconds`
+            # and every `[display.*]` entry with it — #1040 V1's named
+            # anti-pattern.)
             #
-            # `^/.+` is strictly STRICTER than `validate` (which would also
+            # `^/.+` is strictly STRICTER than the reader (which would also
             # accept a bare `/`), which is the safe direction for a mirror:
             # every value this option accepts loads, and the one value it
-            # refuses that `validate` would take is not a socket path.
+            # refuses that the reader would take is not a socket path.
             # Pinned by `flake.nix`'s
             # `checks.nixos-module-agents-relative-socket`.
             type = lib.types.nullOr (lib.types.strMatching "^/.+");
@@ -1570,12 +1569,10 @@ in
               The hive's host admin socket — an **absolute** path.
               Checked at nix eval (`lib.types.strMatching "^/.+"`) rather
               than left to the file schema the way `core-leds.color`
-              above is: a bad `color` fails per-key at load time, but a
-              bad `socket` fails `AgentsConfig::validate` for the file as
-              a **whole**, and `hytte-config`'s `load_or_default` then
-              discards the entire merged `agents.toml` back to the
-              plugin's built-in default — reverting `poll_seconds` and
-              every `[display.*]` entry with it. `null` (the default)
+              above is: both are judged per key at load time, but a
+              rejected `socket` falls back to the plugin's built-in path
+              rather than to anything a lower layer set, so the rows
+              would quietly ask a different hive. `null` (the default)
               sets no `socket` key at all, leaving the overlay or the
               plugin's built-in default (`config.rs`'s `DEFAULT_TOML`,
               `/run/hyperhive/host.sock`) to decide.

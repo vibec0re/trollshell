@@ -12101,7 +12101,7 @@ mod sidebar_right_routing {
     /// never leave the union again. That is strictly worse than not tracking it —
     /// `forget_scope` never fires for such a plugin, so its preem renderer
     /// instances (and, since #893, its shader states) stay resident for the life
-    /// of the shell, and once #1160 mounts the surface its card stays on glass
+    /// of the shell, and since #1160/#1244 mounted the surface its card stays on glass
     /// after the process is gone.
     ///
     /// Written as "which mounts failed", not "assert on the first one": the

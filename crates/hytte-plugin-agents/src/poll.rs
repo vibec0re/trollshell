@@ -49,7 +49,7 @@ use hytte_plugin::CmdReceiver;
 use hytte_plugin::poll::{Gate, Wake};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{self, AgentsConfig};
+use crate::config::{self, AgentsConfig, AgentsFile};
 use crate::hive::wire::{AgentStatusRow, Approval, HiveUrls, Request};
 use crate::hive::{HiveError, client};
 
@@ -145,11 +145,13 @@ impl ConfigSource {
         moved
     }
 
-    /// Re-read the layers, degrading to the documented default on any failure
-    /// — the same contract [`config::load`] has, over the same reader.
+    /// Re-read the layers, with one journal line per rejected key, degrading
+    /// to the documented default only when a layer is unusable as a file —
+    /// the same contract [`config::load`] has, over the same reader (#1451:
+    /// a bad value costs its own key here too, not the reload).
     fn read(&self) -> AgentsConfig {
-        match hytte_config::subsystem::load_from::<AgentsConfig>(&self.layers) {
-            Ok(loaded) => loaded.config,
+        match hytte_config::subsystem::load_layer::<AgentsFile>(&self.layers) {
+            Ok(config) => config,
             Err(e) => {
                 tracing::error!(%e, "agents.toml is unusable; keeping the built-in default");
                 AgentsConfig::default()

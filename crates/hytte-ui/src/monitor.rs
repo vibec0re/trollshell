@@ -1,5 +1,7 @@
 //! Thin wrapper around `gdk::Monitor` carrying just the metadata bars need.
 
+use std::collections::HashSet;
+
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use gtk::gdk;
 use gtk::gdk::prelude::MonitorExt;
@@ -57,27 +59,31 @@ impl Monitor {
     /// survived every `close_all` retain.
     ///
     /// Folding it here rather than at the call sites is what makes that one
-    /// policy instead of seven: an empty name is not a name, and no caller
-    /// that reads the name *through this type* has to remember to ask. The
-    /// filters still at those call sites are idempotent against this and
-    /// harmless; they are simply no longer load-bearing, and #1177 owns
-    /// removing them.
-    ///
-    /// **It is not yet true that no caller can forget** (**PR #1199 review,
-    /// LOW 2**): `plugins::region::attached_connectors` reads
-    /// `gdk::Monitor::connector()` off the GDK object directly, so it never
-    /// passes through here and can still put `""` in the attached-connector
-    /// set. The consequence there is one cosmetic log decision ("is this
-    /// region's connector one this display knows about"), which is why that
-    /// site is a cleanup for #1177 rather than a fix here — but the sentence
-    /// above is scoped to callers that go through [`Monitor`] deliberately,
-    /// not out of optimism.
+    /// policy instead of seven: an empty name is not a name. The invariant
+    /// holds tree-wide — nothing reads `gdk::Monitor::connector()` raw
+    /// (#1177); the display-wide set of names is [`Monitor::attached_connectors`].
     ///
     /// A caller wanting something human-readable for an unnamed output still
     /// falls back to [`description`](Self::description).
     #[must_use]
     pub fn connector(&self) -> Option<String> {
         named_connector(self.inner.connector().map(|s| s.to_string()))
+    }
+
+    /// Every connector name of the monitors `display` currently reports,
+    /// with the empty-name policy of [`connector`](Self::connector) applied.
+    #[must_use]
+    pub fn attached_connectors(display: &gdk::Display) -> HashSet<String> {
+        use gtk::gdk::prelude::DisplayExt;
+        use gtk::prelude::Cast;
+        connector_set(
+            display
+                .monitors()
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter_map(|obj| obj.downcast::<gdk::Monitor>().ok())
+                .map(|m| Monitor::new(m).connector()),
+        )
     }
 
     /// Free-form description (manufacturer + model).
@@ -145,6 +151,13 @@ fn named_connector(connector: Option<String>) -> Option<String> {
     connector.filter(|name| !name.trim().is_empty())
 }
 
+/// The set of real connector names among `names`: [`named_connector`] over
+/// each, unnamed outputs dropped. Pure, so the "no empty name in the set"
+/// invariant is testable with no display.
+fn connector_set(names: impl IntoIterator<Item = Option<String>>) -> HashSet<String> {
+    names.into_iter().filter_map(named_connector).collect()
+}
+
 /// Disconnects a `gdk::Monitor` `notify::geometry` handler when dropped. Owned
 /// by the [`Monitor::size_changed`] signal so the handler's lifetime is tied to
 /// the subscription — a persistent `gdk::Monitor` doesn't accumulate a live
@@ -164,7 +177,25 @@ impl Drop for GeometryNotifyGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::named_connector;
+    use super::{connector_set, named_connector};
+
+    /// **#1448.** The display-wide set of known connectors never holds an
+    /// empty or whitespace name; `plugins::region` reads it for its
+    /// "unknown output" log decision.
+    #[test]
+    fn the_connector_set_never_holds_an_empty_name() {
+        let set = connector_set([
+            Some("DP-1".to_owned()),
+            Some(String::new()),
+            Some("  ".to_owned()),
+            None,
+            Some("HDMI-A-1".to_owned()),
+        ]);
+        assert_eq!(set.len(), 2, "{set:?}");
+        assert!(set.contains("DP-1") && set.contains("HDMI-A-1"));
+        assert!(!set.contains(""), "an empty name must not enter the set");
+        assert!(!set.contains("  "));
+    }
 
     /// **#1180 item 6.** One empty-connector policy, applied where the name
     /// is read rather than at each of seven call sites.

@@ -24,9 +24,10 @@
 //! `git diff` before committing: a change you cannot explain from the source
 //! change is exactly the regression this suite exists to catch.
 
+use hytte_config::subsystem::Subsystem as _;
 use hytte_plugin::{Input, Plugin, cmd_channel};
 use hytte_plugin_agents::Agents;
-use hytte_plugin_agents::config::AgentsConfig;
+use hytte_plugin_agents::config::{AgentsConfig, AgentsFile};
 use hytte_plugin_agents::hive::client::HiveError;
 use hytte_plugin_agents::hive::wire::{
     AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, Response, VersionMismatch,
@@ -49,12 +50,14 @@ fn roster(fixture: &str) -> Vec<AgentStatusRow> {
 }
 
 fn config(body: &str) -> AgentsConfig {
-    hytte_config::subsystem::assemble::<AgentsConfig>(&[(
+    hytte_config::subsystem::assemble::<AgentsFile>(&[(
         PathBuf::from("overlay.toml"),
         body.to_owned(),
     )])
     .expect("the golden's config assembles")
     .config
+    .parsed()
+    .0
 }
 
 /// A fixed clock, so every age label in a golden is deterministic.

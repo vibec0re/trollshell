@@ -1083,3 +1083,28 @@ mod tests {
         );
     }
 }
+
+/// Kit-side half of the wire-default pin (#1449). `speed_dots_per_sec` has no
+/// kit counterpart (the kit owns no clock), so it is not compared here.
+#[cfg(test)]
+mod wire_default_tests {
+    use super::{Dots, Marquee};
+    use crate::DisplayStyle;
+    use hytte_plugin_proto::preem::MarqueeConfig;
+
+    #[test]
+    fn new_matches_the_wire_default() {
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let MarqueeConfig {
+            style: _, // the skin, not a geometry default
+            window_px,
+            gap_dots,
+            dot_px,
+            speed_dots_per_sec: _, // no kit counterpart: the kit owns no clock (#929)
+        } = MarqueeConfig::default();
+        let kit = Marquee::new(DisplayStyle::Vfd);
+        assert_eq!(kit.window_px, window_px as usize, "window_px");
+        assert_eq!(kit.gap_dots, gap_dots as usize, "gap_dots");
+        assert_eq!(kit.dots, Dots::new(dot_px as usize), "dot_px");
+    }
+}

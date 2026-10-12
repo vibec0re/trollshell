@@ -2116,3 +2116,45 @@ mod tests {
         );
     }
 }
+
+/// Kit-side half of the wire-default pin (#1449). `duration_secs`/`stagger_secs`
+/// are `None` on the wire = "the mechanism's own", so the kit side is checked
+/// against the mechanism's default accessors.
+#[cfg(test)]
+mod wire_default_tests {
+    use super::{DEFAULT_CELLS, FlipBoard, Mechanism};
+    use hytte_plugin_proto::preem::FlipBoardConfig;
+
+    #[test]
+    fn new_matches_the_wire_default() {
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let FlipBoardConfig {
+            style: _, // the skin, not a geometry default
+            mechanism: wire_mechanism,
+            cells,
+            glyph_px,
+            scale,
+            duration_secs,
+            stagger_secs,
+        } = FlipBoardConfig::default();
+        assert_eq!(duration_secs, None);
+        assert_eq!(stagger_secs, None);
+        let mechanism = match wire_mechanism.name() {
+            "split-flap" => Mechanism::SplitFlap,
+            "nixie" => Mechanism::Nixie,
+            other => panic!("unmapped wire mechanism {other}"),
+        };
+        assert_eq!(mechanism, Mechanism::SplitFlap, "the default mechanism");
+        let kit = FlipBoard::new(mechanism);
+        assert_eq!(kit.mechanism, mechanism);
+        assert_eq!(kit.cells.len(), cells as usize, "cells");
+        assert_eq!(DEFAULT_CELLS, cells as usize, "DEFAULT_CELLS");
+        assert_eq!(kit.glyph_px, glyph_px as usize, "glyph_px");
+        assert_eq!(kit.scale, scale as usize, "scale");
+        assert!(
+            (kit.duration - mechanism.default_duration_secs()).abs() < f32::EPSILON
+                && (kit.stagger - mechanism.default_stagger_secs()).abs() < f32::EPSILON,
+            "timings are the mechanism's own"
+        );
+    }
+}

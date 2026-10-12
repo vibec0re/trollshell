@@ -123,9 +123,9 @@
 //!   ([`Mount::SidebarRightLead`] / [`Mount::SidebarRightTop`] /
 //!   [`Mount::SidebarRightBottom`], #1158/#1159), which the host treats
 //!   identically: same mailbox shape, same reconciler, same `.ts-plugin-card`
-//!   class, only a different surface to mount the region on. (P1 routes them;
-//!   nothing mounts the right slots until #1160 builds the surface, so a plugin
-//!   placed right today registers and renders into a mailbox nobody reads.)
+//!   class, only a different surface to mount the region on. (P1 routes them; the right
+//!   sidebar window, #1160/#1244, mounts the right slots, so a plugin placed
+//!   right renders on that surface.)
 //!   The three bar regions ([`Mount::BarLeft`] / [`Mount::BarCenter`] /
 //!   [`Mount::BarRight`]) render as bar **chips** (#349) — the plugin's `view()`
 //!   tree wrapped in a `.ts-plugin-chip` pill in the matching bar group. Both
@@ -520,8 +520,8 @@ pub struct PluginHandles {
     sidebar_bottom: Mutable<Vec<SlotRender>>,
     /// The **right** sidebar's three regions (#1158/#1159) — the same shape as
     /// the three above, because the host treats the two families identically.
-    /// Written by the reader task from P1 on; nothing reads them until #1160
-    /// builds the right sidebar surface and mounts
+    /// Written by the reader task from P1 on; read by the right sidebar window
+    /// (#1160/#1244), which mounts
     /// [`sidebar_right_lead_slot`](region::sidebar_right_lead_slot) & co.
     sidebar_right_lead: Mutable<Vec<SlotRender>>,
     sidebar_right_top: Mutable<Vec<SlotRender>>,

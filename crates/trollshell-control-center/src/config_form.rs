@@ -19,7 +19,7 @@
 //! | [`Kind::Choice`] | `AdwComboRow` over the options (plus a transient item when the file's word is not one of them) |
 //! | [`Kind::Color`] | an `AdwComboRow` of the named colours (plus a *custom* item) and an `AdwEntryRow` for the `#rrggbb` literal, with a swatch |
 //! | [`Kind::Text`] | `AdwEntryRow` with an apply button |
-//! | [`Kind::List`] / [`Kind::Map`] | a read-only `AdwActionRow` summarising the value — editing a collection is #888 P2 |
+//! | [`Kind::List`] / [`Kind::Map`] | a read-only `AdwActionRow` summarising the value that opens a sub-page to edit the entries (#888 P2, #1383) |
 //!
 //! The row's **subtitle is provenance** (*Default* / *From `<layer file>`* /
 //! *Yours* / *Set in nix*), its **tooltip** is the field's one-line `doc`
@@ -1143,7 +1143,7 @@ enum Control {
     },
     /// [`Kind::Text`].
     Text(adw::EntryRow),
-    /// [`Kind::List`] / [`Kind::Map`] — a summary, read-only in v1.
+    /// [`Kind::List`] / [`Kind::Map`] — a summary row that opens the collection sub-page (#888 P2, #1383).
     Collection(adw::ActionRow),
 }
 

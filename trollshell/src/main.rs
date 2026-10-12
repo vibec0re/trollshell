@@ -20,6 +20,8 @@ mod plugins;
 mod revision;
 mod scale;
 mod secrets;
+#[cfg(test)]
+mod test_support;
 mod widgets;
 mod workspace_stacks;
 

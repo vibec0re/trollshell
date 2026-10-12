@@ -258,8 +258,11 @@ mod tests {
     /// A `gio::AppInfo` a test can hand back as "the desktop entry was
     /// found", without needing a real installed `.desktop` file:
     /// `create_from_commandline` builds one entirely in memory — no D-Bus, no
-    /// display, no `$XDG_DATA_DIRS` lookup — so this stays a hermetic `#[test]`
-    /// rather than needing `#[gtk::test]`.
+    /// display, no `$XDG_DATA_DIRS` lookup — so this stays a plain `#[test]`
+    /// rather than needing `#[gtk::test]`. It is not free of process-wide `GLib`
+    /// state, though: in the `system-tests` build the first creation of the
+    /// `GAppInfo` types races `gtk::init` on the GTK test thread (#1461), so
+    /// callers start with `crate::test_support::gio_ready()` (#1463).
     fn fake_app_info() -> gio::AppInfo {
         gio::AppInfo::create_from_commandline(
             "true",
@@ -278,6 +281,7 @@ mod tests {
     /// `path` now answers first and `Route::Binary` comes back instead.
     #[test]
     fn the_desktop_entry_wins_over_the_binary() {
+        crate::test_support::gio_ready();
         let route = resolve_control_center(
             |id| {
                 assert_eq!(id, super::DESKTOP_ID);

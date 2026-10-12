@@ -5,7 +5,7 @@
 /// `ThemedIcon`, `AppInfo::create_from_commandline`) (#1461, #1463).
 ///
 /// In the `system-tests` build the same binary's `#[gtk::test]`s run `gtk::init`
-/// on the GTK test thread, and two threads first-initialising the same GLib
+/// on the GTK test thread, and two threads first-initialising the same `GLib`
 /// type or default at once can deadlock. So under that feature this parks the
 /// caller behind the GTK test thread (`gtk::test_synced`, which runs
 /// `gtk::init` first) and first-creates those types there, once; on the GTK

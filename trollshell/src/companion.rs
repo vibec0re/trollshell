@@ -259,7 +259,7 @@ mod tests {
     /// found", without needing a real installed `.desktop` file:
     /// `create_from_commandline` builds one entirely in memory — no D-Bus, no
     /// display, no `$XDG_DATA_DIRS` lookup — so this stays a plain `#[test]`
-    /// rather than needing `#[gtk::test]`. It is not free of process-wide GLib
+    /// rather than needing `#[gtk::test]`. It is not free of process-wide `GLib`
     /// state, though: in the `system-tests` build the first creation of the
     /// `GAppInfo` types races `gtk::init` on the GTK test thread (#1461), so
     /// callers start with `crate::test_support::gio_ready()` (#1463).

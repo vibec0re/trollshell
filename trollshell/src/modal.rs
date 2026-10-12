@@ -518,8 +518,9 @@ struct ModalPanel {
     /// flush with the bar's trailing edge. See [`TriggerAnchor`].
     anchor: RefCell<Option<TriggerAnchor>>,
     /// Emits `true` while the drawer is open (between `show_panel` and the
-    /// retract animation finishing). Consumers — e.g. the bar — bind CSS
-    /// classes to this so the seam between bar and drawer can restyle.
+    /// retract animation finishing). Consumers (e.g. `overlays::osd`)
+    /// subscribe through [`drawer_open_signal`]. The bar/drawer seam itself is
+    /// painted by the drawer's cairo silhouette, not by CSS.
     open_state: Mutable<bool>,
 }
 
@@ -1267,8 +1268,7 @@ pub fn close_all() {
 /// That silently poisoned every subscriber for the rest of the session:
 /// `overlays::osd` treats `drawer_open` as "the drawer already shows this
 /// control, the OSD would be redundant" and suppressed volume/mic/brightness
-/// feedback on that output, and `main.rs`'s `bind_class` kept the bar's
-/// squared-off `drawer-open` seam corner. The overlay rebuild didn't rescue it:
+/// feedback on that output. The overlay rebuild didn't rescue it:
 /// a fresh `OsdView` starts at `false`, but subscribing to a `Mutable` delivers
 /// its current value immediately, so the new view was handed the stale `true`
 /// right back. Written with `set_neq` so the monitors that were already closed
@@ -1315,11 +1315,9 @@ pub fn close_all() {
 /// than the pre-#631 shape, whose last-sender drop happened *at* the `retain`
 /// call, inside the active `borrow_mut()`.
 ///
-/// The fallback keys this prunes do have a live subscriber, so this is not
-/// hypothetical: `main.rs` binds the bar's `drawer-open` class for every
-/// monitor, and it's only `overlays::osd::install` that skips the unnamed ones.
-/// It goes unobserved today purely because that bar window is being destroyed
-/// anyway — not because nobody is listening.
+/// The fallback keys this prunes can have a live subscriber (any
+/// `drawer_open_signal` consumer on an unnamed monitor), so the clear is not
+/// hypothetical either.
 fn reset_drawer_open_states() {
     // Collect the handles before calling `set_neq` on any of them (#631):
     // `set_neq` notifies via `Waker::wake()`, and holding `DRAWER_OPEN`
@@ -2906,8 +2904,7 @@ mod tests {
     /// surviving `DRAWER_OPEN` state must read `false`. Leaving a connector's
     /// entry latched at `true` made `overlays::osd` suppress the volume / mic /
     /// brightness OSD on that output for the rest of the session (it reads the
-    /// state as "the drawer already shows this control"), and kept the bar's
-    /// `drawer-open` seam class applied with no drawer attached.
+    /// state as "the drawer already shows this control").
     ///
     /// Drives [`reset_drawer_open_states`] rather than [`close_all`]: the rest
     /// of `close_all` closes GTK windows and reaches into the plugin service

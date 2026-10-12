@@ -37,11 +37,9 @@
 
 /* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
  * than @shell_background so the weather/calendar/tasks/departures cards read as
- * raised over the translucent (frosted) sidebar panel. Deliberately opaque: the
- * panel is translucent so niri's blur frosts the wallpaper behind it, which
- * makes text sitting straight on the panel unreadable. Each widget gets its own
- * opaque card so its text reads against a stable dark surface, not the blurred
- * wallpaper. Same purple hue as the shell colour; tune freely. */
+ * raised over the panel's flat @shell_background fill. Each widget gets its own
+ * card so its text reads against a stable dark surface. Same purple hue as the
+ * shell colour; tune freely. */
 @define-color sidebar_card_background rgb(32, 22, 54);
 
 * {
@@ -515,8 +513,8 @@ label.ts-gpu-temp {
 }
 
 /* Sidebar widget cards — each top-level widget is a SOLID opaque dark card so
- * its text reads against a stable surface instead of straight on the blurred
- * wallpaper behind the translucent panel (#194). Background/radius/margin live
+ * its text reads against a stable surface instead of straight on the panel
+ * (#194). Background/radius/margin live
  * here; per-widget padding is kept in each widget's own rule below so their
  * internal rhythm is untouched.
  *
@@ -539,7 +537,7 @@ label.ts-gpu-temp {
 /* Plugin sidebar cards (#319). Each out-of-process plugin's card root gets
  * `.ts-plugin-card` (`trollshell/src/plugins.rs` `build_region`), one card per
  * plugin inside the `.ts-plugin-region` container. Without a fill the plugin's
- * tree paints flat on the frosted panel; this gives it the same opaque surface
+ * tree paints flat on the panel; this gives it the same opaque surface
  * as the built-in sidebar widgets above so its text stays readable. One rule
  * cards all three sidebar regions (Lead/Top/Bottom) — they share the class.
  * Deliberately no `padding`: matching the built-ins, the plugin owns its own

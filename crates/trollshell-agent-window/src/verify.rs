@@ -987,6 +987,27 @@ pub(crate) mod tls_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    /// Every test that binds or probes a loopback port (`serve*`,
+    /// [`closed_port`], a [`probe`] against either) takes this for its whole
+    /// body, via [`lock_sockets`]. The kernel hands `127.0.0.1:0` whatever
+    /// port it currently thinks is free; cargo runs tests as parallel threads
+    /// in one process, so a port `closed_port` just released can be recycled
+    /// into another test's one-shot `serve`, and the "closed" probe then
+    /// consumes that server's only accept (#716; same cure as #718 in
+    /// `hytte-ai-providers`; this crate's instance is #1458). Separate test
+    /// binaries (`tests/*.rs`) are separate processes and bind only unix
+    /// sockets or nothing, so this process-wide lock covers everything that
+    /// shares a port space with these tests.
+    static TEST_SOCKETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`TEST_SOCKETS`], looking through poison so one panicking test
+    /// does not turn every later socket test into a misleading poison error.
+    pub(crate) fn lock_sockets() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SOCKETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A PEM from `tests/fixtures/tls` — see that directory's README for what
     /// each one is and `generate.sh` for how they were minted.
     pub(crate) fn fixture(name: &str) -> PathBuf {
@@ -1054,6 +1075,12 @@ pub(crate) mod tls_tests {
     }
 
     /// A loopback port with nothing behind it: bound, read back, released.
+    ///
+    /// **Only safe while the caller holds [`lock_sockets`].** The port is
+    /// free the moment this returns, so a sibling test's [`serve`] could be
+    /// handed the very same number and the probe would then steal that
+    /// server's single `accept` (#716, #1458). The lock makes that
+    /// impossible by construction.
     fn closed_port() -> u16 {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to borrow");
@@ -1158,6 +1185,7 @@ pub(crate) mod tls_tests {
     /// and this reds on the elapsed bound.
     #[test]
     fn a_dribbling_peer_cannot_hold_the_probe_past_its_deadline() {
+        let _sockets = lock_sockets();
         let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(300));
         let budget = Duration::from_secs(2);
         let started = std::time::Instant::now();
@@ -1189,6 +1217,7 @@ pub(crate) mod tls_tests {
     /// down with it rather than parking for the rest of the budget.
     #[test]
     fn the_deadline_does_not_slow_a_gateway_that_answers() {
+        let _sockets = lock_sockets();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let started = std::time::Instant::now();
         let verdict = probe(&anchors(), "localhost", port, 5, Duration::from_secs(30));
@@ -1217,6 +1246,7 @@ pub(crate) mod tls_tests {
     /// sentence below.
     #[test]
     fn an_anchors_file_that_will_not_load_is_not_reported_as_the_gateway_being_down() {
+        let _sockets = lock_sockets();
         let verdict = probe(
             &fixture("README.md"),
             "127.0.0.1",
@@ -1270,6 +1300,7 @@ pub(crate) mod tls_tests {
     /// the shape N2 measured against a bare niri session.
     #[test]
     fn no_gio_tls_backend_names_gio_extra_modules_not_the_file() {
+        let _sockets = lock_sockets();
         let exe = std::env::current_exe().expect("this test binary's own path");
         let out = std::process::Command::new(exe)
             .args([
@@ -1300,6 +1331,7 @@ pub(crate) mod tls_tests {
     /// nothing to assert.
     #[test]
     fn no_gio_tls_backend_names_gio_extra_modules_not_the_file_inner() {
+        let _sockets = lock_sockets();
         if std::env::var_os("AGENT_WINDOW_TEST_NO_GIO_BACKEND").is_none() {
             return;
         }
@@ -1372,6 +1404,7 @@ pub(crate) mod tls_tests {
     /// [`the_deadline_does_not_slow_a_gateway_that_answers`]: tls_tests::the_deadline_does_not_slow_a_gateway_that_answers
     #[test]
     fn a_certificate_that_does_not_name_the_host_is_refused_for_that_reason() {
+        let _sockets = lock_sockets();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let verdict = probe(&anchors(), "127.0.0.2", port, 10, TEST_BUDGET);
         let Presented::Refused { flags } = verdict else {
@@ -1459,6 +1492,7 @@ pub(crate) mod tls_tests {
     /// instead of the peer's, and this reds.
     #[test]
     fn the_hives_anchors_verify_the_gateway_and_the_leaf_is_what_gets_pinned() {
+        let _sockets = lock_sockets();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let Presented::Trusted(pem) = probe(&anchors(), "localhost", port, 30, TEST_BUDGET) else {
             panic!("the fixture CA signs the fixture leaf; this must verify");
@@ -1485,6 +1519,7 @@ pub(crate) mod tls_tests {
     /// and this reds with a `Trusted`.
     #[test]
     fn a_leaf_under_another_ca_is_refused_and_the_reason_is_named() {
+        let _sockets = lock_sockets();
         let port = serve("other-leaf.pem", "other-leaf-key.pem");
         let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30, TEST_BUDGET)
         else {
@@ -1505,6 +1540,7 @@ pub(crate) mod tls_tests {
     /// too, and named differently — the distinction the operator needs.
     #[test]
     fn an_expired_leaf_is_refused_and_named_as_expired() {
+        let _sockets = lock_sockets();
         let port = serve("expired-leaf.pem", "expired-leaf-key.pem");
         let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30, TEST_BUDGET)
         else {
@@ -1531,6 +1567,7 @@ pub(crate) mod tls_tests {
     /// `Refused { flags: empty }` and the second assertion reds.
     #[test]
     fn a_gateway_that_does_not_answer_is_a_reachability_failure_not_a_trust_one() {
+        let _sockets = lock_sockets();
         let Presented::Unreachable(why) =
             probe(&anchors(), "127.0.0.1", closed_port(), 5, TEST_BUDGET)
         else {
@@ -1559,6 +1596,7 @@ pub(crate) mod tls_tests {
     /// and the card's sentence names the anchors file.
     #[test]
     fn resolving_the_bundle_route_pins_the_verified_leaf_and_says_which_file_did_it() {
+        let _sockets = lock_sockets();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let resolved = resolve_route(
             &Route::VerifyAgainstBundle {
@@ -1587,6 +1625,7 @@ pub(crate) mod tls_tests {
     /// name.
     #[test]
     fn resolving_a_refused_bundle_route_keeps_the_system_store_and_names_the_check() {
+        let _sockets = lock_sockets();
         let port = serve("other-leaf.pem", "other-leaf-key.pem");
         let resolved = resolve_route(
             &Route::VerifyAgainstBundle {

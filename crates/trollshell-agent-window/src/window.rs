@@ -861,7 +861,9 @@ mod gtk_tests {
     use crate::cli::Tab;
     use crate::feed::{AgentState, Update};
     use crate::ui::Decision;
-    use crate::verify::tls_tests::{anchors, serve, serve_counting_dribbler, serve_dribbling};
+    use crate::verify::tls_tests::{
+        anchors, lock_sockets, serve, serve_counting_dribbler, serve_dribbling,
+    };
     use crate::verify::{Route, Source};
     use crate::{tls, webview};
     use gtk::prelude::*;
@@ -2120,6 +2122,7 @@ mod gtk_tests {
     /// too (the slot holds the page, never the state).
     #[gtk::test]
     fn a_slow_hive_paints_the_verifying_state_and_the_main_loop_keeps_running() {
+        let _sockets = lock_sockets();
         let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(1500));
         let (trust, runs) = scripted_trust(Duration::from_millis(900));
         let (w, _rx) = window_with_trust(trust);
@@ -2177,6 +2180,7 @@ mod gtk_tests {
     /// `cancel()`, and both elapsed assertions red at ~30 s.
     #[gtk::test]
     fn the_deadline_bounds_a_probe_that_never_finishes_on_the_worker() {
+        let _sockets = lock_sockets();
         let port = serve_dribbling(Duration::from_secs(30), Duration::from_millis(200));
         let budget = Duration::from_millis(700);
         let (trust, runs) = scripted_trust(budget);
@@ -2257,6 +2261,7 @@ mod gtk_tests {
     /// and the accept count is 2 before either mounts anything.
     #[gtk::test]
     fn a_second_activation_during_the_probe_opens_no_second_connection() {
+        let _sockets = lock_sockets();
         let (port, accepted) = serve_counting_dribbler(Duration::from_millis(200));
         let (trust, runs) = scripted_trust(Duration::from_millis(900));
         let (w, _rx) = window_with_trust(trust);
@@ -2321,6 +2326,7 @@ mod gtk_tests {
     /// second probe would hang rather than quietly succeed.
     #[gtk::test]
     fn the_verified_leaf_is_pinned_and_the_page_mounts_once() {
+        let _sockets = lock_sockets();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let (trust, runs) = scripted_trust(Duration::from_secs(30));
         let (w, _rx) = window_with_trust(trust);

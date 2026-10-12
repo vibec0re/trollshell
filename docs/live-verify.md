@@ -4675,12 +4675,12 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       this a failure: as of **#634** the _backend probe_ no longer runs only
       once at startup — it retries at capped backoff while inconclusive, so a
       manager that was merely slow to answer (bus still coming up, a
-      transient `ListNames` failure) is picked up without a restart. The remaining case: a manager that appears **after** the
-      probe has already committed to a verdict — e.g. installing
+      transient `ListNames` failure) is picked up without a restart. Since
+      **#820** (which closed **#633**, split off #613), a manager that appears
+      **after** the probe has already committed to a verdict — e.g. installing
       NetworkManager mid-session on a host that booted with only iwd, or vice
-      versa. That gap was tracked as **#633** (split off #613, now closed) and
-      is closed: #820 added `spawn_supervised_handle`, the cancellation primitive, and
-      the wireless backend now switches at runtime.
+      versa — is picked up too: `spawn_supervised_handle` lets the wireless
+      backend switch at runtime.
 - [ ] **(#610)** With `RUST_LOG=hytte_services=debug`, confirm no new log noise
       — `link_source()` uses `set_neq`, so it must not re-emit on every 5 s
       poll.

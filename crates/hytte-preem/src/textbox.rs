@@ -746,3 +746,34 @@ mod tests {
         );
     }
 }
+
+/// Kit-side half of the wire-default pin (#1449): `TextBox::new()` must equal
+/// `hytte_plugin_proto::preem::TextBoxConfig::default()`. The proto crate cannot
+/// see this crate, so its own test only pins the wire side.
+#[cfg(test)]
+mod wire_default_tests {
+    use super::{TextBox, WidthSpec};
+    use hytte_plugin_proto::preem::{TextBoxConfig, TextBoxWidth};
+
+    #[test]
+    fn new_matches_the_wire_default() {
+        let wire = TextBoxConfig::default();
+        let kit = TextBox::new();
+        let TextBoxWidth::Cols(wire_cols) = wire.width else {
+            panic!("the wire default width is not Cols: {:?}", wire.width);
+        };
+        assert!(
+            matches!(kit.width, WidthSpec::Cols(c) if c == wire_cols as usize),
+            "width: kit {:?} vs wire Cols({wire_cols})",
+            kit.width
+        );
+        assert_eq!(kit.max_lines, wire.max_lines as usize, "max_lines");
+        assert_eq!(kit.pad, wire.pad as usize, "pad");
+        assert_eq!(kit.corner, wire.corner as usize, "corner");
+        assert_eq!(kit.scale, wire.scale as usize, "scale");
+        assert_eq!(kit.fixed_width, wire.fixed_width, "fixed_width");
+        // `notdef` is deliberately not compared: wire `None` means "the skin's
+        // own", which the host resolves, while the bare kit builder carries a
+        // concrete grey that `styled` overrides.
+    }
+}

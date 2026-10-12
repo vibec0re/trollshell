@@ -69,3 +69,10 @@ tempfile.workspace = true
 # test asserts a 5 s budget, and paused virtual time makes that assertion
 # instant rather than a five-second stall in every `cargo test` run.
 tokio = { workspace = true, features = ["test-util"] }
+# `test-support` for `hytte_config::test_support::capture`: `tests/poll_task.rs`
+# counts the per-key rejection lines a live reload emits (one per edit, not one
+# per tick — #1457 review, MEDIUM 1). A **dev**-dependency feature only, so no
+# shipped rlib carries the harness's `set_global_default`, and it adds no
+# resolved package: `hytte-config` is already this crate's dependency, and the
+# feature's two extra crates are already in `Cargo.lock` through it.
+hytte-config = { path = "../hytte-config", features = ["test-support"] }

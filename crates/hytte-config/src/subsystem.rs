@@ -1229,13 +1229,20 @@ const REQUIRED_TABLE_MESSAGE: &str = "table has no key this schema owns, but the
 /// declared; a map key is the user's own content and has no `None` to
 /// round-trip into, so the two are not the same question. This was written down
 /// rather than fixed so that the first author to type a map would decide it
-/// deliberately; `hytte-plugin-agents`' `agents.toml` is that first one
-/// (`crates/hytte-plugin-agents/src/config.rs`, `AgentsConfig::display`, #947),
-/// and it **took the drop** — an all-`None` entry there is a no-op by
+/// deliberately; `hytte-plugin-agents`' `agents.toml` was that first one
+/// (#947), and it **took the drop** — an all-`None` entry there is a no-op by
 /// construction, so materialising it would only give the writer a row to
-/// round-trip that changes nothing. A later map whose entries are *not*
-/// no-ops when empty is free to argue the other way; this rule is the default,
-/// not a verdict.
+/// round-trip that changes nothing.
+///
+/// No `Subsystem` in the tree types a map field any more. Since #1451 that
+/// file's `display` is a raw [`toml::Value`] on the file form
+/// (`crates/hytte-plugin-agents/src/config.rs`, `AgentsFile`), so a bad entry
+/// costs that entry rather than the file; its deserializer still walks each
+/// entry's keys and hands an unknown one to serde as ignored, which is what
+/// lets this rule (and rule 4) keep seeing inside an entry, and the file
+/// form's `parsed` states the same drop again for an entry whose every key
+/// was rejected. A later map whose entries are *not* no-ops when empty is
+/// free to argue the other way; this rule is the default, not a verdict.
 ///
 /// # Passes
 ///

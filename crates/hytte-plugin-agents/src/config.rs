@@ -55,6 +55,7 @@ use std::time::Duration;
 use hytte_config::schema::{Family, Field, Kind, Schema};
 use hytte_config::subsystem::env::EnvKnob;
 use hytte_config::subsystem::{InvalidValue, Subsystem, keep, spelling};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 /// The subsystem's file stem: `~/.config/trollshell/agents.toml`.
@@ -156,8 +157,10 @@ pub const SCHEMA: Schema = Schema {
             kind: Kind::Int {
                 min: MIN_POLL_SECONDS.cast_signed(),
                 max: MAX_POLL_SECONDS.cast_signed(),
-                // A plain spin row: `parse_poll` takes a number and nothing
-                // else.
+                // A plain spin row: no words beside the number. `parse_poll`
+                // reads the key's `spelling`, so it also takes a quoted
+                // integer (`"5"`, `"+5"`, `"0005"`) exactly as `stats`' does;
+                // the row only ever writes a bare one.
                 also: &[],
             },
             doc: "Seconds between AgentStatus polls while the sidebar is open.",
@@ -264,12 +267,14 @@ pub struct AgentsConfig {
     /// ```
     ///
     /// resolves to `display = {}` with **no** rejection and no unknown-key
-    /// warning. Since #1451 the decision is made in one explicit place: the
-    /// file form's `display` is a raw value, so the reader's own empty-table
-    /// rule no longer reaches inside it, and [`AgentsFile::parsed`] drops an
-    /// entry that resolved to [`Display::default`] instead. An entry whose
-    /// every key was *rejected* goes the same way — the rejections are what is
-    /// reported, and what is left of the entry decorates nothing.
+    /// warning. Since #1451 the file form's `display` is a raw value, and the
+    /// decision is stated where the value is judged: [`AgentsFile::parsed`]
+    /// drops an entry that resolved to [`Display::default`]. A literally empty
+    /// entry is usually gone before that — the reader's own empty-table rule
+    /// still sees inside an entry, because the file form's reader hands an
+    /// unknown key there to serde as ignored — but an entry whose every key
+    /// was *rejected* only meets the second check, and goes the same way: the
+    /// rejections are what is reported, and what is left decorates nothing.
     ///
     /// That is right for this file rather than merely acceptable, because an
     /// all-`None` `Display` is a **no-op by construction**: `label_for`,
@@ -362,20 +367,113 @@ impl AgentsConfig {
 /// (#963 review, LOW-1). Now `label` is one warned line naming
 /// `display.*.label` and the agent, and everything else in the file applies.
 ///
-/// `display` is raw **whole**, not a map of raw entries, on `workspaces`'
+/// `display` is raw **whole**, not a map of typed entries, on `workspaces`'
 /// precedent: a `BTreeMap<String, _>` would still hand serde the verdict on an
 /// entry that is not a table (`display.argus = "oops"`) and on a `display`
 /// that is not a table at all, and both of those would still be whole-file.
-/// What that costs is serde's view *inside* an entry — rule 4's unknown-key
-/// report cannot see past a raw value — so an unknown key inside an entry is
-/// reported by the judge itself, as a rejection naming it, exactly as
-/// `workspaces.rs` does for a key inside a stack.
+///
+/// It is read by `raw_display` rather than by `toml::Value`'s own
+/// `Deserialize`, for exactly one difference: a key inside an entry that
+/// [`Display`] does not have is handed to serde as **ignored**, which is what
+/// rule 4's unknown-key report listens for. So `[display.argus] colour = "x"`
+/// is the ordinary `unknown key in config; ignoring it` line with
+/// `key = "display.argus.colour"` — the agent in the key, and in
+/// `Loaded::unknown_keys` — the same as before #1451, rather than a rejection
+/// keyed by the `display.*` template (#1457 review, NIT 5).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct AgentsFile {
     socket: toml::Value,
     poll_seconds: toml::Value,
+    #[serde(deserialize_with = "raw_display")]
     display: toml::Value,
+}
+
+/// `display` as a raw value, every shape kept for the judge — except that a
+/// key inside an entry that [`DISPLAY_KEYS`] does not name is **ignored**
+/// rather than kept, so `serde_ignored` reports it under its full dotted path
+/// (see [`AgentsFile`]). A `display` or an entry that is not a table comes
+/// through as the value it is, for the judge to reject on its own.
+fn raw_display<'de, D: Deserializer<'de>>(deserializer: D) -> Result<toml::Value, D::Error> {
+    deserializer.deserialize_any(Raw::Display)
+}
+
+/// Which table `raw_display`'s visitor is walking: the agent map, or one
+/// agent's entry.
+#[derive(Clone, Copy)]
+enum Raw {
+    /// `display` itself — every key is an agent name.
+    Display,
+    /// One `[display.<name>]` — every key should be one of [`DISPLAY_KEYS`].
+    Entry,
+}
+
+impl<'de> DeserializeSeed<'de> for Raw {
+    type Value = toml::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<toml::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Raw {
+    type Value = toml::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any TOML value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<toml::Value, E> {
+        Ok(toml::Value::Boolean(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<toml::Value, E> {
+        Ok(toml::Value::Integer(v))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<toml::Value, E> {
+        i64::try_from(v)
+            .map(toml::Value::Integer)
+            .map_err(E::custom)
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<toml::Value, E> {
+        Ok(toml::Value::Float(v))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<toml::Value, E> {
+        Ok(toml::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<toml::Value, E> {
+        Ok(toml::Value::String(v))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<toml::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element::<toml::Value>()? {
+            items.push(item);
+        }
+        Ok(toml::Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<toml::Value, A::Error> {
+        let mut table = toml::Table::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = match self {
+                Self::Display => map.next_value_seed(Self::Entry)?,
+                Self::Entry if DISPLAY_KEYS.contains(&key.as_str()) => {
+                    map.next_value::<toml::Value>()?
+                }
+                Self::Entry => {
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+            };
+            table.insert(key, value);
+        }
+        Ok(toml::Value::Table(table))
+    }
 }
 
 impl Default for AgentsFile {
@@ -421,14 +519,14 @@ const DISPLAY: EnvKnob = EnvKnob::same(
     "a table of per-agent overrides keyed by agent name",
 );
 const DISPLAY_ENTRY: EnvKnob = EnvKnob::same("", "display.*", "a table of label, icon or project");
-const DISPLAY_KEY: EnvKnob = EnvKnob::same("", "display.*", "label, icon or project");
 const LABEL: EnvKnob = EnvKnob::same("", "display.*.label", "a string");
 const ICON: EnvKnob = EnvKnob::same("", "display.*.icon", "a string");
 const PROJECT: EnvKnob = EnvKnob::same("", "display.*.project", "a string");
 
 /// The keys one `[display.<name>]` entry may carry — [`DISPLAY_FIELDS`]' rows,
 /// which `the_schemas_fields_are_the_serde_surface` holds them to. Anything
-/// else in an entry is reported, once, and ignored.
+/// else in an entry is ignored by `raw_display`, which is what makes rule 4
+/// report it.
 const DISPLAY_KEYS: [&str; 3] = ["label", "icon", "project"];
 
 impl Subsystem for AgentsFile {
@@ -504,8 +602,10 @@ fn parse_socket(value: &toml::Value) -> Option<String> {
 /// `poll_seconds = 86400000` into a silent 3600, and the reader never learns
 /// their file said something else ([`AgentsConfig::poll_interval`] still
 /// clamps, for a value built by hand). Parsing a `u64` refuses a negative or
-/// fractional spelling without a branch of its own, and a quoted `"5"` is
-/// taken for the reason [`spelling`] gives.
+/// fractional spelling without a branch of its own. A quoted integer (`"5"`,
+/// and since `u64::from_str` takes a leading `+` and leading zeros, `"+5"` and
+/// `"0005"` too) is taken for the reason [`spelling`] gives — `stats`'
+/// `parse_poll` takes the same set.
 fn parse_poll(spelling: &str) -> Option<u64> {
     spelling
         .parse::<u64>()
@@ -519,8 +619,10 @@ fn parse_poll(spelling: &str) -> Option<u64> {
 /// * A `display` that is not a table costs the map, and nothing else.
 /// * An entry that is not a table costs that entry; its siblings apply.
 /// * Inside an entry, a key of the wrong type costs that key and the entry's
-///   other keys apply; a key [`Display`] does not have is reported and
-///   ignored — rule 4's spirit inside a raw value (see [`AgentsFile`]).
+///   other keys apply.
+///
+/// A key [`Display`] does not have never reaches here: `raw_display` left it
+/// out and rule 4 reported it, under its own dotted path (see [`AgentsFile`]).
 ///
 /// No agent *name* is judged: the roster is the hive's, so a name it does not
 /// report decorates nothing rather than being an error (the module docs).
@@ -541,15 +643,6 @@ fn parse_display(
             ));
             continue;
         };
-        for unknown in fields
-            .keys()
-            .filter(|key| !DISPLAY_KEYS.contains(&key.as_str()))
-        {
-            rejected.push(InvalidValue::written(
-                &DISPLAY_KEY,
-                &format!("{agent}.{unknown}"),
-            ));
-        }
         let overrides = parse_entry(agent, fields, rejected);
         // The empty-entry decision `AgentsConfig::display` argues: an entry
         // that resolved to nothing decorates nothing, so it goes.
@@ -609,7 +702,9 @@ mod tests {
         DISPLAY_KEYS, Display, FAMILY, Kind, MAX_POLL_SECONDS, MIN_POLL_SECONDS, NAME, SCHEMA,
     };
     use hytte_config::schema;
-    use hytte_config::subsystem::{InvalidValue, Subsystem as _, assemble, assemble_base_layers};
+    use hytte_config::subsystem::{
+        FindingKind, InvalidValue, Subsystem as _, assemble, assemble_base_layers,
+    };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -1014,8 +1109,12 @@ mod tests {
     /// three warns or is rejected — an empty entry is not a mistake, it is a
     /// known key holding nothing.
     ///
-    /// Falsification: drop `parse_display`'s `Display::default()` guard and the
-    /// second assertion reds.
+    /// The literally-empty entry here is dropped twice over: by the reader's
+    /// own #1088 empty-table rule (which sees inside an entry because
+    /// `raw_display` hands it unknown keys as ignored) and by
+    /// `parse_display`'s `Display::default()` guard. The guard alone is what
+    /// drops an entry whose every key was *rejected*, which is
+    /// `a_bad_display_on_one_agent_leaves_another_agents_alone`'s pin.
     #[test]
     fn an_empty_display_entry_is_dropped_and_a_populated_one_is_not() {
         let empty_map =
@@ -1222,11 +1321,16 @@ mod tests {
         );
     }
 
-    /// An unknown key **inside** an entry is still named — by the judge now,
-    /// rather than by rule 4's `unknown_keys`, because serde cannot see past a
-    /// raw value. `workspaces`' `an_unknown_key_inside_a_stack_is_reported_too`
-    /// is the precedent. Without it a misspelt `lable` would be ignored with
-    /// nothing logged; with it the entry's good keys still apply.
+    /// An unknown key **inside** an entry is rule 4's, exactly as it was
+    /// before #1451: one `unknown_keys` entry under its **full** dotted path —
+    /// the agent in the key, not the `display.*` template a rejection would
+    /// carry (#1457 review, NIT 5) — and no rejection, because it is not a bad
+    /// value for a key the schema has. The entry's good keys still apply.
+    ///
+    /// Falsification: have `raw_display` keep an unknown entry key as a
+    /// `toml::Value` instead of ignoring it, and the `unknown_keys` assertion
+    /// reds (empty) — the misspelt `lable` would then vanish with nothing
+    /// logged.
     #[test]
     fn an_unknown_key_inside_a_display_entry_is_reported_and_its_siblings_apply() {
         let loaded = assemble::<AgentsFile>(&[(
@@ -1234,17 +1338,125 @@ mod tests {
             "[display.argus]\nlable = \"Argus\"\nicon = \"starred-symbolic\"\n".to_owned(),
         )])
         .expect("an unknown key never fails the load");
-        assert!(
-            loaded.unknown_keys.is_empty(),
-            "reported by the judge, not by rule 4: {:?}",
-            loaded.unknown_keys
+        assert_eq!(
+            loaded.unknown_keys,
+            ["display.argus.lable"],
+            "rule 4, keyed by the agent"
         );
         let (cfg, rejected) = loaded.config.parsed();
         assert_eq!(cfg.icon_for("argus"), "starred-symbolic");
         assert_eq!(cfg.label_for("argus"), "argus");
+        assert!(rejected.is_empty(), "not a rejected value: {rejected:?}");
+    }
+
+    /// A rejected `socket` costs the socket and nothing beside it — the sibling
+    /// direction `a_relative_socket_and_a_silly_cadence_cost_only_themselves`
+    /// cannot see, because there both keys are bad (#1457 review, LOW 2).
+    #[test]
+    fn a_bad_socket_costs_only_the_socket() {
+        let (cfg, rejected) = parse(concat!(
+            "socket = \"relative.sock\"\n",
+            "poll_seconds = 9\n",
+            "[display.argus]\n",
+            "label = \"A\"\n",
+        ));
+        assert_eq!(cfg.socket, crate::hive::DEFAULT_SOCKET);
+        assert_eq!(
+            cfg.poll_seconds, 9,
+            "the cadence beside a bad socket applies"
+        );
+        assert_eq!(cfg.label_for("argus"), "A");
+        assert_eq!(keys(&rejected), ["socket"]);
+    }
+
+    /// **The merge rules, `_unset` and a nix `_locked` still compose with the
+    /// per-key judge** now that the file form is raw (#1457 review, LOW 3) —
+    /// three layers: a low base, a nix-written base that locks `socket` and
+    /// one display leaf, and an overlay that tries to override both.
+    ///
+    /// The judge never sees `_locked` (the merge applies it before anything is
+    /// deserialised), so there is no per-key lock check to delete; the
+    /// mutation that reds this is the reader's own — fold the overlay in as a
+    /// base in `hytte-config`'s `assemble_layers`, and the lock stops binding.
+    #[test]
+    fn locks_deep_merge_unset_and_per_key_compose_across_layers() {
+        let loaded = assemble::<AgentsFile>(&[
+            (
+                PathBuf::from("/etc/xdg/low/trollshell/agents.toml"),
+                "[display.argus]\nproject = \"base0\"\n\
+                 [display.choom]\nlabel = \"C0\"\n\
+                 [display.dropme]\nlabel = \"x\"\n"
+                    .to_owned(),
+            ),
+            (
+                PathBuf::from("/etc/xdg/nix/trollshell/agents.toml"),
+                "_locked = [\"socket\", \"display.argus.label\"]\n\
+                 socket = \"/srv/nix/host.sock\"\n\
+                 [display.argus]\nlabel = \"Nix\"\nicon = \"nix-icon\"\n"
+                    .to_owned(),
+            ),
+            (
+                PathBuf::from("/home/u/.config/trollshell/agents.toml"),
+                "socket = \"/srv/mine.sock\"\npoll_seconds = 9\n\
+                 [display]\n_unset = [\"dropme\"]\n\
+                 [display.argus]\nlabel = \"Mine\"\nproject = \"mine\"\n_unset = [\"icon\"]\n\
+                 [display.choom]\nicon = 5\n"
+                    .to_owned(),
+            ),
+        ])
+        .expect("layers assemble");
+        assert!(loaded.unknown_keys.is_empty(), "{:?}", loaded.unknown_keys);
+        assert!(
+            loaded.unset_findings.is_empty(),
+            "{:?}",
+            loaded.unset_findings
+        );
+        let mut shadowed: Vec<&str> = loaded
+            .lock_findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::ShadowedLockedKey)
+            .map(|finding| finding.key.as_str())
+            .collect();
+        shadowed.sort_unstable();
+        assert_eq!(
+            shadowed,
+            ["display.argus.label", "socket"],
+            "each refused override reported exactly once: {:?}",
+            loaded.lock_findings
+        );
+
+        let (cfg, rejected) = loaded.config.parsed();
+        assert_eq!(
+            cfg.socket, "/srv/nix/host.sock",
+            "the lock binds the overlay"
+        );
+        assert_eq!(cfg.poll_seconds, 9, "rule 1: the overlay's scalar wins");
+        assert_eq!(
+            cfg.display_for("argus"),
+            Some(&Display {
+                label: Some("Nix".to_owned()),
+                icon: None,
+                project: Some("mine".to_owned()),
+            }),
+            "rule 2 per agent across three layers; `_unset` inside an entry; the lock inside an entry"
+        );
+        assert_eq!(
+            cfg.display_for("choom"),
+            Some(&Display {
+                label: Some("C0".to_owned()),
+                icon: None,
+                project: None,
+            }),
+            "a bad overlay key costs itself; the base's sibling key survives"
+        );
+        assert_eq!(
+            cfg.display_for("dropme"),
+            None,
+            "`[display] _unset` erases an entry"
+        );
         assert_eq!(
             lines(&rejected),
-            ["display.* = argus.lable is not valid; expected label, icon or project"]
+            ["display.*.icon = choom: 5 is not valid; expected a string"]
         );
     }
 

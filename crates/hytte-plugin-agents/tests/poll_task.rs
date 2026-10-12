@@ -18,9 +18,10 @@
 //! went by and the socket was untouched" a statement about the loop rather
 //! than about how long the test slept.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
+use hytte_config::test_support::{Captured, capture};
 use hytte_plugin::cmd_channel;
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::wire::Request;
@@ -386,6 +387,98 @@ async fn a_reload_with_a_bad_display_value_keeps_the_files_socket() {
         "Argus",
         "another agent's entry applies"
     );
+    task.abort();
+}
+
+/// How many times the journal named `trollshell-choom`'s bad `label`.
+fn label_lines(log: &Captured) -> usize {
+    log.warnings()
+        .iter()
+        .filter(|w| w.contains("display.*.label = trollshell-choom: 5 is not valid"))
+        .count()
+}
+
+/// Write `body` to `path` and set its mtime explicitly, so two edits can never
+/// share an mtime granule and read as one.
+fn write_at(path: &Path, body: &str, secs: u64) {
+    std::fs::write(path, body).expect("write");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+        .expect("set mtime");
+}
+
+/// **A live reload names a rejected key once per edit, not once per tick**
+/// (#1457 review, MEDIUM 1) — the journal half of #1451 on the reload path.
+///
+/// `a_reload_with_a_bad_display_value_keeps_the_files_socket` pins the
+/// reload's *values*; this pins that the rejection is *said*, and said once.
+/// Twelve ticks after one edit give exactly one line (the reload only
+/// re-reads when a stamp moved), and a second edit gives a second line — the
+/// control that makes the first count a statement about ticks rather than a
+/// capture that saw nothing.
+///
+/// Falsification (verified red): make `ConfigSource::read` silent
+/// (`load_from` + `parsed().0`, no line) or whole-file (the built-in default
+/// on any rejection) and the count is 0; make `ConfigSource::changed` always
+/// `true` and it is one per tick.
+#[tokio::test(start_paused = true)]
+async fn a_live_reload_reports_a_bad_key_once_per_edit_not_once_per_tick() {
+    let (log, _guard) = capture();
+    let hive = FakeHive::serve(replies(&[(
+        "agent_status",
+        &fixture("agent_status_grouped.json"),
+    )]));
+    let socket = hive.path().display().to_string();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layer = dir.path().join("agents.toml");
+    let body = format!(
+        "socket = {}\npoll_seconds = 1\n[display.trollshell-choom]\nlabel = 5\n",
+        toml::Value::from(socket.as_str())
+    );
+
+    let (tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Msg>();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        AgentsConfig {
+            socket: socket.clone(),
+            poll_seconds: 1,
+            ..AgentsConfig::default()
+        },
+        ConfigSource::over(vec![layer.clone()]),
+    ));
+    tx.send(Cmd::SetVisible(true)).expect("the lane is open");
+    settle().await;
+
+    write_at(&layer, &body, 1_000_000);
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        while msg_rx.try_recv().is_ok() {}
+    }
+    assert_eq!(
+        label_lines(&log),
+        1,
+        "one line for one edit across 12 ticks: {:?}",
+        log.warnings()
+    );
+    assert!(
+        !hive.seen().is_empty(),
+        "the file's socket is the one polled"
+    );
+
+    // Control: a second edit (a new mtime) is a second line.
+    write_at(&layer, &body, 1_000_001);
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        while msg_rx.try_recv().is_ok() {}
+    }
+    assert_eq!(label_lines(&log), 2, "{:?}", log.warnings());
     task.abort();
 }
 

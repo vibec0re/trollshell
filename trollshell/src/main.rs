@@ -598,14 +598,6 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
     // for the perpendicular (bar-thickness) margin at open time.
     modal::install(monitor, &bar, BAR_EDGE, BAR_EDGE_OFFSET);
 
-    // When the drawer is open on this monitor, mark the bar window so CSS
-    // can square off the bottom-right corner (seam between bar and drawer).
-    bind_class(
-        modal::drawer_open_signal(monitor),
-        bar.window(),
-        "drawer-open",
-    );
-
     bar
 }
 

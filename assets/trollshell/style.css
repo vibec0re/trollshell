@@ -27,13 +27,12 @@
  * too whenever this changes COLOUR.
  *
  * OPAQUE (alpha 1.0): all shell chrome (bar, sidebar, drawer, frame) is a solid
- * flat purple. The frosted-glass / translucency experiment is parked — niri's
- * layer-rule blur (etc/niri/blur.kdl) is now inert, since blur only shows
- * through a translucent surface and is invisible over this opaque fill. The
- * full frosted state lives on the `experiment/frosted-glass-blur` branch.
+ * flat purple. The frosted-glass / translucency experiment is retired: blur
+ * only shows through a translucent surface, so it would be invisible over this
+ * opaque fill, and the niri blur layer-rule config went with the frost (#312).
  * To bring the frost back, give this an alpha < 1 (e.g. `rgba(28, 6, 44, 0.80)`)
- * and match it in frame.rs (it hardcodes the same RGB(A) — cairo can't read CSS
- * vars). */
+ * AND match it in frame.rs (its cairo fill hardcodes the same RGBA, ~line 333 --
+ * cairo can't read CSS vars), then re-add a niri blur layer-rule. */
 @define-color shell_background rgb(28, 6, 44);
 
 /* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
@@ -68,13 +67,11 @@
  *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
-    /* Translucent fill matching @shell_background (alpha 0.80) so niri's
-     * hytte-bar blur layer-rule frosts the wallpaper behind the bar, matching
-     * the sidebar and drawer. frame.rs uses the same 0.80 alpha, so the bar's
-     * bottom edge meets the frame's top edge with no opacity seam. Paint the
-     * surface here ONCE — .hytte-bar-content stays transparent (double-painting
-     * @shell_background there would stack two 0.80 layers → ~0.96 effective
-     * alpha: a visible seam). */
+    /* Opaque fill (@shell_background, alpha 1.0), the same flat purple frame.rs
+     * paints, so the bar's edge meets the frame's with no seam. Paint the
+     * surface here ONCE — .hytte-bar-content stays transparent. If
+     * @shell_background ever gains alpha < 1, double-painting it there would
+     * stack two translucent layers into a visible seam. */
     background: @shell_background;
     color: #ffffff;
     border: none;
@@ -101,9 +98,9 @@
     margin: 0;
     min-height: 32px;
     border-radius: 0;
-    /* Transparent: the translucent .hytte-bar window behind it supplies the
-     * single flat fill. Double-painting @shell_background here would stack two
-     * 0.80 layers → ~0.96 effective alpha: a visible seam vs the frame's 0.80. */
+    /* Transparent: the .hytte-bar window behind it supplies the single flat
+     * fill (see above); painting @shell_background here too would double-paint
+     * the surface. */
     background: transparent;
 }
 .hytte-bar-group-left button,

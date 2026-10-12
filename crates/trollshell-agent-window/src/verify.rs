@@ -976,36 +976,108 @@ pub(crate) mod tls_tests {
     //! thread. A second copy of a loopback TLS server, in the module that is
     //! *not* about TLS, is the thing that would drift.
     //!
+    //! # Every test here starts with [`glib_ready`] (#1461)
+    //!
+    //! These are plain `#[test]`s, so libtest runs them on its own threads,
+    //! **in parallel with** the `#[gtk::test]` thread — whose first job is
+    //! `gtk::init`. Both sides touch `GObject` types for the first time, and
+    //! `GLib`'s type system can deadlock when two threads do that to types that
+    //! depend on each other: it is the type-initialisation deadlock `GLib`
+    //! itself cites as bugzilla 674885 in the two partial workarounds it
+    //! carries (`gsocket.c`'s `GSocket` prelude, `gdbusprivate.c`'s
+    //! `ensure_required_types`). Captured live on `origin/main` (#1461): the
+    //! GTK thread inside `gtk_init` → `g_bus_get_sync` →
+    //! `_g_dbus_initialize` was registering `GSocketAddress` (holding that
+    //! type's `g_once`) and waited in `g_type_add_interface_static` for
+    //! `class_init_rec_mutex`; a [`serve`] thread held that mutex, inside
+    //! `GSocketListener`'s class init, and waited in `g_socket_get_type`'s
+    //! prelude for that same `g_once`. Every other `GObject` user then queued
+    //! on the mutex — so every TLS test failed or stalled, and not one GTK
+    //! test ever ran.
+    //!
+    //! [`glib_ready`] takes both halves of that race away, once per process:
+    //! nothing in this module touches `GLib` until `gtk::init` has finished,
+    //! and by then every type the probe and these fixtures use is registered
+    //! and class-initialised by one thread. A launch never meets this: `main`
+    //! runs `gtk::init` and `GApplication`'s own D-Bus registration on the
+    //! main thread before `window.rs`'s `begin_probe` can start a worker.
+    //!
     //! [`probe`]: super::probe
 
-    use super::{Presented, Route, Source, probe};
+    use super::{Presented, Route, Source, connect_target, probe};
     use crate::tls::{Pinned, Resolved, TlsPolicy, resolve_route};
     use gtk::gio;
     use gtk::gio::prelude::*;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Once};
     use std::time::Duration;
 
-    /// Every test that binds or probes a loopback port (`serve*`,
-    /// [`closed_port`], a [`probe`] against either) takes this for its whole
-    /// body, via [`lock_sockets`]. The kernel hands `127.0.0.1:0` whatever
-    /// port it currently thinks is free; cargo runs tests as parallel threads
-    /// in one process, so a port `closed_port` just released can be recycled
-    /// into another test's one-shot `serve`, and the "closed" probe then
-    /// consumes that server's only accept (#716; same cure as #718 in
-    /// `hytte-ai-providers`; this crate's instance is #1458). Separate test
-    /// binaries (`tests/*.rs`) are separate processes and bind only unix
-    /// sockets or nothing, so this process-wide lock covers everything that
-    /// shares a port space with these tests.
-    static TEST_SOCKETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Set once [`warm_gio_types`] has run, which only ever happens on the GTK
+    /// test thread.
+    static GIO_WARM: Once = Once::new();
 
-    /// Take [`TEST_SOCKETS`], looking through poison so one panicking test
-    /// does not turn every later socket test into a misleading poison error.
-    pub(crate) fn lock_sockets() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SOCKETS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Call first in every test that touches `GLib` (see this module's
+    /// "Every test here starts with" section): returns once `gtk::init` has
+    /// finished and every type the probe path uses has been registered and
+    /// class-initialised by one thread (#1461).
+    ///
+    /// From any other thread it parks the caller behind the GTK test thread
+    /// (`gtk::test_synced`, which runs `gtk::init` first if nothing has yet)
+    /// and does the warm-up there. On the GTK test thread itself (`window.rs`'s
+    /// `gtk_tests` use the same fixtures) it warms up directly: waiting on
+    /// `READY` from there could wait on the very thread it is.
+    pub(crate) fn glib_ready() {
+        static READY: Once = Once::new();
+        if gtk::is_initialized_main_thread() {
+            GIO_WARM.call_once(warm_gio_types);
+        } else {
+            READY.call_once(|| gtk::test_synced(|| GIO_WARM.call_once(warm_gio_types)));
+        }
+    }
+
+    /// One pass, on one thread, over every `GObject` type the loopback-TLS
+    /// path touches — the probe's own calls in [`probe`]'s order, then both
+    /// ends of a connection the way [`serve`] and [`closed_port`] build them.
+    ///
+    /// Nothing is asserted and nothing is handshaken. This exists only to make
+    /// the types exist; any real failure (no TLS backend, no loopback) is left
+    /// for the test that cares to report in its own words.
+    fn warm_gio_types() {
+        drop(gio::Cancellable::new());
+        drop(gio::TlsFileDatabase::new(anchors()));
+        let identity = gio::TlsCertificate::from_files(
+            fixture("server-leaf.pem"),
+            fixture("server-leaf-key.pem"),
+        )
+        .ok();
+        drop(closed_port());
+        let listener = gio::SocketListener::new();
+        let Ok(port) = listener.add_any_inet_port(None::<&gtk::glib::Object>) else {
+            return;
+        };
+        let client = gio::SocketClient::new();
+        // A name that resolves and a literal: the two shapes the tests dial.
+        for host in ["localhost", "127.0.0.1"] {
+            let Ok(outgoing) =
+                client.connect_to_host(&connect_target(host, port), port, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+            // `connect` returned, so the kernel has already queued this
+            // connection on the one listener bound to `port`: no wait here.
+            let Ok((incoming, _)) = listener.accept(gio::Cancellable::NONE) else {
+                continue;
+            };
+            let server_identity = gio::NetworkAddress::new(host, port);
+            drop(gio::TlsClientConnection::new(
+                &outgoing,
+                Some(&server_identity),
+            ));
+            if let Some(identity) = &identity {
+                drop(gio::TlsServerConnection::new(&incoming, Some(identity)));
+            }
+        }
     }
 
     /// A PEM from `tests/fixtures/tls` — see that directory's README for what
@@ -1037,7 +1109,18 @@ pub(crate) mod tls_tests {
     /// every certificate it is not happy with (see [`probe`]'s docs), so for
     /// three of the four cases below a server-side error **is** the expected
     /// outcome.
+    ///
+    /// The server thread is a second thread touching `GObject` types, which is
+    /// exactly what #1461's deadlock needs, so this refuses to start one before
+    /// the caller has gone through [`glib_ready`]. (Run this round: drop the
+    /// `glib_ready()` from one of `window.rs`'s fixture tests and run it alone
+    /// with `--exact`, and it panics here with this message.)
     pub(crate) fn serve(cert: &str, key: &str) -> u16 {
+        assert!(
+            GIO_WARM.is_completed(),
+            "call glib_ready() before serve(): a GIO thread started alongside gtk::init can \
+             deadlock the whole test binary (#1461)"
+        );
         let (cert, key) = (fixture(cert), fixture(key));
         let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
         std::thread::spawn(move || {
@@ -1074,19 +1157,61 @@ pub(crate) mod tls_tests {
             .expect("the fixture server started")
     }
 
-    /// A loopback port with nothing behind it: bound, read back, released.
+    /// A loopback port with nothing listening on it, **held** until the
+    /// returned socket drops.
     ///
-    /// **Only safe while the caller holds [`lock_sockets`].** The port is
-    /// free the moment this returns, so a sibling test's [`serve`] could be
-    /// handed the very same number and the probe would then steal that
-    /// server's single `accept` (#716, #1458). The lock makes that
-    /// impossible by construction.
-    fn closed_port() -> u16 {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port to borrow");
-        let port = listener.local_addr().expect("…with an address").port();
-        drop(listener);
-        port
+    /// The socket is bound and never listens, so a connect to the port is
+    /// refused — and, because it is bound without `SO_REUSEADDR`, the kernel
+    /// cannot hand the same port to anything else meanwhile, in this process
+    /// or any other. The old shape bound, read and **released** the port, and
+    /// a sibling test's [`serve`] could then be given that very number: the
+    /// "closed" probe connected to it and spent that server's single `accept`
+    /// (#716; seen here as #1458). Keep the socket alive for as long as the
+    /// port must stay closed.
+    fn closed_port() -> (u16, gio::Socket) {
+        let socket = gio::Socket::new(
+            gio::SocketFamily::Ipv4,
+            gio::SocketType::Stream,
+            gio::SocketProtocol::Tcp,
+        )
+        .expect("a TCP socket");
+        let any_loopback_port =
+            gio::InetSocketAddress::from_string("127.0.0.1", 0).expect("a loopback address");
+        // `allow_reuse = false` is what makes the hold exclusive.
+        socket
+            .bind(&any_loopback_port, false)
+            .expect("a loopback port to hold");
+        let port = socket
+            .local_address()
+            .expect("…with an address")
+            .downcast::<gio::InetSocketAddress>()
+            .expect("…an inet one")
+            .port();
+        (port, socket)
+    }
+
+    /// **A closed port stays closed and stays ours** — the property #1458's
+    /// race broke.
+    ///
+    /// Mutation (run this round, red): `drop(socket.close())` inside
+    /// [`closed_port`] before returning the port, i.e. release it the way the
+    /// pre-#1458 shape did — the second assertion reds, because the released
+    /// port can be bound again, which is all a sibling test's [`serve`] needed
+    /// to be handed it. The first assertion stays green under that mutation:
+    /// a released port refuses connections too, until someone else takes it.
+    #[test]
+    fn a_closed_port_refuses_connections_and_cannot_be_handed_to_a_sibling() {
+        glib_ready();
+        let (port, _held) = closed_port();
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "nothing may be listening on a closed port"
+        );
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "port {port} was handed out again while the test still meant it to be closed — a \
+             sibling's serve() could be given it and its one accept stolen (#1458)"
+        );
     }
 
     /// The deadline the tests that are *not* about the deadline run under:
@@ -1185,7 +1310,7 @@ pub(crate) mod tls_tests {
     /// and this reds on the elapsed bound.
     #[test]
     fn a_dribbling_peer_cannot_hold_the_probe_past_its_deadline() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve_dribbling(Duration::from_secs(12), Duration::from_millis(300));
         let budget = Duration::from_secs(2);
         let started = std::time::Instant::now();
@@ -1217,7 +1342,7 @@ pub(crate) mod tls_tests {
     /// down with it rather than parking for the rest of the budget.
     #[test]
     fn the_deadline_does_not_slow_a_gateway_that_answers() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let started = std::time::Instant::now();
         let verdict = probe(&anchors(), "localhost", port, 5, Duration::from_secs(30));
@@ -1246,14 +1371,9 @@ pub(crate) mod tls_tests {
     /// sentence below.
     #[test]
     fn an_anchors_file_that_will_not_load_is_not_reported_as_the_gateway_being_down() {
-        let _sockets = lock_sockets();
-        let verdict = probe(
-            &fixture("README.md"),
-            "127.0.0.1",
-            closed_port(),
-            5,
-            TEST_BUDGET,
-        );
+        glib_ready();
+        let (port, _held) = closed_port();
+        let verdict = probe(&fixture("README.md"), "127.0.0.1", port, 5, TEST_BUDGET);
         let Presented::UnusableAnchors(why) = verdict else {
             panic!("a file that is not a PEM is an anchors problem, not a network one: {verdict:?}")
         };
@@ -1300,7 +1420,6 @@ pub(crate) mod tls_tests {
     /// the shape N2 measured against a bare niri session.
     #[test]
     fn no_gio_tls_backend_names_gio_extra_modules_not_the_file() {
-        let _sockets = lock_sockets();
         let exe = std::env::current_exe().expect("this test binary's own path");
         let out = std::process::Command::new(exe)
             .args([
@@ -1329,13 +1448,18 @@ pub(crate) mod tls_tests {
     /// re-executed with `GIO_EXTRA_MODULES` pointed nowhere; an ordinary
     /// devShell/CI run has a working backend (#1234 ask 3), so there would be
     /// nothing to assert.
+    ///
+    /// No [`glib_ready`]: in the parent this returns before touching `GLib`,
+    /// and in the child it is the only test in its process, so no second
+    /// thread can be touching `GObject` types for the first time beside it
+    /// (#1461).
     #[test]
     fn no_gio_tls_backend_names_gio_extra_modules_not_the_file_inner() {
-        let _sockets = lock_sockets();
         if std::env::var_os("AGENT_WINDOW_TEST_NO_GIO_BACKEND").is_none() {
             return;
         }
-        let verdict = probe(&anchors(), "127.0.0.1", closed_port(), 5, TEST_BUDGET);
+        let (port, _held) = closed_port();
+        let verdict = probe(&anchors(), "127.0.0.1", port, 5, TEST_BUDGET);
         let Presented::UnusableAnchors(why) = verdict else {
             panic!("with no GIO TLS backend the anchors cannot even be opened: {verdict:?}")
         };
@@ -1404,7 +1528,7 @@ pub(crate) mod tls_tests {
     /// [`the_deadline_does_not_slow_a_gateway_that_answers`]: tls_tests::the_deadline_does_not_slow_a_gateway_that_answers
     #[test]
     fn a_certificate_that_does_not_name_the_host_is_refused_for_that_reason() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let verdict = probe(&anchors(), "127.0.0.2", port, 10, TEST_BUDGET);
         let Presented::Refused { flags } = verdict else {
@@ -1436,6 +1560,7 @@ pub(crate) mod tls_tests {
     /// handshake failures below.
     #[test]
     fn gio_has_a_tls_backend_here_which_is_what_glib_networking_buys() {
+        glib_ready();
         let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/trust-bundle.pem");
         gio::TlsCertificate::from_file(&bundle).unwrap_or_else(|e| {
@@ -1463,6 +1588,7 @@ pub(crate) mod tls_tests {
     /// `tests/fixtures/tls/generate.sh` and regenerate — both halves red.
     #[test]
     fn gateway_pem_pins_the_leaf_and_a_ca_first_file_does_not() {
+        glib_ready();
         let leaf = gio::TlsCertificate::from_file(fixture("server-leaf.pem"))
             .expect("the fixture leaf parses");
         let ca = gio::TlsCertificate::from_file(anchors()).expect("the fixture anchor parses");
@@ -1492,7 +1618,7 @@ pub(crate) mod tls_tests {
     /// instead of the peer's, and this reds.
     #[test]
     fn the_hives_anchors_verify_the_gateway_and_the_leaf_is_what_gets_pinned() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let Presented::Trusted(pem) = probe(&anchors(), "localhost", port, 30, TEST_BUDGET) else {
             panic!("the fixture CA signs the fixture leaf; this must verify");
@@ -1519,7 +1645,7 @@ pub(crate) mod tls_tests {
     /// and this reds with a `Trusted`.
     #[test]
     fn a_leaf_under_another_ca_is_refused_and_the_reason_is_named() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("other-leaf.pem", "other-leaf-key.pem");
         let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30, TEST_BUDGET)
         else {
@@ -1540,7 +1666,7 @@ pub(crate) mod tls_tests {
     /// too, and named differently — the distinction the operator needs.
     #[test]
     fn an_expired_leaf_is_refused_and_named_as_expired() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("expired-leaf.pem", "expired-leaf-key.pem");
         let Presented::Refused { flags } = probe(&anchors(), "localhost", port, 30, TEST_BUDGET)
         else {
@@ -1567,9 +1693,9 @@ pub(crate) mod tls_tests {
     /// `Refused { flags: empty }` and the second assertion reds.
     #[test]
     fn a_gateway_that_does_not_answer_is_a_reachability_failure_not_a_trust_one() {
-        let _sockets = lock_sockets();
-        let Presented::Unreachable(why) =
-            probe(&anchors(), "127.0.0.1", closed_port(), 5, TEST_BUDGET)
+        glib_ready();
+        let (port, _held) = closed_port();
+        let Presented::Unreachable(why) = probe(&anchors(), "127.0.0.1", port, 5, TEST_BUDGET)
         else {
             panic!("nothing is listening there");
         };
@@ -1580,7 +1706,7 @@ pub(crate) mod tls_tests {
                 bundle: anchors(),
                 source: Source::HiveDir,
             },
-            &format!("https://127.0.0.1:{}/agent/stray/", closed_port()),
+            &format!("https://127.0.0.1:{port}/agent/stray/"),
         );
         assert_eq!(resolved.policy, TlsPolicy::SystemStore);
         let tried = resolved.tried.expect("the card says what was tried");
@@ -1596,7 +1722,7 @@ pub(crate) mod tls_tests {
     /// and the card's sentence names the anchors file.
     #[test]
     fn resolving_the_bundle_route_pins_the_verified_leaf_and_says_which_file_did_it() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("server-leaf.pem", "server-leaf-key.pem");
         let resolved = resolve_route(
             &Route::VerifyAgainstBundle {
@@ -1625,7 +1751,7 @@ pub(crate) mod tls_tests {
     /// name.
     #[test]
     fn resolving_a_refused_bundle_route_keeps_the_system_store_and_names_the_check() {
-        let _sockets = lock_sockets();
+        glib_ready();
         let port = serve("other-leaf.pem", "other-leaf-key.pem");
         let resolved = resolve_route(
             &Route::VerifyAgainstBundle {
@@ -1653,6 +1779,7 @@ pub(crate) mod tls_tests {
     /// pins a CA and a card that cannot say why nothing matched.
     #[test]
     fn resolving_the_gateway_file_names_the_wrong_order_on_the_card() {
+        glib_ready();
         let good = resolve_route(
             &Route::PinLeaf {
                 pem: fixture("gateway.pem"),
@@ -1696,6 +1823,7 @@ pub(crate) mod tls_tests {
     /// typo actually hits.
     #[test]
     fn an_unreadable_pin_degrades_to_the_system_store_and_names_the_path() {
+        glib_ready();
         let resolved: Resolved = resolve_route(
             &Route::PinLeaf {
                 pem: PathBuf::from("/nonexistent/hive-gateway.pem"),

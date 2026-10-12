@@ -556,15 +556,7 @@ fn unknown_connectors<'a>(hidden_on: &'a [String], known: &HashSet<String>) -> V
 /// set would make every name "unknown" and log a false alarm).
 fn attached_connectors() -> Option<HashSet<String>> {
     let display = gtk::gdk::Display::default()?;
-    Some(
-        display
-            .monitors()
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
-            .filter_map(|m| m.connector().map(|s| s.to_string()))
-            .collect(),
-    )
+    Some(Monitor::attached_connectors(&display))
 }
 
 /// Reconcile a mount region's child cards against the latest sorted plugin

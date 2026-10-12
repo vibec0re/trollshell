@@ -31,7 +31,7 @@ thread_local! {
 /// each change into `fullscreen_inhibit`. No-op for a monitor without a
 /// connector.
 pub fn install(monitor: &Monitor) {
-    let Some(connector) = monitor.connector().filter(|c| !c.is_empty()) else {
+    let Some(connector) = monitor.connector() else {
         tracing::warn!(
             description = ?monitor.description(),
             "fullscreen::install: monitor has no connector; skipping"

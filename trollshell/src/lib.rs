@@ -65,6 +65,8 @@ pub mod plugins;
 // to this one `mod` rather than a crate-wide allow.
 #[allow(dead_code)]
 pub mod scale;
+#[cfg(test)]
+mod test_support;
 pub mod widgets;
 // In the closure since #1071 phase 2: `panels::workspaces` puts Start/Stop on
 // its cards, and both transactions live here rather than in the panel because

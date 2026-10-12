@@ -3880,6 +3880,10 @@ mod tests {
 
     // ── Launch timeout (#1060, review N1) ─────────────────────────────────────
     //
+    // These build a bare `gio::Cancellable`, which is a leaf type with no vfs,
+    // socket or module default behind it, so they are not routed through
+    // `test_support::gio_ready()` (#1463).
+    //
     // [`launch_with_timeout`]'s *ordering* logic (whichever of the timer or
     // `start`'s own callback fires first wins, and the loser is a no-op) is
     // what these two tests pin — not real 10 s wall-clock timing, and

@@ -869,6 +869,7 @@ mod tests {
     /// keeps it).
     #[test]
     fn the_icon_rule_is_gios_arm_by_arm() {
+        crate::test_support::gio_ready();
         for (value, file) in [
             ("/opt/icons/app.png", "/opt/icons/app.png"),
             ("/opt/icons/editor.svg", "/opt/icons/editor.svg"),

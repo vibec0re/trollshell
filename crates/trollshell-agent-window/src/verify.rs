@@ -980,27 +980,40 @@ pub(crate) mod tls_tests {
     //!
     //! These are plain `#[test]`s, so libtest runs them on its own threads,
     //! **in parallel with** the `#[gtk::test]` thread — whose first job is
-    //! `gtk::init`. Both sides touch `GObject` types for the first time, and
-    //! `GLib`'s type system can deadlock when two threads do that to types that
-    //! depend on each other: it is the type-initialisation deadlock `GLib`
-    //! itself cites as bugzilla 674885 in the two partial workarounds it
-    //! carries (`gsocket.c`'s `GSocket` prelude, `gdbusprivate.c`'s
-    //! `ensure_required_types`). Captured live on `origin/main` (#1461): the
-    //! GTK thread inside `gtk_init` → `g_bus_get_sync` →
-    //! `_g_dbus_initialize` was registering `GSocketAddress` (holding that
-    //! type's `g_once`) and waited in `g_type_add_interface_static` for
-    //! `class_init_rec_mutex`; a [`serve`] thread held that mutex, inside
-    //! `GSocketListener`'s class init, and waited in `g_socket_get_type`'s
-    //! prelude for that same `g_once`. Every other `GObject` user then queued
-    //! on the mutex — so every TLS test failed or stalled, and not one GTK
-    //! test ever ran.
+    //! `gtk::init`. Both sides then initialise `GLib` state for the first
+    //! time, and `GLib` can deadlock when two threads do that to things that
+    //! depend on each other: a `g_once` held by one thread while it waits for
+    //! a lock the other holds while it waits for that `g_once`. Seven live
+    //! stacks of hung runs on `origin/main` (#1461) showed two shapes:
     //!
-    //! [`glib_ready`] takes both halves of that race away, once per process:
+    //! - **types** (six of seven): the GTK thread, inside `gtk_init` →
+    //!   `g_bus_get_sync` → `_g_dbus_initialize`, was registering
+    //!   `GSocketAddress` or `GSocket` (holding that type's `g_once`) and
+    //!   waited in `g_type_add_interface_static` for `class_init_rec_mutex`; a
+    //!   [`serve`] thread held that mutex, inside `GSocketListener`'s class
+    //!   init, and waited for the same `g_once`. `GLib` itself cites this
+    //!   type-initialisation deadlock as bugzilla 674885 in the two partial
+    //!   workarounds it carries (`gsocket.c`'s `GSocket` prelude,
+    //!   `gdbusprivate.c`'s `ensure_required_types`).
+    //! - **GIO defaults** (one of seven): the GTK thread, loading its theme in
+    //!   the first GTK test, held `g_vfs_get_default`'s `g_once` and waited
+    //!   for `_g_io_module_get_default`'s lock; a [`probe`]'s first
+    //!   `connect_to_host` held that lock, creating the default proxy resolver
+    //!   (→ `GSettings` → the keyfile backend → a `GFile`), and waited for the
+    //!   `GVfs` `g_once`.
+    //!
+    //! Either way every other `GObject` user then queued behind the two — so
+    //! every TLS test failed or stalled, and not one GTK test ever ran.
+    //!
+    //! [`glib_ready`] takes both races away the same way, once per process:
     //! nothing in this module touches `GLib` until `gtk::init` has finished,
-    //! and by then every type the probe and these fixtures use is registered
-    //! and class-initialised by one thread. A launch never meets this: `main`
-    //! runs `gtk::init` and `GApplication`'s own D-Bus registration on the
-    //! main thread before `window.rs`'s `begin_probe` can start a worker.
+    //! and by then one thread has registered every type, and created every
+    //! GIO default (TLS backend, proxy resolver, `GSettings` backend, `GVfs`),
+    //! that the probe and these fixtures use. A launch never meets either: `main`
+    //! finishes `gtk::init` and `GApplication`'s own D-Bus registration on the
+    //! main thread before `window.rs`'s `begin_probe` can start a worker, and
+    //! nothing on the main thread touches TLS or proxies until the worker has
+    //! answered.
     //!
     //! [`probe`]: super::probe
 
@@ -1019,8 +1032,8 @@ pub(crate) mod tls_tests {
 
     /// Call first in every test that touches `GLib` (see this module's
     /// "Every test here starts with" section): returns once `gtk::init` has
-    /// finished and every type the probe path uses has been registered and
-    /// class-initialised by one thread (#1461).
+    /// finished and every type and GIO default the probe path uses has been
+    /// created by one thread (#1461).
     ///
     /// From any other thread it parks the caller behind the GTK test thread
     /// (`gtk::test_synced`, which runs `gtk::init` first if nothing has yet)
@@ -1036,9 +1049,11 @@ pub(crate) mod tls_tests {
         }
     }
 
-    /// One pass, on one thread, over every `GObject` type the loopback-TLS
-    /// path touches — the probe's own calls in [`probe`]'s order, then both
-    /// ends of a connection the way [`serve`] and [`closed_port`] build them.
+    /// One pass, on one thread, over every `GObject` type and GIO default the
+    /// loopback-TLS path touches — the probe's own calls in [`probe`]'s order
+    /// (a real `connect_to_host` is what creates the proxy resolver, and with
+    /// it the `GSettings` backend and `GVfs`), then both ends of a connection
+    /// the way [`serve`] and [`closed_port`] build them.
     ///
     /// Nothing is asserted and nothing is handshaken. This exists only to make
     /// the types exist; any real failure (no TLS backend, no loopback) is left

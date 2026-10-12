@@ -681,11 +681,16 @@ mod wire_default_tests {
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = LedStripConfig::default();
-        assert_eq!(LedStrip::new(DisplayStyle::Vfd).leds, wire.leds as usize);
-        assert_eq!(DEFAULT_LEDS, wire.leds as usize);
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let LedStripConfig {
+            style: _, // the skin, not a geometry default
+            leds,
+            peak_hold,
+        } = LedStripConfig::default();
+        assert_eq!(LedStrip::new(DisplayStyle::Vfd).leds, leds as usize);
+        assert_eq!(DEFAULT_LEDS, leds as usize);
         assert!(
-            wire.peak_hold.is_none(),
+            peak_hold.is_none(),
             "the kit strip has no peak-hold state of its own"
         );
     }

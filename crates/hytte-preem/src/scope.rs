@@ -886,11 +886,18 @@ mod wire_default_tests {
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = ScopeConfig::default();
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let ScopeConfig {
+            style: _, // the skin, not a geometry default
+            cols,
+            rows,
+            scale,
+            persistence,
+        } = ScopeConfig::default();
         let kit = Scope::new();
-        assert_eq!(kit.cols, wire.cols as usize, "cols");
-        assert_eq!(kit.rows, wire.rows as usize, "rows");
-        assert_eq!(kit.scale, wire.scale as usize, "scale");
-        assert_eq!(kit.persistence, wire.persistence, "persistence");
+        assert_eq!(kit.cols, cols as usize, "cols");
+        assert_eq!(kit.rows, rows as usize, "rows");
+        assert_eq!(kit.scale, scale as usize, "scale");
+        assert_eq!(kit.persistence, persistence, "persistence");
     }
 }

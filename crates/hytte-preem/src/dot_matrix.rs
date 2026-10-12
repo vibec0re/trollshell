@@ -843,11 +843,15 @@ mod wire_default_tests {
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = DotMatrixConfig::default();
-        assert_eq!(DEFAULT_DOT_PX, wire.dot_px as usize, "DEFAULT_DOT_PX");
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let DotMatrixConfig {
+            style: _, // the skin, not a geometry default
+            dot_px,
+        } = DotMatrixConfig::default();
+        assert_eq!(DEFAULT_DOT_PX, dot_px as usize, "DEFAULT_DOT_PX");
         assert_eq!(
             DotMatrix::new(DisplayStyle::Vfd).dots,
-            Dots::new(wire.dot_px as usize),
+            Dots::new(dot_px as usize),
             "the constructor's pitch"
         );
     }

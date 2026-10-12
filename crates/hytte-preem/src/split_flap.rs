@@ -2127,10 +2127,19 @@ mod wire_default_tests {
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = FlipBoardConfig::default();
-        assert_eq!(wire.duration_secs, None);
-        assert_eq!(wire.stagger_secs, None);
-        let mechanism = match wire.mechanism.name() {
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let FlipBoardConfig {
+            style: _, // the skin, not a geometry default
+            mechanism: wire_mechanism,
+            cells,
+            glyph_px,
+            scale,
+            duration_secs,
+            stagger_secs,
+        } = FlipBoardConfig::default();
+        assert_eq!(duration_secs, None);
+        assert_eq!(stagger_secs, None);
+        let mechanism = match wire_mechanism.name() {
             "split-flap" => Mechanism::SplitFlap,
             "nixie" => Mechanism::Nixie,
             other => panic!("unmapped wire mechanism {other}"),
@@ -2138,10 +2147,10 @@ mod wire_default_tests {
         assert_eq!(mechanism, Mechanism::SplitFlap, "the default mechanism");
         let kit = FlipBoard::new(mechanism);
         assert_eq!(kit.mechanism, mechanism);
-        assert_eq!(kit.cells.len(), wire.cells as usize, "cells");
-        assert_eq!(DEFAULT_CELLS, wire.cells as usize, "DEFAULT_CELLS");
-        assert_eq!(kit.glyph_px, wire.glyph_px as usize, "glyph_px");
-        assert_eq!(kit.scale, wire.scale as usize, "scale");
+        assert_eq!(kit.cells.len(), cells as usize, "cells");
+        assert_eq!(DEFAULT_CELLS, cells as usize, "DEFAULT_CELLS");
+        assert_eq!(kit.glyph_px, glyph_px as usize, "glyph_px");
+        assert_eq!(kit.scale, scale as usize, "scale");
         assert!(
             (kit.duration - mechanism.default_duration_secs()).abs() < f32::EPSILON
                 && (kit.stagger - mechanism.default_stagger_secs()).abs() < f32::EPSILON,

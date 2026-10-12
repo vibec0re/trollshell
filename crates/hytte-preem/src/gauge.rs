@@ -3189,25 +3189,33 @@ mod tests {
 #[allow(clippy::float_cmp)] // literal defaults, not computed quantities
 mod wire_default_tests {
     use super::{Gauge, PI};
-    use hytte_plugin_proto::preem::GaugeConfig;
+    use hytte_plugin_proto::preem::{GaugeConfig, GaugeRange};
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = GaugeConfig::default();
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let GaugeConfig {
+            style: _, // the skin, not a geometry default
+            cols,
+            rows,
+            scale,
+            sweep_deg,
+            divisions,
+            subdivisions,
+            range: GaugeRange { low, high },
+            frequency_hz,
+            damping,
+        } = GaugeConfig::default();
         let kit = Gauge::new();
-        assert_eq!(kit.cols, wire.cols as usize, "cols");
-        assert_eq!(kit.rows, wire.rows as usize, "rows");
-        assert_eq!(kit.scale, wire.scale as usize, "scale");
-        assert_eq!(kit.sweep, wire.sweep_deg.to_radians(), "sweep_deg");
-        assert_eq!(kit.divisions, wire.divisions as usize, "divisions");
-        assert_eq!(kit.subdivisions, wire.subdivisions as usize, "subdivisions");
-        assert_eq!(kit.needle.low, wire.range.low, "range.low");
-        assert_eq!(kit.needle.high, wire.range.high, "range.high");
-        assert_eq!(
-            kit.needle.omega,
-            2.0 * PI * wire.frequency_hz,
-            "frequency_hz"
-        );
-        assert_eq!(kit.needle.zeta, wire.damping, "damping");
+        assert_eq!(kit.cols, cols as usize, "cols");
+        assert_eq!(kit.rows, rows as usize, "rows");
+        assert_eq!(kit.scale, scale as usize, "scale");
+        assert_eq!(kit.sweep, sweep_deg.to_radians(), "sweep_deg");
+        assert_eq!(kit.divisions, divisions as usize, "divisions");
+        assert_eq!(kit.subdivisions, subdivisions as usize, "subdivisions");
+        assert_eq!(kit.needle.low, low, "range.low");
+        assert_eq!(kit.needle.high, high, "range.high");
+        assert_eq!(kit.needle.omega, 2.0 * PI * frequency_hz, "frequency_hz");
+        assert_eq!(kit.needle.zeta, damping, "damping");
     }
 }

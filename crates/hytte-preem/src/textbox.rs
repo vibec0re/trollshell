@@ -757,21 +757,32 @@ mod wire_default_tests {
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = TextBoxConfig::default();
+        // Exhaustive on purpose (no `..`): a field added to the wire config is a
+        // compile error here, so someone must decide if the kit has a counterpart.
+        let TextBoxConfig {
+            style: _, // the skin, not a geometry default
+            width,
+            max_lines,
+            pad,
+            corner,
+            scale,
+            fixed_width,
+            notdef: _, // wire `None` = the skin's own; see the note below
+        } = TextBoxConfig::default();
         let kit = TextBox::new();
-        let TextBoxWidth::Cols(wire_cols) = wire.width else {
-            panic!("the wire default width is not Cols: {:?}", wire.width);
+        let TextBoxWidth::Cols(wire_cols) = width else {
+            panic!("the wire default width is not Cols: {width:?}");
         };
         assert!(
             matches!(kit.width, WidthSpec::Cols(c) if c == wire_cols as usize),
             "width: kit {:?} vs wire Cols({wire_cols})",
             kit.width
         );
-        assert_eq!(kit.max_lines, wire.max_lines as usize, "max_lines");
-        assert_eq!(kit.pad, wire.pad as usize, "pad");
-        assert_eq!(kit.corner, wire.corner as usize, "corner");
-        assert_eq!(kit.scale, wire.scale as usize, "scale");
-        assert_eq!(kit.fixed_width, wire.fixed_width, "fixed_width");
+        assert_eq!(kit.max_lines, max_lines as usize, "max_lines");
+        assert_eq!(kit.pad, pad as usize, "pad");
+        assert_eq!(kit.corner, corner as usize, "corner");
+        assert_eq!(kit.scale, scale as usize, "scale");
+        assert_eq!(kit.fixed_width, fixed_width, "fixed_width");
         // `notdef` is deliberately not compared: wire `None` means "the skin's
         // own", which the host resolves, while the bare kit builder carries a
         // concrete grey that `styled` overrides.

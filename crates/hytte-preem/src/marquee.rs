@@ -1094,10 +1094,17 @@ mod wire_default_tests {
 
     #[test]
     fn new_matches_the_wire_default() {
-        let wire = MarqueeConfig::default();
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let MarqueeConfig {
+            style: _, // the skin, not a geometry default
+            window_px,
+            gap_dots,
+            dot_px,
+            speed_dots_per_sec: _, // no kit counterpart: the kit owns no clock (#929)
+        } = MarqueeConfig::default();
         let kit = Marquee::new(DisplayStyle::Vfd);
-        assert_eq!(kit.window_px, wire.window_px as usize, "window_px");
-        assert_eq!(kit.gap_dots, wire.gap_dots as usize, "gap_dots");
-        assert_eq!(kit.dots, Dots::new(wire.dot_px as usize), "dot_px");
+        assert_eq!(kit.window_px, window_px as usize, "window_px");
+        assert_eq!(kit.gap_dots, gap_dots as usize, "gap_dots");
+        assert_eq!(kit.dots, Dots::new(dot_px as usize), "dot_px");
     }
 }

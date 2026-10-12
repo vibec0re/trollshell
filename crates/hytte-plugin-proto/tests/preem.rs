@@ -416,7 +416,10 @@ fn a_pre_882_decoder_rejects_the_new_variants_cleanly() {
 /// case are the manual link. The kit-side half lives in `hytte-preem` (#1449):
 /// each widget module carries a `wire_default_tests::new_matches_the_wire_default`
 /// asserting its constructor against `hytte_plugin_proto::preem::*Config::default()`,
-/// so a drift on either side turns at least one of the two red.
+/// so a drift on either side turns at least one of the two red. Those tests
+/// destructure the wire config exhaustively (no `..`) on purpose, so a field
+/// added here is a compile error there until someone decides whether the kit
+/// has a counterpart.
 #[test]
 fn wire_defaults_match_the_documented_kit_values() {
     assert_eq!(

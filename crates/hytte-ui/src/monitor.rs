@@ -17,9 +17,7 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    /// Wrap a `gdk::Monitor`.
-    #[must_use]
-    pub fn new(inner: gdk::Monitor) -> Self {
+    pub(crate) fn new(inner: gdk::Monitor) -> Self {
         Self { inner }
     }
 

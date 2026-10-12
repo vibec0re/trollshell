@@ -833,3 +833,26 @@ mod tests {
         assert!(ticker.width() <= 296, "{}", ticker.width());
     }
 }
+
+/// Kit-side half of the wire-default pin (#1449).
+#[cfg(test)]
+mod wire_default_tests {
+    use super::{DEFAULT_DOT_PX, DotMatrix, Dots};
+    use crate::DisplayStyle;
+    use hytte_plugin_proto::preem::DotMatrixConfig;
+
+    #[test]
+    fn new_matches_the_wire_default() {
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let DotMatrixConfig {
+            style: _, // the skin, not a geometry default
+            dot_px,
+        } = DotMatrixConfig::default();
+        assert_eq!(DEFAULT_DOT_PX, dot_px as usize, "DEFAULT_DOT_PX");
+        assert_eq!(
+            DotMatrix::new(DisplayStyle::Vfd).dots,
+            Dots::new(dot_px as usize),
+            "the constructor's pitch"
+        );
+    }
+}

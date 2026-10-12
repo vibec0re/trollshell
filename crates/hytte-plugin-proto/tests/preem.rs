@@ -413,9 +413,13 @@ fn a_pre_882_decoder_rejects_the_new_variants_cleanly() {
 /// the language-neutral schema anchor and deliberately does not depend on
 /// `hytte-preem`, so if someone changes `TextBox::new`'s 16 columns tomorrow,
 /// this test stays green and the *doc* becomes the lie. The citations on each
-/// case are the manual link. A real cross-check has to live on the kit side
-/// (a `hytte-preem` test asserting its constructors against these numbers) —
-/// out of lane for a proto-only PR; noted as a #884-era follow-up.
+/// case are the manual link. The kit-side half lives in `hytte-preem` (#1449):
+/// each widget module carries a `wire_default_tests::new_matches_the_wire_default`
+/// asserting its constructor against `hytte_plugin_proto::preem::*Config::default()`,
+/// so a drift on either side turns at least one of the two red. Those tests
+/// destructure the wire config exhaustively (no `..`) on purpose, so a field
+/// added here is a compile error there until someone decides whether the kit
+/// has a counterpart.
 #[test]
 fn wire_defaults_match_the_documented_kit_values() {
     assert_eq!(

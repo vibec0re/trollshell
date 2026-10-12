@@ -671,3 +671,27 @@ mod tests {
         assert_ne!(lcd, oled);
     }
 }
+
+/// Kit-side half of the wire-default pin (#1449).
+#[cfg(test)]
+mod wire_default_tests {
+    use super::{DEFAULT_LEDS, LedStrip};
+    use crate::DisplayStyle;
+    use hytte_plugin_proto::preem::LedStripConfig;
+
+    #[test]
+    fn new_matches_the_wire_default() {
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let LedStripConfig {
+            style: _, // the skin, not a geometry default
+            leds,
+            peak_hold,
+        } = LedStripConfig::default();
+        assert_eq!(LedStrip::new(DisplayStyle::Vfd).leds, leds as usize);
+        assert_eq!(DEFAULT_LEDS, leds as usize);
+        assert!(
+            peak_hold.is_none(),
+            "the kit strip has no peak-hold state of its own"
+        );
+    }
+}

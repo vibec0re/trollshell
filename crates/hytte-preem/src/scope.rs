@@ -877,3 +877,27 @@ mod tests {
         );
     }
 }
+
+/// Kit-side half of the wire-default pin (#1449).
+#[cfg(test)]
+mod wire_default_tests {
+    use super::Scope;
+    use hytte_plugin_proto::preem::ScopeConfig;
+
+    #[test]
+    fn new_matches_the_wire_default() {
+        // Exhaustive on purpose (no `..`): a new wire field must be decided on here.
+        let ScopeConfig {
+            style: _, // the skin, not a geometry default
+            cols,
+            rows,
+            scale,
+            persistence,
+        } = ScopeConfig::default();
+        let kit = Scope::new();
+        assert_eq!(kit.cols, cols as usize, "cols");
+        assert_eq!(kit.rows, rows as usize, "rows");
+        assert_eq!(kit.scale, scale as usize, "scale");
+        assert_eq!(kit.persistence, persistence, "persistence");
+    }
+}

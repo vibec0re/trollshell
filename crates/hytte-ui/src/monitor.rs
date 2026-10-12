@@ -17,6 +17,7 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Wrap a `gdk::Monitor`.
     #[must_use]
     pub fn new(inner: gdk::Monitor) -> Self {
         Self { inner }
@@ -75,6 +76,7 @@ impl Monitor {
     /// with the empty-name policy of [`connector`](Self::connector) applied.
     #[must_use]
     pub fn attached_connectors(display: &gdk::Display) -> HashSet<String> {
+        use gtk::gdk::prelude::DisplayExt;
         use gtk::prelude::Cast;
         connector_set(
             display

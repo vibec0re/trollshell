@@ -30,6 +30,12 @@ hytte-plugin = { path = "../hytte-plugin" }
 # — the same argument that let `trollshell-control-center` link it in #640.
 hytte-config = { path = "../hytte-config" }
 serde.workspace = true
+# The file form's fields are raw `toml::Value`s so a bad value costs its own
+# key rather than the whole file (#1040 T1, #1451) — see `config.rs`'s
+# `AgentsFile`; `hytte-plugin-stats` is the precedent. Adds no resolved
+# package: `hytte-config` already links it, and it was this crate's
+# dev-dependency before.
+toml.workspace = true
 # `host.sock` speaks JSON lines: one object per request, one per response.
 serde_json.workspace = true
 # The poll task's interval + command-lane `select!` loop, the unix socket, and
@@ -63,10 +69,3 @@ tempfile.workspace = true
 # test asserts a 5 s budget, and paused virtual time makes that assertion
 # instant rather than a five-second stall in every `cargo test` run.
 tokio = { workspace = true, features = ["test-util"] }
-# #888 P0's `the_schemas_fields_are_the_serde_surface`: it serialises
-# `AgentsConfig`/`Display` and compares the key sets against `SCHEMA`, which is
-# the one direction the schema walker structurally cannot see (`DEFAULT_TOML`
-# leaves `[display.*]` commented out). A **dev**-dependency because nothing
-# this crate ships touches `toml` directly — the layering does — and it adds no
-# resolved package, since `hytte-config` already links it.
-toml.workspace = true

@@ -2865,7 +2865,7 @@
           # dict (order- and formatting-insensitive), this asserts the
           # rendered file's BYTES against a checked-in fixture
           # (`crates/hytte-plugin-agents/tests/fixtures/agents-nix-rendered.toml`).
-          # That fixture is also fed straight through `AgentsConfig`'s real
+          # That fixture is also fed straight through `AgentsFile`'s real
           # `Subsystem` reader by a Rust test in the same crate
           # (`config.rs`'s
           # `nix_rendered_fixture_round_trips_through_the_real_reader`), so
@@ -3303,14 +3303,14 @@
               touch $out
             '';
 
-          # #1237 review MEDIUM-2: `socket` is judged by a WHOLE-FILE rule on
-          # the Rust side (`AgentsConfig::validate` -> `ConfigError::Invalid`
-          # -> `load_or_default` discards the entire merged file back to
-          # `DEFAULT_TOML`), so a relative path set from nix would silently
-          # revert `poll_seconds` and every `[display.*]` entry with it —
-          # #1040 V1's named anti-pattern. `nix/module-common.nix` therefore
-          # types it `strMatching "^/.+"` rather than an open `str`, and this
-          # is the pin.
+          # #1237 review MEDIUM-2: a relative `socket` set from nix is
+          # rejected on the Rust side and falls back to the plugin's BUILT-IN
+          # path, not to the value nix set — so the rows would quietly ask a
+          # different hive. (Until #1451 it was a WHOLE-FILE rule and reverted
+          # `poll_seconds` and every `[display.*]` entry too; since then
+          # `AgentsFile::parsed` costs only the key.) `nix/module-common.nix`
+          # therefore types it `strMatching "^/.+"` rather than an open `str`,
+          # and this is the pin.
           #
           # Same tryEval-plus-control shape as
           # `nixos-module-core-leds-unknown-key` above, and for the same

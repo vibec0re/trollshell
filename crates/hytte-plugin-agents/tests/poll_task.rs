@@ -302,6 +302,93 @@ async fn an_agents_toml_edit_is_picked_up_on_the_next_poll() {
     task.abort();
 }
 
+/// **A live reload keeps the file's socket past a bad display value** (#1451)
+/// — the per-key rule pinned on the path that actually ships, not only on
+/// `config.rs`'s own `assemble` seam: `ConfigSource::read` is what a running
+/// plugin re-reads `agents.toml` through.
+///
+/// The edited file points the socket at the fake hive and carries one
+/// wrong-typed `label`. Whole-file, that `label` failed the layer and the
+/// reload published the built-in default instead — `/run/hyperhive/host.sock`,
+/// the 2 s cadence, no decorations — so the rows silently went looking for a
+/// different hive. Per key, it costs that one label.
+///
+/// Falsification: point `ConfigSource::read` back at a whole-file reader (give
+/// `AgentsFile::validate` an error whenever `parsed` rejects anything) and the
+/// socket assertion reds.
+#[tokio::test(start_paused = true)]
+async fn a_reload_with_a_bad_display_value_keeps_the_files_socket() {
+    let hive = FakeHive::serve(replies(&[(
+        "agent_status",
+        &fixture("agent_status_grouped.json"),
+    )]));
+    let socket = hive.path().display().to_string();
+    let layer_dir = tempfile::tempdir().expect("a tempdir");
+    let layer: PathBuf = layer_dir.path().join("agents.toml");
+
+    let (tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg_for(&hive),
+        ConfigSource::over(vec![layer.clone()]),
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    tx.send(Cmd::SetVisible(true)).expect("the lane is open");
+    assert!(matches!(
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
+
+    std::fs::write(
+        &layer,
+        format!(
+            "socket = {}\npoll_seconds = 1\n\
+             [display.trollshell-choom]\nlabel = 5\nproject = \"viberoot\"\n\
+             [display.argus]\nlabel = \"Argus\"\n",
+            toml::Value::from(socket.as_str())
+        ),
+    )
+    .expect("write the overlay");
+
+    let reloaded = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+            while let Ok(msg) = msg_rx.try_recv() {
+                if let Msg::Config(cfg) = msg {
+                    return cfg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("an edited layer must be re-read");
+
+    assert_eq!(reloaded.socket, socket, "the file's socket survives");
+    assert_eq!(reloaded.poll_seconds, 1, "…and so does its cadence");
+    assert_eq!(
+        reloaded.project_for("trollshell-choom"),
+        Some("viberoot"),
+        "the bad label's own entry keeps its good key"
+    );
+    assert_eq!(
+        reloaded.label_for("trollshell-choom"),
+        "trollshell-choom",
+        "the bad label falls back to the hive's name"
+    );
+    assert_eq!(
+        reloaded.label_for("argus"),
+        "Argus",
+        "another agent's entry applies"
+    );
+    task.abort();
+}
+
 /// **A refused write reaches the reducer.** The hive answers `ok: false` to a
 /// `set_paused`; the task must turn that into a `Msg::WriteRefused` carrying
 /// the daemon's own words, and must still re-poll so the row un-sticks.

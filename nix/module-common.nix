@@ -24,7 +24,10 @@ let
   # Whether this machine runs a hive — the default of `agentWindow.enable`
   # and the gate on `agentWindow.hiveTlsStateDir`'s. Guarded with `or`, so
   # a machine with no hyperhive module evaluates as `false`.
-  hostRunsHyperhive = hostConfig.services.hyperhive.enable or false;
+  # `services.hyperhive.enable` is a renamed option (now
+  # `deploy.hive-controller.enable`); reading the old name fires NixOS's
+  # "Obsolete option" trace on every evaluation, so read the new one.
+  hostRunsHyperhive = hostConfig.services.hyperhive.deploy.hive-controller.enable or false;
 
   # The bundled plugin ids (#1400): nix/bundled-plugins.nix's
   # `hytte-plugin-<id>` names — the same list flake.nix builds a
@@ -284,8 +287,9 @@ in
         type = lib.types.bool;
         default = hostRunsHyperhive;
         defaultText = lib.literalExpression ''
-          config.services.hyperhive.enable (NixOS), or
-          osConfig.services.hyperhive.enable (home-manager inside NixOS);
+          config.services.hyperhive.deploy.hive-controller.enable (NixOS), or
+          osConfig.services.hyperhive.deploy.hive-controller.enable
+          (home-manager inside NixOS);
           false when neither exists
         '';
         example = true;
@@ -296,7 +300,8 @@ in
           pause / settings as its own chrome.
 
           **Defaults to on exactly when this machine runs hyperhive**
-          (`services.hyperhive.enable`; under home-manager, read through
+          (`services.hyperhive.deploy.hive-controller.enable`; under
+          home-manager, read through
           `osConfig` when home-manager runs as a NixOS module, and off
           standalone). The window is the one package in this flake that
           links WebKitGTK, about 167 MiB of closure (#1400 review), and it

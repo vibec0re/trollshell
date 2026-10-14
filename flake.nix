@@ -2500,7 +2500,8 @@
           # the NixOS config directly, and through `osConfig` under
           # home-manager run as a NixOS module. There is no hyperhive module
           # in this flake's inputs, so `stubHive` declares the two options
-          # the modules read.
+          # the modules read, under hyperhive's current names (it renamed
+          # `services.hyperhive.enable` to `deploy.hive-controller.enable`).
           #
           #   nixos    no hive: off, no TLS dir; a hive: on, TLS dir is the
           #            hive's `tls.stateDir`.
@@ -2515,7 +2516,7 @@
                 { lib, ... }:
                 {
                   options.services.hyperhive = {
-                    enable = lib.mkEnableOption "a stand-in for hyperhive's module";
+                    deploy.hive-controller.enable = lib.mkEnableOption "a stand-in for hyperhive's hive controller";
                     deploy.hive-controller.tls.stateDir = lib.mkOption {
                       type = lib.types.str;
                       default = "/var/lib/hive-tls-stub";
@@ -2576,10 +2577,10 @@
               window = cfg: cfg.programs.trollshell.agentWindow;
               hmWindow = cfg: window cfg.home-manager.users.alice;
               noHive = nixos { };
-              hive = nixos { services.hyperhive.enable = true; };
+              hive = nixos { services.hyperhive.deploy.hive-controller.enable = true; };
               remote = nixos { programs.trollshell.agentWindow.enable = true; };
               hiveOff = nixos {
-                services.hyperhive.enable = true;
+                services.hyperhive.deploy.hive-controller.enable = true;
                 programs.trollshell.agentWindow.enable = false;
               };
               probe =

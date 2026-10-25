@@ -217,9 +217,14 @@ impl ControlIface {
     /// [`set_plugin_enabled`](Self::set_plugin_enabled)). Re-query
     /// [`list_plugins`](Self::list_plugins) shortly after to read back the state.
     ///
+    /// A declared plugin whose unit is still stopping (`deactivating`, e.g. a
+    /// `StopPlugin` a moment ago) is launched once the unit is gone, so the
+    /// answer can take up to the launcher's 12 s stop wait (#1417 follow-up).
+    ///
     /// # Errors
-    /// Unknown/invalid id, a unit that is already running, or an unreachable
-    /// user manager — see [`plugin_launcher::start`].
+    /// Unknown/invalid id, a unit that is already running, a unit still
+    /// stopping when that wait ran out, or an unreachable user manager — see
+    /// [`plugin_launcher::start`].
     async fn start_plugin(&self, id: String) -> zbus::fdo::Result<()> {
         plugin_launcher::start(&id)
             .await

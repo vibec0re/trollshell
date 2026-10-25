@@ -536,6 +536,57 @@ async fn a_refused_status_poll_does_not_also_ask_for_the_queue() {
     );
 }
 
+/// **A hive that comes back re-sends its queue, even an unchanged one.**
+///
+/// The window forgets its queue when the status poll fails
+/// (`Window::update`, the plugin's rule since #1509: rows nobody can vouch
+/// for must not keep live buttons), so the feed's dedup has to forget it too.
+/// Otherwise a hive that returns holding exactly the queue it left with —
+/// here the empty one, which is the common case — answers what
+/// `last_approvals` already has, nothing is sent, and the window keeps saying
+/// "the hive is unreachable" in its approvals group under a green header
+/// until the queue next changes.
+///
+/// Mutation (verified red): drop the `*last_approvals = None` in
+/// `poll_once`'s failed-status arm and the last `next` times out — only the
+/// `State` comes back.
+#[tokio::test(start_paused = true)]
+async fn a_hive_that_comes_back_re_sends_its_queue_even_unchanged() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        tokio::sync::watch::channel(true).1,
+        out_tx,
+    ));
+
+    let _seed = seed_state(&mut out_rx).await;
+
+    hive.start_refusing("agent_status", "the hive is restarting");
+    let down = next_state(&mut out_rx, "the poll that finds the hive gone").await;
+    assert!(
+        matches!(down, AgentState::Unreachable { .. }),
+        "a refused status poll is an unreachable hive: {down:?}"
+    );
+
+    hive.stop_refusing("agent_status");
+    match next(&mut out_rx, "the poll that finds it back").await {
+        Update::State(AgentState::Up(_)) => {}
+        other => panic!("expected the agent back on the roster, got {other:?}"),
+    }
+    match next(&mut out_rx, "the queue it came back with").await {
+        Update::Approvals(Ok(rows)) => assert!(rows.is_empty(), "{rows:?}"),
+        other => panic!(
+            "the first answering poll after an outage must re-send the queue the window forgot, \
+             got {other:?}"
+        ),
+    }
+}
+
 /// **A refused `Pending` clears this window's rows** rather than freezing on
 /// the last good answer, and says which it is (#1146's review, M3/M1).
 ///

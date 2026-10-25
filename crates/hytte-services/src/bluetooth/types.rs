@@ -37,6 +37,11 @@ pub enum PromptKind {
 /// `respond_to_prompt(...)` is called.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairPrompt {
+    /// Identifies this one agent request, unique within the process. Two
+    /// prompts for the same device are separate requests with separate ids,
+    /// for example a retry after bluetoothd sent `Cancel`. That is how a
+    /// request takes down only its own banner and never a newer one.
+    pub id: u64,
     pub device_path: String,
     /// Resolved alias from the `devices()` snapshot at prompt time.
     /// Falls back to the bare path if the device isn't yet in our cache.

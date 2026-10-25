@@ -89,8 +89,8 @@ const PAIRING_CALL_TIMEOUT: Duration = Duration::from_mins(5);
 //     pairing dialog hangs forever on a no-op.
 //   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
 //     `request_confirmation`, `request_authorization`, `cancel`) call
-//     `lookup_alias`, `pending_response_arc`, `set_prompt`, `clear_prompt`
-//     — all of which used `registry::with`.
+//     `lookup_alias`, `pending_response_arc` and `await_reply`, which reach
+//     the prompt slot; all of them once used `registry::with`.
 //
 // The cross-thread-safe alternative is `hytte_reactive::shared` (the
 // process-global registry mirror): `Service::start` publishes this bag with

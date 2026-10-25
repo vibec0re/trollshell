@@ -946,14 +946,22 @@ mod tests {
 mod system_tests {
     use super::*;
 
+    use crate::wifi::DaemonChange;
+    use crate::wifi::nm_registrar::run_registrar;
+    use crate::wifi_backend::NM_BUS_NAME;
+    use crate::wifi_nm::{NM_AGENT_IDENTIFIER, ensure_nm_agent_registered_via};
+    use futures_util::StreamExt as _;
+    use hytte_bus::SignalItem;
+    use hytte_bus::test_support::SharedConnection;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::{Child, Command};
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
     use zbus::Connection;
     use zbus::connection::Builder;
 
@@ -1653,6 +1661,473 @@ mod system_tests {
             prompts.get_cloned().is_none(),
             "prompt should be cleared after cancel"
         );
+    }
+
+    // -- 5. staying registered: NM restarts, late NM, a reconnect -------------
+    //
+    // The agent only hears `GetSecrets` while NM holds a registration for it,
+    // and that registration lives in NM's memory, keyed to our unique name.
+    // These drive the real registration path — `wifi::DaemonChange` over a
+    // real `NameOwnerChanged` stream, the `nm_registrar` loop, and
+    // `wifi_nm::ensure_nm_agent_registered_via`'s wire calls — against a fake
+    // `AgentManager` that keeps NM's rules. What they do not drive is the
+    // `wifi` service's own glue (`watch_for_daemon_changes` → `recheck` →
+    // `renew_nm_registration`), which needs the host's system bus for its
+    // re-probe; `forward_renewals` below is that glue's renewal half, one line.
+
+    /// Where NM serves its `AgentManager`; the fake answers at the same path.
+    const AGENT_MANAGER_PATH: &str = "/org/freedesktop/NetworkManager/AgentManager";
+
+    /// The settle the registrar waits before each attempt — the production
+    /// 500 ms is there for a re-mount these tests do not have.
+    const TEST_SETTLE: Duration = Duration::from_millis(20);
+
+    /// A ramp fast enough that a retry-driven convergence costs milliseconds.
+    const FAST_RETRY: crate::retry::Policy = crate::retry::Policy {
+        max_attempts: None,
+        initial: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(200),
+    };
+
+    /// A ramp whose first retry is an hour away, so a registration that lands
+    /// within a test's budget was caused by a renewal, not by the backoff.
+    const GLACIAL_RETRY: crate::retry::Policy = crate::retry::Policy {
+        max_attempts: None,
+        initial: Duration::from_hours(1),
+        max_backoff: Duration::from_hours(1),
+    };
+
+    /// A fake `org.freedesktop.NetworkManager.AgentManager` that keeps the two
+    /// rules of NM's (1.56, `nm-agent-manager.c`) these tests depend on: **one
+    /// agent per identifier** for the (single) uid on a test bus, a second
+    /// registration refused rather than replacing the first; and `Unregister`
+    /// removes only the *caller's* agent. Dropping an agent whose unique name
+    /// left the bus — NM's third rule — is [`drop_agents_of_vanished_names`].
+    #[derive(Clone, Default)]
+    struct FakeAgentManager {
+        /// identifier → the unique name holding it.
+        agents: Arc<AsyncMutex<HashMap<String, String>>>,
+        /// Every registration accepted, in order: its sender and the
+        /// capabilities it advertised.
+        accepted: Arc<AsyncMutex<Vec<(String, u32)>>>,
+        /// How many registrations were refused as duplicates.
+        refused: Arc<AtomicU32>,
+    }
+
+    impl FakeAgentManager {
+        async fn holder(&self) -> Option<String> {
+            self.agents.lock().await.get(NM_AGENT_IDENTIFIER).cloned()
+        }
+
+        /// The senders of every accepted registration, in order.
+        async fn accepted_from(&self) -> Vec<String> {
+            self.accepted
+                .lock()
+                .await
+                .iter()
+                .map(|(sender, _)| sender.clone())
+                .collect()
+        }
+
+        fn refused(&self) -> u32 {
+            self.refused.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// The error names NM's `AgentManager` answers with.
+    #[derive(Debug, zbus::DBusError)]
+    #[zbus(prefix = "org.freedesktop.NetworkManager.AgentManager")]
+    enum FakeAgentManagerError {
+        #[zbus(error)]
+        ZBus(zbus::Error),
+        PermissionDenied(String),
+        NotRegistered(String),
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.AgentManager")]
+    impl FakeAgentManager {
+        async fn register_with_capabilities(
+            &self,
+            identifier: String,
+            capabilities: u32,
+            #[zbus(header)] header: zbus::message::Header<'_>,
+        ) -> Result<(), FakeAgentManagerError> {
+            let sender = header.sender().map(ToString::to_string).unwrap_or_default();
+            let mut agents = self.agents.lock().await;
+            if agents.contains_key(&identifier) {
+                self.refused.fetch_add(1, AtomicOrdering::SeqCst);
+                // NM's literal, spelled out rather than borrowed from
+                // `wifi_nm`, so a change to the constant there cannot quietly
+                // move the fake along with it.
+                return Err(FakeAgentManagerError::PermissionDenied(
+                    "An agent with this ID is already registered for this user.".into(),
+                ));
+            }
+            agents.insert(identifier, sender.clone());
+            self.accepted.lock().await.push((sender, capabilities));
+            Ok(())
+        }
+
+        async fn unregister(
+            &self,
+            #[zbus(header)] header: zbus::message::Header<'_>,
+        ) -> Result<(), FakeAgentManagerError> {
+            let sender = header.sender().map(ToString::to_string).unwrap_or_default();
+            let mut agents = self.agents.lock().await;
+            let before = agents.len();
+            agents.retain(|_, holder| *holder != sender);
+            if agents.len() == before {
+                return Err(FakeAgentManagerError::NotRegistered(
+                    "Caller is not registered as an Agent".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// Bring up a fake NM: a connection that serves `manager` and owns NM's
+    /// bus name — which is what produces the `NameOwnerChanged` an NM start
+    /// does. The interface is staged on the builder for #756's reason.
+    async fn start_fake_nm(guard: &BusGuard, manager: FakeAgentManager) -> Connection {
+        Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .serve_at(AGENT_MANAGER_PATH, manager)
+            .expect("stage the fake AgentManager")
+            .name(NM_BUS_NAME)
+            .expect("a valid well-known name")
+            .build()
+            .await
+            .expect("bring the fake NM up")
+    }
+
+    /// NM's third rule: an agent whose unique name leaves the bus is dropped
+    /// ("agent unregistered or disappeared"). Subscribed before this returns,
+    /// so no departure after it can be missed.
+    async fn drop_agents_of_vanished_names(
+        nm: &Connection,
+        manager: &FakeAgentManager,
+    ) -> tokio::task::JoinHandle<()> {
+        let dbus = zbus::fdo::DBusProxy::new(nm)
+            .await
+            .expect("org.freedesktop.DBus proxy");
+        let mut changes = dbus
+            .receive_name_owner_changed()
+            .await
+            .expect("subscribe to NameOwnerChanged");
+        let agents = manager.agents.clone();
+        tokio::spawn(async move {
+            while let Some(change) = changes.next().await {
+                let Ok(args) = change.args() else { continue };
+                if args.new_owner().is_none() {
+                    let gone = args.name().to_string();
+                    agents.lock().await.retain(|_, holder| *holder != gone);
+                }
+            }
+        })
+    }
+
+    /// The shell's side: a production-shaped connection (`build_pooled`,
+    /// through `test_support::connect`) wrapped the way `hytte_bus`'s pooled
+    /// system connection is, plus its unique name.
+    async fn shell_connection(guard: &BusGuard) -> (Connection, String) {
+        let conn = hytte_bus::test_support::connect(guard.address.as_str())
+            .await
+            .expect("connect the shell to the ephemeral bus");
+        let unique = conn
+            .unique_name()
+            .expect("a bus connection has a unique name")
+            .to_string();
+        (conn, unique)
+    }
+
+    /// The `NameOwnerChanged` subscription the `wifi` service holds, on
+    /// `shared`, returned once it is demonstrably live: a throwaway
+    /// connection's arrival has come through it. Without that wait, a fake NM
+    /// started straight after could announce itself before the match rule
+    /// exists, and the renewal under test would never be asked for.
+    async fn live_name_owner_changed(
+        guard: &BusGuard,
+        shared: &SharedConnection,
+    ) -> hytte_bus::SignalSubscription {
+        let sub = hytte_bus::signals_with(shared, "org.freedesktop.DBus")
+            .at_path("/org/freedesktop/DBus")
+            .iface("org.freedesktop.DBus")
+            .signal("NameOwnerChanged")
+            .start();
+        let mut probe = sub.items();
+        let end = tokio::time::Instant::now() + DBUS_REPLY_BUDGET;
+        while tokio::time::Instant::now() < end {
+            let _throwaway = Builder::address(guard.address.as_str())
+                .expect("parse ephemeral bus address")
+                .build()
+                .await
+                .expect("connect a throwaway client");
+            if let Ok(Some(SignalItem::Event(_))) =
+                tokio::time::timeout(Duration::from_millis(200), probe.next()).await
+            {
+                return sub;
+            }
+        }
+        panic!("the NameOwnerChanged subscription never went live within {DBUS_REPLY_BUDGET:?}");
+    }
+
+    /// The renewal half of `wifi::watch_for_daemon_changes`: every item that
+    /// `DaemonChange` says may have cost the registration wakes the registrar.
+    fn forward_renewals(
+        sub: &hytte_bus::SignalSubscription,
+        wake: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut items = sub.items();
+        tokio::spawn(async move {
+            while let Some(item) = items.next().await {
+                if DaemonChange::of(&item).is_some_and(DaemonChange::renews_nm_registration) {
+                    wake.notify_one();
+                }
+            }
+        })
+    }
+
+    /// A registration attempt, boxed: the production future is unnameable, and
+    /// a closure's return type cannot be `impl Future`.
+    type Attempt = std::pin::Pin<Box<dyn Future<Output = Result<(), hytte_bus::BusError>> + Send>>;
+
+    /// The production registration (`ensure_nm_agent_registered_via`) over
+    /// `shared` instead of the pooled system connection, counting attempts as
+    /// they *finish* — so a test can wait for one to have failed, not merely
+    /// to have been sent.
+    fn register_over(
+        shared: &SharedConnection,
+        finished: &Arc<AtomicU32>,
+    ) -> impl Fn() -> Attempt + Send + use<> {
+        let shared = shared.clone();
+        let finished = finished.clone();
+        move || {
+            let shared = shared.clone();
+            let finished = finished.clone();
+            Box::pin(async move {
+                let outcome =
+                    ensure_nm_agent_registered_via(|| hytte_bus::call_with(&shared, NM_BUS_NAME))
+                        .await;
+                finished.fetch_add(1, AtomicOrdering::SeqCst);
+                outcome
+            })
+        }
+    }
+
+    /// Wait until `check` holds, or fail naming `what`.
+    async fn eventually(what: &str, check: impl AsyncFn() -> bool) {
+        let end = tokio::time::Instant::now() + DBUS_REPLY_BUDGET;
+        while tokio::time::Instant::now() < end {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{what} did not happen within {DBUS_REPLY_BUDGET:?}");
+    }
+
+    /// The bug, end to end: the shell starts before NM (the one start-up
+    /// attempt fails), NM comes up, NM restarts. The agent must end up
+    /// registered with *each* NM instance, exactly once each.
+    ///
+    /// The ramp here is an hour, so every registration that lands was caused
+    /// by NM's name gaining an owner, not by a retry. Falsify by renewing on
+    /// nothing (the pre-fix behaviour): `accepted` on the first fake NM stays
+    /// empty and the first `eventually` fails. Falsify the "exactly once" half
+    /// by renewing on NM *losing* its name too: the extra attempt lands before
+    /// the second fake exists, and the attempt count reads 4.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_registers_when_nm_comes_up_and_again_when_it_restarts() {
+        let guard = ephemeral_bus().await;
+        let (conn, shell) = shell_connection(&guard).await;
+        let shared = SharedConnection::for_test_system(conn);
+        let sub = live_name_owner_changed(&guard, &shared).await;
+
+        let wake = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicU32::new(0));
+        let forwarder = forward_renewals(&sub, wake.clone());
+        let registrar = tokio::spawn(run_registrar(
+            wake,
+            register_over(&shared, &attempts),
+            GLACIAL_RETRY,
+            TEST_SETTLE,
+        ));
+
+        // No NM on the bus: the start-up attempt is made and fails, and the
+        // ramp will not try again for an hour. Waiting for it to *finish*
+        // matters — an attempt still in flight when the fake NM claims its
+        // name could reach it, and then the renewal below would be a
+        // duplicate.
+        eventually("the start-up registration attempt", async || {
+            attempts.load(AtomicOrdering::SeqCst) == 1
+        })
+        .await;
+
+        // NM comes up late.
+        let first = FakeAgentManager::default();
+        let first_nm = start_fake_nm(&guard, first.clone()).await;
+        eventually("registration with the NM that came up late", async || {
+            first.holder().await.as_deref() == Some(shell.as_str())
+        })
+        .await;
+
+        // `systemctl restart NetworkManager`: the name is lost, and the NM
+        // that re-acquires it starts with an empty registry.
+        first_nm.close().await.expect("close the first fake NM");
+        let second = FakeAgentManager::default();
+        let _second_nm = start_fake_nm(&guard, second.clone()).await;
+        eventually("registration with the restarted NM", async || {
+            second.holder().await.as_deref() == Some(shell.as_str())
+        })
+        .await;
+
+        // Exactly once each — the lost name renewed nothing, and nothing
+        // registered twice. Give a stray renewal time to show itself.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(first.accepted_from().await, vec![shell.clone()]);
+        assert_eq!(second.accepted_from().await, vec![shell.clone()]);
+        assert_eq!(second.refused(), 0);
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            3,
+            "one failed start-up attempt, one per NM instance, and no more"
+        );
+        // …and the renewal still asks for VPN hints
+        // (`NM_SECRET_AGENT_CAPABILITY_VPN_HINTS`, bit 0).
+        assert!(
+            second
+                .accepted
+                .lock()
+                .await
+                .iter()
+                .all(|(_, capabilities)| *capabilities == 0x1),
+            "a renewal must advertise the same capabilities as the first registration"
+        );
+
+        registrar.abort();
+        forwarder.abort();
+    }
+
+    /// The bus-reconnect case. A reconnect gives the shell a new unique name;
+    /// NM drops the old name's agent once that name leaves the bus, and until
+    /// it has, it refuses the new name's registration as a duplicate. The
+    /// subscription's `Resubscribed` must renew, and the renewal must converge
+    /// on the new name through that refusal — the withdraw-and-retry path in
+    /// `ensure_nm_agent_registered_via` plus the registrar's ramp.
+    ///
+    /// The old connection is held open until the new one has been refused at
+    /// least once, so the stale-holder window is exercised deterministically
+    /// rather than hoped for. Falsify by reading `events()` instead of
+    /// `items()` in `forward_renewals` (dropping the `Resubscribed` marker):
+    /// nothing renews and no refusal is ever counted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn re_registers_from_the_new_unique_name_after_a_reconnect() {
+        let guard = ephemeral_bus().await;
+        let nm = FakeAgentManager::default();
+        let nm_conn = start_fake_nm(&guard, nm.clone()).await;
+        let _vanish = drop_agents_of_vanished_names(&nm_conn, &nm).await;
+
+        let (before, old_name) = shell_connection(&guard).await;
+        let shared = SharedConnection::for_test_system(before.clone());
+        let sub = live_name_owner_changed(&guard, &shared).await;
+
+        let wake = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicU32::new(0));
+        let forwarder = forward_renewals(&sub, wake.clone());
+        let registrar = tokio::spawn(run_registrar(
+            wake,
+            register_over(&shared, &attempts),
+            FAST_RETRY,
+            TEST_SETTLE,
+        ));
+        eventually("the start-up registration", async || {
+            nm.holder().await.as_deref() == Some(old_name.as_str())
+        })
+        .await;
+
+        // The reconnect: the pooled connection is replaced, exactly as the
+        // supervisor installs a fresh one (generation + epoch bump), which is
+        // what makes the subscription re-subscribe and report it.
+        let (after, new_name) = shell_connection(&guard).await;
+        shared.install_fresh_connection_for_test(after).await;
+
+        eventually(
+            "the new name's registration being refused as a duplicate",
+            async || nm.refused() >= 1,
+        )
+        .await;
+        assert_eq!(
+            nm.holder().await.as_deref(),
+            Some(old_name.as_str()),
+            "the withdraw step must not remove a registration that is not the caller's"
+        );
+
+        // The old connection finally goes away; NM drops its agent, and the
+        // retry ramp registers the new name.
+        before
+            .close()
+            .await
+            .expect("close the pre-reconnect connection");
+        eventually("registration from the new unique name", async || {
+            nm.holder().await.as_deref() == Some(new_name.as_str())
+        })
+        .await;
+        assert_eq!(nm.accepted_from().await, vec![old_name, new_name]);
+
+        registrar.abort();
+        forwarder.abort();
+    }
+
+    /// A renewal nobody needed — a `Lagged` hole with NM untouched, say — must
+    /// converge, not spin. NM refuses the duplicate even from the connection
+    /// that holds it, so a registrar that only retried would retry forever
+    /// against a registration that is fine; `ensure_nm_agent_registered_via`
+    /// withdraws this connection's own registration and makes it again.
+    ///
+    /// Falsify by deleting the withdraw-and-register arm (plain register
+    /// only): `refused` keeps climbing on the 50–200 ms ramp, and the final
+    /// assertion reads well above 1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_needless_renewal_converges_instead_of_retrying_forever() {
+        let guard = ephemeral_bus().await;
+        let nm = FakeAgentManager::default();
+        let _nm_conn = start_fake_nm(&guard, nm.clone()).await;
+
+        let (conn, shell) = shell_connection(&guard).await;
+        let shared = SharedConnection::for_test_system(conn);
+        let wake = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicU32::new(0));
+        let registrar = tokio::spawn(run_registrar(
+            wake.clone(),
+            register_over(&shared, &attempts),
+            FAST_RETRY,
+            TEST_SETTLE,
+        ));
+        eventually("the start-up registration", async || {
+            attempts.load(AtomicOrdering::SeqCst) == 1
+        })
+        .await;
+
+        // What a `DaemonChange::Hole` does, with nothing actually lost.
+        wake.notify_one();
+        eventually("the renewal", async || {
+            attempts.load(AtomicOrdering::SeqCst) == 2
+        })
+        .await;
+
+        // Several ramp periods: a registrar stuck on the refusal would have
+        // retried a handful of times by now.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(nm.holder().await.as_deref(), Some(shell.as_str()));
+        assert_eq!(
+            nm.refused(),
+            1,
+            "the renewal's first register is refused once, then withdraw-and-register succeeds"
+        );
+        assert_eq!(nm.accepted_from().await, vec![shell.clone(), shell]);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+
+        registrar.abort();
     }
 
     // -- helpers --------------------------------------------------------------

@@ -4808,6 +4808,46 @@ color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
       the panel. On a single-AP network, or when you happen to be on the
       strongest member, nothing should look different from before.
 
+- [ ] **(#1484)** The secret agent **survives an NM
+      restart**. Before this, `sudo systemctl restart NetworkManager` left the
+      shell registered with an NM that no longer existed: joining a new
+      secured network (or a VPN with no stored secret) failed with "secrets
+      required" and **no prompt**, until the shell itself was restarted. Turn
+      on NM's agent logging first, so NM's side of the handshake is visible:
+
+  ```sh
+  sudo nmcli general logging level DEBUG domains AGENTS
+  sudo systemctl restart NetworkManager
+  sleep 5
+  journalctl --user -u trollshell --since -1min | grep 'secret agent registered'
+  journalctl -u NetworkManager --since -1min | grep 'mov.vibec0re.trollshell'
+  ```
+
+  Expect a fresh `wifi_nm: secret agent registered with NM` line ~1.5 s after
+  the restart (1 s `CHANGE_SETTLE` plus the registrar's 500 ms settle), and an
+  `agent registered` line naming `mov.vibec0re.trollshell` on NM's side. Then
+  the real check: join a **never-before-seen** secured network from the Wi-Fi
+  panel — the passphrase prompt must appear. Same for activating a VPN profile
+  whose secret is not stored. Restore logging with
+  `sudo nmcli general logging level INFO domains AGENTS` afterwards.
+
+- [ ] **(#1484)** The agent registers when **NM comes up
+      after the shell**: `sudo systemctl stop NetworkManager`,
+      `systemctl --user restart trollshell`, wait ~10 s, then
+      `sudo systemctl start NetworkManager`. Expect the same
+      `secret agent registered with NM` line within a few seconds of NM
+      starting — either straight away or, if an earlier attempt failed, as
+      `…registered with NM after earlier attempts failed` preceded by **one**
+      `secret agent registration failed` `warn!` (not one per retry). Then the
+      prompt check from the entry above.
+
+- [ ] **(#1484)** A switch away from NM still withdraws the
+      registration, and nothing re-registers behind it: on a host with both
+      daemons, move to iwd mid-session (stop NM, start iwd) and confirm
+      NM's journal (with the logging above) shows our agent unregistered and
+      **no** later `agent registered` for `mov.vibec0re.trollshell` once the
+      switch has happened.
+
 ## Night light
 
 - [ ] **(#585)** Night light with **no** configured coordinates

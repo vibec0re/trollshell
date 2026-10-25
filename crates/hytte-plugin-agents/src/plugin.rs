@@ -1108,7 +1108,7 @@ impl Agents {
         if let Some(rest) = node.strip_prefix(ids::START) {
             if let Some(name) = AgentName::parse(rest) {
                 let _ = self.cmd_tx.send(Cmd::Send(Request::Start {
-                    scope: Scope::agent(name.as_str()),
+                    scope: Scope::agent(&name),
                 }));
             }
             return Vec::new();
@@ -1116,7 +1116,7 @@ impl Agents {
         if let Some(rest) = node.strip_prefix(ids::STOP) {
             if let Some(name) = AgentName::parse(rest) {
                 let _ = self.cmd_tx.send(Cmd::Send(Request::Stop {
-                    scope: Scope::agent(name.as_str()),
+                    scope: Scope::agent(&name),
                     graceful: true,
                 }));
             }

@@ -58,7 +58,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{clamp, single_line};
+use crate::model::{AgentName, clamp, single_line};
 
 /// The wire-schema version this build speaks, mirroring hyperhive's
 /// `HOST_SOCK_VERSION` (`hive-host-sock/src/lib.rs:543`, currently `1`).
@@ -229,7 +229,9 @@ pub enum Request {
 ///   struct (`hive-host-sock/src/lib.rs:485-500`), so they arrive as `false`.
 /// - There is **no `Default` impl** and no all-false constructor.
 ///   [`Scope::agent`] is the only way to build one and it always fills
-///   `agent_names` with exactly one non-empty name.
+///   `agent_names` with exactly one name — an [`AgentName`], so a name that
+///   passed hyperhive's own `Ident` rule, and never `""`. The type says so
+///   rather than a convention among its callers.
 ///
 /// Should the hive ever drop those `#[serde(default)]`s, this frame is
 /// *rejected* rather than silently widened — a loud failure, which is the
@@ -243,10 +245,14 @@ pub struct Scope {
 
 impl Scope {
     /// The only constructor: scope a lifecycle verb to one named agent.
+    ///
+    /// Takes an [`AgentName`] rather than a `&str` so the one name cannot be
+    /// empty or outside the hive's `Ident` charset — every caller already
+    /// holds one, re-parsed off the wire.
     #[must_use]
-    pub fn agent(name: &str) -> Self {
+    pub fn agent(name: &AgentName) -> Self {
         Self {
-            agent_names: vec![name.to_owned()],
+            agent_names: vec![name.as_str().to_owned()],
         }
     }
 
@@ -557,6 +563,11 @@ mod tests {
         AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, HOST_SOCK_VERSION, Request,
         Response, Scope, VersionMismatch, check_version,
     };
+    use crate::model::AgentName;
+
+    fn scope_of(name: &str) -> Scope {
+        Scope::agent(&AgentName::parse(name).expect("a legal test name"))
+    }
 
     fn line(req: &Request) -> String {
         serde_json::to_string(req).expect("a Request always serializes")
@@ -590,13 +601,13 @@ mod tests {
         );
         assert_eq!(
             line(&Request::Start {
-                scope: Scope::agent("trollshell-choom"),
+                scope: scope_of("trollshell-choom"),
             }),
             r#"{"cmd":"start","scope":{"agent_names":["trollshell-choom"]}}"#
         );
         assert_eq!(
             line(&Request::Stop {
-                scope: Scope::agent("trollshell-choom"),
+                scope: scope_of("trollshell-choom"),
                 graceful: true,
             }),
             r#"{"cmd":"stop","scope":{"agent_names":["trollshell-choom"]},"graceful":true}"#
@@ -636,14 +647,14 @@ mod tests {
     fn every_lifecycle_frame_names_exactly_one_agent() {
         let frames = [
             Request::Start {
-                scope: Scope::agent("alpha"),
+                scope: scope_of("alpha"),
             },
             Request::Stop {
-                scope: Scope::agent("alpha"),
+                scope: scope_of("alpha"),
                 graceful: false,
             },
             Request::Stop {
-                scope: Scope::agent("alpha"),
+                scope: scope_of("alpha"),
                 graceful: true,
             },
         ];
@@ -666,7 +677,7 @@ mod tests {
     #[test]
     fn the_scope_frame_carries_no_class_flags() {
         let value: serde_json::Value = serde_json::from_str(&line(&Request::Start {
-            scope: Scope::agent("alpha"),
+            scope: scope_of("alpha"),
         }))
         .expect("our own frame parses");
         let scope = value
@@ -683,7 +694,7 @@ mod tests {
 
     #[test]
     fn scope_agent_names_is_never_empty() {
-        assert_eq!(Scope::agent("alpha").agent_names(), ["alpha".to_owned()]);
+        assert_eq!(scope_of("alpha").agent_names(), ["alpha".to_owned()]);
     }
 
     /// A response carrying keys this build has never heard of still decodes —

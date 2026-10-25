@@ -436,11 +436,11 @@ fn the_lifecycle_button_starts_a_stopped_agent_and_stops_a_running_one() {
         lines(&mut rx),
         vec![
             serde_json::to_string(&Request::Start {
-                scope: Scope::agent("stray")
+                scope: Scope::agent(&name("stray"))
             })
             .expect("serializes"),
             serde_json::to_string(&Request::Stop {
-                scope: Scope::agent("trollshell-choom"),
+                scope: Scope::agent(&name("trollshell-choom")),
                 graceful: true,
             })
             .expect("serializes"),
@@ -741,13 +741,13 @@ fn the_refusal_toast_phrases_the_verb_and_uses_the_display_label() {
         ),
         (
             Request::Start {
-                scope: Scope::agent("trollshell-choom"),
+                scope: Scope::agent(&name("trollshell-choom")),
             },
             "start choom",
         ),
         (
             Request::Stop {
-                scope: Scope::agent("trollshell-choom"),
+                scope: Scope::agent(&name("trollshell-choom")),
                 graceful: true,
             },
             "stop choom",

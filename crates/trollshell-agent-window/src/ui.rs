@@ -870,6 +870,11 @@ pub fn refusal(request: &hytte_plugin_agents::hive::wire::Request, reason: &str)
 mod tests {
     use super::refusal;
     use hytte_plugin_agents::hive::wire::{Request, Scope};
+    use hytte_plugin_agents::model::AgentName;
+
+    fn stray() -> AgentName {
+        AgentName::parse("stray").expect("a legal test name")
+    }
 
     /// Every arm is a sentence that parses, including the one no verb this
     /// window sends can reach.
@@ -882,10 +887,10 @@ mod tests {
         use hytte_plugin_agents::hive::wire::Request;
         let all = [
             Request::Start {
-                scope: Scope::agent("stray"),
+                scope: Scope::agent(&stray()),
             },
             Request::Stop {
-                scope: Scope::agent("stray"),
+                scope: Scope::agent(&stray()),
                 graceful: true,
             },
             Request::SetPaused {
@@ -919,7 +924,7 @@ mod tests {
         assert!(
             refusal(
                 &Request::Start {
-                    scope: Scope::agent("stray")
+                    scope: Scope::agent(&stray())
                 },
                 "no such agent"
             )

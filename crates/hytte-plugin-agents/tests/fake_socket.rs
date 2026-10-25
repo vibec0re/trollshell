@@ -25,7 +25,7 @@ use hytte_plugin_agents::hive::client::{HiveError, MAX_ANSWER_BYTES, REQUEST_TIM
 use hytte_plugin_agents::hive::wire::{
     ApprovalKind, ApprovalStatus, HOST_SOCK_VERSION, Request, Scope, VersionMismatch,
 };
-use hytte_plugin_agents::model::PendingApprovals;
+use hytte_plugin_agents::model::{AgentName, PendingApprovals};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixListener;
 
@@ -217,10 +217,10 @@ async fn the_control_verbs_put_their_pinned_bytes_on_the_socket() {
             paused: false,
         },
         Request::Start {
-            scope: Scope::agent("trollshell-choom"),
+            scope: Scope::agent(&AgentName::parse("trollshell-choom").expect("a legal test name")),
         },
         Request::Stop {
-            scope: Scope::agent("trollshell-choom"),
+            scope: Scope::agent(&AgentName::parse("trollshell-choom").expect("a legal test name")),
             graceful: true,
         },
     ] {

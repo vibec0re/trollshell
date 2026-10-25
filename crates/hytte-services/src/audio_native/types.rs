@@ -79,6 +79,18 @@ pub(super) struct NodeProxy {
 /// bind only the one named `default`. Like `NodeProxy`, both must stay
 /// alive together — dropping either ends property events.
 pub(super) struct MetadataProxy {
+    /// The **registry global id** this proxy was bound to — what the
+    /// registry's `global_remove` names when the object goes away.
+    ///
+    /// Kept because nothing on the proxy carries it: `Proxy::id()` is
+    /// `pw_proxy_get_id`, the proxy's *client-local* id, a separate number
+    /// space. Comparing that against a removed global's id (which the removal
+    /// path used to do) missed the real removal on a `WirePlumber` restart,
+    /// and matched whatever unrelated global — a link, a node, a short-lived
+    /// client such as a keybind's `wpctl` — happened to carry the same number,
+    /// clearing both defaults and dropping this listener for the rest of the
+    /// session while the `default` metadata was still alive.
+    pub(super) global_id: u32,
     #[allow(dead_code)]
     pub(super) proxy: pw::metadata::Metadata,
     #[allow(dead_code)]

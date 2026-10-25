@@ -532,12 +532,14 @@ pub(super) fn run_once(
             }
             // If the default Metadata global went away (pipewire-pulse or
             // wireplumber restart), drop our cached proxy so the next
-            // re-add rebinds cleanly. We don't know the id of the metadata
-            // global without tracking it; compare by checking whether
-            // the proxy's upcast id matches. Cheaper to clear on any
-            // removal that hits a Metadata-shaped slot.
-            if let Some(meta) = s.metadata_default.as_ref()
-                && pw::proxy::ProxyT::upcast_ref(&meta.proxy).id() == id
+            // re-add rebinds cleanly. Compared against the global id the
+            // proxy was bound to, which `MetadataProxy` records for exactly
+            // this — the proxy's own `id()` is a client-local number, so
+            // comparing that missed the real removal and matched unrelated
+            // globals that happened to share it (see `global_id`'s doc).
+            if s.metadata_default
+                .as_ref()
+                .is_some_and(|meta| meta.global_id == id)
             {
                 tracing::debug!(id, "audio_native: - default metadata");
                 s.metadata_default = None;
@@ -667,6 +669,7 @@ fn bind_default_metadata(
         .register();
 
     Ok(MetadataProxy {
+        global_id: id,
         proxy: metadata,
         listener,
     })

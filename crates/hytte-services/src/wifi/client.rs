@@ -220,6 +220,38 @@ pub(super) async fn refresh_networks(
     }
 }
 
+/// How long iwd gives our agent to answer one `RequestPassphrase` before it
+/// cancels it: `agent_timeout_input_request()` in iwd's `src/agent.c`
+/// (120 s). Copied from the C source for the test that holds
+/// [`NETWORK_CONNECT_TIMEOUT`] above it.
+#[cfg(test)]
+const IWD_AGENT_INPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// Deadline for iwd's `Network.Connect`.
+///
+/// `Connect` blocks until the connection has finished or failed. That
+/// includes the passphrase prompt our agent raises: iwd waits two minutes
+/// for the user there. Then, with iwd's own network configuration on, it
+/// includes DHCP, which iwd documents as "roughly 30 seconds per BSS"
+/// (`doc/network-api.txt`). `hytte_bus::call`'s 25 s default is shorter than
+/// the prompt alone. With it, a user still typing the passphrase got a
+/// Critical "Wi-Fi connection failed: call timeout" while iwd went on
+/// connecting with the passphrase they then submitted.
+///
+/// iwd bounds every one of those steps itself, and `iwctl` puts no deadline
+/// on `Connect` at all (`ell`'s D-Bus client has none). Five minutes is a
+/// backstop for an iwd that has stopped answering: a whole prompt plus
+/// several BSSes' worth of DHCP. An iwd that exits does not reach it: the
+/// bus answers the pending call with `NoReply` as soon as iwd disconnects.
+const NETWORK_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// The deadline an iwd `Network` method gets, or `None` for
+/// `hytte_bus::call`'s default. Only `Connect` waits on the user. See
+/// [`NETWORK_CONNECT_TIMEOUT`].
+pub(super) fn network_call_deadline(method: &str) -> Option<std::time::Duration> {
+    (method == "Connect").then_some(NETWORK_CONNECT_TIMEOUT)
+}
+
 /// Register our agent object with iwd's `AgentManager`.
 pub(super) async fn register_iwd_agent(agent_path: &str) -> Result<(), hytte_bus::BusError> {
     let agent_obj_path = zbus::zvariant::ObjectPath::try_from(agent_path)
@@ -262,4 +294,25 @@ pub(super) async fn discover_station() -> Option<(ManagedObjects, zbus::zvariant
     };
 
     Some((managed, station_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IWD_AGENT_INPUT_TIMEOUT, network_call_deadline};
+
+    /// `Network.Connect` blocks while the user types the passphrase on our
+    /// agent's prompt, and iwd waits two minutes for that. A deadline shorter
+    /// than that fires while the prompt is still open: a Critical "Wi-Fi
+    /// connection failed" toast for a connection that then succeeds.
+    ///
+    /// **Falsification:** make `network_call_deadline` return `None` for
+    /// `Connect` (the 25 s default) and this fails.
+    #[test]
+    fn connect_outlasts_a_passphrase_prompt() {
+        let deadline = network_call_deadline("Connect");
+        assert!(
+            deadline.is_some_and(|d| d > IWD_AGENT_INPUT_TIMEOUT),
+            "Connect must wait out a whole passphrase prompt, got {deadline:?}"
+        );
+    }
 }

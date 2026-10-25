@@ -1393,13 +1393,15 @@ async fn do_station_call(path: &str, method: &str) -> Result<(), hytte_bus::BusE
 }
 
 async fn do_network_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(BusKind::System, "net.connman.iwd")
+    let call = hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path(path.to_string())
         .iface("net.connman.iwd.Network")
-        .method(method)
-        .args(())
-        .send::<()>()
-        .await
+        .method(method);
+    let call = match client::network_call_deadline(method) {
+        Some(deadline) => call.timeout(deadline),
+        None => call,
+    };
+    call.args(()).send::<()>().await
 }
 
 async fn do_set_powered(adapter_path: &str, on: bool) -> Result<(), hytte_bus::BusError> {

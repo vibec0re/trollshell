@@ -660,6 +660,13 @@ pub fn builtin_default() -> Vec<Place> {
 ///
 /// Returns [`builtin_default`] when no layer contributes a usable `[[place]]`.
 ///
+/// This is the **startup** read, and the only reader that writes anything.
+/// [`ConfigWatcher::poll`] deliberately does not call it: a `places.toml` that
+/// is missing *mid-session* is not a first run but a save in flight (an editor
+/// that saves by rename leaves the path empty for a moment) or a deletion, and
+/// seeding the default into that window can rename it over the save that is
+/// about to land. See [`ConfigWatcher::poll`] for what the watcher does instead.
+///
 /// # First run, and why nix suppresses it (#1227 item 2)
 ///
 /// With no overlay file this has always written [`DEFAULT_CONFIG`] into
@@ -834,6 +841,26 @@ pub struct ConfigWatcher {
     /// One stamp per entry of [`Self::paths`], `None` for a layer that is not
     /// there — which is how an *appearing* or *vanishing* layer is seen at all.
     last: Vec<Option<(SystemTime, u64)>>,
+    /// The overlay slot, [`config_path`] — named rather than read off the end
+    /// of [`Self::paths`], which holds only base layers when `$HOME` is unset.
+    overlay: Option<PathBuf>,
+    /// Whether this watcher has seen the overlay exist, at construction or on
+    /// any later read. It is what tells a `places.toml` that is *gone* (a save
+    /// in flight, or a deletion: keep the places in use) from one that was
+    /// never there (a nix-declared box with no overlay: reload the base layers
+    /// over nothing, as always). See [`Self::poll`].
+    overlay_seen: bool,
+}
+
+/// What a live reload makes of the overlay — [`ConfigWatcher::poll`]'s three
+/// answers, as a type rather than an `Option<Option<_>>`.
+enum LiveOverlay {
+    /// A body that parses as places: fold it over the base layers.
+    Fold((PathBuf, String)),
+    /// No overlay to fold: no `$HOME`, or a file this watcher has never seen.
+    Absent,
+    /// The overlay cannot be used right now: keep the places already in use.
+    Keep,
 }
 
 impl Default for ConfigWatcher {
@@ -850,7 +877,14 @@ impl ConfigWatcher {
     pub fn new() -> Self {
         let paths = layer_paths();
         let last = paths.iter().map(|p| stamp(p)).collect();
-        Self { paths, last }
+        let overlay = config_path();
+        let overlay_seen = overlay.as_deref().is_some_and(Path::exists);
+        Self {
+            paths,
+            last,
+            overlay,
+            overlay_seen,
+        }
     }
 
     /// Whether **some layer's** content has moved since the previous call —
@@ -883,18 +917,104 @@ impl ConfigWatcher {
 
     /// Reload and return the fresh places when **some layer's** stamp has moved
     /// since the previous poll *and* the merged list differs from `current`;
-    /// otherwise `None` (no layer moved, no layer to watch, or an identical
-    /// reparse).
+    /// otherwise `None`: no layer moved, no layer to watch, an identical
+    /// reparse, or an overlay this reload cannot use.
     ///
     /// For a caller whose whole state *is* the list — the shell's
     /// `Mutable<Arc<Vec<Place>>>`. An editor that also shows the lock set wants
     /// [`Self::moved`]; see there for why this one cannot serve it.
+    ///
+    /// # An overlay that cannot be used keeps the places in use
+    ///
+    /// `None` means "keep `current`", and it is the answer for three overlay
+    /// states that used to reload as something else:
+    ///
+    /// * **It does not parse**: not TOML, or a `[[place]]` the schema cannot
+    ///   read (`lat = "52,4"`). The reader is all-or-nothing ([`parse_places`]),
+    ///   so one bad entry used to fold the whole merge to [`builtin_default`].
+    ///   The shell then published the default place, re-resolved, could fire
+    ///   the `place-changed` hook for it, and fired it again once the real file
+    ///   landed. A file that an in-place editor has truncated mid-write is the
+    ///   same case.
+    /// * **It cannot be read**: permissions, or bytes that are not UTF-8 (a
+    ///   truncation inside a multi-byte character is one).
+    /// * **It is gone, after this watcher has seen it**: a save in flight (an
+    ///   editor that saves by rename, e.g. vim with `backupcopy=no`, leaves the
+    ///   path empty for a moment) or a deletion. Nothing is written. The
+    ///   first-run seed belongs to [`load_places`] alone, and this used to call
+    ///   it, so a poll landing in that window renamed [`DEFAULT_CONFIG`] into
+    ///   the path — over the save itself, if that landed a moment later. A
+    ///   deleted file therefore keeps the places it last held until it is back
+    ///   or the shell restarts, and the restart seeds the default as any first
+    ///   run does. That is the opposite of `subsystem::watch`'s "a deleted
+    ///   layer is an intent" (#1040 F7), on purpose: that rule restores a look,
+    ///   while this list's default is a place in Berlin whose arrival fires a
+    ///   hook.
+    ///
+    /// Each is logged **once per change the stamps see**, not once per tick.
+    /// [`Self::moved`] advances the stamps before anything is read, so a file
+    /// left broken is not re-read until it is saved again — the rule
+    /// `subsystem::watch::Watcher::poll` keeps (#1040 T2). The next save that
+    /// *does* parse reloads every layer, so a base-layer move that landed in
+    /// between is deferred rather than lost.
+    ///
+    /// An overlay this watcher has **never** seen is not "gone": a nix box that
+    /// declares the list has no overlay at all, and its base layers still
+    /// reload over nothing (and still seed nothing).
+    ///
+    /// Two limits, both deliberate. The check is whole-file, so an overlay with
+    /// one bad entry keeps *all* of the previous set rather than applying its
+    /// good entries; per-entry tolerance would be a schema decision, and this
+    /// does not make it. And a truncation that is itself a valid, smaller file
+    /// (cut cleanly between two `[[place]]` blocks) cannot be told from an
+    /// edit, so it reloads as one. Startup is unchanged: with no set to keep,
+    /// [`load_places`] still answers [`builtin_default`] for an overlay that
+    /// does not parse, and still seeds one that is missing.
     pub fn poll(&mut self, current: &[Place]) -> Option<Vec<Place>> {
         if !self.moved() {
             return None;
         }
-        let reloaded = load_places();
+        let overlay = match self.live_overlay() {
+            LiveOverlay::Fold(overlay) => Some(overlay),
+            LiveOverlay::Absent => None,
+            LiveOverlay::Keep => return None,
+        };
+        let reloaded = assemble_places(&read_base_layers(), overlay.as_ref()).places;
         (reloaded.as_slice() != current).then_some(reloaded)
+    }
+
+    /// Read the overlay for a live reload and decide what [`Self::poll`] does
+    /// with it. Every [`LiveOverlay`] answer, and the one line each logs, comes
+    /// from here.
+    fn live_overlay(&mut self) -> LiveOverlay {
+        let Some(path) = self.overlay.clone() else {
+            return LiveOverlay::Absent;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(body) => {
+                self.overlay_seen = true;
+                match parse_places(&body) {
+                    Ok(_) => LiveOverlay::Fold((path, body)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "places: config changed but does not parse; keeping the places already in use");
+                        LiveOverlay::Keep
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self.overlay_seen {
+                    tracing::info!(path = %path.display(), "places: config is gone (a save in flight, or deleted); keeping the places already in use until it is back");
+                    LiveOverlay::Keep
+                } else {
+                    LiveOverlay::Absent
+                }
+            }
+            Err(e) => {
+                self.overlay_seen = true;
+                tracing::warn!(error = %e, path = %path.display(), "places: config changed but is unreadable; keeping the places already in use (not overwriting)");
+                LiveOverlay::Keep
+            }
+        }
     }
 }
 
@@ -2292,6 +2412,185 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Live reload: an overlay that cannot be used keeps the set in use ─────
+
+    /// The operator's own two places. Non-ASCII on purpose: `ü` is two bytes
+    /// in UTF-8, so a write cut between them is a file that is not UTF-8.
+    const TWO_PLACES: &str = "\
+[[place]]
+name = \"Home\"
+lat = 52.5
+lon = 13.4
+
+[[place]]
+name = \"Büro\"
+lat = 52.6
+lon = 13.5
+";
+
+    fn names(places: &[Place]) -> Vec<&str> {
+        places.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// A scratch `$HOME` holding [`TWO_PLACES`] as the overlay, no base layer,
+    /// and the shell's own startup order (`PlacesService::start` loads, then
+    /// `watch_config` builds its watcher). `body` gets the overlay's path, the
+    /// watcher and the set that was published.
+    fn with_a_running_overlay(body: impl FnOnce(&Path, &mut ConfigWatcher, &[Place])) {
+        let root = tempfile::tempdir().expect("tempdir");
+        with_layers(root.path(), &[], || {
+            let path = config_path().expect("$HOME");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, TWO_PLACES).expect("overlay");
+            let current = load_places();
+            let mut watcher = ConfigWatcher::new();
+            assert_eq!(names(&current), ["Home", "Büro"]);
+            body(&path, &mut watcher, &current);
+        });
+    }
+
+    /// One typo'd coordinate in one `[[place]]` is valid TOML that the schema
+    /// cannot read, and the reader is all-or-nothing: the whole merge used to
+    /// fold to [`builtin_default`], which the shell published — re-resolving,
+    /// and firing `place-changed` for a place the operator never configured.
+    /// A live reload keeps the set in use instead, and says so once per save.
+    ///
+    /// **Red if `poll` goes back to `load_places()`**: the first poll returns
+    /// `Some(builtin_default())`.
+    #[test]
+    fn a_live_reload_with_one_bad_entry_keeps_the_places_in_use() {
+        with_a_running_overlay(|path, watcher, current| {
+            let (captured, _guard) = crate::test_support::capture();
+            std::fs::write(path, TWO_PLACES.replace("lat = 52.6", "lat = \"52,6\"")).expect("save");
+
+            assert_eq!(
+                watcher.poll(current),
+                None,
+                "the set in use is kept, not swapped for the default"
+            );
+            for _ in 0..3 {
+                assert_eq!(watcher.poll(current), None);
+            }
+            let warned = captured.warnings();
+            assert_eq!(
+                warned.len(),
+                1,
+                "one line per save, not one per poll: {warned:#?}"
+            );
+            assert!(warned[0].contains("does not parse"), "{warned:#?}");
+
+            // The corrected save reloads as normal.
+            std::fs::write(path, TWO_PLACES.replace("Büro", "Werkstatt")).expect("save");
+            let reloaded = watcher.poll(current).expect("a save that parses reloads");
+            assert_eq!(names(&reloaded), ["Home", "Werkstatt"]);
+        });
+    }
+
+    /// An editor that writes in place truncates the file and then fills it, so
+    /// a poll can read a prefix. Three prefixes, one per way it can fail: not
+    /// TOML, not UTF-8, and TOML that the schema cannot read. Each keeps the
+    /// set in use, with one warning apiece.
+    ///
+    /// **Red if `poll` goes back to `load_places()`**: the first cut returns
+    /// `Some(builtin_default())`.
+    #[test]
+    fn a_live_reload_of_a_truncated_file_keeps_the_places_in_use() {
+        let at = |needle: &str| TWO_PLACES.find(needle).expect("in the fixture");
+        let cuts = [
+            // `name = "Bü` — an unterminated string.
+            ("not TOML", at("ro\"")),
+            // `name = "B` plus the first byte of `ü`.
+            ("not UTF-8", at("ü") + 1),
+            // The second `[[place]]` with its name and no `lat`.
+            ("not the schema", at("lat = 52.6")),
+        ];
+
+        with_a_running_overlay(|path, watcher, current| {
+            let (captured, _guard) = crate::test_support::capture();
+            for (what, cut) in cuts {
+                std::fs::write(path, &TWO_PLACES.as_bytes()[..cut]).expect("a half-done write");
+                assert_eq!(
+                    watcher.poll(current),
+                    None,
+                    "{what}: the set in use is kept"
+                );
+            }
+            let warned = captured.warnings();
+            assert_eq!(warned.len(), cuts.len(), "one per save: {warned:#?}");
+        });
+    }
+
+    /// A save by rename (vim with `backupcopy=no`, and most "atomic" savers)
+    /// leaves `places.toml` absent for a moment. A poll in that window used to
+    /// reach `load_places`' first-run arm and rename the default into the path
+    /// — or rename a pre-rename `departures.toml` there — over the save about
+    /// to land. The watcher writes nothing, keeps the set in use, logs once,
+    /// and reloads when the file is back.
+    ///
+    /// **Red if `poll` goes back to `load_places()`**: phase 1 finds the
+    /// default written into the path, phase 2 finds `departures.toml` renamed
+    /// into it. Red as well if `ConfigWatcher::new` stops counting the overlay
+    /// it was built over as seen.
+    #[test]
+    fn a_poll_that_finds_the_config_gone_writes_nothing() {
+        with_a_running_overlay(|path, watcher, current| {
+            let (captured, _guard) = crate::test_support::capture();
+            let gone = || {
+                captured
+                    .messages_at(tracing::Level::INFO)
+                    .into_iter()
+                    .filter(|m| m.contains("config is gone"))
+                    .count()
+            };
+
+            // Phase 1: the first-run seed must not run.
+            std::fs::remove_file(path).expect("the rename-save window");
+            assert_eq!(watcher.poll(current), None, "the set in use is kept");
+            assert!(!path.exists(), "the watcher must never create places.toml");
+            for _ in 0..3 {
+                assert_eq!(watcher.poll(current), None);
+            }
+            assert_eq!(gone(), 1, "one line per disappearance, not one per poll");
+
+            std::fs::write(path, TWO_PLACES.replace("Büro", "Werkstatt")).expect("the save lands");
+            let reloaded = watcher.poll(current).expect("back → reload");
+            assert_eq!(names(&reloaded), ["Home", "Werkstatt"]);
+
+            // Phase 2: nor the legacy migration, which writes by renaming.
+            let legacy = path.with_file_name("departures.toml");
+            std::fs::write(&legacy, "[[place]]\nname = \"Alt\"\nlat = 1.0\nlon = 2.0\n")
+                .expect("a pre-rename departures.toml");
+            std::fs::remove_file(path).expect("the window again");
+            assert_eq!(watcher.poll(&reloaded), None);
+            assert!(!path.exists(), "nothing renamed into places.toml");
+            assert!(legacy.exists(), "departures.toml left where it was");
+            assert_eq!(gone(), 2);
+        });
+    }
+
+    /// The other side of the line the three tests above draw: **startup** with
+    /// no `places.toml` still seeds the documented default, byte for byte. Only
+    /// the watcher stopped writing.
+    ///
+    /// **Red if the seed is dropped from `load_places`**, i.e. if the fix
+    /// above is made by deleting the first-run write rather than by keeping
+    /// the watcher away from it.
+    #[test]
+    fn startup_with_no_config_still_writes_the_default() {
+        let root = tempfile::tempdir().expect("tempdir");
+        with_layers(root.path(), &[], || {
+            let path = config_path().expect("$HOME");
+            assert!(!path.exists(), "a first run");
+
+            assert_eq!(load_places(), builtin_default());
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("seeded"),
+                DEFAULT_CONFIG,
+                "the documented default, as it always was"
+            );
+        });
     }
 
     // ── Write path: serialisation round-trip (#640) ─────────────────────────

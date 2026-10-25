@@ -43,9 +43,13 @@
 //! A save also **re-reads and reparses the file first** and refuses if it no
 //! longer parses, or parses to something other than what the shell has in
 //! memory. The set in memory is the user's config only when the file could be
-//! read: a malformed one leaves memory on the built-in default indefinitely
-//! (the load happens once, the watcher is mtime-gated), and rewriting that
-//! would replace a hand-written config with one default place. See `edit`.
+//! read. A file that is malformed at startup leaves memory on the built-in
+//! default, and one that turns malformed while the shell runs leaves it on the
+//! last set that parsed (the watcher keeps it rather than reloading, see
+//! [`hytte_config::places::ConfigWatcher::poll`]). Either way memory holds
+//! something the file
+//! no longer says until the next save that parses, and rewriting it would
+//! replace a hand-written config with it. See `edit`.
 //!
 //! A save is a **format-preserving patch, not a re-render**: `places.toml` has
 //! two permanent authors (the operator editing it by hand, which #703 asked to
@@ -425,8 +429,10 @@ static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// **The re-read is a data-loss guard, not a nicety** — see `check_base` for
 /// the two ways the in-memory set can be a lie about what's on disk. It matters
 /// especially here because the shell reads the file exactly once at startup and
-/// its watcher is mtime-gated, so a malformed config leaves memory on the
-/// built-in default indefinitely.
+/// its watcher only re-reads on a change, and neither replaces memory with a
+/// malformed file. Startup leaves memory on the built-in default and the
+/// watcher keeps the last set that parsed, both until the next save that
+/// parses.
 ///
 /// Order then matters. The file is written **first**, so a failed write leaves
 /// the in-memory set untouched and the two still agree. Publishing second is
@@ -479,6 +485,12 @@ fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(
 /// [`BATTERY_CONFIG_POLL_INTERVAL`] on battery — #505) without restarting the
 /// shell. [`resolve_loop`] subscribes to the same handle and re-resolves on
 /// each swap, exactly as it does for the Wi-Fi and `GeoClue` sensors.
+///
+/// A save that does not parse, and a `places.toml` that is briefly gone
+/// mid-save, publish nothing: the watcher keeps the set in use and never writes
+/// the file ([`hytte_config::places::ConfigWatcher::poll`]). Publishing the
+/// built-in default there, as it used to, would re-resolve against it and could
+/// fire `place-changed` twice for one save that never meant to move anything.
 async fn watch_config(places: Mutable<Arc<Vec<Place>>>) {
     let mut watcher = model::ConfigWatcher::new();
     loop {
